@@ -33,3 +33,7 @@ browsersaving/AGENTS.md
 browsersaving/api/.wrangler/
 browsersaving/src-tauri/target/
 browsersaving/src-tauri/.DS_Store
+
+# cleanup runtime leftovers
+*.orig
+video-affiliate/worker/[0-9]*.json
