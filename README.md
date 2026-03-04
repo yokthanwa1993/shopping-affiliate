@@ -2,22 +2,21 @@
 
 รวม 2 ระบบที่ทำงานร่วมกันใน repo เดียว:
 
-- `video-affiliate/` — Telegram Mini App + Worker + FFmpeg/Rust container
-- `browsersaving/` — Browser Profile Manager (API + Worker + Tauri App)
+- `apps/video-affiliate/` — Telegram Mini App + Worker + FFmpeg/Rust container
+- `apps/browsersaving/` — Browser Profile Manager (API + Worker + Tauri App)
 
 วัตถุประสงค์ของโครงสร้างนี้คือให้ AI และทีมแก้ code ได้ใน workflow เดียว โดยคงขอบเขตของแต่ละ service ไว้ชัดเจน
 
 ## โครงสร้างไฟล์หลัก
 
-- `video-affiliate/worker/` Cloudflare Worker API + webhook + cron + auth
-- `video-affiliate/webapp/` Telegram Mini App (React + Vite)
-- `video-affiliate/token-facebook-lite/` Cloudflare Worker สำหรับ token helper
-- `video-affiliate/merge-rust/` Cloudflare Container สำหรับ pipeline/video processing
+- `apps/video-affiliate/worker/` Cloudflare Worker API + webhook + cron + auth
+- `apps/video-affiliate/webapp/` Telegram Mini App (React + Vite)
+- `apps/video-affiliate/token-facebook-lite/` Cloudflare Worker สำหรับ token helper
+- `apps/video-affiliate/merge-rust/` Cloudflare Container สำหรับ pipeline/video processing
 
-- `browsersaving/worker/` Cloudflare Worker จัดการ profiles/cookies
-- `browsersaving/api/` Node API ดึง Postcron token
-- `browsersaving/src/` Tauri + React UI
-- `browsersaving/src-tauri/` Tauri Rust bridge
+- `apps/browsersaving/worker/` Cloudflare Worker จัดการ profiles/cookies
+- `apps/browsersaving/api/` Node API ดึง Postcron token
+- `apps/browsersaving/src-tauri/` Tauri Rust bridge
 
 ## คำสั่งที่รันจาก root
 
@@ -40,11 +39,11 @@
 
 ## Deployment (ตัวอย่างเดิมตาม AGENTS)
 
-- Video Affiliate Worker: `video-affiliate/worker/wrangler.toml`
-- Video Affiliate Pages: `video-affiliate/webapp`
-- BrowserSaving Worker: `browsersaving/worker/wrangler.toml`
-- BrowserSaving API: `browsersaving/api`
-- BrowserSaving Desktop: `browsersaving/src` + `browsersaving/src-tauri`
+- Video Affiliate Worker: `apps/video-affiliate/worker/wrangler.toml`
+- Video Affiliate Pages: `apps/video-affiliate/webapp`
+- BrowserSaving Worker: `apps/browsersaving/worker/wrangler.toml`
+- BrowserSaving API: `apps/browsersaving/api`
+- BrowserSaving Desktop: `apps/browsersaving/src-tauri`
 
 ## หมายเหตุ
 

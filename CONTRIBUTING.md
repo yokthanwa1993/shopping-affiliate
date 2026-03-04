@@ -1,7 +1,7 @@
 # shopping-affiliate Monorepo Contribution Guide
 
 ## โครงสร้างงาน
-- `video-affiliate/` และ `browsersaving/` เป็น 2 service หลักที่ทำงานร่วมกันใน repo เดียว
+- `apps/video-affiliate/` และ `apps/browsersaving/` เป็น 2 service หลักที่ทำงานร่วมกันใน repo เดียว
 - แก้ไขตามพื้นที่ที่ได้รับผลโดยตรงก่อน (ไม่แก้ข้าม service โดยไม่จำเป็น)
 
 ## คำสั่งหลัก (จาก root)

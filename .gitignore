@@ -1,42 +1,42 @@
-video-affiliate/.git/
-browsersaving/.git/
+apps/video-affiliate/.git/
+apps/browsersaving/.git/
 # General
 .DS_Store
 Thumbs.db
 
 # video-affiliate build/runtime artifacts
-video-affiliate/merge-rust/target/
-video-affiliate/merge-rust/output/
-video-affiliate/merge-rust/node_modules/
-video-affiliate/merge-rust/.wrangler/
-video-affiliate/worker/node_modules/
-video-affiliate/worker/.wrangler/
-video-affiliate/worker/.wrangler-dryrun/
-video-affiliate/worker/deploy.tar
-video-affiliate/worker/_processing/
-video-affiliate/worker/_waiting_video/
-video-affiliate/worker/videos/
-video-affiliate/worker/8328894625/
-video-affiliate/worker/_config/categories.json
-video-affiliate/worker/tail.json
-video-affiliate/worker/*.orig
-video-affiliate/webapp/deploy.tar
-video-affiliate/webapp/dist/
-video-affiliate/AGENTS.md
+apps/video-affiliate/merge-rust/target/
+apps/video-affiliate/merge-rust/output/
+apps/video-affiliate/merge-rust/node_modules/
+apps/video-affiliate/merge-rust/.wrangler/
+apps/video-affiliate/worker/node_modules/
+apps/video-affiliate/worker/.wrangler/
+apps/video-affiliate/worker/.wrangler-dryrun/
+apps/video-affiliate/worker/deploy.tar
+apps/video-affiliate/worker/_processing/
+apps/video-affiliate/worker/_waiting_video/
+apps/video-affiliate/worker/videos/
+apps/video-affiliate/worker/8328894625/
+apps/video-affiliate/worker/_config/categories.json
+apps/video-affiliate/worker/tail.json
+apps/video-affiliate/worker/*.orig
+apps/video-affiliate/webapp/deploy.tar
+apps/video-affiliate/webapp/dist/
+apps/video-affiliate/AGENTS.md
 
 # browsersaving build/runtime artifacts
-browsersaving/node_modules/
-browsersaving/dist/
-browsersaving/release/
-browsersaving/.DS_Store
-browsersaving/AGENTS.md
-browsersaving/api/.wrangler/
-browsersaving/src-tauri/target/
-browsersaving/src-tauri/.DS_Store
+apps/browsersaving/node_modules/
+apps/browsersaving/dist/
+apps/browsersaving/release/
+apps/browsersaving/.DS_Store
+apps/browsersaving/AGENTS.md
+apps/browsersaving/api/.wrangler/
+apps/browsersaving/src-tauri/target/
+apps/browsersaving/src-tauri/.DS_Store
 
 # cleanup runtime leftovers
 *.orig
-video-affiliate/worker/[0-9]*.json
+apps/video-affiliate/worker/[0-9]*.json
 
 # Monorepo root output
 node_modules/

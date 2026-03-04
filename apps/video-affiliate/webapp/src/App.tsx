@@ -309,6 +309,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
   const [deleting, setDeleting] = useState(false)
   const [shopeeInput, setShopeeInput] = useState('')
   const [savingShopee, setSavingShopee] = useState(false)
+  const [deletingShopeeLink, setDeletingShopeeLink] = useState(false)
   const [localShopee, setLocalShopee] = useState(getVideoShopeeLink(video as unknown as Record<string, unknown>))
   const [localCats, setLocalCats] = useState<string[]>([])
   const [fetchedCats, setFetchedCats] = useState<string[]>([])
@@ -364,6 +365,35 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
       alert('บันทึกไม่สำเร็จ: ' + (e instanceof Error ? e.message : 'Network error'))
     } finally {
       setSavingShopee(false)
+    }
+  }
+
+  const handleDeleteShopeeLink = async () => {
+    if (!localShopee) return
+    if (!confirm('ยืนยันลบลิงก์ Shopee ออกจากวิดีโอนี้?')) return
+    setDeletingShopeeLink(true)
+    try {
+      const nowIso = new Date().toISOString()
+      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shopeeLink: '' })
+      })
+      if (resp.ok) {
+        video.shopeeLink = ''
+        video.updatedAt = nowIso
+        setLocalShopee('')
+        setShopeeInput('')
+        onUpdate(video.id, { shopeeLink: '', updatedAt: nowIso })
+      } else {
+        const err = await resp.json().catch(() => ({ error: 'Unknown error' }))
+        alert('ลบลิงก์ไม่สำเร็จ: ' + (err.error || resp.status))
+      }
+    } catch (e) {
+      console.error('Delete shopee link failed:', e)
+      alert('ลบลิงก์ไม่สำเร็จ: ' + (e instanceof Error ? e.message : 'Network error'))
+    } finally {
+      setDeletingShopeeLink(false)
     }
   }
 
@@ -519,6 +549,23 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
                   <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </button>
+              {/* ลบลิ้ง Shopee */}
+              <button
+                onClick={handleDeleteShopeeLink}
+                disabled={deletingShopeeLink}
+                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform disabled:opacity-60"
+              >
+                {deletingShopeeLink ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                    <path d="M3 6h18" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4h4v2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </button>
             </div>
           ) : (
             <div className="flex items-center gap-2 mt-3">
@@ -570,10 +617,10 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
   }
 
   return (
-    <div
-      className="relative aspect-[9/16] rounded-2xl overflow-hidden cursor-pointer bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200"
-      onClick={() => setExpanded(true)}
-    >
+      <div
+        className="relative aspect-[9/16] rounded-2xl overflow-hidden cursor-pointer bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200"
+        onClick={() => setExpanded(true)}
+      >
       <Thumb id={video.id} url={video.thumbnailUrl} fallback={video.publicUrl} />
       {getVideoShopeeLink(video as unknown as Record<string, unknown>) && (
         <div className="absolute bottom-2 left-2 bg-orange-500 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg border border-white/20">

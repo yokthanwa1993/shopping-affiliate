@@ -42,4 +42,4 @@ wrangler containers push video-affiliate-worker-mergecontainer:v{VERSION}
 - ใช้ `video-affiliate-*` ทุกจุด
 - หลีกเลี่ยงชื่อ legacy ใน runtime และเอกสาร
 
-ดูรายละเอียดเชิงระบบที่ [AGENTS.md](/Users/yok/Developer/shopping-affiliate/video-affiliate/AGENTS.md)
+ดูรายละเอียดเชิงระบบที่ [AGENTS.md](/Users/yok/Developer/shopping-affiliate/apps/video-affiliate/AGENTS.md)
