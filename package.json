@@ -1,0 +1,31 @@
+{
+  "name": "shopping-affiliate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo for video-affiliate and browsersaving",
+  "scripts": {
+    "start:video-affiliate:webapp": "cd video-affiliate/webapp && npm run dev",
+    "build:video-affiliate:webapp": "cd video-affiliate/webapp && npm run build",
+    "preview:video-affiliate:webapp": "cd video-affiliate/webapp && npm run preview",
+    "start:video-affiliate:worker": "cd video-affiliate/worker && npm run dev",
+    "deploy:video-affiliate:worker": "cd video-affiliate/worker && npm run deploy",
+    "db:create:video-affiliate": "cd video-affiliate/worker && npm run db:create",
+    "db:migrate:video-affiliate": "cd video-affiliate/worker && npm run db:migrate",
+    "db:migrate:video-affiliate:local": "cd video-affiliate/worker && npm run db:migrate:local",
+    "deploy:video-affiliate:token-facebook-lite": "cd video-affiliate/token-facebook-lite && npm run deploy",
+    "check:video-affiliate:token-facebook-lite": "cd video-affiliate/token-facebook-lite && npm run check",
+
+    "start:browsersaving:webapp": "cd browsersaving && npm run dev",
+    "build:browsersaving:webapp": "cd browsersaving && npm run build",
+    "preview:browsersaving:webapp": "cd browsersaving && npm run preview",
+    "tauri:dev:browsersaving": "cd browsersaving && npm run tauri:dev",
+    "tauri:build:browsersaving": "cd browsersaving && npm run tauri:build",
+    "start:browsersaving:api": "cd browsersaving/api && npm run start",
+    "start:browsersaving:worker": "cd browsersaving/worker && npm run dev",
+    "deploy:browsersaving:worker": "cd browsersaving/worker && npm run deploy",
+    "db:migrate:browsersaving:local": "cd browsersaving/worker && npm run db:migrate:local",
+    "db:migrate:browsersaving:prod": "cd browsersaving/worker && npm run db:migrate:prod",
+
+    "help:mono": "node -e \"console.log('Root scripts: start:video-affiliate:webapp | start:video-affiliate:worker | start:browsersaving:webapp | start:browsersaving:api | start:browsersaving:worker | ...')\""
+  }
+}
