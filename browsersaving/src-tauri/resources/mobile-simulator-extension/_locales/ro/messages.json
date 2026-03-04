@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Simulator telefon mobil - test site responsive"
+  },
+  "extDescription": {
+    "message": "Simulator de smartphone-uri și tablete pe computer cu numeroase modele pentru a testa site-ul mobil și responsive."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Anulează"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Telefoane Android"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Telefoane Apple"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Tablete"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Speciale"
+  },
+  "copied": {
+    "message": "Copiat"
+  },
+  "error": {
+    "message": "Eroare"
+  },
+  "link": {
+    "message": "Link"
+  },
+  "optional": {
+    "message": "Opțional"
+  },
+  "close": {
+    "message": "Închide"
+  },
+  "get_pro": {
+    "message": "Obține versiunea PRO"
+  },
+  "error_contact": {
+    "message": "{Contactați-ne} dacă problema persistă."
+  },
+  "more_settings": {
+    "message": "Mai multe setări"
+  },
+  "dimensions": {
+    "message": "Dimensiuni"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Activează vizualizarea mobilă pe acest tab"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Simulatorul nu poate fi activat pe această pagină nativă a browserului dvs. Încercați pe un alt tab sau navigați pe un site și relansați."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Acest simulator nu poate fi activat implicit pe fișiere locale (file:///) dar puteți activa opțiunea manual în setările Chrome."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Activează opțiunea"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Dezactivează simulatorul"
+  },
+  "menu_close_multi": {
+    "message": "Închide această fereastră"
+  },
+  "menu_change_device": {
+    "message": "Schimbă modelul"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Dispozitivul pe care îl căutați nu este în listă? Spuneți-ne!"
+  },
+  "menu_info_device": {
+    "message": "Caracteristici și mockup ale acestui terminal"
+  },
+  "menu_info_device_features": {
+    "message": "Caracteristici (rezoluție viewport, etc.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Mockup gratuit în PNG transparent"
+  },
+  "menu_rotate": {
+    "message": "Schimbă orientarea"
+  },
+  "menu_zoom": {
+    "message": "Mărește în dispozitiv"
+  },
+  "menu_screenshot": {
+    "message": "📷 Fă o captură de ecran"
+  },
+  "menu_screencast": {
+    "message": "📹 Înregistrează un videoclip al ecranului"
+  },
+  "menu_share": {
+    "message": "Partajează cu un coleg, un prieten,..."
+  },
+  "menu_send_improvement": {
+    "message": "Propune o îmbunătățire"
+  },
+  "menu_send_message": {
+    "message": "Centru de ajutor"
+  },
+  "menu_faq_title": {
+    "message": "Întrebări frecvente"
+  },
+  "menu_faq_media_queries": {
+    "message": "Interogările mele media nu sunt luate în considerare"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Cum activez simulatorul în modul incognito?"
+  },
+  "menu_faq_scroll": {
+    "message": "Nu pot derula în simulator"
+  },
+  "menu_faq_subscription": {
+    "message": "De ce nu funcționează abonamentul meu?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Cum configurez scurtături de tastatură?"
+  },
+  "menu_faq_all": {
+    "message": "Vezi toate întrebările frecvente"
+  },
+  "menu_report": {
+    "message": "Raportează un bug"
+  },
+  "menu_settings": {
+    "message": "Configurare"
+  },
+  "menu_add_window": {
+    "message": "Adaugă un model de simulare"
+  },
+  "menu_help_center": {
+    "message": "Centru de ajutor"
+  },
+  "menu_extensions": {
+    "message": "Descoperiți celelalte extensii Chrome ale noastre"
+  },
+  "menu_vote_feature": {
+    "message": "Votează pentru funcțiile pe care le dorești"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Aceasta este doar o imagine. Pentru a schimba URL-ul folosiți câmpul Chrome de mai sus."
+  },
+  "simulator_footer_info": {
+    "message": "Aceasta este doar o imagine. Folosiți propria tastatură."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Captură video doar a terminalului"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Captură video a tab-ului cu terminalul"
+  },
+  "screencast_error": {
+    "message": "A apărut o eroare în timpul înregistrării. {Faceți clic aici} pentru o soluție de ocolire."
+  },
+  "screencast_modale_title": {
+    "message": "Captură video"
+  },
+  "screencast_modale_texte": {
+    "message": "Puteți descărca acest videoclip în diferite formate sau obține un link de partajare."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Descărcați în formatul implicit WEBM (cu transparență dacă opțiunea este activată)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Compatibilitate mai bună cu PowerPoint, dar fără transparență"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Compatibil peste tot, dar calitate inferioară (cu transparență dacă opțiunea este activată)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Durata maximă a unui GIF este de 60 de secunde. Dincolo de aceasta, fișierul ar fi mult prea mare."
+  },
+  "screencast_modale_copy": {
+    "message": "Copiază"
+  },
+  "screencast_modale_upload": {
+    "message": "Obține un link de partajare"
+  },
+  "screencast_modale_contact": {
+    "message": "Raportează un bug, propune o îmbunătățire"
+  },
+  "screencast_start_recording": {
+    "message": "Pornește înregistrarea"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Permisiunea de acces la microfon a fost refuzată."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Permisiunea de acces la cameră a fost refuzată."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Versiunea dvs. de Chrome este prea veche pentru această funcționalitate. Vă rugăm să actualizați Chrome la o versiune superioară 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Calitatea video influențează bitrate-ul, fps-ul și rezoluția înregistrării. Cu cât calitatea este mai mare, cu atât fișierul va fi mai mare."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Înregistrările video sunt limitate la 5 minute în versiunea gratuită."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Captură cu terminalul"
+  },
+  "screenshot_menu_2": {
+    "message": "Captură doar a site-ului"
+  },
+  "screenshot_menu_3": {
+    "message": "Captură a întregii pagini"
+  },
+  "screenshot_menu_4": {
+    "message": "Captură a întregului tab"
+  },
+  "screenshot_button": {
+    "message": "Generează o captură"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Descărcați în format PNG (fără compresie)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Descărcați în format WEBP, compatibil aproape peste tot și compresie optimizată (recomandat)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Opriți înainte de sfârșitul paginii"
+  },
+  "screenshot_modale_title": {
+    "message": "Captură"
+  },
+  "screenshot_modale_copy": {
+    "message": "Copiază imaginea în clipboard"
+  },
+  "screenshot_modale_edit": {
+    "message": "Editează captura"
+  },
+  "screenshot_modale_help": {
+    "message": "Pentru a salva imaginea la dimensiune mare, faceți clic dreapta pe ea și selectați \"Copiază imaginea\" sau \"Salvează\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Închide editorul"
+  },
+  "screenshot_editor_undo": {
+    "message": "Anulează ultima acțiune"
+  },
+  "screenshot_editor_rect": {
+    "message": "Desenează un dreptunghi"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Desenează un cerc"
+  },
+  "screenshot_editor_line": {
+    "message": "Desenează o linie"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Desenează o săgeată"
+  },
+  "screenshot_editor_pen": {
+    "message": "Desen liber"
+  },
+  "screenshot_editor_color": {
+    "message": "Culoarea liniei"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Grosimea liniei"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Deveniți un PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Convertiți capturile video în formate GIF și MP4"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Simulați toate dispozitivele"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Deblocați toate setările"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Deblocați toate setările de înregistrare video"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Eliminați reclamele"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Editați capturile"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Faceți capturi de ecran fără limită"
+  },
+  "pro_modale_h2": {
+    "message": "Deveniți un PRO și contribuiți activ la dezvoltarea acestei extensii susținând dezvoltatorul său."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Facturat anual"
+  },
+  "pro_modale_savings": {
+    "message": "Economisiți"
+  },
+  "pro_modale_from": {
+    "message": "De la"
+  },
+  "pro_modale_recurring_month": {
+    "message": "lună"
+  },
+  "pro_modale_button": {
+    "message": "Mă abonez"
+  },
+  "pro_modale_link_1": {
+    "message": "Sau"
+  },
+  "pro_modale_link_2": {
+    "message": "mă conectez"
+  },
+  "pro_modale_link_3": {
+    "message": "la contul meu de abonat"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Toate setările video"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Eliminarea reclamelor"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Acest simulator mobil îți este util?"
+  },
+  "sharing_h2": {
+    "message": "Atunci împărtășește-l cu colegii sau prietenii tăi"
+  },
+  "sharing_txt": {
+    "message": "Simulator pentru a testa site-ul pe mobil și tabletă"
+  },
+  "sharing_review_1": {
+    "message": "Și dacă ai un minut pentru"
+  },
+  "sharing_review_2": {
+    "message": "a adăuga o recenzie"
+  },
+  "sharing_review_3": {
+    "message": "atunci este cireașa de pe tort! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Adaug o recenzie"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Descoperiți cele mai noi extensii gratuite ale noastre"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Color picker"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Această extensie vă permite să capturați orice culoare de pe ecran."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Font finder"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Identificați cu un clic fontul utilizat pe orice text de pe o pagină web."
+  },
+  "other_extensions_button": {
+    "message": "Instalează"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Cum ați evalua această extensie?"
+  },
+  "review_note_store": {
+    "message": "Mulțumim pentru feedback, nu ezitați să adăugați o notă pe Google Store. V-aș fi foarte recunoscător 😊"
+  },
+  "review_note_feedback": {
+    "message": "Mulțumim pentru feedback, nu ezitați să ne trimiteți un mesaj pentru a putea îmbunătăți această extensie."
+  },
+  "button_feedback": {
+    "message": "Adaugă o notă"
+  },
+  "button_message": {
+    "message": "Trimiteți-ne un mesaj"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Numele dispozitivului"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, etc."
+  },
+  "contact_title": {
+    "message": "Dispozitivul pe care îl căutați nu este în listă? Spuneți-ne!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Terminal"
+  },
+  "settings_h2_global": {
+    "message": "General"
+  },
+  "settings_hide_header_footer": {
+    "message": "Ascunde elementele de sus și de jos ale browserului în webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Nu afișa tastatura falsă la focusul unui câmp de introducere"
+  },
+  "settings_scrollbar_show": {
+    "message": "Afișează bara de derulare nativă în terminal"
+  },
+  "settings_change_cursor": {
+    "message": "Nu schimba stilul cursorului în webview"
+  },
+  "settings_change_background": {
+    "message": "Modifică culoarea de fundal"
+  },
+  "settings_default_device": {
+    "message": "Terminal implicit la fiecare activare"
+  },
+  "settings_change_analytics": {
+    "message": "Ajut dezvoltatorul acestei extensii să își îmbunătățească produsul prin Posthog. Toate datele sunt anonimizate."
+  },
+  "settings_device_hide": {
+    "message": "Nu afișa terminalul"
+  },
+  "settings_batterie_level": {
+    "message": "Nivelul bateriei în header-ul terminalului (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Modifică URL-ul afișat în terminal"
+  },
+  "settings_presenter_mode": {
+    "message": "Mod prezentare (meniul din dreapta vizibil doar la hover)"
+  },
+  "settings_fullscreen": {
+    "message": "Site în ecran complet în terminal"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Selectați un terminal"
+  },
+  "settings_video_quality": {
+    "message": "Calitate video"
+  },
+  "settings_video_quality_low": {
+    "message": "Mediu"
+  },
+  "settings_video_quality_medium": {
+    "message": "Bună"
+  },
+  "settings_video_quality_high": {
+    "message": "Excelentă"
+  },
+  "settings_theme": {
+    "message": "Temă"
+  },
+  "settings_theme_light": {
+    "message": "Luminos"
+  },
+  "settings_theme_dark": {
+    "message": "Întunecat"
+  },
+  "settings_theme_auto": {
+    "message": "Auto"
+  },
+  "settings_shortcuts": {
+    "message": "Definește scurtături de tastatură"
+  },
+  "settings_pro_account": {
+    "message": "Gestionează abonamentul meu"
+  },
+  "settings_microphone": {
+    "message": "Microfon"
+  },
+  "settings_camera": {
+    "message": "Cameră"
+  },
+  "settings_countdown": {
+    "message": "Numărătoare inversă (secunde)"
+  },
+  "settings_transparent_background": {
+    "message": "Fundal transparent"
+  },
+  "settings_transparent_background_info": {
+    "message": "Această opțiune implică mai multe calcule și, prin urmare, un potențial încetinire a afișajului în funcție de computerul dvs. (compatibil doar cu formatele WEBM și GIF)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Soluție de ocolire pentru captura de ecran"
+  },
+  "screenshot_workaround_context": {
+    "message": "Context"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "Din cauza unor limitări tehnice, este posibil ca, în timpul capturii de ecran, să primiți acest mesaj de eroare."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Soluție de ocolire"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "În acest caz, pentru a lansa captura, este suficient să faceți clic dreapta oriunde pe pagină, să alegeți intrarea „Simulator mobil”, apoi „📷 Fă o captură de ecran”"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Ajutați-ne să facem Mobile FIRST și mai util pentru dvs. 🚀"
+  },
+  "feedback_profession": {
+    "message": "Care este departamentul dvs. profesional?"
+  },
+  "feedback_profession_developer": {
+    "message": "Dezvoltare"
+  },
+  "feedback_profession_designer": {
+    "message": "Design"
+  },
+  "feedback_profession_qa": {
+    "message": "Testare / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Management de produs"
+  },
+  "feedback_profession_marketing": {
+    "message": "Marketing"
+  },
+  "feedback_profession_sales": {
+    "message": "Vânzări"
+  },
+  "feedback_profession_other": {
+    "message": "Altul"
+  },
+  "feedback_company_type": {
+    "message": "Care este tipul companiei dvs.?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Independent"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Micro-întreprindere (1-9 angajați)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Mică întreprindere (10-49 angajați)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Întreprindere medie (50-249 angajați)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Întreprindere mare (250-4999 angajați)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Întreprindere foarte mare / grup (5000+ angajați)"
+  },
+  "feedback_use_cases": {
+    "message": "De ce folosiți Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Testați site-ul meu, faceți demonstrații clienților..."
+  },
+  "feedback_frequency": {
+    "message": "Cât de des folosiți această extensie?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Zilnic"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "De câteva ori pe săptămână"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Ocazional"
+  },
+  "feedback_frequency_rare": {
+    "message": "Rar"
+  },
+  "feedback_improvements": {
+    "message": "Ce îmbunătățiri ați dori să vedeți?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "O idee, o fricțiune, o lipsă..."
+  },
+  "feedback_submit": {
+    "message": "Trimite"
+  },
+  "feedback_close": {
+    "message": "Nu răspunde"
+  },
+  "feedback_error_required": {
+    "message": "Toate câmpurile sunt goale 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Vă mulțumim foarte mult pentru feedback-ul dvs. 🤗"
+  },
+  "select": {
+    "message": "Selectați..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Descoperiți acum noua interfață \"Liquid Glass\" a Safari iOS 26 pentru teste și mai realiste!"
+  },
+  "new_ios26_h2": {
+    "message": "Disponibil pe toate variantele iPhone&nbsp;15 și iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Nou!<br>Testați acum site-urile dvs. cu iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX sunt disponibile în simulator."
+  },
+  "new_video_feature_h1": {
+    "message": "Descoperiți acum noua funcționalitate de captură video!"
+  },
+  "new_video_feature_h2": {
+    "message": "Înregistrați cu o calitate mai bună, cu opțiuni noi și cu fundal transparent"
+  },
+  "logout_modale_title": {
+    "message": "Ați fost deconectat automat de pe acest dispozitiv"
+  },
+  "logout_modale_message": {
+    "message": "Acest dispozitiv nu mai face parte din terminalele dvs. autorizate. Dacă ați eliminat acest acces manual, este necesară o nouă conectare."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Informație</strong>Derularea tactilă nu este disponibilă, dar puteți <strong>afișa bara de derulare</strong> dacă nu aveți o rotiță de mouse sau un trackpad pentru a derula.<br><br>Este o opțiune în setările din partea de jos dreapta <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Bine ați venit la Mobile FIRST 👋</strong>Simulați cu un clic telefoane, tablete și computere pentru a testa și vizualiza simplu site-urile dvs.<br><br><strong>Meniul se află în dreapta ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Actualizare v4.12.0</strong>Nouă funcționalitate în versiunea PRO, <strong>editarea capturilor de ecran</strong>. Butoane pentru a desena forme, a adăuga text, etc. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Actualizare v4.14.0</strong>Descoperiți acum noua funcționalitate de <strong>captură video</strong>! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Actualizare v4.14.5</strong>Crestere semnificativă a <strong>rezoluției și calității</strong> capturilor de ecran <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Conectare"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Doriți să partajați abonamentul dvs.? Pentru a autoriza alte persoane, adăugați-le pur și simplu din secțiunea \"Utilizatori\" a contului dvs."
+  }
+}

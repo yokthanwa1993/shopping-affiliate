@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "モバイル電話シミュレーター - レスポンシブサイトのテスト"
+  },
+  "extDescription": {
+    "message": "コンピュータ上でスマートフォンやタブレットをシミュレートし、多くのモデルでモバイルおよびレスポンシブサイトをテストします。"
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "キャンセル"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Android電話"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Apple電話"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> タブレット"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> 特殊"
+  },
+  "copied": {
+    "message": "コピー済み"
+  },
+  "error": {
+    "message": "エラー"
+  },
+  "link": {
+    "message": "リンク"
+  },
+  "optional": {
+    "message": "オプション"
+  },
+  "close": {
+    "message": "閉じる"
+  },
+  "get_pro": {
+    "message": "PROバージョンを取得"
+  },
+  "error_contact": {
+    "message": "問題が続く場合は{お問い合わせください}。"
+  },
+  "more_settings": {
+    "message": "さらに設定"
+  },
+  "dimensions": {
+    "message": "寸法"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "このタブでモバイルビューを有効にする"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "このブラウザのネイティブページではシミュレーターを有効にできません。他のタブで試すか、サイトを閲覧してから再試行してください。"
+  },
+  "popup_activate_local_files_info": {
+    "message": "このシミュレーターはデフォルトでローカルファイル（file:///）では有効にできませんが、Chromeの設定で手動でオプションを有効にできます。"
+  },
+  "popup_activate_local_files_button": {
+    "message": "オプションを有効にする"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "シミュレーターを無効にする"
+  },
+  "menu_close_multi": {
+    "message": "このウィンドウを閉じる"
+  },
+  "menu_change_device": {
+    "message": "モデルを変更"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> 探しているデバイスがリストにありませんか？お知らせください！"
+  },
+  "menu_info_device": {
+    "message": "この端末の特徴とモックアップ"
+  },
+  "menu_info_device_features": {
+    "message": "特徴（ビューポート解像度など）"
+  },
+  "menu_info_device_mockup": {
+    "message": "透明なPNGの無料モックアップ"
+  },
+  "menu_rotate": {
+    "message": "向きを変更"
+  },
+  "menu_zoom": {
+    "message": "デバイスをズーム"
+  },
+  "menu_screenshot": {
+    "message": "📷 スクリーンショットを撮る"
+  },
+  "menu_screencast": {
+    "message": "📹 画面のビデオを録画"
+  },
+  "menu_share": {
+    "message": "同僚や友人に共有する"
+  },
+  "menu_send_improvement": {
+    "message": "改善を提案する"
+  },
+  "menu_send_message": {
+    "message": "ヘルプセンター"
+  },
+  "menu_faq_title": {
+    "message": "よくある質問"
+  },
+  "menu_faq_media_queries": {
+    "message": "メディアクエリが考慮されていません"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "プライベートブラウジングでシミュレーターを有効にする方法は？"
+  },
+  "menu_faq_scroll": {
+    "message": "シミュレーターでスクロールできない"
+  },
+  "menu_faq_subscription": {
+    "message": "なぜ私のサブスクリプションが機能しないのですか？"
+  },
+  "menu_faq_shortcut": {
+    "message": "キーボードショートカットを設定する方法は？"
+  },
+  "menu_faq_all": {
+    "message": "すべてのよくある質問を見る"
+  },
+  "menu_report": {
+    "message": "バグを報告"
+  },
+  "menu_settings": {
+    "message": "設定"
+  },
+  "menu_add_window": {
+    "message": "シミュレーションモデルを追加"
+  },
+  "menu_help_center": {
+    "message": "ヘルプセンター"
+  },
+  "menu_extensions": {
+    "message": "他のChrome拡張機能を発見する"
+  },
+  "menu_vote_feature": {
+    "message": "希望する機能に投票する"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "これは単なる画像です。URLを変更するには、上記のChromeフィールドを使用してください。"
+  },
+  "simulator_footer_info": {
+    "message": "これは単なる画像です。ご自身のキーボードを使用してください。"
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "端末のみのビデオキャプチャ"
+  },
+  "screencast_tooltip_tab": {
+    "message": "端末を含むタブのビデオキャプチャ"
+  },
+  "screencast_error": {
+    "message": "録画中にエラーが発生しました。{こちらをクリック}して回避策を確認してください。"
+  },
+  "screencast_modale_title": {
+    "message": "ビデオキャプチャ"
+  },
+  "screencast_modale_texte": {
+    "message": "このビデオをさまざまな形式でダウンロードするか、共有リンクを取得できます。"
+  },
+  "screencast_modale_download_webm": {
+    "message": "デフォルトのWEBM形式でダウンロード（オプションが有効な場合は透明）"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "PowerPointとの互換性が高いが透明ではない"
+  },
+  "screencast_modale_download_gif": {
+    "message": "どこでも互換性があるが、品質が低い（オプションが有効な場合は透明）"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "GIFの最大長は60秒です。それ以上になるとファイルが非常に大きくなります。"
+  },
+  "screencast_modale_copy": {
+    "message": "コピー"
+  },
+  "screencast_modale_upload": {
+    "message": "共有リンクを取得"
+  },
+  "screencast_modale_contact": {
+    "message": "バグを報告し、改善を提案する"
+  },
+  "screencast_start_recording": {
+    "message": "録画を開始"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "マイクへのアクセス許可が拒否されました。"
+  },
+  "screencast_camera_permission_denied": {
+    "message": "カメラへのアクセス許可が拒否されました。"
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "この機能にはChromeのバージョンが古すぎます。Chromeを94.0以上に更新してください。"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "ビデオ品質はビットレート、fps、録画解像度に影響します。品質が高いほどファイルサイズが大きくなります。"
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "無料版ではビデオ録画は5分に制限されています。"
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "端末と共にキャプチャ"
+  },
+  "screenshot_menu_2": {
+    "message": "サイトのみをキャプチャ"
+  },
+  "screenshot_menu_3": {
+    "message": "ページ全体をキャプチャ"
+  },
+  "screenshot_menu_4": {
+    "message": "タブ全体をキャプチャ"
+  },
+  "screenshot_button": {
+    "message": "キャプチャを生成"
+  },
+  "screenshot_modale_download_png": {
+    "message": "PNG形式でダウンロード（圧縮なし）"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "WEBP形式でダウンロード、ほぼどこでも互換性があり、圧縮が最適化されています（推奨）"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "ページの終わりまでに停止"
+  },
+  "screenshot_modale_title": {
+    "message": "キャプチャ"
+  },
+  "screenshot_modale_copy": {
+    "message": "クリップボードに画像をコピー"
+  },
+  "screenshot_modale_edit": {
+    "message": "キャプチャを編集"
+  },
+  "screenshot_modale_help": {
+    "message": "大きな形式で画像を保存するには、画像を右クリックして「画像をコピー」または「保存」を選択するだけです。"
+  },
+  "screenshot_editor_close": {
+    "message": "エディタを閉じる"
+  },
+  "screenshot_editor_undo": {
+    "message": "最後の操作を取り消す"
+  },
+  "screenshot_editor_rect": {
+    "message": "四角形を描く"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "円を描く"
+  },
+  "screenshot_editor_line": {
+    "message": "線を描く"
+  },
+  "screenshot_editor_arrow": {
+    "message": "矢印を描く"
+  },
+  "screenshot_editor_pen": {
+    "message": "自由描画"
+  },
+  "screenshot_editor_color": {
+    "message": "線の色"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "線の太さ"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "PROになる"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "ビデオキャプチャをGIFとMP4形式に変換"
+  },
+  "pro_modale_h1_devices": {
+    "message": "すべてのデバイスをシミュレート"
+  },
+  "pro_modale_h1_settings": {
+    "message": "すべての設定を解除"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "ビデオ録画のすべての設定を解除"
+  },
+  "pro_modale_h1_ads": {
+    "message": "広告を削除"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "キャプチャを編集"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "無制限にスクリーンショットを撮る"
+  },
+  "pro_modale_h2": {
+    "message": "PROになり、この拡張機能の開発をサポートして積極的に貢献してください。"
+  },
+  "pro_modale_billed_annualy": {
+    "message": "年額請求"
+  },
+  "pro_modale_savings": {
+    "message": "節約"
+  },
+  "pro_modale_from": {
+    "message": "から"
+  },
+  "pro_modale_recurring_month": {
+    "message": "月"
+  },
+  "pro_modale_button": {
+    "message": "購読する"
+  },
+  "pro_modale_link_1": {
+    "message": "または"
+  },
+  "pro_modale_link_2": {
+    "message": "ログイン"
+  },
+  "pro_modale_link_3": {
+    "message": "サブスクリプションアカウントに"
+  },
+  "pro_modale_avantage_1": {
+    "message": "すべてのビデオ設定"
+  },
+  "pro_modale_avantage_2": {
+    "message": "広告の削除"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "このモバイルシミュレーターは役に立ちますか？"
+  },
+  "sharing_h2": {
+    "message": "それなら、同僚や友人と共有してください"
+  },
+  "sharing_txt": {
+    "message": "モバイル＆タブレットでサイトをテストするためのシミュレーター"
+  },
+  "sharing_review_1": {
+    "message": "そして、もし1分あれば"
+  },
+  "sharing_review_2": {
+    "message": "レビューを追加"
+  },
+  "sharing_review_3": {
+    "message": "してくれると嬉しいです！🙂"
+  },
+  "sharing_review_button": {
+    "message": "レビューを追加"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "私たちの最新の無料拡張機能を発見する"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "カラーピッカー"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "この拡張機能は、画面上の任意の色をキャプチャすることができます。"
+  },
+  "other_extensions_font_finder_title": {
+    "message": "フォントファインダー"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "ウェブページ上の任意のテキストで使用されているフォントをクリックで識別します。"
+  },
+  "other_extensions_button": {
+    "message": "インストール"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "この拡張機能をどのように評価しますか？"
+  },
+  "review_note_store": {
+    "message": "フィードバックをありがとうございます。Googleストアで評価を追加していただけると非常に感謝します😊"
+  },
+  "review_note_feedback": {
+    "message": "フィードバックをありがとうございます。改善のためにメッセージを送ってください。"
+  },
+  "button_feedback": {
+    "message": "評価を追加"
+  },
+  "button_message": {
+    "message": "メッセージを送る"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "デバイス名"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, etc."
+  },
+  "contact_title": {
+    "message": "探しているデバイスがリストにありませんか？お知らせください！"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "端末"
+  },
+  "settings_h2_global": {
+    "message": "一般"
+  },
+  "settings_hide_header_footer": {
+    "message": "Webview（PWA）でブラウザの上部と下部の要素を隠す"
+  },
+  "settings_hide_keyboard": {
+    "message": "入力フィールドにフォーカスしたときに偽のキーボードを表示しない"
+  },
+  "settings_scrollbar_show": {
+    "message": "端末でネイティブのスクロールバーを表示"
+  },
+  "settings_change_cursor": {
+    "message": "Webviewでカーソルスタイルを変更しない"
+  },
+  "settings_change_background": {
+    "message": "背景色を変更"
+  },
+  "settings_default_device": {
+    "message": "毎回の起動時にデフォルトの端末"
+  },
+  "settings_change_analytics": {
+    "message": "Posthogを使用してこの拡張機能の開発者を支援します。すべてのデータは匿名化されます。"
+  },
+  "settings_device_hide": {
+    "message": "端末を表示しない"
+  },
+  "settings_batterie_level": {
+    "message": "端末のヘッダーにバッテリーレベル（％）"
+  },
+  "settings_device_default_url": {
+    "message": "端末に表示されるURLを変更"
+  },
+  "settings_presenter_mode": {
+    "message": "プレゼンテーションモード（右メニューはホバー時のみ表示）"
+  },
+  "settings_fullscreen": {
+    "message": "端末でフルスクリーン表示"
+  },
+  "settings_default_device_placeholder": {
+    "message": "端末を選択"
+  },
+  "settings_video_quality": {
+    "message": "ビデオ品質"
+  },
+  "settings_video_quality_low": {
+    "message": "中"
+  },
+  "settings_video_quality_medium": {
+    "message": "良い"
+  },
+  "settings_video_quality_high": {
+    "message": "優れた"
+  },
+  "settings_theme": {
+    "message": "テーマ"
+  },
+  "settings_theme_light": {
+    "message": "ライト"
+  },
+  "settings_theme_dark": {
+    "message": "ダーク"
+  },
+  "settings_theme_auto": {
+    "message": "自動"
+  },
+  "settings_shortcuts": {
+    "message": "キーボードショートカットを設定"
+  },
+  "settings_pro_account": {
+    "message": "サブスクリプションを管理"
+  },
+  "settings_microphone": {
+    "message": "マイク"
+  },
+  "settings_camera": {
+    "message": "カメラ"
+  },
+  "settings_countdown": {
+    "message": "カウントダウン（秒）"
+  },
+  "settings_transparent_background": {
+    "message": "透明な背景"
+  },
+  "settings_transparent_background_info": {
+    "message": "このオプションはより多くの計算を必要とし、コンピュータに応じて表示が遅くなる可能性があります（WEBMおよびGIF形式のみ対応）"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "スクリーンショットの回避策"
+  },
+  "screenshot_workaround_context": {
+    "message": "コンテキスト"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "技術的な制限のため、スクリーンショットを撮る際にエラーメッセージが表示されることがあります。"
+  },
+  "screenshot_workaround_solution": {
+    "message": "回避策"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "この場合、ページ上で右クリックし、「モバイルシミュレーター」を選択し、「📷 スクリーンショットを撮る」を選択するだけでキャプチャを開始できます。"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Mobile FIRSTをさらに役立てるためにご協力ください🚀"
+  },
+  "feedback_profession": {
+    "message": "あなたの職種は何ですか？"
+  },
+  "feedback_profession_developer": {
+    "message": "開発"
+  },
+  "feedback_profession_designer": {
+    "message": "デザイン"
+  },
+  "feedback_profession_qa": {
+    "message": "テスト/QA"
+  },
+  "feedback_profession_product": {
+    "message": "プロダクトマネジメント"
+  },
+  "feedback_profession_marketing": {
+    "message": "マーケティング"
+  },
+  "feedback_profession_sales": {
+    "message": "営業"
+  },
+  "feedback_profession_other": {
+    "message": "その他"
+  },
+  "feedback_company_type": {
+    "message": "あなたの会社の種類は何ですか？"
+  },
+  "feedback_company_type_freelance": {
+    "message": "フリーランス"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "マイクロビジネス（1-9人の従業員）"
+  },
+  "feedback_company_type_agency": {
+    "message": "小企業（10-49人の従業員）"
+  },
+  "feedback_company_type_startup": {
+    "message": "中企業（50-249人の従業員）"
+  },
+  "feedback_company_type_pme": {
+    "message": "大企業（250-4999人の従業員）"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "非常に大きな企業/グループ（5000人以上の従業員）"
+  },
+  "feedback_use_cases": {
+    "message": "なぜMobile FIRSTを使用していますか？"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "サイトのテスト、クライアントデモの実施..."
+  },
+  "feedback_frequency": {
+    "message": "この拡張機能をどのくらいの頻度で使用しますか？"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "毎日"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "週に数回"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "時々"
+  },
+  "feedback_frequency_rare": {
+    "message": "まれ"
+  },
+  "feedback_improvements": {
+    "message": "どのような改善を望みますか？"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "アイデア、摩擦、欠如..."
+  },
+  "feedback_submit": {
+    "message": "送信"
+  },
+  "feedback_close": {
+    "message": "回答しない"
+  },
+  "feedback_error_required": {
+    "message": "すべてのフィールドが空です🤔"
+  },
+  "feedback_submitted": {
+    "message": "フィードバックをありがとうございます🤗"
+  },
+  "select": {
+    "message": "選択..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Safari iOS 26の新しい「Liquid Glass」インターフェースを今すぐ発見し、よりリアルなテストを行いましょう！"
+  },
+  "new_ios26_h2": {
+    "message": "iPhone&nbsp;15およびiPhone&nbsp;16のすべてのバリエーションで利用可能"
+  },
+  "new_iphone_17_h1": {
+    "message": "新しい！<br>今すぐiPhone&nbsp;17でサイトをテストしましょう。"
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17、iPhone&nbsp; Air、iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAXがシミュレーターで利用可能です。"
+  },
+  "new_video_feature_h1": {
+    "message": "新しいビデオキャプチャ機能を今すぐ発見！"
+  },
+  "new_video_feature_h2": {
+    "message": "より高品質で録画し、新しいオプションと透明な背景を使用"
+  },
+  "logout_modale_title": {
+    "message": "このデバイスで自動的にログアウトされました"
+  },
+  "logout_modale_message": {
+    "message": "このデバイスは、許可された端末のリストに含まれていません。アクセスを手動で削除した場合は、再度ログインが必要です。"
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>情報</strong>タッチスクロールは利用できませんが、<strong>スクロールバーを表示</strong>することができます。マウスホイールやトラックパッドがない場合にスクロールするためのオプションです。<br><br>これは右下の設定オプションです <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Mobile FIRSTへようこそ 👋</strong>ワンクリックで電話、タブレット、コンピュータをシミュレートし、サイトを簡単にテストおよび表示します。<br><br><strong>メニューは右にあります ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>アップデート v4.12.0</strong>PROバージョンの新機能、<strong>スクリーンショットの編集</strong>。形を描く、テキストを追加するボタンなど。 <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>アップデート v4.14.0</strong>新しい<strong>ビデオキャプチャ</strong>機能を今すぐ発見！ <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>アップデート v4.14.5</strong>スクリーンショットの<strong>解像度と品質</strong>の大幅な向上 <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "ログイン"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ サブスクリプションを共有したいですか？ 他の人を許可するには、アカウントの「ユーザー」セクションから追加してください。"
+  }
+}

@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Mobiltelefonsimulator - testa responsiv webbplats"
+  },
+  "extDescription": {
+    "message": "Simulator för smartphones och surfplattor på dator med många modeller för att testa sin mobila och responsiva webbplats."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Avbryt"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Android-telefoner"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Apple-telefoner"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Surfplattor"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Speciella"
+  },
+  "copied": {
+    "message": "Kopierad"
+  },
+  "error": {
+    "message": "Fel"
+  },
+  "link": {
+    "message": "Länk"
+  },
+  "optional": {
+    "message": "Valfritt"
+  },
+  "close": {
+    "message": "Stäng"
+  },
+  "get_pro": {
+    "message": "Skaffa PRO-versionen"
+  },
+  "error_contact": {
+    "message": "{Kontakta oss} om problemet kvarstår."
+  },
+  "more_settings": {
+    "message": "Fler inställningar"
+  },
+  "dimensions": {
+    "message": "Dimensioner"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Aktivera mobilvy på denna flik"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Simulatorn kan inte aktiveras på denna inbyggda sida i din webbläsare. Försök på en annan flik eller navigera till en webbplats och försök igen."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Denna simulator kan inte aktiveras som standard på lokala filer (file:///) men du kan aktivera alternativet manuellt i Chrome-inställningarna."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Aktivera alternativet"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Inaktivera simulatorn"
+  },
+  "menu_close_multi": {
+    "message": "Stäng detta fönster"
+  },
+  "menu_change_device": {
+    "message": "Byt modell"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Enheten du söker finns inte med i listan? Berätta för oss!"
+  },
+  "menu_info_device": {
+    "message": "Specifikationer och mockup av denna terminal"
+  },
+  "menu_info_device_features": {
+    "message": "Specifikationer (viewport-upplösning, etc.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Gratis mockup i transparent PNG"
+  },
+  "menu_rotate": {
+    "message": "Ändra orientering"
+  },
+  "menu_zoom": {
+    "message": "Zooma in i enheten"
+  },
+  "menu_screenshot": {
+    "message": "📷 Ta en skärmdump"
+  },
+  "menu_screencast": {
+    "message": "📹 Spela in en skärmvide"
+  },
+  "menu_share": {
+    "message": "Dela med en kollega, vän,..."
+  },
+  "menu_send_improvement": {
+    "message": "Föreslå en förbättring"
+  },
+  "menu_send_message": {
+    "message": "Hjälpcenter"
+  },
+  "menu_faq_title": {
+    "message": "Vanliga frågor"
+  },
+  "menu_faq_media_queries": {
+    "message": "Mina media queries tas inte hänsyn till"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Hur aktiverar jag simulatorn i inkognitoläge?"
+  },
+  "menu_faq_scroll": {
+    "message": "Kan inte scrolla i simulatorn"
+  },
+  "menu_faq_subscription": {
+    "message": "Varför fungerar inte mitt abonnemang?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Hur ställer jag in kortkommandon?"
+  },
+  "menu_faq_all": {
+    "message": "Visa alla vanliga frågor"
+  },
+  "menu_report": {
+    "message": "Rapportera ett fel"
+  },
+  "menu_settings": {
+    "message": "Konfiguration"
+  },
+  "menu_add_window": {
+    "message": "Lägg till en simuleringsmodell"
+  },
+  "menu_help_center": {
+    "message": "Hjälpcenter"
+  },
+  "menu_extensions": {
+    "message": "Upptäck våra andra Chrome-tillägg"
+  },
+  "menu_vote_feature": {
+    "message": "Rösta på de funktioner du vill ha"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Detta är bara en bild. För att ändra URL, använd Chrome-fältet ovan."
+  },
+  "simulator_footer_info": {
+    "message": "Detta är bara en bild. Använd ditt eget tangentbord."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Endast terminalvideoinspelning"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Videoinspelning av fliken med terminalen"
+  },
+  "screencast_error": {
+    "message": "Ett fel uppstod vid inspelningen. {Klicka här} för en lösning."
+  },
+  "screencast_modale_title": {
+    "message": "Videoinspelning"
+  },
+  "screencast_modale_texte": {
+    "message": "Du kan ladda ner denna video i olika format eller få en delningslänk."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Ladda ner i standardformatet WEBM (med transparens om alternativet är aktiverat)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Bättre kompatibilitet med PowerPoint, men ingen transparens"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Kompatibel överallt, men lägre kvalitet (med transparens om alternativet är aktiverat)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Den maximala längden för en GIF är 60 sekunder. Utöver det skulle filen bli för stor."
+  },
+  "screencast_modale_copy": {
+    "message": "Kopiera"
+  },
+  "screencast_modale_upload": {
+    "message": "Få en delningslänk"
+  },
+  "screencast_modale_contact": {
+    "message": "Rapportera ett fel, föreslå en förbättring"
+  },
+  "screencast_start_recording": {
+    "message": "Starta inspelning"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Mikrofonåtkomst nekad."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Kameratillgång nekad."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Din version av Chrome är för gammal för denna funktion. Uppdatera Chrome till en version över 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Videokvaliteten påverkar bitrate, fps och upplösning av inspelningen. Ju högre kvalitet, desto större fil."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Videoinspelningar är begränsade till 5 minuter i gratisversionen."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Skärmdump med terminalen"
+  },
+  "screenshot_menu_2": {
+    "message": "Endast skärmdump av webbplatsen"
+  },
+  "screenshot_menu_3": {
+    "message": "Skärmdump av hela sidan"
+  },
+  "screenshot_menu_4": {
+    "message": "Skärmdump av hela fliken"
+  },
+  "screenshot_button": {
+    "message": "Generera en skärmdump"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Ladda ner i PNG-format (ingen kompression)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Ladda ner i WEBP-format, kompatibelt nästan överallt och optimerad kompression (rekommenderas)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Stoppa innan sidan är slut"
+  },
+  "screenshot_modale_title": {
+    "message": "Skärmdump"
+  },
+  "screenshot_modale_copy": {
+    "message": "Kopiera bilden till urklipp"
+  },
+  "screenshot_modale_edit": {
+    "message": "Redigera skärmdumpen"
+  },
+  "screenshot_modale_help": {
+    "message": "För att spara bilden i stort format, högerklicka på den och välj \"Kopiera bild\" eller \"Spara\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Stäng redigeraren"
+  },
+  "screenshot_editor_undo": {
+    "message": "Ångra senaste åtgärd"
+  },
+  "screenshot_editor_rect": {
+    "message": "Rita en rektangel"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Rita en cirkel"
+  },
+  "screenshot_editor_line": {
+    "message": "Rita en linje"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Rita en pil"
+  },
+  "screenshot_editor_pen": {
+    "message": "Frihandsteckning"
+  },
+  "screenshot_editor_color": {
+    "message": "Linje färg"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Linje tjocklek"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Bli en PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Konvertera dina videoinspelningar till GIF- och MP4-format"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Simulera alla enheter"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Lås upp alla inställningar"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Lås upp alla videoinspelningsinställningar"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Ta bort annonser"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Redigera dina skärmdumpar"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Ta obegränsade skärmdumpar"
+  },
+  "pro_modale_h2": {
+    "message": "Bli en PRO och bidra aktivt till utvecklingen av detta tillägg genom att stödja dess utvecklare."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Faktureras årligen"
+  },
+  "pro_modale_savings": {
+    "message": "Spara"
+  },
+  "pro_modale_from": {
+    "message": "Från"
+  },
+  "pro_modale_recurring_month": {
+    "message": "månad"
+  },
+  "pro_modale_button": {
+    "message": "Jag prenumererar"
+  },
+  "pro_modale_link_1": {
+    "message": "Eller"
+  },
+  "pro_modale_link_2": {
+    "message": "jag loggar in"
+  },
+  "pro_modale_link_3": {
+    "message": "på mitt abonnentkonto"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Alla videoinställningar"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Borttagning av annonser"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Är denna mobilsimulator användbar för dig?"
+  },
+  "sharing_h2": {
+    "message": "Dela den då med dina kollegor eller vänner"
+  },
+  "sharing_txt": {
+    "message": "Simulator för att testa sin webbplats på mobil & surfplatta"
+  },
+  "sharing_review_1": {
+    "message": "Och om du har en minut för att"
+  },
+  "sharing_review_2": {
+    "message": "lägga till en recension"
+  },
+  "sharing_review_3": {
+    "message": "så är det pricken över i:et! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Jag lägger till en recension"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Upptäck våra helt nya gratis tillägg"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Färgväljare"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Detta tillägg låter dig fånga vilken färg som helst på skärmen."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Font Finder"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Identifiera med ett klick vilket typsnitt som används på vilken text som helst på en webbsida."
+  },
+  "other_extensions_button": {
+    "message": "Installera"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Hur skulle du betygsätta detta tillägg?"
+  },
+  "review_note_store": {
+    "message": "Tack för din feedback, tveka inte att lägga till ett betyg på Google Store. Jag skulle vara mycket tacksam 😊"
+  },
+  "review_note_feedback": {
+    "message": "Tack för din feedback, tveka inte att skicka oss ett meddelande så att vi kan förbättra detta tillägg."
+  },
+  "button_feedback": {
+    "message": "Lägg till ett betyg"
+  },
+  "button_message": {
+    "message": "Skicka oss ett meddelande"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Enhetens namn"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, etc."
+  },
+  "contact_title": {
+    "message": "Enheten du söker finns inte med i listan? Berätta för oss!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Terminal"
+  },
+  "settings_h2_global": {
+    "message": "Allmänt"
+  },
+  "settings_hide_header_footer": {
+    "message": "Dölj webbläsarens topp- och bottnelement i webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Visa inte det falska tangentbordet vid fokus på ett inmatningsfält"
+  },
+  "settings_scrollbar_show": {
+    "message": "Visa den inbyggda rullningslisten i terminalen"
+  },
+  "settings_change_cursor": {
+    "message": "Ändra inte markörstilen i webview"
+  },
+  "settings_change_background": {
+    "message": "Ändra bakgrundsfärg"
+  },
+  "settings_default_device": {
+    "message": "Standardterminal vid varje aktivering"
+  },
+  "settings_change_analytics": {
+    "message": "Jag hjälper utvecklaren av detta tillägg att förbättra sin produkt med hjälp av Posthog. Alla data anonymiseras."
+  },
+  "settings_device_hide": {
+    "message": "Visa inte terminalen"
+  },
+  "settings_batterie_level": {
+    "message": "Batterinivå i terminalens header (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Ändra URL som visas i terminalen"
+  },
+  "settings_presenter_mode": {
+    "message": "Presentationsläge (menyn till höger synlig endast vid hovring)"
+  },
+  "settings_fullscreen": {
+    "message": "Webbplats i helskärm i terminalen"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Välj en terminal"
+  },
+  "settings_video_quality": {
+    "message": "Videokvalitet"
+  },
+  "settings_video_quality_low": {
+    "message": "Medel"
+  },
+  "settings_video_quality_medium": {
+    "message": "Bra"
+  },
+  "settings_video_quality_high": {
+    "message": "Utmärkt"
+  },
+  "settings_theme": {
+    "message": "Tema"
+  },
+  "settings_theme_light": {
+    "message": "Ljus"
+  },
+  "settings_theme_dark": {
+    "message": "Mörk"
+  },
+  "settings_theme_auto": {
+    "message": "Auto"
+  },
+  "settings_shortcuts": {
+    "message": "Definiera kortkommandon"
+  },
+  "settings_pro_account": {
+    "message": "Hantera mitt abonnemang"
+  },
+  "settings_microphone": {
+    "message": "Mikrofon"
+  },
+  "settings_camera": {
+    "message": "Kamera"
+  },
+  "settings_countdown": {
+    "message": "Nedräkning (sekunder)"
+  },
+  "settings_transparent_background": {
+    "message": "Transparent bakgrund"
+  },
+  "settings_transparent_background_info": {
+    "message": "Detta alternativ innebär fler beräkningar och därmed en potentiell avmattning av visningen beroende på din dator (endast kompatibel med WEBM- och GIF-format)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Lösning för skärmdump"
+  },
+  "screenshot_workaround_context": {
+    "message": "Sammanhang"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "På grund av vissa tekniska begränsningar kan det hända att du får detta felmeddelande vid skärmdump."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Lösning"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "I detta fall, för att starta skärmdumpen, högerklicka var som helst på sidan, välj \"Mobil simulator\", och sedan \"📷 Ta en skärmdump\""
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Hjälp oss att göra Mobile FIRST ännu mer användbart för dig 🚀"
+  },
+  "feedback_profession": {
+    "message": "Vilken är din yrkesavdelning?"
+  },
+  "feedback_profession_developer": {
+    "message": "Utveckling"
+  },
+  "feedback_profession_designer": {
+    "message": "Design"
+  },
+  "feedback_profession_qa": {
+    "message": "Test / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Produktledning"
+  },
+  "feedback_profession_marketing": {
+    "message": "Marknadsföring"
+  },
+  "feedback_profession_sales": {
+    "message": "Försäljning"
+  },
+  "feedback_profession_other": {
+    "message": "Annat"
+  },
+  "feedback_company_type": {
+    "message": "Vilken typ av företag har du?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Frilans"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Mikroföretag (1-9 anställda)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Litet företag (10-49 anställda)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Medelstort företag (50-249 anställda)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Stort företag (250-4999 anställda)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Mycket stort företag / koncern (5000+ anställda)"
+  },
+  "feedback_use_cases": {
+    "message": "Varför använder du Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Testa min webbplats, göra kundpresentationer..."
+  },
+  "feedback_frequency": {
+    "message": "Hur ofta använder du detta tillägg?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Dagligen"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Flera gånger i veckan"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Tillfälligt"
+  },
+  "feedback_frequency_rare": {
+    "message": "Sällan"
+  },
+  "feedback_improvements": {
+    "message": "Vilka förbättringar skulle du vilja se?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "En idé, en friktion, en brist..."
+  },
+  "feedback_submit": {
+    "message": "Skicka"
+  },
+  "feedback_close": {
+    "message": "Svara inte"
+  },
+  "feedback_error_required": {
+    "message": "Alla fält är tomma 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Tack så mycket för din feedback 🤗"
+  },
+  "select": {
+    "message": "Välj..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Upptäck nu det nya \"Liquid Glass\"-gränssnittet i Safari iOS 26 för ännu mer realistiska tester!"
+  },
+  "new_ios26_h2": {
+    "message": "Tillgänglig på alla varianter av iPhone&nbsp;15 och iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Nyhet!<br>Testa nu dina webbplatser med iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX är tillgängliga i simulatorn."
+  },
+  "new_video_feature_h1": {
+    "message": "Upptäck nu den nya videoinspelningsfunktionen!"
+  },
+  "new_video_feature_h2": {
+    "message": "Spela in med bättre kvalitet, med nya alternativ och med transparent bakgrund"
+  },
+  "logout_modale_title": {
+    "message": "Du har automatiskt loggats ut på den här enheten"
+  },
+  "logout_modale_message": {
+    "message": "Den här enheten är inte längre en av dina auktoriserade enheter. Om du har tagit bort åtkomsten manuellt, behöver du logga in igen."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Information</strong>Touch scroll är inte tillgängligt, men du kan <strong>visa rullningslisten</strong> om du inte har en musrulle eller en styrplatta för att scrolla.<br><br>Det är ett alternativ i inställningarna längst ner till höger <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Välkommen till Mobile FIRST 👋</strong>Simulera med ett klick telefoner, surfplattor och datorer för att enkelt testa och visualisera dina webbplatser.<br><br><strong>Menyn finns till höger ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Uppdatering v4.12.0</strong>Ny funktion i PRO-versionen, <strong>redigering av skärmdumpar</strong>. Knappar för att rita former, lägga till text, etc. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Uppdatering v4.14.0</strong>Upptäck nu den nya funktionen för <strong>videoinspelning</strong>! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Uppdatering v4.14.5</strong>Betydande ökning av <strong>upplösning och kvalitet</strong> på skärmdumpar <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Logga in"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Vill du dela ditt abonnemang? För att ge andra personer tillåtelse, lägg bara till dem från avsnittet \"Användare\" på ditt konto."
+  }
+}

@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Mobiltelefon Simulator - test responsivt websted"
+  },
+  "extDescription": {
+    "message": "Simulator til smartphones og tablets på computer med mange modeller til at teste dit mobile og responsive websted."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Annuller"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Android-telefoner"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Apple-telefoner"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Tablets"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Specielle"
+  },
+  "copied": {
+    "message": "Kopieret"
+  },
+  "error": {
+    "message": "Fejl"
+  },
+  "link": {
+    "message": "Link"
+  },
+  "optional": {
+    "message": "Valgfri"
+  },
+  "close": {
+    "message": "Luk"
+  },
+  "get_pro": {
+    "message": "Få PRO-versionen"
+  },
+  "error_contact": {
+    "message": "{Kontakt os} hvis problemet fortsætter."
+  },
+  "more_settings": {
+    "message": "Flere indstillinger"
+  },
+  "dimensions": {
+    "message": "Dimensioner"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Aktiver mobilvisning på denne fane"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Simulatoren kan ikke aktiveres på denne native side i din browser. Prøv på en anden fane eller naviger til et websted og prøv igen."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Denne simulator kan ikke aktiveres som standard på lokale filer (file:///) men du kan manuelt aktivere indstillingen i Chrome-indstillingerne."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Aktiver indstillingen"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Deaktiver simulatoren"
+  },
+  "menu_close_multi": {
+    "message": "Luk dette vindue"
+  },
+  "menu_change_device": {
+    "message": "Skift model"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Er den enhed, du leder efter, ikke på listen? Fortæl os det!"
+  },
+  "menu_info_device": {
+    "message": "Specifikationer og mockup af denne enhed"
+  },
+  "menu_info_device_features": {
+    "message": "Specifikationer (viewport opløsning, etc.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Gratis mockup i transparent PNG"
+  },
+  "menu_rotate": {
+    "message": "Skift orientering"
+  },
+  "menu_zoom": {
+    "message": "Zoom ind på enheden"
+  },
+  "menu_screenshot": {
+    "message": "📷 Tag et skærmbillede"
+  },
+  "menu_screencast": {
+    "message": "📹 Optag en video af skærmen"
+  },
+  "menu_share": {
+    "message": "Del med en kollega, en ven,..."
+  },
+  "menu_send_improvement": {
+    "message": "Foreslå en forbedring"
+  },
+  "menu_send_message": {
+    "message": "Hjælpecenter"
+  },
+  "menu_faq_title": {
+    "message": "Ofte stillede spørgsmål"
+  },
+  "menu_faq_media_queries": {
+    "message": "Mine medieforespørgsler bliver ikke taget i betragtning"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Hvordan aktiverer jeg simulatoren i inkognitotilstand?"
+  },
+  "menu_faq_scroll": {
+    "message": "Kan ikke rulle i simulatoren"
+  },
+  "menu_faq_subscription": {
+    "message": "Hvorfor virker mit abonnement ikke?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Hvordan indstiller jeg tastaturgenveje?"
+  },
+  "menu_faq_all": {
+    "message": "Se alle ofte stillede spørgsmål"
+  },
+  "menu_report": {
+    "message": "Rapportér en fejl"
+  },
+  "menu_settings": {
+    "message": "Konfiguration"
+  },
+  "menu_add_window": {
+    "message": "Tilføj en simuleringsmodel"
+  },
+  "menu_help_center": {
+    "message": "Hjælpecenter"
+  },
+  "menu_extensions": {
+    "message": "Oplev vores andre Chrome-udvidelser"
+  },
+  "menu_vote_feature": {
+    "message": "Stem på de funktioner, du ønsker"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Dette er bare et billede. For at ændre URL'en skal du bruge Chrome-feltet ovenfor."
+  },
+  "simulator_footer_info": {
+    "message": "Dette er bare et billede. Brug dit eget tastatur."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Videooptagelse af kun enheden"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Videooptagelse af fanen med enheden"
+  },
+  "screencast_error": {
+    "message": "Der opstod en fejl under optagelsen. {Klik her} for en løsning."
+  },
+  "screencast_modale_title": {
+    "message": "Videooptagelse"
+  },
+  "screencast_modale_texte": {
+    "message": "Du kan downloade denne video i forskellige formater eller få et delingslink."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Download i standardformatet WEBM (med gennemsigtighed, hvis aktiveret)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Bedre kompatibilitet med PowerPoint, men ingen gennemsigtighed"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Kompatibel overalt, men lavere kvalitet (med gennemsigtighed, hvis aktiveret)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Den maksimale varighed for en GIF er 60 sekunder. Udover det ville filen være for stor."
+  },
+  "screencast_modale_copy": {
+    "message": "Kopier"
+  },
+  "screencast_modale_upload": {
+    "message": "Få et delingslink"
+  },
+  "screencast_modale_contact": {
+    "message": "Rapportér en fejl, foreslå en forbedring"
+  },
+  "screencast_start_recording": {
+    "message": "Start optagelse"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Tilladelse til mikrofonadgang nægtet."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Tilladelse til kameraadgang nægtet."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Din version af Chrome er for gammel til denne funktion. Opdater Chrome til en version højere end 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Videokvaliteten påvirker bitrate, fps & opløsning af optagelsen. Jo højere kvalitet, jo større fil."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Videooptagelser er begrænset til 5 minutter i den gratis version."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Optagelse med enheden"
+  },
+  "screenshot_menu_2": {
+    "message": "Optagelse af kun webstedet"
+  },
+  "screenshot_menu_3": {
+    "message": "Optagelse af hele siden"
+  },
+  "screenshot_menu_4": {
+    "message": "Optagelse af hele fanen"
+  },
+  "screenshot_button": {
+    "message": "Generer et skærmbillede"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Download i PNG-format (ingen kompression)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Download i WEBP-format, kompatibel næsten overalt og optimeret kompression (anbefalet)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Stop før slutningen af siden"
+  },
+  "screenshot_modale_title": {
+    "message": "Optagelse"
+  },
+  "screenshot_modale_copy": {
+    "message": "Kopier billedet til udklipsholderen"
+  },
+  "screenshot_modale_edit": {
+    "message": "Rediger optagelsen"
+  },
+  "screenshot_modale_help": {
+    "message": "For at gemme billedet i stort format skal du højreklikke på det og vælge \"Kopier billede\" eller \"Gem\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Luk editoren"
+  },
+  "screenshot_editor_undo": {
+    "message": "Fortryd sidste handling"
+  },
+  "screenshot_editor_rect": {
+    "message": "Tegn en rektangel"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Tegn en cirkel"
+  },
+  "screenshot_editor_line": {
+    "message": "Tegn en linje"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Tegn en pil"
+  },
+  "screenshot_editor_pen": {
+    "message": "Frihåndstegning"
+  },
+  "screenshot_editor_color": {
+    "message": "Linje farve"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Linje tykkelse"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Bliv en PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Konverter dine videooptagelser til GIF- og MP4-formater"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Simuler alle enheder"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Lås op for alle indstillinger"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Lås op for alle videooptagelsesindstillinger"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Fjern annoncer"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Rediger dine optagelser"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Tag ubegrænsede skærmbilleder"
+  },
+  "pro_modale_h2": {
+    "message": "Bliv en PRO og bidrag aktivt til udviklingen af denne udvidelse ved at støtte dens udvikler."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Faktureret årligt"
+  },
+  "pro_modale_savings": {
+    "message": "Spar"
+  },
+  "pro_modale_from": {
+    "message": "Fra"
+  },
+  "pro_modale_recurring_month": {
+    "message": "måned"
+  },
+  "pro_modale_button": {
+    "message": "Jeg abonnerer"
+  },
+  "pro_modale_link_1": {
+    "message": "Eller"
+  },
+  "pro_modale_link_2": {
+    "message": "jeg logger ind"
+  },
+  "pro_modale_link_3": {
+    "message": "på min abonnentkonto"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Alle videoindstillinger"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Fjernelse af annoncer"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Er denne mobile simulator nyttig for dig?"
+  },
+  "sharing_h2": {
+    "message": "Så del den med dine kolleger eller venner"
+  },
+  "sharing_txt": {
+    "message": "Simulator til at teste dit websted på mobil & tablet"
+  },
+  "sharing_review_1": {
+    "message": "Og hvis du har et minut til at"
+  },
+  "sharing_review_2": {
+    "message": "tilføje en anmeldelse"
+  },
+  "sharing_review_3": {
+    "message": "så er det prikken over i'et! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Jeg tilføjer en anmeldelse"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Oplev vores helt nye gratis udvidelser"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Farvevælger"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Denne udvidelse giver dig mulighed for at fange enhver farve på skærmen."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Skriftfinder"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Identificer med et klik den skrifttype, der bruges på enhver tekst på en webside."
+  },
+  "other_extensions_button": {
+    "message": "Installer"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Hvordan vil du bedømme denne udvidelse?"
+  },
+  "review_note_store": {
+    "message": "Tak for din feedback, tøv ikke med at tilføje en anmeldelse på Google Store. Jeg ville sætte stor pris på det 😊"
+  },
+  "review_note_feedback": {
+    "message": "Tak for din feedback, tøv ikke med at sende os en besked, så vi kan forbedre denne udvidelse."
+  },
+  "button_feedback": {
+    "message": "Tilføj en anmeldelse"
+  },
+  "button_message": {
+    "message": "Send os en besked"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Enhedens navn"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, etc."
+  },
+  "contact_title": {
+    "message": "Er den enhed, du leder efter, ikke på listen? Fortæl os det!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Enhed"
+  },
+  "settings_h2_global": {
+    "message": "Generelt"
+  },
+  "settings_hide_header_footer": {
+    "message": "Skjul top- og bund-elementer i browseren i webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Vis ikke det falske tastatur ved fokus på et inputfelt"
+  },
+  "settings_scrollbar_show": {
+    "message": "Vis den native rullebjælke i enheden"
+  },
+  "settings_change_cursor": {
+    "message": "Skift ikke cursorstilen i webview"
+  },
+  "settings_change_background": {
+    "message": "Ændr baggrundsfarven"
+  },
+  "settings_default_device": {
+    "message": "Standard enhed ved hver aktivering"
+  },
+  "settings_change_analytics": {
+    "message": "Jeg hjælper udvikleren af denne udvidelse med at forbedre sit produkt via Posthog. Alle data er anonymiseret."
+  },
+  "settings_device_hide": {
+    "message": "Vis ikke enheden"
+  },
+  "settings_batterie_level": {
+    "message": "Batteriniveau i enhedens header (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Ændr URL'en vist i enheden"
+  },
+  "settings_presenter_mode": {
+    "message": "Præsentationstilstand (menuen til højre kun synlig ved hover)"
+  },
+  "settings_fullscreen": {
+    "message": "Websted i fuld skærm i enheden"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Vælg en enhed"
+  },
+  "settings_video_quality": {
+    "message": "Videokvalitet"
+  },
+  "settings_video_quality_low": {
+    "message": "Middel"
+  },
+  "settings_video_quality_medium": {
+    "message": "God"
+  },
+  "settings_video_quality_high": {
+    "message": "Fremragende"
+  },
+  "settings_theme": {
+    "message": "Tema"
+  },
+  "settings_theme_light": {
+    "message": "Lys"
+  },
+  "settings_theme_dark": {
+    "message": "Mørk"
+  },
+  "settings_theme_auto": {
+    "message": "Auto"
+  },
+  "settings_shortcuts": {
+    "message": "Definer tastaturgenveje"
+  },
+  "settings_pro_account": {
+    "message": "Administrer mit abonnement"
+  },
+  "settings_microphone": {
+    "message": "Mikrofon"
+  },
+  "settings_camera": {
+    "message": "Kamera"
+  },
+  "settings_countdown": {
+    "message": "Nedtælling (sekunder)"
+  },
+  "settings_transparent_background": {
+    "message": "Gennemsigtig baggrund"
+  },
+  "settings_transparent_background_info": {
+    "message": "Denne indstilling kræver flere beregninger og kan derfor potentielt sænke visningen afhængigt af din computer (kun kompatibel med WEBM- og GIF-formater)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Løsning til skærmbillede"
+  },
+  "screenshot_workaround_context": {
+    "message": "Kontekst"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "På grund af visse tekniske begrænsninger kan det være, at du modtager denne fejlmeddelelse, når du tager et skærmbillede."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Løsning"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "I dette tilfælde for at starte optagelsen, skal du højreklikke hvor som helst på siden, vælge \"Mobil simulator\", og derefter \"📷 Tag et skærmbillede\""
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Hjælp os med at gøre Mobile FIRST endnu mere nyttigt for dig 🚀"
+  },
+  "feedback_profession": {
+    "message": "Hvad er din professionelle afdeling?"
+  },
+  "feedback_profession_developer": {
+    "message": "Udvikling"
+  },
+  "feedback_profession_designer": {
+    "message": "Design"
+  },
+  "feedback_profession_qa": {
+    "message": "Test / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Produktstyring"
+  },
+  "feedback_profession_marketing": {
+    "message": "Marketing"
+  },
+  "feedback_profession_sales": {
+    "message": "Salg"
+  },
+  "feedback_profession_other": {
+    "message": "Andet"
+  },
+  "feedback_company_type": {
+    "message": "Hvad er din virksomhedstype?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Freelance"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Mikrovirksomhed (1-9 ansatte)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Lille virksomhed (10-49 ansatte)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Mellemstor virksomhed (50-249 ansatte)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Stor virksomhed (250-4999 ansatte)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Meget stor virksomhed / koncern (5000+ ansatte)"
+  },
+  "feedback_use_cases": {
+    "message": "Hvorfor bruger du Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Test mit websted, lave kundepræsentationer..."
+  },
+  "feedback_frequency": {
+    "message": "Hvor ofte bruger du denne udvidelse?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Dagligt"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Flere gange om ugen"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Lejlighedsvis"
+  },
+  "feedback_frequency_rare": {
+    "message": "Sjældent"
+  },
+  "feedback_improvements": {
+    "message": "Hvilke forbedringer vil du gerne se?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "En idé, en irritation, en mangel..."
+  },
+  "feedback_submit": {
+    "message": "Send"
+  },
+  "feedback_close": {
+    "message": "Svar ikke"
+  },
+  "feedback_error_required": {
+    "message": "Alle felter er tomme 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Mange tak for din feedback 🤗"
+  },
+  "select": {
+    "message": "Vælg..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Oplev nu den nye \"Liquid Glass\" interface i Safari iOS 26 for endnu mere realistiske tests!"
+  },
+  "new_ios26_h2": {
+    "message": "Tilgængelig på alle varianter af iPhone&nbsp;15 og iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Nyhed!<br>Test dine websteder nu med iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX er tilgængelige i simulatoren."
+  },
+  "new_video_feature_h1": {
+    "message": "Oplev nu den nye videooptagelsesfunktion!"
+  },
+  "new_video_feature_h2": {
+    "message": "Optag med bedre kvalitet, med nye muligheder og med gennemsigtig baggrund"
+  },
+  "logout_modale_title": {
+    "message": "Du er blevet logget ud automatisk på denne enhed"
+  },
+  "logout_modale_message": {
+    "message": "Denne enhed er ikke længere en del af dine autoriserede enheder. Hvis du har fjernet denne adgang manuelt, er en ny login nødvendig."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Information</strong>Touch scroll er ikke tilgængelig, men du kan <strong>vise rullebjælken</strong> hvis du ikke har en mus med hjul eller en trackpad til at rulle.<br><br>Det er en indstilling i indstillingerne nederst til højre <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Velkommen til Mobile FIRST 👋</strong>Simuler med et klik telefoner, tablets og computere for nemt at teste og visualisere dine websteder.<br><br><strong>Menuen er til højre ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Opdatering v4.12.0</strong>Ny funktion i PRO-versionen, <strong>redigering af skærmbilleder</strong>. Knapper til at tegne former, tilføje tekst, etc. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Opdatering v4.14.0</strong>Oplev nu den nye <strong>videooptagelsesfunktion</strong>! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Opdatering v4.14.5</strong>Betydelig stigning i <strong>opløsning og kvalitet</strong> af skærmbilleder <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Log ind"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Ønsker du at dele dit abonnement? For at give andre adgang, tilføj dem blot fra \"Brugere\" sektionen på din konto."
+  }
+}

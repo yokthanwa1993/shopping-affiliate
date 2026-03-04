@@ -1,0 +1,7 @@
+name = "video-affiliate-worker-mergecontainer"
+main = "src/main.rs"
+compatibility_date = "2026-02-24"
+
+[[containers]]
+image = "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:latest"
+class_name = "MergeContainer"

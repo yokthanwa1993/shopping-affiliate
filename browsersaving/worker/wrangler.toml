@@ -1,0 +1,28 @@
+name = "browsersaving-worker"
+main = "src/index.ts"
+compatibility_date = "2024-02-01"
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "browsersaving"
+database_id = "4f72ff6f-9ad9-4cab-b4d8-c1f30cc22618"
+
+# R2 Bucket
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "browsersaving"
+
+# Environment variables
+[vars]
+ENVIRONMENT = "production"
+VIDEO_AFFILIATE_TAG_SYNC_URL = "https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev/api/pages/tag-sync"
+VIDEO_AFFILIATE_NAMESPACE_ID = "8328894625"
+
+[[services]]
+binding = "TOKEN_FACEBOOK_LITE_SERVICE"
+service = "token-facebook-lite"
+
+[[services]]
+binding = "VIDEO_AFFILIATE_SERVICE"
+service = "video-affiliate-worker"

@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "شبیه‌ساز تلفن همراه - تست سایت واکنش‌گرا"
+  },
+  "extDescription": {
+    "message": "شبیه‌ساز گوشی‌های هوشمند و تبلت‌ها روی کامپیوتر با مدل‌های متعدد برای تست سایت موبایل و واکنش‌گرا."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "لغو"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> تلفن‌های اندروید"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> تلفن‌های اپل"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> تبلت‌ها"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> ویژه‌ها"
+  },
+  "copied": {
+    "message": "کپی شد"
+  },
+  "error": {
+    "message": "خطا"
+  },
+  "link": {
+    "message": "لینک"
+  },
+  "optional": {
+    "message": "اختیاری"
+  },
+  "close": {
+    "message": "بستن"
+  },
+  "get_pro": {
+    "message": "نسخه PRO را دریافت کنید"
+  },
+  "error_contact": {
+    "message": "{اگر مشکل ادامه داشت با ما تماس بگیرید}."
+  },
+  "more_settings": {
+    "message": "تنظیمات بیشتر"
+  },
+  "dimensions": {
+    "message": "ابعاد"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "نمای موبایل را در این تب فعال کنید"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "شبیه‌ساز در این صفحه بومی مرورگر شما فعال نمی‌شود. روی تب دیگری امتحان کنید یا به سایتی بروید و دوباره اجرا کنید."
+  },
+  "popup_activate_local_files_info": {
+    "message": "این شبیه‌ساز به‌طور پیش‌فرض روی فایل‌های محلی (file:///) فعال نمی‌شود اما می‌توانید این گزینه را به‌صورت دستی در تنظیمات Chrome فعال کنید."
+  },
+  "popup_activate_local_files_button": {
+    "message": "گزینه را فعال کنید"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "شبیه‌ساز را غیرفعال کنید"
+  },
+  "menu_close_multi": {
+    "message": "این پنجره را ببندید"
+  },
+  "menu_change_device": {
+    "message": "مدل را تغییر دهید"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> دستگاهی که به دنبال آن هستید در لیست نیست؟ به ما بگویید!"
+  },
+  "menu_info_device": {
+    "message": "ویژگی‌ها و ماکاپ این دستگاه"
+  },
+  "menu_info_device_features": {
+    "message": "ویژگی‌ها (وضوح viewport و غیره)"
+  },
+  "menu_info_device_mockup": {
+    "message": "ماکاپ رایگان در PNG شفاف"
+  },
+  "menu_rotate": {
+    "message": "جهت را تغییر دهید"
+  },
+  "menu_zoom": {
+    "message": "در دستگاه زوم کنید"
+  },
+  "menu_screenshot": {
+    "message": "📷 گرفتن اسکرین‌شات"
+  },
+  "menu_screencast": {
+    "message": "📹 ضبط ویدئو از صفحه"
+  },
+  "menu_share": {
+    "message": "به یک همکار، دوست،... به اشتراک بگذارید"
+  },
+  "menu_send_improvement": {
+    "message": "پیشنهاد بهبود"
+  },
+  "menu_send_message": {
+    "message": "مرکز کمک"
+  },
+  "menu_faq_title": {
+    "message": "سوالات متداول"
+  },
+  "menu_faq_media_queries": {
+    "message": "مدیا کوئری‌های من در نظر گرفته نمی‌شوند"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "چگونه شبیه‌ساز را در حالت ناشناس فعال کنم؟"
+  },
+  "menu_faq_scroll": {
+    "message": "امکان اسکرول در شبیه‌ساز وجود ندارد"
+  },
+  "menu_faq_subscription": {
+    "message": "چرا اشتراک من کار نمی‌کند؟"
+  },
+  "menu_faq_shortcut": {
+    "message": "چگونه میانبرهای صفحه‌کلید را تنظیم کنم؟"
+  },
+  "menu_faq_all": {
+    "message": "مشاهده تمام سوالات متداول"
+  },
+  "menu_report": {
+    "message": "گزارش یک باگ"
+  },
+  "menu_settings": {
+    "message": "پیکربندی"
+  },
+  "menu_add_window": {
+    "message": "افزودن مدل شبیه‌سازی"
+  },
+  "menu_help_center": {
+    "message": "مرکز کمک"
+  },
+  "menu_extensions": {
+    "message": "دیگر افزونه‌های Chrome ما را کشف کنید"
+  },
+  "menu_vote_feature": {
+    "message": "برای ویژگی‌هایی که می‌خواهید رأی دهید"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "این فقط یک تصویر است. برای تغییر URL از فیلد Chrome در بالا استفاده کنید."
+  },
+  "simulator_footer_info": {
+    "message": "این فقط یک تصویر است. از صفحه‌کلید خود استفاده کنید."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "ضبط ویدئو فقط از دستگاه"
+  },
+  "screencast_tooltip_tab": {
+    "message": "ضبط ویدئو از تب با دستگاه"
+  },
+  "screencast_error": {
+    "message": "هنگام ضبط خطایی رخ داد. {برای راه‌حل جایگزین اینجا کلیک کنید}."
+  },
+  "screencast_modale_title": {
+    "message": "ضبط ویدئو"
+  },
+  "screencast_modale_texte": {
+    "message": "می‌توانید این ویدئو را در فرمت‌های مختلف دانلود کنید یا لینک اشتراک دریافت کنید."
+  },
+  "screencast_modale_download_webm": {
+    "message": "دانلود به فرمت پیش‌فرض WEBM (با شفافیت در صورت فعال بودن گزینه)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "سازگاری بهتر با PowerPoint، اما بدون شفافیت"
+  },
+  "screencast_modale_download_gif": {
+    "message": "سازگار با همه جا، اما کیفیت پایین‌تر (با شفافیت در صورت فعال بودن گزینه)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "حداکثر مدت زمان یک GIF 60 ثانیه است. بیشتر از آن فایل بسیار حجیم خواهد بود."
+  },
+  "screencast_modale_copy": {
+    "message": "کپی"
+  },
+  "screencast_modale_upload": {
+    "message": "دریافت لینک اشتراک"
+  },
+  "screencast_modale_contact": {
+    "message": "گزارش یک باگ، پیشنهاد بهبود"
+  },
+  "screencast_start_recording": {
+    "message": "شروع ضبط"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "دسترسی به میکروفون رد شد."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "دسترسی به دوربین رد شد."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "نسخه Chrome شما برای این ویژگی خیلی قدیمی است. لطفاً Chrome را به نسخه بالاتر از 94.0 به‌روزرسانی کنید."
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "کیفیت ویدئو بر بیت‌ریت، fps و وضوح ضبط تأثیر می‌گذارد. هرچه کیفیت بالاتر باشد، فایل حجیم‌تر خواهد بود."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "ضبط‌های ویدئویی در نسخه رایگان به 5 دقیقه محدود شده‌اند."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "گرفتن با دستگاه"
+  },
+  "screenshot_menu_2": {
+    "message": "گرفتن فقط از سایت"
+  },
+  "screenshot_menu_3": {
+    "message": "گرفتن از کل صفحه"
+  },
+  "screenshot_menu_4": {
+    "message": "گرفتن از کل تب"
+  },
+  "screenshot_button": {
+    "message": "تولید اسکرین‌شات"
+  },
+  "screenshot_modale_download_png": {
+    "message": "دانلود به فرمت PNG (بدون فشرده‌سازی)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "دانلود به فرمت WEBP، تقریباً همه جا سازگار و فشرده‌سازی بهینه (توصیه‌شده)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "قبل از پایان صفحه متوقف کنید"
+  },
+  "screenshot_modale_title": {
+    "message": "اسکرین‌شات"
+  },
+  "screenshot_modale_copy": {
+    "message": "کپی تصویر در کلیپ‌بورد"
+  },
+  "screenshot_modale_edit": {
+    "message": "ویرایش اسکرین‌شات"
+  },
+  "screenshot_modale_help": {
+    "message": "برای ذخیره تصویر در فرمت بزرگ، کافی است روی آن راست‌کلیک کنید و \"کپی تصویر\" یا \"ذخیره\" را انتخاب کنید."
+  },
+  "screenshot_editor_close": {
+    "message": "بستن ویرایشگر"
+  },
+  "screenshot_editor_undo": {
+    "message": "لغو آخرین عمل"
+  },
+  "screenshot_editor_rect": {
+    "message": "رسم مستطیل"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "رسم دایره"
+  },
+  "screenshot_editor_line": {
+    "message": "رسم خط"
+  },
+  "screenshot_editor_arrow": {
+    "message": "رسم فلش"
+  },
+  "screenshot_editor_pen": {
+    "message": "رسم آزاد"
+  },
+  "screenshot_editor_color": {
+    "message": "رنگ خط"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "ضخامت خط"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "PRO شوید"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "ویدئوهای ضبط‌شده خود را به فرمت‌های GIF و MP4 تبدیل کنید"
+  },
+  "pro_modale_h1_devices": {
+    "message": "همه دستگاه‌ها را شبیه‌سازی کنید"
+  },
+  "pro_modale_h1_settings": {
+    "message": "همه تنظیمات را باز کنید"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "همه تنظیمات ضبط ویدئو را باز کنید"
+  },
+  "pro_modale_h1_ads": {
+    "message": "تبلیغات را حذف کنید"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "تصاویر خود را ویرایش کنید"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "بدون محدودیت اسکرین‌شات بگیرید"
+  },
+  "pro_modale_h2": {
+    "message": "PRO شوید و با حمایت از توسعه‌دهنده این افزونه به توسعه فعال آن کمک کنید."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "سالانه صورتحساب می‌شود"
+  },
+  "pro_modale_savings": {
+    "message": "صرفه‌جویی"
+  },
+  "pro_modale_from": {
+    "message": "از"
+  },
+  "pro_modale_recurring_month": {
+    "message": "ماه"
+  },
+  "pro_modale_button": {
+    "message": "اشتراک می‌گیرم"
+  },
+  "pro_modale_link_1": {
+    "message": "یا"
+  },
+  "pro_modale_link_2": {
+    "message": "وارد می‌شوم"
+  },
+  "pro_modale_link_3": {
+    "message": "به حساب کاربری خود"
+  },
+  "pro_modale_avantage_1": {
+    "message": "همه تنظیمات ویدئو"
+  },
+  "pro_modale_avantage_2": {
+    "message": "حذف تبلیغات"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "آیا این شبیه‌ساز موبایل برای شما مفید است؟"
+  },
+  "sharing_h2": {
+    "message": "پس آن را با همکاران یا دوستان خود به اشتراک بگذارید"
+  },
+  "sharing_txt": {
+    "message": "شبیه‌ساز برای تست سایت روی موبایل و تبلت"
+  },
+  "sharing_review_1": {
+    "message": "و اگر یک دقیقه وقت دارید برای"
+  },
+  "sharing_review_2": {
+    "message": "افزودن نظر"
+  },
+  "sharing_review_3": {
+    "message": "پس این گیلاس روی کیک است! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "نظر اضافه می‌کنم"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "جدیدترین افزونه‌های رایگان ما را کشف کنید"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "انتخابگر رنگ"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "این افزونه به شما امکان می‌دهد هر رنگی را روی صفحه بگیرید."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "یابنده فونت"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "با یک کلیک فونت استفاده‌شده روی هر متنی در یک صفحه وب را شناسایی کنید."
+  },
+  "other_extensions_button": {
+    "message": "نصب"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "چگونه این افزونه را ارزیابی می‌کنید؟"
+  },
+  "review_note_store": {
+    "message": "از بازخورد شما متشکریم، لطفاً در صورت تمایل نظر خود را در فروشگاه Google اضافه کنید. بسیار سپاسگزار خواهم بود 😊"
+  },
+  "review_note_feedback": {
+    "message": "از بازخورد شما متشکریم، لطفاً در صورت تمایل پیامی برای ما ارسال کنید تا بتوانیم این افزونه را بهبود دهیم."
+  },
+  "button_feedback": {
+    "message": "نظر اضافه کنید"
+  },
+  "button_message": {
+    "message": "پیامی برای ما ارسال کنید"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "نام دستگاه"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, etc."
+  },
+  "contact_title": {
+    "message": "دستگاهی که به دنبال آن هستید در لیست نیست؟ به ما بگویید!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "دستگاه"
+  },
+  "settings_h2_global": {
+    "message": "عمومی"
+  },
+  "settings_hide_header_footer": {
+    "message": "عناصر بالا و پایین مرورگر را در وب‌ویو (PWA) پنهان کنید"
+  },
+  "settings_hide_keyboard": {
+    "message": "کیبورد جعلی را در فوکوس یک فیلد ورودی نمایش ندهید"
+  },
+  "settings_scrollbar_show": {
+    "message": "نوار پیمایش بومی را در دستگاه نمایش دهید"
+  },
+  "settings_change_cursor": {
+    "message": "سبک نشانگر را در وب‌ویو تغییر ندهید"
+  },
+  "settings_change_background": {
+    "message": "رنگ پس‌زمینه را تغییر دهید"
+  },
+  "settings_default_device": {
+    "message": "دستگاه پیش‌فرض در هر فعال‌سازی"
+  },
+  "settings_change_analytics": {
+    "message": "من به توسعه‌دهنده این افزونه کمک می‌کنم تا محصول خود را با Posthog بهبود بخشد. تمام داده‌ها ناشناس هستند."
+  },
+  "settings_device_hide": {
+    "message": "دستگاه را نمایش ندهید"
+  },
+  "settings_batterie_level": {
+    "message": "سطح باتری در هدر دستگاه (%)"
+  },
+  "settings_device_default_url": {
+    "message": "URL نمایش داده‌شده در دستگاه را تغییر دهید"
+  },
+  "settings_presenter_mode": {
+    "message": "حالت ارائه (منوی سمت راست فقط در هنگام حرکت ماوس قابل مشاهده است)"
+  },
+  "settings_fullscreen": {
+    "message": "سایت در حالت تمام صفحه در دستگاه"
+  },
+  "settings_default_device_placeholder": {
+    "message": "یک دستگاه انتخاب کنید"
+  },
+  "settings_video_quality": {
+    "message": "کیفیت ویدئو"
+  },
+  "settings_video_quality_low": {
+    "message": "متوسط"
+  },
+  "settings_video_quality_medium": {
+    "message": "خوب"
+  },
+  "settings_video_quality_high": {
+    "message": "عالی"
+  },
+  "settings_theme": {
+    "message": "تم"
+  },
+  "settings_theme_light": {
+    "message": "روشن"
+  },
+  "settings_theme_dark": {
+    "message": "تیره"
+  },
+  "settings_theme_auto": {
+    "message": "خودکار"
+  },
+  "settings_shortcuts": {
+    "message": "میانبرهای صفحه‌کلید را تعریف کنید"
+  },
+  "settings_pro_account": {
+    "message": "اشتراک من را مدیریت کنید"
+  },
+  "settings_microphone": {
+    "message": "میکروفون"
+  },
+  "settings_camera": {
+    "message": "دوربین"
+  },
+  "settings_countdown": {
+    "message": "شمارش معکوس (ثانیه)"
+  },
+  "settings_transparent_background": {
+    "message": "پس‌زمینه شفاف"
+  },
+  "settings_transparent_background_info": {
+    "message": "این گزینه محاسبات بیشتری را در بر دارد و بنابراین ممکن است نمایش را بر اساس کامپیوتر شما کند کند (فقط با فرمت‌های WEBM و GIF سازگار است)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "راه‌حل جایگزین برای اسکرین‌شات"
+  },
+  "screenshot_workaround_context": {
+    "message": "زمینه"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "به دلیل برخی محدودیت‌های فنی، ممکن است هنگام گرفتن اسکرین‌شات این پیام خطا را دریافت کنید."
+  },
+  "screenshot_workaround_solution": {
+    "message": "راه‌حل جایگزین"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "در این صورت برای شروع گرفتن، کافی است روی صفحه راست‌کلیک کنید، ورودی «شبیه‌ساز موبایل» را انتخاب کنید، سپس «📷 گرفتن اسکرین‌شات»"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "به ما کمک کنید تا Mobile FIRST را برای شما مفیدتر کنیم 🚀"
+  },
+  "feedback_profession": {
+    "message": "بخش حرفه‌ای شما چیست؟"
+  },
+  "feedback_profession_developer": {
+    "message": "توسعه"
+  },
+  "feedback_profession_designer": {
+    "message": "طراحی"
+  },
+  "feedback_profession_qa": {
+    "message": "تست / QA"
+  },
+  "feedback_profession_product": {
+    "message": "مدیریت محصول"
+  },
+  "feedback_profession_marketing": {
+    "message": "بازاریابی"
+  },
+  "feedback_profession_sales": {
+    "message": "فروش"
+  },
+  "feedback_profession_other": {
+    "message": "دیگر"
+  },
+  "feedback_company_type": {
+    "message": "نوع شرکت شما چیست؟"
+  },
+  "feedback_company_type_freelance": {
+    "message": "فریلنسر"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "کسب و کار کوچک (1-9 کارمند)"
+  },
+  "feedback_company_type_agency": {
+    "message": "شرکت کوچک (10-49 کارمند)"
+  },
+  "feedback_company_type_startup": {
+    "message": "شرکت متوسط (50-249 کارمند)"
+  },
+  "feedback_company_type_pme": {
+    "message": "شرکت بزرگ (250-4999 کارمند)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "شرکت بسیار بزرگ / گروه (5000+ کارمند)"
+  },
+  "feedback_use_cases": {
+    "message": "چرا از Mobile FIRST استفاده می‌کنید؟"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "تست سایت من، انجام دموهای مشتری..."
+  },
+  "feedback_frequency": {
+    "message": "چند وقت یکبار از این افزونه استفاده می‌کنید؟"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "روزانه"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "چند بار در هفته"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "گاه‌به‌گاه"
+  },
+  "feedback_frequency_rare": {
+    "message": "نادر"
+  },
+  "feedback_improvements": {
+    "message": "چه بهبودهایی را دوست دارید ببینید؟"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "یک ایده، یک مشکل، یک کمبود..."
+  },
+  "feedback_submit": {
+    "message": "ارسال"
+  },
+  "feedback_close": {
+    "message": "پاسخ ندهید"
+  },
+  "feedback_error_required": {
+    "message": "همه فیلدها خالی هستند 🤔"
+  },
+  "feedback_submitted": {
+    "message": "بسیار متشکریم برای بازخورد شما 🤗"
+  },
+  "select": {
+    "message": "انتخاب کنید..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "اکنون رابط جدید \"Liquid Glass\" Safari iOS 26 را برای تست‌های واقعی‌تر کشف کنید!"
+  },
+  "new_ios26_h2": {
+    "message": "در تمام نسخه‌های iPhone&nbsp;15 و iPhone&nbsp;16 موجود است"
+  },
+  "new_iphone_17_h1": {
+    "message": "جدید!<br>اکنون سایت‌های خود را با iPhone&nbsp;17 تست کنید."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17، iPhone&nbsp; Air، iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX در شبیه‌ساز موجود هستند."
+  },
+  "new_video_feature_h1": {
+    "message": "اکنون ویژگی جدید ضبط ویدئو را کشف کنید!"
+  },
+  "new_video_feature_h2": {
+    "message": "با کیفیت بهتر، گزینه‌های جدید و با پس‌زمینه شفاف ضبط کنید"
+  },
+  "logout_modale_title": {
+    "message": "شما به طور خودکار از این دستگاه خارج شده‌اید"
+  },
+  "logout_modale_message": {
+    "message": "این دستگاه دیگر جزو دستگاه‌های مجاز شما نیست. اگر این دسترسی را به صورت دستی حذف کرده‌اید، نیاز به ورود مجدد است."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>اطلاعات</strong>پیمایش لمسی در دسترس نیست، اما می‌توانید <strong>نوار پیمایش را نمایش دهید</strong> اگر ماوس یا ترک‌پد برای پیمایش ندارید.<br><br>این یک گزینه در تنظیمات در پایین سمت راست است <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>به Mobile FIRST خوش آمدید 👋</strong>تلفن‌ها، تبلت‌ها و کامپیوترها را با یک کلیک شبیه‌سازی کنید تا سایت‌های خود را به سادگی تست و مشاهده کنید.<br><br><strong>منو در سمت راست قرار دارد ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>به‌روزرسانی v4.12.0</strong>ویژگی جدید در نسخه PRO، <strong>ویرایش اسکرین‌شات‌ها</strong>. دکمه‌ها برای رسم اشکال، افزودن متن و غیره <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>به‌روزرسانی v4.14.0</strong>اکنون ویژگی جدید <strong>ضبط ویدئو</strong> را کشف کنید! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>به‌روزرسانی v4.14.5</strong>افزایش قابل توجه <strong>وضوح و کیفیت</strong> اسکرین‌شات‌ها <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "ورود"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ می‌خواهید اشتراک خود را به اشتراک بگذارید؟ برای مجاز کردن افراد دیگر، آن‌ها را به سادگی از بخش \"کاربران\" حساب خود اضافه کنید."
+  }
+}

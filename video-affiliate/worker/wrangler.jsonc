@@ -1,0 +1,82 @@
+{
+    "name": "video-affiliate-worker",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-02-14",
+    "compatibility_flags": [
+        "nodejs_compat"
+    ],
+    // Pipeline ใช้เวลา 2-3 นาที
+    "limits": {
+        "cpu_ms": 300000
+    },
+    // Container: FFmpeg merge service
+    "containers": [
+        {
+            "class_name": "MergeContainer",
+            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-02-25.11",
+            "instance_type": "standard-2",
+            "max_instances": 2
+        }
+    ],
+    // Durable Objects (Container = DO)
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "MERGE_CONTAINER",
+                "class_name": "MergeContainer"
+            }
+        ]
+    },
+    "services": [
+        {
+            "binding": "BROWSERSAVING_SERVICE",
+            "service": "browsersaving-worker"
+        }
+    ],
+    // DO migrations
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": [
+                "MergeContainer"
+            ]
+        }
+    ],
+    // D1 Database
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "video-affiliate-db",
+            "database_id": "742796ce-d973-49d3-bc38-7a44a576d67f"
+        }
+    ],
+    // R2 Bucket
+    "r2_buckets": [
+        {
+            "binding": "BUCKET",
+            "bucket_name": "video-affiliate-videos"
+        }
+    ],
+    // Environment variables
+    "vars": {
+        "CORS_ORIGIN": "*",
+        "R2_PUBLIC_URL": "https://pub-bcebfe413008439fafe39af7765f4e0a.r2.dev",
+        "GEMINI_MODEL": "gemini-3-flash-preview",
+        "WEBAPP_URL": "https://video-affiliate-webapp.pages.dev",
+        "BROWSERSAVING_WORKER_URL": "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev",
+        "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com"
+    },
+    "observability": {
+        "enabled": true
+    },
+    // Secrets (set via `wrangler secret put`):
+    // GOOGLE_API_KEY
+    // TELEGRAM_BOT_TOKEN
+    // TAG_SYNC_PUSH_SECRET
+    // Cron trigger for auto-posting to Facebook Reels
+    "triggers": {
+        "crons": [
+            "* * * * *"
+        ]
+    }
+}

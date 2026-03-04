@@ -1,0 +1,29 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,FC Iconic,82,&H00FFFFFF,&H00000000,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,10,0,2,10,10,250,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,00:00:00.00,00:00:00.98,Default,,0,0,0,,ตายแล้วแม่!
+Dialogue: 0,00:00:00.98,00:00:01.96,Default,,0,0,0,,ใครยังไม่มี
+Dialogue: 0,00:00:01.96,00:00:03.49,Default,,0,0,0,,เครื่องทำไอติมผัด
+Dialogue: 0,00:00:03.49,00:00:05.10,Default,,0,0,0,,อันนี้คือเชยสะบัด!
+Dialogue: 0,00:00:05.10,00:00:06.44,Default,,0,0,0,,ดูสิคะ ใส่ผลไม้
+Dialogue: 0,00:00:06.44,00:00:07.15,Default,,0,0,0,,เทนมลงไป
+Dialogue: 0,00:00:07.15,00:00:07.96,Default,,0,0,0,,สับๆ ผัดๆ
+Dialogue: 0,00:00:07.96,00:00:08.77,Default,,0,0,0,,แป๊บเดียว
+Dialogue: 0,00:00:08.77,00:00:09.93,Default,,0,0,0,,ได้กินแล้วจ้า
+Dialogue: 0,00:00:09.93,00:00:11.36,Default,,0,0,0,,ทำเองที่บ้านเก๋ๆ
+Dialogue: 0,00:00:11.36,00:00:12.79,Default,,0,0,0,,ไม่ต้องไปง้อร้าน
+Dialogue: 0,00:00:12.79,00:00:14.13,Default,,0,0,0,,ให้เสียเวลาเนอะ
+Dialogue: 0,00:00:14.13,00:00:14.85,Default,,0,0,0,,อร่อยฟิน
+Dialogue: 0,00:00:14.85,00:00:15.92,Default,,0,0,0,,จนอยากกรี๊ด!
+Dialogue: 0,00:00:15.92,00:00:17.18,Default,,0,0,0,,ใครช้าอดหมดสวย
+Dialogue: 0,00:00:17.18,00:00:17.62,Default,,0,0,0,,นะจ๊ะ
+Dialogue: 0,00:00:17.62,00:00:18.61,Default,,0,0,0,,กดสั่งเลยสิ
+Dialogue: 0,00:00:18.61,00:00:19.24,Default,,0,0,0,,รออะไร!

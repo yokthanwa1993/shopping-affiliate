@@ -1,0 +1,25 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,FC Iconic,82,&H00FFFFFF,&H00000000,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,10,0,2,10,10,250,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,00:00:00.00,00:00:02.50,Default,,0,0,0,,แม่จ๋าา วันนี้มีของดีมาอวด!
+Dialogue: 0,00:00:02.50,00:00:05.50,Default,,0,0,0,,ชุดเครื่องมือ HOTO\Nครบจบในตัวเดียว!
+Dialogue: 0,00:00:05.50,00:00:08.50,Default,,0,0,0,,ไขควงไฟฟ้า\Nปรับแรงบิดได้ 3 ระดับ
+Dialogue: 0,00:00:08.50,00:00:12.00,Default,,0,0,0,,ขันน็อต ซ่อมจักรยาน\Nงานบ้านงานไม้เอาอยู่หมด!
+Dialogue: 0,00:00:12.00,00:00:15.00,Default,,0,0,0,,หัวไขควงหลายแบบ\Nเปลี่ยนง่ายมากก
+Dialogue: 0,00:00:15.00,00:00:18.50,Default,,0,0,0,,มีประแจเลื่อนด้วยนะ\Nปรับขนาดได้สบาย
+Dialogue: 0,00:00:18.50,00:00:22.00,Default,,0,0,0,,ไม้บรรทัดวัดความยาว\Nพับเก็บได้สะดวก
+Dialogue: 0,00:00:22.00,00:00:26.00,Default,,0,0,0,,คีมปากจิ้งจก + มีดตัด\Nใช้งานได้จริงทุกชิ้น
+Dialogue: 0,00:00:26.00,00:00:30.00,Default,,0,0,0,,ไขควงลองไฟได้ด้วยจ้ะ\Nซ่อมไฟบ้านเองได้เลย
+Dialogue: 0,00:00:30.00,00:00:35.00,Default,,0,0,0,,ค้อนหัวแบน ดึงตะปูได้\Nตอกไม้นุ่มนวล
+Dialogue: 0,00:00:35.00,00:00:39.00,Default,,0,0,0,,เลื่อยมือคมกริบ\Nตัดไม้ลื่นไม่มีสะดุด
+Dialogue: 0,00:00:39.00,00:00:44.00,Default,,0,0,0,,ชุดนี้มีทุกอย่างจริงๆ\Nพกไปไหนก็ง่าย
+Dialogue: 0,00:00:44.00,00:00:48.50,Default,,0,0,0,,กล่องเก็บกระชับ\Nเปิดปิดล็อกได้สนิท
+Dialogue: 0,00:00:48.50,00:00:49.18,Default,,0,0,0,,แม่ๆ ต้องมีติดบ้านนะคะ!

@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "โปรแกรมจำลองโทรศัพท์มือถือ - ทดสอบเว็บไซต์ที่ตอบสนอง"
+  },
+  "extDescription": {
+    "message": "โปรแกรมจำลองสมาร์ทโฟนและแท็บเล็ตบนคอมพิวเตอร์พร้อมด้วยโมเดลมากมายเพื่อทดสอบเว็บไซต์มือถือและที่ตอบสนอง."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "ยกเลิก"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> โทรศัพท์ Android"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> โทรศัพท์ Apple"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> แท็บเล็ต"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> พิเศษ"
+  },
+  "copied": {
+    "message": "คัดลอกแล้ว"
+  },
+  "error": {
+    "message": "ข้อผิดพลาด"
+  },
+  "link": {
+    "message": "ลิงก์"
+  },
+  "optional": {
+    "message": "ไม่บังคับ"
+  },
+  "close": {
+    "message": "ปิด"
+  },
+  "get_pro": {
+    "message": "รับเวอร์ชัน PRO"
+  },
+  "error_contact": {
+    "message": "{กรุณาติดต่อเรา} หากปัญหายังคงอยู่."
+  },
+  "more_settings": {
+    "message": "การตั้งค่าเพิ่มเติม"
+  },
+  "dimensions": {
+    "message": "ขนาด"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "เปิดใช้งานมุมมองมือถือในแท็บนี้"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "โปรแกรมจำลองไม่สามารถเปิดใช้งานบนหน้านี้ซึ่งเป็นหน้าเนทีฟของเบราว์เซอร์ของคุณ ลองในแท็บอื่นหรือเรียกดูเว็บไซต์แล้วลองใหม่."
+  },
+  "popup_activate_local_files_info": {
+    "message": "โปรแกรมจำลองนี้ไม่สามารถเปิดใช้งานโดยค่าเริ่มต้นบนไฟล์ท้องถิ่น (file:///) แต่คุณสามารถเปิดใช้งานตัวเลือกนี้ด้วยตนเองในการตั้งค่า Chrome."
+  },
+  "popup_activate_local_files_button": {
+    "message": "เปิดใช้งานตัวเลือก"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "ปิดโปรแกรมจำลอง"
+  },
+  "menu_close_multi": {
+    "message": "ปิดหน้าต่างนี้"
+  },
+  "menu_change_device": {
+    "message": "เปลี่ยนโมเดล"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> อุปกรณ์ที่คุณค้นหาไม่อยู่ในรายการหรือไม่? บอกเรา!"
+  },
+  "menu_info_device": {
+    "message": "คุณสมบัติและ mockup ของอุปกรณ์นี้"
+  },
+  "menu_info_device_features": {
+    "message": "คุณสมบัติ (ความละเอียด viewport ฯลฯ)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Mockup ฟรีใน PNG โปร่งใส"
+  },
+  "menu_rotate": {
+    "message": "เปลี่ยนการวางแนว"
+  },
+  "menu_zoom": {
+    "message": "ซูมในอุปกรณ์"
+  },
+  "menu_screenshot": {
+    "message": "📷 ถ่ายภาพหน้าจอ"
+  },
+  "menu_screencast": {
+    "message": "📹 บันทึกวิดีโอหน้าจอ"
+  },
+  "menu_share": {
+    "message": "แชร์ให้เพื่อนร่วมงาน เพื่อน,..."
+  },
+  "menu_send_improvement": {
+    "message": "เสนอการปรับปรุง"
+  },
+  "menu_send_message": {
+    "message": "ศูนย์ช่วยเหลือ"
+  },
+  "menu_faq_title": {
+    "message": "คำถามที่พบบ่อย"
+  },
+  "menu_faq_media_queries": {
+    "message": "Media queries ของฉันไม่ถูกนำมาพิจารณา"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "จะเปิดใช้งานโปรแกรมจำลองในโหมดไม่ระบุตัวตนได้อย่างไร?"
+  },
+  "menu_faq_scroll": {
+    "message": "ไม่สามารถเลื่อนในโปรแกรมจำลอง"
+  },
+  "menu_faq_subscription": {
+    "message": "ทำไมการสมัครสมาชิกของฉันไม่ทำงาน?"
+  },
+  "menu_faq_shortcut": {
+    "message": "จะตั้งค่าทางลัดแป้นพิมพ์ได้อย่างไร?"
+  },
+  "menu_faq_all": {
+    "message": "ดูคำถามที่พบบ่อยทั้งหมด"
+  },
+  "menu_report": {
+    "message": "รายงานข้อบกพร่อง"
+  },
+  "menu_settings": {
+    "message": "การตั้งค่า"
+  },
+  "menu_add_window": {
+    "message": "เพิ่มโมเดลการจำลอง"
+  },
+  "menu_help_center": {
+    "message": "ศูนย์ช่วยเหลือ"
+  },
+  "menu_extensions": {
+    "message": "ค้นพบส่วนขยาย Chrome อื่น ๆ ของเรา"
+  },
+  "menu_vote_feature": {
+    "message": "โหวตสำหรับฟีเจอร์ที่คุณต้องการ"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "นี่เป็นเพียงภาพเท่านั้น หากต้องการเปลี่ยน URL ให้ใช้ช่องของ Chrome ด้านบน."
+  },
+  "simulator_footer_info": {
+    "message": "นี่เป็นเพียงภาพเท่านั้น ใช้แป้นพิมพ์ของคุณเอง."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "บันทึกวิดีโอเฉพาะอุปกรณ์"
+  },
+  "screencast_tooltip_tab": {
+    "message": "บันทึกวิดีโอแท็บพร้อมอุปกรณ์"
+  },
+  "screencast_error": {
+    "message": "เกิดข้อผิดพลาดระหว่างการบันทึก {คลิกที่นี่} สำหรับวิธีแก้ปัญหา."
+  },
+  "screencast_modale_title": {
+    "message": "บันทึกวิดีโอ"
+  },
+  "screencast_modale_texte": {
+    "message": "คุณสามารถดาวน์โหลดวิดีโอนี้ในรูปแบบต่าง ๆ หรือรับลิงก์แชร์."
+  },
+  "screencast_modale_download_webm": {
+    "message": "ดาวน์โหลดในรูปแบบเริ่มต้น WEBM (พร้อมความโปร่งใสหากเปิดใช้งานตัวเลือก)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "ความเข้ากันได้ที่ดีกับ PowerPoint แต่ไม่มีความโปร่งใส"
+  },
+  "screencast_modale_download_gif": {
+    "message": "เข้ากันได้ทุกที่ แต่คุณภาพต่ำกว่า (พร้อมความโปร่งใสหากเปิดใช้งานตัวเลือก)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "ระยะเวลาสูงสุดของ GIF คือ 60 วินาที เกินกว่านั้นไฟล์จะมีขนาดใหญ่เกินไป."
+  },
+  "screencast_modale_copy": {
+    "message": "คัดลอก"
+  },
+  "screencast_modale_upload": {
+    "message": "รับลิงก์แชร์"
+  },
+  "screencast_modale_contact": {
+    "message": "รายงานข้อบกพร่อง เสนอการปรับปรุง"
+  },
+  "screencast_start_recording": {
+    "message": "เริ่มการบันทึก"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "การอนุญาตเข้าถึงไมโครโฟนถูกปฏิเสธ."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "การอนุญาตเข้าถึงกล้องถูกปฏิเสธ."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "เวอร์ชัน Chrome ของคุณเก่าเกินไปสำหรับฟีเจอร์นี้ กรุณาอัปเดต Chrome เป็นเวอร์ชันที่สูงกว่า 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "คุณภาพวิดีโอมีผลต่อบิตเรต, fps & ความละเอียดของการบันทึก ยิ่งคุณภาพสูงไฟล์จะยิ่งมีขนาดใหญ่."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "การบันทึกวิดีโอถูกจำกัดไว้ที่ 5 นาทีในเวอร์ชันฟรี."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "จับภาพพร้อมอุปกรณ์"
+  },
+  "screenshot_menu_2": {
+    "message": "จับภาพเฉพาะเว็บไซต์"
+  },
+  "screenshot_menu_3": {
+    "message": "จับภาพทั้งหน้า"
+  },
+  "screenshot_menu_4": {
+    "message": "จับภาพทั้งแท็บ"
+  },
+  "screenshot_button": {
+    "message": "สร้างภาพหน้าจอ"
+  },
+  "screenshot_modale_download_png": {
+    "message": "ดาวน์โหลดในรูปแบบ PNG (ไม่มีการบีบอัด)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "ดาวน์โหลดในรูปแบบ WEBP, เข้ากันได้เกือบทุกที่และการบีบอัดที่เหมาะสม (แนะนำ)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "หยุดก่อนสิ้นสุดหน้า"
+  },
+  "screenshot_modale_title": {
+    "message": "ภาพหน้าจอ"
+  },
+  "screenshot_modale_copy": {
+    "message": "คัดลอกรูปภาพไปยังคลิปบอร์ด"
+  },
+  "screenshot_modale_edit": {
+    "message": "แก้ไขภาพหน้าจอ"
+  },
+  "screenshot_modale_help": {
+    "message": "เพื่อบันทึกรูปภาพในรูปแบบขนาดใหญ่เพียงคลิกขวาที่รูปภาพแล้วเลือก \"คัดลอกรูปภาพ\" หรือ \"บันทึก\"."
+  },
+  "screenshot_editor_close": {
+    "message": "ปิดตัวแก้ไข"
+  },
+  "screenshot_editor_undo": {
+    "message": "ยกเลิกการกระทำล่าสุด"
+  },
+  "screenshot_editor_rect": {
+    "message": "วาดสี่เหลี่ยม"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "วาดวงกลม"
+  },
+  "screenshot_editor_line": {
+    "message": "วาดเส้น"
+  },
+  "screenshot_editor_arrow": {
+    "message": "วาดลูกศร"
+  },
+  "screenshot_editor_pen": {
+    "message": "วาดเสรี"
+  },
+  "screenshot_editor_color": {
+    "message": "สีของเส้น"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "ความหนาของเส้น"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "เป็น PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "แปลงภาพวิดีโอของคุณเป็นรูปแบบ GIF และ MP4"
+  },
+  "pro_modale_h1_devices": {
+    "message": "จำลองอุปกรณ์ทั้งหมด"
+  },
+  "pro_modale_h1_settings": {
+    "message": "ปลดล็อกการตั้งค่าทั้งหมด"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "ปลดล็อกการตั้งค่าการบันทึกวิดีโอทั้งหมด"
+  },
+  "pro_modale_h1_ads": {
+    "message": "ลบโฆษณา"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "แก้ไขภาพหน้าจอของคุณ"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "ถ่ายภาพหน้าจอได้ไม่จำกัด"
+  },
+  "pro_modale_h2": {
+    "message": "เป็น PRO และมีส่วนร่วมในการพัฒนาโปรแกรมเสริมนี้โดยสนับสนุนนักพัฒนา."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "เรียกเก็บเงินรายปี"
+  },
+  "pro_modale_savings": {
+    "message": "ประหยัด"
+  },
+  "pro_modale_from": {
+    "message": "เริ่มต้นที่"
+  },
+  "pro_modale_recurring_month": {
+    "message": "เดือน"
+  },
+  "pro_modale_button": {
+    "message": "ฉันสมัครสมาชิก"
+  },
+  "pro_modale_link_1": {
+    "message": "หรือ"
+  },
+  "pro_modale_link_2": {
+    "message": "ฉันเข้าสู่ระบบ"
+  },
+  "pro_modale_link_3": {
+    "message": "ในบัญชีสมาชิกของฉัน"
+  },
+  "pro_modale_avantage_1": {
+    "message": "การตั้งค่าวิดีโอทั้งหมด"
+  },
+  "pro_modale_avantage_2": {
+    "message": "ลบโฆษณา"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "โปรแกรมจำลองมือถือมีประโยชน์กับคุณหรือไม่?"
+  },
+  "sharing_h2": {
+    "message": "ถ้าใช่ แชร์ให้เพื่อนร่วมงานหรือเพื่อนของคุณ"
+  },
+  "sharing_txt": {
+    "message": "โปรแกรมจำลองเพื่อทดสอบเว็บไซต์บนมือถือและแท็บเล็ต"
+  },
+  "sharing_review_1": {
+    "message": "และถ้าคุณมีเวลาสักนาทีเพื่อ"
+  },
+  "sharing_review_2": {
+    "message": "เพิ่มรีวิว"
+  },
+  "sharing_review_3": {
+    "message": "นั่นคือเชอร์รี่บนเค้ก! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "ฉันเพิ่มรีวิว"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "ค้นพบส่วนขยายฟรีใหม่ล่าสุดของเรา"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Color picker"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "ส่วนขยายนี้ช่วยให้คุณจับสีใด ๆ บนหน้าจอได้."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Font finder"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "ระบุฟอนต์ที่ใช้บนข้อความใด ๆ ของหน้าเว็บด้วยคลิกเดียว."
+  },
+  "other_extensions_button": {
+    "message": "ติดตั้ง"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "คุณจะให้คะแนนโปรแกรมเสริมนี้อย่างไร?"
+  },
+  "review_note_store": {
+    "message": "ขอบคุณสำหรับความคิดเห็นของคุณ อย่าลังเลที่จะเพิ่มคะแนนใน Google Store ฉันจะขอบคุณมาก 😊"
+  },
+  "review_note_feedback": {
+    "message": "ขอบคุณสำหรับความคิดเห็นของคุณ อย่าลังเลที่จะส่งข้อความถึงเราเพื่อให้เราสามารถปรับปรุงโปรแกรมเสริมนี้."
+  },
+  "button_feedback": {
+    "message": "เพิ่มคะแนน"
+  },
+  "button_message": {
+    "message": "ส่งข้อความถึงเรา"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "ชื่ออุปกรณ์"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, ฯลฯ."
+  },
+  "contact_title": {
+    "message": "อุปกรณ์ที่คุณค้นหาไม่อยู่ในรายการหรือไม่? บอกเรา!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "อุปกรณ์"
+  },
+  "settings_h2_global": {
+    "message": "ทั่วไป"
+  },
+  "settings_hide_header_footer": {
+    "message": "ซ่อนส่วนหัวและส่วนท้ายของเบราว์เซอร์ใน webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "ไม่แสดงแป้นพิมพ์ปลอมเมื่อโฟกัสที่ช่องป้อนข้อมูล"
+  },
+  "settings_scrollbar_show": {
+    "message": "แสดงแถบเลื่อนเนทีฟในอุปกรณ์"
+  },
+  "settings_change_cursor": {
+    "message": "ไม่เปลี่ยนสไตล์เคอร์เซอร์ใน webview"
+  },
+  "settings_change_background": {
+    "message": "เปลี่ยนสีพื้นหลัง"
+  },
+  "settings_default_device": {
+    "message": "อุปกรณ์เริ่มต้นทุกครั้งที่เปิดใช้งาน"
+  },
+  "settings_change_analytics": {
+    "message": "ฉันช่วยนักพัฒนาของโปรแกรมเสริมนี้ปรับปรุงผลิตภัณฑ์ของเขาด้วย Posthog ข้อมูลทั้งหมดจะถูกทำให้ไม่ระบุตัวตน."
+  },
+  "settings_device_hide": {
+    "message": "ไม่แสดงอุปกรณ์"
+  },
+  "settings_batterie_level": {
+    "message": "ระดับแบตเตอรี่ในส่วนหัวของอุปกรณ์ (%)"
+  },
+  "settings_device_default_url": {
+    "message": "เปลี่ยน URL ที่แสดงในอุปกรณ์"
+  },
+  "settings_presenter_mode": {
+    "message": "โหมดการนำเสนอ (เมนูด้านขวาแสดงเฉพาะเมื่อวางเมาส์)"
+  },
+  "settings_fullscreen": {
+    "message": "เว็บไซต์เต็มหน้าจอในอุปกรณ์"
+  },
+  "settings_default_device_placeholder": {
+    "message": "เลือกอุปกรณ์"
+  },
+  "settings_video_quality": {
+    "message": "คุณภาพวิดีโอ"
+  },
+  "settings_video_quality_low": {
+    "message": "ปานกลาง"
+  },
+  "settings_video_quality_medium": {
+    "message": "ดี"
+  },
+  "settings_video_quality_high": {
+    "message": "ยอดเยี่ยม"
+  },
+  "settings_theme": {
+    "message": "ธีม"
+  },
+  "settings_theme_light": {
+    "message": "สว่าง"
+  },
+  "settings_theme_dark": {
+    "message": "มืด"
+  },
+  "settings_theme_auto": {
+    "message": "อัตโนมัติ"
+  },
+  "settings_shortcuts": {
+    "message": "กำหนดทางลัดแป้นพิมพ์"
+  },
+  "settings_pro_account": {
+    "message": "จัดการการสมัครสมาชิกของฉัน"
+  },
+  "settings_microphone": {
+    "message": "ไมโครโฟน"
+  },
+  "settings_camera": {
+    "message": "กล้อง"
+  },
+  "settings_countdown": {
+    "message": "นับถอยหลัง (วินาที)"
+  },
+  "settings_transparent_background": {
+    "message": "พื้นหลังโปร่งใส"
+  },
+  "settings_transparent_background_info": {
+    "message": "ตัวเลือกนี้เกี่ยวข้องกับการคำนวณเพิ่มเติมและอาจทำให้การแสดงผลช้าลงขึ้นอยู่กับคอมพิวเตอร์ของคุณ (เข้ากันได้เฉพาะกับรูปแบบ WEBM และ GIF)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "วิธีแก้ปัญหาสำหรับการจับภาพหน้าจอ"
+  },
+  "screenshot_workaround_context": {
+    "message": "บริบท"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "เนื่องจากข้อจำกัดทางเทคนิคบางประการ อาจเป็นไปได้ว่าเมื่อจับภาพหน้าจอคุณจะได้รับข้อความแสดงข้อผิดพลาดนี้."
+  },
+  "screenshot_workaround_solution": {
+    "message": "วิธีแก้ปัญหา"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "ในกรณีนี้เพื่อเริ่มการจับภาพ เพียงคลิกขวาที่ใดก็ได้บนหน้า เลือกรายการ \"โปรแกรมจำลองมือถือ\" แล้ว \"📷 ถ่ายภาพหน้าจอ\""
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "ช่วยให้เราทำให้ Mobile FIRST มีประโยชน์มากขึ้นสำหรับคุณ 🚀"
+  },
+  "feedback_profession": {
+    "message": "แผนกอาชีพของคุณคืออะไร?"
+  },
+  "feedback_profession_developer": {
+    "message": "การพัฒนา"
+  },
+  "feedback_profession_designer": {
+    "message": "การออกแบบ"
+  },
+  "feedback_profession_qa": {
+    "message": "การทดสอบ / QA"
+  },
+  "feedback_profession_product": {
+    "message": "การจัดการผลิตภัณฑ์"
+  },
+  "feedback_profession_marketing": {
+    "message": "การตลาด"
+  },
+  "feedback_profession_sales": {
+    "message": "การขาย"
+  },
+  "feedback_profession_other": {
+    "message": "อื่น ๆ"
+  },
+  "feedback_company_type": {
+    "message": "ประเภทบริษัทของคุณคืออะไร?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "อิสระ"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "ธุรกิจขนาดเล็ก (1-9 พนักงาน)"
+  },
+  "feedback_company_type_agency": {
+    "message": "ธุรกิจขนาดเล็ก (10-49 พนักงาน)"
+  },
+  "feedback_company_type_startup": {
+    "message": "ธุรกิจขนาดกลาง (50-249 พนักงาน)"
+  },
+  "feedback_company_type_pme": {
+    "message": "ธุรกิจขนาดใหญ่ (250-4999 พนักงาน)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "ธุรกิจขนาดใหญ่มาก / กลุ่ม (5000+ พนักงาน)"
+  },
+  "feedback_use_cases": {
+    "message": "ทำไมคุณถึงใช้ Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "ทดสอบเว็บไซต์ของฉัน ทำการสาธิตลูกค้า..."
+  },
+  "feedback_frequency": {
+    "message": "คุณใช้โปรแกรมเสริมนี้บ่อยแค่ไหน?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "ทุกวัน"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "หลายครั้งต่อสัปดาห์"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "เป็นครั้งคราว"
+  },
+  "feedback_frequency_rare": {
+    "message": "หายาก"
+  },
+  "feedback_improvements": {
+    "message": "คุณต้องการเห็นการปรับปรุงอะไรบ้าง?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "ไอเดีย ความขัดข้อง การขาดแคลน..."
+  },
+  "feedback_submit": {
+    "message": "ส่ง"
+  },
+  "feedback_close": {
+    "message": "ไม่ตอบ"
+  },
+  "feedback_error_required": {
+    "message": "ทุกช่องว่างเปล่า 🤔"
+  },
+  "feedback_submitted": {
+    "message": "ขอบคุณมากสำหรับความคิดเห็นของคุณ 🤗"
+  },
+  "select": {
+    "message": "เลือก..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "ค้นพบอินเทอร์เฟซใหม่ \"Liquid Glass\" ของ Safari iOS 26 สำหรับการทดสอบที่สมจริงยิ่งขึ้น!"
+  },
+  "new_ios26_h2": {
+    "message": "มีให้ในทุกรุ่นของ iPhone&nbsp;15 และ iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "ใหม่!<br>ทดสอบเว็บไซต์ของคุณด้วย iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX มีให้ในโปรแกรมจำลอง."
+  },
+  "new_video_feature_h1": {
+    "message": "ค้นพบฟีเจอร์การจับภาพวิดีโอใหม่!"
+  },
+  "new_video_feature_h2": {
+    "message": "บันทึกด้วยคุณภาพที่ดีขึ้น พร้อมตัวเลือกใหม่และพื้นหลังโปร่งใส"
+  },
+  "logout_modale_title": {
+    "message": "คุณได้ออกจากระบบอัตโนมัติบนอุปกรณ์นี้"
+  },
+  "logout_modale_message": {
+    "message": "อุปกรณ์นี้ไม่ใช่อุปกรณ์ที่ได้รับอนุญาตอีกต่อไป หากคุณได้ลบการเข้าถึงนี้ด้วยตนเอง จำเป็นต้องเข้าสู่ระบบใหม่อีกครั้ง"
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>ข้อมูล</strong>การเลื่อนด้วยการสัมผัสไม่สามารถใช้ได้ แต่คุณสามารถ <strong>แสดงแถบเลื่อน</strong> หากคุณไม่มีล้อเมาส์หรือแทร็คแพดเพื่อเลื่อน.<br><br>นี่คือตัวเลือกในการตั้งค่าที่ด้านล่างขวา <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>ยินดีต้อนรับสู่ Mobile FIRST 👋</strong>จำลองโทรศัพท์ แท็บเล็ต และคอมพิวเตอร์ด้วยคลิกเดียวเพื่อทดสอบและดูเว็บไซต์ของคุณได้อย่างง่ายดาย.<br><br><strong>เมนูอยู่ทางขวา ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>อัปเดต v4.12.0</strong>ฟีเจอร์ใหม่ในเวอร์ชัน PRO, <strong>การแก้ไขภาพหน้าจอ</strong>. ปุ่มสำหรับวาดรูปทรง เพิ่มข้อความ ฯลฯ <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>อัปเดต v4.14.0</strong>ค้นพบฟีเจอร์ใหม่ของ <strong>การจับภาพวิดีโอ</strong>! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>อัปเดต v4.14.5</strong>เพิ่มความละเอียดและคุณภาพของภาพหน้าจออย่างมีนัยสำคัญ <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "เข้าสู่ระบบ"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ คุณต้องการแชร์การสมัครสมาชิกของคุณหรือไม่? เพื่ออนุญาตให้ผู้อื่นใช้งาน เพียงเพิ่มพวกเขาจากส่วน \"ผู้ใช้\" ในบัญชีของคุณ"
+  }
+}

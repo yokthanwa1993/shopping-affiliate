@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Simulátor mobilného telefónu - test responzívneho webu"
+  },
+  "extDescription": {
+    "message": "Simulátor smartfónov a tabletov na počítači s mnohými modelmi na testovanie mobilného a responzívneho webu."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Zrušiť"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Android telefóny"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Apple telefóny"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Tablety"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Špeciálne"
+  },
+  "copied": {
+    "message": "Skopírované"
+  },
+  "error": {
+    "message": "Chyba"
+  },
+  "link": {
+    "message": "Odkaz"
+  },
+  "optional": {
+    "message": "Voliteľné"
+  },
+  "close": {
+    "message": "Zatvoriť"
+  },
+  "get_pro": {
+    "message": "Získať verziu PRO"
+  },
+  "error_contact": {
+    "message": "{Kontaktujte nás} ak problém pretrváva."
+  },
+  "more_settings": {
+    "message": "Viac nastavení"
+  },
+  "dimensions": {
+    "message": "Rozmery"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Aktivovať mobilné zobrazenie na tejto karte"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Simulátor nie je možné aktivovať na tejto natívnej stránke vášho prehliadača. Skúste na inej karte alebo prejdite na web a znova spustite."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Tento simulátor nemožno predvolene aktivovať na lokálnych súboroch (file:///), ale môžete manuálne aktivovať túto možnosť v nastaveniach Chrome."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Aktivovať možnosť"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Deaktivovať simulátor"
+  },
+  "menu_close_multi": {
+    "message": "Zatvoriť toto okno"
+  },
+  "menu_change_device": {
+    "message": "Zmeniť model"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Zariadenie, ktoré hľadáte, nie je v zozname? Dajte nám vedieť!"
+  },
+  "menu_info_device": {
+    "message": "Vlastnosti a mockup tohto zariadenia"
+  },
+  "menu_info_device_features": {
+    "message": "Vlastnosti (rozlíšenie viewportu, atď.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Bezplatný mockup v priehľadnom PNG"
+  },
+  "menu_rotate": {
+    "message": "Zmeniť orientáciu"
+  },
+  "menu_zoom": {
+    "message": "Priblížiť v zariadení"
+  },
+  "menu_screenshot": {
+    "message": "📷 Urobiť snímku obrazovky"
+  },
+  "menu_screencast": {
+    "message": "📹 Nahrať video obrazovky"
+  },
+  "menu_share": {
+    "message": "Zdieľať s kolegom, priateľom,..."
+  },
+  "menu_send_improvement": {
+    "message": "Navrhnúť vylepšenie"
+  },
+  "menu_send_message": {
+    "message": "Centrum pomoci"
+  },
+  "menu_faq_title": {
+    "message": "Často kladené otázky"
+  },
+  "menu_faq_media_queries": {
+    "message": "Moje media queries nie sú zohľadnené"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Ako aktivovať simulátor v režime inkognito?"
+  },
+  "menu_faq_scroll": {
+    "message": "Nie je možné posúvať v simulátore"
+  },
+  "menu_faq_subscription": {
+    "message": "Prečo moje predplatné nefunguje?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Ako nastaviť klávesové skratky?"
+  },
+  "menu_faq_all": {
+    "message": "Zobraziť všetky často kladené otázky"
+  },
+  "menu_report": {
+    "message": "Nahlásiť chybu"
+  },
+  "menu_settings": {
+    "message": "Konfigurácia"
+  },
+  "menu_add_window": {
+    "message": "Pridať model simulácie"
+  },
+  "menu_help_center": {
+    "message": "Centrum pomoci"
+  },
+  "menu_extensions": {
+    "message": "Objavte naše ďalšie rozšírenia pre Chrome"
+  },
+  "menu_vote_feature": {
+    "message": "Hlasujte za funkcie, ktoré chcete"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Toto je len obrázok. Na zmenu URL použite pole Chrome vyššie."
+  },
+  "simulator_footer_info": {
+    "message": "Toto je len obrázok. Použite svoju vlastnú klávesnicu."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Záznam videa iba zo zariadenia"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Záznam videa z karty so zariadením"
+  },
+  "screencast_error": {
+    "message": "Pri nahrávaní došlo k chybe. {Kliknite sem} pre riešenie."
+  },
+  "screencast_modale_title": {
+    "message": "Záznam videa"
+  },
+  "screencast_modale_texte": {
+    "message": "Toto video si môžete stiahnuť v rôznych formátoch alebo získať odkaz na zdieľanie."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Stiahnuť vo formáte WEBM (s priehľadnosťou, ak je možnosť aktivovaná)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Lepšia kompatibilita s PowerPoint, ale bez priehľadnosti"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Kompatibilné všade, ale nižšia kvalita (s priehľadnosťou, ak je možnosť aktivovaná)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Maximálna dĺžka GIF je 60 sekúnd. Nad tento limit by bol súbor príliš veľký."
+  },
+  "screencast_modale_copy": {
+    "message": "Kopírovať"
+  },
+  "screencast_modale_upload": {
+    "message": "Získať odkaz na zdieľanie"
+  },
+  "screencast_modale_contact": {
+    "message": "Nahlásiť chybu, navrhnúť vylepšenie"
+  },
+  "screencast_start_recording": {
+    "message": "Spustiť nahrávanie"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Prístup k mikrofónu bol odmietnutý."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Prístup k kamere bol odmietnutý."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Vaša verzia Chrome je príliš stará pre túto funkciu. Aktualizujte Chrome na verziu vyššiu ako 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Kvalita videa ovplyvňuje bitrate, fps a rozlíšenie nahrávania. Čím vyššia kvalita, tým väčší súbor."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Video nahrávky sú obmedzené na 5 minút v bezplatnej verzii."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Snímka so zariadením"
+  },
+  "screenshot_menu_2": {
+    "message": "Snímka iba webu"
+  },
+  "screenshot_menu_3": {
+    "message": "Snímka celej stránky"
+  },
+  "screenshot_menu_4": {
+    "message": "Snímka celej karty"
+  },
+  "screenshot_button": {
+    "message": "Vytvoriť snímku"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Stiahnuť vo formáte PNG (bez kompresie)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Stiahnuť vo formáte WEBP, kompatibilné takmer všade a optimalizovaná kompresia (odporúčané)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Zastaviť pred koncom stránky"
+  },
+  "screenshot_modale_title": {
+    "message": "Snímka"
+  },
+  "screenshot_modale_copy": {
+    "message": "Kopírovať obrázok do schránky"
+  },
+  "screenshot_modale_edit": {
+    "message": "Upraviť snímku"
+  },
+  "screenshot_modale_help": {
+    "message": "Ak chcete uložiť obrázok vo veľkom formáte, stačí naň kliknúť pravým tlačidlom myši a vybrať \"Kopírovať obrázok\" alebo \"Uložiť\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Zatvoriť editor"
+  },
+  "screenshot_editor_undo": {
+    "message": "Zrušiť poslednú akciu"
+  },
+  "screenshot_editor_rect": {
+    "message": "Nakresliť obdĺžnik"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Nakresliť kruh"
+  },
+  "screenshot_editor_line": {
+    "message": "Nakresliť čiaru"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Nakresliť šípku"
+  },
+  "screenshot_editor_pen": {
+    "message": "Voľné kreslenie"
+  },
+  "screenshot_editor_color": {
+    "message": "Farba čiary"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Hrúbka čiary"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Staňte sa PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Konvertujte svoje video snímky do formátov GIF a MP4"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Simulujte všetky zariadenia"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Odomknite všetky nastavenia"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Odomknite všetky nastavenia video nahrávania"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Odstráňte reklamy"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Upravujte svoje snímky"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Vytvárajte snímky obrazovky bez obmedzenia"
+  },
+  "pro_modale_h2": {
+    "message": "Staňte sa PRO a aktívne prispievajte k vývoju tohto rozšírenia podporou jeho vývojára."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Fakturované ročne"
+  },
+  "pro_modale_savings": {
+    "message": "Ušetrite"
+  },
+  "pro_modale_from": {
+    "message": "Od"
+  },
+  "pro_modale_recurring_month": {
+    "message": "mesiac"
+  },
+  "pro_modale_button": {
+    "message": "Predplatiť"
+  },
+  "pro_modale_link_1": {
+    "message": "Alebo"
+  },
+  "pro_modale_link_2": {
+    "message": "prihlásiť sa"
+  },
+  "pro_modale_link_3": {
+    "message": "do môjho účtu predplatiteľa"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Všetky video nastavenia"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Odstránenie reklám"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Je tento mobilný simulátor pre teba užitočný?"
+  },
+  "sharing_h2": {
+    "message": "Tak ho zdieľaj so svojimi kolegami alebo priateľmi"
+  },
+  "sharing_txt": {
+    "message": "Simulátor na testovanie webu na mobiloch a tabletoch"
+  },
+  "sharing_review_1": {
+    "message": "A ak máš minútu na"
+  },
+  "sharing_review_2": {
+    "message": "pridanie recenzie"
+  },
+  "sharing_review_3": {
+    "message": "tak to je čerešnička na torte! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Pridať recenziu"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Objavte naše úplne nové bezplatné rozšírenia"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Výber farieb"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Toto rozšírenie vám umožňuje zachytiť akúkoľvek farbu na obrazovke."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Vyhľadávač fontov"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Identifikujte jedným kliknutím font použitý na akomkoľvek texte na webovej stránke."
+  },
+  "other_extensions_button": {
+    "message": "Inštalovať"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Ako by ste ohodnotili toto rozšírenie?"
+  },
+  "review_note_store": {
+    "message": "Ďakujeme za vašu spätnú väzbu, neváhajte pridať hodnotenie na Google Store. Budem vám veľmi vďačný 😊"
+  },
+  "review_note_feedback": {
+    "message": "Ďakujeme za vašu spätnú väzbu, neváhajte nám poslať správu, aby sme mohli toto rozšírenie vylepšiť."
+  },
+  "button_feedback": {
+    "message": "Pridať hodnotenie"
+  },
+  "button_message": {
+    "message": "Pošlite nám správu"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Názov zariadenia"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, atď."
+  },
+  "contact_title": {
+    "message": "Zariadenie, ktoré hľadáte, nie je v zozname? Dajte nám vedieť!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Zariadenie"
+  },
+  "settings_h2_global": {
+    "message": "Všeobecné"
+  },
+  "settings_hide_header_footer": {
+    "message": "Skryť horné a dolné prvky prehliadača vo webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Nezobrazovať falošnú klávesnicu pri zameraní na vstupné pole"
+  },
+  "settings_scrollbar_show": {
+    "message": "Zobraziť natívny posuvník v zariadení"
+  },
+  "settings_change_cursor": {
+    "message": "Nezmeniť štýl kurzora vo webview"
+  },
+  "settings_change_background": {
+    "message": "Zmeniť farbu pozadia"
+  },
+  "settings_default_device": {
+    "message": "Predvolené zariadenie pri každej aktivácii"
+  },
+  "settings_change_analytics": {
+    "message": "Pomáham vývojárovi tohto rozšírenia zlepšiť jeho produkt pomocou Posthog. Všetky údaje sú anonymizované."
+  },
+  "settings_device_hide": {
+    "message": "Nezobrazovať zariadenie"
+  },
+  "settings_batterie_level": {
+    "message": "Úroveň batérie v hlavičke zariadenia (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Zmeniť URL zobrazenú v zariadení"
+  },
+  "settings_presenter_mode": {
+    "message": "Prezentačný režim (menu vpravo viditeľné iba pri prechode myšou)"
+  },
+  "settings_fullscreen": {
+    "message": "Web v režime celej obrazovky v zariadení"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Vybrať zariadenie"
+  },
+  "settings_video_quality": {
+    "message": "Kvalita videa"
+  },
+  "settings_video_quality_low": {
+    "message": "Stredná"
+  },
+  "settings_video_quality_medium": {
+    "message": "Dobrá"
+  },
+  "settings_video_quality_high": {
+    "message": "Vynikajúca"
+  },
+  "settings_theme": {
+    "message": "Téma"
+  },
+  "settings_theme_light": {
+    "message": "Svetlá"
+  },
+  "settings_theme_dark": {
+    "message": "Tmavá"
+  },
+  "settings_theme_auto": {
+    "message": "Automatická"
+  },
+  "settings_shortcuts": {
+    "message": "Nastaviť klávesové skratky"
+  },
+  "settings_pro_account": {
+    "message": "Spravovať moje predplatné"
+  },
+  "settings_microphone": {
+    "message": "Mikrofón"
+  },
+  "settings_camera": {
+    "message": "Kamera"
+  },
+  "settings_countdown": {
+    "message": "Odpočítavanie (sekundy)"
+  },
+  "settings_transparent_background": {
+    "message": "Priehľadné pozadie"
+  },
+  "settings_transparent_background_info": {
+    "message": "Táto možnosť vyžaduje viac výpočtov a môže spôsobiť spomalenie zobrazenia v závislosti od vášho počítača (kompatibilné iba s formátmi WEBM a GIF)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Riešenie pre snímku obrazovky"
+  },
+  "screenshot_workaround_context": {
+    "message": "Kontext"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "Kvôli niektorým technickým obmedzeniam sa môže stať, že pri snímke obrazovky dostanete túto chybovú správu."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Riešenie"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "V tomto prípade stačí kliknúť pravým tlačidlom myši kdekoľvek na stránke, vybrať položku „Mobilný simulátor“ a potom „📷 Urobiť snímku obrazovky“"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Pomôžte nám urobiť Mobile FIRST ešte užitočnejším pre vás 🚀"
+  },
+  "feedback_profession": {
+    "message": "Aké je vaše pracovné oddelenie?"
+  },
+  "feedback_profession_developer": {
+    "message": "Vývoj"
+  },
+  "feedback_profession_designer": {
+    "message": "Dizajn"
+  },
+  "feedback_profession_qa": {
+    "message": "Testovanie / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Product management"
+  },
+  "feedback_profession_marketing": {
+    "message": "Marketing"
+  },
+  "feedback_profession_sales": {
+    "message": "Predaj"
+  },
+  "feedback_profession_other": {
+    "message": "Iné"
+  },
+  "feedback_company_type": {
+    "message": "Aký je typ vašej spoločnosti?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Na voľnej nohe"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Mikropodnik (1-9 zamestnancov)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Malý podnik (10-49 zamestnancov)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Stredný podnik (50-249 zamestnancov)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Veľký podnik (250-4999 zamestnancov)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Veľmi veľký podnik / skupina (5000+ zamestnancov)"
+  },
+  "feedback_use_cases": {
+    "message": "Prečo používate Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Testovanie môjho webu, prezentácie klientom..."
+  },
+  "feedback_frequency": {
+    "message": "Ako často používate toto rozšírenie?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Denne"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Niekoľkokrát týždenne"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Príležitostne"
+  },
+  "feedback_frequency_rare": {
+    "message": "Zriedka"
+  },
+  "feedback_improvements": {
+    "message": "Aké vylepšenia by ste chceli vidieť?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "Nápad, problém, nedostatok..."
+  },
+  "feedback_submit": {
+    "message": "Odoslať"
+  },
+  "feedback_close": {
+    "message": "Neodpovedať"
+  },
+  "feedback_error_required": {
+    "message": "Všetky polia sú prázdne 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Ďakujeme veľmi pekne za vašu spätnú väzbu 🤗"
+  },
+  "select": {
+    "message": "Vybrať..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Objavte teraz nové rozhranie \"Liquid Glass\" Safari iOS 26 pre ešte realistickejšie testy!"
+  },
+  "new_ios26_h2": {
+    "message": "Dostupné na všetkých verziách iPhone&nbsp;15 a iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Novinka!<br>Testujte teraz svoje weby s iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX sú dostupné v simulátore."
+  },
+  "new_video_feature_h1": {
+    "message": "Objavte teraz novú funkciu záznamu videa!"
+  },
+  "new_video_feature_h2": {
+    "message": "Nahrávajte s lepšou kvalitou, s novými možnosťami a s priehľadným pozadím"
+  },
+  "logout_modale_title": {
+    "message": "Boli ste automaticky odhlásení z tohto zariadenia"
+  },
+  "logout_modale_message": {
+    "message": "Toto zariadenie už nie je súčasťou vašich autorizovaných terminálov. Ak ste tento prístup odstránili manuálne, je potrebné nové prihlásenie."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Informácia</strong>Touch scroll nie je dostupný, ale môžete <strong>zobraziť posuvník</strong> ak nemáte myš s kolieskom alebo trackpad na posúvanie.<br><br>Je to možnosť v nastaveniach vpravo dole <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Vitajte v Mobile FIRST 👋</strong>Simulujte jedným kliknutím telefóny, tablety a počítače na jednoduché testovanie a vizualizáciu vašich webov.<br><br><strong>Menu sa nachádza vpravo ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Aktualizácia v4.12.0</strong>Nová funkcia v PRO verzii, <strong>úprava snímok obrazovky</strong>. Tlačidlá na kreslenie tvarov, pridávanie textu, atď. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Aktualizácia v4.14.0</strong>Objavte teraz novú funkciu <strong>záznamu videa</strong>! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Aktualizácia v4.14.5</strong>Výrazné zvýšenie <strong>rozlíšenia a kvality</strong> snímok obrazovky <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Prihlásiť sa"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Chcete zdieľať svoje predplatné? Ak chcete povoliť prístup iným osobám, jednoducho ich pridajte v sekcii \"Používatelia\" vo vašom účte."
+  }
+}

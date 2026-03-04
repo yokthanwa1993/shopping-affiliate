@@ -1,0 +1,87 @@
+{
+"update_url": "https://clients2.google.com/service/update2/crx",
+
+  "manifest_version": 3,
+  "name": "__MSG_extName__",
+  "description": "__MSG_extDescription__",
+  "default_locale": "en",
+  "author": "François Duprat",
+  "permissions": [
+    "webRequest",
+    "scripting",
+    "tabs",
+    "activeTab",
+    "declarativeNetRequest",
+    "webNavigation",
+    "storage",
+    "contextMenus",
+    "tabCapture",
+    "offscreen",
+    "commands"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "*://*/*"
+  ],
+  "icons": {
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "background": {
+    "service_worker": "js/background.js"
+  },
+  "action": {
+    "default_title": "__MSG_context_menu_activate__",
+    "default_icon": {
+      "32": "icons/32.png",
+      "48": "icons/48.png"
+    }
+  },
+  "commands": {
+    "take-screenshot-1": {
+      "description": "__MSG_screenshot_menu_1__"
+    },
+    "take-screenshot-2": {
+      "description": "__MSG_screenshot_menu_2__"
+    },
+    "take-screenshot-3": {
+      "description": "__MSG_screenshot_menu_3__"
+    },
+    "take-screenshot-4": {
+      "description": "__MSG_screenshot_menu_4__"
+    },
+    "start-stop-video-capture": {
+      "description": "__MSG_menu_screencast__"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "spoofer.js",
+        "assets/**/*",
+        "fonts/icomoon.ttf",
+        "fonts/avenir.otf",
+        "css/**/*",
+        "icons/**/*",
+        "workers/*.js",
+        "pages/permission/micro.html",
+        "pages/permission/camera.html",
+        "pages/permission/requestMicroPermission.ts",
+        "pages/permission/requestCameraPermission.ts"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; connect-src ws://localhost:9090/ blob: data: https://bixsctseziswsruplxzm.supabase.co https://mobile-first-admin.herokuapp.com https://jth7w9hc3m.execute-api.eu-west-3.amazonaws.com https://y13qoxjas8.execute-api.eu-west-3.amazonaws.com https://webmobilefirst-screencasts.s3.eu-west-3.amazonaws.com https://versionhistory.googleapis.com https://www.google-analytics.com https://us.i.posthog.com https://pro.ip-api.com https://mobile-first-extension-temp-webm-video-captures.s3.eu-west-3.amazonaws.com"
+  },
+  "version": "4.14.8",
+  "externally_connectable": {
+    "matches": [
+      "https://www.webmobilefirst.com/*"
+    ]
+  }
+}

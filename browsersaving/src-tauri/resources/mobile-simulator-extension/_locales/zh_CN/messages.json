@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "移动电话模拟器 - 响应式网站测试"
+  },
+  "extDescription": {
+    "message": "在计算机上模拟智能手机和平板电脑，提供多种型号以测试移动和响应式网站。"
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "取消"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> 安卓手机"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> 苹果手机"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> 平板电脑"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> 特殊"
+  },
+  "copied": {
+    "message": "已复制"
+  },
+  "error": {
+    "message": "错误"
+  },
+  "link": {
+    "message": "链接"
+  },
+  "optional": {
+    "message": "可选"
+  },
+  "close": {
+    "message": "关闭"
+  },
+  "get_pro": {
+    "message": "获取专业版"
+  },
+  "error_contact": {
+    "message": "{如果问题仍然存在，请联系我们}。"
+  },
+  "more_settings": {
+    "message": "更多设置"
+  },
+  "dimensions": {
+    "message": "尺寸"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "在此标签页上激活移动视图"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "模拟器无法在您浏览器的此本地页面上激活。请尝试在其他标签页上或浏览网站后重新启动。"
+  },
+  "popup_activate_local_files_info": {
+    "message": "此模拟器默认无法在本地文件（file:///）上激活，但您可以在Chrome设置中手动启用该选项。"
+  },
+  "popup_activate_local_files_button": {
+    "message": "启用选项"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "禁用模拟器"
+  },
+  "menu_close_multi": {
+    "message": "关闭此窗口"
+  },
+  "menu_change_device": {
+    "message": "更换型号"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> 您寻找的设备不在列表中？告诉我们！"
+  },
+  "menu_info_device": {
+    "message": "此终端的特性和模型"
+  },
+  "menu_info_device_features": {
+    "message": "特性（视口分辨率等）"
+  },
+  "menu_info_device_mockup": {
+    "message": "透明PNG格式的免费模型"
+  },
+  "menu_rotate": {
+    "message": "更改方向"
+  },
+  "menu_zoom": {
+    "message": "在设备中缩放"
+  },
+  "menu_screenshot": {
+    "message": "📷 截屏"
+  },
+  "menu_screencast": {
+    "message": "📹 录制屏幕视频"
+  },
+  "menu_share": {
+    "message": "分享给同事、朋友..."
+  },
+  "menu_send_improvement": {
+    "message": "提出改进建议"
+  },
+  "menu_send_message": {
+    "message": "帮助中心"
+  },
+  "menu_faq_title": {
+    "message": "常见问题"
+  },
+  "menu_faq_media_queries": {
+    "message": "我的媒体查询未被考虑"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "如何在隐身模式下激活模拟器？"
+  },
+  "menu_faq_scroll": {
+    "message": "无法在模拟器中滚动"
+  },
+  "menu_faq_subscription": {
+    "message": "为什么我的订阅不起作用？"
+  },
+  "menu_faq_shortcut": {
+    "message": "如何设置键盘快捷键？"
+  },
+  "menu_faq_all": {
+    "message": "查看所有常见问题"
+  },
+  "menu_report": {
+    "message": "报告错误"
+  },
+  "menu_settings": {
+    "message": "配置"
+  },
+  "menu_add_window": {
+    "message": "添加模拟模型"
+  },
+  "menu_help_center": {
+    "message": "帮助中心"
+  },
+  "menu_extensions": {
+    "message": "发现我们的其他Chrome扩展"
+  },
+  "menu_vote_feature": {
+    "message": "为您想要的功能投票"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "这只是一个图像。要更改URL，请使用上面的Chrome字段。"
+  },
+  "simulator_footer_info": {
+    "message": "这只是一个图像。请使用您自己的键盘。"
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "仅捕获终端视频"
+  },
+  "screencast_tooltip_tab": {
+    "message": "捕获带终端的标签页视频"
+  },
+  "screencast_error": {
+    "message": "录制时发生错误。{点击此处}获取解决方案。"
+  },
+  "screencast_modale_title": {
+    "message": "视频捕获"
+  },
+  "screencast_modale_texte": {
+    "message": "您可以以不同格式下载此视频或获取分享链接。"
+  },
+  "screencast_modale_download_webm": {
+    "message": "下载默认WEBM格式（如果启用选项则带透明）"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "与PowerPoint更兼容，但不支持透明"
+  },
+  "screencast_modale_download_gif": {
+    "message": "几乎兼容所有地方，但质量较低（如果启用选项则带透明）"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "GIF的最大时长为60秒。超过此时长文件将过大。"
+  },
+  "screencast_modale_copy": {
+    "message": "复制"
+  },
+  "screencast_modale_upload": {
+    "message": "获取分享链接"
+  },
+  "screencast_modale_contact": {
+    "message": "报告错误，提出改进建议"
+  },
+  "screencast_start_recording": {
+    "message": "开始录制"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "麦克风访问权限被拒绝。"
+  },
+  "screencast_camera_permission_denied": {
+    "message": "摄像头访问权限被拒绝。"
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "您的Chrome版本过旧，无法使用此功能。请更新Chrome至94.0以上版本。"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "视频质量影响比特率、帧率和录制分辨率。质量越高，文件越大。"
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "免费版的视频录制限制为5分钟。"
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "带终端的捕获"
+  },
+  "screenshot_menu_2": {
+    "message": "仅捕获网站"
+  },
+  "screenshot_menu_3": {
+    "message": "捕获整个页面"
+  },
+  "screenshot_menu_4": {
+    "message": "捕获整个标签页"
+  },
+  "screenshot_button": {
+    "message": "生成截图"
+  },
+  "screenshot_modale_download_png": {
+    "message": "下载PNG格式（无压缩）"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "下载WEBP格式，几乎兼容所有地方且压缩优化（推荐）"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "在页面结束前停止"
+  },
+  "screenshot_modale_title": {
+    "message": "截图"
+  },
+  "screenshot_modale_copy": {
+    "message": "复制图像到剪贴板"
+  },
+  "screenshot_modale_edit": {
+    "message": "编辑截图"
+  },
+  "screenshot_modale_help": {
+    "message": "要保存大格式图像，只需右键点击图像，然后选择“复制图像”或“保存”。"
+  },
+  "screenshot_editor_close": {
+    "message": "关闭编辑器"
+  },
+  "screenshot_editor_undo": {
+    "message": "撤销上一步操作"
+  },
+  "screenshot_editor_rect": {
+    "message": "绘制矩形"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "绘制圆形"
+  },
+  "screenshot_editor_line": {
+    "message": "绘制直线"
+  },
+  "screenshot_editor_arrow": {
+    "message": "绘制箭头"
+  },
+  "screenshot_editor_pen": {
+    "message": "自由绘制"
+  },
+  "screenshot_editor_color": {
+    "message": "线条颜色"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "线条粗细"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "成为PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "将您的视频捕获转换为GIF和MP4格式"
+  },
+  "pro_modale_h1_devices": {
+    "message": "模拟所有设备"
+  },
+  "pro_modale_h1_settings": {
+    "message": "解锁所有设置"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "解锁所有视频录制设置"
+  },
+  "pro_modale_h1_ads": {
+    "message": "移除广告"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "编辑您的截图"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "无限制截图"
+  },
+  "pro_modale_h2": {
+    "message": "成为PRO，积极支持开发者以推动此扩展的开发。"
+  },
+  "pro_modale_billed_annualy": {
+    "message": "按年计费"
+  },
+  "pro_modale_savings": {
+    "message": "节省"
+  },
+  "pro_modale_from": {
+    "message": "起价"
+  },
+  "pro_modale_recurring_month": {
+    "message": "月"
+  },
+  "pro_modale_button": {
+    "message": "我订阅"
+  },
+  "pro_modale_link_1": {
+    "message": "或"
+  },
+  "pro_modale_link_2": {
+    "message": "我登录"
+  },
+  "pro_modale_link_3": {
+    "message": "到我的订阅账户"
+  },
+  "pro_modale_avantage_1": {
+    "message": "所有视频设置"
+  },
+  "pro_modale_avantage_2": {
+    "message": "移除广告"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "这个移动模拟器对你有用吗？"
+  },
+  "sharing_h2": {
+    "message": "那么就分享给你的同事或朋友"
+  },
+  "sharing_txt": {
+    "message": "用于测试移动和平板网站的模拟器"
+  },
+  "sharing_review_1": {
+    "message": "如果你有一分钟时间"
+  },
+  "sharing_review_2": {
+    "message": "添加评论"
+  },
+  "sharing_review_3": {
+    "message": "那就是锦上添花！🙂"
+  },
+  "sharing_review_button": {
+    "message": "我添加评论"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "发现我们全新的免费扩展"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "颜色选择器"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "此扩展允许您捕获屏幕上的任何颜色。"
+  },
+  "other_extensions_font_finder_title": {
+    "message": "字体查找器"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "只需点击一下即可识别网页上任何文本使用的字体。"
+  },
+  "other_extensions_button": {
+    "message": "安装"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "您如何评价此扩展？"
+  },
+  "review_note_store": {
+    "message": "感谢您的反馈，欢迎在Google Store上添加评分。我将非常感激😊"
+  },
+  "review_note_feedback": {
+    "message": "感谢您的反馈，欢迎给我们发送消息以便我们改进此扩展。"
+  },
+  "button_feedback": {
+    "message": "添加评分"
+  },
+  "button_message": {
+    "message": "给我们发送消息"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "设备名称"
+  },
+  "contact_message_field_placeholder": {
+    "message": "三星Galaxy S24 Ultra，iPhone 17 Pro Max等。"
+  },
+  "contact_title": {
+    "message": "您寻找的设备不在列表中？告诉我们！"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "终端"
+  },
+  "settings_h2_global": {
+    "message": "常规"
+  },
+  "settings_hide_header_footer": {
+    "message": "在webview中隐藏浏览器顶部和底部元素（PWA）"
+  },
+  "settings_hide_keyboard": {
+    "message": "在输入字段聚焦时不显示虚拟键盘"
+  },
+  "settings_scrollbar_show": {
+    "message": "在终端中显示原生滚动条"
+  },
+  "settings_change_cursor": {
+    "message": "不更改webview中的光标样式"
+  },
+  "settings_change_background": {
+    "message": "更改背景颜色"
+  },
+  "settings_default_device": {
+    "message": "每次激活时的默认终端"
+  },
+  "settings_change_analytics": {
+    "message": "我通过Posthog帮助此扩展的开发者改进产品。所有数据都是匿名的。"
+  },
+  "settings_device_hide": {
+    "message": "不显示终端"
+  },
+  "settings_batterie_level": {
+    "message": "终端顶部的电池电量（%）"
+  },
+  "settings_device_default_url": {
+    "message": "更改终端中显示的URL"
+  },
+  "settings_presenter_mode": {
+    "message": "演示模式（仅在悬停时可见右侧菜单）"
+  },
+  "settings_fullscreen": {
+    "message": "终端中的全屏网站"
+  },
+  "settings_default_device_placeholder": {
+    "message": "选择一个终端"
+  },
+  "settings_video_quality": {
+    "message": "视频质量"
+  },
+  "settings_video_quality_low": {
+    "message": "中等"
+  },
+  "settings_video_quality_medium": {
+    "message": "良好"
+  },
+  "settings_video_quality_high": {
+    "message": "优秀"
+  },
+  "settings_theme": {
+    "message": "主题"
+  },
+  "settings_theme_light": {
+    "message": "浅色"
+  },
+  "settings_theme_dark": {
+    "message": "深色"
+  },
+  "settings_theme_auto": {
+    "message": "自动"
+  },
+  "settings_shortcuts": {
+    "message": "定义键盘快捷键"
+  },
+  "settings_pro_account": {
+    "message": "管理我的订阅"
+  },
+  "settings_microphone": {
+    "message": "麦克风"
+  },
+  "settings_camera": {
+    "message": "摄像头"
+  },
+  "settings_countdown": {
+    "message": "倒计时（秒）"
+  },
+  "settings_transparent_background": {
+    "message": "透明背景"
+  },
+  "settings_transparent_background_info": {
+    "message": "此选项涉及更多计算，因此可能会根据您的计算机导致显示缓慢（仅与WEBM和GIF格式兼容）"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "截屏解决方案"
+  },
+  "screenshot_workaround_context": {
+    "message": "背景"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "由于某些技术限制，截屏时可能会收到此错误消息。"
+  },
+  "screenshot_workaround_solution": {
+    "message": "解决方案"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "在这种情况下，要启动截屏，只需在页面上任意位置右键单击，选择“移动模拟器”条目，然后选择“📷 截屏”"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "帮助我们使Mobile FIRST对您更有用 🚀"
+  },
+  "feedback_profession": {
+    "message": "您的职业部门是什么？"
+  },
+  "feedback_profession_developer": {
+    "message": "开发"
+  },
+  "feedback_profession_designer": {
+    "message": "设计"
+  },
+  "feedback_profession_qa": {
+    "message": "测试/QA"
+  },
+  "feedback_profession_product": {
+    "message": "产品管理"
+  },
+  "feedback_profession_marketing": {
+    "message": "市场营销"
+  },
+  "feedback_profession_sales": {
+    "message": "销售"
+  },
+  "feedback_profession_other": {
+    "message": "其他"
+  },
+  "feedback_company_type": {
+    "message": "您的公司类型是什么？"
+  },
+  "feedback_company_type_freelance": {
+    "message": "自由职业者"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "微型企业（1-9名员工）"
+  },
+  "feedback_company_type_agency": {
+    "message": "小型企业（10-49名员工）"
+  },
+  "feedback_company_type_startup": {
+    "message": "中型企业（50-249名员工）"
+  },
+  "feedback_company_type_pme": {
+    "message": "大型企业（250-4999名员工）"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "超大型企业/集团（5000+名员工）"
+  },
+  "feedback_use_cases": {
+    "message": "您为什么使用Mobile FIRST？"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "测试我的网站，进行客户演示..."
+  },
+  "feedback_frequency": {
+    "message": "您使用此扩展的频率如何？"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "每天"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "每周多次"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "偶尔"
+  },
+  "feedback_frequency_rare": {
+    "message": "很少"
+  },
+  "feedback_improvements": {
+    "message": "您希望看到哪些改进？"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "一个想法，一个摩擦，一个缺失..."
+  },
+  "feedback_submit": {
+    "message": "发送"
+  },
+  "feedback_close": {
+    "message": "不回答"
+  },
+  "feedback_error_required": {
+    "message": "所有字段都是空的🤔"
+  },
+  "feedback_submitted": {
+    "message": "非常感谢您的反馈🤗"
+  },
+  "select": {
+    "message": "选择..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "立即体验Safari iOS 26的全新“Liquid Glass”界面，进行更真实的测试！"
+  },
+  "new_ios26_h2": {
+    "message": "适用于所有iPhone&nbsp;15和iPhone&nbsp;16的变体"
+  },
+  "new_iphone_17_h1": {
+    "message": "新！<br>立即使用iPhone&nbsp;17测试您的网站。"
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17，iPhone&nbsp; Air，iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX在模拟器中可用。"
+  },
+  "new_video_feature_h1": {
+    "message": "立即体验全新的视频捕获功能！"
+  },
+  "new_video_feature_h2": {
+    "message": "以更高质量录制，提供新选项和透明背景"
+  },
+  "logout_modale_title": {
+    "message": "您已在此设备上自动注销"
+  },
+  "logout_modale_message": {
+    "message": "此设备不再是您授权的终端之一。如果您手动删除了此访问，则需要重新登录。"
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>信息</strong>触摸滚动不可用，但如果您没有鼠标滚轮或触控板进行滚动，您可以<strong>显示滚动条</strong>。<br><br>这是右下角设置中的一个选项<i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>欢迎使用Mobile FIRST 👋</strong>一键模拟手机、平板和电脑，轻松测试和查看您的网站。<br><br><strong>菜单在右侧 ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>更新 v4.12.0</strong>专业版新功能，<strong>截图编辑</strong>。按钮用于绘制形状、添加文本等。<i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>更新 v4.14.0</strong>立即体验全新的<strong>视频捕获</strong>功能！<i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>更新 v4.14.5</strong>显著提高了截图的<strong>分辨率和质量</strong><i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "登录"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ 您想分享您的订阅吗？要授权其他人，只需从您的帐户的“用户”部分添加他们。"
+  }
+}

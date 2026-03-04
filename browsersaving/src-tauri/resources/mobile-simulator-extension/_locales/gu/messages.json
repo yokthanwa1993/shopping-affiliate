@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "મોબાઇલ ફોન સિમ્યુલેટર - પ્રતિસાદી સાઇટ પરીક્ષણ"
+  },
+  "extDescription": {
+    "message": "તમારા મોબાઇલ અને પ્રતિસાદી સાઇટને પરીક્ષણ કરવા માટે ઘણા મોડેલો સાથે કમ્પ્યુટર પર સ્માર્ટફોન અને ટેબ્લેટ્સનો સિમ્યુલેટર."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "રદ કરો"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> એન્ડ્રોઇડ ફોન"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> એપલ ફોન"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> ટેબ્લેટ્સ"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> વિશેષ"
+  },
+  "copied": {
+    "message": "કૉપિ થયું"
+  },
+  "error": {
+    "message": "ભૂલ"
+  },
+  "link": {
+    "message": "લિંક"
+  },
+  "optional": {
+    "message": "વૈકલ્પિક"
+  },
+  "close": {
+    "message": "બંધ કરો"
+  },
+  "get_pro": {
+    "message": "PRO વર્ઝન મેળવો"
+  },
+  "error_contact": {
+    "message": "{મહેરબાની કરીને અમારો સંપર્ક કરો} જો સમસ્યા ચાલુ રહે."
+  },
+  "more_settings": {
+    "message": "વધુ સેટિંગ્સ"
+  },
+  "dimensions": {
+    "message": "પરિમાણો"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "આ ટેબ પર મોબાઇલ દૃશ્ય સક્રિય કરો"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "સિમ્યુલેટર તમારા બ્રાઉઝરની આ મૂળ પેજ પર સક્રિય કરી શકાયું નથી. અન્ય ટેબ પર પ્રયાસ કરો અથવા સાઇટ પર જાઓ અને ફરીથી શરૂ કરો."
+  },
+  "popup_activate_local_files_info": {
+    "message": "આ સિમ્યુલેટર ડિફોલ્ટ દ્વારા સ્થાનિક ફાઇલો (file:///) પર સક્રિય કરી શકાતું નથી પરંતુ તમે Chrome સેટિંગ્સમાં વિકલ્પને મેન્યુઅલી સક્રિય કરી શકો છો."
+  },
+  "popup_activate_local_files_button": {
+    "message": "વિકલ્પ સક્રિય કરો"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "સિમ્યુલેટર નિષ્ક્રિય કરો"
+  },
+  "menu_close_multi": {
+    "message": "આ વિન્ડો બંધ કરો"
+  },
+  "menu_change_device": {
+    "message": "મોડલ બદલો"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> તમે શોધી રહ્યા છો તે ઉપકરણ યાદીમાં નથી? અમને જણાવો!"
+  },
+  "menu_info_device": {
+    "message": "આ ટર્મિનલની વિશેષતાઓ અને મૉકઅપ"
+  },
+  "menu_info_device_features": {
+    "message": "વિશેષતાઓ (વ્યુપોર્ટ રિઝોલ્યુશન, વગેરે)"
+  },
+  "menu_info_device_mockup": {
+    "message": "પારદર્શક PNG માં મૉકઅપ મફત"
+  },
+  "menu_rotate": {
+    "message": "ઓરિએન્ટેશન બદલો"
+  },
+  "menu_zoom": {
+    "message": "ડિવાઇસમાં ઝૂમ કરો"
+  },
+  "menu_screenshot": {
+    "message": "📷 સ્ક્રીનશૉટ લો"
+  },
+  "menu_screencast": {
+    "message": "📹 સ્ક્રીન વિડિઓ રેકોર્ડ કરો"
+  },
+  "menu_share": {
+    "message": "સહકર્મી, મિત્ર,... સાથે શેર કરો"
+  },
+  "menu_send_improvement": {
+    "message": "સુધારણા સૂચવો"
+  },
+  "menu_send_message": {
+    "message": "સહાય કેન્દ્ર"
+  },
+  "menu_faq_title": {
+    "message": "વારંવાર પૂછાતા પ્રશ્નો"
+  },
+  "menu_faq_media_queries": {
+    "message": "મારા મીડિયા ક્વેરીઝ ધ્યાનમાં લેવામાં નથી આવી રહી"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "નિજી બ્રાઉઝિંગમાં સિમ્યુલેટર કેવી રીતે સક્રિય કરવું?"
+  },
+  "menu_faq_scroll": {
+    "message": "સિમ્યુલેટરમાં સ્ક્રોલ કરી શકાતું નથી"
+  },
+  "menu_faq_subscription": {
+    "message": "મારું સબ્સ્ક્રિપ્શન કેમ કામ કરતું નથી?"
+  },
+  "menu_faq_shortcut": {
+    "message": "કીસબોર્ડ શૉર્ટકટ્સ કેવી રીતે સેટ કરવું?"
+  },
+  "menu_faq_all": {
+    "message": "બધા વારંવાર પૂછાતા પ્રશ્નો જુઓ"
+  },
+  "menu_report": {
+    "message": "બગ રિપોર્ટ કરો"
+  },
+  "menu_settings": {
+    "message": "કૉન્ફિગરેશન"
+  },
+  "menu_add_window": {
+    "message": "સિમ્યુલેશન મોડલ ઉમેરો"
+  },
+  "menu_help_center": {
+    "message": "સહાય કેન્દ્ર"
+  },
+  "menu_extensions": {
+    "message": "અમારી અન્ય Chrome એક્સ્ટેન્શન્સ શોધો"
+  },
+  "menu_vote_feature": {
+    "message": "તમે ઇચ્છતા ફીચર્સ માટે મત આપો"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "આ માત્ર એક છબી છે. URL બદલવા માટે ઉપર Chrome ફીલ્ડનો ઉપયોગ કરો."
+  },
+  "simulator_footer_info": {
+    "message": "આ માત્ર એક છબી છે. તમારું પોતાનું કીસબોર્ડ વાપરો."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "માત્ર ટર્મિનલની વિડિઓ કૅપ્ચર"
+  },
+  "screencast_tooltip_tab": {
+    "message": "ટેબની સાથે ટર્મિનલની વિડિઓ કૅપ્ચર"
+  },
+  "screencast_error": {
+    "message": "રેકોર્ડિંગ દરમિયાન એક ભૂલ આવી. {અહીં ક્લિક કરો} માટે એક વળાંક ઉકેલ."
+  },
+  "screencast_modale_title": {
+    "message": "વિડિઓ કૅપ્ચર"
+  },
+  "screencast_modale_texte": {
+    "message": "તમે આ વિડિઓને વિવિધ ફોર્મેટમાં ડાઉનલોડ કરી શકો છો અથવા શેર લિંક મેળવી શકો છો."
+  },
+  "screencast_modale_download_webm": {
+    "message": "ડિફોલ્ટ WEBM ફોર્મેટમાં ડાઉનલોડ કરો (પારદર્શકતા સાથે જો વિકલ્પ સક્રિય છે)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "PowerPoint સાથે શ્રેષ્ઠ સુસંગતતા, પરંતુ પારદર્શકતા નથી"
+  },
+  "screencast_modale_download_gif": {
+    "message": "સર્વત્ર સુસંગત, પરંતુ નીચી ગુણવત્તા (પારદર્શકતા સાથે જો વિકલ્પ સક્રિય છે)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "GIF ની મહત્તમ અવધિ 60 સેકન્ડ છે. તેનાથી વધુ ફાઇલ ખૂબ મોટી થશે."
+  },
+  "screencast_modale_copy": {
+    "message": "કૉપિ કરો"
+  },
+  "screencast_modale_upload": {
+    "message": "શેર લિંક મેળવો"
+  },
+  "screencast_modale_contact": {
+    "message": "બગ રિપોર્ટ કરો, સુધારણા સૂચવો"
+  },
+  "screencast_start_recording": {
+    "message": "રેકોર્ડિંગ શરૂ કરો"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "માઇક્રોફોન ઍક્સેસ માટેની પરવાનગી નકારી."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "કૅમેરા ઍક્સેસ માટેની પરવાનગી નકારી."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "તમારા Chrome ની આવૃત્તિ આ ફીચર માટે ખૂબ જૂની છે. Chrome ને 94.0 થી ઉપરની આવૃત્તિમાં અપડેટ કરો."
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "વિડિઓ ગુણવત્તા બિટરેટ, fps અને રેકોર્ડિંગ રિઝોલ્યુશનને અસર કરે છે. ગુણવત્તા વધુ ઊંચી હોય છે, ફાઇલ વધુ મોટી થાય છે."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "મફત વર્ઝનમાં વિડિઓ રેકોર્ડિંગ્સ 5 મિનિટ સુધી મર્યાદિત છે."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "ટર્મિનલ સાથે કૅપ્ચર"
+  },
+  "screenshot_menu_2": {
+    "message": "માત્ર સાઇટનું કૅપ્ચર"
+  },
+  "screenshot_menu_3": {
+    "message": "સંપૂર્ણ પેજનું કૅપ્ચર"
+  },
+  "screenshot_menu_4": {
+    "message": "સંપૂર્ણ ટેબનું કૅપ્ચર"
+  },
+  "screenshot_button": {
+    "message": "કૅપ્ચર જનરેટ કરો"
+  },
+  "screenshot_modale_download_png": {
+    "message": "PNG ફોર્મેટમાં ડાઉનલોડ કરો (કોઈ સંકોચન નથી)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "WEBP ફોર્મેટમાં ડાઉનલોડ કરો, લગભગ સર્વત્ર સુસંગત અને સંકોચન ઑપ્ટિમાઇઝ્ડ (ભલામણ કરેલ)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "પેજના અંત પહેલા બંધ કરો"
+  },
+  "screenshot_modale_title": {
+    "message": "કૅપ્ચર"
+  },
+  "screenshot_modale_copy": {
+    "message": "છબીને ક્લિપબોર્ડમાં કૉપિ કરો"
+  },
+  "screenshot_modale_edit": {
+    "message": "કૅપ્ચર સંપાદિત કરો"
+  },
+  "screenshot_modale_help": {
+    "message": "છબીને મોટા ફોર્મેટમાં સાચવવા માટે, તેના પર રાઇટ-ક્લિક કરો અને પછી \"છબી કૉપિ કરો\" અથવા \"સાચવો\" પસંદ કરો."
+  },
+  "screenshot_editor_close": {
+    "message": "સંપાદક બંધ કરો"
+  },
+  "screenshot_editor_undo": {
+    "message": "છેલ્લી ક્રિયા રદ કરો"
+  },
+  "screenshot_editor_rect": {
+    "message": "ચોરસ દોરો"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "વૃત દોરો"
+  },
+  "screenshot_editor_line": {
+    "message": "રેખા દોરો"
+  },
+  "screenshot_editor_arrow": {
+    "message": "તીર દોરો"
+  },
+  "screenshot_editor_pen": {
+    "message": "મુક્ત હસ્ત દોરણ"
+  },
+  "screenshot_editor_color": {
+    "message": "રેખાની રંગ"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "રેખાની જાડાઈ"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "PRO બનો"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "તમારા વિડિઓ કૅપ્ચર્સને GIF અને MP4 ફોર્મેટમાં રૂપાંતરિત કરો"
+  },
+  "pro_modale_h1_devices": {
+    "message": "બધા ઉપકરણોનું સિમ્યુલેટ કરો"
+  },
+  "pro_modale_h1_settings": {
+    "message": "બધા સેટિંગ્સ અનલૉક કરો"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "બધા વિડિઓ રેકોર્ડિંગ સેટિંગ્સ અનલૉક કરો"
+  },
+  "pro_modale_h1_ads": {
+    "message": "જાહેરાતો દૂર કરો"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "તમારા કૅપ્ચર્સ સંપાદિત કરો"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "અસીમિત સ્ક્રીનશૉટ્સ લો"
+  },
+  "pro_modale_h2": {
+    "message": "PRO બનો અને આ એક્સ્ટેન્શનના વિકાસમાં સક્રિય રીતે યોગદાન આપો તેના ડેવલપરને ટેકો આપીને."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "વાર્ષિક બિલ"
+  },
+  "pro_modale_savings": {
+    "message": "બચત કરો"
+  },
+  "pro_modale_from": {
+    "message": "શરૂઆતથી"
+  },
+  "pro_modale_recurring_month": {
+    "message": "મહિનો"
+  },
+  "pro_modale_button": {
+    "message": "હું સબ્સ્ક્રાઇબ કરું છું"
+  },
+  "pro_modale_link_1": {
+    "message": "અથવા"
+  },
+  "pro_modale_link_2": {
+    "message": "હું લૉગ ઇન કરું છું"
+  },
+  "pro_modale_link_3": {
+    "message": "મારા સબ્સ્ક્રાઇબર એકાઉન્ટમાં"
+  },
+  "pro_modale_avantage_1": {
+    "message": "બધા વિડિઓ સેટિંગ્સ"
+  },
+  "pro_modale_avantage_2": {
+    "message": "જાહેરાતો દૂર કરવી"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "આ મોબાઇલ સિમ્યુલેટર તમને ઉપયોગી છે?"
+  },
+  "sharing_h2": {
+    "message": "તો પછી તેને તમારા સહકર્મીઓ અથવા મિત્રો સાથે શેર કરો"
+  },
+  "sharing_txt": {
+    "message": "મોબાઇલ અને ટેબ્લેટ પર તમારી સાઇટને પરીક્ષણ કરવા માટે સિમ્યુલેટર"
+  },
+  "sharing_review_1": {
+    "message": "અને જો તમારી પાસે એક મિનિટ છે"
+  },
+  "sharing_review_2": {
+    "message": "સમીક્ષા ઉમેરવા માટે"
+  },
+  "sharing_review_3": {
+    "message": "તો પછી તે કેક પર ચેરી છે! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "હું સમીક્ષા ઉમેરું છું"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "અમારી નવીનતમ મફત એક્સ્ટેન્શન્સ શોધો"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "કલર પિકર"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "આ એક્સ્ટેન્શન તમને સ્ક્રીન પર કોઈપણ રંગ કૅપ્ચર કરવાની મંજૂરી આપે છે."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "ફોન્ટ ફાઇન્ડર"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "કોઈપણ વેબ પેજના ટેક્સ્ટ પર ઉપયોગમાં લેવાતા ફોન્ટને એક ક્લિકથી ઓળખો."
+  },
+  "other_extensions_button": {
+    "message": "ઇન્સ્ટોલ કરો"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "તમે આ એક્સ્ટેન્શનને કેવી રીતે રેટ કરશો?"
+  },
+  "review_note_store": {
+    "message": "તમારા પ્રતિસાદ માટે આભાર, કૃપા કરીને Google સ્ટોર પર રેટિંગ ઉમેરવા માટે સંકોચશો નહીં. હું ખૂબ આભારી રહીશ 😊"
+  },
+  "review_note_feedback": {
+    "message": "તમારા પ્રતિસાદ માટે આભાર, કૃપા કરીને અમને સંદેશ મોકલવા માટે સંકોચશો નહીં જેથી અમે આ એક્સ્ટેન્શનને સુધારી શકીએ."
+  },
+  "button_feedback": {
+    "message": "રેટિંગ ઉમેરો"
+  },
+  "button_message": {
+    "message": "અમને સંદેશ મોકલો"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "ઉપકરણનું નામ"
+  },
+  "contact_message_field_placeholder": {
+    "message": "સેમસંગ ગેલેક્સી S24 અલ્ટ્રા, iPhone 17 પ્રો મેક્સ, વગેરે."
+  },
+  "contact_title": {
+    "message": "તમે શોધી રહ્યા છો તે ઉપકરણ યાદીમાં નથી? અમને જણાવો!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "ટર્મિનલ"
+  },
+  "settings_h2_global": {
+    "message": "સામાન્ય"
+  },
+  "settings_hide_header_footer": {
+    "message": "વેબવ્યુ (PWA) માં બ્રાઉઝર હેડર અને ફૂટર છુપાવો"
+  },
+  "settings_hide_keyboard": {
+    "message": "પ્રવેશ ક્ષેત્ર પર ફોકસ પર નકલી કીસબોર્ડ ન બતાવો"
+  },
+  "settings_scrollbar_show": {
+    "message": "ટર્મિનલમાં મૂળ સ્ક્રોલબાર બતાવો"
+  },
+  "settings_change_cursor": {
+    "message": "વેબવ્યુમાં કર્સર શૈલી ન બદલો"
+  },
+  "settings_change_background": {
+    "message": "પૃષ્ઠભૂમિનો રંગ બદલો"
+  },
+  "settings_default_device": {
+    "message": "દરેક સક્રિયતા પર ડિફોલ્ટ ટર્મિનલ"
+  },
+  "settings_change_analytics": {
+    "message": "હું આ એક્સ્ટેન્શનના ડેવલપરને Posthog દ્વારા તેના ઉત્પાદનને સુધારવામાં મદદ કરું છું. બધી માહિતી અનામી છે."
+  },
+  "settings_device_hide": {
+    "message": "ટર્મિનલ ન બતાવો"
+  },
+  "settings_batterie_level": {
+    "message": "ટર્મિનલના હેડરમાં બેટરી સ્તર (%)"
+  },
+  "settings_device_default_url": {
+    "message": "ટર્મિનલમાં દર્શાવેલ URL બદલો"
+  },
+  "settings_presenter_mode": {
+    "message": "પ્રસ્તુતિ મોડ (માત્ર હૉવર પર જમણી બાજુનું મેનુ દેખાય છે)"
+  },
+  "settings_fullscreen": {
+    "message": "ટર્મિનલમાં સંપૂર્ણ સ્ક્રીન સાઇટ"
+  },
+  "settings_default_device_placeholder": {
+    "message": "ટર્મિનલ પસંદ કરો"
+  },
+  "settings_video_quality": {
+    "message": "વિડિઓ ગુણવત્તા"
+  },
+  "settings_video_quality_low": {
+    "message": "મધ્યમ"
+  },
+  "settings_video_quality_medium": {
+    "message": "સારી"
+  },
+  "settings_video_quality_high": {
+    "message": "ઉત્તમ"
+  },
+  "settings_theme": {
+    "message": "થીમ"
+  },
+  "settings_theme_light": {
+    "message": "પ્રકાશ"
+  },
+  "settings_theme_dark": {
+    "message": "અંધારું"
+  },
+  "settings_theme_auto": {
+    "message": "ઓટો"
+  },
+  "settings_shortcuts": {
+    "message": "કીસબોર્ડ શૉર્ટકટ્સ સેટ કરો"
+  },
+  "settings_pro_account": {
+    "message": "મારું સબ્સ્ક્રિપ્શન મેનેજ કરો"
+  },
+  "settings_microphone": {
+    "message": "માઇક્રોફોન"
+  },
+  "settings_camera": {
+    "message": "કૅમેરા"
+  },
+  "settings_countdown": {
+    "message": "ઉલટાઉંટી (સેકન્ડ)"
+  },
+  "settings_transparent_background": {
+    "message": "પારદર્શક પૃષ્ઠભૂમિ"
+  },
+  "settings_transparent_background_info": {
+    "message": "આ વિકલ્પ વધુ ગણતરીઓનો સમાવેશ કરે છે અને તેથી તમારા કમ્પ્યુટર પર આધાર રાખીને પ્રદર્શનને ધીમું કરી શકે છે (માત્ર WEBM અને GIF ફોર્મેટ્સ સાથે સુસંગત)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "સ્ક્રીનશૉટ માટે વળાંક ઉકેલ"
+  },
+  "screenshot_workaround_context": {
+    "message": "સંદર્ભ"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "કેટલાક તકનીકી મર્યાદાઓને કારણે, સ્ક્રીનશૉટ લેતી વખતે, તમને આ ભૂલ સંદેશ મળી શકે છે."
+  },
+  "screenshot_workaround_solution": {
+    "message": "વળાંક ઉકેલ"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "આ કિસ્સામાં કૅપ્ચર શરૂ કરવા માટે, પેજ પર ક્યાંય પણ રાઇટ-ક્લિક કરો, \"મોબાઇલ સિમ્યુલેટર\" એન્ટ્રી પસંદ કરો, પછી \"📷 સ્ક્રીનશૉટ લો\" પસંદ કરો"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Mobile FIRST ને તમારા માટે વધુ ઉપયોગી બનાવવા માટે અમને મદદ કરો 🚀"
+  },
+  "feedback_profession": {
+    "message": "તમારો વ્યાવસાયિક વિભાગ શું છે?"
+  },
+  "feedback_profession_developer": {
+    "message": "ડેવલપમેન્ટ"
+  },
+  "feedback_profession_designer": {
+    "message": "ડિઝાઇન"
+  },
+  "feedback_profession_qa": {
+    "message": "ટેસ્ટ / QA"
+  },
+  "feedback_profession_product": {
+    "message": "પ્રોડક્ટ મેનેજમેન્ટ"
+  },
+  "feedback_profession_marketing": {
+    "message": "માર્કેટિંગ"
+  },
+  "feedback_profession_sales": {
+    "message": "વેચાણ"
+  },
+  "feedback_profession_other": {
+    "message": "અન્ય"
+  },
+  "feedback_company_type": {
+    "message": "તમારી કંપનીનો પ્રકાર શું છે?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "ફ્રીલાન્સ"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "માઇક્રો-બિઝનેસ (1-9 કર્મચારીઓ)"
+  },
+  "feedback_company_type_agency": {
+    "message": "નાની કંપની (10-49 કર્મચારીઓ)"
+  },
+  "feedback_company_type_startup": {
+    "message": "મધ્યમ કંપની (50-249 કર્મચારીઓ)"
+  },
+  "feedback_company_type_pme": {
+    "message": "મોટી કંપની (250-4999 કર્મચારીઓ)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "ખૂબ મોટી કંપની / ગ્રુપ (5000+ કર્મચારીઓ)"
+  },
+  "feedback_use_cases": {
+    "message": "તમે Mobile FIRST નો ઉપયોગ શા માટે કરો છો?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "મારી સાઇટનું પરીક્ષણ, ગ્રાહક ડેમો..."
+  },
+  "feedback_frequency": {
+    "message": "તમે આ એક્સ્ટેન્શનનો ઉપયોગ કેટલી વાર કરો છો?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "દૈનિક"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "અઠવાડિયામાં ઘણી વાર"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "અવકાશિક"
+  },
+  "feedback_frequency_rare": {
+    "message": "દુર્લભ"
+  },
+  "feedback_improvements": {
+    "message": "તમે કયા સુધારાઓ જોવા માંગો છો?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "એક વિચાર, એક ઘર્ષણ, એક અભાવ..."
+  },
+  "feedback_submit": {
+    "message": "મોકલો"
+  },
+  "feedback_close": {
+    "message": "જવાબ ન આપો"
+  },
+  "feedback_error_required": {
+    "message": "બધા ક્ષેત્રો ખાલી છે 🤔"
+  },
+  "feedback_submitted": {
+    "message": "તમારા પ્રતિસાદ માટે ખૂબ આભાર 🤗"
+  },
+  "select": {
+    "message": "પસંદ કરો..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Safari iOS 26 ની નવી \"Liquid Glass\" ઇન્ટરફેસને હવે શોધો વધુ વાસ્તવિક પરીક્ષણ માટે!"
+  },
+  "new_ios26_h2": {
+    "message": "iPhone&nbsp;15 અને iPhone&nbsp;16 ના તમામ વેરિઅન્ટ્સ પર ઉપલબ્ધ"
+  },
+  "new_iphone_17_h1": {
+    "message": "નવું!<br>હવે તમારા સાઇટ્સને iPhone&nbsp;17 સાથે પરીક્ષણ કરો."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX સિમ્યુલેટરમાં ઉપલબ્ધ છે."
+  },
+  "new_video_feature_h1": {
+    "message": "હવે નવી વિડિઓ કૅપ્ચર ફીચર શોધો!"
+  },
+  "new_video_feature_h2": {
+    "message": "ઉત્તમ ગુણવત્તા સાથે રેકોર્ડ કરો, નવી વિકલ્પો સાથે અને પારદર્શક પૃષ્ઠભૂમિ સાથે"
+  },
+  "logout_modale_title": {
+    "message": "તમે આ ઉપકરણ પર આપમેળે લૉગ આઉટ થઈ ગયા છો"
+  },
+  "logout_modale_message": {
+    "message": "આ ઉપકરણ હવે તમારા અધિકૃત ઉપકરણોમાંનો ભાગ નથી. જો તમે આ ઍક્સેસને મેન્યુઅલી દૂર કરી છે, તો નવી લૉગિન જરૂરી છે."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>માહિતી</strong>ટચ સ્ક્રોલ ઉપલબ્ધ નથી, પરંતુ જો તમારી પાસે માઉસ વ્હીલ અથવા સ્ક્રોલ કરવા માટે ટ્રેકપેડ નથી તો તમે <strong>સ્ક્રોલબાર બતાવી શકો છો</strong>.<br><br>આ સેટિંગ્સમાં વિકલ્પ છે નીચે જમણી બાજુ <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Mobile FIRST પર આપનું સ્વાગત છે 👋</strong>તમારા સાઇટ્સને સરળતાથી પરીક્ષણ અને જોવા માટે એક ક્લિકમાં ફોન, ટેબ્લેટ અને કમ્પ્યુટર્સનું સિમ્યુલેટ કરો.<br><br><strong>મેનુ જમણી બાજુ છે ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>અપડેટ v4.12.0</strong>PRO વર્ઝનમાં નવી ફીચર, <strong>સ્ક્રીનશૉટ્સનું સંપાદન</strong>. આકારો દોરવા, ટેક્સ્ટ ઉમેરવા માટે બટન્સ, વગેરે. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>અપડેટ v4.14.0</strong>હવે નવી <strong>વિડિઓ કૅપ્ચર</strong> ફીચર શોધો! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>અપડેટ v4.14.5</strong>સ્ક્રીનશૉટ્સની <strong>રિઝોલ્યુશન અને ગુણવત્તામાં</strong> નોંધપાત્ર વધારો <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "લૉગિન કરો"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ તમે તમારી સબ્સ્ક્રિપ્શન શેર કરવા માંગો છો? અન્ય લોકોને અધિકૃત કરવા માટે, તેમને તમારા ખાતાની \"વપરાશકર્તાઓ\" વિભાગમાંથી સરળતાથી ઉમેરો."
+  }
+}

@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Trình giả lập điện thoại di động - kiểm tra trang web đáp ứng"
+  },
+  "extDescription": {
+    "message": "Trình giả lập điện thoại thông minh và máy tính bảng trên máy tính với nhiều mẫu để kiểm tra trang web di động và đáp ứng."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Hủy"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Điện thoại Android"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Điện thoại Apple"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Máy tính bảng"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Đặc biệt"
+  },
+  "copied": {
+    "message": "Đã sao chép"
+  },
+  "error": {
+    "message": "Lỗi"
+  },
+  "link": {
+    "message": "Liên kết"
+  },
+  "optional": {
+    "message": "Tùy chọn"
+  },
+  "close": {
+    "message": "Đóng"
+  },
+  "get_pro": {
+    "message": "Nhận phiên bản PRO"
+  },
+  "error_contact": {
+    "message": "{Vui lòng liên hệ với chúng tôi} nếu vấn đề vẫn tiếp diễn."
+  },
+  "more_settings": {
+    "message": "Thêm cài đặt"
+  },
+  "dimensions": {
+    "message": "Kích thước"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Kích hoạt chế độ xem di động trên tab này"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Trình giả lập không thể kích hoạt trên trang gốc của trình duyệt của bạn. Thử trên một tab khác hoặc duyệt một trang web rồi khởi động lại."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Trình giả lập này không thể kích hoạt mặc định trên các tệp cục bộ (file:///) nhưng bạn có thể kích hoạt tùy chọn này thủ công trong cài đặt của Chrome."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Kích hoạt tùy chọn"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Tắt trình giả lập"
+  },
+  "menu_close_multi": {
+    "message": "Đóng cửa sổ này"
+  },
+  "menu_change_device": {
+    "message": "Thay đổi mẫu"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Thiết bị bạn tìm kiếm không có trong danh sách? Hãy cho chúng tôi biết!"
+  },
+  "menu_info_device": {
+    "message": "Đặc điểm và mockup của thiết bị này"
+  },
+  "menu_info_device_features": {
+    "message": "Đặc điểm (độ phân giải viewport, v.v.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Mockup miễn phí trong PNG trong suốt"
+  },
+  "menu_rotate": {
+    "message": "Thay đổi hướng"
+  },
+  "menu_zoom": {
+    "message": "Phóng to trong thiết bị"
+  },
+  "menu_screenshot": {
+    "message": "📷 Chụp ảnh màn hình"
+  },
+  "menu_screencast": {
+    "message": "📹 Ghi lại video màn hình"
+  },
+  "menu_share": {
+    "message": "Chia sẻ với đồng nghiệp, bạn bè,..."
+  },
+  "menu_send_improvement": {
+    "message": "Đề xuất cải tiến"
+  },
+  "menu_send_message": {
+    "message": "Trung tâm trợ giúp"
+  },
+  "menu_faq_title": {
+    "message": "Câu hỏi thường gặp"
+  },
+  "menu_faq_media_queries": {
+    "message": "Các truy vấn media của tôi không được chấp nhận"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Làm thế nào để kích hoạt trình giả lập trong chế độ ẩn danh?"
+  },
+  "menu_faq_scroll": {
+    "message": "Không thể cuộn trong trình giả lập"
+  },
+  "menu_faq_subscription": {
+    "message": "Tại sao đăng ký của tôi không hoạt động?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Làm thế nào để cài đặt phím tắt?"
+  },
+  "menu_faq_all": {
+    "message": "Xem tất cả câu hỏi thường gặp"
+  },
+  "menu_report": {
+    "message": "Báo cáo lỗi"
+  },
+  "menu_settings": {
+    "message": "Cấu hình"
+  },
+  "menu_add_window": {
+    "message": "Thêm mẫu mô phỏng"
+  },
+  "menu_help_center": {
+    "message": "Trung tâm trợ giúp"
+  },
+  "menu_extensions": {
+    "message": "Khám phá các tiện ích mở rộng Chrome khác của chúng tôi"
+  },
+  "menu_vote_feature": {
+    "message": "Bỏ phiếu cho các tính năng bạn muốn"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Đây chỉ là một hình ảnh. Để thay đổi URL, hãy sử dụng trường của Chrome phía trên."
+  },
+  "simulator_footer_info": {
+    "message": "Đây chỉ là một hình ảnh. Sử dụng bàn phím của bạn."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Chỉ ghi video của thiết bị"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Ghi video của tab với thiết bị"
+  },
+  "screencast_error": {
+    "message": "Đã xảy ra lỗi trong quá trình ghi. {Nhấp vào đây} để có giải pháp thay thế."
+  },
+  "screencast_modale_title": {
+    "message": "Ghi video"
+  },
+  "screencast_modale_texte": {
+    "message": "Bạn có thể tải video này xuống dưới nhiều định dạng khác nhau hoặc nhận liên kết chia sẻ."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Tải xuống định dạng mặc định WEBM (với độ trong suốt nếu tùy chọn được kích hoạt)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Tương thích tốt hơn với PowerPoint, nhưng không có độ trong suốt"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Tương thích mọi nơi, nhưng chất lượng thấp hơn (với độ trong suốt nếu tùy chọn được kích hoạt)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Thời lượng tối đa của GIF là 60 giây. Vượt quá sẽ làm tệp quá lớn."
+  },
+  "screencast_modale_copy": {
+    "message": "Sao chép"
+  },
+  "screencast_modale_upload": {
+    "message": "Nhận liên kết chia sẻ"
+  },
+  "screencast_modale_contact": {
+    "message": "Báo cáo lỗi, đề xuất cải tiến"
+  },
+  "screencast_start_recording": {
+    "message": "Bắt đầu ghi"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Quyền truy cập microphone bị từ chối."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Quyền truy cập camera bị từ chối."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Phiên bản Chrome của bạn quá cũ cho tính năng này. Vui lòng cập nhật Chrome lên phiên bản cao hơn 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Chất lượng video ảnh hưởng đến bitrate, fps & độ phân giải của bản ghi. Chất lượng càng cao, tệp càng lớn."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Ghi video bị giới hạn ở 5 phút trong phiên bản miễn phí."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Chụp với thiết bị"
+  },
+  "screenshot_menu_2": {
+    "message": "Chụp chỉ trang web"
+  },
+  "screenshot_menu_3": {
+    "message": "Chụp toàn bộ trang"
+  },
+  "screenshot_menu_4": {
+    "message": "Chụp toàn bộ tab"
+  },
+  "screenshot_button": {
+    "message": "Tạo ảnh chụp"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Tải xuống định dạng PNG (không nén)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Tải xuống định dạng WEBP, tương thích gần như mọi nơi và nén tối ưu (khuyến nghị)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Dừng trước khi kết thúc trang"
+  },
+  "screenshot_modale_title": {
+    "message": "Chụp ảnh"
+  },
+  "screenshot_modale_copy": {
+    "message": "Sao chép hình ảnh vào clipboard"
+  },
+  "screenshot_modale_edit": {
+    "message": "Chỉnh sửa ảnh chụp"
+  },
+  "screenshot_modale_help": {
+    "message": "Để lưu hình ảnh ở định dạng lớn, chỉ cần nhấp chuột phải vào hình ảnh rồi chọn \"Sao chép hình ảnh\" hoặc \"Lưu\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Đóng trình chỉnh sửa"
+  },
+  "screenshot_editor_undo": {
+    "message": "Hoàn tác hành động cuối cùng"
+  },
+  "screenshot_editor_rect": {
+    "message": "Vẽ hình chữ nhật"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Vẽ hình tròn"
+  },
+  "screenshot_editor_line": {
+    "message": "Vẽ đường thẳng"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Vẽ mũi tên"
+  },
+  "screenshot_editor_pen": {
+    "message": "Vẽ tự do"
+  },
+  "screenshot_editor_color": {
+    "message": "Màu của đường"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Độ dày của đường"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Trở thành PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Chuyển đổi ảnh chụp video của bạn sang định dạng GIF và MP4"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Mô phỏng tất cả các thiết bị"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Mở khóa tất cả cài đặt"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Mở khóa tất cả cài đặt ghi video"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Xóa quảng cáo"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Chỉnh sửa ảnh chụp của bạn"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Chụp ảnh màn hình không giới hạn"
+  },
+  "pro_modale_h2": {
+    "message": "Trở thành PRO và đóng góp tích cực vào sự phát triển của tiện ích mở rộng này bằng cách hỗ trợ nhà phát triển."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Thanh toán hàng năm"
+  },
+  "pro_modale_savings": {
+    "message": "Tiết kiệm"
+  },
+  "pro_modale_from": {
+    "message": "Từ"
+  },
+  "pro_modale_recurring_month": {
+    "message": "tháng"
+  },
+  "pro_modale_button": {
+    "message": "Tôi đăng ký"
+  },
+  "pro_modale_link_1": {
+    "message": "Hoặc"
+  },
+  "pro_modale_link_2": {
+    "message": "tôi đăng nhập"
+  },
+  "pro_modale_link_3": {
+    "message": "vào tài khoản đăng ký của tôi"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Tất cả cài đặt video"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Xóa quảng cáo"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Trình giả lập di động này có hữu ích cho bạn không?"
+  },
+  "sharing_h2": {
+    "message": "Vậy hãy chia sẻ nó với đồng nghiệp hoặc bạn bè của bạn"
+  },
+  "sharing_txt": {
+    "message": "Trình giả lập để kiểm tra trang web của bạn trên di động & máy tính bảng"
+  },
+  "sharing_review_1": {
+    "message": "Và nếu bạn có một phút để"
+  },
+  "sharing_review_2": {
+    "message": "thêm một đánh giá"
+  },
+  "sharing_review_3": {
+    "message": "thì đó là quả cherry trên bánh! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Tôi thêm một đánh giá"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Khám phá các tiện ích mở rộng miễn phí mới nhất của chúng tôi"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Color picker"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Tiện ích mở rộng này cho phép bạn chụp bất kỳ màu nào trên màn hình."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Font finder"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Xác định font được sử dụng trên bất kỳ văn bản nào trên trang web chỉ với một cú nhấp chuột."
+  },
+  "other_extensions_button": {
+    "message": "Cài đặt"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Bạn đánh giá tiện ích mở rộng này như thế nào?"
+  },
+  "review_note_store": {
+    "message": "Cảm ơn bạn đã phản hồi, đừng ngần ngại thêm một đánh giá trên Google Store. Tôi sẽ rất biết ơn 😊"
+  },
+  "review_note_feedback": {
+    "message": "Cảm ơn bạn đã phản hồi, đừng ngần ngại gửi cho chúng tôi một tin nhắn để chúng tôi có thể cải thiện tiện ích mở rộng này."
+  },
+  "button_feedback": {
+    "message": "Thêm một đánh giá"
+  },
+  "button_message": {
+    "message": "Gửi cho chúng tôi một tin nhắn"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Tên thiết bị"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, v.v."
+  },
+  "contact_title": {
+    "message": "Thiết bị bạn tìm kiếm không có trong danh sách? Hãy cho chúng tôi biết!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Thiết bị"
+  },
+  "settings_h2_global": {
+    "message": "Chung"
+  },
+  "settings_hide_header_footer": {
+    "message": "Ẩn các phần tử trên và dưới của trình duyệt trong webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Không hiển thị bàn phím giả khi tập trung vào trường nhập liệu"
+  },
+  "settings_scrollbar_show": {
+    "message": "Hiển thị thanh cuộn gốc trong thiết bị"
+  },
+  "settings_change_cursor": {
+    "message": "Không thay đổi kiểu con trỏ trong webview"
+  },
+  "settings_change_background": {
+    "message": "Thay đổi màu nền"
+  },
+  "settings_default_device": {
+    "message": "Thiết bị mặc định khi kích hoạt"
+  },
+  "settings_change_analytics": {
+    "message": "Tôi giúp nhà phát triển tiện ích mở rộng này cải thiện sản phẩm của họ thông qua Posthog. Tất cả dữ liệu đều được ẩn danh."
+  },
+  "settings_device_hide": {
+    "message": "Không hiển thị thiết bị"
+  },
+  "settings_batterie_level": {
+    "message": "Mức pin trong tiêu đề của thiết bị (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Thay đổi URL hiển thị trong thiết bị"
+  },
+  "settings_presenter_mode": {
+    "message": "Chế độ trình bày (menu bên phải chỉ hiển thị khi di chuột)"
+  },
+  "settings_fullscreen": {
+    "message": "Trang web toàn màn hình trong thiết bị"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Chọn một thiết bị"
+  },
+  "settings_video_quality": {
+    "message": "Chất lượng video"
+  },
+  "settings_video_quality_low": {
+    "message": "Trung bình"
+  },
+  "settings_video_quality_medium": {
+    "message": "Tốt"
+  },
+  "settings_video_quality_high": {
+    "message": "Xuất sắc"
+  },
+  "settings_theme": {
+    "message": "Chủ đề"
+  },
+  "settings_theme_light": {
+    "message": "Sáng"
+  },
+  "settings_theme_dark": {
+    "message": "Tối"
+  },
+  "settings_theme_auto": {
+    "message": "Tự động"
+  },
+  "settings_shortcuts": {
+    "message": "Đặt phím tắt"
+  },
+  "settings_pro_account": {
+    "message": "Quản lý đăng ký của tôi"
+  },
+  "settings_microphone": {
+    "message": "Microphone"
+  },
+  "settings_camera": {
+    "message": "Camera"
+  },
+  "settings_countdown": {
+    "message": "Đếm ngược (giây)"
+  },
+  "settings_transparent_background": {
+    "message": "Nền trong suốt"
+  },
+  "settings_transparent_background_info": {
+    "message": "Tùy chọn này yêu cầu nhiều tính toán hơn và do đó có thể làm chậm hiển thị tùy thuộc vào máy tính của bạn (chỉ tương thích với định dạng WEBM và GIF)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Giải pháp thay thế cho ảnh chụp màn hình"
+  },
+  "screenshot_workaround_context": {
+    "message": "Ngữ cảnh"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "Do một số hạn chế kỹ thuật, có thể khi chụp ảnh màn hình, bạn sẽ nhận được thông báo lỗi này."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Giải pháp thay thế"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "Trong trường hợp này, để bắt đầu chụp, chỉ cần nhấp chuột phải vào bất kỳ đâu trên trang, chọn mục \"Trình giả lập di động\", sau đó \"📷 Chụp ảnh màn hình\""
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Giúp chúng tôi làm cho Mobile FIRST hữu ích hơn cho bạn 🚀"
+  },
+  "feedback_profession": {
+    "message": "Bộ phận chuyên môn của bạn là gì?"
+  },
+  "feedback_profession_developer": {
+    "message": "Phát triển"
+  },
+  "feedback_profession_designer": {
+    "message": "Thiết kế"
+  },
+  "feedback_profession_qa": {
+    "message": "Kiểm thử / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Quản lý sản phẩm"
+  },
+  "feedback_profession_marketing": {
+    "message": "Tiếp thị"
+  },
+  "feedback_profession_sales": {
+    "message": "Bán hàng"
+  },
+  "feedback_profession_other": {
+    "message": "Khác"
+  },
+  "feedback_company_type": {
+    "message": "Loại công ty của bạn là gì?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Tự do"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Doanh nghiệp nhỏ (1-9 nhân viên)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Doanh nghiệp nhỏ (10-49 nhân viên)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Doanh nghiệp vừa (50-249 nhân viên)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Doanh nghiệp lớn (250-4999 nhân viên)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Doanh nghiệp rất lớn / tập đoàn (5000+ nhân viên)"
+  },
+  "feedback_use_cases": {
+    "message": "Tại sao bạn sử dụng Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Kiểm tra trang web của tôi, thực hiện demo cho khách hàng..."
+  },
+  "feedback_frequency": {
+    "message": "Bạn sử dụng tiện ích mở rộng này với tần suất như thế nào?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Hàng ngày"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Nhiều lần trong tuần"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Thỉnh thoảng"
+  },
+  "feedback_frequency_rare": {
+    "message": "Hiếm"
+  },
+  "feedback_improvements": {
+    "message": "Bạn muốn thấy những cải tiến nào?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "Một ý tưởng, một khó khăn, một thiếu sót..."
+  },
+  "feedback_submit": {
+    "message": "Gửi"
+  },
+  "feedback_close": {
+    "message": "Không trả lời"
+  },
+  "feedback_error_required": {
+    "message": "Tất cả các trường đều trống 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Cảm ơn rất nhiều vì phản hồi của bạn 🤗"
+  },
+  "select": {
+    "message": "Chọn..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Khám phá ngay giao diện \"Liquid Glass\" mới của Safari iOS 26 để thử nghiệm thực tế hơn!"
+  },
+  "new_ios26_h2": {
+    "message": "Có sẵn trên tất cả các phiên bản của iPhone&nbsp;15 và iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Mới!<br>Thử nghiệm ngay trang web của bạn với iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX có sẵn trong trình giả lập."
+  },
+  "new_video_feature_h1": {
+    "message": "Khám phá ngay tính năng ghi video mới!"
+  },
+  "new_video_feature_h2": {
+    "message": "Ghi lại với chất lượng tốt hơn, với các tùy chọn mới và với nền trong suốt"
+  },
+  "logout_modale_title": {
+    "message": "Bạn đã tự động đăng xuất trên thiết bị này"
+  },
+  "logout_modale_message": {
+    "message": "Thiết bị này không còn là một trong những thiết bị được ủy quyền của bạn. Nếu bạn đã xóa quyền truy cập này theo cách thủ công, cần phải đăng nhập lại."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Thông tin</strong>Cuộn cảm ứng không khả dụng, nhưng bạn có thể <strong>hiển thị thanh cuộn</strong> nếu bạn không có chuột cuộn hoặc bàn di chuột để cuộn.<br><br>Đây là một tùy chọn trong cài đặt ở góc dưới bên phải <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Chào mừng đến với Mobile FIRST 👋</strong>Mô phỏng chỉ với một cú nhấp chuột các điện thoại, máy tính bảng và máy tính để kiểm tra và xem trang web của bạn một cách đơn giản.<br><br><strong>Menu nằm ở bên phải ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Cập nhật v4.12.0</strong>Tính năng mới trong phiên bản PRO, <strong>chỉnh sửa ảnh chụp màn hình</strong>. Các nút để vẽ hình dạng, thêm văn bản, v.v. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Cập nhật v4.14.0</strong>Khám phá ngay tính năng <strong>ghi video</strong> mới! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Cập nhật v4.14.5</strong>Tăng đáng kể <strong>độ phân giải và chất lượng</strong> của ảnh chụp màn hình <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Đăng nhập"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Bạn muốn chia sẻ gói đăng ký của mình? Để cho phép người khác, chỉ cần thêm họ từ phần \"Người dùng\" trong tài khoản của bạn."
+  }
+}
