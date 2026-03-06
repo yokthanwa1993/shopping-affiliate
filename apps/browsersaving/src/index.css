@@ -805,6 +805,13 @@ body {
   transition: all 0.15s;
 }
 
+.action-btn-placeholder {
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
 .action-btn svg {
   width: 16px;
   height: 16px;

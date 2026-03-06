@@ -4,8 +4,8 @@ let content = fs.readFileSync('src/index.ts', 'utf8');
 
 // 1. Update Cron Query to include bot_id
 content = content.replace(
-    'SELECT id, name, access_token, comment_token, post_hours, last_post_at',
-    'SELECT id, name, access_token, comment_token, post_hours, last_post_at, bot_id'
+    'SELECT id, name, access_token, post_hours, last_post_at',
+    'SELECT id, name, access_token, post_hours, last_post_at, bot_id'
 );
 
 content = content.replace(

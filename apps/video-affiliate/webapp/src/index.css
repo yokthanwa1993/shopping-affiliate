@@ -106,18 +106,39 @@
     @apply border-border;
   }
 
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    min-height: 100%;
+    margin: 0;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
   body {
     @apply bg-background text-foreground;
   }
 }
 
 /* Safe area for Telegram Mini App */
-html,
-body {
-  padding-top: env(safe-area-inset-top, 0px);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+.app-scroll {
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  touch-action: pan-y;
+}
+
+.app-scroll::-webkit-scrollbar {
+  display: none;
 }
 
 .safe-top {
   padding-top: calc(env(safe-area-inset-top, 0px) + 60px);
-}/* deployed Fri Feb  6 17:03:00 +07 2026 */
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+/* deployed Fri Feb  6 17:03:00 +07 2026 */

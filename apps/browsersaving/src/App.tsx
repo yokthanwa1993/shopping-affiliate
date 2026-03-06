@@ -1,16 +1,10 @@
-import { useState, useEffect, useCallback, type FormEvent, type MouseEvent } from 'react'
+import { useState, useEffect, useCallback, type FormEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { type Update, check } from '@tauri-apps/plugin-updater'
 import { CreateProfileModal } from './components/CreateProfileModal'
 import { LogViewer } from './components/LogViewer'
 import { DebugConsole } from './components/DebugConsole'
-import postcronIcon from './assets/postcron.webp'
-// 2FA Icon component
-const TwoFALogo = ({ opacity = 1 }: { opacity?: number }) => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ width: 18, height: 18, opacity }}>
-    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-  </svg>
-)
 import './index.css'
 
 // Server URL (fallback for web mode)
@@ -20,7 +14,6 @@ const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://browsersaving-wor
 const DEFAULT_BROWSERLESS_URL = 'http://localhost:3333'
 const DEFAULT_BROWSERLESS_TOKEN = 'browserless_token'
 const PROFILE_TAG_OPTIONS = ['post', 'comment', 'mobile'] as const
-const TOKEN_ROLE_TAGS = ['post', 'comment'] as const
 
 const normalizeProfileTag = (value: string) => value.trim().toLowerCase()
 const normalizeProfileName = (value: string) => value.trim().toLowerCase()
@@ -33,16 +26,6 @@ const normalizeProfileTags = (tags: string[] = []) => {
   return Array.from(unique)
 }
 
-const getTokenRoleState = (tags: string[] = []) => {
-  const normalized = normalizeProfileTags(tags)
-  const hasPost = normalized.includes('post')
-  const hasComment = normalized.includes('comment')
-  return {
-    hasPost,
-    hasComment,
-    hasConflict: hasPost && hasComment,
-  }
-}
 
 // Helper to get full avatar URL
 const getAvatarUrl = (avatarUrl?: string) => {
@@ -64,8 +47,7 @@ interface Profile {
   username?: string
   password?: string
   datr?: string
-  postcron_token?: string
-  comment_token?: string
+  access_token?: string
   facebook_token?: string
   page_name?: string
   page_avatar_url?: string
@@ -196,6 +178,16 @@ const AUTH_SESSION_STORAGE_KEY = 'browsersaving_auth_session'
 type AuthSession = {
   token: string
   email: string
+}
+
+type AppUpdateState = {
+  checking: boolean
+  installing: boolean
+  availableVersion: string
+  availableNotes: string
+  lastCheckedAt: string
+  message: string
+  error: string
 }
 
 const normalizeAuthEmail = (raw: unknown) => String(raw || '').trim().toLowerCase()
@@ -336,7 +328,10 @@ async function deleteProfile(id: string): Promise<boolean> {
   return res.ok
 }
 
-async function fetchPageInfo(profileId: string): Promise<{page_name?: string; page_avatar_url?: string} | null> {
+async function fetchPageInfo(
+  profileId: string,
+  _preferRole?: 'post' | 'comment'
+): Promise<{ page_name?: string; page_avatar_url?: string } | null> {
   try {
     const res = await apiFetch(`/api/profiles/${profileId}/page`)
     if (!res.ok) return null
@@ -386,13 +381,13 @@ async function launchAndroidEmulator(profile: Profile): Promise<{ success: boole
   }
 }
 
-async function stopBrowser(profileId: string): Promise<{ success: boolean }> {
+async function stopBrowser(profileId: string): Promise<{ success: boolean; error?: string }> {
   try {
     await invoke('stop_browser', { profileId })
     return { success: true }
   } catch {
     if (isTauri()) {
-      return { success: false }
+      return { success: false, error: 'Failed to stop browser' }
     }
   }
 
@@ -454,18 +449,16 @@ function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [deletingProfile, setDeletingProfile] = useState<Profile | null>(null)
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
-  const [totpProfile, setTotpProfile] = useState<Profile | null>(null)
   const [credentialsProfile, setCredentialsProfile] = useState<Profile | null>(null)
   const [tokenResult, setTokenResult] = useState<{
     profileId: string
     profileName: string
-    mode: 'post' | 'comment'
     token: string
   } | null>(null)
   const [fetchingToken, setFetchingToken] = useState<Set<string>>(new Set())
   const [copiedProfileId, setCopiedProfileId] = useState<string | null>(null)
-  const [totpCode, setTotpCode] = useState('')
-  const [totpCountdown, setTotpCountdown] = useState(30)
+  const [credentialsTotpCode, setCredentialsTotpCode] = useState('')
+  const [credentialsTotpCountdown, setCredentialsTotpCountdown] = useState(30)
   const [debugProfile, setDebugProfile] = useState<Profile | null>(null)
   const [debuggingIds, setDebuggingIds] = useState<Set<string>>(new Set())
   const [currentPage, setCurrentPage] = useState<'profiles' | 'proxy' | 'settings' | 'debug'>('profiles')
@@ -481,6 +474,15 @@ function App() {
   })
   const [tagPickerProfileId, setTagPickerProfileId] = useState<string | null>(null)
   const [savingTagIds, setSavingTagIds] = useState<Set<string>>(new Set())
+  const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>({
+    checking: false,
+    installing: false,
+    availableVersion: '',
+    availableNotes: '',
+    lastCheckedAt: '',
+    message: 'ยังไม่เช็คอัปเดต',
+    error: '',
+  })
 
   // Browserless state
   const [browserlessUrl, setBrowserlessUrl] = useState(() => {
@@ -490,32 +492,130 @@ function App() {
     return localStorage.getItem('browserlessToken') || DEFAULT_BROWSERLESS_TOKEN
   })
   const [browserlessConnected, setBrowserlessConnected] = useState(false)
-  const [postcronLoading, setPostcronLoading] = useState<Set<string>>(new Set())
-  const [postcronContextMenu, setPostcronContextMenu] = useState<{
-    profile: Profile
-    x: number
-    y: number
-  } | null>(null)
-  const [postcronProgress, setPostcronProgress] = useState<{
-    profileName: string;
-    profileId?: string;
-    steps: { label: string; status: 'pending' | 'active' | 'done' | 'error' }[];
-    currentStep: number;
-    waitingForNext?: boolean;
-    stepResult?: string;
-    error?: string;
-    token?: string;
-  } | null>(null)
 
-  const getPostcronToken = (profile: Profile) => (profile.postcron_token || '').trim()
-  const getCommentToken = (profile: Profile) => (profile.comment_token || '').trim()
-  const hasPostcronToken = (profile: Profile) => getPostcronToken(profile).length > 0
-  const hasCommentToken = (profile: Profile) => getCommentToken(profile).length > 0
+  const getAccessToken = (profile: Profile) => (profile.access_token || '').trim()
+  const hasAccessToken = (profile: Profile) => getAccessToken(profile).length > 0
   const hasAnyFacebookToken = (profile: Profile) => (
-    getPostcronToken(profile).length > 0 ||
-    getCommentToken(profile).length > 0 ||
+    getAccessToken(profile).length > 0 ||
     (profile.facebook_token || '').trim().length > 0
   )
+
+  const installUpdateNow = useCallback(async (update: Update) => {
+    setAppUpdateState(prev => ({
+      ...prev,
+      installing: true,
+      error: '',
+      message: `กำลังติดตั้งเวอร์ชัน ${update.version}...`,
+    }))
+
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === 'Progress') {
+          const downloadedBytes = event.data.chunkLength || 0
+          if (downloadedBytes > 0) {
+            setAppUpdateState(prev => ({
+              ...prev,
+              message: `กำลังดาวน์โหลดอัปเดตเวอร์ชัน ${update.version}...`,
+            }))
+          }
+        }
+      }, { timeout: 180000 })
+      setAppUpdateState(prev => ({
+        ...prev,
+        installing: false,
+        message: `ติดตั้งสำเร็จเวอร์ชัน ${update.version} กำลังรีสตาร์ต...`,
+      }))
+      await relaunch()
+    } catch (err) {
+      const message = String(err instanceof Error ? err.message : err)
+      setAppUpdateState(prev => ({
+        ...prev,
+        installing: false,
+        error: message,
+        message: `ติดตั้งอัปเดตไม่สำเร็จ: ${message}`,
+      }))
+      throw err
+    }
+  }, [])
+
+  const checkForAppUpdate = useCallback(async (mode: 'silent' | 'ask' | 'install-only' = 'silent') => {
+    if (!isTauri()) {
+      setAppUpdateState(prev => ({
+        ...prev,
+        message: 'OTA อัปเดตทำงานเฉพาะแอป Desktop',
+        availableVersion: '',
+        availableNotes: '',
+      }))
+      return null
+    }
+
+    setAppUpdateState(prev => ({
+      ...prev,
+      checking: true,
+      error: '',
+      message: 'กำลังตรวจสอบอัปเดต...',
+    }))
+
+    try {
+      const update = await check({ timeout: 30000 })
+      if (!update) {
+        setAppUpdateState(prev => ({
+          ...prev,
+          checking: false,
+          availableVersion: '',
+          availableNotes: '',
+          lastCheckedAt: new Date().toLocaleString(),
+          message: 'แอปเป็นเวอร์ชันล่าสุด',
+        }))
+        if (mode === 'ask') {
+          alert('ระบบไม่พบอัปเดตใหม่')
+        }
+        return null
+      }
+
+      const updateNotes = update.body || ''
+      const now = new Date().toLocaleString()
+      setAppUpdateState(prev => ({
+        ...prev,
+        checking: false,
+        availableVersion: update.version,
+        availableNotes: updateNotes,
+        lastCheckedAt: now,
+        message: `พบอัปเดตใหม่: ${update.version}`,
+      }))
+
+      if (mode === 'install-only') {
+        await installUpdateNow(update)
+        return update
+      }
+
+      if (mode === 'ask') {
+        const shouldInstall = window.confirm(
+          `พบอัปเดตเวอร์ชัน ${update.version}\n\n${updateNotes || 'มีการอัปเดตใหม่'}\n\nต้องการติดตั้งตอนนี้?`
+        )
+        if (shouldInstall) {
+          await installUpdateNow(update)
+        }
+      }
+
+      return update
+    } catch (err) {
+      const message = String(err instanceof Error ? err.message : err)
+      setAppUpdateState(prev => ({
+        ...prev,
+        checking: false,
+        installing: false,
+        availableVersion: '',
+        availableNotes: '',
+        message: 'ตรวจสอบอัปเดตไม่สำเร็จ',
+        error: message,
+      }))
+      if (mode === 'ask') {
+        alert(`ตรวจสอบอัปเดตไม่สำเร็จ: ${message}`)
+      }
+      return null
+    }
+  }, [installUpdateNow])
 
   useEffect(() => {
     let active = true
@@ -594,26 +694,15 @@ function App() {
     return () => window.removeEventListener('click', closePicker)
   }, [tagPickerProfileId])
 
+
+
   useEffect(() => {
-    if (!postcronContextMenu) return
-
-    const closeMenu = () => setPostcronContextMenu(null)
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeMenu()
-    }
-
-    window.addEventListener('click', closeMenu)
-    window.addEventListener('scroll', closeMenu, true)
-    window.addEventListener('resize', closeMenu)
-    window.addEventListener('keydown', onKeyDown)
-
-    return () => {
-      window.removeEventListener('click', closeMenu)
-      window.removeEventListener('scroll', closeMenu, true)
-      window.removeEventListener('resize', closeMenu)
-      window.removeEventListener('keydown', onKeyDown)
-    }
-  }, [postcronContextMenu])
+    if (!isTauri()) return
+    const timer = setTimeout(() => {
+      void checkForAppUpdate('ask')
+    }, 1800)
+    return () => clearTimeout(timer)
+  }, [checkForAppUpdate])
 
   const loadProfiles = useCallback(async () => {
     if (!authSession?.token) {
@@ -678,24 +767,32 @@ function App() {
     }
   }, [])
 
+  const handleManualUpdateCheck = async () => {
+    await checkForAppUpdate('ask')
+  }
+
+  const handleManualUpdateInstall = async () => {
+    await checkForAppUpdate('install-only')
+  }
+
   // Fetch page info on demand and update profile
-  const fetchPageForProfile = async (profile: Profile) => {
+  const fetchPageForProfile = async (profile: Profile, preferRole?: 'post' | 'comment') => {
     console.log(`🖱️ Clicked on page column for: ${profile.name}`)
     if (!hasAnyFacebookToken(profile)) {
       console.log('No token available for page fetch')
       return
     }
-    
+
     try {
-      console.log(`Fetching page info for ${profile.name}...`)
-      const pageInfo = await fetchPageInfo(profile.id)
+      console.log(`Fetching page info for ${profile.name}...`, { preferRole: preferRole || 'auto' })
+      const pageInfo = await fetchPageInfo(profile.id, preferRole)
       console.log('Page info received:', pageInfo)
       if (pageInfo?.page_name) {
         console.log(`Updating profile ${profile.name} with page: ${pageInfo.page_name}`)
         // Update profile in state
         setProfiles(prevProfiles => {
-          const newProfiles = prevProfiles.map(p => 
-            p.id === profile.id 
+          const newProfiles = prevProfiles.map(p =>
+            p.id === profile.id
               ? { ...p, page_name: pageInfo.page_name, page_avatar_url: pageInfo.page_avatar_url }
               : p
           )
@@ -817,33 +914,27 @@ function App() {
     }
   }
 
-  // TOTP Modal
-  const handleShowTOTP = (profile: Profile) => {
-    if (!profile.totp_secret) return
-    setTotpProfile(profile)
-    setTotpCode(generateTOTP(profile.totp_secret))
-    setTotpCountdown(30 - (Math.floor(Date.now() / 1000) % 30))
-  }
-
-  // Update TOTP code every second
   useEffect(() => {
-    if (!totpProfile?.totp_secret) return
+    if (!credentialsProfile?.totp_secret) {
+      setCredentialsTotpCode('')
+      setCredentialsTotpCountdown(30)
+      return
+    }
 
+    const refresh = () => {
+      const nextCode = generateTOTP(credentialsProfile.totp_secret!)
+      const remainingSeconds = 30 - (Math.floor(Date.now() / 1000) % 30)
+      setCredentialsTotpCode(nextCode)
+      setCredentialsTotpCountdown(remainingSeconds)
+    }
+
+    refresh()
     const interval = setInterval(() => {
-      const secondsInPeriod = Math.floor(Date.now() / 1000) % 30
-      setTotpCountdown(30 - secondsInPeriod)
-
-      if (secondsInPeriod === 0) {
-        setTotpCode(generateTOTP(totpProfile.totp_secret!))
-      }
+      refresh()
     }, 1000)
 
     return () => clearInterval(interval)
-  }, [totpProfile])
-
-  const copyTOTP = () => {
-    navigator.clipboard.writeText(totpCode)
-  }
+  }, [credentialsProfile])
 
   const copyCredentials = (profile: Profile) => {
     const text = `${profile.username || ''}\n${profile.password || ''}`
@@ -874,10 +965,6 @@ function App() {
     }
 
     let nextTags = [...currentTags, normalizedTag]
-    if (TOKEN_ROLE_TAGS.includes(normalizedTag as typeof TOKEN_ROLE_TAGS[number])) {
-      const oppositeTag = normalizedTag === 'post' ? 'comment' : 'post'
-      nextTags = nextTags.filter((t) => t !== oppositeTag)
-    }
     setSavingTagIds(prev => new Set(prev).add(profile.id))
     try {
       const updated = await updateProfile(profile.id, { tags: nextTags })
@@ -977,26 +1064,11 @@ function App() {
     setDebugProfile(null)
   }
 
-  const handleFetchRoleToken = async (profile: Profile, mode: 'post' | 'comment') => {
-    const roleState = getTokenRoleState(profile.tags || [])
-    if (roleState.hasConflict) {
-      alert('โปรไฟล์นี้ติด tag post และ comment พร้อมกันอยู่ กรุณาให้เหลืออย่างใดอย่างหนึ่งก่อน')
-      return
-    }
-    if (mode === 'post' && !roleState.hasPost) {
-      alert('โปรไฟล์นี้ยังไม่ได้ติด tag post')
-      return
-    }
-    if (mode === 'comment' && !roleState.hasComment) {
-      alert('โปรไฟล์นี้ยังไม่ได้ติด tag comment')
-      return
-    }
-
-    const setLoading = mode === 'post' ? setPostcronLoading : setFetchingToken
-    setLoading(prev => new Set(prev).add(profile.id))
+  const handleFetchToken = async (profile: Profile) => {
+    setFetchingToken(prev => new Set(prev).add(profile.id))
 
     try {
-      const res = await apiFetch(`/api/postcron/${profile.id}/${mode}`)
+      const res = await apiFetch(`/api/token/${profile.id}`)
       const data = await res.json().catch(() => ({} as any))
       const token = String(
         data?.token ||
@@ -1015,19 +1087,18 @@ function App() {
         setProfiles(prev => prev.map((p) => (
           p.id === profile.id
             ? {
-                ...p,
-                page_name: pageNameFromToken || p.page_name,
-                page_avatar_url: pageAvatarFromToken || p.page_avatar_url,
-              }
+              ...p,
+              page_name: pageNameFromToken || p.page_name,
+              page_avatar_url: pageAvatarFromToken || p.page_avatar_url,
+            }
             : p
         )))
       }
 
-      // Re-fetch page details from Graph using the fresh role token so avatar/page stays in sync.
+      // Re-fetch page details from Graph using the fresh token so avatar/page stays in sync.
       await fetchPageForProfile(
-        mode === 'post'
-          ? { ...profile, postcron_token: token }
-          : { ...profile, comment_token: token }
+        { ...profile, access_token: token },
+        'post'
       )
 
       // Endpoint saves token into DB already; reload list to reflect fresh state.
@@ -1035,14 +1106,13 @@ function App() {
       setTokenResult({
         profileId: profile.id,
         profileName: profile.name,
-        mode,
         token,
       })
     } catch (err) {
-      console.error(`Failed to get ${mode} token:`, err)
-      alert(`Failed to get ${mode} token: ${String(err)}`)
+      console.error('Failed to get token:', err)
+      alert(`Failed to get token: ${String(err)}`)
     } finally {
-      setLoading(prev => {
+      setFetchingToken(prev => {
         const next = new Set(prev)
         next.delete(profile.id)
         return next
@@ -1068,7 +1138,11 @@ function App() {
   }
 
   const handleStop = async (id: string) => {
-    await stopBrowser(id)
+    const result = await stopBrowser(id)
+    if (!result.success) {
+      alert(result.error || 'Failed to stop profile')
+      return
+    }
     await loadProfiles()
     await checkStatus()
   }
@@ -1090,167 +1164,7 @@ function App() {
     }
   }
 
-  // Postcron Step-by-Step Token Extraction
-  const postcronSteps = [
-    { label: 'Launch Chrome with profile cookies', command: 'postcron_step_launch', needsProfileId: true },
-    { label: 'Navigate to Postcron OAuth', command: 'postcron_step_navigate' },
-    { label: 'Click "Continue" button', command: 'postcron_step_click' },
-    { label: 'Extract access token', command: 'postcron_step_extract' },
-  ]
-
-  const handlePostcronStart = async (profile: Profile, headfulMode = false) => {
-    // Initialize progress modal
-    setPostcronProgress({
-      profileName: profile.name,
-      profileId: profile.id,
-      steps: postcronSteps.map(s => ({ label: s.label, status: 'pending' as const })),
-      currentStep: -1,
-      waitingForNext: false,
-    })
-
-    // Auto-run all steps sequentially
-    for (let i = 0; i < postcronSteps.length; i++) {
-      const stepDef = postcronSteps[i]
-      console.log(`[Postcron] Starting step ${i+1}: ${stepDef.command}`)
-
-      // Mark step as active
-      setPostcronProgress(prev => {
-        if (!prev) return null
-        return {
-          ...prev,
-          steps: prev.steps.map((s, idx) => ({
-            ...s,
-            status: idx < i ? 'done' as const : idx === i ? 'active' as const : s.status
-          })),
-          currentStep: i,
-          waitingForNext: false,
-          stepResult: undefined,
-        }
-      })
-
-      try {
-        // Use headful command for step 1 if headfulMode is enabled
-        const command = (headfulMode && i === 0) 
-          ? 'postcron_step_launch_headful' 
-          : stepDef.command
-        const args = stepDef.needsProfileId ? { profileId: profile.id } : {}
-        const invokeResult = await invoke(command, args)
-        console.log(`[Postcron Step ${i+1}] Raw result:`, invokeResult, typeof invokeResult)
-        const result = typeof invokeResult === 'string' ? invokeResult : String(invokeResult)
-
-        // Check if token was extracted
-        if (stepDef.command === 'postcron_step_extract') {
-          let token: string | null = null;
-          
-          // Handle JSON result from Rust
-          if (typeof invokeResult === 'object' && invokeResult !== null) {
-            const resultObj = invokeResult as any;
-            console.log(`[Postcron Step ${i+1}] Got object result:`, resultObj);
-            if (resultObj.success && resultObj.token) {
-              token = resultObj.token;
-              console.log(`[Postcron Step ${i+1}] Token from object:`, token.substring(0, 50) + '...');
-            } else {
-              console.error(`[Postcron Step ${i+1}] No token in result:`, resultObj);
-              throw new Error(resultObj.error || 'No token found');
-            }
-          } else if (typeof result === 'string' && result.startsWith('EAA')) {
-            token = result;
-            console.log(`[Postcron Step ${i+1}] Token from string:`, token.substring(0, 50) + '...');
-          }
-          
-          if (!token) {
-            console.error(`[Postcron Step ${i+1}] Failed to extract token, result:`, invokeResult);
-            throw new Error('Failed to extract token');
-          }
-          
-          await updateProfile(profile.id, { postcron_token: token })
-          
-          // Fetch page info using the new token
-          const pageInfo = await fetchPageInfo(profile.id)
-          if (pageInfo?.page_name) {
-            console.log(`Page fetched: ${pageInfo.page_name}`)
-          }
-          
-          await loadProfiles()
-
-          setPostcronProgress(prev => prev ? {
-            ...prev,
-            steps: prev.steps.map(s => ({ ...s, status: 'done' as const })),
-            currentStep: i,
-            waitingForNext: false,
-            token: token,
-            stepResult: pageInfo?.page_name 
-              ? `Token & Page "${pageInfo.page_name}" saved! ✅` 
-              : 'Token extracted! ✅',
-          } : null)
-        } else {
-          // Mark step done, continue to next
-          setPostcronProgress(prev => prev ? {
-            ...prev,
-            steps: prev.steps.map((s, idx) => ({
-              ...s,
-              status: idx <= i ? 'done' as const : s.status
-            })),
-            currentStep: i,
-          } : null)
-        }
-      } catch (err) {
-        console.error(`[Postcron Step ${i+1}] ERROR:`, err)
-        const errorMsg = err instanceof Error ? err.message : String(err)
-        console.error(`[Postcron Step ${i+1}] Error message:`, errorMsg)
-        setPostcronProgress(prev => prev ? {
-          ...prev,
-          steps: prev.steps.map((s, idx) => ({
-            ...s,
-            status: idx === i ? 'error' as const : s.status
-          })),
-          waitingForNext: false,
-          error: errorMsg,
-          stepResult: errorMsg,
-        } : null)
-        // Stop on error
-        return
-      }
-    }
-  }
-
-  const withPostcronLoading = async (profileId: string, runner: () => Promise<void>) => {
-    setPostcronLoading(prev => new Set(prev).add(profileId))
-    try {
-      await runner()
-    } finally {
-      setPostcronLoading(prev => {
-        const next = new Set(prev)
-        next.delete(profileId)
-        return next
-      })
-    }
-  }
-
-  const handlePostcronAction = async (profile: Profile, action: 'add' | 'reconnect') => {
-    setPostcronContextMenu(null)
-    const headfulMode = action === 'reconnect'
-    await withPostcronLoading(profile.id, async () => {
-      await handlePostcronStart(profile, headfulMode)
-    })
-  }
-
-  const openPostcronContextMenu = (event: MouseEvent<HTMLButtonElement>, profile: Profile) => {
-    event.preventDefault()
-    event.stopPropagation()
-
-    const menuWidth = 170
-    const menuHeight = 92
-    const x = Math.min(event.clientX, window.innerWidth - menuWidth - 8)
-    const y = Math.min(event.clientY, window.innerHeight - menuHeight - 8)
-
-    setPostcronContextMenu({ profile, x: Math.max(8, x), y: Math.max(8, y) })
-  }
-
-  const handlePostcronClose = async () => {
-    try { await invoke('postcron_close') } catch { }
-    setPostcronProgress(null)
-  }
+  // Postcron extraction removed — using unified FB Lite token API only
 
   const toggleSelect = (id: string) => {
     const next = new Set(selectedIds)
@@ -1482,17 +1396,17 @@ function App() {
                   <th className="col-profile-tag">Tag</th>
                   <th className="col-tags">Page</th>
                   <th className="col-page-name">
-                          <select 
-                            value={selectedPage} 
-                            onChange={(e) => setSelectedPage(e.target.value)}
-                            className="page-filter"
-                          >
-                            <option value="all">All Pages</option>
-                            {Array.from(new Set(profiles.map(p => p.page_name).filter(Boolean))).map(pageName => (
-                              <option key={pageName} value={pageName}>{pageName}</option>
-                            ))}
-                          </select>
-                        </th>
+                    <select
+                      value={selectedPage}
+                      onChange={(e) => setSelectedPage(e.target.value)}
+                      className="page-filter"
+                    >
+                      <option value="all">All Pages</option>
+                      {Array.from(new Set(profiles.map(p => p.page_name).filter(Boolean))).map(pageName => (
+                        <option key={pageName} value={pageName}>{pageName}</option>
+                      ))}
+                    </select>
+                  </th>
                   <th className="col-status">Status</th>
                   <th className="col-actions">Actions</th>
                 </tr>
@@ -1518,226 +1432,171 @@ function App() {
                 ) : (
                   filteredProfiles
                     .map((profile, index) => {
-                    const isRunning = runningIds.has(profile.id)
-                    const isLaunching = launchingIds.has(profile.id)
-                    const isUploading = uploadingIds.has(profile.id)
-                    const isDeleting = deletingIds.has(profile.id)
-                    const isSavingTag = savingTagIds.has(profile.id)
-                    const isLaunchingAndroid = launchingAndroidIds.has(profile.id)
-                    const isRunningAndroid = runningAndroidIds.has(profile.id)
-                    const isUploadingAndroid = uploadingAndroidIds.has(profile.id)
-                    const profileTags = normalizeProfileTags(profile.tags || [])
-                    const tokenRoleState = getTokenRoleState(profileTags)
-                    const canUsePostToken = tokenRoleState.hasPost && !tokenRoleState.hasConflict
-                    const canUseCommentToken = tokenRoleState.hasComment && !tokenRoleState.hasConflict
-                    return (
-                      <tr key={profile.id} className={isRunning ? 'row-running' : ''}>
-                        <td className="col-check">
-                          <input
-                            type="checkbox"
-                            checked={selectedIds.has(profile.id)}
-                            onChange={() => toggleSelect(profile.id)}
-                          />
-                        </td>
-                        <td className="col-num">{index + 1}</td>
-                        <td className="col-name">
-                          <div className="name-cell">
-                            {profile.avatar_url ? (
-                              <img src={getAvatarUrl(profile.avatar_url)!} alt="" className="profile-avatar" />
-                            ) : (
-                              <span className="profile-icon">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10" />
-                                  <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-                                </svg>
-                              </span>
-                            )}
-                            <span className="profile-name">{profile.name}</span>
-                          </div>
-                        </td>
-                        <td className="col-notes">
-                          <span className="notes-text">{profile.notes || '-'}</span>
-                        </td>
-                        <td className="col-proxy">
-                          <span className="proxy-text">{profile.proxy || '-'}</span>
-                        </td>
-                        <td className="col-profile-tag">
-                          <div className="profile-tag-cell" onClick={(e) => e.stopPropagation()}>
-                            <div className="profile-tag-list">
-                              {profileTags.length === 0 ? (
-                                <span className="profile-tag-empty">-</span>
+                      const isRunning = runningIds.has(profile.id)
+                      const isLaunching = launchingIds.has(profile.id)
+                      const isUploading = uploadingIds.has(profile.id)
+                      const isDeleting = deletingIds.has(profile.id)
+                      const isSavingTag = savingTagIds.has(profile.id)
+                      const isLaunchingAndroid = launchingAndroidIds.has(profile.id)
+                      const isRunningAndroid = runningAndroidIds.has(profile.id)
+                      const isUploadingAndroid = uploadingAndroidIds.has(profile.id)
+                      const profileTags = normalizeProfileTags(profile.tags || [])
+                      const hasCredentials = !!(profile.uid || profile.username || profile.password || profile.totp_secret)
+                      return (
+                        <tr key={profile.id} className={isRunning ? 'row-running' : ''}>
+                          <td className="col-check">
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.has(profile.id)}
+                              onChange={() => toggleSelect(profile.id)}
+                            />
+                          </td>
+                          <td className="col-num">{index + 1}</td>
+                          <td className="col-name">
+                            <div className="name-cell">
+                              {profile.avatar_url ? (
+                                <img src={getAvatarUrl(profile.avatar_url)!} alt="" className="profile-avatar" />
                               ) : (
-                                profileTags.map((tag) => (
-                                  <button
-                                    key={tag}
-                                    type="button"
-                                    className={`profile-tag-badge ${tag}`}
-                                    onClick={() => handleRemoveTagFromProfile(profile, tag)}
-                                    disabled={isSavingTag}
-                                    title={`Remove ${tag} tag`}
-                                  >
-                                    {tag}
-                                    <span className="profile-tag-remove">×</span>
-                                  </button>
-                                ))
+                                <span className="profile-icon">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="10" />
+                                    <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+                                  </svg>
+                                </span>
                               )}
+                              <span className="profile-name">{profile.name}</span>
                             </div>
-                            <button
-                              type="button"
-                              className="profile-tag-add-btn"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                setTagPickerProfileId(current => current === profile.id ? null : profile.id)
-                              }}
-                              disabled={isSavingTag}
-                              title={isSavingTag ? 'Syncing tags...' : 'Add tag'}
-                            >
-                              {isSavingTag ? (
-                                <svg className="spinner-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="9" strokeOpacity="0.28" />
-                                  <path d="M21 12a9 9 0 0 0-9-9" />
-                                </svg>
-                              ) : '+'}
-                            </button>
-                            {tagPickerProfileId === profile.id && (
-                              <div className="profile-tag-picker" onClick={(e) => e.stopPropagation()}>
-                                {PROFILE_TAG_OPTIONS.map((tag) => {
-                                  const hasTag = profileTags.includes(tag)
-                                  return (
+                          </td>
+                          <td className="col-notes">
+                            <span className="notes-text">{profile.notes || '-'}</span>
+                          </td>
+                          <td className="col-proxy">
+                            <span className="proxy-text">{profile.proxy || '-'}</span>
+                          </td>
+                          <td className="col-profile-tag">
+                            <div className="profile-tag-cell" onClick={(e) => e.stopPropagation()}>
+                              <div className="profile-tag-list">
+                                {profileTags.length === 0 ? (
+                                  <span className="profile-tag-empty">-</span>
+                                ) : (
+                                  profileTags.map((tag) => (
                                     <button
                                       key={tag}
                                       type="button"
-                                      className={`profile-tag-option ${hasTag ? 'active' : ''}`}
-                                      onClick={() => handleAddTagToProfile(profile, tag)}
-                                      disabled={isSavingTag || hasTag}
+                                      className={`profile-tag-badge ${tag}`}
+                                      onClick={() => handleRemoveTagFromProfile(profile, tag)}
+                                      disabled={isSavingTag}
+                                      title={`Remove ${tag} tag`}
                                     >
                                       {tag}
+                                      <span className="profile-tag-remove">×</span>
                                     </button>
-                                  )
-                                })}
+                                  ))
+                                )}
                               </div>
-                            )}
-                          </div>
-                        </td>
-                        <td className="col-tags" onClick={() => fetchPageForProfile(profile)} style={{cursor: hasAnyFacebookToken(profile) && !profile.page_name ? 'pointer' : 'default'}}>
-                          {profile.page_avatar_url ? (
-                            <img 
-                              src={profile.page_avatar_url} 
-                              alt={profile.page_name || profile.name}
-                              className="page-avatar"
-                              title={profile.page_name || profile.name}
-                            />
-                          ) : profile.page_name ? (
-                            <div className="page-name">{profile.page_name}</div>
-                          ) : hasAnyFacebookToken(profile) ? (
-                            <div className="page-name" style={{color: 'var(--accent)', fontSize: '11px'}}>Click to load</div>
-                          ) : (
-                            <div className="page-name">-</div>
-                          )}
-                        </td>
-                        <td className="col-page-name">
-                          <div className="page-name-text" title={profile.page_name || ''}>
-                            {profile.page_name || '-'}
-                          </div>
-                        </td>
-                        <td className="col-status">
-                          {isLaunching ? (
-                            <span className="badge launching">Launching...</span>
-                          ) : isUploading ? (
-                            <span className="badge uploading">Uploading...</span>
-                          ) : isRunning ? (
-                            <span className="badge running">Running</span>
-                          ) : (
-                            <span className="badge stopped">Stopped</span>
-                          )}
-                        </td>
-                        <td className="col-actions">
-                          <div className="actions">
-                            {isLaunching ? (
-                              <button className="action-btn launching" disabled title="Launching...">
-                                <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-                                  <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                                </svg>
-                              </button>
-                            ) : isUploading ? (
-                              <button className="action-btn uploading" disabled title="Uploading...">
-                                <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-                                  <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                                </svg>
-                              </button>
-                            ) : isRunning ? (
-                              <button className="action-btn stop" onClick={() => handleStop(profile.id)} title="Stop">
-                                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" /></svg>
-                              </button>
-                            ) : (
-                              <button className="action-btn start" onClick={() => handleLaunch(profile)} title="Start">
-                                <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3" /></svg>
-                              </button>
-                            )}
-                            {isUploadingAndroid ? (
-                              <button className="action-btn android uploading" disabled title="Syncing Android profile...">
-                                <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-                                  <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                                </svg>
-                              </button>
-                            ) : isLaunchingAndroid ? (
-                              <button className="action-btn android launching" disabled title="Opening Android Emulator...">
-                                <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-                                  <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                                </svg>
-                              </button>
-                            ) : (
                               <button
-                                className={`action-btn android ${isRunningAndroid ? 'active' : ''}`}
-                                onClick={() => handleLaunchAndroid(profile)}
-                                disabled={isRunningAndroid}
-                                title={isRunningAndroid ? 'Android Emulator is running' : 'Open Android Emulator'}
+                                type="button"
+                                className="profile-tag-add-btn"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  setTagPickerProfileId(current => current === profile.id ? null : profile.id)
+                                }}
+                                disabled={isSavingTag}
+                                title={isSavingTag ? 'Syncing tags...' : 'Add tag'}
                               >
-                                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                                  <path d="M17.6 9.48 19.44 6.3a.62.62 0 0 0-.26-.85.62.62 0 0 0-.84.26L16.47 8.9A10.53 10.53 0 0 0 12 7.9c-1.58 0-3.07.34-4.47 1L5.66 5.7a.62.62 0 0 0-.84-.26.62.62 0 0 0-.26.85L6.4 9.48A8.01 8.01 0 0 0 2 16v1h20v-1a8.01 8.01 0 0 0-4.4-6.52ZM8 14.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm8 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z" />
-                                </svg>
+                                {isSavingTag ? (
+                                  <svg className="spinner-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="9" strokeOpacity="0.28" />
+                                    <path d="M21 12a9 9 0 0 0-9-9" />
+                                  </svg>
+                                ) : '+'}
                               </button>
-                            )}
-                            <button
-                              className={`action-btn copy-id ${copiedProfileId === profile.id ? 'copied' : ''}`}
-                              onClick={() => handleCopyProfileId(profile)}
-                              title={copiedProfileId === profile.id ? 'Copied Profile ID' : `Copy Profile ID: ${profile.id}`}
-                            >
-                              {copiedProfileId === profile.id ? (
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
-                                </svg>
-                              ) : (
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                                </svg>
+                              {tagPickerProfileId === profile.id && (
+                                <div className="profile-tag-picker" onClick={(e) => e.stopPropagation()}>
+                                  {PROFILE_TAG_OPTIONS.map((tag) => {
+                                    const hasTag = profileTags.includes(tag)
+                                    return (
+                                      <button
+                                        key={tag}
+                                        type="button"
+                                        className={`profile-tag-option ${hasTag ? 'active' : ''}`}
+                                        onClick={() => handleAddTagToProfile(profile, tag)}
+                                        disabled={isSavingTag || hasTag}
+                                      >
+                                        {tag}
+                                      </button>
+                                    )
+                                  })}
+                                </div>
                               )}
-                            </button>
-                            {/* Credentials Button - UID/Email/Password */}
-                            {profile.uid || profile.username || profile.password ? (
-                              <button className="action-btn credentials" onClick={() => setCredentialsProfile(profile)} title="View Credentials (UID/Password)">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                                  <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                                </svg>
-                              </button>
+                            </div>
+                          </td>
+                          <td className="col-tags" onClick={() => fetchPageForProfile(profile)} style={{ cursor: hasAnyFacebookToken(profile) && !profile.page_name ? 'pointer' : 'default' }}>
+                            {profile.page_avatar_url ? (
+                              <img
+                                src={profile.page_avatar_url}
+                                alt={profile.page_name || profile.name}
+                                className="page-avatar"
+                                title={profile.page_name || profile.name}
+                              />
+                            ) : profile.page_name ? (
+                              <div className="page-name">{profile.page_name}</div>
+                            ) : hasAnyFacebookToken(profile) ? (
+                              <div className="page-name" style={{ color: 'var(--accent)', fontSize: '11px' }}>Click to load</div>
                             ) : (
-                              <button className="action-btn disabled" disabled title="No Credentials">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.3">
-                                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                                  <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                                </svg>
-                              </button>
+                              <div className="page-name">-</div>
                             )}
-                            {/* Post Token (show only for tag:post) */}
-                            {canUsePostToken ? (
-                              postcronLoading.has(profile.id) ? (
-                                <button className="action-btn postcron loading" disabled title="Getting Post Token...">
+                          </td>
+                          <td className="col-page-name">
+                            <div className="page-name-text" title={profile.page_name || ''}>
+                              {profile.page_name || '-'}
+                            </div>
+                          </td>
+                          <td className="col-status">
+                            {isLaunching ? (
+                              <span className="badge launching">Launching...</span>
+                            ) : isUploading ? (
+                              <span className="badge uploading">Uploading...</span>
+                            ) : isRunning ? (
+                              <span className="badge running">Running</span>
+                            ) : (
+                              <span className="badge stopped">Stopped</span>
+                            )}
+                          </td>
+                          <td className="col-actions">
+                            <div className="actions">
+                              {isLaunching ? (
+                                <button className="action-btn launching" disabled title="Launching...">
+                                  <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                                    <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
+                                  </svg>
+                                </button>
+                              ) : isUploading ? (
+                                <button className="action-btn uploading" disabled title="Uploading...">
+                                  <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                                    <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
+                                  </svg>
+                                </button>
+                              ) : isRunning ? (
+                                <button className="action-btn stop" onClick={() => handleStop(profile.id)} title="Stop">
+                                  <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" /></svg>
+                                </button>
+                              ) : (
+                                <button className="action-btn start" onClick={() => handleLaunch(profile)} title="Start">
+                                  <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3" /></svg>
+                                </button>
+                              )}
+                              {isUploadingAndroid ? (
+                                <button className="action-btn android uploading" disabled title="Syncing Android profile...">
+                                  <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                                    <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
+                                  </svg>
+                                </button>
+                              ) : isLaunchingAndroid ? (
+                                <button className="action-btn android launching" disabled title="Opening Android Emulator...">
                                   <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                     <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
                                     <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
@@ -1745,18 +1604,51 @@ function App() {
                                 </button>
                               ) : (
                                 <button
-                                  className={`action-btn postcron ${hasPostcronToken(profile) ? 'has-token' : 'missing-token'}`}
-                                  onClick={() => handleFetchRoleToken(profile, 'post')}
-                                  title={hasPostcronToken(profile) ? 'Refresh Post Token' : 'Get Post Token'}
+                                  className={`action-btn android ${isRunningAndroid ? 'active' : ''}`}
+                                  onClick={() => handleLaunchAndroid(profile)}
+                                  disabled={isRunningAndroid}
+                                  title={isRunningAndroid ? 'Android Emulator is running' : 'Open Android Emulator'}
                                 >
-                                  <img src={postcronIcon} alt="Postcron" style={{ width: 18, height: 18, borderRadius: '50%' }} />
+                                  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                                    <path d="M17.6 9.48 19.44 6.3a.62.62 0 0 0-.26-.85.62.62 0 0 0-.84.26L16.47 8.9A10.53 10.53 0 0 0 12 7.9c-1.58 0-3.07.34-4.47 1L5.66 5.7a.62.62 0 0 0-.84-.26.62.62 0 0 0-.26.85L6.4 9.48A8.01 8.01 0 0 0 2 16v1h20v-1a8.01 8.01 0 0 0-4.4-6.52ZM8 14.5a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm8 0a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z" />
+                                  </svg>
                                 </button>
-                              )
-                            ) : null}
-                            {/* Comment Token (show only for tag:comment) */}
-                            {canUseCommentToken ? (
-                              fetchingToken.has(profile.id) ? (
-                                <button className="action-btn token fetching" disabled title="Getting Comment Token...">
+                              )}
+                              <button
+                                className={`action-btn copy-id ${copiedProfileId === profile.id ? 'copied' : ''}`}
+                                onClick={() => handleCopyProfileId(profile)}
+                                title={copiedProfileId === profile.id ? 'Copied Profile ID' : `Copy Profile ID: ${profile.id}`}
+                              >
+                                {copiedProfileId === profile.id ? (
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <polyline points="20 6 9 17 4 12" strokeLinecap="round" strokeLinejoin="round" />
+                                  </svg>
+                                ) : (
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                                  </svg>
+                                )}
+                              </button>
+                              {/* Credentials Button */}
+                              {hasCredentials ? (
+                                <button className="action-btn credentials" onClick={() => setCredentialsProfile(profile)} title="View Credentials (UID/Password/2FA)">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                                  </svg>
+                                </button>
+                              ) : (
+                                <button className="action-btn disabled" disabled title="No Credentials">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.3">
+                                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                                  </svg>
+                                </button>
+                              )}
+                              {/* Token Button */}
+                              {fetchingToken.has(profile.id) ? (
+                                <button className="action-btn token fetching" disabled title="Getting Token...">
                                   <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                     <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
                                     <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
@@ -1764,84 +1656,66 @@ function App() {
                                 </button>
                               ) : (
                                 <button
-                                  className={`action-btn token facebook-comment ${hasCommentToken(profile) ? 'has-token' : ''}`}
-                                  onClick={() => handleFetchRoleToken(profile, 'comment')}
-                                  title={hasCommentToken(profile) ? 'Refresh Comment Token' : 'Get Comment Token'}
+                                  className={`action-btn token facebook-comment ${hasAccessToken(profile) ? 'has-token' : ''}`}
+                                  onClick={() => handleFetchToken(profile)}
+                                  title={hasAccessToken(profile) ? 'Refresh Token' : 'Get Token'}
                                 >
                                   <svg viewBox="0 0 24 24" aria-hidden="true">
                                     <path fill="#1877F2" d="M22 12.07C22 6.503 17.523 2 12 2S2 6.503 2 12.07c0 5.017 3.657 9.178 8.438 9.93v-7.02H7.898v-2.91h2.54V9.845c0-2.523 1.492-3.917 3.777-3.917 1.094 0 2.238.196 2.238.196v2.476H15.19c-1.243 0-1.63.776-1.63 1.572v1.898h2.773l-.443 2.91h-2.33V22c4.78-.752 8.44-4.913 8.44-9.93z" />
                                   </svg>
                                 </button>
-                              )
-                            ) : null}
-                            {tokenRoleState.hasConflict ? (
-                              <button className="action-btn disabled" disabled title="Tag conflict: keep only post or comment">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.45">
-                                  <circle cx="12" cy="12" r="10" />
-                                  <path d="M12 7v6M12 17h.01" />
-                                </svg>
-                              </button>
-                            ) : null}
-                            {profile.totp_secret ? (
-                              <button className="action-btn totp" onClick={() => handleShowTOTP(profile)} title="2FA Code">
-                                <TwoFALogo />
-                              </button>
-                            ) : (
-                              <button className="action-btn disabled" disabled title="No 2FA">
-                                <TwoFALogo opacity={0.3} />
-                              </button>
-                            )}
-                            {debuggingIds.has(profile.id) ? (
-                              <button className="action-btn debug active" onClick={() => { setDebugProfile(profile); setCurrentPage('debug') }} title="View Debug Logs">
+                              )}
+                              {debuggingIds.has(profile.id) ? (
+                                <button className="action-btn debug active" onClick={() => { setDebugProfile(profile); setCurrentPage('debug') }} title="View Debug Logs">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M8 2l1.88 1.88M14.12 3.88L16 2M9 7.13v-1a3.003 3.003 0 116 0v1" />
+                                    <path d="M12 20c-3.3 0-6-2.7-6-6v-3a6 6 0 0112 0v3c0 3.3-2.7 6-6 6z" />
+                                    <path d="M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H3M6 17H3M21 5c0 2.1-1.6 3.8-3.53 4M18 13h3M18 17h3" />
+                                  </svg>
+                                </button>
+                              ) : isRunning ? (
+                                <button className="action-btn disabled" disabled title="Stop browser first to use debug mode">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.3">
+                                    <path d="M8 2l1.88 1.88M14.12 3.88L16 2M9 7.13v-1a3.003 3.003 0 116 0v1" />
+                                    <path d="M12 20c-3.3 0-6-2.7-6-6v-3a6 6 0 0112 0v3c0 3.3-2.7 6-6 6z" />
+                                    <path d="M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H3M6 17H3M21 5c0 2.1-1.6 3.8-3.53 4M18 13h3M18 17h3" />
+                                  </svg>
+                                </button>
+                              ) : (
+                                <button className="action-btn debug" onClick={() => handleDebugLaunch(profile)} title="Launch Debug Mode">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M8 2l1.88 1.88M14.12 3.88L16 2M9 7.13v-1a3.003 3.003 0 116 0v1" />
+                                    <path d="M12 20c-3.3 0-6-2.7-6-6v-3a6 6 0 0112 0v3c0 3.3-2.7 6-6 6z" />
+                                    <path d="M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H3M6 17H3M21 5c0 2.1-1.6 3.8-3.53 4M18 13h3M18 17h3" />
+                                  </svg>
+                                </button>
+                              )}
+                              <button className="action-btn" onClick={() => setEditingProfile(profile)} title="Edit">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <path d="M8 2l1.88 1.88M14.12 3.88L16 2M9 7.13v-1a3.003 3.003 0 116 0v1" />
-                                  <path d="M12 20c-3.3 0-6-2.7-6-6v-3a6 6 0 0112 0v3c0 3.3-2.7 6-6 6z" />
-                                  <path d="M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H3M6 17H3M21 5c0 2.1-1.6 3.8-3.53 4M18 13h3M18 17h3" />
+                                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
                                 </svg>
                               </button>
-                            ) : isRunning ? (
-                              <button className="action-btn disabled" disabled title="Stop browser first to use debug mode">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.3">
-                                  <path d="M8 2l1.88 1.88M14.12 3.88L16 2M9 7.13v-1a3.003 3.003 0 116 0v1" />
-                                  <path d="M12 20c-3.3 0-6-2.7-6-6v-3a6 6 0 0112 0v3c0 3.3-2.7 6-6 6z" />
-                                  <path d="M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H3M6 17H3M21 5c0 2.1-1.6 3.8-3.53 4M18 13h3M18 17h3" />
-                                </svg>
-                              </button>
-                            ) : (
-                              <button className="action-btn debug" onClick={() => handleDebugLaunch(profile)} title="Launch Debug Mode">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <path d="M8 2l1.88 1.88M14.12 3.88L16 2M9 7.13v-1a3.003 3.003 0 116 0v1" />
-                                  <path d="M12 20c-3.3 0-6-2.7-6-6v-3a6 6 0 0112 0v3c0 3.3-2.7 6-6 6z" />
-                                  <path d="M12 20v-9M6.53 9C4.6 8.8 3 7.1 3 5M6 13H3M6 17H3M21 5c0 2.1-1.6 3.8-3.53 4M18 13h3M18 17h3" />
-                                </svg>
-                              </button>
-                            )}
-                            <button className="action-btn" onClick={() => setEditingProfile(profile)} title="Edit">
-                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
-                              </svg>
-                            </button>
-                            {isDeleting ? (
-                              <button className="action-btn deleting" disabled title="Deleting...">
-                                <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-                                  <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                                </svg>
-                              </button>
-                            ) : (
-                              <button className="action-btn delete" onClick={() => handleDeleteClick(profile)} title="Delete">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <polyline points="3 6 5 6 21 6" />
-                                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                                </svg>
-                              </button>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    )
-                  })
+                              {isDeleting ? (
+                                <button className="action-btn deleting" disabled title="Deleting...">
+                                  <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                                    <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
+                                  </svg>
+                                </button>
+                              ) : (
+                                <button className="action-btn delete" onClick={() => handleDeleteClick(profile)} title="Delete">
+                                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <polyline points="3 6 5 6 21 6" />
+                                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                                  </svg>
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })
                 )}
               </tbody>
             </table>
@@ -1912,6 +1786,66 @@ function App() {
               <p>📖 Docs: <a href="https://docs.browserless.io" target="_blank" rel="noopener">docs.browserless.io</a></p>
             </div>
           </div>
+
+          <div className="settings-section">
+            <h3 className="settings-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                <path d="M12 4v16M4 12h16M5 5l14 14M19 5 5 19" strokeWidth="2" />
+              </svg>
+              App Update
+            </h3>
+
+            <div className="settings-field">
+              <label>Current update status</label>
+              <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                {appUpdateState.message}
+              </p>
+              {appUpdateState.lastCheckedAt ? (
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                  Last checked: {appUpdateState.lastCheckedAt}
+                </p>
+              ) : null}
+            </div>
+
+            {appUpdateState.availableVersion ? (
+              <div className="settings-field">
+                <label>Latest available</label>
+                <p style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
+                  {appUpdateState.availableVersion}
+                </p>
+                {appUpdateState.availableNotes ? (
+                  <p style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'pre-wrap', marginTop: 4 }}>
+                    {appUpdateState.availableNotes}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="settings-actions">
+              <button
+                className="btn-outline"
+                onClick={handleManualUpdateCheck}
+                disabled={appUpdateState.checking || appUpdateState.installing}
+              >
+                {appUpdateState.checking ? 'Checking...' : 'Check for Updates'}
+              </button>
+              {appUpdateState.availableVersion ? (
+                <button
+                  className="btn-primary"
+                  onClick={handleManualUpdateInstall}
+                  disabled={appUpdateState.checking || appUpdateState.installing}
+                >
+                  {appUpdateState.installing ? 'Installing...' : `Install v${appUpdateState.availableVersion}`}
+                </button>
+              ) : null}
+            </div>
+
+            {appUpdateState.error ? (
+              <div className="settings-info">
+                <p style={{ color: 'var(--red)' }}>{appUpdateState.error}</p>
+              </div>
+            ) : null}
+          </div>
         </div>
       )}
 
@@ -1962,37 +1896,6 @@ function App() {
               <button className="btn-danger" onClick={handleDeleteConfirm}>
                 Delete
               </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {totpProfile && (
-        <div className="modal-overlay" onClick={() => setTotpProfile(null)}>
-          <div className="modal totp-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>2FA Code</h3>
-              <button className="close-btn" onClick={() => setTotpProfile(null)}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M18 6L6 18M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <div className="modal-body totp-body">
-              <p className="totp-profile-name">{totpProfile.name}</p>
-              <div className="totp-code-container">
-                <span className="totp-code">{totpCode}</span>
-                <button className="totp-copy-btn" onClick={copyTOTP} title="Copy">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                  </svg>
-                </button>
-              </div>
-              <div className="totp-countdown">
-                <div className="totp-progress" style={{ width: `${(totpCountdown / 30) * 100}%` }}></div>
-              </div>
-              <p className="totp-timer">New code in {totpCountdown}s</p>
             </div>
           </div>
         </div>
@@ -2052,6 +1955,20 @@ function App() {
               </div>
 
               <div className="credential-field">
+                <label>2FA (Current Code)</label>
+                <div className="credential-value-row">
+                  <input type="text" value={credentialsTotpCode || ''} readOnly />
+                  <button className="copy-btn" onClick={() => { navigator.clipboard.writeText(credentialsTotpCode || ''); }} title="Copy TOTP code">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                    </svg>
+                  </button>
+                </div>
+                <p className="form-hint" style={{ marginTop: 6 }}>ใหม่ในอีก {credentialsTotpCountdown} วินาที</p>
+              </div>
+
+              <div className="credential-field">
                 <label>DATR</label>
                 <div className="credential-value-row">
                   <input type="text" value={credentialsProfile.datr || ''} readOnly />
@@ -2072,7 +1989,7 @@ function App() {
         <div className="modal-overlay" onClick={() => setTokenResult(null)}>
           <div className="modal token-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>{tokenResult.mode === 'post' ? 'Post Token' : 'Comment Token'}</h3>
+              <h3>Access Token</h3>
               <button className="close-btn" onClick={() => setTokenResult(null)}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M18 6L6 18M6 6l12 12" />
@@ -2083,7 +2000,7 @@ function App() {
               <p className="token-profile-name">{tokenResult.profileName}</p>
 
               <div className="token-field">
-                <label>{tokenResult.mode === 'post' ? 'Post Token' : 'Comment Token'}</label>
+                <label>ACCESS TOKEN</label>
                 <div className="token-value-row">
                   <textarea
                     value={tokenResult.token}
@@ -2110,7 +2027,7 @@ function App() {
                   onClick={() => {
                     const profile = profiles.find(p => p.id === tokenResult.profileId)
                     setTokenResult(null)
-                    if (profile) void handleFetchRoleToken(profile, tokenResult.mode)
+                    if (profile) void handleFetchToken(profile)
                   }}
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2125,113 +2042,11 @@ function App() {
         </div>
       )}
 
-      {/* Postcron Step-by-Step Modal */}
-      {postcronProgress && (
-        <div className="modal-overlay" onClick={() => { }}>
-          <div className="modal postcron-progress-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>🔗 Postcron Token — {postcronProgress.profileName}</h3>
-              <button className="close-btn" onClick={handlePostcronClose}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M18 6L6 18M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            <div className="modal-body">
-              <div className="postcron-steps">
-                {postcronProgress.steps.map((step, i) => (
-                  <div key={i} className={`postcron-step ${step.status}`}>
-                    <div className="step-indicator">
-                      {step.status === 'active' ? (
-                        <svg className="spinner-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                          <circle cx="12" cy="12" r="10" strokeOpacity="0.2" />
-                          <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
-                        </svg>
-                      ) : step.status === 'done' ? (
-                        <svg viewBox="0 0 24 24" fill="none" stroke="#10b981" strokeWidth="2.5">
-                          <path d="M20 6L9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      ) : step.status === 'error' ? (
-                        <svg viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2.5">
-                          <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
-                        </svg>
-                      ) : (
-                        <div className="step-dot" />
-                      )}
-                    </div>
-                    <span className="step-label">{step.label}</span>
-                  </div>
-                ))}
-              </div>
-
-              {/* Step result */}
-              {postcronProgress.stepResult && !postcronProgress.token && (
-                <div className="postcron-step-result">
-                  <p style={{ fontSize: '11px', opacity: 0.7, marginBottom: 4 }}>Result:</p>
-                  <pre className="error-detail" style={{ borderColor: postcronProgress.error ? '#ef4444' : '#10b981' }}>
-                    {postcronProgress.stepResult}
-                  </pre>
-                </div>
-              )}
 
 
 
 
-              {/* Error with retry */}
-              {postcronProgress.error && (
-                <div className="postcron-error">
-                  <p className="error-title">❌ Failed</p>
-                  <button className="btn-outline" onClick={handlePostcronClose} style={{ marginTop: 8 }}>Close & Reset</button>
-                </div>
-              )}
 
-              {/* Success */}
-              {postcronProgress.token && (
-                <div className="postcron-success">
-                  <p className="success-title">✅ Token saved to database!</p>
-                  <div className="token-preview">
-                    <code>{postcronProgress.token.slice(0, 40)}...</code>
-                    <button className="copy-btn" onClick={() => navigator.clipboard.writeText(postcronProgress.token || '')} title="Copy">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                      </svg>
-                    </button>
-                  </div>
-                  <button className="btn-primary" onClick={handlePostcronClose}>Done</button>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {postcronContextMenu && (
-        <div
-          className="postcron-context-menu"
-          style={{ left: postcronContextMenu.x, top: postcronContextMenu.y }}
-          onClick={(event) => event.stopPropagation()}
-          onContextMenu={(event) => event.preventDefault()}
-        >
-          {hasPostcronToken(postcronContextMenu.profile) ? (
-            <button
-              type="button"
-              className="postcron-context-item"
-              onClick={() => handlePostcronAction(postcronContextMenu.profile, 'reconnect')}
-            >
-              Reconnect
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="postcron-context-item"
-              onClick={() => handlePostcronAction(postcronContextMenu.profile, 'add')}
-            >
-              Add
-            </button>
-          )}
-        </div>
-      )}
 
 
     </div>

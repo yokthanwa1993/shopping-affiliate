@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 
 interface Profile {
   id: string
@@ -55,6 +55,17 @@ export function CreateProfileModal({ profile, onClose, onSave, existingProfiles 
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const totpInputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [onClose])
 
   const handleAvatarClick = () => {
     fileInputRef.current?.click()
@@ -137,7 +148,7 @@ export function CreateProfileModal({ profile, onClose, onSave, existingProfiles 
   const isSubmitDisabled = name.trim().length === 0 || isDuplicateName
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay">
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>{profile ? 'Edit Profile' : 'New Profile'}</h2>
         <form onSubmit={handleSubmit}>

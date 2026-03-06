@@ -131,7 +131,6 @@ interface FacebookPage {
   name: string
   image_url: string
   access_token?: string
-  comment_token?: string
   post_interval_minutes: number
   post_hours?: string  // slot: "2:22,9:49" or interval: "every:30"
   is_active: number
@@ -145,8 +144,7 @@ interface TaggedPageProfile {
   facebook_name?: string
   roles: Array<'post' | 'comment'>
   tags: string[]
-  post_token?: string
-  comment_token?: string
+  token?: string
 }
 
 type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
@@ -617,10 +615,10 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
   }
 
   return (
-      <div
-        className="relative aspect-[9/16] rounded-2xl overflow-hidden cursor-pointer bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200"
-        onClick={() => setExpanded(true)}
-      >
+    <div
+      className="relative aspect-[9/16] rounded-2xl overflow-hidden cursor-pointer bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200"
+      onClick={() => setExpanded(true)}
+    >
       <Thumb id={video.id} url={video.thumbnailUrl} fallback={video.publicUrl} />
       {getVideoShopeeLink(video as unknown as Record<string, unknown>) && (
         <div className="absolute bottom-2 left-2 bg-orange-500 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg border border-white/20">
@@ -924,12 +922,11 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [intervalMinutes, setIntervalMinutes] = useState<number>(() => parseInterval(page.post_hours, page.post_interval_minutes || 60))
   const [isActive, setIsActive] = useState(page.is_active === 1)
   const [accessToken, setAccessToken] = useState(page.access_token || '')
-  const [commentToken, setCommentToken] = useState(page.comment_token || '')
   const [saving, setSaving] = useState(false)
-  const [tokenInspector, setTokenInspector] = useState<'access' | 'comment' | null>(null)
-  const [editingToken, setEditingToken] = useState<'access' | 'comment' | null>(null)
+  const [tokenInspector, setTokenInspector] = useState<'access' | null>(null)
+  const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
-  const [editingTaggedProfile, setEditingTaggedProfile] = useState<{ mode: 'access' | 'comment'; profile: TaggedPageProfile } | null>(null)
+  const [editingTaggedProfile, setEditingTaggedProfile] = useState<{ mode: 'access'; profile: TaggedPageProfile } | null>(null)
   const [editingTaggedTokenValue, setEditingTaggedTokenValue] = useState('')
   const [savingTaggedToken, setSavingTaggedToken] = useState(false)
   const [taggedProfiles, setTaggedProfiles] = useState<TaggedPageProfile[]>([])
@@ -945,13 +942,11 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     return `${token.slice(0, 20)}...`
   }
 
-  const postTaggedProfiles = taggedProfiles.filter((profile) => profile.roles.includes('post'))
-  const commentTaggedProfiles = taggedProfiles.filter((profile) => profile.roles.includes('comment'))
-  const postProfilesWithToken = postTaggedProfiles.filter((profile) => String(profile.post_token || '').trim()).length
-  const commentProfilesWithToken = commentTaggedProfiles.filter((profile) => String(profile.comment_token || '').trim()).length
+  const allTaggedProfiles = taggedProfiles
+  const profilesWithToken = allTaggedProfiles.filter((profile) => String(profile.token || '').trim()).length
 
-  const inspectorProfiles = tokenInspector === 'access' ? postTaggedProfiles : commentTaggedProfiles
-  const inspectorProfilesWithToken = tokenInspector === 'access' ? postProfilesWithToken : commentProfilesWithToken
+  const inspectorProfiles = allTaggedProfiles
+  const inspectorProfilesWithToken = profilesWithToken
 
   useEffect(() => {
     let cancelled = false
@@ -966,7 +961,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           error?: string
         }
         if (!resp.ok) {
-          throw new Error(String(data?.error || 'โหลดโปรไฟล์ tag ไม่สำเร็จ'))
+          throw new Error(String(data?.error || 'โหลดโปรไฟล์ BrowserSaving ไม่สำเร็จ'))
         }
         if (cancelled) return
         setTaggedProfiles(Array.isArray(data?.profiles) ? data.profiles : [])
@@ -999,7 +994,6 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     setSaving(true)
     try {
       const accessTokenChanged = accessToken.trim() !== String(page.access_token || '').trim()
-      const commentTokenChanged = commentToken.trim() !== String(page.comment_token || '').trim()
       const normalizedInterval = normalizeInterval(intervalMinutes)
       const schedulePostHours = scheduleMode === 'interval'
         ? `every:${normalizedInterval}`
@@ -1012,7 +1006,6 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
           is_active: isActive,
           access_token: accessToken || undefined,
-          comment_token: commentToken
         })
       })
       if (resp.ok) {
@@ -1023,26 +1016,15 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : page.post_interval_minutes,
           is_active: isActive ? 1 : 0,
           access_token: accessToken,
-          comment_token: commentToken
         }
 
         setAccessToken(savedPage.access_token || '')
-        setCommentToken(savedPage.comment_token || '')
         setScheduleMode(detectScheduleMode(savedPage.post_hours))
         setIntervalMinutes(parseInterval(savedPage.post_hours, savedPage.post_interval_minutes || normalizedInterval))
         onSave(savedPage)
 
         if (accessTokenChanged && data?.resolved?.access_token === 'browsersaving_profile_id') {
           alert('Access Token: ดึงจาก BrowserSaving Profile ID และแปลงเป็น Page Token แล้ว')
-        }
-
-        if (commentTokenChanged && data?.resolved?.comment_token === 'browsersaving_profile_id') {
-          alert('Comment Token: ดึงจาก BrowserSaving Profile ID แล้ว และแปลงเป็น Page Token แล้ว')
-        } else if (commentTokenChanged && commentToken.trim() && data?.resolved?.comment_token === 'provided_as_is') {
-          const reason = data?.resolved_details?.comment_token
-            ? `\nเหตุผล: ${data.resolved_details.comment_token}`
-            : ''
-          alert(`ยังแปลงเป็น Page Token ไม่ได้ ระบบจึงบันทึก token เดิมไว้ก่อน${reason}`)
         }
 
         onBack()
@@ -1063,7 +1045,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         </button>
       </div>
       {/* Scrollable content area */}
-      <div className="flex-1 overflow-y-auto min-h-0">
+      <div className="flex-1 overflow-y-auto min-h-0 app-scroll">
 
         {/* Page Logo */}
         <div className="flex flex-col items-center mb-4">
@@ -1093,26 +1075,11 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
             className="w-full flex items-center justify-between p-4 active:bg-gray-50 transition-colors"
           >
             <div className="text-left">
-              <p className="text-sm font-bold text-gray-900">Access Token (โพสต์)</p>
+              <p className="text-sm font-bold text-gray-900">Access Token</p>
               <p className="text-xs text-gray-400 mt-0.5">
                 {taggedLoading
-                  ? 'กำลังโหลดจาก tag...'
-                  : `จาก tag: ${postProfilesWithToken}/${postTaggedProfiles.length} โปรไฟล์มี token`}
-              </p>
-            </div>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><path d="M9 18l6-6-6-6" strokeLinecap="round" strokeLinejoin="round" /></svg>
-          </button>
-          <div className="h-px bg-gray-100 mx-4" />
-          <button
-            onClick={() => setTokenInspector('comment')}
-            className="w-full flex items-center justify-between p-4 active:bg-gray-50 transition-colors"
-          >
-            <div className="text-left">
-              <p className="text-sm font-bold text-gray-900">Comment Token (คอมเม้นท์)</p>
-              <p className="text-xs text-gray-400 mt-0.5">
-                {taggedLoading
-                  ? 'กำลังโหลดจาก tag...'
-                  : `จาก tag: ${commentProfilesWithToken}/${commentTaggedProfiles.length} โปรไฟล์มี token`}
+                  ? 'กำลังโหลดจาก BrowserSaving...'
+                  : `จาก BrowserSaving: ${profilesWithToken}/${allTaggedProfiles.length} โปรไฟล์มี token`}
               </p>
             </div>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><path d="M9 18l6-6-6-6" strokeLinecap="round" strokeLinejoin="round" /></svg>
@@ -1125,7 +1092,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
             <div className="bg-white rounded-2xl w-full max-w-md max-h-[80vh] p-4 flex flex-col" onClick={(e) => e.stopPropagation()}>
               <div className="mb-3">
                 <h3 className="font-bold text-gray-900 text-base text-center">
-                  {tokenInspector === 'access' ? 'Post Token จาก Tag' : 'Comment Token จาก Tag'}
+                  Token จาก BrowserSaving
                 </h3>
                 <p className="text-xs text-gray-500 text-center mt-1">
                   {taggedLoading
@@ -1140,17 +1107,16 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 ) : taggedLoading ? (
                   <p className="text-xs text-gray-400">กำลังโหลดรายการโปรไฟล์...</p>
                 ) : inspectorProfiles.length === 0 ? (
-                  <p className="text-xs text-gray-400">ไม่พบโปรไฟล์ที่ติด tag สำหรับรายการนี้</p>
+                  <p className="text-xs text-gray-400">ไม่พบโปรไฟล์ BrowserSaving ที่แมตช์กับเพจนี้</p>
                 ) : (
                   inspectorProfiles.map((profile) => {
-                    const currentToken = tokenInspector === 'access' ? profile.post_token : profile.comment_token
+                    const currentToken = profile.token
                     return (
                       <button
-                        key={`${tokenInspector}-${profile.profile_id}`}
+                        key={`access-${profile.profile_id}`}
                         type="button"
                         onClick={() => {
-                          const mode = tokenInspector === 'comment' ? 'comment' : 'access'
-                          setEditingTaggedProfile({ mode, profile })
+                          setEditingTaggedProfile({ mode: 'access', profile })
                           setEditingTaggedTokenValue(String(currentToken || '').trim())
                         }}
                         className="w-full rounded-xl border border-gray-100 bg-gray-50/60 p-3 text-left active:scale-[0.99] transition-all"
@@ -1173,10 +1139,9 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
               <div className="flex gap-2 mt-3">
                 <button
                   onClick={() => {
-                    const mode = tokenInspector
                     setTokenInspector(null)
-                    setEditingToken(mode)
-                    setEditingTokenValue(mode === 'access' ? accessToken : commentToken)
+                    setEditingToken('access')
+                    setEditingTokenValue(accessToken)
                   }}
                   className="flex-1 py-2.5 rounded-xl font-bold text-sm border border-blue-200 text-blue-600 active:scale-95 transition-all"
                 >
@@ -1201,7 +1166,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           >
             <div className="bg-white rounded-2xl w-full max-w-md p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
               <h3 className="font-bold text-gray-900 text-base text-center">
-                {editingTaggedProfile.mode === 'access' ? 'แก้ไข Post Token (Tag)' : 'แก้ไข Comment Token (Tag)'}
+                แก้ไข Token (โปรไฟล์)
               </h3>
               <p className="text-xs text-gray-500 text-center -mt-2">
                 {editingTaggedProfile.profile.profile_name || editingTaggedProfile.profile.profile_id}
@@ -1209,11 +1174,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
               <textarea
                 value={editingTaggedTokenValue}
                 onChange={(e) => { setEditingTaggedTokenValue(e.target.value); e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px' }}
-                placeholder={
-                  editingTaggedProfile.mode === 'access'
-                    ? 'วาง Post Token หรือเว้นว่างเพื่อล้าง...'
-                    : 'วาง Comment Token หรือเว้นว่างเพื่อล้าง...'
-                }
+                placeholder={'วาง Token (โพสต์/คอมเมนต์) หรือเว้นว่างเพื่อล้าง...'}
                 rows={2}
                 className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all resize-none overflow-hidden"
               />
@@ -1227,7 +1188,6 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 </button>
                 <button
                   onClick={async () => {
-                    const mode = editingTaggedProfile.mode === 'access' ? 'post' : 'comment'
                     const profileId = editingTaggedProfile.profile.profile_id
                     const nextToken = editingTaggedTokenValue.trim()
                     setSavingTaggedToken(true)
@@ -1235,7 +1195,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                       const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}/token`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mode, token: nextToken }),
+                        body: JSON.stringify({ token: nextToken }),
                       })
                       const data = await resp.json().catch(() => ({})) as { error?: string; token?: string }
                       if (!resp.ok) {
@@ -1245,9 +1205,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                       const savedToken = String(data?.token ?? nextToken).trim()
                       setTaggedProfiles((prev) => prev.map((item) => {
                         if (item.profile_id !== profileId) return item
-                        return mode === 'post'
-                          ? { ...item, post_token: savedToken }
-                          : { ...item, comment_token: savedToken }
+                        return { ...item, token: savedToken }
                       }))
                       try {
                         const pageResp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}`)
@@ -1282,16 +1240,14 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center px-6" onClick={() => setEditingToken(null)}>
             <div className="bg-white rounded-2xl w-full max-w-md p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
               <h3 className="font-bold text-gray-900 text-base text-center">
-                {editingToken === 'access' ? 'Access Token (โพสต์)' : 'Comment Token (คอมเม้นท์)'}
+                Access Token (โพสต์)
               </h3>
               <textarea
                 ref={(el) => { if (el) { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' } }}
                 value={editingTokenValue}
                 onChange={(e) => { setEditingTokenValue(e.target.value); e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px' }}
                 placeholder={
-                  editingToken === 'access'
-                    ? 'วาง Page/User Token หรือ BrowserSaving Profile ID (UUID) ที่นี่...'
-                    : 'วาง Comment Token (User/Page) หรือ BrowserSaving Profile ID (UUID) ที่นี่...'
+                  'วาง Page/User Token หรือ BrowserSaving Profile ID (UUID) ที่นี่...'
                 }
                 rows={2}
                 className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all resize-none overflow-hidden"
@@ -1305,8 +1261,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 </button>
                 <button
                   onClick={() => {
-                    if (editingToken === 'access') setAccessToken(editingTokenValue)
-                    else setCommentToken(editingTokenValue)
+                    setAccessToken(editingTokenValue)
                     setEditingToken(null)
                   }}
                   className="flex-1 py-3 rounded-xl font-bold text-sm bg-blue-600 text-white active:scale-95 transition-all"
@@ -1573,7 +1528,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
 
         {error && (
           <div className="flex items-center justify-center gap-1.5">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>
             <p className="text-sm text-red-500 font-medium">{error}</p>
           </div>
         )}
@@ -1586,7 +1541,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
         >
           {loading ? (
             <span className="flex items-center justify-center gap-2">
-              <svg className="animate-spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round"/></svg>
+              <svg className="animate-spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round" /></svg>
               กำลังเข้าสู่ระบบ...
             </span>
           ) : 'เข้าสู่ระบบ'}
@@ -1612,9 +1567,8 @@ function SettingsMenuItem({
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-center gap-3 rounded-2xl border px-4 py-3 text-left active:scale-[0.99] transition-transform ${
-        danger ? 'border-red-100 bg-red-50/70' : 'border-gray-200 bg-white'
-      }`}
+      className={`w-full flex items-center gap-3 rounded-2xl border px-4 py-3 text-left active:scale-[0.99] transition-transform ${danger ? 'border-red-100 bg-red-50/70' : 'border-gray-200 bg-white'
+        }`}
     >
       <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-lg ${danger ? 'bg-red-100' : 'bg-gray-100'}`}>
         {icon}
@@ -2359,7 +2313,10 @@ function App() {
       : 'not_configured'
   }
 
-  const getPostStatusMeta = (status: string) => {
+  const getPostStatusMeta = (status: string, commentStatus?: string | null) => {
+    if (status === 'success' && normalizeCommentStatus(commentStatus) === 'failed') {
+      return { label: 'คอมเม้นต์ไม่ผ่าน', cls: 'bg-red-50 text-red-600' }
+    }
     if (status === 'success') return { label: 'สำเร็จ', cls: 'bg-green-50 text-green-600' }
     if (status === 'posting') return { label: 'กำลังโพสต์', cls: 'bg-yellow-50 text-yellow-600' }
     return { label: 'ผิดพลาด', cls: 'bg-red-50 text-red-600' }
@@ -2386,7 +2343,7 @@ function App() {
       'permission',
       'access denied',
       'session',
-      'comment_token_missing',
+      'access_token_missing',
       'code":190',
       'error_subcode',
     ].some((keyword) => msg.includes(keyword))
@@ -2436,8 +2393,11 @@ function App() {
   // If viewing a specific page detail
   if (selectedPage) {
     return (
-      <div className="h-screen bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden fixed inset-0">
-        <div className="flex-1 pt-[52px] pb-6 flex flex-col overflow-hidden">
+      <div
+        style={{ height: 'var(--tg-viewport-stable-height, 100dvh)', minHeight: 'var(--tg-viewport-stable-height, 100dvh)' }}
+        className="bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden fixed inset-0"
+      >
+        <div style={{ paddingTop: 'calc(env(safe-area-inset-top, 0px) + 52px)' }} className="flex-1 pb-6 flex flex-col overflow-hidden">
           <PageDetail
             page={selectedPage}
             onBack={() => setSelectedPage(null)}
@@ -2451,7 +2411,10 @@ function App() {
   // ========== AUTH GATE ==========
   if (authBootstrapping && !token) {
     return (
-      <div className="h-screen bg-white flex items-center justify-center font-['Sukhumvit_Set','Kanit',sans-serif]">
+      <div
+        style={{ height: 'var(--tg-viewport-stable-height, 100dvh)', minHeight: 'var(--tg-viewport-stable-height, 100dvh)' }}
+        className="bg-white flex items-center justify-center font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden"
+      >
         <div className="flex flex-col items-center gap-3 text-gray-500">
           <div className="w-7 h-7 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
           <p className="text-sm font-medium">กำลังตรวจสอบการเข้าสู่ระบบ...</p>
@@ -2496,12 +2459,23 @@ function App() {
     galleryUnusedVideos.length > 0 ||
     galleryUsedVideos.length > 0
   )
-  const galleryTopPaddingClass = showGalleryFilterBar ? 'pt-[164px]' : 'pt-[104px]'
+  const galleryHeaderOffset = showGalleryFilterBar ? 164 : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
   const galleryVisibleVideos = galleryAvailableVideos
+  const appViewportStyle = {
+    height: 'var(--tg-viewport-stable-height, 100dvh)',
+    minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
+  } as const
+  const headerTopPaddingStyle = {
+    paddingTop: 'calc(env(safe-area-inset-top, 0px) + 52px)',
+  } as const
+  const mainContentPaddingStyle = {
+    paddingTop: `calc(env(safe-area-inset-top, 0px) + ${galleryHeaderOffset}px)`,
+    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 6rem)',
+  } as const
 
   return (
-    <div className="h-screen bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif]">
+    <div style={appViewportStyle} className="bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden">
       {/* Add Page Popup */}
       {showAddPagePopup && (
         <AddPagePopup
@@ -2511,7 +2485,7 @@ function App() {
       )}
 
       {/* Top Nav — fixed */}
-      <div className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-30 pt-[52px] px-5">
+      <div style={headerTopPaddingStyle} className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5">
         <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
           {tab === 'dashboard' ? 'Dashboard' : tab === 'processing' ? 'Processing' : tab === 'gallery' ? 'Gallery' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
         </h1>
@@ -2540,7 +2514,7 @@ function App() {
       </div>
 
       {/* Main Content */}
-      <div className={`flex-1 ${galleryTopPaddingClass} pb-24 [&::-webkit-scrollbar]:hidden overflow-y-auto`}>
+      <div style={mainContentPaddingStyle} className="flex-1 [&::-webkit-scrollbar]:hidden overflow-y-auto app-scroll">
 
         {tab === 'dashboard' && (
           <div className="px-4 space-y-4">
@@ -2818,7 +2792,7 @@ function App() {
                       if (item.fb_post_id) return `https://www.facebook.com/watch/?v=${item.fb_post_id}`
                       return ''
                     })()
-                    const postMeta = getPostStatusMeta(item.status)
+                    const postMeta = getPostStatusMeta(item.status, item.comment_status)
                     const commentMeta = getCommentStatusMeta(item.comment_status)
                     const isExpanded = expandedLogId === item.id
                     const showCommentError = item.comment_error && item.comment_error.trim().length > 0

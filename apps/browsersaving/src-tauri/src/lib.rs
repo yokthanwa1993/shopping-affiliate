@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
 const MOBILE_SIMULATOR_EXT_URL: &str = "https://chromewebstore.google.com/detail/mobile-simulator-responsi/ckejmhbmlajgoklhgbapkiccekfoccmk";
-const MOBILE_PROFILE_TAG: &str = "mobile";
 const DEFAULT_ANDROID_SDK_DIR: &str = "Library/Android/sdk";
 const ANDROID_AVD_ENV_KEY: &str = "BROWSERSAVING_ANDROID_AVD";
 const ANDROID_PROFILE_META_FILE: &str = "android-profile-meta.json";
@@ -45,18 +44,18 @@ pub struct Profile {
     pub updated_at: Option<String>,
 }
 
-fn is_mobile_profile(profile: &Profile) -> bool {
-    profile.tags.as_ref().is_some_and(|tags| {
-        tags.iter()
-            .any(|tag| tag.eq_ignore_ascii_case(MOBILE_PROFILE_TAG))
-    })
-}
-
 fn get_mobile_simulator_extension_dir() -> Option<PathBuf> {
     if let Ok(custom_path) = std::env::var("MOBILE_SIMULATOR_EXTENSION_DIR") {
         let path = PathBuf::from(custom_path.trim());
         if path.join("manifest.json").exists() {
             return Some(path);
+        }
+    }
+
+    let project_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("extension/Mobile simulator - responsive testing tool"));
+    if let Some(ref ext_path) = project_path {
+        if ext_path.join("manifest.json").exists() {
+            return Some(ext_path.clone());
         }
     }
 
@@ -93,29 +92,197 @@ fn get_mobile_simulator_extension_dir() -> Option<PathBuf> {
         return Some(cache_path);
     }
 
-    None
-}
-
-fn startup_extension_arg(profile: &Profile) -> String {
-    let mut extension_paths: Vec<String> = vec![get_stealth_extension_dir().display().to_string()];
-
-    if is_mobile_profile(profile) {
-        if let Some(path) = get_mobile_simulator_extension_dir() {
-            extension_paths.push(path.display().to_string());
+    if let Some(download_dir) = dirs::download_dir() {
+        if let Some(path) = find_mobile_simulator_extension_in_dir(&download_dir, true) {
+            return Some(path);
         }
     }
 
-    format!("--load-extension={}", extension_paths.join(","))
+    if let Some(home_dir) = dirs::home_dir() {
+        let downloads_like = home_dir.join("Downloads");
+        if let Some(path) = find_mobile_simulator_extension_in_dir(&downloads_like, false) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn looks_like_mobile_simulator_extension_dir(path: &Path) -> bool {
+    let manifest_path = path.join("manifest.json");
+    let background_path = path.join("js/background.js");
+
+    if !manifest_path.is_file() || !background_path.is_file() {
+        return false;
+    }
+
+    let manifest = match fs::read_to_string(&manifest_path) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+
+    let has_localized_name = manifest.contains("__MSG_extName__");
+    let has_worker = manifest.contains("\"service_worker\": \"js/background.js\"");
+
+    has_localized_name && (has_worker || manifest.contains("\"background\""))
+}
+
+fn find_mobile_simulator_extension_in_dir(root: &Path, scan_nested: bool) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    let mut generic_match: Option<PathBuf> = None;
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        if looks_like_mobile_simulator_extension_dir(&path) {
+            if is_extension_folder_name_like_mobile_simulator(&path) {
+                return Some(path);
+            }
+            if generic_match.is_none() {
+                generic_match = Some(path.clone());
+            }
+        }
+
+        if scan_nested {
+            let Ok(nested) = fs::read_dir(&path) else {
+                continue;
+            };
+            for child in nested.filter_map(Result::ok) {
+                let child_path = child.path();
+                if !child_path.is_dir() {
+                    continue;
+                }
+                if looks_like_mobile_simulator_extension_dir(&child_path)
+                    && is_extension_folder_name_like_mobile_simulator(&child_path)
+                {
+                    return Some(child_path);
+                }
+            }
+        }
+    }
+
+    generic_match
+}
+
+fn is_extension_folder_name_like_mobile_simulator(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_lowercase();
+    lower.contains("mobile")
+        || lower.contains("simulator")
+        || lower.contains("web")
+        || lower.contains("chrome")
+        || lower.contains("webstore")
+        || lower.contains("มือถือ")
+        || lower.contains("โทรศัพท์")
+        || lower.contains("เว็บ")
+        || lower.contains("จำลอง")
+}
+
+fn startup_extension_args() -> Vec<String> {
+    let mut extension_paths: Vec<String> = vec![get_stealth_extension_dir().display().to_string()];
+
+    if let Some(path) = get_mobile_simulator_extension_dir() {
+        extension_paths.push(path.display().to_string());
+    }
+
+    let joined = extension_paths.join(",");
+    vec![
+        format!("--load-extension={}", joined),
+        format!("--disable-extensions-except={}", joined),
+    ]
+}
+
+/// Compute the Chrome extension ID from an unpacked extension's absolute path.
+/// Chrome uses SHA-256 of the path, takes the first 32 hex characters,
+/// and maps each hex digit (0-f) to a letter (a-p).
+fn compute_chrome_extension_id(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    let hex = format!("{:x}", hash);
+    hex.chars()
+        .take(32)
+        .map(|c| {
+            let digit = c.to_digit(16).unwrap_or(0) as u8;
+            (b'a' + digit) as char
+        })
+        .collect()
+}
+
+/// Write pinned extension IDs into the Chrome profile Preferences file
+/// so their icons appear on the toolbar instead of being hidden behind the puzzle piece.
+fn pin_extensions_in_preferences(profile_cache_dir: &Path) {
+    let default_dir = profile_cache_dir.join("Default");
+    let _ = fs::create_dir_all(&default_dir);
+    let prefs_path = default_dir.join("Preferences");
+
+    // Collect extension IDs to pin
+    let mut pin_ids: Vec<String> = Vec::new();
+
+    if let Some(mobile_path) = get_mobile_simulator_extension_dir() {
+        pin_ids.push(compute_chrome_extension_id(&mobile_path));
+    }
+
+    if pin_ids.is_empty() {
+        return;
+    }
+
+    // Read existing preferences or create new
+    let mut prefs: serde_json::Value = if prefs_path.exists() {
+        match fs::read_to_string(&prefs_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or(serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // Set extensions.pinned_extensions
+    let extensions = prefs
+        .as_object_mut()
+        .unwrap()
+        .entry("extensions")
+        .or_insert(serde_json::json!({}));
+    let ext_obj = extensions.as_object_mut().unwrap();
+
+    let pin_json: Vec<serde_json::Value> = pin_ids
+        .iter()
+        .map(|id| serde_json::Value::String(id.clone()))
+        .collect();
+    ext_obj.insert(
+        "pinned_extensions".to_string(),
+        serde_json::Value::Array(pin_json.clone()),
+    );
+
+    // Also set toolbar order so Chrome respects the pin
+    ext_obj.insert(
+        "toolbar".to_string(),
+        serde_json::Value::Array(pin_json),
+    );
+
+    // Write back
+    if let Ok(json_str) = serde_json::to_string_pretty(&prefs) {
+        let _ = fs::write(&prefs_path, json_str);
+        log::info!(
+            "Pinned extensions {:?} in {}",
+            pin_ids,
+            prefs_path.display()
+        );
+    }
 }
 
 fn startup_urls(profile: &Profile) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
 
-    if is_mobile_profile(profile) {
-        urls.push("chrome://extensions/".to_string());
-    }
+    urls.push("chrome://extensions/".to_string());
 
-    if is_mobile_profile(profile) && get_mobile_simulator_extension_dir().is_none() {
+    if get_mobile_simulator_extension_dir().is_none() {
         urls.push(MOBILE_SIMULATOR_EXT_URL.to_string());
     }
 
@@ -1766,9 +1933,11 @@ fn get_profile_wrapper_exec(profile: &Profile, chrome_path: &Path) -> Option<Pat
             return None;
         }
 
-        if let Err(e) =
-            write_profile_wrapper_plist(&contents_dir.join("Info.plist"), &profile.name, &profile.id)
-        {
+        if let Err(e) = write_profile_wrapper_plist(
+            &contents_dir.join("Info.plist"),
+            &profile.name,
+            &profile.id,
+        ) {
             log::warn!("Create wrapper Info.plist failed: {}", e);
             let _ = fs::remove_dir_all(&wrapper_app_path);
             return None;
@@ -2054,6 +2223,41 @@ async fn upload_browser_data(profile_id: String) -> Result<bool, String> {
             Err(format!("Upload error: {}", e))
         }
     }
+}
+
+async fn upload_browser_data_with_retry(profile_id: &str) -> Result<bool, String> {
+    let mut last_err: Option<String> = None;
+
+    for attempt in 1..=3 {
+        match upload_browser_data(profile_id.to_string()).await {
+            Ok(result) => {
+                if attempt > 1 {
+                    log::info!(
+                        "Upload succeeded for {} after {} attempt(s)",
+                        profile_id,
+                        attempt
+                    );
+                }
+                return Ok(result);
+            }
+            Err(e) => {
+                last_err = Some(e.clone());
+                log::warn!(
+                    "Upload attempt {} failed for {}: {}",
+                    attempt,
+                    profile_id,
+                    e
+                );
+
+                if attempt < 3 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(600 * attempt as u64))
+                        .await;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "Upload failed".to_string()))
 }
 
 // Export cookies from running browser via CDP
@@ -3167,8 +3371,8 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
 
     let cache_dir = get_cache_dir().join(&profile_id);
     let chrome_path = get_chrome_path();
-    let launch_path = get_profile_wrapper_exec(&profile, &chrome_path)
-        .unwrap_or_else(|| chrome_path.clone());
+    let launch_path =
+        get_profile_wrapper_exec(&profile, &chrome_path).unwrap_or_else(|| chrome_path.clone());
 
     // Clear session files to prevent tab restore
     let default_profile = cache_dir.join("Default");
@@ -3210,7 +3414,7 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
         "--disable-background-networking".to_string(),
         "--disable-client-side-phishing-detection".to_string(),
         "--disable-default-apps".to_string(),
-        "--disable-extensions-except".to_string(),
+        // --disable-extensions-except is now handled by startup_extension_args()
 
         // Performance/stability
         "--disable-dev-shm-usage".to_string(),
@@ -3268,7 +3472,10 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
     for startup_url in startup_urls(&profile).into_iter() {
         args.push(startup_url);
     }
-    args.push(startup_extension_arg(&profile));
+    args.extend(startup_extension_args());
+
+    // Pin extensions to toolbar before launching
+    pin_extensions_in_preferences(&cache_dir);
 
     // Launch Chrome directly with stealth flags
     log::info!("Launching Chrome for profile: {}", profile.name);
@@ -3355,7 +3562,7 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
                         log::info!("Uploading data for: {}", profile_id_clone);
 
                         // Upload data
-                        if let Err(e) = upload_browser_data(profile_id_clone.clone()).await {
+                        if let Err(e) = upload_browser_data_with_retry(&profile_id_clone).await {
                             log::error!("Failed to upload: {}", e);
                         }
 
@@ -3448,8 +3655,8 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
 
     let cache_dir = get_cache_dir().join(&profile_id);
     let chrome_path = get_chrome_path();
-    let launch_path = get_profile_wrapper_exec(&profile, &chrome_path)
-        .unwrap_or_else(|| chrome_path.clone());
+    let launch_path =
+        get_profile_wrapper_exec(&profile, &chrome_path).unwrap_or_else(|| chrome_path.clone());
 
     // Clear session files
     let default_profile = cache_dir.join("Default");
@@ -3484,7 +3691,7 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
         "--disable-background-networking".to_string(),
         "--disable-client-side-phishing-detection".to_string(),
         "--disable-default-apps".to_string(),
-        "--disable-extensions-except".to_string(),
+        // --disable-extensions-except is now handled by startup_extension_args()
         "--disable-dev-shm-usage".to_string(),
         "--disable-hang-monitor".to_string(),
         "--disable-ipc-flooding-protection".to_string(),
@@ -3516,7 +3723,10 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
     for startup_url in startup_urls(&profile).into_iter() {
         args.push(startup_url);
     }
-    args.push(startup_extension_arg(&profile));
+    args.extend(startup_extension_args());
+
+    // Pin extensions to toolbar before launching
+    pin_extensions_in_preferences(&cache_dir);
 
     log::info!("Launching Chrome in DEBUG mode on port {}", debug_port);
 
@@ -3577,7 +3787,7 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
                     };
 
                     if should_upload {
-                        if let Err(e) = upload_browser_data(profile_id_clone.clone()).await {
+                        if let Err(e) = upload_browser_data_with_retry(&profile_id_clone).await {
                             log::error!("Failed to upload: {}", e);
                         }
 
@@ -3831,9 +4041,11 @@ async fn stop_browser(profile_id: String, state: State<'_, AppState>) -> Result<
     };
     if let Some(port) = maybe_port {
         log::info!("Exporting cookies via CDP from port {}...", port);
-        match export_cookies_via_cdp(port, &profile_id).await {
-            Ok(count) => log::info!("Exported {} cookies for: {}", count, profile_id),
-            Err(e) => log::warn!("Cookie export failed: {}", e),
+        if !export_cookies_with_retry(port, &profile_id).await {
+            log::warn!(
+                "Cookie export skipped: no successful CDP export for {}",
+                profile_id
+            );
         }
     } else {
         log::warn!("No debug port for cookie export: {}", profile_id);
@@ -3878,9 +4090,9 @@ async fn stop_browser(profile_id: String, state: State<'_, AppState>) -> Result<
     // 5. Wait a bit more for file handles to be released
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // 6. Upload browser data
+    // 6. Upload browser data (with retry)
     log::info!("Uploading browser data for: {}", profile_id);
-    let upload_result = upload_browser_data(profile_id.clone()).await;
+    let upload_result = upload_browser_data_with_retry(profile_id.as_str()).await;
 
     // 7. Remove from uploading
     {
@@ -4353,8 +4565,8 @@ async fn launch_browser_internal(
 
     let cache_dir = get_cache_dir().join(&profile_id);
     let chrome_path = get_chrome_path();
-    let launch_path = get_profile_wrapper_exec(&profile, &chrome_path)
-        .unwrap_or_else(|| chrome_path.clone());
+    let launch_path =
+        get_profile_wrapper_exec(&profile, &chrome_path).unwrap_or_else(|| chrome_path.clone());
 
     // Clear session files
     let default_profile = cache_dir.join("Default");
@@ -4386,7 +4598,7 @@ async fn launch_browser_internal(
         "--disable-background-networking".to_string(),
         "--disable-client-side-phishing-detection".to_string(),
         "--disable-default-apps".to_string(),
-        "--disable-extensions-except".to_string(),
+        // --disable-extensions-except is now handled by startup_extension_args()
         "--disable-dev-shm-usage".to_string(),
         "--disable-hang-monitor".to_string(),
         "--disable-ipc-flooding-protection".to_string(),
@@ -4418,7 +4630,10 @@ async fn launch_browser_internal(
     for startup_url in startup_urls(&profile).into_iter() {
         args.push(startup_url);
     }
-    args.push(startup_extension_arg(&profile));
+    args.extend(startup_extension_args());
+
+    // Pin extensions to toolbar before launching
+    pin_extensions_in_preferences(&cache_dir);
 
     let child = spawn_chrome_process(&launch_path, &chrome_path, &args)?;
 
@@ -4462,7 +4677,7 @@ async fn launch_browser_internal(
                     };
 
                     if should_upload {
-                        if let Err(e) = upload_browser_data(profile_id_clone.clone()).await {
+                        if let Err(e) = upload_browser_data_with_retry(&profile_id_clone).await {
                             log::error!("Failed to upload: {}", e);
                         }
 
@@ -4506,6 +4721,26 @@ async fn stop_browser_internal(
         running.remove(&profile_id);
     }
 
+    let maybe_port = {
+        let debug_ports = state.state.debug_ports.lock().unwrap();
+        debug_ports.get(&profile_id).copied()
+    };
+    if let Some(port) = maybe_port {
+        log::info!("Exporting cookies via CDP from port {}...", port);
+        if !export_cookies_with_retry(port, &profile_id).await {
+            log::warn!(
+                "Cookie export skipped: no successful CDP export for {}",
+                profile_id
+            );
+        }
+    } else {
+        log::warn!("No debug port for cookie export: {}", profile_id);
+    }
+    {
+        let mut debug_ports = state.state.debug_ports.lock().unwrap();
+        debug_ports.remove(&profile_id);
+    }
+
     let _ = Command::new("pkill")
         .args(["-TERM", "-f", &format!("user-data-dir=.*{}", profile_id)])
         .output();
@@ -4532,7 +4767,7 @@ async fn stop_browser_internal(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let upload_result = upload_browser_data(profile_id.clone()).await;
+    let upload_result = upload_browser_data_with_retry(profile_id.as_str()).await;
 
     {
         let mut uploading = state.state.uploading_profiles.lock().unwrap();
@@ -4547,6 +4782,48 @@ async fn stop_browser_internal(
     }
 }
 
+async fn export_cookies_with_retry(port: u16, profile_id: &str) -> bool {
+    for attempt in 1..=3 {
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            export_cookies_via_cdp(port, profile_id),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_count)) => {
+                log::info!(
+                    "Cookie export success for {} on attempt {}",
+                    profile_id,
+                    attempt
+                );
+                return true;
+            }
+            Ok(Err(e)) => {
+                log::warn!(
+                    "Cookie export attempt {} failed for {}: {}",
+                    attempt,
+                    profile_id,
+                    e
+                );
+            }
+            Err(_) => {
+                log::warn!(
+                    "Cookie export attempt {} timed out for {}",
+                    attempt,
+                    profile_id
+                );
+            }
+        }
+
+        if attempt < 3 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+        }
+    }
+
+    false
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4554,6 +4831,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)

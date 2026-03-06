@@ -7,7 +7,6 @@ CREATE TABLE IF NOT EXISTS pages (
     name TEXT NOT NULL,
     image_url TEXT,
     access_token TEXT NOT NULL,
-    comment_token TEXT,
     post_interval_minutes INTEGER DEFAULT 60,
     bot_id TEXT DEFAULT 'default',
     post_hours TEXT DEFAULT '',

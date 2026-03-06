@@ -8,6 +8,13 @@ type Bindings = {
     DB: D1Database;
     BUCKET: R2Bucket;
     ENVIRONMENT: string;
+    BROWSERSAVING_UPDATE_VERSION?: string;
+    BROWSERSAVING_UPDATE_NOTES?: string;
+    BROWSERSAVING_UPDATE_NOTES_PUBLISHED?: string;
+    BROWSERSAVING_UPDATE_DMG_URL?: string;
+    BROWSERSAVING_UPDATE_DMG_URL_X64?: string;
+    BROWSERSAVING_UPDATE_DMG_SIGNATURE?: string;
+    BROWSERSAVING_UPDATE_DMG_SIGNATURE_X64?: string;
     TOKEN_FACEBOOK_LITE_SERVICE?: Fetcher;
     VIDEO_AFFILIATE_TAG_SYNC_URL?: string;
     VIDEO_AFFILIATE_EMAIL_RESOLVE_URL?: string;
@@ -34,8 +41,7 @@ interface Profile {
     username: string | null;
     password: string | null;
     datr: string | null;
-    postcron_token: string | null;
-    comment_token: string | null;
+    access_token: string | null;
     facebook_token: string | null;
     shopee_cookies: string | null;
     page_name: string | null;
@@ -70,21 +76,10 @@ function isPostRoleToken(token: string): boolean {
     return !!t;
 }
 
-function validateRoleTokenInput(raw: unknown, mode: 'post' | 'comment', fieldName: string): { ok: true; token: string | null } | { ok: false; error: string } {
+function validateRoleTokenInput(raw: unknown, _mode: 'post' | 'comment', fieldName: string): { ok: true; token: string | null } | { ok: false; error: string } {
     if (raw === undefined || raw === null) return { ok: true, token: null };
     const token = normalizeToken(raw);
     if (!token) return { ok: true, token: null };
-
-    if (mode === 'comment') {
-        if (!isCommentRoleToken(token)) {
-            return { ok: false, error: `${fieldName} must not be empty` };
-        }
-        return { ok: true, token };
-    }
-
-    if (!isPostRoleToken(token)) {
-        return { ok: false, error: `${fieldName} must not be empty` };
-    }
     return { ok: true, token };
 }
 
@@ -152,75 +147,6 @@ function hasVideoAffiliateRoleTag(tags: string[]): boolean {
     return normalized.includes('post') || normalized.includes('comment');
 }
 
-function getRoleTagState(rawTags: unknown): {
-    tags: string[];
-    hasPost: boolean;
-    hasComment: boolean;
-    hasConflict: boolean;
-} {
-    const tags = normalizeTagList(rawTags);
-    const hasPost = tags.includes('post');
-    const hasComment = tags.includes('comment');
-    return {
-        tags,
-        hasPost,
-        hasComment,
-        hasConflict: hasPost && hasComment,
-    };
-}
-
-function enforceRoleTokenByTags(
-    tags: string[],
-    postToken: string | null,
-    commentToken: string | null,
-): { postToken: string | null; commentToken: string | null } {
-    const roleState = getRoleTagState(tags);
-    if (roleState.hasPost && !roleState.hasComment) {
-        return { postToken, commentToken: null };
-    }
-    if (roleState.hasComment && !roleState.hasPost) {
-        return { postToken: null, commentToken };
-    }
-    return { postToken, commentToken };
-}
-
-async function triggerVideoAffiliateTagSync(
-    c: any,
-    options: { forceFullSync?: boolean; email?: string } = {},
-) {
-    const endpoint = String(c.env.VIDEO_AFFILIATE_TAG_SYNC_URL || DEFAULT_VIDEO_AFFILIATE_TAG_SYNC_URL).trim();
-    if (!endpoint) return { ok: false as const, skipped: 'missing_endpoint' };
-
-    const headers: Record<string, string> = {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-    };
-    const secret = String(c.env.VIDEO_AFFILIATE_TAG_SYNC_SECRET || '').trim();
-    if (secret) headers['x-tag-sync-secret'] = secret;
-
-    const payload: Record<string, unknown> = {};
-    const email = normalizeEmail(options.email || '');
-    if (email) {
-        payload.email = email;
-    } else {
-        const namespaceId = String(c.env.VIDEO_AFFILIATE_NAMESPACE_ID || '').trim();
-        if (namespaceId) payload.namespace_id = namespaceId;
-    }
-    if (options.forceFullSync === true) payload.force_full_sync = true;
-
-    const resp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-    });
-    const data = await resp.json().catch(() => ({} as any));
-    if (!resp.ok) {
-        const details = String(data?.error || data?.details || `HTTP ${resp.status}`);
-        throw new Error(`video_affiliate_tag_sync_failed: ${details}`);
-    }
-    return { ok: true as const, data };
-}
-
 type FacebookAccountItem = {
     id?: string;
     name?: string;
@@ -231,20 +157,35 @@ type FacebookAccountItem = {
 function pickTargetFacebookPage(accounts: FacebookAccountItem[], profile: Partial<Profile>): FacebookAccountItem | null {
     if (!Array.isArray(accounts) || accounts.length === 0) return null;
 
-    const pageIdHint = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''));
-    if (pageIdHint) {
-        const byId = accounts.find((acc) => String(acc?.id || '').trim() === pageIdHint);
-        if (byId) return byId;
-    }
+    const profileNameHint = normalizePageName(profile.name || '');
+    const storedPageNameHint = normalizePageName(profile.page_name || '');
+    const hasExplicitPageHint =
+        !!storedPageNameHint &&
+        storedPageNameHint !== profileNameHint;
 
-    const pageNameHint = normalizePageName(profile.page_name || profile.name || '');
-    if (pageNameHint) {
-        const byName = accounts.find((acc) => normalizePageName(acc?.name || '') === pageNameHint);
+    // Trust persisted hints only when user had already synced an explicit page name
+    // that differs from the profile owner's personal name.
+    if (hasExplicitPageHint) {
+        const pageIdHint = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''));
+        if (pageIdHint) {
+            const byId = accounts.find((acc) => String(acc?.id || '').trim() === pageIdHint);
+            if (byId) return byId;
+        }
+
+        const byName = accounts.find((acc) => normalizePageName(acc?.name || '') === storedPageNameHint);
         if (byName) return byName;
     }
 
-    if (accounts.length === 1) return accounts[0];
-    return null;
+    // No explicit page hint (or stale personal-name hint):
+    // prefer a managed page whose name is different from the personal profile name.
+    if (profileNameHint) {
+        const nonPersonalNamedPage = accounts.find(
+            (acc) => normalizePageName(acc?.name || '') !== profileNameHint
+        );
+        if (nonPersonalNamedPage) return nonPersonalNamedPage;
+    }
+
+    return accounts[0] || null;
 }
 
 async function resolveProfilePageToken(userToken: string, profile: Partial<Profile>) {
@@ -420,6 +361,75 @@ async function resolveVideoAffiliateWorkspaceByEmail(c: any, email: string): Pro
         isOwner: !!data?.is_owner,
         isTeamMember: !!data?.is_team_member,
     };
+}
+
+function buildVideoAffiliatePageSyncUrl(c: any): string {
+    const configured = String(c.env.VIDEO_AFFILIATE_TAG_SYNC_URL || DEFAULT_VIDEO_AFFILIATE_TAG_SYNC_URL).trim();
+    if (configured) return configured.replace(/\/tag-sync(?:\?.*)?$/i, '/profile-sync');
+    return DEFAULT_VIDEO_AFFILIATE_TAG_SYNC_URL.replace(/\/tag-sync$/i, '/profile-sync');
+}
+
+async function pushVideoAffiliatePageSync(c: any, input: {
+    profileId: string;
+    pageId: string;
+    pageName?: string;
+    pageAvatarUrl?: string;
+    accessToken: string;
+}): Promise<{ namespaceId: string }> {
+    const pageId = String(input.pageId || '').trim();
+    const accessToken = normalizeToken(input.accessToken);
+    if (!pageId || !accessToken) throw new Error('video_affiliate_page_sync_missing_required_fields');
+
+    const authEmail = getAuthEmail(c);
+    let namespaceId = String(c.env.VIDEO_AFFILIATE_NAMESPACE_ID || '').trim();
+    if (authEmail) {
+        try {
+            const workspace = await resolveVideoAffiliateWorkspaceByEmail(c, authEmail);
+            if (workspace.namespaceId) namespaceId = workspace.namespaceId;
+        } catch (err) {
+            console.log(`[VIDEO-AFFILIATE] namespace resolve failed for ${authEmail}: ${String(err)}`);
+        }
+    }
+    if (!namespaceId) throw new Error('video_affiliate_namespace_not_found');
+
+    const headers: Record<string, string> = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    };
+    const secret = String(c.env.VIDEO_AFFILIATE_TAG_SYNC_SECRET || '').trim();
+    if (secret) headers['x-tag-sync-secret'] = secret;
+
+    const body = JSON.stringify({
+        namespace_id: namespaceId,
+        profile_id: String(input.profileId || '').trim() || null,
+        page_id: pageId,
+        page_name: String(input.pageName || '').trim() || null,
+        page_avatar_url: String(input.pageAvatarUrl || '').trim() || null,
+        access_token: accessToken,
+    });
+
+    let response: Response;
+    if (c.env.VIDEO_AFFILIATE_SERVICE && typeof c.env.VIDEO_AFFILIATE_SERVICE.fetch === 'function') {
+        response = await c.env.VIDEO_AFFILIATE_SERVICE.fetch('https://video-affiliate-worker/api/pages/profile-sync', {
+            method: 'POST',
+            headers,
+            body,
+        });
+    } else {
+        response = await fetch(buildVideoAffiliatePageSyncUrl(c), {
+            method: 'POST',
+            headers,
+            body,
+        });
+    }
+
+    const data = await response.json().catch(() => ({} as any));
+    if (!response.ok || !data?.success) {
+        const detail = String(data?.error || data?.details || `HTTP ${response.status}`).trim();
+        throw new Error(`video_affiliate_page_sync_failed:${detail}`);
+    }
+
+    return { namespaceId };
 }
 
 app.use('/api/*', async (c, next) => {
@@ -624,27 +634,16 @@ app.get('/api/profiles', async (c) => {
 app.post('/api/profiles', async (c) => {
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
-    const postTokenValidation = validateRoleTokenInput(body.postcron_token, 'post', 'postcron_token');
-    if (!postTokenValidation.ok) return c.json({ error: postTokenValidation.error }, 400);
+    const tokenValidation = validateRoleTokenInput(body.access_token || body.postcron_token || body.comment_token, 'post', 'access_token');
+    if (!tokenValidation.ok) return c.json({ error: tokenValidation.error }, 400);
 
-    const commentTokenValidation = validateRoleTokenInput(body.comment_token, 'comment', 'comment_token');
-    if (!commentTokenValidation.ok) return c.json({ error: commentTokenValidation.error }, 400);
-
-    let postcronToken = postTokenValidation.token;
-    let commentToken = commentTokenValidation.token;
+    const accessToken = tokenValidation.token;
     const legacyToken = body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : null;
     const nextTags = normalizeTagList(body.tags || []);
-    const roleState = getRoleTagState(nextTags);
-    if (roleState.hasConflict) {
-        return c.json({ error: 'Profile tag cannot contain both post and comment at the same time' }, 400);
-    }
-    const normalizedTokens = enforceRoleTokenByTags(nextTags, postcronToken, commentToken);
-    postcronToken = normalizedTokens.postToken;
-    commentToken = normalizedTokens.commentToken;
 
     const { results } = await c.env.DB.prepare(`
-    INSERT INTO profiles (owner_email, name, proxy, homepage, notes, tags, totp_secret, uid, username, password, datr, postcron_token, comment_token, facebook_token)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO profiles (owner_email, name, proxy, homepage, notes, tags, totp_secret, uid, username, password, datr, access_token, facebook_token)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING *
   `).bind(
         authEmail || null,
@@ -658,29 +657,14 @@ app.post('/api/profiles', async (c) => {
         body.username || null,
         body.password || null,
         body.datr || null,
-        postcronToken,
-        commentToken,
+        accessToken,
         legacyToken
     ).all<Profile>();
 
     const profile = results[0];
-    let tagSync: any = null;
-    if (nextTags.length > 0) {
-        try {
-            tagSync = await triggerVideoAffiliateTagSync(c, {
-                forceFullSync: hasVideoAffiliateRoleTag(nextTags),
-                email: authEmail || undefined,
-            });
-        } catch (syncErr: any) {
-            const message = syncErr?.message || String(syncErr);
-            console.log(`tag-sync failed for new profile ${profile?.id || 'unknown'}: ${message}`);
-            tagSync = { ok: false, error: message };
-        }
-    }
     return c.json({
         ...profile,
         tags: JSON.parse(profile.tags || '[]'),
-        tag_sync: tagSync,
     });
 });
 
@@ -688,23 +672,12 @@ app.post('/api/profiles', async (c) => {
 app.post('/api/import', async (c) => {
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
-    const postTokenValidation = validateRoleTokenInput(body.postcron_token, 'post', 'postcron_token');
-    if (!postTokenValidation.ok) return c.json({ error: postTokenValidation.error }, 400);
+    const tokenValidation = validateRoleTokenInput(body.access_token || body.postcron_token || body.comment_token, 'post', 'access_token');
+    if (!tokenValidation.ok) return c.json({ error: tokenValidation.error }, 400);
 
-    const commentTokenValidation = validateRoleTokenInput(body.comment_token, 'comment', 'comment_token');
-    if (!commentTokenValidation.ok) return c.json({ error: commentTokenValidation.error }, 400);
-
-    let postcronToken = postTokenValidation.token;
-    let commentToken = commentTokenValidation.token;
+    const accessToken = tokenValidation.token;
     const legacyToken = body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : null;
     const nextTags = normalizeTagList(body.tags || []);
-    const roleState = getRoleTagState(nextTags);
-    if (roleState.hasConflict) {
-        return c.json({ error: 'Profile tag cannot contain both post and comment at the same time' }, 400);
-    }
-    const normalizedTokens = enforceRoleTokenByTags(nextTags, postcronToken, commentToken);
-    postcronToken = normalizedTokens.postToken;
-    commentToken = normalizedTokens.commentToken;
 
     if (!body.id) {
         return c.json({ error: 'id is required' }, 400);
@@ -720,8 +693,8 @@ app.post('/api/import', async (c) => {
     }
 
     const { results } = await c.env.DB.prepare(`
-    INSERT INTO profiles (id, owner_email, name, proxy, homepage, notes, tags, avatar_url, totp_secret, uid, username, password, datr, postcron_token, comment_token, facebook_token, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO profiles (id, owner_email, name, proxy, homepage, notes, tags, avatar_url, totp_secret, uid, username, password, datr, access_token, facebook_token, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING *
   `).bind(
         body.id,
@@ -737,8 +710,7 @@ app.post('/api/import', async (c) => {
         body.username || null,
         body.password || null,
         body.datr || null,
-        postcronToken,
-        commentToken,
+        accessToken,
         legacyToken,
         body.created_at || new Date().toISOString(),
         body.updated_at || new Date().toISOString()
@@ -758,11 +730,8 @@ app.put('/api/profiles/:id', async (c) => {
         const body = await c.req.json();
         const authEmail = getAuthEmail(c);
 
-        const postTokenValidation = validateRoleTokenInput(body.postcron_token, 'post', 'postcron_token');
-        if (!postTokenValidation.ok) return c.json({ error: postTokenValidation.error }, 400);
-
-        const commentTokenValidation = validateRoleTokenInput(body.comment_token, 'comment', 'comment_token');
-        if (!commentTokenValidation.ok) return c.json({ error: commentTokenValidation.error }, 400);
+        const tokenValidation = validateRoleTokenInput(body.access_token || body.postcron_token || body.comment_token, 'post', 'access_token');
+        if (!tokenValidation.ok) return c.json({ error: tokenValidation.error }, 400);
 
         // Get existing profile
         const existing = authEmail
@@ -777,20 +746,12 @@ app.put('/api/profiles/:id', async (c) => {
             return c.json({ error: 'Not found' }, 404);
         }
 
-        const existingTags = normalizeTagList(existing.tags || '[]');
         const requestedTags = body.tags !== undefined ? body.tags : JSON.parse(existing.tags || '[]');
         const nextTags = normalizeTagList(requestedTags);
-        const roleState = getRoleTagState(nextTags);
-        if (roleState.hasConflict) {
-            return c.json({ error: 'Profile tag cannot contain both post and comment at the same time' }, 400);
-        }
-        const tagsChanged = !sameTagList(existingTags, nextTags);
 
-        const requestedPostToken = body.postcron_token !== undefined ? postTokenValidation.token : (existing.postcron_token ?? null);
-        const requestedCommentToken = body.comment_token !== undefined ? commentTokenValidation.token : (existing.comment_token ?? null);
-        const normalizedTokens = enforceRoleTokenByTags(nextTags, requestedPostToken, requestedCommentToken);
-        const nextPostToken = normalizedTokens.postToken;
-        const nextCommentToken = normalizedTokens.commentToken;
+        const nextAccessToken = (body.access_token !== undefined || body.postcron_token !== undefined || body.comment_token !== undefined)
+            ? tokenValidation.token
+            : (existing.access_token ?? null);
 
         // 🔒 Create backup snapshot before update
         await createBackup(c.env.DB, id, 'update', authEmail);
@@ -809,8 +770,7 @@ app.put('/api/profiles/:id', async (c) => {
           username = ?,
           password = ?,
           datr = ?,
-          postcron_token = ?,
-          comment_token = ?,
+          access_token = ?,
           facebook_token = ?,
           shopee_cookies = ?,
           page_name = ?,
@@ -832,8 +792,7 @@ app.put('/api/profiles/:id', async (c) => {
           username = ?,
           password = ?,
           datr = ?,
-          postcron_token = ?,
-          comment_token = ?,
+          access_token = ?,
           facebook_token = ?,
           shopee_cookies = ?,
           page_name = ?,
@@ -855,8 +814,7 @@ app.put('/api/profiles/:id', async (c) => {
                 body.username ?? existing.username ?? null,
                 body.password ?? existing.password ?? null,
                 body.datr ?? existing.datr ?? null,
-                nextPostToken,
-                nextCommentToken,
+                nextAccessToken,
                 body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : (existing.facebook_token ?? null),
                 body.shopee_cookies !== undefined
                     ? (body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null)
@@ -867,47 +825,32 @@ app.put('/api/profiles/:id', async (c) => {
                 authEmail,
             ]
             : [
-            body.name ?? existing.name ?? null,
-            body.proxy ?? existing.proxy ?? null,
-            body.homepage ?? existing.homepage ?? null,
-            body.notes ?? existing.notes ?? null,
-            JSON.stringify(nextTags),
-            body.avatar_url ?? existing.avatar_url ?? null,
-            body.totp_secret ?? existing.totp_secret ?? null,
-            body.uid ?? existing.uid ?? null,
-            body.username ?? existing.username ?? null,
-            body.password ?? existing.password ?? null,
-            body.datr ?? existing.datr ?? null,
-            nextPostToken,
-            nextCommentToken,
-            body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : (existing.facebook_token ?? null),
-            body.shopee_cookies !== undefined 
-                ? (body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null)
-                : (existing.shopee_cookies ?? null),
-            body.page_name ?? existing.page_name ?? null,
-            body.page_avatar_url ?? existing.page_avatar_url ?? null,
-            id
-        ];
+                body.name ?? existing.name ?? null,
+                body.proxy ?? existing.proxy ?? null,
+                body.homepage ?? existing.homepage ?? null,
+                body.notes ?? existing.notes ?? null,
+                JSON.stringify(nextTags),
+                body.avatar_url ?? existing.avatar_url ?? null,
+                body.totp_secret ?? existing.totp_secret ?? null,
+                body.uid ?? existing.uid ?? null,
+                body.username ?? existing.username ?? null,
+                body.password ?? existing.password ?? null,
+                body.datr ?? existing.datr ?? null,
+                nextAccessToken,
+                body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : (existing.facebook_token ?? null),
+                body.shopee_cookies !== undefined
+                    ? (body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null)
+                    : (existing.shopee_cookies ?? null),
+                body.page_name ?? existing.page_name ?? null,
+                body.page_avatar_url ?? existing.page_avatar_url ?? null,
+                id
+            ];
         const { results } = await c.env.DB.prepare(updateSql).bind(...updateBinds).all<Profile>();
 
         const profile = results[0];
-        let tagSync: any = null;
-        if (tagsChanged) {
-            try {
-                tagSync = await triggerVideoAffiliateTagSync(c, {
-                    forceFullSync: hasVideoAffiliateRoleTag(nextTags),
-                    email: authEmail || undefined,
-                });
-            } catch (syncErr: any) {
-                const message = syncErr?.message || String(syncErr);
-                console.log(`tag-sync failed for profile ${id}: ${message}`);
-                tagSync = { ok: false, error: message };
-            }
-        }
         return c.json({
             ...profile,
             tags: JSON.parse(profile.tags || '[]'),
-            tag_sync: tagSync,
         });
     } catch (err: any) {
         console.error('PUT /api/profiles/:id error:', err);
@@ -928,11 +871,11 @@ app.put('/api/profiles/:id/shopee-cookies', async (c) => {
         : await c.env.DB.prepare(
             'SELECT * FROM profiles WHERE id = ?'
         ).bind(id).first<Profile>();
-    
+
     if (!existing) {
         return c.json({ error: 'Not found' }, 404);
     }
-    
+
     // Update only shopee_cookies field
     const { results } = await c.env.DB.prepare(`
         UPDATE profiles SET
@@ -944,7 +887,7 @@ app.put('/api/profiles/:id/shopee-cookies', async (c) => {
         body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null,
         id
     ).all<Profile>();
-    
+
     const profile = results[0];
     return c.json({
         success: true,
@@ -965,15 +908,15 @@ app.get('/api/profiles/:id/shopee-cookies', async (c) => {
         : await c.env.DB.prepare(
             'SELECT id, name, shopee_cookies FROM profiles WHERE id = ?'
         ).bind(id).first<Profile>();
-    
+
     if (!profile) {
         return c.json({ error: 'Not found' }, 404);
     }
-    
+
     if (!profile.shopee_cookies) {
         return c.json({ error: 'No Shopee cookies found' }, 404);
     }
-    
+
     try {
         const cookies = JSON.parse(profile.shopee_cookies);
         return c.json({
@@ -1039,18 +982,7 @@ app.delete('/api/profiles/:id', async (c) => {
         console.log(`🏷️ Soft deleted profile: ${id}`);
     }
 
-    let tagSync: any = null;
-    if (hadTags) {
-        try {
-            tagSync = await triggerVideoAffiliateTagSync(c, { email: authEmail || undefined });
-        } catch (syncErr: any) {
-            const message = syncErr?.message || String(syncErr);
-            console.log(`tag-sync failed after delete ${id}: ${message}`);
-            tagSync = { ok: false, error: message };
-        }
-    }
-
-    return c.json({ success: true, hard, tag_sync: tagSync });
+    return c.json({ success: true, hard });
 });
 
 // POST /api/profiles/:id/restore - Restore soft-deleted profile
@@ -1080,24 +1012,9 @@ app.post('/api/profiles/:id/restore', async (c) => {
 
     const profile = results[0];
     console.log(`♻️ Restored profile: ${profile.name}`);
-    let tagSync: any = null;
-    const restoredTags = normalizeTagList(profile?.tags || '[]');
-    if (restoredTags.length > 0) {
-        try {
-            tagSync = await triggerVideoAffiliateTagSync(c, {
-                forceFullSync: hasVideoAffiliateRoleTag(restoredTags),
-                email: authEmail || undefined,
-            });
-        } catch (syncErr: any) {
-            const message = syncErr?.message || String(syncErr);
-            console.log(`tag-sync failed after restore ${id}: ${message}`);
-            tagSync = { ok: false, error: message };
-        }
-    }
     return c.json({
         ...profile,
         tags: JSON.parse(profile.tags || '[]'),
-        tag_sync: tagSync,
     });
 });
 
@@ -1143,11 +1060,8 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
     }
 
     const snapshot = JSON.parse(backup.snapshot);
-    const snapshotPostValidation = validateRoleTokenInput(snapshot.postcron_token, 'post', 'snapshot.postcron_token');
-    if (!snapshotPostValidation.ok) return c.json({ error: snapshotPostValidation.error }, 400);
-
-    const snapshotCommentValidation = validateRoleTokenInput(snapshot.comment_token, 'comment', 'snapshot.comment_token');
-    if (!snapshotCommentValidation.ok) return c.json({ error: snapshotCommentValidation.error }, 400);
+    // Resolve access_token from snapshot (may have old postcron_token/comment_token)
+    const snapshotAccessToken = normalizeToken(snapshot.access_token || snapshot.comment_token || snapshot.postcron_token) || null;
 
     // Create a backup of current state before restoring
     await createBackup(c.env.DB, id, 'update', authEmail);
@@ -1157,7 +1071,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
     UPDATE profiles SET
       name = ?, proxy = ?, homepage = ?, notes = ?, tags = ?,
       avatar_url = ?, totp_secret = ?, uid = ?, username = ?, password = ?,
-      datr = ?, postcron_token = ?, comment_token = ?, facebook_token = ?, deleted_at = NULL, updated_at = datetime('now')
+      datr = ?, access_token = ?, facebook_token = ?, deleted_at = NULL, updated_at = datetime('now')
     WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?
     RETURNING *
   `
@@ -1165,7 +1079,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
     UPDATE profiles SET
       name = ?, proxy = ?, homepage = ?, notes = ?, tags = ?,
       avatar_url = ?, totp_secret = ?, uid = ?, username = ?, password = ?,
-      datr = ?, postcron_token = ?, comment_token = ?, facebook_token = ?, deleted_at = NULL, updated_at = datetime('now')
+      datr = ?, access_token = ?, facebook_token = ?, deleted_at = NULL, updated_at = datetime('now')
     WHERE id = ?
     RETURNING *
   `;
@@ -1175,8 +1089,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
             snapshot.tags, snapshot.avatar_url, snapshot.totp_secret,
             snapshot.uid, snapshot.username, snapshot.password,
             snapshot.datr ?? null,
-            snapshotPostValidation.token,
-            snapshotCommentValidation.token,
+            snapshotAccessToken,
             normalizeToken(snapshot.facebook_token) || null,
             id,
             authEmail,
@@ -1186,8 +1099,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
             snapshot.tags, snapshot.avatar_url, snapshot.totp_secret,
             snapshot.uid, snapshot.username, snapshot.password,
             snapshot.datr ?? null,
-            snapshotPostValidation.token,
-            snapshotCommentValidation.token,
+            snapshotAccessToken,
             normalizeToken(snapshot.facebook_token) || null,
             id,
         ];
@@ -1265,6 +1177,92 @@ app.get('/storage/*', async (c) => {
 
 // === BROWSER DATA SYNC APIs ===
 
+app.get('/api/updates/manifest', async (c) => {
+    const origin = new URL(c.req.url).origin;
+    const latestObj = await c.env.BUCKET.get('updates/latest.json').catch(() => null);
+    if (latestObj) {
+        const latest = await latestObj.json<any>().catch(() => null);
+        const version = String(latest?.version || '').trim();
+        const notes = String(latest?.notes || '').trim();
+        const pubDate = String(latest?.pub_date || latest?.published_at || '').trim() || new Date().toISOString();
+        const rawPlatforms = latest && typeof latest === 'object' ? (latest.platforms || {}) as Record<string, any> : {};
+        const platforms = Object.fromEntries(
+            Object.entries(rawPlatforms).flatMap(([platform, entry]) => {
+                const signature = String(entry?.signature || '').trim();
+                const directUrl = String(entry?.url || '').trim();
+                const objectKey = String(entry?.object_key || '').trim();
+                const url = directUrl || (objectKey ? `${origin}/api/updates/download?key=${encodeURIComponent(objectKey)}` : '');
+                if (!signature || !url) return [];
+                return [[platform, { signature, url }]];
+            })
+        );
+
+        if (version && Object.keys(platforms).length > 0) {
+            return c.json({
+                version,
+                notes: notes || `BrowserSaving ${version}`,
+                pub_date: pubDate,
+                platforms,
+            });
+        }
+    }
+
+    const releaseVersion = (c.env.BROWSERSAVING_UPDATE_VERSION || '').trim();
+    const releaseNotes = (
+        c.env.BROWSERSAVING_UPDATE_NOTES || 'BrowserSaving update manifest'
+    ).trim();
+    const releaseDate = (
+        c.env.BROWSERSAVING_UPDATE_NOTES_PUBLISHED ||
+        new Date().toISOString()
+    ).trim();
+    const signatureArm64 = (c.env.BROWSERSAVING_UPDATE_DMG_SIGNATURE || '').trim();
+    const signatureX64 = (c.env.BROWSERSAVING_UPDATE_DMG_SIGNATURE_X64 || '').trim();
+    const urlArm64 = (c.env.BROWSERSAVING_UPDATE_DMG_URL || '').trim();
+    const urlX64 = (c.env.BROWSERSAVING_UPDATE_DMG_URL_X64 || '').trim();
+
+    if (!urlArm64 && !urlX64) {
+        return c.json({ error: 'Update artifact not configured' }, 404);
+    }
+
+    return c.json({
+        version: releaseVersion || '0.1.0',
+        notes: releaseNotes,
+        pub_date: releaseDate,
+        platforms: {
+            'darwin-aarch64': {
+                signature: signatureArm64 || '',
+                url: urlArm64 || urlX64 || '',
+            },
+            'darwin-x86_64': {
+                signature: signatureX64 || signatureArm64 || '',
+                url: urlX64 || urlArm64 || '',
+            },
+        },
+    });
+});
+
+app.get('/api/updates/download', async (c) => {
+    const key = String(c.req.query('key') || '').trim();
+    if (!key || !key.startsWith('updates/')) {
+        return c.json({ error: 'Invalid update key' }, 400);
+    }
+
+    const object = await c.env.BUCKET.get(key);
+    if (!object) {
+        return c.json({ error: 'Update artifact not found' }, 404);
+    }
+
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+    headers.set('etag', object.httpEtag);
+    headers.set('cache-control', 'public, max-age=300');
+    if (!headers.has('content-type')) {
+        headers.set('content-type', 'application/octet-stream');
+    }
+
+    return new Response(object.body, { headers });
+});
+
 // POST /api/sync/:profileId/upload - Upload browser data to R2
 app.post('/api/sync/:profileId/upload', async (c) => {
     const profileId = c.req.param('profileId');
@@ -1280,7 +1278,7 @@ app.post('/api/sync/:profileId/upload', async (c) => {
 
     const cookies = await extractCookiesFromTarGz(bytes);
     if (!cookies || cookies.length === 0) {
-        return c.json({ error: 'Invalid browser archive: cookies.json missing or unreadable' }, 400);
+        console.log(`⚠️ No cookies found for ${profileId}; saving archive anyway`);
     }
 
     const datr = extractDatrFromCookies(cookies);
@@ -1460,9 +1458,7 @@ app.get('/api/android-presigned/:profileId/download', async (c) => {
     return c.json({ url, exists: true });
 });
 
-// === POSTCRON TOKEN API ===
-const POSTCRON_BROWSERLESS_HOST = 'browserless.lslly.com';
-const POSTCRON_BROWSERLESS_TOKEN = '77482ddfd0ec44d1c1a8b55ddf352d98';
+// === TOKEN API ===
 const COMMENT_TOKEN_API_URL = 'https://token-facebook-lite.yokthanwa1993-bc9.workers.dev/token';
 
 async function requestCommentTokenFromTokenFacebookLite(c: any, payload: Record<string, unknown>) {
@@ -1481,19 +1477,12 @@ async function requestCommentTokenFromTokenFacebookLite(c: any, payload: Record<
     });
 }
 
-async function saveProfileToken(c: any, profileId: string, token: string, mode: 'post' | 'comment') {
+async function saveProfileToken(c: any, profileId: string, token: string, _mode: 'post' | 'comment' = 'post') {
     const normalized = normalizeToken(token);
-    if (!normalized) throw new Error(`${mode}_token_empty`);
-
-    if (mode === 'post') {
-        await c.env.DB.prepare(
-            "UPDATE profiles SET postcron_token = ?, comment_token = NULL, updated_at = datetime('now') WHERE id = ?"
-        ).bind(normalized, profileId).run();
-        return;
-    }
+    if (!normalized) throw new Error('token_empty');
 
     await c.env.DB.prepare(
-        "UPDATE profiles SET comment_token = ?, postcron_token = NULL, updated_at = datetime('now') WHERE id = ?"
+        "UPDATE profiles SET access_token = ?, updated_at = datetime('now') WHERE id = ?"
     ).bind(normalized, profileId).run();
 }
 
@@ -1546,260 +1535,16 @@ function stringifyUnknown(value: unknown): string {
     }
 }
 
-function buildTokenExtractFailureCopy(reason: string | null): { error: string; hintTh: string; actionRequired: string } {
-    if (reason === 'facebook_checkpoint') {
-        return {
-            error: 'Facebook checkpoint required',
-            hintTh: 'เจอหน้า Checkpoint ของ Facebook ระบบพยายามกดปิดแล้วแต่ยังไม่ผ่าน ให้เปิดโปรไฟล์นี้ไปยืนยันหน้า checkpoint แล้ว Stop และลองใหม่',
-            actionRequired: 'Complete Facebook checkpoint for this profile manually, stop to sync cookies, then retry.',
-        };
-    }
-    if (reason === 'facebook_automated_behavior') {
-        return {
-            error: 'Facebook automated behavior warning',
-            hintTh: 'เจอหน้าเตือนพฤติกรรมอัตโนมัติ ระบบพยายามกดปิดให้อัตโนมัติแล้ว แต่ยังไม่ผ่าน ให้เข้าโปรไฟล์นี้ไปยืนยัน/ปิดแจ้งเตือนด้วยมือ แล้ว Stop และลองใหม่',
-            actionRequired: 'Open this profile and clear Facebook automated-behavior warning, stop profile to sync cookies, then retry.',
-        };
-    }
-    if (reason === 'facebook_login_required') {
-        return {
-            error: 'Facebook login required',
-            hintTh: 'Facebook หลุด login ให้เปิดโปรไฟล์นี้ล็อกอินใหม่ แล้ว Stop และลองใหม่',
-            actionRequired: 'Log in to Facebook in this profile, stop profile to sync cookies, then retry.',
-        };
-    }
-    if (reason === 'facebook_security_confirmation') {
-        return {
-            error: 'Facebook security confirmation required',
-            hintTh: 'Facebook ต้องยืนยันความปลอดภัยเพิ่มเติม ให้ยืนยันให้เสร็จ แล้ว Stop และลองใหม่',
-            actionRequired: 'Complete Facebook security confirmation for this profile, stop profile, then retry.',
-        };
-    }
-    return {
-        error: 'Failed to extract token — Facebook session may be expired',
-        hintTh: 'เปิดเบราเซอร์โปรไฟล์นี้แล้วล็อกอิน Facebook ใหม่ จากนั้น Stop แล้วลองใหม่',
-        actionRequired: 'Open profile browser, refresh Facebook session/cookies, stop profile, then retry.',
-    };
-}
 
-async function loadArchiveCookies(c: any, profileId: string): Promise<{
-    allCookies: any[];
-    facebookCookies: any[];
-    error?: string;
-}> {
-    try {
-        const key = `browser-data/${profileId}.tar.gz`;
-        const object = await c.env.BUCKET.get(key);
-        if (!object) return { allCookies: [], facebookCookies: [], error: 'archive_not_found' };
 
-        const archiveBuffer = await object.arrayBuffer();
-        const allCookies = await extractCookiesFromTarGz(new Uint8Array(archiveBuffer));
-        if (!allCookies || allCookies.length === 0) {
-            return { allCookies: [], facebookCookies: [], error: 'cookies_not_found' };
-        }
 
-        const facebookCookies = allCookies.filter((cookie: any) => String(cookie?.domain || '').includes('facebook.com'));
-        if (facebookCookies.length === 0) {
-            return { allCookies, facebookCookies: [], error: 'facebook_cookies_not_found' };
-        }
-
-        return { allCookies, facebookCookies };
-    } catch (err) {
-        return { allCookies: [], facebookCookies: [], error: `cookies_load_failed:${String(err)}` };
-    }
-}
-
-async function diagnoseFacebookBarrierWithBrowserless(c: any, profileId: string): Promise<{
-    extract: PostcronExtractResult | null;
-    diagnosticsError?: string;
-    cookieCount?: number;
-    facebookCookieCount?: number;
-}> {
-    const loaded = await loadArchiveCookies(c, profileId);
-    if (loaded.error) {
-        return { extract: null, diagnosticsError: loaded.error };
-    }
-
-    try {
-        const extract = await extractPostcronTokenWithRetry(
-            POSTCRON_BROWSERLESS_HOST,
-            POSTCRON_BROWSERLESS_TOKEN,
-            loaded.allCookies,
-        );
-        return {
-            extract,
-            cookieCount: loaded.allCookies.length,
-            facebookCookieCount: loaded.facebookCookies.length,
-        };
-    } catch (err) {
-        return {
-            extract: null,
-            diagnosticsError: `browserless_extract_failed:${String(err)}`,
-            cookieCount: loaded.allCookies.length,
-            facebookCookieCount: loaded.facebookCookies.length,
-        };
-    }
-}
-
-function isRetryableBrowserlessError(err: unknown): boolean {
-    const text = stringifyUnknown(err).toLowerCase();
-    if (!text) return false;
-    return text.includes('websocket error')
-        || text.includes('switching protocols')
-        || text.includes(' 502 ')
-        || text.includes('received 502')
-        || text.includes('cloudflare');
-}
-
-async function extractPostcronTokenWithRetry(
-    browserlessHost: string,
-    browserlessToken: string,
-    cookies: any[],
-): Promise<PostcronExtractResult> {
-    const maxAttempts = 3;
-    let lastError: unknown = null;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-            return await extractPostcronToken(browserlessHost, browserlessToken, cookies);
-        } catch (err) {
-            lastError = err;
-            if (!isRetryableBrowserlessError(err) || attempt >= maxAttempts) {
-                throw err;
-            }
-            const waitMs = 600 * attempt;
-            console.log(`⚠️ Browserless transient error (attempt ${attempt}/${maxAttempts}), retrying in ${waitMs}ms: ${stringifyUnknown(err)}`);
-            await new Promise((r) => setTimeout(r, waitMs));
-        }
-    }
-    throw lastError || new Error('extract_postcron_token_retry_exhausted');
-}
-
-async function handlePostToken(c: any, profileId: string) {
-    const profile = await c.env.DB.prepare(
-        'SELECT id, name, tags, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL'
-    ).bind(profileId).first<Profile>();
-
-    if (!profile) {
-        return c.json({ error: 'Profile not found', profileId }, 404);
-    }
-
-    const roleState = getRoleTagState(profile.tags || '[]');
-    if (roleState.hasConflict) {
-        return c.json({
-            error: 'Profile has both post and comment tags. Keep only one role tag before syncing token.',
-            profileId,
-            profile: profile.name,
-        }, 400);
-    }
-    if (!roleState.hasPost) {
-        return c.json({
-            error: 'Profile is not tagged as post. Add post tag before syncing post token.',
-            profileId,
-            profile: profile.name,
-        }, 400);
-    }
-
-    const loaded = await loadArchiveCookies(c, profileId);
-    if (loaded.error === 'archive_not_found') {
-        return c.json({ error: 'No browser data in R2. Start browser → login Facebook → Stop first', profileId }, 404);
-    }
-    if (loaded.error === 'cookies_not_found') {
-        return c.json({ error: 'No cookies found in archive. Start browser → login Facebook → Stop first', profileId }, 400);
-    }
-    if (loaded.error === 'facebook_cookies_not_found') {
-        return c.json({ error: 'No Facebook cookies. Start browser → login Facebook → Stop first', profileId }, 400);
-    }
-    if (loaded.error) {
-        return c.json({ error: `Failed to load archive cookies: ${loaded.error}`, profileId }, 500);
-    }
-
-    const cookies = loaded.allCookies;
-    const fbCookies = loaded.facebookCookies;
-    console.log(`🍪 ${profile.name}: ${cookies.length} cookies (${fbCookies.length} Facebook)`);
-
-    try {
-        const extract = await extractPostcronTokenWithRetry(POSTCRON_BROWSERLESS_HOST, POSTCRON_BROWSERLESS_TOKEN, cookies);
-        const userToken = String(extract?.token || '').trim();
-
-        if (!userToken) {
-            const reason = String(extract?.reason || 'session_expired').trim();
-            const currentUrl = String(extract?.url || '').trim() || null;
-            const detail = String(extract?.detail || '').trim() || null;
-            const copy = buildTokenExtractFailureCopy(reason);
-
-            return c.json({
-                error: copy.error,
-                reason,
-                profileId,
-                profile: profile.name,
-                current_url: currentUrl,
-                detail,
-                action_required: copy.actionRequired,
-                hint_th: copy.hintTh,
-            }, 400);
-        }
-
-        let resolvedPage: { pageToken: string; pageId: string; pageName: string; pageAvatarUrl: string };
-        try {
-            resolvedPage = await resolveProfilePageToken(userToken, profile);
-        } catch (resolveErr) {
-            return c.json({
-                error: `Failed to convert user token to page token via me/accounts: ${String(resolveErr)}`,
-                profileId,
-                profile: profile.name,
-            }, 400);
-        }
-
-        await saveProfileToken(c, profileId, resolvedPage.pageToken, 'post');
-        await c.env.DB.prepare(
-            "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
-        ).bind(
-            resolvedPage.pageName || null,
-            resolvedPage.pageAvatarUrl || null,
-            profileId
-        ).run();
-        console.log(`🔑 ${profile.name}: Post page token saved`);
-
-        return c.json({
-            success: true,
-            mode: 'post',
-            profile: profile.name,
-            profileId,
-            token: resolvedPage.pageToken,
-            page_id: resolvedPage.pageId || null,
-            page_name: resolvedPage.pageName || null,
-            page_avatar_url: resolvedPage.pageAvatarUrl || null,
-            savedAt: new Date().toISOString(),
-        });
-    } catch (err) {
-        console.error(`❌ ${profile.name}: ${err}`);
-        return c.json({ error: String(err), profileId, profile: profile.name }, 500);
-    }
-}
-
-async function handleCommentToken(c: any, profileId: string) {
+async function handleGetToken(c: any, profileId: string) {
     const profile = await c.env.DB.prepare(
         'SELECT id, name, tags, uid, username, password, totp_secret, datr, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL'
     ).bind(profileId).first<Profile>();
 
     if (!profile) {
         return c.json({ error: 'Profile not found', profileId }, 404);
-    }
-
-    const roleState = getRoleTagState(profile.tags || '[]');
-    if (roleState.hasConflict) {
-        return c.json({
-            error: 'Profile has both post and comment tags. Keep only one role tag before syncing token.',
-            profileId,
-            profile: profile.name,
-        }, 400);
-    }
-    if (!roleState.hasComment) {
-        return c.json({
-            error: 'Profile is not tagged as comment. Add comment tag before syncing comment token.',
-            profileId,
-            profile: profile.name,
-        }, 400);
     }
 
     const loginId = (profile.uid || profile.username || '').trim();
@@ -1828,39 +1573,13 @@ async function handleCommentToken(c: any, profileId: string) {
             '';
 
         if (!response.ok || !result?.success || !userToken) {
-            const upstreamError = stringifyUnknown(result?.error) || `Comment token API failed (${response.status})`;
-            const diagnostics = await diagnoseFacebookBarrierWithBrowserless(c, profileId);
-            const diagnosedReason = String(diagnostics.extract?.reason || '').trim();
-            const diagnosedUrl = String(diagnostics.extract?.url || '').trim() || null;
-            const diagnosedDetail = String(diagnostics.extract?.detail || '').trim() || null;
-
-            if (diagnosedReason) {
-                const copy = buildTokenExtractFailureCopy(diagnosedReason);
-                return c.json({
-                    error: copy.error,
-                    reason: diagnosedReason,
-                    profileId,
-                    profile: profile.name,
-                    current_url: diagnosedUrl,
-                    detail: diagnosedDetail,
-                    action_required: copy.actionRequired,
-                    hint_th: copy.hintTh,
-                    upstream_error: upstreamError,
-                    diagnostics_error: diagnostics.diagnosticsError || null,
-                    diagnostics_cookie_count: diagnostics.cookieCount ?? null,
-                    diagnostics_facebook_cookies: diagnostics.facebookCookieCount ?? null,
-                }, 400);
-            }
-
+            const upstreamError = stringifyUnknown(result?.error) || `Token API failed (${response.status})`;
             return c.json({
                 error: upstreamError,
                 profileId,
                 profile: profile.name,
                 reason: stringifyUnknown(result?.reason) || null,
                 detail: stringifyUnknown(result?.detail || result?.error_user_msg) || null,
-                diagnostics_error: diagnostics.diagnosticsError || null,
-                diagnostics_cookie_count: diagnostics.cookieCount ?? null,
-                diagnostics_facebook_cookies: diagnostics.facebookCookieCount ?? null,
             }, response.status >= 500 ? 502 : 400);
         }
 
@@ -1875,7 +1594,7 @@ async function handleCommentToken(c: any, profileId: string) {
             }, 400);
         }
 
-        await saveProfileToken(c, profileId, resolvedPage.pageToken, 'comment');
+        await saveProfileToken(c, profileId, resolvedPage.pageToken);
         await c.env.DB.prepare(
             "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
         ).bind(
@@ -1883,20 +1602,35 @@ async function handleCommentToken(c: any, profileId: string) {
             resolvedPage.pageAvatarUrl || null,
             profileId
         ).run();
-        console.log(`🔑 ${profile.name}: Comment page token saved`);
+        console.log(`🔑 ${profile.name}: Token saved`);
+
+        let videoAffiliateSync: { ok: boolean; namespace_id?: string; error?: string } = { ok: false };
+        try {
+            const synced = await pushVideoAffiliatePageSync(c, {
+                profileId,
+                pageId: resolvedPage.pageId,
+                pageName: resolvedPage.pageName,
+                pageAvatarUrl: resolvedPage.pageAvatarUrl,
+                accessToken: resolvedPage.pageToken,
+            });
+            videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
+        } catch (syncErr) {
+            const message = String(syncErr || '');
+            console.log(`[VIDEO-AFFILIATE] page sync failed for ${profile.name}: ${message}`);
+            videoAffiliateSync = { ok: false, error: message };
+        }
 
         return c.json({
             success: true,
-            mode: 'comment',
             profile: profile.name,
             profileId,
             token: resolvedPage.pageToken,
             page_id: resolvedPage.pageId || null,
             page_name: resolvedPage.pageName || null,
             page_avatar_url: resolvedPage.pageAvatarUrl || null,
-            token_type: result?.converted_token?.target_app || 'FB_LITE',
             datr_source: datrResolved.source,
             savedAt: new Date().toISOString(),
+            video_affiliate_sync: videoAffiliateSync,
         });
     } catch (err) {
         console.error(`❌ ${profile.name}: ${err}`);
@@ -1904,20 +1638,27 @@ async function handleCommentToken(c: any, profileId: string) {
     }
 }
 
-// GET /api/postcron/:profileId/post - Post token
+// GET /api/token/:profileId - Get access token via FB Lite API
+app.get('/api/token/:profileId', async (c) => {
+    const profileId = c.req.param('profileId');
+    const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
+    if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
+    return handleGetToken(c, profileId);
+});
+
+// Backward-compatible routes (redirect to unified handler)
 app.get('/api/postcron/:profileId/post', async (c) => {
     const profileId = c.req.param('profileId');
     const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
     if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
-    return handlePostToken(c, profileId);
+    return handleGetToken(c, profileId);
 });
 
-// GET /api/postcron/:profileId/comment - Comment token
 app.get('/api/postcron/:profileId/comment', async (c) => {
     const profileId = c.req.param('profileId');
     const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
     if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
-    return handleCommentToken(c, profileId);
+    return handleGetToken(c, profileId);
 });
 
 // GET /api/profiles/:id/page - Get Facebook Page info
@@ -1925,32 +1666,27 @@ app.get('/api/profiles/:id/page', async (c) => {
     const id = c.req.param('id');
     const allowed = await ensureProfileAccess(c, id, { includeDeleted: false });
     if (!allowed) return c.json({ error: 'Profile not found' }, 404);
-    
+
     // Get profile with token
     const profile = await c.env.DB.prepare(
-        'SELECT id, name, postcron_token, comment_token, facebook_token, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL'
+        'SELECT id, name, access_token, facebook_token, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL'
     ).bind(id).first<Profile>();
-    
+
     if (!profile) {
         return c.json({ error: 'Profile not found' }, 404);
     }
-    
-    const postToken = normalizeToken(profile.postcron_token);
-    const commentToken = normalizeToken(profile.comment_token);
+
+    const accessToken = normalizeToken(profile.access_token);
     const legacyToken = normalizeToken(profile.facebook_token);
-    const graphToken =
-        (postToken || '') ||
-        (commentToken || '') ||
-        (legacyToken || '');
+    const graphToken = accessToken || legacyToken || '';
     if (!graphToken) {
         return c.json({
             error: 'No token',
             page_name: null,
-            has_post_token: !!postToken,
-            has_comment_token: isCommentRoleToken(commentToken),
+            has_access_token: !!accessToken,
         });
     }
-    
+
     try {
         // Prefer /me/accounts (works with user token), fallback to /me (works with page token).
         let pageName = '';
@@ -1984,21 +1720,21 @@ app.get('/api/profiles/:id/page', async (c) => {
         }
 
         if (pageId) {
-            
+
             let r2ImageUrl = null;
-            
+
             // Download image from Facebook and upload to R2
             if (facebookImageUrl) {
                 try {
                     console.log('Downloading page image for ' + profile.name + ' from Facebook...');
                     const imageResponse = await fetch(facebookImageUrl);
-                    
+
                     if (imageResponse.ok) {
                         const imageBuffer = await imageResponse.arrayBuffer();
                         const contentType = imageResponse.headers.get('content-type') || 'image/jpeg';
                         const fileExt = contentType.includes('png') ? 'png' : 'jpg';
                         const r2Key = 'page-avatars/' + pageId + '.' + fileExt;
-                        
+
                         console.log('Uploading to R2: ' + r2Key);
                         await c.env.BUCKET.put(r2Key, imageBuffer, {
                             contentType: contentType,
@@ -2009,7 +1745,7 @@ app.get('/api/profiles/:id/page', async (c) => {
                                 pageId: pageId
                             }
                         });
-                        
+
                         // Generate public URL for the image
                         r2ImageUrl = c.req.url.split('/api')[0] + '/storage/' + r2Key;
                         console.log('Image saved to R2: ' + r2ImageUrl);
@@ -2022,20 +1758,22 @@ app.get('/api/profiles/:id/page', async (c) => {
                     r2ImageUrl = facebookImageUrl;
                 }
             }
-            
+
             // Save page_name and page_avatar_url (R2 URL) to database
             const finalAvatarUrl = r2ImageUrl || facebookImageUrl;
             await c.env.DB.prepare(
                 'UPDATE profiles SET page_name = ?, page_avatar_url = ? WHERE id = ?'
             ).bind(pageName, finalAvatarUrl, id).run();
-            
-            return c.json({ 
-                success: true, 
+
+            return c.json({
+                success: true,
                 page_name: pageName,
                 page_avatar_url: finalAvatarUrl,
                 page_id: pageId,
                 profile: profile.name,
-                stored_in_r2: !!r2ImageUrl
+                stored_in_r2: !!r2ImageUrl,
+                token_source: selectedToken?.role || null,
+                prefer,
             });
         } else {
             return c.json({ page_name: null, message: 'No pages found' });

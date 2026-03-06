@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Мобильный симулятор - тестирование адаптивного сайта"
+  },
+  "extDescription": {
+    "message": "Симулятор смартфонов и планшетов на компьютере с множеством моделей для тестирования мобильного и адаптивного сайта."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Отменить"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Телефоны Android"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Телефоны Apple"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Планшеты"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Специальные"
+  },
+  "copied": {
+    "message": "Скопировано"
+  },
+  "error": {
+    "message": "Ошибка"
+  },
+  "link": {
+    "message": "Ссылка"
+  },
+  "optional": {
+    "message": "Необязательно"
+  },
+  "close": {
+    "message": "Закрыть"
+  },
+  "get_pro": {
+    "message": "Получить версию PRO"
+  },
+  "error_contact": {
+    "message": "{Свяжитесь с нами}, если проблема сохраняется."
+  },
+  "more_settings": {
+    "message": "Больше настроек"
+  },
+  "dimensions": {
+    "message": "Размеры"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Активировать мобильный вид на этой вкладке"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Симулятор не может быть активирован на этой родной странице вашего браузера. Попробуйте на другой вкладке или перейдите на сайт, затем перезапустите."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Этот симулятор не может быть активирован по умолчанию на локальных файлах (file:///), но вы можете вручную включить эту опцию в настройках Chrome."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Активировать опцию"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Отключить симулятор"
+  },
+  "menu_close_multi": {
+    "message": "Закрыть это окно"
+  },
+  "menu_change_device": {
+    "message": "Сменить модель"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Устройство, которое вы ищете, не в списке? Сообщите нам!"
+  },
+  "menu_info_device": {
+    "message": "Характеристики и макет этого устройства"
+  },
+  "menu_info_device_features": {
+    "message": "Характеристики (разрешение экрана и т.д.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Бесплатный макет в прозрачном PNG"
+  },
+  "menu_rotate": {
+    "message": "Изменить ориентацию"
+  },
+  "menu_zoom": {
+    "message": "Увеличить в устройстве"
+  },
+  "menu_screenshot": {
+    "message": "📷 Сделать скриншот"
+  },
+  "menu_screencast": {
+    "message": "📹 Записать видео с экрана"
+  },
+  "menu_share": {
+    "message": "Поделиться с коллегой, другом,..."
+  },
+  "menu_send_improvement": {
+    "message": "Предложить улучшение"
+  },
+  "menu_send_message": {
+    "message": "Центр помощи"
+  },
+  "menu_faq_title": {
+    "message": "Часто задаваемые вопросы"
+  },
+  "menu_faq_media_queries": {
+    "message": "Мои медиа-запросы не учитываются"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Как активировать симулятор в режиме инкогнито?"
+  },
+  "menu_faq_scroll": {
+    "message": "Невозможно прокручивать в симуляторе"
+  },
+  "menu_faq_subscription": {
+    "message": "Почему моя подписка не работает?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Как настроить горячие клавиши?"
+  },
+  "menu_faq_all": {
+    "message": "Посмотреть все часто задаваемые вопросы"
+  },
+  "menu_report": {
+    "message": "Сообщить об ошибке"
+  },
+  "menu_settings": {
+    "message": "Конфигурация"
+  },
+  "menu_add_window": {
+    "message": "Добавить модель симуляции"
+  },
+  "menu_help_center": {
+    "message": "Центр помощи"
+  },
+  "menu_extensions": {
+    "message": "Ознакомьтесь с нашими другими расширениями для Chrome"
+  },
+  "menu_vote_feature": {
+    "message": "Голосуйте за функции, которые вы хотите"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Это всего лишь изображение. Чтобы изменить URL, используйте поле Chrome выше."
+  },
+  "simulator_footer_info": {
+    "message": "Это всего лишь изображение. Используйте свою собственную клавиатуру."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Запись видео только с устройства"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Запись видео с вкладки с устройством"
+  },
+  "screencast_error": {
+    "message": "Произошла ошибка при записи. {Нажмите здесь} для обходного решения."
+  },
+  "screencast_modale_title": {
+    "message": "Запись видео"
+  },
+  "screencast_modale_texte": {
+    "message": "Вы можете скачать это видео в различных форматах или получить ссылку для обмена."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Скачать в формате по умолчанию WEBM (с прозрачностью, если опция активирована)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Лучшая совместимость с PowerPoint, но без прозрачности"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Совместимо везде, но качество ниже (с прозрачностью, если опция активирована)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Максимальная продолжительность GIF составляет 60 секунд. В противном случае файл будет слишком большим."
+  },
+  "screencast_modale_copy": {
+    "message": "Копировать"
+  },
+  "screencast_modale_upload": {
+    "message": "Получить ссылку для обмена"
+  },
+  "screencast_modale_contact": {
+    "message": "Сообщить об ошибке, предложить улучшение"
+  },
+  "screencast_start_recording": {
+    "message": "Начать запись"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Доступ к микрофону запрещен."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Доступ к камере запрещен."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Ваша версия Chrome слишком старая для этой функции. Пожалуйста, обновите Chrome до версии выше 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Качество видео влияет на битрейт, fps и разрешение записи. Чем выше качество, тем больше будет файл."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Записи видео ограничены 5 минутами в бесплатной версии."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Скриншот с устройством"
+  },
+  "screenshot_menu_2": {
+    "message": "Скриншот только сайта"
+  },
+  "screenshot_menu_3": {
+    "message": "Скриншот всей страницы"
+  },
+  "screenshot_menu_4": {
+    "message": "Скриншот всей вкладки"
+  },
+  "screenshot_button": {
+    "message": "Создать скриншот"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Скачать в формате PNG (без сжатия)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Скачать в формате WEBP, совместимо почти везде и оптимизированное сжатие (рекомендуется)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Остановить до конца страницы"
+  },
+  "screenshot_modale_title": {
+    "message": "Скриншот"
+  },
+  "screenshot_modale_copy": {
+    "message": "Копировать изображение в буфер обмена"
+  },
+  "screenshot_modale_edit": {
+    "message": "Редактировать скриншот"
+  },
+  "screenshot_modale_help": {
+    "message": "Чтобы сохранить изображение в большом формате, просто щелкните правой кнопкой мыши на нем, затем выберите \"Копировать изображение\" или \"Сохранить\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Закрыть редактор"
+  },
+  "screenshot_editor_undo": {
+    "message": "Отменить последнее действие"
+  },
+  "screenshot_editor_rect": {
+    "message": "Нарисовать прямоугольник"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Нарисовать круг"
+  },
+  "screenshot_editor_line": {
+    "message": "Нарисовать линию"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Нарисовать стрелку"
+  },
+  "screenshot_editor_pen": {
+    "message": "Свободное рисование"
+  },
+  "screenshot_editor_color": {
+    "message": "Цвет линии"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Толщина линии"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Станьте PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Конвертируйте ваши видео в форматы GIF и MP4"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Симулируйте все устройства"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Разблокируйте все настройки"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Разблокируйте все параметры записи видео"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Удалите рекламу"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Редактируйте ваши скриншоты"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Делайте неограниченные скриншоты"
+  },
+  "pro_modale_h2": {
+    "message": "Станьте PRO и активно поддержите разработку этого расширения, поддерживая его разработчика."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Выставляется ежегодно"
+  },
+  "pro_modale_savings": {
+    "message": "Экономьте"
+  },
+  "pro_modale_from": {
+    "message": "От"
+  },
+  "pro_modale_recurring_month": {
+    "message": "месяц"
+  },
+  "pro_modale_button": {
+    "message": "Подписаться"
+  },
+  "pro_modale_link_1": {
+    "message": "Или"
+  },
+  "pro_modale_link_2": {
+    "message": "войти"
+  },
+  "pro_modale_link_3": {
+    "message": "в мой аккаунт подписчика"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Все видео настройки"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Удаление рекламы"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Этот мобильный симулятор полезен вам?"
+  },
+  "sharing_h2": {
+    "message": "Тогда поделитесь им с вашими коллегами или друзьями"
+  },
+  "sharing_txt": {
+    "message": "Симулятор для тестирования вашего сайта на мобильных устройствах и планшетах"
+  },
+  "sharing_review_1": {
+    "message": "И если у вас есть минута, чтобы"
+  },
+  "sharing_review_2": {
+    "message": "добавить отзыв"
+  },
+  "sharing_review_3": {
+    "message": "тогда это будет вишенка на торте! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Добавить отзыв"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Ознакомьтесь с нашими новыми бесплатными расширениями"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Палитра цветов"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Это расширение позволяет вам захватывать любой цвет на экране."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Поиск шрифта"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Определите одним кликом шрифт, используемый на любом тексте веб-страницы."
+  },
+  "other_extensions_button": {
+    "message": "Установить"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Как бы вы оценили это расширение?"
+  },
+  "review_note_store": {
+    "message": "Спасибо за ваш отзыв, не стесняйтесь добавить оценку в Google Store. Я был бы очень признателен 😊"
+  },
+  "review_note_feedback": {
+    "message": "Спасибо за ваш отзыв, не стесняйтесь отправить нам сообщение, чтобы мы могли улучшить это расширение."
+  },
+  "button_feedback": {
+    "message": "Добавить оценку"
+  },
+  "button_message": {
+    "message": "Отправьте нам сообщение"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Название устройства"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max и т.д."
+  },
+  "contact_title": {
+    "message": "Устройство, которое вы ищете, не в списке? Сообщите нам!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Устройство"
+  },
+  "settings_h2_global": {
+    "message": "Общие"
+  },
+  "settings_hide_header_footer": {
+    "message": "Скрыть верхние и нижние элементы браузера в веб-просмотре (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Не показывать фальшивую клавиатуру при фокусе на поле ввода"
+  },
+  "settings_scrollbar_show": {
+    "message": "Показать родной скроллбар в устройстве"
+  },
+  "settings_change_cursor": {
+    "message": "Не изменять стиль курсора в веб-просмотре"
+  },
+  "settings_change_background": {
+    "message": "Изменить цвет фона"
+  },
+  "settings_default_device": {
+    "message": "Устройство по умолчанию при каждом активации"
+  },
+  "settings_change_analytics": {
+    "message": "Я помогаю разработчику этого расширения улучшать его продукт с помощью Posthog. Все данные анонимны."
+  },
+  "settings_device_hide": {
+    "message": "Не показывать устройство"
+  },
+  "settings_batterie_level": {
+    "message": "Уровень заряда батареи в заголовке устройства (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Изменить URL, отображаемый в устройстве"
+  },
+  "settings_presenter_mode": {
+    "message": "Режим презентации (меню справа видно только при наведении)"
+  },
+  "settings_fullscreen": {
+    "message": "Сайт на весь экран в устройстве"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Выберите устройство"
+  },
+  "settings_video_quality": {
+    "message": "Качество видео"
+  },
+  "settings_video_quality_low": {
+    "message": "Среднее"
+  },
+  "settings_video_quality_medium": {
+    "message": "Хорошее"
+  },
+  "settings_video_quality_high": {
+    "message": "Отличное"
+  },
+  "settings_theme": {
+    "message": "Тема"
+  },
+  "settings_theme_light": {
+    "message": "Светлая"
+  },
+  "settings_theme_dark": {
+    "message": "Темная"
+  },
+  "settings_theme_auto": {
+    "message": "Авто"
+  },
+  "settings_shortcuts": {
+    "message": "Настроить горячие клавиши"
+  },
+  "settings_pro_account": {
+    "message": "Управление моей подпиской"
+  },
+  "settings_microphone": {
+    "message": "Микрофон"
+  },
+  "settings_camera": {
+    "message": "Камера"
+  },
+  "settings_countdown": {
+    "message": "Обратный отсчет (секунды)"
+  },
+  "settings_transparent_background": {
+    "message": "Прозрачный фон"
+  },
+  "settings_transparent_background_info": {
+    "message": "Эта опция требует больше вычислений и может замедлить отображение в зависимости от вашего компьютера (совместимо только с форматами WEBM и GIF)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Обходное решение для скриншота"
+  },
+  "screenshot_workaround_context": {
+    "message": "Контекст"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "Из-за некоторых технических ограничений возможно, что при создании скриншота вы получите это сообщение об ошибке."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Обходное решение"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "В этом случае, чтобы начать захват, просто щелкните правой кнопкой мыши в любом месте страницы, выберите пункт «Мобильный симулятор», затем «📷 Сделать скриншот»"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Помогите нам сделать Mobile FIRST еще более полезным для вас 🚀"
+  },
+  "feedback_profession": {
+    "message": "Какой у вас профессиональный отдел?"
+  },
+  "feedback_profession_developer": {
+    "message": "Разработка"
+  },
+  "feedback_profession_designer": {
+    "message": "Дизайн"
+  },
+  "feedback_profession_qa": {
+    "message": "Тестирование / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Управление продуктом"
+  },
+  "feedback_profession_marketing": {
+    "message": "Маркетинг"
+  },
+  "feedback_profession_sales": {
+    "message": "Продажи"
+  },
+  "feedback_profession_other": {
+    "message": "Другое"
+  },
+  "feedback_company_type": {
+    "message": "Какой у вас тип компании?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Фриланс"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Микропредприятие (1-9 сотрудников)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Малый бизнес (10-49 сотрудников)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Средний бизнес (50-249 сотрудников)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Крупный бизнес (250-4999 сотрудников)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Очень крупное предприятие / группа (5000+ сотрудников)"
+  },
+  "feedback_use_cases": {
+    "message": "Почему вы используете Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Тестирование моего сайта, проведение клиентских демонстраций..."
+  },
+  "feedback_frequency": {
+    "message": "Как часто вы используете это расширение?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Ежедневно"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Несколько раз в неделю"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Иногда"
+  },
+  "feedback_frequency_rare": {
+    "message": "Редко"
+  },
+  "feedback_improvements": {
+    "message": "Какие улучшения вы хотели бы видеть?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "Идея, трение, недостаток..."
+  },
+  "feedback_submit": {
+    "message": "Отправить"
+  },
+  "feedback_close": {
+    "message": "Не отвечать"
+  },
+  "feedback_error_required": {
+    "message": "Все поля пусты 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Большое спасибо за ваш отзыв 🤗"
+  },
+  "select": {
+    "message": "Выбрать..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Откройте для себя новый интерфейс \"Liquid Glass\" Safari iOS 26 для более реалистичного тестирования!"
+  },
+  "new_ios26_h2": {
+    "message": "Доступно на всех моделях iPhone&nbsp;15 и iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Новинка!<br>Тестируйте ваши сайты с iPhone&nbsp;17 прямо сейчас."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO и iPhone&nbsp;17 PRO MAX доступны в симуляторе."
+  },
+  "new_video_feature_h1": {
+    "message": "Откройте для себя новую функцию записи видео прямо сейчас!"
+  },
+  "new_video_feature_h2": {
+    "message": "Записывайте с лучшим качеством, с новыми опциями и прозрачным фоном"
+  },
+  "logout_modale_title": {
+    "message": "Вы были автоматически отключены на этом устройстве"
+  },
+  "logout_modale_message": {
+    "message": "Это устройство больше не является частью ваших авторизованных терминалов. Если вы удалили этот доступ вручную, необходимо выполнить новый вход."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Информация</strong>Сенсорная прокрутка недоступна, но вы можете <strong>показать полосу прокрутки</strong>, если у вас нет мыши с колесиком или трекпада для прокрутки.<br><br>Это опция в настройках внизу справа <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Добро пожаловать в Mobile FIRST 👋</strong>Симулируйте одним кликом телефоны, планшеты и компьютеры для простого тестирования и визуализации ваших сайтов.<br><br><strong>Меню находится справа ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Обновление v4.12.0</strong>Новая функция в версии PRO, <strong>редактирование скриншотов</strong>. Кнопки для рисования фигур, добавления текста и т.д. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Обновление v4.14.0</strong>Откройте для себя новую функцию <strong>записи видео</strong> прямо сейчас! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Обновление v4.14.5</strong>Значительное увеличение <strong>разрешения и качества</strong> скриншотов <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Войти"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Хотите поделиться своей подпиской? Чтобы разрешить доступ другим людям, просто добавьте их в разделе \"Пользователи\" вашего аккаунта."
+  }
+}

@@ -69,14 +69,14 @@
     "observability": {
         "enabled": true
     },
-    // Secrets (set via `wrangler secret put`):
-    // GOOGLE_API_KEY
-    // TELEGRAM_BOT_TOKEN
-    // TAG_SYNC_PUSH_SECRET
-    // Cron trigger for auto-posting to Facebook Reels
+    // Cron triggers - run every minute for auto-posting
     "triggers": {
         "crons": [
             "* * * * *"
         ]
-    }
+    },
+    // Secrets (set via `wrangler secret put`):
+    // GOOGLE_API_KEY
+    // TELEGRAM_BOT_TOKEN
+    // TAG_SYNC_PUSH_SECRET
 }

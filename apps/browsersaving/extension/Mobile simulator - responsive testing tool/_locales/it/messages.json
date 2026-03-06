@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Simulatore telefono mobile - test sito responsive"
+  },
+  "extDescription": {
+    "message": "Simulatore di smartphone e tablet su computer con molti modelli per testare il proprio sito mobile e responsive."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "Annulla"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Telefoni Android"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Telefoni Apple"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Tablet"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Speciali"
+  },
+  "copied": {
+    "message": "Copiato"
+  },
+  "error": {
+    "message": "Errore"
+  },
+  "link": {
+    "message": "Link"
+  },
+  "optional": {
+    "message": "Facoltativo"
+  },
+  "close": {
+    "message": "Chiudi"
+  },
+  "get_pro": {
+    "message": "Ottieni la versione PRO"
+  },
+  "error_contact": {
+    "message": "{Contattaci} se il problema persiste."
+  },
+  "more_settings": {
+    "message": "Più impostazioni"
+  },
+  "dimensions": {
+    "message": "Dimensioni"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Attiva la vista mobile su questa scheda"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Il simulatore non è attivabile su questa pagina nativa del tuo browser. Prova su un'altra scheda o naviga su un sito e riavvia."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Questo simulatore non può essere attivato di default sui file locali (file:///) ma puoi attivare l'opzione manualmente nelle impostazioni di Chrome."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Attiva l'opzione"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Disattiva il simulatore"
+  },
+  "menu_close_multi": {
+    "message": "Chiudi questa finestra"
+  },
+  "menu_change_device": {
+    "message": "Cambia modello"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Il dispositivo che cerchi non è nella lista? Facci sapere!"
+  },
+  "menu_info_device": {
+    "message": "Caratteristiche e mockup di questo terminale"
+  },
+  "menu_info_device_features": {
+    "message": "Caratteristiche (risoluzione viewport, ecc.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Mockup gratuito in PNG trasparente"
+  },
+  "menu_rotate": {
+    "message": "Cambia orientamento"
+  },
+  "menu_zoom": {
+    "message": "Zoom nel dispositivo"
+  },
+  "menu_screenshot": {
+    "message": "📷 Fai uno screenshot"
+  },
+  "menu_screencast": {
+    "message": "📹 Registra un video dello schermo"
+  },
+  "menu_share": {
+    "message": "Condividi con un collega, un amico,..."
+  },
+  "menu_send_improvement": {
+    "message": "Proponi un miglioramento"
+  },
+  "menu_send_message": {
+    "message": "Centro assistenza"
+  },
+  "menu_faq_title": {
+    "message": "Domande frequenti"
+  },
+  "menu_faq_media_queries": {
+    "message": "Le mie media queries non vengono considerate"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Come attivare il simulatore in navigazione privata?"
+  },
+  "menu_faq_scroll": {
+    "message": "Impossibile scorrere nel simulatore"
+  },
+  "menu_faq_subscription": {
+    "message": "Perché il mio abbonamento non funziona?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Come impostare le scorciatoie da tastiera?"
+  },
+  "menu_faq_all": {
+    "message": "Vedi tutte le domande frequenti"
+  },
+  "menu_report": {
+    "message": "Segnala un bug"
+  },
+  "menu_settings": {
+    "message": "Configurazione"
+  },
+  "menu_add_window": {
+    "message": "Aggiungi un modello di simulazione"
+  },
+  "menu_help_center": {
+    "message": "Centro assistenza"
+  },
+  "menu_extensions": {
+    "message": "Scopri le nostre altre estensioni Chrome"
+  },
+  "menu_vote_feature": {
+    "message": "Vota per le funzionalità che desideri"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Questa è solo un'immagine. Per cambiare l'URL usa il campo di Chrome sopra."
+  },
+  "simulator_footer_info": {
+    "message": "Questa è solo un'immagine. Usa la tua tastiera."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Cattura video solo del terminale"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Cattura video della scheda con il terminale"
+  },
+  "screencast_error": {
+    "message": "Si è verificato un errore durante la registrazione. {Clicca qui} per una soluzione alternativa."
+  },
+  "screencast_modale_title": {
+    "message": "Cattura video"
+  },
+  "screencast_modale_texte": {
+    "message": "Puoi scaricare questo video in diversi formati o ottenere un link di condivisione."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Scarica nel formato predefinito WEBM (con trasparenza se l'opzione è attivata)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "Migliore compatibilità con PowerPoint, ma senza trasparenza"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Compatibile ovunque, ma qualità inferiore (con trasparenza se l'opzione è attivata)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "La durata massima di un GIF è di 60 secondi. Oltre il file sarebbe troppo voluminoso."
+  },
+  "screencast_modale_copy": {
+    "message": "Copia"
+  },
+  "screencast_modale_upload": {
+    "message": "Ottieni un link di condivisione"
+  },
+  "screencast_modale_contact": {
+    "message": "Segnala un bug, proponi un miglioramento"
+  },
+  "screencast_start_recording": {
+    "message": "Avvia la registrazione"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Permesso di accesso al microfono negato."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Permesso di accesso alla fotocamera negato."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "La tua versione di Chrome è troppo vecchia per questa funzionalità. Aggiorna Chrome a una versione superiore a 94.0"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "La qualità video influisce sul bitrate, fps e risoluzione della registrazione. Maggiore è la qualità, più grande sarà il file."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Le registrazioni video sono limitate a 5 minuti nella versione gratuita."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Cattura con il terminale"
+  },
+  "screenshot_menu_2": {
+    "message": "Cattura solo del sito"
+  },
+  "screenshot_menu_3": {
+    "message": "Cattura di tutta la pagina"
+  },
+  "screenshot_menu_4": {
+    "message": "Cattura di tutta la scheda"
+  },
+  "screenshot_button": {
+    "message": "Genera una cattura"
+  },
+  "screenshot_modale_download_png": {
+    "message": "Scarica in formato PNG (senza compressione)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "Scarica in formato WEBP, compatibile quasi ovunque e compressione ottimizzata (consigliato)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Ferma prima della fine della pagina"
+  },
+  "screenshot_modale_title": {
+    "message": "Cattura"
+  },
+  "screenshot_modale_copy": {
+    "message": "Copia l'immagine negli appunti"
+  },
+  "screenshot_modale_edit": {
+    "message": "Modifica la cattura"
+  },
+  "screenshot_modale_help": {
+    "message": "Per salvare l'immagine in grande formato basta fare clic destro su di essa e poi \"Copia immagine\" o \"Salva\"."
+  },
+  "screenshot_editor_close": {
+    "message": "Chiudi l'editor"
+  },
+  "screenshot_editor_undo": {
+    "message": "Annulla l'ultima azione"
+  },
+  "screenshot_editor_rect": {
+    "message": "Disegna un rettangolo"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Disegna un cerchio"
+  },
+  "screenshot_editor_line": {
+    "message": "Disegna una linea"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Disegna una freccia"
+  },
+  "screenshot_editor_pen": {
+    "message": "Disegno libero"
+  },
+  "screenshot_editor_color": {
+    "message": "Colore del tratto"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Spessore del tratto"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "Diventa un PRO"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Converti i tuoi video in formati GIF e MP4"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Simula tutti i dispositivi"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Sblocca tutte le impostazioni"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Sblocca tutte le impostazioni di registrazione video"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Rimuovi le pubblicità"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Modifica le tue catture"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Fai screenshot senza limiti"
+  },
+  "pro_modale_h2": {
+    "message": "Diventa un PRO e contribuisci attivamente allo sviluppo di questa estensione supportando il suo sviluppatore."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Fatturato annualmente"
+  },
+  "pro_modale_savings": {
+    "message": "Risparmia"
+  },
+  "pro_modale_from": {
+    "message": "A partire da"
+  },
+  "pro_modale_recurring_month": {
+    "message": "mese"
+  },
+  "pro_modale_button": {
+    "message": "Mi abbono"
+  },
+  "pro_modale_link_1": {
+    "message": "Oppure"
+  },
+  "pro_modale_link_2": {
+    "message": "accedo"
+  },
+  "pro_modale_link_3": {
+    "message": "al mio account abbonato"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Tutte le impostazioni video"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Rimozione delle pubblicità"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Questo simulatore mobile ti è utile?"
+  },
+  "sharing_h2": {
+    "message": "Allora condividilo con i tuoi colleghi o amici"
+  },
+  "sharing_txt": {
+    "message": "Simulatore per testare il proprio sito su mobile e tablet"
+  },
+  "sharing_review_1": {
+    "message": "E se hai un minuto per"
+  },
+  "sharing_review_2": {
+    "message": "aggiungere una recensione"
+  },
+  "sharing_review_3": {
+    "message": "allora è la ciliegina sulla torta! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Aggiungo una recensione"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "Scopri le nostre nuovissime estensioni gratuite"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Color picker"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Questa estensione ti permette di catturare qualsiasi colore sullo schermo."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Font finder"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Identifica con un clic il font utilizzato su qualsiasi testo di una pagina web."
+  },
+  "other_extensions_button": {
+    "message": "Installa"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Come valuteresti questa estensione?"
+  },
+  "review_note_store": {
+    "message": "Grazie per il tuo feedback, non esitare ad aggiungere una recensione sul Google Store. Te ne sarei molto grato 😊"
+  },
+  "review_note_feedback": {
+    "message": "Grazie per il tuo feedback, non esitare a inviarci un messaggio per migliorare questa estensione."
+  },
+  "button_feedback": {
+    "message": "Aggiungi una recensione"
+  },
+  "button_message": {
+    "message": "Inviaci un messaggio"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Nome del dispositivo"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, ecc."
+  },
+  "contact_title": {
+    "message": "Il dispositivo che cerchi non è nella lista? Facci sapere!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Terminale"
+  },
+  "settings_h2_global": {
+    "message": "Generale"
+  },
+  "settings_hide_header_footer": {
+    "message": "Nascondi gli elementi in alto e in basso del browser nella webview (PWA)"
+  },
+  "settings_hide_keyboard": {
+    "message": "Non mostrare la tastiera finta al focus di un campo di input"
+  },
+  "settings_scrollbar_show": {
+    "message": "Mostra la barra di scorrimento nativa nel terminale"
+  },
+  "settings_change_cursor": {
+    "message": "Non cambiare lo stile del cursore nella webview"
+  },
+  "settings_change_background": {
+    "message": "Modifica il colore di sfondo"
+  },
+  "settings_default_device": {
+    "message": "Terminale predefinito a ogni attivazione"
+  },
+  "settings_change_analytics": {
+    "message": "Aiuto lo sviluppatore di questa estensione a migliorare il suo prodotto grazie a Posthog. Tutti i dati sono anonimizzati."
+  },
+  "settings_device_hide": {
+    "message": "Non mostrare il terminale"
+  },
+  "settings_batterie_level": {
+    "message": "Livello di batteria nell'header del terminale (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Modifica l'URL visualizzato nel terminale"
+  },
+  "settings_presenter_mode": {
+    "message": "Modalità presentazione (menu a destra visibile solo al passaggio del mouse)"
+  },
+  "settings_fullscreen": {
+    "message": "Sito a schermo intero nel terminale"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Seleziona un terminale"
+  },
+  "settings_video_quality": {
+    "message": "Qualità video"
+  },
+  "settings_video_quality_low": {
+    "message": "Media"
+  },
+  "settings_video_quality_medium": {
+    "message": "Buona"
+  },
+  "settings_video_quality_high": {
+    "message": "Eccellente"
+  },
+  "settings_theme": {
+    "message": "Tema"
+  },
+  "settings_theme_light": {
+    "message": "Chiaro"
+  },
+  "settings_theme_dark": {
+    "message": "Scuro"
+  },
+  "settings_theme_auto": {
+    "message": "Auto"
+  },
+  "settings_shortcuts": {
+    "message": "Definisci le scorciatoie da tastiera"
+  },
+  "settings_pro_account": {
+    "message": "Gestisci il mio abbonamento"
+  },
+  "settings_microphone": {
+    "message": "Microfono"
+  },
+  "settings_camera": {
+    "message": "Fotocamera"
+  },
+  "settings_countdown": {
+    "message": "Conto alla rovescia (secondi)"
+  },
+  "settings_transparent_background": {
+    "message": "Sfondo trasparente"
+  },
+  "settings_transparent_background_info": {
+    "message": "Questa opzione implica più calcoli e quindi un potenziale rallentamento della visualizzazione a seconda del tuo computer (compatibile solo con i formati WEBM e GIF)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Soluzione alternativa per lo screenshot"
+  },
+  "screenshot_workaround_context": {
+    "message": "Contesto"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "A causa di alcune limitazioni tecniche, è possibile che, durante lo screenshot, ricevi questo messaggio di errore."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Soluzione alternativa"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "In questo caso, per avviare la cattura, basta fare clic destro ovunque sulla pagina, scegliere l'opzione « Simulatore mobile », quindi « 📷 Fai uno screenshot »"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Aiutaci a rendere Mobile FIRST ancora più utile per te 🚀"
+  },
+  "feedback_profession": {
+    "message": "Qual è il tuo dipartimento professionale?"
+  },
+  "feedback_profession_developer": {
+    "message": "Sviluppo"
+  },
+  "feedback_profession_designer": {
+    "message": "Design"
+  },
+  "feedback_profession_qa": {
+    "message": "Test / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Gestione del prodotto"
+  },
+  "feedback_profession_marketing": {
+    "message": "Marketing"
+  },
+  "feedback_profession_sales": {
+    "message": "Vendite"
+  },
+  "feedback_profession_other": {
+    "message": "Altro"
+  },
+  "feedback_company_type": {
+    "message": "Qual è il tuo tipo di azienda?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Libero professionista"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Micro-impresa (1-9 dipendenti)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Piccola impresa (10-49 dipendenti)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Media impresa (50-249 dipendenti)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Grande impresa (250-4999 dipendenti)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Grandissima impresa / gruppo (5000+ dipendenti)"
+  },
+  "feedback_use_cases": {
+    "message": "Perché usi Mobile FIRST?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Testare il mio sito, fare demo ai clienti..."
+  },
+  "feedback_frequency": {
+    "message": "Con quale frequenza usi questa estensione?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Quotidiano"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Più volte a settimana"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Occasionale"
+  },
+  "feedback_frequency_rare": {
+    "message": "Raro"
+  },
+  "feedback_improvements": {
+    "message": "Quali miglioramenti vorresti vedere?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "Un'idea, un problema, una mancanza..."
+  },
+  "feedback_submit": {
+    "message": "Invia"
+  },
+  "feedback_close": {
+    "message": "Non rispondere"
+  },
+  "feedback_error_required": {
+    "message": "Tutti i campi sono vuoti 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Grazie mille per il tuo feedback 🤗"
+  },
+  "select": {
+    "message": "Seleziona..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Scopri ora la nuova interfaccia \"Liquid Glass\" di Safari iOS 26 per test ancora più realistici!"
+  },
+  "new_ios26_h2": {
+    "message": "Disponibile su tutte le varianti di iPhone&nbsp;15 e iPhone&nbsp;16"
+  },
+  "new_iphone_17_h1": {
+    "message": "Nuovo!<br>Testa ora i tuoi siti con l'iPhone&nbsp;17."
+  },
+  "new_iphone_17_h2": {
+    "message": "L'iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX sono disponibili nel simulatore."
+  },
+  "new_video_feature_h1": {
+    "message": "Scopri ora la nuova funzionalità di cattura video!"
+  },
+  "new_video_feature_h2": {
+    "message": "Registra con una qualità migliore, con nuove opzioni e con sfondo trasparente"
+  },
+  "logout_modale_title": {
+    "message": "Sei stato disconnesso automaticamente su questo dispositivo"
+  },
+  "logout_modale_message": {
+    "message": "Questo dispositivo non fa più parte dei tuoi terminali autorizzati. Se hai rimosso questo accesso manualmente, è necessario un nuovo accesso."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Informazione</strong>Il touch scroll non è disponibile, ma puoi <strong>mostrare la barra di scorrimento</strong> se non hai una rotella del mouse o un trackpad per scorrere.<br><br>È un'opzione nelle impostazioni in basso a destra <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Benvenuto su Mobile FIRST 👋</strong>Simula con un clic telefoni, tablet e computer per testare e visualizzare facilmente i tuoi siti.<br><br><strong>Il menu si trova a destra ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Aggiornamento v4.12.0</strong>Nuova funzionalità in versione PRO, <strong>l'editing degli screenshot</strong>. Pulsanti per disegnare forme, aggiungere testo, ecc. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Aggiornamento v4.14.0</strong>Scopri ora la nuova funzionalità di <strong>cattura video</strong>! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Aggiornamento v4.14.5</strong>Aumento significativo della <strong>risoluzione e qualità</strong> degli screenshot <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Accedi"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Vuoi condividere il tuo abbonamento? Per autorizzare altre persone, aggiungile semplicemente dalla sezione \"Utenti\" del tuo account."
+  }
+}

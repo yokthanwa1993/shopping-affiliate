@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "Mobil Telefon Simülatörü - Duyarlı site testi"
+  },
+  "extDescription": {
+    "message": "Bilgisayarda birçok modelle akıllı telefon ve tablet simülatörü, mobil ve duyarlı sitenizi test etmek için."
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "İptal"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> Android Telefonlar"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> Apple Telefonlar"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> Tabletler"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> Özel"
+  },
+  "copied": {
+    "message": "Kopyalandı"
+  },
+  "error": {
+    "message": "Hata"
+  },
+  "link": {
+    "message": "Bağlantı"
+  },
+  "optional": {
+    "message": "İsteğe bağlı"
+  },
+  "close": {
+    "message": "Kapat"
+  },
+  "get_pro": {
+    "message": "PRO sürümünü edinin"
+  },
+  "error_contact": {
+    "message": "Sorun devam ederse {bize ulaşın}."
+  },
+  "more_settings": {
+    "message": "Daha fazla ayar"
+  },
+  "dimensions": {
+    "message": "Boyutlar"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "Bu sekmede mobil görünümü etkinleştir"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "Simülatör, tarayıcınızın bu yerel sayfasında etkinleştirilemez. Başka bir sekmede deneyin veya bir siteye gidin ve yeniden başlatın."
+  },
+  "popup_activate_local_files_info": {
+    "message": "Bu simülatör, yerel dosyalarda (file:///) varsayılan olarak etkinleştirilemez ancak Chrome ayarlarından manuel olarak etkinleştirebilirsiniz."
+  },
+  "popup_activate_local_files_button": {
+    "message": "Seçeneği etkinleştir"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "Simülatörü devre dışı bırak"
+  },
+  "menu_close_multi": {
+    "message": "Bu pencereyi kapat"
+  },
+  "menu_change_device": {
+    "message": "Modeli değiştir"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> Aradığınız cihaz listede yok mu? Bize bildirin!"
+  },
+  "menu_info_device": {
+    "message": "Bu terminalin özellikleri ve mockup"
+  },
+  "menu_info_device_features": {
+    "message": "Özellikler (görünüm çözünürlüğü, vb.)"
+  },
+  "menu_info_device_mockup": {
+    "message": "Ücretsiz şeffaf PNG mockup"
+  },
+  "menu_rotate": {
+    "message": "Yönü değiştir"
+  },
+  "menu_zoom": {
+    "message": "Cihazda yakınlaştır"
+  },
+  "menu_screenshot": {
+    "message": "📷 Ekran görüntüsü al"
+  },
+  "menu_screencast": {
+    "message": "📹 Ekran videosu kaydet"
+  },
+  "menu_share": {
+    "message": "Bir meslektaşla, bir arkadaşla paylaş..."
+  },
+  "menu_send_improvement": {
+    "message": "Geliştirme öner"
+  },
+  "menu_send_message": {
+    "message": "Yardım merkezi"
+  },
+  "menu_faq_title": {
+    "message": "Sıkça Sorulan Sorular"
+  },
+  "menu_faq_media_queries": {
+    "message": "Medya sorgularım dikkate alınmıyor"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "Simülatörü gizli modda nasıl etkinleştiririm?"
+  },
+  "menu_faq_scroll": {
+    "message": "Simülatörde kaydırma yapılamıyor"
+  },
+  "menu_faq_subscription": {
+    "message": "Aboneliğim neden çalışmıyor?"
+  },
+  "menu_faq_shortcut": {
+    "message": "Klavye kısayollarını nasıl ayarlayabilirim?"
+  },
+  "menu_faq_all": {
+    "message": "Tüm sıkça sorulan soruları gör"
+  },
+  "menu_report": {
+    "message": "Bir hata bildir"
+  },
+  "menu_settings": {
+    "message": "Yapılandırma"
+  },
+  "menu_add_window": {
+    "message": "Simülasyon modeli ekle"
+  },
+  "menu_help_center": {
+    "message": "Yardım merkezi"
+  },
+  "menu_extensions": {
+    "message": "Diğer Chrome uzantılarımızı keşfedin"
+  },
+  "menu_vote_feature": {
+    "message": "İstediğiniz özellikler için oy verin"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "Bu sadece bir resimdir. URL'yi değiştirmek için yukarıdaki Chrome alanını kullanın."
+  },
+  "simulator_footer_info": {
+    "message": "Bu sadece bir resimdir. Kendi klavyenizi kullanın."
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "Sadece terminalin video kaydı"
+  },
+  "screencast_tooltip_tab": {
+    "message": "Terminal ile sekmenin video kaydı"
+  },
+  "screencast_error": {
+    "message": "Kayıt sırasında bir hata oluştu. Bir geçici çözüm için {buraya tıklayın}."
+  },
+  "screencast_modale_title": {
+    "message": "Video kaydı"
+  },
+  "screencast_modale_texte": {
+    "message": "Bu videoyu farklı formatlarda indirebilir veya bir paylaşım bağlantısı alabilirsiniz."
+  },
+  "screencast_modale_download_webm": {
+    "message": "Varsayılan WEBM formatında indir (şeffaflık seçeneği etkinse)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "PowerPoint ile daha iyi uyumluluk, ancak şeffaflık yok"
+  },
+  "screencast_modale_download_gif": {
+    "message": "Her yerde uyumlu, ancak daha düşük kalite (şeffaflık seçeneği etkinse)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "Bir GIF'in maksimum süresi 60 saniyedir. Daha uzun olursa dosya çok büyük olur."
+  },
+  "screencast_modale_copy": {
+    "message": "Kopyala"
+  },
+  "screencast_modale_upload": {
+    "message": "Paylaşım bağlantısı al"
+  },
+  "screencast_modale_contact": {
+    "message": "Bir hata bildir, bir geliştirme öner"
+  },
+  "screencast_start_recording": {
+    "message": "Kaydı başlat"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "Mikrofon erişim izni reddedildi."
+  },
+  "screencast_camera_permission_denied": {
+    "message": "Kamera erişim izni reddedildi."
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Chrome sürümünüz bu özellik için çok eski. Lütfen Chrome'u 94.0 üzeri bir sürüme güncelleyin."
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "Video kalitesi, bitrate, fps ve kayıt çözünürlüğünü etkiler. Kalite ne kadar yüksekse dosya o kadar büyük olur."
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "Ücretsiz sürümde video kayıtları 5 dakika ile sınırlıdır."
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "Terminal ile birlikte çekim"
+  },
+  "screenshot_menu_2": {
+    "message": "Sadece sitenin çekimi"
+  },
+  "screenshot_menu_3": {
+    "message": "Tüm sayfanın çekimi"
+  },
+  "screenshot_menu_4": {
+    "message": "Tüm sekmenin çekimi"
+  },
+  "screenshot_button": {
+    "message": "Çekim oluştur"
+  },
+  "screenshot_modale_download_png": {
+    "message": "PNG formatında indir (sıkıştırma yok)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "WEBP formatında indir, neredeyse her yerde uyumlu ve optimize edilmiş sıkıştırma (önerilir)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "Sayfa sonundan önce durdur"
+  },
+  "screenshot_modale_title": {
+    "message": "Çekim"
+  },
+  "screenshot_modale_copy": {
+    "message": "Görüntüyü panoya kopyala"
+  },
+  "screenshot_modale_edit": {
+    "message": "Çekimi düzenle"
+  },
+  "screenshot_modale_help": {
+    "message": "Görüntüyü büyük formatta kaydetmek için üzerine sağ tıklayıp \"Görüntüyü Kopyala\" veya \"Kaydet\" seçeneğini seçin."
+  },
+  "screenshot_editor_close": {
+    "message": "Editörü kapat"
+  },
+  "screenshot_editor_undo": {
+    "message": "Son işlemi geri al"
+  },
+  "screenshot_editor_rect": {
+    "message": "Dikdörtgen çiz"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "Daire çiz"
+  },
+  "screenshot_editor_line": {
+    "message": "Çizgi çiz"
+  },
+  "screenshot_editor_arrow": {
+    "message": "Ok çiz"
+  },
+  "screenshot_editor_pen": {
+    "message": "Serbest çizim"
+  },
+  "screenshot_editor_color": {
+    "message": "Çizgi rengi"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "Çizgi kalınlığı"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "PRO olun"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "Video çekimlerinizi GIF ve MP4 formatlarına dönüştürün"
+  },
+  "pro_modale_h1_devices": {
+    "message": "Tüm cihazları simüle edin"
+  },
+  "pro_modale_h1_settings": {
+    "message": "Tüm ayarların kilidini açın"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "Tüm video kayıt ayarlarının kilidini açın"
+  },
+  "pro_modale_h1_ads": {
+    "message": "Reklamları kaldırın"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "Çekimlerinizi düzenleyin"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "Sınırsız ekran görüntüsü alın"
+  },
+  "pro_modale_h2": {
+    "message": "PRO olun ve bu uzantının geliştirilmesine katkıda bulunarak geliştiricisini destekleyin."
+  },
+  "pro_modale_billed_annualy": {
+    "message": "Yıllık faturalandırılır"
+  },
+  "pro_modale_savings": {
+    "message": "Tasarruf edin"
+  },
+  "pro_modale_from": {
+    "message": "Başlangıç"
+  },
+  "pro_modale_recurring_month": {
+    "message": "ay"
+  },
+  "pro_modale_button": {
+    "message": "Abone oluyorum"
+  },
+  "pro_modale_link_1": {
+    "message": "Veya"
+  },
+  "pro_modale_link_2": {
+    "message": "giriş yapıyorum"
+  },
+  "pro_modale_link_3": {
+    "message": "abonelik hesabıma"
+  },
+  "pro_modale_avantage_1": {
+    "message": "Tüm video ayarları"
+  },
+  "pro_modale_avantage_2": {
+    "message": "Reklamların kaldırılması"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "Bu mobil simülatör sana faydalı mı?"
+  },
+  "sharing_h2": {
+    "message": "O zaman meslektaşların veya arkadaşlarınla paylaş"
+  },
+  "sharing_txt": {
+    "message": "Mobil ve tablet üzerinde sitenizi test etmek için simülatör"
+  },
+  "sharing_review_1": {
+    "message": "Ve bir dakikan varsa"
+  },
+  "sharing_review_2": {
+    "message": "bir inceleme ekle"
+  },
+  "sharing_review_3": {
+    "message": "o zaman bu pastanın üzerindeki kiraz olur! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "Bir inceleme ekliyorum"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "En yeni ücretsiz uzantılarımızı keşfedin"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "Renk seçici"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "Bu uzantı, ekrandaki herhangi bir rengi yakalamanıza olanak tanır."
+  },
+  "other_extensions_font_finder_title": {
+    "message": "Yazı tipi bulucu"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "Bir web sayfasındaki herhangi bir metinde kullanılan yazı tipini bir tıklamayla tanımlayın."
+  },
+  "other_extensions_button": {
+    "message": "Yükle"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "Bu uzantıyı nasıl değerlendirirsiniz?"
+  },
+  "review_note_store": {
+    "message": "Geri bildiriminiz için teşekkürler, Google Store'da bir not eklemekten çekinmeyin. Çok minnettar olurum 😊"
+  },
+  "review_note_feedback": {
+    "message": "Geri bildiriminiz için teşekkürler, bu uzantıyı geliştirmemiz için bize bir mesaj göndermekten çekinmeyin."
+  },
+  "button_feedback": {
+    "message": "Bir not ekle"
+  },
+  "button_message": {
+    "message": "Bize bir mesaj gönderin"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "Cihaz adı"
+  },
+  "contact_message_field_placeholder": {
+    "message": "Samsung Galaxy S24 Ultra, iPhone 17 Pro Max, vb."
+  },
+  "contact_title": {
+    "message": "Aradığınız cihaz listede yok mu? Bize bildirin!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "Terminal"
+  },
+  "settings_h2_global": {
+    "message": "Genel"
+  },
+  "settings_hide_header_footer": {
+    "message": "Webview'de (PWA) tarayıcı üst ve alt öğelerini gizle"
+  },
+  "settings_hide_keyboard": {
+    "message": "Bir giriş alanına odaklanıldığında sahte klavyeyi göstermeyin"
+  },
+  "settings_scrollbar_show": {
+    "message": "Terminalde yerel kaydırma çubuğunu göster"
+  },
+  "settings_change_cursor": {
+    "message": "Webview'de imleç stilini değiştirmeyin"
+  },
+  "settings_change_background": {
+    "message": "Arka plan rengini değiştir"
+  },
+  "settings_default_device": {
+    "message": "Her etkinleştirmede varsayılan terminal"
+  },
+  "settings_change_analytics": {
+    "message": "Bu uzantının geliştiricisine Posthog ile ürününü geliştirmesi için yardımcı oluyorum. Tüm veriler anonimleştirilmiştir."
+  },
+  "settings_device_hide": {
+    "message": "Terminali göstermeyin"
+  },
+  "settings_batterie_level": {
+    "message": "Terminal başlığında pil seviyesi (%)"
+  },
+  "settings_device_default_url": {
+    "message": "Terminalde gösterilen URL'yi değiştir"
+  },
+  "settings_presenter_mode": {
+    "message": "Sunum modu (sağdaki menü sadece üzerine gelindiğinde görünür)"
+  },
+  "settings_fullscreen": {
+    "message": "Terminalde tam ekran site"
+  },
+  "settings_default_device_placeholder": {
+    "message": "Bir terminal seçin"
+  },
+  "settings_video_quality": {
+    "message": "Video kalitesi"
+  },
+  "settings_video_quality_low": {
+    "message": "Orta"
+  },
+  "settings_video_quality_medium": {
+    "message": "İyi"
+  },
+  "settings_video_quality_high": {
+    "message": "Mükemmel"
+  },
+  "settings_theme": {
+    "message": "Tema"
+  },
+  "settings_theme_light": {
+    "message": "Açık"
+  },
+  "settings_theme_dark": {
+    "message": "Koyu"
+  },
+  "settings_theme_auto": {
+    "message": "Otomatik"
+  },
+  "settings_shortcuts": {
+    "message": "Klavye kısayollarını tanımla"
+  },
+  "settings_pro_account": {
+    "message": "Aboneliğimi yönet"
+  },
+  "settings_microphone": {
+    "message": "Mikrofon"
+  },
+  "settings_camera": {
+    "message": "Kamera"
+  },
+  "settings_countdown": {
+    "message": "Geri sayım (saniye)"
+  },
+  "settings_transparent_background": {
+    "message": "Şeffaf arka plan"
+  },
+  "settings_transparent_background_info": {
+    "message": "Bu seçenek daha fazla hesaplama gerektirir ve bilgisayarınıza bağlı olarak görüntülemede potansiyel bir yavaşlamaya neden olabilir (sadece WEBM ve GIF formatlarıyla uyumlu)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "Ekran görüntüsü için geçici çözüm"
+  },
+  "screenshot_workaround_context": {
+    "message": "Bağlam"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "Bazı teknik sınırlamalar nedeniyle, ekran görüntüsü alırken bu hata mesajını alabilirsiniz."
+  },
+  "screenshot_workaround_solution": {
+    "message": "Geçici çözüm"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "Bu durumda çekimi başlatmak için sayfanın herhangi bir yerine sağ tıklayın, \"Mobil Simülatör\" seçeneğini seçin, ardından \"📷 Ekran görüntüsü al\" seçeneğini seçin"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "Mobile FIRST'ü sizin için daha kullanışlı hale getirmemize yardımcı olun 🚀"
+  },
+  "feedback_profession": {
+    "message": "Mesleki departmanınız nedir?"
+  },
+  "feedback_profession_developer": {
+    "message": "Geliştirme"
+  },
+  "feedback_profession_designer": {
+    "message": "Tasarım"
+  },
+  "feedback_profession_qa": {
+    "message": "Test / QA"
+  },
+  "feedback_profession_product": {
+    "message": "Ürün yönetimi"
+  },
+  "feedback_profession_marketing": {
+    "message": "Pazarlama"
+  },
+  "feedback_profession_sales": {
+    "message": "Satış"
+  },
+  "feedback_profession_other": {
+    "message": "Diğer"
+  },
+  "feedback_company_type": {
+    "message": "Şirket türünüz nedir?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "Serbest çalışan"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "Mikro işletme (1-9 çalışan)"
+  },
+  "feedback_company_type_agency": {
+    "message": "Küçük işletme (10-49 çalışan)"
+  },
+  "feedback_company_type_startup": {
+    "message": "Orta ölçekli işletme (50-249 çalışan)"
+  },
+  "feedback_company_type_pme": {
+    "message": "Büyük işletme (250-4999 çalışan)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "Çok büyük işletme / grup (5000+ çalışan)"
+  },
+  "feedback_use_cases": {
+    "message": "Mobile FIRST'ü neden kullanıyorsunuz?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "Sitemi test etmek, müşteri demoları yapmak..."
+  },
+  "feedback_frequency": {
+    "message": "Bu uzantıyı ne sıklıkla kullanıyorsunuz?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "Günlük"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "Haftada birkaç kez"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "Ara sıra"
+  },
+  "feedback_frequency_rare": {
+    "message": "Nadir"
+  },
+  "feedback_improvements": {
+    "message": "Hangi geliştirmeleri görmek istersiniz?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "Bir fikir, bir sürtüşme, bir eksiklik..."
+  },
+  "feedback_submit": {
+    "message": "Gönder"
+  },
+  "feedback_close": {
+    "message": "Yanıt verme"
+  },
+  "feedback_error_required": {
+    "message": "Tüm alanlar boş 🤔"
+  },
+  "feedback_submitted": {
+    "message": "Geri bildiriminiz için çok teşekkürler 🤗"
+  },
+  "select": {
+    "message": "Seç..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "Daha gerçekçi testler için Safari iOS 26'nın yeni \"Liquid Glass\" arayüzünü hemen keşfedin!"
+  },
+  "new_ios26_h2": {
+    "message": "iPhone&nbsp;15 ve iPhone&nbsp;16'nın tüm varyantlarında mevcut"
+  },
+  "new_iphone_17_h1": {
+    "message": "Yeni!<br>iPhone&nbsp;17 ile sitelerinizi hemen test edin."
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX simülatörde mevcut."
+  },
+  "new_video_feature_h1": {
+    "message": "Yeni video çekim özelliğini hemen keşfedin!"
+  },
+  "new_video_feature_h2": {
+    "message": "Daha iyi kalite, yeni seçenekler ve şeffaf arka plan ile kaydedin"
+  },
+  "logout_modale_title": {
+    "message": "Bu cihazda otomatik olarak çıkış yaptınız"
+  },
+  "logout_modale_message": {
+    "message": "Bu cihaz artık yetkili cihazlarınız arasında değil. Bu erişimi manuel olarak kaldırdıysanız, yeniden giriş yapmanız gerekmektedir."
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>Bilgi</strong>Dokunmatik kaydırma mevcut değil, ancak kaydırmak için fare tekerleğiniz veya bir trackpad'iniz yoksa <strong>kaydırma çubuğunu gösterebilirsiniz</strong>.<br><br>Bu, sağ alttaki ayarlarda bir seçenektir <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Mobile FIRST'e hoş geldiniz 👋</strong>Telefonları, tabletleri ve bilgisayarları tek tıkla simüle edin ve sitelerinizi kolayca test edin ve görüntüleyin.<br><br><strong>Menü sağda ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>Güncelleme v4.12.0</strong>PRO sürümde yeni özellik, <strong>ekran görüntüsü düzenleme</strong>. Şekiller çizmek, metin eklemek için düğmeler, vb. <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>Güncelleme v4.14.0</strong>Yeni <strong>video çekim</strong> özelliğini hemen keşfedin! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>Güncelleme v4.14.5</strong>Ekran görüntülerinin <strong>çözünürlüğü ve kalitesinde</strong> önemli bir artış <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "Giriş yap"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ Aboneliğinizi paylaşmak mı istiyorsunuz? Başkalarını yetkilendirmek için, onları hesabınızın \"Kullanıcılar\" bölümünden ekleyin."
+  }
+}

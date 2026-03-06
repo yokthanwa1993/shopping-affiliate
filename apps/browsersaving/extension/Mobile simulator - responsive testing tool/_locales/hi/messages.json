@@ -1,0 +1,677 @@
+{
+  "extName": {
+    "message": "मोबाइल फोन सिम्युलेटर - उत्तरदायी साइट परीक्षण"
+  },
+  "extDescription": {
+    "message": "कंप्यूटर पर स्मार्टफोन और टैबलेट सिम्युलेटर के साथ कई मॉडल्स के लिए अपने मोबाइल और उत्तरदायी साइट का परीक्षण करें।"
+  },
+  "global": {
+    "message": "--------------------------------------------------------"
+  },
+  "global_cancel": {
+    "message": "रद्द करें"
+  },
+  "android_smartphone": {
+    "message": "<i class='mdi'>&#xe922;</i> एंड्रॉइड फोन"
+  },
+  "apple_smartphone": {
+    "message": "<i class='mdi'>&#xeabe;</i> एप्पल फोन"
+  },
+  "tablet": {
+    "message": "<i class='mdi'>&#xe920;</i> टैबलेट"
+  },
+  "others": {
+    "message": "<i class='mdi'>&#xe921;</i> विशेष"
+  },
+  "copied": {
+    "message": "कॉपी किया गया"
+  },
+  "error": {
+    "message": "त्रुटि"
+  },
+  "link": {
+    "message": "लिंक"
+  },
+  "optional": {
+    "message": "वैकल्पिक"
+  },
+  "close": {
+    "message": "बंद करें"
+  },
+  "get_pro": {
+    "message": "PRO संस्करण प्राप्त करें"
+  },
+  "error_contact": {
+    "message": "{यदि समस्या बनी रहती है तो हमसे संपर्क करें}।"
+  },
+  "more_settings": {
+    "message": "अधिक सेटिंग्स"
+  },
+  "dimensions": {
+    "message": "आयाम"
+  },
+  "context_menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "context_menu_activate": {
+    "message": "इस टैब पर मोबाइल दृश्य सक्रिय करें"
+  },
+  "popup": {
+    "message": "--------------------------------------------------------"
+  },
+  "popup_site_incompatible": {
+    "message": "यह सिम्युलेटर आपके ब्राउज़र के इस मूल पृष्ठ पर सक्रिय नहीं किया जा सकता। किसी अन्य टैब पर प्रयास करें या किसी साइट पर नेविगेट करें और फिर से प्रयास करें।"
+  },
+  "popup_activate_local_files_info": {
+    "message": "यह सिम्युलेटर डिफ़ॉल्ट रूप से स्थानीय फाइलों (file:///) पर सक्रिय नहीं किया जा सकता, लेकिन आप इसे Chrome सेटिंग्स में मैन्युअल रूप से सक्रिय कर सकते हैं।"
+  },
+  "popup_activate_local_files_button": {
+    "message": "विकल्प सक्रिय करें"
+  },
+  "menu": {
+    "message": "--------------------------------------------------------"
+  },
+  "menu_close_alone": {
+    "message": "सिम्युलेटर निष्क्रिय करें"
+  },
+  "menu_close_multi": {
+    "message": "इस विंडो को बंद करें"
+  },
+  "menu_change_device": {
+    "message": "मॉडल बदलें"
+  },
+  "menu_contact_devices": {
+    "message": "<i class='mdi'>&#xe900;</i> क्या आप जिस उपकरण की तलाश कर रहे हैं वह सूची में नहीं है? हमें बताएं!"
+  },
+  "menu_info_device": {
+    "message": "इस टर्मिनल की विशेषताएं और मॉकअप"
+  },
+  "menu_info_device_features": {
+    "message": "विशेषताएं (व्यूपोर्ट रिज़ॉल्यूशन, आदि)"
+  },
+  "menu_info_device_mockup": {
+    "message": "पारदर्शी PNG में मुफ्त मॉकअप"
+  },
+  "menu_rotate": {
+    "message": "ओरिएंटेशन बदलें"
+  },
+  "menu_zoom": {
+    "message": "डिवाइस में ज़ूम करें"
+  },
+  "menu_screenshot": {
+    "message": "📷 स्क्रीनशॉट लें"
+  },
+  "menu_screencast": {
+    "message": "📹 स्क्रीन रिकॉर्डिंग करें"
+  },
+  "menu_share": {
+    "message": "किसी सहकर्मी, मित्र के साथ साझा करें,..."
+  },
+  "menu_send_improvement": {
+    "message": "सुधार का प्रस्ताव दें"
+  },
+  "menu_send_message": {
+    "message": "सहायता केंद्र"
+  },
+  "menu_faq_title": {
+    "message": "अक्सर पूछे जाने वाले प्रश्न"
+  },
+  "menu_faq_media_queries": {
+    "message": "मेरे मीडिया क्वेरीज़ को ध्यान में नहीं लिया जा रहा"
+  },
+  "menu_faq_ignonito_mode": {
+    "message": "गोपनीय ब्राउज़िंग में सिम्युलेटर कैसे सक्रिय करें?"
+  },
+  "menu_faq_scroll": {
+    "message": "सिम्युलेटर में स्क्रॉल नहीं कर सकते"
+  },
+  "menu_faq_subscription": {
+    "message": "मेरा सब्सक्रिप्शन क्यों काम नहीं कर रहा?"
+  },
+  "menu_faq_shortcut": {
+    "message": "कुंजीपटल शॉर्टकट कैसे सेट करें?"
+  },
+  "menu_faq_all": {
+    "message": "सभी अक्सर पूछे जाने वाले प्रश्न देखें"
+  },
+  "menu_report": {
+    "message": "बग रिपोर्ट करें"
+  },
+  "menu_settings": {
+    "message": "कॉन्फ़िगरेशन"
+  },
+  "menu_add_window": {
+    "message": "सिमुलेशन मॉडल जोड़ें"
+  },
+  "menu_help_center": {
+    "message": "सहायता केंद्र"
+  },
+  "menu_extensions": {
+    "message": "हमारे अन्य Chrome एक्सटेंशन देखें"
+  },
+  "menu_vote_feature": {
+    "message": "उन विशेषताओं के लिए वोट करें जिन्हें आप चाहते हैं"
+  },
+  "simulator": {
+    "message": "--------------------------------------------------------"
+  },
+  "simulator_header_info": {
+    "message": "यह सिर्फ एक छवि है। URL बदलने के लिए ऊपर Chrome के क्षेत्र का उपयोग करें।"
+  },
+  "simulator_footer_info": {
+    "message": "यह सिर्फ एक छवि है। अपने कीबोर्ड का उपयोग करें।"
+  },
+  "screencast": {
+    "message": "--------------------------------------------------------"
+  },
+  "screencast_tooltip_device": {
+    "message": "केवल टर्मिनल का वीडियो कैप्चर"
+  },
+  "screencast_tooltip_tab": {
+    "message": "टर्मिनल के साथ टैब का वीडियो कैप्चर"
+  },
+  "screencast_error": {
+    "message": "रिकॉर्डिंग के दौरान एक त्रुटि हुई। {समाधान के लिए यहां क्लिक करें}।"
+  },
+  "screencast_modale_title": {
+    "message": "वीडियो कैप्चर"
+  },
+  "screencast_modale_texte": {
+    "message": "आप इस वीडियो को विभिन्न प्रारूपों में डाउनलोड कर सकते हैं या एक साझा लिंक प्राप्त कर सकते हैं।"
+  },
+  "screencast_modale_download_webm": {
+    "message": "डिफ़ॉल्ट WEBM प्रारूप में डाउनलोड करें (यदि विकल्प सक्रिय है तो पारदर्शिता के साथ)"
+  },
+  "screencast_modale_download_mp4": {
+    "message": "PowerPoint के साथ बेहतर संगतता, लेकिन पारदर्शिता नहीं"
+  },
+  "screencast_modale_download_gif": {
+    "message": "हर जगह संगत, लेकिन निम्न गुणवत्ता (यदि विकल्प सक्रिय है तो पारदर्शिता के साथ)"
+  },
+  "screencast_modale_gif_duration_limit_info": {
+    "message": "GIF की अधिकतम अवधि 60 सेकंड है। इससे अधिक होने पर फ़ाइल बहुत बड़ी हो जाएगी।"
+  },
+  "screencast_modale_copy": {
+    "message": "कॉपी करें"
+  },
+  "screencast_modale_upload": {
+    "message": "शेयर लिंक प्राप्त करें"
+  },
+  "screencast_modale_contact": {
+    "message": "बग रिपोर्ट करें, सुधार का प्रस्ताव दें"
+  },
+  "screencast_start_recording": {
+    "message": "रिकॉर्डिंग शुरू करें"
+  },
+  "screencast_microphone_permission_denied": {
+    "message": "माइक्रोफोन तक पहुंच की अनुमति अस्वीकृत।"
+  },
+  "screencast_camera_permission_denied": {
+    "message": "कैमरा तक पहुंच की अनुमति अस्वीकृत।"
+  },
+  "screencast_error_media_stream_track_processor_or_generator": {
+    "message": "Chrome का आपका संस्करण इस सुविधा के लिए बहुत पुराना है। कृपया Chrome को 94.0 से ऊपर के संस्करण में अपडेट करें।"
+  },
+  "screencast_quality_info_tooltip": {
+    "message": "वीडियो गुणवत्ता बिटरेट, fps और रिकॉर्डिंग के रिज़ॉल्यूशन को प्रभावित करती है। जितनी अधिक गुणवत्ता होगी, फ़ाइल उतनी ही बड़ी होगी।"
+  },
+  "screencast_modale_auto_stop_limit_reached": {
+    "message": "मुफ्त संस्करण में वीडियो रिकॉर्डिंग 5 मिनट तक सीमित हैं।"
+  },
+  "screenshot": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_menu_1": {
+    "message": "टर्मिनल के साथ कैप्चर"
+  },
+  "screenshot_menu_2": {
+    "message": "केवल साइट का कैप्चर"
+  },
+  "screenshot_menu_3": {
+    "message": "पूरे पृष्ठ का कैप्चर"
+  },
+  "screenshot_menu_4": {
+    "message": "पूरे टैब का कैप्चर"
+  },
+  "screenshot_button": {
+    "message": "कैप्चर जनरेट करें"
+  },
+  "screenshot_modale_download_png": {
+    "message": "PNG प्रारूप में डाउनलोड करें (कोई संपीड़न नहीं)"
+  },
+  "screenshot_modale_download_webp": {
+    "message": "WEBP प्रारूप में डाउनलोड करें, लगभग हर जगह संगत और अनुकूलित संपीड़न (अनुशंसित)"
+  },
+  "screenshot_menu_stop_fullpage": {
+    "message": "पृष्ठ के अंत से पहले रोकें"
+  },
+  "screenshot_modale_title": {
+    "message": "कैप्चर"
+  },
+  "screenshot_modale_copy": {
+    "message": "क्लिपबोर्ड में छवि कॉपी करें"
+  },
+  "screenshot_modale_edit": {
+    "message": "कैप्चर संपादित करें"
+  },
+  "screenshot_modale_help": {
+    "message": "बड़ी छवि को सहेजने के लिए, बस उस पर राइट-क्लिक करें और \"छवि कॉपी करें\" या \"सहेजें\" चुनें।"
+  },
+  "screenshot_editor_close": {
+    "message": "संपादक बंद करें"
+  },
+  "screenshot_editor_undo": {
+    "message": "अंतिम क्रिया पूर्ववत करें"
+  },
+  "screenshot_editor_rect": {
+    "message": "आयत बनाएं"
+  },
+  "screenshot_editor_ellipse": {
+    "message": "वृत्त बनाएं"
+  },
+  "screenshot_editor_line": {
+    "message": "रेखा बनाएं"
+  },
+  "screenshot_editor_arrow": {
+    "message": "तीर बनाएं"
+  },
+  "screenshot_editor_pen": {
+    "message": "मुक्त चित्रण"
+  },
+  "screenshot_editor_color": {
+    "message": "रेखा का रंग"
+  },
+  "screenshot_editor_stroke_width": {
+    "message": "रेखा की मोटाई"
+  },
+  "pro": {
+    "message": "--------------------------------------------------------"
+  },
+  "pro_modale_h1": {
+    "message": "PRO बनें"
+  },
+  "pro_modale_h1_all_formats": {
+    "message": "अपने वीडियो कैप्चर को GIF और MP4 प्रारूपों में बदलें"
+  },
+  "pro_modale_h1_devices": {
+    "message": "सभी उपकरणों का अनुकरण करें"
+  },
+  "pro_modale_h1_settings": {
+    "message": "सभी सेटिंग्स अनलॉक करें"
+  },
+  "pro_modale_h1_screencast": {
+    "message": "सभी वीडियो रिकॉर्डिंग सेटिंग्स अनलॉक करें"
+  },
+  "pro_modale_h1_ads": {
+    "message": "विज्ञापन हटाएं"
+  },
+  "pro_modale_h1_image_editor": {
+    "message": "अपने कैप्चर संपादित करें"
+  },
+  "pro_modale_h1_unlimited_screenshots": {
+    "message": "असीमित स्क्रीनशॉट लें"
+  },
+  "pro_modale_h2": {
+    "message": "PRO बनें और इस एक्सटेंशन के विकास में सक्रिय रूप से योगदान करें इसके डेवलपर का समर्थन करके।"
+  },
+  "pro_modale_billed_annualy": {
+    "message": "वार्षिक रूप से बिल किया गया"
+  },
+  "pro_modale_savings": {
+    "message": "बचत करें"
+  },
+  "pro_modale_from": {
+    "message": "से शुरू"
+  },
+  "pro_modale_recurring_month": {
+    "message": "महीना"
+  },
+  "pro_modale_button": {
+    "message": "मैं सदस्यता लेता हूँ"
+  },
+  "pro_modale_link_1": {
+    "message": "या"
+  },
+  "pro_modale_link_2": {
+    "message": "मैं लॉग इन करता हूँ"
+  },
+  "pro_modale_link_3": {
+    "message": "मेरे सदस्य खाते में"
+  },
+  "pro_modale_avantage_1": {
+    "message": "सभी वीडियो सेटिंग्स"
+  },
+  "pro_modale_avantage_2": {
+    "message": "विज्ञापन हटाना"
+  },
+  "sharing": {
+    "message": "--------------------------------------------------------"
+  },
+  "sharing_h1": {
+    "message": "क्या यह मोबाइल सिम्युलेटर आपके लिए उपयोगी है?"
+  },
+  "sharing_h2": {
+    "message": "तो इसे अपने सहकर्मियों या दोस्तों के साथ साझा करें"
+  },
+  "sharing_txt": {
+    "message": "मोबाइल और टैबलेट पर अपनी साइट का परीक्षण करने के लिए सिम्युलेटर"
+  },
+  "sharing_review_1": {
+    "message": "और अगर आपके पास एक मिनट है"
+  },
+  "sharing_review_2": {
+    "message": "एक समीक्षा जोड़ें"
+  },
+  "sharing_review_3": {
+    "message": "तो यह केक पर चेरी है! 🙂"
+  },
+  "sharing_review_button": {
+    "message": "मैं एक समीक्षा जोड़ता हूँ"
+  },
+  "other_extensions": {
+    "message": "--------------------------------------------------------"
+  },
+  "other_extensions_h1": {
+    "message": "हमारे सभी नए मुफ्त एक्सटेंशन देखें"
+  },
+  "other_extensions_color_picker_title": {
+    "message": "रंग चयनकर्ता"
+  },
+  "other_extensions_color_picker_description": {
+    "message": "यह एक्सटेंशन आपको स्क्रीन पर किसी भी रंग को कैप्चर करने की अनुमति देता है।"
+  },
+  "other_extensions_font_finder_title": {
+    "message": "फॉन्ट फाइंडर"
+  },
+  "other_extensions_font_finder_description": {
+    "message": "किसी भी वेब पेज के टेक्स्ट पर उपयोग किए गए फॉन्ट की पहचान एक क्लिक से करें।"
+  },
+  "other_extensions_button": {
+    "message": "इंस्टॉल करें"
+  },
+  "review": {
+    "message": "--------------------------------------------------------"
+  },
+  "review_h1": {
+    "message": "आप इस एक्सटेंशन को कैसे रेट करेंगे?"
+  },
+  "review_note_store": {
+    "message": "आपकी प्रतिक्रिया के लिए धन्यवाद, कृपया Google स्टोर पर एक रेटिंग जोड़ने में संकोच न करें। मैं आपका बहुत आभारी रहूँगा 😊"
+  },
+  "review_note_feedback": {
+    "message": "आपकी प्रतिक्रिया के लिए धन्यवाद, कृपया हमें एक संदेश भेजने में संकोच न करें ताकि हम इस एक्सटेंशन को सुधार सकें।"
+  },
+  "button_feedback": {
+    "message": "रेटिंग जोड़ें"
+  },
+  "button_message": {
+    "message": "हमें एक संदेश भेजें"
+  },
+  "contact": {
+    "message": "--------------------------------------------------------"
+  },
+  "contact_message_field_name": {
+    "message": "उपकरण का नाम"
+  },
+  "contact_message_field_placeholder": {
+    "message": "सैमसंग गैलेक्सी S24 अल्ट्रा, आईफोन 17 प्रो मैक्स, आदि।"
+  },
+  "contact_title": {
+    "message": "क्या आप जिस उपकरण की तलाश कर रहे हैं वह सूची में नहीं है? हमें बताएं!"
+  },
+  "settings": {
+    "message": "--------------------------------------------------------"
+  },
+  "settings_h2_device": {
+    "message": "टर्मिनल"
+  },
+  "settings_h2_global": {
+    "message": "सामान्य"
+  },
+  "settings_hide_header_footer": {
+    "message": "वेबव्यू (PWA) में ब्राउज़र के शीर्ष और नीचे के तत्वों को छिपाएं"
+  },
+  "settings_hide_keyboard": {
+    "message": "इनपुट फ़ील्ड पर फोकस होने पर नकली कीबोर्ड न दिखाएं"
+  },
+  "settings_scrollbar_show": {
+    "message": "टर्मिनल में मूल स्क्रॉलबार दिखाएं"
+  },
+  "settings_change_cursor": {
+    "message": "वेबव्यू में कर्सर शैली न बदलें"
+  },
+  "settings_change_background": {
+    "message": "पृष्ठभूमि का रंग बदलें"
+  },
+  "settings_default_device": {
+    "message": "प्रत्येक सक्रियण पर डिफ़ॉल्ट टर्मिनल"
+  },
+  "settings_change_analytics": {
+    "message": "मैं इस एक्सटेंशन के डेवलपर को Posthog के माध्यम से अपने उत्पाद को सुधारने में मदद करता हूँ। सभी डेटा गुमनाम होते हैं।"
+  },
+  "settings_device_hide": {
+    "message": "टर्मिनल न दिखाएं"
+  },
+  "settings_batterie_level": {
+    "message": "टर्मिनल के हेडर में बैटरी स्तर (%)"
+  },
+  "settings_device_default_url": {
+    "message": "टर्मिनल में प्रदर्शित URL बदलें"
+  },
+  "settings_presenter_mode": {
+    "message": "प्रस्तुति मोड (दाएं मेनू केवल होवर पर दिखाई देता है)"
+  },
+  "settings_fullscreen": {
+    "message": "टर्मिनल में पूर्ण स्क्रीन साइट"
+  },
+  "settings_default_device_placeholder": {
+    "message": "एक टर्मिनल चुनें"
+  },
+  "settings_video_quality": {
+    "message": "वीडियो गुणवत्ता"
+  },
+  "settings_video_quality_low": {
+    "message": "मध्यम"
+  },
+  "settings_video_quality_medium": {
+    "message": "अच्छा"
+  },
+  "settings_video_quality_high": {
+    "message": "उत्तम"
+  },
+  "settings_theme": {
+    "message": "थीम"
+  },
+  "settings_theme_light": {
+    "message": "हल्का"
+  },
+  "settings_theme_dark": {
+    "message": "गहरा"
+  },
+  "settings_theme_auto": {
+    "message": "स्वतः"
+  },
+  "settings_shortcuts": {
+    "message": "कुंजीपटल शॉर्टकट सेट करें"
+  },
+  "settings_pro_account": {
+    "message": "मेरी सदस्यता प्रबंधित करें"
+  },
+  "settings_microphone": {
+    "message": "माइक्रोफोन"
+  },
+  "settings_camera": {
+    "message": "कैमरा"
+  },
+  "settings_countdown": {
+    "message": "उलटी गिनती (सेकंड)"
+  },
+  "settings_transparent_background": {
+    "message": "पारदर्शी पृष्ठभूमि"
+  },
+  "settings_transparent_background_info": {
+    "message": "यह विकल्प अधिक गणना की आवश्यकता करता है और इसलिए आपके कंप्यूटर के आधार पर प्रदर्शन में संभावित मंदी का कारण बन सकता है (केवल WEBM और GIF प्रारूपों के साथ संगत)"
+  },
+  "screenshot_workaround": {
+    "message": "--------------------------------------------------------"
+  },
+  "screenshot_workaround_title": {
+    "message": "स्क्रीनशॉट के लिए समाधान"
+  },
+  "screenshot_workaround_context": {
+    "message": "प्रसंग"
+  },
+  "screenshot_workaround_context_text": {
+    "message": "कुछ तकनीकी सीमाओं के कारण, स्क्रीनशॉट लेते समय, आपको यह त्रुटि संदेश प्राप्त हो सकता है।"
+  },
+  "screenshot_workaround_solution": {
+    "message": "समाधान"
+  },
+  "screenshot_workaround_solution_text": {
+    "message": "इस स्थिति में कैप्चर शुरू करने के लिए, बस पृष्ठ पर कहीं भी राइट-क्लिक करें, \"मोबाइल सिम्युलेटर\" प्रविष्टि चुनें, फिर \"📷 स्क्रीनशॉट लें\" चुनें।"
+  },
+  "feedback": {
+    "message": "--------------------------------------------------------"
+  },
+  "feedback_title": {
+    "message": "हमें Mobile FIRST को आपके लिए और अधिक उपयोगी बनाने में मदद करें 🚀"
+  },
+  "feedback_profession": {
+    "message": "आपका पेशेवर विभाग क्या है?"
+  },
+  "feedback_profession_developer": {
+    "message": "विकास"
+  },
+  "feedback_profession_designer": {
+    "message": "डिजाइन"
+  },
+  "feedback_profession_qa": {
+    "message": "परीक्षण / QA"
+  },
+  "feedback_profession_product": {
+    "message": "उत्पाद प्रबंधन"
+  },
+  "feedback_profession_marketing": {
+    "message": "मार्केटिंग"
+  },
+  "feedback_profession_sales": {
+    "message": "बिक्री"
+  },
+  "feedback_profession_other": {
+    "message": "अन्य"
+  },
+  "feedback_company_type": {
+    "message": "आपकी कंपनी का प्रकार क्या है?"
+  },
+  "feedback_company_type_freelance": {
+    "message": "स्वतंत्र"
+  },
+  "feedback_company_type_micro_business": {
+    "message": "सूक्ष्म-व्यवसाय (1-9 कर्मचारी)"
+  },
+  "feedback_company_type_agency": {
+    "message": "छोटा व्यवसाय (10-49 कर्मचारी)"
+  },
+  "feedback_company_type_startup": {
+    "message": "मध्यम व्यवसाय (50-249 कर्मचारी)"
+  },
+  "feedback_company_type_pme": {
+    "message": "बड़ा व्यवसाय (250-4999 कर्मचारी)"
+  },
+  "feedback_company_type_grandeentreprise": {
+    "message": "बहुत बड़ा व्यवसाय / समूह (5000+ कर्मचारी)"
+  },
+  "feedback_use_cases": {
+    "message": "आप Mobile FIRST का उपयोग क्यों करते हैं?"
+  },
+  "feedback_useCases_placeholder": {
+    "message": "मेरी साइट का परीक्षण करना, ग्राहक डेमो करना..."
+  },
+  "feedback_frequency": {
+    "message": "आप इस एक्सटेंशन का कितनी बार उपयोग करते हैं?"
+  },
+  "feedback_frequency_quotidien": {
+    "message": "दैनिक"
+  },
+  "feedback_frequency_plusieursfoisparsemaine": {
+    "message": "सप्ताह में कई बार"
+  },
+  "feedback_frequency_occasionnel": {
+    "message": "आवश्यकतानुसार"
+  },
+  "feedback_frequency_rare": {
+    "message": "दुर्लभ"
+  },
+  "feedback_improvements": {
+    "message": "आप कौन से सुधार देखना चाहेंगे?"
+  },
+  "feedback_improvements_placeholder": {
+    "message": "एक विचार, एक घर्षण, एक कमी..."
+  },
+  "feedback_submit": {
+    "message": "भेजें"
+  },
+  "feedback_close": {
+    "message": "उत्तर न दें"
+  },
+  "feedback_error_required": {
+    "message": "सभी फ़ील्ड खाली हैं 🤔"
+  },
+  "feedback_submitted": {
+    "message": "आपकी प्रतिक्रिया के लिए बहुत धन्यवाद 🤗"
+  },
+  "select": {
+    "message": "चुनें..."
+  },
+  "modales": {
+    "message": "--------------------------------------------------------"
+  },
+  "new_ios26_h1": {
+    "message": "अभी Safari iOS 26 के नए \"लिक्विड ग्लास\" इंटरफ़ेस की खोज करें और अधिक यथार्थवादी परीक्षण करें!"
+  },
+  "new_ios26_h2": {
+    "message": "iPhone&nbsp;15 और iPhone&nbsp;16 के सभी संस्करणों पर उपलब्ध"
+  },
+  "new_iphone_17_h1": {
+    "message": "नया!<br>अभी अपने साइट्स को iPhone&nbsp;17 के साथ परीक्षण करें।"
+  },
+  "new_iphone_17_h2": {
+    "message": "iPhone&nbsp;17, iPhone&nbsp; Air, iPhone&nbsp;17 PRO & iPhone&nbsp;17 PRO MAX सिम्युलेटर में उपलब्ध हैं।"
+  },
+  "new_video_feature_h1": {
+    "message": "अभी वीडियो कैप्चर की नई सुविधा की खोज करें!"
+  },
+  "new_video_feature_h2": {
+    "message": "बेहतर गुणवत्ता के साथ रिकॉर्ड करें, नई विकल्पों के साथ और पारदर्शी पृष्ठभूमि के साथ"
+  },
+  "logout_modale_title": {
+    "message": "आप इस डिवाइस पर स्वचालित रूप से लॉग आउट हो गए हैं"
+  },
+  "logout_modale_message": {
+    "message": "यह डिवाइस अब आपके अधिकृत टर्मिनलों का हिस्सा नहीं है। यदि आपने इस एक्सेस को मैन्युअल रूप से हटा दिया है, तो पुनः लॉगिन आवश्यक है।"
+  },
+  "notifications": {
+    "message": "--------------------------------------------------------"
+  },
+  "notification_update_title_v100_100_100": {
+    "message": "<strong class='mb-2 is-block'>जानकारी</strong>टच स्क्रॉल उपलब्ध नहीं है, लेकिन यदि आपके पास माउस व्हील या स्क्रॉल करने के लिए ट्रैकपैड नहीं है तो आप <strong>स्क्रॉलबार दिखा सकते हैं</strong>।<br><br>यह सेटिंग्स में एक विकल्प है नीचे दाईं ओर <i class='mdi'>&#xe905;</i>"
+  },
+  "notification_update_title_vwelcome": {
+    "message": "<strong class='mb-2 is-block'>Mobile FIRST पर आपका स्वागत है 👋</strong>अपने साइट्स को परीक्षण और देखने के लिए एक क्लिक में फोन, टैबलेट और कंप्यूटर का अनुकरण करें।<br><br><strong>मेनू दाईं ओर है ➡️</strong>"
+  },
+  "notification_update_title_v4_12_0": {
+    "message": "<strong class='mb-2 is-block'>अपडेट v4.12.0</strong>PRO संस्करण में नई सुविधा, <strong>स्क्रीनशॉट संपादन</strong>। आकार बनाने, टेक्स्ट जोड़ने के लिए बटन, आदि। <i class='mdi'>&#xe903;</i>"
+  },
+  "notification_update_title_v4_14_0": {
+    "message": "<strong class='mb-2 is-block'>अपडेट v4.14.0</strong>अभी वीडियो कैप्चर की नई सुविधा की खोज करें! <i class='mdi'>&#xe90e;</i>"
+  },
+  "notification_update_title_v4_14_5": {
+    "message": "<strong class='mb-2 is-block'>अपडेट v4.14.5</strong>स्क्रीनशॉट की <strong>रिज़ॉल्यूशन और गुणवत्ता</strong> में महत्वपूर्ण वृद्धि <i class='mdi'>&#xe903;</i>"
+  },
+  "logout_modale_button": {
+    "message": "लॉग इन करें"
+  },
+  "logout_modale_message_2": {
+    "message": "ℹ️ क्या आप अपनी सदस्यता साझा करना चाहते हैं? अन्य लोगों को अधिकृत करने के लिए, उन्हें बस अपने खाते के \"उपयोगकर्ता\" अनुभाग से जोड़ें।"
+  }
+}
