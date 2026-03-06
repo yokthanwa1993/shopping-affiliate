@@ -543,10 +543,55 @@ async function pickPostableVideoNewestFirst(
 
 // ==================== ADMIN PANEL ====================
 
-app.get('/admin', (c) => c.html(ADMIN_HTML))
+const ADMIN_AUTH_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+app.get('/admin', async (c) => {
+    const launchToken = String(c.req.query('launch') || '').trim()
+    if (launchToken) {
+        const launchKey = `_admin_launch/${launchToken}.json`
+        const launchObj = await c.env.BUCKET.get(launchKey)
+
+        if (launchObj) {
+            let expiresAt = 0
+            try {
+                const payload = await launchObj.json() as any
+                expiresAt = Number(payload?.expires_at || 0)
+            } catch {
+                expiresAt = 0
+            }
+
+            if (expiresAt && Date.now() <= expiresAt) {
+                const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
+                const adminToken = String(setting?.value || '').trim()
+                await c.env.BUCKET.delete(launchKey).catch(() => { })
+
+                if (adminToken) {
+                    const redirectUrl = new URL(c.req.url)
+                    redirectUrl.searchParams.delete('launch')
+                    redirectUrl.searchParams.set('t', adminToken)
+                    redirectUrl.searchParams.set('v', String(Date.now()))
+                    return c.redirect(redirectUrl.toString(), 302)
+                }
+            } else {
+                await c.env.BUCKET.delete(launchKey).catch(() => { })
+            }
+        }
+    }
+
+    return c.html(ADMIN_HTML)
+})
 
 // Auth check middleware for all /admin/api/* except /admin/api/auth
 const adminAuthMiddleware = async (c: any, next: any) => {
+    const path = String(c.req.path || '')
+    if (
+        path === '/admin/api/auth' ||
+        path === '/admin/api/auto-auth' ||
+        path === '/admin/api/launch-auth'
+    ) {
+        await next()
+        return
+    }
     const adminToken = c.req.query('t') || c.req.header('x-admin-token')
     if (!adminToken) return c.json({ error: 'Unauthorized' }, 401)
     const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
@@ -587,6 +632,40 @@ app.post('/admin/api/auto-auth', async (c) => {
     const adminToken = String(setting?.value || '').trim()
     if (!adminToken) return c.json({ error: 'Admin password not set' }, 401)
 
+    await c.env.BUCKET.put(grantKey, JSON.stringify({ expires_at: Date.now() + ADMIN_AUTH_TTL_MS }), {
+        httpMetadata: { contentType: 'application/json' },
+    }).catch(() => { })
+
+    return c.json({ ok: true, token: adminToken })
+})
+
+app.post('/admin/api/launch-auth', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { launch_token?: string }
+    const launchToken = String(body?.launch_token || '').trim()
+    if (!launchToken) return c.json({ error: 'Invalid launch_token' }, 400)
+
+    const launchKey = `_admin_launch/${launchToken}.json`
+    const launchObj = await c.env.BUCKET.get(launchKey)
+    if (!launchObj) return c.json({ error: 'Unauthorized' }, 401)
+
+    let expiresAt = 0
+    try {
+        const payload = await launchObj.json() as any
+        expiresAt = Number(payload?.expires_at || 0)
+    } catch {
+        expiresAt = 0
+    }
+
+    if (!expiresAt || Date.now() > expiresAt) {
+        await c.env.BUCKET.delete(launchKey).catch(() => { })
+        return c.json({ error: 'Launch expired' }, 401)
+    }
+
+    const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
+    const adminToken = String(setting?.value || '').trim()
+    if (!adminToken) return c.json({ error: 'Admin password not set' }, 401)
+
+    await c.env.BUCKET.delete(launchKey).catch(() => { })
     return c.json({ ok: true, token: adminToken })
 })
 
@@ -628,6 +707,7 @@ app.post('/admin/api/comments/retry', async (c) => {
 
         const results: Array<{ id: number; ok: boolean; error?: string; comment_id?: string }> = []
         const list = (rows as { results?: any[] }).results || []
+        await ensurePostHistoryTraceColumns(c.env.DB)
 
         for (const row of list) {
             const historyId = Number(row.id)
@@ -659,6 +739,7 @@ app.post('/admin/api/comments/retry', async (c) => {
             })
             const commentToken = String(tokenCandidates.tokens[0] || row.access_token || '').trim()
             const commentTokenHint = deriveCommentTokenHint(commentToken)
+            const commentProfile = await resolvePostHistoryProfileByToken(c.env, commentToken)
 
             if (!commentToken) {
                 const err = 'access_token_missing'
@@ -696,13 +777,13 @@ app.post('/admin/api/comments/retry', async (c) => {
 
             if (commentResult.ok) {
                 await c.env.DB.prepare(
-                    "UPDATE post_history SET comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=? WHERE id=?"
-                ).bind(commentResult.id || null, commentTokenHint, historyId).run()
+                    "UPDATE post_history SET comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                ).bind(commentResult.id || null, commentTokenHint, commentProfile.profileId, commentProfile.profileName, historyId).run()
                 results.push({ id: historyId, ok: true, comment_id: commentResult.id })
             } else {
                 await c.env.DB.prepare(
-                    "UPDATE post_history SET comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
-                ).bind(commentResult.error || 'comment_failed', commentTokenHint, historyId).run()
+                    "UPDATE post_history SET comment_status='failed', comment_error=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                ).bind(commentResult.error || 'comment_failed', commentTokenHint, commentProfile.profileId, commentProfile.profileName, historyId).run()
                 results.push({ id: historyId, ok: false, error: commentResult.error || 'comment_failed' })
             }
         }
@@ -816,6 +897,12 @@ app.get('/admin/api/data', async (c) => {
 })
 
 const toChanges = (result: any) => Number(result?.meta?.changes || 0)
+const MIN_OWNER_PASSWORD_LENGTH = 6
+const createOwnerWorkspaceId = (): string => {
+    const timestamp = Date.now().toString()
+    const suffix = Math.floor(100000 + Math.random() * 900000).toString()
+    return `${timestamp}${suffix}`
+}
 
 const resolveNamespaceForOwnerEmail = async (db: D1Database, emailLower: string): Promise<string> => {
     try {
@@ -829,6 +916,90 @@ const resolveNamespaceForOwnerEmail = async (db: D1Database, emailLower: string)
         'SELECT namespace_id FROM users WHERE email = ? ORDER BY datetime(created_at) ASC, telegram_id ASC LIMIT 1'
     ).bind(emailLower).first() as any
     return String(fromUsers?.namespace_id || '').trim()
+}
+
+async function upsertOwnerNamespaceMapping(db: D1Database, emailLower: string, namespaceId: string): Promise<void> {
+    await db.prepare(
+        `INSERT INTO email_namespaces (email, namespace_id, created_at, updated_at)
+         VALUES (?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(email) DO UPDATE SET
+           namespace_id = excluded.namespace_id,
+           updated_at = datetime('now')`
+    ).bind(emailLower, namespaceId).run()
+}
+
+async function ensureOwnerWorkspaceUsesEmailNamespace(
+    db: D1Database,
+    emailRaw: string,
+    options?: { preferExistingNamespace?: boolean }
+): Promise<string> {
+    const emailLower = String(emailRaw || '').trim().toLowerCase()
+    if (!emailLower) return ''
+
+    const mapped = await db.prepare('SELECT namespace_id FROM email_namespaces WHERE email = ? LIMIT 1')
+        .bind(emailLower)
+        .first() as { namespace_id?: string } | null
+    const mappedNamespace = String(mapped?.namespace_id || '').trim()
+    if (mappedNamespace) {
+        await db.prepare('UPDATE users SET namespace_id = ? WHERE email = ?').bind(mappedNamespace, emailLower).run()
+        return mappedNamespace
+    }
+
+    let namespaceId = ''
+    if (options?.preferExistingNamespace !== false) {
+        namespaceId = await resolveNamespaceForOwnerEmail(db, emailLower)
+    }
+    if (!namespaceId) {
+        namespaceId = createOwnerWorkspaceId()
+    }
+
+    await upsertOwnerNamespaceMapping(db, emailLower, namespaceId)
+    await db.prepare('UPDATE users SET namespace_id = ? WHERE email = ?').bind(namespaceId, emailLower).run()
+    return namespaceId
+}
+
+async function repairChannelBotIds(db: D1Database): Promise<void> {
+    const rows = await db.prepare(
+        'SELECT bot_id, bot_token FROM channels WHERE bot_token IS NOT NULL AND TRIM(bot_token) <> ""'
+    ).all() as { results?: Array<{ bot_id?: string; bot_token?: string }> }
+
+    for (const row of rows.results || []) {
+        const token = String(row?.bot_token || '').trim()
+        const expectedBotId = String(getBotId(token) || '').trim()
+        const currentBotId = String(row?.bot_id || '').trim()
+        if (!token || !expectedBotId || currentBotId === expectedBotId) continue
+        await db.prepare('UPDATE channels SET bot_id = ? WHERE bot_token = ?').bind(expectedBotId, token).run().catch((error) => {
+            console.log(`[CHANNEL-BOT-REPAIR] skip ${currentBotId} -> ${expectedBotId}: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    }
+}
+
+async function provisionBrowserSavingOwnerAccount(env: Env, email: string, password: string): Promise<void> {
+    const emailLower = String(email || '').trim().toLowerCase()
+    const headers: Record<string, string> = {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+    }
+    const secret = String(env.TAG_SYNC_PUSH_SECRET || '').trim()
+    if (secret) headers['x-tag-sync-secret'] = secret
+
+    let lastError = 'browsersaving_provision_failed'
+    for (const base of buildBrowserSavingBaseUrls(env)) {
+        try {
+            const response = await fetchFromBrowserSavingBase(env, base, '/api/auth/provision-owner', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ email: emailLower, password }),
+            })
+            const data = await response.json().catch(() => ({} as Record<string, unknown>))
+            if (response.ok && data?.success) return
+            lastError = String(data?.error || data?.details || `HTTP ${response.status}`).trim() || lastError
+        } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error)
+        }
+    }
+
+    throw new Error(lastError)
 }
 
 const deleteNamespaceR2Objects = async (bucket: R2Bucket, namespaceId: string) => {
@@ -854,10 +1025,87 @@ const deleteNamespaceR2Objects = async (bucket: R2Bucket, namespaceId: string) =
 }
 
 app.post('/admin/api/emails', async (c) => {
-    const { email } = await c.req.json() as { email: string }
+    const { email, password } = await c.req.json() as { email: string; password?: string }
+    const emailLower = String(email || '').trim().toLowerCase()
+    const rawPassword = String(password || '')
+    if (!emailLower || !emailLower.includes('@')) return c.json({ error: 'Invalid email' }, 400)
+    if (!rawPassword || rawPassword.length < MIN_OWNER_PASSWORD_LENGTH) {
+        return c.json({ error: `Password must be at least ${MIN_OWNER_PASSWORD_LENGTH} characters` }, 400)
+    }
+
+    const existingAllowed = await c.env.DB.prepare(
+        'SELECT email FROM allowed_emails WHERE email = ? LIMIT 1'
+    ).bind(emailLower).first() as { email?: string } | null
+    const existingUsers = await c.env.DB.prepare(
+        'SELECT COUNT(*) AS total FROM users WHERE email = ?'
+    ).bind(emailLower).first() as { total?: number } | null
+
+    const insertedAllowed = !existingAllowed?.email
+    const insertedUser = Number(existingUsers?.total || 0) === 0
+
+    try {
+        if (insertedAllowed) {
+            await c.env.DB.prepare('INSERT OR IGNORE INTO allowed_emails (email) VALUES (?)').bind(emailLower).run()
+        }
+        if (insertedAllowed) {
+            await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(emailLower).run().catch(() => { })
+        }
+        const namespaceId = await ensureOwnerWorkspaceUsesEmailNamespace(
+            c.env.DB,
+            emailLower,
+            { preferExistingNamespace: !insertedAllowed }
+        )
+
+        await c.env.DB.prepare('UPDATE users SET namespace_id = ? WHERE email = ?')
+            .bind(namespaceId, emailLower).run()
+
+        if (insertedUser) {
+            await c.env.DB.prepare(
+                "INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, '')"
+            ).bind(emailLower, namespaceId).run()
+        }
+
+        await provisionBrowserSavingOwnerAccount(c.env, emailLower, rawPassword)
+
+        return c.json({
+            ok: true,
+            email: emailLower,
+            namespace_id: namespaceId,
+            created: insertedAllowed || insertedUser,
+        })
+    } catch (error) {
+        if (insertedUser) {
+            await c.env.DB.prepare(
+                "DELETE FROM users WHERE email = ? AND (session_token IS NULL OR TRIM(session_token) = '')"
+            ).bind(emailLower).run().catch(() => { })
+        }
+        if (insertedAllowed) {
+            await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(emailLower).run().catch(() => { })
+        }
+        return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
+    }
+})
+
+app.put('/admin/api/emails/:email/password', async (c) => {
+    const email = decodeURIComponent(c.req.param('email') || '').trim().toLowerCase()
+    const { password } = await c.req.json().catch(() => ({})) as { password?: string }
+    const rawPassword = String(password || '')
+
     if (!email || !email.includes('@')) return c.json({ error: 'Invalid email' }, 400)
-    await c.env.DB.prepare('INSERT OR IGNORE INTO allowed_emails (email) VALUES (?)').bind(email.trim().toLowerCase()).run()
-    return c.json({ ok: true })
+    if (!rawPassword || rawPassword.length < MIN_OWNER_PASSWORD_LENGTH) {
+        return c.json({ error: `Password must be at least ${MIN_OWNER_PASSWORD_LENGTH} characters` }, 400)
+    }
+
+    const owner = await c.env.DB.prepare(
+        'SELECT email FROM allowed_emails WHERE email = ? LIMIT 1'
+    ).bind(email).first() as { email?: string } | null
+
+    if (!owner?.email) {
+        return c.json({ error: 'Owner not found' }, 404)
+    }
+
+    await provisionBrowserSavingOwnerAccount(c.env, email, rawPassword)
+    return c.json({ ok: true, email })
 })
 
 app.delete('/admin/api/users/:email', async (c) => {
@@ -944,46 +1192,33 @@ app.post('/api/auth/login', async (c) => {
     const sessionToken = 'sess_' + crypto.randomUUID().replace(/-/g, '')
 
     // Resolve canonical namespace:
-    // - Owner: lock by email mapping only (prevent Telegram account cross-contamination)
+    // - Owner: email is the workspace id
     // - Team member: always use owner namespace
-    let namespaceId: string | null = teamMember?.owner_namespace_id ? String(teamMember.owner_namespace_id) : null
+    let namespaceId: string | null = null
 
-    // Priority #1: canonical email mapping table (owner only)
-    if (!namespaceId && isOwner) {
-        try {
-            const mapped = await c.env.DB.prepare('SELECT namespace_id FROM email_namespaces WHERE email = ?').bind(emailLower).first() as any
-            if (mapped?.namespace_id) namespaceId = String(mapped.namespace_id)
-        } catch (e) {
-            console.log(`[AUTH] email_namespaces lookup skipped: ${String(e)}`)
-        }
+    if (isOwner) {
+        namespaceId = await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, emailLower, { preferExistingNamespace: true })
+    } else if (teamMember?.owner_namespace_id) {
+        namespaceId = String(teamMember.owner_namespace_id)
     }
 
-    // Priority #2: historical namespace from same email (owner only)
-    if (!namespaceId && isOwner) {
-        const byEmail = await c.env.DB.prepare(
-            'SELECT namespace_id FROM users WHERE email = ? ORDER BY datetime(created_at) ASC, telegram_id ASC LIMIT 1'
-        ).bind(emailLower).first() as any
-        if (byEmail?.namespace_id) namespaceId = String(byEmail.namespace_id)
-    }
-
-    // Priority #3: team member fallback by telegram row (legacy support only)
+    // Priority #2: team member fallback by telegram row (legacy support only)
     if (!namespaceId && !isOwner && tg_id) {
         const byTg = await c.env.DB.prepare('SELECT namespace_id FROM users WHERE telegram_id = ?').bind(String(tg_id)).first() as any
         if (byTg?.namespace_id) namespaceId = String(byTg.namespace_id)
     }
 
-    // Priority #4: create new namespace once
+    // Priority #3: create new namespace once
     if (!namespaceId) {
-        namespaceId = isOwner ? emailLower.split('@')[0] : (tg_id ? String(tg_id) : emailLower.split('@')[0])
+        namespaceId = isOwner
+            ? await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, emailLower, { preferExistingNamespace: false })
+            : (tg_id ? String(tg_id) : emailLower)
     }
 
-    // Persist canonical email mapping for owners only (do not auto-rewrite existing mapping)
+    // Persist canonical email mapping for owners only
     if (isOwner) {
         try {
-            await c.env.DB.prepare(
-                `INSERT OR IGNORE INTO email_namespaces (email, namespace_id, created_at, updated_at)
-                 VALUES (?, ?, datetime('now'), datetime('now'))`
-            ).bind(emailLower, namespaceId).run()
+            await upsertOwnerNamespaceMapping(c.env.DB, emailLower, namespaceId)
         } catch (e) {
             console.log(`[AUTH] email_namespaces insert skipped: ${String(e)}`)
         }
@@ -1029,11 +1264,41 @@ app.post('/api/auth/resolve-email', async (c) => {
     const email = String(body.email || '').trim().toLowerCase()
     if (!email) return c.json({ error: 'email_required' }, 400)
 
+    const owner = await c.env.DB.prepare(
+        'SELECT email FROM allowed_emails WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(email).first() as { email?: string } | null
+
+    if (owner?.email) {
+        const ownerNamespace = await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, email, { preferExistingNamespace: true })
+
+        await c.env.DB.prepare('UPDATE users SET namespace_id = ? WHERE email = ?')
+            .bind(ownerNamespace, email).run()
+
+        const existingOwnerUser = await c.env.DB.prepare(
+            'SELECT 1 AS ok FROM users WHERE lower(trim(email)) = ? LIMIT 1'
+        ).bind(email).first() as { ok?: number } | null
+
+        if (!existingOwnerUser?.ok) {
+            await c.env.DB.prepare(
+                "INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, '')"
+            ).bind(email, ownerNamespace).run()
+        }
+
+        return c.json({
+            success: true,
+            namespace_id: ownerNamespace,
+            namespaces: [ownerNamespace],
+            is_owner: true,
+            is_team_member: false,
+        })
+    }
+
     const user = await c.env.DB.prepare(
         'SELECT telegram_id, email, namespace_id FROM users WHERE lower(trim(email)) = ? LIMIT 1'
     ).bind(email).first() as { telegram_id?: number; email?: string; namespace_id?: string } | null
 
     if (!user?.namespace_id) {
+
         const team = await c.env.DB.prepare(
             'SELECT email, owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
         ).bind(email).first() as { email?: string; owner_namespace_id?: string } | null
@@ -1054,15 +1319,24 @@ app.post('/api/auth/resolve-email', async (c) => {
     const teamRows = await c.env.DB.prepare(
         'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ?'
     ).bind(email).all() as { results: Array<{ owner_namespace_id: string }> }
-    const teamNamespaces = (teamRows.results || []).map(r => r.owner_namespace_id)
-    const allNamespaces = Array.from(new Set([user.namespace_id, ...teamNamespaces]))
+    const teamNamespaces = (teamRows.results || [])
+        .map(r => String(r.owner_namespace_id || '').trim())
+        .filter(Boolean)
+    const uniqueTeamNamespaces = Array.from(new Set(teamNamespaces))
+
+    if (uniqueTeamNamespaces.length === 0) {
+        return c.json({ error: 'email_not_found', success: false }, 404)
+    }
+
+    const userNamespace = String(user.namespace_id || '').trim()
+    const primaryNamespace = uniqueTeamNamespaces.includes(userNamespace) ? userNamespace : uniqueTeamNamespaces[0]
 
     return c.json({
         success: true,
-        namespace_id: user.namespace_id,
-        namespaces: allNamespaces,
-        is_owner: true,
-        is_team_member: teamNamespaces.length > 0,
+        namespace_id: primaryNamespace,
+        namespaces: uniqueTeamNamespaces,
+        is_owner: false,
+        is_team_member: true,
     })
 })
 
@@ -1146,7 +1420,7 @@ app.get('/api/settings/gemini-key', async (c) => {
     if (!ownerCheck.ok) return ownerCheck.response
 
     const namespaceId = c.get('botId')
-    const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId, c.env.GOOGLE_API_KEY)
+    const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     return c.json({
         ...settings,
         max_chars: MAX_GEMINI_API_KEY_CHARS,
@@ -1165,7 +1439,7 @@ app.put('/api/settings/gemini-key', async (c) => {
 
     const namespaceId = c.get('botId')
     await setNamespaceGeminiApiKey(c.env.DB, namespaceId, apiKey)
-    const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId, c.env.GOOGLE_API_KEY)
+    const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
@@ -1179,7 +1453,7 @@ app.delete('/api/settings/gemini-key', async (c) => {
 
     const namespaceId = c.get('botId')
     await setNamespaceGeminiApiKey(c.env.DB, namespaceId, '')
-    const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId, c.env.GOOGLE_API_KEY)
+    const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
@@ -1198,8 +1472,6 @@ app.post('/api/telegram/:token?', async (c) => {
     const botId = c.get('botId') || 'default'
     const workerUrl = new URL(c.req.url).origin
     const adminStateKey = `_admin_auth/${chatId}.json`
-    const ADMIN_AUTH_TTL_MS = 10 * 60 * 1000
-
     if (!chatId) return c.text('ok')
 
     console.log('[WEBHOOK] chatId:', chatId, 'token:', token?.substring(0, 15), 'botId:', botId, 'isParam:', c.req.param('token')?.substring(0, 15))
@@ -1233,10 +1505,18 @@ app.post('/api/telegram/:token?', async (c) => {
             httpMetadata: { contentType: 'application/json' },
         })
 
-        const adminUrl = `${workerUrl}/admin?t=${encodeURIComponent(password)}&v=${Date.now()}`
+        const launchToken = 'launch_' + crypto.randomUUID().replace(/-/g, '')
+        await c.env.BUCKET.put(`_admin_launch/${launchToken}.json`, JSON.stringify({
+            chat_id: String(chatId),
+            expires_at: Date.now() + (15 * 60 * 1000),
+        }), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+
+        const adminUrl = `${workerUrl}/admin?launch=${encodeURIComponent(launchToken)}&v=${Date.now()}`
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
-            text: `✅ รหัสถูกต้อง\n${adminUrl}`,
+            text: '✅ รหัสถูกต้อง\nกดปุ่มด้านล่างเพื่อเปิด Admin Panel',
             reply_markup: { inline_keyboard: [[{ text: '⚙️ เปิด Admin Panel', web_app: { url: adminUrl } }]] },
         })
     }
@@ -2318,12 +2598,6 @@ async function getNamespacePagesSyncConfig(db: D1Database, namespaceId: string):
     const enabledRaw = String(valueMap.get(NS_SETTING_PAGES_SYNC_ENABLED) || '').trim().toLowerCase()
     let enabled = !(enabledRaw === '0' || enabledRaw === 'false' || enabledRaw === 'off' || enabledRaw === 'no')
 
-    // Legacy namespaces (non-numeric ids from older builds) are disabled by default
-    // unless explicitly opted-in with pages_sync_enabled.
-    if (!hasExplicitEnabled && !/^\d+$/.test(String(namespaceId || '').trim())) {
-        enabled = false
-    }
-
     const postSelectors = parseSelectorList(
         String(valueMap.get(NS_SETTING_PAGES_SYNC_POST_SELECTORS) || ''),
         DEFAULT_PAGES_SYNC_POST_SELECTORS,
@@ -2397,21 +2671,18 @@ async function setNamespaceGeminiApiKey(db: D1Database, namespaceId: string, raw
     ).bind(namespaceId, NS_SETTING_GEMINI_API_KEY, apiKey).run()
 }
 
-async function resolveNamespaceGeminiApiKey(db: D1Database, namespaceId: string, fallbackApiKey?: string): Promise<string> {
+async function resolveNamespaceGeminiApiKey(db: D1Database, namespaceId: string): Promise<string> {
     const workspace = await getNamespaceGeminiApiKeyEntry(db, namespaceId)
     if (workspace.key) return workspace.key
-    return String(fallbackApiKey || '').trim()
+    return ''
 }
 
-async function getNamespaceGeminiApiKeySettings(db: D1Database, namespaceId: string, fallbackApiKey?: string) {
+async function getNamespaceGeminiApiKeySettings(db: D1Database, namespaceId: string) {
     const workspace = await getNamespaceGeminiApiKeyEntry(db, namespaceId)
-    const fallback = String(fallbackApiKey || '').trim()
-    const effective = workspace.key || fallback
-    const source: 'workspace' | 'global' | 'none' = workspace.key
+    const effective = workspace.key
+    const source: 'workspace' | 'none' = workspace.key
         ? 'workspace'
-        : fallback
-            ? 'global'
-            : 'none'
+        : 'none'
     return {
         has_key: !!effective,
         masked_key: maskApiKeyForDisplay(effective),
@@ -3645,15 +3916,17 @@ async function syncTaggedPagesFromProfileMetadata(env: Env, namespaceId: string)
     ))
     const selectedProfiles = collectProfilesBySelectors(profiles, mergedSelectors)
 
+    await env.DB.prepare("DELETE FROM pages WHERE bot_id = ? AND id LIKE 'tagged-%'").bind(ns).run().catch(() => { })
+
     const pageMap = new Map<string, { id: string; name: string; image_url: string }>()
     for (const profile of selectedProfiles) {
         const profileId = String(profile.id || '').trim()
         if (!profileId) continue
         const pageIdFromAvatar = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''))
+        if (!pageIdFromAvatar) continue
         const pageName = String(profile.page_name || '').trim() || String(profile.name || '').trim() || pageIdFromAvatar || profileId
         const pageNameKey = normalizePageName(pageName)
-        const fallbackId = `tagged-${encodeURIComponent(pageNameKey || profileId)}`
-        const pageId = pageIdFromAvatar || fallbackId
+        const pageId = pageIdFromAvatar
         const pageKey = pageNameKey || pageId
         const imageUrl = String(profile.page_avatar_url || '').trim() ||
             (pageIdFromAvatar ? `https://graph.facebook.com/${encodeURIComponent(pageIdFromAvatar)}/picture?type=large` : '')
@@ -4511,10 +4784,10 @@ async function autoSyncPagesForNamespace(
                 if (!profileId) return
 
                 const pageIdFromAvatar = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''))
+                if (!pageIdFromAvatar) return
                 const pageName = String(profile.page_name || '').trim() || String(profile.name || '').trim() || pageIdFromAvatar || profileId
                 const pageNameKey = normalizePageName(pageName)
-                const fallbackId = `tagged-${encodeURIComponent(pageNameKey || profileId)}`
-                const pageId = pageIdFromAvatar || fallbackId
+                const pageId = pageIdFromAvatar
                 const pageKey = pageNameKey || pageId
                 const imageUrl = String(profile.page_avatar_url || '').trim() ||
                     (pageIdFromAvatar ? `https://graph.facebook.com/${encodeURIComponent(pageIdFromAvatar)}/picture?type=large` : '')
@@ -5197,10 +5470,10 @@ async function postShopeeCommentWithFallback(params: {
     commentTokens: string[]
     pageId?: string
     logPrefix: string
-}): Promise<{ ok: boolean; id?: string; error?: string; code?: number; subcode?: number; tried: number }> {
+}): Promise<{ ok: boolean; id?: string; error?: string; code?: number; subcode?: number; tried: number; commentToken?: string }> {
     const commentTokens = normalizeCommentTokenPool(params.commentTokens || [])
     if (commentTokens.length === 0) {
-        return { ok: false, error: 'access_token_missing', code: 0, subcode: 0, tried: 0 }
+        return { ok: false, error: 'access_token_missing', code: 0, subcode: 0, tried: 0, commentToken: '' }
     }
 
     // Dedup: check if we already commented on this video using any token
@@ -5219,7 +5492,7 @@ async function postShopeeCommentWithFallback(params: {
                 shopeeHostPattern.test(String(c.message || ''))
             )?.id || ''
             console.log(`[${params.logPrefix}] comment SKIPPED (already commented: ${existingId})`)
-            return { ok: true, id: existingId, tried: 0 }
+            return { ok: true, id: existingId, tried: 0, commentToken: checkToken }
         }
     } catch (e) {
         console.log(`[${params.logPrefix}] comment dedup check failed (proceeding): ${e instanceof Error ? e.message : String(e)}`)
@@ -5238,14 +5511,21 @@ async function postShopeeCommentWithFallback(params: {
             pageId: params.pageId,
             logPrefix: `${params.logPrefix}${commentTokens.length > 1 ? `(${i + 1}/${commentTokens.length})` : ''}`,
         })
-        if (result.ok) return { ...result, tried: i + 1 }
+        if (result.ok) return { ...result, tried: i + 1, commentToken: token }
 
-        lastError = result.error || lastError
+        lastError = `${deriveCommentTokenHint(token) || 'unknown_token'}: ${result.error || lastError}`
         lastCode = result.code || 0
         lastSubcode = result.subcode || 0
     }
 
-    return { ok: false, error: lastError, code: lastCode, subcode: lastSubcode, tried: commentTokens.length }
+    return {
+        ok: false,
+        error: lastError,
+        code: lastCode,
+        subcode: lastSubcode,
+        tried: commentTokens.length,
+        commentToken: commentTokens[commentTokens.length - 1] || '',
+    }
 }
 
 function deriveCommentTokenHint(token?: string | null): string | null {
@@ -5253,6 +5533,58 @@ function deriveCommentTokenHint(token?: string | null): string | null {
     if (!normalized) return null
     if (normalized.length <= 10) return normalized
     return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`
+}
+
+let postHistoryTraceColumnsReady: Promise<void> | null = null
+
+async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
+    if (!postHistoryTraceColumnsReady) {
+        postHistoryTraceColumnsReady = (async () => {
+            const statements = [
+                'ALTER TABLE post_history ADD COLUMN post_token_hint TEXT',
+                'ALTER TABLE post_history ADD COLUMN post_profile_id TEXT',
+                'ALTER TABLE post_history ADD COLUMN post_profile_name TEXT',
+                'ALTER TABLE post_history ADD COLUMN comment_profile_id TEXT',
+                'ALTER TABLE post_history ADD COLUMN comment_profile_name TEXT',
+            ]
+            for (const sql of statements) {
+                await db.prepare(sql).run().catch(() => { })
+            }
+        })()
+    }
+
+    await postHistoryTraceColumnsReady
+}
+
+async function resolvePostHistoryProfileByToken(env: Env, token?: string | null): Promise<{ profileId: string | null; profileName: string | null }> {
+    const normalized = String(token || '').trim()
+    if (!normalized) {
+        return { profileId: null, profileName: null }
+    }
+
+    try {
+        const profiles = await fetchBrowserSavingProfiles(env) as Array<Record<string, unknown>>
+        for (const profile of profiles || []) {
+            const profileTokens = normalizePostTokenPool([
+                String(profile.access_token || ''),
+                String(profile.postcron_token || ''),
+            ])
+            if (!profileTokens.some((candidate) => candidate.toLowerCase() === normalized.toLowerCase())) {
+                continue
+            }
+
+            const profileId = String(profile.id || profile.profile_id || '').trim()
+            const profileName = String(profile.name || profile.profile_name || profile.email || '').trim()
+            return {
+                profileId: profileId || null,
+                profileName: profileName || null,
+            }
+        }
+    } catch (error) {
+        console.log(`[POST-HISTORY] resolve profile by token failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    return { profileId: null, profileName: null }
 }
 
 function buildExpectedCaptionFromMeta(meta: Record<string, unknown>): string {
@@ -5269,6 +5601,7 @@ async function reconcilePostingHistoryRows(params: {
     logPrefix: string
 }): Promise<void> {
     const { env, bucket, botId, logPrefix } = params
+    await ensurePostHistoryTraceColumns(env.DB)
     const { results } = await env.DB.prepare(
         `SELECT ph.id, ph.page_id, ph.video_id, ph.posted_at, ph.comment_status,
                 p.name AS page_name, p.access_token
@@ -5316,6 +5649,7 @@ async function reconcilePostingHistoryRows(params: {
                 const recoveredReelUrl = String(recovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}/`
                 const shopeeLink = normalizeMetaShopeeLink(meta) || ''
                 const commentTokenHint = deriveCommentTokenHint(row.access_token)
+                const commentProfile = await resolvePostHistoryProfileByToken(env, row.access_token)
                 let commentStatus = shopeeLink ? 'pending' : 'not_configured'
                 let commentError: string | null = null
                 let commentFbId: string | null = null
@@ -5338,12 +5672,14 @@ async function reconcilePostingHistoryRows(params: {
                 }
 
                 await env.DB.prepare(
-                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, error_message=NULL, comment_status=?, comment_token_hint=?, comment_error=?, comment_fb_id=? WHERE id=? AND status='posting'"
+                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, error_message=NULL, comment_status=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=?, comment_error=?, comment_fb_id=? WHERE id=? AND status='posting'"
                 ).bind(
                     recoveredPostId,
                     recoveredReelUrl,
                     commentStatus,
                     commentTokenHint,
+                    commentProfile.profileId,
+                    commentProfile.profileName,
                     commentError,
                     commentFbId,
                     row.id,
@@ -5740,7 +6076,8 @@ async function publishReelDirectWithTokenFallback(params: {
             }
         } catch (err) {
             const msg = parseFacebookErrorLike(err)?.message || (err instanceof Error ? err.message : String(err))
-            errors.push(msg)
+            const tokenHint = deriveCommentTokenHint(token) || 'unknown_token'
+            errors.push(`${tokenHint}: ${msg}`)
             console.warn(`[${params.logPrefix}] token failed for direct reel, trying next (${msg})`)
         }
     }
@@ -6881,7 +7218,8 @@ async function generateCaption(script: string, apiKey: string, model: string): P
 app.post('/api/generate-title/:id', async (c) => {
     const env = c.env
     const id = c.req.param('id')
-    const apiKey = await resolveNamespaceGeminiApiKey(env.DB, String(c.get('botId') || ''), env.GOOGLE_API_KEY)
+    const apiKey = await resolveNamespaceGeminiApiKey(env.DB, String(c.get('botId') || ''))
+    if (!apiKey) return c.json({ error: 'Gemini API key not configured for this workspace' }, 400)
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
 
     const obj = await env.BUCKET.get(`videos/${id}.json`)
@@ -6971,6 +7309,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let useCommentTokenForPosting = false
     let postTokenCandidates: string[] = []
     let commentTokenCandidates: string[] = []
+    let postingTokenUsed = ''
 
     try {
         // Check if skip comment
@@ -7041,7 +7380,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }
 
         // Use title if available, otherwise generate caption from script
-        const apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId, env.GOOGLE_API_KEY)
+        const apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId)
+        if (!title && script && !apiKey) {
+            return c.json({ error: 'Gemini API key not configured for this workspace' }, 400)
+        }
         const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
         let caption = title
             ? title
@@ -7051,19 +7393,25 @@ app.post('/api/pages/:id/force-post', async (c) => {
         caption += `\n#สินค้า #ของน่าใช้ #ช็อปปิ้งออนไลน์${category ? ` #${category}` : ''}`
         selectedCaption = caption
 
+        await ensurePostHistoryTraceColumns(env.DB)
         commentTokenHint = deriveCommentTokenHint(pageCommentToken)
+        const initialPostTokenHint = deriveCommentTokenHint(postTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, postTokenCandidates[0] || null)
         const initialCommentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
         // Record attempt BEFORE posting (prevents duplicate on failure)
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
             nowStr,
             'posting',
             botId,
+            initialPostTokenHint,
+            initialPostProfile.profileId,
+            initialPostProfile.profileName,
             initialCommentStatus,
             commentTokenHint,
             null,
@@ -7084,6 +7432,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const videoBuffer = await videoResp.arrayBuffer()
         if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
 
+        postingTokenUsed = String(postTokenCandidates[0] || '').trim()
         const reelResult = await publishReelDirectWithTokenFallback({
             pageId: page.id,
             postTokens: postTokenCandidates,
@@ -7091,7 +7440,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
             description: caption,
             logPrefix: 'FORCE-POST',
         })
-        const postingToken = reelResult.postingToken
+        postingTokenUsed = reelResult.postingToken
+        const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
         fbVideoId = reelResult.id
         const confirmedPostId = fbVideoId
@@ -7101,6 +7451,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
         let commentStatus = initialCommentStatus
         let commentError: string | null = null
         let commentFbId: string | null = null
+        let commentTokenUsed = String(pageCommentToken || '').trim()
+        let commentProfileId: string | null = null
+        let commentProfileName: string | null = null
         const commentTargetId = confirmedPostId || fbVideoId
 
         if (normalizedShopeeLink && !skipComment) {
@@ -7117,6 +7470,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
             if (!commentResult.ok) {
                 commentStatus = 'failed'
                 commentError = commentResult.error || 'comment_failed'
+                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                commentProfileId = commentProfile.profileId
+                commentProfileName = commentProfile.profileName
                 console.error(`[FORCE-POST] Comment failed for ${fbVideoId}: ${commentResult.error}`)
                 await notifyCommentTokenIssue(
                     env,
@@ -7130,6 +7487,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
             } else {
                 commentStatus = 'success'
                 commentFbId = commentResult.id || null
+                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                commentProfileId = commentProfile.profileId
+                commentProfileName = commentProfile.profileName
             }
         } else if (skipComment) {
             commentStatus = 'skipped'
@@ -7138,8 +7499,22 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         // Update to success
         await env.DB.prepare(
-            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status = 'posting'"
-        ).bind(confirmedPostId, fbReelUrl, commentStatus, commentTokenHint, commentError, commentFbId, page.id, unpostedId).run()
+            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status = 'posting'"
+        ).bind(
+            confirmedPostId,
+            fbReelUrl,
+            deriveCommentTokenHint(postingTokenUsed),
+            postingProfile.profileId,
+            postingProfile.profileName,
+            commentStatus,
+            deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+            commentProfileId,
+            commentProfileName,
+            commentError,
+            commentFbId,
+            page.id,
+            unpostedId,
+        ).run()
 
         await clearVideoShopeeLink(c.get('bucket'), unpostedId)
         return c.json({ success: true, page: page.name, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId, fb_reel_url: fbReelUrl })
@@ -7187,6 +7562,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     let commentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
                     let commentError: string | null = null
                     let commentFbId: string | null = null
+                    let commentTokenUsed = String(pageCommentToken || '').trim()
+                    let commentProfileId: string | null = null
+                    let commentProfileName: string | null = null
                     const commentTargetId = recoveredPostId || fbVideoId
 
                     if (normalizedShopeeLink && !skipComment) {
@@ -7203,6 +7581,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         if (!commentResult.ok) {
                             commentStatus = 'failed'
                             commentError = commentResult.error || 'comment_failed'
+                            commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                            const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                            commentProfileId = commentProfile.profileId
+                            commentProfileName = commentProfile.profileName
                             await notifyCommentTokenIssue(
                                 env,
                                 botId,
@@ -7215,18 +7597,28 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         } else {
                             commentStatus = 'success'
                             commentFbId = commentResult.id || null
+                            commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                            const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                            commentProfileId = commentProfile.profileId
+                            commentProfileName = commentProfile.profileName
                         }
                     } else if (skipComment) {
                         commentStatus = 'skipped'
                     }
 
+                    const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
                     await env.DB.prepare(
-                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status IN ('posting','failed')"
+                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status IN ('posting','failed')"
                     ).bind(
                         recoveredPostId,
                         recoveredReelUrl,
+                        deriveCommentTokenHint(postingTokenUsed),
+                        recoveredPostProfile.profileId,
+                        recoveredPostProfile.profileName,
                         commentStatus,
-                        commentTokenHint,
+                        deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                        commentProfileId,
+                        commentProfileName,
                         commentError,
                         commentFbId,
                         pageId,
@@ -7745,8 +8137,13 @@ async function handleScheduled(env: Env) {
         // Generate short caption from script (no Shopee link)
         let apiKey = geminiApiKeyByNamespace.get(botId)
         if (!apiKey) {
-            apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId, env.GOOGLE_API_KEY)
+            apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId)
             geminiApiKeyByNamespace.set(botId, apiKey)
+        }
+        if (!title && script && !apiKey) {
+            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (Gemini API key missing for workspace ${botId})`)
+            await botBucket.delete(dedupKey).catch(() => { })
+            continue
         }
         const geminiModel = env.GEMINI_MODEL || 'gemini-3-flash-preview'
         let caption = title
@@ -7779,17 +8176,23 @@ async function handleScheduled(env: Env) {
         const commentTokenCandidates = tokenCandidates.tokens.length > 0
             ? tokenCandidates.tokens
             : normalizePostTokenPool([String(page.access_token || '')])
+        await ensurePostHistoryTraceColumns(env.DB)
         const commentTokenHint = deriveCommentTokenHint(commentTokenCandidates[0] || null)
+        const initialPostTokenHint = deriveCommentTokenHint(postTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, postTokenCandidates[0] || null)
         const initialCommentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
             nowISO,
             'posting',
             botId,
+            initialPostTokenHint,
+            initialPostProfile.profileId,
+            initialPostProfile.profileName,
             initialCommentStatus,
             commentTokenHint,
             null,
@@ -7815,6 +8218,7 @@ async function handleScheduled(env: Env) {
                 logPrefix: `CRON ${page.name}`,
             })
             postingTokenUsed = reelResult.postingToken
+            const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id
             const confirmedPostId = fbVideoId
             const fbReelUrl = `https://www.facebook.com/reel/${confirmedPostId}`
@@ -7823,6 +8227,9 @@ async function handleScheduled(env: Env) {
             let commentStatus = initialCommentStatus
             let commentError: string | null = null
             let commentFbId: string | null = null
+            let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
+            let commentProfileId: string | null = null
+            let commentProfileName: string | null = null
             const commentTargetId = confirmedPostId || fbVideoId
 
             if (normalizedShopeeLink) {
@@ -7843,6 +8250,10 @@ async function handleScheduled(env: Env) {
                     if (!commentResult.ok) {
                         commentStatus = 'failed'
                         commentError = commentResult.error || 'comment_failed'
+                        commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                        const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                        commentProfileId = commentProfile.profileId
+                        commentProfileName = commentProfile.profileName
                         console.error(`[CRON] Page ${page.name}: comment FAILED: ${commentResult.error}`)
                         await notifyCommentTokenIssue(
                             env,
@@ -7857,14 +8268,33 @@ async function handleScheduled(env: Env) {
                         dedupCommentTargets.add(commentTargetId)
                         commentStatus = 'success'
                         commentFbId = commentResult.id || null
+                        commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                        const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                        commentProfileId = commentProfile.profileId
+                        commentProfileName = commentProfile.profileName
                     }
                 }
             }
 
             // Update to success
             await env.DB.prepare(
-                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
-            ).bind(confirmedPostId, fbReelUrl, commentStatus, commentTokenHint, commentError, commentFbId, page.id, unpostedId, botId).run()
+                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
+            ).bind(
+                confirmedPostId,
+                fbReelUrl,
+                deriveCommentTokenHint(postingTokenUsed),
+                postingProfile.profileId,
+                postingProfile.profileName,
+                commentStatus,
+                deriveCommentTokenHint(commentTokenUsed),
+                commentProfileId,
+                commentProfileName,
+                commentError,
+                commentFbId,
+                page.id,
+                unpostedId,
+                botId,
+            ).run()
 
             await clearVideoShopeeLink(botBucket, unpostedId)
             console.log(`[CRON] Page ${page.name}: posted successfully (fb_video_id: ${fbVideoId}, post_id: ${confirmedPostId})`)
@@ -7913,6 +8343,9 @@ async function handleScheduled(env: Env) {
                     let commentStatus = initialCommentStatus
                     let commentError: string | null = null
                     let commentFbId: string | null = null
+                    let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
+                    let commentProfileId: string | null = null
+                    let commentProfileName: string | null = null
                     const commentTargetId = recoveredPostId || fbVideoId
 
                     if (normalizedShopeeLink) {
@@ -7933,6 +8366,10 @@ async function handleScheduled(env: Env) {
                             if (!commentResult.ok) {
                                 commentStatus = 'failed'
                                 commentError = commentResult.error || 'comment_failed'
+                                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                                commentProfileId = commentProfile.profileId
+                                commentProfileName = commentProfile.profileName
                                 await notifyCommentTokenIssue(
                                     env,
                                     botId,
@@ -7946,17 +8383,27 @@ async function handleScheduled(env: Env) {
                                 dedupCommentTargets.add(commentTargetId)
                                 commentStatus = 'success'
                                 commentFbId = commentResult.id || null
+                                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                                commentProfileId = commentProfile.profileId
+                                commentProfileName = commentProfile.profileName
                             }
                         }
                     }
 
+                    const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
                     await env.DB.prepare(
-                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status IN ('posting','failed') AND bot_id = ?"
+                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status IN ('posting','failed') AND bot_id = ?"
                     ).bind(
                         recoveredPostId,
                         recoveredReelUrl,
+                        deriveCommentTokenHint(postingTokenUsed),
+                        recoveredPostProfile.profileId,
+                        recoveredPostProfile.profileName,
                         commentStatus,
-                        commentTokenHint,
+                        deriveCommentTokenHint(commentTokenUsed),
+                        commentProfileId,
+                        commentProfileName,
                         commentError,
                         commentFbId,
                         page.id,

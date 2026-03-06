@@ -102,8 +102,13 @@ interface PostHistory {
   status: string
   page_name: string
   page_image: string
+  post_token_hint?: string | null
+  post_profile_id?: string | null
+  post_profile_name?: string | null
   comment_status?: string
   comment_token_hint?: string | null
+  comment_profile_id?: string | null
+  comment_profile_name?: string | null
   comment_error?: string | null
   comment_fb_id?: string | null
   error_message?: string | null
@@ -148,7 +153,7 @@ interface TaggedPageProfile {
 }
 
 type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
-type GeminiKeySource = 'workspace' | 'global' | 'none'
+type GeminiKeySource = 'workspace' | 'none'
 type SettingsSection = 'menu' | 'account' | 'team' | 'gemini' | 'voice'
 
 const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)?(?:shopee\.co\.th|s\.shopee\.co\.th)\S*/i
@@ -2239,7 +2244,7 @@ function App() {
         max_chars?: number
       }
       setGeminiApiKeyMasked(String(data.masked_key || ''))
-      setGeminiApiKeySource(data.source === 'workspace' || data.source === 'global' ? data.source : 'none')
+      setGeminiApiKeySource(data.source === 'workspace' ? 'workspace' : 'none')
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
       setGeminiApiKeyDraft('')
@@ -2288,7 +2293,7 @@ function App() {
         max_chars?: number
       }
       setGeminiApiKeyMasked(String(data.masked_key || ''))
-      setGeminiApiKeySource(data.source === 'workspace' || data.source === 'global' ? data.source : 'none')
+      setGeminiApiKeySource(data.source === 'workspace' ? 'workspace' : 'none')
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
       setGeminiApiKeyDraft('')
@@ -2313,23 +2318,10 @@ function App() {
       : 'not_configured'
   }
 
-  const getPostStatusMeta = (status: string, commentStatus?: string | null) => {
-    if (status === 'success' && normalizeCommentStatus(commentStatus) === 'failed') {
-      return { label: 'คอมเม้นต์ไม่ผ่าน', cls: 'bg-red-50 text-red-600' }
-    }
-    if (status === 'success') return { label: 'สำเร็จ', cls: 'bg-green-50 text-green-600' }
-    if (status === 'posting') return { label: 'กำลังโพสต์', cls: 'bg-yellow-50 text-yellow-600' }
-    return { label: 'ผิดพลาด', cls: 'bg-red-50 text-red-600' }
-  }
-
-  const getCommentStatusMeta = (status?: string | null) => {
-    const normalized = normalizeCommentStatus(status)
-    if (normalized === 'success') return { label: 'คอมเม้นต์ผ่าน', cls: 'bg-green-50 text-green-600' }
-    if (normalized === 'pending') return { label: 'กำลังคอมเมนต์', cls: 'bg-blue-50 text-blue-600' }
-    if (normalized === 'failed') return { label: 'คอมเม้นต์ไม่ผ่าน', cls: 'bg-red-50 text-red-600' }
-    if (normalized === 'skipped') return { label: 'ข้ามคอมเม้นต์', cls: 'bg-gray-50 text-gray-500' }
-    if (normalized === 'not_attempted') return { label: 'ยังไม่คอมเม้นต์', cls: 'bg-yellow-50 text-yellow-600' }
-    return { label: 'ไม่ตั้งคอมเมนต์', cls: 'bg-gray-50 text-gray-500' }
+  const getSimpleStatusMeta = (isPassed: boolean) => {
+    return isPassed
+      ? { label: 'ผ่าน', cls: 'bg-green-100 text-green-700' }
+      : { label: 'ไม่ผ่าน', cls: 'bg-red-100 text-red-700' }
   }
 
   const looksLikeTokenProblem = (value?: string | null) => {
@@ -2792,9 +2784,11 @@ function App() {
                       if (item.fb_post_id) return `https://www.facebook.com/watch/?v=${item.fb_post_id}`
                       return ''
                     })()
-                    const postMeta = getPostStatusMeta(item.status, item.comment_status)
-                    const commentMeta = getCommentStatusMeta(item.comment_status)
+                    const postMeta = getSimpleStatusMeta(String(item.status || '').trim().toLowerCase() === 'success')
+                    const commentMeta = getSimpleStatusMeta(normalizeCommentStatus(item.comment_status) === 'success')
                     const isExpanded = expandedLogId === item.id
+                    const postActor = String(item.post_profile_name || item.post_profile_id || item.post_token_hint || '').trim() || '-'
+                    const commentActor = String(item.comment_profile_name || item.comment_profile_id || item.comment_token_hint || '').trim() || '-'
                     const showCommentError = item.comment_error && item.comment_error.trim().length > 0
                     const showPostError = item.error_message && item.error_message.trim().length > 0
 
@@ -2820,9 +2814,14 @@ function App() {
                           </div>
                           {/* Status + Link */}
                           <div className="flex items-center gap-2 shrink-0">
-                            <span className={`text-[10px] font-bold px-2 py-1 rounded-lg ${postMeta.cls}`}>
-                              {postMeta.label}
-                            </span>
+                            <div className="flex items-center justify-end gap-1">
+                              <span className={`whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${postMeta.cls}`}>
+                                POST
+                              </span>
+                              <span className={`whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${commentMeta.cls}`}>
+                                COMMENT
+                              </span>
+                            </div>
                             {fbLink && (
                               <a
                                 href={fbLink}
@@ -2869,8 +2868,11 @@ function App() {
                         {isExpanded && (
                           <div className="px-3 pb-3 pt-2 border-t border-gray-100 text-xs text-gray-500 space-y-2">
                             <p><span className="font-semibold text-gray-700">โพสต์:</span> {postMeta.label}</p>
+                            <p><span className="font-semibold text-gray-700">โพสต์ด้วย:</span> {postActor}</p>
+                            <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์:</span> {commentMeta.label}</p>
-                            <p><span className="font-semibold text-gray-700">Token:</span> {item.comment_token_hint || '-'}</p>
+                            <p><span className="font-semibold text-gray-700">คอมเม้นต์ด้วย:</span> {commentActor}</p>
+                            <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
                             {item.comment_fb_id && <p><span className="font-semibold text-gray-700">Comment ID:</span> {item.comment_fb_id}</p>}
                             {showCommentError && <p className="text-red-500"><span className="font-semibold text-red-600">คอมเม้นต์ผิดพลาด:</span> {item.comment_error}</p>}
                             {showPostError && <p className="text-red-500"><span className="font-semibold text-red-600">โพสต์ผิดพลาด:</span> {item.error_message}</p>}
@@ -3049,9 +3051,7 @@ function App() {
                     title="Gemini API Key"
                     subtitle={
                       geminiApiKeySource === 'workspace'
-                        ? 'แหล่งที่ใช้งาน: Workspace'
-                        : geminiApiKeySource === 'global'
-                          ? 'แหล่งที่ใช้งาน: Global'
+                        ? 'แหล่งที่ใช้งาน: Owner นี้เท่านั้น'
                           : 'ยังไม่ตั้งค่า'
                     }
                     onClick={() => setSettingsSection('gemini')}
@@ -3170,7 +3170,7 @@ function App() {
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ตั้งค่า Gemini key แยกตาม workspace (ของใครของมัน) ใช้กับงาน generate/script/caption
+                        ตั้งค่า Gemini key แยกตาม owner/workspace ของใครของมัน ถ้าไม่ตั้งค่า ระบบจะไม่ประมวลผลคลิป และจะไม่ fallback ไปใช้ key กลาง
                       </p>
                       {geminiApiKeyLoading ? (
                         <p className="text-sm text-gray-400 py-3">กำลังโหลด Gemini API key...</p>
@@ -3190,7 +3190,7 @@ function App() {
                           />
                           <div className="flex items-center justify-between text-[11px] text-gray-400">
                             <span>
-                              แหล่งที่ใช้งาน: {geminiApiKeySource === 'workspace' ? 'Workspace' : geminiApiKeySource === 'global' ? 'Global' : 'ยังไม่ตั้งค่า'}
+                              แหล่งที่ใช้งาน: {geminiApiKeySource === 'workspace' ? 'Owner นี้เท่านั้น' : 'ยังไม่ตั้งค่า'}
                             </span>
                             <span>{geminiApiKeyDraft.length}/{geminiApiKeyMaxChars}</span>
                           </div>

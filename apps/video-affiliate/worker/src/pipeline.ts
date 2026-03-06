@@ -31,7 +31,6 @@ export type Env = {
     BUCKET: R2Bucket // Raw bucket, use with BotBucket if needed
     MERGE_CONTAINER: DurableObjectNamespace
     BROWSERSAVING_SERVICE?: Fetcher
-    GOOGLE_API_KEY: string
     TELEGRAM_BOT_TOKEN: string
     R2_PUBLIC_URL: string
     R2_ACCOUNT_ID: string
@@ -237,7 +236,10 @@ export async function runPipeline(
     } catch (e) {
         console.log(`[PIPELINE] DB lookup failed, using default token: ${e}`)
     }
-    const apiKey = await getNamespaceGeminiApiKey(env.DB, botId).catch(() => '') || env.GOOGLE_API_KEY
+    const apiKey = await getNamespaceGeminiApiKey(env.DB, botId).catch(() => '')
+    if (!apiKey) {
+        throw new Error('ยังไม่ได้ตั้ง Gemini API key สำหรับ workspace นี้')
+    }
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
     const voicePrompt = await getVoicePromptTemplate(env.DB, botId)
         .then((v) => v.prompt)

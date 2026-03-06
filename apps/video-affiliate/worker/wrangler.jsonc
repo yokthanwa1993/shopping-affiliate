@@ -76,7 +76,6 @@
         ]
     },
     // Secrets (set via `wrangler secret put`):
-    // GOOGLE_API_KEY
     // TELEGRAM_BOT_TOKEN
     // TAG_SYNC_PUSH_SECRET
 }

@@ -699,7 +699,7 @@ function App() {
   useEffect(() => {
     if (!isTauri()) return
     const timer = setTimeout(() => {
-      void checkForAppUpdate('ask')
+      void checkForAppUpdate('install-only')
     }, 1800)
     return () => clearTimeout(timer)
   }, [checkForAppUpdate])

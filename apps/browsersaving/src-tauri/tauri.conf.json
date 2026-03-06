@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "BrowserSaving",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "identifier": "com.browsersaving.app",
   "build": {
     "frontendDist": "../dist",
@@ -46,7 +46,7 @@
     "macOS": {
       "frameworks": [],
       "exceptionDomain": null,
-      "signingIdentity": null,
+      "signingIdentity": "Apple Development: ธรรมนูญ บุญท้วม (24JZYZJ7GY)",
       "providerShortName": null,
       "entitlements": null,
       "minimumSystemVersion": "10.13"
@@ -64,7 +64,7 @@
       "endpoints": [
         "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev/api/updates/manifest"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkxMUZEMTNENTk2RDg0M0QKUldROWhHMVpQZEVma1ZpNmhESGk0V1Uzc1dxUDJpS0RqYnJwT25wZ0FaUzVickM0NkpqQnpUVmoK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcwNzNFMEVCQzU2ODQ2MDcKUldRSFJtakY2K0J6Y0xZcUloMnJUb2lCNHhKWDlnU0k0Z09HT0h2YUZDVk1KR2p3UkJobzVvcU8K"
     }
   }
 }

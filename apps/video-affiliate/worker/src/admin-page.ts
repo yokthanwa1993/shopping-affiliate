@@ -403,10 +403,17 @@ export const ADMIN_HTML = `<!DOCTYPE html>
     border-top: 1px solid #f1f5f9;
     display: flex;
     gap: 8px;
+    align-items: stretch;
+  }
+
+  .add-fields {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .add-input {
-    flex: 1;
     border: 1.5px solid #e2e8f0;
     border-radius: 12px;
     background: #f8fafc;
@@ -617,15 +624,18 @@ export const ADMIN_HTML = `<!DOCTYPE html>
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h3>Teams</h3>
-              <p>รายชื่อ owner ที่เข้าใช้งานได้</p>
+              <h3>Owners</h3>
+              <p>รายชื่อ Owner ที่เข้าใช้งานได้</p>
             </div>
             <span class="badge" id="team-count">0</span>
           </div>
           <div id="team-list"><div class="list-empty">กำลังโหลด...</div></div>
           <div class="add-wrap">
-            <input class="add-input" type="email" id="email-input" placeholder="email@example.com" />
-            <button class="btn-add" id="email-add-btn" onclick="addEmail()">เพิ่มทีม</button>
+            <div class="add-fields">
+              <input class="add-input" type="email" id="email-input" placeholder="owner@example.com" />
+              <input class="add-input" type="password" id="password-input" placeholder="รหัสผ่านขั้นต่ำ 6 ตัวอักษร" />
+            </div>
+            <button class="btn-add" id="email-add-btn" onclick="addEmail()">เพิ่ม Owner</button>
           </div>
         </div>
       </section>
@@ -663,7 +673,7 @@ export const ADMIN_HTML = `<!DOCTYPE html>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
           <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/>
         </svg>
-        <span>Teams</span>
+        <span>Owners</span>
       </button>
       <button class="nav-btn" data-tab="security">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
@@ -680,8 +690,20 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 <script>
 const API = '/admin/api';
 const urlToken = new URLSearchParams(window.location.search).get('t') || '';
-let adminToken = urlToken || sessionStorage.getItem('admin_token') || '';
-if (urlToken) sessionStorage.setItem('admin_token', urlToken);
+const launchToken = new URLSearchParams(window.location.search).get('launch') || '';
+const readStoredAdminToken = () => urlToken || sessionStorage.getItem('admin_token') || localStorage.getItem('admin_token') || '';
+const persistAdminToken = (token) => {
+  const value = String(token || '').trim();
+  if (!value) return;
+  sessionStorage.setItem('admin_token', value);
+  localStorage.setItem('admin_token', value);
+};
+const clearStoredAdminToken = () => {
+  sessionStorage.removeItem('admin_token');
+  localStorage.removeItem('admin_token');
+};
+let adminToken = readStoredAdminToken();
+if (urlToken) persistAdminToken(urlToken);
 let pendingDelete = null;
 let currentTab = 'dashboard';
 let data = { teams: [], dashboard: {} };
@@ -704,7 +726,7 @@ async function doLogin() {
 
     if (r.ok) {
       adminToken = pw;
-      sessionStorage.setItem('admin_token', pw);
+      persistAdminToken(pw);
       el('login-screen').style.display = 'none';
       el('main').style.display = 'block';
       setTab('dashboard');
@@ -724,7 +746,7 @@ async function doLogin() {
 }
 
 function logout() {
-  sessionStorage.removeItem('admin_token');
+  clearStoredAdminToken();
   adminToken = '';
   pendingDelete = null;
   currentTab = 'dashboard';
@@ -774,16 +796,15 @@ async function validateCurrentToken() {
   if (!adminToken) return false;
   try {
     const r = await apiFetch('/data');
-    if (!r.ok) {
-      sessionStorage.removeItem('admin_token');
+    if (r.status === 401 || r.status === 403) {
+      clearStoredAdminToken();
       adminToken = '';
       return false;
     }
+    if (!r.ok) return true;
     return true;
   } catch (e) {
-    sessionStorage.removeItem('admin_token');
-    adminToken = '';
-    return false;
+    return !!adminToken;
   }
 }
 
@@ -807,7 +828,37 @@ async function tryTelegramAutoAuth() {
     if (!token) return false;
 
     adminToken = token;
-    sessionStorage.setItem('admin_token', token);
+    persistAdminToken(token);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function tryLaunchAutoAuth() {
+  const token = String(launchToken || '').trim();
+  if (!token) return false;
+
+  try {
+    const r = await fetch(API + '/launch-auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ launch_token: token }),
+    });
+    if (!r.ok) return false;
+
+    const payload = await r.json().catch(() => ({}));
+    const adminPassword = String(payload?.token || '').trim();
+    if (!adminPassword) return false;
+
+    adminToken = adminPassword;
+    persistAdminToken(adminPassword);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('launch');
+      url.searchParams.delete('t');
+      window.history.replaceState({}, '', url.toString());
+    } catch (e) {}
     return true;
   } catch (e) {
     return false;
@@ -861,9 +912,9 @@ async function confirmDel() {
 function delBtn(type, key) {
   const isConfirming = pendingDelete && pendingDelete.type === type && pendingDelete.key === key;
   if (isConfirming) {
-    return '<div class="confirm-wrap"><button class="btn-mini ok" onclick="confirmDel()">ลบ</button><button class="btn-mini gray" onclick="cancelDel()">ยกเลิก</button></div>';
+    return '<div class="confirm-wrap" onclick="event.stopPropagation()"><button class="btn-mini ok" onclick="event.stopPropagation();confirmDel()">ลบ</button><button class="btn-mini gray" onclick="event.stopPropagation();cancelDel()">ยกเลิก</button></div>';
   }
-  return '<button class="icon-del" data-type="' + escAttr(type) + '" data-key="' + escAttr(key) + '" onclick="askDel(this.dataset.type,this.dataset.key)">' +
+  return '<button class="icon-del" data-type="' + escAttr(type) + '" data-key="' + escAttr(key) + '" onclick="event.stopPropagation();askDel(this.dataset.type,this.dataset.key)">' +
     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 18L18 6M6 6l12 12"/></svg>' +
     '</button>';
 }
@@ -892,6 +943,13 @@ function computeFallbackDashboard(teams) {
 function renderDashboard() {
   const fallback = computeFallbackDashboard(data.teams || []);
   const d = { ...fallback, ...(data.dashboard || {}) };
+  const workspaceOwnerMap = new Map();
+  (data.teams || []).forEach((team) => {
+    const ns = String(team.namespace_id || '').trim();
+    const email = String(team.email || '').trim().toLowerCase();
+    if (!ns || !email || workspaceOwnerMap.has(ns)) return;
+    workspaceOwnerMap.set(ns, email);
+  });
 
   el('hero-owners').textContent = String(d.owners_total || 0);
   el('hero-active').textContent = String(d.owners_active || 0);
@@ -906,14 +964,15 @@ function renderDashboard() {
   el('ns-count').textContent = String(nsStats.length);
 
   if (!nsStats.length) {
-    el('namespace-list').innerHTML = '<div class="list-empty">ยังไม่มี namespace ที่ผูกกับเพจ</div>';
+    el('namespace-list').innerHTML = '<div class="list-empty">ยังไม่มี workspace ที่ผูกกับเพจ</div>';
   } else {
     el('namespace-list').innerHTML = nsStats.map((item) => {
       const ns = String(item.namespace_id || '-');
+      const label = workspaceOwnerMap.get(ns) || 'workspace';
       const pgs = Number(item.pages_count || 0);
       const posts = Number(item.posts_count || 0);
       return '<div class="ns-item">' +
-        '<div class="ns-id">' + ns + '</div>' +
+        '<div class="ns-id">' + escAttr(label) + '</div>' +
         '<div class="ns-meta"><span class="pill">pages ' + pgs + '</span><span class="pill ok">posts ' + posts + '</span></div>' +
       '</div>';
     }).join('');
@@ -925,25 +984,25 @@ function renderTeams() {
   el('team-count').textContent = String(teams.length);
 
   if (!teams.length) {
-    el('team-list').innerHTML = '<div class="list-empty">ยังไม่มีทีม</div>';
+    el('team-list').innerHTML = '<div class="list-empty">ยังไม่มี Owner</div>';
     return;
   }
 
   el('team-list').innerHTML = teams.map((t) => {
     const active = Number(t.active_session) === 1;
     const initial = (t.email || '?').charAt(0).toUpperCase();
-    const ns = t.namespace_id || '-';
+    const email = String(t.email || '').trim().toLowerCase();
 
-    return '<div class="team-item">' +
+    return '<div class="team-item" style="cursor:pointer" data-email="' + escAttr(email) + '" onclick="editOwnerPasswordFromCard(this)">' +
       '<div class="avatar">' + initial + '</div>' +
       '<div class="team-info">' +
-        '<div class="team-email">' + t.email + '</div>' +
+        '<div class="team-email">' + escAttr(email) + '</div>' +
         '<div class="team-sub">' +
-          '<span class="pill">' + ns + '</span>' +
+          '<span class="pill">แตะเพื่อแก้รหัสผ่าน</span>' +
           (active ? '<span class="pill ok">active</span>' : '<span class="pill warn">pending</span>') +
         '</div>' +
       '</div>' +
-      delBtn('team', t.email) +
+      delBtn('team', email) +
     '</div>';
   }).join('');
 }
@@ -974,11 +1033,47 @@ async function load() {
   }
 }
 
+async function editOwnerPasswordFromCard(node) {
+  const normalizedEmail = String(node?.dataset?.email || '').trim().toLowerCase();
+  if (!normalizedEmail) return;
+
+  const nextPassword = window.prompt('ใส่รหัสผ่านใหม่ของ ' + normalizedEmail, '');
+  if (nextPassword === null) return;
+
+  const password = String(nextPassword || '');
+  if (!password || password.length < 6) {
+    toast('รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร', true);
+    return;
+  }
+
+  try {
+    const r = await apiFetch('/emails/' + encodeURIComponent(normalizedEmail) + '/password', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      toast(j.error || 'เปลี่ยนรหัสผ่านไม่สำเร็จ', true);
+      return;
+    }
+    toast('อัปเดตรหัสผ่านแล้ว');
+  } catch (e) {
+    toast('เปลี่ยนรหัสผ่านไม่สำเร็จ', true);
+  }
+}
+
 async function addEmail() {
   const input = el('email-input');
+  const passwordInput = el('password-input');
   const email = String(input.value || '').trim().toLowerCase();
+  const password = String(passwordInput.value || '');
   if (!email || !email.includes('@')) {
     toast('ใส่ email ให้ถูกต้อง', true);
+    return;
+  }
+  if (!password || password.length < 6) {
+    toast('รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร', true);
     return;
   }
 
@@ -987,15 +1082,21 @@ async function addEmail() {
   try {
     const r = await apiFetch('/emails', {
       method: 'POST',
-      body: JSON.stringify({ email })
+      body: JSON.stringify({ email, password })
     });
 
     if (r.ok) {
       input.value = '';
-      toast('เพิ่ม ' + email + ' แล้ว');
+      passwordInput.value = '';
+      toast('เพิ่ม Owner ' + email + ' แล้ว');
       await load();
     } else {
-      toast('เพิ่มทีมไม่สำเร็จ', true);
+      let message = 'เพิ่ม Owner ไม่สำเร็จ';
+      try {
+        const data = await r.json();
+        if (data?.error) message = String(data.error);
+      } catch {}
+      toast(message, true);
     }
   } finally {
     btn.disabled = false;
@@ -1011,6 +1112,7 @@ function toast(msg, err) {
 
 el('pw-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
 el('email-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') addEmail(); });
+el('password-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') addEmail(); });
 el('refresh-btn').addEventListener('click', () => load());
 el('reload-btn').addEventListener('click', () => load());
 
@@ -1039,6 +1141,13 @@ async function boot() {
   el('main').style.display = 'none';
 
   if (await validateCurrentToken()) {
+    showMain();
+    await load();
+    return;
+  }
+
+  const launchAuthOk = await tryLaunchAutoAuth();
+  if (launchAuthOk && await validateCurrentToken()) {
     showMain();
     await load();
     return;

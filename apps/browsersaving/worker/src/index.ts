@@ -248,6 +248,13 @@ function getAuthEmail(c: any): string {
     return normalizeEmail(c.get('authEmail') || '');
 }
 
+function verifyVideoAffiliateProvisionSecret(c: any): boolean {
+    const configured = String(c.env.VIDEO_AFFILIATE_TAG_SYNC_SECRET || '').trim();
+    if (!configured) return false;
+    const incoming = String(c.req.header('x-tag-sync-secret') || '').trim();
+    return !!incoming && incoming === configured;
+}
+
 function randomHex(bytes = 16): string {
     const arr = new Uint8Array(bytes);
     crypto.getRandomValues(arr);
@@ -479,6 +486,47 @@ app.get('/health', async (c) => {
 
 // === AUTH APIs ===
 
+app.post('/api/auth/provision-owner', async (c) => {
+    if (!verifyVideoAffiliateProvisionSecret(c)) {
+        return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    let body: any = {};
+    try {
+        body = await c.req.json();
+    } catch {
+        body = {};
+    }
+
+    const email = normalizeEmail(body.email || '');
+    const password = String(body.password || '');
+
+    if (!isValidEmail(email)) {
+        return c.json({ error: 'Invalid email' }, 400);
+    }
+    if (!password || password.length < AUTH_PASSWORD_MIN_LENGTH) {
+        return c.json({ error: `Password must be at least ${AUTH_PASSWORD_MIN_LENGTH} characters` }, 400);
+    }
+
+    const salt = randomHex(16);
+    const hash = await hashPassword(password, salt);
+    const existing = await c.env.DB.prepare(
+        'SELECT email FROM bs_users WHERE email = ? LIMIT 1'
+    ).bind(email).first<{ email?: string }>();
+
+    if (existing?.email) {
+        await c.env.DB.prepare(
+            "UPDATE bs_users SET password_hash = ?, password_salt = ?, updated_at = datetime('now') WHERE email = ?"
+        ).bind(hash, salt, email).run();
+    } else {
+        await c.env.DB.prepare(
+            "INSERT INTO bs_users (email, password_hash, password_salt, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))"
+        ).bind(email, hash, salt).run();
+    }
+
+    return c.json({ success: true, email, created: !existing?.email });
+});
+
 app.post('/api/auth/login', async (c) => {
     let body: any = {};
     try {
@@ -517,21 +565,15 @@ app.post('/api/auth/login', async (c) => {
         }, 403);
     }
 
-    let user = await db.prepare(
+    const user = await db.prepare(
         'SELECT email, password_hash, password_salt FROM bs_users WHERE email = ? LIMIT 1'
     ).bind(email).first<{ email?: string; password_hash?: string; password_salt?: string }>();
 
     if (!user) {
-        const salt = randomHex(16);
-        const hash = await hashPassword(password, salt);
-        await db.prepare(
-            "INSERT INTO bs_users (email, password_hash, password_salt, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))"
-        ).bind(email, hash, salt).run();
-        accountCreated = true;
-
-        user = await db.prepare(
-            'SELECT email, password_hash, password_salt FROM bs_users WHERE email = ? LIMIT 1'
-        ).bind(email).first<{ email?: string; password_hash?: string; password_salt?: string }>();
+        return c.json({
+            error: 'Account not provisioned',
+            details: 'กรุณาให้ Owner สร้างบัญชีจากหน้าแอดมินก่อน',
+        }, 403);
     }
 
     const valid = user?.password_hash && user?.password_salt

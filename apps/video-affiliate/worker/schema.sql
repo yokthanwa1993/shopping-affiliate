@@ -41,8 +41,13 @@ CREATE TABLE IF NOT EXISTS post_history (
     status TEXT DEFAULT 'success',
     bot_id TEXT DEFAULT 'default', -- success, failed
     error_message TEXT,
+    post_token_hint TEXT,
+    post_profile_id TEXT,
+    post_profile_name TEXT,
     comment_status TEXT DEFAULT 'not_configured', -- success, failed, pending, skipped, not_attempted, not_configured
     comment_token_hint TEXT,
+    comment_profile_id TEXT,
+    comment_profile_name TEXT,
     comment_error TEXT,
     comment_fb_id TEXT,
     FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
