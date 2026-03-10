@@ -1,5 +1,5 @@
 name = "neezs-shopee-shortlink"
-main = "../worker/src/index.js"
+main = "../worker-chearb/src/index.js"
 compatibility_date = "2025-01-01"
 
 [[durable_objects.bindings]]
