@@ -378,7 +378,8 @@ app.whenReady().then(() => {
     width: 1200,
     height: 800,
     show: true,
-    title: 'Shopee Affiliate',
+    maximizable: true,
+    title: 'Shopee Affiliate — CHEARB',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -388,6 +389,7 @@ app.whenReady().then(() => {
     },
   });
 
+  mainWindow.maximize();
   mainWindow.loadURL('https://affiliate.shopee.co.th/offer/custom_link');
 
   // Block wvjbscheme:// and other unknown protocols (Shopee WebViewJavascriptBridge)
