@@ -44,25 +44,43 @@ async function expandUrl(url) {
 async function autoLogin() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const currentUrl = mainWindow.webContents.getURL();
-  // รันเฉพาะตอนอยู่หน้า login (ไม่ใช่หน้า /offer)
-  if (!currentUrl.includes('affiliate.shopee.co.th') || currentUrl.includes('/offer')) return;
+  // หน้า login อยู่ที่ shopee.co.th/buyer/login
+  if (!currentUrl.includes('/buyer/login')) return;
 
-  console.log('[AutoLogin] Detected login page — filling credentials...');
+  console.log('[AutoLogin] Detected login page — waiting for form...');
   await mainWindow.webContents.executeJavaScript(`
-    (function() {
+    (function tryFill(attempt) {
       const setVal = (el, val) => {
+        el.focus();
         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
         setter.call(el, val);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.blur();
       };
       const user = document.querySelector('input[name="loginKey"]');
       const pass = document.querySelector('input[name="password"]');
-      const btn  = document.querySelector('button.b5aVaf');
-      if (!user || !pass || !btn) { console.log('[AutoLogin] form not ready'); return; }
+      if (!user || !pass) {
+        if (attempt < 10) setTimeout(() => tryFill(attempt + 1), 500);
+        else console.log('[AutoLogin] form not found after retries');
+        return;
+      }
       setVal(user, ${JSON.stringify(ACCOUNT.username)});
       setVal(pass, ${JSON.stringify(ACCOUNT.password)});
-      setTimeout(() => { btn.click(); console.log('[AutoLogin] clicked login'); }, 500);
-    })()
+      console.log('[AutoLogin] filled — user:', user.value, 'pass.length:', pass.value.length);
+      setTimeout(() => {
+        // หา button ด้วย text content (stable กว่า class name)
+        const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim().includes('เข้าสู่ระบบ'));
+        if (btn) {
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          console.log('[AutoLogin] clicked btn:', btn.textContent.trim(), 'disabled:', btn.disabled);
+        } else {
+          // fallback: Enter key
+          pass.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+          console.log('[AutoLogin] sent Enter key');
+        }
+      }, 1000);
+    })(0)
   `);
 }
 
@@ -210,14 +228,14 @@ const server = http.createServer(async (req, res) => {
 
   if (!url) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee Shortlink (Neezs)</title>
+    res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee Shortlink</title>
 <style>body{font-family:system-ui;padding:32px;background:#f5f5f5}
 .card{background:#fff;border-radius:12px;padding:28px;max-width:500px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
 .brand{font-size:20px;font-weight:800;color:#EE4D2D;margin-bottom:4px}
 .sub{color:#999;font-size:13px;margin-bottom:20px}
 code{background:#f0f0f0;padding:2px 8px;border-radius:4px;font-size:12px}</style>
 </head><body><div class="card">
-<div class="brand">Shopee Shortlink (Neezs)</div>
+<div class="brand">Shopee Shortlink</div>
 <div class="sub">Electron App — localhost:${PORT}</div>
 <p>วิธีใช้: <code>localhost:${PORT}?url=https://shopee.co.th/i-i.xxx.yyy&sub1=yok</code></p>
 </div></body></html>`);
@@ -320,7 +338,7 @@ function sleep(ms) {
 
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
-    { label: 'Shopee Shortlink (Neezs)', enabled: false },
+    { label: 'Shopee Shortlink', enabled: false },
     { label: `localhost:${PORT}`, enabled: false },
     { type: 'separator' },
     {
@@ -407,7 +425,7 @@ app.whenReady().then(() => {
   trayIcon.setTemplateImage(true); // macOS dark/light mode support
   tray = new Tray(trayIcon);
 
-  tray.setToolTip('Shopee Shortlink (Neezs)');
+  tray.setToolTip('Shopee Shortlink');
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => {
     if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
@@ -415,7 +433,7 @@ app.whenReady().then(() => {
 
   // ── HTTP Server ──
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`✅ Shopee Shortlink (Neezs) server: http://localhost:${PORT}`);
+    console.log(`✅ Shopee Shortlink server: http://localhost:${PORT}`);
   });
 
   server.on('error', (err) => {
@@ -425,8 +443,9 @@ app.whenReady().then(() => {
   // ── Start Cloudflare Worker bridge after WebView loads ──
   mainWindow.webContents.on('did-finish-load', () => {
     const currentUrl = mainWindow.webContents.getURL();
-    if (currentUrl.includes('affiliate.shopee.co.th')) {
+    if (currentUrl.includes('/buyer/login')) {
       autoLogin();
+    } else if (currentUrl.includes('affiliate.shopee.co.th')) {
       startBridge();
     }
   });

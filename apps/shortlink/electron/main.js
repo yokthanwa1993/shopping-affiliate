@@ -44,25 +44,43 @@ async function expandUrl(url) {
 async function autoLogin() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const currentUrl = mainWindow.webContents.getURL();
-  // รันเฉพาะตอนอยู่หน้า login (ไม่ใช่หน้า /offer)
-  if (!currentUrl.includes('affiliate.shopee.co.th') || currentUrl.includes('/offer')) return;
+  // หน้า login อยู่ที่ shopee.co.th/buyer/login
+  if (!currentUrl.includes('/buyer/login')) return;
 
-  console.log('[AutoLogin] Detected login page — filling credentials...');
+  console.log('[AutoLogin] Detected login page — waiting for form...');
   await mainWindow.webContents.executeJavaScript(`
-    (function() {
+    (function tryFill(attempt) {
       const setVal = (el, val) => {
+        el.focus();
         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
         setter.call(el, val);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.blur();
       };
       const user = document.querySelector('input[name="loginKey"]');
       const pass = document.querySelector('input[name="password"]');
-      const btn  = document.querySelector('button.b5aVaf');
-      if (!user || !pass || !btn) { console.log('[AutoLogin] form not ready'); return; }
+      if (!user || !pass) {
+        if (attempt < 10) setTimeout(() => tryFill(attempt + 1), 500);
+        else console.log('[AutoLogin] form not found after retries');
+        return;
+      }
       setVal(user, ${JSON.stringify(ACCOUNT.username)});
       setVal(pass, ${JSON.stringify(ACCOUNT.password)});
-      setTimeout(() => { btn.click(); console.log('[AutoLogin] clicked login'); }, 500);
-    })()
+      console.log('[AutoLogin] filled — user:', user.value, 'pass.length:', pass.value.length);
+      setTimeout(() => {
+        // หา button ด้วย text content (stable กว่า class name)
+        const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim().includes('เข้าสู่ระบบ'));
+        if (btn) {
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          console.log('[AutoLogin] clicked btn:', btn.textContent.trim(), 'disabled:', btn.disabled);
+        } else {
+          // fallback: Enter key
+          pass.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+          console.log('[AutoLogin] sent Enter key');
+        }
+      }, 1000);
+    })(0)
   `);
 }
 
@@ -425,8 +443,9 @@ app.whenReady().then(() => {
   // ── Start Cloudflare Worker bridge after WebView loads ──
   mainWindow.webContents.on('did-finish-load', () => {
     const currentUrl = mainWindow.webContents.getURL();
-    if (currentUrl.includes('affiliate.shopee.co.th')) {
+    if (currentUrl.includes('/buyer/login')) {
       autoLogin();
+    } else if (currentUrl.includes('affiliate.shopee.co.th')) {
       startBridge();
     }
   });
