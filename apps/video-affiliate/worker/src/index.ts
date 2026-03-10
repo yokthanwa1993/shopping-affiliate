@@ -82,6 +82,8 @@ async function getFacebookAdsApi(): Promise<FacebookSdkApi> {
 const app = new Hono<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>()
 const MAX_VOICE_PROMPT_CHARS = 12000
 const MAX_GEMINI_API_KEY_CHARS = 512
+const MAX_SHORTLINK_BASE_URL_CHARS = 512
+const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 
 // CORS
 app.use('*', async (c, next) => {
@@ -889,10 +891,16 @@ app.post('/admin/api/comments/retry', async (c) => {
                 results.push({ id: historyId, ok: false, error: err })
                 continue
             }
+            const shortShopeeLink = await shortenShopeeLinkForNamespace({
+                env: c.env,
+                namespaceId: botId,
+                shopeeLink,
+                logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
+            })
 
             const commentResult = await postShopeeCommentStrict({
                 fbVideoId: targetId,
-                shopeeLink,
+                shopeeLink: shortShopeeLink,
                 commentToken,
                 pageId,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
@@ -1599,6 +1607,101 @@ app.delete('/api/settings/gemini-key', async (c) => {
         ok: true,
         ...settings,
         max_chars: MAX_GEMINI_API_KEY_CHARS,
+    })
+})
+
+app.get('/api/settings/shopee-shortlink', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const namespaceId = c.get('botId')
+    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    return c.json({
+        ...settings,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+    })
+})
+
+app.put('/api/settings/shopee-shortlink', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const body = await c.req.json().catch(() => ({})) as {
+        base_url?: string
+        baseUrl?: string
+        expected_utm_id?: string
+        expectedUtmId?: string
+    }
+    const hasBaseUrl = Object.prototype.hasOwnProperty.call(body, 'base_url') || Object.prototype.hasOwnProperty.call(body, 'baseUrl')
+    const hasExpectedUtmId = Object.prototype.hasOwnProperty.call(body, 'expected_utm_id') || Object.prototype.hasOwnProperty.call(body, 'expectedUtmId')
+    if (!hasBaseUrl && !hasExpectedUtmId) {
+        return c.json({ error: 'Shortlink settings payload is required' }, 400)
+    }
+
+    const baseUrl = String(hasBaseUrl ? (body.base_url ?? body.baseUrl ?? '') : '').trim()
+    if (baseUrl.length > MAX_SHORTLINK_BASE_URL_CHARS) {
+        return c.json({ error: `Shortlink base URL too long (max ${MAX_SHORTLINK_BASE_URL_CHARS} chars)` }, 400)
+    }
+    const normalizedBaseUrl = baseUrl ? normalizeShortlinkBaseUrl(baseUrl) : ''
+    if (baseUrl && !normalizedBaseUrl) return c.json({ error: 'Shortlink base URL is invalid' }, 400)
+
+    const expectedUtmIdInput = String(hasExpectedUtmId ? (body.expected_utm_id ?? body.expectedUtmId ?? '') : '').trim()
+    if (expectedUtmIdInput.length > MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS) {
+        return c.json({ error: `Expected UTM ID too long (max ${MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS} chars)` }, 400)
+    }
+    const normalizedExpectedUtmId = expectedUtmIdInput ? normalizeShortlinkExpectedUtmId(expectedUtmIdInput) : ''
+    if (expectedUtmIdInput && !normalizedExpectedUtmId) {
+        return c.json({ error: 'Expected UTM ID must be digits only เช่น 15130770000' }, 400)
+    }
+
+    const namespaceId = c.get('botId')
+    if (hasBaseUrl) {
+        await setNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId, normalizedBaseUrl)
+    }
+    if (hasExpectedUtmId) {
+        await setNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, namespaceId, normalizedExpectedUtmId)
+    }
+    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        ...settings,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+    })
+})
+
+app.put('/api/settings/shopee-shortlink/requirement', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const body = await c.req.json().catch(() => ({})) as { required?: boolean }
+    const required = body.required === true
+    const namespaceId = c.get('botId')
+    await setNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId, required)
+    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        ...settings,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+    })
+})
+
+app.delete('/api/settings/shopee-shortlink', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const namespaceId = c.get('botId')
+    await setNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId, '')
+    await setNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId, false)
+    await setNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, namespaceId, '')
+    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        ...settings,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
     })
 })
 
@@ -2591,7 +2694,7 @@ app.get('/api/gallery/all-original', getAllOriginalGallery)
 app.put('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
     try {
-        const body = await c.req.json() as { shopeeLink?: string; category?: string; title?: string }
+        const body = await c.req.json() as { shopeeLink?: string; category?: string; title?: string; keepInPostedTab?: boolean }
         const metaObj = await c.get('bucket').get(`videos/${id}.json`)
         if (!metaObj) return c.json({ error: 'Video not found' }, 404)
         const meta = await metaObj.json() as Record<string, unknown>
@@ -2601,6 +2704,14 @@ app.put('/api/gallery/:id', async (c) => {
             meta.shopeeLink = normalizedShopeeLink
             if (normalizedShopeeLink) {
                 meta.linkSubmittedAt = new Date().toISOString()
+            }
+            changed = true
+        }
+        if (body.keepInPostedTab !== undefined) {
+            if (body.keepInPostedTab) {
+                meta.keepInPostedTab = true
+            } else {
+                delete meta.keepInPostedTab
             }
             changed = true
         }
@@ -2671,6 +2782,9 @@ const NS_SETTING_PAGES_SYNC_LAST_AT_MS = 'pages_sync_last_at_ms'
 const NS_SETTING_PAGES_TOKEN_MIGRATE_LAST_AT_MS = 'pages_token_migrate_last_at_ms'
 const NS_SETTING_PAGES_TOKEN_POOL_V1 = 'pages_token_pool_v1'
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
+const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
+const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
+const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_utm_id_v1'
 const DEFAULT_PAGES_SYNC_POST_SELECTORS = 'tag:post'
 const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
@@ -2843,6 +2957,151 @@ async function getNamespaceGeminiApiKeySettings(db: D1Database, namespaceId: str
         source,
         updated_at: workspace.updatedAt,
     }
+}
+
+function normalizeShortlinkBaseUrl(rawValue: string): string {
+    const value = String(rawValue || '').trim()
+    if (!value) return ''
+    try {
+        const url = new URL(value)
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') return ''
+        url.hash = ''
+        return url.toString()
+    } catch {
+        return ''
+    }
+}
+
+function normalizeShortlinkExpectedUtmId(rawValue: string): string {
+    const value = String(rawValue || '').trim().replace(/^an_/i, '')
+    if (!value) return ''
+    if (!/^\d+$/.test(value)) return ''
+    return value.slice(0, MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS)
+}
+
+function computeShortlinkUtmMatchValue(expectedUtmId: string, actualUtmSource?: string | null): number | null {
+    const expected = normalizeShortlinkExpectedUtmId(expectedUtmId)
+    if (!expected) return null
+    const actual = normalizeShortlinkExpectedUtmId(actualUtmSource || '')
+    return actual === expected ? 1 : 0
+}
+
+async function getNamespaceShopeeShortlinkBaseUrlEntry(db: D1Database, namespaceId: string): Promise<{ baseUrl: string; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_BASE_URL).first() as { value?: string; updated_at?: string } | null
+    return {
+        baseUrl: normalizeShortlinkBaseUrl(String(row?.value || '')),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
+async function getNamespaceShopeeShortlinkExpectedUtmIdEntry(db: D1Database, namespaceId: string): Promise<{ expectedUtmId: string; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID).first() as { value?: string; updated_at?: string } | null
+    return {
+        expectedUtmId: normalizeShortlinkExpectedUtmId(String(row?.value || '')),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
+async function getNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: string): Promise<boolean> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_REQUIRED).first() as { value?: string } | null
+    const value = String(row?.value || '').trim().toLowerCase()
+    return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+}
+
+async function resolveNamespaceShopeeShortlinkExpectedUtmId(db: D1Database, namespaceId: string): Promise<string> {
+    const row = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
+    return row.expectedUtmId
+}
+
+async function setNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: string, required: boolean): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    if (!required) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_REQUIRED).run()
+        return
+    }
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, '1', datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = '1', updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_REQUIRED).run()
+}
+
+async function setNamespaceShopeeShortlinkExpectedUtmId(db: D1Database, namespaceId: string, rawExpectedUtmId: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const expectedUtmId = normalizeShortlinkExpectedUtmId(rawExpectedUtmId)
+    if (!expectedUtmId) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID).run()
+        return
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID, expectedUtmId).run()
+}
+
+async function setNamespaceShopeeShortlinkBaseUrl(db: D1Database, namespaceId: string, rawBaseUrl: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const baseUrl = normalizeShortlinkBaseUrl(rawBaseUrl).slice(0, MAX_SHORTLINK_BASE_URL_CHARS)
+    if (!baseUrl) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_BASE_URL).run()
+        return
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_BASE_URL, baseUrl).run()
+}
+
+async function resolveNamespaceShopeeShortlinkBaseUrl(db: D1Database, namespaceId: string): Promise<string> {
+    const row = await getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId)
+    return row.baseUrl
+}
+
+async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: string) {
+    const row = await getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId)
+    const required = await getNamespaceShopeeShortlinkRequired(db, namespaceId)
+    const expected = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
+    const updatedAt = [row.updatedAt, expected.updatedAt]
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+        .sort()
+        .at(-1) || null
+    return {
+        base_url: row.baseUrl,
+        enabled: !!row.baseUrl,
+        required,
+        expected_utm_id: expected.expectedUtmId,
+        updated_at: updatedAt,
+    }
+}
+
+function deriveShortlinkSub1(namespaceId: string): string {
+    const normalized = String(namespaceId || '').trim().toLowerCase()
+    const fromEmail = normalized.includes('@') ? normalized.split('@')[0] : normalized
+    const safe = fromEmail.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32)
+    return safe || 'workspace'
 }
 
 async function getNamespacePagesLastSyncAtMs(db: D1Database, namespaceId: string): Promise<number> {
@@ -3866,6 +4125,82 @@ function buildShopeeCommentMessage(shopeeLink: string): string {
     const link = String(shopeeLink || '').trim()
     const prefix = pickRandomCommentTemplate()
     return `${prefix}\n${link}`
+}
+
+async function shortenShopeeLinkForNamespace(params: {
+    env: Env
+    namespaceId: string
+    shopeeLink: string
+    logPrefix: string
+    trace?: {
+        utmSource?: string | null
+        status?: 'disabled' | 'shortened' | 'fallback'
+        error?: string | null
+    }
+}): Promise<string> {
+    const writeTrace = (payload: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null }) => {
+        if (!params.trace) return
+        if (payload.utmSource !== undefined) params.trace.utmSource = payload.utmSource
+        if (payload.status) params.trace.status = payload.status
+        if (payload.error !== undefined) params.trace.error = payload.error
+    }
+    const originalLink = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
+    if (!originalLink) {
+        writeTrace({ utmSource: null, status: 'disabled', error: null })
+        return ''
+    }
+
+    const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(params.env.DB, params.namespaceId)
+    if (!baseUrl) {
+        writeTrace({ utmSource: null, status: 'disabled', error: null })
+        return originalLink
+    }
+
+    const requestUrl = new URL(baseUrl)
+    requestUrl.searchParams.set('url', originalLink)
+    requestUrl.searchParams.set('sub1', deriveShortlinkSub1(params.namespaceId))
+
+    let lastError: string | null = null
+    const maxAttempts = 5
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            if (attempt > 1) {
+                const backoffMs = Math.min(2500, 250 * Math.pow(2, attempt - 2))
+                await waitMs(backoffMs)
+            }
+            const resp = await fetchWithTimeout(requestUrl.toString(), {}, 15000, 'shortlink')
+            if (!resp.ok) {
+                const errText = await resp.text().catch(() => '')
+                throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
+            }
+            const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+            const shortLink = pickFirstShopeeUrl(
+                String(
+                    data.shortLink ||
+                    data.shortlink ||
+                    data.short_link ||
+                    data.shortUrl ||
+                    data.short_url ||
+                    data.url ||
+                    ''
+                )
+            ) || ''
+            const utmSource = String(data.utm_source || data.utmSource || '').trim() || null
+            if (shortLink) {
+                writeTrace({ utmSource, status: 'shortened', error: null })
+                return shortLink
+            }
+            throw new Error('missing_short_link_in_response')
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            lastError = msg
+            console.log(`[${params.logPrefix}] Shortlink attempt ${attempt}/${maxAttempts} failed: ${msg}`)
+            if (attempt >= maxAttempts) break
+        }
+    }
+
+    writeTrace({ utmSource: null, status: 'fallback', error: lastError })
+    return originalLink
 }
 
 function pickProfilePostToken(profile: BrowserSavingProfileRecord): string {
@@ -5700,6 +6035,11 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN post_profile_name TEXT',
                 'ALTER TABLE post_history ADD COLUMN comment_profile_id TEXT',
                 'ALTER TABLE post_history ADD COLUMN comment_profile_name TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_utm_source TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_status TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_error TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_expected_utm_id TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_utm_match INTEGER',
             ]
             for (const sql of statements) {
                 await db.prepare(sql).run().catch(() => { })
@@ -5809,9 +6149,15 @@ async function reconcilePostingHistoryRows(params: {
                 let commentFbId: string | null = null
 
                 if (shopeeLink) {
+                    const shortShopeeLink = await shortenShopeeLinkForNamespace({
+                        env,
+                        namespaceId: botId,
+                        shopeeLink,
+                        logPrefix: `${logPrefix} RECON ${row.id}`,
+                    })
                     const commentResult = await postShopeeCommentWithFallback({
                         fbVideoId: recoveredPostId,
-                        shopeeLink,
+                        shopeeLink: shortShopeeLink,
                         commentTokens: [String(row.access_token || '').trim()],
                         pageId: row.page_id,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
@@ -6310,32 +6656,10 @@ async function resolveShopeeLinkForRetry(params: {
 }
 
 async function clearVideoShopeeLink(bucket: R2Bucket, videoId: string): Promise<void> {
-    const id = String(videoId || '').trim()
-    if (!id) return
-    try {
-        const key = `videos/${id}.json`
-        const metaObj = await bucket.get(key)
-        if (!metaObj) return
-
-        const meta = await metaObj.json() as Record<string, unknown>
-        let changed = false
-        for (const linkKey of SHOPEE_LINK_KEYS) {
-            if (meta[linkKey] !== undefined) {
-                delete meta[linkKey]
-                changed = true
-            }
-        }
-
-        if (!changed) return
-
-        meta.updatedAt = new Date().toISOString()
-        await bucket.put(key, JSON.stringify(meta, null, 2), {
-            httpMetadata: { contentType: 'application/json' },
-        })
-        await updateGalleryCache(bucket, id)
-    } catch (e) {
-        console.error(`[GALLERY] clear Shopee link failed for video ${id}: ${e instanceof Error ? e.message : String(e)}`)
-    }
+    // Requirement: never auto-remove Shopee link from video metadata in any flow.
+    void bucket
+    void videoId
+    return
 }
 
 async function notifyCommentTokenIssue(
@@ -7600,7 +7924,22 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const unpostedId = pickedVideo.id
         const meta = pickedVideo.meta
         selectedVideoId = unpostedId
+        const shortlinkRequired = await getNamespaceShopeeShortlinkRequired(env.DB, botId)
+        const expectedShortlinkUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, botId)
+        const forceShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         normalizedShopeeLink = pickedVideo.shopeeLink
+            ? await shortenShopeeLinkForNamespace({
+                env,
+                namespaceId: botId,
+                shopeeLink: pickedVideo.shopeeLink,
+                logPrefix: 'FORCE-POST',
+                trace: forceShortlinkTrace,
+            })
+            : ''
+        const normalizedShopeeUtmSource = forceShortlinkTrace.utmSource || null
+        const normalizedShopeeStatus = forceShortlinkTrace.status || (normalizedShopeeLink ? 'fallback' : 'disabled')
+        const normalizedShopeeError = forceShortlinkTrace.error || null
+        const normalizedShopeeUtmMatch = computeShortlinkUtmMatchValue(expectedShortlinkUtmId, normalizedShopeeUtmSource)
         const title = metaToString(meta, 'title')
         const script = metaToString(meta, 'script')
         const publicUrl = metaToString(meta, 'publicUrl')
@@ -7633,7 +7972,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
@@ -7648,8 +7987,17 @@ app.post('/api/pages/:id/force-post', async (c) => {
             null,
             null,
             normalizedShopeeLink || null,
+            normalizedShopeeUtmSource,
+            normalizedShopeeStatus,
+            normalizedShopeeError,
+            expectedShortlinkUtmId || null,
+            normalizedShopeeUtmMatch,
         ).run()
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ?').bind(nowStr, page.id).run()
+
+        if (pickedVideo.shopeeLink && shortlinkRequired && normalizedShopeeStatus !== 'shortened') {
+            throw new Error(`shortlink_required_failed${normalizedShopeeError ? `: ${normalizedShopeeError}` : ''}`)
+        }
 
         // Handle legacy publicUrl without namespace path
         let realVideoUrl = publicUrl
@@ -7910,6 +8258,24 @@ app.post('/api/manual-post-reel', async (c) => {
 
         console.log(`[MANUAL-REEL] Starting for page ${pageId}`)
         console.log(`[MANUAL-REEL] Video: ${videoUrl}`)
+        const namespaceId = String(c.get('botId') || '').trim()
+        const shortlinkRequired = namespaceId ? await getNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId) : false
+        const manualShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
+        const effectiveShopeeLink = shopeeLink
+            ? await shortenShopeeLinkForNamespace({
+                env: c.env,
+                namespaceId,
+                shopeeLink,
+                logPrefix: 'MANUAL-REEL',
+                trace: manualShortlinkTrace,
+            })
+            : ''
+        if (shopeeLink && shortlinkRequired && manualShortlinkTrace.status !== 'shortened') {
+            return c.json({
+                error: `shortlink_required_failed${manualShortlinkTrace.error ? `: ${manualShortlinkTrace.error}` : ''}`,
+                stage: 'shortlink',
+            }, 400)
+        }
 
         // Step 1: Init upload
         let initData: { video_id?: string; upload_url?: string }
@@ -7982,7 +8348,7 @@ app.post('/api/manual-post-reel', async (c) => {
             try {
                 const res = await postShopeeCommentWithFallback({
                     fbVideoId: confirmedPostId || fbVideoId,
-                    shopeeLink,
+                    shopeeLink: effectiveShopeeLink,
                     commentTokens: [commentToken || ''],
                     pageId,
                     logPrefix: 'MANUAL-REEL',
@@ -8359,7 +8725,22 @@ async function handleScheduled(env: Env) {
 
         // Get video metadata
         const meta = pickedVideo.meta
+        const shortlinkRequired = await getNamespaceShopeeShortlinkRequired(env.DB, botId)
+        const expectedShortlinkUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, botId)
+        const cronShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         const normalizedShopeeLink = pickedVideo.shopeeLink
+            ? await shortenShopeeLinkForNamespace({
+                env,
+                namespaceId: botId,
+                shopeeLink: pickedVideo.shopeeLink,
+                logPrefix: `CRON ${page.name}`,
+                trace: cronShortlinkTrace,
+            })
+            : ''
+        const normalizedShopeeUtmSource = cronShortlinkTrace.utmSource || null
+        const normalizedShopeeStatus = cronShortlinkTrace.status || (normalizedShopeeLink ? 'fallback' : 'disabled')
+        const normalizedShopeeError = cronShortlinkTrace.error || null
+        const normalizedShopeeUtmMatch = computeShortlinkUtmMatchValue(expectedShortlinkUtmId, normalizedShopeeUtmSource)
         const title = metaToString(meta, 'title')
         const script = metaToString(meta, 'script')
         const publicUrl = metaToString(meta, 'publicUrl')
@@ -8414,7 +8795,7 @@ async function handleScheduled(env: Env) {
         const initialCommentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
@@ -8429,12 +8810,21 @@ async function handleScheduled(env: Env) {
             null,
             null,
             normalizedShopeeLink || null,
+            normalizedShopeeUtmSource,
+            normalizedShopeeStatus,
+            normalizedShopeeError,
+            expectedShortlinkUtmId || null,
+            normalizedShopeeUtmMatch,
         ).run()
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
 
         let fbVideoId = ''
         let postingTokenUsed = String(postTokenCandidates[0] || page.access_token || '').trim()
         try {
+            if (pickedVideo.shopeeLink && shortlinkRequired && normalizedShopeeStatus !== 'shortened') {
+                throw new Error(`shortlink_required_failed${normalizedShopeeError ? `: ${normalizedShopeeError}` : ''}`)
+            }
+
             // Download video and publish reel (single POST with is_reel=true)
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')
             if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)

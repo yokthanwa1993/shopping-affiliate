@@ -3,7 +3,8 @@
     "main": "src/index.ts",
     "compatibility_date": "2026-02-14",
     "compatibility_flags": [
-        "nodejs_compat"
+        "nodejs_compat",
+        "global_fetch_strictly_public"
     ],
     // Pipeline ใช้เวลา 2-3 นาที
     "limits": {

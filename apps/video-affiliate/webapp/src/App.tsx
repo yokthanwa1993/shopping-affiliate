@@ -94,6 +94,7 @@ interface Video {
   shopeeLink?: string
   category?: string
   title?: string
+  keepInPostedTab?: boolean
 }
 
 interface GlobalOriginalVideo {
@@ -126,6 +127,12 @@ interface PostHistory {
   comment_profile_name?: string | null
   comment_error?: string | null
   comment_fb_id?: string | null
+  shopee_link?: string | null
+  shortlink_utm_source?: string | null
+  shortlink_status?: string | null
+  shortlink_error?: string | null
+  shortlink_expected_utm_id?: string | null
+  shortlink_utm_match?: number | null
   error_message?: string | null
 }
 
@@ -168,8 +175,9 @@ interface TaggedPageProfile {
 }
 
 type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
+type PostedLinkFilter = 'all' | 'with-link' | 'no-link'
 type GeminiKeySource = 'workspace' | 'none'
-type SettingsSection = 'menu' | 'account' | 'team' | 'gemini' | 'voice'
+type SettingsSection = 'menu' | 'account' | 'team' | 'gemini' | 'shortlink' | 'voice'
 
 const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)?(?:shopee\.co\.th|s\.shopee\.co\.th)\S*/i
 
@@ -322,7 +330,7 @@ function Thumb({ id, url, fallback }: { id: string; url?: string; fallback: stri
 }
 
 // Video card component
-function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange }: { video: Video; formatDuration: (s: number) => string; onDelete: (id: string) => void; onUpdate: (id: string, fields: Partial<Video>) => void; onExpandedChange?: (expanded: boolean) => void }) {
+function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange, keepInPostedOnLinkSave = false }: { video: Video; formatDuration: (s: number) => string; onDelete: (id: string) => void; onUpdate: (id: string, fields: Partial<Video>) => void; onExpandedChange?: (expanded: boolean) => void; keepInPostedOnLinkSave?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [shopeeInput, setShopeeInput] = useState('')
@@ -371,14 +379,22 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
       const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ shopeeLink: shopeeInput.trim() })
+        body: JSON.stringify({
+          shopeeLink: shopeeInput.trim(),
+          keepInPostedTab: keepInPostedOnLinkSave || undefined,
+        })
       })
       if (resp.ok) {
         video.shopeeLink = shopeeInput.trim()
+        if (keepInPostedOnLinkSave) video.keepInPostedTab = true
         video.updatedAt = nowIso
         setLocalShopee(shopeeInput.trim())
         setShopeeInput('')
-        onUpdate(video.id, { shopeeLink: shopeeInput.trim(), updatedAt: nowIso })
+        onUpdate(video.id, {
+          shopeeLink: shopeeInput.trim(),
+          keepInPostedTab: keepInPostedOnLinkSave ? true : video.keepInPostedTab,
+          updatedAt: nowIso
+        })
       } else {
         const err = await resp.json().catch(() => ({ error: 'Unknown error' }))
         alert('บันทึกไม่สำเร็จ: ' + (err.error || resp.status))
@@ -1728,6 +1744,14 @@ function App() {
     setGeminiApiKeyLoading(false)
     setGeminiApiKeySaving(false)
     setGeminiApiKeyMaxChars(512)
+    setShortlinkBaseUrlDraft('')
+    setShortlinkBaseUrlCurrent('')
+    setShortlinkEnabled(false)
+    setShortlinkUpdatedAt('')
+    setShortlinkMessage('')
+    setShortlinkLoading(false)
+    setShortlinkSaving(false)
+    setShortlinkMaxChars(512)
     setPages([])
     setVideos([])
     setUsedVideos([])
@@ -1779,6 +1803,19 @@ function App() {
   const [geminiApiKeyLoading, setGeminiApiKeyLoading] = useState(false)
   const [geminiApiKeySaving, setGeminiApiKeySaving] = useState(false)
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
+  const [shortlinkBaseUrlDraft, setShortlinkBaseUrlDraft] = useState('')
+  const [shortlinkBaseUrlCurrent, setShortlinkBaseUrlCurrent] = useState('')
+  const [shortlinkExpectedUtmIdDraft, setShortlinkExpectedUtmIdDraft] = useState('')
+  const [shortlinkExpectedUtmIdCurrent, setShortlinkExpectedUtmIdCurrent] = useState('')
+  const [shortlinkEnabled, setShortlinkEnabled] = useState(false)
+  const [shortlinkUpdatedAt, setShortlinkUpdatedAt] = useState('')
+  const [shortlinkMessage, setShortlinkMessage] = useState('')
+  const [shortlinkLoading, setShortlinkLoading] = useState(false)
+  const [shortlinkSaving, setShortlinkSaving] = useState(false)
+  const [shortlinkRequired, setShortlinkRequired] = useState(false)
+  const [shortlinkRequirementSaving, setShortlinkRequirementSaving] = useState(false)
+  const [shortlinkMaxChars, setShortlinkMaxChars] = useState(512)
+  const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [logoutLoading, setLogoutLoading] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('menu')
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
@@ -1820,7 +1857,8 @@ function App() {
   }
 
 
-  const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('missing-link')
+  const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('unused')
+  const [postedLinkFilter, setPostedLinkFilter] = useState<PostedLinkFilter>('all')
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null)
@@ -2009,7 +2047,7 @@ function App() {
   }, [tab, settingsSection])
 
   useEffect(() => {
-    if (!isOwner && (settingsSection === 'team' || settingsSection === 'gemini' || settingsSection === 'voice')) {
+    if (!isOwner && (settingsSection === 'team' || settingsSection === 'gemini' || settingsSection === 'shortlink' || settingsSection === 'voice')) {
       setSettingsSection('menu')
     }
   }, [isOwner, settingsSection])
@@ -2019,6 +2057,7 @@ function App() {
     if (tab !== 'settings') return
     void loadVoicePrompt()
     void loadGeminiApiKey()
+    void loadShortlinkSettings()
   }, [tab, token, authBootstrapping, isOwner])
 
   useEffect(() => {
@@ -2452,6 +2491,164 @@ function App() {
     }
   }
 
+  async function loadShortlinkSettings() {
+    const session = getToken()
+    if (!session || !isOwner) return
+    setShortlinkMessage('')
+    setShortlinkLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setShortlinkMessage('บัญชีนี้ไม่มีสิทธิ์แก้ Shortlink URL')
+        return
+      }
+      if (!resp.ok) {
+        setShortlinkMessage('โหลด Shortlink URL ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as {
+        base_url?: string
+        enabled?: boolean
+        required?: boolean
+        expected_utm_id?: string
+        updated_at?: string
+        max_chars?: number
+        max_expected_utm_chars?: number
+      }
+      const baseUrl = String(data.base_url || '')
+      const expectedUtmId = String(data.expected_utm_id || '')
+      setShortlinkBaseUrlCurrent(baseUrl)
+      setShortlinkBaseUrlDraft(baseUrl)
+      setShortlinkExpectedUtmIdCurrent(expectedUtmId)
+      setShortlinkExpectedUtmIdDraft(expectedUtmId)
+      setShortlinkEnabled(!!data.enabled && !!baseUrl)
+      setShortlinkRequired(data.required === true)
+      setShortlinkUpdatedAt(String(data.updated_at || ''))
+      if (typeof data.max_chars === 'number' && data.max_chars > 0) setShortlinkMaxChars(data.max_chars)
+      if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
+      setShortlinkMessage('')
+    } catch {
+      setShortlinkMessage('โหลด Shortlink URL ไม่สำเร็จ')
+    } finally {
+      setShortlinkLoading(false)
+    }
+  }
+
+  async function saveShortlinkSettings(nextBaseUrl: string) {
+    const session = getToken()
+    if (!session || !isOwner) return
+    const trimmed = String(nextBaseUrl || '').trim()
+    const expectedTrimmed = String(shortlinkExpectedUtmIdDraft || '').trim()
+    setShortlinkSaving(true)
+    setShortlinkMessage('')
+    try {
+      const isClear = !trimmed && !expectedTrimmed
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink`, isClear ? {
+        method: 'DELETE',
+      } : {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: trimmed, expected_utm_id: expectedTrimmed }),
+      })
+
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setShortlinkMessage('บัญชีนี้ไม่มีสิทธิ์แก้ Shortlink URL')
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setShortlinkMessage(data.error || 'บันทึก Shortlink URL ไม่สำเร็จ')
+        return
+      }
+
+      const data = await resp.json() as {
+        base_url?: string
+        enabled?: boolean
+        required?: boolean
+        expected_utm_id?: string
+        updated_at?: string
+        max_chars?: number
+        max_expected_utm_chars?: number
+      }
+      const baseUrl = String(data.base_url || '')
+      const expectedUtmId = String(data.expected_utm_id || '')
+      setShortlinkBaseUrlCurrent(baseUrl)
+      setShortlinkBaseUrlDraft(baseUrl)
+      setShortlinkExpectedUtmIdCurrent(expectedUtmId)
+      setShortlinkExpectedUtmIdDraft(expectedUtmId)
+      setShortlinkEnabled(!!data.enabled && !!baseUrl)
+      setShortlinkRequired(data.required === true)
+      setShortlinkUpdatedAt(String(data.updated_at || ''))
+      if (typeof data.max_chars === 'number' && data.max_chars > 0) setShortlinkMaxChars(data.max_chars)
+      if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
+      setShortlinkMessage(isClear ? 'ล้างค่า Shortlink แล้ว' : 'บันทึกค่า Shortlink แล้ว')
+    } catch {
+      setShortlinkMessage('บันทึกค่า Shortlink ไม่สำเร็จ')
+    } finally {
+      setShortlinkSaving(false)
+    }
+  }
+
+  async function saveShortlinkRequirement(nextRequired: boolean) {
+    const session = getToken()
+    if (!session || !isOwner) return
+    setShortlinkRequirementSaving(true)
+    setShortlinkMessage('')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink/requirement`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ required: nextRequired }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setShortlinkMessage('บัญชีนี้ไม่มีสิทธิ์แก้การบังคับย่อลิงก์')
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setShortlinkMessage(data.error || 'บันทึกการบังคับย่อลิงก์ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as {
+        base_url?: string
+        enabled?: boolean
+        required?: boolean
+        expected_utm_id?: string
+        updated_at?: string
+        max_chars?: number
+        max_expected_utm_chars?: number
+      }
+      const baseUrl = String(data.base_url || '')
+      const expectedUtmId = String(data.expected_utm_id || '')
+      setShortlinkBaseUrlCurrent(baseUrl)
+      setShortlinkBaseUrlDraft(baseUrl)
+      setShortlinkExpectedUtmIdCurrent(expectedUtmId)
+      setShortlinkExpectedUtmIdDraft(expectedUtmId)
+      setShortlinkEnabled(!!data.enabled && !!baseUrl)
+      setShortlinkRequired(data.required === true)
+      setShortlinkUpdatedAt(String(data.updated_at || ''))
+      if (typeof data.max_chars === 'number' && data.max_chars > 0) setShortlinkMaxChars(data.max_chars)
+      if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
+      setShortlinkMessage(nextRequired ? 'เปิดบังคับย่อลิงก์ก่อนโพสต์แล้ว' : 'ปิดบังคับย่อลิงก์ก่อนโพสต์แล้ว')
+    } catch {
+      setShortlinkMessage('บันทึกการบังคับย่อลิงก์ไม่สำเร็จ')
+    } finally {
+      setShortlinkRequirementSaving(false)
+    }
+  }
+
   function formatDuration(seconds: number) {
     const mins = Math.floor(seconds / 60)
     const secs = Math.floor(seconds % 60)
@@ -2569,11 +2766,12 @@ function App() {
   }
 
   const usedVideoIdSet = new Set(usedVideos.map((video) => String(video.id || '')))
+  const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
   const getGallerySortTs = (video: Video) => {
     const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
     return Number.isFinite(ts) ? ts : 0
   }
-  // "ไม่มีลิ้ง" = วิดีโอที่ยังไม่มี Shopee link
+  // วิดีโอที่ยังไม่มี Shopee link
   const galleryMissingLinkVideos = videos
     .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
     .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
@@ -2581,24 +2779,44 @@ function App() {
   const galleryUnusedVideos = videos
     .filter((video) =>
       !usedVideoIdSet.has(String(video.id || '')) &&
+      !isKeepInPostedTab(video) &&
       !!getVideoShopeeLink(video as unknown as Record<string, unknown>)
     )
     .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  // "โพสต์แล้ว" = มาจาก backend ฝั่ง used เท่านั้น
-  const galleryUsedVideos = [...usedVideos]
+  const galleryPinnedPostedVideos = videos
+    .filter((video) =>
+      !usedVideoIdSet.has(String(video.id || '')) &&
+      isKeepInPostedTab(video)
+    )
     .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  const galleryAvailableVideos = categoryFilter === 'missing-link'
-    ? galleryMissingLinkVideos
-    : categoryFilter === 'used'
-      ? galleryUsedVideos
-      : galleryUnusedVideos
+  // "โพสต์แล้ว" = used จาก backend + คลิปไม่มีลิ้งทั้งหมด
+  const galleryUsedMergedVideos: Video[] = [
+    ...usedVideos,
+    ...galleryPinnedPostedVideos,
+    ...galleryMissingLinkVideos.filter((video) => !usedVideoIdSet.has(String(video.id || '')))
+  ]
+  const galleryUsedVideos = galleryUsedMergedVideos
+    .filter((video, index, arr) => arr.findIndex((v) => String(v.id || '') === String(video.id || '')) === index)
+    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
+  const galleryUsedWithLinkVideos = galleryUsedVideos
+    .filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
+  const galleryUsedWithoutLinkVideos = galleryUsedVideos
+    .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
+  const galleryUsedVisibleVideos = postedLinkFilter === 'with-link'
+    ? galleryUsedWithLinkVideos
+    : postedLinkFilter === 'no-link'
+      ? galleryUsedWithoutLinkVideos
+      : galleryUsedVideos
+  const galleryAvailableVideos = (categoryFilter === 'used' || categoryFilter === 'missing-link')
+    ? galleryUsedVisibleVideos
+    : galleryUnusedVideos
   const showGalleryFilterBar = tab === 'gallery' && (
     loading ||
-    galleryMissingLinkVideos.length > 0 ||
     galleryUnusedVideos.length > 0 ||
     galleryUsedVideos.length > 0
   )
-  const galleryHeaderOffset = showGalleryFilterBar ? 164 : 104
+  const showPostedSubFilterBar = tab === 'gallery' && categoryFilter === 'used' && showGalleryFilterBar
+  const galleryHeaderOffset = showGalleryFilterBar ? (showPostedSubFilterBar ? 214 : 164) : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
   const galleryVisibleVideos = galleryAvailableVideos
   const appViewportStyle = {
@@ -2631,12 +2849,6 @@ function App() {
           {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
               <button
-                onClick={() => setCategoryFilter('missing-link')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'missing-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                ไม่มีลิ้ง ({galleryMissingLinkVideos.length})
-              </button>
-              <button
                 onClick={() => setCategoryFilter('unused')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
@@ -2647,6 +2859,28 @@ function App() {
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
                 โพสต์แล้ว ({galleryUsedVideos.length})
+              </button>
+            </div>
+          )}
+          {tab === 'gallery' && showPostedSubFilterBar && (
+            <div className="flex bg-gray-100/70 p-1 mb-2 rounded-xl gap-1">
+              <button
+                onClick={() => setPostedLinkFilter('all')}
+                className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${postedLinkFilter === 'all' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ทั้งหมด ({galleryUsedVideos.length})
+              </button>
+              <button
+                onClick={() => setPostedLinkFilter('with-link')}
+                className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${postedLinkFilter === 'with-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                มีลิ้ง ({galleryUsedWithLinkVideos.length})
+              </button>
+              <button
+                onClick={() => setPostedLinkFilter('no-link')}
+                className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${postedLinkFilter === 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ไม่มีลิ้ง ({galleryUsedWithoutLinkVideos.length})
               </button>
             </div>
           )}
@@ -2803,18 +3037,22 @@ function App() {
                   <span className="text-4xl grayscale opacity-50">🎬</span>
                 </div>
                 <p className="text-gray-900 font-bold text-lg">
-                  {categoryFilter === 'missing-link'
-                    ? 'ไม่มีคลิปที่ขาดลิ้ง'
-                    : categoryFilter === 'used'
-                      ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
-                      : 'ไม่มีคลิปพร้อมโพสต์'}
+                  {categoryFilter === 'used'
+                    ? postedLinkFilter === 'with-link'
+                      ? 'ยังไม่มีคลิปที่มีลิ้ง'
+                      : postedLinkFilter === 'no-link'
+                        ? 'ยังไม่มีคลิปที่ไม่มีลิ้ง'
+                        : 'ยังไม่มีคลิปที่โพสต์แล้ว'
+                    : 'ไม่มีคลิปพร้อมโพสต์'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
-                  {categoryFilter === 'missing-link'
-                    ? 'คลิปที่ยังไม่มี Shopee link จะมาอยู่แท็บนี้'
-                    : categoryFilter === 'used'
-                      ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
-                      : 'คลิปที่มี Shopee link และยังไม่โพสต์จะแสดงที่นี่'}
+                  {categoryFilter === 'used'
+                    ? postedLinkFilter === 'with-link'
+                      ? 'คลิปที่มีลิ้งจะแสดงที่นี่'
+                      : postedLinkFilter === 'no-link'
+                        ? 'คลิปที่ไม่มีลิ้งจะแสดงที่นี่'
+                        : 'คลิปที่โพสต์สำเร็จ และคลิปที่ไม่มีลิ้งจะแสดงที่นี่'
+                    : 'คลิปที่มี Shopee link และยังไม่โพสต์จะแสดงที่นี่'}
                 </p>
               </div>
             ) : (
@@ -2824,6 +3062,7 @@ function App() {
                     key={video.id}
                     video={video}
                     formatDuration={formatDuration}
+                    keepInPostedOnLinkSave={categoryFilter === 'used'}
                     onDelete={(id) => {
                       setVideos(videos.filter(v => v.id !== id));
                       setUsedVideos(usedVideos.filter(v => v.id !== id));
@@ -2938,6 +3177,37 @@ function App() {
                     const isExpanded = expandedLogId === item.id
                     const postActor = String(item.post_profile_name || item.post_profile_id || item.post_token_hint || '').trim() || '-'
                     const commentActor = String(item.comment_profile_name || item.comment_profile_id || item.comment_token_hint || '').trim() || '-'
+                    const shortlinkUtmSource = (() => {
+                      const direct = String(item.shortlink_utm_source || '').trim()
+                      if (direct) return direct
+                      const link = String(item.shopee_link || '').trim()
+                      if (!link) return ''
+                      try {
+                        return String(new URL(link).searchParams.get('utm_source') || '').trim()
+                      } catch {
+                        return ''
+                      }
+                    })()
+                    const normalizeShortlinkUtmId = (value: string) => String(value || '').trim().replace(/^an_/i, '').trim()
+                    const shortlinkExpectedUtmId = String(item.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
+                    const shortlinkUtmMatch = (() => {
+                      if (!shortlinkExpectedUtmId) return null
+                      if (typeof item.shortlink_utm_match === 'number') return item.shortlink_utm_match === 1
+                      if (typeof item.shortlink_utm_match === 'string') return item.shortlink_utm_match === '1'
+                      if (!shortlinkUtmSource) return false
+                      return normalizeShortlinkUtmId(shortlinkUtmSource) === normalizeShortlinkUtmId(shortlinkExpectedUtmId)
+                    })()
+                    const shortlinkUtmMatchLabel = shortlinkExpectedUtmId
+                      ? (shortlinkUtmMatch ? '✅ ตรงกับ workspace' : '❌ ไม่ตรงกับ workspace')
+                      : '-'
+                    const shortlinkStatus = String(item.shortlink_status || '').trim().toLowerCase()
+                    const shortlinkStatusLabel = shortlinkStatus === 'shortened'
+                      ? 'ผ่าน'
+                      : shortlinkStatus === 'fallback'
+                        ? 'ไม่ผ่าน (ใช้ลิงก์เดิม)'
+                        : shortlinkStatus === 'disabled'
+                          ? 'ปิดการใช้งาน'
+                          : '-'
                     const showCommentError = item.comment_error && item.comment_error.trim().length > 0
                     const showPostError = item.error_message && item.error_message.trim().length > 0
 
@@ -3022,6 +3292,13 @@ function App() {
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์:</span> {commentMeta.label}</p>
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์ด้วย:</span> {commentActor}</p>
                             <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
+                            <p><span className="font-semibold text-gray-700">UTM Source:</span> {shortlinkUtmSource || '-'}</p>
+                            <p><span className="font-semibold text-gray-700">UTM ที่ตั้งค่า:</span> {shortlinkExpectedUtmId || '-'}</p>
+                            <p><span className="font-semibold text-gray-700">UTM ตรวจสอบ:</span> {shortlinkUtmMatchLabel}</p>
+                            <p><span className="font-semibold text-gray-700">ลิงก์ย่อ:</span> {shortlinkUtmSource ? 'ยืนยันแล้ว' : 'ไม่พบข้อมูล'}</p>
+                            <p><span className="font-semibold text-gray-700">สถานะย่อลิงก์:</span> {shortlinkStatusLabel}</p>
+                            <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ที่คอมเมนต์:</span> {item.shopee_link || '-'}</p>
+                            {item.shortlink_error && <p className="text-red-500"><span className="font-semibold text-red-600">Shortlink Error:</span> {item.shortlink_error}</p>}
                             {item.comment_fb_id && <p><span className="font-semibold text-gray-700">Comment ID:</span> {item.comment_fb_id}</p>}
                             {showCommentError && <p className="text-red-500"><span className="font-semibold text-red-600">คอมเม้นต์ผิดพลาด:</span> {item.comment_error}</p>}
                             {showPostError && <p className="text-red-500"><span className="font-semibold text-red-600">โพสต์ผิดพลาด:</span> {item.error_message}</p>}
@@ -3217,6 +3494,14 @@ function App() {
                 )}
                 {isOwner && (
                   <SettingsMenuItem
+                    icon="🔗"
+                    title="Shopee Shortlink"
+                    subtitle={shortlinkEnabled ? shortlinkBaseUrlCurrent : 'ยังไม่ตั้งค่า'}
+                    onClick={() => setSettingsSection('shortlink')}
+                  />
+                )}
+                {isOwner && (
+                  <SettingsMenuItem
                     icon="🎙️"
                     title="Voice Prompt"
                     subtitle={voicePromptSource === 'custom' ? 'กำลังใช้ prompt แบบกำหนดเอง' : 'กำลังใช้ prompt ค่าเริ่มต้น'}
@@ -3242,7 +3527,9 @@ function App() {
                         ? 'Team'
                         : settingsSection === 'gemini'
                           ? 'Gemini API Key'
-                          : 'Voice Prompt'}
+                          : settingsSection === 'shortlink'
+                            ? 'Shopee Shortlink'
+                            : 'Voice Prompt'}
                   </p>
                 </div>
 
@@ -3353,6 +3640,9 @@ function App() {
                               : 'AIza...'}
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
+                          <p className="text-[11px] text-gray-500 break-all">
+                            คีย์ปัจจุบัน: {geminiApiKeyMasked || '-'}
+                          </p>
                           <div className="flex items-center justify-between text-[11px] text-gray-400">
                             <span>
                               แหล่งที่ใช้งาน: {geminiApiKeySource === 'workspace' ? 'Owner นี้เท่านั้น' : 'ยังไม่ตั้งค่า'}
@@ -3384,6 +3674,120 @@ function App() {
                                 void saveGeminiApiKey('')
                               }}
                               disabled={geminiApiKeySaving || (geminiApiKeySource === 'none' && !geminiApiKeyMasked)}
+                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              ล้างค่า
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {settingsSection === 'shortlink' && isOwner && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <p className="text-xs text-gray-500 leading-relaxed">
+                        ระบบจะย่อลิ้ง Shopee ก่อนคอมเมนต์ตอนโพสต์จริง โดยใช้ URL นี้แยกตาม workspace ของแต่ละ owner
+                      </p>
+                      {shortlinkLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลด Shortlink URL...</p>
+                      ) : (
+                        <>
+                          <input
+                            type="url"
+                            value={shortlinkBaseUrlDraft}
+                            onChange={(e) => {
+                              setShortlinkBaseUrlDraft(e.target.value)
+                              if (shortlinkMessage) setShortlinkMessage('')
+                            }}
+                            placeholder="https://chearb-shopee-shortlink.yokthanwa1993-bc9.workers.dev/"
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                          />
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={shortlinkExpectedUtmIdDraft}
+                            onChange={(e) => {
+                              setShortlinkExpectedUtmIdDraft(e.target.value.replace(/[^\d]/g, ''))
+                              if (shortlinkMessage) setShortlinkMessage('')
+                            }}
+                            placeholder="15130770000"
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                          />
+                          <p className="text-[11px] text-gray-500 break-all">
+                            URL ปัจจุบัน: {shortlinkBaseUrlCurrent || '-'}
+                          </p>
+                          <p className="text-[11px] text-gray-500 break-all">
+                            UTM ID ปัจจุบัน: {shortlinkExpectedUtmIdCurrent || '-'}
+                          </p>
+                          <p className="text-[11px] text-gray-500">
+                            ใส่เฉพาะตัวเลข เช่น 15130770000 ระบบจะเช็คกับค่า `an_15130770000`
+                          </p>
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs font-semibold text-gray-800">บังคับย่อลิงก์ก่อนโพสต์</p>
+                              <p className="text-[11px] text-gray-500">
+                                {shortlinkRequired ? 'เปิด: ย่อไม่ผ่านจะไม่โพสต์' : 'ปิด: ย่อไม่ผ่านยังโพสต์ได้'}
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => {
+                                if (shortlinkRequirementSaving) return
+                                void saveShortlinkRequirement(!shortlinkRequired)
+                              }}
+                              disabled={shortlinkRequirementSaving}
+                              className={`relative inline-flex h-6 w-11 rounded-full transition-colors overflow-hidden ${shortlinkRequired ? 'bg-blue-500' : 'bg-gray-300'} ${shortlinkRequirementSaving ? 'opacity-50' : ''}`}
+                              aria-label="สลับบังคับย่อลิงก์"
+                            >
+                              <span
+                                className={`absolute left-0.5 top-0.5 h-5 w-5 bg-white rounded-full shadow transition-transform ${shortlinkRequired ? 'translate-x-5' : 'translate-x-0'}`}
+                              />
+                            </button>
+                          </div>
+                          <div className="flex items-center justify-between text-[11px] text-gray-400">
+                            <span>สถานะ: {shortlinkEnabled ? 'เปิดใช้งาน' : 'ปิดใช้งาน'}</span>
+                            <span>{shortlinkBaseUrlDraft.length}/{shortlinkMaxChars}</span>
+                          </div>
+                          <div className="flex items-center justify-between text-[11px] text-gray-400">
+                            <span>UTM ID</span>
+                            <span>{shortlinkExpectedUtmIdDraft.length}/{shortlinkExpectedUtmIdMaxChars}</span>
+                          </div>
+                          {shortlinkUpdatedAt && (
+                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(shortlinkUpdatedAt).toLocaleString()}</p>
+                          )}
+                          {shortlinkMessage && (
+                            <p className={`text-xs ${shortlinkMessage.includes('ไม่สำเร็จ') || shortlinkMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
+                              {shortlinkMessage}
+                            </p>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => {
+                                if (
+                                  shortlinkSaving ||
+                                  shortlinkBaseUrlDraft.length > shortlinkMaxChars ||
+                                  shortlinkExpectedUtmIdDraft.length > shortlinkExpectedUtmIdMaxChars
+                                ) return
+                                void saveShortlinkSettings(shortlinkBaseUrlDraft)
+                              }}
+                              disabled={
+                                shortlinkSaving ||
+                                shortlinkBaseUrlDraft.length > shortlinkMaxChars ||
+                                shortlinkExpectedUtmIdDraft.length > shortlinkExpectedUtmIdMaxChars ||
+                                (!shortlinkBaseUrlDraft.trim() && !shortlinkExpectedUtmIdDraft.trim())
+                              }
+                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              {shortlinkSaving ? 'กำลังบันทึก...' : 'บันทึกค่า'}
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (shortlinkSaving) return
+                                void saveShortlinkSettings('')
+                              }}
+                              disabled={shortlinkSaving || (!shortlinkEnabled && !shortlinkExpectedUtmIdCurrent)}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               ล้างค่า
