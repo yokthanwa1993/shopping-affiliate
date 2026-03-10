@@ -4,7 +4,7 @@ const path = require('path');
 const WebSocket = require('ws');
 
 const PORT = 3001;
-const ACCOUNT = { username: 'affiliate@neezs.com', password: '!@7EvaYLj986' };
+const ACCOUNT = { username: 'affiliate@neezs.com', password: '!Affiliate@neezs' };
 let tray = null;
 let mainWindow = null;
 
