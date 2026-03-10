@@ -26,10 +26,10 @@ export class BridgeDO {
   async webSocketMessage(ws, message) {
     try {
       const result = JSON.parse(message);
-      const { jobId, ok, shortLink, normalizedUrl, redirectUrl, error } = result;
+      const { jobId, ok, shortLink, utmSource, normalizedUrl, redirectUrl, error } = result;
       const job = this.pendingJobs.get(jobId);
       if (!job) return;
-      job.resolve({ ok, shortLink, normalizedUrl, redirectUrl, error });
+      job.resolve({ ok, shortLink, utmSource, normalizedUrl, redirectUrl, error });
     } catch (_) {}
   }
 
@@ -79,7 +79,7 @@ export class BridgeDO {
 
       this.pendingJobs.set(jobId, {
         timer,
-        resolve: ({ ok, shortLink, normalizedUrl, redirectUrl, error }) => {
+        resolve: ({ ok, shortLink, utmSource, normalizedUrl, redirectUrl, error }) => {
           clearTimeout(timer);
           this.pendingJobs.delete(jobId);
           if (ok) {
@@ -88,6 +88,7 @@ export class BridgeDO {
               ...(redirectUrl ? { redirectLink: redirectUrl } : {}),
               longLink: normalizedUrl || rawUrl,
               shortLink: shortLink,
+              ...(utmSource ? { utm_source: utmSource } : {}),
               sub1: url.searchParams.get('sub1') || null,
               sub2: url.searchParams.get('sub2') || null,
               sub3: url.searchParams.get('sub3') || null,

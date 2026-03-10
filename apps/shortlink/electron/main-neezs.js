@@ -3,7 +3,7 @@ const http = require('http');
 const path = require('path');
 const WebSocket = require('ws');
 
-const PORT = 3000;
+const PORT = 3001;
 let tray = null;
 let mainWindow = null;
 
@@ -182,14 +182,14 @@ const server = http.createServer(async (req, res) => {
 
   if (!url) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee Shortlink</title>
+    res.end(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shopee Shortlink (Neezs)</title>
 <style>body{font-family:system-ui;padding:32px;background:#f5f5f5}
 .card{background:#fff;border-radius:12px;padding:28px;max-width:500px;box-shadow:0 2px 12px rgba(0,0,0,.08)}
 .brand{font-size:20px;font-weight:800;color:#EE4D2D;margin-bottom:4px}
 .sub{color:#999;font-size:13px;margin-bottom:20px}
 code{background:#f0f0f0;padding:2px 8px;border-radius:4px;font-size:12px}</style>
 </head><body><div class="card">
-<div class="brand">Shopee Shortlink</div>
+<div class="brand">Shopee Shortlink (Neezs)</div>
 <div class="sub">Electron App — localhost:${PORT}</div>
 <p>วิธีใช้: <code>localhost:${PORT}?url=https://shopee.co.th/i-i.xxx.yyy&sub1=yok</code></p>
 </div></body></html>`);
@@ -227,8 +227,8 @@ code{background:#f0f0f0;padding:2px 8px;border-radius:4px;font-size:12px}</style
 // ── Cloudflare Worker Bridge (poll loop) ──────────────────────────────────────
 // รัน polling loop ใน main process — แทน Chrome extension
 
-const WORKER_URL = 'https://chearb-shopee-shortlink.yokthanwa1993-bc9.workers.dev';
-const WORKER_WS  = 'wss://chearb-shopee-shortlink.yokthanwa1993-bc9.workers.dev/ws';
+const WORKER_URL = 'https://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev';
+const WORKER_WS  = 'wss://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev/ws';
 let bridgeRunning = false;
 let bridgeWs = null;
 
@@ -292,7 +292,7 @@ function sleep(ms) {
 
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
-    { label: 'Shopee Shortlink', enabled: false },
+    { label: 'Shopee Shortlink (Neezs)', enabled: false },
     { label: `localhost:${PORT}`, enabled: false },
     { type: 'separator' },
     {
@@ -379,7 +379,7 @@ app.whenReady().then(() => {
   trayIcon.setTemplateImage(true); // macOS dark/light mode support
   tray = new Tray(trayIcon);
 
-  tray.setToolTip('Shopee Shortlink');
+  tray.setToolTip('Shopee Shortlink (Neezs)');
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => {
     if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
@@ -387,7 +387,7 @@ app.whenReady().then(() => {
 
   // ── HTTP Server ──
   server.listen(PORT, '127.0.0.1', () => {
-    console.log(`✅ Shopee Shortlink server: http://localhost:${PORT}`);
+    console.log(`✅ Shopee Shortlink (Neezs) server: http://localhost:${PORT}`);
   });
 
   server.on('error', (err) => {
