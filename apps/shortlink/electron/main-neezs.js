@@ -390,7 +390,19 @@ app.whenReady().then(() => {
   });
 
   mainWindow.maximize();
-  mainWindow.loadURL('https://affiliate.shopee.co.th/offer/custom_link');
+
+  function loadAffiliatePage() {
+    mainWindow.loadURL('https://affiliate.shopee.co.th/offer/custom_link');
+  }
+
+  loadAffiliatePage();
+
+  // ถ้าโหลดไม่ได้ (เน็ต/renderer ยังไม่พร้อม) → retry อัตโนมัติ
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDesc) => {
+    if (errorCode === -3) return; // ERR_ABORTED (user navigated away) — ไม่ต้อง retry
+    console.log(`[Load] failed (${errorCode}: ${errorDesc}) — retrying in 3s...`);
+    setTimeout(loadAffiliatePage, 3000);
+  });
 
   // Block wvjbscheme:// and other unknown protocols (Shopee WebViewJavascriptBridge)
   mainWindow.webContents.on('will-navigate', (event, url) => {
