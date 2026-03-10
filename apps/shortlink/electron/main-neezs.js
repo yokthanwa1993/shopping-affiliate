@@ -4,6 +4,7 @@ const path = require('path');
 const WebSocket = require('ws');
 
 const PORT = 3001;
+const ACCOUNT = { username: 'affiliate@neezs.com', password: '!@7EvaYLj986' };
 let tray = null;
 let mainWindow = null;
 
@@ -36,6 +37,33 @@ async function expandUrl(url) {
   } catch (_) {
     return url;
   }
+}
+
+// ── Auto Login ─────────────────────────────────────────────────────────────────
+
+async function autoLogin() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const currentUrl = mainWindow.webContents.getURL();
+  // รันเฉพาะตอนอยู่หน้า login (ไม่ใช่หน้า /offer)
+  if (!currentUrl.includes('affiliate.shopee.co.th') || currentUrl.includes('/offer')) return;
+
+  console.log('[AutoLogin] Detected login page — filling credentials...');
+  await mainWindow.webContents.executeJavaScript(`
+    (function() {
+      const setVal = (el, val) => {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, val);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      const user = document.querySelector('input[name="loginKey"]');
+      const pass = document.querySelector('input[name="password"]');
+      const btn  = document.querySelector('button.b5aVaf');
+      if (!user || !pass || !btn) { console.log('[AutoLogin] form not ready'); return; }
+      setVal(user, ${JSON.stringify(ACCOUNT.username)});
+      setVal(pass, ${JSON.stringify(ACCOUNT.password)});
+      setTimeout(() => { btn.click(); console.log('[AutoLogin] clicked login'); }, 500);
+    })()
+  `);
 }
 
 // ── Shopee GraphQL via WebView XHR ─────────────────────────────────────────────
@@ -398,6 +426,7 @@ app.whenReady().then(() => {
   mainWindow.webContents.on('did-finish-load', () => {
     const currentUrl = mainWindow.webContents.getURL();
     if (currentUrl.includes('affiliate.shopee.co.th')) {
+      autoLogin();
       startBridge();
     }
   });
