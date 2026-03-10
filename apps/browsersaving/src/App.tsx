@@ -455,6 +455,7 @@ function App() {
     profileName: string
     token: string
   } | null>(null)
+  const [deletingTokenProfileId, setDeletingTokenProfileId] = useState<string | null>(null)
   const [fetchingToken, setFetchingToken] = useState<Set<string>>(new Set())
   const [copiedProfileId, setCopiedProfileId] = useState<string | null>(null)
   const [credentialsTotpCode, setCredentialsTotpCode] = useState('')
@@ -1120,6 +1121,39 @@ function App() {
     }
   }
 
+  const handleDeleteToken = async (profileId: string) => {
+    if (!window.confirm('Delete token from this profile?')) return
+    setDeletingTokenProfileId(profileId)
+    try {
+      const res = await apiFetch(`/api/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          access_token: null,
+          facebook_token: null,
+        }),
+      })
+      const data = await res.json().catch(() => ({} as any))
+      if (!res.ok) {
+        const errorMessage = data?.error || data?.detail?.error || `HTTP ${res.status}`
+        throw new Error(errorMessage)
+      }
+      setProfiles(prev => prev.map((profile) => (
+        profile.id === profileId
+          ? { ...profile, access_token: null, facebook_token: null }
+          : profile
+      )))
+      setTokenResult(null)
+      await loadProfiles()
+      alert('Delete token success')
+    } catch (err) {
+      console.error('Failed to delete token:', err)
+      alert(`Failed to delete token: ${String(err)}`)
+    } finally {
+      setDeletingTokenProfileId(null)
+    }
+  }
+
   const handleLaunch = async (profile: Profile) => {
     setLaunchingIds(prev => new Set(prev).add(profile.id))
     try {
@@ -1657,8 +1691,18 @@ function App() {
                               ) : (
                                 <button
                                   className={`action-btn token facebook-comment ${hasAccessToken(profile) ? 'has-token' : ''}`}
-                                  onClick={() => handleFetchToken(profile)}
-                                  title={hasAccessToken(profile) ? 'Refresh Token' : 'Get Token'}
+                                  onClick={() => {
+                                    if (hasAccessToken(profile)) {
+                                      setTokenResult({
+                                        profileId: profile.id,
+                                        profileName: profile.name,
+                                        token: getAccessToken(profile),
+                                      })
+                                      return
+                                    }
+                                    void handleFetchToken(profile)
+                                  }}
+                                  title={hasAccessToken(profile) ? 'View Token' : 'Get Token'}
                                 >
                                   <svg viewBox="0 0 24 24" aria-hidden="true">
                                     <path fill="#1877F2" d="M22 12.07C22 6.503 17.523 2 12 2S2 6.503 2 12.07c0 5.017 3.657 9.178 8.438 9.93v-7.02H7.898v-2.91h2.54V9.845c0-2.523 1.492-3.917 3.777-3.917 1.094 0 2.238.196 2.238.196v2.476H15.19c-1.243 0-1.63.776-1.63 1.572v1.898h2.773l-.443 2.91h-2.33V22c4.78-.752 8.44-4.913 8.44-9.93z" />
@@ -2029,12 +2073,26 @@ function App() {
                     setTokenResult(null)
                     if (profile) void handleFetchToken(profile)
                   }}
+                  disabled={deletingTokenProfileId === tokenResult.profileId}
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M23 4v6h-6M1 20v-6h6" />
                     <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
                   </svg>
                   Refresh Token
+                </button>
+                <button
+                  className="btn-danger"
+                  onClick={() => void handleDeleteToken(tokenResult.profileId)}
+                  disabled={deletingTokenProfileId === tokenResult.profileId}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M3 6h18" strokeLinecap="round" />
+                    <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" strokeLinecap="round" />
+                    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" strokeLinecap="round" />
+                    <path d="M10 11v6M14 11v6" strokeLinecap="round" />
+                  </svg>
+                  {deletingTokenProfileId === tokenResult.profileId ? 'Deleting...' : 'Delete Token'}
                 </button>
               </div>
             </div>

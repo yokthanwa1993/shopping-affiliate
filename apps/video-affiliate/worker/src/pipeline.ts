@@ -327,6 +327,37 @@ export async function runPipeline(
         const errMsg = error instanceof Error ? error.message : String(error)
         console.error(`[PIPELINE] ผิดพลาด: ${errMsg}`)
 
+        try {
+            const botBucket = new BotBucket(env.BUCKET, botId)
+            const key = `_processing/${videoId}.json`
+            const existingObj = await botBucket.get(key)
+            let current: Record<string, unknown> = {}
+            if (existingObj) {
+                try {
+                    current = await existingObj.json() as Record<string, unknown>
+                } catch {
+                    current = {}
+                }
+            }
+
+            const nowIso = new Date().toISOString()
+            await botBucket.put(key, JSON.stringify({
+                ...current,
+                id: videoId,
+                videoUrl,
+                shopeeLink: String(shopeeLink || '').trim() || undefined,
+                chatId,
+                status: 'failed',
+                error: errMsg,
+                updatedAt: nowIso,
+                createdAt: String(current.createdAt || '').trim() || nowIso,
+            }), {
+                httpMetadata: { contentType: 'application/json' },
+            })
+        } catch (persistErr) {
+            console.error(`[PIPELINE] mark failed error: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`)
+        }
+
         if (statusMsgId) {
             await sendTelegram(token, 'editMessageText', {
                 chat_id: chatId,
@@ -341,6 +372,10 @@ export async function runPipeline(
                 parse_mode: 'HTML',
             }).catch(() => { })
         }
+
+        await processNextInQueue(env, botId).catch((queueErr) => {
+            console.error(`[PIPELINE] queue next error: ${queueErr instanceof Error ? queueErr.message : String(queueErr)}`)
+        })
     }
 }
 

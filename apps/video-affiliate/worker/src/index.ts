@@ -174,6 +174,129 @@ async function resolveNamespacesForTagSync(
 // Health check
 app.get('/', (c) => c.json({ status: 'ok', service: 'video-affiliate-worker' }))
 
+async function ensureTelegramBotSessionsTable(db: D1Database) {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS telegram_bot_sessions (
+            telegram_id TEXT NOT NULL,
+            bot_scope TEXT NOT NULL,
+            email TEXT NOT NULL,
+            namespace_id TEXT NOT NULL,
+            session_token TEXT NOT NULL DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (telegram_id, bot_scope)
+        )`
+    ).run()
+    await db.prepare(
+        'CREATE INDEX IF NOT EXISTS idx_telegram_bot_sessions_token ON telegram_bot_sessions(session_token)'
+    ).run().catch(() => { })
+}
+
+async function getTelegramBotSession(db: D1Database, telegramId: string, botScope: string) {
+    await ensureTelegramBotSessionsTable(db)
+    return await db.prepare(
+        `SELECT telegram_id, bot_scope, email, namespace_id, session_token
+         FROM telegram_bot_sessions
+         WHERE telegram_id = ? AND bot_scope = ?
+         LIMIT 1`
+    ).bind(telegramId, botScope).first() as {
+        telegram_id?: string
+        bot_scope?: string
+        email?: string
+        namespace_id?: string
+        session_token?: string
+    } | null
+}
+
+async function upsertTelegramBotSession(
+    db: D1Database,
+    telegramId: string,
+    botScope: string,
+    email: string,
+    namespaceId: string,
+    sessionToken: string,
+) {
+    await ensureTelegramBotSessionsTable(db)
+    await db.prepare(
+        `INSERT INTO telegram_bot_sessions (telegram_id, bot_scope, email, namespace_id, session_token, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(telegram_id, bot_scope)
+         DO UPDATE SET
+           email = excluded.email,
+           namespace_id = excluded.namespace_id,
+           session_token = excluded.session_token,
+           updated_at = datetime('now')`
+    ).bind(telegramId, botScope, email, namespaceId, sessionToken).run()
+}
+
+async function clearTelegramBotSessionByScope(db: D1Database, telegramId: string, botScope: string) {
+    const current = await getTelegramBotSession(db, telegramId, botScope)
+    const sessionToken = String(current?.session_token || '').trim()
+    if (sessionToken) {
+        await db.prepare("UPDATE users SET session_token = '' WHERE session_token = ?").bind(sessionToken).run().catch(() => { })
+    }
+    await ensureTelegramBotSessionsTable(db)
+    await db.prepare(
+        "UPDATE telegram_bot_sessions SET session_token = '', updated_at = datetime('now') WHERE telegram_id = ? AND bot_scope = ?"
+    ).bind(telegramId, botScope).run().catch(() => { })
+    return !!sessionToken
+}
+
+async function clearTelegramBotSessionByToken(db: D1Database, sessionToken: string) {
+    const normalized = String(sessionToken || '').trim()
+    if (!normalized) return
+    await ensureTelegramBotSessionsTable(db)
+    await db.prepare(
+        "UPDATE telegram_bot_sessions SET session_token = '', updated_at = datetime('now') WHERE session_token = ?"
+    ).bind(normalized).run().catch(() => { })
+}
+
+async function resolveTelegramWorkspaceSession(db: D1Database, telegramId: string, botScope: string) {
+    const scoped = botScope ? await getTelegramBotSession(db, telegramId, botScope).catch(() => null) : null
+    if (scoped?.namespace_id) {
+        return {
+            namespace_id: String(scoped.namespace_id || '').trim(),
+            session_token: String(scoped.session_token || '').trim(),
+            email: String(scoped.email || '').trim(),
+        }
+    }
+    const legacy = await db.prepare(
+        'SELECT namespace_id, session_token, email FROM users WHERE telegram_id = ?'
+    ).bind(telegramId).first() as {
+        namespace_id?: string
+        session_token?: string
+        email?: string
+    } | null
+    if (!legacy?.namespace_id) return null
+    const legacyNamespaceId = String(legacy.namespace_id || '').trim()
+    const normalizedBotScope = String(botScope || '').trim()
+    if (normalizedBotScope && legacyNamespaceId && legacyNamespaceId !== normalizedBotScope) {
+        const knownChannelBot = await db.prepare(
+            'SELECT 1 AS ok FROM channels WHERE bot_id = ? LIMIT 1'
+        ).bind(normalizedBotScope).first().catch(() => null) as { ok?: number } | null
+        if (Number(knownChannelBot?.ok || 0) === 1) {
+            return null
+        }
+    }
+    return {
+        namespace_id: legacyNamespaceId,
+        session_token: String(legacy.session_token || '').trim(),
+        email: String(legacy.email || '').trim(),
+    }
+}
+
+function buildScopedWebAppUrl(baseUrl: string, botScope: string) {
+    const scope = String(botScope || '').trim()
+    if (!scope) return baseUrl
+    try {
+        const url = new URL(baseUrl)
+        url.searchParams.set('bot', scope)
+        return url.toString()
+    } catch {
+        return `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}bot=${encodeURIComponent(scope)}`
+    }
+}
+
 // Push sync from BrowserSaving after tag updates.
 // Default mode is metadata-only (no heavy Graph calls).
 app.post('/api/pages/tag-sync', async (c) => {
@@ -1168,10 +1291,23 @@ app.delete('/admin/api/users/:email', async (c) => {
 // ==================== AUTH ====================
 
 app.post('/api/auth/login', async (c) => {
-    const { email, tg_id } = await c.req.json()
+    const { email, tg_id, bot_id } = await c.req.json()
+    const botScope = String(bot_id || '').trim()
 
     // Auto-login by tg_id (Telegram WebApp init)
     if (tg_id && !email) {
+        if (botScope) {
+            const scoped = await getTelegramBotSession(c.env.DB, String(tg_id), botScope)
+            if (scoped?.session_token) return c.json({ session_token: scoped.session_token })
+            const legacyUser = await c.env.DB.prepare(
+                'SELECT session_token, namespace_id FROM users WHERE telegram_id = ?'
+            ).bind(String(tg_id)).first() as { session_token?: string; namespace_id?: string } | null
+            const legacyNamespaceId = String(legacyUser?.namespace_id || '').trim()
+            if (legacyUser?.session_token && legacyNamespaceId === botScope) {
+                return c.json({ session_token: String(legacyUser.session_token || '').trim() })
+            }
+            return c.json({ error: 'Not registered' }, 401)
+        }
         const user = await c.env.DB.prepare(
             'SELECT session_token FROM users WHERE telegram_id = ?'
         ).bind(String(tg_id)).first() as any
@@ -1228,20 +1364,24 @@ app.post('/api/auth/login', async (c) => {
     await c.env.DB.prepare('UPDATE users SET namespace_id = ? WHERE email = ?')
         .bind(namespaceId, emailLower).run()
 
-    let bindTgId = tg_id ? Number(tg_id) : null;
+    const bindTgId = tg_id ? String(tg_id).trim() : '';
 
-    if (bindTgId) {
+    if (bindTgId && botScope) {
+        await c.env.DB.prepare('INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, ?)')
+            .bind(emailLower, namespaceId, sessionToken).run()
+        await upsertTelegramBotSession(c.env.DB, bindTgId, botScope, emailLower, namespaceId, sessionToken)
+    } else if (bindTgId) {
         // Upsert: ถ้า telegram_id นี้มีอยู่แล้ว → update, ถ้าไม่มี → insert ใหม่
         // รองรับ 1 email login จากหลาย Telegram account
-        const existingTgRow = await c.env.DB.prepare('SELECT email FROM users WHERE telegram_id = ?').bind(bindTgId).first() as any;
+        const existingTgRow = await c.env.DB.prepare('SELECT email FROM users WHERE telegram_id = ?').bind(Number(bindTgId)).first() as any;
         if (existingTgRow) {
             // telegram_id นี้เคย login → update email + session
             await c.env.DB.prepare('UPDATE users SET email = ?, namespace_id = ?, session_token = ? WHERE telegram_id = ?')
-                .bind(emailLower, namespaceId, sessionToken, bindTgId).run();
+                .bind(emailLower, namespaceId, sessionToken, Number(bindTgId)).run();
         } else {
             // telegram_id ใหม่ → insert row ใหม่ (email เดียวกันมีได้หลาย row)
             await c.env.DB.prepare('INSERT INTO users (telegram_id, email, namespace_id, session_token) VALUES (?, ?, ?, ?)')
-                .bind(bindTgId, emailLower, namespaceId, sessionToken).run();
+                .bind(Number(bindTgId), emailLower, namespaceId, sessionToken).run();
         }
     } else {
         // ไม่มี tg_id → insert โดยไม่ผูก telegram
@@ -1256,6 +1396,7 @@ app.post('/api/auth/logout', async (c) => {
     const token = c.req.header('x-auth-token') || ''
     if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
     await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE session_token = ?").bind(token).run()
+    await clearTelegramBotSessionByToken(c.env.DB, token)
     return c.json({ ok: true })
 })
 
@@ -1598,7 +1739,7 @@ app.post('/api/telegram/:token?', async (c) => {
                     const webAppUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
 
                     const buttons = [
-                        [{ text: `📱 เปิดหน้าจัดการระบบ (Mini App)`, web_app: { url: webAppUrl } }],
+                        [{ text: `📱 เปิดหน้าจัดการระบบ (Mini App)`, web_app: { url: buildScopedWebAppUrl(webAppUrl, String(ch.bot_id || '')) } }],
                         [{ text: `🗑 ลบ ${ch.name || ch.bot_username}`, callback_data: `del_channel:${ch.bot_id}` }],
                         [{ text: `🔙 กลับรายการช่องทั้งหมด`, callback_data: `back_to_list` }]
                     ]
@@ -1809,16 +1950,29 @@ app.post('/api/telegram/:token?', async (c) => {
     if (await tryHandleAdminPasswordInput(text)) return c.text('ok')
 
     // Auth state & user lookup (session_token NULL = logged out)
-    const userRecord = await c.env.DB.prepare('SELECT namespace_id, session_token FROM users WHERE telegram_id = ?').bind(chatId).first() as any
+    const currentBotId = String(getBotId(token) || '').trim()
+    const userRecord = await resolveTelegramWorkspaceSession(c.env.DB, String(chatId), currentBotId)
 
     // /logout command — ล้าง session จาก bot side
     if (text === '/logout') {
-        await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE telegram_id = ?").bind(chatId).run()
+        const clearedScoped = currentBotId
+            ? await clearTelegramBotSessionByScope(c.env.DB, String(chatId), currentBotId)
+            : false
+        if (!clearedScoped) {
+            const legacyUser = await c.env.DB.prepare(
+                'SELECT namespace_id FROM users WHERE telegram_id = ?'
+            ).bind(chatId).first() as { namespace_id?: string } | null
+            const legacyNamespaceId = String(legacyUser?.namespace_id || '').trim()
+            const canClearLegacy = !currentBotId || !legacyNamespaceId || legacyNamespaceId === currentBotId
+            if (canClearLegacy) {
+                await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE telegram_id = ?").bind(chatId).run()
+            }
+        }
         const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
             text: '✅ ออกจากระบบแล้ว\n\nกด "เปิด Workspace" เพื่อ login ใหม่',
-            reply_markup: { inline_keyboard: [[{ text: '🚀 เปิด Workspace', web_app: { url: appUrl } }]] }
+            reply_markup: { inline_keyboard: [[{ text: '🚀 เปิด Workspace', web_app: { url: buildScopedWebAppUrl(appUrl, currentBotId) } }]] }
         })
         return c.text('ok')
     }
@@ -1837,7 +1991,7 @@ app.post('/api/telegram/:token?', async (c) => {
             text: '👋 กรุณาเปิด Workspace เพื่อเริ่มใช้งาน',
             reply_markup: {
                 inline_keyboard: [[
-                    { text: '🚀 เปิด Workspace', web_app: { url: appUrl } }
+                    { text: '🚀 เปิด Workspace', web_app: { url: buildScopedWebAppUrl(appUrl, currentBotId) } }
                 ]]
             }
         })
@@ -6315,8 +6469,9 @@ app.get('/api/dashboard', async (c) => {
             : toThaiDateString(new Date())
 
         await ensureLinkSubmissionsTable(c.env.DB)
+        await ensureTelegramBotSessionsTable(c.env.DB)
 
-        const [postsAllRow, postsOnDateRow, linksAllRow, linksOnDateRow, usersRes, linksByAdminRes] = await Promise.all([
+        const [postsAllRow, postsOnDateRow, linksAllRow, linksOnDateRow, usersRes, scopedSessionsRes, linksByAdminRes] = await Promise.all([
             c.env.DB.prepare(
                 "SELECT COUNT(*) AS total FROM post_history WHERE bot_id = ? AND status IN ('success','posting')"
             ).bind(botId).first() as Promise<{ total?: number } | null>,
@@ -6333,12 +6488,22 @@ app.get('/api/dashboard', async (c) => {
                 'SELECT telegram_id, email FROM users WHERE namespace_id = ? AND telegram_id IS NOT NULL AND TRIM(telegram_id) <> \'\''
             ).bind(botId).all() as Promise<{ results?: Array<{ telegram_id?: string | number; email?: string }> }>,
             c.env.DB.prepare(
+                'SELECT telegram_id, email FROM telegram_bot_sessions WHERE namespace_id = ? AND telegram_id IS NOT NULL AND TRIM(telegram_id) <> \'\''
+            ).bind(botId).all() as Promise<{ results?: Array<{ telegram_id?: string | number; email?: string }> }>,
+            c.env.DB.prepare(
                 "SELECT telegram_id, COUNT(*) AS total FROM link_submissions WHERE namespace_id = ? AND date(datetime(created_at, '+7 hours')) = ? GROUP BY telegram_id"
             ).bind(botId, targetDate).all() as Promise<{ results?: Array<{ telegram_id?: string | number; total?: number }> }>,
         ])
 
         const emailByTelegram = new Map<string, string>()
         for (const row of usersRes.results || []) {
+            const telegramId = String(row?.telegram_id || '').trim()
+            const email = String(row?.email || '').trim().toLowerCase()
+            if (telegramId && email && !emailByTelegram.has(telegramId)) {
+                emailByTelegram.set(telegramId, email)
+            }
+        }
+        for (const row of scopedSessionsRes.results || []) {
             const telegramId = String(row?.telegram_id || '').trim()
             const email = String(row?.email || '').trim().toLowerCase()
             if (telegramId && email && !emailByTelegram.has(telegramId)) {
@@ -6623,9 +6788,9 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
             }, 404)
         }
 
-        const updatePayload: Record<string, string | null> = {
-            access_token: token || null,
-        }
+        const updatePayload: Record<string, string | null> = token
+            ? { access_token: token }
+            : { access_token: null, facebook_token: null }
 
         const endpointBases = buildBrowserSavingBaseUrls(c.env)
         const path = `/api/profiles/${encodeURIComponent(profileId)}`
@@ -6680,21 +6845,87 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
                     sync_error = syncErr instanceof Error ? syncErr.message : String(syncErr)
                 }
 
-                await c.env.DB.prepare(
-                    'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-                ).bind(scopedToken || null, pageId, botId).run()
-
+                let rebuiltPrimaryToken = scopedToken || ''
                 try {
+                    const refreshedProfiles = await fetchBrowserSavingProfiles(c.env)
+                    const cfg = await getNamespacePagesSyncConfig(c.env.DB, botId)
+                    const postProfileIds = new Set(
+                        collectProfilesBySelectors(refreshedProfiles, cfg.postSelectors)
+                            .map((profile) => String(profile.id || '').trim().toLowerCase())
+                            .filter(Boolean),
+                    )
+                    const commentProfileIds = new Set(
+                        collectProfilesBySelectors(refreshedProfiles, cfg.commentSelectors)
+                            .map((profile) => String(profile.id || '').trim().toLowerCase())
+                            .filter(Boolean),
+                    )
+
+                    const byProfileId = new Map<string, {
+                        profile_id: string
+                        roles: Array<'post' | 'comment'>
+                        token: string
+                        post_token: string
+                    }>()
+
+                    for (const profile of refreshedProfiles) {
+                        if (!matchesProfileToPage(profile, String(page.id || ''), String(page.name || ''))) continue
+                        const id = String(profile.id || '').trim()
+                        if (!id) continue
+                        const key = id.toLowerCase()
+                        const postToken = pickProfilePostToken(profile)
+                        const commentToken = pickProfileCommentToken(profile)
+                        const existing = byProfileId.get(key)
+                        if (!existing) {
+                            const roles: Array<'post' | 'comment'> = []
+                            if (postProfileIds.has(key)) roles.push('post')
+                            if (commentProfileIds.has(key) && !roles.includes('comment')) roles.push('comment')
+                            byProfileId.set(key, {
+                                profile_id: id,
+                                roles,
+                                token: postToken || commentToken,
+                                post_token: postToken,
+                            })
+                            continue
+                        }
+                        if (postProfileIds.has(key) && !existing.roles.includes('post')) existing.roles.push('post')
+                        if (commentProfileIds.has(key) && !existing.roles.includes('comment')) existing.roles.push('comment')
+                        if (!existing.post_token) existing.post_token = postToken
+                        if (!existing.token) existing.token = postToken || commentToken
+                    }
+
+                    const rebuiltTokens = normalizePostTokenPool((await Promise.all(
+                        Array.from(byProfileId.values()).map(async (item) => {
+                            const currentToken = String(item.token || item.post_token || '').trim()
+                            if (!currentToken) return ''
+                            try {
+                                const resolveMode: BrowserSavingTokenMode = item.roles.includes('comment') && !item.roles.includes('post')
+                                    ? 'comment'
+                                    : 'post'
+                                const resolved = await resolvePageScopedToken(currentToken, pageId, c.env, resolveMode)
+                                return String(resolved.token || '').trim()
+                            } catch {
+                                return ''
+                            }
+                        })
+                    )).filter(Boolean))
+
+                    rebuiltPrimaryToken = String(rebuiltTokens[0] || '').trim()
+                    await c.env.DB.prepare(
+                        'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+                    ).bind(rebuiltPrimaryToken || null, pageId, botId).run()
+
                     const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
-                    const existingEntry = tokenPool[pageId] || { post_tokens: [] }
-                    const nextTokens = normalizePostTokenPool([scopedToken, ...(existingEntry.post_tokens || []), ...(existingEntry.comment_tokens || [])])
-                    tokenPool[pageId] = {
-                        post_tokens: nextTokens,
-                        updated_at: new Date().toISOString(),
+                    if (rebuiltTokens.length > 0) {
+                        tokenPool[pageId] = {
+                            post_tokens: rebuiltTokens,
+                            updated_at: new Date().toISOString(),
+                        }
+                    } else {
+                        delete tokenPool[pageId]
                     }
                     await setNamespacePagesTokenPool(c.env.DB, botId, tokenPool)
                 } catch (e) {
-                    console.log(`[PAGES-TOKEN-POOL] failed to update token pool for page ${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+                    console.log(`[PAGES-TOKEN-POOL] failed to rebuild token pool for page ${pageId}: ${e instanceof Error ? e.message : String(e)}`)
                 }
 
                 if (mode === 'comment') {
@@ -6707,7 +6938,7 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
                     page_id: pageId,
                     profile_id: profileId,
                     mode,
-                    token: scopedToken || savedToken,
+                    token: token ? (scopedToken || savedToken || rebuiltPrimaryToken) : '',
                     scoped_token: scopedToken || '',
                     token_scope: scopedSource,
                     scope_reason: scopedReason,
@@ -8448,15 +8679,43 @@ async function watchdogStuckJobs(env: Env) {
     const STUCK_THRESHOLD_MS = 10 * 60 * 1000 // 10 นาที
     const now = Date.now()
 
-    // รวบรวม botId ทั้งหมด (default + ทุก channel ที่ลงทะเบียน)
-    const botIds: string[] = ['default']
+    // รวบรวม bucket scope ทั้งหมด:
+    // - legacy/default
+    // - ทุก channel bot_id
+    // - ทุก workspace namespace_id ที่ใช้งานจริง
+    const botIds = new Set<string>(['default'])
     try {
         const { results } = await env.DB.prepare('SELECT DISTINCT bot_id FROM channels').all()
         for (const row of results) {
             const id = (row as any).bot_id
-            if (id && id !== 'default') botIds.push(id)
+            if (id && id !== 'default') botIds.add(String(id))
         }
     } catch { /* DB might not have channels yet */ }
+
+    try {
+        const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
+        for (const row of results || []) {
+            const id = String((row as any)?.namespace_id || '').trim()
+            if (id && id !== 'default') botIds.add(id)
+        }
+    } catch { /* DB might not have email_namespaces yet */ }
+
+    try {
+        const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM users').all()
+        for (const row of results || []) {
+            const id = String((row as any)?.namespace_id || '').trim()
+            if (id && id !== 'default') botIds.add(id)
+        }
+    } catch { /* DB might not have users yet */ }
+
+    try {
+        await ensureTelegramBotSessionsTable(env.DB)
+        const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM telegram_bot_sessions').all()
+        for (const row of results || []) {
+            const id = String((row as any)?.namespace_id || '').trim()
+            if (id && id !== 'default') botIds.add(id)
+        }
+    } catch { /* DB might not have telegram_bot_sessions yet */ }
 
     for (const botId of botIds) {
         const botBucket = new BotBucket(env.BUCKET, botId)

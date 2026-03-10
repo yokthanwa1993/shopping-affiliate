@@ -1539,6 +1539,7 @@ body {
 
 .token-value-row .copy-btn {
   width: 40px;
+  height: 40px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1548,8 +1549,7 @@ body {
   color: var(--text-secondary);
   cursor: pointer;
   transition: all 0.15s;
-  align-self: flex-start;
-  height: 40px;
+  flex-shrink: 0;
 }
 
 .token-value-row .copy-btn:hover {
@@ -1566,6 +1566,32 @@ body {
 .token-actions {
   margin-top: 14px;
   display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.token-actions button {
+  width: auto;
+  min-height: 40px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.token-actions button svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.token-actions .btn-outline,
+.token-actions .btn-danger {
   justify-content: center;
 }
 

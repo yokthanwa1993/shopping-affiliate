@@ -1,6 +1,6 @@
 {
   "name": "browser-saving",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "Browser Profile Manager - Cloudflare + Tauri + React",
   "type": "module",
   "scripts": {

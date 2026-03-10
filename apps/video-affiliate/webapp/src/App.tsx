@@ -3,12 +3,27 @@ import { useEffect, useRef, useState, type SyntheticEvent } from 'react'
 
 const WORKER_URL = 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev'
 
+const getBotScopeFromLocation = () => {
+  try {
+    const url = new URL(window.location.href)
+    return String(url.searchParams.get('bot') || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+const scopedStorageKey = (base: string, botScope?: string | null) => {
+  const scope = String(botScope || '').trim()
+  return scope ? `${base}:${scope}` : base
+}
+
 const normalizeSessionToken = (value?: string | null) => {
   const token = String(value || '').trim()
   return token.startsWith('sess_') ? token : ''
 }
 
-const getToken = () => normalizeSessionToken(localStorage.getItem('auth_token'));
+const getToken = (botScope = getBotScopeFromLocation()) =>
+  normalizeSessionToken(localStorage.getItem(scopedStorageKey('auth_token', botScope)));
 
 const readCache = <T,>(key: string, fallback: T): T => {
   try {
@@ -24,8 +39,8 @@ const writeCache = (key: string, value: unknown) => {
   try { localStorage.setItem(key, JSON.stringify(value)) } catch { }
 }
 
-const getStoredNamespace = () => {
-  try { return String(localStorage.getItem('auth_namespace') || '').trim() } catch { return '' }
+const getStoredNamespace = (botScope = getBotScopeFromLocation()) => {
+  try { return String(localStorage.getItem(scopedStorageKey('auth_namespace', botScope)) || '').trim() } catch { return '' }
 }
 
 const CACHE_VERSION = 'v3'
@@ -307,7 +322,7 @@ function Thumb({ id, url, fallback }: { id: string; url?: string; fallback: stri
 }
 
 // Video card component
-function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video; formatDuration: (s: number) => string; onDelete: (id: string) => void; onUpdate: (id: string, fields: Partial<Video>) => void }) {
+function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange }: { video: Video; formatDuration: (s: number) => string; onDelete: (id: string) => void; onUpdate: (id: string, fields: Partial<Video>) => void; onExpandedChange?: (expanded: boolean) => void }) {
   const [expanded, setExpanded] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [shopeeInput, setShopeeInput] = useState('')
@@ -330,6 +345,11 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
       apiFetch(`${WORKER_URL}/api/categories`).then(r => r.json()).then(d => setFetchedCats(d.categories || [])).catch(() => { })
     }
   }, [expanded])
+
+  useEffect(() => {
+    onExpandedChange?.(expanded)
+    return () => onExpandedChange?.(false)
+  }, [expanded, onExpandedChange])
 
   const toggleCategory = async (cat: string) => {
     const next = localCats.includes(cat) ? localCats.filter(c => c !== cat) : [...localCats, cat]
@@ -641,13 +661,18 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate }: { video: Video
   )
 }
 
-function GlobalOriginalVideoCard({ video }: { video: GlobalOriginalVideo }) {
+function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOriginalVideo; onExpandedChange?: (expanded: boolean) => void }) {
   const [expanded, setExpanded] = useState(false)
   const ownerLabel = String(video.owner_email || '').trim() || `namespace: ${video.namespace_id}`
   const createdAt = new Date(video.created_at)
   const createdLabel = Number.isNaN(createdAt.getTime())
     ? '-'
     : createdAt.toLocaleString('th-TH', { hour12: false })
+
+  useEffect(() => {
+    onExpandedChange?.(expanded)
+    return () => onExpandedChange?.(false)
+  }, [expanded, onExpandedChange])
 
   return (
     <>
@@ -933,7 +958,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [editingTokenValue, setEditingTokenValue] = useState('')
   const [editingTaggedProfile, setEditingTaggedProfile] = useState<{ mode: 'access'; profile: TaggedPageProfile } | null>(null)
   const [editingTaggedTokenValue, setEditingTaggedTokenValue] = useState('')
-  const [savingTaggedToken, setSavingTaggedToken] = useState(false)
+  const [taggedTokenMutation, setTaggedTokenMutation] = useState<'save' | 'delete' | null>(null)
   const [taggedProfiles, setTaggedProfiles] = useState<TaggedPageProfile[]>([])
   const [taggedLoading, setTaggedLoading] = useState(true)
   const [taggedError, setTaggedError] = useState('')
@@ -952,6 +977,48 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
 
   const inspectorProfiles = allTaggedProfiles
   const inspectorProfilesWithToken = profilesWithToken
+
+  const refreshPageAfterTaggedTokenChange = async () => {
+    try {
+      const pageResp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}`)
+      if (!pageResp.ok) return
+      const pageData = await pageResp.json().catch(() => ({})) as { page?: FacebookPage }
+      if (!pageData.page) return
+      setAccessToken(pageData.page.access_token || '')
+      onSave(pageData.page)
+    } catch {
+      // ignore refresh failures after token update
+    }
+  }
+
+  const mutateTaggedProfileToken = async (profileId: string, nextToken: string, mutation: 'save' | 'delete') => {
+    setTaggedTokenMutation(mutation)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}/token`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: nextToken }),
+      })
+      const data = await resp.json().catch(() => ({})) as { error?: string; token?: string }
+      if (!resp.ok) {
+        throw new Error(String(data?.error || (mutation === 'delete' ? 'ลบ token ไม่สำเร็จ' : 'บันทึก token ไม่สำเร็จ')))
+      }
+
+      const savedToken = String(data?.token ?? nextToken).trim()
+      setTaggedProfiles((prev) => prev.map((item) => {
+        if (item.profile_id !== profileId) return item
+        return { ...item, token: savedToken }
+      }))
+      await refreshPageAfterTaggedTokenChange()
+      setEditingTaggedProfile(null)
+      setEditingTaggedTokenValue('')
+      alert(mutation === 'delete' ? 'ลบ token โปรไฟล์สำเร็จ' : 'บันทึก token โปรไฟล์สำเร็จ')
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setTaggedTokenMutation(null)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -1117,17 +1184,41 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                   inspectorProfiles.map((profile) => {
                     const currentToken = profile.token
                     return (
-                      <button
+                      <div
                         key={`access-${profile.profile_id}`}
-                        type="button"
                         onClick={() => {
                           setEditingTaggedProfile({ mode: 'access', profile })
                           setEditingTaggedTokenValue(String(currentToken || '').trim())
                         }}
-                        className="w-full rounded-xl border border-gray-100 bg-gray-50/60 p-3 text-left active:scale-[0.99] transition-all"
+                        className="w-full rounded-xl border border-gray-100 bg-gray-50/60 p-3 text-left active:scale-[0.99] transition-all cursor-pointer"
                       >
-                        <p className="text-sm font-bold text-gray-900 truncate">{profile.profile_name || profile.profile_id}</p>
-                        <p className="text-[11px] text-gray-500 truncate">{profile.facebook_name || profile.profile_id}</p>
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-bold text-gray-900 truncate">{profile.profile_name || profile.profile_id}</p>
+                            <p className="text-[11px] text-gray-500 truncate">{profile.facebook_name || profile.profile_id}</p>
+                          </div>
+                          {currentToken ? (
+                            <button
+                              type="button"
+                              onClick={async (e) => {
+                                e.stopPropagation()
+                                if (taggedTokenMutation) return
+                                if (!window.confirm('ลบ token โปรไฟล์นี้ออกจาก BrowserSaving และหน้านี้ใช่ไหม?')) return
+                                await mutateTaggedProfileToken(profile.profile_id, '', 'delete')
+                              }}
+                              disabled={!!taggedTokenMutation}
+                              className="shrink-0 w-8 h-8 rounded-lg border border-red-200 bg-red-50 text-red-500 flex items-center justify-center active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                              title="ลบ token"
+                            >
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M3 6h18" strokeLinecap="round" />
+                                <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" strokeLinecap="round" />
+                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" strokeLinecap="round" />
+                                <path d="M10 11v6M14 11v6" strokeLinecap="round" />
+                              </svg>
+                            </button>
+                          ) : null}
+                        </div>
                         <div className="mt-1 flex items-center justify-between gap-2">
                           <span className="text-[11px] text-gray-500">Token</span>
                           <span className={`text-[11px] font-mono truncate ${currentToken ? 'text-gray-800' : 'text-orange-600 font-bold'}`}>
@@ -1135,7 +1226,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                           </span>
                         </div>
                         <p className="mt-1 text-[11px] text-blue-500">แตะเพื่อแก้ไข token โปรไฟล์นี้</p>
-                      </button>
+                      </div>
                     )
                   })
                 )}
@@ -1167,7 +1258,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         {editingTaggedProfile && (
           <div
             className="fixed inset-0 bg-black/40 z-[60] flex items-center justify-center px-6"
-            onClick={() => { if (!savingTaggedToken) setEditingTaggedProfile(null) }}
+            onClick={() => { if (!taggedTokenMutation) setEditingTaggedProfile(null) }}
           >
             <div className="bg-white rounded-2xl w-full max-w-md p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
               <h3 className="font-bold text-gray-900 text-base text-center">
@@ -1186,7 +1277,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
               <div className="flex gap-3">
                 <button
                   onClick={() => setEditingTaggedProfile(null)}
-                  disabled={savingTaggedToken}
+                  disabled={!!taggedTokenMutation}
                   className="flex-1 py-3 rounded-xl font-bold text-sm border border-gray-200 text-gray-600 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   ยกเลิก
@@ -1194,46 +1285,24 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 <button
                   onClick={async () => {
                     const profileId = editingTaggedProfile.profile.profile_id
-                    const nextToken = editingTaggedTokenValue.trim()
-                    setSavingTaggedToken(true)
-                    try {
-                      const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}/token`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token: nextToken }),
-                      })
-                      const data = await resp.json().catch(() => ({})) as { error?: string; token?: string }
-                      if (!resp.ok) {
-                        throw new Error(String(data?.error || 'บันทึก token ไม่สำเร็จ'))
-                      }
-
-                      const savedToken = String(data?.token ?? nextToken).trim()
-                      setTaggedProfiles((prev) => prev.map((item) => {
-                        if (item.profile_id !== profileId) return item
-                        return { ...item, token: savedToken }
-                      }))
-                      try {
-                        const pageResp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}`)
-                        if (pageResp.ok) {
-                          const pageData = await pageResp.json().catch(() => ({})) as { page?: FacebookPage }
-                          if (pageData.page) onSave(pageData.page)
-                        }
-                      } catch {
-                        // ignore refresh failures after token save
-                      }
-                      setEditingTaggedProfile(null)
-                      setEditingTaggedTokenValue('')
-                      alert('บันทึก token โปรไฟล์สำเร็จ')
-                    } catch (err) {
-                      alert(err instanceof Error ? err.message : String(err))
-                    } finally {
-                      setSavingTaggedToken(false)
-                    }
+                    if (!window.confirm('ลบ token โปรไฟล์นี้ออกจาก BrowserSaving และหน้านี้ใช่ไหม?')) return
+                    await mutateTaggedProfileToken(profileId, '', 'delete')
                   }}
-                  disabled={savingTaggedToken}
+                  disabled={!!taggedTokenMutation || !String(editingTaggedProfile.profile.token || editingTaggedTokenValue || '').trim()}
+                  className="flex-1 py-3 rounded-xl font-bold text-sm bg-red-500 text-white active:scale-95 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {taggedTokenMutation === 'delete' ? 'กำลังลบ...' : 'ลบ Token'}
+                </button>
+                <button
+                  onClick={async () => {
+                    const profileId = editingTaggedProfile.profile.profile_id
+                    const nextToken = editingTaggedTokenValue.trim()
+                    await mutateTaggedProfileToken(profileId, nextToken, 'save')
+                  }}
+                  disabled={!!taggedTokenMutation}
                   className="flex-1 py-3 rounded-xl font-bold text-sm bg-blue-600 text-white active:scale-95 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  {savingTaggedToken ? 'กำลังบันทึก...' : 'บันทึก'}
+                  {taggedTokenMutation === 'save' ? 'กำลังบันทึก...' : 'บันทึก'}
                 </button>
               </div>
             </div>
@@ -1445,6 +1514,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
 
   const tg = (window as any).Telegram?.WebApp
   const tgUser = tg?.initDataUnsafe?.user
+  const botScope = getBotScopeFromLocation()
 
   const handleSubmit = async () => {
     if (!email.trim()) return
@@ -1456,7 +1526,8 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: email.trim().toLowerCase(),
-          tg_id: tgUser?.id
+          tg_id: tgUser?.id,
+          bot_id: botScope || undefined,
         })
       })
       const data = await res.json() as any
@@ -1590,6 +1661,7 @@ function SettingsMenuItem({
 }
 
 function App() {
+  const botScope = getBotScopeFromLocation()
 
   const [token, setTokenState] = useState<string>(() => {
     try {
@@ -1598,28 +1670,28 @@ function App() {
       if (queryToken) {
         const sessionFromQuery = normalizeSessionToken(queryToken)
         if (sessionFromQuery) {
-          localStorage.setItem('auth_token', sessionFromQuery)
+          localStorage.setItem(scopedStorageKey('auth_token', botScope), sessionFromQuery)
         }
         url.searchParams.delete('token');
         url.searchParams.delete('auth_token');
         window.history.replaceState({}, document.title, url.toString());
         if (sessionFromQuery) return sessionFromQuery
       }
-      return getToken()
-    } catch { return getToken() }
+      return getToken(botScope)
+    } catch { return getToken(botScope) }
   });
   const [authBootstrapping, setAuthBootstrapping] = useState(true)
 
   const applySessionToken = (value: string) => {
     const session = normalizeSessionToken(value)
     if (!session) return
-    localStorage.setItem('auth_token', session)
+    localStorage.setItem(scopedStorageKey('auth_token', botScope), session)
     setTokenState(session)
   }
 
   const clearSession = (clearCaches = false) => {
-    const currentNs = namespaceId || getStoredNamespace()
-    localStorage.removeItem('auth_token')
+    const currentNs = namespaceId || getStoredNamespace(botScope)
+    localStorage.removeItem(scopedStorageKey('auth_token', botScope))
     if (clearCaches) {
       localStorage.removeItem('gallery_cache')
       localStorage.removeItem('used_cache')
@@ -1634,7 +1706,7 @@ function App() {
         localStorage.removeItem(nsCacheKey('history', currentNs))
       }
     }
-    localStorage.removeItem('auth_namespace')
+    localStorage.removeItem(scopedStorageKey('auth_namespace', botScope))
     setTokenState('')
     setNamespaceId('')
     setMeEmail('')
@@ -1671,6 +1743,22 @@ function App() {
     loadTeam()
     loadAll()
   };
+
+  const handleLogout = async () => {
+    if (logoutLoading) return
+    setLogoutLoading(true)
+    try {
+      if (token) {
+        await apiFetch(`${WORKER_URL}/api/auth/logout`, { method: 'POST' }).catch(() => null)
+      }
+    } finally {
+      clearSession(true)
+      setSettingsSection('menu')
+      setAuthBootstrapping(false)
+      setLogoutLoading(false)
+    }
+  }
+
   const [isOwner, setIsOwner] = useState(false)
   const [meEmail, setMeEmail] = useState('')
   const [teamMembers, setTeamMembers] = useState<{ email: string; created_at: string }[]>([])
@@ -1691,8 +1779,9 @@ function App() {
   const [geminiApiKeyLoading, setGeminiApiKeyLoading] = useState(false)
   const [geminiApiKeySaving, setGeminiApiKeySaving] = useState(false)
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
+  const [logoutLoading, setLogoutLoading] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('menu')
-  const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace())
+  const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
   const [postHistory, setPostHistory] = useState<PostHistory[]>(() => {
     const ns = getStoredNamespace()
     if (ns) return readCache<PostHistory[]>(nsCacheKey('history', ns), [])
@@ -1751,7 +1840,9 @@ function App() {
   const [tab, _setTab] = useState<TabName>(getInitialTab())
   const setTab = (t: TabName) => {
     _setTab(t)
-    window.history.pushState(null, '', `/${t}`)
+    const url = new URL(window.location.href)
+    url.pathname = `/${t}`
+    window.history.pushState(null, '', url.toString())
   }
   const [pages, setPages] = useState<FacebookPage[]>([])
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
@@ -1759,11 +1850,13 @@ function App() {
   const [pagesLoading, setPagesLoading] = useState(false)
   const [deletePageId, setDeletePageId] = useState<string | null>(null)
   const [deletingPageId, setDeletingPageId] = useState<string | null>(null)
+  const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const loadAllInFlightRef = useRef(false)
   const processingFetchInFlightRef = useRef(false)
   const usedFetchInFlightRef = useRef(false)
   const globalOriginalFetchInFlightRef = useRef(false)
   const loadPagesRequestRef = useRef(0)
+  const loadTeamRequestRef = useRef(0)
   const lastUsedFetchAtRef = useRef(0)
   const lastGlobalOriginalFetchAtRef = useRef(0)
 
@@ -1784,10 +1877,10 @@ function App() {
 
   useEffect(() => {
     try {
-      if (namespaceId) localStorage.setItem('auth_namespace', namespaceId)
-      else localStorage.removeItem('auth_namespace')
+      if (namespaceId) localStorage.setItem(scopedStorageKey('auth_namespace', botScope), namespaceId)
+      else localStorage.removeItem(scopedStorageKey('auth_namespace', botScope))
     } catch { }
-  }, [namespaceId])
+  }, [botScope, namespaceId])
 
   useEffect(() => {
     if (!namespaceId) return
@@ -1821,10 +1914,20 @@ function App() {
   }, [tg])
 
   useEffect(() => {
+    setTokenState(getToken(botScope))
+    setNamespaceId(getStoredNamespace(botScope))
+    setMeEmail('')
+    setIsOwner(false)
+    setTeamMembers([])
+    setNewMemberEmail('')
+    setAuthBootstrapping(true)
+  }, [botScope])
+
+  useEffect(() => {
     let cancelled = false
 
     const bootstrapAuth = async () => {
-      const session = getToken()
+      const session = getToken(botScope)
       if (session) {
         try {
           const meResp = await fetch(`${WORKER_URL}/api/me`, { headers: { 'x-auth-token': session } })
@@ -1841,13 +1944,47 @@ function App() {
         } catch { }
       }
 
+      const tgId = tg?.initDataUnsafe?.user?.id
+      if (tgId) {
+        try {
+          const autoResp = await fetch(`${WORKER_URL}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              tg_id: tgId,
+              bot_id: botScope || undefined,
+            }),
+          })
+          if (autoResp.ok) {
+            const autoData = await autoResp.json().catch(() => ({})) as any
+            const autoSession = normalizeSessionToken(autoData?.session_token)
+            if (autoSession) {
+              localStorage.setItem(scopedStorageKey('auth_token', botScope), autoSession)
+              setTokenState(autoSession)
+
+              const meResp = await fetch(`${WORKER_URL}/api/me`, { headers: { 'x-auth-token': autoSession } })
+              if (meResp.ok) {
+                const me = await meResp.json().catch(() => ({})) as any
+                const ns = String(me?.namespace_id || '').trim()
+                if (ns) {
+                  setNamespaceId(ns)
+                  hydrateNamespaceCaches(ns)
+                }
+                if (!cancelled) setAuthBootstrapping(false)
+                return
+              }
+            }
+          }
+        } catch { }
+      }
+
       clearSession()
       if (!cancelled) setAuthBootstrapping(false)
     }
 
     bootstrapAuth()
     return () => { cancelled = true }
-  }, [])
+  }, [botScope])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -2109,28 +2246,38 @@ function App() {
   }
 
   async function loadTeam() {
-    const session = getToken()
+    const requestId = ++loadTeamRequestRef.current
+    const session = getToken(botScope)
     if (!session) return
     try {
       const meResp = await apiFetch(`${WORKER_URL}/api/me`)
       if (meResp.status === 401 || meResp.status === 404) {
+        if (requestId === loadTeamRequestRef.current) {
+          setTeamMembers([])
+        }
         await recoverSessionOrLogout()
         return
       }
       if (meResp.ok) {
         const me = await meResp.json() as any
-        setIsOwner(!!me.is_owner)
-        if (me.email) setMeEmail(me.email)
-        const ns = String(me.namespace_id || '').trim()
-        if (ns && ns !== namespaceId) {
-          setNamespaceId(ns)
-          hydrateNamespaceCaches(ns)
+        if (requestId === loadTeamRequestRef.current) {
+          setIsOwner(!!me.is_owner)
+          if (me.email) setMeEmail(me.email)
+          const ns = String(me.namespace_id || '').trim()
+          if (ns && ns !== namespaceId) {
+            setNamespaceId(ns)
+            hydrateNamespaceCaches(ns)
+          }
         }
       }
       const teamResp = await apiFetch(`${WORKER_URL}/api/team`)
       if (teamResp.ok) {
         const data = await teamResp.json() as any
-        setTeamMembers(data.members || [])
+        if (requestId === loadTeamRequestRef.current) {
+          setTeamMembers(data.members || [])
+        }
+      } else if (requestId === loadTeamRequestRef.current) {
+        setTeamMembers([])
       }
     } catch { }
   }
@@ -2476,34 +2623,35 @@ function App() {
         />
       )}
 
-      {/* Top Nav — fixed */}
-      <div style={headerTopPaddingStyle} className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5">
-        <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
-          {tab === 'dashboard' ? 'Dashboard' : tab === 'processing' ? 'Processing' : tab === 'gallery' ? 'Gallery' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
-        </h1>
-        {tab === 'gallery' && showGalleryFilterBar && (
-          <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
-            <button
-              onClick={() => setCategoryFilter('missing-link')}
-              className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'missing-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-            >
-              ไม่มีลิ้ง ({galleryMissingLinkVideos.length})
-            </button>
-            <button
-              onClick={() => setCategoryFilter('unused')}
-              className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-            >
-              ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
-            </button>
-            <button
-              onClick={() => setCategoryFilter('used')}
-              className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-            >
-              โพสต์แล้ว ({galleryUsedVideos.length})
-            </button>
-          </div>
-        )}
-      </div>
+      {!videoViewerOpen && (
+        <div style={headerTopPaddingStyle} className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5">
+          <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
+            {tab === 'dashboard' ? 'Dashboard' : tab === 'processing' ? 'Processing' : tab === 'gallery' ? 'Gallery' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
+          </h1>
+          {tab === 'gallery' && showGalleryFilterBar && (
+            <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
+              <button
+                onClick={() => setCategoryFilter('missing-link')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'missing-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ไม่มีลิ้ง ({galleryMissingLinkVideos.length})
+              </button>
+              <button
+                onClick={() => setCategoryFilter('unused')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
+              </button>
+              <button
+                onClick={() => setCategoryFilter('used')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                โพสต์แล้ว ({galleryUsedVideos.length})
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Main Content */}
       <div style={mainContentPaddingStyle} className="flex-1 [&::-webkit-scrollbar]:hidden overflow-y-auto app-scroll">
@@ -2639,7 +2787,7 @@ function App() {
               ) : (
                 <div className="grid grid-cols-3 gap-3">
                   {globalOriginalVideos.map((video) => (
-                    <GlobalOriginalVideoCard key={video.id} video={video} />
+                    <GlobalOriginalVideoCard key={video.id} video={video} onExpandedChange={setVideoViewerOpen} />
                   ))}
                 </div>
               )
@@ -2684,6 +2832,7 @@ function App() {
                       setVideos(videos.map(v => v.id === id ? { ...v, ...fields } : v));
                       setUsedVideos(usedVideos.map(v => v.id === id ? { ...v, ...fields } : v));
                     }}
+                    onExpandedChange={setVideoViewerOpen}
                   />
                 ))}
               </div>
@@ -3025,16 +3174,25 @@ function App() {
             {settingsSection === 'menu' ? (
               <>
                 {meEmail && (
-                  <div className="flex items-center p-4 bg-white rounded-2xl border border-gray-200">
-                    <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white text-xl font-bold shadow-lg flex-shrink-0">
-                      {meEmail.charAt(0).toUpperCase()}
+                  <div className="flex items-center justify-between gap-3 p-4 bg-white rounded-2xl border border-gray-200">
+                    <div className="flex items-center min-w-0">
+                      <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white text-xl font-bold shadow-lg flex-shrink-0">
+                        {meEmail.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="ml-4 min-w-0">
+                        <p className="font-semibold text-gray-900 text-sm truncate">{meEmail}</p>
+                        <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
+                          {isOwner ? 'Owner' : 'Member'}
+                        </p>
+                      </div>
                     </div>
-                    <div className="ml-4 min-w-0">
-                      <p className="font-semibold text-gray-900 text-sm truncate">{meEmail}</p>
-                      <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
-                        {isOwner ? 'Owner' : 'Member'}
-                      </p>
-                    </div>
+                    <button
+                      onClick={handleLogout}
+                      disabled={logoutLoading}
+                      className="px-4 py-2 rounded-xl border border-red-200 bg-red-50 text-red-600 text-sm font-semibold active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      {logoutLoading ? 'กำลังออก...' : 'Logout'}
+                    </button>
                   </div>
                 )}
                 {isOwner && (
@@ -3107,6 +3265,13 @@ function App() {
                         ไม่พบบัญชีผู้ใช้
                       </div>
                     )}
+                    <button
+                      onClick={handleLogout}
+                      disabled={logoutLoading}
+                      className="w-full h-12 rounded-2xl bg-red-500 text-white font-bold active:scale-[0.99] disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      {logoutLoading ? 'กำลังออกจากระบบ...' : 'Logout'}
+                    </button>
                   </div>
                 )}
 
@@ -3295,53 +3460,54 @@ function App() {
         )}
       </div>
 
-      {/* Bottom Navigation */}
-      <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-t border-gray-100 safe-bottom z-40">
-        <div className="flex pt-2 pb-1">
-          <NavItem
-            icon={<DashboardIcon />}
-            iconActive={<DashboardIconFilled />}
-            label="Dashboard"
-            active={tab === 'dashboard'}
-            onClick={() => setTab('dashboard')}
-          />
-          <NavItem
-            icon={<ProcessIcon />}
-            iconActive={<ProcessIconFilled />}
-            label="Processing"
-            active={tab === 'processing'}
-            onClick={() => setTab('processing')}
-          />
-          <NavItem
-            icon={<VideoIcon />}
-            iconActive={<VideoIconFilled />}
-            label="Gallery"
-            active={tab === 'gallery'}
-            onClick={() => setTab('gallery')}
-          />
-          <NavItem
-            icon={<ListIcon />}
-            iconActive={<ListIconFilled />}
-            label="Logs"
-            active={tab === 'logs'}
-            onClick={() => setTab('logs')}
-          />
-          <NavItem
-            icon={<PagesIcon />}
-            iconActive={<PagesIconFilled />}
-            label="Pages"
-            active={tab === 'pages'}
-            onClick={() => setTab('pages')}
-          />
-          <NavItem
-            icon={<SettingsIcon />}
-            iconActive={<SettingsIconFilled />}
-            label="Settings"
-            active={tab === 'settings'}
-            onClick={() => setTab('settings')}
-          />
+      {!videoViewerOpen && (
+        <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-t border-gray-100 safe-bottom z-40">
+          <div className="flex pt-2 pb-1">
+            <NavItem
+              icon={<DashboardIcon />}
+              iconActive={<DashboardIconFilled />}
+              label="Dashboard"
+              active={tab === 'dashboard'}
+              onClick={() => setTab('dashboard')}
+            />
+            <NavItem
+              icon={<ProcessIcon />}
+              iconActive={<ProcessIconFilled />}
+              label="Processing"
+              active={tab === 'processing'}
+              onClick={() => setTab('processing')}
+            />
+            <NavItem
+              icon={<VideoIcon />}
+              iconActive={<VideoIconFilled />}
+              label="Gallery"
+              active={tab === 'gallery'}
+              onClick={() => setTab('gallery')}
+            />
+            <NavItem
+              icon={<ListIcon />}
+              iconActive={<ListIconFilled />}
+              label="Logs"
+              active={tab === 'logs'}
+              onClick={() => setTab('logs')}
+            />
+            <NavItem
+              icon={<PagesIcon />}
+              iconActive={<PagesIconFilled />}
+              label="Pages"
+              active={tab === 'pages'}
+              onClick={() => setTab('pages')}
+            />
+            <NavItem
+              icon={<SettingsIcon />}
+              iconActive={<SettingsIconFilled />}
+              label="Settings"
+              active={tab === 'settings'}
+              onClick={() => setTab('settings')}
+            />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }
