@@ -1,8 +1,3 @@
-function normalizeShopeeUrl(url) {
-  const match = url.match(/[-.\/]i\.(\d+)\.(\d+)/);
-  if (match) return `https://shopee.co.th/i-i.${match[1]}.${match[2]}`;
-  return url;
-}
 
 export class BridgeDO {
   constructor(state, env) {
@@ -31,10 +26,10 @@ export class BridgeDO {
   async webSocketMessage(ws, message) {
     try {
       const result = JSON.parse(message);
-      const { jobId, ok, shortLink, error } = result;
+      const { jobId, ok, shortLink, normalizedUrl, redirectUrl, error } = result;
       const job = this.pendingJobs.get(jobId);
       if (!job) return;
-      job.resolve({ ok, shortLink, error });
+      job.resolve({ ok, shortLink, normalizedUrl, redirectUrl, error });
     } catch (_) {}
   }
 
@@ -63,10 +58,9 @@ export class BridgeDO {
       return json({ error: 'Electron app ไม่ได้เชื่อมต่อ — เปิด app ก่อน' }, 503);
     }
 
-    const productUrl = normalizeShopeeUrl(rawUrl);
     const jobId = crypto.randomUUID();
     const payload = {
-      productUrl,
+      rawUrl,  // ส่ง rawUrl ให้ Electron — Electron จะ expand+normalize เอง
       subId1: url.searchParams.get('sub1') || undefined,
       subId2: url.searchParams.get('sub2') || undefined,
       subId3: url.searchParams.get('sub3') || undefined,
@@ -85,14 +79,15 @@ export class BridgeDO {
 
       this.pendingJobs.set(jobId, {
         timer,
-        resolve: ({ ok, shortLink, error }) => {
+        resolve: ({ ok, shortLink, normalizedUrl, redirectUrl, error }) => {
           clearTimeout(timer);
           this.pendingJobs.delete(jobId);
           if (ok) {
             resolve(json({
-              originalUrl: rawUrl,
-              shortLink: productUrl,
-              affiliateLink: shortLink,
+              originalLink: rawUrl,
+              ...(redirectUrl ? { redirectLink: redirectUrl } : {}),
+              longLink: normalizedUrl || rawUrl,
+              shortLink: shortLink,
               sub1: url.searchParams.get('sub1') || null,
               sub2: url.searchParams.get('sub2') || null,
               sub3: url.searchParams.get('sub3') || null,

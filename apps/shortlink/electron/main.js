@@ -10,9 +10,32 @@ let mainWindow = null;
 // ── URL normalizer ─────────────────────────────────────────────────────────────
 
 function normalizeShopeeUrl(url) {
-  const match = url.match(/[-./]i\.(\d+)\.(\d+)/);
-  if (match) return `https://shopee.co.th/i-i.${match[1]}.${match[2]}`;
+  // รูปแบบ i-i: /i.{shopId}.{itemId} หรือ -i.{shopId}.{itemId}
+  const matchI = url.match(/[-./]i\.(\d+)\.(\d+)/);
+  if (matchI) return `https://shopee.co.th/product/${matchI[1]}/${matchI[2]}`;
+
+  // รูปแบบ /{username}/{shopId}/{itemId}
+  const matchPath = url.match(/shopee\.co\.th\/[^/?]+\/(\d{5,})\/(\d{5,})/);
+  if (matchPath) return `https://shopee.co.th/product/${matchPath[1]}/${matchPath[2]}`;
+
   return url;
+}
+
+// ── URL expander (follow s.shopee.co.th redirect) ──────────────────────────────
+
+async function expandUrl(url) {
+  if (!url.includes('s.shopee.co.th')) return url;
+  try {
+    const res = await fetch(url, {
+      method: 'HEAD',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(5000),
+    });
+    const location = res.headers.get('location');
+    return location || url;
+  } catch (_) {
+    return url;
+  }
 }
 
 // ── Shopee GraphQL via WebView XHR ─────────────────────────────────────────────
@@ -108,7 +131,8 @@ const server = http.createServer(async (req, res) => {
   const [pathname, qs] = req.url.split('?');
   const params = new URLSearchParams(qs || '');
   const rawUrl = params.get('url');
-  const url = rawUrl ? normalizeShopeeUrl(rawUrl) : null;
+  const expandedUrl = rawUrl ? await expandUrl(rawUrl) : null;
+  const url = expandedUrl ? normalizeShopeeUrl(expandedUrl) : null;
 
   res.setHeader('Access-Control-Allow-Origin', '*');
 
@@ -178,9 +202,9 @@ code{background:#f0f0f0;padding:2px 8px;border-radius:4px;font-size:12px}</style
     const affiliateLink = await generateLink(url, subIds);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      originalUrl: rawUrl || null,
-      shortLink: url,
-      affiliateLink,
+      originalLink: rawUrl || null,
+      longLink: url,
+      shortLink: affiliateLink,
       sub1: params.get('sub1') || null,
       sub2: params.get('sub2') || null,
       sub3: params.get('sub3') || null,
@@ -224,13 +248,17 @@ function connectBridgeWs() {
     const { jobId, payload } = msg;
     if (!jobId || !payload) return;
 
-    const { productUrl, subId1, subId2, subId3, subId4, subId5 } = payload;
+    const { rawUrl, subId1, subId2, subId3, subId4, subId5 } = payload;
     const subIds = [subId1, subId2, subId3, subId4, subId5].map(v => v || '');
-    console.log('[Bridge] Job:', jobId, productUrl);
+
+    // expand s.shopee.co.th → full URL, then normalize
+    const expandedUrl = await expandUrl(rawUrl);
+    const productUrl = normalizeShopeeUrl(expandedUrl);
+    console.log('[Bridge] Job:', jobId, rawUrl, '→', productUrl);
 
     try {
       const shortLink = await generateLink(productUrl, subIds);
-      ws.send(JSON.stringify({ jobId, ok: true, shortLink }));
+      ws.send(JSON.stringify({ jobId, ok: true, shortLink, normalizedUrl: productUrl, redirectUrl: expandedUrl !== rawUrl ? expandedUrl.split('?')[0] : undefined }));
       console.log('[Bridge] Done:', shortLink);
     } catch (err) {
       ws.send(JSON.stringify({ jobId, ok: false, error: err.message }));
