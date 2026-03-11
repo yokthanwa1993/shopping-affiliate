@@ -52,7 +52,9 @@ fn get_mobile_simulator_extension_dir() -> Option<PathBuf> {
         }
     }
 
-    let project_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("extension/Mobile simulator - responsive testing tool"));
+    let project_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("extension/Mobile simulator - responsive testing tool"));
     if let Some(ref ext_path) = project_path {
         if ext_path.join("manifest.json").exists() {
             return Some(ext_path.clone());
@@ -261,10 +263,7 @@ fn pin_extensions_in_preferences(profile_cache_dir: &Path) {
     );
 
     // Also set toolbar order so Chrome respects the pin
-    ext_obj.insert(
-        "toolbar".to_string(),
-        serde_json::Value::Array(pin_json),
-    );
+    ext_obj.insert("toolbar".to_string(), serde_json::Value::Array(pin_json));
 
     // Write back
     if let Ok(json_str) = serde_json::to_string_pretty(&prefs) {
@@ -2386,54 +2385,268 @@ fn extract_ea_token(text: &str) -> Option<String> {
     }
 }
 
-// Get comment token via external Python script (/Users/yok/Developer/token/to.py)
-#[tauri::command]
-async fn get_comment_token_via_script(
-    uid: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-    totp_secret: Option<String>,
-) -> Result<String, String> {
-    let login = uid
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .or_else(|| {
-            username
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.trim().to_string())
-        })
-        .ok_or("Missing UID/username".to_string())?;
-
-    let pass = password
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-        .ok_or("Missing password".to_string())?;
-
-    let script_path = PathBuf::from("/Users/yok/Developer/token/to.py");
-    if !script_path.exists() {
-        return Err(format!("Script not found: {}", script_path.display()));
+fn get_fb_token_cli_script_path() -> Option<PathBuf> {
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/fb_token_cli.py");
+    if dev_path.exists() {
+        return Some(dev_path);
     }
 
-    log::info!("[Comment Token] Running script for login: {}", login);
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(macos_dir) = exe_path.parent() {
+            if let Some(contents_dir) = macos_dir.parent() {
+                let packaged_candidates = [
+                    contents_dir.join("Resources/fb_token_cli.py"),
+                    contents_dir.join("Resources/resources/fb_token_cli.py"),
+                ];
+                for candidate in packaged_candidates {
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
 
-    let mut child = Command::new("python3")
-        .arg(&script_path)
+    let external_fallbacks = [PathBuf::from("/Users/yok/Developer/token/to.py")];
+    external_fallbacks
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn get_python3_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("BROWSERSAVING_PYTHON3") {
+        let path = PathBuf::from(explicit.trim());
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let candidates = [
+        PathBuf::from("/opt/homebrew/bin/python3"),
+        PathBuf::from("/usr/local/bin/python3"),
+        PathBuf::from("/usr/bin/python3"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(output) = Command::new("/usr/bin/which").arg("python3").output() {
+        if output.status.success() {
+            let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !resolved.is_empty() {
+                let path = PathBuf::from(resolved);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalFacebookPictureData {
+    url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalFacebookPicture {
+    data: Option<LocalFacebookPictureData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalFacebookAccountItem {
+    id: Option<String>,
+    name: Option<String>,
+    access_token: Option<String>,
+    picture: Option<LocalFacebookPicture>,
+}
+
+fn normalize_page_name_local(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+fn parse_page_id_from_avatar_url_local(raw: &str) -> String {
+    let input = raw.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+
+    if let Some(idx) = input.find("/page-avatars/") {
+        let tail = &input[idx + "/page-avatars/".len()..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits;
+        }
+    }
+
+    if let Some(idx) = input.find("graph.facebook.com/") {
+        let tail = &input[idx + "graph.facebook.com/".len()..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits;
+        }
+    }
+
+    String::new()
+}
+
+fn pick_target_facebook_page_local(
+    accounts: &[LocalFacebookAccountItem],
+    profile_name: &str,
+    stored_page_name: Option<&str>,
+    stored_page_avatar_url: Option<&str>,
+) -> Option<LocalFacebookAccountItem> {
+    if accounts.is_empty() {
+        return None;
+    }
+
+    let profile_name_hint = normalize_page_name_local(profile_name);
+    let stored_page_name_hint = normalize_page_name_local(stored_page_name.unwrap_or_default());
+    let has_explicit_page_hint =
+        !stored_page_name_hint.is_empty() && stored_page_name_hint != profile_name_hint;
+
+    if has_explicit_page_hint {
+        let page_id_hint =
+            parse_page_id_from_avatar_url_local(stored_page_avatar_url.unwrap_or_default());
+        if !page_id_hint.is_empty() {
+            if let Some(found) = accounts
+                .iter()
+                .find(|acc| acc.id.as_deref().unwrap_or_default().trim() == page_id_hint)
+            {
+                return Some(found.clone());
+            }
+        }
+
+        if let Some(found) = accounts.iter().find(|acc| {
+            normalize_page_name_local(acc.name.as_deref().unwrap_or_default())
+                == stored_page_name_hint
+        }) {
+            return Some(found.clone());
+        }
+    }
+
+    if !profile_name_hint.is_empty() {
+        if let Some(found) = accounts.iter().find(|acc| {
+            normalize_page_name_local(acc.name.as_deref().unwrap_or_default()) != profile_name_hint
+        }) {
+            return Some(found.clone());
+        }
+    }
+
+    accounts.first().cloned()
+}
+
+#[tauri::command]
+async fn resolve_page_token_via_graph(
+    user_token: String,
+    profile_name: String,
+    page_name: Option<String>,
+    page_avatar_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let token = user_token.trim().to_string();
+    if token.is_empty() {
+        return Err("Missing user token".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let response = client
+        .get("https://graph.facebook.com/v21.0/me/accounts")
+        .query(&[
+            ("fields", "id,name,access_token,picture.type(large)"),
+            ("limit", "200"),
+            ("access_token", token.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Graph request failed: {}", e))?;
+
+    let status = response.status();
+    let raw: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid Graph response: {}", e))?;
+
+    if !status.is_success() {
+        let message = raw
+            .get("error")
+            .and_then(|err| err.get("message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("Facebook API failed");
+        return Err(format!("facebook_me_accounts_failed: {}", message));
+    }
+
+    let accounts: Vec<LocalFacebookAccountItem> =
+        serde_json::from_value(raw.get("data").cloned().unwrap_or(serde_json::Value::Null))
+            .unwrap_or_default();
+
+    if accounts.is_empty() {
+        return Err("facebook_me_accounts_empty".to_string());
+    }
+
+    let matched = pick_target_facebook_page_local(
+        &accounts,
+        &profile_name,
+        page_name.as_deref(),
+        page_avatar_url.as_deref(),
+    )
+    .ok_or("facebook_me_accounts_ambiguous_profile_page_not_matched".to_string())?;
+
+    let page_token = matched
+        .access_token
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if page_token.is_empty() {
+        return Err("page_token_missing".to_string());
+    }
+
+    Ok(serde_json::json!({
+        "pageToken": page_token,
+        "pageId": matched.id.as_deref().unwrap_or_default().trim(),
+        "pageName": matched.name.as_deref().unwrap_or_default().trim(),
+        "pageAvatarUrl": matched
+            .picture
+            .as_ref()
+            .and_then(|picture| picture.data.as_ref())
+            .and_then(|data| data.url.as_deref())
+            .unwrap_or_default()
+            .trim(),
+    }))
+}
+
+// Get local FB Lite token via Python CLI script
+fn run_fb_token_cli_attempt(
+    python_path: &Path,
+    script_path: &Path,
+    login: &str,
+    password: &str,
+    totp_secret: &str,
+    datr: &str,
+) -> Result<String, String> {
+    let mut child = Command::new(python_path)
+        .arg(script_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start python3: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to start python3 at {}: {}",
+                python_path.display(),
+                e
+            )
+        })?;
 
-    let input_payload = format!(
-        "{}\n{}\n{}\n{}\n",
-        login,
-        pass,
-        totp_secret.unwrap_or_default().replace(' ', ""),
-        ""
-    );
+    let input_payload = format!("{}\n{}\n{}\n{}\n", login, password, totp_secret, datr);
 
     if let Some(stdin) = child.stdin.as_mut() {
         stdin
@@ -2452,15 +2665,90 @@ async fn get_comment_token_via_script(
     let combined = format!("{}\n{}", stdout, stderr);
 
     if let Some(token) = extract_ea_token(&combined) {
-        log::info!("[Comment Token] Token extracted ({} chars)", token.len());
         return Ok(token);
     }
 
     let short_out = combined.lines().take(20).collect::<Vec<_>>().join("\n");
-
     Err(format!(
         "Script returned no token (exit: {}). Output:\n{}",
         output.status, short_out
+    ))
+}
+
+#[tauri::command]
+async fn get_comment_token_via_script(
+    uid: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    totp_secret: Option<String>,
+    datr: Option<String>,
+) -> Result<String, String> {
+    let mut login_candidates: Vec<String> = Vec::new();
+    if let Some(value) = username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        login_candidates.push(value.to_string());
+    }
+    if let Some(value) = uid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !login_candidates.iter().any(|candidate| candidate == value) {
+            login_candidates.push(value.to_string());
+        }
+    }
+    if login_candidates.is_empty() {
+        return Err("Missing UID/username".to_string());
+    }
+
+    let pass = password
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .ok_or("Missing password".to_string())?;
+    let normalized_totp = totp_secret.unwrap_or_default().replace(' ', "");
+    let normalized_datr = datr.unwrap_or_default().trim().to_string();
+
+    let script_path = get_fb_token_cli_script_path().ok_or(
+        "Local token CLI script not found. Expected fb_token_cli.py in app resources or /Users/yok/Developer/token/to.py"
+            .to_string(),
+    )?;
+    let python_path = get_python3_path().ok_or(
+        "python3 not found. Set BROWSERSAVING_PYTHON3 or install python3 in /opt/homebrew/bin, /usr/local/bin, or /usr/bin"
+            .to_string(),
+    )?;
+
+    let mut attempt_errors: Vec<String> = Vec::new();
+
+    for login in login_candidates {
+        log::info!(
+            "[Comment Token] Running script for login: {} via {} (datr: {})",
+            login,
+            python_path.display(),
+            if normalized_datr.is_empty() {
+                "no"
+            } else {
+                "yes"
+            }
+        );
+
+        match run_fb_token_cli_attempt(
+            &python_path,
+            &script_path,
+            &login,
+            &pass,
+            &normalized_totp,
+            &normalized_datr,
+        ) {
+            Ok(token) => {
+                log::info!("[Comment Token] Token extracted ({} chars)", token.len());
+                return Ok(token);
+            }
+            Err(err) => {
+                log::warn!("[Comment Token] Attempt failed for {}: {}", login, err);
+                attempt_errors.push(format!("{} -> {}", login, err));
+            }
+        }
+    }
+
+    Err(format!(
+        "Local token CLI failed for all login candidates:\n{}",
+        attempt_errors.join("\n\n")
     ))
 }
 
@@ -4888,6 +5176,7 @@ pub fn run() {
             download_browser_data,
             upload_browser_data,
             get_comment_token_via_script,
+            resolve_page_token_via_graph,
             get_facebook_token,
             postcron_step_launch,
             postcron_step_launch_headful,

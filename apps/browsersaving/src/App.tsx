@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type FormEvent } from 'react'
+import { useState, useEffect, useCallback, type FormEvent, type MouseEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { type Update, check } from '@tauri-apps/plugin-updater'
@@ -51,6 +51,13 @@ interface Profile {
   facebook_token?: string
   page_name?: string
   page_avatar_url?: string
+}
+
+type LocalResolvedPageToken = {
+  pageToken: string
+  pageId?: string
+  pageName?: string
+  pageAvatarUrl?: string
 }
 
 // TOTP Generator
@@ -189,6 +196,8 @@ type AppUpdateState = {
   message: string
   error: string
 }
+
+type TokenFetchSource = 'worker' | 'local'
 
 const normalizeAuthEmail = (raw: unknown) => String(raw || '').trim().toLowerCase()
 
@@ -455,6 +464,11 @@ function App() {
     profileName: string
     token: string
   } | null>(null)
+  const [tokenContextMenu, setTokenContextMenu] = useState<{
+    profileId: string
+    x: number
+    y: number
+  } | null>(null)
   const [deletingTokenProfileId, setDeletingTokenProfileId] = useState<string | null>(null)
   const [fetchingToken, setFetchingToken] = useState<Set<string>>(new Set())
   const [copiedProfileId, setCopiedProfileId] = useState<string | null>(null)
@@ -694,6 +708,24 @@ function App() {
     window.addEventListener('click', closePicker)
     return () => window.removeEventListener('click', closePicker)
   }, [tagPickerProfileId])
+
+  useEffect(() => {
+    if (!tokenContextMenu) return
+
+    const closeMenu = () => setTokenContextMenu(null)
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setTokenContextMenu(null)
+    }
+
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('contextmenu', closeMenu)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('contextmenu', closeMenu)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [tokenContextMenu])
 
 
 
@@ -1065,12 +1097,68 @@ function App() {
     setDebugProfile(null)
   }
 
-  const handleFetchToken = async (profile: Profile) => {
+  const handleFetchToken = async (profile: Profile, source: TokenFetchSource = 'worker') => {
+    setTokenContextMenu(null)
     setFetchingToken(prev => new Set(prev).add(profile.id))
 
     try {
-      const res = await apiFetch(`/api/token/${profile.id}`)
-      const data = await res.json().catch(() => ({} as any))
+      let res: Response
+      let data: any = {}
+
+      if (source === 'local') {
+        if (!isTauri()) {
+          throw new Error('Local token mode requires the desktop app')
+        }
+
+        const localUserToken = String(await invoke<string>('get_comment_token_via_script', {
+          uid: profile.uid,
+          username: profile.username,
+          password: profile.password,
+          totpSecret: profile.totp_secret,
+          datr: profile.datr,
+        }) || '').trim()
+
+        if (!localUserToken) {
+          throw new Error('Local CLI returned empty token')
+        }
+
+        const resolved = await invoke<LocalResolvedPageToken>('resolve_page_token_via_graph', {
+          userToken: localUserToken,
+          profileName: profile.name,
+          pageName: profile.page_name,
+          pageAvatarUrl: profile.page_avatar_url,
+        })
+
+        const pageToken = String(resolved?.pageToken || '').trim()
+        if (!pageToken) {
+          throw new Error('Local page token resolve returned empty token')
+        }
+
+        res = await apiFetch(`/api/profiles/${profile.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            access_token: pageToken,
+            page_name: String(resolved?.pageName || '').trim() || null,
+            page_avatar_url: String(resolved?.pageAvatarUrl || '').trim() || null,
+          }),
+        })
+        await res.json().catch(() => ({} as any))
+        if (!res.ok) {
+          throw new Error(`Failed to save local token: HTTP ${res.status}`)
+        }
+
+        data = {
+          success: true,
+          token: pageToken,
+          page_id: String(resolved?.pageId || '').trim() || null,
+          page_name: String(resolved?.pageName || '').trim() || null,
+          page_avatar_url: String(resolved?.pageAvatarUrl || '').trim() || null,
+        }
+      } else {
+        res = await apiFetch(`/api/token/${profile.id}`)
+        data = await res.json().catch(() => ({} as any))
+      }
+
       const token = String(
         data?.token ||
         data?.converted_token?.access_token ||
@@ -1119,6 +1207,22 @@ function App() {
         return next
       })
     }
+  }
+
+  const openTokenContextMenu = (event: MouseEvent<HTMLButtonElement>, profile: Profile) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (fetchingToken.has(profile.id)) return
+
+    const menuWidth = 176
+    const menuHeight = 92
+    const x = Math.min(event.clientX, window.innerWidth - menuWidth - 12)
+    const y = Math.min(event.clientY, window.innerHeight - menuHeight - 12)
+    setTokenContextMenu({
+      profileId: profile.id,
+      x: Math.max(12, x),
+      y: Math.max(12, y),
+    })
   }
 
   const handleDeleteToken = async (profileId: string) => {
@@ -1692,6 +1796,7 @@ function App() {
                                 <button
                                   className={`action-btn token facebook-comment ${hasAccessToken(profile) ? 'has-token' : ''}`}
                                   onClick={() => {
+                                    setTokenContextMenu(null)
                                     if (hasAccessToken(profile)) {
                                       setTokenResult({
                                         profileId: profile.id,
@@ -1702,7 +1807,8 @@ function App() {
                                     }
                                     void handleFetchToken(profile)
                                   }}
-                                  title={hasAccessToken(profile) ? 'View Token' : 'Get Token'}
+                                  onContextMenu={(event) => openTokenContextMenu(event, profile)}
+                                  title={hasAccessToken(profile) ? 'Left click: View Token, Right click: Worker / Local' : 'Left click: Get Token (Worker), Right click: Worker / Local'}
                                 >
                                   <svg viewBox="0 0 24 24" aria-hidden="true">
                                     <path fill="#1877F2" d="M22 12.07C22 6.503 17.523 2 12 2S2 6.503 2 12.07c0 5.017 3.657 9.178 8.438 9.93v-7.02H7.898v-2.91h2.54V9.845c0-2.523 1.492-3.917 3.777-3.917 1.094 0 2.238.196 2.238.196v2.476H15.19c-1.243 0-1.63.776-1.63 1.572v1.898h2.773l-.443 2.91h-2.33V22c4.78-.752 8.44-4.913 8.44-9.93z" />
@@ -2097,6 +2203,33 @@ function App() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {tokenContextMenu && (
+        <div
+          className="postcron-context-menu"
+          style={{ left: tokenContextMenu.x, top: tokenContextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            className="postcron-context-item"
+            onClick={() => {
+              const profile = profiles.find((item) => item.id === tokenContextMenu.profileId)
+              if (profile) void handleFetchToken(profile, 'worker')
+            }}
+          >
+            Worker
+          </button>
+          <button
+            className="postcron-context-item"
+            onClick={() => {
+              const profile = profiles.find((item) => item.id === tokenContextMenu.profileId)
+              if (profile) void handleFetchToken(profile, 'local')
+            }}
+          >
+            Local
+          </button>
         </div>
       )}
 

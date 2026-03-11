@@ -43,9 +43,18 @@ const getStoredNamespace = (botScope = getBotScopeFromLocation()) => {
   try { return String(localStorage.getItem(scopedStorageKey('auth_namespace', botScope)) || '').trim() } catch { return '' }
 }
 
+const getStoredShortlinkBaseUrl = (botScope = getBotScopeFromLocation()) => {
+  try { return String(localStorage.getItem(scopedStorageKey('shortlink_base_url', botScope)) || '').trim() } catch { return '' }
+}
+
+const getStoredShortlinkExpectedUtmId = (botScope = getBotScopeFromLocation()) => {
+  try { return String(localStorage.getItem(scopedStorageKey('shortlink_expected_utm_id', botScope)) || '').trim() } catch { return '' }
+}
+
 const CACHE_VERSION = 'v3'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
+const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
 
 const apiFetch = async (url: string, options: RequestInit = {}) => {
   const headers = { ...options.headers, 'x-auth-token': getToken() }
@@ -84,6 +93,8 @@ const onPageImageError = (
 
 interface Video {
   id: string
+  namespace_id?: string
+  owner_email?: string
   script: string
   duration: number
   originalUrl: string
@@ -211,6 +222,17 @@ const getVideoShopeeLink = (video: Record<string, unknown>): string => {
   return ''
 }
 
+const getVideoIdentityKey = (video: Partial<Video> & Record<string, unknown>) => {
+  const id = String(video.id || '').trim()
+  const namespaceId = String(video.namespace_id || '').trim()
+  return namespaceId ? `${namespaceId}:${id}` : id
+}
+
+const matchesVideoIdentity = (video: Partial<Video> & Record<string, unknown>, id: string, namespaceId?: string) => {
+  return String(video.id || '').trim() === String(id || '').trim()
+    && String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
+}
+
 declare global {
   interface Window {
     Telegram?: {
@@ -330,7 +352,21 @@ function Thumb({ id, url, fallback }: { id: string; url?: string; fallback: stri
 }
 
 // Video card component
-function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange, keepInPostedOnLinkSave = false }: { video: Video; formatDuration: (s: number) => string; onDelete: (id: string) => void; onUpdate: (id: string, fields: Partial<Video>) => void; onExpandedChange?: (expanded: boolean) => void; keepInPostedOnLinkSave?: boolean }) {
+function VideoCard({
+  video,
+  formatDuration,
+  onDelete,
+  onUpdate,
+  onExpandedChange,
+  keepInPostedOnLinkSave = false
+}: {
+  video: Video
+  formatDuration: (s: number) => string
+  onDelete: (id: string, namespaceId?: string) => void
+  onUpdate: (id: string, namespaceId: string | undefined, fields: Partial<Video>) => void
+  onExpandedChange?: (expanded: boolean) => void
+  keepInPostedOnLinkSave?: boolean
+}) {
   const [expanded, setExpanded] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [shopeeInput, setShopeeInput] = useState('')
@@ -342,6 +378,13 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
   const [editingTitle, setEditingTitle] = useState(false)
   const [localTitle, setLocalTitle] = useState(video.title || '')
   const [savingTitle, setSavingTitle] = useState(false)
+  const videoNamespaceId = String(video.namespace_id || '').trim() || undefined
+  const videoStorageId = videoNamespaceId ? `${videoNamespaceId}:${video.id}` : video.id
+  const buildVideoApiUrl = () => {
+    const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(video.id)}`)
+    if (videoNamespaceId) url.searchParams.set('namespace_id', videoNamespaceId)
+    return url.toString()
+  }
 
   useEffect(() => {
     setLocalShopee(getVideoShopeeLink(video as unknown as Record<string, unknown>))
@@ -363,11 +406,11 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
     const next = localCats.includes(cat) ? localCats.filter(c => c !== cat) : [...localCats, cat]
     setLocalCats(next)
     const newCat = next.join(',')
-    onUpdate(video.id, { category: newCat })
-    await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+    onUpdate(video.id, videoNamespaceId, { category: newCat })
+    await apiFetch(buildVideoApiUrl(), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ category: newCat })
+      body: JSON.stringify({ category: newCat, namespace_id: videoNamespaceId })
     }).catch(() => { })
   }
 
@@ -376,12 +419,13 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
     setSavingShopee(true)
     try {
       const nowIso = new Date().toISOString()
-      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+      const resp = await apiFetch(buildVideoApiUrl(), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           shopeeLink: shopeeInput.trim(),
           keepInPostedTab: keepInPostedOnLinkSave || undefined,
+          namespace_id: videoNamespaceId,
         })
       })
       if (resp.ok) {
@@ -390,7 +434,7 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
         video.updatedAt = nowIso
         setLocalShopee(shopeeInput.trim())
         setShopeeInput('')
-        onUpdate(video.id, {
+        onUpdate(video.id, videoNamespaceId, {
           shopeeLink: shopeeInput.trim(),
           keepInPostedTab: keepInPostedOnLinkSave ? true : video.keepInPostedTab,
           updatedAt: nowIso
@@ -413,17 +457,17 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
     setDeletingShopeeLink(true)
     try {
       const nowIso = new Date().toISOString()
-      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+      const resp = await apiFetch(buildVideoApiUrl(), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ shopeeLink: '' })
+        body: JSON.stringify({ shopeeLink: '', namespace_id: videoNamespaceId })
       })
       if (resp.ok) {
         video.shopeeLink = ''
         video.updatedAt = nowIso
         setLocalShopee('')
         setShopeeInput('')
-        onUpdate(video.id, { shopeeLink: '', updatedAt: nowIso })
+        onUpdate(video.id, videoNamespaceId, { shopeeLink: '', updatedAt: nowIso })
       } else {
         const err = await resp.json().catch(() => ({ error: 'Unknown error' }))
         alert('ลบลิงก์ไม่สำเร็จ: ' + (err.error || resp.status))
@@ -439,14 +483,14 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
   const handleSaveTitle = async (newTitle: string) => {
     setSavingTitle(true)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, {
+      const resp = await apiFetch(buildVideoApiUrl(), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: newTitle })
+        body: JSON.stringify({ title: newTitle, namespace_id: videoNamespaceId })
       })
       if (resp.ok) {
         video.title = newTitle
-        onUpdate(video.id, { title: newTitle })
+        onUpdate(video.id, videoNamespaceId, { title: newTitle })
       }
     } catch (e) {
       console.error('Save title failed:', e)
@@ -460,10 +504,10 @@ function VideoCard({ video, formatDuration, onDelete, onUpdate, onExpandedChange
     if (!confirm('ยืนยันลบวีดีโอนี้?')) return
     setDeleting(true)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/gallery/${video.id}`, { method: 'DELETE' })
+      const resp = await apiFetch(buildVideoApiUrl(), { method: 'DELETE' })
       if (resp.ok) {
-        try { localStorage.removeItem(`t_${video.id}`) } catch { }
-        onDelete(video.id)
+        try { localStorage.removeItem(`t_${videoStorageId}`) } catch { }
+        onDelete(video.id, videoNamespaceId)
         setExpanded(false)
       }
     } catch (e) {
@@ -974,7 +1018,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [editingTokenValue, setEditingTokenValue] = useState('')
   const [editingTaggedProfile, setEditingTaggedProfile] = useState<{ mode: 'access'; profile: TaggedPageProfile } | null>(null)
   const [editingTaggedTokenValue, setEditingTaggedTokenValue] = useState('')
-  const [taggedTokenMutation, setTaggedTokenMutation] = useState<'save' | 'delete' | null>(null)
+  const [taggedTokenMutation, setTaggedTokenMutation] = useState<'save' | 'delete' | 'unlink' | null>(null)
   const [taggedProfiles, setTaggedProfiles] = useState<TaggedPageProfile[]>([])
   const [taggedLoading, setTaggedLoading] = useState(true)
   const [taggedError, setTaggedError] = useState('')
@@ -1029,6 +1073,29 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
       setEditingTaggedProfile(null)
       setEditingTaggedTokenValue('')
       alert(mutation === 'delete' ? 'ลบ token โปรไฟล์สำเร็จ' : 'บันทึก token โปรไฟล์สำเร็จ')
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setTaggedTokenMutation(null)
+    }
+  }
+
+  const unlinkTaggedProfileFromPage = async (profileId: string) => {
+    setTaggedTokenMutation('unlink')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}`, {
+        method: 'DELETE',
+      })
+      const data = await resp.json().catch(() => ({})) as { error?: string }
+      if (!resp.ok) {
+        throw new Error(String(data?.error || 'ลบโปรไฟล์ออกจากเพจไม่สำเร็จ'))
+      }
+
+      setTaggedProfiles((prev) => prev.filter((item) => item.profile_id !== profileId))
+      await refreshPageAfterTaggedTokenChange()
+      setEditingTaggedProfile(null)
+      setEditingTaggedTokenValue('')
+      alert('ลบโปรไฟล์ออกจากเพจสำเร็จ ถ้าอยากให้กลับมา ให้กดซิงค์โทเค็นใหม่')
     } catch (err) {
       alert(err instanceof Error ? err.message : String(err))
     } finally {
@@ -1213,27 +1280,25 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                             <p className="text-sm font-bold text-gray-900 truncate">{profile.profile_name || profile.profile_id}</p>
                             <p className="text-[11px] text-gray-500 truncate">{profile.facebook_name || profile.profile_id}</p>
                           </div>
-                          {currentToken ? (
-                            <button
-                              type="button"
-                              onClick={async (e) => {
-                                e.stopPropagation()
-                                if (taggedTokenMutation) return
-                                if (!window.confirm('ลบ token โปรไฟล์นี้ออกจาก BrowserSaving และหน้านี้ใช่ไหม?')) return
-                                await mutateTaggedProfileToken(profile.profile_id, '', 'delete')
-                              }}
-                              disabled={!!taggedTokenMutation}
-                              className="shrink-0 w-8 h-8 rounded-lg border border-red-200 bg-red-50 text-red-500 flex items-center justify-center active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                              title="ลบ token"
-                            >
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                <path d="M3 6h18" strokeLinecap="round" />
-                                <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" strokeLinecap="round" />
-                                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" strokeLinecap="round" />
-                                <path d="M10 11v6M14 11v6" strokeLinecap="round" />
-                              </svg>
-                            </button>
-                          ) : null}
+                          <button
+                            type="button"
+                            onClick={async (e) => {
+                              e.stopPropagation()
+                              if (taggedTokenMutation) return
+                              if (!window.confirm('ลบโปรไฟล์นี้ออกจากเพจนี้ใช่ไหม? ถ้าอยากให้กลับมา ให้กดซิงค์โทเค็นใหม่')) return
+                              await unlinkTaggedProfileFromPage(profile.profile_id)
+                            }}
+                            disabled={!!taggedTokenMutation}
+                            className="shrink-0 w-8 h-8 rounded-lg border border-red-200 bg-red-50 text-red-500 flex items-center justify-center active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="ลบออกจากเพจ"
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M3 6h18" strokeLinecap="round" />
+                              <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" strokeLinecap="round" />
+                              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" strokeLinecap="round" />
+                              <path d="M10 11v6M14 11v6" strokeLinecap="round" />
+                            </svg>
+                          </button>
                         </div>
                         <div className="mt-1 flex items-center justify-between gap-2">
                           <span className="text-[11px] text-gray-500">Token</span>
@@ -1301,13 +1366,13 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 <button
                   onClick={async () => {
                     const profileId = editingTaggedProfile.profile.profile_id
-                    if (!window.confirm('ลบ token โปรไฟล์นี้ออกจาก BrowserSaving และหน้านี้ใช่ไหม?')) return
-                    await mutateTaggedProfileToken(profileId, '', 'delete')
+                    if (!window.confirm('ลบโปรไฟล์นี้ออกจากเพจนี้ใช่ไหม? ถ้าอยากให้กลับมา ให้กดซิงค์โทเค็นใหม่')) return
+                    await unlinkTaggedProfileFromPage(profileId)
                   }}
-                  disabled={!!taggedTokenMutation || !String(editingTaggedProfile.profile.token || editingTaggedTokenValue || '').trim()}
+                  disabled={!!taggedTokenMutation}
                   className="flex-1 py-3 rounded-xl font-bold text-sm bg-red-500 text-white active:scale-95 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  {taggedTokenMutation === 'delete' ? 'กำลังลบ...' : 'ลบ Token'}
+                  {taggedTokenMutation === 'unlink' ? 'กำลังลบ...' : 'ลบออกจากเพจ'}
                 </button>
                 <button
                   onClick={async () => {
@@ -1445,7 +1510,17 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   )
 }
 
-function ProcessingCard({ video, onCancel }: { video: any, onCancel: (id: string, isQueued: boolean) => void }) {
+function ProcessingCard({
+  video,
+  onCancel,
+  onReprocess,
+  retrying,
+}: {
+  video: any,
+  onCancel: (id: string, isQueued: boolean) => void,
+  onReprocess: (id: string) => void,
+  retrying: boolean,
+}) {
   const displayProgress = video.status === 'queued' ? 0 : Math.max(5, Math.min(100, Math.floor(((video.step || 0) / 5) * 100)));
 
   const [elapsed, setElapsed] = useState(0);
@@ -1473,13 +1548,34 @@ function ProcessingCard({ video, onCancel }: { video: any, onCancel: (id: string
             <p className="text-[10px] text-gray-400 font-medium">เริ่มเมื่อ {new Date(video.createdAt).toLocaleTimeString('th-TH')}</p>
           </div>
         </div>
-        <button
-          onClick={() => onCancel(video.id, video.status === 'queued')}
-          title={video.status === 'failed' ? 'ลบประวัติ' : 'ยกเลิก'}
-          className={`p-2 rounded-full transition-colors ${video.status === 'failed' ? 'bg-red-50 text-red-500 hover:bg-red-100' : 'bg-gray-50 text-gray-400 hover:bg-red-50 hover:text-red-500'}`}
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-        </button>
+        <div className="flex items-center gap-2">
+          {video.status === 'failed' && (
+            <button
+              onClick={() => onReprocess(video.id)}
+              disabled={retrying}
+              title="ประมวลผลใหม่"
+              className="p-2 rounded-full bg-blue-50 text-blue-500 hover:bg-blue-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {retrying ? (
+                <div className="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent animate-spin rounded-full" />
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 2v6h-6" />
+                  <path d="M3 11a9 9 0 0 1 15-6.7L21 8" />
+                  <path d="M3 22v-6h6" />
+                  <path d="M21 13a9 9 0 0 1-15 6.7L3 16" />
+                </svg>
+              )}
+            </button>
+          )}
+          <button
+            onClick={() => onCancel(video.id, video.status === 'queued')}
+            title={video.status === 'failed' ? 'ลบประวัติ' : 'ยกเลิก'}
+            className={`p-2 rounded-full transition-colors ${video.status === 'failed' ? 'bg-red-50 text-red-500 hover:bg-red-100' : 'bg-gray-50 text-gray-400 hover:bg-red-50 hover:text-red-500'}`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+          </button>
+        </div>
       </div>
 
       {/* Middle Row: Status Text + Link + % */}
@@ -1803,11 +1899,11 @@ function App() {
   const [geminiApiKeyLoading, setGeminiApiKeyLoading] = useState(false)
   const [geminiApiKeySaving, setGeminiApiKeySaving] = useState(false)
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
-  const [shortlinkBaseUrlDraft, setShortlinkBaseUrlDraft] = useState('')
-  const [shortlinkBaseUrlCurrent, setShortlinkBaseUrlCurrent] = useState('')
-  const [shortlinkExpectedUtmIdDraft, setShortlinkExpectedUtmIdDraft] = useState('')
-  const [shortlinkExpectedUtmIdCurrent, setShortlinkExpectedUtmIdCurrent] = useState('')
-  const [shortlinkEnabled, setShortlinkEnabled] = useState(false)
+  const [shortlinkBaseUrlDraft, setShortlinkBaseUrlDraft] = useState(() => getStoredShortlinkBaseUrl(botScope))
+  const [shortlinkBaseUrlCurrent, setShortlinkBaseUrlCurrent] = useState(() => getStoredShortlinkBaseUrl(botScope))
+  const [shortlinkExpectedUtmIdDraft, setShortlinkExpectedUtmIdDraft] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
+  const [shortlinkExpectedUtmIdCurrent, setShortlinkExpectedUtmIdCurrent] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
+  const [shortlinkEnabled, setShortlinkEnabled] = useState(() => !!getStoredShortlinkBaseUrl(botScope))
   const [shortlinkUpdatedAt, setShortlinkUpdatedAt] = useState('')
   const [shortlinkMessage, setShortlinkMessage] = useState('')
   const [shortlinkLoading, setShortlinkLoading] = useState(false)
@@ -1827,7 +1923,9 @@ function App() {
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null)
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null)
   const [videos, setVideos] = useState<Video[]>(() => {
-    const ns = getStoredNamespace()
+    const shortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
+    if (shortlinkBaseUrl) return readCache<Video[]>(systemGalleryCacheKey(botScope), [])
+    const ns = getStoredNamespace(botScope)
     if (ns) return readCache<Video[]>(nsCacheKey('gallery', ns), [])
     return readCache<Video[]>(globalCacheKey('gallery'), [])
   })
@@ -1839,8 +1937,12 @@ function App() {
   const [globalOriginalVideos, setGlobalOriginalVideos] = useState<GlobalOriginalVideo[]>([])
   const [globalOriginalLoading, setGlobalOriginalLoading] = useState(false)
   const [processingVideos, setProcessingVideos] = useState<Video[]>([])
+  const [retryingProcessingId, setRetryingProcessingId] = useState<string | null>(null)
   const [loading, setLoading] = useState(() => {
-    const ns = getStoredNamespace()
+    if (getStoredShortlinkBaseUrl(botScope)) {
+      return readCache<Video[]>(systemGalleryCacheKey(botScope), []).length === 0
+    }
+    const ns = getStoredNamespace(botScope)
     if (ns) {
       const hasGallery = readCache<Video[]>(nsCacheKey('gallery', ns), []).length > 0
       const hasUsed = readCache<Video[]>(nsCacheKey('used', ns), []).length > 0
@@ -1890,6 +1992,7 @@ function App() {
   const [deletingPageId, setDeletingPageId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const loadAllInFlightRef = useRef(false)
+  const loadAllPendingRef = useRef(false)
   const processingFetchInFlightRef = useRef(false)
   const usedFetchInFlightRef = useRef(false)
   const globalOriginalFetchInFlightRef = useRef(false)
@@ -1897,12 +2000,20 @@ function App() {
   const loadTeamRequestRef = useRef(0)
   const lastUsedFetchAtRef = useRef(0)
   const lastGlobalOriginalFetchAtRef = useRef(0)
+  const systemWideGalleryMode = !!String(shortlinkBaseUrlCurrent || '').trim()
+  const systemWideGalleryModeRef = useRef(systemWideGalleryMode)
+
+  useEffect(() => {
+    systemWideGalleryModeRef.current = systemWideGalleryMode
+  }, [systemWideGalleryMode])
 
   const tg = window.Telegram?.WebApp
   const hydrateNamespaceCaches = (ns: string) => {
     const scopedNamespace = String(ns || '').trim()
     if (!scopedNamespace) return
-    const cachedVideos = readCache<Video[]>(nsCacheKey('gallery', scopedNamespace), [])
+    const cachedVideos = String(shortlinkBaseUrlCurrent || getStoredShortlinkBaseUrl(botScope) || '').trim()
+      ? readCache<Video[]>(systemGalleryCacheKey(botScope), [])
+      : readCache<Video[]>(nsCacheKey('gallery', scopedNamespace), [])
     const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
     setVideos(cachedVideos)
@@ -1921,9 +2032,23 @@ function App() {
   }, [botScope, namespaceId])
 
   useEffect(() => {
+    try {
+      if (shortlinkBaseUrlCurrent) localStorage.setItem(scopedStorageKey('shortlink_base_url', botScope), shortlinkBaseUrlCurrent)
+      else localStorage.removeItem(scopedStorageKey('shortlink_base_url', botScope))
+
+      if (shortlinkExpectedUtmIdCurrent) localStorage.setItem(scopedStorageKey('shortlink_expected_utm_id', botScope), shortlinkExpectedUtmIdCurrent)
+      else localStorage.removeItem(scopedStorageKey('shortlink_expected_utm_id', botScope))
+    } catch { }
+  }, [botScope, shortlinkBaseUrlCurrent, shortlinkExpectedUtmIdCurrent])
+
+  useEffect(() => {
+    if (systemWideGalleryMode) {
+      writeCache(systemGalleryCacheKey(botScope), videos)
+      return
+    }
     if (!namespaceId) return
     writeCache(nsCacheKey('gallery', namespaceId), videos)
-  }, [namespaceId, videos])
+  }, [botScope, namespaceId, systemWideGalleryMode, videos])
 
   useEffect(() => {
     if (!namespaceId) return
@@ -1954,6 +2079,13 @@ function App() {
   useEffect(() => {
     setTokenState(getToken(botScope))
     setNamespaceId(getStoredNamespace(botScope))
+    const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
+    const storedShortlinkExpectedUtmId = getStoredShortlinkExpectedUtmId(botScope)
+    setShortlinkBaseUrlCurrent(storedShortlinkBaseUrl)
+    setShortlinkBaseUrlDraft(storedShortlinkBaseUrl)
+    setShortlinkExpectedUtmIdCurrent(storedShortlinkExpectedUtmId)
+    setShortlinkExpectedUtmIdDraft(storedShortlinkExpectedUtmId)
+    setShortlinkEnabled(!!storedShortlinkBaseUrl)
     setMeEmail('')
     setIsOwner(false)
     setTeamMembers([])
@@ -2053,12 +2185,18 @@ function App() {
   }, [isOwner, settingsSection])
 
   useEffect(() => {
-    if (authBootstrapping || !token || !isOwner) return
-    if (tab !== 'settings') return
+    if (authBootstrapping || !token) return
+    void loadShortlinkSettings()
+    if (!isOwner) return
     void loadVoicePrompt()
     void loadGeminiApiKey()
-    void loadShortlinkSettings()
-  }, [tab, token, authBootstrapping, isOwner])
+  }, [token, authBootstrapping, isOwner])
+
+  useEffect(() => {
+    if (!systemWideGalleryMode) return
+    setVideos(readCache<Video[]>(systemGalleryCacheKey(botScope), []))
+    if (postedLinkFilter === 'all') setPostedLinkFilter('with-link')
+  }, [botScope, systemWideGalleryMode, postedLinkFilter])
 
   useEffect(() => {
     if (authBootstrapping || !token || tab !== 'dashboard') return
@@ -2171,7 +2309,10 @@ function App() {
   }
 
   async function loadAll() {
-    if (loadAllInFlightRef.current) return
+    if (loadAllInFlightRef.current) {
+      loadAllPendingRef.current = true
+      return
+    }
     loadAllInFlightRef.current = true
 
     const session = getToken()
@@ -2201,7 +2342,8 @@ function App() {
       })()
 
       const galleryTask = (async () => {
-        const galleryResp = await apiFetch(`${WORKER_URL}/api/gallery`)
+        const galleryEndpoint = `${WORKER_URL}/api/gallery`
+        const galleryResp = await apiFetch(galleryEndpoint)
         if (galleryResp.status === 401) {
           await onUnauthorized()
           return
@@ -2218,6 +2360,10 @@ function App() {
       loadAllInFlightRef.current = false
       void loadProcessingSnapshot()
       void loadUsedVideos()
+      if (loadAllPendingRef.current) {
+        loadAllPendingRef.current = false
+        void loadAll()
+      }
     }
   }
 
@@ -2233,6 +2379,11 @@ function App() {
     void loadUsedVideos({ force: categoryFilter === 'used' })
     if (isOwner) void loadGlobalOriginalVideos()
   }, [tab, categoryFilter, token, authBootstrapping, isOwner])
+
+  useEffect(() => {
+    if (authBootstrapping || !token) return
+    void loadAll()
+  }, [systemWideGalleryMode])
 
 
 
@@ -2305,7 +2456,6 @@ function App() {
           const ns = String(me.namespace_id || '').trim()
           if (ns && ns !== namespaceId) {
             setNamespaceId(ns)
-            hydrateNamespaceCaches(ns)
           }
         }
       }
@@ -2493,7 +2643,7 @@ function App() {
 
   async function loadShortlinkSettings() {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setShortlinkMessage('')
     setShortlinkLoading(true)
     try {
@@ -2726,6 +2876,20 @@ function App() {
     } catch { }
   }
 
+  const handleReprocessJob = async (id: string) => {
+    setRetryingProcessingId(id)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/processing/${encodeURIComponent(id)}/reprocess`, {
+        method: 'POST',
+      })
+      if (!resp.ok) return
+      await loadProcessingSnapshot()
+    } catch {
+    } finally {
+      setRetryingProcessingId(null)
+    }
+  }
+
   // If viewing a specific page detail
   if (selectedPage) {
     return (
@@ -2771,6 +2935,12 @@ function App() {
     const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
     return Number.isFinite(ts) ? ts : 0
   }
+  const gallerySystemWithLinkVideos = videos
+    .filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
+  const gallerySystemWithoutLinkVideos = videos
+    .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
   // วิดีโอที่ยังไม่มี Shopee link
   const galleryMissingLinkVideos = videos
     .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
@@ -2807,15 +2977,18 @@ function App() {
     : postedLinkFilter === 'no-link'
       ? galleryUsedWithoutLinkVideos
       : galleryUsedVideos
-  const galleryAvailableVideos = (categoryFilter === 'used' || categoryFilter === 'missing-link')
+  const galleryAvailableVideos = systemWideGalleryMode
+    ? (postedLinkFilter === 'no-link' ? gallerySystemWithoutLinkVideos : gallerySystemWithLinkVideos)
+    : (categoryFilter === 'used' || categoryFilter === 'missing-link')
     ? galleryUsedVisibleVideos
     : galleryUnusedVideos
   const showGalleryFilterBar = tab === 'gallery' && (
     loading ||
-    galleryUnusedVideos.length > 0 ||
-    galleryUsedVideos.length > 0
+    (systemWideGalleryMode
+      ? (videos.length > 0)
+      : (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0))
   )
-  const showPostedSubFilterBar = tab === 'gallery' && categoryFilter === 'used' && showGalleryFilterBar
+  const showPostedSubFilterBar = tab === 'gallery' && !systemWideGalleryMode && categoryFilter === 'used' && showGalleryFilterBar
   const galleryHeaderOffset = showGalleryFilterBar ? (showPostedSubFilterBar ? 214 : 164) : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
   const galleryVisibleVideos = galleryAvailableVideos
@@ -2848,18 +3021,37 @@ function App() {
           </h1>
           {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
-              <button
-                onClick={() => setCategoryFilter('unused')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
-              </button>
-              <button
-                onClick={() => setCategoryFilter('used')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                โพสต์แล้ว ({galleryUsedVideos.length})
-              </button>
+              {systemWideGalleryMode ? (
+                <>
+                  <button
+                    onClick={() => setPostedLinkFilter('with-link')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${postedLinkFilter !== 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  >
+                    มีลิ้ง ({gallerySystemWithLinkVideos.length})
+                  </button>
+                  <button
+                    onClick={() => setPostedLinkFilter('no-link')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${postedLinkFilter === 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  >
+                    ไม่มีลิ้ง ({gallerySystemWithoutLinkVideos.length})
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setCategoryFilter('unused')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  >
+                    ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
+                  </button>
+                  <button
+                    onClick={() => setCategoryFilter('used')}
+                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  >
+                    โพสต์แล้ว ({galleryUsedVideos.length})
+                  </button>
+                </>
+              )}
             </div>
           )}
           {tab === 'gallery' && showPostedSubFilterBar && (
@@ -2994,7 +3186,13 @@ function App() {
             ) : (
               <div className="space-y-3">
                 {processingVideos.map((video: any) => (
-                  <ProcessingCard key={video.id} video={video} onCancel={handleCancelJob} />
+                  <ProcessingCard
+                    key={video.id}
+                    video={video}
+                    onCancel={handleCancelJob}
+                    onReprocess={handleReprocessJob}
+                    retrying={retryingProcessingId === video.id}
+                  />
                 ))}
               </div>
             )}
@@ -3037,7 +3235,11 @@ function App() {
                   <span className="text-4xl grayscale opacity-50">🎬</span>
                 </div>
                 <p className="text-gray-900 font-bold text-lg">
-                  {categoryFilter === 'used'
+                  {systemWideGalleryMode
+                    ? postedLinkFilter === 'no-link'
+                      ? 'ยังไม่มีคลิปที่ไม่มีลิ้ง'
+                      : 'ยังไม่มีคลิปที่มีลิ้ง'
+                    : categoryFilter === 'used'
                     ? postedLinkFilter === 'with-link'
                       ? 'ยังไม่มีคลิปที่มีลิ้ง'
                       : postedLinkFilter === 'no-link'
@@ -3046,7 +3248,11 @@ function App() {
                     : 'ไม่มีคลิปพร้อมโพสต์'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
-                  {categoryFilter === 'used'
+                  {systemWideGalleryMode
+                    ? postedLinkFilter === 'no-link'
+                      ? 'คลิปทุก workspace ที่ยังไม่มีลิ้งจะแสดงที่นี่'
+                      : 'คลิปทุก workspace ที่มีลิ้งจะแสดงที่นี่'
+                    : categoryFilter === 'used'
                     ? postedLinkFilter === 'with-link'
                       ? 'คลิปที่มีลิ้งจะแสดงที่นี่'
                       : postedLinkFilter === 'no-link'
@@ -3059,17 +3265,17 @@ function App() {
               <div className="grid grid-cols-3 gap-3">
                 {galleryVisibleVideos.map((video) => (
                   <VideoCard
-                    key={video.id}
+                    key={getVideoIdentityKey(video as unknown as Record<string, unknown>)}
                     video={video}
                     formatDuration={formatDuration}
-                    keepInPostedOnLinkSave={categoryFilter === 'used'}
-                    onDelete={(id) => {
-                      setVideos(videos.filter(v => v.id !== id));
-                      setUsedVideos(usedVideos.filter(v => v.id !== id));
+                    keepInPostedOnLinkSave={!systemWideGalleryMode && categoryFilter === 'used'}
+                    onDelete={(id, targetNamespaceId) => {
+                      setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                      setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
                     }}
-                    onUpdate={(id, fields) => {
-                      setVideos(videos.map(v => v.id === id ? { ...v, ...fields } : v));
-                      setUsedVideos(usedVideos.map(v => v.id === id ? { ...v, ...fields } : v));
+                    onUpdate={(id, targetNamespaceId, fields) => {
+                      setVideos(videos.map(v => matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId) ? { ...v, ...fields } : v));
+                      setUsedVideos(usedVideos.map(v => matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId) ? { ...v, ...fields } : v));
                     }}
                     onExpandedChange={setVideoViewerOpen}
                   />

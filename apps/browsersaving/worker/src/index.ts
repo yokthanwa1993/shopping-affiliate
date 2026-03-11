@@ -1577,6 +1577,40 @@ function stringifyUnknown(value: unknown): string {
     }
 }
 
+async function persistResolvedPageToken(c: any, input: {
+    profileId: string;
+    profileName: string;
+    resolvedPage: { pageToken: string; pageId: string; pageName: string; pageAvatarUrl: string };
+}) {
+    await saveProfileToken(c, input.profileId, input.resolvedPage.pageToken);
+    await c.env.DB.prepare(
+        "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
+    ).bind(
+        input.resolvedPage.pageName || null,
+        input.resolvedPage.pageAvatarUrl || null,
+        input.profileId
+    ).run();
+    console.log(`🔑 ${input.profileName}: Token saved`);
+
+    let videoAffiliateSync: { ok: boolean; namespace_id?: string; error?: string } = { ok: false };
+    try {
+        const synced = await pushVideoAffiliatePageSync(c, {
+            profileId: input.profileId,
+            pageId: input.resolvedPage.pageId,
+            pageName: input.resolvedPage.pageName,
+            pageAvatarUrl: input.resolvedPage.pageAvatarUrl,
+            accessToken: input.resolvedPage.pageToken,
+        });
+        videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
+    } catch (syncErr) {
+        const message = String(syncErr || '');
+        console.log(`[VIDEO-AFFILIATE] page sync failed for ${input.profileName}: ${message}`);
+        videoAffiliateSync = { ok: false, error: message };
+    }
+
+    return videoAffiliateSync;
+}
+
 
 
 
@@ -1636,31 +1670,11 @@ async function handleGetToken(c: any, profileId: string) {
             }, 400);
         }
 
-        await saveProfileToken(c, profileId, resolvedPage.pageToken);
-        await c.env.DB.prepare(
-            "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
-        ).bind(
-            resolvedPage.pageName || null,
-            resolvedPage.pageAvatarUrl || null,
-            profileId
-        ).run();
-        console.log(`🔑 ${profile.name}: Token saved`);
-
-        let videoAffiliateSync: { ok: boolean; namespace_id?: string; error?: string } = { ok: false };
-        try {
-            const synced = await pushVideoAffiliatePageSync(c, {
-                profileId,
-                pageId: resolvedPage.pageId,
-                pageName: resolvedPage.pageName,
-                pageAvatarUrl: resolvedPage.pageAvatarUrl,
-                accessToken: resolvedPage.pageToken,
-            });
-            videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
-        } catch (syncErr) {
-            const message = String(syncErr || '');
-            console.log(`[VIDEO-AFFILIATE] page sync failed for ${profile.name}: ${message}`);
-            videoAffiliateSync = { ok: false, error: message };
-        }
+        const videoAffiliateSync = await persistResolvedPageToken(c, {
+            profileId,
+            profileName: profile.name,
+            resolvedPage,
+        });
 
         return c.json({
             success: true,
@@ -1686,6 +1700,56 @@ app.get('/api/token/:profileId', async (c) => {
     const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
     if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
     return handleGetToken(c, profileId);
+});
+
+// POST /api/token/:profileId/resolve - Resolve local user token into saved page token
+app.post('/api/token/:profileId/resolve', async (c) => {
+    const profileId = c.req.param('profileId');
+    const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
+    if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
+
+    const body = await c.req.json().catch(() => ({} as any));
+    const userToken = normalizeToken(body?.user_token);
+    if (!userToken) {
+        return c.json({ error: 'Missing user_token', profileId }, 400);
+    }
+
+    const profile = await c.env.DB.prepare(
+        'SELECT id, name, tags, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL'
+    ).bind(profileId).first<Profile>();
+
+    if (!profile) {
+        return c.json({ error: 'Profile not found', profileId }, 404);
+    }
+
+    try {
+        const resolvedPage = await resolveProfilePageToken(userToken, profile);
+        const videoAffiliateSync = await persistResolvedPageToken(c, {
+            profileId,
+            profileName: profile.name,
+            resolvedPage,
+        });
+
+        return c.json({
+            success: true,
+            profile: profile.name,
+            profileId,
+            token: resolvedPage.pageToken,
+            token_source: 'local_cli',
+            page_id: resolvedPage.pageId || null,
+            page_name: resolvedPage.pageName || null,
+            page_avatar_url: resolvedPage.pageAvatarUrl || null,
+            savedAt: new Date().toISOString(),
+            video_affiliate_sync: videoAffiliateSync,
+        });
+    } catch (err) {
+        console.error(`❌ ${profile.name}: ${err}`);
+        return c.json({
+            error: `Failed to resolve local user token: ${String(err)}`,
+            profileId,
+            profile: profile.name,
+        }, 400);
+    }
 });
 
 // Backward-compatible routes (redirect to unified handler)
