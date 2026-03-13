@@ -2,12 +2,15 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import puppeteer from '@cloudflare/puppeteer';
 import pako from 'pako';
 
 type Bindings = {
     DB: D1Database;
     BUCKET: R2Bucket;
+    MYBROWSER?: Fetcher;
     ENVIRONMENT: string;
+    BROWSERSAVING_API_URL?: string;
     BROWSERSAVING_UPDATE_VERSION?: string;
     BROWSERSAVING_UPDATE_NOTES?: string;
     BROWSERSAVING_UPDATE_NOTES_PUBLISHED?: string;
@@ -66,6 +69,10 @@ function normalizeToken(raw: unknown): string {
     return String(raw || '').trim();
 }
 
+function looksLikeCommentAccessToken(raw: unknown): boolean {
+    return /^EAAD6/i.test(normalizeToken(raw));
+}
+
 function isCommentRoleToken(token: string): boolean {
     const t = normalizeToken(token);
     return !!t;
@@ -98,6 +105,25 @@ function parsePageIdFromAvatarUrl(raw: string): string {
 
 function normalizePageName(raw: unknown): string {
     return String(raw || '').trim().toLowerCase();
+}
+
+function normalizeTrustedOwnerEmailFilters(rawValues: unknown[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+
+    for (const raw of rawValues || []) {
+        const source = String(raw || '').trim();
+        if (!source) continue;
+        for (const part of source.split(',')) {
+            const email = normalizeEmail(part);
+            if (!isValidEmail(email)) continue;
+            if (seen.has(email)) continue;
+            seen.add(email);
+            out.push(email);
+        }
+    }
+
+    return out;
 }
 
 function normalizeTagList(raw: unknown): string[] {
@@ -157,6 +183,18 @@ type FacebookAccountItem = {
 function pickTargetFacebookPage(accounts: FacebookAccountItem[], profile: Partial<Profile>): FacebookAccountItem | null {
     if (!Array.isArray(accounts) || accounts.length === 0) return null;
 
+    const preferredPageId = String((profile as any).__preferred_page_id || '').trim();
+    if (preferredPageId) {
+        const byPreferredId = accounts.find((acc) => String(acc?.id || '').trim() === preferredPageId);
+        if (byPreferredId) return byPreferredId;
+    }
+
+    const preferredPageName = normalizePageName((profile as any).__preferred_page_name || '');
+    if (preferredPageName) {
+        const byPreferredName = accounts.find((acc) => normalizePageName(acc?.name || '') === preferredPageName);
+        if (byPreferredName) return byPreferredName;
+    }
+
     const profileNameHint = normalizePageName(profile.name || '');
     const storedPageNameHint = normalizePageName(profile.page_name || '');
     const hasExplicitPageHint =
@@ -188,6 +226,44 @@ function pickTargetFacebookPage(accounts: FacebookAccountItem[], profile: Partia
     return accounts[0] || null;
 }
 
+async function resolvePreferredProfilePageHint(profile: Partial<Profile>): Promise<{
+    pageId: string;
+    pageName: string;
+    pageAvatarUrl: string;
+}> {
+    const hintedPageId = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''));
+    const hintedPageName = String(profile.page_name || '').trim();
+    const hintedAvatarUrl = String(profile.page_avatar_url || '').trim();
+    const currentCommentPageToken = normalizeToken((profile as any)?.access_token);
+
+    if (currentCommentPageToken) {
+        try {
+            const me = await fetchFacebookMeIdentity(currentCommentPageToken);
+            const hintedPageNameNormalized = normalizePageName(hintedPageName);
+            const matchesStoredHint =
+                (!!hintedPageId && me.id === hintedPageId)
+                || (!!hintedPageNameNormalized && normalizePageName(me.name) === hintedPageNameNormalized);
+            if (!matchesStoredHint) {
+                throw new Error('stored_access_token_hint_mismatch');
+            }
+            const pageId = String(me.id || '').trim() || hintedPageId;
+            const pageName = String(me.name || '').trim() || hintedPageName || pageId;
+            const pageAvatarUrl = String(me.pictureUrl || '').trim()
+                || hintedAvatarUrl
+                || (pageId ? `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large` : '');
+            return { pageId, pageName, pageAvatarUrl };
+        } catch {
+            // Fall back to stored metadata below.
+        }
+    }
+
+    return {
+        pageId: hintedPageId,
+        pageName: hintedPageName || hintedPageId,
+        pageAvatarUrl: hintedAvatarUrl || (hintedPageId ? `https://graph.facebook.com/${encodeURIComponent(hintedPageId)}/picture?type=large` : ''),
+    };
+}
+
 async function resolveProfilePageToken(userToken: string, profile: Partial<Profile>) {
     const token = normalizeToken(userToken);
     if (!token) throw new Error('user_token_empty');
@@ -203,7 +279,12 @@ async function resolveProfilePageToken(userToken: string, profile: Partial<Profi
     const accounts = Array.isArray(data?.data) ? (data.data as FacebookAccountItem[]) : [];
     if (accounts.length === 0) throw new Error('facebook_me_accounts_empty');
 
-    const matched = pickTargetFacebookPage(accounts, profile);
+    const preferredHint = await resolvePreferredProfilePageHint(profile);
+    const matched = pickTargetFacebookPage(accounts, {
+        ...profile,
+        __preferred_page_id: preferredHint.pageId,
+        __preferred_page_name: preferredHint.pageName,
+    } as Partial<Profile>);
     if (!matched) {
         throw new Error('facebook_me_accounts_ambiguous_profile_page_not_matched');
     }
@@ -218,6 +299,77 @@ async function resolveProfilePageToken(userToken: string, profile: Partial<Profi
     const pageAvatarUrl = String(matched?.picture?.data?.url || '').trim();
 
     return { pageToken, pageId, pageName, pageAvatarUrl };
+}
+
+async function fetchFacebookMeIdentity(tokenRaw: string): Promise<{ id: string; name: string; pictureUrl: string }> {
+    const token = normalizeToken(tokenRaw);
+    if (!token) throw new Error('facebook_me_identity_token_empty');
+
+    const url = `https://graph.facebook.com/v21.0/me?fields=id,name,picture.type(large)&access_token=${encodeURIComponent(token)}`;
+    const response = await fetch(url);
+    const data = await response.json().catch(() => ({} as any));
+    if (!response.ok) {
+        const message = String(data?.error?.message || data?.error || `HTTP ${response.status}`);
+        throw new Error(`facebook_me_identity_failed: ${message}`);
+    }
+
+    const id = String(data?.id || '').trim();
+    if (!id) throw new Error('facebook_me_identity_missing_id');
+
+    return {
+        id,
+        name: String(data?.name || '').trim(),
+        pictureUrl: String(data?.picture?.data?.url || '').trim(),
+    };
+}
+
+async function resolveStoredPageTokenForSync(tokenRaw: string, profile: Partial<Profile>): Promise<{
+    pageToken: string;
+    pageId: string;
+    pageName: string;
+    pageAvatarUrl: string;
+}> {
+    const token = normalizeToken(tokenRaw);
+    if (!token) throw new Error('stored_page_token_empty');
+    const preferredHint = await resolvePreferredProfilePageHint(profile);
+
+    try {
+        return await resolveProfilePageToken(token, profile);
+    } catch (resolveErr) {
+        try {
+            const me = await fetchFacebookMeIdentity(token);
+            const hintedPageId = String(preferredHint.pageId || '').trim();
+            const hintedPageName = String(preferredHint.pageName || '').trim();
+            const hintedAvatarUrl = String(preferredHint.pageAvatarUrl || '').trim();
+            const hintedPageNameNormalized = normalizePageName(hintedPageName);
+            const matchesHint =
+                !hintedPageId && !hintedPageNameNormalized
+                || (!!hintedPageId && me.id === hintedPageId)
+                || (!!hintedPageNameNormalized && normalizePageName(me.name) === hintedPageNameNormalized);
+
+            if (!matchesHint) {
+                throw new Error(`stored_page_token_mismatch:${hintedPageId || hintedPageNameNormalized || 'unknown'}:${me.id}`);
+            }
+
+            const pageId = me.id || hintedPageId;
+            const pageName = me.name || hintedPageName || pageId;
+            const pageAvatarUrl = me.pictureUrl
+                || hintedAvatarUrl
+                || (pageId ? `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large` : '');
+
+            return {
+                pageToken: token,
+                pageId,
+                pageName,
+                pageAvatarUrl,
+            };
+        } catch (identityErr) {
+            if (identityErr instanceof Error && identityErr.message.startsWith('stored_page_token_mismatch:')) {
+                throw identityErr;
+            }
+            throw resolveErr;
+        }
+    }
 }
 
 // CORS
@@ -248,11 +400,20 @@ function getAuthEmail(c: any): string {
     return normalizeEmail(c.get('authEmail') || '');
 }
 
+function isPublicApiPath(pathRaw: string): boolean {
+    const path = String(pathRaw || '').trim();
+    return path.startsWith('/api/auth/') || path.startsWith('/api/updates/');
+}
+
 function verifyVideoAffiliateProvisionSecret(c: any): boolean {
     const configured = String(c.env.VIDEO_AFFILIATE_TAG_SYNC_SECRET || '').trim();
     if (!configured) return false;
     const incoming = String(c.req.header('x-tag-sync-secret') || '').trim();
     return !!incoming && incoming === configured;
+}
+
+function hasTrustedVideoAffiliateAccess(c: any): boolean {
+    return verifyVideoAffiliateProvisionSecret(c);
 }
 
 function randomHex(bytes = 16): string {
@@ -304,8 +465,17 @@ async function maybeClaimUnownedProfiles(db: D1Database, email: string): Promise
 }
 
 async function ensureProfileAccess(c: any, profileId: string, options: { includeDeleted?: boolean } = {}): Promise<boolean> {
+    if (hasTrustedVideoAffiliateAccess(c)) {
+        const includeDeleted = options.includeDeleted === true;
+        const sql = includeDeleted
+            ? 'SELECT id FROM profiles WHERE id = ?'
+            : 'SELECT id FROM profiles WHERE id = ? AND deleted_at IS NULL';
+        const row = await c.env.DB.prepare(sql).bind(profileId).first<{ id?: string }>();
+        return !!row?.id;
+    }
+
     const authEmail = getAuthEmail(c);
-    if (!authEmail) return true;
+    if (!authEmail) return false;
 
     const includeDeleted = options.includeDeleted === true;
     const sql = includeDeleted
@@ -382,20 +552,22 @@ async function pushVideoAffiliatePageSync(c: any, input: {
     pageName?: string;
     pageAvatarUrl?: string;
     accessToken: string;
+    commentToken?: string;
 }): Promise<{ namespaceId: string }> {
     const pageId = String(input.pageId || '').trim();
     const accessToken = normalizeToken(input.accessToken);
+    const commentToken = normalizeToken(input.commentToken);
     if (!pageId || !accessToken) throw new Error('video_affiliate_page_sync_missing_required_fields');
 
     const authEmail = getAuthEmail(c);
-    let namespaceId = String(c.env.VIDEO_AFFILIATE_NAMESPACE_ID || '').trim();
-    if (authEmail) {
-        try {
-            const workspace = await resolveVideoAffiliateWorkspaceByEmail(c, authEmail);
-            if (workspace.namespaceId) namespaceId = workspace.namespaceId;
-        } catch (err) {
-            console.log(`[VIDEO-AFFILIATE] namespace resolve failed for ${authEmail}: ${String(err)}`);
-        }
+    if (!authEmail) throw new Error('video_affiliate_auth_email_missing');
+
+    let namespaceId = '';
+    try {
+        const workspace = await resolveVideoAffiliateWorkspaceByEmail(c, authEmail);
+        if (workspace.namespaceId) namespaceId = workspace.namespaceId;
+    } catch (err) {
+        console.log(`[VIDEO-AFFILIATE] namespace resolve failed for ${authEmail}: ${String(err)}`);
     }
     if (!namespaceId) throw new Error('video_affiliate_namespace_not_found');
 
@@ -413,6 +585,7 @@ async function pushVideoAffiliatePageSync(c: any, input: {
         page_name: String(input.pageName || '').trim() || null,
         page_avatar_url: String(input.pageAvatarUrl || '').trim() || null,
         access_token: accessToken,
+        comment_token: commentToken || null,
     });
 
     let response: Response;
@@ -469,6 +642,26 @@ app.use('/api/*', async (c, next) => {
         }
     } catch (err) {
         console.log(`auth middleware lookup failed: ${String(err)}`);
+    }
+
+    await next();
+});
+
+app.use('/api/*', async (c, next) => {
+    if (isPublicApiPath(c.req.path)) {
+        await next();
+        return;
+    }
+
+    if (hasTrustedVideoAffiliateAccess(c)) {
+        await next();
+        return;
+    }
+
+    const authEmail = getAuthEmail(c);
+    const authToken = String(c.get('authToken') || '').trim();
+    if (!authEmail || !authToken) {
+        return c.json({ error: 'Unauthorized' }, 401);
     }
 
     await next();
@@ -651,12 +844,21 @@ async function createBackup(db: D1Database, profileId: string, action: 'update' 
 app.get('/api/profiles', async (c) => {
     const includeDeleted = c.req.query('include_deleted') === 'true';
     const authEmail = getAuthEmail(c);
+    const trustedOwnerEmails = hasTrustedVideoAffiliateAccess(c)
+        ? normalizeTrustedOwnerEmailFilters([
+            c.req.query('owner_email'),
+            c.req.query('owner_emails'),
+        ])
+        : [];
     const whereParts: string[] = [];
     const binds: unknown[] = [];
     if (!includeDeleted) whereParts.push('deleted_at IS NULL');
     if (authEmail) {
         whereParts.push("lower(trim(coalesce(owner_email, ''))) = ?");
         binds.push(authEmail);
+    } else if (trustedOwnerEmails.length > 0) {
+        whereParts.push(`lower(trim(coalesce(owner_email, ''))) IN (${trustedOwnerEmails.map(() => '?').join(',')})`);
+        binds.push(...trustedOwnerEmails);
     }
     const whereSql = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
     const query = `SELECT * FROM profiles ${whereSql} ORDER BY created_at DESC`;
@@ -672,15 +874,75 @@ app.get('/api/profiles', async (c) => {
     return c.json(profiles);
 });
 
+// GET /api/profiles/name-conflicts - Find matching names that also exist in other workspaces
+app.get('/api/profiles/name-conflicts', async (c) => {
+    const authEmail = getAuthEmail(c);
+    const query = normalizePageName(c.req.query('q') || '');
+
+    if (!authEmail || query.length < 2) {
+        return c.json([]);
+    }
+
+    const like = `%${query}%`;
+    const { results } = await c.env.DB.prepare(
+        `WITH current_matches AS (
+            SELECT
+                lower(trim(coalesce(name, ''))) AS normalized_name,
+                MIN(name) AS sample_name,
+                COUNT(*) AS current_count
+            FROM profiles
+            WHERE deleted_at IS NULL
+              AND lower(trim(coalesce(owner_email, ''))) = ?
+              AND lower(trim(coalesce(name, ''))) LIKE ?
+            GROUP BY lower(trim(coalesce(name, '')))
+        ),
+        other_matches AS (
+            SELECT
+                lower(trim(coalesce(name, ''))) AS normalized_name,
+                COUNT(*) AS other_count,
+                COUNT(DISTINCT lower(trim(coalesce(owner_email, '')))) AS other_owner_count
+            FROM profiles
+            WHERE deleted_at IS NULL
+              AND lower(trim(coalesce(owner_email, ''))) <> ''
+              AND lower(trim(coalesce(owner_email, ''))) <> ?
+              AND lower(trim(coalesce(name, ''))) LIKE ?
+            GROUP BY lower(trim(coalesce(name, '')))
+        )
+        SELECT
+            c.sample_name AS name,
+            c.current_count AS current_count,
+            o.other_count AS other_count,
+            o.other_owner_count AS other_owner_count
+        FROM current_matches c
+        INNER JOIN other_matches o ON o.normalized_name = c.normalized_name
+        ORDER BY o.other_owner_count DESC, o.other_count DESC, c.sample_name ASC
+        LIMIT 10`
+    ).bind(authEmail, like, authEmail, like).all<{
+        name?: string;
+        current_count?: number | string;
+        other_count?: number | string;
+        other_owner_count?: number | string;
+    }>();
+
+    return c.json(results.map((row) => ({
+        name: String(row.name || '').trim(),
+        current_count: Number(row.current_count || 0),
+        other_count: Number(row.other_count || 0),
+        other_owner_count: Number(row.other_owner_count || 0),
+    })).filter((row) => row.name && row.other_count > 0 && row.other_owner_count > 0));
+});
+
 // POST /api/profiles - Create profile
 app.post('/api/profiles', async (c) => {
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
-    const tokenValidation = validateRoleTokenInput(body.access_token || body.postcron_token || body.comment_token, 'post', 'access_token');
-    if (!tokenValidation.ok) return c.json({ error: tokenValidation.error }, 400);
+    const accessTokenValidation = validateRoleTokenInput(body.access_token || body.comment_token, 'post', 'access_token');
+    const postcronTokenValidation = validateRoleTokenInput(body.facebook_token || body.postcron_token, 'post', 'facebook_token');
+    if (!accessTokenValidation.ok) return c.json({ error: accessTokenValidation.error }, 400);
+    if (!postcronTokenValidation.ok) return c.json({ error: postcronTokenValidation.error }, 400);
 
-    const accessToken = tokenValidation.token;
-    const legacyToken = body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : null;
+    const accessToken = accessTokenValidation.token;
+    const legacyToken = postcronTokenValidation.token;
     const nextTags = normalizeTagList(body.tags || []);
 
     const { results } = await c.env.DB.prepare(`
@@ -714,11 +976,13 @@ app.post('/api/profiles', async (c) => {
 app.post('/api/import', async (c) => {
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
-    const tokenValidation = validateRoleTokenInput(body.access_token || body.postcron_token || body.comment_token, 'post', 'access_token');
-    if (!tokenValidation.ok) return c.json({ error: tokenValidation.error }, 400);
+    const accessTokenValidation = validateRoleTokenInput(body.access_token || body.comment_token, 'post', 'access_token');
+    const postcronTokenValidation = validateRoleTokenInput(body.facebook_token || body.postcron_token, 'post', 'facebook_token');
+    if (!accessTokenValidation.ok) return c.json({ error: accessTokenValidation.error }, 400);
+    if (!postcronTokenValidation.ok) return c.json({ error: postcronTokenValidation.error }, 400);
 
-    const accessToken = tokenValidation.token;
-    const legacyToken = body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : null;
+    const accessToken = accessTokenValidation.token;
+    const legacyToken = postcronTokenValidation.token;
     const nextTags = normalizeTagList(body.tags || []);
 
     if (!body.id) {
@@ -772,8 +1036,10 @@ app.put('/api/profiles/:id', async (c) => {
         const body = await c.req.json();
         const authEmail = getAuthEmail(c);
 
-        const tokenValidation = validateRoleTokenInput(body.access_token || body.postcron_token || body.comment_token, 'post', 'access_token');
-        if (!tokenValidation.ok) return c.json({ error: tokenValidation.error }, 400);
+        const accessTokenValidation = validateRoleTokenInput(body.access_token || body.comment_token, 'post', 'access_token');
+        const postcronTokenValidation = validateRoleTokenInput(body.facebook_token || body.postcron_token, 'post', 'facebook_token');
+        if (!accessTokenValidation.ok) return c.json({ error: accessTokenValidation.error }, 400);
+        if (!postcronTokenValidation.ok) return c.json({ error: postcronTokenValidation.error }, 400);
 
         // Get existing profile
         const existing = authEmail
@@ -791,9 +1057,12 @@ app.put('/api/profiles/:id', async (c) => {
         const requestedTags = body.tags !== undefined ? body.tags : JSON.parse(existing.tags || '[]');
         const nextTags = normalizeTagList(requestedTags);
 
-        const nextAccessToken = (body.access_token !== undefined || body.postcron_token !== undefined || body.comment_token !== undefined)
-            ? tokenValidation.token
+        const nextAccessToken = (body.access_token !== undefined || body.comment_token !== undefined)
+            ? accessTokenValidation.token
             : (existing.access_token ?? null);
+        const nextFacebookToken = (body.facebook_token !== undefined || body.postcron_token !== undefined)
+            ? postcronTokenValidation.token
+            : (existing.facebook_token ?? null);
 
         // 🔒 Create backup snapshot before update
         await createBackup(c.env.DB, id, 'update', authEmail);
@@ -857,7 +1126,7 @@ app.put('/api/profiles/:id', async (c) => {
                 body.password ?? existing.password ?? null,
                 body.datr ?? existing.datr ?? null,
                 nextAccessToken,
-                body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : (existing.facebook_token ?? null),
+                nextFacebookToken,
                 body.shopee_cookies !== undefined
                     ? (body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null)
                     : (existing.shopee_cookies ?? null),
@@ -879,7 +1148,7 @@ app.put('/api/profiles/:id', async (c) => {
                 body.password ?? existing.password ?? null,
                 body.datr ?? existing.datr ?? null,
                 nextAccessToken,
-                body.facebook_token !== undefined ? (normalizeToken(body.facebook_token) || null) : (existing.facebook_token ?? null),
+                nextFacebookToken,
                 body.shopee_cookies !== undefined
                     ? (body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null)
                     : (existing.shopee_cookies ?? null),
@@ -1528,6 +1797,19 @@ async function saveProfileToken(c: any, profileId: string, token: string, _mode:
     ).bind(normalized, profileId).run();
 }
 
+async function saveLegacyPostcronToken(c: any, profileId: string, accessToken: string | null, postcronToken: string) {
+    const normalizedPostcronToken = normalizeToken(postcronToken);
+    if (!normalizedPostcronToken) throw new Error('postcron_token_empty');
+
+    await c.env.DB.prepare(
+        "UPDATE profiles SET access_token = ?, facebook_token = ?, updated_at = datetime('now') WHERE id = ?"
+    ).bind(
+        accessToken ? normalizeToken(accessToken) : null,
+        normalizedPostcronToken,
+        profileId
+    ).run();
+}
+
 function extractDatrFromCookies(cookies: any[]): string | null {
     if (!Array.isArray(cookies) || cookies.length === 0) return null;
     for (const cookie of cookies) {
@@ -1577,59 +1859,46 @@ function stringifyUnknown(value: unknown): string {
     }
 }
 
-async function persistResolvedPageToken(c: any, input: {
-    profileId: string;
-    profileName: string;
-    resolvedPage: { pageToken: string; pageId: string; pageName: string; pageAvatarUrl: string };
-}) {
-    await saveProfileToken(c, input.profileId, input.resolvedPage.pageToken);
-    await c.env.DB.prepare(
-        "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
-    ).bind(
-        input.resolvedPage.pageName || null,
-        input.resolvedPage.pageAvatarUrl || null,
-        input.profileId
-    ).run();
-    console.log(`🔑 ${input.profileName}: Token saved`);
-
-    let videoAffiliateSync: { ok: boolean; namespace_id?: string; error?: string } = { ok: false };
-    try {
-        const synced = await pushVideoAffiliatePageSync(c, {
-            profileId: input.profileId,
-            pageId: input.resolvedPage.pageId,
-            pageName: input.resolvedPage.pageName,
-            pageAvatarUrl: input.resolvedPage.pageAvatarUrl,
-            accessToken: input.resolvedPage.pageToken,
-        });
-        videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
-    } catch (syncErr) {
-        const message = String(syncErr || '');
-        console.log(`[VIDEO-AFFILIATE] page sync failed for ${input.profileName}: ${message}`);
-        videoAffiliateSync = { ok: false, error: message };
-    }
-
-    return videoAffiliateSync;
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-
-
-
-async function handleGetToken(c: any, profileId: string) {
-    const profile = await c.env.DB.prepare(
+async function loadProfileForCommentToken(c: any, profileId: string): Promise<Profile | null> {
+    return await c.env.DB.prepare(
         'SELECT id, name, tags, uid, username, password, totp_secret, datr, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL'
-    ).bind(profileId).first<Profile>();
+    ).bind(profileId).first() as Profile | null;
+}
 
+type CommentTokenFetchResult =
+    | {
+        ok: true;
+        profile: Profile;
+        userToken: string;
+        datrSource: 'profile' | 'archive' | 'none';
+    }
+    | {
+        ok: false;
+        status: number;
+        body: Record<string, unknown>;
+    };
+
+async function fetchFreshCommentToken(c: any, profileId: string): Promise<CommentTokenFetchResult> {
+    const profile = await loadProfileForCommentToken(c, profileId);
     if (!profile) {
-        return c.json({ error: 'Profile not found', profileId }, 404);
+        return { ok: false, status: 404, body: { error: 'Profile not found', profileId } };
     }
 
     const loginId = (profile.uid || profile.username || '').trim();
     if (!loginId || !profile.password) {
-        return c.json({
-            error: 'Missing uid/username or password in profile',
-            profileId,
-            profile: profile.name
-        }, 400);
+        return {
+            ok: false,
+            status: 400,
+            body: {
+                error: 'Missing uid/username or password in profile',
+                profileId,
+                profile: profile.name,
+            },
+        };
     }
 
     try {
@@ -1650,29 +1919,336 @@ async function handleGetToken(c: any, profileId: string) {
 
         if (!response.ok || !result?.success || !userToken) {
             const upstreamError = stringifyUnknown(result?.error) || `Token API failed (${response.status})`;
-            return c.json({
-                error: upstreamError,
-                profileId,
-                profile: profile.name,
-                reason: stringifyUnknown(result?.reason) || null,
-                detail: stringifyUnknown(result?.detail || result?.error_user_msg) || null,
-            }, response.status >= 500 ? 502 : 400);
+            return {
+                ok: false,
+                status: response.status >= 500 ? 502 : 400,
+                body: {
+                    error: upstreamError,
+                    profileId,
+                    profile: profile.name,
+                    reason: stringifyUnknown(result?.reason) || null,
+                    detail: stringifyUnknown(result?.detail || result?.error_user_msg) || null,
+                },
+            };
         }
 
-        let resolvedPage: { pageToken: string; pageId: string; pageName: string; pageAvatarUrl: string };
+        return {
+            ok: true,
+            profile,
+            userToken,
+            datrSource: datrResolved.source,
+        };
+    } catch (err) {
+        return {
+            ok: false,
+            status: 500,
+            body: {
+                error: String(err),
+                profileId,
+                profile: profile.name,
+            },
+        };
+    }
+}
+
+async function persistCommentTokenAndResolvedPage(c: any, input: {
+    profileId: string;
+    profileName: string;
+    commentToken: string;
+    resolvedPage: { pageToken: string; pageId: string; pageName: string; pageAvatarUrl: string };
+}) {
+    const resolvedCommentToken = normalizeToken(input.resolvedPage.pageToken);
+    if (!resolvedCommentToken) throw new Error('resolved_comment_page_token_empty');
+
+    await saveProfileToken(c, input.profileId, resolvedCommentToken, 'comment');
+    await c.env.DB.prepare(
+        "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
+    ).bind(
+        input.resolvedPage.pageName || null,
+        input.resolvedPage.pageAvatarUrl || null,
+        input.profileId
+    ).run();
+    console.log(`🔑 ${input.profileName}: Token saved`);
+
+    let videoAffiliateSync: { ok: boolean; namespace_id?: string; error?: string } = { ok: false };
+    try {
+        const synced = await pushVideoAffiliatePageSync(c, {
+            profileId: input.profileId,
+            pageId: input.resolvedPage.pageId,
+            pageName: input.resolvedPage.pageName,
+            pageAvatarUrl: input.resolvedPage.pageAvatarUrl,
+            accessToken: input.resolvedPage.pageToken,
+            commentToken: resolvedCommentToken,
+        });
+        videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
+    } catch (syncErr) {
+        const message = String(syncErr || '');
+        console.log(`[VIDEO-AFFILIATE] page sync failed for ${input.profileName}: ${message}`);
+        videoAffiliateSync = { ok: false, error: message };
+    }
+
+    return videoAffiliateSync;
+}
+
+type PostcronTokenFetchResult = {
+    ok: boolean;
+    token: string | null;
+    duration?: string | null;
+    error?: string | null;
+    reason?: string | null;
+    detail?: string | null;
+    pageId?: string | null;
+    pageName?: string | null;
+    pageAvatarUrl?: string | null;
+    videoAffiliateSync?: { ok: boolean; namespace_id?: string; error?: string };
+};
+
+async function loadProfileForPostcronToken(c: any, profileId: string): Promise<Partial<Profile> | null> {
+    return await c.env.DB.prepare(
+        'SELECT id, name, access_token, facebook_token, page_name, page_avatar_url FROM profiles WHERE id = ? AND deleted_at IS NULL LIMIT 1'
+    ).bind(profileId).first() as Partial<Profile> | null;
+}
+
+async function loadProfileBrowserCookies(c: any, profileId: string): Promise<any[]> {
+    const key = `browser-data/${profileId}.tar.gz`;
+    const object = await c.env.BUCKET.get(key);
+    if (!object) return [];
+    const bytes = new Uint8Array(await object.arrayBuffer());
+    return extractCookiesFromTarGz(bytes);
+}
+
+async function fetchAndPersistPostcronToken(c: any, profileId: string, accessTokenOverride?: string | null): Promise<PostcronTokenFetchResult> {
+    const profile = await loadProfileForPostcronToken(c, profileId);
+    if (!profile?.id) {
+        return { ok: false, token: null, error: 'Profile not found' };
+    }
+
+    if (!c.env.MYBROWSER) {
+        return {
+            ok: false,
+            token: null,
+            error: 'Cloudflare Browser Rendering binding is not configured',
+        };
+    }
+
+    const preservedAccessToken = normalizeToken(accessTokenOverride)
+        || normalizeToken(profile.access_token)
+        || null;
+
+    try {
+        const startedAt = Date.now();
+        const cookies = await loadProfileBrowserCookies(c, profileId);
+        if (cookies.length === 0) {
+            return {
+                ok: false,
+                token: null,
+                error: 'Browser profile cookies not found',
+                reason: 'browser_data_missing',
+                detail: 'Upload/sync browser data before fetching Postcron token',
+            };
+        }
+
+        const result = await extractPostcronToken(c.env.MYBROWSER, cookies);
+        const token = normalizeToken(result?.token);
+        const duration = `${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
+
+        if (!token) {
+            return {
+                ok: false,
+                token: null,
+                duration,
+                error: 'Cloudflare Browser Rendering failed to extract Postcron token',
+                reason: stringifyUnknown(result?.reason) || 'session_expired',
+                detail: stringifyUnknown(result?.detail || result?.url) || null,
+            };
+        }
+
+        const resolvedPage = await resolveProfilePageToken(token, profile);
+        await saveLegacyPostcronToken(c, profileId, preservedAccessToken, resolvedPage.pageToken);
+        await c.env.DB.prepare(
+            "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
+        ).bind(
+            resolvedPage.pageName || null,
+            resolvedPage.pageAvatarUrl || null,
+            profileId
+        ).run();
+
+        let videoAffiliateSync: { ok: boolean; namespace_id?: string; error?: string } = { ok: false };
         try {
-            resolvedPage = await resolveProfilePageToken(userToken, profile);
-        } catch (resolveErr) {
-            return c.json({
-                error: `Failed to convert user token to page token via me/accounts: ${String(resolveErr)}`,
+            const synced = await pushVideoAffiliatePageSync(c, {
                 profileId,
-                profile: profile.name,
-            }, 400);
+                pageId: resolvedPage.pageId,
+                pageName: resolvedPage.pageName,
+                pageAvatarUrl: resolvedPage.pageAvatarUrl,
+                accessToken: resolvedPage.pageToken,
+                commentToken: preservedAccessToken || undefined,
+            });
+            videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
+        } catch (syncErr) {
+            const message = String(syncErr || '');
+            console.log(`[VIDEO-AFFILIATE] postcron page sync failed for ${String(profile.name || profileId)}: ${message}`);
+            videoAffiliateSync = { ok: false, error: message };
         }
 
-        const videoAffiliateSync = await persistResolvedPageToken(c, {
+        return {
+            ok: true,
+            token: resolvedPage.pageToken,
+            duration,
+            pageId: resolvedPage.pageId || null,
+            pageName: resolvedPage.pageName || null,
+            pageAvatarUrl: resolvedPage.pageAvatarUrl || null,
+            videoAffiliateSync,
+        };
+    } catch (err) {
+        return {
+            ok: false,
+            token: null,
+            error: String(err),
+        };
+    }
+}
+
+async function getStoredProfileTokens(c: any, profileId: string): Promise<{
+    profileName: string;
+    accessToken: string;
+    postcronToken: string;
+}> {
+    const row = await loadProfileForPostcronToken(c, profileId);
+
+    return {
+        profileName: String(row?.name || '').trim(),
+        accessToken: normalizeToken(row?.access_token) || '',
+        postcronToken: normalizeToken(row?.facebook_token) || '',
+    };
+}
+
+async function ensureStoredPostcronPageToken(c: any, profileId: string): Promise<{
+    profileName: string;
+    accessToken: string;
+    postcronToken: string;
+    pageId: string;
+    pageName: string;
+    pageAvatarUrl: string;
+}> {
+    const profile = await loadProfileForPostcronToken(c, profileId);
+    if (!profile?.id) {
+        return {
+            profileName: '',
+            accessToken: '',
+            postcronToken: '',
+            pageId: '',
+            pageName: '',
+            pageAvatarUrl: '',
+        };
+    }
+
+    const profileName = String(profile.name || '').trim();
+    const accessToken = normalizeToken(profile.access_token) || '';
+    const storedPostcronToken = normalizeToken(profile.facebook_token) || '';
+    if (!storedPostcronToken) {
+        return {
+            profileName,
+            accessToken,
+            postcronToken: '',
+            pageId: '',
+            pageName: String(profile.page_name || '').trim(),
+            pageAvatarUrl: String(profile.page_avatar_url || '').trim(),
+        };
+    }
+
+    try {
+        const resolvedPage = await resolveStoredPageTokenForSync(storedPostcronToken, profile);
+        if (resolvedPage.pageToken && resolvedPage.pageToken !== storedPostcronToken) {
+            await saveLegacyPostcronToken(c, profileId, accessToken || null, resolvedPage.pageToken);
+            await c.env.DB.prepare(
+                "UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime('now') WHERE id = ?"
+            ).bind(
+                resolvedPage.pageName || null,
+                resolvedPage.pageAvatarUrl || null,
+                profileId
+            ).run();
+            return {
+                profileName,
+                accessToken,
+                postcronToken: resolvedPage.pageToken,
+                pageId: resolvedPage.pageId || '',
+                pageName: resolvedPage.pageName || '',
+                pageAvatarUrl: resolvedPage.pageAvatarUrl || '',
+            };
+        }
+
+        return {
+            profileName,
+            accessToken,
+            postcronToken: resolvedPage.pageToken,
+            pageId: resolvedPage.pageId || '',
+            pageName: resolvedPage.pageName || '',
+            pageAvatarUrl: resolvedPage.pageAvatarUrl || '',
+        };
+    } catch (err) {
+        console.log(`[POSTCRON] stored token validation failed for ${profileId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const preferredHint = await resolvePreferredProfilePageHint(profile);
+
+    return {
+        profileName,
+        accessToken,
+        postcronToken: '',
+        pageId: String(preferredHint.pageId || '').trim(),
+        pageName: String(preferredHint.pageName || '').trim(),
+        pageAvatarUrl: String(preferredHint.pageAvatarUrl || '').trim(),
+    };
+}
+
+async function syncStoredPostcronPageTokenToVideoAffiliate(c: any, input: {
+    profileId: string;
+    profileName: string;
+    accessToken: string;
+    postcronToken: string;
+    pageId: string;
+    pageName: string;
+    pageAvatarUrl: string;
+}): Promise<{ ok: boolean; namespace_id?: string; error?: string }> {
+    const pageId = String(input.pageId || '').trim();
+    const postcronToken = normalizeToken(input.postcronToken);
+    if (!pageId || !postcronToken) return { ok: false, error: 'page_identity_missing' };
+
+    try {
+        const synced = await pushVideoAffiliatePageSync(c, {
+            profileId: input.profileId,
+            pageId,
+            pageName: String(input.pageName || '').trim() || pageId,
+            pageAvatarUrl: String(input.pageAvatarUrl || '').trim()
+                || `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`,
+            accessToken: postcronToken,
+            commentToken: normalizeToken(input.accessToken) || undefined,
+        });
+        return { ok: true, namespace_id: synced.namespaceId };
+    } catch (syncErr) {
+        const message = String(syncErr || '');
+        console.log(`[VIDEO-AFFILIATE] stored postcron sync failed for ${input.profileName || input.profileId}: ${message}`);
+        return { ok: false, error: message };
+    }
+}
+
+
+
+
+async function handleGetToken(c: any, profileId: string) {
+    const fetched = await fetchFreshCommentToken(c, profileId);
+    if (!fetched.ok) {
+        return c.json(fetched.body, fetched.status);
+    }
+
+    const { profile, userToken, datrSource } = fetched;
+
+    try {
+        const resolvedPage = await resolveProfilePageToken(userToken, profile);
+        const videoAffiliateSync = await persistCommentTokenAndResolvedPage(c, {
             profileId,
             profileName: profile.name,
+            commentToken: userToken,
             resolvedPage,
         });
 
@@ -1681,16 +2257,22 @@ async function handleGetToken(c: any, profileId: string) {
             profile: profile.name,
             profileId,
             token: resolvedPage.pageToken,
+            raw_user_token: userToken,
+            page_token: resolvedPage.pageToken,
             page_id: resolvedPage.pageId || null,
             page_name: resolvedPage.pageName || null,
             page_avatar_url: resolvedPage.pageAvatarUrl || null,
-            datr_source: datrResolved.source,
+            datr_source: datrSource,
             savedAt: new Date().toISOString(),
             video_affiliate_sync: videoAffiliateSync,
         });
     } catch (err) {
         console.error(`❌ ${profile.name}: ${err}`);
-        return c.json({ error: String(err), profileId, profile: profile.name }, 500);
+        return c.json({
+            error: `Failed to convert user token to page token via me/accounts: ${String(err)}`,
+            profileId,
+            profile: profile.name,
+        }, 400);
     }
 }
 
@@ -1702,7 +2284,63 @@ app.get('/api/token/:profileId', async (c) => {
     return handleGetToken(c, profileId);
 });
 
-// POST /api/token/:profileId/resolve - Resolve local user token into saved page token
+// GET /api/token/:profileId/postcron - Get and persist Postcron token while keeping access_token intact
+app.get('/api/token/:profileId/postcron', async (c) => {
+    const profileId = c.req.param('profileId');
+    const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
+    if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
+
+    const stored = await ensureStoredPostcronPageToken(c, profileId);
+    if (stored.postcronToken) {
+        const videoAffiliateSync = await syncStoredPostcronPageTokenToVideoAffiliate(c, {
+            profileId,
+            profileName: stored.profileName,
+            accessToken: stored.accessToken,
+            postcronToken: stored.postcronToken,
+            pageId: stored.pageId,
+            pageName: stored.pageName,
+            pageAvatarUrl: stored.pageAvatarUrl,
+        });
+
+        return c.json({
+            success: true,
+            profile: stored.profileName || null,
+            profileId,
+            token: stored.postcronToken,
+            token_source: 'saved_postcron',
+            page_id: stored.pageId || null,
+            page_name: stored.pageName || null,
+            page_avatar_url: stored.pageAvatarUrl || null,
+            video_affiliate_sync: videoAffiliateSync,
+        });
+    }
+
+    const postcron = await fetchAndPersistPostcronToken(c, profileId);
+    if (!postcron.ok || !postcron.token) {
+        return c.json({
+            success: false,
+            profileId,
+            token: null,
+            duration: postcron.duration || null,
+            error: postcron.error || 'Failed to fetch Postcron token',
+            reason: postcron.reason || null,
+            detail: postcron.detail || null,
+        }, 400);
+    }
+
+    return c.json({
+        success: true,
+        profileId,
+        token: postcron.token,
+        duration: postcron.duration || null,
+        page_id: postcron.pageId || null,
+        page_name: postcron.pageName || null,
+        page_avatar_url: postcron.pageAvatarUrl || null,
+        video_affiliate_sync: postcron.videoAffiliateSync || null,
+    });
+});
+
+// POST /api/token/:profileId/resolve - Resolve local user token, save comment token, and sync page token
 app.post('/api/token/:profileId/resolve', async (c) => {
     const profileId = c.req.param('profileId');
     const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
@@ -1724,9 +2362,10 @@ app.post('/api/token/:profileId/resolve', async (c) => {
 
     try {
         const resolvedPage = await resolveProfilePageToken(userToken, profile);
-        const videoAffiliateSync = await persistResolvedPageToken(c, {
+        const videoAffiliateSync = await persistCommentTokenAndResolvedPage(c, {
             profileId,
             profileName: profile.name,
+            commentToken: userToken,
             resolvedPage,
         });
 
@@ -1735,6 +2374,8 @@ app.post('/api/token/:profileId/resolve', async (c) => {
             profile: profile.name,
             profileId,
             token: resolvedPage.pageToken,
+            raw_user_token: userToken,
+            page_token: resolvedPage.pageToken,
             token_source: 'local_cli',
             page_id: resolvedPage.pageId || null,
             page_name: resolvedPage.pageName || null,
@@ -1752,18 +2393,80 @@ app.post('/api/token/:profileId/resolve', async (c) => {
     }
 });
 
-// Backward-compatible routes (redirect to unified handler)
+// Backward-compatible routes (now role-specific)
 app.get('/api/postcron/:profileId/post', async (c) => {
     const profileId = c.req.param('profileId');
     const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
     if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
-    return handleGetToken(c, profileId);
+
+    const stored = await ensureStoredPostcronPageToken(c, profileId);
+    if (stored.postcronToken) {
+        const videoAffiliateSync = await syncStoredPostcronPageTokenToVideoAffiliate(c, {
+            profileId,
+            profileName: stored.profileName,
+            accessToken: stored.accessToken,
+            postcronToken: stored.postcronToken,
+            pageId: stored.pageId,
+            pageName: stored.pageName,
+            pageAvatarUrl: stored.pageAvatarUrl,
+        });
+        return c.json({
+            success: true,
+            profile: stored.profileName || null,
+            profileId,
+            token: stored.postcronToken,
+            token_source: 'saved_postcron',
+            page_id: stored.pageId || null,
+            page_name: stored.pageName || null,
+            page_avatar_url: stored.pageAvatarUrl || null,
+            video_affiliate_sync: videoAffiliateSync,
+        });
+    }
+
+    const postcron = await fetchAndPersistPostcronToken(c, profileId, stored.accessToken || null);
+    if (!postcron.ok || !postcron.token) {
+        return c.json({
+            success: false,
+            profile: stored.profileName || null,
+            profileId,
+            token: null,
+            duration: postcron.duration || null,
+            error: postcron.error || 'Failed to fetch Postcron token',
+            reason: postcron.reason || null,
+            detail: postcron.detail || null,
+        }, 400);
+    }
+
+    return c.json({
+        success: true,
+        profile: stored.profileName || null,
+        profileId,
+        token: postcron.token,
+        token_source: 'fresh_postcron',
+        duration: postcron.duration || null,
+        page_id: postcron.pageId || null,
+        page_name: postcron.pageName || null,
+        page_avatar_url: postcron.pageAvatarUrl || null,
+        video_affiliate_sync: postcron.videoAffiliateSync || null,
+    });
 });
 
 app.get('/api/postcron/:profileId/comment', async (c) => {
     const profileId = c.req.param('profileId');
     const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: false });
     if (!allowed) return c.json({ error: 'Profile not found', profileId }, 404);
+
+    const stored = await getStoredProfileTokens(c, profileId);
+    if (looksLikeCommentAccessToken(stored.accessToken)) {
+        return c.json({
+            success: true,
+            profile: stored.profileName || null,
+            profileId,
+            token: stored.accessToken,
+            token_source: 'saved_access_token',
+        });
+    }
+
     return handleGetToken(c, profileId);
 });
 
@@ -2027,226 +2730,138 @@ type PostcronExtractResult = {
     detail?: string | null;
 }
 
-// Helper: Connect to Browserless and extract Postcron token via raw CDP
+function normalizePuppeteerCookieSameSite(raw: unknown): 'Strict' | 'Lax' | 'None' | undefined {
+    const value = String(raw || '').trim().toLowerCase();
+    if (!value) return undefined;
+    if (value === 'strict') return 'Strict';
+    if (value === 'lax') return 'Lax';
+    if (value === 'none' || value === 'no_restriction') return 'None';
+    return undefined;
+}
+
+// Helper: Use Cloudflare Browser Rendering and extract Postcron token with injected cookies
 async function extractPostcronToken(
-    browserlessHost: string,
-    browserlessToken: string,
+    browserBinding: Fetcher,
     cookies: any[]
 ): Promise<PostcronExtractResult> {
-    const wsUrl = `wss://${browserlessHost}/?token=${browserlessToken}`;
+    let browser: any = null;
+    try {
+        browser = await puppeteer.launch(browserBinding);
+        const page = await browser.newPage();
+        page.setDefaultNavigationTimeout?.(30000);
+        await page.setViewport({ width: 1280, height: 800 });
+        await page.setUserAgent(
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
+        );
 
-    return new Promise(async (resolve, reject) => {
-        const stringifyWsError = (err: unknown): string => {
-            if (!err) return 'unknown_websocket_error';
-            if (typeof err === 'string') return err;
-            if (err instanceof Error) return `${err.name}: ${err.message}`;
-            try {
-                const anyErr = err as any;
-                const payload: Record<string, unknown> = {};
-                if (typeof anyErr?.type === 'string') payload.type = anyErr.type;
-                if (typeof anyErr?.message === 'string') payload.message = anyErr.message;
-                if (anyErr?.error !== undefined) payload.error = String(anyErr.error);
-                if (typeof anyErr?.code === 'number' || typeof anyErr?.code === 'string') payload.code = anyErr.code;
-                if (Object.keys(payload).length > 0) return JSON.stringify(payload);
-                return String(err);
-            } catch {
-                return String(err);
-            }
-        };
+        await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        let msgId = 1;
-        let targetId = '';
-        let sessionId = '';
-        let resolved = false;
-        const timeout = setTimeout(() => {
-            if (!resolved) {
-                resolved = true;
-                ws.close();
-                reject('Timeout: Token extraction took too long (30s)');
-            }
-        }, 30000);
+        const cookieParams = cookies.map((cookie: any) => {
+            const sameSite = normalizePuppeteerCookieSameSite(cookie.same_site ?? cookie.sameSite);
+            const expires = Number(cookie.expires);
+            return {
+                name: String(cookie.name || '').trim(),
+                value: String(cookie.value || '').trim(),
+                domain: String(cookie.domain || '').trim() || undefined,
+                path: String(cookie.path || '/').trim() || '/',
+                secure: cookie.secure ?? true,
+                httpOnly: cookie.http_only ?? cookie.httpOnly ?? false,
+                sameSite,
+                expires: Number.isFinite(expires) && expires > 0 ? expires : undefined,
+            };
+        }).filter((cookie: any) => cookie.name && cookie.value && cookie.domain);
 
-        const ws = new WebSocket(wsUrl);
+        if (cookieParams.length > 0) {
+            await page.setCookie(...cookieParams);
+        }
+        console.log(`🍪 Injected ${cookieParams.length} cookies via Browser Rendering`);
 
-        const sendCDP = (method: string, params: any = {}, sid?: string) => {
-            const id = msgId++;
-            const msg: any = { id, method, params };
-            if (sid) msg.sessionId = sid;
-            ws.send(JSON.stringify(msg));
-            return id;
-        };
-
-        const pendingCallbacks = new Map<number, { resolve: (result: any) => void; reject: (err: unknown) => void }>();
-
-        const sendAndWait = (method: string, params: any = {}, sid?: string): Promise<any> => {
-            return new Promise((resolveOne, rejectOne) => {
-                const id = sendCDP(method, params, sid);
-                pendingCallbacks.set(id, { resolve: resolveOne, reject: rejectOne });
-            });
-        };
-
-        ws.addEventListener('open', async () => {
-            try {
-                // Create a new browser context (incognito-like)
-                const ctx = await sendAndWait('Target.createBrowserContext', {});
-                const browserContextId = ctx.browserContextId;
-
-                // Create a new page
-                const target = await sendAndWait('Target.createTarget', {
-                    url: 'about:blank',
-                    browserContextId,
-                });
-                targetId = target.targetId;
-
-                // Attach to the page
-                const attached = await sendAndWait('Target.attachToTarget', {
-                    targetId,
-                    flatten: true,
-                });
-                sessionId = attached.sessionId;
-
-                // Enable Network and Page domains
-                await sendAndWait('Network.enable', {}, sessionId);
-                await sendAndWait('Page.enable', {}, sessionId);
-
-                // Set cookies
-                const cookieParams = cookies.map((c: any) => ({
-                    name: c.name,
-                    value: c.value,
-                    domain: c.domain,
-                    path: c.path || '/',
-                    secure: c.secure ?? true,
-                    httpOnly: c.http_only ?? c.httpOnly ?? false,
-                    sameSite: c.same_site ?? c.sameSite ?? undefined,
-                })).filter((c: any) => c.name && c.value && c.domain);
-
-                await sendAndWait('Network.setCookies', { cookies: cookieParams }, sessionId);
-                console.log(`🍪 Injected ${cookieParams.length} cookies`);
-
-                // Navigate to Postcron OAuth
-                const postcronUrl = 'https://postcron.com/api/v2.0/social-accounts/url-redirect/?should_redirect=true&social_network=facebook';
-                await sendAndWait('Page.navigate', { url: postcronUrl }, sessionId);
-
-                // Wait for navigation
-                await new Promise(r => setTimeout(r, 5000));
-
-                const inspectBarrier = async (): Promise<{
-                    url: string;
-                    checkpoint: boolean;
-                    login: boolean;
-                    security: boolean;
-                    automated: boolean;
-                    automated_keyword: string;
-                }> => {
-                    const inspectScript = `
-                        (function() {
-                            const href = String(window.location.href || '');
-                            const lowerUrl = href.toLowerCase();
-                            const bodyText = String((document.body && document.body.innerText) || '').toLowerCase();
-                            const autoKeywords = [
-                                'พฤติกรรมอัตโนมัติ',
-                                'พฤติกรรมที่ไม่ปกติ',
-                                'เราได้ตรวจพบกิจกรรมที่ผิดปกติ',
-                                'automated behavior',
-                                'unusual activity',
-                                'suspicious activity',
-                                'we limit how often'
-                            ];
-                            let automatedKeyword = '';
-                            for (const k of autoKeywords) {
-                                if (k && bodyText.includes(k.toLowerCase())) {
-                                    automatedKeyword = k;
-                                    break;
-                                }
-                            }
-                            return {
-                                url: href,
-                                checkpoint: lowerUrl.includes('facebook.com/checkpoint'),
-                                login: lowerUrl.includes('facebook.com/login'),
-                                security: lowerUrl.includes('facebook.com/two_factor') || lowerUrl.includes('approvals_code') || lowerUrl.includes('save-device'),
-                                automated: !!automatedKeyword,
-                                automated_keyword: automatedKeyword
-                            };
-                        })()
-                    `;
-                    const result = await sendAndWait('Runtime.evaluate', {
-                        expression: inspectScript,
-                        returnByValue: true,
-                    }, sessionId);
-                    const value = result?.result?.value || {};
-                    return {
-                        url: String(value?.url || ''),
-                        checkpoint: !!value?.checkpoint,
-                        login: !!value?.login,
-                        security: !!value?.security,
-                        automated: !!value?.automated,
-                        automated_keyword: String(value?.automated_keyword || ''),
-                    };
+        const inspectBarrier = async (): Promise<{
+            url: string;
+            checkpoint: boolean;
+            login: boolean;
+            security: boolean;
+            automated: boolean;
+            automated_keyword: string;
+        }> => {
+            const value = await page.evaluate(`(() => {
+                const href = String(window.location.href || '');
+                const lowerUrl = href.toLowerCase();
+                const bodyText = String((document.body && document.body.innerText) || '').toLowerCase();
+                const autoKeywords = [
+                    'พฤติกรรมอัตโนมัติ',
+                    'พฤติกรรมที่ไม่ปกติ',
+                    'เราได้ตรวจพบกิจกรรมที่ผิดปกติ',
+                    'automated behavior',
+                    'unusual activity',
+                    'suspicious activity',
+                    'we limit how often',
+                ];
+                let automatedKeyword = '';
+                for (const keyword of autoKeywords) {
+                    if (keyword && bodyText.includes(keyword.toLowerCase())) {
+                        automatedKeyword = keyword;
+                        break;
+                    }
+                }
+                return {
+                    url: href,
+                    checkpoint: lowerUrl.includes('facebook.com/checkpoint'),
+                    login: lowerUrl.includes('facebook.com/login'),
+                    security: lowerUrl.includes('facebook.com/two_factor') || lowerUrl.includes('approvals_code') || lowerUrl.includes('save-device'),
+                    automated: !!automatedKeyword,
+                    automated_keyword: automatedKeyword,
                 };
+            })()`);
+            return {
+                url: String(value?.url || ''),
+                checkpoint: !!value?.checkpoint,
+                login: !!value?.login,
+                security: !!value?.security,
+                automated: !!value?.automated,
+                automated_keyword: String(value?.automated_keyword || ''),
+            };
+        };
 
-                const dismissFacebookBarrier = async (phase: string): Promise<{ ok: boolean; reason?: PostcronExtractFailReason; url: string; note: string; detail?: string }> => {
-                    const closeScript = `
-                        (function() {
-                            const selectors = [
-                                'div[role="button"][aria-label="ปิด"]',
-                                'div[role="button"][aria-label*="ปิด"]',
-                                '[role="button"][aria-label="Close"]',
-                                '[role="button"][aria-label*="close" i]',
-                                'button[aria-label="ปิด"]',
-                                'button[aria-label="Close"]'
-                            ];
-                            for (const sel of selectors) {
-                                const el = document.querySelector(sel);
-                                if (el) {
-                                    const target = (el.closest && el.closest('[role="button"],button')) || el;
-                                    target.click();
-                                    return 'clicked:' + sel;
-                                }
-                            }
-                            const all = document.querySelectorAll('div[role="button"], button, span, [aria-label]');
-                            for (const el of all) {
-                                const txt = (el.textContent || '').trim().toLowerCase();
-                                const label = ((el.getAttribute && el.getAttribute('aria-label')) || '').trim().toLowerCase();
-                                if (txt === 'ปิด' || txt === 'close' || label === 'ปิด' || label === 'close') {
-                                    const target = (el.closest && el.closest('[role="button"],button')) || el;
-                                    target.click();
-                                    return 'clicked:fallback';
-                                }
-                            }
-                            return 'not-found';
-                        })()
-                    `;
-
-                    for (let attempt = 1; attempt <= 3; attempt++) {
-                        const click = await sendAndWait('Runtime.evaluate', {
-                            expression: closeScript,
-                            returnByValue: true,
-                        }, sessionId);
-                        const clickResult = String(click?.result?.value || 'unknown');
-                        console.log(`🧩 Barrier close (${phase}) attempt ${attempt}/3: ${clickResult}`);
-
-                        await new Promise(r => setTimeout(r, 2000));
-                        const inspected = await inspectBarrier();
-                        if (!inspected.checkpoint && !inspected.automated) {
-                            console.log(`✅ Barrier dismissed (${phase}) -> ${inspected.url.substring(0, 90)}`);
-                            return { ok: true, url: inspected.url, note: clickResult };
-                        }
-
-                        if (clickResult === 'not-found') {
-                            const failReason: PostcronExtractFailReason = inspected.checkpoint
-                                ? 'facebook_checkpoint'
-                                : 'facebook_automated_behavior';
-                            return {
-                                ok: false,
-                                reason: failReason,
-                                url: inspected.url,
-                                note: clickResult,
-                                detail: inspected.automated_keyword || undefined,
-                            };
+        const dismissFacebookBarrier = async (phase: string): Promise<{ ok: boolean; reason?: PostcronExtractFailReason; url: string; note: string; detail?: string }> => {
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                const clickResult = await page.evaluate(`(() => {
+                    const selectors = [
+                        'div[role="button"][aria-label="ปิด"]',
+                        'div[role="button"][aria-label*="ปิด"]',
+                        '[role="button"][aria-label="Close"]',
+                        '[role="button"][aria-label*="close" i]',
+                        'button[aria-label="ปิด"]',
+                        'button[aria-label="Close"]',
+                    ];
+                    for (const selector of selectors) {
+                        const element = document.querySelector(selector);
+                        if (element) {
+                            const target = (element.closest && element.closest('[role="button"],button')) || element;
+                            target.click();
+                            return 'clicked:' + selector;
                         }
                     }
+                    const all = document.querySelectorAll('div[role="button"], button, span, [aria-label]');
+                    for (const element of all) {
+                        const text = (element.textContent || '').trim().toLowerCase();
+                        const label = ((element.getAttribute && element.getAttribute('aria-label')) || '').trim().toLowerCase();
+                        if (text === 'ปิด' || text === 'close' || label === 'ปิด' || label === 'close') {
+                            const target = (element.closest && element.closest('[role="button"],button')) || element;
+                            target.click();
+                            return 'clicked:fallback';
+                        }
+                    }
+                    return 'not-found';
+                })()`);
 
-                    const inspected = await inspectBarrier();
+                console.log(`🧩 Barrier close (${phase}) attempt ${attempt}/3: ${clickResult}`);
+                await sleep(2000);
+                const inspected = await inspectBarrier();
+                if (!inspected.checkpoint && !inspected.automated) {
+                    return { ok: true, url: inspected.url, note: String(clickResult || '') };
+                }
+                if (clickResult === 'not-found') {
                     const failReason: PostcronExtractFailReason = inspected.checkpoint
                         ? 'facebook_checkpoint'
                         : 'facebook_automated_behavior';
@@ -2254,181 +2869,127 @@ async function extractPostcronToken(
                         ok: false,
                         reason: failReason,
                         url: inspected.url,
-                        note: 'barrier-still-open',
+                        note: String(clickResult || ''),
                         detail: inspected.automated_keyword || undefined,
                     };
+                }
+            }
+
+            const inspected = await inspectBarrier();
+            const failReason: PostcronExtractFailReason = inspected.checkpoint
+                ? 'facebook_checkpoint'
+                : 'facebook_automated_behavior';
+            return {
+                ok: false,
+                reason: failReason,
+                url: inspected.url,
+                note: 'barrier-still-open',
+                detail: inspected.automated_keyword || undefined,
+            };
+        };
+
+        const postcronUrl = 'https://postcron.com/api/v2.0/social-accounts/url-redirect/?should_redirect=true&social_network=facebook';
+        await page.goto(postcronUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await sleep(5000);
+
+        const initialInspect = await inspectBarrier();
+        const initialUrl = initialInspect.url;
+        const initialBarrier = classifyFacebookBarrierUrl(initialUrl);
+        if (initialBarrier === 'facebook_login_required' || initialBarrier === 'facebook_security_confirmation') {
+            return { token: null, reason: initialBarrier, url: initialUrl };
+        }
+        if (initialInspect.checkpoint || initialInspect.automated) {
+            const dismissed = await dismissFacebookBarrier('initial');
+            if (!dismissed.ok) {
+                return {
+                    token: null,
+                    reason: dismissed.reason || (initialInspect.checkpoint ? 'facebook_checkpoint' : 'facebook_automated_behavior'),
+                    url: dismissed.url || initialUrl,
+                    detail: dismissed.detail || null,
                 };
+            }
+        }
 
-                const initialInspect = await inspectBarrier();
-                const currentUrl = initialInspect.url;
-                console.log(`📍 After navigate: ${currentUrl.substring(0, 80)}...`);
-
-                const initialBarrier = classifyFacebookBarrierUrl(currentUrl);
-                if (initialBarrier === 'facebook_login_required' || initialBarrier === 'facebook_security_confirmation') {
-                    resolved = true;
-                    clearTimeout(timeout);
-                    ws.close();
-                    resolve({ token: null, reason: initialBarrier, url: currentUrl });
+        await page.evaluate(`(() => {
+            const selectors = [
+                'div[aria-label*="ดำเนินการต่อ"]',
+                'div[aria-label*="Continue"]',
+                'button[name="__CONFIRM__"]',
+                'input[value="Continue"]',
+            ];
+            for (const selector of selectors) {
+                try {
+                    const element = document.querySelector(selector);
+                    if (element) {
+                        element.click();
+                        return;
+                    }
+                } catch {
+                    // continue
+                }
+            }
+            const buttons = document.querySelectorAll('div[role="button"], button');
+            for (const button of buttons) {
+                const text = button.textContent || '';
+                if (text.includes('Continue') || text.includes('ดำเนินการต่อ')) {
+                    button.click();
                     return;
                 }
-                if (initialInspect.checkpoint || initialInspect.automated) {
-                    const dismissed = await dismissFacebookBarrier('initial');
-                    if (!dismissed.ok) {
-                        resolved = true;
-                        clearTimeout(timeout);
-                        ws.close();
-                        resolve({
-                            token: null,
-                            reason: dismissed.reason || (initialInspect.checkpoint ? 'facebook_checkpoint' : 'facebook_automated_behavior'),
-                            url: dismissed.url || currentUrl,
-                            detail: dismissed.detail || null,
-                        });
-                        return;
-                    }
-                }
-
-                // Try to click "Continue" / "ดำเนินการต่อ" button
-                const clickScript = `
-                    (function() {
-                        const selectors = [
-                            'div[aria-label*="ดำเนินการต่อ"]',
-                            'div[aria-label*="Continue"]',
-                            'button[name="__CONFIRM__"]',
-                            'input[value="Continue"]'
-                        ];
-                        for (const sel of selectors) {
-                            try {
-                                const el = document.querySelector(sel);
-                                if (el) { el.click(); return 'clicked: ' + sel; }
-                            } catch(e) {}
-                        }
-                        // Fallback: find by text
-                        const allBtns = document.querySelectorAll('div[role="button"], button');
-                        for (const btn of allBtns) {
-                            const txt = btn.textContent || '';
-                            if (txt.includes('Continue') || txt.includes('ดำเนินการต่อ')) {
-                                btn.click();
-                                return 'clicked by text: ' + txt.trim().substring(0, 30);
-                            }
-                        }
-                        return 'no button found';
-                    })()
-                `;
-
-                await sendAndWait('Runtime.evaluate', {
-                    expression: clickScript,
-                    returnByValue: true,
-                }, sessionId);
-
-                // Wait for redirect after click
-                await new Promise(r => setTimeout(r, 5000));
-
-                // Check for token in URL (try multiple times)
-                for (let attempt = 0; attempt < 5; attempt++) {
-                    const inspected = await inspectBarrier();
-                    const url = inspected.url || '';
-                    const barrier = classifyFacebookBarrierUrl(url);
-
-                    if (barrier === 'facebook_login_required' || barrier === 'facebook_security_confirmation') {
-                        resolved = true;
-                        clearTimeout(timeout);
-                        ws.close();
-                        resolve({ token: null, reason: barrier, url });
-                        return;
-                    }
-                    if (inspected.checkpoint || inspected.automated) {
-                        const dismissed = await dismissFacebookBarrier(`loop-${attempt + 1}`);
-                        if (!dismissed.ok) {
-                            resolved = true;
-                            clearTimeout(timeout);
-                            ws.close();
-                            resolve({
-                                token: null,
-                                reason: dismissed.reason || (inspected.checkpoint ? 'facebook_checkpoint' : 'facebook_automated_behavior'),
-                                url: dismissed.url || url,
-                                detail: dismissed.detail || null,
-                            });
-                            return;
-                        }
-                        if (attempt < 4) await new Promise(r => setTimeout(r, 1500));
-                        continue;
-                    }
-
-                    const tokenMatch = url.match(/access_token=([^&]+)/);
-                    if (tokenMatch) {
-                        const token = decodeURIComponent(tokenMatch[1]);
-                        console.log(`🔑 Token found: ${token.substring(0, 20)}...`);
-                        resolved = true;
-                        clearTimeout(timeout);
-                        ws.close();
-                        resolve({ token, reason: null, url });
-                        return;
-                    }
-
-                    if (attempt < 4) await new Promise(r => setTimeout(r, 2000));
-                }
-
-                // No token found
-                const finalInspect = await inspectBarrier();
-                const finalReason: PostcronExtractFailReason =
-                    finalInspect.checkpoint
-                        ? 'facebook_checkpoint'
-                        : finalInspect.automated
-                            ? 'facebook_automated_behavior'
-                            : classifyFacebookBarrierUrl(finalInspect.url) || 'session_expired';
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({
-                    token: null,
-                    reason: finalReason,
-                    url: finalInspect.url || null,
-                    detail: finalInspect.automated_keyword || null,
-                });
-            } catch (err) {
-                if (!resolved) {
-                    resolved = true;
-                    clearTimeout(timeout);
-                    ws.close();
-                    reject(String(err));
-                }
             }
-        });
+        })()`);
 
-        ws.addEventListener('message', (event) => {
-            try {
-                const msg = JSON.parse(event.data as string);
-                if (msg.id && pendingCallbacks.has(msg.id)) {
-                    const cb = pendingCallbacks.get(msg.id)!;
-                    pendingCallbacks.delete(msg.id);
-                    if (msg.error) {
-                        cb.reject(`CDP ${String(msg.error?.code || 'ERR')}: ${String(msg.error?.message || JSON.stringify(msg.error))}`);
-                    } else {
-                        cb.resolve(msg.result || {});
-                    }
+        await sleep(5000);
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const inspected = await inspectBarrier();
+            const currentUrl = inspected.url || '';
+            const barrier = classifyFacebookBarrierUrl(currentUrl);
+
+            if (barrier === 'facebook_login_required' || barrier === 'facebook_security_confirmation') {
+                return { token: null, reason: barrier, url: currentUrl };
+            }
+            if (inspected.checkpoint || inspected.automated) {
+                const dismissed = await dismissFacebookBarrier(`loop-${attempt + 1}`);
+                if (!dismissed.ok) {
+                    return {
+                        token: null,
+                        reason: dismissed.reason || (inspected.checkpoint ? 'facebook_checkpoint' : 'facebook_automated_behavior'),
+                        url: dismissed.url || currentUrl,
+                        detail: dismissed.detail || null,
+                    };
                 }
-            } catch {
-                // ignore non-JSON CDP events
+                if (attempt < 4) await sleep(1500);
+                continue;
             }
-        });
 
-        ws.addEventListener('error', (err) => {
-            if (!resolved) {
-                resolved = true;
-                clearTimeout(timeout);
-                try { ws.close(); } catch { }
-                reject(`WebSocket error: ${stringifyWsError(err)}`);
+            const tokenMatch = currentUrl.match(/access_token=([^&]+)/);
+            if (tokenMatch) {
+                const token = decodeURIComponent(tokenMatch[1]);
+                console.log(`🔑 Postcron token found: ${token.substring(0, 20)}...`);
+                return { token, reason: null, url: currentUrl };
             }
-        });
 
-        ws.addEventListener('close', () => {
-            if (!resolved) {
-                resolved = true;
-                clearTimeout(timeout);
-                reject('WebSocket closed unexpectedly');
-            }
-        });
-    });
+            if (attempt < 4) await sleep(2000);
+        }
+
+        const finalInspect = await inspectBarrier();
+        const finalReason: PostcronExtractFailReason =
+            finalInspect.checkpoint
+                ? 'facebook_checkpoint'
+                : finalInspect.automated
+                    ? 'facebook_automated_behavior'
+                    : classifyFacebookBarrierUrl(finalInspect.url) || 'session_expired';
+        return {
+            token: null,
+            reason: finalReason,
+            url: finalInspect.url || null,
+            detail: finalInspect.automated_keyword || null,
+        };
+    } finally {
+        if (browser) {
+            await browser.close().catch(() => null);
+        }
+    }
 }
 
 // Root

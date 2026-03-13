@@ -14,7 +14,7 @@
     "containers": [
         {
             "class_name": "MergeContainer",
-            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-02-25.11",
+            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-03-12.01",
             "instance_type": "standard-2",
             "max_instances": 2
         }

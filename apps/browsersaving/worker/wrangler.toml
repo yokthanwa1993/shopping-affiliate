@@ -1,6 +1,7 @@
 name = "browsersaving-worker"
 main = "src/index.ts"
-compatibility_date = "2024-02-01"
+compatibility_date = "2025-03-13"
+compatibility_flags = ["nodejs_compat"]
 
 # D1 Database
 [[d1_databases]]
@@ -26,3 +27,6 @@ service = "token-facebook-lite"
 [[services]]
 binding = "VIDEO_AFFILIATE_SERVICE"
 service = "video-affiliate-worker"
+
+[browser]
+binding = "MYBROWSER"

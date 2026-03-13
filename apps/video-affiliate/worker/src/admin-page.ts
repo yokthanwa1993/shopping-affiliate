@@ -611,8 +611,8 @@ export const ADMIN_HTML = `<!DOCTYPE html>
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h3>Namespace Overview</h3>
-              <p>เพจ/โพสต์ ต่อ namespace</p>
+              <h3>Owner Overview</h3>
+              <p>อีเมล Owner + เพจ/โพสต์/วิดีโอ</p>
             </div>
             <span class="badge" id="ns-count">0</span>
           </div>
@@ -689,9 +689,12 @@ export const ADMIN_HTML = `<!DOCTYPE html>
 
 <script>
 const API = '/admin/api';
+const ADMIN_DATA_CACHE_KEY = 'admin_data_cache_v1';
+const BOOTSTRAP_TOKEN = String(window.__ADMIN_DIRECT_TOKEN__ || '').trim();
+const BOOTSTRAP_DATA = (window.__ADMIN_BOOTSTRAP__ && typeof window.__ADMIN_BOOTSTRAP__ === 'object') ? window.__ADMIN_BOOTSTRAP__ : null;
 const urlToken = new URLSearchParams(window.location.search).get('t') || '';
 const launchToken = new URLSearchParams(window.location.search).get('launch') || '';
-const readStoredAdminToken = () => urlToken || sessionStorage.getItem('admin_token') || localStorage.getItem('admin_token') || '';
+const readStoredAdminToken = () => urlToken || BOOTSTRAP_TOKEN || sessionStorage.getItem('admin_token') || localStorage.getItem('admin_token') || '';
 const persistAdminToken = (token) => {
   const value = String(token || '').trim();
   if (!value) return;
@@ -706,9 +709,28 @@ let adminToken = readStoredAdminToken();
 if (urlToken) persistAdminToken(urlToken);
 let pendingDelete = null;
 let currentTab = 'dashboard';
-let data = { teams: [], dashboard: {} };
+let data = BOOTSTRAP_DATA || { teams: [], dashboard: {} };
+let hasRenderedAdminData = !!BOOTSTRAP_DATA;
 
 function el(id) { return document.getElementById(id); }
+
+function readCachedAdminData() {
+  try {
+    const raw = localStorage.getItem(ADMIN_DATA_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function persistCachedAdminData(value) {
+  try {
+    localStorage.setItem(ADMIN_DATA_CACHE_KEY, JSON.stringify(value || {}));
+  } catch (e) {}
+}
 
 async function doLogin() {
   const pw = el('pw-input').value.trim();
@@ -783,6 +805,27 @@ function showTelegramReauthScreen() {
   }
 }
 
+function showFatalScreen(message) {
+  const wrap = el('login-screen');
+  const safeMessage = String(message || 'โหลดหน้าแอดมินไม่สำเร็จ');
+  wrap.innerHTML = '<div class="login-logo">' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
+    '<path d="M12 9v4"/>' +
+    '<path d="M12 17h.01"/>' +
+    '<path d="M10.29 3.86l-7.5 13A2 2 0 004.53 20h14.94a2 2 0 001.74-3.14l-7.5-13a2 2 0 00-3.42 0z"/>' +
+    '</svg>' +
+    '</div>' +
+    '<h2>Admin Error</h2>' +
+    '<p>' + escAttr(safeMessage) + '</p>' +
+    '<button class="login-btn" id="fatal-reload-btn">ลองใหม่</button>';
+  wrap.style.display = 'flex';
+  el('main').style.display = 'none';
+  const btn = document.getElementById('fatal-reload-btn');
+  if (btn) {
+    btn.addEventListener('click', () => window.location.reload());
+  }
+}
+
 async function apiFetch(path, opts) {
   const options = opts || {};
   const sep = path.includes('?') ? '&' : '?';
@@ -792,16 +835,31 @@ async function apiFetch(path, opts) {
   });
 }
 
+async function apiFetchJson(path, opts) {
+  const controller = new AbortController();
+  const timeoutMs = Number(opts?.timeoutMs || 10000);
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+  try {
+    const response = await apiFetch(path, { ...(opts || {}), signal: controller.signal });
+    const payload = await response.json().catch(() => ({}));
+    return { response, payload };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function validateCurrentToken() {
   if (!adminToken) return false;
   try {
-    const r = await apiFetch('/data');
+    const r = await apiFetch('/ping');
     if (r.status === 401 || r.status === 403) {
+      await r.text().catch(() => '');
       clearStoredAdminToken();
       adminToken = '';
       return false;
     }
-    if (!r.ok) return true;
+    await r.text().catch(() => '');
+    if (!r.ok) return false;
     return true;
   } catch (e) {
     return !!adminToken;
@@ -964,16 +1022,18 @@ function renderDashboard() {
   el('ns-count').textContent = String(nsStats.length);
 
   if (!nsStats.length) {
-    el('namespace-list').innerHTML = '<div class="list-empty">ยังไม่มี workspace ที่ผูกกับเพจ</div>';
+    el('namespace-list').innerHTML = '<div class="list-empty">ยังไม่มี owner/workspace ในระบบ</div>';
   } else {
     el('namespace-list').innerHTML = nsStats.map((item) => {
       const ns = String(item.namespace_id || '-');
-      const label = workspaceOwnerMap.get(ns) || 'workspace';
+      const ownerEmail = String(item.owner_email || '').trim().toLowerCase();
+      const label = ownerEmail || workspaceOwnerMap.get(ns) || 'workspace';
       const pgs = Number(item.pages_count || 0);
       const posts = Number(item.posts_count || 0);
+      const videos = Number(item.videos_count || 0);
       return '<div class="ns-item">' +
         '<div class="ns-id">' + escAttr(label) + '</div>' +
-        '<div class="ns-meta"><span class="pill">pages ' + pgs + '</span><span class="pill ok">posts ' + posts + '</span></div>' +
+        '<div class="ns-meta"><span class="pill">pages ' + pgs + '</span><span class="pill ok">posts ' + posts + '</span><span class="pill warn">videos ' + videos + '</span></div>' +
       '</div>';
     }).join('');
   }
@@ -1016,19 +1076,30 @@ function renderAll() {
   renderMetaTime();
   renderDashboard();
   renderTeams();
+  hasRenderedAdminData = true;
 }
 
 async function load() {
   try {
-    const r = await apiFetch('/data');
+    const { response: r, payload } = await apiFetchJson('/data', { timeoutMs: 12000 });
     if (r.status === 401) { logout(); return; }
     if (!r.ok) {
       toast('โหลดข้อมูลไม่สำเร็จ', true);
       return;
     }
-    data = await r.json();
+    data = payload || { teams: [], dashboard: {} };
+    persistCachedAdminData(data);
     renderAll();
   } catch (e) {
+    if (!hasRenderedAdminData) {
+      const cached = readCachedAdminData();
+      if (cached) {
+        data = cached;
+        renderAll();
+        toast('แสดงข้อมูลล่าสุดที่เคยโหลดได้', true);
+        return;
+      }
+    }
     toast('โหลดข้อมูลไม่สำเร็จ', true);
   }
 }
@@ -1136,37 +1207,103 @@ if (window.Telegram && window.Telegram.WebApp) {
 }
 
 async function boot() {
-  const isTelegramWebApp = !!(window.Telegram && window.Telegram.WebApp);
-  el('login-screen').style.display = 'none';
-  el('main').style.display = 'none';
+  try {
+    const isTelegramWebApp = !!(window.Telegram && window.Telegram.WebApp);
+    el('login-screen').style.display = 'flex';
+    el('main').style.display = 'none';
+    const cached = readCachedAdminData();
 
-  if (await validateCurrentToken()) {
-    showMain();
-    await load();
-    return;
+    if (BOOTSTRAP_TOKEN || urlToken) {
+      showMain();
+      if (cached) {
+        data = cached;
+        renderAll();
+      }
+      await load();
+      return;
+    }
+
+    if (await validateCurrentToken()) {
+      showMain();
+      if (BOOTSTRAP_DATA) {
+        data = BOOTSTRAP_DATA;
+        persistCachedAdminData(data);
+        renderAll();
+        load();
+        return;
+      } else if (cached) {
+        data = cached;
+        renderAll();
+        load();
+        return;
+      }
+      await load();
+      return;
+    }
+
+    const launchAuthOk = await tryLaunchAutoAuth();
+    if (launchAuthOk && await validateCurrentToken()) {
+      showMain();
+      if (BOOTSTRAP_DATA) {
+        data = BOOTSTRAP_DATA;
+        persistCachedAdminData(data);
+        renderAll();
+        load();
+        return;
+      } else if (cached) {
+        data = cached;
+        renderAll();
+        load();
+        return;
+      }
+      await load();
+      return;
+    }
+
+    const autoAuthOk = await tryTelegramAutoAuth();
+    if (autoAuthOk && await validateCurrentToken()) {
+      showMain();
+      if (BOOTSTRAP_DATA) {
+        data = BOOTSTRAP_DATA;
+        persistCachedAdminData(data);
+        renderAll();
+        load();
+        return;
+      } else if (cached) {
+        data = cached;
+        renderAll();
+        load();
+        return;
+      }
+      await load();
+      return;
+    }
+
+    if (isTelegramWebApp) {
+      showTelegramReauthScreen();
+      return;
+    }
+
+    el('login-screen').style.display = 'flex';
+  } catch (e) {
+    const msg = e && typeof e === 'object' && 'message' in e ? String(e.message || '') : '';
+    showFatalScreen(msg || 'โหลดหน้าแอดมินไม่สำเร็จ');
   }
-
-  const launchAuthOk = await tryLaunchAutoAuth();
-  if (launchAuthOk && await validateCurrentToken()) {
-    showMain();
-    await load();
-    return;
-  }
-
-  const autoAuthOk = await tryTelegramAutoAuth();
-  if (autoAuthOk && await validateCurrentToken()) {
-    showMain();
-    await load();
-    return;
-  }
-
-  if (isTelegramWebApp) {
-    showTelegramReauthScreen();
-    return;
-  }
-
-  el('login-screen').style.display = 'flex';
 }
+
+window.addEventListener('error', (event) => {
+  const msg = String(event?.error?.message || event?.message || '').trim();
+  if (!msg) return;
+  showFatalScreen(msg);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event?.reason;
+  const msg = typeof reason === 'string'
+    ? reason
+    : String(reason?.message || 'เกิดข้อผิดพลาดที่ไม่ได้จัดการ');
+  showFatalScreen(msg);
+});
 
 boot();
 </script>

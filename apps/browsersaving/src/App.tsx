@@ -10,10 +10,7 @@ import './index.css'
 // Server URL (fallback for web mode)
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev'
 
-// Browserless defaults
-const DEFAULT_BROWSERLESS_URL = 'http://localhost:3333'
-const DEFAULT_BROWSERLESS_TOKEN = 'browserless_token'
-const PROFILE_TAG_OPTIONS = ['post', 'comment', 'mobile'] as const
+const PROFILE_TAG_OPTIONS = ['post', 'comment', 'mobile', 'admin'] as const
 
 const normalizeProfileTag = (value: string) => value.trim().toLowerCase()
 const normalizeProfileName = (value: string) => value.trim().toLowerCase()
@@ -26,6 +23,8 @@ const normalizeProfileTags = (tags: string[] = []) => {
   return Array.from(unique)
 }
 
+const hasProfileTag = (tags: string[] = [], tag: string) => normalizeProfileTags(tags).includes(normalizeProfileTag(tag))
+
 
 // Helper to get full avatar URL
 const getAvatarUrl = (avatarUrl?: string) => {
@@ -33,6 +32,32 @@ const getAvatarUrl = (avatarUrl?: string) => {
   if (avatarUrl.startsWith('http')) return avatarUrl
   return `${SERVER_URL}${avatarUrl}`
 }
+
+const AdminPageIcon = ({ title }: { title: string }) => (
+  <div className="page-admin-icon" title={title}>
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="11" fill="rgba(255,255,255,0.18)" />
+      <path
+        d="M12 3.25 18.85 6.1v4.88c0 4.03-2.45 7.75-6.85 9.32-4.4-1.57-6.85-5.29-6.85-9.32V6.1L12 3.25Z"
+        fill="#153e9f"
+      />
+      <path
+        d="M12 3.25 18.85 6.1v4.88c0 4.03-2.45 7.75-6.85 9.32-4.4-1.57-6.85-5.29-6.85-9.32V6.1L12 3.25Z"
+        stroke="rgba(255,255,255,0.48)"
+        strokeWidth="1"
+      />
+      <path
+        d="m12 7.1 1.15 2.34 2.58.38-1.86 1.82.44 2.58L12 12.99l-2.31 1.23.44-2.58-1.86-1.82 2.58-.38L12 7.1Z"
+        fill="#fff4c2"
+      />
+      <path
+        d="M8.35 15.45c1 .91 2.26 1.63 3.65 2.14 1.4-.51 2.65-1.23 3.65-2.14"
+        stroke="rgba(255,255,255,0.34)"
+        strokeLinecap="round"
+      />
+    </svg>
+  </div>
+)
 
 interface Profile {
   id: string
@@ -53,9 +78,29 @@ interface Profile {
   page_avatar_url?: string
 }
 
-type LocalResolvedPageToken = {
-  pageToken: string
-  pageId?: string
+type ProfileNameConflict = {
+  name: string
+  current_count: number
+  other_count: number
+  other_owner_count: number
+}
+
+type TokenResult = {
+  profileId: string
+  profileName: string
+  accessToken: string
+  postcronToken: string
+  postcronError: string
+  postcronReason: string
+  postcronDetail: string
+}
+
+type PostcronTokenResponse = {
+  success: boolean
+  token: string
+  error: string
+  reason: string
+  detail: string
   pageName?: string
   pageAvatarUrl?: string
 }
@@ -181,6 +226,7 @@ const isTauri = () => {
 }
 
 const AUTH_SESSION_STORAGE_KEY = 'browsersaving_auth_session'
+const AUTH_ACCOUNTS_STORAGE_KEY = 'browsersaving_auth_accounts'
 
 type AuthSession = {
   token: string
@@ -201,34 +247,73 @@ type TokenFetchSource = 'worker' | 'local'
 
 const normalizeAuthEmail = (raw: unknown) => String(raw || '').trim().toLowerCase()
 
+function normalizeAuthSession(raw: unknown): AuthSession | null {
+  const token = String((raw as AuthSession | null | undefined)?.token || '').trim()
+  const email = normalizeAuthEmail((raw as AuthSession | null | undefined)?.email || '')
+  if (!token || !email) return null
+  return { token, email }
+}
+
+function dedupeAuthSessions(sessions: AuthSession[]): AuthSession[] {
+  const unique = new Map<string, AuthSession>()
+  sessions.forEach((session) => {
+    const normalized = normalizeAuthSession(session)
+    if (!normalized) return
+    unique.set(normalized.email, normalized)
+  })
+  return Array.from(unique.values())
+}
+
 function getStoredAuthSession(): AuthSession | null {
   try {
     const raw = localStorage.getItem(AUTH_SESSION_STORAGE_KEY)
     if (!raw) return null
-    const parsed = JSON.parse(raw)
-    const token = String(parsed?.token || '').trim()
-    const email = normalizeAuthEmail(parsed?.email || '')
-    if (!token || !email) return null
-    return { token, email }
+    return normalizeAuthSession(JSON.parse(raw))
   } catch {
     return null
   }
 }
 
+function getStoredAuthAccounts(): AuthSession[] {
+  try {
+    const raw = localStorage.getItem(AUTH_ACCOUNTS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return dedupeAuthSessions(parsed)
+  } catch {
+    return []
+  }
+}
+
 function storeAuthSession(session: AuthSession) {
-  localStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify({
-    token: String(session.token || '').trim(),
-    email: normalizeAuthEmail(session.email),
-  }))
+  const normalized = normalizeAuthSession(session)
+  if (!normalized) return
+  localStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(normalized))
 }
 
 function clearStoredAuthSession() {
   localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
 }
 
-function createWorkerHeaders(headersInit?: HeadersInit): Headers {
+function storeAuthAccounts(accounts: AuthSession[]) {
+  localStorage.setItem(AUTH_ACCOUNTS_STORAGE_KEY, JSON.stringify(dedupeAuthSessions(accounts)))
+}
+
+function upsertAuthAccount(accounts: AuthSession[], session: AuthSession): AuthSession[] {
+  const normalized = normalizeAuthSession(session)
+  if (!normalized) return dedupeAuthSessions(accounts)
+  return dedupeAuthSessions([normalized, ...accounts.filter((account) => normalizeAuthEmail(account.email) !== normalized.email)])
+}
+
+function removeAuthAccount(accounts: AuthSession[], email: string): AuthSession[] {
+  const target = normalizeAuthEmail(email)
+  return dedupeAuthSessions(accounts.filter((account) => normalizeAuthEmail(account.email) !== target))
+}
+
+function createWorkerHeaders(headersInit?: HeadersInit, sessionOverride?: AuthSession | null): Headers {
   const headers = new Headers(headersInit || {})
-  const session = getStoredAuthSession()
+  const session = sessionOverride ?? getStoredAuthSession()
   if (session?.token) headers.set('x-auth-token', session.token)
   return headers
 }
@@ -245,8 +330,8 @@ async function readApiError(response: Response): Promise<string> {
   }
 }
 
-async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const headers = createWorkerHeaders(init.headers)
+async function apiFetch(path: string, init: RequestInit = {}, sessionOverride?: AuthSession | null): Promise<Response> {
+  const headers = createWorkerHeaders(init.headers, sessionOverride)
   const body = init.body
   if (body && !(body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
@@ -270,8 +355,8 @@ async function loginWithEmailPassword(email: string, password: string): Promise<
   return { token, email: normalizeAuthEmail(data?.email || normalizedEmail) }
 }
 
-async function fetchCurrentSessionMe(): Promise<{ email: string }> {
-  const res = await apiFetch('/api/me')
+async function fetchCurrentSessionMe(sessionOverride?: AuthSession | null): Promise<{ email: string }> {
+  const res = await apiFetch('/api/me', {}, sessionOverride)
   if (!res.ok) throw new Error(await readApiError(res))
   const data = await res.json()
   const email = normalizeAuthEmail(data?.email || '')
@@ -279,8 +364,8 @@ async function fetchCurrentSessionMe(): Promise<{ email: string }> {
   return { email }
 }
 
-async function logoutCurrentSession(): Promise<void> {
-  await apiFetch('/api/auth/logout', { method: 'POST' })
+async function logoutCurrentSession(sessionOverride?: AuthSession | null): Promise<void> {
+  await apiFetch('/api/auth/logout', { method: 'POST' }, sessionOverride)
 }
 
 // API Functions - use Tauri invoke or fallback to HTTP
@@ -329,12 +414,11 @@ async function updateProfile(id: string, data: Partial<Profile>): Promise<Profil
   }
 }
 
-async function deleteProfile(id: string): Promise<boolean> {
-  if (isTauri()) {
-    return invoke('delete_profile', { id })
-  }
+async function deleteProfile(id: string): Promise<void> {
   const res = await apiFetch(`/api/profiles/${id}`, { method: 'DELETE' })
-  return res.ok
+  if (!res.ok) {
+    throw new Error(await readApiError(res))
+  }
 }
 
 async function fetchPageInfo(
@@ -350,9 +434,137 @@ async function fetchPageInfo(
   }
 }
 
-async function launchBrowser(profile: Profile): Promise<{ success: boolean; error?: string }> {
+async function fetchProfileNameConflicts(query: string): Promise<ProfileNameConflict[]> {
+  const trimmed = query.trim()
+  if (trimmed.length < 2) return []
+  const params = new URLSearchParams({ q: trimmed })
+  const res = await apiFetch(`/api/profiles/name-conflicts?${params.toString()}`)
+  if (!res.ok) {
+    throw new Error(await readApiError(res))
+  }
+  return res.json()
+}
+
+async function fetchPostcronTokenFromWorker(profileId: string): Promise<PostcronTokenResponse> {
   try {
-    await invoke('launch_browser', { profile })
+    const res = await apiFetch(`/api/token/${profileId}/postcron`)
+    const data = await res.json().catch(() => ({} as any))
+    const token = String(data?.token || '').trim()
+    return {
+      success: res.ok && !!data?.success && !!token,
+      token,
+      error: String(data?.error || (res.ok ? '' : `HTTP ${res.status}`)).trim(),
+      reason: String(data?.reason || '').trim(),
+      detail: String(data?.detail || '').trim(),
+      pageName: String(data?.page_name || '').trim() || undefined,
+      pageAvatarUrl: String(data?.page_avatar_url || '').trim() || undefined,
+    }
+  } catch (err) {
+    return {
+      success: false,
+      token: '',
+      error: String(err || 'Postcron token request failed'),
+      reason: '',
+      detail: '',
+    }
+  }
+}
+
+async function resolveStoredPostcronToken(profileId: string): Promise<PostcronTokenResponse> {
+  try {
+    const res = await apiFetch(`/api/postcron/${profileId}/post`)
+    const data = await res.json().catch(() => ({} as any))
+    const token = String(data?.token || '').trim()
+    return {
+      success: res.ok && !!data?.success && !!token,
+      token,
+      error: String(data?.error || (res.ok ? '' : `HTTP ${res.status}`)).trim(),
+      reason: String(data?.reason || '').trim(),
+      detail: String(data?.detail || '').trim(),
+      pageName: String(data?.page_name || '').trim() || undefined,
+      pageAvatarUrl: String(data?.page_avatar_url || '').trim() || undefined,
+    }
+  } catch (err) {
+    return {
+      success: false,
+      token: '',
+      error: String(err || 'Stored Postcron token request failed'),
+      reason: '',
+      detail: '',
+    }
+  }
+}
+
+async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronTokenResponse> {
+  if (!isTauri()) {
+    return {
+      success: false,
+      token: '',
+      error: 'Local Postcron mode requires the desktop app',
+      reason: '',
+      detail: '',
+    }
+  }
+
+  let launchCompleted = false
+  try {
+    await invoke<string>('postcron_step_launch_headful', { profileId: profile.id })
+    launchCompleted = true
+    await invoke<string>('postcron_step_navigate')
+    await invoke<string>('postcron_step_click')
+
+    const extracted = await invoke<Record<string, unknown>>('postcron_step_extract')
+    const rawToken = String(extracted?.token || '').trim()
+    if (!rawToken) {
+      return {
+        success: false,
+        token: '',
+        error: String(extracted?.error || 'Local Postcron extraction returned empty token'),
+        reason: '',
+        detail: '',
+      }
+    }
+
+    const saveRes = await apiFetch(`/api/profiles/${encodeURIComponent(profile.id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ facebook_token: rawToken }),
+    })
+    if (!saveRes.ok) {
+      return {
+        success: false,
+        token: '',
+        error: await readApiError(saveRes),
+        reason: '',
+        detail: '',
+      }
+    }
+
+    return await resolveStoredPostcronToken(profile.id)
+  } catch (err) {
+    return {
+      success: false,
+      token: '',
+      error: String(err || 'Local Postcron extraction failed'),
+      reason: '',
+      detail: '',
+    }
+  } finally {
+    if (launchCompleted) {
+      await invoke('postcron_close').catch(() => null)
+    }
+  }
+}
+
+async function fetchPostcronToken(profile: Profile): Promise<PostcronTokenResponse> {
+  return fetchPostcronTokenFromWorker(profile.id)
+}
+
+async function launchBrowser(
+  profile: Profile,
+  authToken?: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await invoke('launch_browser', { profile, authToken })
     return { success: true }
   } catch (e) {
     if (isTauri()) {
@@ -365,9 +577,13 @@ async function launchBrowser(profile: Profile): Promise<{ success: boolean; erro
   return { success: true }
 }
 
-async function launchBrowserWithUrl(profile: Profile, url: string): Promise<{ success: boolean; error?: string }> {
+async function launchBrowserWithUrl(
+  profile: Profile,
+  url: string,
+  authToken?: string
+): Promise<{ success: boolean; error?: string }> {
   try {
-    await invoke('launch_browser_with_url', { profile, url })
+    await invoke('launch_browser_with_url', { profile, url, authToken })
     return { success: true }
   } catch (e) {
     if (isTauri()) {
@@ -390,13 +606,16 @@ async function launchAndroidEmulator(profile: Profile): Promise<{ success: boole
   }
 }
 
-async function stopBrowser(profileId: string): Promise<{ success: boolean; error?: string }> {
+async function stopBrowser(
+  profileId: string,
+  authToken?: string
+): Promise<{ success: boolean; error?: string }> {
   try {
-    await invoke('stop_browser', { profileId })
+    await invoke('stop_browser', { profileId, authToken })
     return { success: true }
-  } catch {
+  } catch (e) {
     if (isTauri()) {
-      return { success: false, error: 'Failed to stop browser' }
+      return { success: false, error: String(e) }
     }
   }
 
@@ -438,12 +657,18 @@ async function getBrowserStatus(): Promise<BrowserStatus> {
 export type { Profile }
 
 function App() {
+  const [storedAuthAccounts, setStoredAuthAccounts] = useState<AuthSession[]>(() => getStoredAuthAccounts())
   const [authSession, setAuthSession] = useState<AuthSession | null>(() => getStoredAuthSession())
   const [authChecking, setAuthChecking] = useState(() => !!getStoredAuthSession())
   const [authLoading, setAuthLoading] = useState(false)
+  const [accountActionLoading, setAccountActionLoading] = useState(false)
   const [authError, setAuthError] = useState('')
-  const [loginEmail, setLoginEmail] = useState(() => normalizeAuthEmail(getStoredAuthSession()?.email || ''))
+  const [loginEmail, setLoginEmail] = useState(() => normalizeAuthEmail(getStoredAuthSession()?.email || getStoredAuthAccounts()[0]?.email || ''))
   const [loginPassword, setLoginPassword] = useState('')
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
+  const [showAddAccountForm, setShowAddAccountForm] = useState(false)
+  const [secondaryLoginEmail, setSecondaryLoginEmail] = useState('')
+  const [secondaryLoginPassword, setSecondaryLoginPassword] = useState('')
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [runningIds, setRunningIds] = useState<Set<string>>(new Set())
   const [launchingIds, setLaunchingIds] = useState<Set<string>>(new Set())
@@ -459,11 +684,7 @@ function App() {
   const [deletingProfile, setDeletingProfile] = useState<Profile | null>(null)
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
   const [credentialsProfile, setCredentialsProfile] = useState<Profile | null>(null)
-  const [tokenResult, setTokenResult] = useState<{
-    profileId: string
-    profileName: string
-    token: string
-  } | null>(null)
+  const [tokenResult, setTokenResult] = useState<TokenResult | null>(null)
   const [tokenContextMenu, setTokenContextMenu] = useState<{
     profileId: string
     x: number
@@ -483,6 +704,7 @@ function App() {
   })
   const [selectedPage, setSelectedPage] = useState<string>('all')
   const [profileSearch, setProfileSearch] = useState('')
+  const [profileNameConflicts, setProfileNameConflicts] = useState<ProfileNameConflict[]>([])
   const [uiScale, setUiScale] = useState(() => {
     const saved = localStorage.getItem('uiScale')
     return saved ? parseFloat(saved) : 1.0
@@ -499,21 +721,103 @@ function App() {
     error: '',
   })
 
-  // Browserless state
-  const [browserlessUrl, setBrowserlessUrl] = useState(() => {
-    return localStorage.getItem('browserlessUrl') || DEFAULT_BROWSERLESS_URL
-  })
-  const [browserlessToken, setBrowserlessToken] = useState(() => {
-    return localStorage.getItem('browserlessToken') || DEFAULT_BROWSERLESS_TOKEN
-  })
-  const [browserlessConnected, setBrowserlessConnected] = useState(false)
+  const persistAuthState = useCallback((nextSession: AuthSession | null, nextAccounts: AuthSession[]) => {
+    const normalizedAccounts = dedupeAuthSessions(nextAccounts)
+    storeAuthAccounts(normalizedAccounts)
+    setStoredAuthAccounts(normalizedAccounts)
+
+    if (nextSession) {
+      const normalizedSession = normalizeAuthSession(nextSession)
+      if (normalizedSession) {
+        storeAuthSession(normalizedSession)
+        setAuthSession(normalizedSession)
+        setLoginEmail(normalizedSession.email)
+        setServerConnected(true)
+        return normalizedSession
+      }
+    }
+
+    clearStoredAuthSession()
+    setAuthSession(null)
+    setLoginEmail(normalizedAccounts[0]?.email || '')
+    setServerConnected(false)
+    return null
+  }, [])
+
+  const resetSessionScopedUi = useCallback(() => {
+    setProfiles([])
+    setSelectedIds(new Set())
+    setCurrentPage('profiles')
+    setDebugProfile(null)
+    setViewingLogs(null)
+    setCredentialsProfile(null)
+    setTokenResult(null)
+    setTokenContextMenu(null)
+    setTagPickerProfileId(null)
+  }, [])
+
+  const applyAuthenticatedSession = useCallback((session: AuthSession, existingAccounts?: AuthSession[]) => {
+    const normalizedSession = normalizeAuthSession(session)
+    if (!normalizedSession) return
+    const nextAccounts = upsertAuthAccount(existingAccounts ?? storedAuthAccounts, normalizedSession)
+    persistAuthState(normalizedSession, nextAccounts)
+    setAuthError('')
+    setAuthChecking(false)
+    setLoginPassword('')
+    setSecondaryLoginEmail('')
+    setSecondaryLoginPassword('')
+    setShowAddAccountForm(false)
+    setAccountMenuOpen(false)
+  }, [persistAuthState, storedAuthAccounts])
+
+  const switchAuthAccount = useCallback(async (account: AuthSession) => {
+    if (accountActionLoading) return
+
+    const normalizedAccount = normalizeAuthSession(account)
+    if (!normalizedAccount) return
+
+    setAccountActionLoading(true)
+    setAuthError('')
+
+    try {
+      const me = await fetchCurrentSessionMe(normalizedAccount)
+      const nextSession = { token: normalizedAccount.token, email: me.email }
+      resetSessionScopedUi()
+      applyAuthenticatedSession(nextSession)
+    } catch (err) {
+      const remainingAccounts = removeAuthAccount(storedAuthAccounts, normalizedAccount.email)
+      persistAuthState(
+        authSession ? authSession : null,
+        authSession ? upsertAuthAccount(remainingAccounts, authSession) : remainingAccounts
+      )
+      setAuthError(`Session for ${normalizedAccount.email} ใช้งานไม่ได้แล้ว`)
+    } finally {
+      setAccountActionLoading(false)
+      setAuthChecking(false)
+    }
+  }, [accountActionLoading, applyAuthenticatedSession, authSession, persistAuthState, resetSessionScopedUi, storedAuthAccounts])
 
   const getAccessToken = (profile: Profile) => (profile.access_token || '').trim()
+  const getPostcronToken = (profile: Profile) => (profile.facebook_token || '').trim()
   const hasAccessToken = (profile: Profile) => getAccessToken(profile).length > 0
+  const hasPostcronToken = (profile: Profile) => getPostcronToken(profile).length > 0
   const hasAnyFacebookToken = (profile: Profile) => (
     getAccessToken(profile).length > 0 ||
     (profile.facebook_token || '').trim().length > 0
   )
+  const hasTokenPair = (profile: Profile) => hasAccessToken(profile) && hasPostcronToken(profile)
+  const buildTokenResult = (
+    profile: Profile,
+    overrides: Partial<Omit<TokenResult, 'profileId' | 'profileName'>> = {}
+  ): TokenResult => ({
+    profileId: profile.id,
+    profileName: profile.name,
+    accessToken: overrides.accessToken ?? getAccessToken(profile),
+    postcronToken: overrides.postcronToken ?? getPostcronToken(profile),
+    postcronError: overrides.postcronError ?? '',
+    postcronReason: overrides.postcronReason ?? '',
+    postcronDetail: overrides.postcronDetail ?? '',
+  })
 
   const installUpdateNow = useCallback(async (update: Update) => {
     setAppUpdateState(prev => ({
@@ -636,6 +940,8 @@ function App() {
     let active = true
     const bootstrap = async () => {
       const existing = getStoredAuthSession()
+      const savedAccounts = getStoredAuthAccounts()
+      if (active) setStoredAuthAccounts(savedAccounts)
       if (!existing?.token) {
         if (active) {
           setAuthSession(null)
@@ -645,15 +951,19 @@ function App() {
       }
 
       try {
-        const me = await fetchCurrentSessionMe()
+        const me = await fetchCurrentSessionMe(existing)
         if (!active) return
         const nextSession = { token: existing.token, email: me.email }
-        storeAuthSession(nextSession)
-        setAuthSession(nextSession)
+        const nextAccounts = upsertAuthAccount(savedAccounts, nextSession)
+        persistAuthState(nextSession, nextAccounts)
       } catch {
         if (!active) return
+        const remainingAccounts = removeAuthAccount(savedAccounts, existing.email)
         clearStoredAuthSession()
         setAuthSession(null)
+        setStoredAuthAccounts(remainingAccounts)
+        storeAuthAccounts(remainingAccounts)
+        setLoginEmail(remainingAccounts[0]?.email || '')
       } finally {
         if (active) setAuthChecking(false)
       }
@@ -661,7 +971,7 @@ function App() {
 
     void bootstrap()
     return () => { active = false }
-  }, [])
+  }, [persistAuthState])
 
   // Apply dark mode
   useEffect(() => {
@@ -675,31 +985,6 @@ function App() {
     document.body.style.zoom = actualZoom.toString()
     localStorage.setItem('uiScale', uiScale.toString())
   }, [uiScale])
-
-  // Persist Browserless settings
-  useEffect(() => {
-    localStorage.setItem('browserlessUrl', browserlessUrl)
-  }, [browserlessUrl])
-
-  useEffect(() => {
-    localStorage.setItem('browserlessToken', browserlessToken)
-  }, [browserlessToken])
-
-  // Check Browserless connectivity
-  const checkBrowserless = useCallback(async () => {
-    const trimmedUrl = browserlessUrl.trim()
-    if (!trimmedUrl) {
-      setBrowserlessConnected(false)
-      return
-    }
-
-    try {
-      const res = await fetch(`${trimmedUrl}/config?token=${browserlessToken}`, { signal: AbortSignal.timeout(3000) })
-      setBrowserlessConnected(res.ok)
-    } catch {
-      setBrowserlessConnected(false)
-    }
-  }, [browserlessUrl, browserlessToken])
 
   useEffect(() => {
     if (!tagPickerProfileId) return
@@ -727,6 +1012,49 @@ function App() {
     }
   }, [tokenContextMenu])
 
+  useEffect(() => {
+    if (!accountMenuOpen) return
+
+    const closeMenu = () => {
+      setAccountMenuOpen(false)
+      setShowAddAccountForm(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu()
+    }
+
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [accountMenuOpen])
+
+  useEffect(() => {
+    const query = profileSearch.trim()
+    if (!authSession?.token || query.length < 2) {
+      setProfileNameConflicts([])
+      return
+    }
+
+    let cancelled = false
+    const timer = setTimeout(() => {
+      void fetchProfileNameConflicts(query)
+        .then((conflicts) => {
+          if (!cancelled) setProfileNameConflicts(conflicts)
+        })
+        .catch(() => {
+          if (!cancelled) setProfileNameConflicts([])
+        })
+    }, 250)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [authSession?.token, profileSearch])
+
 
 
   useEffect(() => {
@@ -750,13 +1078,19 @@ function App() {
     } catch (err) {
       const message = String(err || '')
       if (message.toLowerCase().includes('unauthorized')) {
-        clearStoredAuthSession()
-        setAuthSession(null)
-        setAuthError('Session expired. Please login again.')
+        const remainingAccounts = removeAuthAccount(storedAuthAccounts, authSession.email)
+        resetSessionScopedUi()
+        if (remainingAccounts.length > 0) {
+          persistAuthState(remainingAccounts[0], remainingAccounts)
+          setAuthError(`Session หมดอายุ สลับไป ${remainingAccounts[0].email} แล้ว`)
+        } else {
+          persistAuthState(null, remainingAccounts)
+          setAuthError('Session expired. Please login again.')
+        }
       }
       setServerConnected(false)
     }
-  }, [authSession?.token])
+  }, [authSession, persistAuthState, resetSessionScopedUi, storedAuthAccounts])
 
   const handleLoginSubmit = useCallback(async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -773,32 +1107,59 @@ function App() {
     setAuthError('')
     try {
       const session = await loginWithEmailPassword(email, password)
-      storeAuthSession(session)
-      setAuthSession(session)
-      setLoginPassword('')
-      setServerConnected(true)
+      resetSessionScopedUi()
+      applyAuthenticatedSession(session)
     } catch (err) {
       setAuthError(String(err || 'Login failed'))
     } finally {
       setAuthLoading(false)
       setAuthChecking(false)
     }
-  }, [authLoading, loginEmail, loginPassword])
+  }, [applyAuthenticatedSession, authLoading, loginEmail, loginPassword, resetSessionScopedUi])
+
+  const handleAddAccountSubmit = useCallback(async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (accountActionLoading) return
+
+    const email = normalizeAuthEmail(secondaryLoginEmail)
+    const password = String(secondaryLoginPassword || '')
+    if (!email || !password) {
+      setAuthError('Please enter email and password')
+      return
+    }
+
+    setAccountActionLoading(true)
+    setAuthError('')
+    try {
+      const session = await loginWithEmailPassword(email, password)
+      resetSessionScopedUi()
+      applyAuthenticatedSession(session)
+    } catch (err) {
+      setAuthError(String(err || 'Login failed'))
+    } finally {
+      setAccountActionLoading(false)
+    }
+  }, [accountActionLoading, applyAuthenticatedSession, resetSessionScopedUi, secondaryLoginEmail, secondaryLoginPassword])
 
   const handleLogout = useCallback(async () => {
+    const currentSession = authSession
     try {
-      await logoutCurrentSession()
+      if (currentSession) {
+        await logoutCurrentSession(currentSession)
+      }
     } catch (err) {
       console.log('Logout request failed:', err)
     } finally {
-      clearStoredAuthSession()
-      setAuthSession(null)
-      setProfiles([])
-      setSelectedIds(new Set())
+      const remainingAccounts = currentSession
+        ? removeAuthAccount(storedAuthAccounts, currentSession.email)
+        : storedAuthAccounts
+      resetSessionScopedUi()
+      persistAuthState(remainingAccounts[0] ?? null, remainingAccounts)
       setAuthError('')
-      setCurrentPage('profiles')
+      setShowAddAccountForm(false)
+      setAccountMenuOpen(false)
     }
-  }, [])
+  }, [authSession, persistAuthState, resetSessionScopedUi, storedAuthAccounts])
 
   const handleManualUpdateCheck = async () => {
     await checkForAppUpdate('ask')
@@ -932,12 +1293,12 @@ function App() {
     setDeletingProfile(null)
 
     try {
-      const success = await deleteProfile(profileId)
-      if (success) {
-        await loadProfiles()
-      }
+      await deleteProfile(profileId)
+      await loadProfiles()
     } catch (e) {
       console.error('Delete failed:', e)
+      const message = e instanceof Error ? e.message : 'ลบโปรไฟล์ไม่สำเร็จ'
+      alert(message)
     } finally {
       setDeletingIds(prev => {
         const next = new Set(prev)
@@ -1054,7 +1415,7 @@ function App() {
       }
 
       // Launch browser in debug mode
-      await invoke('launch_browser_debug', { profile })
+      await invoke('launch_browser_debug', { profile, authToken: authSession?.token })
 
       // Wait for browser to start
       await new Promise(r => setTimeout(r, 2000))
@@ -1085,7 +1446,7 @@ function App() {
 
       // Stop browser if requested
       if (stopBrowserToo) {
-        await stopBrowser(debugProfile.id)
+        await stopBrowser(debugProfile.id, authSession?.token)
         setDebuggingIds(prev => {
           const next = new Set(prev)
           next.delete(debugProfile.id)
@@ -1122,38 +1483,13 @@ function App() {
           throw new Error('Local CLI returned empty token')
         }
 
-        const resolved = await invoke<LocalResolvedPageToken>('resolve_page_token_via_graph', {
-          userToken: localUserToken,
-          profileName: profile.name,
-          pageName: profile.page_name,
-          pageAvatarUrl: profile.page_avatar_url,
-        })
-
-        const pageToken = String(resolved?.pageToken || '').trim()
-        if (!pageToken) {
-          throw new Error('Local page token resolve returned empty token')
-        }
-
-        res = await apiFetch(`/api/profiles/${profile.id}`, {
-          method: 'PUT',
+        res = await apiFetch(`/api/token/${profile.id}/resolve`, {
+          method: 'POST',
           body: JSON.stringify({
-            access_token: pageToken,
-            page_name: String(resolved?.pageName || '').trim() || null,
-            page_avatar_url: String(resolved?.pageAvatarUrl || '').trim() || null,
+            user_token: localUserToken,
           }),
         })
-        await res.json().catch(() => ({} as any))
-        if (!res.ok) {
-          throw new Error(`Failed to save local token: HTTP ${res.status}`)
-        }
-
-        data = {
-          success: true,
-          token: pageToken,
-          page_id: String(resolved?.pageId || '').trim() || null,
-          page_name: String(resolved?.pageName || '').trim() || null,
-          page_avatar_url: String(resolved?.pageAvatarUrl || '').trim() || null,
-        }
+        data = await res.json().catch(() => ({} as any))
       } else {
         res = await apiFetch(`/api/token/${profile.id}`)
         data = await res.json().catch(() => ({} as any))
@@ -1172,13 +1508,30 @@ function App() {
 
       const pageNameFromToken = String(data?.page_name || '').trim()
       const pageAvatarFromToken = String(data?.page_avatar_url || '').trim()
-      if (pageNameFromToken || pageAvatarFromToken) {
+      let postcronToken = ''
+      let postcronError = ''
+      let postcronReason = ''
+      let postcronDetail = ''
+
+      const postcron = await fetchPostcronToken(profile)
+      if (postcron.success) {
+        postcronToken = postcron.token
+      } else {
+        postcronError = postcron.error
+        postcronReason = postcron.reason
+        postcronDetail = postcron.detail
+      }
+
+      const resolvedPageName = postcron.pageName || pageNameFromToken
+      const resolvedPageAvatar = postcron.pageAvatarUrl || pageAvatarFromToken
+
+      if (resolvedPageName || resolvedPageAvatar) {
         setProfiles(prev => prev.map((p) => (
           p.id === profile.id
             ? {
               ...p,
-              page_name: pageNameFromToken || p.page_name,
-              page_avatar_url: pageAvatarFromToken || p.page_avatar_url,
+              page_name: resolvedPageName || p.page_name,
+              page_avatar_url: resolvedPageAvatar || p.page_avatar_url,
             }
             : p
         )))
@@ -1193,9 +1546,13 @@ function App() {
       // Endpoint saves token into DB already; reload list to reflect fresh state.
       await loadProfiles()
       setTokenResult({
-        profileId: profile.id,
-        profileName: profile.name,
-        token,
+        ...buildTokenResult(profile, {
+          accessToken: token,
+          postcronToken,
+          postcronError,
+          postcronReason,
+          postcronDetail,
+        }),
       })
     } catch (err) {
       console.error('Failed to get token:', err)
@@ -1263,7 +1620,7 @@ function App() {
     try {
       // Show spinner first
       await new Promise(r => setTimeout(r, 500))
-      const result = await launchBrowser(profile)
+      const result = await launchBrowser(profile, authSession?.token)
       if (!result.success) alert(result.error || 'Failed to launch')
       await checkStatus()
     } finally {
@@ -1276,7 +1633,7 @@ function App() {
   }
 
   const handleStop = async (id: string) => {
-    const result = await stopBrowser(id)
+    const result = await stopBrowser(id, authSession?.token)
     if (!result.success) {
       alert(result.error || 'Failed to stop profile')
       return
@@ -1331,6 +1688,10 @@ function App() {
     setSelectedIds(next)
   }
 
+  const availableAuthAccounts = authSession
+    ? upsertAuthAccount(storedAuthAccounts, authSession)
+    : storedAuthAccounts
+
   if (authChecking) {
     return (
       <div className="auth-screen">
@@ -1348,6 +1709,24 @@ function App() {
         <form className="auth-card" onSubmit={handleLoginSubmit}>
           <h1>BrowserSaving Login</h1>
           <p>ล็อกอินด้วยอีเมลและรหัสผ่านของ BrowserSaving</p>
+          {storedAuthAccounts.length > 0 ? (
+            <div className="auth-saved-accounts">
+              <span className="auth-saved-label">Saved accounts</span>
+              <div className="auth-saved-list">
+                {storedAuthAccounts.map((account) => (
+                  <button
+                    key={account.email}
+                    type="button"
+                    className="auth-saved-account"
+                    onClick={() => { void switchAuthAccount(account) }}
+                    disabled={accountActionLoading}
+                  >
+                    {account.email}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <label>
             Email
             <input
@@ -1382,6 +1761,16 @@ function App() {
   const filteredProfiles = profiles
     .filter(profile => selectedPage === 'all' || profile.page_name === selectedPage)
     .filter(profile => !searchQuery || profile.name.toLowerCase().includes(searchQuery))
+    .map((profile, originalIndex) => ({
+      profile,
+      originalIndex,
+      isAdmin: hasProfileTag(profile.tags || [], 'admin'),
+    }))
+    .sort((a, b) => {
+      if (a.isAdmin !== b.isAdmin) return a.isAdmin ? -1 : 1
+      return a.originalIndex - b.originalIndex
+    })
+    .map(({ profile }) => profile)
   const allFilteredSelected = filteredProfiles.length > 0 && filteredProfiles.every((profile) => selectedIds.has(profile.id))
 
   return (
@@ -1426,8 +1815,79 @@ function App() {
               </svg>
             )}
           </button>
-          <div className="auth-pill" title={authSession.email}>
-            {authSession.email}
+          <div className="account-switcher" onClick={(event) => event.stopPropagation()}>
+            <button
+              type="button"
+              className={`auth-pill auth-pill-button ${accountMenuOpen ? 'open' : ''}`}
+              title={authSession.email}
+              onClick={() => setAccountMenuOpen((open) => !open)}
+            >
+              <span className="auth-pill-text">{authSession.email}</span>
+              <svg className="auth-pill-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+            {accountMenuOpen ? (
+              <div className="account-menu">
+                <div className="account-menu-header">
+                  <div>
+                    <div className="account-menu-title">Accounts</div>
+                    <div className="account-menu-subtitle">สลับแอคเคานต์ได้ทันที</div>
+                  </div>
+                  <button
+                    type="button"
+                    className="account-menu-link"
+                    onClick={() => {
+                      setShowAddAccountForm((value) => !value)
+                      setSecondaryLoginEmail('')
+                      setSecondaryLoginPassword('')
+                    }}
+                  >
+                    {showAddAccountForm ? 'Cancel' : 'Add account'}
+                  </button>
+                </div>
+                <div className="account-menu-list">
+                  {availableAuthAccounts.map((account) => {
+                    const isCurrent = normalizeAuthEmail(account.email) === normalizeAuthEmail(authSession.email)
+                    return (
+                      <button
+                        key={account.email}
+                        type="button"
+                        className={`account-menu-item ${isCurrent ? 'active' : ''}`}
+                        onClick={() => { if (!isCurrent) void switchAuthAccount(account) }}
+                        disabled={accountActionLoading}
+                      >
+                        <span className="account-menu-email">{account.email}</span>
+                        <span className="account-menu-meta">{isCurrent ? 'Current' : 'Switch'}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+                {showAddAccountForm ? (
+                  <form className="account-menu-form" onSubmit={handleAddAccountSubmit}>
+                    <input
+                      type="email"
+                      value={secondaryLoginEmail}
+                      onChange={(event) => setSecondaryLoginEmail(event.target.value)}
+                      placeholder="email"
+                      autoComplete="email"
+                      required
+                    />
+                    <input
+                      type="password"
+                      value={secondaryLoginPassword}
+                      onChange={(event) => setSecondaryLoginPassword(event.target.value)}
+                      placeholder="password"
+                      autoComplete="current-password"
+                      required
+                    />
+                    <button className="btn-primary account-menu-submit" type="submit" disabled={accountActionLoading}>
+                      {accountActionLoading ? 'Signing in...' : 'Add account'}
+                    </button>
+                  </form>
+                ) : null}
+              </div>
+            ) : null}
           </div>
           <button className="btn-outline btn-logout" onClick={handleLogout}>
             Logout
@@ -1498,6 +1958,22 @@ function App() {
               </button>
             </div>
           </div>
+
+          {profileNameConflicts.length > 0 && (
+            <div className="search-warning">
+              <div className="search-warning-title">พบชื่อโปรไฟล์ซ้ำใน workspace อื่น</div>
+              <div className="search-warning-list">
+                {profileNameConflicts.map((conflict) => (
+                  <div key={conflict.name} className="search-warning-item">
+                    <span className="search-warning-name">{conflict.name}</span>
+                    <span className="search-warning-meta">
+                      ที่นี่ {conflict.current_count} | workspace อื่น {conflict.other_owner_count} | โปรไฟล์ซ้ำ {conflict.other_count}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Stats */}
           <div className="stats">
@@ -1579,6 +2055,7 @@ function App() {
                       const isRunningAndroid = runningAndroidIds.has(profile.id)
                       const isUploadingAndroid = uploadingAndroidIds.has(profile.id)
                       const profileTags = normalizeProfileTags(profile.tags || [])
+                      const isAdminProfile = hasProfileTag(profileTags, 'admin')
                       const hasCredentials = !!(profile.uid || profile.username || profile.password || profile.totp_secret)
                       return (
                         <tr key={profile.id} className={isRunning ? 'row-running' : ''}>
@@ -1670,13 +2147,17 @@ function App() {
                             </div>
                           </td>
                           <td className="col-tags" onClick={() => fetchPageForProfile(profile)} style={{ cursor: hasAnyFacebookToken(profile) && !profile.page_name ? 'pointer' : 'default' }}>
-                            {profile.page_avatar_url ? (
-                              <img
-                                src={profile.page_avatar_url}
-                                alt={profile.page_name || profile.name}
-                                className="page-avatar"
-                                title={profile.page_name || profile.name}
-                              />
+                            {isAdminProfile ? (
+                              <AdminPageIcon title={`${profile.page_name || profile.name} • ADMIN`} />
+                            ) : profile.page_avatar_url ? (
+                              <div className="page-avatar-wrap">
+                                <img
+                                  src={profile.page_avatar_url}
+                                  alt={profile.page_name || profile.name}
+                                  className="page-avatar"
+                                  title={profile.page_name || profile.name}
+                                />
+                              </div>
                             ) : profile.page_name ? (
                               <div className="page-name">{profile.page_name}</div>
                             ) : hasAnyFacebookToken(profile) ? (
@@ -1686,8 +2167,8 @@ function App() {
                             )}
                           </td>
                           <td className="col-page-name">
-                            <div className="page-name-text" title={profile.page_name || ''}>
-                              {profile.page_name || '-'}
+                            <div className="page-name-text" title={isAdminProfile ? '' : (profile.page_name || '')}>
+                              {isAdminProfile ? '' : (profile.page_name || '-')}
                             </div>
                           </td>
                           <td className="col-status">
@@ -1794,21 +2275,17 @@ function App() {
                                 </button>
                               ) : (
                                 <button
-                                  className={`action-btn token facebook-comment ${hasAccessToken(profile) ? 'has-token' : ''}`}
+                                  className={`action-btn token facebook-comment ${hasAnyFacebookToken(profile) ? 'has-token' : ''}`}
                                   onClick={() => {
                                     setTokenContextMenu(null)
-                                    if (hasAccessToken(profile)) {
-                                      setTokenResult({
-                                        profileId: profile.id,
-                                        profileName: profile.name,
-                                        token: getAccessToken(profile),
-                                      })
+                                    if (hasTokenPair(profile)) {
+                                      setTokenResult(buildTokenResult(profile))
                                       return
                                     }
                                     void handleFetchToken(profile)
                                   }}
                                   onContextMenu={(event) => openTokenContextMenu(event, profile)}
-                                  title={hasAccessToken(profile) ? 'Left click: View Token, Right click: Worker / Local' : 'Left click: Get Token (Worker), Right click: Worker / Local'}
+                                  title={hasTokenPair(profile) ? 'Left click: View Tokens, Right click: Access Token via Cloudflare Script / token.py' : 'Left click: Get Tokens, Right click: Access Token via Cloudflare Script / token.py'}
                                 >
                                   <svg viewBox="0 0 24 24" aria-hidden="true">
                                     <path fill="#1877F2" d="M22 12.07C22 6.503 17.523 2 12 2S2 6.503 2 12.07c0 5.017 3.657 9.178 8.438 9.93v-7.02H7.898v-2.91h2.54V9.845c0-2.523 1.492-3.917 3.777-3.917 1.094 0 2.238.196 2.238.196v2.476H15.19c-1.243 0-1.63.776-1.63 1.572v1.898h2.773l-.443 2.91h-2.33V22c4.78-.752 8.44-4.913 8.44-9.93z" />
@@ -1894,46 +2371,12 @@ function App() {
                 <circle cx="8.5" cy="8.5" r="1.5" />
                 <path d="M21 15l-5-5L5 21" />
               </svg>
-              Browserless
-              <span className={`browserless-status ${browserlessConnected ? 'online' : 'offline'}`}>
-                <span className="status-dot"></span>
-                {browserlessConnected ? 'Connected' : 'Offline'}
-              </span>
+              Postcron Renderer
             </h3>
 
-            <div className="settings-field">
-              <label>Browserless URL</label>
-              <input
-                type="text"
-                value={browserlessUrl}
-                onChange={e => setBrowserlessUrl(e.target.value)}
-                placeholder="http://localhost:3333"
-              />
-            </div>
-
-            <div className="settings-field">
-              <label>Token</label>
-              <input
-                type="text"
-                value={browserlessToken}
-                onChange={e => setBrowserlessToken(e.target.value)}
-                placeholder="browserless_token"
-              />
-            </div>
-
-            <div className="settings-actions">
-              <button className="btn-outline" onClick={checkBrowserless}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M23 4v6h-6M1 20v-6h6" />
-                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-                </svg>
-                Test Connection
-              </button>
-            </div>
-
             <div className="settings-info">
-              <p>🐳 Docker: <code>docker run -d --name browserless -p 3333:3000 -e TOKEN=browserless_token ghcr.io/browserless/chromium</code></p>
-              <p>📖 Docs: <a href="https://docs.browserless.io" target="_blank" rel="noopener">docs.browserless.io</a></p>
+              <p>POSTCRON TOKEN ใช้ Cloudflare Browser Rendering ผ่าน `browsersaving-worker` โดยตรงแล้ว</p>
+              <p>เมนู `Cloudflare Script` และ `token.py` มีผลเฉพาะ ACCESS TOKEN ด้านบนเท่านั้น</p>
             </div>
           </div>
 
@@ -2139,7 +2582,7 @@ function App() {
         <div className="modal-overlay" onClick={() => setTokenResult(null)}>
           <div className="modal token-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Access Token</h3>
+              <h3>Tokens</h3>
               <button className="close-btn" onClick={() => setTokenResult(null)}>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M18 6L6 18M6 6l12 12" />
@@ -2153,16 +2596,17 @@ function App() {
                 <label>ACCESS TOKEN</label>
                 <div className="token-value-row">
                   <textarea
-                    value={tokenResult.token}
+                    value={tokenResult.accessToken}
                     readOnly
                     rows={4}
                   />
                   <button
                     className="copy-btn"
                     onClick={() => {
-                      navigator.clipboard.writeText(tokenResult.token)
+                      navigator.clipboard.writeText(tokenResult.accessToken)
                     }}
                     title="Copy"
+                    disabled={!tokenResult.accessToken}
                   >
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
@@ -2170,6 +2614,39 @@ function App() {
                     </svg>
                   </button>
                 </div>
+              </div>
+              <div className="token-field">
+                <label>POSTCRON TOKEN (Cloudflare Rendering)</label>
+                <div className="token-value-row">
+                  <textarea
+                    value={tokenResult.postcronToken}
+                    readOnly
+                    rows={4}
+                    placeholder={tokenResult.postcronError ? 'Postcron token unavailable' : 'No Postcron token'}
+                  />
+                  <button
+                    className="copy-btn"
+                    onClick={() => {
+                      navigator.clipboard.writeText(tokenResult.postcronToken)
+                    }}
+                    title="Copy"
+                    disabled={!tokenResult.postcronToken}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                    </svg>
+                  </button>
+                </div>
+                {tokenResult.postcronError ? (
+                  <p className="token-status warning">
+                    {tokenResult.postcronError}
+                    {tokenResult.postcronReason ? ` (${tokenResult.postcronReason})` : ''}
+                    {tokenResult.postcronDetail ? ` - ${tokenResult.postcronDetail}` : ''}
+                  </p>
+                ) : !tokenResult.postcronToken ? (
+                  <p className="token-status muted">ยังไม่มี Postcron token</p>
+                ) : null}
               </div>
               <div className="token-actions">
                 <button
@@ -2185,7 +2662,7 @@ function App() {
                     <path d="M23 4v6h-6M1 20v-6h6" />
                     <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
                   </svg>
-                  Refresh Token
+                  Refresh Tokens
                 </button>
                 <button
                   className="btn-danger"
@@ -2219,7 +2696,7 @@ function App() {
               if (profile) void handleFetchToken(profile, 'worker')
             }}
           >
-            Worker
+            Cloudflare Script
           </button>
           <button
             className="postcron-context-item"
@@ -2228,7 +2705,7 @@ function App() {
               if (profile) void handleFetchToken(profile, 'local')
             }}
           >
-            Local
+            token.py
           </button>
         </div>
       )}

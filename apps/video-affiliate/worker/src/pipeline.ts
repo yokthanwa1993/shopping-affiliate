@@ -5,7 +5,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-02-25.11'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-03-12.01'
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const GEMINI_API_KEY_SETTING_KEY = 'gemini_api_key_v1'
 const MAX_VOICE_PROMPT_CHARS = 12000

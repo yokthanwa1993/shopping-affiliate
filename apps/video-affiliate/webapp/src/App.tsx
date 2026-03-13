@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type SyntheticEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 
 
 const WORKER_URL = 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev'
@@ -51,10 +51,26 @@ const getStoredShortlinkExpectedUtmId = (botScope = getBotScopeFromLocation()) =
   try { return String(localStorage.getItem(scopedStorageKey('shortlink_expected_utm_id', botScope)) || '').trim() } catch { return '' }
 }
 
-const CACHE_VERSION = 'v3'
+const CACHE_VERSION = 'v5'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
+const GALLERY_BATCH_SIZE = 24
+const LOGS_REVEAL_BATCH_SIZE = 1
+const LOGS_REVEAL_INTERVAL_MS = 45
+
+const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
+  if (systemWide || getStoredShortlinkBaseUrl(botScope)) {
+    return []
+  }
+
+  const scopedNamespace = String(namespaceId || getStoredNamespace(botScope) || '').trim()
+  if (scopedNamespace) {
+    return dedupeGalleryVideos(readCache<Video[]>(nsCacheKey('gallery', scopedNamespace), []))
+  }
+
+  return dedupeGalleryVideos(readCache<Video[]>(globalCacheKey('gallery'), []))
+}
 
 const apiFetch = async (url: string, options: RequestInit = {}) => {
   const headers = { ...options.headers, 'x-auth-token': getToken() }
@@ -108,6 +124,24 @@ interface Video {
   keepInPostedTab?: boolean
 }
 
+interface GalleryPageResponse {
+  videos?: Video[]
+  total?: number
+  offset?: number
+  limit?: number
+  has_more?: boolean
+  with_link_total?: number
+  without_link_total?: number
+}
+
+interface SystemGalleryStats {
+  total: number
+  withLink: number
+  withoutLink: number
+}
+
+type SystemWidePostedLinkFilter = 'with-link' | 'no-link'
+
 interface GlobalOriginalVideo {
   id: string
   video_id: string
@@ -138,6 +172,8 @@ interface PostHistory {
   comment_profile_name?: string | null
   comment_error?: string | null
   comment_fb_id?: string | null
+  comment_delay_seconds?: number | null
+  comment_due_at?: string | null
   shopee_link?: string | null
   shortlink_utm_source?: string | null
   shortlink_status?: string | null
@@ -183,6 +219,7 @@ interface TaggedPageProfile {
   roles: Array<'post' | 'comment'>
   tags: string[]
   token?: string
+  postcron_token?: string
 }
 
 type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
@@ -219,6 +256,68 @@ const getVideoShopeeLink = (video: Record<string, unknown>): string => {
     const hit = extractShopeeLink(candidate)
     if (hit) return hit
   }
+  return ''
+}
+
+function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
+  const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
+  return Number.isFinite(ts) ? ts : 0
+}
+
+function pickPreferredGalleryVideo(
+  current: Partial<Video> & Record<string, unknown>,
+  next: Partial<Video> & Record<string, unknown>,
+) {
+  const currentHasLink = !!getVideoShopeeLink(current)
+  const nextHasLink = !!getVideoShopeeLink(next)
+  if (currentHasLink !== nextHasLink) {
+    return nextHasLink ? next : current
+  }
+
+  const currentHasThumbnail = !!String(current.thumbnailUrl || '').trim()
+  const nextHasThumbnail = !!String(next.thumbnailUrl || '').trim()
+  if (currentHasThumbnail !== nextHasThumbnail) {
+    return nextHasThumbnail ? next : current
+  }
+
+  const currentTs = getGalleryVideoSortMs(current)
+  const nextTs = getGalleryVideoSortMs(next)
+  if (currentTs !== nextTs) {
+    return nextTs >= currentTs ? next : current
+  }
+
+  const currentNamespaceId = String(current.namespace_id || '').trim()
+  const nextNamespaceId = String(next.namespace_id || '').trim()
+  return nextNamespaceId.localeCompare(currentNamespaceId) <= 0 ? next : current
+}
+
+function dedupeGalleryVideos(rows: Video[]): Video[] {
+  const byId = new Map<string, Video>()
+  for (const video of rows || []) {
+    const id = String(video?.id || '').trim()
+    if (!id) continue
+    const prev = byId.get(id)
+    if (!prev) {
+      byId.set(id, video)
+      continue
+    }
+    byId.set(id, pickPreferredGalleryVideo(prev as Video & Record<string, unknown>, video as Video & Record<string, unknown>) as Video)
+  }
+  return Array.from(byId.values()).sort((a, b) => getGalleryVideoSortMs(b as Video & Record<string, unknown>) - getGalleryVideoSortMs(a as Video & Record<string, unknown>))
+}
+
+const resolvePlayableVideoUrl = (video: Partial<Video> & Record<string, unknown>) => {
+  const publicUrl = String(video.publicUrl || '').trim()
+  const originalUrl = String(video.originalUrl || '').trim()
+  return publicUrl || originalUrl || ''
+}
+
+const resolveFallbackVideoUrl = (video: Partial<Video> & Record<string, unknown>, currentUrl?: string) => {
+  const publicUrl = String(video.publicUrl || '').trim()
+  const originalUrl = String(video.originalUrl || '').trim()
+  const current = String(currentUrl || '').trim()
+  if (current && current === publicUrl && originalUrl && originalUrl !== publicUrl) return originalUrl
+  if (current && current === originalUrl && publicUrl && publicUrl !== originalUrl) return publicUrl
   return ''
 }
 
@@ -325,35 +424,97 @@ const CloseIcon = () => (
     <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
   </svg>
 )
+const WorkspaceCurrentIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <path d="M3 10.5L12 3l9 7.5" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M5.25 9.75V20a1 1 0 001 1h4.5v-6h2.5v6h4.5a1 1 0 001-1V9.75" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+)
+const WorkspaceOtherIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+    <rect x="4" y="4" width="7" height="7" rx="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    <rect x="13" y="13" width="7" height="7" rx="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M13 7h3a1 1 0 011 1v3" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M11 17H8a1 1 0 01-1-1v-3" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+)
 
-// Thumbnail with localStorage cache
-function Thumb({ id, url, fallback }: { id: string; url?: string; fallback: string }) {
-  const [src, setSrc] = useState(() => {
-    try { return localStorage.getItem(`t_${id}`) || '' } catch { return '' }
-  })
+function VideoWorkspaceBadge({
+  videoNamespaceId,
+  currentNamespaceId,
+  showLabel = false,
+}: {
+  videoNamespaceId?: string
+  currentNamespaceId?: string
+  showLabel?: boolean
+}) {
+  const currentId = String(currentNamespaceId || '').trim()
+  const videoId = String(videoNamespaceId || '').trim()
+  if (!currentId || !videoId) return null
 
-  useEffect(() => {
-    if (src) return // already cached
-    if (!url) return
-    fetch(url).then(r => r.blob()).then(blob => {
-      const reader = new FileReader()
-      reader.onloadend = () => {
-        const b64 = reader.result as string
-        setSrc(b64)
-        try { localStorage.setItem(`t_${id}`, b64) } catch { }
-      }
-      reader.readAsDataURL(blob)
-    }).catch(() => { })
-  }, [id, url, src])
+  const isCurrentWorkspace = currentId === videoId
+  const label = isCurrentWorkspace ? 'work id นี้' : 'work id อื่น'
+  const className = isCurrentWorkspace
+    ? 'bg-blue-500/95 text-white border-blue-400/70'
+    : 'bg-slate-900/82 text-white border-white/15'
 
-  if (src) return <img src={src} className="w-full h-full object-cover" alt="" />
-  if (url) return <img src={url} className="w-full h-full object-cover" loading="lazy" alt="" />
-  return <video src={`${fallback}#t=0.1`} className="w-full h-full object-cover" preload="metadata" muted playsInline />
+  return (
+    <div
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-semibold shadow-lg backdrop-blur-sm ${className}`}
+      title={label}
+      aria-label={label}
+    >
+      {isCurrentWorkspace ? <WorkspaceCurrentIcon /> : <WorkspaceOtherIcon />}
+      {showLabel && <span>{label}</span>}
+    </div>
+  )
+}
+
+function inferThumbnailUrl(url: string | undefined, fallback: string): string {
+  const direct = String(url || '').trim()
+  if (direct) return direct
+  const source = String(fallback || '').trim()
+  if (!source) return ''
+  return source.replace(/(?:_original)?\.mp4(?:#.*)?$/i, '_thumb.webp')
+}
+
+// Grid thumbnails stay image-only. If a thumb is missing, show a lightweight placeholder.
+function Thumb({ url, fallback }: { id: string; url?: string; fallback: string }) {
+  const [failed, setFailed] = useState(false)
+  const src = failed ? '' : inferThumbnailUrl(url, fallback)
+
+  if (!src) {
+    if (fallback) {
+      return (
+        <video
+          src={`${fallback}#t=0.1`}
+          className="w-full h-full object-cover"
+          preload="metadata"
+          muted
+          playsInline
+        />
+      )
+    }
+    return <div className="w-full h-full bg-gray-100" />
+  }
+
+  return (
+    <img
+      src={src}
+      className="w-full h-full object-cover"
+      loading="lazy"
+      decoding="async"
+      alt=""
+      onError={() => setFailed(true)}
+    />
+  )
 }
 
 // Video card component
 function VideoCard({
   video,
+  currentNamespaceId,
+  showWorkspaceBadge = false,
   formatDuration,
   onDelete,
   onUpdate,
@@ -361,6 +522,8 @@ function VideoCard({
   keepInPostedOnLinkSave = false
 }: {
   video: Video
+  currentNamespaceId?: string
+  showWorkspaceBadge?: boolean
   formatDuration: (s: number) => string
   onDelete: (id: string, namespaceId?: string) => void
   onUpdate: (id: string, namespaceId: string | undefined, fields: Partial<Video>) => void
@@ -378,6 +541,7 @@ function VideoCard({
   const [editingTitle, setEditingTitle] = useState(false)
   const [localTitle, setLocalTitle] = useState(video.title || '')
   const [savingTitle, setSavingTitle] = useState(false)
+  const [playbackUrl, setPlaybackUrl] = useState(resolvePlayableVideoUrl(video as Video & Record<string, unknown>))
   const videoNamespaceId = String(video.namespace_id || '').trim() || undefined
   const videoStorageId = videoNamespaceId ? `${videoNamespaceId}:${video.id}` : video.id
   const buildVideoApiUrl = () => {
@@ -389,6 +553,10 @@ function VideoCard({
   useEffect(() => {
     setLocalShopee(getVideoShopeeLink(video as unknown as Record<string, unknown>))
   }, [video.id, video.shopeeLink])
+
+  useEffect(() => {
+    setPlaybackUrl(resolvePlayableVideoUrl(video as Video & Record<string, unknown>))
+  }, [video.id, video.publicUrl, video.originalUrl])
 
   useEffect(() => {
     if (expanded) {
@@ -571,11 +739,17 @@ function VideoCard({
           </div>
           <div className="aspect-[3/4] rounded-2xl overflow-hidden">
             <video
-              src={video.publicUrl}
+              src={playbackUrl}
               className="w-full h-full object-cover"
               controls
               autoPlay
               playsInline
+              onError={() => {
+                const fallbackUrl = resolveFallbackVideoUrl(video as Video & Record<string, unknown>, playbackUrl)
+                if (fallbackUrl && fallbackUrl !== playbackUrl) {
+                  setPlaybackUrl(fallbackUrl)
+                }
+              }}
             />
           </div>
           {/* Category chips */}
@@ -704,7 +878,15 @@ function VideoCard({
       className="relative aspect-[9/16] rounded-2xl overflow-hidden cursor-pointer bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200"
       onClick={() => setExpanded(true)}
     >
-      <Thumb id={video.id} url={video.thumbnailUrl} fallback={video.publicUrl} />
+      <Thumb id={video.id} url={video.thumbnailUrl} fallback={resolvePlayableVideoUrl(video as Video & Record<string, unknown>)} />
+      {showWorkspaceBadge && (
+        <div className="absolute top-2 left-2">
+          <VideoWorkspaceBadge
+            videoNamespaceId={videoNamespaceId}
+            currentNamespaceId={currentNamespaceId}
+          />
+        </div>
+      )}
       {getVideoShopeeLink(video as unknown as Record<string, unknown>) && (
         <div className="absolute bottom-2 left-2 bg-orange-500 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg border border-white/20">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -1034,9 +1216,11 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
 
   const allTaggedProfiles = taggedProfiles
   const profilesWithToken = allTaggedProfiles.filter((profile) => String(profile.token || '').trim()).length
+  const profilesWithPostcronToken = allTaggedProfiles.filter((profile) => String(profile.postcron_token || '').trim()).length
 
   const inspectorProfiles = allTaggedProfiles
   const inspectorProfilesWithToken = profilesWithToken
+  const inspectorProfilesWithPostcronToken = profilesWithPostcronToken
 
   const refreshPageAfterTaggedTokenChange = async () => {
     try {
@@ -1057,17 +1241,22 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
       const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}/token`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: nextToken }),
+        body: JSON.stringify({ token: nextToken, mode: 'comment' }),
       })
-      const data = await resp.json().catch(() => ({})) as { error?: string; token?: string }
+      const data = await resp.json().catch(() => ({})) as { error?: string; token?: string; postcron_token?: string }
       if (!resp.ok) {
         throw new Error(String(data?.error || (mutation === 'delete' ? 'ลบ token ไม่สำเร็จ' : 'บันทึก token ไม่สำเร็จ')))
       }
 
       const savedToken = String(data?.token ?? nextToken).trim()
+      const savedPostcronToken = String(data?.postcron_token || '').trim()
       setTaggedProfiles((prev) => prev.map((item) => {
         if (item.profile_id !== profileId) return item
-        return { ...item, token: savedToken }
+        return {
+          ...item,
+          token: savedToken,
+          postcron_token: savedPostcronToken,
+        }
       }))
       await refreshPageAfterTaggedTokenChange()
       setEditingTaggedProfile(null)
@@ -1234,7 +1423,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
               <p className="text-xs text-gray-400 mt-0.5">
                 {taggedLoading
                   ? 'กำลังโหลดจาก BrowserSaving...'
-                  : `จาก BrowserSaving: ${profilesWithToken}/${allTaggedProfiles.length} โปรไฟล์มี token`}
+                  : `จาก BrowserSaving: access ${profilesWithToken}/${allTaggedProfiles.length} | postcron ${profilesWithPostcronToken}/${allTaggedProfiles.length}`}
               </p>
             </div>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><path d="M9 18l6-6-6-6" strokeLinecap="round" strokeLinejoin="round" /></svg>
@@ -1247,12 +1436,12 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
             <div className="bg-white rounded-2xl w-full max-w-md max-h-[80vh] p-4 flex flex-col" onClick={(e) => e.stopPropagation()}>
               <div className="mb-3">
                 <h3 className="font-bold text-gray-900 text-base text-center">
-                  Token จาก BrowserSaving
+                  Tokens จาก BrowserSaving
                 </h3>
                 <p className="text-xs text-gray-500 text-center mt-1">
                   {taggedLoading
                     ? 'กำลังโหลด...'
-                    : `${inspectorProfilesWithToken}/${inspectorProfiles.length} โปรไฟล์มี token`}
+                    : `access ${inspectorProfilesWithToken}/${inspectorProfiles.length} | postcron ${inspectorProfilesWithPostcronToken}/${inspectorProfiles.length}`}
                 </p>
               </div>
 
@@ -1266,6 +1455,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 ) : (
                   inspectorProfiles.map((profile) => {
                     const currentToken = profile.token
+                    const currentPostcronToken = profile.postcron_token
                     return (
                       <div
                         key={`access-${profile.profile_id}`}
@@ -1300,10 +1490,16 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                             </svg>
                           </button>
                         </div>
-                        <div className="mt-1 flex items-center justify-between gap-2">
-                          <span className="text-[11px] text-gray-500">Token</span>
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                          <span className="text-[11px] text-gray-500">Access Token</span>
                           <span className={`text-[11px] font-mono truncate ${currentToken ? 'text-gray-800' : 'text-orange-600 font-bold'}`}>
                             {renderTokenPreview(currentToken)}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-center justify-between gap-2">
+                          <span className="text-[11px] text-gray-500">Postcron Token</span>
+                          <span className={`text-[11px] font-mono truncate ${currentPostcronToken ? 'text-gray-800' : 'text-orange-600 font-bold'}`}>
+                            {renderTokenPreview(currentPostcronToken)}
                           </span>
                         </div>
                         <p className="mt-1 text-[11px] text-blue-500">แตะเพื่อแก้ไข token โปรไฟล์นี้</p>
@@ -1355,6 +1551,12 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 rows={2}
                 className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all resize-none overflow-hidden"
               />
+              <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Postcron Token</p>
+                <p className={`mt-1 text-xs font-mono break-all ${editingTaggedProfile.profile.postcron_token ? 'text-gray-700' : 'text-orange-600 font-bold'}`}>
+                  {editingTaggedProfile.profile.postcron_token || 'ไม่มีโทเค้น'}
+                </p>
+              </div>
               <div className="flex gap-3">
                 <button
                   onClick={() => setEditingTaggedProfile(null)}
@@ -1851,10 +2053,15 @@ function App() {
     setPages([])
     setVideos([])
     setUsedVideos([])
+    setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0 })
+    setSystemGalleryHasMore(false)
+    setGalleryLoadingMore(false)
+    setGalleryVisibleCount(GALLERY_BATCH_SIZE)
     setGlobalOriginalVideos([])
     setGlobalOriginalLoading(false)
     setPostHistory([])
     setLoading(true)
+    setGalleryLoading(true)
   }
 
   const handleLogin = (t: string) => {
@@ -1923,11 +2130,7 @@ function App() {
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null)
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null)
   const [videos, setVideos] = useState<Video[]>(() => {
-    const shortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
-    if (shortlinkBaseUrl) return readCache<Video[]>(systemGalleryCacheKey(botScope), [])
-    const ns = getStoredNamespace(botScope)
-    if (ns) return readCache<Video[]>(nsCacheKey('gallery', ns), [])
-    return readCache<Video[]>(globalCacheKey('gallery'), [])
+    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), !!getStoredShortlinkBaseUrl(botScope))
   })
   const [usedVideos, setUsedVideos] = useState<Video[]>(() => {
     const ns = getStoredNamespace()
@@ -1951,6 +2154,12 @@ function App() {
     }
     return readCache<Video[]>(globalCacheKey('gallery'), []).length === 0
   })
+  const [galleryLoading, setGalleryLoading] = useState(() => {
+    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), !!getStoredShortlinkBaseUrl(botScope)).length === 0
+  })
+  const [systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0 })
+  const [systemGalleryHasMore, setSystemGalleryHasMore] = useState(false)
+  const [galleryLoadingMore, setGalleryLoadingMore] = useState(false)
   // Get today's date in YYYY-MM-DD format for Thailand timezone
   const getTodayString = () => {
     const now = new Date()
@@ -1965,6 +2174,8 @@ function App() {
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null)
   const [logDateFilter, setLogDateFilter] = useState<string>(getTodayString())
+  const [logNowMs, setLogNowMs] = useState(() => Date.now())
+  const [visibleLogCount, setVisibleLogCount] = useState(0)
   // Read initial tab from URL path or query param
   type TabName = 'dashboard' | 'processing' | 'gallery' | 'logs' | 'pages' | 'settings'
   const getInitialTab = (): TabName => {
@@ -1991,6 +2202,7 @@ function App() {
   const [deletePageId, setDeletePageId] = useState<string | null>(null)
   const [deletingPageId, setDeletingPageId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
+  const [galleryVisibleCount, setGalleryVisibleCount] = useState(GALLERY_BATCH_SIZE)
   const loadAllInFlightRef = useRef(false)
   const loadAllPendingRef = useRef(false)
   const processingFetchInFlightRef = useRef(false)
@@ -2002,23 +2214,33 @@ function App() {
   const lastGlobalOriginalFetchAtRef = useRef(0)
   const systemWideGalleryMode = !!String(shortlinkBaseUrlCurrent || '').trim()
   const systemWideGalleryModeRef = useRef(systemWideGalleryMode)
+  const mainScrollRef = useRef<HTMLDivElement | null>(null)
+  const galleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
+  const systemGalleryRequestRef = useRef(0)
+  const systemGalleryLoadedCountRef = useRef(videos.length)
 
   useEffect(() => {
     systemWideGalleryModeRef.current = systemWideGalleryMode
   }, [systemWideGalleryMode])
+  useEffect(() => {
+    systemGalleryLoadedCountRef.current = videos.length
+  }, [videos.length])
 
   const tg = window.Telegram?.WebApp
   const hydrateNamespaceCaches = (ns: string) => {
     const scopedNamespace = String(ns || '').trim()
     if (!scopedNamespace) return
-    const cachedVideos = String(shortlinkBaseUrlCurrent || getStoredShortlinkBaseUrl(botScope) || '').trim()
-      ? readCache<Video[]>(systemGalleryCacheKey(botScope), [])
-      : readCache<Video[]>(nsCacheKey('gallery', scopedNamespace), [])
+    const cachedVideos = readGalleryCacheForScope(
+      botScope,
+      scopedNamespace,
+      !!String(shortlinkBaseUrlCurrent || getStoredShortlinkBaseUrl(botScope) || '').trim()
+    )
     const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
     setVideos(cachedVideos)
     setUsedVideos(cachedUsedVideos)
     setPostHistory(cachedHistory)
+    setGalleryLoading(cachedVideos.length === 0)
     if (cachedVideos.length > 0 || cachedUsedVideos.length > 0 || cachedHistory.length > 0) {
       setLoading(false)
     }
@@ -2043,7 +2265,7 @@ function App() {
 
   useEffect(() => {
     if (systemWideGalleryMode) {
-      writeCache(systemGalleryCacheKey(botScope), videos)
+      try { localStorage.removeItem(systemGalleryCacheKey(botScope)) } catch { }
       return
     }
     if (!namespaceId) return
@@ -2076,10 +2298,68 @@ function App() {
     }
   }, [tg])
 
+  const filteredLogHistory = useMemo(() => {
+    return postHistory.filter((item) => {
+      const itemDate = new Date(item.posted_at)
+      const thaiItemDate = new Date(itemDate.getTime() + 7 * 60 * 60 * 1000)
+      const itemDateStr = thaiItemDate.toISOString().split('T')[0]
+      return itemDateStr === logDateFilter
+    })
+  }, [logDateFilter, postHistory])
+
+  useEffect(() => {
+    if (tab !== 'logs') {
+      setVisibleLogCount(filteredLogHistory.length)
+      return
+    }
+
+    if (loading && postHistory.length === 0) {
+      setVisibleLogCount(0)
+      return
+    }
+
+    const total = filteredLogHistory.length
+    if (total === 0) {
+      setVisibleLogCount(0)
+      return
+    }
+
+    const initialCount = Math.min(LOGS_REVEAL_BATCH_SIZE, total)
+    setVisibleLogCount(initialCount)
+    if (initialCount >= total) return
+
+    const timer = window.setInterval(() => {
+      setVisibleLogCount((current) => {
+        if (current >= total) {
+          window.clearInterval(timer)
+          return current
+        }
+        const next = Math.min(current + LOGS_REVEAL_BATCH_SIZE, total)
+        if (next >= total) window.clearInterval(timer)
+        return next
+      })
+    }, LOGS_REVEAL_INTERVAL_MS)
+
+    return () => window.clearInterval(timer)
+  }, [filteredLogHistory.length, loading, postHistory.length, tab])
+
+  useEffect(() => {
+    if (tab !== 'logs') return
+    setLogNowMs(Date.now())
+    const timer = window.setInterval(() => {
+      setLogNowMs(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [tab])
+
   useEffect(() => {
     setTokenState(getToken(botScope))
-    setNamespaceId(getStoredNamespace(botScope))
+    const storedNamespace = getStoredNamespace(botScope)
     const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
+    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, !!storedShortlinkBaseUrl)
+    setNamespaceId(storedNamespace)
+    setVideos(cachedVideos)
+    setGalleryLoading(cachedVideos.length === 0)
     const storedShortlinkExpectedUtmId = getStoredShortlinkExpectedUtmId(botScope)
     setShortlinkBaseUrlCurrent(storedShortlinkBaseUrl)
     setShortlinkBaseUrlDraft(storedShortlinkBaseUrl)
@@ -2158,13 +2438,15 @@ function App() {
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    loadAll()
+    void loadAll({ skipGallery: systemWideGalleryMode })
     loadTeam()
     if (tab === 'pages') loadPages()
 
-    const interval = setInterval(loadAll, 10000)
+    const interval = setInterval(() => {
+      void loadAll({ skipGallery: systemWideGalleryMode })
+    }, 10000)
     return () => clearInterval(interval)
-  }, [token, authBootstrapping])
+  }, [token, authBootstrapping, tab, systemWideGalleryMode])
 
   // Reload pages when switching to Pages tab
   useEffect(() => {
@@ -2193,10 +2475,25 @@ function App() {
   }, [token, authBootstrapping, isOwner])
 
   useEffect(() => {
+    const cachedVideos = readGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
+    setVideos(cachedVideos)
+    setGalleryLoading(cachedVideos.length === 0)
+    if (!systemWideGalleryMode) {
+      setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0 })
+      setSystemGalleryHasMore(false)
+      setGalleryLoadingMore(false)
+    }
+  }, [botScope, namespaceId, systemWideGalleryMode])
+
+  useEffect(() => {
     if (!systemWideGalleryMode) return
-    setVideos(readCache<Video[]>(systemGalleryCacheKey(botScope), []))
     if (postedLinkFilter === 'all') setPostedLinkFilter('with-link')
-  }, [botScope, systemWideGalleryMode, postedLinkFilter])
+  }, [systemWideGalleryMode, postedLinkFilter])
+
+  useEffect(() => {
+    if (tab !== 'gallery' || isOwner && categoryFilter === 'all-original') return
+    setGalleryVisibleCount(GALLERY_BATCH_SIZE)
+  }, [tab, botScope, namespaceId, categoryFilter, postedLinkFilter, systemWideGalleryMode, isOwner])
 
   useEffect(() => {
     if (authBootstrapping || !token || tab !== 'dashboard') return
@@ -2308,7 +2605,65 @@ function App() {
     }
   }
 
-  async function loadAll() {
+  async function loadSystemGalleryPage(options: { reset?: boolean } = {}) {
+    const session = getToken()
+    if (!session) return
+
+    const reset = !!options.reset
+    const activeLinkFilter: SystemWidePostedLinkFilter = postedLinkFilter === 'no-link' ? 'no-link' : 'with-link'
+    const requestId = reset ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
+    if (reset) {
+      setGalleryLoading(true)
+      setGalleryLoadingMore(false)
+      setSystemGalleryHasMore(false)
+    } else {
+      if (galleryLoadingMore || !systemGalleryHasMore) return
+      setGalleryLoadingMore(true)
+    }
+
+    try {
+      const offset = reset ? 0 : systemGalleryLoadedCountRef.current
+      const params = new URLSearchParams()
+      params.set('offset', String(offset))
+      params.set('limit', String(GALLERY_BATCH_SIZE))
+      params.set('link_filter', activeLinkFilter)
+
+      const resp = await apiFetch(`${WORKER_URL}/api/gallery?${params.toString()}`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (!resp.ok) return
+
+      const data = await resp.json() as GalleryPageResponse
+      if (requestId !== systemGalleryRequestRef.current) return
+
+      const nextVideos = Array.isArray(data.videos) ? data.videos : []
+      const hasMore = !!data.has_more && nextVideos.length > 0
+      setVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : dedupeGalleryVideos([...prev, ...nextVideos]))
+      setSystemGalleryStats({
+        total: Number(data.total || 0),
+        withLink: Number(data.with_link_total || 0),
+        withoutLink: Number(data.without_link_total || 0),
+      })
+      setSystemGalleryHasMore(hasMore)
+    } catch {
+      // Keep current gallery snapshot on transient errors.
+    } finally {
+      if (requestId === systemGalleryRequestRef.current) {
+        setGalleryLoading(false)
+        setGalleryLoadingMore(false)
+      }
+    }
+  }
+
+  useEffect(() => {
+    if (systemWideGalleryMode && postedLinkFilter === 'all') {
+      setPostedLinkFilter('with-link')
+    }
+  }, [systemWideGalleryMode, postedLinkFilter])
+
+  async function loadAll(options: { skipGallery?: boolean } = {}) {
     if (loadAllInFlightRef.current) {
       loadAllPendingRef.current = true
       return
@@ -2341,28 +2696,35 @@ function App() {
         }
       })()
 
-      const galleryTask = (async () => {
-        const galleryEndpoint = `${WORKER_URL}/api/gallery`
-        const galleryResp = await apiFetch(galleryEndpoint)
-        if (galleryResp.status === 401) {
-          await onUnauthorized()
-          return
-        }
-        if (galleryResp.ok) {
-          const data = await galleryResp.json()
-          setVideos(data.videos || [])
-        }
-      })()
+      const tasks: Promise<void>[] = [historyTask]
+      if (!options.skipGallery) {
+        const galleryTask = (async () => {
+          const galleryEndpoint = `${WORKER_URL}/api/gallery`
+          const galleryResp = await apiFetch(galleryEndpoint)
+          if (galleryResp.status === 401) {
+            await onUnauthorized()
+            return
+          }
+          if (galleryResp.ok) {
+            const data = await galleryResp.json() as { videos?: Video[] }
+            setVideos(dedupeGalleryVideos(Array.isArray(data.videos) ? data.videos : []))
+          }
+          if (!unauthorized) setGalleryLoading(false)
+        })()
+        tasks.push(galleryTask)
+      }
 
-      await Promise.allSettled([historyTask, galleryTask])
+      await Promise.allSettled(tasks)
       if (!unauthorized) setLoading(false)
     } finally {
       loadAllInFlightRef.current = false
       void loadProcessingSnapshot()
-      void loadUsedVideos()
+      if (!systemWideGalleryModeRef.current) {
+        void loadUsedVideos()
+      }
       if (loadAllPendingRef.current) {
         loadAllPendingRef.current = false
-        void loadAll()
+        void loadAll(options)
       }
     }
   }
@@ -2376,14 +2738,20 @@ function App() {
       return
     }
 
+    if (systemWideGalleryMode) {
+      if (postedLinkFilter === 'all') return
+      void loadSystemGalleryPage({ reset: true })
+      return
+    }
+
     void loadUsedVideos({ force: categoryFilter === 'used' })
     if (isOwner) void loadGlobalOriginalVideos()
-  }, [tab, categoryFilter, token, authBootstrapping, isOwner])
+  }, [tab, categoryFilter, postedLinkFilter, token, authBootstrapping, isOwner, systemWideGalleryMode])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    void loadAll()
-  }, [systemWideGalleryMode])
+    void loadAll({ skipGallery: systemWideGalleryMode })
+  }, [systemWideGalleryMode, token, authBootstrapping])
 
 
 
@@ -2812,10 +3180,68 @@ function App() {
       : 'not_configured'
   }
 
-  const getSimpleStatusMeta = (isPassed: boolean) => {
-    return isPassed
-      ? { label: 'ผ่าน', cls: 'bg-green-100 text-green-700' }
-      : { label: 'ไม่ผ่าน', cls: 'bg-red-100 text-red-700' }
+  const formatCountdownClock = (seconds: number) => {
+    const total = Math.max(0, Math.ceil(seconds))
+    const minutes = Math.floor(total / 60)
+    const remainingSeconds = total % 60
+    return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`
+  }
+
+  type LogStatusTone = 'success' | 'pending' | 'failed' | 'idle'
+
+  const getSimpleStatusMeta = (tone: LogStatusTone, kind: 'post' | 'comment', status?: string | null) => {
+    if (tone === 'success') {
+      return { label: 'ผ่าน', cls: 'bg-green-100 text-green-700', loading: false }
+    }
+    if (tone === 'pending') {
+      return {
+        label: kind === 'post' ? 'กำลังโพสต์' : 'กำลังคอมเมนต์',
+        cls: 'bg-slate-100 text-slate-600',
+        loading: true,
+      }
+    }
+    if (tone === 'idle') {
+      const normalizedStatus = normalizeCommentStatus(status)
+      return {
+        label: kind === 'comment'
+          ? (normalizedStatus === 'not_attempted' ? 'รอคอมเมนต์' : 'รอ')
+          : 'รอ',
+        cls: 'bg-slate-100 text-slate-500',
+        loading: false,
+      }
+    }
+    return { label: 'ไม่ผ่าน', cls: 'bg-red-100 text-red-700', loading: false }
+  }
+
+  const getPostLogTone = (item: Pick<PostHistory, 'status' | 'fb_post_id' | 'fb_reel_url'>): LogStatusTone => {
+    const status = item.status
+    const value = String(status || '').trim().toLowerCase()
+    if (String(item.fb_post_id || '').trim() || String(item.fb_reel_url || '').trim()) return 'success'
+    if (value === 'success') return 'success'
+    if (value === 'posting') return 'pending'
+    return 'failed'
+  }
+
+  const getCommentLogTone = (status?: string | null): LogStatusTone => {
+    const value = normalizeCommentStatus(status)
+    if (value === 'success') return 'success'
+    if (value === 'pending') return 'pending'
+    if (value === 'skipped' || value === 'not_attempted' || value === 'not_configured') return 'idle'
+    return 'failed'
+  }
+
+  const getCommentCountdownSeconds = (
+    item: Pick<PostHistory, 'comment_status' | 'comment_due_at' | 'fb_post_id' | 'fb_reel_url'>,
+    nowMs: number
+  ) => {
+    if (normalizeCommentStatus(item.comment_status) !== 'not_attempted') return null
+    if (!String(item.fb_post_id || '').trim() && !String(item.fb_reel_url || '').trim()) return null
+    const dueAtRaw = String(item.comment_due_at || '').trim()
+    if (!dueAtRaw) return null
+    const dueAtMs = Date.parse(dueAtRaw)
+    if (!Number.isFinite(dueAtMs)) return null
+    const remainingSeconds = Math.ceil((dueAtMs - nowMs) / 1000)
+    return remainingSeconds > 0 ? remainingSeconds : null
   }
 
   const looksLikeTokenProblem = (value?: string | null) => {
@@ -2890,6 +3316,225 @@ function App() {
     }
   }
 
+  const updateGalleryVideoState = (id: string, targetNamespaceId: string | undefined, fields: Partial<Video>) => {
+    const previousVideo = videos.find((video) =>
+      matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+    )
+
+    setVideos((prev) => {
+      return prev.flatMap((video) => {
+        if (!matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)) {
+          return [video]
+        }
+
+        const nextVideo = { ...video, ...fields }
+        if (!systemWideGalleryMode) {
+          return [nextVideo]
+        }
+
+        const nextHasLink = !!getVideoShopeeLink(nextVideo as unknown as Record<string, unknown>)
+        const activeFilter: SystemWidePostedLinkFilter = postedLinkFilter === 'no-link' ? 'no-link' : 'with-link'
+        const shouldStayVisible = activeFilter === 'no-link' ? !nextHasLink : nextHasLink
+        return shouldStayVisible ? [nextVideo] : []
+      })
+    })
+
+    setUsedVideos((prev) => prev.map((video) =>
+      matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+        ? { ...video, ...fields }
+        : video
+    ))
+
+    if (!systemWideGalleryMode || !previousVideo) return
+
+    const previousHasLink = !!getVideoShopeeLink(previousVideo as unknown as Record<string, unknown>)
+    const nextHasLink = !!getVideoShopeeLink({ ...previousVideo, ...fields } as unknown as Record<string, unknown>)
+    if (previousHasLink !== nextHasLink) {
+      setSystemGalleryStats((prev) => ({
+        ...prev,
+        withLink: Math.max(0, prev.withLink + (nextHasLink ? 1 : -1)),
+        withoutLink: Math.max(0, prev.withoutLink + (nextHasLink ? -1 : 1)),
+      }))
+    }
+
+    const activeFilter: SystemWidePostedLinkFilter = postedLinkFilter === 'no-link' ? 'no-link' : 'with-link'
+    const removedFromCurrentFilter = activeFilter === 'no-link' ? nextHasLink : !nextHasLink
+    if (removedFromCurrentFilter && systemGalleryHasMore && !galleryLoadingMore) {
+      window.setTimeout(() => {
+        void loadSystemGalleryPage()
+      }, 0)
+    }
+  }
+
+  const usedVideoIdSet = useMemo(() => {
+    return new Set(usedVideos.map((video) => String(video.id || '')))
+  }, [usedVideos])
+  const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
+  const {
+    gallerySystemWithLinkVideos,
+    gallerySystemWithoutLinkVideos,
+    galleryUnusedVideos,
+    galleryUsedVideos,
+    galleryUsedWithLinkVideos,
+    galleryUsedWithoutLinkVideos,
+    galleryAvailableVideos,
+  } = useMemo(() => {
+    const getGallerySortTs = (video: Video) => {
+      const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
+      return Number.isFinite(ts) ? ts : 0
+    }
+    const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
+    const sourceVideos = dedupeGalleryVideos(videos)
+    const systemWithLinkVideos = sortNewestFirst(
+      sourceVideos.filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    )
+    const systemWithoutLinkVideos = sortNewestFirst(
+      sourceVideos.filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    )
+    const galleryMissingLinkVideos = sortNewestFirst(
+      sourceVideos.filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    )
+    const unusedVideos = sortNewestFirst(
+      sourceVideos.filter((video) =>
+        !usedVideoIdSet.has(String(video.id || '')) &&
+        !isKeepInPostedTab(video) &&
+        !!getVideoShopeeLink(video as unknown as Record<string, unknown>)
+      )
+    )
+    const galleryPinnedPostedVideos = sortNewestFirst(
+      sourceVideos.filter((video) =>
+        !usedVideoIdSet.has(String(video.id || '')) &&
+        isKeepInPostedTab(video)
+      )
+    )
+    const galleryUsedMergedVideos: Video[] = [
+      ...usedVideos,
+      ...galleryPinnedPostedVideos,
+      ...galleryMissingLinkVideos.filter((video) => !usedVideoIdSet.has(String(video.id || '')))
+    ]
+    const dedupedUsedVideos = sortNewestFirst(
+      galleryUsedMergedVideos.filter((video, index, arr) => arr.findIndex((v) => String(v.id || '') === String(video.id || '')) === index)
+    )
+    const usedWithLinkVideos = dedupedUsedVideos
+      .filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    const usedWithoutLinkVideos = dedupedUsedVideos
+      .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    const usedVisibleVideos = postedLinkFilter === 'with-link'
+      ? usedWithLinkVideos
+      : postedLinkFilter === 'no-link'
+        ? usedWithoutLinkVideos
+        : dedupedUsedVideos
+    const availableVideos = systemWideGalleryMode
+      ? (postedLinkFilter === 'no-link' ? systemWithoutLinkVideos : systemWithLinkVideos)
+      : (categoryFilter === 'used' || categoryFilter === 'missing-link')
+        ? usedVisibleVideos
+        : unusedVideos
+
+    return {
+      gallerySystemWithLinkVideos: systemWithLinkVideos,
+      gallerySystemWithoutLinkVideos: systemWithoutLinkVideos,
+      galleryUnusedVideos: unusedVideos,
+      galleryUsedVideos: dedupedUsedVideos,
+      galleryUsedWithLinkVideos: usedWithLinkVideos,
+      galleryUsedWithoutLinkVideos: usedWithoutLinkVideos,
+      galleryAvailableVideos: availableVideos,
+    }
+  }, [videos, usedVideos, usedVideoIdSet, postedLinkFilter, systemWideGalleryMode, categoryFilter])
+  const showGalleryFilterBar = tab === 'gallery' && (
+    galleryLoading ||
+    (systemWideGalleryMode
+      ? ((systemGalleryStats.withLink + systemGalleryStats.withoutLink) > 0)
+      : (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0))
+  )
+  const showPostedSubFilterBar = tab === 'gallery' && !systemWideGalleryMode && categoryFilter === 'used' && showGalleryFilterBar
+  const galleryHeaderOffset = showGalleryFilterBar ? (showPostedSubFilterBar ? 214 : 164) : 104
+  const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
+  const galleryVisibleVideos = useMemo(() => {
+    if (systemWideGalleryMode) return galleryAvailableVideos
+    return galleryAvailableVideos.slice(0, galleryVisibleCount)
+  }, [systemWideGalleryMode, galleryAvailableVideos, galleryVisibleCount])
+  const galleryHasMore = systemWideGalleryMode
+    ? systemGalleryHasMore
+    : galleryVisibleVideos.length < galleryAvailableVideos.length
+  const gallerySystemWithLinkCount = systemWideGalleryMode ? systemGalleryStats.withLink : gallerySystemWithLinkVideos.length
+  const gallerySystemWithoutLinkCount = systemWideGalleryMode ? systemGalleryStats.withoutLink : gallerySystemWithoutLinkVideos.length
+  const galleryCurrentTotal = systemWideGalleryMode
+    ? (postedLinkFilter === 'no-link'
+      ? systemGalleryStats.withoutLink
+      : postedLinkFilter === 'with-link'
+        ? systemGalleryStats.withLink
+        : systemGalleryStats.total)
+    : galleryAvailableVideos.length
+  const appViewportStyle = {
+    height: 'var(--tg-viewport-stable-height, 100dvh)',
+    minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
+  } as const
+  const headerTopPaddingStyle = {
+    paddingTop: 'calc(env(safe-area-inset-top, 0px) + 52px)',
+  } as const
+  const mainContentPaddingStyle = {
+    paddingTop: `calc(env(safe-area-inset-top, 0px) + ${galleryHeaderOffset}px)`,
+    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 6rem)',
+  } as const
+
+  useEffect(() => {
+    if (tab !== 'gallery' || isAllOriginalMode || galleryLoading || !galleryHasMore) return
+
+    const root = mainScrollRef.current
+    const target = galleryLoadMoreRef.current
+    if (!root || !target) return
+
+    const observer = new IntersectionObserver((entries) => {
+      const first = entries[0]
+      if (!first?.isIntersecting) return
+      if (systemWideGalleryMode) {
+        void loadSystemGalleryPage()
+        return
+      }
+      setGalleryVisibleCount((prev) => Math.min(prev + GALLERY_BATCH_SIZE, galleryAvailableVideos.length))
+    }, {
+      root,
+      rootMargin: '360px 0px',
+      threshold: 0.01,
+    })
+
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, videos.length, galleryLoadingMore, postedLinkFilter])
+
+  useEffect(() => {
+    if (tab !== 'gallery' || isAllOriginalMode || galleryLoading || !galleryHasMore) return
+
+    const root = mainScrollRef.current
+    if (!root) return
+
+    let rafId = 0
+    const maybeLoadMore = () => {
+      if (rafId) return
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0
+        if (galleryLoadingMore) return
+
+        const distanceToBottom = root.scrollHeight - root.scrollTop - root.clientHeight
+        if (distanceToBottom > 480) return
+
+        if (systemWideGalleryMode) {
+          void loadSystemGalleryPage()
+          return
+        }
+
+        setGalleryVisibleCount((prev) => Math.min(prev + GALLERY_BATCH_SIZE, galleryAvailableVideos.length))
+      })
+    }
+
+    maybeLoadMore()
+    root.addEventListener('scroll', maybeLoadMore, { passive: true })
+    return () => {
+      root.removeEventListener('scroll', maybeLoadMore)
+      if (rafId) window.cancelAnimationFrame(rafId)
+    }
+  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, galleryLoadingMore, postedLinkFilter])
+
   // If viewing a specific page detail
   if (selectedPage) {
     return (
@@ -2929,81 +3574,6 @@ function App() {
     )
   }
 
-  const usedVideoIdSet = new Set(usedVideos.map((video) => String(video.id || '')))
-  const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
-  const getGallerySortTs = (video: Video) => {
-    const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
-    return Number.isFinite(ts) ? ts : 0
-  }
-  const gallerySystemWithLinkVideos = videos
-    .filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  const gallerySystemWithoutLinkVideos = videos
-    .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  // วิดีโอที่ยังไม่มี Shopee link
-  const galleryMissingLinkVideos = videos
-    .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  // "ยังไม่ได้ใช้" = ยังไม่โพสต์ + มี Shopee link
-  const galleryUnusedVideos = videos
-    .filter((video) =>
-      !usedVideoIdSet.has(String(video.id || '')) &&
-      !isKeepInPostedTab(video) &&
-      !!getVideoShopeeLink(video as unknown as Record<string, unknown>)
-    )
-    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  const galleryPinnedPostedVideos = videos
-    .filter((video) =>
-      !usedVideoIdSet.has(String(video.id || '')) &&
-      isKeepInPostedTab(video)
-    )
-    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  // "โพสต์แล้ว" = used จาก backend + คลิปไม่มีลิ้งทั้งหมด
-  const galleryUsedMergedVideos: Video[] = [
-    ...usedVideos,
-    ...galleryPinnedPostedVideos,
-    ...galleryMissingLinkVideos.filter((video) => !usedVideoIdSet.has(String(video.id || '')))
-  ]
-  const galleryUsedVideos = galleryUsedMergedVideos
-    .filter((video, index, arr) => arr.findIndex((v) => String(v.id || '') === String(video.id || '')) === index)
-    .sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-  const galleryUsedWithLinkVideos = galleryUsedVideos
-    .filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
-  const galleryUsedWithoutLinkVideos = galleryUsedVideos
-    .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
-  const galleryUsedVisibleVideos = postedLinkFilter === 'with-link'
-    ? galleryUsedWithLinkVideos
-    : postedLinkFilter === 'no-link'
-      ? galleryUsedWithoutLinkVideos
-      : galleryUsedVideos
-  const galleryAvailableVideos = systemWideGalleryMode
-    ? (postedLinkFilter === 'no-link' ? gallerySystemWithoutLinkVideos : gallerySystemWithLinkVideos)
-    : (categoryFilter === 'used' || categoryFilter === 'missing-link')
-    ? galleryUsedVisibleVideos
-    : galleryUnusedVideos
-  const showGalleryFilterBar = tab === 'gallery' && (
-    loading ||
-    (systemWideGalleryMode
-      ? (videos.length > 0)
-      : (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0))
-  )
-  const showPostedSubFilterBar = tab === 'gallery' && !systemWideGalleryMode && categoryFilter === 'used' && showGalleryFilterBar
-  const galleryHeaderOffset = showGalleryFilterBar ? (showPostedSubFilterBar ? 214 : 164) : 104
-  const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
-  const galleryVisibleVideos = galleryAvailableVideos
-  const appViewportStyle = {
-    height: 'var(--tg-viewport-stable-height, 100dvh)',
-    minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
-  } as const
-  const headerTopPaddingStyle = {
-    paddingTop: 'calc(env(safe-area-inset-top, 0px) + 52px)',
-  } as const
-  const mainContentPaddingStyle = {
-    paddingTop: `calc(env(safe-area-inset-top, 0px) + ${galleryHeaderOffset}px)`,
-    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 6rem)',
-  } as const
-
   return (
     <div style={appViewportStyle} className="bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden">
       {/* Add Page Popup */}
@@ -3027,13 +3597,13 @@ function App() {
                     onClick={() => setPostedLinkFilter('with-link')}
                     className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${postedLinkFilter !== 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                   >
-                    มีลิ้ง ({gallerySystemWithLinkVideos.length})
+                    มีลิ้ง ({gallerySystemWithLinkCount})
                   </button>
                   <button
                     onClick={() => setPostedLinkFilter('no-link')}
                     className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${postedLinkFilter === 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                   >
-                    ไม่มีลิ้ง ({gallerySystemWithoutLinkVideos.length})
+                    ไม่มีลิ้ง ({gallerySystemWithoutLinkCount})
                   </button>
                 </>
               ) : (
@@ -3080,7 +3650,7 @@ function App() {
       )}
 
       {/* Main Content */}
-      <div style={mainContentPaddingStyle} className="flex-1 [&::-webkit-scrollbar]:hidden overflow-y-auto app-scroll">
+      <div ref={mainScrollRef} style={mainContentPaddingStyle} className="flex-1 [&::-webkit-scrollbar]:hidden overflow-y-auto app-scroll">
 
         {tab === 'dashboard' && (
           <div className="px-4 space-y-4">
@@ -3223,13 +3793,13 @@ function App() {
                   ))}
                 </div>
               )
-            ) : loading ? (
+            ) : galleryLoading ? (
               <div className="grid grid-cols-3 gap-3">
                 {[1, 2, 3, 4, 5, 6].map(i => (
                   <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />
                 ))}
               </div>
-            ) : galleryAvailableVideos.length === 0 ? (
+            ) : galleryCurrentTotal === 0 ? (
               <div className="flex flex-col items-center justify-center h-[50vh]">
                 <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
                   <span className="text-4xl grayscale opacity-50">🎬</span>
@@ -3262,24 +3832,41 @@ function App() {
                 </p>
               </div>
             ) : (
-              <div className="grid grid-cols-3 gap-3">
-                {galleryVisibleVideos.map((video) => (
-                  <VideoCard
-                    key={getVideoIdentityKey(video as unknown as Record<string, unknown>)}
-                    video={video}
-                    formatDuration={formatDuration}
-                    keepInPostedOnLinkSave={!systemWideGalleryMode && categoryFilter === 'used'}
-                    onDelete={(id, targetNamespaceId) => {
-                      setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                      setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                    }}
-                    onUpdate={(id, targetNamespaceId, fields) => {
-                      setVideos(videos.map(v => matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId) ? { ...v, ...fields } : v));
-                      setUsedVideos(usedVideos.map(v => matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId) ? { ...v, ...fields } : v));
-                    }}
-                    onExpandedChange={setVideoViewerOpen}
-                  />
-                ))}
+              <div>
+                <div className="grid grid-cols-3 gap-3">
+                  {galleryVisibleVideos.map((video) => (
+                    <VideoCard
+                      key={getVideoIdentityKey(video as unknown as Record<string, unknown>)}
+                      video={video}
+                      currentNamespaceId={namespaceId}
+                      showWorkspaceBadge={systemWideGalleryMode}
+                      formatDuration={formatDuration}
+                      keepInPostedOnLinkSave={!systemWideGalleryMode && categoryFilter === 'used'}
+                      onDelete={(id, targetNamespaceId) => {
+                        setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                        setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                      }}
+                      onUpdate={updateGalleryVideoState}
+                      onExpandedChange={setVideoViewerOpen}
+                    />
+                  ))}
+                </div>
+
+                {galleryHasMore && (
+                  <div ref={galleryLoadMoreRef} className={galleryLoadingMore ? 'py-5' : 'h-1'}>
+                    {galleryLoadingMore && (
+                      <div className="flex items-center justify-center">
+                        <div className="w-8 h-8 border-[3px] border-blue-200 border-t-blue-500 rounded-full animate-spin" />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {!galleryHasMore && galleryCurrentTotal > GALLERY_BATCH_SIZE && (
+                  <p className="py-4 text-center text-xs font-medium text-gray-400">
+                    แสดงแล้ว {galleryVisibleVideos.length}/{galleryCurrentTotal} คลิป
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -3344,14 +3931,7 @@ function App() {
                 )
               }
 
-              const filteredLogs = postHistory.filter(item => {
-                const itemDate = new Date(item.posted_at)
-                const thaiItemDate = new Date(itemDate.getTime() + 7 * 60 * 60 * 1000)
-                const itemDateStr = thaiItemDate.toISOString().split('T')[0]
-                return itemDateStr === logDateFilter
-              })
-
-              if (filteredLogs.length === 0) return (
+              if (filteredLogHistory.length === 0) return (
                 <div className="flex flex-col items-center justify-center h-[40vh]">
                   <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
                     <span className="text-4xl grayscale opacity-50">📋</span>
@@ -3361,9 +3941,12 @@ function App() {
                 </div>
               )
 
+              const displayedLogs = filteredLogHistory.slice(0, tab === 'logs' ? visibleLogCount : filteredLogHistory.length)
+              const revealPlaceholders = Math.min(3, Math.max(filteredLogHistory.length - displayedLogs.length, 0))
+
               return (
                 <div className="space-y-2.5">
-                  {filteredLogs.map((item) => {
+                  {displayedLogs.map((item) => {
                     const postedDate = new Date(item.posted_at)
                     const thaiDate = new Date(postedDate.getTime() + 7 * 60 * 60 * 1000)
                     const timeStr = `${thaiDate.getUTCHours().toString().padStart(2, '0')}:${thaiDate.getUTCMinutes().toString().padStart(2, '0')}`
@@ -3378,8 +3961,20 @@ function App() {
                       if (item.fb_post_id) return `https://www.facebook.com/watch/?v=${item.fb_post_id}`
                       return ''
                     })()
-                    const postMeta = getSimpleStatusMeta(String(item.status || '').trim().toLowerCase() === 'success')
-                    const commentMeta = getSimpleStatusMeta(normalizeCommentStatus(item.comment_status) === 'success')
+                    const postMeta = getSimpleStatusMeta(getPostLogTone(item), 'post', item.status)
+                    const commentCountdownSeconds = getCommentCountdownSeconds(item, logNowMs)
+                    const baseCommentMeta = getSimpleStatusMeta(getCommentLogTone(item.comment_status), 'comment', item.comment_status)
+                    const commentMeta = commentCountdownSeconds !== null
+                      ? {
+                          ...baseCommentMeta,
+                          label: `รอคอมเมนต์ ${formatCountdownClock(commentCountdownSeconds)}`,
+                          cls: 'bg-amber-50 text-amber-700',
+                          loading: false,
+                        }
+                      : baseCommentMeta
+                    const commentBadgeText = commentCountdownSeconds !== null
+                      ? `COMMENT ${formatCountdownClock(commentCountdownSeconds)}`
+                      : 'COMMENT'
                     const isExpanded = expandedLogId === item.id
                     const postActor = String(item.post_profile_name || item.post_profile_id || item.post_token_hint || '').trim() || '-'
                     const commentActor = String(item.comment_profile_name || item.comment_profile_id || item.comment_token_hint || '').trim() || '-'
@@ -3440,11 +4035,23 @@ function App() {
                           {/* Status + Link */}
                           <div className="flex items-center gap-2 shrink-0">
                             <div className="flex items-center justify-end gap-1">
-                              <span className={`whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${postMeta.cls}`}>
+                              <span className={`inline-flex items-center gap-1 whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${postMeta.cls}`}>
+                                {postMeta.loading && (
+                                  <span className="w-2.5 h-2.5 border-[1.5px] border-current/30 border-t-current rounded-full animate-spin" />
+                                )}
                                 POST
                               </span>
-                              <span className={`whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${commentMeta.cls}`}>
-                                COMMENT
+                              <span className={`inline-flex items-center gap-1 whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${commentMeta.cls}`}>
+                                {commentMeta.loading && (
+                                  <span className="w-2.5 h-2.5 border-[1.5px] border-current/30 border-t-current rounded-full animate-spin" />
+                                )}
+                                {commentCountdownSeconds !== null && !commentMeta.loading && (
+                                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <circle cx="12" cy="12" r="8" />
+                                    <path d="M12 8v4l2.5 2.5" strokeLinecap="round" strokeLinejoin="round" />
+                                  </svg>
+                                )}
+                                {commentBadgeText}
                               </span>
                             </div>
                             {fbLink && (
@@ -3515,6 +4122,9 @@ function App() {
                       </div>
                     )
                   })}
+                  {revealPlaceholders > 0 && Array.from({ length: revealPlaceholders }, (_, index) => (
+                    <div key={`log-reveal-placeholder-${index}`} className="h-20 rounded-2xl border border-gray-100 bg-gray-50 animate-pulse" />
+                  ))}
                 </div>
               )
             })()}

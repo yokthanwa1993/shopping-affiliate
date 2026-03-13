@@ -1390,6 +1390,7 @@ pub struct AppState {
     uploading_android_profiles: Arc<Mutex<Vec<String>>>, // profiles currently uploading android data
     debug_ports: Arc<Mutex<HashMap<String, u16>>>,       // profile_id -> debug port
     debug_logs: Arc<Mutex<HashMap<String, DebugLogs>>>,  // profile_id -> logs
+    profile_auth_tokens: Arc<Mutex<HashMap<String, String>>>, // profile_id -> auth token
 }
 
 impl Default for AppState {
@@ -1401,8 +1402,40 @@ impl Default for AppState {
             uploading_android_profiles: Arc::new(Mutex::new(Vec::new())),
             debug_ports: Arc::new(Mutex::new(HashMap::new())),
             debug_logs: Arc::new(Mutex::new(HashMap::new())),
+            profile_auth_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+fn normalize_auth_token(raw: Option<&str>) -> Option<String> {
+    let token = raw.unwrap_or_default().trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn remember_profile_auth_token(state: &AppState, profile_id: &str, auth_token: Option<String>) {
+    let mut tokens = state.profile_auth_tokens.lock().unwrap();
+    if let Some(token) = normalize_auth_token(auth_token.as_deref()) {
+        tokens.insert(profile_id.to_string(), token);
+    } else {
+        tokens.remove(profile_id);
+    }
+}
+
+fn lookup_profile_auth_token(state: &AppState, profile_id: &str) -> Option<String> {
+    state
+        .profile_auth_tokens
+        .lock()
+        .unwrap()
+        .get(profile_id)
+        .cloned()
+}
+
+fn clear_profile_auth_token(state: &AppState, profile_id: &str) {
+    state.profile_auth_tokens.lock().unwrap().remove(profile_id);
 }
 
 // Get cache directory for browser profiles
@@ -2036,7 +2069,7 @@ fn get_chrome_path() -> PathBuf {
 
 // Download browser data from server (via Worker CDN - faster than direct R2)
 #[tauri::command]
-async fn download_browser_data(profile_id: String) -> Result<bool, String> {
+async fn download_browser_data(profile_id: String, auth_token: Option<String>) -> Result<bool, String> {
     let server_url = get_server_url();
     let cache_dir = get_cache_dir().join(&profile_id);
     let default_dir = cache_dir.join("Default");
@@ -2067,7 +2100,12 @@ async fn download_browser_data(profile_id: String) -> Result<bool, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    match client.get(&url).send().await {
+    let mut request = client.get(&url);
+    if let Some(token) = normalize_auth_token(auth_token.as_deref()) {
+        request = request.header("x-auth-token", token);
+    }
+
+    match request.send().await {
         Ok(response) => {
             if response.status() == 404 {
                 log::info!("No existing data for profile: {}", profile_id);
@@ -2113,7 +2151,7 @@ async fn download_browser_data(profile_id: String) -> Result<bool, String> {
 
 // Upload browser data to server (via Worker CDN)
 #[tauri::command]
-async fn upload_browser_data(profile_id: String) -> Result<bool, String> {
+async fn upload_browser_data(profile_id: String, auth_token: Option<String>) -> Result<bool, String> {
     let server_url = get_server_url();
     let cache_dir = get_cache_dir().join(&profile_id);
 
@@ -2197,12 +2235,13 @@ async fn upload_browser_data(profile_id: String) -> Result<bool, String> {
 
     let url = format!("{}/api/sync/{}/upload", server_url, profile_id);
 
-    let response = client
+    let mut request = client
         .post(&url)
-        .header("Content-Type", "application/gzip")
-        .body(buffer)
-        .send()
-        .await;
+        .header("Content-Type", "application/gzip");
+    if let Some(token) = normalize_auth_token(auth_token.as_deref()) {
+        request = request.header("x-auth-token", token);
+    }
+    let response = request.body(buffer).send().await;
 
     fs::remove_file(&temp_file).ok();
 
@@ -2224,11 +2263,14 @@ async fn upload_browser_data(profile_id: String) -> Result<bool, String> {
     }
 }
 
-async fn upload_browser_data_with_retry(profile_id: &str) -> Result<bool, String> {
+async fn upload_browser_data_with_retry(
+    profile_id: &str,
+    auth_token: Option<String>,
+) -> Result<bool, String> {
     let mut last_err: Option<String> = None;
 
     for attempt in 1..=3 {
-        match upload_browser_data(profile_id.to_string()).await {
+        match upload_browser_data(profile_id.to_string(), auth_token.clone()).await {
             Ok(result) => {
                 if attempt > 1 {
                     log::info!(
@@ -2897,7 +2939,7 @@ fn get_postcron_session() -> &'static tokio::sync::Mutex<Option<PostcronSession>
 
 // Step 1: Download profile + Export cookies locally + Connect Browserless + Inject
 #[tauri::command]
-async fn postcron_step_launch(profile_id: String) -> Result<String, String> {
+async fn postcron_step_launch(profile_id: String, auth_token: Option<String>) -> Result<String, String> {
     use chromiumoxide::cdp::browser_protocol::network::CookieParam;
     use chromiumoxide::Browser;
 
@@ -2931,8 +2973,12 @@ async fn postcron_step_launch(profile_id: String) -> Result<String, String> {
             .build()
             .map_err(|e| format!("{}", e))?;
 
-        let response = client
-            .get(&url)
+        let mut request = client.get(&url);
+        if let Some(token) = normalize_auth_token(auth_token.as_deref()) {
+            request = request.header("x-auth-token", token);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| format!("Download: {}", e))?;
@@ -3254,12 +3300,29 @@ async fn postcron_step_navigate() -> Result<String, String> {
 
     log::info!("[Postcron Step 2] Navigating to: {}", oauth_url);
 
-    sess.page
-        .goto(oauth_url)
-        .await
-        .map_err(|e| format!("Failed to navigate: {}", e))?;
+    let mut navigate_note = String::new();
+    if let Err(err) = sess.page.goto(oauth_url).await {
+        let error_text = format!("{}", err);
+        log::warn!(
+            "[Postcron Step 2] goto timed out or failed, falling back to window.location: {}",
+            error_text
+        );
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let oauth_url_json = serde_json::to_string(oauth_url)
+            .unwrap_or_else(|_| "\"https://postcron.com\"".to_string());
+        let js = format!(
+            "(function() {{ window.location.href = {}; return window.location.href; }})()",
+            oauth_url_json
+        );
+        sess.page
+            .evaluate(js.as_str())
+            .await
+            .map_err(|e| format!("Failed to navigate: {} | Fallback navigation failed: {}", error_text, e))?;
+
+        navigate_note = format!("Navigation fallback used: {}", error_text);
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let url = sess
         .page
@@ -3268,11 +3331,28 @@ async fn postcron_step_navigate() -> Result<String, String> {
         .map_err(|e| format!("Failed to get URL: {}", e))?
         .unwrap_or_default();
 
+    if url.trim().is_empty() || url == "about:blank" {
+        let message = if navigate_note.is_empty() {
+            "Failed to navigate: page stayed on about:blank".to_string()
+        } else {
+            format!("{} | page stayed on about:blank", navigate_note)
+        };
+        return Err(message);
+    }
+
     log::info!(
         "[Postcron Step 2] Current URL: {}",
         &url[..150.min(url.len())]
     );
-    Ok(format!("Current URL: {}", &url[..200.min(url.len())]))
+    if navigate_note.is_empty() {
+        Ok(format!("Current URL: {}", &url[..200.min(url.len())]))
+    } else {
+        Ok(format!(
+            "{}\nCurrent URL: {}",
+            navigate_note,
+            &url[..200.min(url.len())]
+        ))
+    }
 }
 
 // Step 3: Try to click "Continue" button
@@ -3319,7 +3399,7 @@ async fn postcron_step_click() -> Result<String, String> {
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     // Check if we need more clicks (e.g. privacy/consent page after forced_account_switch)
-    let url = sess
+    let mut url = sess
         .page
         .url()
         .await
@@ -3390,6 +3470,7 @@ async fn postcron_step_click() -> Result<String, String> {
                 );
                 return Ok(format!("Done - redirected to postcron callback"));
             }
+            url = new_url;
         }
     }
 
@@ -3632,7 +3713,11 @@ async fn inject_autofill(port: u16, username: &str, password: &str) -> Result<()
 
 // Launch browser
 #[tauri::command]
-async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<bool, String> {
+async fn launch_browser(
+    profile: Profile,
+    auth_token: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
     log::info!("Launching browser for: {}", profile.name);
     let profile_id = profile.id.clone();
 
@@ -3643,11 +3728,17 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
         }
     }
 
+    let auth_token_for_sync =
+        normalize_auth_token(auth_token.as_deref()).or_else(|| lookup_profile_auth_token(&state, &profile_id));
+    if auth_token_for_sync.is_some() {
+        remember_profile_auth_token(&state, &profile_id, auth_token_for_sync.clone());
+    }
+
     // Download latest data (allow up to 2 minutes)
     log::info!("Attempting to download browser data...");
     let download_timeout = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        download_browser_data(profile_id.clone()),
+        download_browser_data(profile_id.clone(), auth_token_for_sync.clone()),
     )
     .await;
 
@@ -3811,6 +3902,8 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
     let running_browsers = state.running_browsers.clone();
     let uploading_profiles = state.uploading_profiles.clone();
     let debug_ports_clone = state.debug_ports.clone();
+    let profile_auth_tokens = state.profile_auth_tokens.clone();
+    let monitor_auth_token = auth_token_for_sync.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -3850,7 +3943,9 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
                         log::info!("Uploading data for: {}", profile_id_clone);
 
                         // Upload data
-                        if let Err(e) = upload_browser_data_with_retry(&profile_id_clone).await {
+                        if let Err(e) =
+                            upload_browser_data_with_retry(&profile_id_clone, monitor_auth_token.clone()).await
+                        {
                             log::error!("Failed to upload: {}", e);
                         }
 
@@ -3858,6 +3953,10 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
                         {
                             let mut uploading = uploading_profiles.lock().unwrap();
                             uploading.retain(|id| id != &profile_id_clone);
+                        }
+                        {
+                            let mut auth_tokens = profile_auth_tokens.lock().unwrap();
+                            auth_tokens.remove(&profile_id_clone);
                         }
                         log::info!("Upload complete for: {}", profile_id_clone);
                     } else {
@@ -3883,6 +3982,7 @@ async fn launch_browser(profile: Profile, state: State<'_, AppState>) -> Result<
 async fn launch_browser_with_url(
     profile: Profile,
     url: String,
+    auth_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     log::info!("Launching browser with URL: {} for: {}", url, profile.name);
@@ -3892,12 +3992,16 @@ async fn launch_browser_with_url(
     modified_profile.homepage = Some(url);
 
     // Use the existing launch_browser logic
-    launch_browser(modified_profile, state).await
+    launch_browser(modified_profile, auth_token, state).await
 }
 
 // Launch browser in debug mode with CDP
 #[tauri::command]
-async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> Result<u16, String> {
+async fn launch_browser_debug(
+    profile: Profile,
+    auth_token: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<u16, String> {
     log::info!("Launching browser in DEBUG mode for: {}", profile.name);
     let profile_id = profile.id.clone();
 
@@ -3911,6 +4015,12 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
             }
             return Err("Browser already running (not in debug mode)".to_string());
         }
+    }
+
+    let auth_token_for_sync =
+        normalize_auth_token(auth_token.as_deref()).or_else(|| lookup_profile_auth_token(&state, &profile_id));
+    if auth_token_for_sync.is_some() {
+        remember_profile_auth_token(&state, &profile_id, auth_token_for_sync.clone());
     }
 
     // Find available port (9222 + offset based on running debug browsers)
@@ -3931,7 +4041,7 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
     log::info!("Attempting to download browser data...");
     let download_timeout = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        download_browser_data(profile_id.clone()),
+        download_browser_data(profile_id.clone(), auth_token_for_sync.clone()),
     )
     .await;
 
@@ -4044,6 +4154,8 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
     let running_browsers = state.running_browsers.clone();
     let uploading_profiles = state.uploading_profiles.clone();
     let debug_ports_clone = state.debug_ports.clone();
+    let profile_auth_tokens = state.profile_auth_tokens.clone();
+    let monitor_auth_token = auth_token_for_sync.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -4075,13 +4187,19 @@ async fn launch_browser_debug(profile: Profile, state: State<'_, AppState>) -> R
                     };
 
                     if should_upload {
-                        if let Err(e) = upload_browser_data_with_retry(&profile_id_clone).await {
+                        if let Err(e) =
+                            upload_browser_data_with_retry(&profile_id_clone, monitor_auth_token.clone()).await
+                        {
                             log::error!("Failed to upload: {}", e);
                         }
 
                         {
                             let mut uploading = uploading_profiles.lock().unwrap();
                             uploading.retain(|id| id != &profile_id_clone);
+                        }
+                        {
+                            let mut auth_tokens = profile_auth_tokens.lock().unwrap();
+                            auth_tokens.remove(&profile_id_clone);
                         }
                     } else {
                         log::info!(
@@ -4302,11 +4420,21 @@ fn disconnect_cdp(profile_id: String, state: State<'_, AppState>) {
 
 // Stop browser - Sync first, then close
 #[tauri::command]
-async fn stop_browser(profile_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+async fn stop_browser(
+    profile_id: String,
+    auth_token: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
     log::info!(
         "Stopping browser for profile: {} - will sync first",
         profile_id
     );
+
+    let auth_token_for_sync =
+        normalize_auth_token(auth_token.as_deref()).or_else(|| lookup_profile_auth_token(&state, &profile_id));
+    if auth_token_for_sync.is_some() {
+        remember_profile_auth_token(&state, &profile_id, auth_token_for_sync.clone());
+    }
 
     // 1. Mark as uploading FIRST (so UI shows "Syncing...")
     {
@@ -4380,7 +4508,8 @@ async fn stop_browser(profile_id: String, state: State<'_, AppState>) -> Result<
 
     // 6. Upload browser data (with retry)
     log::info!("Uploading browser data for: {}", profile_id);
-    let upload_result = upload_browser_data_with_retry(profile_id.as_str()).await;
+    let upload_result =
+        upload_browser_data_with_retry(profile_id.as_str(), auth_token_for_sync.clone()).await;
 
     // 7. Remove from uploading
     {
@@ -4390,6 +4519,7 @@ async fn stop_browser(profile_id: String, state: State<'_, AppState>) -> Result<
 
     // 8. Cleanup wrapper app
     cleanup_wrapper_for_profile(&profile_id);
+    clear_profile_auth_token(&state, &profile_id);
 
     match upload_result {
         Ok(_) => {
@@ -4837,11 +4967,13 @@ async fn launch_browser_internal(
         }
     }
 
+    let auth_token_for_sync = lookup_profile_auth_token(state.state, &profile_id);
+
     // Download latest data
     log::info!("Attempting to download browser data...");
     let download_timeout = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        download_browser_data(profile_id.clone()),
+        download_browser_data(profile_id.clone(), auth_token_for_sync.clone()),
     )
     .await;
 
@@ -4937,6 +5069,8 @@ async fn launch_browser_internal(
     let profile_id_clone = profile_id.clone();
     let running_browsers = state.state.running_browsers.clone();
     let uploading_profiles = state.state.uploading_profiles.clone();
+    let profile_auth_tokens = state.state.profile_auth_tokens.clone();
+    let monitor_auth_token = auth_token_for_sync.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -4965,13 +5099,19 @@ async fn launch_browser_internal(
                     };
 
                     if should_upload {
-                        if let Err(e) = upload_browser_data_with_retry(&profile_id_clone).await {
+                        if let Err(e) =
+                            upload_browser_data_with_retry(&profile_id_clone, monitor_auth_token.clone()).await
+                        {
                             log::error!("Failed to upload: {}", e);
                         }
 
                         {
                             let mut uploading = uploading_profiles.lock().unwrap();
                             uploading.retain(|id| id != &profile_id_clone);
+                        }
+                        {
+                            let mut auth_tokens = profile_auth_tokens.lock().unwrap();
+                            auth_tokens.remove(&profile_id_clone);
                         }
                     } else {
                         log::info!(
@@ -4996,6 +5136,8 @@ async fn stop_browser_internal(
     state: &StateWrapper<'_>,
 ) -> Result<bool, String> {
     log::info!("Stopping browser for profile: {}", profile_id);
+
+    let auth_token_for_sync = lookup_profile_auth_token(state.state, &profile_id);
 
     {
         let mut uploading = state.state.uploading_profiles.lock().unwrap();
@@ -5055,7 +5197,8 @@ async fn stop_browser_internal(
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let upload_result = upload_browser_data_with_retry(profile_id.as_str()).await;
+    let upload_result =
+        upload_browser_data_with_retry(profile_id.as_str(), auth_token_for_sync.clone()).await;
 
     {
         let mut uploading = state.state.uploading_profiles.lock().unwrap();
@@ -5063,6 +5206,7 @@ async fn stop_browser_internal(
     }
 
     cleanup_wrapper_for_profile(&profile_id);
+    clear_profile_auth_token(state.state, &profile_id);
 
     match upload_result {
         Ok(_) => Ok(true),

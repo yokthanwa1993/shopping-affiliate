@@ -4,6 +4,14 @@ import { Container } from '@cloudflare/containers'
 import * as nodeCrypto from 'node:crypto'
 import { Buffer as NodeBuffer } from 'node:buffer'
 import { BotBucket } from './utils/botBucket'
+import {
+    deleteGalleryIndexEntry,
+    getGalleryIndexSummary,
+    listGalleryIndexVideos,
+    listGalleryIndexVideosMissingThumbnails,
+    rebuildGalleryIndexFromR2,
+    syncGalleryIndexEntry,
+} from './gallery-index'
 import { getBotId } from './utils/botAuth'
 import {
     type Env,
@@ -390,6 +398,7 @@ app.post('/api/pages/profile-sync', async (c) => {
     const pageName = String(body?.page_name || body?.pageName || '').trim()
     const pageAvatarUrl = String(body?.page_avatar_url || body?.pageAvatarUrl || '').trim()
     const accessToken = String(body?.access_token || body?.accessToken || '').trim()
+    const commentToken = String(body?.comment_token || body?.commentToken || '').trim()
     const profileId = String(body?.profile_id || body?.profileId || '').trim()
 
     if (!namespaceId) return c.json({ error: 'namespace_not_found' }, 400)
@@ -407,7 +416,21 @@ app.post('/api/pages/profile-sync', async (c) => {
             pageName,
             pageAvatarUrl,
             accessToken,
+            commentToken,
         })
+
+        if (profileId && looksLikeBrowserSavingProfileId(profileId)) {
+            try {
+                const linkedProfiles = await getNamespaceLinkedTaggedProfiles(c.env.DB, namespaceId)
+                linkedProfiles[pageId] = normalizeHiddenTaggedProfileIds([
+                    ...(hasLinkedTaggedProfilesEntryForPage(linkedProfiles, pageId) ? linkedProfiles[pageId] || [] : []),
+                    profileId,
+                ])
+                await setNamespaceLinkedTaggedProfiles(c.env.DB, namespaceId, linkedProfiles)
+            } catch (e) {
+                console.log(`[PAGE-PROFILE-SYNC] persist linked profile failed ns=${namespaceId} page=${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
 
         return c.json({
             success: true,
@@ -554,6 +577,76 @@ function dedupeVideosById(videos: any[]): any[] {
     return Array.from(byId.values())
 }
 
+function getGalleryVideoSortMs(video: Record<string, unknown> | null | undefined): number {
+    const ts = new Date(String(
+        video?.updatedAt
+        || video?.updated_at
+        || video?.createdAt
+        || video?.created_at
+        || ''
+    )).getTime()
+    return Number.isFinite(ts) ? ts : 0
+}
+
+function hasGalleryVideoThumbnail(video: Record<string, unknown> | null | undefined): boolean {
+    return !!String(
+        video?.thumbnailUrl
+        || video?.thumbnail_url
+        || ''
+    ).trim()
+}
+
+function pickPreferredSystemGalleryVideo(current: Record<string, unknown>, next: Record<string, unknown>): Record<string, unknown> {
+    const currentHasLink = !!normalizeMetaShopeeLink(current)
+    const nextHasLink = !!normalizeMetaShopeeLink(next)
+    if (currentHasLink !== nextHasLink) {
+        return nextHasLink ? next : current
+    }
+
+    const currentHasThumbnail = hasGalleryVideoThumbnail(current)
+    const nextHasThumbnail = hasGalleryVideoThumbnail(next)
+    if (currentHasThumbnail !== nextHasThumbnail) {
+        return nextHasThumbnail ? next : current
+    }
+
+    const currentTs = getGalleryVideoSortMs(current)
+    const nextTs = getGalleryVideoSortMs(next)
+    if (currentTs !== nextTs) {
+        return nextTs >= currentTs ? next : current
+    }
+
+    const currentNamespaceId = String(current.namespace_id || '').trim()
+    const nextNamespaceId = String(next.namespace_id || '').trim()
+    return nextNamespaceId.localeCompare(currentNamespaceId) <= 0 ? next : current
+}
+
+function dedupeSystemGalleryVideos(videos: any[]): any[] {
+    const byVideoId = new Map<string, Record<string, unknown>>()
+    for (const rawVideo of videos || []) {
+        const video = rawVideo as Record<string, unknown>
+        const id = String(video?.id || '').trim()
+        if (!id) continue
+        const prev = byVideoId.get(id)
+        if (!prev) {
+            byVideoId.set(id, video)
+            continue
+        }
+        byVideoId.set(id, pickPreferredSystemGalleryVideo(prev, video))
+    }
+
+    return Array.from(byVideoId.values()).sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a))
+}
+
+function shuffleInPlace<T>(items: T[]): T[] {
+    for (let i = items.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1))
+        const tmp = items[i]
+        items[i] = items[j]
+        items[j] = tmp
+    }
+    return items
+}
+
 async function listAllVideoJsonIds(bucket: R2Bucket): Promise<string[]> {
     const objects = await listAllVideoObjects(bucket)
     const ids: string[] = []
@@ -625,6 +718,22 @@ function hasShopeeLinkInMeta(meta: Record<string, unknown>): boolean {
     return !!normalizeMetaShopeeLink(meta)
 }
 
+function parseNonNegativeInt(value: string | null | undefined, fallback: number): number {
+    const parsed = Number.parseInt(String(value || '').trim(), 10)
+    if (!Number.isFinite(parsed) || parsed < 0) return fallback
+    return parsed
+}
+
+function sliceGalleryPage<T>(videos: T[], offset: number, limit: number): { videos: T[]; hasMore: boolean } {
+    const safeOffset = Math.max(0, offset)
+    const safeLimit = Math.max(1, limit)
+    const pageVideos = videos.slice(safeOffset, safeOffset + safeLimit)
+    return {
+        videos: pageVideos,
+        hasMore: safeOffset + pageVideos.length < videos.length,
+    }
+}
+
 async function pickPostableVideoNewestFirst(
     bucket: R2Bucket,
     candidateIds: string[],
@@ -676,12 +785,87 @@ async function pickPostableVideoNewestFirst(
     return null
 }
 
+async function pickRandomPostableVideoFromNamespaceGallery(
+    bucket: R2Bucket,
+    candidateIds: string[],
+    namespaceId: string,
+): Promise<{ id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId: string } | null> {
+    const normalizedNamespaceId = String(namespaceId || '').trim() || 'default'
+    const allowedIds = new Set(uniqueVideoIds(candidateIds))
+    if (allowedIds.size === 0) return null
+
+    try {
+        const cacheObj = await bucket.get('_cache/gallery.json')
+        if (cacheObj) {
+            const payload = await cacheObj.json() as { videos?: Array<Record<string, unknown>> }
+            const rows = dedupeVideosById(Array.isArray(payload?.videos) ? payload.videos : [])
+            const shuffled = shuffleInPlace(rows.filter((row) => {
+                const id = String(row?.id || '').trim()
+                return !!id && allowedIds.has(id) && !!normalizeMetaShopeeLink(row)
+            }))
+            for (const row of shuffled) {
+                const id = String(row?.id || '').trim()
+                const shopeeLink = normalizeMetaShopeeLink(row)
+                if (!id || !shopeeLink) continue
+                return {
+                    id,
+                    meta: row,
+                    shopeeLink,
+                    sourceNamespaceId: normalizedNamespaceId,
+                }
+            }
+        }
+    } catch (e) {
+        console.log(`[VIDEO PICK] failed to read gallery cache for random pick: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    const shuffledIds = shuffleInPlace([...allowedIds])
+    for (const id of shuffledIds) {
+        const metaObj = await bucket.get(`videos/${id}.json`)
+        if (!metaObj) continue
+        const meta = await metaObj.json() as Record<string, unknown>
+        const shopeeLink = normalizeMetaShopeeLink(meta) || ''
+        if (!shopeeLink) continue
+        return {
+            id,
+            meta,
+            shopeeLink,
+            sourceNamespaceId: normalizedNamespaceId,
+        }
+    }
+
+    return null
+}
+
+async function pickRandomGalleryVideoForPosting(params: {
+    env: Env
+    namespaceId: string
+    bucket: R2Bucket
+    candidateIds: string[]
+    excludedVideoIds: Set<string>
+}): Promise<{ id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId: string } | null> {
+    const namespaceId = String(params.namespaceId || '').trim() || 'default'
+    const candidateIds = uniqueVideoIds(params.candidateIds).filter((id) => !params.excludedVideoIds.has(id))
+    if (candidateIds.length === 0 && params.excludedVideoIds.size === 0) return null
+
+    if (await isSystemGalleryEnabledForNamespace(params.env.DB, namespaceId)) {
+        const systemPicked = await pickRandomPostableVideoFromSystem(params.env, params.excludedVideoIds)
+        if (systemPicked) return systemPicked
+    }
+
+    return pickRandomPostableVideoFromNamespaceGallery(params.bucket, candidateIds, namespaceId)
+}
+
 function getVideoPublicUrlForNamespace(r2BaseUrl: string, namespaceId: string, videoId: string): string {
-    return `${r2BaseUrl}/${namespaceId}/videos/${videoId}.mp4`
+    return String(namespaceId || '').trim() === 'default'
+        ? `${r2BaseUrl}/videos/${videoId}.mp4`
+        : `${r2BaseUrl}/${namespaceId}/videos/${videoId}.mp4`
 }
 
 function getVideoThumbnailUrlForNamespace(r2BaseUrl: string, namespaceId: string, videoId: string): string {
-    return `${r2BaseUrl}/${namespaceId}/videos/${videoId}_thumb.webp`
+    return String(namespaceId || '').trim() === 'default'
+        ? `${r2BaseUrl}/videos/${videoId}_thumb.webp`
+        : `${r2BaseUrl}/${namespaceId}/videos/${videoId}_thumb.webp`
 }
 
 async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: string): Promise<boolean> {
@@ -709,6 +893,11 @@ async function getNamespaceOwnerEmailMap(db: D1Database): Promise<Map<string, st
 }
 
 async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string, unknown>>> {
+    const indexedVideos = await listGalleryIndexVideos(env.DB).catch(() => [])
+    if (indexedVideos.length > 0) {
+        return indexedVideos as Array<Record<string, unknown>>
+    }
+
     const cacheKey = '_admin_cache/all_gallery_videos.json'
     const cached = await env.BUCKET.get(cacheKey).catch(() => null)
     if (cached) {
@@ -774,26 +963,115 @@ async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string,
     return deduped
 }
 
+async function getOwnerLinkedSystemGalleryVideos(env: Env): Promise<Array<Record<string, unknown>>> {
+    const indexedVideos = await listGalleryIndexVideos(env.DB, { onlyOwnerLinked: true }).catch(() => [])
+    if (indexedVideos.length > 0) {
+        return dedupeSystemGalleryVideos(indexedVideos as Array<Record<string, unknown>>)
+    }
+
+    const cacheKey = '_admin_cache/all_gallery_owner_videos.json'
+    const cached = await env.BUCKET.get(cacheKey).catch(() => null)
+    if (cached) {
+        const payload = await cached.json().catch(() => ({})) as { created_at?: string; videos?: Array<Record<string, unknown>> }
+        const createdAt = payload?.created_at ? new Date(payload.created_at).getTime() : 0
+        if (createdAt > 0 && (Date.now() - createdAt) < 60_000) {
+            return dedupeSystemGalleryVideos(Array.isArray(payload.videos) ? payload.videos : [])
+        }
+    }
+
+    const namespaceEmailMap = await getNamespaceOwnerEmailMap(env.DB)
+    const metadataVideos = dedupeVideosById(await getAllSystemGalleryVideos(env))
+    const visibleById = new Map<string, Record<string, unknown>>()
+
+    let cursor: string | undefined = undefined
+    do {
+        const listed = await env.BUCKET.list({ prefix: '', cursor })
+        for (const obj of listed.objects) {
+            const key = String(obj.key || '')
+            const match = key.match(/^([^/]+)\/videos\/(.+)_original\.mp4$/)
+            if (!match) continue
+
+            const namespaceId = String(match[1] || '').trim()
+            const videoId = String(match[2] || '').trim()
+            const ownerEmail = String(namespaceEmailMap.get(namespaceId) || '').trim().toLowerCase()
+            if (!namespaceId || !videoId || !ownerEmail) continue
+
+            const dedupeKey = `${namespaceId}:${videoId}`
+            const originalUrl = `${env.R2_PUBLIC_URL}/${namespaceId}/videos/${videoId}_original.mp4`
+            const uploadedAt = obj.uploaded.toISOString()
+            visibleById.set(dedupeKey, {
+                id: videoId,
+                namespace_id: namespaceId,
+                owner_email: ownerEmail,
+                script: '',
+                duration: 0,
+                title: '',
+                category: '',
+                shopeeLink: '',
+                originalUrl,
+                publicUrl: originalUrl,
+                createdAt: uploadedAt,
+                updatedAt: uploadedAt,
+                original_only: true,
+            })
+        }
+        cursor = listed.truncated ? listed.cursor : undefined
+    } while (cursor)
+
+    for (const rawVideo of metadataVideos) {
+        const namespaceId = String(rawVideo?.namespace_id || '').trim()
+        const videoId = String(rawVideo?.id || '').trim()
+        const ownerEmail = String(rawVideo?.owner_email || namespaceEmailMap.get(namespaceId) || '').trim().toLowerCase()
+        if (!namespaceId || !videoId || !ownerEmail) continue
+
+        const dedupeKey = `${namespaceId}:${videoId}`
+        const existing = visibleById.get(dedupeKey)
+        if (!existing) continue
+
+        visibleById.set(dedupeKey, {
+            ...existing,
+            ...rawVideo,
+            id: videoId,
+            namespace_id: namespaceId,
+            owner_email: ownerEmail,
+            originalUrl: String(rawVideo?.originalUrl || existing.originalUrl || `${env.R2_PUBLIC_URL}/${namespaceId}/videos/${videoId}_original.mp4`),
+            publicUrl: String(rawVideo?.publicUrl || existing.publicUrl || getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, namespaceId, videoId)),
+            createdAt: String(rawVideo?.createdAt || existing.createdAt || rawVideo?.updatedAt || existing.updatedAt || ''),
+            updatedAt: String(rawVideo?.updatedAt || existing.updatedAt || rawVideo?.createdAt || existing.createdAt || ''),
+            duration: Number(rawVideo?.duration || existing.duration || 0),
+        })
+    }
+
+    const videos = dedupeSystemGalleryVideos(Array.from(visibleById.values()))
+
+    await env.BUCKET.put(cacheKey, JSON.stringify({
+        created_at: new Date().toISOString(),
+        videos,
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    }).catch(() => { })
+
+    return videos
+}
+
 async function pickRandomPostableVideoFromSystem(
     env: Env,
     excludedVideoIds: Set<string>,
 ): Promise<{ id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId: string } | null> {
-    const videos = await getAllSystemGalleryVideos(env)
-    const candidates = dedupeVideosById(videos).filter((video) => {
+    const videos = await listGalleryIndexVideos(env.DB, {
+        onlyOwnerLinked: true,
+        linkFilter: 'with-link',
+    }).catch(() => [])
+    const candidates = dedupeSystemGalleryVideos(videos).filter((video) => {
         const id = String(video?.id || '').trim()
         if (!id || excludedVideoIds.has(id)) return false
-        return !!normalizeMetaShopeeLink(video)
+        return !!normalizeMetaShopeeLink(video as unknown as Record<string, unknown>)
     })
     if (candidates.length === 0) return null
 
-    for (let i = candidates.length - 1; i > 0; i -= 1) {
-        const j = Math.floor(Math.random() * (i + 1))
-        const tmp = candidates[i]
-        candidates[i] = candidates[j]
-        candidates[j] = tmp
-    }
+    shuffleInPlace(candidates)
 
-    const picked = candidates[0] as Record<string, unknown>
+    const picked = candidates[0] as unknown as Record<string, unknown>
     const id = String(picked.id || '').trim()
     const sourceNamespaceId = String(picked.namespace_id || '').trim()
     const shopeeLink = normalizeMetaShopeeLink(picked)
@@ -810,6 +1088,221 @@ async function pickRandomPostableVideoFromSystem(
 // ==================== ADMIN PANEL ====================
 
 const ADMIN_AUTH_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+async function buildAdminDataPayload(env: Env) {
+    const teamsRes = await env.DB.prepare(
+        `SELECT
+            ae.email,
+            ae.created_at,
+            (
+                SELECT u.telegram_id
+                FROM users u
+                WHERE u.email = ae.email
+                ORDER BY datetime(u.created_at) DESC, u.telegram_id DESC
+                LIMIT 1
+            ) AS telegram_id,
+            COALESCE(
+                (
+                    SELECT en.namespace_id
+                    FROM email_namespaces en
+                    WHERE en.email = ae.email
+                    LIMIT 1
+                ),
+                (
+                    SELECT u2.namespace_id
+                    FROM users u2
+                    WHERE u2.email = ae.email
+                    ORDER BY datetime(u2.created_at) ASC, u2.telegram_id ASC
+                    LIMIT 1
+                )
+            ) AS namespace_id,
+            EXISTS(
+                SELECT 1
+                FROM users us
+                WHERE us.email = ae.email
+                  AND us.session_token IS NOT NULL
+                  AND TRIM(us.session_token) <> ''
+            ) AS active_session
+         FROM allowed_emails ae
+         ORDER BY ae.created_at DESC`
+    ).all()
+
+    const pagesTotalRes = await env.DB.prepare(
+        `SELECT COUNT(*) AS total FROM pages`
+    ).first() as any
+    const pagesActiveRes = await env.DB.prepare(
+        `SELECT COUNT(*) AS total FROM pages WHERE is_active = 1`
+    ).first() as any
+    const postsTotalRes = await env.DB.prepare(
+        `SELECT COUNT(*) AS total FROM post_history WHERE status IN ('success','posting')`
+    ).first() as any
+    const postsTodayRes = await env.DB.prepare(
+        `SELECT COUNT(*) AS total FROM post_history WHERE status IN ('success','posting') AND date(posted_at) = date('now')`
+    ).first() as any
+    const latestPostRes = await env.DB.prepare(
+        `SELECT posted_at FROM post_history WHERE status IN ('success','posting') ORDER BY datetime(posted_at) DESC LIMIT 1`
+    ).first() as any
+    const namespacePagesRes = await env.DB.prepare(
+        `SELECT bot_id AS namespace_id, COUNT(*) AS pages_count
+         FROM pages
+         GROUP BY bot_id
+         ORDER BY pages_count DESC
+         LIMIT 8`
+    ).all() as any
+    const namespacePostsRes = await env.DB.prepare(
+        `SELECT bot_id AS namespace_id, COUNT(*) AS posts_count
+         FROM post_history
+         WHERE status IN ('success','posting')
+         GROUP BY bot_id`
+    ).all() as any
+    const allVideos = await getOwnerLinkedSystemGalleryVideos(env).catch(() => []) as Array<Record<string, unknown>>
+
+    const teams = (teamsRes.results || []) as any[]
+    const activeOwners = teams.filter((t) => Number(t.active_session) === 1).length
+    const namespaces = new Set(teams.map((t) => String(t.namespace_id || '').trim()).filter(Boolean)).size
+
+    const postCountMap = new Map<string, number>()
+    for (const row of (namespacePostsRes.results || []) as any[]) {
+        const ns = String(row.namespace_id || '').trim()
+        if (!ns) continue
+        postCountMap.set(ns, Number(row.posts_count || 0))
+    }
+    const pageCountMap = new Map<string, number>()
+    for (const row of (namespacePagesRes.results || []) as any[]) {
+        const ns = String(row.namespace_id || '').trim()
+        if (!ns) continue
+        pageCountMap.set(ns, Number(row.pages_count || 0))
+    }
+    const videoCountMap = new Map<string, number>()
+    for (const video of allVideos) {
+        const ns = String(video?.namespace_id || '').trim()
+        if (!ns) continue
+        videoCountMap.set(ns, Number(videoCountMap.get(ns) || 0) + 1)
+    }
+    const ownerStatsMap = new Map<string, { namespace_id: string; owner_email: string }>()
+    for (const team of teams) {
+        const ownerEmail = String(team.email || '').trim().toLowerCase()
+        if (!ownerEmail || ownerStatsMap.has(ownerEmail)) continue
+        ownerStatsMap.set(ownerEmail, {
+            namespace_id: String(team.namespace_id || '').trim(),
+            owner_email: ownerEmail,
+        })
+    }
+    const namespaceStats = Array.from(ownerStatsMap.values())
+        .map((item) => {
+            const ns = String(item.namespace_id || '').trim()
+            return {
+                namespace_id: ns,
+                owner_email: item.owner_email,
+                pages_count: Number(pageCountMap.get(ns) || 0),
+                posts_count: Number(postCountMap.get(ns) || 0),
+                videos_count: Number(videoCountMap.get(ns) || 0),
+            }
+        })
+        .sort((a, b) =>
+            Number(b.videos_count || 0) - Number(a.videos_count || 0) ||
+            Number(b.pages_count || 0) - Number(a.pages_count || 0) ||
+            a.owner_email.localeCompare(b.owner_email)
+        )
+
+    return {
+        teams,
+        dashboard: {
+            owners_total: teams.length,
+            owners_active: activeOwners,
+            namespaces_total: namespaces,
+            pages_total: Number(pagesTotalRes?.total || 0),
+            pages_active: Number(pagesActiveRes?.total || 0),
+            posts_total: Number(postsTotalRes?.total || 0),
+            posts_today: Number(postsTodayRes?.total || 0),
+            latest_post_at: latestPostRes?.posted_at || null,
+            namespace_stats: namespaceStats,
+        }
+    }
+}
+
+async function generateThumbnailViaContainer(env: Env, videoUrl: string): Promise<NodeBuffer> {
+    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+    const containerStub = env.MERGE_CONTAINER.get(containerId)
+    const resp = await containerStub.fetch('http://container/thumbnail', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_url: videoUrl }),
+    })
+
+    const body = await resp.text()
+    if (body.startsWith('<') || !resp.ok) {
+        throw new Error(`container_thumbnail_error_${resp.status}: ${body.slice(0, 160)}`)
+    }
+
+    const payload = JSON.parse(body) as { thumbnail_base64?: string }
+    const thumbBase64 = String(payload?.thumbnail_base64 || '').trim()
+    if (!thumbBase64) {
+        throw new Error('thumbnail_base64_missing')
+    }
+    return NodeBuffer.from(thumbBase64, 'base64')
+}
+
+async function backfillGalleryThumbnail(env: Env, namespaceId: string, videoId: string): Promise<{ generated: boolean; thumbnailUrl: string }> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedNamespaceId || !normalizedVideoId) {
+        return { generated: false, thumbnailUrl: '' }
+    }
+
+    const bucket = new BotBucket(env.BUCKET, normalizedNamespaceId) as unknown as R2Bucket
+    const [originalObj, publicObj, currentThumbObj] = await Promise.all([
+        bucket.head(`videos/${normalizedVideoId}_original.mp4`).catch(() => null),
+        bucket.head(`videos/${normalizedVideoId}.mp4`).catch(() => null),
+        bucket.head(`videos/${normalizedVideoId}_thumb.webp`).catch(() => null),
+    ])
+
+    const thumbnailUrl = getVideoThumbnailUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, normalizedVideoId)
+    if (currentThumbObj) {
+        await syncGalleryIndexEntry(env, normalizedNamespaceId, normalizedVideoId).catch(() => { })
+        return { generated: false, thumbnailUrl }
+    }
+
+    const sourceUrl = originalObj
+        ? (normalizedNamespaceId === 'default'
+            ? `${env.R2_PUBLIC_URL}/videos/${normalizedVideoId}_original.mp4`
+            : `${env.R2_PUBLIC_URL}/${normalizedNamespaceId}/videos/${normalizedVideoId}_original.mp4`)
+        : publicObj
+            ? getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, normalizedVideoId)
+            : ''
+    if (!sourceUrl) {
+        return { generated: false, thumbnailUrl: '' }
+    }
+
+    const thumbBytes = await generateThumbnailViaContainer(env, sourceUrl)
+    if (!thumbBytes.length) {
+        throw new Error('thumbnail_bytes_empty')
+    }
+
+    await bucket.put(`videos/${normalizedVideoId}_thumb.webp`, thumbBytes, {
+        httpMetadata: { contentType: 'image/webp' },
+    })
+
+    const metaObj = await bucket.get(`videos/${normalizedVideoId}.json`)
+    if (metaObj) {
+        let meta: Record<string, unknown> = {}
+        try {
+            meta = await metaObj.json() as Record<string, unknown>
+        } catch {
+            meta = {}
+        }
+        if (String(meta.thumbnailUrl || '').trim() !== thumbnailUrl) {
+            meta.thumbnailUrl = thumbnailUrl
+            await bucket.put(`videos/${normalizedVideoId}.json`, JSON.stringify(meta, null, 2), {
+                httpMetadata: { contentType: 'application/json' },
+            })
+            await updateGalleryCache(bucket, normalizedVideoId).catch(() => { })
+        }
+    }
+
+    await syncGalleryIndexEntry(env, normalizedNamespaceId, normalizedVideoId)
+    return { generated: true, thumbnailUrl }
+}
 
 app.get('/admin', async (c) => {
     const launchToken = String(c.req.query('launch') || '').trim()
@@ -844,7 +1337,22 @@ app.get('/admin', async (c) => {
         }
     }
 
-    return c.html(ADMIN_HTML)
+    const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
+    const adminToken = String(setting?.value || '').trim()
+    let html = ADMIN_HTML
+    if (adminToken) {
+        const safeToken = JSON.stringify(adminToken).replace(/</g, '\\u003c')
+        html = ADMIN_HTML.replace('<script>', `<script>window.__ADMIN_DIRECT_TOKEN__=${safeToken};</script>\n<script>`)
+    }
+
+    return new Response(html, {
+        headers: {
+            'content-type': 'text/html; charset=UTF-8',
+            'cache-control': 'no-store, no-cache, must-revalidate, max-age=0',
+            pragma: 'no-cache',
+            expires: '0',
+        },
+    })
 })
 
 // Auth check middleware for all /admin/api/* except /admin/api/auth
@@ -937,6 +1445,68 @@ app.post('/admin/api/launch-auth', async (c) => {
 
 app.use('/admin/api/*', adminAuthMiddleware)
 
+app.get('/admin/api/ping', async (c) => {
+    return c.json({ ok: true, now: new Date().toISOString() })
+})
+
+app.get('/admin/api/gallery/index/status', async (c) => {
+    const summary = await getGalleryIndexSummary(c.env.DB)
+    return c.json({ ok: true, ...summary })
+})
+
+app.post('/admin/api/gallery/index/rebuild', async (c) => {
+    const result = await rebuildGalleryIndexFromR2(c.env)
+    await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+    await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+    return c.json({ ok: true, ...result })
+})
+
+app.post('/admin/api/gallery/thumbnails/backfill', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { limit?: number }
+    const limit = Math.min(Math.max(Number(body.limit || 12), 1), 50)
+    const targets = await listGalleryIndexVideosMissingThumbnails(c.env.DB, limit)
+    const results: Array<{
+        namespace_id: string
+        video_id: string
+        ok: boolean
+        generated: boolean
+        thumbnail_url?: string
+        error?: string
+    }> = []
+
+    for (const target of targets) {
+        try {
+            const result = await backfillGalleryThumbnail(c.env, target.namespace_id, target.video_id)
+            results.push({
+                namespace_id: target.namespace_id,
+                video_id: target.video_id,
+                ok: true,
+                generated: result.generated,
+                thumbnail_url: result.thumbnailUrl || target.thumbnail_url || undefined,
+            })
+        } catch (error) {
+            results.push({
+                namespace_id: target.namespace_id,
+                video_id: target.video_id,
+                ok: false,
+                generated: false,
+                error: error instanceof Error ? error.message : String(error),
+            })
+        }
+    }
+
+    const summary = await getGalleryIndexSummary(c.env.DB)
+    return c.json({
+        ok: true,
+        requested: limit,
+        processed: targets.length,
+        generated: results.filter((item) => item.ok && item.generated).length,
+        remaining_missing_thumbnails: summary.missingThumbnailTotal,
+        remaining_missing_owner_linked_thumbnails: summary.missingOwnerLinkedThumbnailTotal,
+        results,
+    })
+})
+
 // Retry latest failed comments (admin-only)
 app.post('/admin/api/comments/retry', async (c) => {
     try {
@@ -986,7 +1556,7 @@ app.post('/admin/api/comments/retry', async (c) => {
             const targetFromUrl = fbReelUrl
                 ? extractReelIdFromPermalink(normalizeFacebookPermalink(fbReelUrl))
                 : ''
-            const targetId = fbPostId || targetFromUrl
+            const targetId = targetFromUrl || fbPostId
 
             if (!pageId || !targetId) {
                 const err = 'comment_target_missing'
@@ -997,13 +1567,16 @@ app.post('/admin/api/comments/retry', async (c) => {
                 continue
             }
 
-            const tokenCandidates = await getPageTokenCandidates({
+            const tokenCandidates = await ensurePageTokenCandidates({
+                env: c.env,
                 db: c.env.DB,
                 namespaceId: botId,
                 pageId,
+                pageName,
                 primaryToken: String(row.access_token || ''),
+                logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
             })
-            const commentToken = String(tokenCandidates.tokens[0] || row.access_token || '').trim()
+            const commentToken = String(tokenCandidates.commentTokens[0] || '').trim()
             const commentTokenHint = deriveCommentTokenHint(commentToken)
             const commentProfile = await resolvePostHistoryProfileByToken(c.env, commentToken)
 
@@ -1040,6 +1613,7 @@ app.post('/admin/api/comments/retry', async (c) => {
             })
 
             const commentResult = await postShopeeCommentStrict({
+                env: c.env,
                 fbVideoId: targetId,
                 shopeeLink: shortShopeeLink,
                 commentToken,
@@ -1067,105 +1641,7 @@ app.post('/admin/api/comments/retry', async (c) => {
 })
 
 app.get('/admin/api/data', async (c) => {
-    const teamsRes = await c.env.DB.prepare(
-        `SELECT
-            ae.email,
-            ae.created_at,
-            (
-                SELECT u.telegram_id
-                FROM users u
-                WHERE u.email = ae.email
-                ORDER BY datetime(u.created_at) DESC, u.telegram_id DESC
-                LIMIT 1
-            ) AS telegram_id,
-            COALESCE(
-                (
-                    SELECT en.namespace_id
-                    FROM email_namespaces en
-                    WHERE en.email = ae.email
-                    LIMIT 1
-                ),
-                (
-                    SELECT u2.namespace_id
-                    FROM users u2
-                    WHERE u2.email = ae.email
-                    ORDER BY datetime(u2.created_at) ASC, u2.telegram_id ASC
-                    LIMIT 1
-                )
-            ) AS namespace_id,
-            EXISTS(
-                SELECT 1
-                FROM users us
-                WHERE us.email = ae.email
-                  AND us.session_token IS NOT NULL
-                  AND TRIM(us.session_token) <> ''
-            ) AS active_session
-         FROM allowed_emails ae
-         ORDER BY ae.created_at DESC`
-    ).all()
-
-    const pagesTotalRes = await c.env.DB.prepare(
-        `SELECT COUNT(*) AS total FROM pages`
-    ).first() as any
-    const pagesActiveRes = await c.env.DB.prepare(
-        `SELECT COUNT(*) AS total FROM pages WHERE is_active = 1`
-    ).first() as any
-    const postsTotalRes = await c.env.DB.prepare(
-        `SELECT COUNT(*) AS total FROM post_history WHERE status IN ('success','posting')`
-    ).first() as any
-    const postsTodayRes = await c.env.DB.prepare(
-        `SELECT COUNT(*) AS total FROM post_history WHERE status IN ('success','posting') AND date(posted_at) = date('now')`
-    ).first() as any
-    const latestPostRes = await c.env.DB.prepare(
-        `SELECT posted_at FROM post_history WHERE status IN ('success','posting') ORDER BY datetime(posted_at) DESC LIMIT 1`
-    ).first() as any
-    const namespacePagesRes = await c.env.DB.prepare(
-        `SELECT bot_id AS namespace_id, COUNT(*) AS pages_count
-         FROM pages
-         GROUP BY bot_id
-         ORDER BY pages_count DESC
-         LIMIT 8`
-    ).all() as any
-    const namespacePostsRes = await c.env.DB.prepare(
-        `SELECT bot_id AS namespace_id, COUNT(*) AS posts_count
-         FROM post_history
-         WHERE status IN ('success','posting')
-         GROUP BY bot_id`
-    ).all() as any
-
-    const teams = (teamsRes.results || []) as any[]
-    const activeOwners = teams.filter((t) => Number(t.active_session) === 1).length
-    const namespaces = new Set(teams.map((t) => String(t.namespace_id || '').trim()).filter(Boolean)).size
-
-    const postCountMap = new Map<string, number>()
-    for (const row of (namespacePostsRes.results || []) as any[]) {
-        const ns = String(row.namespace_id || '').trim()
-        if (!ns) continue
-        postCountMap.set(ns, Number(row.posts_count || 0))
-    }
-    const namespaceStats = ((namespacePagesRes.results || []) as any[]).map((row) => {
-        const ns = String(row.namespace_id || '').trim()
-        return {
-            namespace_id: ns,
-            pages_count: Number(row.pages_count || 0),
-            posts_count: Number(postCountMap.get(ns) || 0),
-        }
-    })
-
-    return c.json({
-        teams,
-        dashboard: {
-            owners_total: teams.length,
-            owners_active: activeOwners,
-            namespaces_total: namespaces,
-            pages_total: Number(pagesTotalRes?.total || 0),
-            pages_active: Number(pagesActiveRes?.total || 0),
-            posts_total: Number(postsTotalRes?.total || 0),
-            posts_today: Number(postsTodayRes?.total || 0),
-            latest_post_at: latestPostRes?.posted_at || null,
-            namespace_stats: namespaceStats,
-        }
-    })
+    return c.json(await buildAdminDataPayload(c.env))
 })
 
 const toChanges = (result: any) => Number(result?.meta?.changes || 0)
@@ -2290,6 +2766,9 @@ app.post('/api/telegram/:token?', async (c) => {
                     httpMetadata: { contentType: 'application/json' },
                 })
                 await updateGalleryCache(c.get('bucket'), pending.videoId)
+                await syncGalleryIndexEntry(c.env, String(c.get('botId') || ''), pending.videoId).catch((error) => {
+                    console.log(`[TG-CATEGORY] sync gallery index failed video=${pending.videoId}: ${error instanceof Error ? error.message : String(error)}`)
+                })
             }
 
             return c.text('ok')
@@ -2639,6 +3118,11 @@ app.get('/api/stats', async (c) => {
 app.post('/api/gallery/refresh/:id', async (c) => {
     try {
         await updateGalleryCache(c.get('bucket'), c.req.param('id'))
+        await syncGalleryIndexEntry(c.env, String(c.get('botId') || ''), c.req.param('id')).catch((error) => {
+            console.log(`[GALLERY-REFRESH] sync gallery index failed video=${c.req.param('id')}: ${error instanceof Error ? error.message : String(error)}`)
+        })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
 
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
         c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
@@ -2705,6 +3189,15 @@ app.put('/api/categories', async (c) => {
 app.get('/api/gallery', async (c) => {
     const r2Url = c.env.R2_PUBLIC_URL
     const botId = c.get('botId')
+    const offset = parseNonNegativeInt(c.req.query('offset'), 0)
+    const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
+    const limit = Math.min(Math.max(requestedLimit, 1), 120)
+    const linkFilterRaw = String(c.req.query('link_filter') || '').trim().toLowerCase()
+    const linkFilter = linkFilterRaw === 'no-link'
+        ? 'no-link'
+        : linkFilterRaw === 'with-link'
+            ? 'with-link'
+            : 'all'
     const fixUrls = (data: any) => {
         const s = JSON.stringify(data)
         // Fix old pub URLs to new bucket with botId prefix
@@ -2713,8 +3206,30 @@ app.get('/api/gallery', async (c) => {
     try {
         const systemWideEnabled = await isSystemGalleryEnabledForNamespace(c.env.DB, botId)
         if (systemWideEnabled) {
-            const videos = await getAllSystemGalleryVideos(c.env)
-            return c.json({ videos }, 200, { 'Cache-Control': 'private, max-age=30', 'Vary': 'x-auth-token' })
+            // Fallback once while gallery_index is still warming or not backfilled yet.
+            c.executionCtx.waitUntil(rebuildGalleryIndexFromR2(c.env).catch((error) => {
+                console.log(`[GALLERY-INDEX] warmup rebuild failed: ${error instanceof Error ? error.message : String(error)}`)
+            }))
+
+            const videos = await getOwnerLinkedSystemGalleryVideos(c.env)
+            const withLinkVideos = videos.filter((video) => hasShopeeLinkInMeta(video as Record<string, unknown>))
+            const withoutLinkVideos = videos.filter((video) => !hasShopeeLinkInMeta(video as Record<string, unknown>))
+            const filteredVideos = linkFilter === 'no-link'
+                ? withoutLinkVideos
+                : linkFilter === 'with-link'
+                    ? withLinkVideos
+                    : videos
+            const page = sliceGalleryPage(filteredVideos, offset, limit)
+
+            return c.json({
+                videos: page.videos,
+                total: filteredVideos.length,
+                offset,
+                limit,
+                has_more: page.hasMore,
+                with_link_total: withLinkVideos.length,
+                without_link_total: withoutLinkVideos.length,
+            }, 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
         }
 
         // "ยังไม่ได้ใช้" = video_id ที่ยังไม่มี fb_post_id จริง
@@ -2728,12 +3243,32 @@ app.get('/api/gallery', async (c) => {
             const data = await cached.json() as { videos: any[] }
             const filteredVideos = dedupeVideosById(data.videos || [])
                 .filter((v: any) => !postedIds.has(String(v?.id || '').trim()))
+            if (c.req.query('offset') !== undefined || c.req.query('limit') !== undefined) {
+                const page = sliceGalleryPage(filteredVideos, offset, limit)
+                return c.json(fixUrls({
+                    videos: page.videos,
+                    total: filteredVideos.length,
+                    offset,
+                    limit,
+                    has_more: page.hasMore,
+                }), 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
+            }
             return c.json(fixUrls({ videos: filteredVideos }), 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
         }
 
         const videos = await rebuildGalleryCache(c.get('bucket'))
         const filteredVideos = videos
             .filter((v: any) => !postedIds.has(String((v as any)?.id || '').trim()))
+        if (c.req.query('offset') !== undefined || c.req.query('limit') !== undefined) {
+            const page = sliceGalleryPage(filteredVideos, offset, limit)
+            return c.json(fixUrls({
+                videos: page.videos,
+                total: filteredVideos.length,
+                offset,
+                limit,
+                has_more: page.hasMore,
+            }))
+        }
         return c.json(fixUrls({ videos: filteredVideos }))
     } catch (e) {
         return c.json({ videos: [], error: String(e) })
@@ -2748,10 +3283,162 @@ app.get('/api/gallery/system', async (c) => {
             return c.json({ error: 'system_gallery_not_enabled' }, 403)
         }
 
-        const videos = await getAllSystemGalleryVideos(c.env)
+        const videos = await getOwnerLinkedSystemGalleryVideos(c.env)
         return c.json({ videos }, 200, { 'Cache-Control': 'private, max-age=30', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
+    }
+})
+
+app.post('/api/gallery/restore-links', async (c) => {
+    const owner = await requireOwnerSession(c)
+    if (!owner.ok) return owner.response
+
+    try {
+        const currentNamespaceId = String(c.get('botId') || '').trim()
+        const enabled = await isSystemGalleryEnabledForNamespace(c.env.DB, currentNamespaceId)
+        if (!enabled) {
+            return c.json({ error: 'system_gallery_not_enabled' }, 403)
+        }
+
+        const [submissionRows, historyRows] = await Promise.all([
+            c.env.DB.prepare(
+                "SELECT video_id, shopee_link, created_at AS ts FROM link_submissions WHERE TRIM(COALESCE(shopee_link,'')) <> ''"
+            ).all() as Promise<{ results?: Array<{ video_id?: string; shopee_link?: string; ts?: string }> }>,
+            c.env.DB.prepare(
+                "SELECT video_id, shopee_link, posted_at AS ts FROM post_history WHERE TRIM(COALESCE(shopee_link,'')) <> ''"
+            ).all() as Promise<{ results?: Array<{ video_id?: string; shopee_link?: string; ts?: string }> }>,
+        ])
+
+        const linksByVideoId = new Map<string, Map<string, string>>()
+        const collect = (videoIdRaw: string | undefined, shopeeLinkRaw: string | undefined, tsRaw: string | undefined) => {
+            const videoId = String(videoIdRaw || '').trim()
+            const shopeeLink = pickFirstShopeeUrl(shopeeLinkRaw || '') || ''
+            const ts = String(tsRaw || '').trim()
+            if (!videoId || !shopeeLink) return
+            let linkMap = linksByVideoId.get(videoId)
+            if (!linkMap) {
+                linkMap = new Map<string, string>()
+                linksByVideoId.set(videoId, linkMap)
+            }
+            const prevTs = String(linkMap.get(shopeeLink) || '').trim()
+            if (!prevTs || ts > prevTs) {
+                linkMap.set(shopeeLink, ts)
+            }
+        }
+
+        for (const row of submissionRows.results || []) collect(row.video_id, row.shopee_link, row.ts)
+        for (const row of historyRows.results || []) collect(row.video_id, row.shopee_link, row.ts)
+
+        const exactMatchLinks = new Map<string, string>()
+        let conflictingVideos = 0
+        for (const [videoId, linkMap] of linksByVideoId.entries()) {
+            const links = Array.from(linkMap.keys())
+            if (links.length === 1) {
+                exactMatchLinks.set(videoId, links[0] || '')
+            } else if (links.length > 1) {
+                conflictingVideos += 1
+            }
+        }
+
+        const videos = dedupeVideosById(await getAllSystemGalleryVideos(c.env))
+        const currentWithLink = videos.reduce((sum, video) => sum + (normalizeMetaShopeeLink(video) ? 1 : 0), 0)
+
+        const restoreTargets = videos.filter((video) => {
+            const videoId = String(video?.id || '').trim()
+            if (!videoId) return false
+            if (normalizeMetaShopeeLink(video)) return false
+            return exactMatchLinks.has(videoId)
+        })
+
+        const touchedNamespaces = new Set<string>()
+        const nowIso = new Date().toISOString()
+        const batchSize = 25
+        let restoredCount = 0
+        for (let i = 0; i < restoreTargets.length; i += batchSize) {
+            const slice = restoreTargets.slice(i, i + batchSize)
+            const results = await Promise.all(slice.map(async (video) => {
+                const videoId = String(video?.id || '').trim()
+                const namespaceId = String(video?.namespace_id || '').trim()
+                const restoredLink = String(exactMatchLinks.get(videoId) || '').trim()
+                if (!videoId || !namespaceId || !restoredLink) return false
+
+                const targetBucket = namespaceId === currentNamespaceId
+                    ? c.get('bucket')
+                    : new BotBucket(c.env.BUCKET, namespaceId) as unknown as R2Bucket
+
+                const currentMetaObj = await targetBucket.get(`videos/${videoId}.json`)
+                let meta: Record<string, unknown> = {}
+                if (currentMetaObj) {
+                    meta = await currentMetaObj.json() as Record<string, unknown>
+                } else {
+                    const [originalObj, publicObj, thumbObj] = await Promise.all([
+                        targetBucket.head(`videos/${videoId}_original.mp4`).catch(() => null),
+                        targetBucket.head(`videos/${videoId}.mp4`).catch(() => null),
+                        targetBucket.head(`videos/${videoId}_thumb.webp`).catch(() => null),
+                    ])
+                    const uploadedAt = originalObj?.uploaded?.toISOString?.() || publicObj?.uploaded?.toISOString?.() || nowIso
+                    const originalUrl = originalObj
+                        ? (namespaceId === 'default'
+                            ? `${c.env.R2_PUBLIC_URL}/videos/${videoId}_original.mp4`
+                            : `${c.env.R2_PUBLIC_URL}/${namespaceId}/videos/${videoId}_original.mp4`)
+                        : ''
+                    const publicUrl = publicObj
+                        ? getVideoPublicUrlForNamespace(c.env.R2_PUBLIC_URL, namespaceId, videoId)
+                        : (originalUrl || getVideoPublicUrlForNamespace(c.env.R2_PUBLIC_URL, namespaceId, videoId))
+                    meta = {
+                        createdAt: uploadedAt,
+                        updatedAt: uploadedAt,
+                        duration: 0,
+                        script: '',
+                        title: '',
+                        category: '',
+                        originalUrl: originalUrl || publicUrl,
+                        publicUrl,
+                        thumbnailUrl: thumbObj ? getVideoThumbnailUrlForNamespace(c.env.R2_PUBLIC_URL, namespaceId, videoId) : '',
+                    }
+                }
+                meta.shopeeLink = restoredLink
+                meta.updatedAt = nowIso
+                if (!String(meta.linkSubmittedAt || '').trim()) {
+                    meta.linkSubmittedAt = nowIso
+                }
+
+                await targetBucket.put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
+                    httpMetadata: { contentType: 'application/json' },
+                })
+                await syncGalleryIndexEntry(c.env, namespaceId, videoId).catch((error) => {
+                    console.log(`[RESTORE-LINKS] sync gallery index failed ns=${namespaceId} video=${videoId}: ${error instanceof Error ? error.message : String(error)}`)
+                })
+                touchedNamespaces.add(namespaceId)
+                return true
+            }))
+            restoredCount += results.filter(Boolean).length
+        }
+
+        for (const namespaceId of touchedNamespaces) {
+            await rebuildGalleryCache(c.env.BUCKET, namespaceId).catch((e) => {
+                console.log(`[RESTORE-LINKS] rebuild gallery cache failed ns=${namespaceId}: ${e instanceof Error ? e.message : String(e)}`)
+            })
+        }
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+
+        const finalVideos = dedupeVideosById(await getAllSystemGalleryVideos(c.env))
+        const finalWithLink = finalVideos.reduce((sum, video) => sum + (normalizeMetaShopeeLink(video) ? 1 : 0), 0)
+
+        return c.json({
+            success: true,
+            total_videos: videos.length,
+            current_with_link: currentWithLink,
+            restored_count: restoredCount,
+            final_with_link: finalWithLink,
+            exact_match_videos_total: exactMatchLinks.size,
+            conflicting_videos_total: conflictingVideos,
+            unresolved_videos_total: Math.max(0, videos.length - exactMatchLinks.size - conflictingVideos),
+        })
+    } catch (e) {
+        return c.json({ error: `restore_links_failed: ${e instanceof Error ? e.message : String(e)}` }, 500)
     }
 })
 
@@ -2908,8 +3595,36 @@ app.put('/api/gallery/:id', async (c) => {
             ? c.get('bucket')
             : new BotBucket(c.env.BUCKET, targetNamespaceId) as unknown as R2Bucket
         const metaObj = await targetBucket.get(`videos/${id}.json`)
-        if (!metaObj) return c.json({ error: 'Video not found' }, 404)
-        const meta = await metaObj.json() as Record<string, unknown>
+        let meta: Record<string, unknown> = {}
+        if (metaObj) {
+            meta = await metaObj.json() as Record<string, unknown>
+        } else {
+            const originalObj = await targetBucket.get(`videos/${id}_original.mp4`)
+            const publicObj = await targetBucket.get(`videos/${id}.mp4`)
+            const thumbObj = await targetBucket.head(`videos/${id}_thumb.webp`).catch(() => null)
+            const sourceObj = originalObj || publicObj
+            if (!sourceObj) return c.json({ error: 'Video not found' }, 404)
+            const uploadedAt = sourceObj.uploaded.toISOString()
+            const originalUrl = originalObj
+                ? (targetNamespaceId === 'default'
+                    ? `${c.env.R2_PUBLIC_URL}/videos/${id}_original.mp4`
+                    : `${c.env.R2_PUBLIC_URL}/${targetNamespaceId}/videos/${id}_original.mp4`)
+                : ''
+            const publicUrl = publicObj
+                ? getVideoPublicUrlForNamespace(c.env.R2_PUBLIC_URL, targetNamespaceId, id)
+                : (originalUrl || getVideoPublicUrlForNamespace(c.env.R2_PUBLIC_URL, targetNamespaceId, id))
+            meta = {
+                createdAt: uploadedAt,
+                updatedAt: uploadedAt,
+                duration: 0,
+                script: '',
+                title: '',
+                category: '',
+                originalUrl: originalUrl || publicUrl,
+                publicUrl,
+                thumbnailUrl: thumbObj ? getVideoThumbnailUrlForNamespace(c.env.R2_PUBLIC_URL, targetNamespaceId, id) : '',
+            }
+        }
         let changed = false
         if (body.shopeeLink !== undefined) {
             const normalizedShopeeLink = String(body.shopeeLink || '').trim()
@@ -2942,7 +3657,11 @@ app.put('/api/gallery/:id', async (c) => {
             httpMetadata: { contentType: 'application/json' },
         })
         await updateGalleryCache(targetBucket, id)
+        await syncGalleryIndexEntry(c.env, targetNamespaceId, id).catch((error) => {
+            console.log(`[GALLERY-PUT] sync gallery index failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
+        })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
         return c.json({ success: true })
     } catch {
         return c.json({ error: 'Failed to update video' }, 500)
@@ -2964,7 +3683,11 @@ app.delete('/api/gallery/:id', async (c) => {
             : new BotBucket(c.env.BUCKET, targetNamespaceId) as unknown as R2Bucket
         // Update cache first (fast: read 1 file, write 1 file) — user sees result instantly
         await removeFromGalleryCache(bucket, id)
+        await deleteGalleryIndexEntry(c.env.DB, targetNamespaceId, id).catch((error) => {
+            console.log(`[GALLERY-DELETE] delete gallery index failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
+        })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
         // Delete all R2 files in parallel + return response immediately
         c.executionCtx.waitUntil(Promise.all([
             bucket.delete(`videos/${id}.json`),
@@ -3015,6 +3738,7 @@ const NS_SETTING_PAGES_SYNC_LAST_AT_MS = 'pages_sync_last_at_ms'
 const NS_SETTING_PAGES_TOKEN_MIGRATE_LAST_AT_MS = 'pages_token_migrate_last_at_ms'
 const NS_SETTING_PAGES_TOKEN_POOL_V1 = 'pages_token_pool_v1'
 const NS_SETTING_PAGES_HIDDEN_TAGGED_PROFILES_V1 = 'pages_hidden_tagged_profiles_v1'
+const NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1 = 'pages_linked_tagged_profiles_v1'
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
@@ -3044,6 +3768,7 @@ type PageTokenPoolEntry = {
 
 type NamespacePageTokenPool = Record<string, PageTokenPoolEntry>
 type NamespacePageHiddenTaggedProfiles = Record<string, string[]>
+type NamespacePageLinkedTaggedProfiles = Record<string, string[]>
 function canonicalPageTokenFromRows(row: { access_token?: string | null }): string {
     return String(row?.access_token || '').trim()
 }
@@ -3355,12 +4080,36 @@ async function setNamespacePagesTokenMigrateLastAtMs(db: D1Database, namespaceId
     await setNamespaceSettingMs(db, namespaceId, NS_SETTING_PAGES_TOKEN_MIGRATE_LAST_AT_MS, valueMs)
 }
 
+async function getNamespaceBrowserSavingOwnerEmails(db: D1Database, namespaceId: string): Promise<string[]> {
+    const ns = String(namespaceId || '').trim()
+    if (!ns) return []
+
+    const rows = await db.prepare(
+        `SELECT DISTINCT lower(trim(coalesce(email, ''))) AS email
+         FROM users
+         WHERE namespace_id = ?
+           AND trim(coalesce(email, '')) <> ''
+         ORDER BY email`
+    ).bind(ns).all() as { results?: Array<{ email?: string | null }> }
+
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const row of rows.results || []) {
+        const email = String(row?.email || '').trim().toLowerCase()
+        if (!email || seen.has(email)) continue
+        seen.add(email)
+        out.push(email)
+    }
+    return out
+}
+
 async function upsertNamespacePageFromProfileSync(env: Env, params: {
     namespaceId: string
     pageId: string
     pageName?: string
     pageAvatarUrl?: string
     accessToken: string
+    commentToken?: string
 }): Promise<{ created: boolean; updated: boolean; moved: boolean }> {
     const namespaceId = String(params.namespaceId || '').trim()
     const pageId = String(params.pageId || '').trim()
@@ -3368,50 +4117,77 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     const pageAvatarUrl = String(params.pageAvatarUrl || '').trim() ||
         `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`
     const accessToken = String(params.accessToken || '').trim()
+    const commentToken = String(params.commentToken || '').trim()
 
     if (!namespaceId) throw new Error('namespace_not_found')
     if (!pageId) throw new Error('page_id_required')
     if (!accessToken) throw new Error('access_token_required')
 
+    let incomingPostToken = ''
+    try {
+        const scoped = await resolvePageScopedToken(accessToken, pageId, env, 'post')
+        incomingPostToken = isPostRoleToken(String(scoped.token || '').trim())
+            ? String(scoped.token || '').trim()
+            : ''
+    } catch {
+        incomingPostToken = ''
+    }
+
     let created = false
     let updated = false
     let moved = false
 
+    const tokenPool = await getNamespacePagesTokenPool(env.DB, namespaceId)
+    const existingEntry = tokenPool[pageId] || { post_tokens: [], comment_tokens: [] }
     const existing = await env.DB.prepare(
-        'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
-    ).bind(pageId, namespaceId).first() as { id?: string } | null
+        'SELECT id, access_token FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; access_token?: string | null } | null
+    const currentPrimaryToken = isPostRoleToken(String(existing?.access_token || '').trim())
+        ? String(existing?.access_token || '').trim()
+        : ''
+    const resolvedCommentToken = commentToken
+        ? await resolveCommentPageTokenForPage(env, pageId, commentToken)
+        : ''
+    const nextPostTokens = normalizePostTokenPool([
+        incomingPostToken,
+        ...(existingEntry.post_tokens || []),
+    ])
+    const nextCommentTokens = normalizeCommentTokenPool([
+        resolvedCommentToken,
+        ...(existingEntry.comment_tokens || []),
+    ])
+    const nextPrimaryToken = String(nextPostTokens[0] || currentPrimaryToken || '').trim()
 
     if (existing?.id) {
         await env.DB.prepare(
             'UPDATE pages SET access_token = ?, image_url = ?, name = ?, updated_at = datetime(\"now\") WHERE id = ? AND bot_id = ?'
-        ).bind(accessToken, pageAvatarUrl, pageName, pageId, namespaceId).run()
+        ).bind(nextPrimaryToken, pageAvatarUrl, pageName, pageId, namespaceId).run()
         updated = true
     } else {
         const existingInOtherNamespace = await env.DB.prepare(
-            'SELECT bot_id FROM pages WHERE id = ? LIMIT 1'
-        ).bind(pageId).first() as { bot_id?: string } | null
+            'SELECT bot_id, access_token FROM pages WHERE id = ? LIMIT 1'
+        ).bind(pageId).first() as { bot_id?: string; access_token?: string | null } | null
 
         if (existingInOtherNamespace?.bot_id && String(existingInOtherNamespace.bot_id || '').trim() !== namespaceId) {
+            const existingOtherPrimaryToken = isPostRoleToken(String(existingInOtherNamespace.access_token || '').trim())
+                ? String(existingInOtherNamespace.access_token || '').trim()
+                : ''
+            const movedPrimaryToken = String(nextPostTokens[0] || existingOtherPrimaryToken || '').trim()
             await env.DB.prepare(
                 'UPDATE pages SET bot_id = ?, access_token = ?, image_url = ?, name = ?, updated_at = datetime(\"now\") WHERE id = ?'
-            ).bind(namespaceId, accessToken, pageAvatarUrl, pageName, pageId).run()
+            ).bind(namespaceId, movedPrimaryToken, pageAvatarUrl, pageName, pageId).run()
             moved = true
         } else {
             await env.DB.prepare(
                 'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, bot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-            ).bind(pageId, pageName, pageAvatarUrl, accessToken, 60, generateRandomPostHours(), 1, namespaceId).run()
+            ).bind(pageId, pageName, pageAvatarUrl, nextPrimaryToken, 60, generateRandomPostHours(), 1, namespaceId).run()
             created = true
         }
     }
 
-    const tokenPool = await getNamespacePagesTokenPool(env.DB, namespaceId)
-    const existingEntry = tokenPool[pageId] || { post_tokens: [] }
     tokenPool[pageId] = {
-        post_tokens: normalizePostTokenPool([
-            accessToken,
-            ...(existingEntry.post_tokens || []),
-            ...(existingEntry.comment_tokens || []),
-        ]),
+        post_tokens: nextPostTokens,
+        comment_tokens: nextCommentTokens,
         updated_at: new Date().toISOString(),
     }
     await setNamespacePagesTokenPool(env.DB, namespaceId, tokenPool)
@@ -3431,6 +4207,10 @@ function uniqueTokens(raw: string[]): string[] {
         out.push(token)
     }
     return out
+}
+
+function hasTokenList(tokens: string[] | undefined | null): boolean {
+    return Array.isArray(tokens) && tokens.some((token) => !!String(token || '').trim())
 }
 
 function isTokenString(token: string): boolean {
@@ -3464,20 +4244,42 @@ function generateRandomPostHours(): string {
 }
 
 function normalizePostTokenPool(tokens: string[]): string[] {
-    return normalizeTokenPool(tokens)
+    return uniqueTokens((tokens || []).filter((token) => isPostRoleToken(token)))
 }
 
-// Backward-compatible aliases — now token validation is unified
 function isCommentRoleToken(token: string): boolean {
-    return isTokenValid(token)
+    return /^EAAD6/i.test(String(token || '').trim())
 }
 
 function isPostRoleToken(token: string): boolean {
-    return isTokenValid(token)
+    const normalized = String(token || '').trim()
+    return !!normalized && isTokenValid(normalized) && !isCommentRoleToken(normalized)
+}
+
+function isPageScopedRoleToken(token: string): boolean {
+    return isPostRoleToken(token)
+}
+
+function isResolvedCommentToken(token: string): boolean {
+    return isTokenValid(String(token || '').trim())
+}
+
+function isResolvedRoleTokenForMode(token: string, mode: BrowserSavingTokenMode): boolean {
+    return mode === 'comment'
+        ? isResolvedCommentToken(token)
+        : isPageScopedRoleToken(token)
+}
+
+function isRoleTokenForMode(token: string, mode: BrowserSavingTokenMode): boolean {
+    return mode === 'comment'
+        ? isCommentRoleToken(token)
+        : isPostRoleToken(token)
 }
 
 function normalizeCommentTokenPool(tokens: string[]): string[] {
-    return normalizeTokenPool(tokens)
+    // Comment tokens are validated against the target page via /me/accounts at use time.
+    // Do not infer invalidity from the prefix alone.
+    return uniqueTokens(tokens.filter((token) => isResolvedCommentToken(token)))
 }
 
 function preferCommentToken(existingRaw: string, candidateRaw: string): string {
@@ -3503,12 +4305,16 @@ async function getNamespacePagesTokenPool(db: D1Database, namespaceId: string): 
             const pageId = String(pageIdRaw || '').trim()
             if (!pageId || !entryRaw || typeof entryRaw !== 'object') continue
             const entryObj = entryRaw as Record<string, unknown>
-            const allTokens = normalizePostTokenPool([
-                ...(Array.isArray(entryObj.post_tokens) ? entryObj.post_tokens : []),
-                ...(Array.isArray(entryObj.comment_tokens) ? entryObj.comment_tokens : []),
-            ].map((x) => String(x || '')))
+            const postTokens = normalizePostTokenPool(
+                (Array.isArray(entryObj.post_tokens) ? entryObj.post_tokens : []).map((x) => String(x || ''))
+            )
+            const commentTokens = normalizeCommentTokenPool(
+                (Array.isArray(entryObj.comment_tokens) ? entryObj.comment_tokens : []).map((x) => String(x || ''))
+            )
+            if (postTokens.length === 0 && commentTokens.length === 0) continue
             out[pageId] = {
-                post_tokens: allTokens,
+                post_tokens: postTokens,
+                comment_tokens: commentTokens,
                 updated_at: typeof entryObj.updated_at === 'string' ? entryObj.updated_at : undefined,
             }
         }
@@ -3524,13 +4330,16 @@ async function setNamespacePagesTokenPool(db: D1Database, namespaceId: string, p
     for (const [pageIdRaw, entryRaw] of Object.entries(pool || {})) {
         const pageId = String(pageIdRaw || '').trim()
         if (!pageId || !entryRaw) continue
-        const allTokens = normalizePostTokenPool([
-            ...(Array.isArray(entryRaw.post_tokens) ? entryRaw.post_tokens : []),
-            ...(Array.isArray(entryRaw.comment_tokens) ? entryRaw.comment_tokens : []),
-        ].map((x) => String(x || '')))
-        if (allTokens.length === 0) continue
+        const postTokens = normalizePostTokenPool(
+            (Array.isArray(entryRaw.post_tokens) ? entryRaw.post_tokens : []).map((x) => String(x || ''))
+        )
+        const commentTokens = normalizeCommentTokenPool(
+            (Array.isArray(entryRaw.comment_tokens) ? entryRaw.comment_tokens : []).map((x) => String(x || ''))
+        )
+        if (postTokens.length === 0 && commentTokens.length === 0) continue
         normalized[pageId] = {
-            post_tokens: allTokens,
+            post_tokens: postTokens,
+            comment_tokens: commentTokens,
             updated_at: (entryRaw as { updated_at?: string }).updated_at || new Date().toISOString(),
         }
     }
@@ -3609,6 +4418,56 @@ async function setNamespaceHiddenTaggedProfiles(db: D1Database, namespaceId: str
     ).bind(namespaceId, NS_SETTING_PAGES_HIDDEN_TAGGED_PROFILES_V1, value).run()
 }
 
+async function getNamespaceLinkedTaggedProfiles(db: D1Database, namespaceId: string): Promise<NamespacePageLinkedTaggedProfiles> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1).first() as { value?: string } | null
+
+    const raw = String(row?.value || '').trim()
+    if (!raw) return {}
+
+    try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>
+        if (!parsed || typeof parsed !== 'object') return {}
+        const out: NamespacePageLinkedTaggedProfiles = {}
+        for (const [pageIdRaw, idsRaw] of Object.entries(parsed)) {
+            const pageId = String(pageIdRaw || '').trim()
+            if (!pageId || !Array.isArray(idsRaw)) continue
+            out[pageId] = normalizeHiddenTaggedProfileIds(idsRaw.map((value) => String(value || '')))
+        }
+        return out
+    } catch {
+        return {}
+    }
+}
+
+async function setNamespaceLinkedTaggedProfiles(db: D1Database, namespaceId: string, linkedProfiles: NamespacePageLinkedTaggedProfiles): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const normalized: NamespacePageLinkedTaggedProfiles = {}
+    for (const [pageIdRaw, idsRaw] of Object.entries(linkedProfiles || {})) {
+        const pageId = String(pageIdRaw || '').trim()
+        if (!pageId) continue
+        normalized[pageId] = normalizeHiddenTaggedProfileIds(Array.isArray(idsRaw) ? idsRaw : [])
+    }
+
+    if (Object.keys(normalized).length === 0) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1).run()
+        return
+    }
+
+    const value = JSON.stringify(normalized)
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1, value).run()
+}
+
 async function clearNamespaceHiddenTaggedProfiles(db: D1Database, namespaceId: string): Promise<void> {
     await db.prepare(
         'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
@@ -3628,6 +4487,69 @@ function getHiddenTaggedProfileIdsForPage(hiddenProfiles: NamespacePageHiddenTag
     return new Set(normalizeHiddenTaggedProfileIds(hiddenProfiles[String(pageId || '').trim()] || []))
 }
 
+function hasLinkedTaggedProfilesEntryForPage(linkedProfiles: NamespacePageLinkedTaggedProfiles, pageId: string): boolean {
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId) return false
+    return Object.prototype.hasOwnProperty.call(linkedProfiles || {}, normalizedPageId)
+}
+
+function getLinkedTaggedProfileIdsForPage(linkedProfiles: NamespacePageLinkedTaggedProfiles, pageId: string): Set<string> {
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId) return new Set()
+    if (!hasLinkedTaggedProfilesEntryForPage(linkedProfiles, normalizedPageId)) return new Set()
+    return new Set(normalizeHiddenTaggedProfileIds(linkedProfiles[normalizedPageId] || []))
+}
+
+function collectExplicitLinkedProfileIdsForPage(
+    profiles: BrowserSavingProfileRecord[],
+    selectors: string[],
+    pageId: string,
+    pageName: string,
+): string[] {
+    const explicitIds: string[] = []
+    for (const selectorRaw of selectors) {
+        const selector = String(selectorRaw || '').trim()
+        if (!selector) continue
+        if (looksLikeBrowserSavingProfileId(selector)) {
+            explicitIds.push(selector)
+            continue
+        }
+        const tag = parseBrowserSavingTagSelector(selector)
+        if (!tag) continue
+        const selectedProfiles = collectProfilesBySelectors(profiles, [selector])
+        for (const profile of selectedProfiles) {
+            if (!matchesProfileToPage(profile, pageId, pageName)) continue
+            explicitIds.push(String(profile.id || ''))
+        }
+    }
+    return normalizeHiddenTaggedProfileIds(explicitIds)
+}
+
+function filterProfilesForTaggedPage(params: {
+    profiles: BrowserSavingProfileRecord[]
+    pageId: string
+    pageName: string
+    hiddenProfiles: NamespacePageHiddenTaggedProfiles
+    linkedProfiles?: NamespacePageLinkedTaggedProfiles
+}): BrowserSavingProfileRecord[] {
+    const normalizedPageId = String(params.pageId || '').trim()
+    const normalizedPageName = String(params.pageName || '').trim()
+    const hiddenProfileIds = getHiddenTaggedProfileIdsForPage(params.hiddenProfiles, normalizedPageId)
+    const linkedProfiles = params.linkedProfiles || {}
+    const hasLinkedEntry = hasLinkedTaggedProfilesEntryForPage(linkedProfiles, normalizedPageId)
+    const linkedProfileIds = hasLinkedEntry
+        ? getLinkedTaggedProfileIdsForPage(linkedProfiles, normalizedPageId)
+        : new Set<string>()
+
+    return (params.profiles || []).filter((profile) => {
+        const profileId = String(profile.id || '').trim().toLowerCase()
+        if (!profileId) return false
+        if (hiddenProfileIds.has(profileId)) return false
+        if (hasLinkedEntry) return linkedProfileIds.has(profileId)
+        return matchesProfileToPage(profile, normalizedPageId, normalizedPageName)
+    })
+}
+
 function isHiddenTaggedProfileForPage(hiddenProfiles: NamespacePageHiddenTaggedProfiles, pageId: string, profileId: string): boolean {
     const normalizedProfileId = String(profileId || '').trim().toLowerCase()
     if (!normalizedProfileId) return false
@@ -3642,35 +4564,32 @@ function isHiddenTaggedProfileForDerivedPage(hiddenProfiles: NamespacePageHidden
     return isHiddenTaggedProfileForPage(hiddenProfiles, pageId, profileId)
 }
 
-async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pageId: string, pageName: string): Promise<{ primaryToken: string; tokens: string[] }> {
-    const profiles = await fetchBrowserSavingProfiles(env)
+async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pageId: string, pageName: string): Promise<{ primaryToken: string; tokens: string[]; postTokens: string[]; commentTokens: string[] }> {
+    const profiles = await fetchBrowserSavingProfilesForNamespace(env, env.DB, namespaceId)
     const cfg = await getNamespacePagesSyncConfig(env.DB, namespaceId)
     const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(env.DB, namespaceId)
-    const hiddenProfileIds = getHiddenTaggedProfileIdsForPage(hiddenProfiles, pageId)
+    const linkedProfiles = await getNamespaceLinkedTaggedProfiles(env.DB, namespaceId)
 
-    const visibleProfiles = profiles.filter((profile) => {
-        if (!matchesProfileToPage(profile, pageId, pageName)) return false
-        const profileId = String(profile.id || '').trim().toLowerCase()
-        if (!profileId) return false
-        return !hiddenProfileIds.has(profileId)
+    const visibleProfiles = filterProfilesForTaggedPage({
+        profiles,
+        pageId,
+        pageName,
+        hiddenProfiles,
+        linkedProfiles,
     })
 
-    const postProfileIds = new Set(
-        collectProfilesBySelectors(visibleProfiles, cfg.postSelectors)
-            .map((profile) => String(profile.id || '').trim().toLowerCase())
-            .filter(Boolean),
-    )
-    const commentProfileIds = new Set(
-        collectProfilesBySelectors(visibleProfiles, cfg.commentSelectors)
-            .map((profile) => String(profile.id || '').trim().toLowerCase())
-            .filter(Boolean),
-    )
+    const { postProfileIds, commentProfileIds } = deriveRoleProfileIdsForTaggedPage({
+        profiles: visibleProfiles,
+        pageId,
+        linkedProfiles,
+        cfg,
+    })
 
     const byProfileId = new Map<string, {
         profile_id: string
         roles: Array<'post' | 'comment'>
-        token: string
         post_token: string
+        comment_token: string
     }>()
 
     for (const profile of visibleProfiles) {
@@ -3687,26 +4606,24 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
             byProfileId.set(key, {
                 profile_id: id,
                 roles,
-                token: postToken || commentToken,
                 post_token: postToken,
+                comment_token: commentToken,
             })
             continue
         }
         if (postProfileIds.has(key) && !existing.roles.includes('post')) existing.roles.push('post')
         if (commentProfileIds.has(key) && !existing.roles.includes('comment')) existing.roles.push('comment')
         if (!existing.post_token) existing.post_token = postToken
-        if (!existing.token) existing.token = postToken || commentToken
+        if (!existing.comment_token) existing.comment_token = commentToken
     }
 
-    const rebuiltTokens = normalizePostTokenPool((await Promise.all(
+    const rebuiltPostTokens = normalizePostTokenPool((await Promise.all(
         Array.from(byProfileId.values()).map(async (item) => {
-            const currentToken = String(item.token || item.post_token || '').trim()
+            if (!item.roles.includes('post')) return ''
+            const currentToken = String(item.post_token || '').trim()
             if (!currentToken) return ''
             try {
-                const resolveMode: BrowserSavingTokenMode = item.roles.includes('comment') && !item.roles.includes('post')
-                    ? 'comment'
-                    : 'post'
-                const resolved = await resolvePageScopedToken(currentToken, pageId, env, resolveMode)
+                const resolved = await resolvePageScopedToken(currentToken, pageId, env, 'post')
                 return String(resolved.token || '').trim()
             } catch {
                 return ''
@@ -3714,15 +4631,31 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
         })
     )).filter(Boolean))
 
-    const rebuiltPrimaryToken = String(rebuiltTokens[0] || '').trim()
+    const rebuiltCommentTokens = normalizeCommentTokenPool((await Promise.all(
+        Array.from(byProfileId.values()).map(async (item) => {
+            if (!item.roles.includes('comment')) return ''
+            const currentToken = String(item.comment_token || '').trim()
+            if (!currentToken) return ''
+            return resolveCommentPageTokenForPage(env, pageId, currentToken)
+        })
+    )).filter(Boolean))
+
+    const existingPage = await env.DB.prepare(
+        'SELECT access_token FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { access_token?: string | null } | null
+    const preservedPrimaryToken = isPostRoleToken(String(existingPage?.access_token || '').trim())
+        ? String(existingPage?.access_token || '').trim()
+        : ''
+    const rebuiltPrimaryToken = String(rebuiltPostTokens[0] || preservedPrimaryToken || '').trim()
     await env.DB.prepare(
         'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-    ).bind(rebuiltPrimaryToken || null, pageId, namespaceId).run()
+    ).bind(rebuiltPrimaryToken, pageId, namespaceId).run()
 
     const tokenPool = await getNamespacePagesTokenPool(env.DB, namespaceId)
-    if (rebuiltTokens.length > 0) {
+    if (rebuiltPostTokens.length > 0 || rebuiltCommentTokens.length > 0) {
         tokenPool[pageId] = {
-            post_tokens: rebuiltTokens,
+            post_tokens: rebuiltPostTokens,
+            comment_tokens: rebuiltCommentTokens,
             updated_at: new Date().toISOString(),
         }
     } else {
@@ -3730,7 +4663,12 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
     }
     await setNamespacePagesTokenPool(env.DB, namespaceId, tokenPool)
 
-    return { primaryToken: rebuiltPrimaryToken, tokens: rebuiltTokens }
+    return {
+        primaryToken: rebuiltPrimaryToken,
+        tokens: uniqueTokens([...rebuiltPostTokens, ...rebuiltCommentTokens]),
+        postTokens: rebuiltPostTokens,
+        commentTokens: rebuiltCommentTokens,
+    }
 }
 
 async function getPageTokenCandidates(params: {
@@ -3744,18 +4682,61 @@ async function getPageTokenCandidates(params: {
 
     const pool = await getNamespacePagesTokenPool(params.db, params.namespaceId)
     const entry = pool[pageId]
+    const storedPostTokens = normalizePostTokenPool(entry?.post_tokens || [])
+    const storedCommentTokens = normalizeCommentTokenPool(entry?.comment_tokens || [])
 
-    const tokens = normalizePostTokenPool([
-        primaryToken,
-        ...(entry?.post_tokens || []),
-        ...(entry?.comment_tokens || []),
+    const postTokens = storedPostTokens.length > 0
+        ? storedPostTokens
+        : normalizePostTokenPool([primaryToken])
+    const commentTokens = storedCommentTokens
+    const tokens = uniqueTokens([
+        ...postTokens,
+        ...commentTokens,
     ])
 
     return {
         tokens,
-        postTokens: tokens,
-        commentTokens: tokens,
+        postTokens,
+        commentTokens,
     }
+}
+
+async function ensurePageTokenCandidates(params: {
+    env: Env
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    pageName: string
+    primaryToken?: string | null
+    logPrefix: string
+}): Promise<{ tokens: string[]; postTokens: string[]; commentTokens: string[] }> {
+    let candidates = await getPageTokenCandidates(params)
+    const needsCommentRecover = candidates.commentTokens.length === 0
+    const needsPostRecover = candidates.postTokens.length === 0
+    if (!needsCommentRecover && !needsPostRecover) {
+        return candidates
+    }
+
+    try {
+        const rebuilt = await rebuildTaggedPageProfileTokens(
+            params.env,
+            params.namespaceId,
+            params.pageId,
+            params.pageName,
+        )
+        const fallbackPostTokens = normalizePostTokenPool([String(params.primaryToken || '').trim()])
+        const postTokens = rebuilt.postTokens.length > 0 ? rebuilt.postTokens : fallbackPostTokens
+        const commentTokens = rebuilt.commentTokens
+        candidates = {
+            tokens: uniqueTokens([...postTokens, ...commentTokens]),
+            postTokens,
+            commentTokens,
+        }
+    } catch (e) {
+        console.log(`[${params.logPrefix}] token auto-rebuild failed for page ${params.pageId}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    return candidates
 }
 
 function getFacebookErrorMessage(rawError: unknown): string {
@@ -3796,9 +4777,19 @@ async function refreshPagePostTokensFromBrowserSaving(params: {
     const cfg = await getNamespacePagesSyncConfig(params.db, namespaceId)
     if (!cfg.enabled) throw new Error('checkpoint_recover_pages_sync_disabled')
 
-    const profiles = await fetchBrowserSavingProfiles(params.env)
-    const postProfiles = collectProfilesBySelectors(profiles, cfg.postSelectors)
-    const pageProfiles = postProfiles.filter((profile) => matchesProfileToPage(profile, pageId, pageName))
+    const profiles = await fetchBrowserSavingProfilesForNamespace(params.env, params.db, namespaceId)
+    const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(params.db, namespaceId)
+    const linkedProfiles = await getNamespaceLinkedTaggedProfiles(params.db, namespaceId)
+    const scopedProfiles = filterProfilesForTaggedPage({
+        profiles,
+        pageId,
+        pageName,
+        hiddenProfiles,
+        linkedProfiles,
+    })
+    const pageProfiles = hasLinkedTaggedProfilesEntryForPage(linkedProfiles, pageId)
+        ? scopedProfiles.filter((profile) => !!pickProfilePostToken(profile))
+        : collectProfilesBySelectors(scopedProfiles, cfg.postSelectors)
     if (pageProfiles.length === 0) {
         throw new Error(`checkpoint_recover_no_post_profile_for_page:${pageId}`)
     }
@@ -3820,19 +4811,26 @@ async function refreshPagePostTokensFromBrowserSaving(params: {
         throw new Error('checkpoint_recover_primary_token_missing')
     }
 
+    const existingPage = await params.db.prepare(
+        'SELECT access_token FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { access_token?: string | null } | null
+    const preservedAccessToken = isPostRoleToken(String(existingPage?.access_token || '').trim())
+        ? String(existingPage?.access_token || '').trim()
+        : ''
+    const nextStoredAccessToken = preservedAccessToken || primary
     await params.db.prepare(
         'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-    ).bind(primary, pageId, namespaceId).run()
+    ).bind(nextStoredAccessToken, pageId, namespaceId).run()
 
     try {
         const tokenPool = await getNamespacePagesTokenPool(params.db, namespaceId)
-        const existingEntry = tokenPool[pageId] || { post_tokens: [] }
+        const existingEntry = tokenPool[pageId] || { post_tokens: [], comment_tokens: [] }
         tokenPool[pageId] = {
             post_tokens: normalizePostTokenPool([
                 ...mergedTokens,
                 ...(existingEntry.post_tokens || []),
-                ...(existingEntry.comment_tokens || []),
             ]),
+            comment_tokens: normalizeCommentTokenPool(existingEntry.comment_tokens || []),
             updated_at: new Date().toISOString(),
         }
         await setNamespacePagesTokenPool(params.db, namespaceId, tokenPool)
@@ -4004,6 +5002,57 @@ async function getPostingVideoIds(params: {
         if (id) out.add(id)
     }
     return out
+}
+
+async function getRecentPagePostGuard(params: {
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    withinSeconds?: number
+}): Promise<{
+    blocked: boolean
+    status: string | null
+    postedAt: string | null
+    historyId: number | null
+}> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const withinSecondsRaw = Number(params.withinSeconds)
+    const withinSeconds = Number.isFinite(withinSecondsRaw)
+        ? Math.max(30, Math.min(900, Math.floor(withinSecondsRaw)))
+        : 180
+
+    if (!namespaceId || !pageId) {
+        return { blocked: false, status: null, postedAt: null, historyId: null }
+    }
+
+    const row = await params.db.prepare(
+        `SELECT id, status, posted_at
+         FROM post_history
+         WHERE bot_id = ?
+           AND page_id = ?
+           AND status IN ('posting', 'success')
+         ORDER BY posted_at DESC, id DESC
+         LIMIT 1`
+    ).bind(namespaceId, pageId).first() as {
+        id?: number
+        status?: string
+        posted_at?: string
+    } | null
+
+    const postedAt = String(row?.posted_at || '').trim()
+    const postedAtMs = postedAt ? Date.parse(postedAt) : Number.NaN
+    const ageSeconds = Number.isFinite(postedAtMs)
+        ? Math.max(0, Math.floor((Date.now() - postedAtMs) / 1000))
+        : Number.POSITIVE_INFINITY
+    const blocked = !!row && Number.isFinite(postedAtMs) && ageSeconds <= withinSeconds
+
+    return {
+        blocked,
+        status: row?.status ? String(row.status) : null,
+        postedAt: postedAt || null,
+        historyId: typeof row?.id === 'number' ? row.id : null,
+    }
 }
 
 async function ensureLinkSubmissionsTable(db: D1Database): Promise<void> {
@@ -4294,6 +5343,30 @@ function buildBrowserSavingBaseUrls(env: Env): string[] {
     return out
 }
 
+function buildBrowserSavingProfileBaseUrls(env: Env): string[] {
+    const candidates = [
+        hasBrowserSavingServiceBinding(env) ? BROWSERSAVING_SERVICE_BASE : '',
+        DEFAULT_BROWSERSAVING_WORKER_URL,
+        String(env.BROWSERSAVING_WORKER_URL || '').trim(),
+    ]
+
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const raw of candidates) {
+        const base = String(raw || '').trim().replace(/\/+$/, '')
+        if (!base) continue
+        const key = base.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(base)
+    }
+    return out
+}
+
+function getBrowserSavingSyncSecret(env: Env): string {
+    return String((env as any).BROWSERSAVING_TAG_SYNC_SECRET || env.TAG_SYNC_PUSH_SECRET || '').trim()
+}
+
 function buildBrowserSavingRequestLabel(base: string, path: string): string {
     const normalizedPath = String(path || '').startsWith('/') ? path : `/${path}`
     if (base === BROWSERSAVING_SERVICE_BASE) return `service:browsersaving-worker${normalizedPath}`
@@ -4307,14 +5380,33 @@ async function fetchFromBrowserSavingBase(
     init?: RequestInit,
 ): Promise<Response> {
     const normalizedPath = String(path || '').startsWith('/') ? path : `/${path}`
+    const headers = new Headers(init?.headers || {})
+    const secret = getBrowserSavingSyncSecret(env)
+    if (secret && !headers.has('x-tag-sync-secret')) {
+        headers.set('x-tag-sync-secret', secret)
+    }
+    const requestInit: RequestInit = {
+        ...(init || {}),
+        headers,
+    }
     if (base === BROWSERSAVING_SERVICE_BASE) {
         if (!hasBrowserSavingServiceBinding(env)) {
             throw new Error('service_binding_missing:BROWSERSAVING_SERVICE')
         }
         // Service binding call avoids cross-worker workers.dev 404 from edge egress.
-        return env.BROWSERSAVING_SERVICE.fetch(`https://browsersaving-worker${normalizedPath}`, init)
+        return env.BROWSERSAVING_SERVICE.fetch(`https://browsersaving-worker${normalizedPath}`, requestInit)
     }
-    return fetch(`${base}${normalizedPath}`, init)
+    return fetch(`${base}${normalizedPath}`, requestInit)
+}
+
+function extractBrowserSavingProfilesPayload(data: unknown): BrowserSavingProfileRecord[] | null {
+    if (Array.isArray(data)) return data as BrowserSavingProfileRecord[]
+    if (data && typeof data === 'object') {
+        const payload = data as Record<string, unknown>
+        if (Array.isArray(payload.profiles)) return payload.profiles as BrowserSavingProfileRecord[]
+        if (Array.isArray(payload.results)) return payload.results as BrowserSavingProfileRecord[]
+    }
+    return null
 }
 
 function normalizeBrowserSavingProfileTags(raw: unknown): string[] {
@@ -4350,12 +5442,23 @@ function normalizeBrowserSavingProfileTags(raw: unknown): string[] {
     return out
 }
 
-async function fetchBrowserSavingProfiles(env: Env): Promise<BrowserSavingProfileRecord[]> {
-    const endpointBases = buildBrowserSavingBaseUrls(env)
+async function fetchBrowserSavingProfiles(
+    env: Env,
+    options: { ownerEmails?: string[] } = {},
+): Promise<BrowserSavingProfileRecord[]> {
+    const endpointBases = buildBrowserSavingProfileBaseUrls(env)
+    const ownerEmails = uniqueTokens((options.ownerEmails || []).map((value) => String(value || '').trim().toLowerCase()))
+        .filter((value) => value.includes('@'))
+    const query = new URLSearchParams()
+    if (ownerEmails.length === 1) {
+        query.set('owner_email', ownerEmails[0])
+    } else if (ownerEmails.length > 1) {
+        query.set('owner_emails', ownerEmails.join(','))
+    }
+    const path = query.toString() ? `/api/profiles?${query.toString()}` : '/api/profiles'
 
     const errors: string[] = []
     for (const base of endpointBases) {
-        const path = '/api/profiles'
         const label = buildBrowserSavingRequestLabel(base, path)
         try {
             const resp = await fetchFromBrowserSavingBase(env, base, path, {
@@ -4370,17 +5473,26 @@ async function fetchBrowserSavingProfiles(env: Env): Promise<BrowserSavingProfil
                 errors.push(`${label}: ${details}`)
                 continue
             }
-            if (!Array.isArray(data)) {
+            const profiles = extractBrowserSavingProfilesPayload(data)
+            if (!profiles) {
                 errors.push(`${label}: invalid_profiles_payload`)
                 continue
             }
-            return data as BrowserSavingProfileRecord[]
+            return profiles
         } catch (e) {
             errors.push(`${label}: ${e instanceof Error ? e.message : String(e)}`)
         }
     }
 
     throw new Error(`browsersaving_profiles_fetch_failed: ${errors.join(' | ') || 'no_endpoint_available'}`)
+}
+
+async function fetchBrowserSavingProfilesForNamespace(env: Env, db: D1Database, namespaceId: string): Promise<BrowserSavingProfileRecord[]> {
+    const ownerEmails = await getNamespaceBrowserSavingOwnerEmails(db, namespaceId)
+    if (ownerEmails.length === 0) {
+        throw new Error(`browsersaving_owner_emails_not_found:${namespaceId}`)
+    }
+    return fetchBrowserSavingProfiles(env, { ownerEmails })
 }
 
 function collectProfilesBySelectors(
@@ -4644,13 +5756,59 @@ async function shortenShopeeLinkForNamespace(params: {
 }
 
 function pickProfilePostToken(profile: BrowserSavingProfileRecord): string {
-    // Prefer access_token, fallback to legacy postcron_token
-    const token = String(profile.access_token || profile.postcron_token || '').trim()
+    const token = pickProfilePostcronToken(profile)
     return isPostRoleToken(token) ? token : ''
 }
 
+function pickProfilePostcronToken(profile: BrowserSavingProfileRecord): string {
+    return String(profile.facebook_token || profile.postcron_token || '').trim()
+}
+
+function pickProfileAccessToken(profile: BrowserSavingProfileRecord): string {
+    const token = String(profile.access_token || '').trim()
+    return isCommentRoleToken(token) ? token : ''
+}
+
 function pickProfileCommentToken(profile: BrowserSavingProfileRecord): string {
-    return pickProfilePostToken(profile)
+    return pickProfileAccessToken(profile)
+}
+
+function deriveRoleProfileIdsForTaggedPage(params: {
+    profiles: BrowserSavingProfileRecord[]
+    pageId: string
+    linkedProfiles?: NamespacePageLinkedTaggedProfiles
+    cfg: NamespacePagesSyncConfig
+}): { postProfileIds: Set<string>; commentProfileIds: Set<string> } {
+    const hasLinkedEntry = hasLinkedTaggedProfilesEntryForPage(params.linkedProfiles || {}, params.pageId)
+    if (hasLinkedEntry) {
+        return {
+            postProfileIds: new Set(
+                (params.profiles || [])
+                    .filter((profile) => !!pickProfilePostToken(profile))
+                    .map((profile) => String(profile.id || '').trim().toLowerCase())
+                    .filter(Boolean),
+            ),
+            commentProfileIds: new Set(
+                (params.profiles || [])
+                    .filter((profile) => !!pickProfileCommentToken(profile))
+                    .map((profile) => String(profile.id || '').trim().toLowerCase())
+                    .filter(Boolean),
+            ),
+        }
+    }
+
+    return {
+        postProfileIds: new Set(
+            collectProfilesBySelectors(params.profiles, params.cfg.postSelectors)
+                .map((profile) => String(profile.id || '').trim().toLowerCase())
+                .filter(Boolean),
+        ),
+        commentProfileIds: new Set(
+            collectProfilesBySelectors(params.profiles, params.cfg.commentSelectors)
+                .map((profile) => String(profile.id || '').trim().toLowerCase())
+                .filter(Boolean),
+        ),
+    }
 }
 
 function matchesProfileToPage(profile: BrowserSavingProfileRecord, pageId: string, pageName: string): boolean {
@@ -4837,7 +5995,7 @@ async function syncTaggedPagesFromProfileMetadata(env: Env, namespaceId: string)
         cfg.commentSelectors.some((s) => parseBrowserSavingTagSelector(s) !== null)
     if (!hasTagSelector) return
 
-    const profiles = await fetchBrowserSavingProfiles(env)
+    const profiles = await fetchBrowserSavingProfilesForNamespace(env, env.DB, ns)
     const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(env.DB, ns)
     const mergedSelectors = Array.from(new Set(
         [...cfg.postSelectors, ...cfg.commentSelectors]
@@ -5129,6 +6287,8 @@ async function resolveTagTokenCandidatesForAutoSync(
 
 async function resolveUserTokenCandidatesFromSelectors(
     env: Env,
+    db: D1Database,
+    namespaceId: string,
     selectors: string[],
     mode: BrowserSavingTokenMode,
 ): Promise<AutoSyncTokenCandidate[]> {
@@ -5148,7 +6308,7 @@ async function resolveUserTokenCandidatesFromSelectors(
             if (tag) {
                 if (!profilesLoaded) {
                     try {
-                        profiles = await fetchBrowserSavingProfiles(env)
+                        profiles = await fetchBrowserSavingProfilesForNamespace(env, db, namespaceId)
                     } catch (e) {
                         profiles = []
                         profilesFetchError = e instanceof Error ? e.message : String(e)
@@ -5381,7 +6541,8 @@ async function fetchMeIdentityViaHttp(accessToken: string): Promise<{ id?: strin
 
 // Accept either page token or user token.
 // If a user token is provided, resolve the page-scoped token via /me/accounts.
-// Returns page-scoped token for both post/comment modes.
+// Returns the page-linked token for the requested mode.
+// For comment mode, /me/accounts may return an EAAD6... token for the matched page.
 async function resolvePageScopedToken(
     rawToken: string,
     pageId: string,
@@ -5395,7 +6556,7 @@ async function resolvePageScopedToken(
     const resolveFromMeAccountsData = (items: Array<{ id?: string; access_token?: string }>): { token: string; source: 'resolved_from_me_accounts' | 'provided_as_is' | 'browsersaving_profile_id'; reason?: string } => {
         const matched = items.find((p) => String(p.id || '') === String(pageId))
         const pageToken = String(matched?.access_token || '').trim()
-        if (isCommentRoleToken(pageToken)) {
+        if (isResolvedRoleTokenForMode(pageToken, mode)) {
             return {
                 token: pageToken,
                 source: tokenInput.source === 'browsersaving_profile_id' ? 'browsersaving_profile_id' : 'resolved_from_me_accounts',
@@ -5423,7 +6584,7 @@ async function resolvePageScopedToken(
         return resolveFromMeAccountsData(data.data || [])
     } catch (e) {
         console.log(`[PAGES] resolvePageScopedToken sdk fallback: ${String(e)}`)
-        if (isCommentRoleToken(token)) {
+        if (isResolvedRoleTokenForMode(token, mode)) {
             try {
                 const me = await fetchMeIdentityViaHttp(token)
                 const meId = String(me?.id || '').trim()
@@ -5477,7 +6638,7 @@ async function resolveTokenForSpecificPage(
     if (cache.has(cacheKey)) return String(cache.get(cacheKey) || '')
 
     // Case 1: token is already a page-scoped token for this page.
-    if (isCommentRoleToken(token)) {
+    if (isPageScopedRoleToken(token)) {
         try {
             const me = await fetchMeIdentityViaHttp(token)
             const meId = String(me?.id || '').trim()
@@ -5495,7 +6656,7 @@ async function resolveTokenForSpecificPage(
         const accounts = await fetchMeAccountsViaHttp(token)
         const matched = accounts.find((item) => String(item?.id || '').trim() === pageId)
         const pageToken = String(matched?.access_token || '').trim()
-        if (isCommentRoleToken(pageToken)) {
+        if (isPageScopedRoleToken(pageToken)) {
             cache.set(cacheKey, pageToken)
             return pageToken
         }
@@ -5505,6 +6666,39 @@ async function resolveTokenForSpecificPage(
 
     cache.set(cacheKey, '')
     return ''
+}
+
+async function resolveCommentPageTokenForPage(
+    env: Env,
+    pageIdRaw: string,
+    rawToken: string,
+): Promise<string> {
+    const token = String(rawToken || '').trim()
+    const pageId = String(pageIdRaw || '').trim()
+    if (!token) return ''
+    if (!pageId) {
+        return isResolvedCommentToken(token) ? token : ''
+    }
+
+    try {
+        const resolved = await resolvePageScopedToken(token, pageId, env, 'comment')
+        return String(resolved.token || '').trim()
+    } catch {
+        return ''
+    }
+}
+
+async function resolveCommentPageTokenPoolForPage(
+    env: Env,
+    pageIdRaw: string,
+    rawTokens: string[],
+): Promise<string[]> {
+    const pageId = String(pageIdRaw || '').trim()
+    if (!pageId) return normalizeCommentTokenPool(rawTokens || [])
+    const resolved = await Promise.all((rawTokens || []).map(async (token) => {
+        return resolveCommentPageTokenForPage(env, pageId, token)
+    }))
+    return normalizeCommentTokenPool(resolved)
 }
 
 async function hasPagesCommentTokenColumn(_db: D1Database): Promise<boolean> {
@@ -5576,7 +6770,7 @@ async function maybeMigrateNamespaceStoredPageTokens(
         if (nextAccess !== String(row?.access_token || '').trim()) {
             await env.DB.prepare(
                 'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-            ).bind(nextAccess || null, pageId, ns).run()
+            ).bind(nextAccess, pageId, ns).run()
             updatedRows += 1
         }
 
@@ -5594,18 +6788,20 @@ async function maybeMigrateNamespaceStoredPageTokens(
                 nextPoolRaw.push(current)
             }
         }
-        for (const token of poolEntry.comment_tokens || []) {
-            const current = String(token || '').trim()
-            if (!current) continue
-            nextPoolRaw.push(current)
-        }
 
         const nextPostPool = normalizePostTokenPool(nextPoolRaw)
         const currentPostPool = normalizePostTokenPool(poolEntry.post_tokens || [])
+        const nextCommentPool = await resolveCommentPageTokenPoolForPage(
+            env,
+            pageId,
+            poolEntry.comment_tokens || [],
+        )
+        const currentCommentPool = normalizeCommentTokenPool(poolEntry.comment_tokens || [])
 
-        if (!sameTokenList(nextPostPool, currentPostPool)) {
+        if (!sameTokenList(nextPostPool, currentPostPool) || !sameTokenList(nextCommentPool, currentCommentPool)) {
             nextPool[pageId] = {
                 post_tokens: nextPostPool,
+                comment_tokens: nextCommentPool,
                 updated_at: new Date().toISOString(),
             }
             updatedPoolPages += 1
@@ -5696,7 +6892,7 @@ async function autoSyncPagesForNamespace(
     // This keeps UI aligned with tags.
     if (hasTagSelector) {
         try {
-            const profiles = await fetchBrowserSavingProfiles(env)
+            const profiles = await fetchBrowserSavingProfilesForNamespace(env, env.DB, ns)
             const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(env.DB, ns)
             const postProfiles = collectProfilesBySelectors(profiles, cfg.postSelectors)
                 .filter((profile) => !isHiddenTaggedProfileForDerivedPage(hiddenProfiles, profile))
@@ -5871,7 +7067,11 @@ async function autoSyncPagesForNamespace(
                         appendPoolToken(postTokenPoolByPage, resolvedPageId, pickProfilePostToken(profile), 'post')
                     }
                     if (roles.has('comment')) {
-                        const commentToken = pickProfileCommentToken(profile)
+                        const commentToken = await resolveCommentPageTokenForPage(
+                            env,
+                            resolvedPageId,
+                            pickProfileCommentToken(profile),
+                        )
                         appendPoolToken(commentTokenPoolByPage, resolvedPageId, commentToken, 'comment')
                         if (commentToken && !commentTokenByPage.has(resolvedPageId)) {
                             commentTokenByPage.set(resolvedPageId, commentToken)
@@ -5939,9 +7139,11 @@ async function autoSyncPagesForNamespace(
                     post_interval_minutes: number
                     is_active: number
                 }>()
+                const currentNamespacePageIds = new Set<string>()
                 for (const row of (existingRowsInNamespace.results || [])) {
                     const rowId = String(row?.id || '').trim()
                     if (!rowId) continue
+                    currentNamespacePageIds.add(rowId)
                     existingById.set(rowId, {
                         access_token: String(row?.access_token || '').trim(),
                         post_interval_minutes: Number(row?.post_interval_minutes || 60) || 60,
@@ -5953,23 +7155,35 @@ async function autoSyncPagesForNamespace(
                     const pageId = page.id
                     desiredPageIds.add(pageId)
                     const existingRow = existingById.get(pageId)
-                    const existingAccessToken = String(existingRow?.access_token || '').trim()
+                    const existingAccessToken = isPostRoleToken(String(existingRow?.access_token || '').trim())
+                        ? String(existingRow?.access_token || '').trim()
+                        : ''
 
-                    const pageTokenPool = normalizePostTokenPool([
+                    const discoveredPostTokenPool = normalizePostTokenPool([
                         ...(postTokenPoolByPage.get(pageId) || []),
-                        ...(commentTokenPoolByPage.get(pageId) || []),
-                        ...(existingPool[pageId]?.post_tokens || []),
-                        ...(existingPool[pageId]?.comment_tokens || []),
-                        existingAccessToken,
                         page.access_token,
+                    ])
+                    const discoveredCommentTokenPool = normalizeCommentTokenPool([
+                        ...(commentTokenPoolByPage.get(pageId) || []),
                         String(commentTokenByPage.get(pageId) || '').trim(),
                     ])
+                    const postTokenPool = discoveredPostTokenPool.length > 0
+                        ? normalizePostTokenPool([
+                            ...discoveredPostTokenPool,
+                            ...(existingPool[pageId]?.post_tokens || []),
+                        ])
+                        : normalizePostTokenPool(existingPool[pageId]?.post_tokens || [])
+                    const commentTokenPool = discoveredCommentTokenPool.length > 0
+                        ? normalizeCommentTokenPool([
+                            ...discoveredCommentTokenPool,
+                            ...(existingPool[pageId]?.comment_tokens || []),
+                        ])
+                        : normalizeCommentTokenPool(existingPool[pageId]?.comment_tokens || [])
 
-                    const primaryToken = String(pageTokenPool[0] || '').trim()
-                    nextPool[pageId] = {
-                        post_tokens: pageTokenPool,
-                        updated_at: new Date().toISOString(),
-                    }
+                    const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
+                        ? String(page.access_token || '').trim()
+                        : ''
+                    const primaryToken = String(postTokenPool[0] || existingAccessToken || discoveredPrimaryToken || '').trim()
 
                     const existingInNamespace = await env.DB.prepare(
                         'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
@@ -5979,6 +7193,11 @@ async function autoSyncPagesForNamespace(
                         await env.DB.prepare(
                             'UPDATE pages SET access_token = ?, image_url = ?, name = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
                         ).bind(primaryToken, page.image_url, page.name, pageId, ns).run()
+                        nextPool[pageId] = {
+                            post_tokens: postTokenPool,
+                            comment_tokens: commentTokenPool,
+                            updated_at: new Date().toISOString(),
+                        }
                         updated += 1
                         continue
                     }
@@ -5987,10 +7206,9 @@ async function autoSyncPagesForNamespace(
                         'SELECT bot_id FROM pages WHERE id = ?'
                     ).bind(pageId).first() as { bot_id?: string } | null
                     if (existingInOtherNamespace?.bot_id) {
-                        await env.DB.prepare(
-                            'UPDATE pages SET bot_id = ?, access_token = ?, image_url = ?, name = ?, updated_at = datetime("now") WHERE id = ?'
-                        ).bind(ns, primaryToken, page.image_url, page.name, pageId).run()
-                        moved += 1
+                        console.log(
+                            `[PAGES-AUTO-SYNC] namespace=${ns} skip page=${pageId} already_connected_to_other_workspace existing=${String(existingInOtherNamespace.bot_id || '')}`
+                        )
                         continue
                     }
 
@@ -5999,8 +7217,20 @@ async function autoSyncPagesForNamespace(
                     await env.DB.prepare(
                         'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, bot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                     ).bind(pageId, page.name, page.image_url, primaryToken, 60, randomPostHours, defaultIsActive, ns).run()
+                    currentNamespacePageIds.add(pageId)
+                    nextPool[pageId] = {
+                        post_tokens: postTokenPool,
+                        comment_tokens: commentTokenPool,
+                        updated_at: new Date().toISOString(),
+                    }
                     console.log(`[PAGES-AUTO-SYNC] new page ${page.name} (${pageId}): auto-assigned post_hours=${randomPostHours}`)
                     imported += 1
+                }
+
+                for (const poolPageId of Object.keys(nextPool)) {
+                    if (!currentNamespacePageIds.has(String(poolPageId || '').trim())) {
+                        delete nextPool[poolPageId]
+                    }
                 }
 
                 // NOTE: Tags no longer control page existence.
@@ -6033,7 +7263,7 @@ async function autoSyncPagesForNamespace(
 
     let postCandidates: AutoSyncTokenCandidate[]
     try {
-        postCandidates = await resolveUserTokenCandidatesFromSelectors(env, cfg.postSelectors, 'post')
+        postCandidates = await resolveUserTokenCandidatesFromSelectors(env, env.DB, ns, cfg.postSelectors, 'post')
     } catch (e) {
         console.log(`[PAGES-AUTO-SYNC] namespace=${ns} skip: cannot resolve post selector (${e instanceof Error ? e.message : String(e)})`)
         return
@@ -6041,7 +7271,7 @@ async function autoSyncPagesForNamespace(
 
     let commentCandidates: AutoSyncTokenCandidate[] = []
     try {
-        commentCandidates = await resolveUserTokenCandidatesFromSelectors(env, cfg.commentSelectors, 'comment')
+        commentCandidates = await resolveUserTokenCandidatesFromSelectors(env, env.DB, ns, cfg.commentSelectors, 'comment')
     } catch (e) {
         console.log(`[PAGES-AUTO-SYNC] namespace=${ns} comment selectors unavailable (${e instanceof Error ? e.message : String(e)})`)
     }
@@ -6124,19 +7354,19 @@ async function autoSyncPagesForNamespace(
             commentFetchErrors.push(msg)
             continue
         }
+        const candidateToken = String(result.value.candidateToken || '').trim()
         for (const item of result.value.commentPages) {
             const pid = String(item?.id || '').trim()
+            const pageToken = String(item?.access_token || '').trim()
             if (!pid) continue
             if (!pageMap.has(pid)) continue
             if (commentTokenByPage.has(pid)) continue
-            const commentPageToken = String(item?.access_token || '').trim()
-            if (!isCommentRoleToken(commentPageToken)) continue
-            commentTokenByPage.set(pid, commentPageToken)
+            if (!isResolvedCommentToken(pageToken)) continue
+            commentTokenByPage.set(pid, pageToken)
         }
         const pageIdentity = result.value.pageIdentity
-        const candidateToken = String(result.value.candidateToken || '').trim()
         const identityPageId = String(pageIdentity?.id || '').trim()
-        if (identityPageId && pageMap.has(identityPageId) && !commentTokenByPage.has(identityPageId) && isCommentRoleToken(candidateToken)) {
+        if (identityPageId && pageMap.has(identityPageId) && !commentTokenByPage.has(identityPageId) && isResolvedCommentToken(candidateToken)) {
             commentTokenByPage.set(identityPageId, candidateToken)
         }
     }
@@ -6145,19 +7375,40 @@ async function autoSyncPagesForNamespace(
     let updated = 0
     let conflicts = 0
     const desiredPageIds = new Set<string>()
+    const existingPool = await getNamespacePagesTokenPool(env.DB, ns)
+    const nextPool: NamespacePageTokenPool = { ...existingPool }
 
     for (const page of pageMap.values()) {
         const pageId = page.id
         desiredPageIds.add(pageId)
 
-        const pageTokenRaw = String(commentTokenByPage.get(pageId) || '').trim()
+        const commentTokenRaw = String(commentTokenByPage.get(pageId) || '').trim()
+        const existingEntry = existingPool[pageId] || { post_tokens: [], comment_tokens: [] }
+        const postTokenPool = normalizePostTokenPool([
+            page.access_token,
+            ...(existingEntry.post_tokens || []),
+        ])
+        const commentTokenPool = commentTokenRaw
+            ? normalizeCommentTokenPool([
+                commentTokenRaw,
+                ...(existingEntry.comment_tokens || []),
+            ])
+            : normalizeCommentTokenPool(existingEntry.comment_tokens || [])
+        const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
+            ? String(page.access_token || '').trim()
+            : ''
+        const primaryToken = String(postTokenPool[0] || discoveredPrimaryToken || '').trim()
+        nextPool[pageId] = {
+            post_tokens: postTokenPool,
+            comment_tokens: commentTokenPool,
+            updated_at: new Date().toISOString(),
+        }
 
         const existingInNamespace = await env.DB.prepare(
             'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(pageId, ns).first() as { id?: string } | null
 
         if (existingInNamespace?.id) {
-            const primaryToken = String(pageTokenRaw || page.access_token || '').trim()
             await env.DB.prepare(
                 'UPDATE pages SET access_token = ?, image_url = ?, name = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(primaryToken, page.image_url, page.name, pageId, ns).run()
@@ -6173,7 +7424,6 @@ async function autoSyncPagesForNamespace(
             continue
         }
 
-        const primaryToken = String(pageTokenRaw || page.access_token || '').trim()
         await env.DB.prepare(
             'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?)'
         ).bind(pageId, page.name, page.image_url, primaryToken, ns).run()
@@ -6195,9 +7445,12 @@ async function autoSyncPagesForNamespace(
             await env.DB.prepare(
                 'DELETE FROM pages WHERE id = ? AND bot_id = ?'
             ).bind(staleId, ns).run()
+            delete nextPool[staleId]
             deleted += 1
         }
     }
+
+    await setNamespacePagesTokenPool(env.DB, ns, nextPool)
 
     if (imported > 0 || updated > 0 || conflicts > 0 || deleted > 0 || commentFetchErrors.length > 0 || postFetchErrors.length > 0) {
         console.log(
@@ -6322,15 +7575,21 @@ async function resolveCommentTargetIdViaGraph(params: {
 }
 
 async function postShopeeCommentStrict(params: {
+    env: Env
     fbVideoId: string
     shopeeLink: string
     commentToken?: string | null
     pageId?: string
     logPrefix: string
 }): Promise<{ ok: boolean; id?: string; error?: string; code?: number; subcode?: number }> {
-    const commentToken = String(params.commentToken || '').trim()
-    if (!commentToken) {
+    const rawCommentToken = String(params.commentToken || '').trim()
+    if (!rawCommentToken) {
         return { ok: false, error: 'access_token_missing', code: 0, subcode: 0 }
+    }
+    const pageId = String(params.pageId || '').trim()
+    const commentToken = await resolveCommentPageTokenForPage(params.env, pageId, rawCommentToken)
+    if (!commentToken) {
+        return { ok: false, error: 'comment_page_token_missing', code: 0, subcode: 0 }
     }
 
     const initialTargetId = String(params.fbVideoId || '').trim()
@@ -6399,13 +7658,18 @@ async function postShopeeCommentStrict(params: {
 }
 
 async function postShopeeCommentWithFallback(params: {
+    env: Env
     fbVideoId: string
     shopeeLink: string
     commentTokens: string[]
     pageId?: string
     logPrefix: string
 }): Promise<{ ok: boolean; id?: string; error?: string; code?: number; subcode?: number; tried: number; commentToken?: string }> {
-    const commentTokens = normalizeCommentTokenPool(params.commentTokens || [])
+    const commentTokens = await resolveCommentPageTokenPoolForPage(
+        params.env,
+        String(params.pageId || '').trim(),
+        params.commentTokens || [],
+    )
     if (commentTokens.length === 0) {
         return { ok: false, error: 'access_token_missing', code: 0, subcode: 0, tried: 0, commentToken: '' }
     }
@@ -6439,6 +7703,7 @@ async function postShopeeCommentWithFallback(params: {
     for (let i = 0; i < commentTokens.length; i += 1) {
         const token = commentTokens[i]
         const result = await postShopeeCommentStrict({
+            env: params.env,
             fbVideoId: params.fbVideoId,
             shopeeLink: params.shopeeLink,
             commentToken: token,
@@ -6485,6 +7750,8 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN shortlink_error TEXT',
                 'ALTER TABLE post_history ADD COLUMN shortlink_expected_utm_id TEXT',
                 'ALTER TABLE post_history ADD COLUMN shortlink_utm_match INTEGER',
+                'ALTER TABLE post_history ADD COLUMN comment_delay_seconds INTEGER',
+                'ALTER TABLE post_history ADD COLUMN comment_due_at TEXT',
             ]
             for (const sql of statements) {
                 await db.prepare(sql).run().catch(() => { })
@@ -6504,8 +7771,9 @@ async function resolvePostHistoryProfileByToken(env: Env, token?: string | null)
     try {
         const profiles = await fetchBrowserSavingProfiles(env) as Array<Record<string, unknown>>
         for (const profile of profiles || []) {
-            const profileTokens = normalizePostTokenPool([
+            const profileTokens = uniqueTokens([
                 String(profile.access_token || ''),
+                String(profile.facebook_token || ''),
                 String(profile.postcron_token || ''),
             ])
             if (!profileTokens.some((candidate) => candidate.toLowerCase() === normalized.toLowerCase())) {
@@ -6586,9 +7854,20 @@ async function reconcilePostingHistoryRows(params: {
             if (recovered.published && recovered.post_id) {
                 const recoveredPostId = String(recovered.post_id || '').trim()
                 const recoveredReelUrl = String(recovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}/`
+                const recoveredCommentTargetId = extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
                 const shopeeLink = normalizeMetaShopeeLink(meta) || ''
-                const commentTokenHint = deriveCommentTokenHint(row.access_token)
-                const commentProfile = await resolvePostHistoryProfileByToken(env, row.access_token)
+                const tokenCandidates = await ensurePageTokenCandidates({
+                    env,
+                    db: env.DB,
+                    namespaceId: botId,
+                    pageId: String(row.page_id || ''),
+                    pageName: String(row.page_name || ''),
+                    primaryToken: String(row.access_token || ''),
+                    logPrefix: `${logPrefix} RECON ${row.id}`,
+                })
+                const recoveredCommentTokens = tokenCandidates.commentTokens
+                const commentTokenHint = deriveCommentTokenHint(recoveredCommentTokens[0] || null)
+                const commentProfile = await resolvePostHistoryProfileByToken(env, recoveredCommentTokens[0] || null)
                 let commentStatus = shopeeLink ? 'pending' : 'not_configured'
                 let commentError: string | null = null
                 let commentFbId: string | null = null
@@ -6601,9 +7880,10 @@ async function reconcilePostingHistoryRows(params: {
                         logPrefix: `${logPrefix} RECON ${row.id}`,
                     })
                     const commentResult = await postShopeeCommentWithFallback({
-                        fbVideoId: recoveredPostId,
+                        env,
+                        fbVideoId: recoveredCommentTargetId,
                         shopeeLink: shortShopeeLink,
-                        commentTokens: [String(row.access_token || '').trim()],
+                        commentTokens: recoveredCommentTokens,
                         pageId: row.page_id,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
                     })
@@ -6657,8 +7937,25 @@ function waitMs(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function getRandomCommentDelaySeconds(): number {
+    return Math.floor(Math.random() * 59) + 1
+}
+
 function getRandomCommentDelayMs(): number {
-    return Math.floor(Math.random() * 60_000)
+    return getRandomCommentDelaySeconds() * 1000
+}
+
+function getInitialCommentTraceState(hasShopeeLink: boolean): { status: string; error: string | null } {
+    return hasShopeeLink
+        ? { status: 'not_attempted', error: null }
+        : { status: 'not_configured', error: null }
+}
+
+function getPostReadyCommentTraceState(hasShopeeLink: boolean, hasCommentToken: boolean, skipComment = false): { status: string; error: string | null } {
+    if (!hasShopeeLink) return { status: 'not_configured', error: null }
+    if (skipComment) return { status: 'skipped', error: null }
+    if (!hasCommentToken) return { status: 'failed', error: 'access_token_missing' }
+    return { status: 'not_attempted', error: null }
 }
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 120000, label = 'fetch'): Promise<Response> {
@@ -6994,36 +8291,71 @@ async function publishReelDirect(params: {
     return data
 }
 
-/** Publish reel with token fallback — tries each token until one succeeds */
+/** Publish reel with token fallback using the 3-step /video_reels flow. */
 async function publishReelDirectWithTokenFallback(params: {
     pageId: string
     postTokens: string[]
     videoBuffer: ArrayBuffer
     description: string
     logPrefix: string
-}): Promise<{ id: string; postingToken: string }> {
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
     const candidates = normalizePostTokenPool(params.postTokens || [])
     if (candidates.length === 0) throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
     const errors: string[] = []
 
     for (const token of candidates) {
         try {
-            const result = await publishReelDirect({
-                pageId: params.pageId,
+            const initData = await facebookGraphPost<{ video_id?: string; upload_url?: string }>(
+                token,
+                `${FB_GRAPH_V19}/${params.pageId}/video_reels`,
+                { upload_phase: 'start' },
+            )
+            const fbVideoId = String(initData.video_id || '').trim()
+            const uploadUrl = String(initData.upload_url || '').trim()
+            if (!fbVideoId || !uploadUrl) {
+                throw new Error('facebook_reel_upload_start_failed')
+            }
+
+            const uploadResp = await fetch(uploadUrl, {
+                method: 'POST',
+                headers: {
+                    Authorization: `OAuth ${token}`,
+                    offset: '0',
+                    file_size: String(params.videoBuffer.byteLength),
+                },
+                body: params.videoBuffer,
+            })
+            const uploadData = await uploadResp.json().catch(() => ({} as any)) as {
+                success?: boolean
+                error?: { message?: string; code?: number; error_subcode?: number }
+            }
+            if (!uploadResp.ok || uploadData?.error) {
+                const uploadError = String(uploadData?.error?.message || `facebook_reel_upload_http_${uploadResp.status}`)
+                throw new FacebookRequestFailedError(
+                    uploadError,
+                    Number(uploadData?.error?.code || 0),
+                    Number(uploadData?.error?.error_subcode || 0),
+                )
+            }
+
+            const finishData = await finishReelPublishWithRetry({
                 accessToken: token,
-                videoBuffer: params.videoBuffer,
+                pageId: params.pageId,
+                fbVideoId,
                 description: params.description,
                 logPrefix: params.logPrefix,
             })
             return {
-                id: String(result.id || '').trim(),
+                id: fbVideoId,
+                postId: String(finishData.post_id || '').trim(),
+                permalinkUrl: String(finishData.permalink_url || '').trim(),
                 postingToken: token,
             }
         } catch (err) {
             const msg = parseFacebookErrorLike(err)?.message || (err instanceof Error ? err.message : String(err))
             const tokenHint = deriveCommentTokenHint(token) || 'unknown_token'
             errors.push(`${tokenHint}: ${msg}`)
-            console.warn(`[${params.logPrefix}] token failed for direct reel, trying next (${msg})`)
+            console.warn(`[${params.logPrefix}] token failed for 3-step reel, trying next (${msg})`)
         }
     }
 
@@ -7351,20 +8683,23 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
 
         if (!page?.id) return c.json({ error: 'Page not found' }, 404)
 
-        const profiles = await fetchBrowserSavingProfiles(c.env)
+        const profiles = await fetchBrowserSavingProfilesForNamespace(c.env, c.env.DB, botId)
         const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(c.env.DB, botId)
-        const hiddenProfileIds = getHiddenTaggedProfileIdsForPage(hiddenProfiles, String(page.id || ''))
+        const linkedProfiles = await getNamespaceLinkedTaggedProfiles(c.env.DB, botId)
+        const visibleProfiles = filterProfilesForTaggedPage({
+            profiles,
+            pageId: String(page.id || ''),
+            pageName: String(page.name || ''),
+            hiddenProfiles,
+            linkedProfiles,
+        })
         const cfg = await getNamespacePagesSyncConfig(c.env.DB, botId)
-        const postProfileIds = new Set(
-            collectProfilesBySelectors(profiles, cfg.postSelectors)
-                .map((profile) => String(profile.id || '').trim().toLowerCase())
-                .filter(Boolean),
-        )
-        const commentProfileIds = new Set(
-            collectProfilesBySelectors(profiles, cfg.commentSelectors)
-                .map((profile) => String(profile.id || '').trim().toLowerCase())
-                .filter(Boolean),
-        )
+        const { postProfileIds, commentProfileIds } = deriveRoleProfileIdsForTaggedPage({
+            profiles: visibleProfiles,
+            pageId: String(page.id || ''),
+            linkedProfiles,
+            cfg,
+        })
 
         const byProfileId = new Map<string, {
             profile_id: string
@@ -7373,16 +8708,15 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
             roles: Array<'post' | 'comment'>
             tags: string[]
             post_token: string
+            comment_token: string
             token: string
+            postcron_token: string
         }>()
 
         const upsertProfile = (profile: BrowserSavingProfileRecord) => {
-            if (!matchesProfileToPage(profile, String(page.id || ''), String(page.name || ''))) return
-
             const id = String(profile.id || '').trim()
             if (!id) return
             const key = id.toLowerCase()
-            if (hiddenProfileIds.has(key)) return
             const profileName = String(profile.name || '').trim() || id
             const facebookName = String(profile.username || profile.uid || '').trim()
             const tags = normalizeBrowserSavingProfileTags(profile.tags)
@@ -7391,7 +8725,8 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
             if (!existing) {
                 const postToken = pickProfilePostToken(profile)
                 const commentToken = pickProfileCommentToken(profile)
-                const token = postToken || commentToken
+                const postcronToken = pickProfilePostcronToken(profile)
+                const token = commentToken
                 const roles: Array<'post' | 'comment'> = []
                 if (postProfileIds.has(key)) roles.push('post')
                 if (commentProfileIds.has(key) && !roles.includes('comment')) roles.push('comment')
@@ -7402,7 +8737,9 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
                     roles,
                     tags,
                     post_token: postToken,
+                    comment_token: commentToken,
                     token,
+                    postcron_token: postcronToken,
                 })
                 return
             }
@@ -7411,11 +8748,13 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
             if (commentProfileIds.has(key) && !existing.roles.includes('comment')) existing.roles.push('comment')
             if (!existing.facebook_name && facebookName) existing.facebook_name = facebookName
             if (!existing.post_token) existing.post_token = pickProfilePostToken(profile)
-            if (!existing.token) existing.token = pickProfilePostToken(profile) || pickProfileCommentToken(profile)
+            if (!existing.comment_token) existing.comment_token = pickProfileCommentToken(profile)
+            if (!existing.token) existing.token = pickProfileCommentToken(profile)
+            if (!existing.postcron_token) existing.postcron_token = pickProfilePostcronToken(profile)
             if (existing.tags.length === 0 && tags.length > 0) existing.tags = tags
         }
 
-        for (const profile of profiles) upsertProfile(profile)
+        for (const profile of visibleProfiles) upsertProfile(profile)
 
         const items = Array.from(byProfileId.values()).sort((a, b) => {
             const aBoth = a.roles.length > 1 ? 1 : 0
@@ -7428,26 +8767,69 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
         })
 
         const resolvedItems = await Promise.all(items.map(async (item) => {
-            let token = String(item.token || item.post_token || '').trim()
-            let token_scoped = false
-            if (token) {
+            let comment_token = String(item.comment_token || item.token || '').trim()
+            if (item.roles.includes('comment')) {
+                let refreshedCommentToken = ''
                 try {
-                    const mode: BrowserSavingTokenMode = item.roles.includes('comment') && !item.roles.includes('post')
-                        ? 'comment'
-                        : 'post'
-                    const resolved = await resolvePageScopedToken(token, String(page.id || ''), c.env, mode)
-                    if (resolved.token) {
-                        token = String(resolved.token).trim()
-                        token_scoped = true
-                    } else {
-                        token = ''
+                    const resolvedComment = await resolveBrowserSavingProfileToken(c.env, item.profile_id, 'comment')
+                    const recoveredCommentToken = String(resolvedComment.token || '').trim()
+                    if (isCommentRoleToken(recoveredCommentToken)) {
+                        refreshedCommentToken = recoveredCommentToken
                     }
                 } catch {
-                    token = ''
+                    refreshedCommentToken = ''
+                }
+                if (refreshedCommentToken) {
+                    comment_token = refreshedCommentToken
+                } else if (!isCommentRoleToken(comment_token)) {
+                    comment_token = ''
                 }
             }
 
-            return { ...item, token, token_scoped }
+            let token = comment_token
+            let token_scoped = !!token
+            let comment_page_token = ''
+            if (comment_token && item.roles.includes('comment')) {
+                comment_page_token = await resolveCommentPageTokenForPage(c.env, String(page.id || ''), comment_token)
+                token_scoped = !!comment_page_token
+            }
+
+            let postcron_token = String(item.postcron_token || '').trim()
+            if (item.roles.includes('post')) {
+                let refreshedPostToken = ''
+                try {
+                    const resolvedPost = await resolveBrowserSavingProfileToken(c.env, item.profile_id, 'post')
+                    const recoveredPostToken = String(resolvedPost.token || '').trim()
+                    if (isPostRoleToken(recoveredPostToken)) {
+                        refreshedPostToken = recoveredPostToken
+                    }
+                } catch {
+                    refreshedPostToken = ''
+                }
+                if (refreshedPostToken) {
+                    postcron_token = refreshedPostToken
+                } else if (!isPostRoleToken(postcron_token)) {
+                    postcron_token = ''
+                }
+            }
+
+            let post_token = String(item.post_token || postcron_token).trim()
+            let post_token_scoped = false
+            if (post_token && item.roles.includes('post')) {
+                try {
+                    const resolved = await resolvePageScopedToken(post_token, String(page.id || ''), c.env, 'post')
+                    if (resolved.token) {
+                        post_token = String(resolved.token).trim()
+                        post_token_scoped = true
+                    } else {
+                        post_token = ''
+                    }
+                } catch {
+                    post_token = ''
+                }
+            }
+
+            return { ...item, comment_token, comment_page_token, token, token_scoped, postcron_token, post_token, post_token_scoped }
         }))
 
         try {
@@ -7466,34 +8848,48 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
                 }
             }
 
-            const discoveredTokens = normalizePostTokenPool([
+            const discoveredPostTokens = normalizePostTokenPool([
                 ...resolvedItems
-                    .filter((item) => item.token_scoped)
-                    .map((item) => String(item.token || '').trim()),
+                    .filter((item) => item.post_token_scoped && item.roles.includes('post'))
+                    .map((item) => String(item.post_token || '').trim()),
+            ])
+            const discoveredCommentTokens = normalizeCommentTokenPool([
+                ...resolvedItems
+                    .filter((item) => item.roles.includes('comment'))
+                    .map((item) => String((item as any).comment_page_token || '').trim()),
             ])
 
             const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
-            const existingEntry = tokenPool[String(page.id || '')] || { post_tokens: [] }
+            const existingEntry = tokenPool[String(page.id || '')] || { post_tokens: [], comment_tokens: [] }
 
-            const nextTokenPool = normalizePostTokenPool([
-                ...(existingEntry.post_tokens || []),
-                ...(existingEntry.comment_tokens || []),
-                ...(discoveredTokens || []),
-                storedAccessScoped,
-            ])
+            const nextPostTokenPool = discoveredPostTokens.length > 0
+                ? discoveredPostTokens
+                : normalizePostTokenPool([
+                    ...(existingEntry.post_tokens || []),
+                    storedAccessScoped,
+                ])
+            const nextCommentTokenPool = discoveredCommentTokens.length > 0
+                ? normalizeCommentTokenPool([
+                    ...discoveredCommentTokens,
+                    ...(existingEntry.comment_tokens || []),
+                ])
+                : normalizeCommentTokenPool(existingEntry.comment_tokens || [])
 
-            const nextAccess = storedAccessScoped || nextTokenPool[0] || ''
+            const storedPostScoped = isPostRoleToken(storedAccessScoped) ? storedAccessScoped : ''
+            const nextAccess = nextPostTokenPool[0] || storedPostScoped || ''
 
             if (
                 nextAccess !== storedAccess ||
-                !sameTokenList(existingEntry.post_tokens || [], nextTokenPool)
+                !sameTokenList(existingEntry.post_tokens || [], nextPostTokenPool) ||
+                !sameTokenList(existingEntry.comment_tokens || [], nextCommentTokenPool)
             ) {
                 await c.env.DB.prepare(
                     'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
                 ).bind(nextAccess || null, String(page.id || ''), botId).run()
 
                 tokenPool[String(page.id || '')] = {
-                    post_tokens: nextTokenPool,
+                    post_tokens: nextPostTokenPool,
+                    comment_tokens: nextCommentTokenPool,
                     updated_at: new Date().toISOString(),
                 }
                 await setNamespacePagesTokenPool(c.env.DB, botId, tokenPool)
@@ -7545,14 +8941,15 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
         ).bind(pageId, botId).first() as { id?: string; name?: string } | null
         if (!page?.id) return c.json({ error: 'Page not found' }, 404)
 
-        const profiles = await fetchBrowserSavingProfiles(c.env)
+        const profiles = await fetchBrowserSavingProfilesForNamespace(c.env, c.env.DB, botId)
         const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(c.env.DB, botId)
-        const hiddenProfileIds = getHiddenTaggedProfileIdsForPage(hiddenProfiles, String(page.id || ''))
-        const scopedProfiles = profiles.filter((profile) => {
-            if (!matchesProfileToPage(profile, String(page.id || ''), String(page.name || ''))) return false
-            const currentProfileId = String(profile.id || '').trim().toLowerCase()
-            if (!currentProfileId) return false
-            return !hiddenProfileIds.has(currentProfileId)
+        const linkedProfiles = await getNamespaceLinkedTaggedProfiles(c.env.DB, botId)
+        const scopedProfiles = filterProfilesForTaggedPage({
+            profiles,
+            pageId: String(page.id || ''),
+            pageName: String(page.name || ''),
+            hiddenProfiles,
+            linkedProfiles,
         })
 
         const targetProfile = scopedProfiles.find((profile) => {
@@ -7565,11 +8962,11 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
             }, 404)
         }
 
-        const updatePayload: Record<string, string | null> = token
-            ? { access_token: token }
-            : { access_token: null, facebook_token: null }
+        const updatePayload: Record<string, string | null> = mode === 'comment'
+            ? (token ? { access_token: token } : { access_token: null })
+            : (token ? { facebook_token: token } : { facebook_token: null })
 
-        const endpointBases = buildBrowserSavingBaseUrls(c.env)
+        const endpointBases = buildBrowserSavingProfileBaseUrls(c.env)
         const path = `/api/profiles/${encodeURIComponent(profileId)}`
         const errors: string[] = []
 
@@ -7592,7 +8989,9 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
                 }
 
                 const profile = data?.profile || null
-                const savedTokenRaw = String(profile?.access_token || profile?.postcron_token || '').trim()
+                const savedTokenRaw = mode === 'comment'
+                    ? String(profile?.access_token || '').trim()
+                    : String(profile?.facebook_token || profile?.postcron_token || '').trim()
                 const savedToken = token
                     ? (savedTokenRaw || token)
                     : ''
@@ -7600,7 +8999,7 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
                 let scopedSource = ''
                 let scopedReason = ''
 
-                if (savedToken) {
+                if (savedToken && mode === 'post') {
                     const scoped = await resolvePageScopedToken(savedToken, pageId, c.env, mode)
                     scopedSource = String(scoped.source || '')
                     scopedReason = String(scoped.reason || '')
@@ -7622,6 +9021,19 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
                     sync_error = syncErr instanceof Error ? syncErr.message : String(syncErr)
                 }
 
+                try {
+                    const nextLinkedProfiles = await getNamespaceLinkedTaggedProfiles(c.env.DB, botId)
+                    const pageKey = String(page.id || '')
+                    const nextIds = normalizeHiddenTaggedProfileIds([
+                        ...(hasLinkedTaggedProfilesEntryForPage(nextLinkedProfiles, pageKey) ? nextLinkedProfiles[pageKey] || [] : []),
+                        profileId,
+                    ])
+                    nextLinkedProfiles[pageKey] = nextIds
+                    await setNamespaceLinkedTaggedProfiles(c.env.DB, botId, nextLinkedProfiles)
+                } catch (e) {
+                    console.log(`[TAG-PROFILES] failed to persist linked profile for page ${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+                }
+
                 let rebuiltPrimaryToken = scopedToken || ''
                 try {
                     const rebuilt = await rebuildTaggedPageProfileTokens(c.env, botId, pageId, String(page.name || ''))
@@ -7640,7 +9052,10 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
                     page_id: pageId,
                     profile_id: profileId,
                     mode,
-                    token: token ? (scopedToken || savedToken || rebuiltPrimaryToken) : '',
+                    token: token ? (mode === 'comment' ? savedToken : (scopedToken || savedToken || rebuiltPrimaryToken)) : '',
+                    postcron_token: token
+                        ? String(profile?.facebook_token || profile?.postcron_token || '').trim()
+                        : '',
                     scoped_token: scopedToken || '',
                     token_scope: scopedSource,
                     scope_reason: scopedReason,
@@ -7676,9 +9091,17 @@ app.delete('/api/pages/:id/tag-profiles/:profileId', async (c) => {
         ).bind(pageId, botId).first() as { id?: string; name?: string } | null
         if (!page?.id) return c.json({ error: 'Page not found' }, 404)
 
-        const profiles = await fetchBrowserSavingProfiles(c.env)
-        const targetProfile = profiles.find((profile) => {
-            if (!matchesProfileToPage(profile, String(page.id || ''), String(page.name || ''))) return false
+        const profiles = await fetchBrowserSavingProfilesForNamespace(c.env, c.env.DB, botId)
+        const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(c.env.DB, botId)
+        const linkedProfiles = await getNamespaceLinkedTaggedProfiles(c.env.DB, botId)
+        const scopedProfiles = filterProfilesForTaggedPage({
+            profiles,
+            pageId: String(page.id || ''),
+            pageName: String(page.name || ''),
+            hiddenProfiles,
+            linkedProfiles,
+        })
+        const targetProfile = scopedProfiles.find((profile) => {
             return String(profile.id || '').trim().toLowerCase() === profileId.toLowerCase()
         })
         if (!targetProfile) {
@@ -7688,12 +9111,19 @@ app.delete('/api/pages/:id/tag-profiles/:profileId', async (c) => {
             }, 404)
         }
 
-        const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(c.env.DB, botId)
         hiddenProfiles[String(page.id || '')] = normalizeHiddenTaggedProfileIds([
             ...(hiddenProfiles[String(page.id || '')] || []),
             profileId,
         ])
         await setNamespaceHiddenTaggedProfiles(c.env.DB, botId, hiddenProfiles)
+
+        const pageKey = String(page.id || '')
+        if (hasLinkedTaggedProfilesEntryForPage(linkedProfiles, pageKey)) {
+            linkedProfiles[pageKey] = normalizeHiddenTaggedProfileIds(
+                (linkedProfiles[pageKey] || []).filter((id) => String(id || '').trim().toLowerCase() !== profileId.toLowerCase()),
+            )
+            await setNamespaceLinkedTaggedProfiles(c.env.DB, botId, linkedProfiles)
+        }
 
         const rebuilt = await rebuildTaggedPageProfileTokens(c.env, botId, String(page.id || ''), String(page.name || ''))
 
@@ -7780,19 +9210,25 @@ app.put('/api/pages/:id', async (c) => {
         }
 
         const tokenUpdated = access_token !== undefined || comment_token !== undefined
-
-        // Update access_token if provided (accepts both access_token and comment_token from client)
         const resolved: { access_token?: string; comment_token?: string } = {}
         const resolved_details: { access_token?: string; comment_token?: string } = {}
-        const tokenToResolve = comment_token !== undefined ? comment_token : access_token
-        if (tokenToResolve !== undefined) {
-            const rawToken = String(tokenToResolve || '').trim()
+        const tokenPool = await getNamespacePagesTokenPool(c.env.DB, c.get('botId'))
+        const existingEntry = tokenPool[id] || { post_tokens: [], comment_tokens: [] }
+        let nextPostTokenPool = normalizePostTokenPool(existingEntry.post_tokens || [])
+        let nextCommentTokenPool = normalizeCommentTokenPool(existingEntry.comment_tokens || [])
+
+        if (access_token !== undefined) {
+            const rawToken = String(access_token || '').trim()
             if (rawToken) {
                 const accessResolved = await resolvePageScopedToken(rawToken, id, c.env, 'post')
                 await c.env.DB.prepare(
                     'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
                 ).bind(accessResolved.token, id, c.get('botId')).run()
                 effectivePostToken = String(accessResolved.token || '').trim()
+                nextPostTokenPool = normalizePostTokenPool([
+                    effectivePostToken,
+                    ...nextPostTokenPool,
+                ])
                 resolved.access_token = accessResolved.source
                 if (accessResolved.reason) resolved_details.access_token = accessResolved.reason
             } else {
@@ -7800,8 +9236,37 @@ app.put('/api/pages/:id', async (c) => {
                     'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
                 ).bind('', id, c.get('botId')).run()
                 effectivePostToken = ''
+                nextPostTokenPool = []
                 resolved.access_token = 'provided_as_is'
             }
+        }
+
+        if (comment_token !== undefined) {
+            const rawCommentToken = String(comment_token || '').trim()
+            if (rawCommentToken) {
+                const resolvedCommentToken = await resolveCommentPageTokenForPage(c.env, id, rawCommentToken)
+                nextCommentTokenPool = normalizeCommentTokenPool([
+                    resolvedCommentToken,
+                    ...nextCommentTokenPool,
+                ])
+                resolved.comment_token = 'resolved_for_page'
+            } else {
+                nextCommentTokenPool = []
+                resolved.comment_token = 'provided_as_is'
+            }
+        }
+
+        if (tokenUpdated) {
+            if (nextPostTokenPool.length > 0 || nextCommentTokenPool.length > 0) {
+                tokenPool[id] = {
+                    post_tokens: nextPostTokenPool,
+                    comment_tokens: nextCommentTokenPool,
+                    updated_at: new Date().toISOString(),
+                }
+            } else {
+                delete tokenPool[id]
+            }
+            await setNamespacePagesTokenPool(c.env.DB, c.get('botId'), tokenPool)
         }
 
         // Support both old interval and new hours-based scheduling
@@ -7928,15 +9393,33 @@ app.post('/api/pages/import', async (c) => {
         const conflicts: { id: string; name: string; reason: string; existing_bot_id: string }[] = []
         const invalidPostTokenPages: { id: string; name: string; reason: string }[] = []
         const commentPageTokenById = new Map<string, string>()
+        const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
+        const explicitSelectorInputs = [postRawInput, commentRawInput].filter((input) => {
+            return looksLikeBrowserSavingProfileId(input) || parseBrowserSavingTagSelector(input) !== null
+        })
+        const shouldPersistLinkedProfiles = explicitSelectorInputs.length > 0
+        const tagSelectorInputs = explicitSelectorInputs.filter((input) => parseBrowserSavingTagSelector(input) !== null)
+        let browserSavingProfiles: BrowserSavingProfileRecord[] = []
+        if (tagSelectorInputs.length > 0) {
+            try {
+                browserSavingProfiles = await fetchBrowserSavingProfilesForNamespace(c.env, c.env.DB, botId)
+            } catch (e) {
+                console.log(`[PAGES-IMPORT] fetch BrowserSaving profiles for linked profile map failed: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+        const linkedTaggedProfiles = shouldPersistLinkedProfiles
+            ? await getNamespaceLinkedTaggedProfiles(c.env.DB, botId)
+            : null
+        const pageIdsToClearHidden = new Set<string>()
 
         if (String(commentImportToken || '').trim()) {
             try {
                 const commentPages = await fetchMeAccountsViaHttp(commentImportToken)
                 for (const item of commentPages) {
                     const id = String(item?.id || '').trim()
-                    const token = String(item?.access_token || '').trim()
-                    if (!id || !isCommentRoleToken(token)) continue
-                    if (!commentPageTokenById.has(id)) commentPageTokenById.set(id, token)
+                    const pageToken = String(item?.access_token || '').trim()
+                    if (!id || !isResolvedCommentToken(pageToken)) continue
+                    if (!commentPageTokenById.has(id)) commentPageTokenById.set(id, pageToken)
                 }
             } catch (e) {
                 const parsed = parseFacebookErrorLike(e)
@@ -7964,7 +9447,24 @@ app.post('/api/pages/import', async (c) => {
                 continue
             }
             const pageCommentTokenRaw = String(commentPageTokenById.get(pageId) || '').trim()
-            const primaryToken = String(pageCommentTokenRaw || pageAccessToken || '').trim()
+            const primaryToken = String(pageAccessToken || '').trim()
+            const existingEntry = tokenPool[pageId] || { post_tokens: [], comment_tokens: [] }
+            tokenPool[pageId] = {
+                post_tokens: normalizePostTokenPool([
+                    pageAccessToken,
+                    ...(existingEntry.post_tokens || []),
+                ]),
+                comment_tokens: pageCommentTokenRaw
+                    ? normalizeCommentTokenPool([
+                        pageCommentTokenRaw,
+                        ...(existingEntry.comment_tokens || []),
+                    ])
+                    : normalizeCommentTokenPool(existingEntry.comment_tokens || []),
+                updated_at: new Date().toISOString(),
+            }
+            const explicitLinkedProfileIds = shouldPersistLinkedProfiles
+                ? collectExplicitLinkedProfileIdsForPage(browserSavingProfiles, explicitSelectorInputs, pageId, pageName)
+                : []
 
             const existingInNamespace = await c.env.DB.prepare(
                 'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
@@ -7974,6 +9474,10 @@ app.post('/api/pages/import', async (c) => {
                 await c.env.DB.prepare(
                     'UPDATE pages SET access_token = ?, image_url = ?, name = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
                 ).bind(primaryToken, pageImageUrl, pageName, pageId, botId).run()
+                if (linkedTaggedProfiles && explicitLinkedProfileIds.length > 0) {
+                    linkedTaggedProfiles[pageId] = explicitLinkedProfileIds
+                    pageIdsToClearHidden.add(pageId)
+                }
                 updated.push({ id: pageId, name: pageName, reason: 'updated' })
                 continue
             }
@@ -7994,8 +9498,22 @@ app.post('/api/pages/import', async (c) => {
                 await c.env.DB.prepare(
                     'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?)'
                 ).bind(pageId, pageName, pageImageUrl, primaryToken, botId).run()
+                if (linkedTaggedProfiles && explicitLinkedProfileIds.length > 0) {
+                    linkedTaggedProfiles[pageId] = explicitLinkedProfileIds
+                    pageIdsToClearHidden.add(pageId)
+                }
                 imported.push({ id: pageId, name: pageName })
             }
+        }
+
+        await setNamespacePagesTokenPool(c.env.DB, botId, tokenPool)
+        if (linkedTaggedProfiles) {
+            await setNamespaceLinkedTaggedProfiles(c.env.DB, botId, linkedTaggedProfiles)
+        }
+        for (const syncedPageId of pageIdsToClearHidden) {
+            await clearNamespaceHiddenTaggedProfilesForPage(c.env.DB, botId, syncedPageId).catch((e) => {
+                console.log(`[PAGES-IMPORT] clear hidden profiles failed page=${syncedPageId}: ${e instanceof Error ? e.message : String(e)}`)
+            })
         }
 
         return c.json({
@@ -8246,8 +9764,12 @@ script: ${script}`
     if (!title) return c.json({ error: 'no title generated' }, 500)
 
     meta.title = title
-    await env.BUCKET.put(`videos/${id}.json`, JSON.stringify(meta, null, 2), {
+    await c.get('bucket').put(`videos/${id}.json`, JSON.stringify(meta, null, 2), {
         httpMetadata: { contentType: 'application/json' },
+    })
+    await updateGalleryCache(c.get('bucket'), id)
+    await syncGalleryIndexEntry(c.env, String(c.get('botId') || ''), id).catch((error) => {
+        console.log(`[GENERATE-TITLE] sync gallery index failed video=${id}: ${error instanceof Error ? error.message : String(error)}`)
     })
 
     return c.json({ id, title })
@@ -8293,6 +9815,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let postTokenCandidates: string[] = []
     let commentTokenCandidates: string[] = []
     let postingTokenUsed = ''
+    let hasCommentToken = false
+    let initialCommentStatus = 'not_configured'
+    let initialCommentError: string | null = null
 
     try {
         // Check if skip comment
@@ -8313,18 +9838,34 @@ app.post('/api/pages/:id/force-post', async (c) => {
         ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
-        pageName = page.name
-        pageAccessToken = String(page.access_token || '').trim()
-        pageCommentToken = pageAccessToken
-        const tokenCandidates = await getPageTokenCandidates({
+        const recentPostGuard = await getRecentPagePostGuard({
             db: env.DB,
             namespaceId: botId,
             pageId: page.id,
-            primaryToken: pageAccessToken,
         })
-        commentTokenCandidates = tokenCandidates.tokens.length > 0
-            ? tokenCandidates.tokens
-            : normalizePostTokenPool([pageAccessToken])
+        if (recentPostGuard.blocked) {
+            return c.json({
+                error: 'page_recently_posted_or_posting',
+                details: {
+                    history_id: recentPostGuard.historyId,
+                    status: recentPostGuard.status,
+                    posted_at: recentPostGuard.postedAt,
+                },
+            }, 409)
+        }
+        pageName = page.name
+        pageAccessToken = String(page.access_token || '').trim()
+        pageCommentToken = null
+        const tokenCandidates = await ensurePageTokenCandidates({
+            env,
+            db: env.DB,
+            namespaceId: botId,
+            pageId: page.id,
+            pageName: page.name,
+            primaryToken: pageAccessToken,
+            logPrefix: 'FORCE-POST',
+        })
+        commentTokenCandidates = tokenCandidates.commentTokens
         pageCommentToken = commentTokenCandidates[0] || null
         postTokenCandidates = useCommentTokenForPosting && commentTokenCandidates.length > 0
             ? commentTokenCandidates
@@ -8332,7 +9873,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 ? tokenCandidates.postTokens
                 : normalizePostTokenPool([pageAccessToken]))
 
-        const systemGalleryEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
         const postedIds = await getPostedVideoIds({
             db: env.DB,
             namespaceId: botId,
@@ -8340,17 +9880,15 @@ app.post('/api/pages/:id/force-post', async (c) => {
             withinDays: 30,
         })
 
-        let pickedVideo: { id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId?: string } | null = null
-        if (systemGalleryEnabled) {
-            pickedVideo = await pickRandomPostableVideoFromSystem(env, postedIds)
-            if (!pickedVideo) return c.json({ error: 'No postable system videos with Shopee link left' }, 404)
-        } else {
-            const allVideoIds = await listAllVideoJsonIds(c.get('bucket'))
-            if (allVideoIds.length === 0) return c.json({ error: 'No videos available' }, 404)
-            const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
-            if (unpostedVideos.length === 0) return c.json({ error: 'No unposted videos left' }, 404)
-            pickedVideo = await pickPostableVideoNewestFirst(c.get('bucket'), unpostedVideos)
-        }
+        const allVideoIds = await listAllVideoJsonIds(c.get('bucket'))
+        const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
+        const pickedVideo = await pickRandomGalleryVideoForPosting({
+            env,
+            namespaceId: botId,
+            bucket: c.get('bucket'),
+            candidateIds: unpostedVideos,
+            excludedVideoIds: postedIds,
+        })
         if (!pickedVideo) return c.json({ error: 'No readable video metadata left' }, 404)
         const unpostedId = pickedVideo.id
         const meta = pickedVideo.meta
@@ -8399,7 +9937,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
         commentTokenHint = deriveCommentTokenHint(pageCommentToken)
         const initialPostTokenHint = deriveCommentTokenHint(postTokenCandidates[0] || null)
         const initialPostProfile = await resolvePostHistoryProfileByToken(env, postTokenCandidates[0] || null)
-        const initialCommentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
+        hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
+        const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
+        initialCommentStatus = initialCommentState.status
+        initialCommentError = initialCommentState.error
         // Record attempt BEFORE posting (prevents duplicate on failure)
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
@@ -8416,7 +9957,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             initialPostProfile.profileName,
             initialCommentStatus,
             commentTokenHint,
-            null,
+            initialCommentError,
             null,
             normalizedShopeeLink || null,
             normalizedShopeeUtmSource,
@@ -8455,23 +9996,54 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
         fbVideoId = reelResult.id
-        const confirmedPostId = fbVideoId
-        const fbReelUrl = `https://www.facebook.com/reel/${confirmedPostId}`
+        const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+        const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
+        const scheduledCommentDelaySeconds = normalizedShopeeLink && !skipComment && hasCommentToken
+            ? getRandomCommentDelaySeconds()
+            : null
+        const scheduledCommentDueAt = scheduledCommentDelaySeconds
+            ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
+            : null
+        const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+        await env.DB.prepare(
+            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE page_id = ? AND video_id = ? AND status = 'posting'"
+        ).bind(
+            confirmedPostId,
+            fbReelUrl,
+            deriveCommentTokenHint(postingTokenUsed),
+            postingProfile.profileId,
+            postingProfile.profileName,
+            postReadyCommentState.status,
+            deriveCommentTokenHint(pageCommentToken),
+            postReadyCommentState.error,
+            scheduledCommentDelaySeconds,
+            scheduledCommentDueAt,
+            page.id,
+            unpostedId,
+        ).run()
 
         // Wait 10s for video to be processed before commenting (unless skipped)
-        let commentStatus = initialCommentStatus
-        let commentError: string | null = null
+        let commentStatus = postReadyCommentState.status
+        let commentError: string | null = postReadyCommentState.error
         let commentFbId: string | null = null
         let commentTokenUsed = String(pageCommentToken || '').trim()
         let commentProfileId: string | null = null
         let commentProfileName: string | null = null
-        const commentTargetId = confirmedPostId || fbVideoId
+        const commentTargetId = fbVideoId || confirmedPostId
 
-        if (normalizedShopeeLink && !skipComment) {
-            const commentWaitMs = getRandomCommentDelayMs()
+        if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+            const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
             console.log(`[FORCE-POST] Waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
             await waitMs(commentWaitMs)
+            await env.DB.prepare(
+                "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE page_id = ? AND video_id = ? AND status = 'posting'"
+            ).bind(
+                deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                page.id,
+                unpostedId,
+            ).run()
             const commentResult = await postShopeeCommentWithFallback({
+                env,
                 fbVideoId: commentTargetId,
                 shopeeLink: normalizedShopeeLink,
                 commentTokens: commentTokenCandidates,
@@ -8505,6 +10077,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }
         } else if (skipComment) {
             commentStatus = 'skipped'
+            commentError = null
             console.log(`[FORCE-POST] Skipped comment for ${fbVideoId}`)
         }
 
@@ -8570,19 +10143,21 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         recoveredReelUrl = `https://www.facebook.com/reel/${recoveredPostId}`
                     }
 
-                    let commentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
-                    let commentError: string | null = null
+                    const recoveredCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+                    let commentStatus = recoveredCommentState.status
+                    let commentError: string | null = recoveredCommentState.error
                     let commentFbId: string | null = null
                     let commentTokenUsed = String(pageCommentToken || '').trim()
                     let commentProfileId: string | null = null
                     let commentProfileName: string | null = null
-                    const commentTargetId = recoveredPostId || fbVideoId
+                    const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
 
-                    if (normalizedShopeeLink && !skipComment) {
+                    if (normalizedShopeeLink && !skipComment && hasCommentToken) {
                         const commentWaitMs = getRandomCommentDelayMs()
                         console.log(`[FORCE-POST-RECOVER] Waiting ${Math.ceil(commentWaitMs / 1000)}s before recovery comment...`)
                         await waitMs(commentWaitMs)
                         const commentResult = await postShopeeCommentWithFallback({
+                            env,
                             fbVideoId: commentTargetId,
                             shopeeLink: normalizedShopeeLink,
                             commentTokens: commentTokenCandidates,
@@ -8615,6 +10190,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         }
                     } else if (skipComment) {
                         commentStatus = 'skipped'
+                        commentError = null
                     }
 
                     const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
@@ -8779,7 +10355,8 @@ app.post('/api/manual-post-reel', async (c) => {
             await waitMs(commentWaitMs)
             try {
                 const res = await postShopeeCommentWithFallback({
-                    fbVideoId: confirmedPostId || fbVideoId,
+                    env: c.env,
+                    fbVideoId: fbVideoId || confirmedPostId,
                     shopeeLink: effectiveShopeeLink,
                     commentTokens: [commentToken || ''],
                     pageId,
@@ -8879,6 +10456,7 @@ async function handleScheduled(env: Env) {
             try {
                 console.log(`[CRON] Pending comment ${data.fbVideoId}: using comment token ${pendingCommentToken.slice(0, 30)}...`)
                 const result = await postShopeeCommentStrict({
+                    env,
                     fbVideoId: data.fbVideoId,
                     shopeeLink: data.shopeeLink,
                     commentToken: pendingCommentToken,
@@ -8966,6 +10544,17 @@ async function handleScheduled(env: Env) {
     for (const page of pages) {
         // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
         const botId = page.bot_id || 'default';
+        const recentPostGuard = await getRecentPagePostGuard({
+            db: env.DB,
+            namespaceId: botId,
+            pageId: page.id,
+        })
+        if (recentPostGuard.blocked) {
+            console.log(
+                `[CRON] Page ${page.name}: skip (recent ${recentPostGuard.status || 'activity'} history_id=${recentPostGuard.historyId || '-'} posted_at=${recentPostGuard.postedAt || '-'})`
+            )
+            continue
+        }
 
         // ถ้ายังไม่เคยดึง videos ของ namespace นี้
         if (!videoNamespaceCache[botId]) {
@@ -9105,7 +10694,6 @@ async function handleScheduled(env: Env) {
 
         // 2. Get a video that hasn't been posted to this page in the last 30 days
         // ใช้ video จาก cache แล้ว
-        const systemGalleryEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
         const postedIds = await getPostedVideoIds({
             db: env.DB,
             namespaceId: botId,
@@ -9114,32 +10702,17 @@ async function handleScheduled(env: Env) {
         })
         console.log(`[CRON] Page ${page.name}: videos already posted to this page in last 30 days: ${Array.from(postedIds).join(', ') || 'none'}`)
 
-        let pickedVideo: { id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId?: string } | null = null
-        if (systemGalleryEnabled) {
-            pickedVideo = await pickRandomPostableVideoFromSystem(env, postedIds)
-            if (!pickedVideo) {
-                console.log(`[CRON] Page ${page.name}: no postable system videos with Shopee link`)
-                await botBucket.delete(dedupKey).catch(() => { })
-                continue
-            }
-        } else {
-            const allVideoIds = videoNamespaceNewestFirstCache[botId] || videoNamespaceCache[botId] || []
-            console.log(`[CRON] Page ${page.name}: found ${allVideoIds.length} videos in R2`)
+        const allVideoIds = videoNamespaceNewestFirstCache[botId] || videoNamespaceCache[botId] || []
+        console.log(`[CRON] Page ${page.name}: found ${allVideoIds.length} videos in R2`)
 
-            if (allVideoIds.length === 0) {
-                console.log(`[CRON] No videos available for page ${page.name}`)
-                await botBucket.delete(dedupKey).catch(() => { })
-                continue
-            }
-
-            const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
-            if (unpostedVideos.length === 0) {
-                console.log(`[CRON] Page ${page.name}: no unposted videos`)
-                await botBucket.delete(dedupKey).catch(() => { })
-                continue
-            }
-            pickedVideo = await pickPostableVideoNewestFirst(botBucket, unpostedVideos)
-        }
+        const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
+        const pickedVideo = await pickRandomGalleryVideoForPosting({
+            env,
+            namespaceId: botId,
+            bucket: botBucket,
+            candidateIds: unpostedVideos,
+            excludedVideoIds: postedIds,
+        })
         if (!pickedVideo) {
             console.log(`[CRON] Page ${page.name}: no readable video metadata left`)
             await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
@@ -9161,9 +10734,9 @@ async function handleScheduled(env: Env) {
             const postedAtMs = Date.parse(String(row?.posted_at || ''))
             return Number.isFinite(postedAtMs) && (Date.now() - postedAtMs) <= (60 * 60 * 1000)
         })
-        if (recentFailedAttempts.length >= 2) {
-            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} after ${recentFailedAttempts.length} failed attempts in the last hour`)
-            await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
+        if (recentFailedAttempts.length >= 1) {
+            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} after ${recentFailedAttempts.length} failed attempt in the last hour`)
+            console.log(`[CRON] Page ${page.name}: keep dedup key after recent failure, skip retries until next schedule window`)
             continue
         }
 
@@ -9220,23 +10793,27 @@ async function handleScheduled(env: Env) {
 
         console.log(`[CRON] Page ${page.name}: posting video ${unpostedId} — caption: ${caption}`)
 
-        const tokenCandidates = await getPageTokenCandidates({
+        const tokenCandidates = await ensurePageTokenCandidates({
+            env,
             db: env.DB,
             namespaceId: botId,
             pageId: String(page.id || ''),
+            pageName: String(page.name || ''),
             primaryToken: String(page.access_token || ''),
+            logPrefix: `CRON ${page.name}`,
         })
         const postTokenCandidates = tokenCandidates.postTokens.length > 0
             ? tokenCandidates.postTokens
             : normalizePostTokenPool([String(page.access_token || '')])
-        const commentTokenCandidates = tokenCandidates.tokens.length > 0
-            ? tokenCandidates.tokens
-            : normalizePostTokenPool([String(page.access_token || '')])
+        const commentTokenCandidates = tokenCandidates.commentTokens
         await ensurePostHistoryTraceColumns(env.DB)
         const commentTokenHint = deriveCommentTokenHint(commentTokenCandidates[0] || null)
         const initialPostTokenHint = deriveCommentTokenHint(postTokenCandidates[0] || null)
         const initialPostProfile = await resolvePostHistoryProfileByToken(env, postTokenCandidates[0] || null)
-        const initialCommentStatus = normalizedShopeeLink ? 'pending' : 'not_configured'
+        const hasCommentToken = commentTokenCandidates.length > 0
+        const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
+        const initialCommentStatus = initialCommentState.status
+        const initialCommentError = initialCommentState.error
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         await env.DB.prepare(
             'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
@@ -9251,7 +10828,7 @@ async function handleScheduled(env: Env) {
             initialPostProfile.profileName,
             initialCommentStatus,
             commentTokenHint,
-            null,
+            initialCommentError,
             null,
             normalizedShopeeLink || null,
             normalizedShopeeUtmSource,
@@ -9285,27 +10862,60 @@ async function handleScheduled(env: Env) {
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id
-            const confirmedPostId = fbVideoId
-            const fbReelUrl = `https://www.facebook.com/reel/${confirmedPostId}`
+            const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+            const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
+            const scheduledCommentDelaySeconds = normalizedShopeeLink && hasCommentToken
+                ? getRandomCommentDelaySeconds()
+                : null
+            const scheduledCommentDueAt = scheduledCommentDelaySeconds
+                ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
+                : null
+            const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, false)
+            await env.DB.prepare(
+                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
+            ).bind(
+                confirmedPostId,
+                fbReelUrl,
+                deriveCommentTokenHint(postingTokenUsed),
+                postingProfile.profileId,
+                postingProfile.profileName,
+                postReadyCommentState.status,
+                deriveCommentTokenHint(commentTokenCandidates[0] || null),
+                postReadyCommentState.error,
+                scheduledCommentDelaySeconds,
+                scheduledCommentDueAt,
+                page.id,
+                unpostedId,
+                botId,
+            ).run()
 
             // คอมเม้นท์เลยหลังรอ 10 วินาที
-            let commentStatus = initialCommentStatus
-            let commentError: string | null = null
+            let commentStatus = postReadyCommentState.status
+            let commentError: string | null = postReadyCommentState.error
             let commentFbId: string | null = null
             let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
             let commentProfileId: string | null = null
             let commentProfileName: string | null = null
-            const commentTargetId = confirmedPostId || fbVideoId
+            const commentTargetId = fbVideoId || confirmedPostId
 
-            if (normalizedShopeeLink) {
+            if (normalizedShopeeLink && hasCommentToken) {
                 if (dedupCommentTargets.has(commentTargetId)) {
                     console.log(`[CRON] Page ${page.name}: skip comment for ${commentTargetId} (already commented in this run)`)
                     commentStatus = 'success'
                 } else {
-                    const commentWaitMs = getRandomCommentDelayMs()
+                    const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
                     console.log(`[CRON] Page ${page.name}: waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
                     await waitMs(commentWaitMs)
+                    await env.DB.prepare(
+                        "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
+                    ).bind(
+                        deriveCommentTokenHint(commentTokenUsed),
+                        page.id,
+                        unpostedId,
+                        botId,
+                    ).run()
                     const commentResult = await postShopeeCommentWithFallback({
+                        env,
                         fbVideoId: commentTargetId,
                         shopeeLink: normalizedShopeeLink,
                         commentTokens: commentTokenCandidates,
@@ -9405,15 +11015,16 @@ async function handleScheduled(env: Env) {
                         recoveredReelUrl = `https://www.facebook.com/reel/${recoveredPostId}`
                     }
 
-                    let commentStatus = initialCommentStatus
-                    let commentError: string | null = null
+                    const recoveredCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, false)
+                    let commentStatus = recoveredCommentState.status
+                    let commentError: string | null = recoveredCommentState.error
                     let commentFbId: string | null = null
                     let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
                     let commentProfileId: string | null = null
                     let commentProfileName: string | null = null
-                    const commentTargetId = recoveredPostId || fbVideoId
+                    const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
 
-                    if (normalizedShopeeLink) {
+                    if (normalizedShopeeLink && hasCommentToken) {
                         if (dedupCommentTargets.has(commentTargetId)) {
                             console.log(`[CRON] Page ${page.name}: recovery comment skip for ${commentTargetId} (already commented in this run)`)
                             commentStatus = 'success'
@@ -9422,6 +11033,7 @@ async function handleScheduled(env: Env) {
                             console.log(`[CRON] Page ${page.name}: recovery comment wait ${Math.ceil(commentWaitMs / 1000)}s...`)
                             await waitMs(commentWaitMs)
                             const commentResult = await postShopeeCommentWithFallback({
+                                env,
                                 fbVideoId: commentTargetId,
                                 shopeeLink: normalizedShopeeLink,
                                 commentTokens: commentTokenCandidates,
@@ -9493,8 +11105,8 @@ async function handleScheduled(env: Env) {
                 "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
             ).bind(errorMsg, page.id, unpostedId, botId).run()
 
-            // Clean up dedup key to allow retry in next cron cycle
-            await botBucket.delete(dedupKey).catch(() => { })
+            // Keep dedup key so this schedule window/interval bucket does not retry again after one failed attempt.
+            console.log(`[CRON] Page ${page.name}: keep dedup key after failure, skip retries until next schedule window`)
         }
     }
 

@@ -6,6 +6,7 @@ use tower_http::cors::CorsLayer;
 use serde_json::json;
 
 mod merge;
+mod thumbnail;
 mod xhs;
 mod pipeline;
 mod version;
@@ -34,6 +35,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/merge", post(merge::handle_merge))
+        .route("/thumbnail", post(thumbnail::handle_thumbnail))
         .route("/xhs/resolve", post(xhs::handle_resolve))
         .route("/pipeline", post(pipeline::handle_pipeline))
         .layer(CorsLayer::permissive());

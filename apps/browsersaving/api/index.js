@@ -36,7 +36,7 @@ const server = http.createServer(async (req, res) => {
     const debugMatch = url.pathname.match(/^\/debug\/cookies\/([^/]+)$/);
     if (debugMatch) {
         try {
-            const cookies = await downloadCookies(debugMatch[1]);
+            const cookies = await downloadCookies(debugMatch[1], req);
             return json(res, 200, {
                 count: cookies.length,
                 fb: cookies.filter(c => c.domain?.includes('facebook')).length,
@@ -50,17 +50,17 @@ const server = http.createServer(async (req, res) => {
     // Single profile token
     const tokenMatch = url.pathname.match(/^\/api\/postcron\/([^/]+)\/token$/);
     if (tokenMatch && req.method === 'GET') {
-        return handleToken(tokenMatch[1], res);
+        return handleToken(tokenMatch[1], req, res);
     }
 
     // Profile post/comment token aliases
     const postMatch = url.pathname.match(/^\/api\/postcron\/([^/]+)\/post$/);
     if (postMatch && req.method === 'GET') {
-        return handleToken(postMatch[1], res);
+        return handleToken(postMatch[1], req, res);
     }
     const commentMatch = url.pathname.match(/^\/api\/postcron\/([^/]+)\/comment$/);
     if (commentMatch && req.method === 'GET') {
-        return handleCommentToken(commentMatch[1], res);
+        return handleCommentToken(commentMatch[1], req, res);
     }
 
     // Tag-based post/comment token
@@ -68,12 +68,12 @@ const server = http.createServer(async (req, res) => {
     if (tagModeMatch && req.method === 'GET') {
         const rawTag = decodeURIComponent(tagModeMatch[1] || '').trim();
         const mode = String(tagModeMatch[2] || '').toLowerCase();
-        return handleTagToken(rawTag, mode, res);
+        return handleTagToken(rawTag, mode, req, res);
     }
 
     // All profiles
     if (url.pathname === '/api/postcron/all/tokens' && req.method === 'GET') {
-        return handleAllTokens(res);
+        return handleAllTokens(req, res);
     }
 
     // Shopee Affiliate Link Generator
@@ -94,15 +94,59 @@ function json(res, status, data) {
     res.end(JSON.stringify(data, null, 2));
 }
 
-async function handleToken(profileId, res) {
+function buildWorkerHeaders(req, extraHeaders = {}) {
+    const headers = { ...extraHeaders };
+    const authToken = String(req?.headers?.['x-auth-token'] || '').trim();
+    const authorization = String(req?.headers?.authorization || '').trim();
+    if (authToken && !headers['x-auth-token']) headers['x-auth-token'] = authToken;
+    if (authorization && !headers.Authorization && !headers.authorization) headers.authorization = authorization;
+    return headers;
+}
+
+async function fetchWorkerJson(req, path, init = {}) {
+    const headers = buildWorkerHeaders(req, init.headers || {});
+    const resp = await fetch(`${WORKER_URL}${path}`, { ...init, headers });
+    const data = await resp.json().catch(() => null);
+    return { resp, data };
+}
+
+function extractProfilesList(payload) {
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload?.profiles)) return payload.profiles;
+    if (Array.isArray(payload?.results)) return payload.results;
+    return null;
+}
+
+function getProfilesLoadErrorDetails(payload, resp) {
+    return payload?.details || payload?.error || `HTTP ${resp.status}`;
+}
+
+async function updateWorkerProfile(req, profileId, body) {
+    return fetch(`${WORKER_URL}/api/profiles/${profileId}`, {
+        method: 'PUT',
+        headers: buildWorkerHeaders(req, {
+            'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify(body),
+    });
+}
+
+async function handleToken(profileId, req, res) {
     const t0 = Date.now();
     console.log(`🔑 [${profileId.substring(0, 8)}] Start`);
     try {
-        const profiles = await (await fetch(`${WORKER_URL}/api/profiles`)).json();
+        const { resp: profilesResp, data: profilesData } = await fetchWorkerJson(req, '/api/profiles');
+        const profiles = extractProfilesList(profilesData);
+        if (!profilesResp.ok || !profiles) {
+            return json(res, profilesResp.status || 502, {
+                error: 'Failed to load profiles from BrowserSaving worker',
+                details: getProfilesLoadErrorDetails(profilesData, profilesResp),
+            });
+        }
         const profile = profiles.find(p => p.id === profileId);
         if (!profile) return json(res, 404, { error: 'Profile not found' });
 
-        const cookies = await downloadCookies(profileId);
+        const cookies = await downloadCookies(profileId, req);
         const fbCount = cookies.filter(c => c.domain?.includes('facebook.com')).length;
         console.log(`🍪 [${profile.name}] ${cookies.length} cookies, ${fbCount} FB`);
 
@@ -118,11 +162,7 @@ async function handleToken(profileId, res) {
             return json(res, 400, buildPostcronFailure(profile.name, dur, extract));
         }
 
-        await fetch(`${WORKER_URL}/api/profiles/${profileId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ postcron_token: token }),
-        });
+        await updateWorkerProfile(req, profileId, { facebook_token: token });
 
         console.log(`✅ [${profile.name}] ${dur}s`);
         return json(res, 200, { success: true, profile: profile.name, token, duration: dur + 's' });
@@ -158,11 +198,15 @@ function extractDatrFromCookies(cookies) {
     return '';
 }
 
-async function findProfileByTag(tag) {
+async function findProfileByTag(tag, req) {
     const normalizedTag = String(tag || '').trim().toLowerCase();
     if (!normalizedTag) throw new Error('tag_required');
 
-    const profiles = await (await fetch(`${WORKER_URL}/api/profiles`)).json();
+    const { resp: profilesResp, data } = await fetchWorkerJson(req, '/api/profiles');
+    const profiles = extractProfilesList(data);
+    if (!profilesResp.ok || !profiles) {
+        throw new Error(`profiles_fetch_failed:${getProfilesLoadErrorDetails(data, profilesResp)}`);
+    }
     const matched = profiles.filter((p) => normalizeTags(p?.tags).includes(normalizedTag));
     if (matched.length === 0) throw new Error(`tag_not_found:${normalizedTag}`);
     if (matched.length > 1) {
@@ -172,11 +216,18 @@ async function findProfileByTag(tag) {
     return { profile: matched[0], matchedCount: matched.length, tag: normalizedTag };
 }
 
-async function handleCommentToken(profileId, res) {
+async function handleCommentToken(profileId, req, res) {
     const t0 = Date.now();
     console.log(`💬 [${String(profileId).substring(0, 8)}] Start`);
     try {
-        const profiles = await (await fetch(`${WORKER_URL}/api/profiles`)).json();
+        const { resp: profilesResp, data: profilesData } = await fetchWorkerJson(req, '/api/profiles');
+        const profiles = extractProfilesList(profilesData);
+        if (!profilesResp.ok || !profiles) {
+            return json(res, profilesResp.status || 502, {
+                error: 'Failed to load profiles from BrowserSaving worker',
+                details: getProfilesLoadErrorDetails(profilesData, profilesResp),
+            });
+        }
         const profile = profiles.find(p => p.id === profileId);
         if (!profile) return json(res, 404, { error: 'Profile not found' });
 
@@ -190,16 +241,12 @@ async function handleCommentToken(profileId, res) {
         let datrSource = datr ? 'profile' : 'none';
         if (!datr) {
             try {
-                const cookies = await downloadCookies(profileId);
+                const cookies = await downloadCookies(profileId, req);
                 const fromCookies = extractDatrFromCookies(cookies);
                 if (fromCookies) {
                     datr = fromCookies;
                     datrSource = 'cookies';
-                    await fetch(`${WORKER_URL}/api/profiles/${profileId}`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ datr: fromCookies }),
-                    }).catch(() => {});
+                    await updateWorkerProfile(req, profileId, { datr: fromCookies }).catch(() => {});
                 }
             } catch (e) {
                 console.log(`⚠️ [${profile.name}] datr auto-resolve failed: ${e.message || e}`);
@@ -227,11 +274,7 @@ async function handleCommentToken(profileId, res) {
             return json(res, 400, { error: 'token_missing', profile: profile.name });
         }
 
-        await fetch(`${WORKER_URL}/api/profiles/${profileId}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ comment_token: token }),
-        });
+        await updateWorkerProfile(req, profileId, { comment_token: token });
 
         const dur = ((Date.now() - t0) / 1000).toFixed(1);
         console.log(`✅ [${profile.name}] comment ${dur}s`);
@@ -242,25 +285,32 @@ async function handleCommentToken(profileId, res) {
     }
 }
 
-async function handleTagToken(tag, mode, res) {
+async function handleTagToken(tag, mode, req, res) {
     try {
-        const { profile, matchedCount, tag: normalizedTag } = await findProfileByTag(tag);
+        const { profile, matchedCount, tag: normalizedTag } = await findProfileByTag(tag, req);
         if (mode === 'comment') {
-            return handleCommentToken(profile.id, res);
+            return handleCommentToken(profile.id, req, res);
         }
-        return handleToken(profile.id, res);
+        return handleToken(profile.id, req, res);
     } catch (err) {
         return json(res, 400, { error: err.message || String(err), tag, mode });
     }
 }
 
-async function handleAllTokens(res) {
-    const profiles = await (await fetch(`${WORKER_URL}/api/profiles`)).json();
+async function handleAllTokens(req, res) {
+    const { resp: profilesResp, data } = await fetchWorkerJson(req, '/api/profiles');
+    const profiles = extractProfilesList(data);
+    if (!profilesResp.ok || !profiles) {
+        return json(res, profilesResp.status || 502, {
+            error: 'Failed to load profiles from BrowserSaving worker',
+            details: getProfilesLoadErrorDetails(data, profilesResp),
+        });
+    }
     const results = [];
 
     for (const profile of profiles) {
         try {
-            const cookies = await downloadCookies(profile.id);
+            const cookies = await downloadCookies(profile.id, req);
             if (cookies.filter(c => c.domain?.includes('facebook.com')).length === 0) {
                 results.push({ profile: profile.name, status: 'skip', reason: 'No FB cookies' });
                 continue;
@@ -268,11 +318,7 @@ async function handleAllTokens(res) {
             const extract = await extractToken(cookies);
             const token = extract?.token || null;
             if (token) {
-                await fetch(`${WORKER_URL}/api/profiles/${profile.id}`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ postcron_token: token }),
-                });
+                await updateWorkerProfile(req, profile.id, { facebook_token: token });
                 results.push({ profile: profile.name, status: 'ok', token: token.substring(0, 20) + '...' });
             } else {
                 results.push({
@@ -293,11 +339,13 @@ async function handleAllTokens(res) {
 
 // ==================== DOWNLOAD COOKIES ====================
 
-async function downloadCookies(profileId) {
+async function downloadCookies(profileId, req) {
     const url = `${WORKER_URL}/api/sync/${profileId}/download`;
     console.log(`📥 Fetching ${url}`);
 
-    const resp = await fetch(url);
+    const resp = await fetch(url, {
+        headers: buildWorkerHeaders(req),
+    });
     if (!resp.ok) {
         console.log(`📥 HTTP ${resp.status}`);
         return [];
@@ -656,7 +704,7 @@ async function handleShopeeAffiliate(req, res, urlObj) {
         
         // Get cookies from archive
         console.log(`📦 [Shopee Affiliate] Extracting cookies from archive for: ${profileId}`);
-        const archiveCookies = await downloadCookies(profileId);
+        const archiveCookies = await downloadCookies(profileId, req);
         const shopeeCookies = archiveCookies.filter(c => 
             c.domain?.includes('shopee.co.th') || 
             c.domain?.includes('affiliate.shopee.co.th')
@@ -855,12 +903,19 @@ async function handleFacebookComment(req, res) {
         }
         
         // Get profile info
-        const profiles = await (await fetch(`${WORKER_URL}/api/profiles`)).json();
+        const { resp: profilesResp, data: profilesData } = await fetchWorkerJson(req, '/api/profiles');
+        const profiles = extractProfilesList(profilesData);
+        if (!profilesResp.ok || !profiles) {
+            return json(res, profilesResp.status || 502, {
+                error: 'Failed to load profiles from BrowserSaving worker',
+                details: getProfilesLoadErrorDetails(profilesData, profilesResp),
+            });
+        }
         const profile = profiles.find(p => p.id === profileId);
         if (!profile) return json(res, 404, { error: 'Profile not found' });
-        
+
         // Download cookies
-        const cookies = await downloadCookies(profileId);
+        const cookies = await downloadCookies(profileId, req);
         const fbCount = cookies.filter(c => c.domain?.includes('facebook.com')).length;
         
         if (fbCount === 0) {
