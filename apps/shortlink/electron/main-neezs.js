@@ -15,7 +15,8 @@ const ACCOUNT = {
 const AFFILIATE_URL = envOrDefault('SHORTLINK_AFFILIATE_URL', 'https://affiliate.shopee.co.th/offer/custom_link');
 const AFFILIATE_LOGIN_URL = `https://shopee.co.th/buyer/login?next=${encodeURIComponent(AFFILIATE_URL)}`;
 const ACCOUNT_KEY = envOrDefault('SHORTLINK_ACCOUNT_KEY', 'neezs').trim().toLowerCase();
-const APP_NAME = envOrDefault('SHORTLINK_APP_NAME', `Shopee Shortlink (${ACCOUNT_KEY})`);
+const DISPLAY_NAME = envOrDefault('SHORTLINK_DISPLAY_NAME', ACCOUNT_KEY.toUpperCase());
+const APP_NAME = envOrDefault('SHORTLINK_APP_NAME', DISPLAY_NAME);
 const LOCALHOST_LABEL = envOrDefault('SHORTLINK_LOCALHOST_LABEL', `เปิด localhost:${PORT}`);
 const BRIDGE_HEARTBEAT_MS = 15000;
 const BRIDGE_STALE_MS = 45000;
@@ -38,9 +39,10 @@ let jobQueue = Promise.resolve();
 function fitMainWindowToDisplay() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
 
-  const { x, y, width, height } = screen.getPrimaryDisplay().bounds;
+  const { x, y, width, height } = screen.getPrimaryDisplay().workArea;
   mainWindow.setBounds({ x, y, width, height });
-  mainWindow.setFullScreen(true);
+  mainWindow.setFullScreen(false);
+  mainWindow.maximize();
 }
 
 function resetWebContentsScale() {
@@ -88,54 +90,7 @@ async function expandUrl(url) {
   }
 }
 
-// ── Auto Login ─────────────────────────────────────────────────────────────────
-
-async function autoLogin() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  if (!ACCOUNT.username || !ACCOUNT.password) {
-    console.log('[AutoLogin] Missing credentials — waiting for manual login');
-    return;
-  }
-  const currentUrl = mainWindow.webContents.getURL();
-  // หน้า login อยู่ที่ shopee.co.th/buyer/login
-  if (!currentUrl.includes('/buyer/login')) return;
-
-  console.log('[AutoLogin] Detected login page — waiting for form...');
-  await mainWindow.webContents.executeJavaScript(`
-    (function tryFill(attempt) {
-      const setVal = (el, val) => {
-        el.focus();
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(el, val);
-        el.dispatchEvent(new Event('input',  { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        el.blur();
-      };
-      const user = document.querySelector('input[name="loginKey"]');
-      const pass = document.querySelector('input[name="password"]');
-      if (!user || !pass) {
-        if (attempt < 10) setTimeout(() => tryFill(attempt + 1), 500);
-        else console.log('[AutoLogin] form not found after retries');
-        return;
-      }
-      setVal(user, ${JSON.stringify(ACCOUNT.username)});
-      setVal(pass, ${JSON.stringify(ACCOUNT.password)});
-      console.log('[AutoLogin] filled — user:', user.value, 'pass.length:', pass.value.length);
-      setTimeout(() => {
-        // หา button ด้วย text content (stable กว่า class name)
-        const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim().includes('เข้าสู่ระบบ'));
-        if (btn) {
-          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          console.log('[AutoLogin] clicked btn:', btn.textContent.trim(), 'disabled:', btn.disabled);
-        } else {
-          // fallback: Enter key
-          pass.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-          console.log('[AutoLogin] sent Enter key');
-        }
-      }, 1000);
-    })(0)
-  `);
-}
+// ── Manual Login Only ──────────────────────────────────────────────────────────
 
 async function getAffiliateSessionSnapshot() {
   if (!mainWindow || mainWindow.isDestroyed()) {
@@ -389,10 +344,8 @@ async function ensureAffiliateContext() {
       return currentUrl;
     }
 
-    if (isLoginPageUrl(currentUrl)) {
-      await autoLogin();
-    } else if (isLoginPageUrl(probeUrl)) {
-      await autoLogin();
+    if (isLoginPageUrl(currentUrl) || isLoginPageUrl(probeUrl)) {
+      throw new Error('Shopee login required in the app window');
     } else if (isCaptchaPageUrl(currentUrl)) {
       throw new Error('Shopee ต้องยืนยัน CAPTCHA ในหน้าจอ');
     } else if (isCaptchaPageUrl(probeUrl)) {
@@ -824,7 +777,7 @@ function sleep(ms) {
 
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
-    { label: 'Shopee Shortlink', enabled: false },
+    { label: DISPLAY_NAME, enabled: false },
     { label: `localhost:${PORT}`, enabled: false },
     { type: 'separator' },
     {
@@ -860,7 +813,7 @@ app.whenReady().then(() => {
   if (process.platform === 'darwin') app.dock.hide();
 
   // ── Main Window (Shopee Affiliate WebView) ──
-  const { x, y, width, height } = screen.getPrimaryDisplay().bounds;
+  const { x, y, width, height } = screen.getPrimaryDisplay().workArea;
 
   mainWindow = new BrowserWindow({
     x,
@@ -869,7 +822,7 @@ app.whenReady().then(() => {
     height,
     show: false,
     autoHideMenuBar: true,
-    fullscreen: true,
+    fullscreen: false,
     fullscreenable: true,
     maximizable: true,
     title: APP_NAME,
@@ -968,7 +921,7 @@ app.whenReady().then(() => {
   trayIcon.setTemplateImage(true); // macOS dark/light mode support
   tray = new Tray(trayIcon);
 
-  tray.setToolTip('Shopee Shortlink');
+  tray.setToolTip(DISPLAY_NAME);
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => {
     if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
@@ -988,9 +941,7 @@ app.whenReady().then(() => {
 
   mainWindow.webContents.on('did-finish-load', () => {
     const currentUrl = mainWindow.webContents.getURL();
-    if (currentUrl.includes('/buyer/login')) {
-      autoLogin();
-    } else if (currentUrl.includes('affiliate.shopee.co.th')) {
+    if (currentUrl.includes('affiliate.shopee.co.th')) {
       startBridge();
     }
   });

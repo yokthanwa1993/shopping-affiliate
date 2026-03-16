@@ -1,10 +1,9 @@
 import { useState, useEffect, useCallback, type FormEvent, type MouseEvent } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { relaunch } from '@tauri-apps/plugin-process'
 import { type Update, check } from '@tauri-apps/plugin-updater'
 import { CreateProfileModal } from './components/CreateProfileModal'
 import { LogViewer } from './components/LogViewer'
 import { DebugConsole } from './components/DebugConsole'
+import { desktopInvoke, desktopRelaunch, isDesktopApp, isTauri } from './desktopBridge'
 import {
   BROWSERSAVING_API_URL,
   COMMENT_TOKEN_SERVICE_URL,
@@ -241,11 +240,6 @@ function rotl(n: number, s: number): number {
   return ((n << s) | (n >>> (32 - s))) >>> 0
 }
 
-// Check if running in Tauri
-const isTauri = () => {
-  return typeof window !== 'undefined' && ('__TAURI__' in window || '__TAURI_INTERNALS__' in window)
-}
-
 const AUTH_SESSION_STORAGE_KEY = 'browsersaving_auth_session'
 const AUTH_ACCOUNTS_STORAGE_KEY = 'browsersaving_auth_accounts'
 const GLOBAL_PROXY_STORAGE_KEY = 'browsersaving_global_proxy'
@@ -268,6 +262,10 @@ type AppUpdateState = {
 }
 
 type TokenFetchSource = 'worker' | 'local'
+
+function getDefaultTokenFetchSource(): TokenFetchSource {
+  return isDesktopApp() ? 'local' : 'worker'
+}
 
 const normalizeAuthEmail = (raw: unknown) => String(raw || '').trim().toLowerCase()
 
@@ -432,7 +430,7 @@ function createRemoteViewerStorageKey(launchId: string) {
 }
 
 function createRemoteViewerReservation(): RemoteViewerReservation | null {
-  if (typeof window === 'undefined' || !REMOTE_LAUNCHER_URL || isTauri()) return null
+  if (typeof window === 'undefined' || !REMOTE_LAUNCHER_URL || isDesktopApp()) return null
   const launchId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -690,7 +688,7 @@ async function resolveStoredPostcronToken(profileId: string): Promise<PostcronTo
 }
 
 async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronTokenResponse> {
-  if (!isTauri()) {
+  if (!isDesktopApp()) {
     return {
       success: false,
       token: '',
@@ -702,12 +700,12 @@ async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronToke
 
   let launchCompleted = false
   try {
-    await invoke<string>('postcron_step_launch_headful', { profileId: profile.id })
+    await desktopInvoke<string>('postcron_step_launch_headful', { profileId: profile.id })
     launchCompleted = true
-    await invoke<string>('postcron_step_navigate')
-    await invoke<string>('postcron_step_click')
+    await desktopInvoke<string>('postcron_step_navigate')
+    await desktopInvoke<string>('postcron_step_click')
 
-    const extracted = await invoke<Record<string, unknown>>('postcron_step_extract')
+    const extracted = await desktopInvoke<Record<string, unknown>>('postcron_step_extract')
     const rawToken = String(extracted?.token || '').trim()
     if (!rawToken) {
       return {
@@ -744,13 +742,14 @@ async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronToke
     }
   } finally {
     if (launchCompleted) {
-      await invoke('postcron_close').catch(() => null)
+      await desktopInvoke('postcron_close').catch(() => null)
     }
   }
 }
 
 async function fetchPostcronToken(profile: Profile): Promise<PostcronTokenResponse> {
-  return fetchPostcronTokenFromApi(profile)
+  void profile
+  return fetchPostcronTokenFromWorker(profile.id)
 }
 
 async function launchBrowser(
@@ -758,11 +757,11 @@ async function launchBrowser(
   authToken?: string,
   viewerReservation?: RemoteViewerReservation | null
 ): Promise<{ success: boolean; error?: string }> {
-  try {
-    await invoke('launch_browser', { profile, authToken })
-    return { success: true }
-  } catch (e) {
-    if (isTauri()) {
+  if (isDesktopApp()) {
+    try {
+      await desktopInvoke('launch_browser', { profile, authToken })
+      return { success: true }
+    } catch (e) {
       return { success: false, error: String(e) }
     }
   }
@@ -798,11 +797,11 @@ async function launchBrowserWithUrl(
   authToken?: string,
   viewerReservation?: RemoteViewerReservation | null
 ): Promise<{ success: boolean; error?: string }> {
-  try {
-    await invoke('launch_browser_with_url', { profile, url, authToken })
-    return { success: true }
-  } catch (e) {
-    if (isTauri()) {
+  if (isDesktopApp()) {
+    try {
+      await desktopInvoke('launch_browser_with_url', { profile, url, authToken })
+      return { success: true }
+    } catch (e) {
       return { success: false, error: String(e) }
     }
   }
@@ -832,10 +831,10 @@ async function launchBrowserWithUrl(
 
 async function launchAndroidEmulator(profile: Profile): Promise<{ success: boolean; avd?: string; error?: string }> {
   try {
-    const avd = await invoke<string>('launch_android_emulator', { profile })
+    const avd = await desktopInvoke<string>('launch_android_emulator', { profile })
     return { success: true, avd }
   } catch (e) {
-    if (!isTauri()) {
+    if (!isDesktopApp()) {
       return { success: false, error: 'Requires desktop app' }
     }
     return { success: false, error: String(e) }
@@ -846,11 +845,11 @@ async function stopBrowser(
   profileId: string,
   authToken?: string
 ): Promise<{ success: boolean; error?: string }> {
-  try {
-    await invoke('stop_browser', { profileId, authToken })
-    return { success: true }
-  } catch (e) {
-    if (isTauri()) {
+  if (isDesktopApp()) {
+    try {
+      await desktopInvoke('stop_browser', { profileId, authToken })
+      return { success: true }
+    } catch (e) {
       return { success: false, error: String(e) }
     }
   }
@@ -879,10 +878,10 @@ interface BrowserStatus {
 }
 
 async function getBrowserStatus(authToken?: string): Promise<BrowserStatus | null> {
-  try {
-    return invoke('get_browser_status')
-  } catch {
-    if (isTauri()) {
+  if (isDesktopApp()) {
+    try {
+      return await desktopInvoke<BrowserStatus>('get_browser_status')
+    } catch {
       return null
     }
   }
@@ -1128,7 +1127,7 @@ function App() {
         installing: false,
         message: `ติดตั้งสำเร็จเวอร์ชัน ${update.version} กำลังรีสตาร์ต...`,
       }))
-      await relaunch()
+      await desktopRelaunch()
     } catch (err) {
       const message = String(err instanceof Error ? err.message : err)
       setAppUpdateState(prev => ({
@@ -1145,7 +1144,7 @@ function App() {
     if (!isTauri()) {
       setAppUpdateState(prev => ({
         ...prev,
-        message: 'OTA อัปเดตทำงานเฉพาะแอป Desktop',
+        message: 'OTA อัปเดตทำงานเฉพาะแอป Tauri',
         availableVersion: '',
         availableNotes: '',
       }))
@@ -1749,7 +1748,7 @@ function App() {
   const handleDebugLaunch = async (profile: Profile) => {
     setLaunchingIds(prev => new Set(prev).add(profile.id))
     try {
-      if (!isTauri()) {
+      if (!isDesktopApp()) {
         alert('Debug mode requires the desktop app')
         return
       }
@@ -1757,13 +1756,13 @@ function App() {
       const launchProfile = getLaunchProfile(profile)
 
       // Launch browser in debug mode
-      await invoke('launch_browser_debug', { profile: launchProfile, authToken: authSession?.token })
+      await desktopInvoke('launch_browser_debug', { profile: launchProfile, authToken: authSession?.token })
 
       // Wait for browser to start
       await new Promise(r => setTimeout(r, 2000))
 
       // Connect CDP directly in app
-      await invoke('connect_cdp', { profileId: profile.id })
+      await desktopInvoke('connect_cdp', { profileId: profile.id })
 
       setDebuggingIds(prev => new Set(prev).add(profile.id))
       setDebugProfile(profile)
@@ -1782,9 +1781,9 @@ function App() {
   }
 
   const handleDebugClose = async (stopBrowserToo: boolean = false) => {
-    if (debugProfile && isTauri()) {
+    if (debugProfile && isDesktopApp()) {
       // Disconnect CDP
-      await invoke('disconnect_cdp', { profileId: debugProfile.id })
+      await desktopInvoke('disconnect_cdp', { profileId: debugProfile.id })
 
       // Stop browser if requested
       if (stopBrowserToo) {
@@ -1800,7 +1799,7 @@ function App() {
     setDebugProfile(null)
   }
 
-  const handleFetchToken = async (profile: Profile, source: TokenFetchSource = 'worker') => {
+  const handleFetchToken = async (profile: Profile, source: TokenFetchSource = getDefaultTokenFetchSource()) => {
     setTokenContextMenu(null)
     setFetchingToken(prev => new Set(prev).add(profile.id))
 
@@ -1924,7 +1923,7 @@ function App() {
     if (fetchingToken.has(profile.id)) return
 
     const menuWidth = 176
-    const menuHeight = 92
+    const menuHeight = 56
     const x = Math.min(event.clientX, window.innerWidth - menuWidth - 12)
     const y = Math.min(event.clientY, window.innerHeight - menuHeight - 12)
     setTokenContextMenu({
@@ -2650,7 +2649,7 @@ function App() {
                                     void handleFetchToken(profile)
                                   }}
                                   onContextMenu={(event) => openTokenContextMenu(event, profile)}
-                                  title={hasTokenPair(profile) ? 'Left click: View Tokens, Right click: Access Token via Cloudflare Script / token.py' : 'Left click: Get Tokens, Right click: Access Token via Cloudflare Script / token.py'}
+                                  title={hasTokenPair(profile) ? 'Left click: View Tokens, Right click: Access Token via token.py' : 'Left click: Get Tokens, Right click: Access Token via token.py'}
                                 >
                                   <svg viewBox="0 0 24 24" aria-hidden="true">
                                     <path fill="#1877F2" d="M22 12.07C22 6.503 17.523 2 12 2S2 6.503 2 12.07c0 5.017 3.657 9.178 8.438 9.93v-7.02H7.898v-2.91h2.54V9.845c0-2.523 1.492-3.917 3.777-3.917 1.094 0 2.238.196 2.238.196v2.476H15.19c-1.243 0-1.63.776-1.63 1.572v1.898h2.773l-.443 2.91h-2.33V22c4.78-.752 8.44-4.913 8.44-9.93z" />
@@ -2797,8 +2796,8 @@ function App() {
             </h3>
 
             <div className="settings-info">
-              <p>POSTCRON TOKEN ใช้ `browsersaving-api` + Browserless แล้ว และจะส่ง proxy ของโปรไฟล์/Global Proxy ไปด้วยทุกครั้ง</p>
-              <p>เมนู `Cloudflare Script` และ `token.py` มีผลเฉพาะ ACCESS TOKEN ด้านบนเท่านั้น</p>
+              <p>POSTCRON TOKEN ใช้ Worker route โดยตรงแล้ว ไม่ต้องอ้อม `browsersaving-api` บน CapRover</p>
+              <p>ACCESS TOKEN ใน desktop app จะใช้ `token.py` local service ถ้ามี Python พร้อมบนเครื่อง</p>
             </div>
           </div>
 
@@ -3076,7 +3075,7 @@ function App() {
                   onClick={() => {
                     const profile = profiles.find(p => p.id === tokenResult.profileId)
                     setTokenResult(null)
-                    if (profile) void handleFetchToken(profile)
+                    if (profile) void handleFetchToken(profile, getDefaultTokenFetchSource())
                   }}
                   disabled={deletingTokenProfileId === tokenResult.profileId}
                 >
@@ -3111,15 +3110,6 @@ function App() {
           style={{ left: tokenContextMenu.x, top: tokenContextMenu.y }}
           onClick={(event) => event.stopPropagation()}
         >
-          <button
-            className="postcron-context-item"
-            onClick={() => {
-              const profile = profiles.find((item) => item.id === tokenContextMenu.profileId)
-              if (profile) void handleFetchToken(profile, 'worker')
-            }}
-          >
-            Cloudflare Script
-          </button>
           <button
             className="postcron-context-item"
             onClick={() => {

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { desktopInvoke, isDesktopApp } from '../desktopBridge'
 import './DebugConsole.css'
 
 interface Profile {
@@ -31,8 +31,6 @@ interface DebugConsoleProps {
   onClose: () => void
 }
 
-const isTauri = () => typeof window !== 'undefined' && '__TAURI__' in window
-
 export function DebugConsole({ profile, onClose }: DebugConsoleProps) {
   const [activeTab, setActiveTab] = useState<'network' | 'console' | 'cookies'>('network')
   const [networkLogs, setNetworkLogs] = useState<NetworkLog[]>([])
@@ -43,11 +41,11 @@ export function DebugConsole({ profile, onClose }: DebugConsoleProps) {
 
   // Fetch logs
   useEffect(() => {
-    if (!autoRefresh || !isTauri()) return
+    if (!autoRefresh || !isDesktopApp()) return
 
     const fetchLogs = async () => {
       try {
-        const data = await invoke('get_debug_logs', { profileId: profile.id }) as {
+        const data = await desktopInvoke('get_debug_logs', { profileId: profile.id }) as {
           network: NetworkLog[]
           console: ConsoleLog[]
           cookies: CookieInfo[]
