@@ -15,7 +15,7 @@ from Crypto.Random import get_random_bytes
 
 class FacebookPasswordEncryptor:
     @staticmethod
-    def get_public_key():
+    def get_public_key(proxy=None):
         try:
             url = 'https://b-graph.facebook.com/pwd_key_fetch'
             params = {
@@ -26,15 +26,21 @@ class FacebookPasswordEncryptor:
                 'fb_api_caller_class': 'com.facebook.auth.login.AuthOperations',
                 'access_token': '438142079694454|fc0a7caa49b192f64f6f5a6d9643bb28'
             }
-            response = requests.post(url, params=params).json()
+            request_kwargs = {}
+            if proxy:
+                request_kwargs['proxies'] = {
+                    'http': proxy,
+                    'https': proxy,
+                }
+            response = requests.post(url, params=params, **request_kwargs).json()
             return response.get('public_key'), str(response.get('key_id', '25'))
         except Exception as e:
             raise Exception(f"Không thể lấy public key: {e}")
 
     @staticmethod
-    def encrypt(password, public_key=None, key_id="25"):
+    def encrypt(password, public_key=None, key_id="25", proxy=None):
         if public_key is None:
-            public_key, key_id = FacebookPasswordEncryptor.get_public_key()
+            public_key, key_id = FacebookPasswordEncryptor.get_public_key(proxy=proxy)
 
         try:
             rand_key = get_random_bytes(32)
@@ -114,14 +120,15 @@ class FacebookLogin:
         "x-fb-server-cluster": "True"
     }
     
-    def __init__(self, uid_phone_mail, password, twwwoo2fa="", machine_id=None, convert_token_to=None, convert_all_tokens=False):
+    def __init__(self, uid_phone_mail, password, twwwoo2fa="", machine_id=None, convert_token_to=None, convert_all_tokens=False, proxy=None):
         self.uid_phone_mail = uid_phone_mail
         self.twwwoo2fa = twwwoo2fa
+        self.proxy = (proxy or "").strip()
         
         if password.startswith("#PWD_FB4A"):
             self.password = password
         else:
-            self.password = FacebookPasswordEncryptor.encrypt(password)
+            self.password = FacebookPasswordEncryptor.encrypt(password, proxy=self.proxy)
         
         if convert_all_tokens:
             self.convert_token_to = FacebookAppTokens.get_all_app_keys()
@@ -131,6 +138,12 @@ class FacebookLogin:
             self.convert_token_to = []
         
         self.session = requests.Session()
+        self.session.trust_env = False
+        if self.proxy:
+            self.session.proxies.update({
+                "http": self.proxy,
+                "https": self.proxy,
+            })
         
         self.device_id = str(uuid.uuid4())
         self.adid = str(uuid.uuid4())
@@ -206,7 +219,7 @@ class FacebookLogin:
             if not app_id:
                 return None
             
-            response = requests.post(
+            response = self.session.post(
                 'https://api.facebook.com/method/auth.getSessionforApp',
                 data={
                     'access_token': access_token,
@@ -363,13 +376,15 @@ if __name__ == "__main__":
     password = input("Password: ").strip()
     twwwoo2fa = input("2FA Secret: ").replace(" ", "")
     machine_id = input("datr (เว้นว่างถ้าไม่มี): ").strip() or None
+    proxy = input("Proxy (optional): ").strip() or None
 
     fb_login = FacebookLogin(
         uid_phone_mail=uid_phone_mail,
         password=password,
         twwwoo2fa=twwwoo2fa,
         machine_id=machine_id,
-        convert_token_to=['FB_LITE']
+        convert_token_to=['FB_LITE'],
+        proxy=proxy,
     )
 
     result = fb_login.login()

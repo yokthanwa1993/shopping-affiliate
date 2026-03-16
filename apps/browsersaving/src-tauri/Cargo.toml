@@ -39,3 +39,5 @@ chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-feature
 async-tungstenite = { version = "0.27", features = ["tokio-native-tls"] }
 futures = "0.3"
 sha2 = "0.10"
+url = "2.5"
+base64 = "0.22"

@@ -1,0 +1,94 @@
+services:
+  shortlink-chearb:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: shortlink-chearb
+    restart: unless-stopped
+    environment:
+      SHORTLINK_MAIN: main.js
+      SHORTLINK_VNC_PORT: 8443
+      SHORTLINK_HTTP_PORT: 3000
+      SHORTLINK_DISPLAY: :1
+      SHORTLINK_WIDTH: ${SHORTLINK_CHEARB_WIDTH:-1440}
+      SHORTLINK_HEIGHT: ${SHORTLINK_CHEARB_HEIGHT:-900}
+      SHORTLINK_USER_DATA_DIR: /data/user-data
+    ports:
+      - "${SHORTLINK_CHEARB_HTTP_BIND:-127.0.0.1}:${SHORTLINK_CHEARB_HTTP_PORT:-3000}:3000"
+      - "${SHORTLINK_CHEARB_VNC_BIND:-0.0.0.0}:${SHORTLINK_CHEARB_VNC_PORT:-8443}:8443"
+    volumes:
+      - "${SHORTLINK_CHEARB_USER_DATA:-./data/chearb}:/data/user-data"
+
+  shortlink-neezs:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: shortlink-neezs
+    restart: unless-stopped
+    environment:
+      SHORTLINK_MAIN: main-neezs.js
+      SHORTLINK_VNC_PORT: 8444
+      SHORTLINK_HTTP_PORT: 3001
+      SHORTLINK_DISPLAY: :1
+      SHORTLINK_WIDTH: ${SHORTLINK_NEEZS_WIDTH:-1440}
+      SHORTLINK_HEIGHT: ${SHORTLINK_NEEZS_HEIGHT:-900}
+      SHORTLINK_USER_DATA_DIR: /data/user-data
+    ports:
+      - "${SHORTLINK_NEEZS_HTTP_BIND:-127.0.0.1}:${SHORTLINK_NEEZS_HTTP_PORT:-3001}:3001"
+      - "${SHORTLINK_NEEZS_VNC_BIND:-0.0.0.0}:${SHORTLINK_NEEZS_VNC_PORT:-8444}:8444"
+    volumes:
+      - "${SHORTLINK_NEEZS_USER_DATA:-./data/neezs}:/data/user-data"
+
+  shortlink-golf:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: shortlink-golf
+    restart: unless-stopped
+    environment:
+      SHORTLINK_MAIN: main.js
+      SHORTLINK_ACCOUNT_KEY: golf
+      SHORTLINK_APP_NAME: Shopee Affiliate - GOLF
+      SHORTLINK_LOCALHOST_LABEL: เปิด localhost:3002
+      SHORTLINK_ACCOUNT_EMAIL: ${SHORTLINK_GOLF_ACCOUNT_EMAIL:-}
+      SHORTLINK_ACCOUNT_PASSWORD: ${SHORTLINK_GOLF_ACCOUNT_PASSWORD:-}
+      SHORTLINK_WORKER_URL: https://golf-shopee-shortlink.yokthanwa1993-bc9.workers.dev
+      SHORTLINK_WORKER_WS: wss://golf-shopee-shortlink.yokthanwa1993-bc9.workers.dev/ws
+      SHORTLINK_VNC_PORT: 8445
+      SHORTLINK_HTTP_PORT: 3002
+      SHORTLINK_DISPLAY: :1
+      SHORTLINK_WIDTH: ${SHORTLINK_GOLF_WIDTH:-1440}
+      SHORTLINK_HEIGHT: ${SHORTLINK_GOLF_HEIGHT:-900}
+      SHORTLINK_USER_DATA_DIR: /data/user-data
+    ports:
+      - "${SHORTLINK_GOLF_HTTP_BIND:-127.0.0.1}:${SHORTLINK_GOLF_HTTP_PORT:-3002}:3002"
+      - "${SHORTLINK_GOLF_VNC_BIND:-0.0.0.0}:${SHORTLINK_GOLF_VNC_PORT:-8445}:8445"
+    volumes:
+      - "${SHORTLINK_GOLF_USER_DATA:-./data/golf}:/data/user-data"
+
+  shortlink-first:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: shortlink-first
+    restart: unless-stopped
+    environment:
+      SHORTLINK_MAIN: main.js
+      SHORTLINK_ACCOUNT_KEY: first
+      SHORTLINK_APP_NAME: Shopee Affiliate - FIRST
+      SHORTLINK_LOCALHOST_LABEL: เปิด localhost:3003
+      SHORTLINK_ACCOUNT_EMAIL: ${SHORTLINK_FIRST_ACCOUNT_EMAIL:-}
+      SHORTLINK_ACCOUNT_PASSWORD: ${SHORTLINK_FIRST_ACCOUNT_PASSWORD:-}
+      SHORTLINK_WORKER_URL: https://first-shopee-shortlink.yokthanwa1993-bc9.workers.dev
+      SHORTLINK_WORKER_WS: wss://first-shopee-shortlink.yokthanwa1993-bc9.workers.dev/ws
+      SHORTLINK_VNC_PORT: 8446
+      SHORTLINK_HTTP_PORT: 3003
+      SHORTLINK_DISPLAY: :1
+      SHORTLINK_WIDTH: ${SHORTLINK_FIRST_WIDTH:-1440}
+      SHORTLINK_HEIGHT: ${SHORTLINK_FIRST_HEIGHT:-900}
+      SHORTLINK_USER_DATA_DIR: /data/user-data
+    ports:
+      - "${SHORTLINK_FIRST_HTTP_BIND:-127.0.0.1}:${SHORTLINK_FIRST_HTTP_PORT:-3003}:3003"
+      - "${SHORTLINK_FIRST_VNC_BIND:-0.0.0.0}:${SHORTLINK_FIRST_VNC_PORT:-8446}:8446"
+    volumes:
+      - "${SHORTLINK_FIRST_USER_DATA:-./data/first}:/data/user-data"

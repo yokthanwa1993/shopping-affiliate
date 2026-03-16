@@ -8,4 +8,5 @@ ENV PORT=80
 ENV WORKER_URL=https://browsersaving-worker.yokthanwa1993-bc9.workers.dev
 ENV BROWSERLESS_WS=ws://srv-captain--browserless:3000
 ENV BROWSERLESS_TOKEN=77482ddfd0ec44d1c1a8b55ddf352d98
+ENV BROWSERLESS_PUBLIC_URL=https://browserless.lslly.com
 CMD ["node", "index.js"]

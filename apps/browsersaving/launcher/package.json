@@ -1,0 +1,13 @@
+{
+  "name": "browsersaving-remote-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@hyperbrowser/sdk": "^0.87.0",
+    "puppeteer-core": "^21.9.0",
+    "http-proxy": "^1.18.1"
+  }
+}

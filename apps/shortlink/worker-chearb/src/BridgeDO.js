@@ -12,6 +12,11 @@ export class BridgeDO {
     if (url.pathname === '/ws') {
       const upgrade = request.headers.get('Upgrade');
       if (upgrade !== 'websocket') return new Response('Expected WebSocket', { status: 426 });
+      for (const socket of this.state.getWebSockets('bridge')) {
+        try {
+          socket.close(1012, 'Replacing stale bridge');
+        } catch (_) {}
+      }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.state.acceptWebSocket(server, ['bridge']);
@@ -26,6 +31,14 @@ export class BridgeDO {
   async webSocketMessage(ws, message) {
     try {
       const result = JSON.parse(message);
+      if (result?.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', ts: result.ts || Date.now() }));
+        return;
+      }
+      if (result?.type === 'hello') {
+        ws.send(JSON.stringify({ type: 'hello-ack', now: Date.now() }));
+        return;
+      }
       const { jobId, ok, shortLink, utmSource, normalizedUrl, redirectUrl, error } = result;
       const job = this.pendingJobs.get(jobId);
       if (!job) return;
@@ -57,6 +70,7 @@ export class BridgeDO {
     if (sockets.length === 0) {
       return json({ error: 'Electron app ไม่ได้เชื่อมต่อ — เปิด app ก่อน' }, 503);
     }
+    const bridgeSocket = sockets[sockets.length - 1];
 
     const jobId = crypto.randomUUID();
     const payload = {
@@ -69,13 +83,20 @@ export class BridgeDO {
     };
 
     // ส่ง job ไปทาง WebSocket ทันที
-    sockets[0].send(JSON.stringify({ jobId, payload }));
+    try {
+      bridgeSocket.send(JSON.stringify({ jobId, payload }));
+    } catch (_) {
+      try {
+        bridgeSocket.close(1011, 'Send failed');
+      } catch (_) {}
+      return json({ error: 'Electron app ไม่ได้เชื่อมต่อ — เปิด app ก่อน' }, 503);
+    }
 
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pendingJobs.delete(jobId);
         resolve(json({ error: 'หมดเวลา — Electron ไม่ตอบกลับ' }, 504));
-      }, 20000);
+      }, 30000);
 
       this.pendingJobs.set(jobId, {
         timer,

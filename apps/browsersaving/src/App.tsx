@@ -5,10 +5,13 @@ import { type Update, check } from '@tauri-apps/plugin-updater'
 import { CreateProfileModal } from './components/CreateProfileModal'
 import { LogViewer } from './components/LogViewer'
 import { DebugConsole } from './components/DebugConsole'
+import {
+  BROWSERSAVING_API_URL,
+  COMMENT_TOKEN_SERVICE_URL,
+  REMOTE_LAUNCHER_URL,
+  SERVER_URL,
+} from './runtimeConfig'
 import './index.css'
-
-// Server URL (fallback for web mode)
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev'
 
 const PROFILE_TAG_OPTIONS = ['post', 'comment', 'mobile', 'admin'] as const
 
@@ -103,6 +106,24 @@ type PostcronTokenResponse = {
   detail: string
   pageName?: string
   pageAvatarUrl?: string
+}
+
+type RemoteLauncherResponse = {
+  success?: boolean
+  error?: string
+  detail?: string
+  viewer_url?: string
+  profile_id?: string
+  stopped?: boolean
+  uploaded?: boolean
+  running?: string[]
+  uploading?: string[]
+  android_running?: string[]
+  android_uploading?: string[]
+}
+
+type RemoteViewerReservation = {
+  launchId: string
 }
 
 // TOTP Generator
@@ -227,6 +248,9 @@ const isTauri = () => {
 
 const AUTH_SESSION_STORAGE_KEY = 'browsersaving_auth_session'
 const AUTH_ACCOUNTS_STORAGE_KEY = 'browsersaving_auth_accounts'
+const GLOBAL_PROXY_STORAGE_KEY = 'browsersaving_global_proxy'
+const REMOTE_VIEWER_LAUNCH_STORAGE_KEY = 'browsersaving_remote_viewer_launch'
+const REMOTE_RUNNING_PROFILES_STORAGE_KEY = 'browsersaving_remote_running_profiles'
 
 type AuthSession = {
   token: string
@@ -252,6 +276,34 @@ function normalizeAuthSession(raw: unknown): AuthSession | null {
   const email = normalizeAuthEmail((raw as AuthSession | null | undefined)?.email || '')
   if (!token || !email) return null
   return { token, email }
+}
+
+function getStoredGlobalProxy(): string {
+  if (typeof window === 'undefined') return ''
+  return localStorage.getItem(GLOBAL_PROXY_STORAGE_KEY) || ''
+}
+
+function getStoredRemoteRunningProfileIds(): string[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(REMOTE_RUNNING_PROFILES_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return Array.from(new Set(parsed.map((value) => String(value || '').trim()).filter(Boolean)))
+  } catch {
+    return []
+  }
+}
+
+function storeRemoteRunningProfileIds(ids: Iterable<string>) {
+  if (typeof window === 'undefined') return
+  const next = Array.from(new Set(Array.from(ids).map((value) => String(value || '').trim()).filter(Boolean)))
+  if (next.length > 0) {
+    localStorage.setItem(REMOTE_RUNNING_PROFILES_STORAGE_KEY, JSON.stringify(next))
+  } else {
+    localStorage.removeItem(REMOTE_RUNNING_PROFILES_STORAGE_KEY)
+  }
 }
 
 function dedupeAuthSessions(sessions: AuthSession[]): AuthSession[] {
@@ -337,6 +389,118 @@ async function apiFetch(path: string, init: RequestInit = {}, sessionOverride?: 
     headers.set('Content-Type', 'application/json')
   }
   return fetch(`${SERVER_URL}${path}`, { ...init, headers })
+}
+
+async function apiServiceFetch(path: string, init: RequestInit = {}, sessionOverride?: AuthSession | null): Promise<Response> {
+  const headers = createWorkerHeaders(init.headers, sessionOverride)
+  const body = init.body
+  if (body && !(body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  return fetch(`${BROWSERSAVING_API_URL}${path}`, { ...init, headers })
+}
+
+async function remoteLauncherFetch(
+  path: string,
+  init: RequestInit = {},
+  authToken?: string
+): Promise<RemoteLauncherResponse> {
+  if (!REMOTE_LAUNCHER_URL) {
+    throw new Error('Remote launcher is not configured')
+  }
+
+  const headers = new Headers(init.headers)
+  const body = init.body
+  if (body && !(body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+  headers.set('Accept', 'application/json')
+  if (authToken) {
+    headers.set('x-auth-token', authToken)
+  }
+
+  const res = await fetch(`${REMOTE_LAUNCHER_URL}${path}`, { ...init, headers })
+  const data = await res.json().catch(() => ({} as RemoteLauncherResponse))
+  if (!res.ok || data?.success === false) {
+    throw new Error(String(data?.error || data?.detail || `HTTP ${res.status}`))
+  }
+  return data
+}
+
+function createRemoteViewerStorageKey(launchId: string) {
+  return `${REMOTE_VIEWER_LAUNCH_STORAGE_KEY}:${launchId}`
+}
+
+function createRemoteViewerReservation(): RemoteViewerReservation | null {
+  if (typeof window === 'undefined' || !REMOTE_LAUNCHER_URL || isTauri()) return null
+  const launchId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const placeholderUrl = `${window.location.origin}/remote-viewer.html?launch=${encodeURIComponent(launchId)}`
+  const popup = window.open(placeholderUrl, '_blank')
+  if (!popup) return null
+  return { launchId }
+}
+
+function publishRemoteViewerReservation(
+  reservation: RemoteViewerReservation | null | undefined,
+  payload: { viewerUrl?: string; error?: string }
+): boolean {
+  if (!reservation || typeof window === 'undefined') return false
+  try {
+    localStorage.setItem(createRemoteViewerStorageKey(reservation.launchId), JSON.stringify({
+      viewerUrl: String(payload.viewerUrl || '').trim(),
+      error: String(payload.error || '').trim(),
+      updatedAt: Date.now(),
+    }))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function notifyRemoteViewerFailure(
+  reservation: RemoteViewerReservation | null | undefined,
+  error: string
+) {
+  publishRemoteViewerReservation(reservation, { error })
+}
+
+function openRemoteViewer(
+  viewerUrl: string,
+  reservation?: RemoteViewerReservation | null
+) {
+  const target = viewerUrl.trim()
+  if (!target) return
+  if (publishRemoteViewerReservation(reservation, { viewerUrl: target })) {
+    return
+  }
+  const popup = window.open('', '_blank')
+  if (popup) {
+    try {
+      popup.opener = null
+    } catch {
+      // Ignore cross-window opener cleanup failures.
+    }
+    popup.location.replace(target)
+    return
+  }
+  window.location.href = target
+}
+
+function getRemoteLaunchViewport() {
+  if (typeof window === 'undefined') return undefined
+
+  const visualViewport = window.visualViewport
+  const width = Math.round(visualViewport?.width || window.innerWidth || 1280)
+  const height = Math.round(visualViewport?.height || window.innerHeight || 800)
+  const deviceScaleFactor = Math.min(2, Math.max(1, window.devicePixelRatio || 1))
+
+  return {
+    width: Math.max(640, width),
+    height: Math.max(480, height),
+    deviceScaleFactor,
+  }
 }
 
 async function loginWithEmailPassword(email: string, password: string): Promise<AuthSession> {
@@ -470,6 +634,36 @@ async function fetchPostcronTokenFromWorker(profileId: string): Promise<Postcron
   }
 }
 
+async function fetchPostcronTokenFromApi(profile: Profile): Promise<PostcronTokenResponse> {
+  try {
+    const headers = new Headers()
+    if (profile.proxy?.trim()) {
+      headers.set('x-profile-proxy', profile.proxy.trim())
+    }
+
+    const res = await apiServiceFetch(`/api/postcron/${profile.id}/post`, { headers })
+    const data = await res.json().catch(() => ({} as any))
+    const token = String(data?.token || '').trim()
+    return {
+      success: res.ok && !!data?.success && !!token,
+      token,
+      error: String(data?.error || (res.ok ? '' : `HTTP ${res.status}`)).trim(),
+      reason: String(data?.reason || '').trim(),
+      detail: String(data?.detail || '').trim(),
+      pageName: String(data?.page_name || '').trim() || undefined,
+      pageAvatarUrl: String(data?.page_avatar_url || '').trim() || undefined,
+    }
+  } catch (err) {
+    return {
+      success: false,
+      token: '',
+      error: String(err || 'Postcron API request failed'),
+      reason: '',
+      detail: '',
+    }
+  }
+}
+
 async function resolveStoredPostcronToken(profileId: string): Promise<PostcronTokenResponse> {
   try {
     const res = await apiFetch(`/api/postcron/${profileId}/post`)
@@ -556,12 +750,13 @@ async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronToke
 }
 
 async function fetchPostcronToken(profile: Profile): Promise<PostcronTokenResponse> {
-  return fetchPostcronTokenFromWorker(profile.id)
+  return fetchPostcronTokenFromApi(profile)
 }
 
 async function launchBrowser(
   profile: Profile,
-  authToken?: string
+  authToken?: string,
+  viewerReservation?: RemoteViewerReservation | null
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await invoke('launch_browser', { profile, authToken })
@@ -569,6 +764,26 @@ async function launchBrowser(
   } catch (e) {
     if (isTauri()) {
       return { success: false, error: String(e) }
+    }
+  }
+
+  if (REMOTE_LAUNCHER_URL) {
+    try {
+      const viewport = getRemoteLaunchViewport()
+      const result = await remoteLauncherFetch('/api/sessions/launch', {
+        method: 'POST',
+        body: JSON.stringify({ profile, viewport }),
+      }, authToken)
+      const viewerUrl = String(result?.viewer_url || '').trim()
+      if (!viewerUrl) {
+        throw new Error('Launcher did not return a viewer URL')
+      }
+      openRemoteViewer(viewerUrl, viewerReservation)
+      return { success: true }
+    } catch (e) {
+      const error = String(e || 'Failed to launch remote profile')
+      notifyRemoteViewerFailure(viewerReservation, error)
+      return { success: false, error }
     }
   }
 
@@ -580,7 +795,8 @@ async function launchBrowser(
 async function launchBrowserWithUrl(
   profile: Profile,
   url: string,
-  authToken?: string
+  authToken?: string,
+  viewerReservation?: RemoteViewerReservation | null
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await invoke('launch_browser_with_url', { profile, url, authToken })
@@ -588,6 +804,26 @@ async function launchBrowserWithUrl(
   } catch (e) {
     if (isTauri()) {
       return { success: false, error: String(e) }
+    }
+  }
+
+  if (REMOTE_LAUNCHER_URL) {
+    try {
+      const viewport = getRemoteLaunchViewport()
+      const result = await remoteLauncherFetch('/api/sessions/launch', {
+        method: 'POST',
+        body: JSON.stringify({ profile, url, viewport }),
+      }, authToken)
+      const viewerUrl = String(result?.viewer_url || '').trim()
+      if (!viewerUrl) {
+        throw new Error('Launcher did not return a viewer URL')
+      }
+      openRemoteViewer(viewerUrl, viewerReservation)
+      return { success: true }
+    } catch (e) {
+      const error = String(e || 'Failed to launch remote profile')
+      notifyRemoteViewerFailure(viewerReservation, error)
+      return { success: false, error }
     }
   }
 
@@ -619,6 +855,17 @@ async function stopBrowser(
     }
   }
 
+  if (REMOTE_LAUNCHER_URL) {
+    try {
+      await remoteLauncherFetch(`/api/sessions/${encodeURIComponent(profileId)}`, {
+        method: 'DELETE',
+      }, authToken)
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
   // Web mode - use custom URL scheme
   window.location.href = `browsersaving://stop/${profileId}`
   return { success: true }
@@ -631,12 +878,26 @@ interface BrowserStatus {
   android_uploading: string[]
 }
 
-async function getBrowserStatus(): Promise<BrowserStatus> {
+async function getBrowserStatus(authToken?: string): Promise<BrowserStatus | null> {
   try {
     return invoke('get_browser_status')
   } catch {
     if (isTauri()) {
-      return { running: [], uploading: [], android_running: [], android_uploading: [] }
+      return null
+    }
+  }
+
+  if (REMOTE_LAUNCHER_URL) {
+    try {
+      const data = await remoteLauncherFetch('/api/status', {}, authToken)
+      return {
+        running: Array.isArray(data.running) ? data.running : [],
+        uploading: Array.isArray(data.uploading) ? data.uploading : [],
+        android_running: Array.isArray(data.android_running) ? data.android_running : [],
+        android_uploading: Array.isArray(data.android_uploading) ? data.android_uploading : [],
+      }
+    } catch {
+      return null
     }
   }
 
@@ -650,7 +911,7 @@ async function getBrowserStatus(): Promise<BrowserStatus> {
       android_uploading: data.android_uploading || [],
     }
   } catch {
-    return { running: [], uploading: [], android_running: [], android_uploading: [] }
+    return null
   }
 }
 
@@ -670,7 +931,7 @@ function App() {
   const [secondaryLoginEmail, setSecondaryLoginEmail] = useState('')
   const [secondaryLoginPassword, setSecondaryLoginPassword] = useState('')
   const [profiles, setProfiles] = useState<Profile[]>([])
-  const [runningIds, setRunningIds] = useState<Set<string>>(new Set())
+  const [runningIds, setRunningIds] = useState<Set<string>>(() => new Set(getStoredRemoteRunningProfileIds()))
   const [launchingIds, setLaunchingIds] = useState<Set<string>>(new Set())
   const [launchingAndroidIds, setLaunchingAndroidIds] = useState<Set<string>>(new Set())
   const [uploadingIds, setUploadingIds] = useState<Set<string>>(new Set())
@@ -709,6 +970,8 @@ function App() {
     const saved = localStorage.getItem('uiScale')
     return saved ? parseFloat(saved) : 1.0
   })
+  const [globalProxyDraft, setGlobalProxyDraft] = useState(() => getStoredGlobalProxy())
+  const [globalProxy, setGlobalProxy] = useState(() => getStoredGlobalProxy().trim())
   const [tagPickerProfileId, setTagPickerProfileId] = useState<string | null>(null)
   const [savingTagIds, setSavingTagIds] = useState<Set<string>>(new Set())
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>({
@@ -755,6 +1018,27 @@ function App() {
     setTokenContextMenu(null)
     setTagPickerProfileId(null)
   }, [])
+
+  const effectiveGlobalProxy = globalProxy.trim()
+  const globalProxyDirty = globalProxyDraft.trim() !== effectiveGlobalProxy
+  const setRemoteProfileRunning = useCallback((profileId: string, isRunning: boolean) => {
+    const normalizedId = String(profileId || '').trim()
+    if (!normalizedId) return
+    setRunningIds((prev) => {
+      const next = new Set(prev)
+      if (isRunning) {
+        next.add(normalizedId)
+      } else {
+        next.delete(normalizedId)
+      }
+      storeRemoteRunningProfileIds(next)
+      return next
+    })
+  }, [])
+  const getLaunchProfile = useCallback((profile: Profile): Profile => {
+    if (!effectiveGlobalProxy) return profile
+    return { ...profile, proxy: effectiveGlobalProxy }
+  }, [effectiveGlobalProxy])
 
   const applyAuthenticatedSession = useCallback((session: AuthSession, existingAccounts?: AuthSession[]) => {
     const normalizedSession = normalizeAuthSession(session)
@@ -935,6 +1219,22 @@ function App() {
       return null
     }
   }, [installUpdateNow])
+
+  const saveGlobalProxy = useCallback(() => {
+    const normalized = globalProxyDraft.trim()
+    setGlobalProxy(normalized)
+    if (normalized) {
+      localStorage.setItem(GLOBAL_PROXY_STORAGE_KEY, normalized)
+    } else {
+      localStorage.removeItem(GLOBAL_PROXY_STORAGE_KEY)
+    }
+  }, [globalProxyDraft])
+
+  const clearGlobalProxy = useCallback(() => {
+    setGlobalProxyDraft('')
+    setGlobalProxy('')
+    localStorage.removeItem(GLOBAL_PROXY_STORAGE_KEY)
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -1201,15 +1501,55 @@ function App() {
 
   const checkStatus = useCallback(async () => {
     try {
-      const status = await getBrowserStatus()
-      setRunningIds(new Set(status.running))
+      const status = await getBrowserStatus(authSession?.token)
+      if (!status) return
+      const nextRunning = new Set(status.running)
+      if (REMOTE_LAUNCHER_URL) {
+        for (const profileId of getStoredRemoteRunningProfileIds()) {
+          nextRunning.add(profileId)
+        }
+      }
+      setRunningIds(nextRunning)
       setUploadingIds(new Set(status.uploading))
       setRunningAndroidIds(new Set(status.android_running || []))
       setUploadingAndroidIds(new Set(status.android_uploading || []))
     } catch {
       // Silent fail for status check
     }
-  }, [])
+  }, [authSession?.token])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !REMOTE_LAUNCHER_URL) return
+
+    let remoteOrigin = ''
+    try {
+      remoteOrigin = new URL(REMOTE_LAUNCHER_URL).origin
+    } catch {
+      remoteOrigin = ''
+    }
+
+    const handleViewerMessage = (event: MessageEvent) => {
+      if (remoteOrigin && event.origin !== remoteOrigin) return
+      const payload = event.data
+      if (!payload || typeof payload !== 'object') return
+
+      const type = String((payload as { type?: unknown }).type || '').trim()
+      const profileId = String((payload as { profileId?: unknown }).profileId || '').trim()
+      if (!type || !profileId) return
+
+      if (type === 'browsersaving-viewer-opened') {
+        setRemoteProfileRunning(profileId, true)
+        return
+      }
+
+      if (type === 'browsersaving-viewer-closing' || type === 'browsersaving-viewer-closed') {
+        setRemoteProfileRunning(profileId, false)
+      }
+    }
+
+    window.addEventListener('message', handleViewerMessage)
+    return () => window.removeEventListener('message', handleViewerMessage)
+  }, [setRemoteProfileRunning])
 
   useEffect(() => {
     if (authChecking || !authSession?.token) {
@@ -1414,8 +1754,10 @@ function App() {
         return
       }
 
+      const launchProfile = getLaunchProfile(profile)
+
       // Launch browser in debug mode
-      await invoke('launch_browser_debug', { profile, authToken: authSession?.token })
+      await invoke('launch_browser_debug', { profile: launchProfile, authToken: authSession?.token })
 
       // Wait for browser to start
       await new Promise(r => setTimeout(r, 2000))
@@ -1467,20 +1809,30 @@ function App() {
       let data: any = {}
 
       if (source === 'local') {
-        if (!isTauri()) {
-          throw new Error('Local token mode requires the desktop app')
-        }
-
-        const localUserToken = String(await invoke<string>('get_comment_token_via_script', {
-          uid: profile.uid,
-          username: profile.username,
-          password: profile.password,
-          totpSecret: profile.totp_secret,
-          datr: profile.datr,
-        }) || '').trim()
+        const proxyProfile = getLaunchProfile(profile)
+        const loginId = String(profile.uid || profile.username || '').trim()
+        const remoteResp = await fetch(COMMENT_TOKEN_SERVICE_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({
+            uid: loginId,
+            username: loginId,
+            password: profile.password,
+            '2fa': profile.totp_secret || null,
+            datr: profile.datr || null,
+            proxy: proxyProfile.proxy || '',
+            target_app: 'FB_LITE',
+          }),
+        })
+        const remoteData = await remoteResp.json().catch(() => ({} as any))
+        const localUserToken = String(remoteData?.token || '').trim()
 
         if (!localUserToken) {
-          throw new Error('Local CLI returned empty token')
+          const errorMessage = remoteData?.error || `HTTP ${remoteResp.status}`
+          throw new Error(errorMessage)
         }
 
         res = await apiFetch(`/api/token/${profile.id}/resolve`, {
@@ -1513,7 +1865,7 @@ function App() {
       let postcronReason = ''
       let postcronDetail = ''
 
-      const postcron = await fetchPostcronToken(profile)
+      const postcron = await fetchPostcronToken(getLaunchProfile(profile))
       if (postcron.success) {
         postcronToken = postcron.token
       } else {
@@ -1616,12 +1968,15 @@ function App() {
   }
 
   const handleLaunch = async (profile: Profile) => {
+    const viewerReservation = createRemoteViewerReservation()
     setLaunchingIds(prev => new Set(prev).add(profile.id))
     try {
-      // Show spinner first
-      await new Promise(r => setTimeout(r, 500))
-      const result = await launchBrowser(profile, authSession?.token)
-      if (!result.success) alert(result.error || 'Failed to launch')
+      const result = await launchBrowser(getLaunchProfile(profile), authSession?.token, viewerReservation)
+      if (!result.success) {
+        alert(result.error || 'Failed to launch')
+      } else {
+        setRemoteProfileRunning(profile.id, true)
+      }
       await checkStatus()
     } finally {
       setLaunchingIds(prev => {
@@ -1633,13 +1988,23 @@ function App() {
   }
 
   const handleStop = async (id: string) => {
-    const result = await stopBrowser(id, authSession?.token)
-    if (!result.success) {
-      alert(result.error || 'Failed to stop profile')
-      return
+    setUploadingIds(prev => new Set(prev).add(id))
+    try {
+      const result = await stopBrowser(id, authSession?.token)
+      if (!result.success) {
+        alert(result.error || 'Failed to stop profile')
+        return
+      }
+      setRemoteProfileRunning(id, false)
+      await loadProfiles()
+      await checkStatus()
+    } finally {
+      setUploadingIds(prev => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
     }
-    await loadProfiles()
-    await checkStatus()
   }
 
   const handleLaunchAndroid = async (profile: Profile) => {
@@ -2357,6 +2722,63 @@ function App() {
         </>
       )}
 
+      {/* Proxy Page */}
+      {currentPage === 'proxy' && (
+        <div className="settings-page">
+          <div className="toolbar">
+            <h2>Proxy</h2>
+          </div>
+
+          <div className="settings-section">
+            <h3 className="settings-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                <path d="M12 2v20M2 12h20" opacity="0.25" />
+                <path d="M5 12a7 7 0 1 0 14 0a7 7 0 1 0 -14 0" />
+                <path d="M9 12h6" />
+              </svg>
+              Global Proxy
+            </h3>
+
+            <form
+              onSubmit={(event) => {
+                event.preventDefault()
+                saveGlobalProxy()
+              }}
+            >
+              <div className="settings-field">
+                <label>Proxy URL</label>
+                <input
+                  type="text"
+                  value={globalProxyDraft}
+                  onChange={(event) => setGlobalProxyDraft(event.target.value)}
+                  placeholder="bind://10.255.15.10"
+                />
+              </div>
+
+              <div className="settings-actions">
+                <button className="btn-primary" type="submit" disabled={!globalProxyDirty}>
+                  Save Global Proxy
+                </button>
+                <button className="btn-outline" type="button" onClick={clearGlobalProxy}>
+                  Clear
+                </button>
+              </div>
+            </form>
+
+            <div className="settings-info">
+              <p>ค่าตรงนี้จะ override `proxy` ของทุกโปรไฟล์ตอนกด `Launch` และ `Debug`</p>
+              <p>ถ้าปล่อยว่างหรือกด `Clear` ระบบจะกลับไปใช้ proxy รายโปรไฟล์ตามเดิม</p>
+              <p>รองรับทั้ง `bind://10.255.15.10`, `http://proxy:lTXPuJiaYCLCVN7B@10.255.15.2:3128`, และ `socks5://proxy:lTXPuJiaYCLCVN7B@10.255.15.2:1080`</p>
+              {effectiveGlobalProxy ? (
+                <p>Current active proxy: <code>{effectiveGlobalProxy}</code></p>
+              ) : (
+                <p>Current active proxy: <code>disabled</code></p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Settings Page */}
       {currentPage === 'settings' && (
         <div className="settings-page">
@@ -2371,11 +2793,11 @@ function App() {
                 <circle cx="8.5" cy="8.5" r="1.5" />
                 <path d="M21 15l-5-5L5 21" />
               </svg>
-              Postcron Renderer
+              Postcron Browserless
             </h3>
 
             <div className="settings-info">
-              <p>POSTCRON TOKEN ใช้ Cloudflare Browser Rendering ผ่าน `browsersaving-worker` โดยตรงแล้ว</p>
+              <p>POSTCRON TOKEN ใช้ `browsersaving-api` + Browserless แล้ว และจะส่ง proxy ของโปรไฟล์/Global Proxy ไปด้วยทุกครั้ง</p>
               <p>เมนู `Cloudflare Script` และ `token.py` มีผลเฉพาะ ACCESS TOKEN ด้านบนเท่านั้น</p>
             </div>
           </div>

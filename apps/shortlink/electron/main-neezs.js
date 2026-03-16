@@ -1,12 +1,61 @@
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, protocol, session } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, protocol, session, screen } = require('electron');
 const http = require('http');
 const path = require('path');
 const WebSocket = require('ws');
 
-const PORT = 3001;
-const ACCOUNT = { username: 'affiliate@neezs.com', password: '!Affiliate@neezs' };
+function envOrDefault(name, fallback) {
+  return Object.prototype.hasOwnProperty.call(process.env, name) ? process.env[name] : fallback;
+}
+
+const PORT = Number(process.env.SHORTLINK_HTTP_PORT || 3001);
+const ACCOUNT = {
+  username: envOrDefault('SHORTLINK_ACCOUNT_EMAIL', 'affiliate@neezs.com'),
+  password: envOrDefault('SHORTLINK_ACCOUNT_PASSWORD', '!Affiliate@neezs'),
+};
+const AFFILIATE_URL = envOrDefault('SHORTLINK_AFFILIATE_URL', 'https://affiliate.shopee.co.th/offer/custom_link');
+const AFFILIATE_LOGIN_URL = `https://shopee.co.th/buyer/login?next=${encodeURIComponent(AFFILIATE_URL)}`;
+const ACCOUNT_KEY = envOrDefault('SHORTLINK_ACCOUNT_KEY', 'neezs').trim().toLowerCase();
+const APP_NAME = envOrDefault('SHORTLINK_APP_NAME', `Shopee Shortlink (${ACCOUNT_KEY})`);
+const LOCALHOST_LABEL = envOrDefault('SHORTLINK_LOCALHOST_LABEL', `เปิด localhost:${PORT}`);
+const BRIDGE_HEARTBEAT_MS = 15000;
+const BRIDGE_STALE_MS = 45000;
+const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
+const BRIDGE_RECONNECT_DELAY_MS = 3000;
+const VNC_TARGETS = {
+  chearb: process.env.SHORTLINK_VNC_CHEARB || 'https://chearbshortlink.pubilo.com/vnc.html?autoconnect=1&resize=remote',
+  neezs: process.env.SHORTLINK_VNC_NEEZS || 'https://neezsshortlink.pubilo.com/vnc.html?autoconnect=1&resize=remote',
+  golf: process.env.SHORTLINK_VNC_GOLF || 'https://golfshortlink.pubilo.com/vnc.html?autoconnect=1&resize=remote',
+  first: process.env.SHORTLINK_VNC_FIRST || 'https://firstshortlink.pubilo.com/vnc.html?autoconnect=1&resize=remote',
+};
 let tray = null;
 let mainWindow = null;
+let lastJobStartedAt = 0;
+let lastJobFinishedAt = 0;
+let lastJobError = '';
+let loadAffiliatePage = null;
+let jobQueue = Promise.resolve();
+
+function fitMainWindowToDisplay() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  const { x, y, width, height } = screen.getPrimaryDisplay().bounds;
+  mainWindow.setBounds({ x, y, width, height });
+  mainWindow.setFullScreen(true);
+}
+
+function resetWebContentsScale() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  try {
+    const { webContents } = mainWindow;
+    if (!webContents || webContents.isDestroyed()) return;
+
+    webContents.setZoomLevel(0);
+    webContents.setZoomFactor(1);
+  } catch (_) {
+    // Display topology can change while a frame is being replaced.
+  }
+}
 
 // ── URL normalizer ─────────────────────────────────────────────────────────────
 
@@ -43,6 +92,10 @@ async function expandUrl(url) {
 
 async function autoLogin() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!ACCOUNT.username || !ACCOUNT.password) {
+    console.log('[AutoLogin] Missing credentials — waiting for manual login');
+    return;
+  }
   const currentUrl = mainWindow.webContents.getURL();
   // หน้า login อยู่ที่ shopee.co.th/buyer/login
   if (!currentUrl.includes('/buyer/login')) return;
@@ -84,6 +137,64 @@ async function autoLogin() {
   `);
 }
 
+async function getAffiliateSessionSnapshot() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return {
+      cookies: [],
+      cookieNames: [],
+      csrfToken: '',
+      hasAuthCookie: false,
+    };
+  }
+
+  const webSession = mainWindow.webContents.session || session.defaultSession;
+  const cookieUrls = [
+    'https://affiliate.shopee.co.th',
+    'https://shopee.co.th',
+  ];
+
+  try {
+    const cookieLists = await Promise.all(cookieUrls.map((url) => webSession.cookies.get({ url })));
+    const cookies = [];
+    const seen = new Set();
+
+    for (const list of cookieLists) {
+      for (const cookie of list) {
+        const key = `${cookie.domain}|${cookie.path}|${cookie.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        cookies.push(cookie);
+      }
+    }
+
+    const findCookie = (name) => cookies.find((cookie) => cookie.name === name && cookie.value);
+    const csrfToken = findCookie('csrftoken')?.value || '';
+    const hasAuthCookie = Boolean(
+      csrfToken ||
+      findCookie('SPC_F') ||
+      findCookie('SPC_EC') ||
+      findCookie('SPC_T_ID') ||
+      findCookie('SPC_CDS') ||
+      findCookie('SPC_SI')
+    );
+
+    return {
+      cookies,
+      cookieNames: cookies.map((cookie) => cookie.name),
+      csrfToken,
+      hasAuthCookie,
+    };
+  } catch (error) {
+    return {
+      cookies: [],
+      cookieNames: [],
+      csrfToken: '',
+      hasAuthCookie: false,
+      cookieError: error.message,
+    };
+  }
+}
+
 // ── Shopee GraphQL via WebView XHR ─────────────────────────────────────────────
 // Runs in Shopee's page context → Shopee SDK auto-injects security headers
 
@@ -91,6 +202,8 @@ async function generateLink(url, subIds) {
   if (!mainWindow || mainWindow.isDestroyed()) {
     throw new Error('WebView ยังไม่พร้อม');
   }
+
+  await ensureAffiliateContext();
 
   const advancedLinkParams = {};
   const keys = ['subId1', 'subId2', 'subId3', 'subId4', 'subId5'];
@@ -113,6 +226,8 @@ async function generateLink(url, subIds) {
 
   const endpoint = 'https://affiliate.shopee.co.th/api/v3/gql?q=batchCustomLink';
   const bodyStr = JSON.stringify(gqlBody);
+  const sessionSnapshot = await getAffiliateSessionSnapshot();
+  const sessionCsrfToken = sessionSnapshot.csrfToken;
 
   // executeJavaScript runs in renderer (Shopee page context)
   // Shopee's SDK hooks XMLHttpRequest and adds security headers automatically
@@ -120,8 +235,11 @@ async function generateLink(url, subIds) {
     (function() {
       return new Promise((resolve) => {
         try {
-          const csrfMatch = document.cookie.match(/csrftoken=([^;]+)/);
-          const csrfToken = csrfMatch ? csrfMatch[1] : '';
+          let fallbackMatch = null;
+          try {
+            fallbackMatch = document.cookie.match(/csrftoken=([^;]+)/);
+          } catch (_) {}
+          const csrfToken = ${JSON.stringify(sessionCsrfToken)} || (fallbackMatch ? fallbackMatch[1] : '');
 
           const xhr = new XMLHttpRequest();
           xhr.open('POST', ${JSON.stringify(endpoint)}, true);
@@ -177,9 +295,243 @@ async function generateLink(url, subIds) {
   return { shortLink: result.shortLink, utmSource: result.utmSource };
 }
 
+function enqueueJob(task) {
+  const runner = jobQueue.then(task, task);
+  jobQueue = runner.catch(() => {});
+  return runner;
+}
+
+async function runShortlinkJob(rawUrl, subIds) {
+  const expandedUrl = await expandUrl(rawUrl);
+  const normalizedUrl = normalizeShopeeUrl(expandedUrl);
+  console.log('[Shortlink] Job:', rawUrl, '→', normalizedUrl);
+
+  lastJobStartedAt = Date.now();
+  lastJobError = '';
+
+  try {
+    const result = await generateLink(normalizedUrl, subIds);
+    lastJobFinishedAt = Date.now();
+    return { ...result, expandedUrl, normalizedUrl };
+  } catch (error) {
+    lastJobFinishedAt = Date.now();
+    lastJobError = error.message;
+    throw error;
+  }
+}
+
+function isAffiliatePageUrl(url = '') {
+  return url.includes('affiliate.shopee.co.th');
+}
+
+function isCustomLinkPageUrl(url = '') {
+  return url.startsWith(AFFILIATE_URL) || url.includes('affiliate.shopee.co.th/offer/custom_link');
+}
+
+async function probeAffiliatePageAccess() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return { href: '', cookieReadable: false, readyState: 'unknown' };
+  }
+
+  try {
+    return await mainWindow.webContents.executeJavaScript(`
+      (() => {
+        try {
+          void document.cookie;
+          return {
+            href: location.href,
+            cookieReadable: true,
+            readyState: document.readyState
+          };
+        } catch (error) {
+          return {
+            href: location.href,
+            cookieReadable: false,
+            readyState: document.readyState,
+            error: error.message
+          };
+        }
+      })()
+    `);
+  } catch (error) {
+    return {
+      href: '',
+      cookieReadable: false,
+      readyState: 'unknown',
+      error: error.message,
+    };
+  }
+}
+
+function isLoginPageUrl(url = '') {
+  return url.includes('/buyer/login');
+}
+
+function isCaptchaPageUrl(url = '') {
+  return url.includes('/verify/captcha');
+}
+
+async function ensureAffiliateContext() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('WebView ยังไม่พร้อม');
+  }
+
+  const deadline = Date.now() + 20000;
+  let lastReloadAt = 0;
+
+  while (Date.now() < deadline) {
+    const currentUrl = mainWindow.webContents.getURL();
+    const probe = await probeAffiliatePageAccess();
+    const probeUrl = typeof probe?.href === 'string' ? probe.href : '';
+    const sessionSnapshot = await getAffiliateSessionSnapshot();
+
+    if (isCustomLinkPageUrl(currentUrl) && isCustomLinkPageUrl(probeUrl) && probe?.cookieReadable && sessionSnapshot.hasAuthCookie) {
+      return currentUrl;
+    }
+
+    if (isLoginPageUrl(currentUrl)) {
+      await autoLogin();
+    } else if (isLoginPageUrl(probeUrl)) {
+      await autoLogin();
+    } else if (isCaptchaPageUrl(currentUrl)) {
+      throw new Error('Shopee ต้องยืนยัน CAPTCHA ในหน้าจอ');
+    } else if (isCaptchaPageUrl(probeUrl)) {
+      throw new Error('Shopee ต้องยืนยัน CAPTCHA ในหน้าจอ');
+    } else if ((isCustomLinkPageUrl(currentUrl) || isCustomLinkPageUrl(probeUrl)) && !sessionSnapshot.hasAuthCookie) {
+      if (typeof loadAffiliatePage === 'function' && Date.now() - lastReloadAt >= 4000) {
+        lastReloadAt = Date.now();
+        void loadAffiliatePage({ forceLogin: true });
+      }
+    } else if (typeof loadAffiliatePage === 'function' && Date.now() - lastReloadAt >= 4000) {
+      lastReloadAt = Date.now();
+      void loadAffiliatePage();
+    }
+
+    await sleep(1500);
+  }
+
+  throw new Error('Shopee custom_link page ไม่พร้อม');
+}
+
 // ── HTTP Server ────────────────────────────────────────────────────────────────
 
-const server = http.createServer(async (req, res) => {
+function getBridgeReadyState() {
+  if (!bridgeWs) return 'CLOSED';
+  switch (bridgeWs.readyState) {
+    case WebSocket.CONNECTING:
+      return 'CONNECTING';
+    case WebSocket.OPEN:
+      return 'OPEN';
+    case WebSocket.CLOSING:
+      return 'CLOSING';
+    case WebSocket.CLOSED:
+    default:
+      return 'CLOSED';
+  }
+}
+
+function getBridgeSnapshot() {
+  const now = Date.now();
+  const lastSeenAt = Math.max(bridgeLastPongAt, bridgeLastMessageAt, bridgeLastConnectAt, 0);
+  const staleForMs = lastSeenAt ? now - lastSeenAt : null;
+
+  return {
+    running: bridgeRunning,
+    connected: getBridgeReadyState() === 'OPEN',
+    readyState: getBridgeReadyState(),
+    lastConnectAt: bridgeLastConnectAt || null,
+    lastDisconnectAt: bridgeLastDisconnectAt || null,
+    lastPongAt: bridgeLastPongAt || null,
+    lastMessageAt: bridgeLastMessageAt || null,
+    lastSeenAt: lastSeenAt || null,
+    staleForMs,
+    reconnectAttempts: bridgeReconnectAttempts,
+    reconnectScheduled: Boolean(bridgeReconnectTimer),
+    lastError: bridgeLastError || null,
+  };
+}
+
+function renderViewerLauncherHtml() {
+  return `<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shortlink Viewer</title>
+  <style>
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1115;color:#f3f4f6;font-family:system-ui,sans-serif}
+    .card{width:min(560px,calc(100vw - 32px));background:#171a20;border:1px solid #2a3040;border-radius:20px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.35)}
+    h1{margin:0 0 8px;font-size:28px}
+    p{margin:0 0 20px;color:#aab2c5;line-height:1.5}
+    .actions{display:grid;gap:12px}
+    a{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-radius:14px;background:#202634;color:#fff;text-decoration:none;border:1px solid #31394d}
+    a:hover{background:#263047}
+    code{background:#11151f;border:1px solid #31394d;padding:2px 6px;border-radius:8px;color:#dbe5ff}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Shortlink Viewer</h1>
+    <p>เลือก account ที่ต้องการเปิดหน้าจอ KasmVNC หรือตรงด้วย query เช่น <code>/vnc.html?launch=chearb</code></p>
+    <div class="actions">
+      <a href="/vnc.html?launch=chearb">เปิด chearb <span>→</span></a>
+      <a href="/vnc.html?launch=neezs">เปิด neezs <span>→</span></a>
+      <a href="/vnc.html?launch=golf">เปิด golf <span>→</span></a>
+      <a href="/vnc.html?launch=first">เปิด first <span>→</span></a>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+async function buildStatusPayload() {
+  const webviewReady = !!(mainWindow && !mainWindow.isDestroyed());
+  const currentUrl = webviewReady ? mainWindow.webContents.getURL() : '';
+  const isAffiliatePage = isAffiliatePageUrl(currentUrl);
+  const isCustomLinkPage = isCustomLinkPageUrl(currentUrl);
+  const isLoginPage = isLoginPageUrl(currentUrl);
+  const isCaptchaPage = isCaptchaPageUrl(currentUrl);
+  const probe = webviewReady ? await probeAffiliatePageAccess() : { cookieReadable: false, readyState: 'unknown', href: '' };
+  const sessionSnapshot = webviewReady ? await getAffiliateSessionSnapshot() : { hasAuthCookie: false, cookies: [] };
+  const bridge = getBridgeSnapshot();
+  const loggedIn = isAffiliatePage && !isLoginPage && !isCaptchaPage && sessionSnapshot.hasAuthCookie;
+  const ready = webviewReady && bridge.connected && isCustomLinkPage && !isLoginPage && !isCaptchaPage && sessionSnapshot.hasAuthCookie && probe.cookieReadable;
+
+  return {
+    server: true,
+    webview: webviewReady,
+    url: currentUrl,
+    loggedIn,
+    affiliatePage: isAffiliatePage,
+    customLinkPage: isCustomLinkPage,
+    ready,
+    captcha: isCaptchaPage,
+    rendererReadyState: probe.readyState,
+    cookieReadable: probe.cookieReadable,
+    rendererUrl: probe.href || null,
+    rendererError: probe.error || null,
+    sessionCookieCount: sessionSnapshot.cookies.length,
+    bridge,
+    lastJobStartedAt: lastJobStartedAt || null,
+    lastJobFinishedAt: lastJobFinishedAt || null,
+    lastJobError: lastJobError || null,
+  };
+}
+
+function buildLivenessPayload() {
+  const webviewReady = !!(mainWindow && !mainWindow.isDestroyed());
+  return {
+    server: true,
+    webview: webviewReady,
+    url: webviewReady ? mainWindow.webContents.getURL() : '',
+    bridge: getBridgeSnapshot(),
+    lastJobStartedAt: lastJobStartedAt || null,
+    lastJobFinishedAt: lastJobFinishedAt || null,
+    lastJobError: lastJobError || null,
+  };
+}
+
+async function handleRequest(req, res) {
   const [pathname, qs] = req.url.split('?');
   const params = new URLSearchParams(qs || '');
   const rawUrl = params.get('url');
@@ -188,18 +540,40 @@ const server = http.createServer(async (req, res) => {
 
   res.setHeader('Access-Control-Allow-Origin', '*');
 
+  if (pathname === '/vnc.html' || pathname === '/viewer') {
+    const launch = (params.get('launch') || '').trim().toLowerCase();
+    const target = VNC_TARGETS[launch];
+    if (target) {
+      res.writeHead(302, { Location: target });
+      res.end();
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderViewerLauncherHtml());
+    return;
+  }
+
+  if (pathname === '/livez') {
+    const payload = buildLivenessPayload();
+    const statusCode = payload.server && payload.webview ? 200 : 503;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
   if (pathname === '/status') {
-    const webviewReady = !!(mainWindow && !mainWindow.isDestroyed());
-    const currentUrl = webviewReady ? mainWindow.webContents.getURL() : '';
-    const isAffiliatePage = currentUrl.includes('affiliate.shopee.co.th');
-    const isOnCustomLink = currentUrl.includes('/offer/custom_link') || currentUrl.includes('/offer');
+    const payload = await buildStatusPayload();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      server: true,
-      webview: webviewReady,
-      url: currentUrl,
-      loggedIn: isAffiliatePage && isOnCustomLink,
-    }));
+    res.end(JSON.stringify(payload));
+    return;
+  }
+
+  if (pathname === '/readyz') {
+    const payload = await buildStatusPayload();
+    const statusCode = payload.ready ? 200 : 503;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
     return;
   }
 
@@ -211,12 +585,18 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
+      const sessionSnapshot = await getAffiliateSessionSnapshot();
       const info = await mainWindow.webContents.executeJavaScript(`({
         url: location.href,
         cookie: document.cookie.substring(0, 200),
         title: document.title,
         readyState: document.readyState,
       })`);
+      info.sessionCookieCount = sessionSnapshot.cookies.length;
+      info.sessionCookieNames = sessionSnapshot.cookieNames;
+      info.hasAuthCookie = sessionSnapshot.hasAuthCookie;
+      info.hasCsrfToken = Boolean(sessionSnapshot.csrfToken);
+      if (sessionSnapshot.cookieError) info.cookieError = sessionSnapshot.cookieError;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(info));
     } catch (e) {
@@ -251,11 +631,11 @@ code{background:#f0f0f0;padding:2px 8px;border-radius:4px;font-size:12px}</style
   const subIds = [1, 2, 3, 4, 5].map(i => params.get(`sub${i}`) || '');
 
   try {
-    const { shortLink, utmSource } = await generateLink(url, subIds);
+    const { shortLink, utmSource, normalizedUrl } = await enqueueJob(() => runShortlinkJob(rawUrl || url, subIds));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       originalLink: rawUrl || null,
-      longLink: url,
+      longLink: normalizedUrl,
       shortLink,
       ...(utmSource ? { utm_source: utmSource } : {}),
       sub1: params.get('sub1') || null,
@@ -268,50 +648,151 @@ code{background:#f0f0f0;padding:2px 8px;border-radius:4px;font-size:12px}</style
     res.writeHead(504, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: err.message }));
   }
+}
+
+const server = http.createServer((req, res) => {
+  Promise.resolve(handleRequest(req, res)).catch((error) => {
+    console.error(`[HTTP] ${req.method} ${req.url} failed:`, error);
+    if (res.headersSent || res.writableEnded) return;
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error.message || 'Internal server error' }));
+  });
 });
 
 // ── Cloudflare Worker Bridge (poll loop) ──────────────────────────────────────
 // รัน polling loop ใน main process — แทน Chrome extension
 
-const WORKER_URL = 'https://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev';
-const WORKER_WS  = 'wss://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev/ws';
+const WORKER_URL = process.env.SHORTLINK_WORKER_URL || 'https://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev';
+const WORKER_WS  = process.env.SHORTLINK_WORKER_WS || `${WORKER_URL.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')}/ws`;
 let bridgeRunning = false;
 let bridgeWs = null;
+let bridgeReconnectTimer = null;
+let bridgeHeartbeatTimer = null;
+let bridgeWatchdogTimer = null;
+let bridgeConnectStartedAt = 0;
+let bridgeLastConnectAt = 0;
+let bridgeLastDisconnectAt = 0;
+let bridgeLastPongAt = 0;
+let bridgeLastMessageAt = 0;
+let bridgeReconnectAttempts = 0;
+let bridgeLastError = '';
 
 async function startBridge() {
-  if (bridgeRunning) return;
+  if (bridgeRunning) return connectBridgeWs();
   bridgeRunning = true;
+  startBridgeWatchdog();
   connectBridgeWs();
+}
+
+function clearBridgeHeartbeat() {
+  if (!bridgeHeartbeatTimer) return;
+  clearInterval(bridgeHeartbeatTimer);
+  bridgeHeartbeatTimer = null;
+}
+
+function startBridgeHeartbeat(ws) {
+  clearBridgeHeartbeat();
+  bridgeHeartbeatTimer = setInterval(() => {
+    if (!bridgeRunning || bridgeWs !== ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+    } catch (error) {
+      bridgeLastError = error.message;
+    }
+  }, BRIDGE_HEARTBEAT_MS);
+}
+
+function scheduleBridgeReconnect(reason, delayMs = BRIDGE_RECONNECT_DELAY_MS) {
+  if (!bridgeRunning || bridgeReconnectTimer) return;
+  bridgeReconnectAttempts += 1;
+  console.log(`[Bridge] Reconnecting in ${delayMs}ms (${reason})`);
+  bridgeReconnectTimer = setTimeout(() => {
+    bridgeReconnectTimer = null;
+    connectBridgeWs();
+  }, delayMs);
+}
+
+function startBridgeWatchdog() {
+  if (bridgeWatchdogTimer) return;
+  bridgeWatchdogTimer = setInterval(() => {
+    if (!bridgeRunning) return;
+
+    const state = getBridgeReadyState();
+    if (state === 'OPEN') {
+      const lastSeenAt = Math.max(bridgeLastPongAt, bridgeLastMessageAt, bridgeLastConnectAt, 0);
+      if (lastSeenAt && Date.now() - lastSeenAt > BRIDGE_STALE_MS) {
+        console.error('[Bridge] No heartbeat from Worker — forcing reconnect');
+        try {
+          bridgeWs?.terminate();
+        } catch (_) {}
+      }
+      return;
+    }
+
+    if (state === 'CONNECTING') {
+      if (bridgeConnectStartedAt && Date.now() - bridgeConnectStartedAt > BRIDGE_CONNECT_TIMEOUT_MS) {
+        console.error('[Bridge] Connect timeout — forcing reconnect');
+        try {
+          bridgeWs?.terminate();
+        } catch (_) {}
+      }
+      return;
+    }
+
+    scheduleBridgeReconnect(`socket state ${state}`, 1000);
+  }, 5000);
 }
 
 function connectBridgeWs() {
   if (!bridgeRunning) return;
+  if (bridgeWs && (bridgeWs.readyState === WebSocket.OPEN || bridgeWs.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
 
   console.log('[Bridge] Connecting WebSocket →', WORKER_WS);
   const ws = new WebSocket(WORKER_WS);
   bridgeWs = ws;
+  bridgeConnectStartedAt = Date.now();
 
   ws.on('open', () => {
+    if (bridgeWs !== ws) return;
     console.log('[Bridge] WebSocket connected ✅');
+    bridgeLastConnectAt = Date.now();
+    bridgeLastMessageAt = bridgeLastConnectAt;
+    bridgeLastPongAt = bridgeLastConnectAt;
+    bridgeReconnectAttempts = 0;
+    bridgeLastError = '';
+    startBridgeHeartbeat(ws);
+    try {
+      ws.send(JSON.stringify({
+        type: 'hello',
+        port: PORT,
+        account: ACCOUNT.username,
+        currentUrl: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : '',
+      }));
+    } catch (error) {
+      bridgeLastError = error.message;
+    }
   });
 
   ws.on('message', async (data) => {
+    if (bridgeWs !== ws) return;
+    bridgeLastMessageAt = Date.now();
     let msg;
     try { msg = JSON.parse(data); } catch (_) { return; }
+    if (msg?.type === 'pong' || msg?.type === 'hello-ack') {
+      bridgeLastPongAt = Date.now();
+      return;
+    }
     const { jobId, payload } = msg;
     if (!jobId || !payload) return;
 
     const { rawUrl, subId1, subId2, subId3, subId4, subId5 } = payload;
     const subIds = [subId1, subId2, subId3, subId4, subId5].map(v => v || '');
 
-    // expand s.shopee.co.th → full URL, then normalize
-    const expandedUrl = await expandUrl(rawUrl);
-    const productUrl = normalizeShopeeUrl(expandedUrl);
-    console.log('[Bridge] Job:', jobId, rawUrl, '→', productUrl);
-
     try {
-      const { shortLink, utmSource } = await generateLink(productUrl, subIds);
-      ws.send(JSON.stringify({ jobId, ok: true, shortLink, utmSource, normalizedUrl: productUrl, redirectUrl: expandedUrl !== rawUrl ? expandedUrl.split('?')[0] : undefined }));
+      const { shortLink, utmSource, normalizedUrl, expandedUrl } = await enqueueJob(() => runShortlinkJob(rawUrl, subIds));
+      ws.send(JSON.stringify({ jobId, ok: true, shortLink, utmSource, normalizedUrl, redirectUrl: expandedUrl !== rawUrl ? expandedUrl.split('?')[0] : undefined }));
       console.log('[Bridge] Done:', shortLink);
     } catch (err) {
       ws.send(JSON.stringify({ jobId, ok: false, error: err.message }));
@@ -320,12 +801,17 @@ function connectBridgeWs() {
   });
 
   ws.on('close', () => {
-    bridgeWs = null;
+    if (bridgeWs === ws) {
+      bridgeWs = null;
+    }
+    bridgeLastDisconnectAt = Date.now();
+    clearBridgeHeartbeat();
     console.log('[Bridge] Disconnected — reconnecting in 3s...');
-    if (bridgeRunning) setTimeout(connectBridgeWs, 3000);
+    scheduleBridgeReconnect('socket closed');
   });
 
   ws.on('error', (err) => {
+    bridgeLastError = err.message;
     console.error('[Bridge] WS error:', err.message);
   });
 }
@@ -348,7 +834,7 @@ function buildTrayMenu() {
       },
     },
     {
-      label: 'เปิด localhost:3000',
+      label: LOCALHOST_LABEL,
       click: () => shell.openExternal(`http://localhost:${PORT}`),
     },
     { type: 'separator' },
@@ -374,12 +860,20 @@ app.whenReady().then(() => {
   if (process.platform === 'darwin') app.dock.hide();
 
   // ── Main Window (Shopee Affiliate WebView) ──
+  const { x, y, width, height } = screen.getPrimaryDisplay().bounds;
+
   mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    show: true,
+    x,
+    y,
+    width,
+    height,
+    show: false,
+    autoHideMenuBar: true,
+    fullscreen: true,
+    fullscreenable: true,
     maximizable: true,
-    title: 'Shopee Affiliate — NEEZS',
+    title: APP_NAME,
+    backgroundColor: '#ffffff',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -389,20 +883,55 @@ app.whenReady().then(() => {
     },
   });
 
-  mainWindow.maximize();
+  mainWindow.removeMenu();
+  mainWindow.setMenuBarVisibility(false);
 
-  function loadAffiliatePage() {
-    mainWindow.loadURL('https://affiliate.shopee.co.th/offer/custom_link');
-  }
+  const syncWindowToDisplay = () => {
+    fitMainWindowToDisplay();
+    resetWebContentsScale();
+    mainWindow.show();
+    mainWindow.focus();
+  };
 
-  loadAffiliatePage();
+  screen.on('display-added', syncWindowToDisplay);
+  screen.on('display-removed', syncWindowToDisplay);
+  screen.on('display-metrics-changed', syncWindowToDisplay);
+
+  mainWindow.once('ready-to-show', syncWindowToDisplay);
+
+  loadAffiliatePage = async function loadAffiliatePageImpl({ forceLogin = false } = {}) {
+    resetWebContentsScale();
+    const sessionSnapshot = forceLogin ? { hasAuthCookie: false } : await getAffiliateSessionSnapshot();
+    const targetUrl = sessionSnapshot.hasAuthCookie ? AFFILIATE_URL : AFFILIATE_LOGIN_URL;
+    mainWindow.loadURL(targetUrl);
+  };
+
+  void loadAffiliatePage();
 
   // ถ้าโหลดไม่ได้ (เน็ต/renderer ยังไม่พร้อม) → retry อัตโนมัติ
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDesc) => {
     if (errorCode === -3) return; // ERR_ABORTED (user navigated away) — ไม่ต้อง retry
     console.log(`[Load] failed (${errorCode}: ${errorDesc}) — retrying in 3s...`);
-    setTimeout(loadAffiliatePage, 3000);
+    setTimeout(() => {
+      void loadAffiliatePage();
+    }, 3000);
   });
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    resetWebContentsScale();
+  });
+
+  setInterval(async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const currentUrl = mainWindow.webContents.getURL();
+    if (isCaptchaPageUrl(currentUrl)) return;
+    const sessionSnapshot = await getAffiliateSessionSnapshot();
+    if (isLoginPageUrl(currentUrl)) return;
+    if (isCustomLinkPageUrl(currentUrl) && sessionSnapshot.hasAuthCookie) return;
+    if (typeof loadAffiliatePage === 'function') {
+      await loadAffiliatePage({ forceLogin: !sessionSnapshot.hasAuthCookie });
+    }
+  }, 15000);
 
   // Block wvjbscheme:// and other unknown protocols (Shopee WebViewJavascriptBridge)
   mainWindow.webContents.on('will-navigate', (event, url) => {
@@ -454,7 +983,9 @@ app.whenReady().then(() => {
     console.error('Server error:', err.message);
   });
 
-  // ── Start Cloudflare Worker bridge after WebView loads ──
+  // ── Keep Cloudflare Worker bridge alive even if Shopee redirects away temporarily ──
+  startBridge();
+
   mainWindow.webContents.on('did-finish-load', () => {
     const currentUrl = mainWindow.webContents.getURL();
     if (currentUrl.includes('/buyer/login')) {
@@ -475,4 +1006,20 @@ app.whenReady().then(() => {
 // Don't quit when all windows are closed (tray app)
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  bridgeRunning = false;
+  clearBridgeHeartbeat();
+  if (bridgeWatchdogTimer) {
+    clearInterval(bridgeWatchdogTimer);
+    bridgeWatchdogTimer = null;
+  }
+  if (bridgeReconnectTimer) {
+    clearTimeout(bridgeReconnectTimer);
+    bridgeReconnectTimer = null;
+  }
+  try {
+    bridgeWs?.terminate();
+  } catch (_) {}
 });

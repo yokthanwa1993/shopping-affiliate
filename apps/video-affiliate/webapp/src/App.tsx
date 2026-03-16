@@ -161,6 +161,7 @@ interface PostHistory {
   fb_reel_url?: string
   posted_at: string
   status: string
+  trigger_source?: string | null
   page_name: string
   page_image: string
   post_token_hint?: string | null
@@ -3978,6 +3979,21 @@ function App() {
                     const isExpanded = expandedLogId === item.id
                     const postActor = String(item.post_profile_name || item.post_profile_id || item.post_token_hint || '').trim() || '-'
                     const commentActor = String(item.comment_profile_name || item.comment_profile_id || item.comment_token_hint || '').trim() || '-'
+                    const triggerSource = String(item.trigger_source || '').trim().toLowerCase()
+                    const triggerSourceLabel = triggerSource === 'force_post'
+                      ? 'FORCE_POST'
+                      : triggerSource === 'cron'
+                        ? 'CRON'
+                        : triggerSource === 'queue'
+                          ? 'QUEUE'
+                          : '-'
+                    const triggerSourceCls = triggerSource === 'force_post'
+                      ? 'bg-orange-50 text-orange-700'
+                      : triggerSource === 'cron'
+                        ? 'bg-sky-50 text-sky-700'
+                        : triggerSource === 'queue'
+                          ? 'bg-violet-50 text-violet-700'
+                          : 'bg-gray-100 text-gray-500'
                     const shortlinkUtmSource = (() => {
                       const direct = String(item.shortlink_utm_source || '').trim()
                       if (direct) return direct
@@ -4030,7 +4046,12 @@ function App() {
                           {/* Info */}
                           <div className="flex-1 min-w-0">
                             <p className="text-sm font-bold text-gray-900 truncate">{item.page_name}</p>
-                            <p className="text-xs text-gray-400">{timeStr} น.</p>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <p className="text-xs text-gray-400">{timeStr} น.</p>
+                              <span className={`inline-flex items-center whitespace-nowrap text-[10px] font-bold px-1.5 py-0.5 rounded-md ${triggerSourceCls}`}>
+                                {triggerSourceLabel}
+                              </span>
+                            </div>
                           </div>
                           {/* Status + Link */}
                           <div className="flex items-center gap-2 shrink-0">
@@ -4099,6 +4120,7 @@ function App() {
 
                         {isExpanded && (
                           <div className="px-3 pb-3 pt-2 border-t border-gray-100 text-xs text-gray-500 space-y-2">
+                            <p><span className="font-semibold text-gray-700">Source:</span> {triggerSourceLabel}</p>
                             <p><span className="font-semibold text-gray-700">โพสต์:</span> {postMeta.label}</p>
                             <p><span className="font-semibold text-gray-700">โพสต์ด้วย:</span> {postActor}</p>
                             <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>

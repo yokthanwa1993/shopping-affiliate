@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Launching Profile</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #111318;
+        color: #f5f7fb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top, rgba(90, 152, 255, 0.18), transparent 45%),
+          linear-gradient(180deg, #171b23 0%, #0f1218 100%);
+      }
+
+      main {
+        width: min(480px, calc(100vw - 32px));
+        padding: 32px 28px;
+        border-radius: 20px;
+        background: rgba(19, 23, 31, 0.94);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: 28px;
+        line-height: 1.1;
+      }
+
+      p {
+        margin: 0;
+        line-height: 1.6;
+        color: rgba(245, 247, 251, 0.74);
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .dot {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        background: #68a1ff;
+        box-shadow: 0 0 0 0 rgba(104, 161, 255, 0.6);
+        animation: pulse 1.4s infinite;
+      }
+
+      .dot.error {
+        background: #ff6b6b;
+        box-shadow: none;
+        animation: none;
+      }
+
+      .hint {
+        margin-top: 16px;
+        font-size: 14px;
+        color: rgba(245, 247, 251, 0.5);
+      }
+
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(104, 161, 255, 0.6);
+        }
+        70% {
+          box-shadow: 0 0 0 14px rgba(104, 161, 255, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(104, 161, 255, 0);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="status">
+        <div class="dot" id="status-dot"></div>
+        <strong id="status-title">Launching profile...</strong>
+      </div>
+      <p id="status-message">Waiting for BrowserSaving to connect this tab to the selected profile.</p>
+      <p class="hint">This tab will redirect automatically when the remote browser session is ready.</p>
+    </main>
+    <script>
+      (function () {
+        const params = new URLSearchParams(window.location.search);
+        const launchId = String(params.get('launch') || '').trim();
+        const storageKey = launchId ? `browsersaving_remote_viewer_launch:${launchId}` : '';
+        const dot = document.getElementById('status-dot');
+        const title = document.getElementById('status-title');
+        const message = document.getElementById('status-message');
+
+        function setStatus(nextTitle, nextMessage, isError) {
+          if (title) title.textContent = nextTitle;
+          if (message) message.textContent = nextMessage;
+          if (dot) dot.className = isError ? 'dot error' : 'dot';
+        }
+
+        function consumePayload() {
+          if (!storageKey) {
+            setStatus('Launch token missing', 'Open the profile again from the dashboard.', true);
+            return true;
+          }
+
+          const raw = window.localStorage.getItem(storageKey);
+          if (!raw) return false;
+
+          let payload = {};
+          try {
+            payload = JSON.parse(raw);
+          } catch {
+            window.localStorage.removeItem(storageKey);
+            setStatus('Launch payload invalid', 'Please try opening the profile again.', true);
+            return true;
+          }
+
+          const viewerUrl = String(payload.viewerUrl || '').trim();
+          const error = String(payload.error || '').trim();
+
+          if (viewerUrl) {
+            window.localStorage.removeItem(storageKey);
+            try {
+              window.opener = null;
+            } catch {}
+            window.location.replace(viewerUrl);
+            return true;
+          }
+
+          if (error) {
+            window.localStorage.removeItem(storageKey);
+            setStatus('Failed to launch profile', error, true);
+            return true;
+          }
+
+          return false;
+        }
+
+        if (!consumePayload()) {
+          window.addEventListener('storage', function (event) {
+            if (event.key === storageKey) {
+              consumePayload();
+            }
+          });
+
+          window.setInterval(consumePayload, 800);
+
+          window.setTimeout(function () {
+            setStatus('Still launching...', 'The browser session is taking longer than usual. This tab will redirect as soon as it is ready.', false);
+          }, 12000);
+        }
+      })();
+    </script>
+  </body>
+</html>

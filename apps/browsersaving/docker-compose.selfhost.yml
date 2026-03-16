@@ -1,0 +1,117 @@
+services:
+  browsersaving-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: browsersaving-web
+    restart: unless-stopped
+    ports:
+      - "${BROWSERSAVING_WEB_BIND:-127.0.0.1}:${BROWSERSAVING_WEB_PORT:-18081}:80"
+    environment:
+      VITE_SERVER_URL: "${VITE_SERVER_URL:-https://browsersaving-worker.yokthanwa1993-bc9.workers.dev}"
+      VITE_BROWSERSAVING_API_URL: "${VITE_BROWSERSAVING_API_URL:-https://browsersaving-api.pubilo.com}"
+      VITE_COMMENT_TOKEN_SERVICE_URL: "${VITE_COMMENT_TOKEN_SERVICE_URL:-https://token.pubilo.com/api/comment-token}"
+      VITE_REMOTE_LAUNCHER_URL: "${VITE_REMOTE_LAUNCHER_URL:-/_launcher}"
+    depends_on:
+      - browsersaving-api
+      - browsersaving-launcher
+      - browsersaving-token
+
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: browsersaving-browserless
+    restart: unless-stopped
+    shm_size: 2gb
+    environment:
+      TOKEN: "${BROWSERLESS_TOKEN:-77482ddfd0ec44d1c1a8b55ddf352d98}"
+      CONCURRENT: "${BROWSERLESS_CONCURRENT:-4}"
+      TIMEOUT: "${BROWSERLESS_TIMEOUT_MS:-120000}"
+      PREBOOT_CHROME: "${BROWSERLESS_PREBOOT_CHROME:-true}"
+      KEEP_ALIVE: "${BROWSERLESS_KEEP_ALIVE_MS:-600000}"
+      CORS: "true"
+    ports:
+      - "${BROWSERLESS_BIND:-127.0.0.1}:${BROWSERLESS_PORT:-18085}:3000"
+
+  browsersaving-token:
+    build:
+      context: ./token
+      dockerfile: Dockerfile
+    container_name: browsersaving-token
+    restart: unless-stopped
+    ports:
+      - "${BROWSERSAVING_TOKEN_BIND:-127.0.0.1}:${BROWSERSAVING_TOKEN_PORT:-18083}:80"
+
+  browsersaving-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: browsersaving-api-selfhost
+    restart: unless-stopped
+    shm_size: 1gb
+    ports:
+      - "${BROWSERSAVING_API_BIND:-127.0.0.1}:${BROWSERSAVING_API_PORT:-18082}:80"
+    environment:
+      PORT: "80"
+      WORKER_URL: "${WORKER_URL:-https://browsersaving-worker.yokthanwa1993-bc9.workers.dev}"
+      BROWSERLESS_WS: "ws://browserless:3000"
+      BROWSERLESS_TOKEN: "${BROWSERLESS_TOKEN:-77482ddfd0ec44d1c1a8b55ddf352d98}"
+      BROWSERLESS_PUBLIC_URL: "${BROWSERLESS_PUBLIC_URL:-https://browserless.pubilo.com}"
+      COMMENT_TOKEN_API_URL: "http://browsersaving-token:80/api/comment-token"
+    depends_on:
+      - browserless
+      - browsersaving-token
+
+  browsersaving-launcher:
+    build:
+      context: ./launcher
+      dockerfile: Dockerfile
+    container_name: browsersaving-launcher
+    restart: unless-stopped
+    shm_size: 2gb
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "${BROWSERSAVING_LAUNCHER_BIND:-127.0.0.1}:${BROWSERSAVING_LAUNCHER_PORT:-18084}:8080"
+      - "${KASM_HOST_BIND:-0.0.0.0}:${KASM_PORT_START:-8620}-${KASM_PORT_END:-8639}:${KASM_PORT_START:-8620}-${KASM_PORT_END:-8639}"
+    environment:
+      PORT: "8080"
+      WORKER_URL: "${WORKER_URL:-https://browsersaving-worker.yokthanwa1993-bc9.workers.dev}"
+      SESSION_BACKEND: "${SESSION_BACKEND:-kasm}"
+      SESSION_PUBLIC_BASE_URL: "${SESSION_PUBLIC_BASE_URL:-https://browser.pubilo.com/_launcher}"
+      SESSION_PATH_PREFIX: "${SESSION_PATH_PREFIX:-/kasm}"
+      SESSION_VIEWER_MODE: "${SESSION_VIEWER_MODE:-proxy}"
+      SESSION_VIEWER_HOST: "${SESSION_VIEWER_HOST:-172.19.20.9}"
+      SESSION_VIEWER_PROTO: "${SESSION_VIEWER_PROTO:-http}"
+      DISPLAY_START: "${DISPLAY_START:-20}"
+      DISPLAY_END: "${DISPLAY_END:-39}"
+      KASM_PORT_START: "${KASM_PORT_START:-8620}"
+      KASM_PORT_END: "${KASM_PORT_END:-8639}"
+      KASM_BIND_INTERFACE: "${KASM_BIND_INTERFACE:-0.0.0.0}"
+      KASM_PUBLIC_IP: "${KASM_PUBLIC_IP:-172.19.20.9}"
+      KASM_CONNECT_HOST: "${KASM_CONNECT_HOST:-127.0.0.1}"
+      SESSION_WIDTH: "${SESSION_WIDTH:-1512}"
+      SESSION_HEIGHT: "${SESSION_HEIGHT:-982}"
+      SESSION_WAIT_TIMEOUT_MS: "${SESSION_WAIT_TIMEOUT_MS:-30000}"
+      HYPERBROWSER_API_KEY: "${HYPERBROWSER_API_KEY:-}"
+      HYPERBROWSER_TIMEOUT_MINUTES: "${HYPERBROWSER_TIMEOUT_MINUTES:-60}"
+      HYPERBROWSER_LIVE_VIEW_TTL_SECONDS: "${HYPERBROWSER_LIVE_VIEW_TTL_SECONDS:-3600}"
+      HYPERBROWSER_ENABLE_WINDOW_MANAGER: "${HYPERBROWSER_ENABLE_WINDOW_MANAGER:-true}"
+      HYPERBROWSER_VIEW_ONLY: "${HYPERBROWSER_VIEW_ONLY:-false}"
+      HYPERBROWSER_USE_STEALTH: "${HYPERBROWSER_USE_STEALTH:-true}"
+      HYPERBROWSER_ACCEPT_COOKIES: "${HYPERBROWSER_ACCEPT_COOKIES:-true}"
+      D_LINK_EGRESS_ENABLED: "${D_LINK_EGRESS_ENABLED:-true}"
+      D_LINK_GATEWAY: "${D_LINK_GATEWAY:-192.168.0.1}"
+    volumes:
+      - browsersaving_launcher_data:/data
+    networks:
+      default: {}
+      dlink_egress:
+        ipv4_address: "${D_LINK_LAUNCHER_IP:-192.168.0.250}"
+
+volumes:
+  browsersaving_launcher_data:
+
+networks:
+  dlink_egress:
+    external: true
+    name: "${D_LINK_NETWORK_NAME:-browsersaving-dlink5g}"

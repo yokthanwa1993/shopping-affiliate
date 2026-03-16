@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BrowserSaving Viewer</title>
+    <style>
+      :root {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #f6f8fc;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+      }
+
+      canvas {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        display: block;
+        background: #000;
+        outline: none;
+        cursor: default;
+        transform: translate(-50%, -50%);
+      }
+
+      .overlay {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        pointer-events: none;
+        padding: 24px;
+      }
+
+      .card {
+        width: min(420px, calc(100vw - 48px));
+        padding: 28px 24px;
+        border-radius: 18px;
+        background: rgba(19, 23, 31, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 20px 70px rgba(0, 0, 0, 0.35);
+      }
+
+      .card h1 {
+        margin: 0 0 10px;
+        font-size: 26px;
+      }
+
+      .card p {
+        margin: 0;
+        line-height: 1.6;
+        color: rgba(246, 248, 252, 0.74);
+      }
+
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="screen" tabindex="0" width="1280" height="800"></canvas>
+    <div class="overlay" id="overlay">
+      <div class="card">
+        <h1 id="overlay-title">Starting browser…</h1>
+        <p id="overlay-message">Waiting for the first frame from BrowserSaving.</p>
+      </div>
+    </div>
+    <script>
+      (function () {
+        const canvas = document.getElementById('screen');
+        const ctx = canvas.getContext('2d');
+        const overlay = document.getElementById('overlay');
+        const overlayTitle = document.getElementById('overlay-title');
+        const overlayMessage = document.getElementById('overlay-message');
+        const image = new Image();
+        let socket;
+        let firstFrameReceived = false;
+        let pendingFrame = null;
+        let drawing = false;
+        let resizeTimer = 0;
+        let closeRequested = false;
+        let closedNotified = false;
+        let logicalWidth = 1280;
+        let logicalHeight = 800;
+
+        function currentProfileId() {
+          const parts = window.location.pathname.split('/').filter(Boolean);
+          const viewIndex = parts.indexOf('view');
+          if (viewIndex < 0) return '';
+          return decodeURIComponent(parts[viewIndex + 1] || '');
+        }
+
+        function notifyOpener(type) {
+          const profileId = currentProfileId();
+          if (!type || !profileId) return;
+          try {
+            if (window.opener && !window.opener.closed) {
+              window.opener.postMessage({ type, profileId }, '*');
+            }
+          } catch {}
+        }
+
+        function notifyClosedOnce() {
+          if (closedNotified) return;
+          closedNotified = true;
+          notifyOpener('browsersaving-viewer-closed');
+        }
+
+        function setOverlay(title, message, hidden) {
+          overlayTitle.textContent = title;
+          overlayMessage.textContent = message;
+          overlay.className = hidden ? 'overlay hidden' : 'overlay';
+        }
+
+        function setMeta(title, url) {
+          if (title) {
+            document.title = title;
+          }
+        }
+
+        function viewerSocketUrl() {
+          const next = new URL(window.location.href);
+          next.protocol = next.protocol === 'https:' ? 'wss:' : 'ws:';
+          next.pathname = next.pathname.replace(/\/$/, '') + '/ws';
+          return next.toString();
+        }
+
+        function viewerCloseUrl() {
+          const next = new URL(window.location.href);
+          next.pathname = next.pathname.replace(/\/$/, '') + '/close';
+          return next.toString();
+        }
+
+        function requestViewerClose() {
+          if (closeRequested) return;
+          closeRequested = true;
+          notifyOpener('browsersaving-viewer-closing');
+
+          try {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+              socket.close();
+            }
+          } catch {}
+
+          try {
+            const beacon = new Blob(['close'], { type: 'text/plain' });
+            navigator.sendBeacon(viewerCloseUrl(), beacon);
+          } catch {}
+        }
+
+        function modifiersFromEvent(event) {
+          return (event.altKey ? 1 : 0) |
+            (event.ctrlKey ? 2 : 0) |
+            (event.metaKey ? 4 : 0) |
+            (event.shiftKey ? 8 : 0);
+        }
+
+        function fitCanvas() {
+          const nextLogicalWidth = Math.max(1, Math.round(logicalWidth || 1280));
+          const nextLogicalHeight = Math.max(1, Math.round(logicalHeight || 800));
+          const availableWidth = Math.max(1, Math.round(window.innerWidth || nextLogicalWidth));
+          const availableHeight = Math.max(1, Math.round(window.innerHeight || nextLogicalHeight));
+          const aspect = nextLogicalWidth / nextLogicalHeight;
+
+          let displayWidth = availableWidth;
+          let displayHeight = Math.round(displayWidth / aspect);
+          if (displayHeight > availableHeight) {
+            displayHeight = availableHeight;
+            displayWidth = Math.round(displayHeight * aspect);
+          }
+
+          canvas.style.width = displayWidth + 'px';
+          canvas.style.height = displayHeight + 'px';
+        }
+
+        function setLogicalViewport(width, height) {
+          const nextWidth = Math.max(1, Math.round(Number(width) || logicalWidth || 1280));
+          const nextHeight = Math.max(1, Math.round(Number(height) || logicalHeight || 800));
+          if (logicalWidth === nextWidth && logicalHeight === nextHeight) return;
+          logicalWidth = nextWidth;
+          logicalHeight = nextHeight;
+          fitCanvas();
+        }
+
+        function pointerPayload(event) {
+          const rect = canvas.getBoundingClientRect();
+          const x = Math.max(0, Math.min(logicalWidth, (event.clientX - rect.left) * (logicalWidth / rect.width)));
+          const y = Math.max(0, Math.min(logicalHeight, (event.clientY - rect.top) * (logicalHeight / rect.height)));
+          const buttonMap = { 0: 'left', 1: 'middle', 2: 'right', 3: 'back', 4: 'forward' };
+          return {
+            x,
+            y,
+            button: buttonMap[event.button] || 'none',
+            buttons: event.buttons || 0,
+            modifiers: modifiersFromEvent(event),
+          };
+        }
+
+        function send(message) {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify(message));
+        }
+
+        function syncViewport() {
+          send({
+            type: 'resize',
+            payload: {
+              width: Math.round(window.innerWidth || 1280),
+              height: Math.round(window.innerHeight || 800),
+              deviceScaleFactor: Math.min(3, Math.max(1, window.devicePixelRatio || 1)),
+            },
+          });
+        }
+
+        function applyCanvasBitmapSize(width, height) {
+          if (!width || !height) return;
+          const nextWidth = Math.max(1, Math.round(width));
+          const nextHeight = Math.max(1, Math.round(height));
+          if (canvas.width === nextWidth && canvas.height === nextHeight) return;
+          canvas.width = nextWidth;
+          canvas.height = nextHeight;
+        }
+
+        function drawNextFrame() {
+          if (drawing || !pendingFrame) return;
+          drawing = true;
+          const frame = pendingFrame;
+          pendingFrame = null;
+          image.onload = function () {
+            applyCanvasBitmapSize(image.naturalWidth || frame.bitmapWidth || logicalWidth, image.naturalHeight || frame.bitmapHeight || logicalHeight);
+            setLogicalViewport(frame.viewportWidth || logicalWidth, frame.viewportHeight || logicalHeight);
+            ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+            drawing = false;
+            if (!firstFrameReceived) {
+              firstFrameReceived = true;
+              setOverlay('', '', true);
+            }
+            if (pendingFrame) {
+              drawNextFrame();
+            }
+          };
+          image.onerror = function () {
+            drawing = false;
+            if (pendingFrame) {
+              drawNextFrame();
+            }
+          };
+          image.src = 'data:image/' + frame.format + ';base64,' + frame.data;
+        }
+
+        function attachCanvasEvents() {
+          canvas.addEventListener('contextmenu', function (event) {
+            event.preventDefault();
+          });
+
+          canvas.addEventListener('mousedown', function (event) {
+            event.preventDefault();
+            canvas.focus();
+            send({ type: 'mouse', event: 'mousedown', payload: pointerPayload(event) });
+          });
+
+          canvas.addEventListener('mouseup', function (event) {
+            event.preventDefault();
+            send({ type: 'mouse', event: 'mouseup', payload: pointerPayload(event) });
+          });
+
+          canvas.addEventListener('mousemove', function (event) {
+            send({ type: 'mouse', event: 'mousemove', payload: pointerPayload(event) });
+          });
+
+          canvas.addEventListener('wheel', function (event) {
+            event.preventDefault();
+            const payload = pointerPayload(event);
+            payload.deltaX = event.deltaX;
+            payload.deltaY = event.deltaY;
+            send({ type: 'mouse', event: 'wheel', payload });
+          }, { passive: false });
+
+          window.addEventListener('keydown', function (event) {
+            if (document.activeElement !== canvas) return;
+            if (event.key === 'Tab') event.preventDefault();
+            send({
+              type: 'key',
+              event: 'keydown',
+              payload: {
+                key: event.key,
+                code: event.code,
+                keyCode: event.keyCode,
+                modifiers: modifiersFromEvent(event),
+                text: event.key && event.key.length === 1 && !event.ctrlKey && !event.metaKey ? event.key : '',
+              },
+            });
+          }, true);
+
+          window.addEventListener('keyup', function (event) {
+            if (document.activeElement !== canvas) return;
+            send({
+              type: 'key',
+              event: 'keyup',
+              payload: {
+                key: event.key,
+                code: event.code,
+                keyCode: event.keyCode,
+                modifiers: modifiersFromEvent(event),
+                text: '',
+              },
+            });
+          }, true);
+
+          window.addEventListener('keypress', function (event) {
+            if (document.activeElement !== canvas) return;
+            send({
+              type: 'key',
+              event: 'keypress',
+              payload: {
+                key: event.key,
+                code: event.code,
+                keyCode: event.keyCode,
+                modifiers: modifiersFromEvent(event),
+                text: event.key && event.key.length === 1 ? event.key : '',
+              },
+            });
+          }, true);
+        }
+
+        function handleMessage(raw) {
+          let message = {};
+          try {
+            message = JSON.parse(raw.data);
+          } catch {
+            return;
+          }
+
+          if (message.type === 'hello') {
+            setLogicalViewport(Number(message.width || 1280), Number(message.height || 800));
+            setMeta(message.title || 'BrowserSaving Viewer', message.url || '');
+            setOverlay('Connecting browser…', 'Waiting for the first frame from BrowserSaving.', false);
+            notifyOpener('browsersaving-viewer-opened');
+            return;
+          }
+
+          if (message.type === 'frame') {
+            if (message.title || message.url) {
+              setMeta(message.title, message.url);
+            }
+            pendingFrame = {
+              data: String(message.data || ''),
+              format: String(message.format || 'png'),
+              bitmapWidth: Number(message.bitmapWidth || 0),
+              bitmapHeight: Number(message.bitmapHeight || 0),
+              viewportWidth: Number(message.width || logicalWidth || 1280),
+              viewportHeight: Number(message.height || logicalHeight || 800),
+            };
+            drawNextFrame();
+            return;
+          }
+
+          if (message.type === 'state') {
+            setMeta(message.title, message.url);
+            return;
+          }
+
+          if (message.type === 'error') {
+            setOverlay('Viewer error', String(message.message || 'Unknown viewer error'), false);
+            return;
+          }
+
+          if (message.type === 'closed') {
+            setOverlay('Session closed', String(message.message || 'The browser session has ended.'), false);
+            notifyClosedOnce();
+          }
+        }
+
+        function connect() {
+          setOverlay('Starting browser…', 'Waiting for BrowserSaving to connect this viewer.', false);
+          socket = new WebSocket(viewerSocketUrl());
+          socket.addEventListener('message', handleMessage);
+          socket.addEventListener('open', function () {
+            canvas.focus();
+            syncViewport();
+          });
+          socket.addEventListener('close', function () {
+            notifyClosedOnce();
+            if (!firstFrameReceived) {
+              setOverlay('Viewer disconnected', 'The WebSocket connection closed before any frame was received.', false);
+            } else {
+              setOverlay('Connection closed', 'Reconnect by opening the profile again from BrowserSaving.', false);
+            }
+          });
+          socket.addEventListener('error', function () {
+            setOverlay('Viewer error', 'BrowserSaving could not open the live viewer channel.', false);
+          });
+        }
+
+        window.addEventListener('resize', function () {
+          window.clearTimeout(resizeTimer);
+          fitCanvas();
+          resizeTimer = window.setTimeout(syncViewport, 150);
+        });
+
+        window.addEventListener('pagehide', requestViewerClose);
+        window.addEventListener('beforeunload', requestViewerClose);
+
+        attachCanvasEvents();
+        fitCanvas();
+        connect();
+      })();
+    </script>
+  </body>
+</html>

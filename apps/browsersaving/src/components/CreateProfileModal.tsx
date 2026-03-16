@@ -213,8 +213,9 @@ export function CreateProfileModal({ profile, onClose, onSave, existingProfiles 
               type="text"
               value={proxy}
               onChange={(e) => setProxy(e.target.value)}
-              placeholder="host:port or user:pass@host:port"
+              placeholder="host:port or socks5://user:pass@host:port"
             />
+            <span className="form-hint">รองรับ `socks5://user:pass@host:port` สำหรับ SOCKS5 ที่มี auth</span>
           </div>
 
           <div className="form-group">

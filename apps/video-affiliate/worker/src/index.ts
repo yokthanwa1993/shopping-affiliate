@@ -3726,7 +3726,6 @@ app.get('/api/gallery/:id', async (c) => {
 // ==================== PAGES API ====================
 
 const FB_GRAPH_V19 = 'https://graph.facebook.com/v19.0'
-const FB_GRAPH_V21 = 'https://graph.facebook.com/v21.0'
 const FACEBOOK_GRAPH_SDK_TIMEOUT_MS = 45000
 const DEFAULT_BROWSERSAVING_WORKER_URL = 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev'
 const DEFAULT_BROWSERSAVING_API_URL = 'https://browsersaving-api.lslly.com'
@@ -4280,6 +4279,10 @@ function normalizeCommentTokenPool(tokens: string[]): string[] {
     // Comment tokens are validated against the target page via /me/accounts at use time.
     // Do not infer invalidity from the prefix alone.
     return uniqueTokens(tokens.filter((token) => isResolvedCommentToken(token)))
+}
+
+function normalizeDirectVideoTokenPool(tokens: string[]): string[] {
+    return uniqueTokens(normalizeCommentTokenPool(tokens).filter((token) => isCommentRoleToken(token)))
 }
 
 function preferCommentToken(existingRaw: string, candidateRaw: string): string {
@@ -6504,7 +6507,7 @@ async function fetchMeAccountsViaHttp(accessToken: string): Promise<Array<{ id?:
     const token = String(accessToken || '').trim()
     if (!token) return []
 
-    const url = buildFacebookGraphUrl(`${FB_GRAPH_V21}/me/accounts`, {
+    const url = buildFacebookGraphUrl(`${FB_GRAPH_V19}/me/accounts`, {
         fields: 'id,name,picture.type(large),access_token',
         limit: 200,
         access_token: token,
@@ -6523,7 +6526,7 @@ async function fetchMeIdentityViaHttp(accessToken: string): Promise<{ id?: strin
     const token = String(accessToken || '').trim()
     if (!token) return null
 
-    const url = buildFacebookGraphUrl(`${FB_GRAPH_V21}/me`, {
+    const url = buildFacebookGraphUrl(`${FB_GRAPH_V19}/me`, {
         fields: 'id,name',
         access_token: token,
     })
@@ -6575,7 +6578,7 @@ async function resolvePageScopedToken(
     try {
         const data = await facebookGraphGet<{ data?: Array<{ id?: string; access_token?: string }> }>(
             token,
-            `${FB_GRAPH_V21}/me/accounts`,
+            `${FB_GRAPH_V19}/me/accounts`,
             {
                 fields: 'id,access_token',
                 limit: 200,
@@ -6682,8 +6685,18 @@ async function resolveCommentPageTokenForPage(
 
     try {
         const resolved = await resolvePageScopedToken(token, pageId, env, 'comment')
-        return String(resolved.token || '').trim()
+        const resolvedToken = String(resolved.token || '').trim()
+        if (resolvedToken) return resolvedToken
+        if (isResolvedCommentToken(token)) {
+            console.log(`[PAGES] resolveCommentPageTokenForPage fallback to raw EAAD6 for page ${pageId} (${String(resolved.reason || 'no_reason')})`)
+            return token
+        }
+        return ''
     } catch {
+        if (isResolvedCommentToken(token)) {
+            console.log(`[PAGES] resolveCommentPageTokenForPage fallback to raw EAAD6 for page ${pageId} (resolve_exception)`)
+            return token
+        }
         return ''
     }
 }
@@ -7743,6 +7756,7 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN post_token_hint TEXT',
                 'ALTER TABLE post_history ADD COLUMN post_profile_id TEXT',
                 'ALTER TABLE post_history ADD COLUMN post_profile_name TEXT',
+                'ALTER TABLE post_history ADD COLUMN trigger_source TEXT',
                 'ALTER TABLE post_history ADD COLUMN comment_profile_id TEXT',
                 'ALTER TABLE post_history ADD COLUMN comment_profile_name TEXT',
                 'ALTER TABLE post_history ADD COLUMN shortlink_utm_source TEXT',
@@ -8267,7 +8281,7 @@ async function publishReelDirect(params: {
     formData.append('is_reel', 'true')
     formData.append('access_token', token)
 
-    const url = `${FB_GRAPH_V21}/${params.pageId}/videos`
+    const url = `${FB_GRAPH_V19}/${params.pageId}/videos`
     console.log(`[${params.logPrefix}] Publishing reel via single POST to ${url} (${params.videoBuffer.byteLength} bytes)`)
 
     const resp = await fetchWithTimeout(url, {
@@ -8289,6 +8303,98 @@ async function publishReelDirect(params: {
 
     console.log(`[${params.logPrefix}] Reel published: id=${data.id}`)
     return data
+}
+
+async function publishReelViaVideosEndpointWithTokenFallback(params: {
+    pageId: string
+    accessTokens: string[]
+    videoBuffer: ArrayBuffer
+    description: string
+    logPrefix: string
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
+    const candidates = uniqueTokens((params.accessTokens || []).map((token) => String(token || '').trim()).filter(Boolean))
+    if (candidates.length === 0) throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
+    const errors: string[] = []
+    const notBeforeIso = new Date().toISOString()
+
+    for (const token of candidates) {
+        try {
+            const publishResult = await publishReelDirect({
+                pageId: params.pageId,
+                accessToken: token,
+                videoBuffer: params.videoBuffer,
+                description: params.description,
+                logPrefix: params.logPrefix,
+            })
+            const fbVideoId = String(publishResult.id || '').trim()
+            if (!fbVideoId) throw new Error('facebook_publish_no_video_id')
+
+            const recovered = await pollPublishedReelAfterProcessing({
+                accessToken: token,
+                fbVideoId,
+                logPrefix: `${params.logPrefix} /videos`,
+            })
+            if (recovered.published && recovered.post_id) {
+                return {
+                    id: fbVideoId,
+                    postId: String(recovered.post_id || '').trim(),
+                    permalinkUrl: String(recovered.permalink_url || '').trim(),
+                    postingToken: token,
+                }
+            }
+
+            const feedRecovered = await recoverPublishedReelFromRecentFeed({
+                accessToken: token,
+                pageId: params.pageId,
+                expectedCaption: params.description,
+                notBeforeIso,
+                logPrefix: `${params.logPrefix} /videos`,
+            })
+            if (feedRecovered.published && feedRecovered.post_id) {
+                return {
+                    id: fbVideoId,
+                    postId: String(feedRecovered.post_id || '').trim(),
+                    permalinkUrl: String(feedRecovered.permalink_url || '').trim(),
+                    postingToken: token,
+                }
+            }
+
+            console.log(`[${params.logPrefix}] /videos accepted without publish confirmation; using fb video id fallback ${fbVideoId}`)
+            return {
+                id: fbVideoId,
+                postId: fbVideoId,
+                permalinkUrl: '',
+                postingToken: token,
+            }
+        } catch (err) {
+            try {
+                const feedRecovered = await recoverPublishedReelFromRecentFeed({
+                    accessToken: token,
+                    pageId: params.pageId,
+                    expectedCaption: params.description,
+                    notBeforeIso,
+                    logPrefix: `${params.logPrefix} /videos-recover`,
+                })
+                if (feedRecovered.published && feedRecovered.post_id) {
+                    const recoveredPostId = String(feedRecovered.post_id || '').trim()
+                    return {
+                        id: recoveredPostId,
+                        postId: recoveredPostId,
+                        permalinkUrl: String(feedRecovered.permalink_url || '').trim(),
+                        postingToken: token,
+                    }
+                }
+            } catch {
+                // ignore feed recovery failures and continue trying fallback tokens
+            }
+            const msg = parseFacebookErrorLike(err)?.message || (err instanceof Error ? err.message : String(err))
+            const tokenHint = deriveCommentTokenHint(token) || 'unknown_token'
+            errors.push(`${tokenHint}: ${msg}`)
+            console.warn(`[${params.logPrefix}] token failed for direct /videos publish, trying next (${msg})`)
+        }
+    }
+
+    throw new Error(`all_direct_video_tokens_failed: ${errors.join(' | ') || 'unknown_error'}`)
 }
 
 /** Publish reel with token fallback using the 3-step /video_reels flow. */
@@ -8360,6 +8466,69 @@ async function publishReelDirectWithTokenFallback(params: {
     }
 
     throw new Error(`all_post_tokens_failed: ${errors.join(' | ') || 'unknown_error'}`)
+}
+
+async function publishReelWithCommentTokenPrimaryFallback(params: {
+    pageId: string
+    commentTokens: string[]
+    postTokens: string[]
+    videoBuffer: ArrayBuffer
+    description: string
+    logPrefix: string
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
+    const directCandidates = normalizeDirectVideoTokenPool(params.commentTokens || [])
+    const fallbackCandidates = normalizePostTokenPool(params.postTokens || [])
+    let directError: unknown = null
+    let fallbackError: unknown = null
+
+    if (directCandidates.length > 0) {
+        try {
+            return await publishReelViaVideosEndpointWithTokenFallback({
+                pageId: params.pageId,
+                accessTokens: directCandidates,
+                videoBuffer: params.videoBuffer,
+                description: params.description,
+                logPrefix: params.logPrefix,
+            })
+        } catch (err) {
+            directError = err
+        }
+    }
+
+    if (fallbackCandidates.length > 0) {
+        try {
+            return await publishReelDirectWithTokenFallback({
+                pageId: params.pageId,
+                postTokens: fallbackCandidates,
+                videoBuffer: params.videoBuffer,
+                description: params.description,
+                logPrefix: params.logPrefix,
+            })
+        } catch (err) {
+            fallbackError = err
+        }
+    }
+
+    if (directError && fallbackError) {
+        const directMsg = parseFacebookErrorLike(directError)?.message || (directError instanceof Error ? directError.message : String(directError))
+        const fallbackMsg = parseFacebookErrorLike(fallbackError)?.message || (fallbackError instanceof Error ? fallbackError.message : String(fallbackError))
+        throw new Error(`comment_primary_and_post_fallback_failed: ${directMsg} | ${fallbackMsg}`)
+    }
+
+    if (fallbackError) throw fallbackError
+    if (directError) throw directError
+
+    if (directCandidates.length > 0) {
+        return publishReelViaVideosEndpointWithTokenFallback({
+            pageId: params.pageId,
+            accessTokens: directCandidates,
+            videoBuffer: params.videoBuffer,
+            description: params.description,
+            logPrefix: params.logPrefix,
+        })
+    }
+
+    throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
 }
 
 function metaToString(meta: Record<string, unknown>, key: string): string {
@@ -9672,8 +9841,8 @@ app.get('/api/scheduler/process', async (c) => {
 
             // TODO: Implement actual Facebook Reels posting
             await c.env.DB.prepare(
-                'INSERT INTO post_history (video_id, page_id, fb_post_id, status) VALUES (?, ?, ?, ?)'
-            ).bind(post.video_id, post.page_id, 'simulated_' + Date.now(), 'success').run()
+                'INSERT INTO post_history (video_id, page_id, fb_post_id, status, trigger_source) VALUES (?, ?, ?, ?, ?)'
+            ).bind(post.video_id, post.page_id, 'simulated_' + Date.now(), 'success', 'queue').run()
 
             await c.env.DB.prepare(
                 'DELETE FROM post_queue WHERE id = ?'
@@ -9811,8 +9980,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let selectedVideoNamespaceId = ''
     let commentTokenHint: string | null = null
     let skipComment = false
-    let useCommentTokenForPosting = false
-    let postTokenCandidates: string[] = []
+    let primaryPostingTokenCandidates: string[] = []
+    let fallbackPostTokenCandidates: string[] = []
     let commentTokenCandidates: string[] = []
     let postingTokenUsed = ''
     let hasCommentToken = false
@@ -9823,15 +9992,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Check if skip comment
         const body = await c.req.json().catch(() => ({})) as {
             skipComment?: boolean
-            useCommentTokenForPosting?: boolean
-            post_token_mode?: 'post' | 'comment'
-            postTokenMode?: 'post' | 'comment'
         }
         skipComment = body.skipComment === true
-        useCommentTokenForPosting = body.useCommentTokenForPosting === true
-            || body.post_token_mode === 'comment'
-            || body.postTokenMode === 'comment'
-            || c.req.query('post_token_mode') === 'comment'
         // Get page info
         const page = await env.DB.prepare(
             'SELECT id, name, access_token, post_hours FROM pages WHERE id = ? AND bot_id = ?'
@@ -9867,11 +10029,17 @@ app.post('/api/pages/:id/force-post', async (c) => {
         })
         commentTokenCandidates = tokenCandidates.commentTokens
         pageCommentToken = commentTokenCandidates[0] || null
-        postTokenCandidates = useCommentTokenForPosting && commentTokenCandidates.length > 0
-            ? commentTokenCandidates
-            : (tokenCandidates.postTokens.length > 0
-                ? tokenCandidates.postTokens
-                : normalizePostTokenPool([pageAccessToken]))
+        fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
+            ? tokenCandidates.postTokens
+            : normalizePostTokenPool([pageAccessToken])
+        const directVideoTokenCandidates = normalizeDirectVideoTokenPool(commentTokenCandidates)
+        primaryPostingTokenCandidates = directVideoTokenCandidates
+        if (primaryPostingTokenCandidates.length === 0) {
+            primaryPostingTokenCandidates = fallbackPostTokenCandidates
+        }
+        if (primaryPostingTokenCandidates.length === 0) {
+            throw new Error('access_token_missing')
+        }
 
         const postedIds = await getPostedVideoIds({
             db: env.DB,
@@ -9935,8 +10103,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         await ensurePostHistoryTraceColumns(env.DB)
         commentTokenHint = deriveCommentTokenHint(pageCommentToken)
-        const initialPostTokenHint = deriveCommentTokenHint(postTokenCandidates[0] || null)
-        const initialPostProfile = await resolvePostHistoryProfileByToken(env, postTokenCandidates[0] || null)
+        const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
         hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
         const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
         initialCommentStatus = initialCommentState.status
@@ -9945,12 +10113,13 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
             nowStr,
             'posting',
+            'force_post',
             botId,
             initialPostTokenHint,
             initialPostProfile.profileId,
@@ -9978,16 +10147,17 @@ app.post('/api/pages/:id/force-post', async (c) => {
             realVideoUrl = getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, selectedVideoNamespaceId, unpostedId)
         }
 
-        // Post to Facebook Reels (single POST with is_reel=true)
+        // Post via EAAD6 /videos first, then fall back to the legacy post token flow if needed.
         const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'force_download_video')
         if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
         const videoBuffer = await videoResp.arrayBuffer()
         if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
 
-        postingTokenUsed = String(postTokenCandidates[0] || '').trim()
-        const reelResult = await publishReelDirectWithTokenFallback({
+        postingTokenUsed = String(primaryPostingTokenCandidates[0] || '').trim()
+        const reelResult = await publishReelWithCommentTokenPrimaryFallback({
             pageId: page.id,
-            postTokens: postTokenCandidates,
+            commentTokens: commentTokenCandidates,
+            postTokens: fallbackPostTokenCandidates,
             videoBuffer,
             description: caption,
             logPrefix: 'FORCE-POST',
@@ -10516,7 +10686,7 @@ async function handleScheduled(env: Env) {
 
     // 1. Get active pages with their post_hours
     const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, comment_token, post_hours, last_post_at, bot_id
+        SELECT id, name, access_token, post_hours, last_post_at, bot_id
         FROM pages
         WHERE is_active = 1 AND post_hours IS NOT NULL AND post_hours != ''
     `).all() as {
@@ -10524,7 +10694,6 @@ async function handleScheduled(env: Env) {
             id: string
             name: string
             access_token: string
-            comment_token: string | null
             post_hours: string
             last_post_at: string | null
             bot_id: string | null
@@ -10802,26 +10971,34 @@ async function handleScheduled(env: Env) {
             primaryToken: String(page.access_token || ''),
             logPrefix: `CRON ${page.name}`,
         })
-        const postTokenCandidates = tokenCandidates.postTokens.length > 0
+        const commentTokenCandidates = tokenCandidates.commentTokens
+        const fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
             ? tokenCandidates.postTokens
             : normalizePostTokenPool([String(page.access_token || '')])
-        const commentTokenCandidates = tokenCandidates.commentTokens
+        const directVideoTokenCandidates = normalizeDirectVideoTokenPool(commentTokenCandidates)
+        const primaryPostingTokenCandidates = directVideoTokenCandidates.length > 0
+            ? directVideoTokenCandidates
+            : fallbackPostTokenCandidates
         await ensurePostHistoryTraceColumns(env.DB)
         const commentTokenHint = deriveCommentTokenHint(commentTokenCandidates[0] || null)
-        const initialPostTokenHint = deriveCommentTokenHint(postTokenCandidates[0] || null)
-        const initialPostProfile = await resolvePostHistoryProfileByToken(env, postTokenCandidates[0] || null)
+        const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
         const hasCommentToken = commentTokenCandidates.length > 0
+        if (primaryPostingTokenCandidates.length === 0) {
+            throw new Error('access_token_missing')
+        }
         const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
         const initialCommentStatus = initialCommentState.status
         const initialCommentError = initialCommentState.error
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
             nowISO,
             'posting',
+            'cron',
             botId,
             initialPostTokenHint,
             initialPostProfile.profileId,
@@ -10840,21 +11017,22 @@ async function handleScheduled(env: Env) {
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
 
         let fbVideoId = ''
-        let postingTokenUsed = String(postTokenCandidates[0] || page.access_token || '').trim()
+        let postingTokenUsed = String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
         try {
             if (pickedVideo.shopeeLink && shortlinkRequired && normalizedShopeeStatus !== 'shortened') {
                 throw new Error(`shortlink_required_failed${normalizedShopeeError ? `: ${normalizedShopeeError}` : ''}`)
             }
 
-            // Download video and publish reel (single POST with is_reel=true)
+            // Download video and publish via EAAD6 /videos first, then fall back to the legacy post token flow if needed.
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')
             if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
             const videoBuffer = await videoResp.arrayBuffer()
             if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
 
-            const reelResult = await publishReelDirectWithTokenFallback({
+            const reelResult = await publishReelWithCommentTokenPrimaryFallback({
                 pageId: String(page.id || ''),
-                postTokens: postTokenCandidates,
+                commentTokens: commentTokenCandidates,
+                postTokens: fallbackPostTokenCandidates,
                 videoBuffer,
                 description: caption,
                 logPrefix: `CRON ${page.name}`,

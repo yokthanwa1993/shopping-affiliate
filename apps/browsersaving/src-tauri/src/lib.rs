@@ -1,14 +1,18 @@
+use base64::Engine;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use url::Url;
 
 const MOBILE_SIMULATOR_EXT_URL: &str = "https://chromewebstore.google.com/detail/mobile-simulator-responsi/ckejmhbmlajgoklhgbapkiccekfoccmk";
 const DEFAULT_ANDROID_SDK_DIR: &str = "Library/Android/sdk";
@@ -1391,6 +1395,7 @@ pub struct AppState {
     debug_ports: Arc<Mutex<HashMap<String, u16>>>,       // profile_id -> debug port
     debug_logs: Arc<Mutex<HashMap<String, DebugLogs>>>,  // profile_id -> logs
     profile_auth_tokens: Arc<Mutex<HashMap<String, String>>>, // profile_id -> auth token
+    proxy_relays: Arc<Mutex<HashMap<String, ProxyRelayRuntime>>>, // profile_id -> local proxy relay
 }
 
 impl Default for AppState {
@@ -1403,8 +1408,51 @@ impl Default for AppState {
             debug_ports: Arc::new(Mutex::new(HashMap::new())),
             debug_logs: Arc::new(Mutex::new(HashMap::new())),
             profile_auth_tokens: Arc::new(Mutex::new(HashMap::new())),
+            proxy_relays: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+struct ProxyRelayRuntime {
+    local_port: u16,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+enum ProxyLaunchConfig {
+    Direct(String),
+    HttpRelay(UpstreamHttpProxy),
+    Socks5Relay(UpstreamSocks5Proxy),
+    BindRelay(IpAddr),
+}
+
+#[derive(Debug, Clone)]
+struct UpstreamHttpProxy {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UpstreamSocks5Proxy {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum SocksTargetAddr {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+#[derive(Debug, Clone)]
+struct SocksConnectTarget {
+    addr: SocksTargetAddr,
+    port: u16,
 }
 
 fn normalize_auth_token(raw: Option<&str>) -> Option<String> {
@@ -1436,6 +1484,1034 @@ fn lookup_profile_auth_token(state: &AppState, profile_id: &str) -> Option<Strin
 
 fn clear_profile_auth_token(state: &AppState, profile_id: &str) {
     state.profile_auth_tokens.lock().unwrap().remove(profile_id);
+}
+
+impl SocksTargetAddr {
+    fn atyp(&self) -> u8 {
+        match self {
+            Self::Ip(IpAddr::V4(_)) => 0x01,
+            Self::Domain(_) => 0x03,
+            Self::Ip(IpAddr::V6(_)) => 0x04,
+        }
+    }
+
+    fn write_to(&self, out: &mut Vec<u8>) -> Result<(), String> {
+        match self {
+            Self::Ip(IpAddr::V4(addr)) => out.extend_from_slice(&addr.octets()),
+            Self::Ip(IpAddr::V6(addr)) => out.extend_from_slice(&addr.octets()),
+            Self::Domain(domain) => {
+                let bytes = domain.as_bytes();
+                if bytes.is_empty() || bytes.len() > 255 {
+                    return Err("SOCKS5 target domain must be 1-255 bytes".to_string());
+                }
+                out.push(bytes.len() as u8);
+                out.extend_from_slice(bytes);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SocksConnectTarget {
+    fn display(&self) -> String {
+        match &self.addr {
+            SocksTargetAddr::Ip(IpAddr::V6(addr)) => format!("[{}]:{}", addr, self.port),
+            SocksTargetAddr::Ip(addr) => format!("{}:{}", addr, self.port),
+            SocksTargetAddr::Domain(domain) => format!("{}:{}", domain, self.port),
+        }
+    }
+}
+
+fn normalize_direct_proxy_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(url) = Url::parse(trimmed) {
+        let scheme = url.scheme().to_lowercase();
+        if matches!(scheme.as_str(), "http" | "https") {
+            if let Some(host) = url.host_str() {
+                if let Some(port) = url.port_or_known_default() {
+                    return format!("{}://{}:{}", scheme, host, port);
+                }
+                return format!("{}://{}", scheme, host);
+            }
+        }
+    }
+
+    if trimmed.contains('@') {
+        return trimmed
+            .split('@')
+            .last()
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn parse_proxy_launch_config(raw: &str) -> Result<Option<ProxyLaunchConfig>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.contains("://") {
+        let parsed = Url::parse(trimmed)
+            .map_err(|e| format!("Invalid proxy URL: {}. Use socks5://user:pass@host:port", e))?;
+        let scheme = parsed.scheme().to_lowercase();
+        match scheme.as_str() {
+            "socks5" | "socks" | "socks5h" => {
+                let host = parsed
+                    .host_str()
+                    .ok_or("SOCKS5 proxy is missing host".to_string())?
+                    .to_string();
+                let port = parsed.port().unwrap_or(1080);
+                let username = if parsed.username().is_empty() {
+                    None
+                } else {
+                    Some(parsed.username().to_string())
+                };
+                let password = parsed.password().map(|value| value.to_string());
+                Ok(Some(ProxyLaunchConfig::Socks5Relay(UpstreamSocks5Proxy {
+                    host,
+                    port,
+                    username,
+                    password,
+                })))
+            }
+            "http" | "https" => {
+                let host = parsed
+                    .host_str()
+                    .ok_or("HTTP proxy is missing host".to_string())?
+                    .to_string();
+                let port = parsed.port_or_known_default().unwrap_or(80);
+                let username = if parsed.username().is_empty() {
+                    None
+                } else {
+                    Some(parsed.username().to_string())
+                };
+                let password = parsed.password().map(|value| value.to_string());
+                if scheme == "http" && (username.is_some() || password.is_some()) {
+                    Ok(Some(ProxyLaunchConfig::HttpRelay(UpstreamHttpProxy {
+                        host,
+                        port,
+                        username,
+                        password,
+                    })))
+                } else {
+                    Ok(Some(ProxyLaunchConfig::Direct(
+                        normalize_direct_proxy_value(trimmed),
+                    )))
+                }
+            }
+            "bind" => {
+                let host = parsed
+                    .host_str()
+                    .ok_or("Bind proxy is missing source IP".to_string())?;
+                let source_ip = host
+                    .parse::<IpAddr>()
+                    .map_err(|e| format!("Bind proxy source IP is invalid: {}", e))?;
+                Ok(Some(ProxyLaunchConfig::BindRelay(source_ip)))
+            }
+            other => Err(format!(
+                "Unsupported proxy scheme `{}`. Use socks5://user:pass@host:port, bind://source-ip, or host:port",
+                other
+            )),
+        }
+    } else {
+        Ok(Some(ProxyLaunchConfig::Direct(
+            normalize_direct_proxy_value(trimmed),
+        )))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HttpProxyRequestHead {
+    method: String,
+    target: String,
+    version: String,
+    headers: Vec<(String, String)>,
+}
+
+fn build_http_proxy_auth_header(username: Option<&str>, password: Option<&str>) -> Option<String> {
+    let user = username.unwrap_or_default();
+    let pass = password.unwrap_or_default();
+    if user.is_empty() && pass.is_empty() {
+        return None;
+    }
+    let token = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
+    Some(format!("Basic {}", token))
+}
+
+fn find_http_head_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+async fn read_http_proxy_head(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut buffer = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        if let Some(head_end) = find_http_head_end(&buffer) {
+            let body_start = head_end + 4;
+            let body = buffer.split_off(body_start);
+            return Ok((buffer, body));
+        }
+
+        if buffer.len() > 128 * 1024 {
+            return Err("HTTP proxy request headers are too large".to_string());
+        }
+
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("Failed to read HTTP proxy request: {}", e))?;
+        if read == 0 {
+            return Err("HTTP proxy client closed connection before sending headers".to_string());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_http_proxy_request_head(raw: &[u8]) -> Result<HttpProxyRequestHead, String> {
+    let text = String::from_utf8(raw.to_vec())
+        .map_err(|e| format!("HTTP proxy request head is not valid UTF-8: {}", e))?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or("HTTP proxy request is missing request line".to_string())?
+        .trim();
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or("HTTP proxy request line is missing method".to_string())?
+        .to_string();
+    let target = parts
+        .next()
+        .ok_or("HTTP proxy request line is missing target".to_string())?
+        .to_string();
+    let version = parts
+        .next()
+        .ok_or("HTTP proxy request line is missing HTTP version".to_string())?
+        .to_string();
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    Ok(HttpProxyRequestHead {
+        method,
+        target,
+        version,
+        headers,
+    })
+}
+
+fn build_http_proxy_request_head(
+    method: &str,
+    target: &str,
+    version: &str,
+    headers: &[(String, String)],
+) -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str(method);
+    output.push(' ');
+    output.push_str(target);
+    output.push(' ');
+    output.push_str(if version.is_empty() {
+        "HTTP/1.1"
+    } else {
+        version
+    });
+    output.push_str("\r\n");
+    for (name, value) in headers {
+        output.push_str(name);
+        output.push_str(": ");
+        output.push_str(value);
+        output.push_str("\r\n");
+    }
+    output.push_str("\r\n");
+    output.into_bytes()
+}
+
+fn parse_http_proxy_status_code(raw: &[u8]) -> Result<u16, String> {
+    let text = String::from_utf8(raw.to_vec())
+        .map_err(|e| format!("HTTP proxy response is not valid UTF-8: {}", e))?;
+    let status_line = text
+        .split("\r\n")
+        .next()
+        .ok_or("HTTP proxy response is missing status line".to_string())?;
+    let mut parts = status_line.split_whitespace();
+    let _version = parts
+        .next()
+        .ok_or("HTTP proxy response is missing version".to_string())?;
+    let status = parts
+        .next()
+        .ok_or("HTTP proxy response is missing status code".to_string())?;
+    status.parse::<u16>().map_err(|e| {
+        format!(
+            "HTTP proxy returned invalid status code `{}`: {}",
+            status, e
+        )
+    })
+}
+
+fn filter_http_proxy_headers(
+    headers: &[(String, String)],
+    drop_connection: bool,
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            lower != "proxy-authorization"
+                && lower != "proxy-connection"
+                && (!drop_connection || lower != "connection")
+        })
+        .cloned()
+        .collect()
+}
+
+async fn connect_upstream_http_proxy(
+    upstream: &UpstreamHttpProxy,
+) -> Result<tokio::net::TcpStream, String> {
+    let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
+    let stream = tokio::net::TcpStream::connect(&upstream_addr)
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to connect upstream HTTP proxy {}: {}",
+                upstream_addr, e
+            )
+        })?;
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("Failed to configure upstream HTTP proxy socket: {}", e))?;
+    Ok(stream)
+}
+
+async fn handle_http_proxy_relay_connection(
+    mut client: tokio::net::TcpStream,
+    upstream: UpstreamHttpProxy,
+) -> Result<(), String> {
+    let (client_head_raw, client_buffered) = read_http_proxy_head(&mut client).await?;
+    let request = parse_http_proxy_request_head(&client_head_raw)?;
+    let mut upstream_stream = connect_upstream_http_proxy(&upstream).await?;
+    let proxy_auth =
+        build_http_proxy_auth_header(upstream.username.as_deref(), upstream.password.as_deref());
+
+    if request.method.eq_ignore_ascii_case("CONNECT") {
+        let mut headers = filter_http_proxy_headers(&request.headers, true);
+        if !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Host"))
+        {
+            headers.push(("Host".to_string(), request.target.clone()));
+        }
+        headers.push(("Connection".to_string(), "Keep-Alive".to_string()));
+        headers.push(("Proxy-Connection".to_string(), "Keep-Alive".to_string()));
+        if let Some(auth_header) = proxy_auth {
+            headers.push(("Proxy-Authorization".to_string(), auth_header));
+        }
+
+        let upstream_request =
+            build_http_proxy_request_head("CONNECT", &request.target, &request.version, &headers);
+        upstream_stream
+            .write_all(&upstream_request)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to send CONNECT request to upstream HTTP proxy: {}",
+                    e
+                )
+            })?;
+
+        let (upstream_head_raw, upstream_buffered) =
+            read_http_proxy_head(&mut upstream_stream).await?;
+        let status = parse_http_proxy_status_code(&upstream_head_raw)?;
+        if status != 200 {
+            client.write_all(&upstream_head_raw).await.map_err(|e| {
+                format!(
+                    "Failed to forward upstream HTTP proxy error response: {}",
+                    e
+                )
+            })?;
+            if !upstream_buffered.is_empty() {
+                client.write_all(&upstream_buffered).await.map_err(|e| {
+                    format!("Failed to forward upstream HTTP proxy error body: {}", e)
+                })?;
+            }
+            return Ok(());
+        }
+
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .map_err(|e| format!("Failed to acknowledge CONNECT tunnel to browser: {}", e))?;
+        if !upstream_buffered.is_empty() {
+            client
+                .write_all(&upstream_buffered)
+                .await
+                .map_err(|e| format!("Failed to forward buffered upstream tunnel data: {}", e))?;
+        }
+        if !client_buffered.is_empty() {
+            upstream_stream
+                .write_all(&client_buffered)
+                .await
+                .map_err(|e| format!("Failed to flush buffered browser tunnel data: {}", e))?;
+        }
+    } else {
+        let mut headers = filter_http_proxy_headers(&request.headers, false);
+        if let Some(auth_header) = proxy_auth {
+            headers.push(("Proxy-Authorization".to_string(), auth_header));
+        }
+
+        let upstream_request = build_http_proxy_request_head(
+            &request.method,
+            &request.target,
+            &request.version,
+            &headers,
+        );
+        upstream_stream
+            .write_all(&upstream_request)
+            .await
+            .map_err(|e| format!("Failed to send HTTP proxy request upstream: {}", e))?;
+        if !client_buffered.is_empty() {
+            upstream_stream
+                .write_all(&client_buffered)
+                .await
+                .map_err(|e| format!("Failed to forward buffered HTTP proxy body: {}", e))?;
+        }
+    }
+
+    tokio::io::copy_bidirectional(&mut client, &mut upstream_stream)
+        .await
+        .map_err(|e| format!("HTTP proxy relay pipe failed for {}: {}", request.target, e))?;
+    Ok(())
+}
+
+async fn read_socks5_target(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<SocksConnectTarget, String> {
+    let mut greeting = [0u8; 2];
+    stream
+        .read_exact(&mut greeting)
+        .await
+        .map_err(|e| format!("Failed to read SOCKS5 greeting: {}", e))?;
+
+    if greeting[0] != 0x05 {
+        return Err("Unsupported SOCKS version from browser".to_string());
+    }
+
+    let method_count = greeting[1] as usize;
+    let mut methods = vec![0u8; method_count];
+    stream
+        .read_exact(&mut methods)
+        .await
+        .map_err(|e| format!("Failed to read SOCKS5 methods: {}", e))?;
+
+    if !methods.contains(&0x00) {
+        let _ = stream.write_all(&[0x05, 0xff]).await;
+        return Err("Browser did not offer no-auth SOCKS5".to_string());
+    }
+
+    stream
+        .write_all(&[0x05, 0x00])
+        .await
+        .map_err(|e| format!("Failed to accept SOCKS5 auth method: {}", e))?;
+
+    let mut request_head = [0u8; 4];
+    stream
+        .read_exact(&mut request_head)
+        .await
+        .map_err(|e| format!("Failed to read SOCKS5 request header: {}", e))?;
+
+    if request_head[0] != 0x05 {
+        return Err("Invalid SOCKS5 request header".to_string());
+    }
+
+    if request_head[1] != 0x01 {
+        let _ = send_socks5_reply(stream, 0x07).await;
+        return Err("SOCKS5 relay supports CONNECT only".to_string());
+    }
+
+    let addr = match request_head[3] {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream
+                .read_exact(&mut octets)
+                .await
+                .map_err(|e| format!("Failed to read IPv4 SOCKS5 target: {}", e))?;
+            SocksTargetAddr::Ip(IpAddr::V4(Ipv4Addr::from(octets)))
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .await
+                .map_err(|e| format!("Failed to read SOCKS5 domain length: {}", e))?;
+            let mut domain = vec![0u8; len[0] as usize];
+            stream
+                .read_exact(&mut domain)
+                .await
+                .map_err(|e| format!("Failed to read SOCKS5 domain target: {}", e))?;
+            SocksTargetAddr::Domain(
+                String::from_utf8(domain)
+                    .map_err(|e| format!("SOCKS5 domain target is not valid UTF-8: {}", e))?,
+            )
+        }
+        0x04 => {
+            let mut octets = [0u8; 16];
+            stream
+                .read_exact(&mut octets)
+                .await
+                .map_err(|e| format!("Failed to read IPv6 SOCKS5 target: {}", e))?;
+            SocksTargetAddr::Ip(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => {
+            let _ = send_socks5_reply(stream, 0x08).await;
+            return Err("Unsupported SOCKS5 address type".to_string());
+        }
+    };
+
+    let mut port_bytes = [0u8; 2];
+    stream
+        .read_exact(&mut port_bytes)
+        .await
+        .map_err(|e| format!("Failed to read SOCKS5 target port: {}", e))?;
+
+    Ok(SocksConnectTarget {
+        addr,
+        port: u16::from_be_bytes(port_bytes),
+    })
+}
+
+async fn send_socks5_reply(stream: &mut tokio::net::TcpStream, status: u8) -> Result<(), String> {
+    stream
+        .write_all(&[0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(|e| format!("Failed to write SOCKS5 reply: {}", e))
+}
+
+async fn connect_upstream_socks5(
+    upstream: &UpstreamSocks5Proxy,
+    target: &SocksConnectTarget,
+) -> Result<tokio::net::TcpStream, String> {
+    let upstream_addr = format!("{}:{}", upstream.host, upstream.port);
+    let mut stream = tokio::net::TcpStream::connect(&upstream_addr)
+        .await
+        .map_err(|e| format!("Failed to connect upstream proxy {}: {}", upstream_addr, e))?;
+
+    let has_auth = upstream.username.is_some() || upstream.password.is_some();
+    let mut methods = Vec::with_capacity(2);
+    methods.push(0x00);
+    if has_auth {
+        methods.push(0x02);
+    }
+
+    let mut greeting = vec![0x05, methods.len() as u8];
+    greeting.extend_from_slice(&methods);
+    stream
+        .write_all(&greeting)
+        .await
+        .map_err(|e| format!("Failed to write upstream SOCKS5 greeting: {}", e))?;
+
+    let mut selection = [0u8; 2];
+    stream
+        .read_exact(&mut selection)
+        .await
+        .map_err(|e| format!("Failed to read upstream SOCKS5 auth choice: {}", e))?;
+
+    if selection[0] != 0x05 {
+        return Err("Upstream proxy returned invalid SOCKS5 version".to_string());
+    }
+
+    match selection[1] {
+        0x00 => {}
+        0x02 => {
+            let username = upstream.username.clone().unwrap_or_default();
+            let password = upstream.password.clone().unwrap_or_default();
+            if username.len() > 255 || password.len() > 255 {
+                return Err("SOCKS5 username/password must not exceed 255 bytes".to_string());
+            }
+
+            let mut auth_packet = Vec::with_capacity(3 + username.len() + password.len());
+            auth_packet.push(0x01);
+            auth_packet.push(username.len() as u8);
+            auth_packet.extend_from_slice(username.as_bytes());
+            auth_packet.push(password.len() as u8);
+            auth_packet.extend_from_slice(password.as_bytes());
+
+            stream
+                .write_all(&auth_packet)
+                .await
+                .map_err(|e| format!("Failed to write SOCKS5 username/password auth: {}", e))?;
+
+            let mut auth_reply = [0u8; 2];
+            stream
+                .read_exact(&mut auth_reply)
+                .await
+                .map_err(|e| format!("Failed to read SOCKS5 username/password reply: {}", e))?;
+
+            if auth_reply[1] != 0x00 {
+                return Err("SOCKS5 username/password authentication failed".to_string());
+            }
+        }
+        0xff => return Err("Upstream SOCKS5 proxy rejected all auth methods".to_string()),
+        method => {
+            return Err(format!(
+                "Upstream SOCKS5 proxy selected unsupported auth method {}",
+                method
+            ))
+        }
+    }
+
+    let mut connect_packet = vec![0x05, 0x01, 0x00, target.addr.atyp()];
+    target.addr.write_to(&mut connect_packet)?;
+    connect_packet.extend_from_slice(&target.port.to_be_bytes());
+
+    stream
+        .write_all(&connect_packet)
+        .await
+        .map_err(|e| format!("Failed to send upstream SOCKS5 connect request: {}", e))?;
+
+    let mut reply_head = [0u8; 4];
+    stream
+        .read_exact(&mut reply_head)
+        .await
+        .map_err(|e| format!("Failed to read upstream SOCKS5 connect reply: {}", e))?;
+
+    if reply_head[1] != 0x00 {
+        return Err(format!(
+            "Upstream SOCKS5 proxy failed to connect to {} (status {})",
+            target.display(),
+            reply_head[1]
+        ));
+    }
+
+    match reply_head[3] {
+        0x01 => {
+            let mut skip = [0u8; 4];
+            stream
+                .read_exact(&mut skip)
+                .await
+                .map_err(|e| format!("Failed to read upstream SOCKS5 IPv4 bind address: {}", e))?;
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream
+                .read_exact(&mut len)
+                .await
+                .map_err(|e| format!("Failed to read upstream SOCKS5 domain bind length: {}", e))?;
+            let mut skip = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut skip).await.map_err(|e| {
+                format!("Failed to read upstream SOCKS5 domain bind address: {}", e)
+            })?;
+        }
+        0x04 => {
+            let mut skip = [0u8; 16];
+            stream
+                .read_exact(&mut skip)
+                .await
+                .map_err(|e| format!("Failed to read upstream SOCKS5 IPv6 bind address: {}", e))?;
+        }
+        _ => return Err("Upstream SOCKS5 proxy returned unsupported bind address".to_string()),
+    }
+
+    let mut bind_port = [0u8; 2];
+    stream
+        .read_exact(&mut bind_port)
+        .await
+        .map_err(|e| format!("Failed to read upstream SOCKS5 bind port: {}", e))?;
+
+    Ok(stream)
+}
+
+async fn connect_bound_direct(
+    source_ip: IpAddr,
+    target: &SocksConnectTarget,
+) -> Result<tokio::net::TcpStream, String> {
+    let candidates: Vec<SocketAddr> = match &target.addr {
+        SocksTargetAddr::Ip(ip) => {
+            if ip.is_ipv4() != source_ip.is_ipv4() {
+                return Err(format!(
+                    "Source IP {} does not match target address family for {}",
+                    source_ip,
+                    target.display()
+                ));
+            }
+            vec![SocketAddr::new(*ip, target.port)]
+        }
+        SocksTargetAddr::Domain(domain) => tokio::net::lookup_host((domain.as_str(), target.port))
+            .await
+            .map_err(|e| format!("Failed to resolve {}: {}", target.display(), e))?
+            .filter(|addr| addr.is_ipv4() == source_ip.is_ipv4())
+            .collect(),
+    };
+
+    if candidates.is_empty() {
+        return Err(format!(
+            "No reachable {} addresses matched source IP {} for {}",
+            if source_ip.is_ipv4() { "IPv4" } else { "IPv6" },
+            source_ip,
+            target.display()
+        ));
+    }
+
+    let bind_addr = SocketAddr::new(source_ip, 0);
+    let mut last_error = None;
+
+    for addr in candidates {
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4().map_err(|e| {
+                format!(
+                    "Failed to create IPv4 socket for {}: {}",
+                    target.display(),
+                    e
+                )
+            })?
+        } else {
+            tokio::net::TcpSocket::new_v6().map_err(|e| {
+                format!(
+                    "Failed to create IPv6 socket for {}: {}",
+                    target.display(),
+                    e
+                )
+            })?
+        };
+
+        socket
+            .bind(bind_addr)
+            .map_err(|e| format!("Failed to bind source IP {}: {}", source_ip, e))?;
+
+        match socket.connect(addr).await {
+            Ok(stream) => {
+                stream.set_nodelay(true).map_err(|e| {
+                    format!(
+                        "Failed to configure direct socket for {}: {}",
+                        target.display(),
+                        e
+                    )
+                })?;
+                return Ok(stream);
+            }
+            Err(err) => {
+                last_error = Some(format!(
+                    "Failed to connect to {} from {}: {}",
+                    addr, source_ip, err
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        format!(
+            "Failed to connect to {} from {}",
+            target.display(),
+            source_ip
+        )
+    }))
+}
+
+async fn handle_socks5_relay_connection(
+    mut client: tokio::net::TcpStream,
+    upstream: UpstreamSocks5Proxy,
+) -> Result<(), String> {
+    let target = read_socks5_target(&mut client).await?;
+    let mut upstream_stream = match connect_upstream_socks5(&upstream, &target).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            let _ = send_socks5_reply(&mut client, 0x01).await;
+            return Err(err);
+        }
+    };
+
+    send_socks5_reply(&mut client, 0x00).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream_stream)
+        .await
+        .map_err(|e| format!("SOCKS5 relay pipe failed for {}: {}", target.display(), e))?;
+    Ok(())
+}
+
+async fn handle_bound_socks5_connection(
+    mut client: tokio::net::TcpStream,
+    source_ip: IpAddr,
+) -> Result<(), String> {
+    let target = read_socks5_target(&mut client).await?;
+    let mut upstream_stream = match connect_bound_direct(source_ip, &target).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            let _ = send_socks5_reply(&mut client, 0x01).await;
+            return Err(err);
+        }
+    };
+
+    send_socks5_reply(&mut client, 0x00).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream_stream)
+        .await
+        .map_err(|e| {
+            format!(
+                "Bound SOCKS5 relay pipe failed for {}: {}",
+                target.display(),
+                e
+            )
+        })?;
+    Ok(())
+}
+
+async fn start_profile_proxy_relay(
+    state: &AppState,
+    profile_id: &str,
+    upstream: UpstreamSocks5Proxy,
+) -> Result<String, String> {
+    stop_profile_proxy_relay(state, profile_id);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("Failed to start local SOCKS5 relay: {}", e))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to resolve local SOCKS5 relay address: {}", e))?
+        .port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let profile_id_owned = profile_id.to_string();
+    let upstream_proxy = upstream.clone();
+
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            let mut conn_shutdown = shutdown_rx.clone();
+                            let upstream_for_conn = upstream_proxy.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    changed = conn_shutdown.changed() => {
+                                        if changed.is_ok() && *conn_shutdown.borrow() {
+                                            log::info!("Stopped local SOCKS5 relay connection");
+                                        }
+                                    }
+                                    result = handle_socks5_relay_connection(stream, upstream_for_conn) => {
+                                        if let Err(err) = result {
+                                            log::warn!("SOCKS5 relay connection failed: {}", err);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            log::warn!("SOCKS5 relay accept failed for {}: {}", profile_id_owned, err);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    state.proxy_relays.lock().unwrap().insert(
+        profile_id.to_string(),
+        ProxyRelayRuntime {
+            local_port,
+            shutdown_tx,
+            task,
+        },
+    );
+
+    Ok(format!("socks5://127.0.0.1:{}", local_port))
+}
+
+async fn start_profile_bind_relay(
+    state: &AppState,
+    profile_id: &str,
+    source_ip: IpAddr,
+) -> Result<String, String> {
+    stop_profile_proxy_relay(state, profile_id);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("Failed to start local bind relay: {}", e))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to resolve local bind relay address: {}", e))?
+        .port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let profile_id_owned = profile_id.to_string();
+
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            let mut conn_shutdown = shutdown_rx.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    changed = conn_shutdown.changed() => {
+                                        if changed.is_ok() && *conn_shutdown.borrow() {
+                                            log::info!("Stopped local bind relay connection");
+                                        }
+                                    }
+                                    result = handle_bound_socks5_connection(stream, source_ip) => {
+                                        if let Err(err) = result {
+                                            log::warn!("Bind relay connection failed: {}", err);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            log::warn!("Bind relay accept failed for {}: {}", profile_id_owned, err);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    state.proxy_relays.lock().unwrap().insert(
+        profile_id.to_string(),
+        ProxyRelayRuntime {
+            local_port,
+            shutdown_tx,
+            task,
+        },
+    );
+
+    Ok(format!("socks5://127.0.0.1:{}", local_port))
+}
+
+async fn start_profile_http_proxy_relay(
+    state: &AppState,
+    profile_id: &str,
+    upstream: UpstreamHttpProxy,
+) -> Result<String, String> {
+    stop_profile_proxy_relay(state, profile_id);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("Failed to start local HTTP proxy relay: {}", e))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to resolve local HTTP proxy relay address: {}", e))?
+        .port();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let profile_id_owned = profile_id.to_string();
+    let upstream_proxy = upstream.clone();
+
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _)) => {
+                            let mut conn_shutdown = shutdown_rx.clone();
+                            let upstream_for_conn = upstream_proxy.clone();
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    changed = conn_shutdown.changed() => {
+                                        if changed.is_ok() && *conn_shutdown.borrow() {
+                                            log::info!("Stopped local HTTP proxy relay connection");
+                                        }
+                                    }
+                                    result = handle_http_proxy_relay_connection(stream, upstream_for_conn) => {
+                                        if let Err(err) = result {
+                                            log::warn!("HTTP proxy relay connection failed: {}", err);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            log::warn!("HTTP proxy relay accept failed for {}: {}", profile_id_owned, err);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    state.proxy_relays.lock().unwrap().insert(
+        profile_id.to_string(),
+        ProxyRelayRuntime {
+            local_port,
+            shutdown_tx,
+            task,
+        },
+    );
+
+    Ok(format!("http://127.0.0.1:{}", local_port))
+}
+
+fn stop_profile_proxy_relay(state: &AppState, profile_id: &str) {
+    let relay = state.proxy_relays.lock().unwrap().remove(profile_id);
+    if let Some(relay) = relay {
+        log::info!(
+            "Stopping local proxy relay for {} on port {}",
+            profile_id,
+            relay.local_port
+        );
+        let _ = relay.shutdown_tx.send(true);
+        relay.task.abort();
+    }
+}
+
+async fn resolve_profile_proxy_server(
+    state: &AppState,
+    profile_id: &str,
+    raw_proxy: &str,
+) -> Result<Option<String>, String> {
+    match parse_proxy_launch_config(raw_proxy)? {
+        None => {
+            stop_profile_proxy_relay(state, profile_id);
+            Ok(None)
+        }
+        Some(ProxyLaunchConfig::Direct(proxy_server)) => {
+            stop_profile_proxy_relay(state, profile_id);
+            Ok(Some(proxy_server))
+        }
+        Some(ProxyLaunchConfig::HttpRelay(upstream)) => {
+            let relay_proxy = start_profile_http_proxy_relay(state, profile_id, upstream).await?;
+            Ok(Some(relay_proxy))
+        }
+        Some(ProxyLaunchConfig::Socks5Relay(upstream)) => {
+            let relay_proxy = start_profile_proxy_relay(state, profile_id, upstream).await?;
+            Ok(Some(relay_proxy))
+        }
+        Some(ProxyLaunchConfig::BindRelay(source_ip)) => {
+            let relay_proxy = start_profile_bind_relay(state, profile_id, source_ip).await?;
+            Ok(Some(relay_proxy))
+        }
+    }
 }
 
 // Get cache directory for browser profiles
@@ -2069,7 +3145,10 @@ fn get_chrome_path() -> PathBuf {
 
 // Download browser data from server (via Worker CDN - faster than direct R2)
 #[tauri::command]
-async fn download_browser_data(profile_id: String, auth_token: Option<String>) -> Result<bool, String> {
+async fn download_browser_data(
+    profile_id: String,
+    auth_token: Option<String>,
+) -> Result<bool, String> {
     let server_url = get_server_url();
     let cache_dir = get_cache_dir().join(&profile_id);
     let default_dir = cache_dir.join("Default");
@@ -2151,7 +3230,10 @@ async fn download_browser_data(profile_id: String, auth_token: Option<String>) -
 
 // Upload browser data to server (via Worker CDN)
 #[tauri::command]
-async fn upload_browser_data(profile_id: String, auth_token: Option<String>) -> Result<bool, String> {
+async fn upload_browser_data(
+    profile_id: String,
+    auth_token: Option<String>,
+) -> Result<bool, String> {
     let server_url = get_server_url();
     let cache_dir = get_cache_dir().join(&profile_id);
 
@@ -2235,9 +3317,7 @@ async fn upload_browser_data(profile_id: String, auth_token: Option<String>) -> 
 
     let url = format!("{}/api/sync/{}/upload", server_url, profile_id);
 
-    let mut request = client
-        .post(&url)
-        .header("Content-Type", "application/gzip");
+    let mut request = client.post(&url).header("Content-Type", "application/gzip");
     if let Some(token) = normalize_auth_token(auth_token.as_deref()) {
         request = request.header("x-auth-token", token);
     }
@@ -2673,6 +3753,7 @@ fn run_fb_token_cli_attempt(
     password: &str,
     totp_secret: &str,
     datr: &str,
+    proxy: &str,
 ) -> Result<String, String> {
     let mut child = Command::new(python_path)
         .arg(script_path)
@@ -2688,7 +3769,10 @@ fn run_fb_token_cli_attempt(
             )
         })?;
 
-    let input_payload = format!("{}\n{}\n{}\n{}\n", login, password, totp_secret, datr);
+    let input_payload = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        login, password, totp_secret, datr, proxy
+    );
 
     if let Some(stdin) = child.stdin.as_mut() {
         stdin
@@ -2724,6 +3808,7 @@ async fn get_comment_token_via_script(
     password: Option<String>,
     totp_secret: Option<String>,
     datr: Option<String>,
+    proxy: Option<String>,
 ) -> Result<String, String> {
     let mut login_candidates: Vec<String> = Vec::new();
     if let Some(value) = username.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -2745,6 +3830,7 @@ async fn get_comment_token_via_script(
         .ok_or("Missing password".to_string())?;
     let normalized_totp = totp_secret.unwrap_or_default().replace(' ', "");
     let normalized_datr = datr.unwrap_or_default().trim().to_string();
+    let normalized_proxy = proxy.unwrap_or_default().trim().to_string();
 
     let script_path = get_fb_token_cli_script_path().ok_or(
         "Local token CLI script not found. Expected fb_token_cli.py in app resources or /Users/yok/Developer/token/to.py"
@@ -2759,14 +3845,19 @@ async fn get_comment_token_via_script(
 
     for login in login_candidates {
         log::info!(
-            "[Comment Token] Running script for login: {} via {} (datr: {})",
+            "[Comment Token] Running script for login: {} via {} (datr: {}, proxy: {})",
             login,
             python_path.display(),
             if normalized_datr.is_empty() {
                 "no"
             } else {
                 "yes"
-            }
+            },
+            if normalized_proxy.is_empty() {
+                "no"
+            } else {
+                "yes"
+            },
         );
 
         match run_fb_token_cli_attempt(
@@ -2776,6 +3867,7 @@ async fn get_comment_token_via_script(
             &pass,
             &normalized_totp,
             &normalized_datr,
+            &normalized_proxy,
         ) {
             Ok(token) => {
                 log::info!("[Comment Token] Token extracted ({} chars)", token.len());
@@ -2939,7 +4031,10 @@ fn get_postcron_session() -> &'static tokio::sync::Mutex<Option<PostcronSession>
 
 // Step 1: Download profile + Export cookies locally + Connect Browserless + Inject
 #[tauri::command]
-async fn postcron_step_launch(profile_id: String, auth_token: Option<String>) -> Result<String, String> {
+async fn postcron_step_launch(
+    profile_id: String,
+    auth_token: Option<String>,
+) -> Result<String, String> {
     use chromiumoxide::cdp::browser_protocol::network::CookieParam;
     use chromiumoxide::Browser;
 
@@ -3314,10 +4409,12 @@ async fn postcron_step_navigate() -> Result<String, String> {
             "(function() {{ window.location.href = {}; return window.location.href; }})()",
             oauth_url_json
         );
-        sess.page
-            .evaluate(js.as_str())
-            .await
-            .map_err(|e| format!("Failed to navigate: {} | Fallback navigation failed: {}", error_text, e))?;
+        sess.page.evaluate(js.as_str()).await.map_err(|e| {
+            format!(
+                "Failed to navigate: {} | Fallback navigation failed: {}",
+                error_text, e
+            )
+        })?;
 
         navigate_note = format!("Navigation fallback used: {}", error_text);
     }
@@ -3728,8 +4825,8 @@ async fn launch_browser(
         }
     }
 
-    let auth_token_for_sync =
-        normalize_auth_token(auth_token.as_deref()).or_else(|| lookup_profile_auth_token(&state, &profile_id));
+    let auth_token_for_sync = normalize_auth_token(auth_token.as_deref())
+        .or_else(|| lookup_profile_auth_token(&state, &profile_id));
     if auth_token_for_sync.is_some() {
         remember_profile_auth_token(&state, &profile_id, auth_token_for_sync.clone());
     }
@@ -3799,6 +4896,7 @@ async fn launch_browser(
         "--disable-dev-shm-usage".to_string(),
         "--disable-hang-monitor".to_string(),
         "--disable-ipc-flooding-protection".to_string(),
+        "--disable-quic".to_string(),
         "--disable-renderer-backgrounding".to_string(),
 
         // Privacy-related (reduce tracking vectors)
@@ -3823,13 +4921,13 @@ async fn launch_browser(
         "--accept-lang=th,th-TH,en-US,en".to_string(),
     ];
 
-    if !profile.proxy.is_empty() {
-        let proxy_server = if profile.proxy.contains('@') {
-            profile.proxy.split('@').last().unwrap_or(&profile.proxy)
-        } else {
-            &profile.proxy
-        };
+    if let Some(proxy_server) =
+        resolve_profile_proxy_server(&state, &profile_id, &profile.proxy).await?
+    {
+        log::info!("Using launch proxy for {}: {}", profile.name, proxy_server);
         args.push(format!("--proxy-server={}", proxy_server));
+    } else {
+        log::info!("Launching {} without proxy override", profile.name);
     }
 
     // Add remote debugging port (always needed for cookie export)
@@ -3861,10 +4959,14 @@ async fn launch_browser(
     log::info!("Chrome path: {:?}", launch_path);
     log::info!("Args: {:?}", args);
 
-    let child = spawn_chrome_process(&launch_path, &chrome_path, &args).map_err(|e| {
-        log::error!("Failed to launch Chrome: {}", e);
-        e
-    })?;
+    let child = match spawn_chrome_process(&launch_path, &chrome_path, &args) {
+        Ok(child) => child,
+        Err(e) => {
+            stop_profile_proxy_relay(&state, &profile_id);
+            log::error!("Failed to launch Chrome: {}", e);
+            return Err(e);
+        }
+    };
 
     let pid = child.id();
 
@@ -3900,6 +5002,7 @@ async fn launch_browser(
     // Monitor browser close
     let profile_id_clone = profile_id.clone();
     let running_browsers = state.running_browsers.clone();
+    let running_browsers_state_for_proxy_cleanup = state.inner().clone();
     let uploading_profiles = state.uploading_profiles.clone();
     let debug_ports_clone = state.debug_ports.clone();
     let profile_auth_tokens = state.profile_auth_tokens.clone();
@@ -3943,8 +5046,16 @@ async fn launch_browser(
                         log::info!("Uploading data for: {}", profile_id_clone);
 
                         // Upload data
-                        if let Err(e) =
-                            upload_browser_data_with_retry(&profile_id_clone, monitor_auth_token.clone()).await
+                        stop_profile_proxy_relay(
+                            &running_browsers_state_for_proxy_cleanup,
+                            &profile_id_clone,
+                        );
+
+                        if let Err(e) = upload_browser_data_with_retry(
+                            &profile_id_clone,
+                            monitor_auth_token.clone(),
+                        )
+                        .await
                         {
                             log::error!("Failed to upload: {}", e);
                         }
@@ -4017,8 +5128,8 @@ async fn launch_browser_debug(
         }
     }
 
-    let auth_token_for_sync =
-        normalize_auth_token(auth_token.as_deref()).or_else(|| lookup_profile_auth_token(&state, &profile_id));
+    let auth_token_for_sync = normalize_auth_token(auth_token.as_deref())
+        .or_else(|| lookup_profile_auth_token(&state, &profile_id));
     if auth_token_for_sync.is_some() {
         remember_profile_auth_token(&state, &profile_id, auth_token_for_sync.clone());
     }
@@ -4093,6 +5204,7 @@ async fn launch_browser_debug(
         "--disable-dev-shm-usage".to_string(),
         "--disable-hang-monitor".to_string(),
         "--disable-ipc-flooding-protection".to_string(),
+        "--disable-quic".to_string(),
         "--disable-renderer-backgrounding".to_string(),
         "--disable-breakpad".to_string(),
         "--disable-component-update".to_string(),
@@ -4109,13 +5221,16 @@ async fn launch_browser_debug(
         "--accept-lang=th,th-TH,en-US,en".to_string(),
     ];
 
-    if !profile.proxy.is_empty() {
-        let proxy_server = if profile.proxy.contains('@') {
-            profile.proxy.split('@').last().unwrap_or(&profile.proxy)
-        } else {
-            &profile.proxy
-        };
+    if let Some(proxy_server) =
+        resolve_profile_proxy_server(&state, &profile_id, &profile.proxy).await?
+    {
+        log::info!("Using debug proxy for {}: {}", profile.name, proxy_server);
         args.push(format!("--proxy-server={}", proxy_server));
+    } else {
+        log::info!(
+            "Launching {} in debug mode without proxy override",
+            profile.name
+        );
     }
 
     for startup_url in startup_urls(&profile).into_iter() {
@@ -4128,10 +5243,14 @@ async fn launch_browser_debug(
 
     log::info!("Launching Chrome in DEBUG mode on port {}", debug_port);
 
-    let child = spawn_chrome_process(&launch_path, &chrome_path, &args).map_err(|e| {
-        log::error!("Failed to launch Chrome: {}", e);
-        e
-    })?;
+    let child = match spawn_chrome_process(&launch_path, &chrome_path, &args) {
+        Ok(child) => child,
+        Err(e) => {
+            stop_profile_proxy_relay(&state, &profile_id);
+            log::error!("Failed to launch Chrome: {}", e);
+            return Err(e);
+        }
+    };
 
     let pid = child.id();
     log::info!(
@@ -4152,6 +5271,7 @@ async fn launch_browser_debug(
     // Monitor browser close
     let profile_id_clone = profile_id.clone();
     let running_browsers = state.running_browsers.clone();
+    let running_browsers_state_for_proxy_cleanup = state.inner().clone();
     let uploading_profiles = state.uploading_profiles.clone();
     let debug_ports_clone = state.debug_ports.clone();
     let profile_auth_tokens = state.profile_auth_tokens.clone();
@@ -4187,8 +5307,15 @@ async fn launch_browser_debug(
                     };
 
                     if should_upload {
-                        if let Err(e) =
-                            upload_browser_data_with_retry(&profile_id_clone, monitor_auth_token.clone()).await
+                        stop_profile_proxy_relay(
+                            &running_browsers_state_for_proxy_cleanup,
+                            &profile_id_clone,
+                        );
+                        if let Err(e) = upload_browser_data_with_retry(
+                            &profile_id_clone,
+                            monitor_auth_token.clone(),
+                        )
+                        .await
                         {
                             log::error!("Failed to upload: {}", e);
                         }
@@ -4430,8 +5557,8 @@ async fn stop_browser(
         profile_id
     );
 
-    let auth_token_for_sync =
-        normalize_auth_token(auth_token.as_deref()).or_else(|| lookup_profile_auth_token(&state, &profile_id));
+    let auth_token_for_sync = normalize_auth_token(auth_token.as_deref())
+        .or_else(|| lookup_profile_auth_token(&state, &profile_id));
     if auth_token_for_sync.is_some() {
         remember_profile_auth_token(&state, &profile_id, auth_token_for_sync.clone());
     }
@@ -4505,6 +5632,9 @@ async fn stop_browser(
 
     // 5. Wait a bit more for file handles to be released
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Stop per-profile local proxy relay after browser is fully closed.
+    stop_profile_proxy_relay(&state, &profile_id);
 
     // 6. Upload browser data (with retry)
     log::info!("Uploading browser data for: {}", profile_id);
@@ -5022,6 +6152,7 @@ async fn launch_browser_internal(
         "--disable-dev-shm-usage".to_string(),
         "--disable-hang-monitor".to_string(),
         "--disable-ipc-flooding-protection".to_string(),
+        "--disable-quic".to_string(),
         "--disable-renderer-backgrounding".to_string(),
         "--disable-breakpad".to_string(),
         "--disable-component-update".to_string(),
@@ -5038,13 +6169,16 @@ async fn launch_browser_internal(
         "--accept-lang=th,th-TH,en-US,en".to_string(),
     ];
 
-    if !profile.proxy.is_empty() {
-        let proxy_server = if profile.proxy.contains('@') {
-            profile.proxy.split('@').last().unwrap_or(&profile.proxy)
-        } else {
-            &profile.proxy
-        };
+    if let Some(proxy_server) =
+        resolve_profile_proxy_server(state.state, &profile_id, &profile.proxy).await?
+    {
+        log::info!("Using recover proxy for {}: {}", profile.name, proxy_server);
         args.push(format!("--proxy-server={}", proxy_server));
+    } else {
+        log::info!(
+            "Launching {} in recovery flow without proxy override",
+            profile.name
+        );
     }
 
     for startup_url in startup_urls(&profile).into_iter() {
@@ -5055,7 +6189,13 @@ async fn launch_browser_internal(
     // Pin extensions to toolbar before launching
     pin_extensions_in_preferences(&cache_dir);
 
-    let child = spawn_chrome_process(&launch_path, &chrome_path, &args)?;
+    let child = match spawn_chrome_process(&launch_path, &chrome_path, &args) {
+        Ok(child) => child,
+        Err(e) => {
+            stop_profile_proxy_relay(state.state, &profile_id);
+            return Err(e);
+        }
+    };
 
     let pid = child.id();
     log::info!("Browser launched with PID: {}", pid);
@@ -5068,6 +6208,7 @@ async fn launch_browser_internal(
     // Monitor browser close
     let profile_id_clone = profile_id.clone();
     let running_browsers = state.state.running_browsers.clone();
+    let state_for_proxy_cleanup = state.state.clone();
     let uploading_profiles = state.state.uploading_profiles.clone();
     let profile_auth_tokens = state.state.profile_auth_tokens.clone();
     let monitor_auth_token = auth_token_for_sync.clone();
@@ -5099,8 +6240,12 @@ async fn launch_browser_internal(
                     };
 
                     if should_upload {
-                        if let Err(e) =
-                            upload_browser_data_with_retry(&profile_id_clone, monitor_auth_token.clone()).await
+                        stop_profile_proxy_relay(&state_for_proxy_cleanup, &profile_id_clone);
+                        if let Err(e) = upload_browser_data_with_retry(
+                            &profile_id_clone,
+                            monitor_auth_token.clone(),
+                        )
+                        .await
                         {
                             log::error!("Failed to upload: {}", e);
                         }

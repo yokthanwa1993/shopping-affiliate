@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS post_history (
     shopee_link TEXT,
     posted_at TEXT DEFAULT (datetime('now')),
     status TEXT DEFAULT 'success',
+    trigger_source TEXT,
     bot_id TEXT DEFAULT 'default', -- success, failed
     error_message TEXT,
     post_token_hint TEXT,

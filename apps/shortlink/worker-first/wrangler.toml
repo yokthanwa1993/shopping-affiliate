@@ -1,0 +1,11 @@
+name = "first-shopee-shortlink"
+main = "../worker-chearb/src/index.js"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "BRIDGE"
+class_name = "BridgeDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["BridgeDO"]
