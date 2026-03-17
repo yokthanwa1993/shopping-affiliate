@@ -50,6 +50,7 @@
         "to": "token",
         "filter": [
           "app.py",
+          "core.py",
           "requirements.txt"
         ]
       }

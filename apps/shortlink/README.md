@@ -34,8 +34,8 @@ GET response JSON
 ```
 apps/shortlink/
 ├── electron/
-│   ├── main.js           ← Electron สำหรับ account chearb (port 3000)
-│   ├── main-neezs.js     ← Electron สำหรับ account neezs  (port 3001)
+│   ├── main.js           ← Electron runtime หลักสำหรับทุก account
+│   ├── main-neezs.js     ← compatibility wrapper สำหรับ neezs
 │   ├── package.json
 │   └── icons/
 ├── worker-chearb/        ← Cloudflare Worker สำหรับ account chearb
@@ -54,7 +54,7 @@ apps/shortlink/
 | Account | Electron | Port | Worker URL |
 |---------|----------|------|------------|
 | chearb | `main.js` | 3000 | `https://chearb-shopee-shortlink.yokthanwa1993-bc9.workers.dev` |
-| neezs | `main-neezs.js` | 3001 | `https://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev` |
+| neezs | `main.js` | 3001 | `https://neezs-shopee-shortlink.yokthanwa1993-bc9.workers.dev` |
 
 แต่ละ account มี Worker แยกกัน และ Electron แยก session (`--user-data-dir`) ทำให้ login คนละ Shopee account ได้บนเครื่องเดียวกัน
 
@@ -130,7 +130,7 @@ XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
 ```bash
 XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
   nohup ~/shopee-shortlink/node_modules/.bin/electron \
-  ~/shopee-shortlink/main-neezs.js \
+  ~/shopee-shortlink/main.js \
   --no-sandbox --ozone-platform=wayland \
   --user-data-dir=/home/yok/.config/shopee-neezs > /tmp/electron-neezs.log 2>&1 &
 ```

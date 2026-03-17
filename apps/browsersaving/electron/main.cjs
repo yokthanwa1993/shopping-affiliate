@@ -3,16 +3,21 @@ const fs = require('fs')
 const fsp = require('fs/promises')
 const path = require('path')
 const http = require('http')
+const tar = require('tar')
 const { createLocalLauncher } = require('./local-launcher.cjs')
-const { createMobileEgressProxy } = require('./mobile-egress-proxy.cjs')
-const { createLocalTokenService } = require('./local-token-service.cjs')
+const {
+  createMobileEgressProxy,
+  fetchViaMobileProxy,
+  getMobileProxyUrl,
+} = require('./mobile-egress-proxy.cjs')
+const { createLocalTokenRunner } = require('./local-token-runner.cjs')
 
 const DIST_DIR = path.join(__dirname, '..', 'dist')
 
 const DEFAULT_RUNTIME_CONFIG = {
   serverUrl: process.env.BROWSERSAVING_SERVER_URL || 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev',
   apiUrl: process.env.BROWSERSAVING_API_URL || 'https://browsersaving-api.pubilo.com',
-  commentTokenServiceUrl: process.env.BROWSERSAVING_COMMENT_TOKEN_URL || 'https://token.pubilo.com/api/comment-token',
+  commentTokenServiceUrl: process.env.BROWSERSAVING_COMMENT_TOKEN_URL || 'https://token.lslly.com/api/comment-token',
   remoteLauncherUrl: '',
 }
 
@@ -34,7 +39,17 @@ let baseUrl = ''
 const profileWindows = new Map()
 let mobileProxy = null
 let mobileProxyState = null
-let localTokenService = null
+let localTokenRunner = null
+let postcronState = null
+
+function readString(value, fallback = '') {
+  const text = String(value || '').trim()
+  return text || fallback
+}
+
+function sanitizeProfileId(value) {
+  return String(value || '').trim().replace(/[^a-zA-Z0-9._-]/g, '_')
+}
 
 const ELECTRON_PROFILE_IMPORT_MAP = [
   { to: ['Cookies'], candidates: [['Default', 'Cookies'], ['Default', 'Network', 'Cookies']] },
@@ -140,6 +155,30 @@ async function directoryHasEntries(targetPath) {
   }
 }
 
+async function profileHasCachedData(profileDir) {
+  const defaultDir = path.join(profileDir, 'Default')
+  const checks = [
+    path.join(profileDir, 'cookies.json'),
+    path.join(defaultDir, 'Cookies'),
+    path.join(defaultDir, 'Preferences'),
+    path.join(defaultDir, 'Local Storage'),
+    path.join(defaultDir, 'IndexedDB'),
+  ]
+
+  for (const targetPath of checks) {
+    if (await pathExists(targetPath)) return true
+  }
+  return false
+}
+
+async function readCookiesFromProfileDir(profileDir) {
+  const cookiesPath = path.join(profileDir, 'cookies.json')
+  if (!(await pathExists(cookiesPath))) return []
+  const content = await fsp.readFile(cookiesPath, 'utf8')
+  const cookies = JSON.parse(content)
+  return Array.isArray(cookies) ? cookies : []
+}
+
 function toCookieUrl(cookie) {
   const domain = String(cookie?.domain || '').trim().replace(/^\./, '')
   if (!domain) return null
@@ -217,24 +256,28 @@ async function exportSessionCookies(ses) {
   }))
 }
 
-async function ensureSessionStorageBootstrapped(sessionState) {
-  await ensureDir(sessionState.profileDir)
-  await ensureDir(sessionState.storagePath)
+async function ensureStorageBootstrappedFromProfile(profileDir, storagePath) {
+  await ensureDir(profileDir)
+  await ensureDir(storagePath)
 
-  const hasExistingStorage = await directoryHasEntries(sessionState.storagePath)
+  const hasExistingStorage = await directoryHasEntries(storagePath)
   if (hasExistingStorage) {
     return
   }
 
   for (const entry of ELECTRON_PROFILE_IMPORT_MAP) {
     for (const candidate of entry.candidates) {
-      const sourcePath = path.join(sessionState.profileDir, ...candidate)
-      const targetPath = path.join(sessionState.storagePath, ...entry.to)
+      const sourcePath = path.join(profileDir, ...candidate)
+      const targetPath = path.join(storagePath, ...entry.to)
       if (await copyPathIfExists(sourcePath, targetPath)) {
         break
       }
     }
   }
+}
+
+async function ensureSessionStorageBootstrapped(sessionState) {
+  await ensureStorageBootstrappedFromProfile(sessionState.profileDir, sessionState.storagePath)
 }
 
 async function syncSessionToProfile(sessionState) {
@@ -286,6 +329,99 @@ async function applyMobileProxyToSession(ses) {
 
   if (typeof ses.closeAllConnections === 'function') {
     await ses.closeAllConnections().catch(() => null)
+  }
+}
+
+async function fetchWithMobileEgress(url, init = {}) {
+  return fetchViaMobileProxy(url, init, mobileProxyState)
+}
+
+async function readJsonResponse(response) {
+  const text = await response.text()
+  if (!text) return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(text)
+  }
+}
+
+function buildWorkerHeaders(authToken, extraHeaders = {}) {
+  const headers = new Headers(extraHeaders)
+  const normalizedToken = readString(authToken)
+  if (normalizedToken) {
+    headers.set('x-auth-token', normalizedToken)
+  }
+  return headers
+}
+
+async function ensureProfileDataAvailable(profileId, authToken, profileDir) {
+  if (await profileHasCachedData(profileDir)) {
+    return
+  }
+
+  const normalizedToken = readString(authToken)
+  if (!normalizedToken) {
+    throw new Error('Missing auth token for profile download')
+  }
+
+  const response = await fetchWithMobileEgress(`${DEFAULT_RUNTIME_CONFIG.serverUrl}/api/sync/${encodeURIComponent(profileId)}/download`, {
+    headers: buildWorkerHeaders(normalizedToken),
+  })
+
+  if (response.status === 404) {
+    return
+  }
+  if (!response.ok) {
+    throw new Error(`Browser data download failed: HTTP ${response.status}`)
+  }
+
+  const tmpDir = await fsp.mkdtemp(path.join(app.getPath('temp'), `${profileId}-download-`))
+  const archivePath = path.join(tmpDir, 'browser-data.tar.gz')
+  const archive = Buffer.from(await response.arrayBuffer())
+
+  try {
+    await fsp.writeFile(archivePath, archive)
+    await fsp.rm(profileDir, { recursive: true, force: true })
+    await fsp.mkdir(profileDir, { recursive: true })
+    await tar.x({ file: archivePath, cwd: profileDir, gzip: true })
+  } finally {
+    await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => null)
+  }
+}
+
+async function resolveCommentTokenLocal(profileId, userToken, authToken) {
+  const response = await fetchWithMobileEgress(`${DEFAULT_RUNTIME_CONFIG.serverUrl}/api/token/${encodeURIComponent(profileId)}/resolve`, {
+    method: 'POST',
+    headers: buildWorkerHeaders(authToken, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ user_token: readString(userToken) }),
+  })
+  const data = await readJsonResponse(response).catch((error) => {
+    throw new Error(String(error))
+  })
+  if (!response.ok || !data?.success) {
+    throw new Error(String(data?.error || data?.detail || `HTTP ${response.status}`))
+  }
+  return data
+}
+
+async function savePostcronTokenLocal(profileId, token, authToken) {
+  const response = await fetchWithMobileEgress(`${DEFAULT_RUNTIME_CONFIG.serverUrl}/api/profiles/${encodeURIComponent(profileId)}`, {
+    method: 'PUT',
+    headers: buildWorkerHeaders(authToken, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ facebook_token: readString(token) }),
+  })
+  const data = await readJsonResponse(response).catch((error) => {
+    throw new Error(String(error))
+  })
+  if (!response.ok) {
+    throw new Error(String(data?.error || `HTTP ${response.status}`))
+  }
+  return {
+    success: true,
+    token: readString(token),
+    page_name: readString(data?.page_name),
+    page_avatar_url: readString(data?.page_avatar_url),
   }
 }
 
@@ -395,9 +531,450 @@ async function closeProfileWindow(sessionState) {
   win.close()
 }
 
+function getProfilesRoot() {
+  return path.join(app.getPath('userData'), 'profiles')
+}
+
+function getPostcronStoragePath(profileDir) {
+  return path.join(profileDir, '_electron_postcron')
+}
+
+function createPostcronChildWindow(targetUrl, ses, profileId) {
+  const child = new BrowserWindow({
+    title: `BrowserSaving - Postcron ${profileId}`,
+    width: 1320,
+    height: 900,
+    minWidth: 900,
+    minHeight: 600,
+    autoHideMenuBar: true,
+    webPreferences: {
+      session: ses,
+      contextIsolation: true,
+    },
+  })
+  child.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      createPostcronChildWindow(url, ses, profileId)
+    } else {
+      shell.openExternal(url).catch(() => null)
+    }
+    return { action: 'deny' }
+  })
+  void child.loadURL(targetUrl)
+  return child
+}
+
+async function clearPostcronState() {
+  const current = postcronState
+  postcronState = null
+  if (!current?.window || current.window.isDestroyed()) return
+  current.window.removeAllListeners('closed')
+  current.window.close()
+}
+
+async function postcronStepLaunchHeadful({ profileId, authToken } = {}) {
+  const normalizedProfileId = sanitizeProfileId(profileId)
+  if (!normalizedProfileId) {
+    throw new Error('Missing profile id')
+  }
+
+  await clearPostcronState()
+
+  const profileDir = path.join(getProfilesRoot(), normalizedProfileId)
+  const storagePath = getPostcronStoragePath(profileDir)
+
+  await fsp.mkdir(getProfilesRoot(), { recursive: true })
+  await ensureProfileDataAvailable(normalizedProfileId, authToken, profileDir)
+  await fsp.rm(storagePath, { recursive: true, force: true }).catch(() => null)
+  await ensureStorageBootstrappedFromProfile(profileDir, storagePath)
+
+  const ses = electronSession.fromPath(storagePath)
+  await applyMobileProxyToSession(ses)
+
+  const cookies = await readCookiesFromProfileDir(profileDir).catch(() => [])
+  if (Array.isArray(cookies) && cookies.length > 0) {
+    await importSessionCookies(ses, cookies, { replace: true })
+  }
+
+  const win = new BrowserWindow({
+    title: `BrowserSaving - Postcron ${normalizedProfileId}`,
+    width: 1280,
+    height: 820,
+    minWidth: 960,
+    minHeight: 640,
+    center: true,
+    autoHideMenuBar: true,
+    show: false,
+    webPreferences: {
+      session: ses,
+      contextIsolation: true,
+      backgroundThrottling: false,
+    },
+  })
+
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      void win.loadURL(url).catch(() => null)
+    } else {
+      shell.openExternal(url).catch(() => null)
+    }
+    return { action: 'deny' }
+  })
+
+  win.on('closed', () => {
+    if (postcronState?.window === win) {
+      postcronState = null
+    }
+  })
+
+  await win.loadURL('about:blank')
+
+  postcronState = {
+    profileId: normalizedProfileId,
+    profileDir,
+    storagePath,
+    authToken: readString(authToken),
+    session: ses,
+    window: win,
+  }
+
+  return `Postcron background session opened. ${Array.isArray(cookies) ? cookies.length : 0} cookies loaded via Electron/D-Link.`
+}
+
+function requirePostcronState() {
+  if (!postcronState?.window || postcronState.window.isDestroyed()) {
+    throw new Error('No browser session. Run Step 1 first.')
+  }
+  return postcronState
+}
+
+async function getPostcronWindowUrl() {
+  const state = requirePostcronState()
+  const current = state.window.webContents.getURL()
+  return readString(current, 'about:blank')
+}
+
+async function postcronStepNavigate() {
+  const state = requirePostcronState()
+  const oauthUrl = 'https://postcron.com/api/v2.0/social-accounts/url-redirect/?should_redirect=true&social_network=facebook'
+  await state.window.loadURL(oauthUrl)
+  await delay(5000)
+  const url = await getPostcronWindowUrl()
+  if (!url || url === 'about:blank') {
+    throw new Error('Failed to navigate: page stayed on about:blank')
+  }
+  return `Current URL: ${url.slice(0, 200)}`
+}
+
+async function postcronEvaluate(script) {
+  const state = requirePostcronState()
+  return state.window.webContents.executeJavaScript(script, true)
+}
+
+function extractAccessTokenFromUrl(url) {
+  const normalizedUrl = readString(url)
+  if (!normalizedUrl || !normalizedUrl.includes('access_token=')) return ''
+
+  const hashIndex = normalizedUrl.indexOf('#')
+  if (hashIndex !== -1) {
+    const fragment = normalizedUrl.slice(hashIndex + 1)
+    const params = new URLSearchParams(fragment)
+    const token = readString(params.get('access_token'))
+    if (token) return token
+  }
+
+  const queryIndex = normalizedUrl.indexOf('?')
+  if (queryIndex !== -1) {
+    const endIndex = hashIndex !== -1 ? hashIndex : undefined
+    const params = new URLSearchParams(normalizedUrl.slice(queryIndex + 1, endIndex))
+    const token = readString(params.get('access_token'))
+    if (token) return token
+  }
+
+  return ''
+}
+
+async function postcronInspectPage() {
+  return postcronEvaluate(`
+    (() => {
+      const url = window.location.href;
+      const extractToken = (inputUrl) => {
+        if (!String(inputUrl || '').includes('access_token=')) return '';
+        const hashIndex = inputUrl.indexOf('#');
+        if (hashIndex !== -1) {
+          const params = new URLSearchParams(inputUrl.slice(hashIndex + 1));
+          const token = params.get('access_token');
+          if (token) return token;
+        }
+        const queryIndex = inputUrl.indexOf('?');
+        if (queryIndex !== -1) {
+          const endIndex = hashIndex !== -1 ? hashIndex : undefined;
+          const params = new URLSearchParams(inputUrl.slice(queryIndex + 1, endIndex));
+          const token = params.get('access_token');
+          if (token) return token;
+        }
+        return '';
+      };
+
+      const clickSelectors = [
+        'button[name="__CONFIRM__"]',
+        'div[aria-label*="ดำเนินการต่อ"]',
+        'div[aria-label*="Continue"]',
+        '[role="button"][aria-label*="ดำเนินการต่อ"]',
+        '[role="button"][aria-label*="Continue"]',
+      ];
+
+      const clickButton = (node, label) => {
+        if (!node) return null;
+        node.click();
+        return {
+          action: 'clicked',
+          buttonText: String(label || node.textContent || node.getAttribute('aria-label') || '').trim().slice(0, 120),
+        };
+      };
+
+      const directToken = extractToken(url);
+      if (directToken) {
+        return { success: true, token: directToken, url, action: 'token_in_url', buttonText: '' };
+      }
+
+      for (const selector of clickSelectors) {
+        try {
+          const node = document.querySelector(selector);
+          if (node) {
+            const clicked = clickButton(node, selector);
+            if (clicked) {
+              return { success: false, token: '', url: window.location.href, ...clicked };
+            }
+          }
+        } catch (error) {}
+      }
+
+      const xpath = "//div[@role='button']//span[contains(text(),'ดำเนินการต่อ') or contains(text(),'Continue')]";
+      try {
+        const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        const labelNode = result.singleNodeValue;
+        if (labelNode) {
+          const button = labelNode.closest('[role="button"]');
+          const clicked = clickButton(button, labelNode.textContent || '');
+          if (clicked) {
+            return { success: false, token: '', url: window.location.href, ...clicked };
+          }
+        }
+      } catch (error) {}
+
+      const textButtons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const node of textButtons) {
+        const label = String(node.textContent || node.getAttribute('aria-label') || '').trim();
+        if (!label) continue;
+        if (label.includes('ดำเนินการต่อ') || label.includes('Continue')) {
+          const clicked = clickButton(node, label);
+          if (clicked) {
+            return { success: false, token: '', url: window.location.href, ...clicked };
+          }
+        }
+      }
+
+      return {
+        success: false,
+        token: '',
+        url,
+        action: 'no_button',
+        buttonText: '',
+        title: document.title || '',
+      };
+    })()
+  `)
+}
+
+async function waitForPostcronToken({ timeoutMs = 45000, pollMs = 1500 } = {}) {
+  const startedAt = Date.now()
+  let lastUrl = ''
+  let lastAction = ''
+  let lastButtonText = ''
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const state = requirePostcronState()
+    const currentUrl = await getPostcronWindowUrl().catch(() => '')
+    lastUrl = readString(currentUrl, lastUrl)
+
+    const directToken = extractAccessTokenFromUrl(lastUrl)
+    if (directToken) {
+      return { token: directToken, url: lastUrl, action: 'token_in_url', buttonText: lastButtonText }
+    }
+
+    const inspected = await postcronInspectPage().catch(() => null)
+    const inspectedUrl = readString(inspected?.url, lastUrl)
+    if (inspectedUrl) lastUrl = inspectedUrl
+
+    const inspectedToken = extractAccessTokenFromUrl(lastUrl) || readString(inspected?.token)
+    if (inspectedToken) {
+      return {
+        token: inspectedToken,
+        url: lastUrl,
+        action: readString(inspected?.action, 'token_in_url'),
+        buttonText: readString(inspected?.buttonText),
+      }
+    }
+
+    lastAction = readString(inspected?.action, lastAction || 'waiting')
+    lastButtonText = readString(inspected?.buttonText, lastButtonText)
+
+    if (lastUrl.includes('forced_account_switch')) {
+      await state.window.loadURL('https://postcron.com/api/v2.0/social-accounts/url-redirect/?should_redirect=true&social_network=facebook')
+    }
+
+    await delay(pollMs)
+  }
+
+  throw new Error(`Postcron token timeout. Last URL: ${lastUrl || 'unknown'}${lastAction ? ` | action=${lastAction}` : ''}${lastButtonText ? ` | button=${lastButtonText}` : ''}`)
+}
+
+async function fetchPostcronTokenLocal({ profileId, authToken } = {}) {
+  let launchCompleted = false
+  try {
+    await postcronStepLaunchHeadful({ profileId, authToken })
+    launchCompleted = true
+    await postcronStepNavigate()
+
+    const extracted = await waitForPostcronToken()
+    const token = readString(extracted?.token)
+    if (!token) {
+      throw new Error('Local Postcron extraction returned empty token')
+    }
+
+    const saved = await savePostcronTokenLocal(profileId, token, authToken)
+    return {
+      success: true,
+      token,
+      url: readString(extracted?.url),
+      page_name: readString(saved?.page_name),
+      page_avatar_url: readString(saved?.page_avatar_url),
+    }
+  } finally {
+    if (launchCompleted) {
+      await postcronClose().catch(() => null)
+    }
+  }
+}
+
+async function postcronStepClick() {
+  requirePostcronState()
+  const initialResult = await postcronEvaluate(`
+    (() => {
+      const selectors = [
+        'button[name="__CONFIRM__"]',
+        'div[aria-label*="ดำเนินการต่อ"]',
+        'div[aria-label*="Continue"]',
+      ];
+      for (const selector of selectors) {
+        try {
+          const btn = document.querySelector(selector);
+          if (btn) { btn.click(); return 'clicked: ' + selector; }
+        } catch (error) {}
+      }
+      const xpath = "//div[@role='button']//span[contains(text(),'ดำเนินการต่อ') or contains(text(),'Continue')]";
+      const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+      if (result.singleNodeValue) {
+        const btn = result.singleNodeValue.closest('[role="button"]');
+        if (btn) { btn.click(); return 'clicked xpath: ' + String(result.singleNodeValue.textContent || '').trim().slice(0, 50); }
+      }
+      const accountLink = document.querySelector('a[href*="profile.php"]');
+      if (accountLink) { accountLink.click(); return 'clicked account link'; }
+      return 'no_button';
+    })()
+  `)
+
+  await delay(3000)
+  let url = await getPostcronWindowUrl()
+
+  if (!url.includes('access_token=') && !url.includes('postcron.com')) {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const state = requirePostcronState()
+      if (url.includes('forced_account_switch')) {
+        await state.window.loadURL('https://postcron.com/api/v2.0/social-accounts/url-redirect/?should_redirect=true&social_network=facebook')
+        await delay(5000)
+      }
+
+      await postcronEvaluate(`
+        (() => {
+          const selectors = ['button[name="__CONFIRM__"]', 'div[aria-label*="ดำเนินการต่อ"]', 'div[aria-label*="Continue"]'];
+          for (const selector of selectors) {
+            const btn = document.querySelector(selector);
+            if (btn) { btn.click(); return 'clicked: ' + selector; }
+          }
+          const xpath = "//div[@role='button']//span[contains(text(),'ดำเนินการต่อ') or contains(text(),'Continue')]";
+          const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          if (result.singleNodeValue) {
+            const btn = result.singleNodeValue.closest('[role=\"button\"]');
+            if (btn) { btn.click(); return 'clicked xpath: ' + String(result.singleNodeValue.textContent || '').trim().slice(0, 50); }
+          }
+          return 'no_button';
+        })()
+      `).catch(() => null)
+
+      await delay(3000)
+      url = await getPostcronWindowUrl()
+      if (url.includes('access_token=') || url.includes('postcron.com')) {
+        return 'Done - redirected to postcron callback'
+      }
+    }
+  }
+
+  return `${String(initialResult || 'unknown')}\n\nURL: ${url.slice(0, 200)}`
+}
+
+async function postcronStepExtract() {
+  requirePostcronState()
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const result = await postcronEvaluate(`
+      (() => {
+        const url = window.location.href;
+        if (url.includes('access_token=')) {
+          const hashIndex = url.indexOf('#');
+          if (hashIndex !== -1) {
+            const fragment = url.substring(hashIndex + 1);
+            const params = new URLSearchParams(fragment);
+            const token = params.get('access_token');
+            if (token) return { success: true, token, source: 'fragment', url };
+          }
+          const queryIndex = url.indexOf('?');
+          if (queryIndex !== -1) {
+            const query = url.substring(queryIndex + 1, hashIndex !== -1 ? hashIndex : undefined);
+            const params = new URLSearchParams(query);
+            const token = params.get('access_token');
+            if (token) return { success: true, token, source: 'query', url };
+          }
+        }
+        return { success: false, url, error: 'No access_token found' };
+      })()
+    `)
+
+    const token = readString(result?.token)
+    if (token) {
+      return {
+        success: true,
+        token,
+        url: readString(result?.url),
+      }
+    }
+
+    await delay(2000)
+  }
+
+  throw new Error('Failed to extract token after multiple attempts')
+}
+
+async function postcronClose() {
+  await clearPostcronState()
+  return 'Postcron browser closed'
+}
+
 const launcher = createLocalLauncher({
   userDataDir: app.getPath('userData'),
   workerUrl: DEFAULT_RUNTIME_CONFIG.serverUrl,
+  fetchImpl: fetchWithMobileEgress,
   openSessionWindow: openProfileWindow,
   navigateSessionWindow: navigateProfileWindow,
   closeSessionWindow: closeProfileWindow,
@@ -519,6 +1096,43 @@ async function createMainWindow() {
 }
 
 ipcMain.handle('browsersaving:invoke', async (_event, command, args) => {
+  if (String(command || '') === 'get_comment_token_local') {
+    if (!localTokenRunner) {
+      localTokenRunner = createLocalTokenRunner({
+        scriptRoot: getBundledTokenServiceDir(),
+        logger: (message) => console.log(message),
+      })
+    }
+    const payload = {
+      ...(args || {}),
+      proxy: getMobileProxyUrl(mobileProxyState) || readString(args?.proxy),
+    }
+    return localTokenRunner.getCommentToken(payload)
+  }
+  if (String(command || '') === 'resolve_comment_token_local') {
+    return resolveCommentTokenLocal(args?.profileId, args?.userToken, args?.authToken)
+  }
+  if (String(command || '') === 'save_postcron_token_local') {
+    return savePostcronTokenLocal(args?.profileId, args?.token, args?.authToken)
+  }
+  if (String(command || '') === 'fetch_postcron_token_local') {
+    return fetchPostcronTokenLocal(args || {})
+  }
+  if (String(command || '') === 'postcron_step_launch_headful') {
+    return postcronStepLaunchHeadful(args || {})
+  }
+  if (String(command || '') === 'postcron_step_navigate') {
+    return postcronStepNavigate()
+  }
+  if (String(command || '') === 'postcron_step_click') {
+    return postcronStepClick()
+  }
+  if (String(command || '') === 'postcron_step_extract') {
+    return postcronStepExtract()
+  }
+  if (String(command || '') === 'postcron_close') {
+    return postcronClose()
+  }
   return launcher.invoke(String(command || ''), args || {})
 })
 
@@ -537,35 +1151,24 @@ app.on('before-quit', (event) => {
   if (app.isQuittingGracefully) return
   event.preventDefault()
   app.isQuittingGracefully = true
-  void launcher.dispose()
-    .catch((error) => {
+  void Promise.all([
+    launcher.dispose().catch((error) => {
       console.warn(`[electron] launcher dispose failed: ${String(error)}`)
-    })
-    .finally(() => {
-      app.quit()
-    })
+    }),
+    clearPostcronState().catch((error) => {
+      console.warn(`[electron] postcron dispose failed: ${String(error)}`)
+    }),
+  ]).finally(() => {
+    app.quit()
+  })
 })
 
 app.whenReady().then(async () => {
-  if (
-    process.platform === 'win32' &&
-    !process.env.BROWSERSAVING_COMMENT_TOKEN_URL &&
-    process.env.BROWSERSAVING_LOCAL_TOKEN_SERVICE !== '0'
-  ) {
-    localTokenService = createLocalTokenService({
+  if (process.platform === 'win32' && process.env.BROWSERSAVING_LOCAL_TOKEN_SERVICE !== '0') {
+    localTokenRunner = createLocalTokenRunner({
       scriptRoot: getBundledTokenServiceDir(),
-      port: Number(process.env.BROWSERSAVING_LOCAL_TOKEN_PORT || 5517),
       logger: (message) => console.log(message),
     })
-
-    const tokenState = await localTokenService.start().catch((error) => {
-      console.warn(`[electron] local token service disabled: ${String(error)}`)
-      return null
-    })
-
-    if (tokenState?.serviceUrl) {
-      DEFAULT_RUNTIME_CONFIG.commentTokenServiceUrl = `${tokenState.serviceUrl}/api/comment-token`
-    }
   }
 
   if (process.platform === 'win32' && process.env.BROWSERSAVING_MOBILE_PROXY !== '0') {
@@ -596,8 +1199,5 @@ app.on('quit', () => {
     mobileProxy = null
     mobileProxyState = null
   }
-  if (localTokenService) {
-    void localTokenService.stop().catch(() => null)
-    localTokenService = null
-  }
+  localTokenRunner = null
 })

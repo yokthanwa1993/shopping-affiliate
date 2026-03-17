@@ -138,6 +138,7 @@ function createLocalLauncher(options) {
   const profilesRoot = path.join(options.userDataDir, 'profiles')
   const tempRoot = path.join(options.userDataDir, 'tmp')
   const usesEmbeddedWindow = typeof options.openSessionWindow === 'function'
+  const doFetch = typeof options.fetchImpl === 'function' ? options.fetchImpl : fetch
   const sessions = new Map()
   const uploading = new Set()
 
@@ -208,7 +209,7 @@ function createLocalLauncher(options) {
       return
     }
 
-    const response = await fetch(`${workerUrl}/api/sync/${encodeURIComponent(profileId)}/download`, {
+    const response = await doFetch(`${workerUrl}/api/sync/${encodeURIComponent(profileId)}/download`, {
       headers: { 'x-auth-token': authToken },
     })
 
@@ -234,7 +235,7 @@ function createLocalLauncher(options) {
   async function downloadSessionCookies(profileId, authToken) {
     if (!authToken) return null
 
-    const response = await fetch(`${workerUrl}/api/sync/${encodeURIComponent(profileId)}/download`, {
+    const response = await doFetch(`${workerUrl}/api/sync/${encodeURIComponent(profileId)}/download`, {
       headers: { 'x-auth-token': authToken },
     })
 
@@ -334,7 +335,7 @@ function createLocalLauncher(options) {
       }, existingEntries)
 
       const archive = await fsp.readFile(archivePath)
-      const response = await fetch(`${workerUrl}/api/sync/${encodeURIComponent(session.profileId)}/upload`, {
+      const response = await doFetch(`${workerUrl}/api/sync/${encodeURIComponent(session.profileId)}/upload`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/gzip',

@@ -45,9 +45,8 @@
 ```
 apps/shortlink/
 ├── electron/
-│   ├── main.js           ← Electron entry point สำหรับ account chearb
-│   ├── main-neezs.js     ← Electron entry point สำหรับ account neezs
-│   │                        (generate จาก main.js โดย sed — ห้ามแก้มือ)
+│   ├── main.js           ← Electron entry point หลักสำหรับทุก account
+│   ├── main-neezs.js     ← compatibility wrapper สำหรับ neezs (forward ไป main.js)
 │   ├── package.json
 │   └── icons/tray.png
 ├── worker-chearb/
@@ -60,10 +59,9 @@ apps/shortlink/
                              main = "../worker-chearb/src/index.js" (share code)
 ```
 
-**กฎสำคัญ:** `main-neezs.js` ต้อง generate จาก `main.js` เสมอ ห้ามแก้มือ — ใช้คำสั่ง:
-```bash
-sed 's/const PORT = 3000/const PORT = 3001/; s/chearb-shopee-shortlink/neezs-shopee-shortlink/g; s/affiliate@chearb\.com/affiliate@neezs.com/g; s/!@7EvaYLj986/!Affiliate@neezs/g' electron/main.js > electron/main-neezs.js
-```
+**กฎสำคัญ:** logic ของทุก account ต้องอยู่ใน `main.js` ตัวเดียว
+- ค่า account/port/worker ให้ inject ผ่าน env หรือ launcher script
+- `main-neezs.js` มีไว้เพื่อ backward compatibility เท่านั้น ห้ามเพิ่ม logic ใหม่ในไฟล์นี้
 
 ---
 
@@ -84,7 +82,7 @@ ssh yok@172.19.20.9
 ```
 ~/shopee-shortlink/
 ├── main.js           ← copy มาจาก electron/main.js
-├── main-neezs.js     ← copy มาจาก electron/main-neezs.js
+├── main-neezs.js     ← optional compatibility wrapper
 ├── package.json
 ├── node_modules/     ← มีอยู่แล้ว ไม่ต้อง npm install ใหม่
 └── icons/tray.png
@@ -119,16 +117,11 @@ Response ที่ดี: `{"loggedIn":true}`
 **ขั้นตอน (ทำตามลำดับ):**
 
 1. แก้ไข `electron/main.js`
-2. Regenerate `main-neezs.js`:
-```bash
-sed 's/const PORT = 3000/const PORT = 3001/; s/chearb-shopee-shortlink/neezs-shopee-shortlink/g; s/affiliate@chearb\.com/affiliate@neezs.com/g; s/!@7EvaYLj986/!Affiliate@neezs/g' apps/shortlink/electron/main.js > apps/shortlink/electron/main-neezs.js
-```
-3. Copy ไป Ubuntu:
+2. Copy ไป Ubuntu:
 ```bash
 scp apps/shortlink/electron/main.js yok@172.19.20.9:~/shopee-shortlink/main.js
-scp apps/shortlink/electron/main-neezs.js yok@172.19.20.9:~/shopee-shortlink/main-neezs.js
 ```
-4. Restart Electron บน Ubuntu:
+3. Restart Electron บน Ubuntu:
 ```bash
 ssh -T yok@172.19.20.9 << 'EOF'
 pkill -f 'electron' 2>/dev/null; sleep 2
@@ -143,7 +136,7 @@ XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
 # neezs
 XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
   nohup /home/yok/shopee-shortlink/node_modules/.bin/electron \
-  /home/yok/shopee-shortlink/main-neezs.js \
+  /home/yok/shopee-shortlink/main.js \
   --no-sandbox --ozone-platform=wayland \
   --user-data-dir=/home/yok/.config/shopee-neezs > /tmp/electron-neezs.log 2>&1 &
 
@@ -152,7 +145,7 @@ curl -s http://localhost:3000/status
 curl -s http://localhost:3001/status
 EOF
 ```
-5. ตรวจสอบ `loggedIn: true` ทั้งสอง
+4. ตรวจสอบ `loggedIn: true` ทั้งสอง
 
 ### เมื่อแก้ไข Worker (BridgeDO.js หรือ index.js)
 
@@ -260,7 +253,7 @@ git push
 
 ## ข้อควรระวัง
 
-1. **อย่าแก้ `main-neezs.js` มือ** — generate จาก `main.js` เสมอ ไม่งั้นจะ out of sync
+1. **อย่าเพิ่ม logic แยกใน `main-neezs.js`** — ถ้าต้องแก้ behavior ให้แก้ `main.js` ตัวเดียว
 2. **Worker neezs share code กับ chearb** — ถ้าแก้ `BridgeDO.js` หรือ `index.js` ต้อง deploy ทั้ง 2 worker
 3. **`s.shopee.co.th` expand ที่ Electron ไม่ใช่ Worker** — Cloudflare IP ถูก Shopee block
 4. **Session cookie บน Ubuntu** — อยู่ใน `~/.config/shopee-chearb` และ `~/.config/shopee-neezs` ห้ามลบ

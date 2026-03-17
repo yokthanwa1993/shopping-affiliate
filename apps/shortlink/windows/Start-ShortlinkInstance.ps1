@@ -18,27 +18,24 @@ New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 
 $configs = @{
   chearb = @{
-    Main = "main.js"
     HttpPort = "3000"
     WorkerAccount = "chearb"
     DisplayName = "CHEARB"
     AppName = "CHEARB"
     LocalhostLabel = "Open localhost:3000"
     Email = "affiliate@chearb.com"
-    Password = "!@7EvaYLj986"
+    Password = ""
   }
   neezs = @{
-    Main = "main-neezs.js"
     HttpPort = "3001"
     WorkerAccount = "neezs"
     DisplayName = "NEEZS"
     AppName = "NEEZS"
     LocalhostLabel = "Open localhost:3001"
     Email = "affiliate@neezs.com"
-    Password = "!Affiliate@neezs"
+    Password = ""
   }
   golf = @{
-    Main = "main.js"
     HttpPort = "3002"
     WorkerAccount = "golf"
     DisplayName = "GOLF"
@@ -48,7 +45,6 @@ $configs = @{
     Password = ""
   }
   first = @{
-    Main = "main.js"
     HttpPort = "3003"
     WorkerAccount = "first"
     DisplayName = "FIRST"
@@ -62,7 +58,6 @@ $configs = @{
 $config = $configs[$Account]
 $workerAccount = $config.WorkerAccount
 $workerUrl = "$sharedWorkerBase/?account=$workerAccount"
-$workerWs = "wss://shortlink.yokthanwa1993-bc9.workers.dev/ws?account=$workerAccount"
 $userDataDir = Join-Path $dataRoot $Account
 $stdoutLog = Join-Path $logRoot "$Account-out.log"
 $stderrLog = Join-Path $logRoot "$Account-err.log"
@@ -76,10 +71,9 @@ if (Test-Path $electronExe) {
 }
 
 $env:SHORTLINK_ACCOUNT_KEY = $Account
-$env:SHORTLINK_MAIN = $config.Main
+$env:SHORTLINK_MAIN = "main.js"
 $env:SHORTLINK_HTTP_PORT = $config.HttpPort
 $env:SHORTLINK_WORKER_URL = $workerUrl
-$env:SHORTLINK_WORKER_WS = $workerWs
 $env:SHORTLINK_DISPLAY_NAME = $config.DisplayName
 $env:SHORTLINK_APP_NAME = $config.AppName
 $env:SHORTLINK_LOCALHOST_LABEL = $config.LocalhostLabel
@@ -93,7 +87,7 @@ $env:SHORTLINK_VNC_FIRST = ""
 New-Item -ItemType Directory -Force -Path $userDataDir | Out-Null
 
 $arguments = @(
-  (Join-Path $appDir $config.Main)
+  (Join-Path $appDir "main.js")
   "--user-data-dir=$userDataDir"
 )
 

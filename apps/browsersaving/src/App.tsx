@@ -3,7 +3,7 @@ import { type Update, check } from '@tauri-apps/plugin-updater'
 import { CreateProfileModal } from './components/CreateProfileModal'
 import { LogViewer } from './components/LogViewer'
 import { DebugConsole } from './components/DebugConsole'
-import { desktopInvoke, desktopRelaunch, isDesktopApp, isTauri } from './desktopBridge'
+import { desktopInvoke, desktopRelaunch, isDesktopApp, isElectron, isTauri } from './desktopBridge'
 import {
   BROWSERSAVING_API_URL,
   COMMENT_TOKEN_SERVICE_URL,
@@ -687,7 +687,10 @@ async function resolveStoredPostcronToken(profileId: string): Promise<PostcronTo
   }
 }
 
-async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronTokenResponse> {
+async function fetchPostcronTokenLocally(
+  profile: Profile,
+  authToken?: string,
+): Promise<PostcronTokenResponse> {
   if (!isDesktopApp()) {
     return {
       success: false,
@@ -698,9 +701,45 @@ async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronToke
     }
   }
 
+  if (isElectron()) {
+    try {
+      const result = await desktopInvoke<Record<string, unknown>>('fetch_postcron_token_local', {
+        profileId: profile.id,
+        authToken,
+      })
+      const rawToken = String(result?.token || '').trim()
+      if (!rawToken) {
+        return {
+          success: false,
+          token: '',
+          error: String(result?.error || 'Local Postcron extraction returned empty token'),
+          reason: '',
+          detail: '',
+        }
+      }
+      return {
+        success: true,
+        token: rawToken,
+        error: '',
+        reason: '',
+        detail: '',
+        pageName: String(result?.page_name || '').trim() || undefined,
+        pageAvatarUrl: String(result?.page_avatar_url || '').trim() || undefined,
+      }
+    } catch (err) {
+      return {
+        success: false,
+        token: '',
+        error: String(err || 'Local Postcron extraction failed'),
+        reason: '',
+        detail: '',
+      }
+    }
+  }
+
   let launchCompleted = false
   try {
-    await desktopInvoke<string>('postcron_step_launch_headful', { profileId: profile.id })
+    await desktopInvoke<string>('postcron_step_launch_headful', { profileId: profile.id, authToken })
     launchCompleted = true
     await desktopInvoke<string>('postcron_step_navigate')
     await desktopInvoke<string>('postcron_step_click')
@@ -714,6 +753,23 @@ async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronToke
         error: String(extracted?.error || 'Local Postcron extraction returned empty token'),
         reason: '',
         detail: '',
+      }
+    }
+
+    if (isElectron()) {
+      const saved = await desktopInvoke<Record<string, unknown>>('save_postcron_token_local', {
+        profileId: profile.id,
+        token: rawToken,
+        authToken,
+      })
+      return {
+        success: true,
+        token: rawToken,
+        error: '',
+        reason: '',
+        detail: '',
+        pageName: String(saved?.page_name || '').trim() || undefined,
+        pageAvatarUrl: String(saved?.page_avatar_url || '').trim() || undefined,
       }
     }
 
@@ -747,8 +803,10 @@ async function fetchPostcronTokenLocally(profile: Profile): Promise<PostcronToke
   }
 }
 
-async function fetchPostcronToken(profile: Profile): Promise<PostcronTokenResponse> {
-  void profile
+async function fetchPostcronToken(profile: Profile, authToken?: string): Promise<PostcronTokenResponse> {
+  if (isElectron()) {
+    return fetchPostcronTokenLocally(profile, authToken)
+  }
   return fetchPostcronTokenFromWorker(profile.id)
 }
 
@@ -1810,37 +1868,53 @@ function App() {
       if (source === 'local') {
         const proxyProfile = getLaunchProfile(profile)
         const loginId = String(profile.uid || profile.username || '').trim()
-        const remoteResp = await fetch(COMMENT_TOKEN_SERVICE_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          body: JSON.stringify({
-            uid: loginId,
-            username: loginId,
-            password: profile.password,
-            '2fa': profile.totp_secret || null,
-            datr: profile.datr || null,
-            proxy: proxyProfile.proxy || '',
-            target_app: 'FB_LITE',
-          }),
-        })
-        const remoteData = await remoteResp.json().catch(() => ({} as any))
+        const payload = {
+          uid: loginId,
+          username: loginId,
+          password: profile.password,
+          '2fa': profile.totp_secret || null,
+          datr: profile.datr || null,
+          proxy: proxyProfile.proxy || '',
+          target_app: 'FB_LITE',
+        }
+        let remoteStatus = 200
+        const remoteData = isElectron()
+          ? await desktopInvoke<Record<string, unknown>>('get_comment_token_local', payload)
+          : await (async () => {
+              const remoteResp = await fetch(COMMENT_TOKEN_SERVICE_URL, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json',
+                },
+                body: JSON.stringify(payload),
+              })
+              remoteStatus = remoteResp.status
+              return remoteResp.json().catch(() => ({} as any))
+            })()
         const localUserToken = String(remoteData?.token || '').trim()
 
         if (!localUserToken) {
-          const errorMessage = remoteData?.error || `HTTP ${remoteResp.status}`
+          const errorMessage = remoteData?.error || `HTTP ${remoteStatus}`
           throw new Error(errorMessage)
         }
 
-        res = await apiFetch(`/api/token/${profile.id}/resolve`, {
-          method: 'POST',
-          body: JSON.stringify({
-            user_token: localUserToken,
-          }),
-        })
-        data = await res.json().catch(() => ({} as any))
+        if (isElectron()) {
+          data = await desktopInvoke<Record<string, unknown>>('resolve_comment_token_local', {
+            profileId: profile.id,
+            userToken: localUserToken,
+            authToken: authSession?.token,
+          })
+          res = new Response(JSON.stringify(data), { status: 200 })
+        } else {
+          res = await apiFetch(`/api/token/${profile.id}/resolve`, {
+            method: 'POST',
+            body: JSON.stringify({
+              user_token: localUserToken,
+            }),
+          })
+          data = await res.json().catch(() => ({} as any))
+        }
       } else {
         res = await apiFetch(`/api/token/${profile.id}`)
         data = await res.json().catch(() => ({} as any))
@@ -1864,7 +1938,7 @@ function App() {
       let postcronReason = ''
       let postcronDetail = ''
 
-      const postcron = await fetchPostcronToken(getLaunchProfile(profile))
+      const postcron = await fetchPostcronToken(getLaunchProfile(profile), authSession?.token)
       if (postcron.success) {
         postcronToken = postcron.token
       } else {
@@ -2792,12 +2866,12 @@ function App() {
                 <circle cx="8.5" cy="8.5" r="1.5" />
                 <path d="M21 15l-5-5L5 21" />
               </svg>
-              Postcron Browserless
+              Postcron Token
             </h3>
 
             <div className="settings-info">
               <p>POSTCRON TOKEN ใช้ Worker route โดยตรงแล้ว ไม่ต้องอ้อม `browsersaving-api` บน CapRover</p>
-              <p>ACCESS TOKEN ใน desktop app จะใช้ `token.py` local service ถ้ามี Python พร้อมบนเครื่อง</p>
+              <p>ACCESS TOKEN ใน desktop app จะเรียก `token.py` ตรงผ่าน Electron ถ้ามี Python พร้อมบนเครื่อง</p>
             </div>
           </div>
 
@@ -3037,7 +3111,7 @@ function App() {
                 </div>
               </div>
               <div className="token-field">
-                <label>POSTCRON TOKEN (Cloudflare Rendering)</label>
+                <label>{isElectron() ? 'POSTCRON TOKEN (Electron Background + D-Link)' : 'POSTCRON TOKEN (Cloudflare Rendering)'}</label>
                 <div className="token-value-row">
                   <textarea
                     value={tokenResult.postcronToken}

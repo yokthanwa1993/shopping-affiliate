@@ -8,7 +8,7 @@
 C:\shortlink-native\
 ├── electron\
 │   ├── main.js
-│   ├── main-neezs.js
+│   ├── main-neezs.js     ← compatibility wrapper (legacy only)
 │   ├── package.json
 │   ├── package-lock.json
 │   ├── icons\
@@ -38,3 +38,4 @@ C:\shortlink-native\
 - `chearb` และ `neezs` มี credential default ในสคริปต์
 - `golf` และ `first` ไม่มี credential default ต้องอาศัย session เดิมจาก user-data ที่ย้ายมาจาก Ubuntu
 - Worker URLs เดิมไม่ต้องเปลี่ยน
+- ตอนนี้ทุก account รันผ่าน `main.js` ตัวเดียว โดย inject ค่า account ผ่าน env ใน `Start-ShortlinkInstance.ps1`

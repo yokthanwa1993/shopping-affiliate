@@ -6,7 +6,6 @@ Get-CimInstance Win32_Process |
   Where-Object {
     $_.Name -match "electron" -or
     $_.CommandLine -match "shortlink-native" -or
-    $_.CommandLine -match "main-neezs.js" -or
     $_.CommandLine -match "main.js"
   } |
   ForEach-Object {

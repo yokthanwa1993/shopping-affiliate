@@ -257,7 +257,76 @@ function createMobileEgressProxy(options = {}) {
   }
 }
 
+function getMobileProxyUrl(state) {
+  if (!state?.listenPort) return ''
+  const host = readString(state.listenHost, '127.0.0.1')
+  return `http://${host}:${state.listenPort}`
+}
+
+function normalizeProxyFetchBody(body) {
+  if (body == null) return null
+  if (Buffer.isBuffer(body)) return body
+  if (body instanceof Uint8Array) return Buffer.from(body)
+  if (body instanceof ArrayBuffer) return Buffer.from(body)
+  if (typeof body === 'string') return Buffer.from(body, 'utf8')
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+    return Buffer.from(body.toString(), 'utf8')
+  }
+  throw new Error('Unsupported body type for mobile proxy fetch')
+}
+
+function appendProxyFetchHeaders(targetUrl, initHeaders, bodyBuffer) {
+  const headers = new Headers(initHeaders || {})
+  headers.set('host', targetUrl.host)
+  if (bodyBuffer && !headers.has('content-length')) {
+    headers.set('content-length', String(bodyBuffer.length))
+  }
+  return headers
+}
+
+async function fetchViaMobileProxy(input, init = {}, state) {
+  if (!state?.listenPort) {
+    return fetch(input, init)
+  }
+
+  const targetUrl = new URL(String(input))
+  const bodyBuffer = normalizeProxyFetchBody(init.body)
+  const headers = appendProxyFetchHeaders(targetUrl, init.headers, bodyBuffer)
+
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: readString(state.listenHost, '127.0.0.1'),
+      port: state.listenPort,
+      method: readString(init.method, 'GET'),
+      path: targetUrl.toString(),
+      headers: Object.fromEntries(headers.entries()),
+    }, (response) => {
+      const chunks = []
+      response.on('data', (chunk) => {
+        chunks.push(Buffer.from(chunk))
+      })
+      response.on('end', () => {
+        const body = Buffer.concat(chunks)
+        resolve(new Response(body, {
+          status: response.statusCode || 502,
+          statusText: response.statusMessage || '',
+          headers: response.headers,
+        }))
+      })
+    })
+
+    request.on('error', reject)
+
+    if (bodyBuffer) {
+      request.write(bodyBuffer)
+    }
+    request.end()
+  })
+}
+
 module.exports = {
   createMobileEgressProxy,
   resolveMobileLocalAddress,
+  getMobileProxyUrl,
+  fetchViaMobileProxy,
 }

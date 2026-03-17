@@ -2,68 +2,108 @@ export class BridgeDO {
   constructor(state, env) {
     this.state = state;
     this.pendingJobs = new Map();
+    this.jobQueue = [];
+    this.waitingPolls = [];
+    this.lastPollAt = 0;
   }
 
   async fetch(request) {
     const url = new URL(request.url);
 
-    if (url.pathname === '/ws') {
-      const upgrade = request.headers.get('Upgrade');
-      if (upgrade !== 'websocket') return new Response('Expected WebSocket', { status: 426 });
-      for (const socket of this.state.getWebSockets('bridge')) {
-        try {
-          socket.close(1012, 'Replacing stale bridge');
-        } catch (_) {}
-      }
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      this.state.acceptWebSocket(server, ['bridge']);
-      return new Response(null, { status: 101, webSocket: client });
+    if (url.pathname === '/api/poll') {
+      return this.handlePoll(request);
+    }
+
+    if (url.pathname === '/api/complete') {
+      return this.handleComplete(request);
     }
 
     return this.handleJob(request);
   }
 
-  async webSocketMessage(ws, message) {
-    try {
-      const result = JSON.parse(message);
-      if (result?.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', ts: result.ts || Date.now() }));
-        return;
-      }
-      if (result?.type === 'hello') {
-        ws.send(JSON.stringify({ type: 'hello-ack', now: Date.now() }));
-        return;
-      }
-      const { jobId, ok, shortLink, utmSource, normalizedUrl, redirectUrl, error } = result;
-      const job = this.pendingJobs.get(jobId);
-      if (!job) return;
-      job.resolve({ ok, shortLink, utmSource, normalizedUrl, redirectUrl, error });
-    } catch (_) {}
-  }
+  async handlePoll(request) {
+    this.lastPollAt = Date.now();
 
-  async webSocketClose() {
-    for (const [jobId, job] of this.pendingJobs) {
-      clearTimeout(job.timer);
-      job.resolve({ ok: false, error: 'Electron disconnected' });
+    let timeoutMs = 25000;
+    if (request.method === 'POST') {
+      try {
+        const body = await request.json();
+        if (Number.isFinite(body?.timeoutMs)) {
+          timeoutMs = Math.max(1000, Math.min(60000, Number(body.timeoutMs)));
+        }
+      } catch (_) {}
     }
-    this.pendingJobs.clear();
+
+    const nextJob = this.jobQueue.shift();
+    if (nextJob) {
+      nextJob.inFlight = true;
+      nextJob.dispatchedAt = Date.now();
+      return json({ jobId: nextJob.jobId, payload: nextJob.payload });
+    }
+
+    return new Promise((resolve) => {
+      const waiter = {
+        resolve,
+        timer: setTimeout(() => {
+          this.waitingPolls = this.waitingPolls.filter((entry) => entry !== waiter);
+          resolve(new Response(null, { status: 204 }));
+        }, timeoutMs),
+      };
+      this.waitingPolls.push(waiter);
+    });
   }
 
-  async webSocketError() {
-    await this.webSocketClose();
+  async handleComplete(request) {
+    let result;
+    try {
+      result = await request.json();
+    } catch (_) {
+      return json({ error: 'invalid completion payload' }, 400);
+    }
+
+    const jobId = String(result?.jobId || result?.requestId || '').trim();
+    if (!jobId) {
+      return json({ error: 'jobId required' }, 400);
+    }
+
+    const job = this.pendingJobs.get(jobId);
+    if (!job) {
+      return json({ ok: true, ignored: true });
+    }
+
+    job.resolve({
+      ok: Boolean(result?.ok),
+      shortLink: result?.shortLink || '',
+      utmSource: result?.utmSource || '',
+      normalizedUrl: result?.normalizedUrl || '',
+      redirectUrl: result?.redirectUrl || '',
+      error: result?.error || '',
+    });
+
+    return json({ ok: true });
+  }
+
+  dispatchJob(jobEnvelope) {
+    const waiter = this.waitingPolls.shift();
+    if (waiter) {
+      clearTimeout(waiter.timer);
+      jobEnvelope.inFlight = true;
+      jobEnvelope.dispatchedAt = Date.now();
+      waiter.resolve(json({ jobId: jobEnvelope.jobId, payload: jobEnvelope.payload }));
+      return;
+    }
+
+    this.jobQueue.push(jobEnvelope);
+  }
+
+  removeQueuedJob(jobId) {
+    this.jobQueue = this.jobQueue.filter((job) => job.jobId !== jobId);
   }
 
   async handleJob(request) {
     const url = new URL(request.url);
     const rawUrl = url.searchParams.get('url');
     if (!rawUrl) return json({ error: 'url param required' }, 400);
-
-    const sockets = this.state.getWebSockets('bridge');
-    if (sockets.length === 0) {
-      return json({ error: 'Electron app is not connected' }, 503);
-    }
-    const bridgeSocket = sockets[sockets.length - 1];
 
     const jobId = crypto.randomUUID();
     const payload = {
@@ -75,26 +115,30 @@ export class BridgeDO {
       subId5: url.searchParams.get('sub5') || undefined,
     };
 
-    try {
-      bridgeSocket.send(JSON.stringify({ jobId, payload }));
-    } catch (_) {
-      try {
-        bridgeSocket.close(1011, 'Send failed');
-      } catch (_) {}
-      return json({ error: 'Electron app is not connected' }, 503);
-    }
-
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pendingJobs.delete(jobId);
-        resolve(json({ error: 'Timed out waiting for Electron response' }, 504));
-      }, 30000);
+        this.removeQueuedJob(jobId);
 
-      this.pendingJobs.set(jobId, {
+        const idleForMs = this.lastPollAt ? Date.now() - this.lastPollAt : Number.POSITIVE_INFINITY;
+        if (idleForMs > 45000) {
+          resolve(json({ error: 'Chrome extension is not connected' }, 503));
+          return;
+        }
+
+        resolve(json({ error: 'Timed out waiting for Chrome bridge response' }, 504));
+      }, 45000);
+
+      const job = {
+        jobId,
         timer,
+        payload,
+        inFlight: false,
         resolve: ({ ok, shortLink, utmSource, normalizedUrl, redirectUrl, error }) => {
           clearTimeout(timer);
           this.pendingJobs.delete(jobId);
+          this.removeQueuedJob(jobId);
+
           if (ok) {
             resolve(json({
               originalLink: rawUrl,
@@ -108,11 +152,15 @@ export class BridgeDO {
               sub4: url.searchParams.get('sub4') || null,
               sub5: url.searchParams.get('sub5') || null,
             }));
-          } else {
-            resolve(json({ error: error || 'Failed to create shortlink' }, 500));
+            return;
           }
+
+          resolve(json({ error: error || 'Failed to create shortlink' }, 500));
         },
-      });
+      };
+
+      this.pendingJobs.set(jobId, job);
+      this.dispatchJob(job);
     });
   }
 }

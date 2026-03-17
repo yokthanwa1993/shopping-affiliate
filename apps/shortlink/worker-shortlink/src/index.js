@@ -62,6 +62,6 @@ function agentHtml() {
 </style></head>
 <body>
   <h2>Shopee Shortlink Agent</h2>
-  <div class="sub">Keep this worker connected to a dedicated Electron runtime.</div>
+  <div class="sub">Keep this page open in Chrome. The extension content script will poll jobs from here.</div>
 </body></html>`;
 }

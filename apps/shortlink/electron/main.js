@@ -1,7 +1,6 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, shell, protocol, session, screen } = require('electron');
 const http = require('http');
 const path = require('path');
-const WebSocket = require('ws');
 
 function envOrDefault(name, fallback) {
   return Object.prototype.hasOwnProperty.call(process.env, name) ? process.env[name] : fallback;
@@ -10,7 +9,6 @@ function envOrDefault(name, fallback) {
 const PORT = Number(process.env.SHORTLINK_HTTP_PORT || 3000);
 const ACCOUNT = {
   username: envOrDefault('SHORTLINK_ACCOUNT_EMAIL', 'affiliate@chearb.com'),
-  password: envOrDefault('SHORTLINK_ACCOUNT_PASSWORD', '!@7EvaYLj986'),
 };
 const AFFILIATE_URL = envOrDefault('SHORTLINK_AFFILIATE_URL', 'https://affiliate.shopee.co.th/offer/custom_link');
 const AFFILIATE_LOGIN_URL = `https://shopee.co.th/buyer/login?next=${encodeURIComponent(AFFILIATE_URL)}`;
@@ -18,9 +16,8 @@ const ACCOUNT_KEY = envOrDefault('SHORTLINK_ACCOUNT_KEY', 'chearb').trim().toLow
 const DISPLAY_NAME = envOrDefault('SHORTLINK_DISPLAY_NAME', ACCOUNT_KEY.toUpperCase());
 const APP_NAME = envOrDefault('SHORTLINK_APP_NAME', DISPLAY_NAME);
 const LOCALHOST_LABEL = envOrDefault('SHORTLINK_LOCALHOST_LABEL', `เปิด localhost:${PORT}`);
-const BRIDGE_HEARTBEAT_MS = 15000;
-const BRIDGE_STALE_MS = 45000;
-const BRIDGE_CONNECT_TIMEOUT_MS = 15000;
+const BRIDGE_IDLE_TIMEOUT_MS = 45000;
+const BRIDGE_POLL_TIMEOUT_MS = 25000;
 const BRIDGE_RECONNECT_DELAY_MS = 3000;
 const VNC_TARGETS = {
   chearb: process.env.SHORTLINK_VNC_CHEARB || 'https://chearbshortlink.pubilo.com/vnc.html?autoconnect=1&resize=remote',
@@ -150,6 +147,28 @@ async function getAffiliateSessionSnapshot() {
   }
 }
 
+function detectShopeeChallengeText(text = '') {
+  const content = String(text || '');
+  if (!content) return '';
+
+  const patterns = [
+    /ยืนยันตัวตนเพื่อดำเนินการต่อ/u,
+    /เลื่อนปุ่มนี้ลงหรือตัวต่อชิ้นส่วนให้เข้ากับเงา/u,
+    /ตรวจสอบว่าคุณเป็นมนุษย์/u,
+    /verify you are human/i,
+    /complete the security check/i,
+    /captcha/i,
+    /bot/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = content.match(pattern);
+    if (match) return match[0];
+  }
+
+  return '';
+}
+
 // ── Shopee GraphQL via WebView XHR ─────────────────────────────────────────────
 // Runs in Shopee's page context → Shopee SDK auto-injects security headers
 
@@ -263,7 +282,6 @@ async function runShortlinkJob(rawUrl, subIds) {
 
   lastJobStartedAt = Date.now();
   lastJobError = '';
-
   try {
     const result = await generateLink(normalizedUrl, subIds);
     lastJobFinishedAt = Date.now();
@@ -293,17 +311,22 @@ async function probeAffiliatePageAccess() {
       (() => {
         try {
           void document.cookie;
+          const bodyText = (document.body?.innerText || '').slice(0, 4000);
           return {
             href: location.href,
             cookieReadable: true,
-            readyState: document.readyState
+            readyState: document.readyState,
+            title: document.title,
+            bodyText
           };
         } catch (error) {
           return {
             href: location.href,
             cookieReadable: false,
             readyState: document.readyState,
-            error: error.message
+            error: error.message,
+            title: document.title,
+            bodyText: ''
           };
         }
       })()
@@ -332,32 +355,41 @@ async function ensureAffiliateContext() {
   }
 
   const deadline = Date.now() + 20000;
-  let lastReloadAt = 0;
+  let navigationTriggered = false;
 
   while (Date.now() < deadline) {
     const currentUrl = mainWindow.webContents.getURL();
-    const probe = await probeAffiliatePageAccess();
-    const probeUrl = typeof probe?.href === 'string' ? probe.href : '';
     const sessionSnapshot = await getAffiliateSessionSnapshot();
 
+    if (!navigationTriggered && !isAffiliatePageUrl(currentUrl)) {
+      navigationTriggered = true;
+      const targetUrl = sessionSnapshot.hasAuthCookie ? AFFILIATE_URL : AFFILIATE_LOGIN_URL;
+      await mainWindow.loadURL(targetUrl);
+      await sleep(1500);
+      continue;
+    }
+
+    const probe = await probeAffiliatePageAccess();
+    const probeUrl = typeof probe?.href === 'string' ? probe.href : '';
+    const challengeReason = detectShopeeChallengeText(probe?.bodyText || '');
+
     if (isCustomLinkPageUrl(currentUrl) && isCustomLinkPageUrl(probeUrl) && probe?.cookieReadable && sessionSnapshot.hasAuthCookie) {
+      if (challengeReason) {
+        throw new Error(`Shopee challenge detected: ${challengeReason}`);
+      }
       return currentUrl;
     }
 
-    if (isLoginPageUrl(currentUrl) || isLoginPageUrl(probeUrl)) {
+    if (challengeReason) {
+      throw new Error(`Shopee challenge detected: ${challengeReason}`);
+    } else if (isLoginPageUrl(currentUrl) || isLoginPageUrl(probeUrl)) {
       throw new Error('Shopee login required in the app window');
     } else if (isCaptchaPageUrl(currentUrl)) {
       throw new Error('Shopee ต้องยืนยัน CAPTCHA ในหน้าจอ');
     } else if (isCaptchaPageUrl(probeUrl)) {
       throw new Error('Shopee ต้องยืนยัน CAPTCHA ในหน้าจอ');
     } else if ((isCustomLinkPageUrl(currentUrl) || isCustomLinkPageUrl(probeUrl)) && !sessionSnapshot.hasAuthCookie) {
-      if (typeof loadAffiliatePage === 'function' && Date.now() - lastReloadAt >= 4000) {
-        lastReloadAt = Date.now();
-        void loadAffiliatePage({ forceLogin: true });
-      }
-    } else if (typeof loadAffiliatePage === 'function' && Date.now() - lastReloadAt >= 4000) {
-      lastReloadAt = Date.now();
-      void loadAffiliatePage();
+      throw new Error('Shopee login required in the app window');
     }
 
     await sleep(1500);
@@ -369,37 +401,28 @@ async function ensureAffiliateContext() {
 // ── HTTP Server ────────────────────────────────────────────────────────────────
 
 function getBridgeReadyState() {
-  if (!bridgeWs) return 'CLOSED';
-  switch (bridgeWs.readyState) {
-    case WebSocket.CONNECTING:
-      return 'CONNECTING';
-    case WebSocket.OPEN:
-      return 'OPEN';
-    case WebSocket.CLOSING:
-      return 'CLOSING';
-    case WebSocket.CLOSED:
-    default:
-      return 'CLOSED';
-  }
+  if (bridgeConnecting) return 'CONNECTING';
+  if (bridgeConnected) return 'OPEN';
+  return 'CLOSED';
 }
 
 function getBridgeSnapshot() {
   const now = Date.now();
-  const lastSeenAt = Math.max(bridgeLastPongAt, bridgeLastMessageAt, bridgeLastConnectAt, 0);
+  const lastSeenAt = Math.max(bridgeLastPollAt, bridgeLastMessageAt, bridgeLastConnectAt, 0);
   const staleForMs = lastSeenAt ? now - lastSeenAt : null;
 
   return {
     running: bridgeRunning,
-    connected: getBridgeReadyState() === 'OPEN',
+    connected: bridgeConnected,
     readyState: getBridgeReadyState(),
     lastConnectAt: bridgeLastConnectAt || null,
     lastDisconnectAt: bridgeLastDisconnectAt || null,
-    lastPongAt: bridgeLastPongAt || null,
+    lastPongAt: bridgeLastPollAt || null,
     lastMessageAt: bridgeLastMessageAt || null,
     lastSeenAt: lastSeenAt || null,
     staleForMs,
     reconnectAttempts: bridgeReconnectAttempts,
-    reconnectScheduled: Boolean(bridgeReconnectTimer),
+    reconnectScheduled: bridgeRunning && !bridgeConnected,
     lastError: bridgeLastError || null,
   };
 }
@@ -446,9 +469,10 @@ async function buildStatusPayload() {
   const isCaptchaPage = isCaptchaPageUrl(currentUrl);
   const probe = webviewReady ? await probeAffiliatePageAccess() : { cookieReadable: false, readyState: 'unknown', href: '' };
   const sessionSnapshot = webviewReady ? await getAffiliateSessionSnapshot() : { hasAuthCookie: false, cookies: [] };
+  const challengeReason = detectShopeeChallengeText(probe.bodyText || '');
   const bridge = getBridgeSnapshot();
   const loggedIn = isAffiliatePage && !isLoginPage && !isCaptchaPage && sessionSnapshot.hasAuthCookie;
-  const ready = webviewReady && bridge.connected && isCustomLinkPage && !isLoginPage && !isCaptchaPage && sessionSnapshot.hasAuthCookie && probe.cookieReadable;
+  const ready = webviewReady && bridge.connected && isCustomLinkPage && !isLoginPage && !isCaptchaPage && !challengeReason && sessionSnapshot.hasAuthCookie && probe.cookieReadable;
 
   return {
     server: true,
@@ -459,6 +483,8 @@ async function buildStatusPayload() {
     customLinkPage: isCustomLinkPage,
     ready,
     captcha: isCaptchaPage,
+    challengeDetected: Boolean(challengeReason),
+    challengeReason: challengeReason || null,
     rendererReadyState: probe.readyState,
     cookieReadable: probe.cookieReadable,
     rendererUrl: probe.href || null,
@@ -544,11 +570,13 @@ async function handleRequest(req, res) {
         cookie: document.cookie.substring(0, 200),
         title: document.title,
         readyState: document.readyState,
+        bodyText: (document.body?.innerText || '').slice(0, 4000),
       })`);
       info.sessionCookieCount = sessionSnapshot.cookies.length;
       info.sessionCookieNames = sessionSnapshot.cookieNames;
       info.hasAuthCookie = sessionSnapshot.hasAuthCookie;
       info.hasCsrfToken = Boolean(sessionSnapshot.csrfToken);
+      info.challengeReason = detectShopeeChallengeText(info.bodyText || '') || null;
       if (sessionSnapshot.cookieError) info.cookieError = sessionSnapshot.cookieError;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(info));
@@ -615,158 +643,123 @@ const server = http.createServer((req, res) => {
 // ── Cloudflare Worker Bridge (poll loop) ──────────────────────────────────────
 // รัน polling loop ใน main process — แทน Chrome extension
 
-const WORKER_URL = process.env.SHORTLINK_WORKER_URL || 'https://chearb-shopee-shortlink.yokthanwa1993-bc9.workers.dev';
-const WORKER_WS  = process.env.SHORTLINK_WORKER_WS || `${WORKER_URL.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')}/ws`;
+const WORKER_URL = process.env.SHORTLINK_WORKER_URL || 'https://shortlink.yokthanwa1993-bc9.workers.dev/?account=chearb';
+const WORKER_BASE = (() => {
+  try {
+    const parsed = new URL(WORKER_URL);
+    const pathname = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '');
+    return `${parsed.origin}${pathname}`;
+  } catch (_) {
+    return WORKER_URL.replace(/\/$/, '');
+  }
+})();
+const WORKER_ACCOUNT = (() => {
+  try {
+    const parsed = new URL(WORKER_URL);
+    return (parsed.searchParams.get('account') || ACCOUNT_KEY).trim().toLowerCase() || ACCOUNT_KEY;
+  } catch (_) {
+    return ACCOUNT_KEY;
+  }
+})();
 let bridgeRunning = false;
-let bridgeWs = null;
-let bridgeReconnectTimer = null;
-let bridgeHeartbeatTimer = null;
-let bridgeWatchdogTimer = null;
-let bridgeConnectStartedAt = 0;
+let bridgeConnected = false;
+let bridgeConnecting = false;
+let bridgeLoopPromise = null;
 let bridgeLastConnectAt = 0;
 let bridgeLastDisconnectAt = 0;
-let bridgeLastPongAt = 0;
+let bridgeLastPollAt = 0;
 let bridgeLastMessageAt = 0;
 let bridgeReconnectAttempts = 0;
 let bridgeLastError = '';
 
 async function startBridge() {
-  if (bridgeRunning) return connectBridgeWs();
+  if (bridgeRunning) return bridgeLoopPromise;
   bridgeRunning = true;
-  startBridgeWatchdog();
-  connectBridgeWs();
+  bridgeLoopPromise = startBridgePoll().finally(() => {
+    bridgeLoopPromise = null;
+  });
+  return bridgeLoopPromise;
 }
 
-function clearBridgeHeartbeat() {
-  if (!bridgeHeartbeatTimer) return;
-  clearInterval(bridgeHeartbeatTimer);
-  bridgeHeartbeatTimer = null;
-}
+async function startBridgePoll() {
+  const pollUrl = `${WORKER_BASE}/api/poll?account=${encodeURIComponent(WORKER_ACCOUNT)}`;
+  const completeUrl = `${WORKER_BASE}/api/complete?account=${encodeURIComponent(WORKER_ACCOUNT)}`;
+  console.log('[Bridge] Starting poll bridge →', pollUrl);
 
-function startBridgeHeartbeat(ws) {
-  clearBridgeHeartbeat();
-  bridgeHeartbeatTimer = setInterval(() => {
-    if (!bridgeRunning || bridgeWs !== ws || ws.readyState !== WebSocket.OPEN) return;
+  while (bridgeRunning) {
+    bridgeConnecting = true;
     try {
-      ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+      bridgeLastPollAt = Date.now();
+      const response = await fetch(pollUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timeoutMs: BRIDGE_POLL_TIMEOUT_MS }),
+      });
+
+      if (!response.ok && response.status !== 204) {
+        throw new Error(`Poll ${response.status}`);
+      }
+
+      if (!bridgeConnected) {
+        bridgeLastConnectAt = Date.now();
+      }
+      bridgeConnected = true;
+      bridgeConnecting = false;
+      bridgeLastError = '';
+      bridgeLastMessageAt = Date.now();
+      bridgeReconnectAttempts = 0;
+
+      if (response.status === 204) {
+        continue;
+      }
+
+      const job = await response.json();
+      if (!job?.jobId || !job?.payload) {
+        throw new Error('Invalid job payload');
+      }
+
+      const { rawUrl, subId1, subId2, subId3, subId4, subId5 } = job.payload;
+      const subIds = [subId1, subId2, subId3, subId4, subId5].map((value) => value || '');
+
+      let completion;
+      try {
+        const { shortLink, utmSource, normalizedUrl, expandedUrl } = await enqueueJob(() => runShortlinkJob(rawUrl, subIds));
+        completion = {
+          jobId: job.jobId,
+          ok: true,
+          shortLink,
+          utmSource,
+          normalizedUrl,
+          redirectUrl: expandedUrl !== rawUrl ? expandedUrl.split('?')[0] : '',
+        };
+        console.log('[Bridge] Done:', shortLink);
+      } catch (error) {
+        completion = {
+          jobId: job.jobId,
+          ok: false,
+          error: error.message,
+        };
+        console.error('[Bridge] Error:', error.message);
+      }
+
+      await fetch(completeUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(completion),
+      });
     } catch (error) {
+      if (bridgeConnected || bridgeConnecting) {
+        bridgeLastDisconnectAt = Date.now();
+      }
+      bridgeConnected = false;
+      bridgeConnecting = false;
+      bridgeReconnectAttempts += 1;
       bridgeLastError = error.message;
+      console.error('[Bridge] Poll error:', error.message);
+      if (!bridgeRunning) break;
+      await sleep(BRIDGE_RECONNECT_DELAY_MS);
     }
-  }, BRIDGE_HEARTBEAT_MS);
-}
-
-function scheduleBridgeReconnect(reason, delayMs = BRIDGE_RECONNECT_DELAY_MS) {
-  if (!bridgeRunning || bridgeReconnectTimer) return;
-  bridgeReconnectAttempts += 1;
-  console.log(`[Bridge] Reconnecting in ${delayMs}ms (${reason})`);
-  bridgeReconnectTimer = setTimeout(() => {
-    bridgeReconnectTimer = null;
-    connectBridgeWs();
-  }, delayMs);
-}
-
-function startBridgeWatchdog() {
-  if (bridgeWatchdogTimer) return;
-  bridgeWatchdogTimer = setInterval(() => {
-    if (!bridgeRunning) return;
-
-    const state = getBridgeReadyState();
-    if (state === 'OPEN') {
-      const lastSeenAt = Math.max(bridgeLastPongAt, bridgeLastMessageAt, bridgeLastConnectAt, 0);
-      if (lastSeenAt && Date.now() - lastSeenAt > BRIDGE_STALE_MS) {
-        console.error('[Bridge] No heartbeat from Worker — forcing reconnect');
-        try {
-          bridgeWs?.terminate();
-        } catch (_) {}
-      }
-      return;
-    }
-
-    if (state === 'CONNECTING') {
-      if (bridgeConnectStartedAt && Date.now() - bridgeConnectStartedAt > BRIDGE_CONNECT_TIMEOUT_MS) {
-        console.error('[Bridge] Connect timeout — forcing reconnect');
-        try {
-          bridgeWs?.terminate();
-        } catch (_) {}
-      }
-      return;
-    }
-
-    scheduleBridgeReconnect(`socket state ${state}`, 1000);
-  }, 5000);
-}
-
-function connectBridgeWs() {
-  if (!bridgeRunning) return;
-  if (bridgeWs && (bridgeWs.readyState === WebSocket.OPEN || bridgeWs.readyState === WebSocket.CONNECTING)) {
-    return;
   }
-
-  console.log('[Bridge] Connecting WebSocket →', WORKER_WS);
-  const ws = new WebSocket(WORKER_WS);
-  bridgeWs = ws;
-  bridgeConnectStartedAt = Date.now();
-
-  ws.on('open', () => {
-    if (bridgeWs !== ws) return;
-    console.log('[Bridge] WebSocket connected ✅');
-    bridgeLastConnectAt = Date.now();
-    bridgeLastMessageAt = bridgeLastConnectAt;
-    bridgeLastPongAt = bridgeLastConnectAt;
-    bridgeReconnectAttempts = 0;
-    bridgeLastError = '';
-    startBridgeHeartbeat(ws);
-    try {
-      ws.send(JSON.stringify({
-        type: 'hello',
-        port: PORT,
-        account: ACCOUNT.username,
-        currentUrl: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : '',
-      }));
-    } catch (error) {
-      bridgeLastError = error.message;
-    }
-  });
-
-  ws.on('message', async (data) => {
-    if (bridgeWs !== ws) return;
-    bridgeLastMessageAt = Date.now();
-    let msg;
-    try { msg = JSON.parse(data); } catch (_) { return; }
-    if (msg?.type === 'pong' || msg?.type === 'hello-ack') {
-      bridgeLastPongAt = Date.now();
-      return;
-    }
-    const { jobId, payload } = msg;
-    if (!jobId || !payload) return;
-
-    const { rawUrl, subId1, subId2, subId3, subId4, subId5 } = payload;
-    const subIds = [subId1, subId2, subId3, subId4, subId5].map(v => v || '');
-
-    try {
-      const { shortLink, utmSource, normalizedUrl, expandedUrl } = await enqueueJob(() => runShortlinkJob(rawUrl, subIds));
-      ws.send(JSON.stringify({ jobId, ok: true, shortLink, utmSource, normalizedUrl, redirectUrl: expandedUrl !== rawUrl ? expandedUrl.split('?')[0] : undefined }));
-      console.log('[Bridge] Done:', shortLink);
-    } catch (err) {
-      ws.send(JSON.stringify({ jobId, ok: false, error: err.message }));
-      console.error('[Bridge] Error:', err.message);
-    }
-  });
-
-  ws.on('close', () => {
-    if (bridgeWs === ws) {
-      bridgeWs = null;
-    }
-    bridgeLastDisconnectAt = Date.now();
-    clearBridgeHeartbeat();
-    console.log('[Bridge] Disconnected — reconnecting in 3s...');
-    scheduleBridgeReconnect('socket closed');
-  });
-
-  ws.on('error', (err) => {
-    bridgeLastError = err.message;
-    console.error('[Bridge] WS error:', err.message);
-  });
 }
 
 function sleep(ms) {
@@ -852,11 +845,11 @@ app.whenReady().then(() => {
 
   mainWindow.once('ready-to-show', syncWindowToDisplay);
 
-  loadAffiliatePage = async function loadAffiliatePageImpl({ forceLogin = false } = {}) {
+  loadAffiliatePage = async function loadAffiliatePageImpl() {
     resetWebContentsScale();
-    const sessionSnapshot = forceLogin ? { hasAuthCookie: false } : await getAffiliateSessionSnapshot();
+    const sessionSnapshot = await getAffiliateSessionSnapshot();
     const targetUrl = sessionSnapshot.hasAuthCookie ? AFFILIATE_URL : AFFILIATE_LOGIN_URL;
-    mainWindow.loadURL(targetUrl);
+    await mainWindow.loadURL(targetUrl);
   };
 
   void loadAffiliatePage();
@@ -864,27 +857,12 @@ app.whenReady().then(() => {
   // ถ้าโหลดไม่ได้ (เน็ต/renderer ยังไม่พร้อม) → retry อัตโนมัติ
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDesc) => {
     if (errorCode === -3) return; // ERR_ABORTED (user navigated away) — ไม่ต้อง retry
-    console.log(`[Load] failed (${errorCode}: ${errorDesc}) — retrying in 3s...`);
-    setTimeout(() => {
-      void loadAffiliatePage();
-    }, 3000);
+    console.log(`[Load] failed (${errorCode}: ${errorDesc})`);
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
     resetWebContentsScale();
   });
-
-  setInterval(async () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    const currentUrl = mainWindow.webContents.getURL();
-    if (isCaptchaPageUrl(currentUrl)) return;
-    const sessionSnapshot = await getAffiliateSessionSnapshot();
-    if (isLoginPageUrl(currentUrl)) return;
-    if (isCustomLinkPageUrl(currentUrl) && sessionSnapshot.hasAuthCookie) return;
-    if (typeof loadAffiliatePage === 'function') {
-      await loadAffiliatePage({ forceLogin: !sessionSnapshot.hasAuthCookie });
-    }
-  }, 15000);
 
   // Block wvjbscheme:// and other unknown protocols (Shopee WebViewJavascriptBridge)
   mainWindow.webContents.on('will-navigate', (event, url) => {
@@ -924,7 +902,10 @@ app.whenReady().then(() => {
   tray.setToolTip(DISPLAY_NAME);
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => {
-    if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
   });
 
   // ── HTTP Server ──
@@ -961,16 +942,6 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   bridgeRunning = false;
-  clearBridgeHeartbeat();
-  if (bridgeWatchdogTimer) {
-    clearInterval(bridgeWatchdogTimer);
-    bridgeWatchdogTimer = null;
-  }
-  if (bridgeReconnectTimer) {
-    clearTimeout(bridgeReconnectTimer);
-    bridgeReconnectTimer = null;
-  }
-  try {
-    bridgeWs?.terminate();
-  } catch (_) {}
+  bridgeConnected = false;
+  bridgeConnecting = false;
 });
