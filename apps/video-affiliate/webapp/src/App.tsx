@@ -140,8 +140,6 @@ interface SystemGalleryStats {
   withoutLink: number
 }
 
-type SystemWidePostedLinkFilter = 'with-link' | 'no-link'
-
 interface GlobalOriginalVideo {
   id: string
   video_id: string
@@ -224,7 +222,6 @@ interface TaggedPageProfile {
 }
 
 type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
-type PostedLinkFilter = 'all' | 'with-link' | 'no-link'
 type GeminiKeySource = 'workspace' | 'none'
 type SettingsSection = 'menu' | 'account' | 'team' | 'gemini' | 'shortlink' | 'voice'
 
@@ -1196,6 +1193,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [isActive, setIsActive] = useState(page.is_active === 1)
   const [accessToken, setAccessToken] = useState(page.access_token || '')
   const [saving, setSaving] = useState(false)
+  const [forcingPost, setForcingPost] = useState(false)
   const [tokenInspector, setTokenInspector] = useState<'access' | null>(null)
   const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
@@ -1381,6 +1379,48 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     }
   }
 
+  const handleFocusPost = async () => {
+    if (forcingPost) return
+    const confirmed = window.confirm('โฟกัสโพสต์ตอนนี้ใช่ไหม? ระบบจะดึงคลิปจริงจาก Gallery แล้วโพสต์จริงเหมือน cron ทันที')
+    if (!confirmed) return
+
+    setForcingPost(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/force-post`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skipComment: false }),
+      })
+      const data = await resp.json().catch(() => ({})) as {
+        success?: boolean
+        error?: string
+        details?: string
+        fb_reel_url?: string
+        fb_post_id?: string
+      }
+
+      if (!resp.ok) {
+        if (resp.status === 409 && data.error === 'page_recently_posted_or_posting') {
+          throw new Error('เพจนี้เพิ่งโพสต์ หรือกำลังโพสต์อยู่แล้ว ลองใหม่อีกสักครู่')
+        }
+        throw new Error(String(data.details || data.error || 'โฟกัสโพสต์ไม่สำเร็จ'))
+      }
+
+      onSave({
+        ...page,
+        last_post_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      alert(data.fb_reel_url
+        ? `โฟกัสโพสต์สำเร็จ\n${data.fb_reel_url}`
+        : `โฟกัสโพสต์สำเร็จ${data.fb_post_id ? `\nPost ID: ${data.fb_post_id}` : ''}`)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setForcingPost(false)
+    }
+  }
+
   return (
     <div className="h-full flex flex-col px-5">
       {/* Back button */}
@@ -1411,6 +1451,22 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           >
             <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${isActive ? 'right-1' : 'left-1'}`}></div>
           </button>
+        </div>
+
+        <div className="bg-white border border-blue-100 rounded-2xl p-4 mb-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">โฟกัสโพสต์</p>
+              <p className="text-xs text-gray-400 mt-0.5">ดึงวิดีโอจริงและโพสต์จริงทันทีเหมือนตอน cron ทำงาน</p>
+            </div>
+            <button
+              onClick={handleFocusPost}
+              disabled={forcingPost}
+              className={`shrink-0 px-4 py-2.5 rounded-xl text-sm font-bold transition-all ${forcingPost ? 'bg-gray-300 text-white' : 'bg-blue-600 text-white active:scale-95'}`}
+            >
+              {forcingPost ? 'กำลังโพสต์...' : 'โพสต์ตอนนี้'}
+            </button>
+          </div>
         </div>
 
         {/* Tokens */}
@@ -2170,7 +2226,6 @@ function App() {
 
 
   const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('unused')
-  const [postedLinkFilter, setPostedLinkFilter] = useState<PostedLinkFilter>('all')
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null)
@@ -2487,14 +2542,9 @@ function App() {
   }, [botScope, namespaceId, systemWideGalleryMode])
 
   useEffect(() => {
-    if (!systemWideGalleryMode) return
-    if (postedLinkFilter === 'all') setPostedLinkFilter('with-link')
-  }, [systemWideGalleryMode, postedLinkFilter])
-
-  useEffect(() => {
     if (tab !== 'gallery' || isOwner && categoryFilter === 'all-original') return
     setGalleryVisibleCount(GALLERY_BATCH_SIZE)
-  }, [tab, botScope, namespaceId, categoryFilter, postedLinkFilter, systemWideGalleryMode, isOwner])
+  }, [tab, botScope, namespaceId, categoryFilter, systemWideGalleryMode, isOwner])
 
   useEffect(() => {
     if (authBootstrapping || !token || tab !== 'dashboard') return
@@ -2611,7 +2661,6 @@ function App() {
     if (!session) return
 
     const reset = !!options.reset
-    const activeLinkFilter: SystemWidePostedLinkFilter = postedLinkFilter === 'no-link' ? 'no-link' : 'with-link'
     const requestId = reset ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
     if (reset) {
       setGalleryLoading(true)
@@ -2627,7 +2676,7 @@ function App() {
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
-      params.set('link_filter', activeLinkFilter)
+      params.set('link_filter', 'all')
 
       const resp = await apiFetch(`${WORKER_URL}/api/gallery?${params.toString()}`)
       if (resp.status === 401) {
@@ -2657,12 +2706,6 @@ function App() {
       }
     }
   }
-
-  useEffect(() => {
-    if (systemWideGalleryMode && postedLinkFilter === 'all') {
-      setPostedLinkFilter('with-link')
-    }
-  }, [systemWideGalleryMode, postedLinkFilter])
 
   async function loadAll(options: { skipGallery?: boolean } = {}) {
     if (loadAllInFlightRef.current) {
@@ -2740,14 +2783,13 @@ function App() {
     }
 
     if (systemWideGalleryMode) {
-      if (postedLinkFilter === 'all') return
       void loadSystemGalleryPage({ reset: true })
       return
     }
 
     void loadUsedVideos({ force: categoryFilter === 'used' })
     if (isOwner) void loadGlobalOriginalVideos()
-  }, [tab, categoryFilter, postedLinkFilter, token, authBootstrapping, isOwner, systemWideGalleryMode])
+  }, [tab, categoryFilter, token, authBootstrapping, isOwner, systemWideGalleryMode])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3329,14 +3371,7 @@ function App() {
         }
 
         const nextVideo = { ...video, ...fields }
-        if (!systemWideGalleryMode) {
-          return [nextVideo]
-        }
-
-        const nextHasLink = !!getVideoShopeeLink(nextVideo as unknown as Record<string, unknown>)
-        const activeFilter: SystemWidePostedLinkFilter = postedLinkFilter === 'no-link' ? 'no-link' : 'with-link'
-        const shouldStayVisible = activeFilter === 'no-link' ? !nextHasLink : nextHasLink
-        return shouldStayVisible ? [nextVideo] : []
+        return [nextVideo]
       })
     })
 
@@ -3358,13 +3393,6 @@ function App() {
       }))
     }
 
-    const activeFilter: SystemWidePostedLinkFilter = postedLinkFilter === 'no-link' ? 'no-link' : 'with-link'
-    const removedFromCurrentFilter = activeFilter === 'no-link' ? nextHasLink : !nextHasLink
-    if (removedFromCurrentFilter && systemGalleryHasMore && !galleryLoadingMore) {
-      window.setTimeout(() => {
-        void loadSystemGalleryPage()
-      }, 0)
-    }
   }
 
   const usedVideoIdSet = useMemo(() => {
@@ -3372,12 +3400,8 @@ function App() {
   }, [usedVideos])
   const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
   const {
-    gallerySystemWithLinkVideos,
-    gallerySystemWithoutLinkVideos,
     galleryUnusedVideos,
     galleryUsedVideos,
-    galleryUsedWithLinkVideos,
-    galleryUsedWithoutLinkVideos,
     galleryAvailableVideos,
   } = useMemo(() => {
     const getGallerySortTs = (video: Video) => {
@@ -3386,12 +3410,6 @@ function App() {
     }
     const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
     const sourceVideos = dedupeGalleryVideos(videos)
-    const systemWithLinkVideos = sortNewestFirst(
-      sourceVideos.filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    )
-    const systemWithoutLinkVideos = sortNewestFirst(
-      sourceVideos.filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    )
     const galleryMissingLinkVideos = sortNewestFirst(
       sourceVideos.filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
     )
@@ -3416,39 +3434,25 @@ function App() {
     const dedupedUsedVideos = sortNewestFirst(
       galleryUsedMergedVideos.filter((video, index, arr) => arr.findIndex((v) => String(v.id || '') === String(video.id || '')) === index)
     )
-    const usedWithLinkVideos = dedupedUsedVideos
-      .filter((video) => !!getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    const usedWithoutLinkVideos = dedupedUsedVideos
-      .filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
-    const usedVisibleVideos = postedLinkFilter === 'with-link'
-      ? usedWithLinkVideos
-      : postedLinkFilter === 'no-link'
-        ? usedWithoutLinkVideos
-        : dedupedUsedVideos
     const availableVideos = systemWideGalleryMode
-      ? (postedLinkFilter === 'no-link' ? systemWithoutLinkVideos : systemWithLinkVideos)
+      ? sourceVideos
       : (categoryFilter === 'used' || categoryFilter === 'missing-link')
-        ? usedVisibleVideos
+        ? dedupedUsedVideos
         : unusedVideos
 
     return {
-      gallerySystemWithLinkVideos: systemWithLinkVideos,
-      gallerySystemWithoutLinkVideos: systemWithoutLinkVideos,
       galleryUnusedVideos: unusedVideos,
       galleryUsedVideos: dedupedUsedVideos,
-      galleryUsedWithLinkVideos: usedWithLinkVideos,
-      galleryUsedWithoutLinkVideos: usedWithoutLinkVideos,
       galleryAvailableVideos: availableVideos,
     }
-  }, [videos, usedVideos, usedVideoIdSet, postedLinkFilter, systemWideGalleryMode, categoryFilter])
+  }, [videos, usedVideos, usedVideoIdSet, systemWideGalleryMode, categoryFilter])
   const showGalleryFilterBar = tab === 'gallery' && (
-    galleryLoading ||
-    (systemWideGalleryMode
-      ? ((systemGalleryStats.withLink + systemGalleryStats.withoutLink) > 0)
-      : (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0))
+    !systemWideGalleryMode && (
+      galleryLoading ||
+      (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0)
+    )
   )
-  const showPostedSubFilterBar = tab === 'gallery' && !systemWideGalleryMode && categoryFilter === 'used' && showGalleryFilterBar
-  const galleryHeaderOffset = showGalleryFilterBar ? (showPostedSubFilterBar ? 214 : 164) : 104
+  const galleryHeaderOffset = showGalleryFilterBar ? 164 : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
   const galleryVisibleVideos = useMemo(() => {
     if (systemWideGalleryMode) return galleryAvailableVideos
@@ -3457,14 +3461,8 @@ function App() {
   const galleryHasMore = systemWideGalleryMode
     ? systemGalleryHasMore
     : galleryVisibleVideos.length < galleryAvailableVideos.length
-  const gallerySystemWithLinkCount = systemWideGalleryMode ? systemGalleryStats.withLink : gallerySystemWithLinkVideos.length
-  const gallerySystemWithoutLinkCount = systemWideGalleryMode ? systemGalleryStats.withoutLink : gallerySystemWithoutLinkVideos.length
   const galleryCurrentTotal = systemWideGalleryMode
-    ? (postedLinkFilter === 'no-link'
-      ? systemGalleryStats.withoutLink
-      : postedLinkFilter === 'with-link'
-        ? systemGalleryStats.withLink
-        : systemGalleryStats.total)
+    ? systemGalleryStats.total
     : galleryAvailableVideos.length
   const appViewportStyle = {
     height: 'var(--tg-viewport-stable-height, 100dvh)',
@@ -3501,7 +3499,7 @@ function App() {
 
     observer.observe(target)
     return () => observer.disconnect()
-  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, videos.length, galleryLoadingMore, postedLinkFilter])
+  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, videos.length, galleryLoadingMore])
 
   useEffect(() => {
     if (tab !== 'gallery' || isAllOriginalMode || galleryLoading || !galleryHasMore) return
@@ -3534,7 +3532,7 @@ function App() {
       root.removeEventListener('scroll', maybeLoadMore)
       if (rafId) window.cancelAnimationFrame(rafId)
     }
-  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, galleryLoadingMore, postedLinkFilter])
+  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, galleryLoadingMore])
 
   // If viewing a specific page detail
   if (selectedPage) {
@@ -3592,58 +3590,17 @@ function App() {
           </h1>
           {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
-              {systemWideGalleryMode ? (
-                <>
-                  <button
-                    onClick={() => setPostedLinkFilter('with-link')}
-                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${postedLinkFilter !== 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                  >
-                    มีลิ้ง ({gallerySystemWithLinkCount})
-                  </button>
-                  <button
-                    onClick={() => setPostedLinkFilter('no-link')}
-                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${postedLinkFilter === 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                  >
-                    ไม่มีลิ้ง ({gallerySystemWithoutLinkCount})
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={() => setCategoryFilter('unused')}
-                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                  >
-                    ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
-                  </button>
-                  <button
-                    onClick={() => setCategoryFilter('used')}
-                    className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                  >
-                    โพสต์แล้ว ({galleryUsedVideos.length})
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-          {tab === 'gallery' && showPostedSubFilterBar && (
-            <div className="flex bg-gray-100/70 p-1 mb-2 rounded-xl gap-1">
               <button
-                onClick={() => setPostedLinkFilter('all')}
-                className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${postedLinkFilter === 'all' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                onClick={() => setCategoryFilter('unused')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                ทั้งหมด ({galleryUsedVideos.length})
+                ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
               </button>
               <button
-                onClick={() => setPostedLinkFilter('with-link')}
-                className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${postedLinkFilter === 'with-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                onClick={() => setCategoryFilter('used')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                มีลิ้ง ({galleryUsedWithLinkVideos.length})
-              </button>
-              <button
-                onClick={() => setPostedLinkFilter('no-link')}
-                className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${postedLinkFilter === 'no-link' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                ไม่มีลิ้ง ({galleryUsedWithoutLinkVideos.length})
+                โพสต์แล้ว ({galleryUsedVideos.length})
               </button>
             </div>
           )}
@@ -3807,29 +3764,17 @@ function App() {
                 </div>
                 <p className="text-gray-900 font-bold text-lg">
                   {systemWideGalleryMode
-                    ? postedLinkFilter === 'no-link'
-                      ? 'ยังไม่มีคลิปที่ไม่มีลิ้ง'
-                      : 'ยังไม่มีคลิปที่มีลิ้ง'
+                    ? 'ยังไม่มีคลิปใน Gallery'
                     : categoryFilter === 'used'
-                    ? postedLinkFilter === 'with-link'
-                      ? 'ยังไม่มีคลิปที่มีลิ้ง'
-                      : postedLinkFilter === 'no-link'
-                        ? 'ยังไม่มีคลิปที่ไม่มีลิ้ง'
-                        : 'ยังไม่มีคลิปที่โพสต์แล้ว'
-                    : 'ไม่มีคลิปพร้อมโพสต์'}
+                      ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
+                      : 'ไม่มีคลิปพร้อมโพสต์'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
                   {systemWideGalleryMode
-                    ? postedLinkFilter === 'no-link'
-                      ? 'คลิปทุก workspace ที่ยังไม่มีลิ้งจะแสดงที่นี่'
-                      : 'คลิปทุก workspace ที่มีลิ้งจะแสดงที่นี่'
+                    ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
-                    ? postedLinkFilter === 'with-link'
-                      ? 'คลิปที่มีลิ้งจะแสดงที่นี่'
-                      : postedLinkFilter === 'no-link'
-                        ? 'คลิปที่ไม่มีลิ้งจะแสดงที่นี่'
-                        : 'คลิปที่โพสต์สำเร็จ และคลิปที่ไม่มีลิ้งจะแสดงที่นี่'
-                    : 'คลิปที่มี Shopee link และยังไม่โพสต์จะแสดงที่นี่'}
+                      ? 'คลิปที่โพสต์สำเร็จ และคลิปที่ยังไม่มีลิ้งจะแสดงที่นี่'
+                      : 'คลิปที่มี Shopee link และยังไม่โพสต์จะแสดงที่นี่'}
                 </p>
               </div>
             ) : (
@@ -4046,16 +3991,14 @@ function App() {
                           {/* Info */}
                           <div className="flex-1 min-w-0">
                             <p className="text-sm font-bold text-gray-900 truncate">{item.page_name}</p>
-                            <div className="flex items-center gap-2 mt-0.5">
-                              <p className="text-xs text-gray-400">{timeStr} น.</p>
-                              <span className={`inline-flex items-center whitespace-nowrap text-[10px] font-bold px-1.5 py-0.5 rounded-md ${triggerSourceCls}`}>
-                                {triggerSourceLabel}
-                              </span>
-                            </div>
+                            <p className="text-xs text-gray-400 mt-0.5">{timeStr} น.</p>
                           </div>
                           {/* Status + Link */}
                           <div className="flex items-center gap-2 shrink-0">
                             <div className="flex items-center justify-end gap-1">
+                              <span className={`inline-flex items-center whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${triggerSourceCls}`}>
+                                {triggerSourceLabel}
+                              </span>
                               <span className={`inline-flex items-center gap-1 whitespace-nowrap text-[10px] font-bold px-2 py-1 rounded-lg ${postMeta.cls}`}>
                                 {postMeta.loading && (
                                   <span className="w-2.5 h-2.5 border-[1.5px] border-current/30 border-t-current rounded-full animate-spin" />

@@ -4059,7 +4059,9 @@ async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: 
 function deriveShortlinkSub1(namespaceId: string): string {
     const normalized = String(namespaceId || '').trim().toLowerCase()
     const fromEmail = normalized.includes('@') ? normalized.split('@')[0] : normalized
-    const safe = fromEmail.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32)
+    // Shopee custom-link rejects some separators (for example "-" and "_") with failCode 3.
+    // Keep sub1 strictly alphanumeric so workspace emails like "mr.adisorn..." remain valid.
+    const safe = fromEmail.replace(/[^a-z0-9]+/g, '').slice(0, 32)
     return safe || 'workspace'
 }
 
@@ -4122,15 +4124,17 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     if (!pageId) throw new Error('page_id_required')
     if (!accessToken) throw new Error('access_token_required')
 
-    let incomingPostToken = ''
-    try {
-        const scoped = await resolvePageScopedToken(accessToken, pageId, env, 'post')
-        incomingPostToken = isPostRoleToken(String(scoped.token || '').trim())
-            ? String(scoped.token || '').trim()
-            : ''
-    } catch {
-        incomingPostToken = ''
-    }
+    // Prefer strict role slots from sync payloads.
+    // Some BrowserSaving sync paths may send the resolved EAAD6 token in access_token
+    // while comment_token still contains an intermediate raw token. Keep the direct
+    // video token in the comment pool so posting does not fall back to Postcron.
+    const incomingPostToken = isPostRoleToken(accessToken) ? accessToken : ''
+    const resolvedCommentToken = String(
+        normalizeDirectVideoTokenPool([
+            commentToken,
+            isCommentRoleToken(accessToken) ? accessToken : '',
+        ])[0] || ''
+    ).trim()
 
     let created = false
     let updated = false
@@ -4143,9 +4147,6 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     ).bind(pageId, namespaceId).first() as { id?: string; access_token?: string | null } | null
     const currentPrimaryToken = isPostRoleToken(String(existing?.access_token || '').trim())
         ? String(existing?.access_token || '').trim()
-        : ''
-    const resolvedCommentToken = commentToken
-        ? await resolveCommentPageTokenForPage(env, pageId, commentToken)
         : ''
     const nextPostTokens = normalizePostTokenPool([
         incomingPostToken,
@@ -4251,6 +4252,8 @@ function isCommentRoleToken(token: string): boolean {
 }
 
 function isPostRoleToken(token: string): boolean {
+    // Post role = Postcron tokens (NOT EAAD6V) — used for fallback via /video_reels
+    // EAAD6V tokens go through comment role → primary posting via /videos
     const normalized = String(token || '').trim()
     return !!normalized && isTokenValid(normalized) && !isCommentRoleToken(normalized)
 }
@@ -4620,28 +4623,28 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
         if (!existing.comment_token) existing.comment_token = commentToken
     }
 
-    const rebuiltPostTokens = normalizePostTokenPool((await Promise.all(
-        Array.from(byProfileId.values()).map(async (item) => {
-            if (!item.roles.includes('post')) return ''
-            const currentToken = String(item.post_token || '').trim()
-            if (!currentToken) return ''
-            try {
-                const resolved = await resolvePageScopedToken(currentToken, pageId, env, 'post')
-                return String(resolved.token || '').trim()
-            } catch {
-                return ''
-            }
-        })
-    )).filter(Boolean))
+    const rebuiltPostTokens = normalizePostTokenPool(
+        Array.from(byProfileId.values())
+            .filter((item) => item.roles.includes('post') && !!String(item.post_token || '').trim())
+            .map((item) => String(item.post_token || '').trim())
+            .filter(Boolean)
+    )
 
-    const rebuiltCommentTokens = normalizeCommentTokenPool((await Promise.all(
-        Array.from(byProfileId.values()).map(async (item) => {
-            if (!item.roles.includes('comment')) return ''
-            const currentToken = String(item.comment_token || '').trim()
-            if (!currentToken) return ''
-            return resolveCommentPageTokenForPage(env, pageId, currentToken)
-        })
-    )).filter(Boolean))
+    let rebuiltCommentTokens = normalizeCommentTokenPool(
+        Array.from(byProfileId.values())
+            .filter((item) => item.roles.includes('comment') && !!String(item.comment_token || '').trim())
+            .map((item) => String(item.comment_token || '').trim())
+            .filter(Boolean)
+    )
+
+    if (rebuiltCommentTokens.length === 0) {
+        rebuiltCommentTokens = normalizeDirectVideoTokenPool(
+            Array.from(byProfileId.values())
+                .filter((item) => item.roles.includes('post') && !!String(item.comment_token || '').trim())
+                .map((item) => String(item.comment_token || '').trim())
+                .filter(Boolean)
+        )
+    }
 
     const existingPage = await env.DB.prepare(
         'SELECT access_token FROM pages WHERE id = ? AND bot_id = ?'
@@ -4714,7 +4717,7 @@ async function ensurePageTokenCandidates(params: {
     logPrefix: string
 }): Promise<{ tokens: string[]; postTokens: string[]; commentTokens: string[] }> {
     let candidates = await getPageTokenCandidates(params)
-    const needsCommentRecover = candidates.commentTokens.length === 0
+    const needsCommentRecover = normalizeDirectVideoTokenPool(candidates.commentTokens).length === 0
     const needsPostRecover = candidates.postTokens.length === 0
     if (!needsCommentRecover && !needsPostRecover) {
         return candidates
@@ -5759,6 +5762,8 @@ async function shortenShopeeLinkForNamespace(params: {
 }
 
 function pickProfilePostToken(profile: BrowserSavingProfileRecord): string {
+    // Postcron token only — used as fallback via /video_reels
+    // EAAD6V is in commentTokens → primary via /videos
     const token = pickProfilePostcronToken(profile)
     return isPostRoleToken(token) ? token : ''
 }
@@ -8281,7 +8286,7 @@ async function publishReelDirect(params: {
     formData.append('is_reel', 'true')
     formData.append('access_token', token)
 
-    const url = `${FB_GRAPH_V19}/${params.pageId}/videos`
+    const url = `https://graph.facebook.com/v21.0/${params.pageId}/videos`
     console.log(`[${params.logPrefix}] Publishing reel via single POST to ${url} (${params.videoBuffer.byteLength} bytes)`)
 
     const resp = await fetchWithTimeout(url, {

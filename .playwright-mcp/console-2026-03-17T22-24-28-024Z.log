@@ -1,0 +1,6 @@
+[     545ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://100.82.152.81:5173/favicon.ico:0
+[  120435ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:5173/:0
+[  135958ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:5173/:0
+[  151483ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:5173/:0
+[  167000ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:5173/:0
+[  182559ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:5173/:0

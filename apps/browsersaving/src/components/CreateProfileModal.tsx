@@ -3,6 +3,7 @@ import { useState, useRef, useEffect } from 'react'
 interface Profile {
   id: string
   name: string
+  owner_email?: string
   proxy: string
   homepage?: string
   notes?: string
@@ -189,7 +190,7 @@ export function CreateProfileModal({ profile, onClose, onSave, existingProfiles 
               placeholder="My Profile"
               className={isDuplicateName ? 'input-error' : ''}
             />
-            {isDuplicateName && <span className="form-error">โปรไฟล์ซ้ำในระบบ</span>}
+            {isDuplicateName && <span className="form-error">โปรไฟล์ซ้ำใน workspace นี้</span>}
           </div>
 
           <div className="form-group">

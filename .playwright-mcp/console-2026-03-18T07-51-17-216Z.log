@@ -1,0 +1,3 @@
+[     450ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://100.82.152.81:5173/favicon.ico:0
+[ 1816518ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://100.82.152.81:5173/App.tsx?t=1773822093617:0
+[ 1816521ms] [ERROR] [hmr] Failed to reload /App.tsx. This could be due to syntax errors or importing non-existent modules. (see errors above) @ http://100.82.152.81:5173/@vite/client:175

@@ -32,7 +32,7 @@ export const BROWSERSAVING_API_URL =
 export const COMMENT_TOKEN_SERVICE_URL =
   readString(runtimeConfig.commentTokenServiceUrl) ||
   readString(import.meta.env.VITE_COMMENT_TOKEN_SERVICE_URL) ||
-  'https://token.lslly.com/api/comment-token'
+  'http://100.82.152.81:3457/token'
 
 export const REMOTE_LAUNCHER_URL =
   readString(runtimeConfig.remoteLauncherUrl) ||

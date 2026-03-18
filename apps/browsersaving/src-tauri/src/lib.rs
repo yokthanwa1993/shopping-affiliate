@@ -14,6 +14,10 @@ use tauri::{Manager, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use url::Url;
 
+// HTTP API server imports
+use axum::{extract::Json as AxumJson, http::StatusCode, routing::{get, post}, Router};
+use tower_http::cors::CorsLayer;
+
 const MOBILE_SIMULATOR_EXT_URL: &str = "https://chromewebstore.google.com/detail/mobile-simulator-responsi/ckejmhbmlajgoklhgbapkiccekfoccmk";
 const DEFAULT_ANDROID_SDK_DIR: &str = "Library/Android/sdk";
 const ANDROID_AVD_ENV_KEY: &str = "BROWSERSAVING_ANDROID_AVD";
@@ -3123,6 +3127,28 @@ fn spawn_chrome_process(
 
 // Get Chrome path - use Chrome for Testing
 fn get_chrome_path() -> PathBuf {
+    // === Windows paths ===
+    #[cfg(target_os = "windows")]
+    {
+        let win_paths = [
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ];
+        // Also check user-local Chrome
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let local_chrome = PathBuf::from(local_app_data).join(r"Google\Chrome\Application\chrome.exe");
+            if local_chrome.exists() {
+                return local_chrome;
+            }
+        }
+        for p in &win_paths {
+            if p.exists() {
+                return p.clone();
+            }
+        }
+    }
+
+    // === macOS paths ===
     // Try newer version first
     let chrome_v144 = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -3139,8 +3165,15 @@ fn get_chrome_path() -> PathBuf {
         return chrome_v127;
     }
 
-    // Last resort: regular Chrome
-    PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    // Last resort: regular Chrome (macOS) or fallback Windows path
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    }
 }
 
 // Download browser data from server (via Worker CDN - faster than direct R2)
@@ -4914,21 +4947,21 @@ async fn launch_browser(
         "--use-mock-keychain".to_string(),
 
         // Window size to avoid detection by unusual dimensions
-        "--window-size=1440,900".to_string(),
+        "--start-maximized".to_string(),
 
         // Language settings
         "--lang=th".to_string(),
         "--accept-lang=th,th-TH,en-US,en".to_string(),
     ];
 
-    if let Some(proxy_server) =
-        resolve_profile_proxy_server(&state, &profile_id, &profile.proxy).await?
-    {
-        log::info!("Using launch proxy for {}: {}", profile.name, proxy_server);
-        args.push(format!("--proxy-server={}", proxy_server));
-    } else {
-        log::info!("Launching {} without proxy override", profile.name);
-    }
+    // Proxy disabled for direct connection (faster)
+    // if let Some(proxy_server) =
+    //     resolve_profile_proxy_server(&state, &profile_id, &profile.proxy).await?
+    // {
+    //     log::info!("Using launch proxy for {}: {}", profile.name, proxy_server);
+    //     args.push(format!("--proxy-server={}", proxy_server));
+    // }
+    log::info!("Launching {} without proxy (proxy disabled)", profile.name);
 
     // Add remote debugging port (always needed for cookie export)
     let has_credentials = profile.username.as_ref().map_or(false, |u| !u.is_empty())
@@ -5216,22 +5249,24 @@ async fn launch_browser_debug(
         "--no-service-autorun".to_string(),
         "--password-store=basic".to_string(),
         "--use-mock-keychain".to_string(),
-        "--window-size=1440,900".to_string(),
+        "--start-maximized".to_string(),
         "--lang=th".to_string(),
         "--accept-lang=th,th-TH,en-US,en".to_string(),
     ];
 
-    if let Some(proxy_server) =
-        resolve_profile_proxy_server(&state, &profile_id, &profile.proxy).await?
-    {
-        log::info!("Using debug proxy for {}: {}", profile.name, proxy_server);
-        args.push(format!("--proxy-server={}", proxy_server));
-    } else {
-        log::info!(
-            "Launching {} in debug mode without proxy override",
-            profile.name
-        );
-    }
+    // Proxy disabled for direct connection (faster)
+    // if let Some(proxy_server) =
+    //     resolve_profile_proxy_server(&state, &profile_id, &profile.proxy).await?
+    // {
+    //     log::info!("Using debug proxy for {}: {}", profile.name, proxy_server);
+    //     args.push(format!("--proxy-server={}", proxy_server));
+    // } else {
+    //     log::info!(
+    //         "Launching {} in debug mode without proxy override",
+    //         profile.name
+    //     );
+    // }
+    log::info!("Launching {} in debug mode without proxy (proxy disabled)", profile.name);
 
     for startup_url in startup_urls(&profile).into_iter() {
         args.push(startup_url);
@@ -6164,22 +6199,24 @@ async fn launch_browser_internal(
         "--no-service-autorun".to_string(),
         "--password-store=basic".to_string(),
         "--use-mock-keychain".to_string(),
-        "--window-size=1440,900".to_string(),
+        "--start-maximized".to_string(),
         "--lang=th".to_string(),
         "--accept-lang=th,th-TH,en-US,en".to_string(),
     ];
 
-    if let Some(proxy_server) =
-        resolve_profile_proxy_server(state.state, &profile_id, &profile.proxy).await?
-    {
-        log::info!("Using recover proxy for {}: {}", profile.name, proxy_server);
-        args.push(format!("--proxy-server={}", proxy_server));
-    } else {
-        log::info!(
-            "Launching {} in recovery flow without proxy override",
-            profile.name
-        );
-    }
+    // Proxy disabled for direct connection (faster)
+    // if let Some(proxy_server) =
+    //     resolve_profile_proxy_server(state.state, &profile_id, &profile.proxy).await?
+    // {
+    //     log::info!("Using recover proxy for {}: {}", profile.name, proxy_server);
+    //     args.push(format!("--proxy-server={}", proxy_server));
+    // } else {
+    //     log::info!(
+    //         "Launching {} in recovery flow without proxy override",
+    //         profile.name
+    //     );
+    // }
+    log::info!("Launching {} in recovery flow without proxy (proxy disabled)", profile.name);
 
     for startup_url in startup_urls(&profile).into_iter() {
         args.push(startup_url);
@@ -6402,6 +6439,314 @@ async fn export_cookies_with_retry(port: u16, profile_id: &str) -> bool {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ============ HTTP API Server for Remote Launching ============
+
+const HTTP_API_PORT: u16 = 3456;
+
+#[derive(Deserialize)]
+struct HttpLaunchRequest {
+    profile: Profile,
+    #[serde(default)]
+    auth_token: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HttpStopRequest {
+    profile_id: String,
+    #[serde(default)]
+    auth_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HttpApiResponse {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    running: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uploading: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewer_url: Option<String>,
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    s.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+            c.to_string()
+        } else {
+            format!("%{:02X}", c as u32)
+        }
+    }).collect()
+}
+
+async fn start_http_api_server(state: AppState) {
+    let state_launch = state.clone();
+    let state_stop = state.clone();
+    let state_status = state.clone();
+
+    let app = Router::new()
+        .route("/api/launch", post(move |AxumJson(req): AxumJson<HttpLaunchRequest>| {
+            let st = state_launch.clone();
+            async move {
+                let profile_name = req.profile.name.clone();
+                log::info!("[HTTP-API] Launch request for: {}", profile_name);
+                match http_api_launch_browser(req.profile, req.auth_token, &st).await {
+                    Ok(debug_port) => {
+                        let viewer_url = format!(
+                            "/remote-viewer.html?host=100.82.152.81&port={}&name={}",
+                            debug_port,
+                            urlencoding_simple(&profile_name)
+                        );
+                        (StatusCode::OK, AxumJson(HttpApiResponse {
+                            success: true, error: None, running: None, uploading: None,
+                            debug_port: Some(debug_port), viewer_url: Some(viewer_url),
+                        }))
+                    },
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(HttpApiResponse {
+                        success: false, error: Some(e), running: None, uploading: None,
+                        debug_port: None, viewer_url: None,
+                    })),
+                }
+            }
+        }))
+        .route("/api/stop", post(move |AxumJson(req): AxumJson<HttpStopRequest>| {
+            let st = state_stop.clone();
+            async move {
+                log::info!("[HTTP-API] Stop request for: {}", req.profile_id);
+                match http_api_stop_browser(req.profile_id, req.auth_token, &st).await {
+                    Ok(_) => (StatusCode::OK, AxumJson(HttpApiResponse {
+                        success: true, error: None, running: None, uploading: None,
+                        debug_port: None, viewer_url: None,
+                    })),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, AxumJson(HttpApiResponse {
+                        success: false, error: Some(e), running: None, uploading: None,
+                        debug_port: None, viewer_url: None,
+                    })),
+                }
+            }
+        }))
+        .route("/api/status", get(move || {
+            let st = state_status.clone();
+            async move {
+                let running: Vec<String> = st.running_browsers.lock().unwrap().keys().cloned().collect();
+                let uploading: Vec<String> = st.uploading_profiles.lock().unwrap().clone();
+                (StatusCode::OK, AxumJson(HttpApiResponse {
+                    success: true, error: None,
+                    running: Some(running), uploading: Some(uploading),
+                    debug_port: None, viewer_url: None,
+                }))
+            }
+        }))
+        .layer(CorsLayer::permissive());
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], HTTP_API_PORT));
+    log::info!("[HTTP-API] Starting HTTP API server on {}", addr);
+    if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+        log::info!("[HTTP-API] HTTP API server listening on port {}", HTTP_API_PORT);
+        let _ = axum::serve(listener, app).await;
+    } else {
+        log::error!("[HTTP-API] Failed to bind HTTP API server on port {}", HTTP_API_PORT);
+    }
+}
+
+// HTTP API launch — simplified, just launches Chrome directly without proxy
+async fn http_api_launch_browser(
+    profile: Profile,
+    auth_token: Option<String>,
+    state: &AppState,
+) -> Result<u16, String> {
+    log::info!("[HTTP-API] Launch request for: {}", profile.name);
+    let profile_id = profile.id.clone();
+
+    {
+        let running = state.running_browsers.lock().unwrap();
+        if running.contains_key(&profile_id) {
+            return Err("Browser already running".to_string());
+        }
+    }
+
+    let auth_token_for_sync = normalize_auth_token(auth_token.as_deref());
+
+    // Download latest data
+    log::info!("[HTTP-API] Downloading browser data...");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        download_browser_data(profile_id.clone(), auth_token_for_sync.clone()),
+    ).await;
+
+    // Get cache dir
+    let cache_dir = get_cache_dir().join(&profile_id);
+
+    let chrome_path = get_chrome_path();
+    if !chrome_path.exists() {
+        return Err("Chrome not found".to_string());
+    }
+
+    // Find available port
+    let debug_port: u16 = {
+        let existing_ports = state.debug_ports.lock().unwrap();
+        let mut port = 49152 + (std::process::id() as u16 % 10000);
+        while existing_ports.values().any(|&p| p == port) {
+            port += 1;
+        }
+        port
+    };
+
+    let user_data_dir = cache_dir.to_string_lossy().to_string();
+
+    let mut args = vec![
+        format!("--user-data-dir={}", user_data_dir),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
+        "--start-maximized".to_string(),
+        "--lang=th".to_string(),
+        "--accept-lang=th,th-TH,en-US,en".to_string(),
+        format!("--remote-debugging-port={}", debug_port),
+    ];
+
+    // Startup URLs
+    for url in startup_urls(&profile) {
+        args.push(url);
+    }
+    args.extend(startup_extension_args());
+
+    // Pin extensions
+    pin_extensions_in_preferences(&cache_dir);
+
+    log::info!("[HTTP-API] Chrome path: {:?}, port: {}", chrome_path, debug_port);
+    let child = Command::new(&chrome_path)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to launch Chrome: {}", e))?;
+
+    let pid = child.id();
+    log::info!("[HTTP-API] Browser launched PID: {}", pid);
+
+    {
+        let mut running = state.running_browsers.lock().unwrap();
+        running.insert(profile_id.clone(), pid);
+    }
+    {
+        let mut ports = state.debug_ports.lock().unwrap();
+        ports.insert(profile_id.clone(), debug_port);
+    }
+
+    // Auto-fill credentials after delay
+    let has_credentials = profile.username.as_ref().map_or(false, |u| !u.is_empty())
+        || profile.password.as_ref().map_or(false, |p| !p.is_empty());
+    if has_credentials {
+        let username = profile.username.clone().unwrap_or_default();
+        let password = profile.password.clone().unwrap_or_default();
+        let port_copy = debug_port;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = inject_autofill(port_copy, &username, &password).await;
+        });
+    }
+
+    Ok(debug_port)
+}
+
+async fn http_api_stop_browser(
+    profile_id: String,
+    auth_token: Option<String>,
+    state: &AppState,
+) -> Result<bool, String> {
+    log::info!("[HTTP-API] Stop request for: {}", profile_id);
+
+    let auth_token_for_sync = normalize_auth_token(auth_token.as_deref())
+        .or_else(|| lookup_profile_auth_token(state, &profile_id));
+    if auth_token_for_sync.is_some() {
+        remember_profile_auth_token(state, &profile_id, auth_token_for_sync.clone());
+    }
+
+    {
+        let mut uploading = state.uploading_profiles.lock().unwrap();
+        if !uploading.contains(&profile_id) {
+            uploading.push(profile_id.clone());
+        }
+    }
+
+    let pid = {
+        let running = state.running_browsers.lock().unwrap();
+        running.get(&profile_id).copied()
+    };
+    let maybe_port = {
+        let debug_ports = state.debug_ports.lock().unwrap();
+        debug_ports.get(&profile_id).copied()
+    };
+
+    {
+        let mut running = state.running_browsers.lock().unwrap();
+        running.remove(&profile_id);
+    }
+
+    if let Some(port) = maybe_port {
+        log::info!("[HTTP-API] Exporting cookies via CDP from port {}...", port);
+        if !export_cookies_with_retry(port, &profile_id).await {
+            log::warn!(
+                "[HTTP-API] Cookie export skipped: no successful CDP export for {}",
+                profile_id
+            );
+        }
+    } else {
+        log::warn!("[HTTP-API] No debug port for cookie export: {}", profile_id);
+    }
+    {
+        let mut ports = state.debug_ports.lock().unwrap();
+        ports.remove(&profile_id);
+    }
+
+    if let Some(pid) = pid {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F", "/T"])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = Command::new("kill").arg(pid.to_string()).output();
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    stop_profile_proxy_relay(state, &profile_id);
+
+    let upload_result =
+        upload_browser_data_with_retry(profile_id.as_str(), auth_token_for_sync.clone()).await;
+
+    {
+        let mut uploading = state.uploading_profiles.lock().unwrap();
+        uploading.retain(|id| id != &profile_id);
+    }
+
+    cleanup_wrapper_for_profile(&profile_id);
+    clear_profile_auth_token(state, &profile_id);
+
+    match upload_result {
+        Ok(_) => {
+            log::info!(
+                "[HTTP-API] Browser stopped and data synced successfully: {}",
+                profile_id
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            log::error!("[HTTP-API] Failed to upload data: {}", e);
+            Err(format!("Browser stopped but sync failed: {}", e))
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -6422,6 +6767,21 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            // Start HTTP API server for remote launching
+            let state = app.state::<AppState>().inner().clone();
+            tokio::spawn(start_http_api_server(state));
+
+            // Minimize to system tray on close
+            let window = app.get_webview_window("main").unwrap();
+            let window_clone = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window_clone.hide();
+                    log::info!("[TRAY] Window hidden to tray");
+                }
+            });
+
             // Handle deep links
             #[cfg(desktop)]
             {

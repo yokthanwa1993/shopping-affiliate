@@ -10,6 +10,7 @@ import {
   REMOTE_LAUNCHER_URL,
   SERVER_URL,
 } from './runtimeConfig'
+import moveIconUrl from './public/move_23058.ico'
 import './index.css'
 
 const PROFILE_TAG_OPTIONS = ['post', 'comment', 'mobile', 'admin'] as const
@@ -63,6 +64,7 @@ const AdminPageIcon = ({ title }: { title: string }) => (
 
 interface Profile {
   id: string
+  owner_email?: string | null
   name: string
   proxy: string
   homepage: string
@@ -261,13 +263,70 @@ type AppUpdateState = {
   error: string
 }
 
+// Clipboard helper that works on HTTP (non-secure context) too
+function copyToClipboard(text: string): void {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(() => {
+      fallbackCopy(text)
+    })
+  } else {
+    fallbackCopy(text)
+  }
+}
+
+function fallbackCopy(text: string): void {
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.top = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  try {
+    document.execCommand('copy')
+  } catch {
+    // silent
+  }
+  document.body.removeChild(textarea)
+}
+
+// Get launcher API base URL — use proxy when on HTTPS (Cloudflare tunnel)
+function getLauncherBase(): string {
+  if (window.location.protocol === 'https:') {
+    return '/launcher'  // Vite proxy → http://localhost:3456
+  }
+  return `http://${window.location.hostname}:3456`
+}
+
+// Get token service base URL — use proxy when on HTTPS
+function getTokenServiceBase(): string {
+  if (window.location.protocol === 'https:') {
+    return '/token-svc'  // Vite proxy → http://localhost:3457
+  }
+  return `http://${window.location.hostname}:3457`
+}
+
 type TokenFetchSource = 'worker' | 'local'
 
 function getDefaultTokenFetchSource(): TokenFetchSource {
-  return isDesktopApp() ? 'local' : 'worker'
+  return 'local' // Always use local token service on Windows server
 }
 
-const normalizeAuthEmail = (raw: unknown) => String(raw || '').trim().toLowerCase()
+const ADMIN_AUTH_ALIAS = 'admin'
+const ADMIN_AUTH_EMAIL = 'admin@browsersaving.local'
+
+const normalizeAuthEmail = (raw: unknown) => {
+  const normalized = String(raw || '').trim().toLowerCase()
+  return normalized === ADMIN_AUTH_ALIAS || normalized === 'admin@browsersaving'
+    ? ADMIN_AUTH_EMAIL
+    : normalized
+}
+
+const getAuthIdentityLabel = (raw: unknown) => {
+  const normalized = normalizeAuthEmail(raw)
+  return normalized === ADMIN_AUTH_EMAIL ? ADMIN_AUTH_ALIAS : normalized
+}
 
 function normalizeAuthSession(raw: unknown): AuthSession | null {
   const token = String((raw as AuthSession | null | undefined)?.token || '').trim()
@@ -377,6 +436,16 @@ async function readApiError(response: Response): Promise<string> {
     return message || `HTTP ${response.status}`
   } catch {
     return text.substring(0, 500)
+  }
+}
+
+async function readJsonResponse<T = any>(response: Response): Promise<{ data: T | null; text: string }> {
+  const text = await response.text()
+  if (!text) return { data: null, text: '' }
+  try {
+    return { data: JSON.parse(text) as T, text }
+  } catch {
+    return { data: null, text }
   }
 }
 
@@ -581,6 +650,18 @@ async function deleteProfile(id: string): Promise<void> {
   if (!res.ok) {
     throw new Error(await readApiError(res))
   }
+}
+
+async function moveProfileToWorkspace(id: string, ownerEmail: string): Promise<Profile> {
+  const res = await apiFetch(`/api/profiles/${id}/move`, {
+    method: 'POST',
+    body: JSON.stringify({ owner_email: ownerEmail }),
+  })
+  const { data, text } = await readJsonResponse<Profile & { error?: string }>(res)
+  if (!res.ok || !data) {
+    throw new Error(String(data?.error || text || `HTTP ${res.status}` || 'Failed to move profile'))
+  }
+  return data
 }
 
 async function fetchPageInfo(
@@ -807,7 +888,83 @@ async function fetchPostcronToken(profile: Profile, authToken?: string): Promise
   if (isElectron()) {
     return fetchPostcronTokenLocally(profile, authToken)
   }
-  return fetchPostcronTokenFromWorker(profile.id)
+
+  // Try local token service on Windows server first
+  try {
+    // Fetch cookies from Worker API
+    const cookieRes = await apiFetch(`/api/sync/${encodeURIComponent(profile.id)}/cookies`)
+    const cookieData = await cookieRes.json().catch(() => ({} as any))
+    const cookies = Array.isArray(cookieData?.cookies) ? cookieData.cookies : []
+
+    if (cookies.length === 0) {
+      return {
+        success: false,
+        token: '',
+        error: 'ไม่พบ cookies ใน profile — กรุณา sync browser data ก่อน',
+        reason: 'browser_data_missing',
+        detail: '',
+      }
+    }
+
+    // Call local token service for Postcron extraction
+    const TOKEN_SERVICE = getTokenServiceBase()
+    const postcronRes = await fetch(`${TOKEN_SERVICE}/postcron-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cookies,
+        profile_name: profile.name || profile.id,
+      }),
+    })
+    const postcronData = await postcronRes.json().catch(() => ({} as any))
+
+    if (!postcronRes.ok || !postcronData?.token) {
+      return {
+        success: false,
+        token: '',
+        error: postcronData?.error || 'Postcron token extraction failed',
+        reason: postcronData?.reason || '',
+        detail: postcronData?.detail || '',
+      }
+    }
+
+    // Resolve page token
+    const resolveRes = await fetch(`${TOKEN_SERVICE}/resolve-page-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        user_token: postcronData.token,
+        page_name: profile.page_name || '',
+        page_id: profile.page_id || '',
+      }),
+    })
+    const resolveData = await resolveRes.json().catch(() => ({} as any))
+
+    if (resolveData?.success && resolveData?.page_token) {
+      return {
+        success: true,
+        token: resolveData.page_token,
+        error: '',
+        reason: '',
+        detail: '',
+        pageName: resolveData.page_name || undefined,
+        pageAvatarUrl: resolveData.page_avatar_url || undefined,
+      }
+    }
+
+    // If resolve fails, return the user token as-is
+    return {
+      success: true,
+      token: postcronData.token,
+      error: '',
+      reason: '',
+      detail: '',
+    }
+  } catch (err) {
+    console.error('Local postcron token failed, falling back to worker:', err)
+    // Fallback to worker
+    return fetchPostcronTokenFromWorker(profile.id)
+  }
 }
 
 async function launchBrowser(
@@ -844,9 +1001,29 @@ async function launchBrowser(
     }
   }
 
-  // Web mode - use custom URL scheme to trigger desktop app
-  window.location.href = `browsersaving://launch/${profile.id}`
-  return { success: true }
+  // Web mode — use HTTP API to launch on server + open CDP remote viewer
+  try {
+    const apiBase = getLauncherBase()
+    const res = await fetch(`${apiBase}/api/launch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile, auth_token: authToken }),
+    })
+    const { data, text } = await readJsonResponse<any>(res)
+    if (!res.ok || !data?.success) {
+      throw new Error(String(data?.error || text || `HTTP ${res.status}` || 'Launch failed'))
+    }
+    // Open remote viewer in new tab
+    if (data.viewer_url) {
+      window.open(data.viewer_url, '_blank')
+    } else if (data.debug_port) {
+      const name = encodeURIComponent(profile.name)
+      window.open(`/remote-viewer.html?host=${window.location.hostname}&port=${data.debug_port}&name=${name}`, '_blank')
+    }
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e || 'Failed to launch') }
+  }
 }
 
 async function launchBrowserWithUrl(
@@ -923,9 +1100,22 @@ async function stopBrowser(
     }
   }
 
-  // Web mode - use custom URL scheme
-  window.location.href = `browsersaving://stop/${profileId}`
-  return { success: true }
+  // Web mode — use HTTP API
+  try {
+    const apiBase = getLauncherBase()
+    const res = await fetch(`${apiBase}/api/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile_id: profileId, auth_token: authToken }),
+    })
+    const { data, text } = await readJsonResponse<any>(res)
+    if (!res.ok || !data?.success) {
+      throw new Error(String(data?.error || text || `HTTP ${res.status}` || 'Failed to stop profile'))
+    }
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
 }
 
 interface BrowserStatus {
@@ -958,9 +1148,12 @@ async function getBrowserStatus(authToken?: string): Promise<BrowserStatus | nul
     }
   }
 
+  // Web mode — use HTTP API
   try {
-    const res = await fetch(`http://localhost:4000/api/status`)
-    const data = await res.json()
+    const apiBase = getLauncherBase()
+    const res = await fetch(`${apiBase}/api/status`)
+    const { data } = await readJsonResponse<any>(res)
+    if (!res.ok || !data) return null
     return {
       running: data.running || [],
       uploading: data.uploading || [],
@@ -988,6 +1181,8 @@ function App() {
   const [secondaryLoginEmail, setSecondaryLoginEmail] = useState('')
   const [secondaryLoginPassword, setSecondaryLoginPassword] = useState('')
   const [profiles, setProfiles] = useState<Profile[]>([])
+  const [selectedOwner, setSelectedOwner] = useState<string>(() => localStorage.getItem('selectedOwner') || '')
+  const [ownerMenuOpen, setOwnerMenuOpen] = useState(false)
   const [runningIds, setRunningIds] = useState<Set<string>>(() => new Set(getStoredRemoteRunningProfileIds()))
   const [launchingIds, setLaunchingIds] = useState<Set<string>>(new Set())
   const [launchingAndroidIds, setLaunchingAndroidIds] = useState<Set<string>>(new Set())
@@ -1000,6 +1195,9 @@ function App() {
   const [serverConnected, setServerConnected] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [deletingProfile, setDeletingProfile] = useState<Profile | null>(null)
+  const [moveWorkspaceProfile, setMoveWorkspaceProfile] = useState<Profile | null>(null)
+  const [moveTargetOwner, setMoveTargetOwner] = useState('')
+  const [movingProfileId, setMovingProfileId] = useState<string | null>(null)
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
   const [credentialsProfile, setCredentialsProfile] = useState<Profile | null>(null)
   const [tokenResult, setTokenResult] = useState<TokenResult | null>(null)
@@ -1299,11 +1497,10 @@ function App() {
       const existing = getStoredAuthSession()
       const savedAccounts = getStoredAuthAccounts()
       if (active) setStoredAuthAccounts(savedAccounts)
+
+      // No existing session → show login screen
       if (!existing?.token) {
-        if (active) {
-          setAuthSession(null)
-          setAuthChecking(false)
-        }
+        if (active) setAuthChecking(false)
         return
       }
 
@@ -1315,12 +1512,10 @@ function App() {
         persistAuthState(nextSession, nextAccounts)
       } catch {
         if (!active) return
-        const remainingAccounts = removeAuthAccount(savedAccounts, existing.email)
-        clearStoredAuthSession()
+        // Session expired or invalid → clear and show login
+        localStorage.removeItem('bs_auth_session')
         setAuthSession(null)
-        setStoredAuthAccounts(remainingAccounts)
-        storeAuthAccounts(remainingAccounts)
-        setLoginEmail(remainingAccounts[0]?.email || '')
+        setStoredAuthAccounts(savedAccounts)
       } finally {
         if (active) setAuthChecking(false)
       }
@@ -1389,6 +1584,22 @@ function App() {
   }, [accountMenuOpen])
 
   useEffect(() => {
+    if (!ownerMenuOpen) return
+
+    const closeMenu = () => setOwnerMenuOpen(false)
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu()
+    }
+
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [ownerMenuOpen])
+
+  useEffect(() => {
     const query = profileSearch.trim()
     if (!authSession?.token || query.length < 2) {
       setProfileNameConflicts([])
@@ -1423,31 +1634,15 @@ function App() {
   }, [checkForAppUpdate])
 
   const loadProfiles = useCallback(async () => {
-    if (!authSession?.token) {
-      setProfiles([])
-      setServerConnected(false)
-      return
-    }
     try {
       const data = await getProfiles()
       setProfiles(data)
       setServerConnected(true)
     } catch (err) {
-      const message = String(err || '')
-      if (message.toLowerCase().includes('unauthorized')) {
-        const remainingAccounts = removeAuthAccount(storedAuthAccounts, authSession.email)
-        resetSessionScopedUi()
-        if (remainingAccounts.length > 0) {
-          persistAuthState(remainingAccounts[0], remainingAccounts)
-          setAuthError(`Session หมดอายุ สลับไป ${remainingAccounts[0].email} แล้ว`)
-        } else {
-          persistAuthState(null, remainingAccounts)
-          setAuthError('Session expired. Please login again.')
-        }
-      }
+      console.log('loadProfiles failed:', err)
       setServerConnected(false)
     }
-  }, [authSession, persistAuthState, resetSessionScopedUi, storedAuthAccounts])
+  }, [])
 
   const handleLoginSubmit = useCallback(async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1627,14 +1822,19 @@ function App() {
     const profileName = (data.name || '').trim()
     if (!profileName) return
 
-    const isDuplicateName = profiles.some((profile) => normalizeProfileName(profile.name) === normalizeProfileName(profileName))
+    const targetOwnerEmail = (activeOwner || authSession?.email || '').trim().toLowerCase()
+    const isDuplicateName = profiles.some((profile) => {
+      const profileOwnerEmail = String(profile.owner_email || '').trim().toLowerCase()
+      return profileOwnerEmail === targetOwnerEmail && normalizeProfileName(profile.name) === normalizeProfileName(profileName)
+    })
     if (isDuplicateName) {
-      alert('โปรไฟล์ซ้ำในระบบ')
+      alert('โปรไฟล์ซ้ำใน workspace นี้')
       return
     }
 
     try {
-      const newProfile = await createProfile({ ...data, name: profileName })
+      const ownerEmail = targetOwnerEmail || (authSession?.email || '').trim().toLowerCase()
+      const newProfile = await createProfile({ ...data, name: profileName, owner_email: ownerEmail })
       console.log('🔧 createProfile result:', newProfile)
 
       // Upload avatar if provided
@@ -1729,12 +1929,12 @@ function App() {
 
   const copyCredentials = (profile: Profile) => {
     const text = `${profile.username || ''}\n${profile.password || ''}`
-    navigator.clipboard.writeText(text)
+    copyToClipboard(text)
   }
 
   const handleCopyProfileId = async (profile: Profile) => {
     try {
-      await navigator.clipboard.writeText(profile.id)
+      copyToClipboard(profile.id)
       setCopiedProfileId(profile.id)
       window.setTimeout(() => {
         setCopiedProfileId((current) => (current === profile.id ? null : current))
@@ -1868,20 +2068,22 @@ function App() {
       if (source === 'local') {
         const proxyProfile = getLaunchProfile(profile)
         const loginId = String(profile.uid || profile.username || '').trim()
+        if (!loginId || !profile.password) {
+          throw new Error('กรุณากรอก uid/username และ password ในโปรไฟล์ก่อน')
+        }
         const payload = {
-          uid: loginId,
-          username: loginId,
+          identifier: loginId,
           password: profile.password,
-          '2fa': profile.totp_secret || null,
+          twofa: profile.totp_secret || null,
           datr: profile.datr || null,
-          proxy: proxyProfile.proxy || '',
           target_app: 'FB_LITE',
+          timeout_seconds: 30,
         }
         let remoteStatus = 200
         const remoteData = isElectron()
           ? await desktopInvoke<Record<string, unknown>>('get_comment_token_local', payload)
           : await (async () => {
-              const remoteResp = await fetch(COMMENT_TOKEN_SERVICE_URL, {
+              const remoteResp = await fetch(`${getTokenServiceBase()}/token`, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
@@ -1892,7 +2094,11 @@ function App() {
               remoteStatus = remoteResp.status
               return remoteResp.json().catch(() => ({} as any))
             })()
-        const localUserToken = String(remoteData?.token || '').trim()
+        const localUserToken = String(
+          remoteData?.converted_token?.access_token ||
+          remoteData?.token ||
+          ''
+        ).trim()
 
         if (!localUserToken) {
           const errorMessage = remoteData?.error || `HTTP ${remoteStatus}`
@@ -1907,11 +2113,50 @@ function App() {
           })
           res = new Response(JSON.stringify(data), { status: 200 })
         } else {
+          // Step 1: Resolve user token → page token on Windows server
+          const TOKEN_SERVICE = getTokenServiceBase()
+          let pageToken: string | undefined
+          let pageName: string | undefined
+          let pageId: string | undefined
+          let pageAvatarUrl: string | undefined
+
+          try {
+            const resolveRes = await fetch(`${TOKEN_SERVICE}/resolve-page-token`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                user_token: localUserToken,
+                page_name: profile.page_name || '',
+                page_id: profile.page_id || '',
+              }),
+            })
+            const resolveData = await resolveRes.json().catch(() => ({} as any))
+
+            if (resolveData?.success && resolveData?.page_token) {
+              pageToken = resolveData.page_token
+              pageName = resolveData.page_name || undefined
+              pageId = resolveData.page_id || undefined
+              pageAvatarUrl = resolveData.page_avatar_url || undefined
+            }
+          } catch (resolveErr) {
+            console.warn('resolve-page-token on Windows failed:', resolveErr)
+          }
+
+          // Step 2: Send to Worker for DB save + Video Affiliate sync
+          const resolveBody: Record<string, unknown> = {
+            user_token: localUserToken,
+          }
+          // If resolved, send pre-resolved page token → Worker skips /me/accounts
+          if (pageToken) {
+            resolveBody.page_token = pageToken
+            if (pageName) resolveBody.page_name = pageName
+            if (pageId) resolveBody.page_id = pageId
+            if (pageAvatarUrl) resolveBody.page_avatar_url = pageAvatarUrl
+          }
+
           res = await apiFetch(`/api/token/${profile.id}/resolve`, {
             method: 'POST',
-            body: JSON.stringify({
-              user_token: localUserToken,
-            }),
+            body: JSON.stringify(resolveBody),
           })
           data = await res.json().catch(() => ({} as any))
         }
@@ -2080,6 +2325,40 @@ function App() {
     }
   }
 
+  const closeMoveWorkspaceModal = () => {
+    if (movingProfileId) return
+    setMoveWorkspaceProfile(null)
+    setMoveTargetOwner('')
+  }
+
+  const openMoveWorkspaceModal = (profile: Profile) => {
+    const currentOwnerEmail = (profile.owner_email || '').trim().toLowerCase()
+    const nextTargetOwner = uniqueOwners.find((ownerEmail) => ownerEmail !== currentOwnerEmail) || ''
+    setMoveWorkspaceProfile(profile)
+    setMoveTargetOwner(nextTargetOwner)
+  }
+
+  const handleMoveWorkspaceConfirm = async () => {
+    if (!moveWorkspaceProfile || !moveTargetOwner) return
+    setMovingProfileId(moveWorkspaceProfile.id)
+    try {
+      await moveProfileToWorkspace(moveWorkspaceProfile.id, moveTargetOwner)
+      setSelectedIds((prev) => {
+        const next = new Set(prev)
+        next.delete(moveWorkspaceProfile.id)
+        return next
+      })
+      setMoveWorkspaceProfile(null)
+      setMoveTargetOwner('')
+      await loadProfiles()
+      await checkStatus()
+    } catch (err) {
+      alert(String(err || 'Failed to move profile'))
+    } finally {
+      setMovingProfileId(null)
+    }
+  }
+
   const handleLaunchAndroid = async (profile: Profile) => {
     setLaunchingAndroidIds(prev => new Set(prev).add(profile.id))
     try {
@@ -2146,7 +2425,7 @@ function App() {
       <div className="auth-screen">
         <form className="auth-card" onSubmit={handleLoginSubmit}>
           <h1>BrowserSaving Login</h1>
-          <p>ล็อกอินด้วยอีเมลและรหัสผ่านของ BrowserSaving</p>
+          <p>ล็อกอินด้วยอีเมล หรือใช้ `admin` เพื่อดูทุก workspace</p>
           {storedAuthAccounts.length > 0 ? (
             <div className="auth-saved-accounts">
               <span className="auth-saved-label">Saved accounts</span>
@@ -2166,12 +2445,13 @@ function App() {
             </div>
           ) : null}
           <label>
-            Email
+            Email / Username
             <input
-              type="email"
+              type="text"
               value={loginEmail}
               onChange={(e) => setLoginEmail(e.target.value)}
-              autoComplete="email"
+              autoComplete="username"
+              placeholder="user@example.com หรือ admin"
               required
             />
           </label>
@@ -2196,7 +2476,30 @@ function App() {
 
   const runningCount = runningIds.size
   const searchQuery = profileSearch.trim().toLowerCase()
+  // Compute unique owners from profiles
+  const allOwners = Array.from(new Set(profiles.map(p => (p.owner_email || '').trim().toLowerCase()).filter(Boolean)))
+  // Admin sees all workspaces, regular users see only their own
+  const isAdmin = (authSession?.email || '').trim().toLowerCase() === ADMIN_AUTH_EMAIL
+  const loggedInEmail = (authSession?.email || '').trim().toLowerCase()
+  const authIdentityLabel = getAuthIdentityLabel(loggedInEmail)
+  const uniqueOwners = isAdmin ? allOwners : allOwners.filter(o => o === loggedInEmail)
+  // Auto-select first owner if none selected
+  const activeOwner = selectedOwner && uniqueOwners.includes(selectedOwner) ? selectedOwner : uniqueOwners[0] || ''
+  const workspaceOptions = uniqueOwners.map((ownerEmail) => ({
+    ownerEmail,
+    count: profiles.filter((profile) => (profile.owner_email || '').trim().toLowerCase() === ownerEmail).length,
+  }))
+  const createWorkspaceLabel = activeOwner || loggedInEmail
+  const editingWorkspaceLabel = (editingProfile?.owner_email || activeOwner || loggedInEmail || '').trim().toLowerCase()
+  const createExistingProfiles = profiles
+    .filter((profile) => ((profile.owner_email || '').trim().toLowerCase() || '') === createWorkspaceLabel)
+    .map(({ id, name }) => ({ id, name }))
+  const editingExistingProfiles = profiles
+    .filter((profile) => ((profile.owner_email || '').trim().toLowerCase() || '') === editingWorkspaceLabel)
+    .map(({ id, name }) => ({ id, name }))
+
   const filteredProfiles = profiles
+    .filter(profile => !activeOwner || (profile.owner_email || '').trim().toLowerCase() === activeOwner)
     .filter(profile => selectedPage === 'all' || profile.page_name === selectedPage)
     .filter(profile => !searchQuery || profile.name.toLowerCase().includes(searchQuery))
     .map((profile, originalIndex) => ({
@@ -2210,6 +2513,8 @@ function App() {
     })
     .map(({ profile }) => profile)
   const allFilteredSelected = filteredProfiles.length > 0 && filteredProfiles.every((profile) => selectedIds.has(profile.id))
+  const moveWorkspaceCurrentOwner = (moveWorkspaceProfile?.owner_email || '').trim().toLowerCase()
+  const moveWorkspaceChoices = workspaceOptions.filter(({ ownerEmail }) => ownerEmail !== moveWorkspaceCurrentOwner)
 
   return (
     <div className="app">
@@ -2253,87 +2558,74 @@ function App() {
               </svg>
             )}
           </button>
+          <div className="auth-pill auth-pill-static" title={loggedInEmail || authIdentityLabel}>
+            <span className="auth-pill-text">{authIdentityLabel || 'Signed in'}</span>
+          </div>
+          {/* Owner Switcher — only show if multiple workspaces (admin) */}
+          {uniqueOwners.length > 1 && (
           <div className="account-switcher" onClick={(event) => event.stopPropagation()}>
             <button
               type="button"
-              className={`auth-pill auth-pill-button ${accountMenuOpen ? 'open' : ''}`}
-              title={authSession.email}
-              onClick={() => setAccountMenuOpen((open) => !open)}
+              className={`auth-pill auth-pill-button ${ownerMenuOpen ? 'open' : ''}`}
+              title={activeOwner}
+              onClick={() => setOwnerMenuOpen((open) => !open)}
             >
-              <span className="auth-pill-text">{authSession.email}</span>
+              <span className="auth-pill-text">{activeOwner || 'Select Owner'}</span>
               <svg className="auth-pill-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="m6 9 6 6 6-6" />
               </svg>
             </button>
-            {accountMenuOpen ? (
+            {ownerMenuOpen ? (
               <div className="account-menu">
                 <div className="account-menu-header">
                   <div>
-                    <div className="account-menu-title">Accounts</div>
-                    <div className="account-menu-subtitle">สลับแอคเคานต์ได้ทันที</div>
+                    <div className="account-menu-title">Owners</div>
+                    <div className="account-menu-subtitle">สลับดู profiles ของแต่ละ owner</div>
                   </div>
-                  <button
-                    type="button"
-                    className="account-menu-link"
-                    onClick={() => {
-                      setShowAddAccountForm((value) => !value)
-                      setSecondaryLoginEmail('')
-                      setSecondaryLoginPassword('')
-                    }}
-                  >
-                    {showAddAccountForm ? 'Cancel' : 'Add account'}
-                  </button>
                 </div>
                 <div className="account-menu-list">
-                  {availableAuthAccounts.map((account) => {
-                    const isCurrent = normalizeAuthEmail(account.email) === normalizeAuthEmail(authSession.email)
+                  {uniqueOwners.map((ownerEmail) => {
+                    const isCurrent = ownerEmail === activeOwner
+                    const count = profiles.filter(p => (p.owner_email || '').trim().toLowerCase() === ownerEmail).length
                     return (
                       <button
-                        key={account.email}
+                        key={ownerEmail}
                         type="button"
                         className={`account-menu-item ${isCurrent ? 'active' : ''}`}
-                        onClick={() => { if (!isCurrent) void switchAuthAccount(account) }}
-                        disabled={accountActionLoading}
+                        onClick={() => {
+                          setSelectedOwner(ownerEmail)
+                          localStorage.setItem('selectedOwner', ownerEmail)
+                          setOwnerMenuOpen(false)
+                        }}
                       >
-                        <span className="account-menu-email">{account.email}</span>
-                        <span className="account-menu-meta">{isCurrent ? 'Current' : 'Switch'}</span>
+                        <span className="account-menu-email">{ownerEmail}</span>
+                        <span className="account-menu-meta">{isCurrent ? 'Current' : `${count} profiles`}</span>
                       </button>
                     )
                   })}
                 </div>
-                {showAddAccountForm ? (
-                  <form className="account-menu-form" onSubmit={handleAddAccountSubmit}>
-                    <input
-                      type="email"
-                      value={secondaryLoginEmail}
-                      onChange={(event) => setSecondaryLoginEmail(event.target.value)}
-                      placeholder="email"
-                      autoComplete="email"
-                      required
-                    />
-                    <input
-                      type="password"
-                      value={secondaryLoginPassword}
-                      onChange={(event) => setSecondaryLoginPassword(event.target.value)}
-                      placeholder="password"
-                      autoComplete="current-password"
-                      required
-                    />
-                    <button className="btn-primary account-menu-submit" type="submit" disabled={accountActionLoading}>
-                      {accountActionLoading ? 'Signing in...' : 'Add account'}
-                    </button>
-                  </form>
-                ) : null}
               </div>
             ) : null}
           </div>
-          <button className="btn-outline btn-logout" onClick={handleLogout}>
-            Logout
-          </button>
+          )}
           <div className={`status-pill ${serverConnected ? 'online' : 'offline'}`}>
             <span className="status-dot"></span>
             {serverConnected ? 'Connected' : 'Offline'}
           </div>
+          <button
+            type="button"
+            className="btn-outline btn-logout"
+            onClick={() => { void handleLogout() }}
+            disabled={accountActionLoading}
+            title="Logout"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+              <path d="M16 17l5-5-5-5" />
+              <path d="M21 12H9" />
+            </svg>
+            {accountActionLoading ? 'Logging out...' : 'Logout'}
+          </button>
         </div>
       </header>
 
@@ -2495,6 +2787,8 @@ function App() {
                       const profileTags = normalizeProfileTags(profile.tags || [])
                       const isAdminProfile = hasProfileTag(profileTags, 'admin')
                       const hasCredentials = !!(profile.uid || profile.username || profile.password || profile.totp_secret)
+                      const currentOwnerEmail = (profile.owner_email || '').trim().toLowerCase()
+                      const canMoveWorkspace = isAdmin && uniqueOwners.some((ownerEmail) => ownerEmail !== currentOwnerEmail)
                       return (
                         <tr key={profile.id} className={isRunning ? 'row-running' : ''}>
                           <td className="col-check">
@@ -2755,6 +3049,11 @@ function App() {
                                   </svg>
                                 </button>
                               )}
+                              {canMoveWorkspace ? (
+                                <button className="action-btn move" onClick={() => openMoveWorkspaceModal(profile)} title="Move Workspace">
+                                  <img src={moveIconUrl} alt="" className="action-icon-img move-icon-img" />
+                                </button>
+                              ) : null}
                               <button className="action-btn" onClick={() => setEditingProfile(profile)} title="Edit">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                   <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
@@ -2941,7 +3240,7 @@ function App() {
         <CreateProfileModal
           onClose={() => setShowCreateModal(false)}
           onSave={handleCreateProfile}
-          existingProfiles={profiles.map(({ id, name }) => ({ id, name }))}
+          existingProfiles={createExistingProfiles}
         />
       )}
 
@@ -2951,7 +3250,7 @@ function App() {
           profile={editingProfile}
           onClose={() => setEditingProfile(null)}
           onSave={handleUpdateProfile}
-          existingProfiles={profiles.map(({ id, name }) => ({ id, name }))}
+          existingProfiles={editingExistingProfiles}
         />
       )}
 
@@ -2989,6 +3288,60 @@ function App() {
         </div>
       )}
 
+      {moveWorkspaceProfile && (
+        <div className="modal-overlay" onClick={closeMoveWorkspaceModal}>
+          <div className="modal move-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Move Profile</h3>
+              <button className="close-btn" onClick={closeMoveWorkspaceModal} disabled={!!movingProfileId}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="modal-body move-modal-body">
+              <p>ย้ายโปรไฟล์ "<strong>{moveWorkspaceProfile.name}</strong>" ไป workspace อื่น</p>
+              <p className="move-workspace-current">
+                ตอนนี้อยู่ที่ <strong>{moveWorkspaceCurrentOwner || '-'}</strong>
+              </p>
+              <div className="move-workspace-list">
+                {moveWorkspaceChoices.length === 0 ? (
+                  <div className="move-workspace-empty">ยังไม่มี workspace อื่นให้ย้ายไป</div>
+                ) : (
+                  moveWorkspaceChoices.map(({ ownerEmail, count }) => {
+                    const isSelected = ownerEmail === moveTargetOwner
+                    return (
+                      <button
+                        key={ownerEmail}
+                        type="button"
+                        className={`move-workspace-option ${isSelected ? 'active' : ''}`}
+                        onClick={() => setMoveTargetOwner(ownerEmail)}
+                        disabled={!!movingProfileId}
+                      >
+                        <span className="move-workspace-option-email">{ownerEmail}</span>
+                        <span className="move-workspace-option-meta">{count} profiles</span>
+                      </button>
+                    )
+                  })
+                )}
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-outline" onClick={closeMoveWorkspaceModal} disabled={!!movingProfileId}>
+                Cancel
+              </button>
+              <button
+                className="btn-primary"
+                onClick={handleMoveWorkspaceConfirm}
+                disabled={!moveTargetOwner || !!movingProfileId}
+              >
+                {movingProfileId === moveWorkspaceProfile.id ? 'Moving...' : 'Move Profile'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {credentialsProfile && (
         <div className="modal-overlay" onClick={() => setCredentialsProfile(null)}>
           <div className="modal credentials-modal" onClick={e => e.stopPropagation()}>
@@ -3007,7 +3360,7 @@ function App() {
                 <label>UID (Facebook User ID)</label>
                 <div className="credential-value-row">
                   <input type="text" value={credentialsProfile.uid || ''} readOnly />
-                  <button className="copy-btn" onClick={() => { navigator.clipboard.writeText(credentialsProfile.uid || ''); }} title="Copy">
+                  <button className="copy-btn" onClick={() => { copyToClipboard(credentialsProfile.uid || ''); }} title="Copy">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
@@ -3020,7 +3373,7 @@ function App() {
                 <label>Email</label>
                 <div className="credential-value-row">
                   <input type="text" value={credentialsProfile.username || ''} readOnly />
-                  <button className="copy-btn" onClick={() => { navigator.clipboard.writeText(credentialsProfile.username || ''); }} title="Copy">
+                  <button className="copy-btn" onClick={() => { copyToClipboard(credentialsProfile.username || ''); }} title="Copy">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
@@ -3033,7 +3386,7 @@ function App() {
                 <label>Password</label>
                 <div className="credential-value-row">
                   <input type="password" value={credentialsProfile.password || ''} readOnly />
-                  <button className="copy-btn" onClick={() => { navigator.clipboard.writeText(credentialsProfile.password || ''); }} title="Copy">
+                  <button className="copy-btn" onClick={() => { copyToClipboard(credentialsProfile.password || ''); }} title="Copy">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
@@ -3046,7 +3399,7 @@ function App() {
                 <label>2FA (Current Code)</label>
                 <div className="credential-value-row">
                   <input type="text" value={credentialsTotpCode || ''} readOnly />
-                  <button className="copy-btn" onClick={() => { navigator.clipboard.writeText(credentialsTotpCode || ''); }} title="Copy TOTP code">
+                  <button className="copy-btn" onClick={() => { copyToClipboard(credentialsTotpCode || ''); }} title="Copy TOTP code">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
@@ -3060,7 +3413,7 @@ function App() {
                 <label>DATR</label>
                 <div className="credential-value-row">
                   <input type="text" value={credentialsProfile.datr || ''} readOnly />
-                  <button className="copy-btn" onClick={() => { navigator.clipboard.writeText(credentialsProfile.datr || ''); }} title="Copy">
+                  <button className="copy-btn" onClick={() => { copyToClipboard(credentialsProfile.datr || ''); }} title="Copy">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
@@ -3098,7 +3451,7 @@ function App() {
                   <button
                     className="copy-btn"
                     onClick={() => {
-                      navigator.clipboard.writeText(tokenResult.accessToken)
+                      copyToClipboard(tokenResult.accessToken)
                     }}
                     title="Copy"
                     disabled={!tokenResult.accessToken}
@@ -3122,7 +3475,7 @@ function App() {
                   <button
                     className="copy-btn"
                     onClick={() => {
-                      navigator.clipboard.writeText(tokenResult.postcronToken)
+                      copyToClipboard(tokenResult.postcronToken)
                     }}
                     title="Copy"
                     disabled={!tokenResult.postcronToken}

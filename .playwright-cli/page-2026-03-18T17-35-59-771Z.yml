@@ -1,0 +1,10 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - button "Back" [ref=e3] [cursor=pointer]:
+      - img [ref=e4]
+    - button "Forward" [ref=e6] [cursor=pointer]:
+      - img [ref=e7]
+    - button "Reload" [ref=e9] [cursor=pointer]:
+      - img [ref=e10]
+    - textbox "Enter URL or search..." [ref=e13]
+  - generic [ref=e17]: Connecting to browser…

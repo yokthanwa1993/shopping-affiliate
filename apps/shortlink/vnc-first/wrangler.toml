@@ -1,7 +1,0 @@
-name = "firstshortlink-vnc"
-main = "index.js"
-compatibility_date = "2026-03-15"
-
-[[routes]]
-pattern = "firstshortlink.pubilo.com"
-custom_domain = true

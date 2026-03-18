@@ -63,6 +63,8 @@ const app = new Hono<{ Bindings: Bindings; Variables: AppVariables }>();
 const AUTH_SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 const AUTH_PASSWORD_MIN_LENGTH = 6;
 const AUTH_TOKEN_PREFIX = 'sess_bs_';
+const ADMIN_EMAIL = 'admin@browsersaving.local';
+const ADMIN_PASSWORD = '!@7EvaYLj986';
 const DEFAULT_VIDEO_AFFILIATE_EMAIL_RESOLVE_URL = 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev/api/auth/resolve-email';
 
 function normalizeToken(raw: unknown): string {
@@ -383,6 +385,11 @@ function normalizeEmail(raw: unknown): string {
     return String(raw || '').trim().toLowerCase();
 }
 
+function normalizeLoginIdentifier(raw: unknown): string {
+    const normalized = normalizeEmail(raw);
+    return normalized === 'admin' || normalized === 'admin@browsersaving' ? ADMIN_EMAIL : normalized;
+}
+
 function isValidEmail(raw: string): boolean {
     const email = normalizeEmail(raw);
     return !!email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -416,6 +423,36 @@ function hasTrustedVideoAffiliateAccess(c: any): boolean {
     return verifyVideoAffiliateProvisionSecret(c);
 }
 
+function isAdminEmail(raw: unknown): boolean {
+    const normalized = normalizeEmail(raw);
+    return normalized === ADMIN_EMAIL || normalized === 'admin@browsersaving' || normalized === 'admin';
+}
+
+function hasFullProfileAccess(c: any, authEmailRaw: unknown): boolean {
+    return hasTrustedVideoAffiliateAccess(c) || isAdminEmail(authEmailRaw);
+}
+
+function getProfileOwnerScope(c: any, authEmailRaw: unknown): string {
+    const authEmail = normalizeEmail(authEmailRaw);
+    if (!authEmail) return '';
+    return hasFullProfileAccess(c, authEmail) ? '' : authEmail;
+}
+
+function canWriteProfilesForOtherOwners(c: any, authEmail: string): boolean {
+    return hasFullProfileAccess(c, authEmail);
+}
+
+function resolveProfileOwnerEmail(c: any, authEmailRaw: string, requestedOwnerEmailRaw: unknown): string | null {
+    const authEmail = normalizeEmail(authEmailRaw);
+    const requestedOwnerEmail = normalizeEmail(requestedOwnerEmailRaw);
+
+    if (requestedOwnerEmail && canWriteProfilesForOtherOwners(c, authEmail)) {
+        return requestedOwnerEmail;
+    }
+
+    return authEmail || requestedOwnerEmail || null;
+}
+
 function randomHex(bytes = 16): string {
     const arr = new Uint8Array(bytes);
     crypto.getRandomValues(arr);
@@ -445,6 +482,31 @@ async function verifyPassword(password: string, salt: string, expectedHash: stri
     return actual === String(expectedHash || '').trim();
 }
 
+async function ensureBuiltinAdminUser(db: D1Database): Promise<void> {
+    const existing = await db.prepare(
+        'SELECT email, password_hash, password_salt FROM bs_users WHERE email = ? LIMIT 1'
+    ).bind(ADMIN_EMAIL).first<{ email?: string; password_hash?: string; password_salt?: string }>();
+
+    const matchesConfiguredPassword = existing?.password_hash && existing?.password_salt
+        ? await verifyPassword(ADMIN_PASSWORD, existing.password_salt, existing.password_hash)
+        : false;
+
+    if (matchesConfiguredPassword) return;
+
+    const salt = randomHex(16);
+    const hash = await hashPassword(ADMIN_PASSWORD, salt);
+
+    if (existing?.email) {
+        await db.prepare(
+            "UPDATE bs_users SET password_hash = ?, password_salt = ?, updated_at = datetime('now') WHERE email = ?"
+        ).bind(hash, salt, ADMIN_EMAIL).run();
+    } else {
+        await db.prepare(
+            "INSERT INTO bs_users (email, password_hash, password_salt, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))"
+        ).bind(ADMIN_EMAIL, hash, salt).run();
+    }
+}
+
 async function maybeClaimUnownedProfiles(db: D1Database, email: string): Promise<void> {
     const normalizedEmail = normalizeEmail(email);
     if (!normalizedEmail) return;
@@ -465,23 +527,22 @@ async function maybeClaimUnownedProfiles(db: D1Database, email: string): Promise
 }
 
 async function ensureProfileAccess(c: any, profileId: string, options: { includeDeleted?: boolean } = {}): Promise<boolean> {
-    if (hasTrustedVideoAffiliateAccess(c)) {
-        const includeDeleted = options.includeDeleted === true;
-        const sql = includeDeleted
-            ? 'SELECT id FROM profiles WHERE id = ?'
-            : 'SELECT id FROM profiles WHERE id = ? AND deleted_at IS NULL';
-        const row = await c.env.DB.prepare(sql).bind(profileId).first<{ id?: string }>();
-        return !!row?.id;
-    }
-
     const authEmail = getAuthEmail(c);
-    if (!authEmail) return false;
+    const ownerScope = getProfileOwnerScope(c, authEmail);
+    const fullAccess = hasFullProfileAccess(c, authEmail);
+    if (!ownerScope && !fullAccess) return false;
 
     const includeDeleted = options.includeDeleted === true;
-    const sql = includeDeleted
-        ? 'SELECT id FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, \'\'))) = ?'
-        : 'SELECT id FROM profiles WHERE id = ? AND deleted_at IS NULL AND lower(trim(coalesce(owner_email, \'\'))) = ?';
-    const row = await c.env.DB.prepare(sql).bind(profileId, authEmail).first<{ id?: string }>();
+    const sql = ownerScope
+        ? (includeDeleted
+            ? "SELECT id FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
+            : "SELECT id FROM profiles WHERE id = ? AND deleted_at IS NULL AND lower(trim(coalesce(owner_email, ''))) = ?")
+        : (includeDeleted
+            ? 'SELECT id FROM profiles WHERE id = ?'
+            : 'SELECT id FROM profiles WHERE id = ? AND deleted_at IS NULL');
+    const row = ownerScope
+        ? await c.env.DB.prepare(sql).bind(profileId, ownerScope).first<{ id?: string }>()
+        : await c.env.DB.prepare(sql).bind(profileId).first<{ id?: string }>();
     return !!row?.id;
 }
 
@@ -694,7 +755,7 @@ app.post('/api/auth/provision-owner', async (c) => {
     const email = normalizeEmail(body.email || '');
     const password = String(body.password || '');
 
-    if (!isValidEmail(email)) {
+    if (!isAdminLogin && !isValidEmail(email)) {
         return c.json({ error: 'Invalid email' }, 400);
     }
     if (!password || password.length < AUTH_PASSWORD_MIN_LENGTH) {
@@ -728,8 +789,9 @@ app.post('/api/auth/login', async (c) => {
         body = {};
     }
 
-    const email = normalizeEmail(body.email || '');
+    const email = normalizeLoginIdentifier(body.email || body.username || '');
     const password = String(body.password || '');
+    const isAdminLogin = isAdminEmail(email);
 
     if (!isValidEmail(email)) {
         return c.json({ error: 'Invalid email' }, 400);
@@ -740,22 +802,32 @@ app.post('/api/auth/login', async (c) => {
 
     const db = c.env.DB;
     let accountCreated = false;
+    if (isAdminLogin) {
+        await ensureBuiltinAdminUser(db);
+    }
 
     let workspace: {
         namespaceId: string;
         namespaces: string[];
         isOwner: boolean;
         isTeamMember: boolean;
+    } = {
+        namespaceId: '',
+        namespaces: [],
+        isOwner: isAdminLogin,
+        isTeamMember: false,
     };
-    try {
-        workspace = await resolveVideoAffiliateWorkspaceByEmail(c, email);
-    } catch (err) {
-        const message = String(err || '');
-        const details = message.replace(/^video_affiliate_email_resolve_failed:/, '').trim();
-        return c.json({
-            error: 'Email not found in video-affiliate workspace',
-            details: details || message || 'email_resolve_failed',
-        }, 403);
+    if (!isAdminLogin) {
+        try {
+            workspace = await resolveVideoAffiliateWorkspaceByEmail(c, email);
+        } catch (err) {
+            const message = String(err || '');
+            const details = message.replace(/^video_affiliate_email_resolve_failed:/, '').trim();
+            return c.json({
+                error: 'Email not found in video-affiliate workspace',
+                details: details || message || 'email_resolve_failed',
+            }, 403);
+        }
     }
 
     const user = await db.prepare(
@@ -783,7 +855,9 @@ app.post('/api/auth/login', async (c) => {
         "INSERT INTO bs_sessions (token, user_email, expires_at, created_at, updated_at) VALUES (?, ?, ?, datetime('now'), datetime('now'))"
     ).bind(sessionToken, email, expiresAt).run();
 
-    await maybeClaimUnownedProfiles(db, email);
+    if (!isAdminLogin) {
+        await maybeClaimUnownedProfiles(db, email);
+    }
 
     return c.json({
         success: true,
@@ -791,10 +865,11 @@ app.post('/api/auth/login', async (c) => {
         email,
         expires_at: expiresAt,
         account_created: accountCreated,
-        namespace_id: workspace.namespaceId,
+        namespace_id: workspace.namespaceId || null,
         namespaces: workspace.namespaces,
         is_owner: workspace.isOwner,
         is_team_member: workspace.isTeamMember,
+        is_admin: isAdminLogin,
     });
 });
 
@@ -844,6 +919,7 @@ async function createBackup(db: D1Database, profileId: string, action: 'update' 
 app.get('/api/profiles', async (c) => {
     const includeDeleted = c.req.query('include_deleted') === 'true';
     const authEmail = getAuthEmail(c);
+    const ownerScope = getProfileOwnerScope(c, authEmail);
     const trustedOwnerEmails = hasTrustedVideoAffiliateAccess(c)
         ? normalizeTrustedOwnerEmailFilters([
             c.req.query('owner_email'),
@@ -853,12 +929,12 @@ app.get('/api/profiles', async (c) => {
     const whereParts: string[] = [];
     const binds: unknown[] = [];
     if (!includeDeleted) whereParts.push('deleted_at IS NULL');
-    if (authEmail) {
-        whereParts.push("lower(trim(coalesce(owner_email, ''))) = ?");
-        binds.push(authEmail);
-    } else if (trustedOwnerEmails.length > 0) {
+    if (trustedOwnerEmails.length > 0) {
         whereParts.push(`lower(trim(coalesce(owner_email, ''))) IN (${trustedOwnerEmails.map(() => '?').join(',')})`);
         binds.push(...trustedOwnerEmails);
+    } else if (ownerScope) {
+        whereParts.push("lower(trim(coalesce(owner_email, ''))) = ?");
+        binds.push(ownerScope);
     }
     const whereSql = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
     const query = `SELECT * FROM profiles ${whereSql} ORDER BY created_at DESC`;
@@ -936,6 +1012,7 @@ app.get('/api/profiles/name-conflicts', async (c) => {
 app.post('/api/profiles', async (c) => {
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
+    const ownerEmail = resolveProfileOwnerEmail(c, authEmail, body.owner_email);
     const accessTokenValidation = validateRoleTokenInput(body.access_token || body.comment_token, 'post', 'access_token');
     const postcronTokenValidation = validateRoleTokenInput(body.facebook_token || body.postcron_token, 'post', 'facebook_token');
     if (!accessTokenValidation.ok) return c.json({ error: accessTokenValidation.error }, 400);
@@ -950,7 +1027,7 @@ app.post('/api/profiles', async (c) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     RETURNING *
   `).bind(
-        authEmail || null,
+        ownerEmail,
         body.name || 'New Profile',
         body.proxy || '',
         body.homepage || '',
@@ -976,6 +1053,7 @@ app.post('/api/profiles', async (c) => {
 app.post('/api/import', async (c) => {
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
+    const ownerEmail = resolveProfileOwnerEmail(c, authEmail, body.owner_email);
     const accessTokenValidation = validateRoleTokenInput(body.access_token || body.comment_token, 'post', 'access_token');
     const postcronTokenValidation = validateRoleTokenInput(body.facebook_token || body.postcron_token, 'post', 'facebook_token');
     if (!accessTokenValidation.ok) return c.json({ error: accessTokenValidation.error }, 400);
@@ -1004,7 +1082,7 @@ app.post('/api/import', async (c) => {
     RETURNING *
   `).bind(
         body.id,
-        authEmail || normalizeEmail(body.owner_email || '') || null,
+        ownerEmail,
         body.name || 'New Profile',
         body.proxy || '',
         body.homepage || '',
@@ -1035,6 +1113,7 @@ app.put('/api/profiles/:id', async (c) => {
         const id = c.req.param('id');
         const body = await c.req.json();
         const authEmail = getAuthEmail(c);
+        const ownerScope = getProfileOwnerScope(c, authEmail);
 
         const accessTokenValidation = validateRoleTokenInput(body.access_token || body.comment_token, 'post', 'access_token');
         const postcronTokenValidation = validateRoleTokenInput(body.facebook_token || body.postcron_token, 'post', 'facebook_token');
@@ -1042,10 +1121,10 @@ app.put('/api/profiles/:id', async (c) => {
         if (!postcronTokenValidation.ok) return c.json({ error: postcronTokenValidation.error }, 400);
 
         // Get existing profile
-        const existing = authEmail
+        const existing = ownerScope
             ? await c.env.DB.prepare(
                 "SELECT * FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
-            ).bind(id, authEmail).first<Profile>()
+            ).bind(id, ownerScope).first<Profile>()
             : await c.env.DB.prepare(
                 'SELECT * FROM profiles WHERE id = ?'
             ).bind(id).first<Profile>();
@@ -1065,9 +1144,9 @@ app.put('/api/profiles/:id', async (c) => {
             : (existing.facebook_token ?? null);
 
         // 🔒 Create backup snapshot before update
-        await createBackup(c.env.DB, id, 'update', authEmail);
+        await createBackup(c.env.DB, id, 'update', ownerScope);
 
-        const updateSql = authEmail
+        const updateSql = ownerScope
             ? `
         UPDATE profiles SET
           name = ?,
@@ -1112,7 +1191,7 @@ app.put('/api/profiles/:id', async (c) => {
         WHERE id = ?
         RETURNING *
       `;
-        const updateBinds = authEmail
+        const updateBinds = ownerScope
             ? [
                 body.name ?? existing.name ?? null,
                 body.proxy ?? existing.proxy ?? null,
@@ -1133,7 +1212,7 @@ app.put('/api/profiles/:id', async (c) => {
                 body.page_name ?? existing.page_name ?? null,
                 body.page_avatar_url ?? existing.page_avatar_url ?? null,
                 id,
-                authEmail,
+                ownerScope,
             ]
             : [
                 body.name ?? existing.name ?? null,
@@ -1169,16 +1248,96 @@ app.put('/api/profiles/:id', async (c) => {
     }
 });
 
+// POST /api/profiles/:id/move - Move profile to another workspace owner
+app.post('/api/profiles/:id/move', async (c) => {
+    try {
+        const id = c.req.param('id');
+        let body: any = {};
+        try {
+            body = await c.req.json();
+        } catch {
+            body = {};
+        }
+
+        const authEmail = normalizeEmail(getAuthEmail(c));
+        if (!authEmail || !canWriteProfilesForOtherOwners(c, authEmail)) {
+            return c.json({ error: 'Forbidden' }, 403);
+        }
+
+        const targetOwnerEmail = normalizeEmail(body.owner_email || body.target_owner_email || '');
+        if (!targetOwnerEmail || !isValidEmail(targetOwnerEmail)) {
+            return c.json({ error: 'Invalid owner_email' }, 400);
+        }
+
+        const existing = await c.env.DB.prepare(
+            'SELECT * FROM profiles WHERE id = ? AND deleted_at IS NULL'
+        ).bind(id).first<Profile>();
+
+        if (!existing) {
+            return c.json({ error: 'Not found' }, 404);
+        }
+
+        const currentOwnerEmail = normalizeEmail(existing.owner_email || '');
+        if (currentOwnerEmail === targetOwnerEmail) {
+            return c.json({
+                ...existing,
+                tags: JSON.parse(existing.tags || '[]'),
+            });
+        }
+
+        const nameConflict = await c.env.DB.prepare(`
+            SELECT id
+            FROM profiles
+            WHERE id <> ?
+              AND deleted_at IS NULL
+              AND lower(trim(coalesce(name, ''))) = ?
+              AND lower(trim(coalesce(owner_email, ''))) = ?
+            LIMIT 1
+        `).bind(
+            id,
+            String(existing.name || '').trim().toLowerCase(),
+            targetOwnerEmail
+        ).first<{ id?: string }>();
+
+        if (nameConflict?.id) {
+            return c.json({ error: 'โปรไฟล์ชื่อนี้มีอยู่แล้วใน workspace ปลายทาง' }, 409);
+        }
+
+        await createBackup(c.env.DB, id, 'update');
+
+        const { results } = await c.env.DB.prepare(`
+            UPDATE profiles
+            SET owner_email = ?, updated_at = datetime('now')
+            WHERE id = ? AND deleted_at IS NULL
+            RETURNING *
+        `).bind(targetOwnerEmail, id).all<Profile>();
+
+        const profile = results[0];
+        if (!profile) {
+            return c.json({ error: 'Move failed' }, 500);
+        }
+
+        return c.json({
+            ...profile,
+            tags: JSON.parse(profile.tags || '[]'),
+        });
+    } catch (err: any) {
+        console.error('POST /api/profiles/:id/move error:', err);
+        return c.json({ error: 'Database error', details: err?.message || String(err) }, 500);
+    }
+});
+
 // PUT /api/profiles/:id/shopee-cookies - Update Shopee cookies only
 app.put('/api/profiles/:id/shopee-cookies', async (c) => {
     const id = c.req.param('id');
     const body = await c.req.json();
     const authEmail = getAuthEmail(c);
+    const ownerScope = getProfileOwnerScope(c, authEmail);
 
-    const existing = authEmail
+    const existing = ownerScope
         ? await c.env.DB.prepare(
             "SELECT * FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
-        ).bind(id, authEmail).first<Profile>()
+        ).bind(id, ownerScope).first<Profile>()
         : await c.env.DB.prepare(
             'SELECT * FROM profiles WHERE id = ?'
         ).bind(id).first<Profile>();
@@ -1188,16 +1347,28 @@ app.put('/api/profiles/:id/shopee-cookies', async (c) => {
     }
 
     // Update only shopee_cookies field
-    const { results } = await c.env.DB.prepare(`
+    const { results } = ownerScope
+        ? await c.env.DB.prepare(`
+        UPDATE profiles SET
+          shopee_cookies = ?,
+          updated_at = datetime('now')
+        WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?
+        RETURNING *
+    `).bind(
+            body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null,
+            id,
+            ownerScope
+        ).all<Profile>()
+        : await c.env.DB.prepare(`
         UPDATE profiles SET
           shopee_cookies = ?,
           updated_at = datetime('now')
         WHERE id = ?
         RETURNING *
     `).bind(
-        body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null,
-        id
-    ).all<Profile>();
+            body.shopee_cookies ? JSON.stringify(body.shopee_cookies) : null,
+            id
+        ).all<Profile>();
 
     const profile = results[0];
     return c.json({
@@ -1211,11 +1382,12 @@ app.put('/api/profiles/:id/shopee-cookies', async (c) => {
 app.get('/api/profiles/:id/shopee-cookies', async (c) => {
     const id = c.req.param('id');
     const authEmail = getAuthEmail(c);
+    const ownerScope = getProfileOwnerScope(c, authEmail);
 
-    const profile = authEmail
+    const profile = ownerScope
         ? await c.env.DB.prepare(
             "SELECT id, name, shopee_cookies FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
-        ).bind(id, authEmail).first<Profile>()
+        ).bind(id, ownerScope).first<Profile>()
         : await c.env.DB.prepare(
             'SELECT id, name, shopee_cookies FROM profiles WHERE id = ?'
         ).bind(id).first<Profile>();
@@ -1244,10 +1416,11 @@ app.delete('/api/profiles/:id', async (c) => {
     const id = c.req.param('id');
     const hard = c.req.query('hard') === 'true';
     const authEmail = getAuthEmail(c);
-    const existing = authEmail
+    const ownerScope = getProfileOwnerScope(c, authEmail);
+    const existing = ownerScope
         ? await c.env.DB.prepare(
             "SELECT tags FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
-        ).bind(id, authEmail).first<{ tags?: string | null }>()
+        ).bind(id, ownerScope).first<{ tags?: string | null }>()
         : await c.env.DB.prepare('SELECT tags FROM profiles WHERE id = ?').bind(id).first<{ tags?: string | null }>();
     if (!existing) {
         return c.json({ error: 'Not found' }, 404);
@@ -1255,7 +1428,7 @@ app.delete('/api/profiles/:id', async (c) => {
     const hadTags = normalizeTagList(existing?.tags || '[]').length > 0;
 
     // 🔒 Create backup snapshot before delete
-    await createBackup(c.env.DB, id, 'delete', authEmail);
+    await createBackup(c.env.DB, id, 'delete', ownerScope);
 
     if (hard) {
         // Hard delete - permanent, removes everything
@@ -1271,20 +1444,20 @@ app.delete('/api/profiles/:id', async (c) => {
             await c.env.BUCKET.delete(obj.key);
         }
 
-        if (authEmail) {
+        if (ownerScope) {
             await c.env.DB.prepare(
                 "DELETE FROM profiles WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
-            ).bind(id, authEmail).run();
+            ).bind(id, ownerScope).run();
         } else {
             await c.env.DB.prepare('DELETE FROM profiles WHERE id = ?').bind(id).run();
         }
         console.log(`🗑️ Hard deleted profile: ${id}`);
     } else {
         // Soft delete - just mark as deleted
-        if (authEmail) {
+        if (ownerScope) {
             await c.env.DB.prepare(
                 "UPDATE profiles SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ?"
-            ).bind(id, authEmail).run();
+            ).bind(id, ownerScope).run();
         } else {
             await c.env.DB.prepare(
                 "UPDATE profiles SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"
@@ -1300,11 +1473,12 @@ app.delete('/api/profiles/:id', async (c) => {
 app.post('/api/profiles/:id/restore', async (c) => {
     const id = c.req.param('id');
     const authEmail = getAuthEmail(c);
+    const ownerScope = getProfileOwnerScope(c, authEmail);
 
-    const existing = authEmail
+    const existing = ownerScope
         ? await c.env.DB.prepare(
             "SELECT * FROM profiles WHERE id = ? AND deleted_at IS NOT NULL AND lower(trim(coalesce(owner_email, ''))) = ?"
-        ).bind(id, authEmail).first<Profile>()
+        ).bind(id, ownerScope).first<Profile>()
         : await c.env.DB.prepare(
             'SELECT * FROM profiles WHERE id = ? AND deleted_at IS NOT NULL'
         ).bind(id).first<Profile>();
@@ -1313,10 +1487,10 @@ app.post('/api/profiles/:id/restore', async (c) => {
         return c.json({ error: 'Profile not found or not deleted' }, 404);
     }
 
-    const { results } = authEmail
+    const { results } = ownerScope
         ? await c.env.DB.prepare(
             "UPDATE profiles SET deleted_at = NULL, updated_at = datetime('now') WHERE id = ? AND lower(trim(coalesce(owner_email, ''))) = ? RETURNING *"
-        ).bind(id, authEmail).all<Profile>()
+        ).bind(id, ownerScope).all<Profile>()
         : await c.env.DB.prepare(
             "UPDATE profiles SET deleted_at = NULL, updated_at = datetime('now') WHERE id = ? RETURNING *"
         ).bind(id).all<Profile>();
@@ -1356,6 +1530,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
     const id = c.req.param('id');
     const backupId = c.req.param('backupId');
     const authEmail = getAuthEmail(c);
+    const ownerScope = getProfileOwnerScope(c, authEmail);
 
     if (authEmail) {
         const allowed = await ensureProfileAccess(c, id, { includeDeleted: true });
@@ -1375,9 +1550,9 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
     const snapshotAccessToken = normalizeToken(snapshot.access_token || snapshot.comment_token || snapshot.postcron_token) || null;
 
     // Create a backup of current state before restoring
-    await createBackup(c.env.DB, id, 'update', authEmail);
+    await createBackup(c.env.DB, id, 'update', ownerScope);
 
-    const restoreSql = authEmail
+    const restoreSql = ownerScope
         ? `
     UPDATE profiles SET
       name = ?, proxy = ?, homepage = ?, notes = ?, tags = ?,
@@ -1394,7 +1569,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
     WHERE id = ?
     RETURNING *
   `;
-    const restoreBinds = authEmail
+    const restoreBinds = ownerScope
         ? [
             snapshot.name, snapshot.proxy, snapshot.homepage, snapshot.notes,
             snapshot.tags, snapshot.avatar_url, snapshot.totp_secret,
@@ -1403,7 +1578,7 @@ app.post('/api/profiles/:id/backups/:backupId/restore', async (c) => {
             snapshotAccessToken,
             normalizeToken(snapshot.facebook_token) || null,
             id,
-            authEmail,
+            ownerScope,
         ]
         : [
             snapshot.name, snapshot.proxy, snapshot.homepage, snapshot.notes,
@@ -1624,6 +1799,22 @@ app.get('/api/sync/:profileId/download', async (c) => {
     return new Response(object.body, {
         headers: { 'Content-Type': 'application/gzip' }
     });
+});
+
+// GET /api/sync/:profileId/cookies - Extract cookies from R2 archive as JSON
+app.get('/api/sync/:profileId/cookies', async (c) => {
+    const profileId = c.req.param('profileId');
+    const allowed = await ensureProfileAccess(c, profileId, { includeDeleted: true });
+    if (!allowed) return c.json({ error: 'Not found' }, 404);
+
+    try {
+        const cookies = await loadProfileBrowserCookies(c, profileId);
+        console.log(`🍪 Extracted ${cookies.length} cookies for ${profileId}`);
+        return c.json({ cookies, count: cookies.length });
+    } catch (err) {
+        console.error(`❌ Cookie extraction failed for ${profileId}: ${err}`);
+        return c.json({ error: 'Cookie extraction failed', cookies: [], count: 0 }, 500);
+    }
 });
 
 // === PRESIGNED URL APIs (Fast direct R2 access) ===
@@ -1977,7 +2168,7 @@ async function persistCommentTokenAndResolvedPage(c: any, input: {
             pageId: input.resolvedPage.pageId,
             pageName: input.resolvedPage.pageName,
             pageAvatarUrl: input.resolvedPage.pageAvatarUrl,
-            accessToken: input.resolvedPage.pageToken,
+            accessToken: resolvedCommentToken,
             commentToken: resolvedCommentToken,
         });
         videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
@@ -2361,11 +2552,27 @@ app.post('/api/token/:profileId/resolve', async (c) => {
     }
 
     try {
-        const resolvedPage = await resolveProfilePageToken(userToken, profile);
+        // If pre-resolved page_token is provided, skip /me/accounts
+        const preResolvedPageToken = normalizeToken(body?.page_token);
+        let resolvedPage: { pageToken: string; pageId?: string; pageName?: string; pageAvatarUrl?: string };
+
+        if (preResolvedPageToken) {
+            // Use pre-resolved data from Windows token service
+            resolvedPage = {
+                pageToken: preResolvedPageToken,
+                pageId: body?.page_id || profile.page_name || undefined,
+                pageName: body?.page_name || profile.page_name || undefined,
+                pageAvatarUrl: body?.page_avatar_url || profile.page_avatar_url || undefined,
+            };
+        } else {
+            // Resolve via Facebook /me/accounts
+            resolvedPage = await resolveProfilePageToken(userToken, profile);
+        }
+
         const videoAffiliateSync = await persistCommentTokenAndResolvedPage(c, {
             profileId,
             profileName: profile.name,
-            commentToken: userToken,
+            commentToken: preResolvedPageToken || userToken,
             resolvedPage,
         });
 
@@ -2376,7 +2583,7 @@ app.post('/api/token/:profileId/resolve', async (c) => {
             token: resolvedPage.pageToken,
             raw_user_token: userToken,
             page_token: resolvedPage.pageToken,
-            token_source: 'local_cli',
+            token_source: preResolvedPageToken ? 'pre_resolved' : 'local_cli',
             page_id: resolvedPage.pageId || null,
             page_name: resolvedPage.pageName || null,
             page_avatar_url: resolvedPage.pageAvatarUrl || null,

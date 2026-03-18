@@ -1,170 +1,919 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Launching Profile</title>
-    <style>
-      :root {
-        color-scheme: dark;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #111318;
-        color: #f5f7fb;
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background:
-          radial-gradient(circle at top, rgba(90, 152, 255, 0.18), transparent 45%),
-          linear-gradient(180deg, #171b23 0%, #0f1218 100%);
-      }
-
-      main {
-        width: min(480px, calc(100vw - 32px));
-        padding: 32px 28px;
-        border-radius: 20px;
-        background: rgba(19, 23, 31, 0.94);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
-      }
-
-      h1 {
-        margin: 0 0 12px;
-        font-size: 28px;
-        line-height: 1.1;
-      }
-
-      p {
-        margin: 0;
-        line-height: 1.6;
-        color: rgba(245, 247, 251, 0.74);
-      }
-
-      .status {
-        display: inline-flex;
-        align-items: center;
-        gap: 12px;
-        margin-bottom: 18px;
-      }
-
-      .dot {
-        width: 14px;
-        height: 14px;
-        border-radius: 999px;
-        background: #68a1ff;
-        box-shadow: 0 0 0 0 rgba(104, 161, 255, 0.6);
-        animation: pulse 1.4s infinite;
-      }
-
-      .dot.error {
-        background: #ff6b6b;
-        box-shadow: none;
-        animation: none;
-      }
-
-      .hint {
-        margin-top: 16px;
-        font-size: 14px;
-        color: rgba(245, 247, 251, 0.5);
-      }
-
-      @keyframes pulse {
-        0% {
-          box-shadow: 0 0 0 0 rgba(104, 161, 255, 0.6);
-        }
-        70% {
-          box-shadow: 0 0 0 14px rgba(104, 161, 255, 0);
-        }
-        100% {
-          box-shadow: 0 0 0 0 rgba(104, 161, 255, 0);
-        }
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <div class="status">
-        <div class="dot" id="status-dot"></div>
-        <strong id="status-title">Launching profile...</strong>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote Viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      background: #000;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+    }
+    :root {
+      --toolbar-height: 48px;
+    }
+    #topBar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: var(--toolbar-height);
+      z-index: 15;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      background: rgba(18, 18, 22, 0.96);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      backdrop-filter: blur(14px);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    .nav-btn {
+      width: 28px;
+      height: 28px;
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: 8px;
+      background: rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.9);
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+    }
+    .nav-btn:hover:not(:disabled) {
+      background: rgba(255,255,255,0.16);
+      color: #fff;
+    }
+    .nav-btn:disabled {
+      opacity: 0.38;
+      cursor: not-allowed;
+    }
+    .nav-btn svg {
+      width: 15px;
+      height: 15px;
+    }
+    #urlForm {
+      flex: 1;
+      min-width: 0;
+    }
+    #urlInput {
+      width: 100%;
+      height: 32px;
+      padding: 0 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(0,0,0,0.48);
+      color: #f8fafc;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    #urlInput::placeholder {
+      color: rgba(255,255,255,0.45);
+    }
+    #urlInput:focus {
+      border-color: rgba(139,233,253,0.45);
+      background: rgba(0,0,0,0.6);
+    }
+    #screen {
+      position: absolute;
+      top: var(--toolbar-height); left: 0;
+      width: 100vw;
+      height: calc(100vh - var(--toolbar-height));
+      cursor: default;
+      image-rendering: auto;
+    }
+    .overlay {
+      position: fixed; inset: 0; display: flex; align-items: center;
+      justify-content: center; background: rgba(0,0,0,0.92); z-index: 10;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    .overlay .msg { text-align: center; color: #8be9fd; }
+    .overlay .msg .spinner {
+      display: inline-block; width: 32px; height: 32px;
+      border: 3px solid #333; border-top-color: #8be9fd;
+      border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .overlay .msg .title { font-size: 20px; font-weight: 600; }
+    .overlay .msg .sub { font-size: 13px; color: #666; margin-top: 8px; }
+    .overlay .msg .retry-btn {
+      margin-top: 20px; background: #8be9fd; color: #000; border: none;
+      padding: 10px 28px; border-radius: 8px; cursor: pointer; font-size: 14px;
+      font-weight: 600;
+    }
+    .overlay .msg .retry-btn:hover { background: #6dd; }
+    /* Upload toolbar */
+    #uploadBar {
+      position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
+      background: rgba(20,20,30,0.95); backdrop-filter: blur(12px);
+      border-top: 1px solid rgba(139,233,253,0.15);
+      padding: 8px 16px; display: flex; align-items: center; gap: 10px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      transform: translateY(100%); transition: transform 0.3s ease;
+      display: none !important;
+    }
+    #uploadBar.visible { transform: translateY(0); display: none !important; }
+    #uploadBar .upload-btn {
+      background: linear-gradient(135deg, #8be9fd 0%, #50fa7b 100%);
+      color: #000; border: none; padding: 6px 16px; border-radius: 6px;
+      cursor: pointer; font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 6px;
+    }
+    #uploadBar .upload-btn:hover { filter: brightness(1.1); }
+    #uploadBar .upload-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #uploadBar .upload-status {
+      color: #8be9fd; font-size: 12px; flex: 1;
+    }
+    #uploadBar .upload-close {
+      background: none; border: none; color: #666; cursor: pointer;
+      font-size: 18px; padding: 4px 8px;
+    }
+    #uploadBar .upload-close:hover { color: #fff; }
+    /* File chooser prompt overlay */
+    #fileChooserPrompt {
+      position: fixed; inset: 0; z-index: 30;
+      background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);
+      display: none; align-items: center; justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    #fileChooserPrompt.active { display: flex; }
+    #fileChooserPrompt .prompt-card {
+      background: #1a1a2e; border: 1px solid rgba(139,233,253,0.2);
+      border-radius: 16px; padding: 32px; text-align: center;
+      max-width: 420px; width: 90%;
+    }
+    #fileChooserPrompt .prompt-icon { font-size: 48px; margin-bottom: 16px; }
+    #fileChooserPrompt .prompt-title { color: #fff; font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+    #fileChooserPrompt .prompt-sub { color: #888; font-size: 13px; margin-bottom: 24px; }
+    #fileChooserPrompt .prompt-actions { display: flex; gap: 12px; justify-content: center; }
+    #fileChooserPrompt .prompt-btn {
+      padding: 10px 24px; border-radius: 8px; border: none; cursor: pointer;
+      font-size: 14px; font-weight: 600;
+    }
+    #fileChooserPrompt .prompt-btn-primary {
+      background: linear-gradient(135deg, #8be9fd 0%, #50fa7b 100%); color: #000;
+    }
+    #fileChooserPrompt .prompt-btn-cancel {
+      background: #333; color: #ccc;
+    }
+  </style>
+</head>
+<body>
+  <div id="topBar">
+    <button type="button" class="nav-btn" id="navBackBtn" title="Back" aria-label="Back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="m15 18-6-6 6-6" />
+      </svg>
+    </button>
+    <button type="button" class="nav-btn" id="navForwardBtn" title="Forward" aria-label="Forward">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="m9 18 6-6-6-6" />
+      </svg>
+    </button>
+    <button type="button" class="nav-btn" id="navReloadBtn" title="Reload" aria-label="Reload">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+        <path d="M21 3v6h-6" />
+      </svg>
+    </button>
+    <form id="urlForm">
+      <input id="urlInput" type="text" placeholder="Enter URL or search..." spellcheck="false" autocomplete="off" />
+    </form>
+  </div>
+  <div class="overlay" id="overlay">
+    <div class="msg">
+      <div class="spinner" id="spinner"></div>
+      <div class="title" id="overlayTitle">Connecting to browser…</div>
+      <div class="sub" id="overlaySub"></div>
+    </div>
+  </div>
+  <canvas id="screen" tabindex="0"></canvas>
+  <textarea id="pasteArea" style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;"></textarea>
+  <input type="file" id="localFilePicker" style="display:none" multiple />
+  <div id="uploadBar">
+    <button class="upload-btn" id="uploadBtn" title="เลือกไฟล์จากเครื่องนี้เพื่ออัพโหลดไปยัง remote browser">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      อัพโหลดไฟล์
+    </button>
+    <span class="upload-status" id="uploadStatus">เลือกไฟล์จากเครื่อง Mac เพื่อส่งไป remote browser</span>
+    <button class="upload-close" id="uploadBarClose" title="ปิด">✕</button>
+  </div>
+  <div id="fileChooserPrompt">
+    <div class="prompt-card">
+      <div class="prompt-icon">📁</div>
+      <div class="prompt-title">เว็บไซต์ต้องการไฟล์จากเครื่องคุณ</div>
+      <div class="prompt-sub">เลือกไฟล์จาก Mac แล้วจะส่งไปยัง remote browser อัตโนมัติ</div>
+      <div class="prompt-actions">
+        <button class="prompt-btn prompt-btn-primary" id="promptChooseBtn">เลือกไฟล์</button>
+        <button class="prompt-btn prompt-btn-cancel" id="promptCancelBtn">ยกเลิก</button>
       </div>
-      <p id="status-message">Waiting for BrowserSaving to connect this tab to the selected profile.</p>
-      <p class="hint">This tab will redirect automatically when the remote browser session is ready.</p>
-    </main>
-    <script>
-      (function () {
-        const params = new URLSearchParams(window.location.search);
-        const launchId = String(params.get('launch') || '').trim();
-        const storageKey = launchId ? `browsersaving_remote_viewer_launch:${launchId}` : '';
-        const dot = document.getElementById('status-dot');
-        const title = document.getElementById('status-title');
-        const message = document.getElementById('status-message');
+    </div>
+  </div>
 
-        function setStatus(nextTitle, nextMessage, isError) {
-          if (title) title.textContent = nextTitle;
-          if (message) message.textContent = nextMessage;
-          if (dot) dot.className = isError ? 'dot error' : 'dot';
+  <script>
+    const params = new URLSearchParams(location.search);
+    const host = params.get('host') || location.hostname;
+    const port = params.get('port');
+    const profileName = decodeURIComponent(params.get('name') || 'Browser');
+    const launcherPort = 3456;
+    const usingHttpsProxy = window.location.protocol === 'https:';
+
+    document.title = `${profileName} — Remote Viewer`;
+
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d');
+    const overlayEl = document.getElementById('overlay');
+    const overlaySub = document.getElementById('overlaySub');
+    const overlayTitle = document.getElementById('overlayTitle');
+    const spinner = document.getElementById('spinner');
+    const navBackBtn = document.getElementById('navBackBtn');
+    const navForwardBtn = document.getElementById('navForwardBtn');
+    const navReloadBtn = document.getElementById('navReloadBtn');
+    const urlForm = document.getElementById('urlForm');
+    const urlInput = document.getElementById('urlInput');
+
+    let ws = null;
+    let cmdId = 1;
+    let pendingCallbacks = {};
+    let connected = false;
+    let retryCount = 0;
+    const MAX_RETRIES = 20;
+    const TOOLBAR_HEIGHT = 48;
+    let currentPageUrl = '';
+
+    // Set canvas to viewport dimensions
+    function syncCanvasSize() {
+      const cssW = window.innerWidth;
+      const cssH = Math.max(0, window.innerHeight - TOOLBAR_HEIGHT);
+      const dpr = 1; // Cap at 1x for remote performance (Retina would be too large)
+      const physW = Math.round(cssW * dpr);
+      const physH = Math.round(cssH * dpr);
+      if (canvas.width !== physW || canvas.height !== physH) {
+        canvas.width = physW;
+        canvas.height = physH;
+      }
+      return { w: cssW, h: cssH, physW, physH, dpr };
+    }
+
+    function showOverlay(title, sub, showRetry) {
+      overlayEl.style.display = 'flex';
+      overlayTitle.textContent = title;
+      overlaySub.textContent = sub || '';
+      spinner.style.display = showRetry ? 'none' : 'block';
+      const old = document.getElementById('retryBtn');
+      if (old) old.remove();
+      if (showRetry) {
+        const btn = document.createElement('button');
+        btn.className = 'retry-btn';
+        btn.id = 'retryBtn';
+        btn.textContent = 'Reconnect';
+        btn.onclick = reconnect;
+        overlayEl.querySelector('.msg').appendChild(btn);
+      }
+    }
+
+    function sendCDP(method, params = {}) {
+      if (!ws || ws.readyState !== 1) return Promise.reject(new Error('Not connected'));
+      const id = cmdId++;
+      ws.send(JSON.stringify({ id, method, params }));
+      return new Promise((resolve, reject) => {
+        pendingCallbacks[id] = { resolve, reject };
+        setTimeout(() => {
+          if (pendingCallbacks[id]) {
+            delete pendingCallbacks[id];
+            reject(new Error('Timeout'));
+          }
+        }, 15000);
+      });
+    }
+
+    function setCurrentUrl(url) {
+      currentPageUrl = String(url || '').trim();
+      if (document.activeElement !== urlInput) {
+        urlInput.value = currentPageUrl;
+      }
+    }
+
+    function normalizeTypedUrl(raw) {
+      const value = String(raw || '').trim();
+      if (!value) return '';
+      if (/^(https?:|about:|data:|file:|chrome:|edge:|view-source:)/i.test(value)) {
+        return value;
+      }
+      if (value.includes(' ') || (!value.includes('.') && !/^localhost(?::\d+)?(\/.*)?$/i.test(value) && !/^\d{1,3}(\.\d{1,3}){3}(?::\d+)?(\/.*)?$/.test(value))) {
+        return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
+      }
+      return `https://${value}`;
+    }
+
+    async function refreshNavigationState() {
+      if (!connected) {
+        navBackBtn.disabled = true;
+        navForwardBtn.disabled = true;
+        navReloadBtn.disabled = true;
+        return;
+      }
+      navReloadBtn.disabled = false;
+      try {
+        const history = await sendCDP('Page.getNavigationHistory');
+        const entries = Array.isArray(history?.entries) ? history.entries : [];
+        const currentEntryIndex = Number(history?.currentIndex ?? -1);
+        const currentEntry = entries[currentEntryIndex];
+        navBackBtn.disabled = currentEntryIndex <= 0;
+        navForwardBtn.disabled = currentEntryIndex < 0 || currentEntryIndex >= entries.length - 1;
+        if (currentEntry?.url) {
+          setCurrentUrl(currentEntry.url);
         }
+      } catch {
+        navBackBtn.disabled = false;
+        navForwardBtn.disabled = false;
+      }
+    }
 
-        function consumePayload() {
-          if (!storageKey) {
-            setStatus('Launch token missing', 'Open the profile again from the dashboard.', true);
-            return true;
-          }
+    async function navigateHistory(offset) {
+      if (!connected) return;
+      try {
+        const history = await sendCDP('Page.getNavigationHistory');
+        const entries = Array.isArray(history?.entries) ? history.entries : [];
+        const currentEntryIndex = Number(history?.currentIndex ?? -1);
+        const target = entries[currentEntryIndex + offset];
+        if (!target?.id) return;
+        await sendCDP('Page.navigateToHistoryEntry', { entryId: target.id });
+        setTimeout(refreshNavigationState, 250);
+      } catch (error) {
+        console.warn('navigateHistory failed:', error);
+      }
+    }
 
-          const raw = window.localStorage.getItem(storageKey);
-          if (!raw) return false;
+    function getLauncherHttpBase() {
+      if (usingHttpsProxy) {
+        return `${window.location.origin}/launcher`;
+      }
+      return `http://${host}:${launcherPort}`;
+    }
 
-          let payload = {};
-          try {
-            payload = JSON.parse(raw);
-          } catch {
-            window.localStorage.removeItem(storageKey);
-            setStatus('Launch payload invalid', 'Please try opening the profile again.', true);
-            return true;
-          }
+    function getLauncherWsBase() {
+      if (usingHttpsProxy) {
+        return `${window.location.origin.replace(/^http/, 'ws')}/launcher`;
+      }
+      return `ws://${host}:${launcherPort}`;
+    }
 
-          const viewerUrl = String(payload.viewerUrl || '').trim();
-          const error = String(payload.error || '').trim();
+    async function fetchCDPPages() {
+      const proxyBase = getLauncherHttpBase();
+      const resp = await fetch(`${proxyBase}/api/cdp/${port}/json`);
+      const text = await resp.text();
+      let pages;
+      try { pages = JSON.parse(text); } catch {
+        throw new Error(`Invalid JSON: ${text.substring(0, 80)}`);
+      }
+      if (!Array.isArray(pages)) {
+        throw new Error(`Non-array response: ${JSON.stringify(pages).substring(0, 80)}`);
+      }
+      return pages;
+    }
 
-          if (viewerUrl) {
-            window.localStorage.removeItem(storageKey);
-            try {
-              window.opener = null;
-            } catch {}
-            window.location.replace(viewerUrl);
-            return true;
-          }
+    // Real-time screencast — Chrome pushes frames when screen changes
+    async function startScreencast() {
+      const { w, h } = syncCanvasSize();
 
-          if (error) {
-            window.localStorage.removeItem(storageKey);
-            setStatus('Failed to launch profile', error, true);
-            return true;
-          }
+      // Set viewport size
+      try {
+        await sendCDP('Emulation.setDeviceMetricsOverride', {
+          width: w,
+          height: h,
+          deviceScaleFactor: 1,
+          mobile: false,
+        });
+      } catch (e) {
+        console.warn('setDeviceMetrics failed:', e);
+      }
 
-          return false;
-        }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
 
-        if (!consumePayload()) {
-          window.addEventListener('storage', function (event) {
-            if (event.key === storageKey) {
-              consumePayload();
-            }
+      // Start screencast — Chrome will push frames via events
+      try {
+        await sendCDP('Page.startScreencast', {
+          format: 'jpeg',
+          quality: 80,
+          maxWidth: 1920,
+          maxHeight: 1080,
+          everyNthFrame: 1,
+        });
+      } catch (e) {
+        console.warn('startScreencast failed, falling back to polling:', e);
+        startScreenshotFallback();
+      }
+    }
+
+    // Fallback: screenshot polling if screencast not supported
+    let screenshotLoop = null;
+    function startScreenshotFallback() {
+      if (screenshotLoop) return;
+      let capturing = false;
+      screenshotLoop = setInterval(async () => {
+        if (!connected || capturing) return;
+        capturing = true;
+        try {
+          const result = await sendCDP('Page.captureScreenshot', {
+            format: 'jpeg',
+            quality: 80,
+            fromSurface: true,
+            captureBeyondViewport: false,
           });
+          if (result && result.data) {
+            const img = new Image();
+            img.onload = () => {
+              syncCanvasSize();
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            };
+            img.src = 'data:image/jpeg;base64,' + result.data;
+          }
+        } catch (e) {}
+        capturing = false;
+      }, 200);
+    }
 
-          window.setInterval(consumePayload, 800);
+    function stopScreencast() {
+      if (screenshotLoop) {
+        clearInterval(screenshotLoop);
+        screenshotLoop = null;
+      }
+      if (connected) {
+        sendCDP('Page.stopScreencast').catch(() => {});
+      }
+    }
 
-          window.setTimeout(function () {
-            setStatus('Still launching...', 'The browser session is taking longer than usual. This tab will redirect as soon as it is ready.', false);
-          }, 12000);
+    async function connect() {
+      if (!port) {
+        showOverlay('No port specified', 'Missing ?port= parameter', true);
+        return;
+      }
+
+      showOverlay(
+        'Connecting…',
+        `${usingHttpsProxy ? `${window.location.host}/launcher` : `${host}:${launcherPort}`} → Chrome:${port} (${retryCount + 1}/${MAX_RETRIES})`
+      );
+
+      try {
+        const pages = await fetchCDPPages();
+        const page = pages.find(p => p.type === 'page' && !p.url.startsWith('chrome-extension://') && !p.url.startsWith('chrome-untrusted://'))
+          || pages.find(p => p.type === 'page')
+          || pages[0];
+
+        if (!page || !page.webSocketDebuggerUrl) {
+          throw new Error('No debuggable page found');
         }
-      })();
-    </script>
-  </body>
+
+        const devtoolsPath = page.webSocketDebuggerUrl.replace(/^ws:\/\/[^/]+/, '');
+        const wsUrl = `${getLauncherWsBase()}/api/cdp/${port}${devtoolsPath}`;
+
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = async () => {
+          connected = true;
+          retryCount = 0;
+          overlayEl.style.display = 'none';
+          canvas.focus();
+
+          try { await sendCDP('Page.enable'); } catch {}
+          try { await sendCDP('DOM.enable'); } catch {}
+          try {
+            await sendCDP('Page.setInterceptFileChooserDialog', { enabled: true });
+            console.log('[FileUpload] File chooser intercept enabled');
+          } catch (e) {
+            console.warn('[FileUpload] Could not enable file chooser intercept:', e);
+          }
+          setCurrentUrl(page.url || '');
+          await refreshNavigationState();
+          await startScreencast();
+        };
+
+        ws.onmessage = (event) => {
+          let msg;
+          try { msg = JSON.parse(event.data); } catch { return; }
+
+          if (msg.id && pendingCallbacks[msg.id]) {
+            const cb = pendingCallbacks[msg.id];
+            delete pendingCallbacks[msg.id];
+            if (msg.error) cb.reject(new Error(msg.error.message));
+            else cb.resolve(msg.result);
+            return;
+          }
+
+          // Handle screencast frames in real-time
+          if (msg.method === 'Page.screencastFrame') {
+            const { data, sessionId } = msg.params;
+            // Acknowledge frame immediately to keep stream flowing
+            sendCDP('Page.screencastFrameAck', { sessionId }).catch(() => {});
+            // Draw frame
+            const img = new Image();
+            img.onload = () => {
+              syncCanvasSize();
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            };
+            img.src = 'data:image/jpeg;base64,' + data;
+            return;
+          }
+
+          if (msg.method === 'Page.frameNavigated') {
+            const url = msg.params?.frame?.url;
+            if (url && !msg.params?.frame?.parentId) {
+              document.title = `${profileName} — ${url}`;
+              setCurrentUrl(url);
+              setTimeout(refreshNavigationState, 150);
+            }
+          }
+
+          // Intercept file chooser dialogs from remote browser
+          if (msg.method === 'Page.fileChooserOpened') {
+            console.log('[FileUpload] File chooser opened in remote browser:', msg.params);
+            handleRemoteFileChooser(msg.params);
+          }
+        };
+
+        ws.onerror = () => {};
+
+        ws.onclose = () => {
+          connected = false;
+          refreshNavigationState().catch(() => {});
+          stopScreencast();
+          showOverlay('Disconnected', 'Browser session ended.', true);
+        };
+
+      } catch (err) {
+        retryCount++;
+        if (retryCount < MAX_RETRIES) {
+          const delay = Math.min(2000, 500 + retryCount * 300);
+          showOverlay('Waiting for browser…', `${err.message} — retry ${retryCount}/${MAX_RETRIES}`);
+          setTimeout(connect, delay);
+        } else {
+          showOverlay('Connection failed', err.message, true);
+        }
+      }
+    }
+
+    function reconnect() {
+      if (ws) { try { ws.close(); } catch {} ws = null; }
+      stopScreenshotLoop();
+      retryCount = 0;
+      connected = false;
+      connect();
+    }
+
+    // Restart on resize
+    let resizeTimer;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(async () => {
+        if (connected) {
+          stopScreenshotLoop();
+          await startScreenshotLoop();
+        }
+      }, 300);
+    });
+
+    // ===== Mouse =====
+    function getCoords(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round(e.clientX - rect.left);
+      const y = Math.round(e.clientY - rect.top);
+      return { x, y };
+    }
+    function btn(e) { return e.button === 0 ? 'left' : e.button === 1 ? 'middle' : 'right'; }
+
+    canvas.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const { x, y } = getCoords(e);
+      sendCDP('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: btn(e), clickCount: 1 }).catch(() => {});
+    });
+    canvas.addEventListener('mouseup', (e) => {
+      e.preventDefault();
+      const { x, y } = getCoords(e);
+      sendCDP('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: btn(e), clickCount: 1 }).catch(() => {});
+    });
+    canvas.addEventListener('mousemove', (e) => {
+      if (!connected) return;
+      const { x, y } = getCoords(e);
+      sendCDP('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }).catch(() => {});
+    });
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const { x, y } = getCoords(e);
+      sendCDP('Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: e.deltaX, deltaY: e.deltaY }).catch(() => {});
+    }, { passive: false });
+    canvas.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      const { x, y } = getCoords(e);
+      sendCDP('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 2 }).catch(() => {});
+      sendCDP('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 2 }).catch(() => {});
+    });
+
+    // ===== Clipboard + Keyboard (textarea-based for HTTP paste support) =====
+    const pasteArea = document.getElementById('pasteArea');
+
+    // The textarea is the real input target — it receives paste/keyboard events
+    // pointer-events:none lets all mouse events (click, wheel, etc.) pass through to canvas
+    pasteArea.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;resize:none;border:none;outline:none;';
+
+    // Handle paste from clipboard (works over HTTP!)
+    pasteArea.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const text = e.clipboardData?.getData('text/plain') || '';
+      if (text && connected) {
+        sendCDP('Input.insertText', { text }).catch(() => {});
+        console.log('[Paste] Sent', text.length, 'chars via CDP');
+      }
+      // Reset textarea after paste
+      pasteArea.value = '';
+    });
+
+    // Clear textarea periodically
+    setInterval(() => { pasteArea.value = ''; }, 2000);
+
+    // Forward keyboard events from document to CDP
+    document.addEventListener('keydown', (e) => {
+      // Ignore if typing in an actual input on this page (shouldn't happen in viewer)
+      if (e.target.tagName === 'INPUT' || (e.target.tagName === 'TEXTAREA' && e.target.id !== 'pasteArea')) return;
+
+      // Cmd+V / Ctrl+V → focus textarea temporarily so browser pastes into it
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+        pasteArea.style.pointerEvents = 'auto';
+        pasteArea.focus();
+        // Browser will paste into textarea → paste event fires → sends to CDP
+        setTimeout(() => { pasteArea.style.pointerEvents = 'none'; }, 200);
+        return; // Don't preventDefault — let native paste happen
+      }
+
+      // Cmd+A / Ctrl+A
+      if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+        e.preventDefault();
+        const mod = (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0);
+        sendCDP('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: mod }).catch(() => {});
+        sendCDP('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: mod }).catch(() => {});
+        return;
+      }
+
+      // Cmd+C / Ctrl+C — let browser handle natively (copy from page)
+      if ((e.ctrlKey || e.metaKey) && e.key === 'c') return;
+
+      e.preventDefault();
+      const mod = (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0);
+      sendCDP('Input.dispatchKeyEvent', { type: 'keyDown', key: e.key, code: e.code, windowsVirtualKeyCode: e.keyCode, modifiers: mod }).catch(() => {});
+      if (e.key.length === 1) {
+        sendCDP('Input.dispatchKeyEvent', { type: 'char', text: e.key, key: e.key, modifiers: mod }).catch(() => {});
+      }
+    });
+
+    document.addEventListener('keyup', (e) => {
+      if (e.target.tagName === 'INPUT' || (e.target.tagName === 'TEXTAREA' && e.target.id !== 'pasteArea')) return;
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'c')) return;
+      e.preventDefault();
+      const mod = (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0);
+      sendCDP('Input.dispatchKeyEvent', { type: 'keyUp', key: e.key, code: e.code, windowsVirtualKeyCode: e.keyCode, modifiers: mod }).catch(() => {});
+    });
+
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    navBackBtn.addEventListener('click', () => navigateHistory(-1));
+    navForwardBtn.addEventListener('click', () => navigateHistory(1));
+    navReloadBtn.addEventListener('click', async () => {
+      if (!connected) return;
+      try {
+        await sendCDP('Page.reload', { ignoreCache: false });
+      } catch (error) {
+        console.warn('reload failed:', error);
+      }
+    });
+    urlInput.addEventListener('focus', () => {
+      urlInput.select();
+    });
+    urlForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (!connected) return;
+      const nextUrl = normalizeTypedUrl(urlInput.value);
+      if (!nextUrl) {
+        urlInput.value = currentPageUrl;
+        return;
+      }
+      try {
+        setCurrentUrl(nextUrl);
+        await sendCDP('Page.navigate', { url: nextUrl });
+        canvas.focus();
+      } catch (error) {
+        console.warn('navigate failed:', error);
+      }
+    });
+
+    // ===== File Upload Bridge =====
+    let pendingFileChooser = null;
+    let autoPickerFallbackTimer = null;
+    const localFilePicker = document.getElementById('localFilePicker');
+    const uploadBar = document.getElementById('uploadBar');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const uploadStatus = document.getElementById('uploadStatus');
+    const uploadBarClose = document.getElementById('uploadBarClose');
+    const fileChooserPrompt = document.getElementById('fileChooserPrompt');
+    const promptChooseBtn = document.getElementById('promptChooseBtn');
+    const promptCancelBtn = document.getElementById('promptCancelBtn');
+
+    // Show upload bar on hover at bottom
+    let uploadBarTimer;
+    document.addEventListener('mousemove', (e) => {
+      if (e.clientY > window.innerHeight - 50) {
+        uploadBar.classList.add('visible');
+        clearTimeout(uploadBarTimer);
+      } else if (!uploadBar.matches(':hover') && !fileChooserPrompt.classList.contains('active')) {
+        clearTimeout(uploadBarTimer);
+        uploadBarTimer = setTimeout(() => uploadBar.classList.remove('visible'), 2000);
+      }
+    });
+    uploadBarClose.addEventListener('click', () => uploadBar.classList.remove('visible'));
+
+    function configureLocalFilePicker(params) {
+      if (params?.mode === 'selectMultiple') {
+        localFilePicker.multiple = true;
+      } else {
+        localFilePicker.multiple = false;
+      }
+      localFilePicker.accept = Array.isArray(params?.accept)
+        ? params.accept.join(',')
+        : (params?.accept || '');
+    }
+
+    function showFileChooserPrompt(params) {
+      fileChooserPrompt.classList.add('active');
+      uploadBar.classList.add('visible');
+      configureLocalFilePicker(params);
+    }
+
+    function hideFileChooserPrompt() {
+      fileChooserPrompt.classList.remove('active');
+    }
+
+    function clearAutoPickerFallback() {
+      if (autoPickerFallbackTimer) {
+        clearTimeout(autoPickerFallbackTimer);
+        autoPickerFallbackTimer = null;
+      }
+    }
+
+    function openLocalFilePicker() {
+      localFilePicker.value = '';
+      localFilePicker.click();
+    }
+
+    function tryAutoOpenLocalFilePicker(params) {
+      clearAutoPickerFallback();
+      hideFileChooserPrompt();
+      configureLocalFilePicker(params);
+
+      let dialogProbablyOpened = false;
+      const markDialogOpen = () => {
+        dialogProbablyOpened = true;
+      };
+
+      const cleanup = () => {
+        window.removeEventListener('blur', markDialogOpen);
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+      };
+
+      const onVisibilityChange = () => {
+        if (document.visibilityState === 'hidden') {
+          markDialogOpen();
+        }
+      };
+
+      window.addEventListener('blur', markDialogOpen, { once: true });
+      document.addEventListener('visibilitychange', onVisibilityChange);
+
+      requestAnimationFrame(() => {
+        try {
+          openLocalFilePicker();
+        } catch (error) {
+          console.warn('[FileUpload] Native picker auto-open threw:', error);
+        }
+
+        autoPickerFallbackTimer = setTimeout(() => {
+          cleanup();
+          autoPickerFallbackTimer = null;
+          if (!dialogProbablyOpened && pendingFileChooser === params) {
+            uploadStatus.textContent = 'Browser บล็อก file picker อัตโนมัติ กด Choose Files เพื่อเปิดจาก Mac';
+            showFileChooserPrompt(params);
+          }
+        }, 350);
+      });
+    }
+
+    function handleRemoteFileChooser(params) {
+      pendingFileChooser = params;
+      uploadBar.classList.add('visible');
+      uploadStatus.textContent = 'กำลังเปิดตัวเลือกรูปจาก Mac...';
+      tryAutoOpenLocalFilePicker(params);
+    }
+
+    promptCancelBtn.addEventListener('click', () => {
+      clearAutoPickerFallback();
+      hideFileChooserPrompt();
+      // Cancel the file chooser in remote browser
+      if (pendingFileChooser) {
+        sendCDP('DOM.setFileInputFiles', {
+          files: [],
+          backendNodeId: pendingFileChooser.backendNodeId,
+        }).catch(() => {});
+        pendingFileChooser = null;
+      }
+    });
+
+    promptChooseBtn.addEventListener('click', () => {
+      clearAutoPickerFallback();
+      openLocalFilePicker();
+    });
+
+    uploadBtn.addEventListener('click', () => {
+      openLocalFilePicker();
+    });
+
+    localFilePicker.addEventListener('change', async () => {
+      clearAutoPickerFallback();
+      const files = localFilePicker.files;
+      if (!files || files.length === 0) return;
+
+      hideFileChooserPrompt();
+      uploadBtn.disabled = true;
+      uploadStatus.textContent = `อัพโหลด ${files.length} ไฟล์...`;
+
+      const uploadedPaths = [];
+      const proxyBase = getLauncherHttpBase();
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        uploadStatus.textContent = `อัพโหลด (${i + 1}/${files.length}): ${file.name}`;
+        try {
+          const buffer = await file.arrayBuffer();
+          const resp = await fetch(`${proxyBase}/api/cdp/${port}/file`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'x-file-name': encodeURIComponent(file.name),
+              'x-file-type': file.type || 'application/octet-stream',
+            },
+            body: buffer,
+          });
+          const result = await resp.json();
+          if (result.success && result.path) {
+            uploadedPaths.push(result.path);
+            console.log(`[FileUpload] Uploaded ${file.name} -> ${result.path}`);
+          } else {
+            console.error(`[FileUpload] Upload failed for ${file.name}:`, result);
+            uploadStatus.textContent = `❌ อัพโหลดล้มเหลว: ${file.name}`;
+          }
+        } catch (err) {
+          console.error(`[FileUpload] Upload error for ${file.name}:`, err);
+          uploadStatus.textContent = `❌ อัพโหลดล้มเหลว: ${err.message}`;
+        }
+      }
+
+      if (uploadedPaths.length > 0) {
+        // Set files on the pending file chooser in remote browser
+        if (pendingFileChooser && pendingFileChooser.backendNodeId) {
+          try {
+            await sendCDP('DOM.setFileInputFiles', {
+              files: uploadedPaths,
+              backendNodeId: pendingFileChooser.backendNodeId,
+            });
+            uploadStatus.textContent = `✅ อัพโหลดสำเร็จ ${uploadedPaths.length} ไฟล์`;
+            console.log('[FileUpload] Files set on remote file input:', uploadedPaths);
+          } catch (e) {
+            console.error('[FileUpload] DOM.setFileInputFiles failed:', e);
+            uploadStatus.textContent = `✅ อัพโหลดแล้ว แต่ set ไฟล์ล้มเหลว — ลองกดปุ่มอัพโหลดอีกครั้ง`;
+          }
+        } else {
+          uploadStatus.textContent = `✅ อัพโหลดสำเร็จ ${uploadedPaths.length} ไฟล์ (ไม่มี file chooser ค้าง)`;
+        }
+        pendingFileChooser = null;
+      }
+
+      uploadBtn.disabled = false;
+      localFilePicker.value = '';
+
+      // Auto-hide after success
+      setTimeout(() => {
+        if (!fileChooserPrompt.classList.contains('active')) {
+          uploadStatus.textContent = 'เลือกไฟล์จากเครื่อง Mac เพื่อส่งไป remote browser';
+        }
+      }, 5000);
+    });
+
+    // Auto-connect
+    if (port) setTimeout(connect, 1500);
+  </script>
+</body>
 </html>

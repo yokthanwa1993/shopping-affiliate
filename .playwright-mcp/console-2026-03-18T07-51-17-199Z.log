@@ -1,0 +1,113 @@
+[     137ms] [ERROR] WebSocket connection to 'ws://100.82.152.81:5173/?token=ntGJNF_8J-Lg' failed:  @ http://100.82.152.81:5173/@vite/client:535
+[     327ms] [ERROR] WebSocket connection to 'ws://localhost:5173/?token=ntGJNF_8J-Lg' failed:  @ http://100.82.152.81:5173/@vite/client:535
+[     338ms] [ERROR] [vite] failed to connect to websocket.
+your current setup:
+  (browser) 100.82.152.81:5173/ <--[HTTP]--> localhost:5173/ (server)
+  (browser) 100.82.152.81:5173/ <--[WebSocket (failing)]--> localhost:5173/ (server)
+Check out your Vite / network configuration and https://vite.dev/config/server-options.html#server-hmr . @ http://100.82.152.81:5173/@vite/client:511
+[     470ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://100.82.152.81:5173/favicon.ico:0
+[ 3626742ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[ 3626996ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[ 4313413ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10402423ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10402671ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10424422ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10426424ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10428458ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10430405ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10450410ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10450410ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10452405ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10454405ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10456440ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10458386ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10478392ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10478392ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10480388ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10482387ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10484417ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10486368ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10500680ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10500680ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10502671ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10504669ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10506702ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10508652ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10522991ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10522992ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10524958ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10526952ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10528986ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10530935ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10545271ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10545272ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10547243ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10549240ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10551266ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10553216ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10567554ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10567554ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10569530ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10571523ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10573553ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10575501ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10585953ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10585954ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10587929ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10589923ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10591952ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10593900ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10604351ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10604351ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10606328ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10608322ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10610350ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10612296ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10622747ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10622747ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10624768ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10626722ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10628763ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10630692ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10641144ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10641144ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10643168ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10645120ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10647164ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10647796ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10658249ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10658249ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10660273ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10662223ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10664267ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10664898ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10675353ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10675353ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10677375ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10679324ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10681370ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10682005ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10692457ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10692457ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10694476ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10696428ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10698475ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10699111ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10715003ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10715004ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10717022ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10718973ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10721015ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10721653ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10737542ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10737543ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10739563ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10741515ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10743556ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10744197ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10760085ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10760085ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10762112ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10764061ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10766100ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0
+[10766744ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_TIMED_OUT @ http://100.82.152.81:3456/api/status:0

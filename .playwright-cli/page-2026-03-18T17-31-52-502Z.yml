@@ -1,0 +1,16 @@
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - button "Back" [ref=e3] [cursor=pointer]:
+      - img [ref=e4]
+    - button "Forward" [ref=e6] [cursor=pointer]:
+      - img [ref=e7]
+    - button "Reload" [ref=e9] [cursor=pointer]:
+      - img [ref=e10]
+    - textbox "Enter URL or search..." [ref=e13]
+  - generic [ref=e20]:
+    - heading "Select files from this Mac" [level=2] [ref=e21]
+    - paragraph [ref=e22]: The remote page opened a file picker. Choose files here to attach them to the remote browser session.
+    - generic [ref=e23]: "Remote page expects multiple files. Accepted types: image/*."
+    - generic [ref=e25]:
+      - button "Choose Files" [ref=e26] [cursor=pointer]
+      - button "Cancel" [ref=e27] [cursor=pointer]
