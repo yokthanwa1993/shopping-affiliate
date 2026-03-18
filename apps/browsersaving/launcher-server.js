@@ -12,8 +12,12 @@ const SERVER_URL = 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev'
 
 // Track running browsers: { profileId: { pid, debugPort } }
 const runningBrowsers = {}
+// Track profiles that are currently launching so parallel starts don't reuse the same debug port
+const pendingBrowsers = {}
 // Track recently released ports to avoid reuse (prevents old viewer tabs from reconnecting)
 const recentlyUsedPorts = new Map() // port -> release timestamp
+// Track reserved debug ports while a browser is still launching
+const reservedDebugPorts = new Set()
 // Track temp upload files per CDP port so they can be cleaned up when the session ends
 const uploadedFilesByPort = new Map() // port -> { dir, files:Set<string> }
 
@@ -48,13 +52,29 @@ function getChromePath() {
 function findAvailablePort(existing) {
   let port = 49152 + (process.pid % 10000)
   const usedPorts = Object.values(existing).map(b => b.debugPort)
+  const pendingPorts = Object.values(pendingBrowsers).map(b => b.debugPort)
   const now = Date.now()
   // Clean up ports older than 30s
   for (const [p, ts] of recentlyUsedPorts) {
     if (now - ts > 30000) recentlyUsedPorts.delete(p)
   }
-  while (usedPorts.includes(port) || recentlyUsedPorts.has(port)) port++
+  while (
+    usedPorts.includes(port)
+    || pendingPorts.includes(port)
+    || reservedDebugPorts.has(port)
+    || recentlyUsedPorts.has(port)
+  ) {
+    port++
+  }
   return port
+}
+
+function reserveDebugPort(debugPort) {
+  if (debugPort) reservedDebugPorts.add(Number(debugPort))
+}
+
+function releaseDebugPort(debugPort) {
+  if (debugPort) reservedDebugPorts.delete(Number(debugPort))
 }
 
 function sanitizeUploadFileName(rawName) {
@@ -672,6 +692,7 @@ const server = http.createServer(async (req, res) => {
     sendJSON(res, 200, {
       success: true,
       running: Object.keys(runningBrowsers),
+      launching: Object.keys(pendingBrowsers),
       uploading: [],
     })
     return
@@ -733,9 +754,16 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, 409, { success: false, error: 'Browser already running' })
       return
     }
+    if (pendingBrowsers[profile.id]) {
+      sendJSON(res, 409, { success: false, error: 'Browser is still launching' })
+      return
+    }
 
+    let debugPort = 0
     try {
-      const debugPort = findAvailablePort(runningBrowsers)
+      debugPort = findAvailablePort(runningBrowsers)
+      reserveDebugPort(debugPort)
+      pendingBrowsers[profile.id] = { debugPort, name: profile.name, authToken }
 
       await downloadBrowserData(profile.id, authToken)
 
@@ -743,6 +771,8 @@ const server = http.createServer(async (req, res) => {
       console.log(`[Launcher] Chrome launched PID=${pid} port=${debugPort} for ${profile.name}`)
 
       runningBrowsers[profile.id] = { pid, debugPort, name: profile.name, authToken }
+      delete pendingBrowsers[profile.id]
+      releaseDebugPort(debugPort)
 
       // Inject cookies in background (don't block response)
       injectCookiesAfterLaunch(profile.id, debugPort, authToken).catch(e => {
@@ -763,6 +793,7 @@ const server = http.createServer(async (req, res) => {
           if (runningBrowsers[profile.id]) {
             console.log(`[Launcher] Chrome on port ${debugPort} no longer responding — marking stopped`)
             delete runningBrowsers[profile.id]
+            releaseDebugPort(debugPort)
             cleanupUploadedFiles(debugPort)
           }
           clearInterval(checkInterval)
@@ -782,6 +813,8 @@ const server = http.createServer(async (req, res) => {
         viewer_url: viewerUrl,
       })
     } catch (e) {
+      delete pendingBrowsers[profile.id]
+      releaseDebugPort(debugPort)
       sendJSON(res, 500, { success: false, error: e.message })
     }
     return
@@ -813,6 +846,7 @@ const server = http.createServer(async (req, res) => {
       recentlyUsedPorts.set(browser.debugPort, Date.now())
       killProcess(browser.pid, browser.debugPort)
       delete runningBrowsers[profileId]
+      releaseDebugPort(browser.debugPort)
       console.log(`[Launcher] Stopped browser for ${profileId} (port ${browser.debugPort} reserved 30s)`)
 
       // Step 3: Wait for file locks to release, then save + upload

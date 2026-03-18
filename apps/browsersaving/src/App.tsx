@@ -768,6 +768,57 @@ async function resolveStoredPostcronToken(profileId: string): Promise<PostcronTo
   }
 }
 
+async function savePostcronToken(
+  profile: Profile,
+  token: string,
+  pageName?: string,
+  pageAvatarUrl?: string,
+): Promise<PostcronTokenResponse> {
+  const normalizedToken = String(token || '').trim()
+  if (!normalizedToken) {
+    return {
+      success: false,
+      token: '',
+      error: 'Postcron token is empty',
+      reason: 'postcron_token_empty',
+      detail: '',
+    }
+  }
+
+  const body: Record<string, unknown> = { facebook_token: normalizedToken }
+  if (String(pageName || '').trim()) body.page_name = String(pageName).trim()
+  if (String(pageAvatarUrl || '').trim()) body.page_avatar_url = String(pageAvatarUrl).trim()
+
+  const saveRes = await apiFetch(`/api/profiles/${encodeURIComponent(profile.id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  })
+  if (!saveRes.ok) {
+    return {
+      success: false,
+      token: '',
+      error: await readApiError(saveRes),
+      reason: 'postcron_save_failed',
+      detail: '',
+    }
+  }
+
+  const stored = await resolveStoredPostcronToken(profile.id)
+  if (stored.success && stored.token) {
+    return stored
+  }
+
+  return {
+    success: true,
+    token: normalizedToken,
+    error: '',
+    reason: '',
+    detail: '',
+    pageName: String(pageName || '').trim() || undefined,
+    pageAvatarUrl: String(pageAvatarUrl || '').trim() || undefined,
+  }
+}
+
 async function fetchPostcronTokenLocally(
   profile: Profile,
   authToken?: string,
@@ -941,25 +992,16 @@ async function fetchPostcronToken(profile: Profile, authToken?: string): Promise
     const resolveData = await resolveRes.json().catch(() => ({} as any))
 
     if (resolveData?.success && resolveData?.page_token) {
-      return {
-        success: true,
-        token: resolveData.page_token,
-        error: '',
-        reason: '',
-        detail: '',
-        pageName: resolveData.page_name || undefined,
-        pageAvatarUrl: resolveData.page_avatar_url || undefined,
-      }
+      return savePostcronToken(
+        profile,
+        resolveData.page_token,
+        resolveData.page_name || undefined,
+        resolveData.page_avatar_url || undefined,
+      )
     }
 
     // If resolve fails, return the user token as-is
-    return {
-      success: true,
-      token: postcronData.token,
-      error: '',
-      reason: '',
-      detail: '',
-    }
+    return savePostcronToken(profile, postcronData.token)
   } catch (err) {
     console.error('Local postcron token failed, falling back to worker:', err)
     // Fallback to worker
@@ -2736,7 +2778,6 @@ function App() {
                   <th className="col-num">#</th>
                   <th className="col-name">Name</th>
                   <th className="col-notes">Notes</th>
-                  <th className="col-proxy">Proxy</th>
                   <th className="col-profile-tag">Tag</th>
                   <th className="col-tags">Page</th>
                   <th className="col-page-name">
@@ -2758,7 +2799,7 @@ function App() {
               <tbody>
                 {filteredProfiles.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="empty-row">
+                    <td colSpan={9} className="empty-row">
                       <div className="empty-state">
                         {profiles.length === 0 ? (
                           <>
@@ -2816,9 +2857,6 @@ function App() {
                           </td>
                           <td className="col-notes">
                             <span className="notes-text">{profile.notes || '-'}</span>
-                          </td>
-                          <td className="col-proxy">
-                            <span className="proxy-text">{profile.proxy || '-'}</span>
                           </td>
                           <td className="col-profile-tag">
                             <div className="profile-tag-cell" onClick={(e) => e.stopPropagation()}>

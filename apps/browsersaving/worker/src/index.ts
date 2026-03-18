@@ -2704,6 +2704,50 @@ app.get('/api/profiles/:id/page', async (c) => {
     }
 
     try {
+        const storedPageName = String(profile.page_name || '').trim();
+        const storedPageAvatarUrl = String(profile.page_avatar_url || '').trim();
+
+        try {
+            const resolvedStored = await resolveStoredPageTokenForSync(legacyToken || accessToken || '', profile);
+            if (resolvedStored.pageId) {
+                const nextPageName = String(resolvedStored.pageName || '').trim() || storedPageName;
+                const nextPageAvatarUrl = String(resolvedStored.pageAvatarUrl || '').trim() || storedPageAvatarUrl;
+
+                await c.env.DB.prepare(
+                    'UPDATE profiles SET page_name = COALESCE(?, page_name), page_avatar_url = COALESCE(?, page_avatar_url), updated_at = datetime(\'now\') WHERE id = ?'
+                ).bind(
+                    nextPageName || null,
+                    nextPageAvatarUrl || null,
+                    id
+                ).run();
+
+                return c.json({
+                    success: true,
+                    page_name: nextPageName || null,
+                    page_avatar_url: nextPageAvatarUrl || null,
+                    page_id: resolvedStored.pageId,
+                    profile: profile.name,
+                    token_source: legacyToken ? 'facebook_token' : 'access_token',
+                    prefer: legacyToken ? 'comment' : 'post',
+                });
+            }
+        } catch (resolvedStoredErr) {
+            const message = String(resolvedStoredErr || '');
+            if ((storedPageName || storedPageAvatarUrl) && message.includes('stored_page_token_mismatch:')) {
+                return c.json({
+                    success: true,
+                    page_name: storedPageName || null,
+                    page_avatar_url: storedPageAvatarUrl || null,
+                    page_id: null,
+                    profile: profile.name,
+                    token_source: 'stored_page_hint',
+                    prefer: legacyToken ? 'comment' : 'post',
+                    warning: 'stored_page_preserved_due_to_token_mismatch',
+                });
+            }
+            console.log(`resolveStoredPageTokenForSync failed for ${profile.name}: ${message}`);
+        }
+
         // Prefer /me/accounts (works with user token), fallback to /me (works with page token).
         let pageName = '';
         let pageId = '';
