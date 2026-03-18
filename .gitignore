@@ -33,6 +33,7 @@ apps/browsersaving/AGENTS.md
 apps/browsersaving/api/.wrangler/
 apps/browsersaving/src-tauri/target/
 apps/browsersaving/src-tauri/.DS_Store
+apps/shortlink/dist/win-unpacked/
 
 # cleanup runtime leftovers
 *.orig
