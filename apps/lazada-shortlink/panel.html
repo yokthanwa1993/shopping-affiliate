@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Lazada Shortlink</title>
+    <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+    <h2>Lazada Shortlink</h2>
+
+    <div class="section">
+        <label>Product URL</label>
+        <textarea id="urlInput" rows="3" placeholder="วางลิงก์สินค้า Lazada ที่นี่"></textarea>
+    </div>
+
+    <div class="buttons">
+        <button id="btnShorten" onclick="onShorten()">Shorten</button>
+        <button id="btnClear" onclick="onClear()">Clear</button>
+    </div>
+
+    <div id="resultBox" class="result hidden">
+        <label>Short Link</label>
+        <input id="resultLink" readonly />
+        <button onclick="onCopy()">Copy</button>
+    </div>
+
+    <div id="statusMsg" class="status"></div>
+
+    <hr>
+
+    <div class="section agent-section">
+        <h3>Agent</h3>
+        <label>Worker URL</label>
+        <input id="workerUrl" placeholder="https://lazada-short.xxx.workers.dev" />
+        <div class="agent-buttons">
+            <button id="btnStartAgent" onclick="toggleAgent()">Start Agent</button>
+            <label><input type="checkbox" id="autoAgent" onchange="saveConfig()"> Auto-start</label>
+        </div>
+        <div id="agentStatus" class="agent-status"></div>
+    </div>
+
+    <div id="logs" class="logs"></div>
+
+    <script src="panel.js"></script>
+</body>
+</html>

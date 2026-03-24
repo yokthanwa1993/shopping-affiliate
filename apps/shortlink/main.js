@@ -123,7 +123,12 @@ function createTray() {
     const iconPath = path.join(__dirname, 'icon.png');
     const icon = nativeImage.createFromPath(iconPath);
     tray = new Tray(icon);
-    tray.setToolTip('Shortlink');
+    tray.setToolTip('Shopee Shortlink');
+    tray.on('double-click', () => {
+        if (config.accounts.length > 0) {
+            createShopeeWindow(config.accounts[0], true);
+        }
+    });
     updateTrayMenu();
 }
 
@@ -152,61 +157,19 @@ function getCaptchaStatusText(status) {
 
 function updateTrayTooltip() {
     if (!tray) return;
-    const lines = ['Shortlink'];
-    for (const acc of config.accounts) {
-        const s = captchaStatus.get(acc);
-        lines.push(`${getCaptchaStatusEmoji(s)} ${acc}: ${getCaptchaStatusText(s)}`);
-    }
-    tray.setToolTip(lines.join('\n'));
+    tray.setToolTip('Shopee Shortlink');
 }
 
 function updateTrayMenu() {
-    const accountItems = [];
-    for (const acc of config.accounts) {
-        const s = captchaStatus.get(acc);
-        accountItems.push(
-            { label: `${getCaptchaStatusEmoji(s)} ${acc} - ${getCaptchaStatusText(s)}`, click: () => createShopeeWindow(acc, true) },
-            { label: `   🔄 เช็ค ${acc}`, click: () => captchaHealthCheckOne(acc) },
-        );
-    }
-
-    // Check if any account has a problem
-    const hasIssue = config.accounts.some(acc => {
-        const s = captchaStatus.get(acc);
-        return s && (s.status === 'failed' || s.status === 'error');
-    });
-
-    const contextMenu = Menu.buildFromTemplate([
-        {
-            label: hasIssue ? '⚠️ Captcha มีปัญหา!' : '✅ Captcha OK',
-            enabled: false,
-        },
-        { type: 'separator' },
-        ...accountItems,
-        { type: 'separator' },
-        {
-            label: 'Logs',
-            click: () => createLogWindow(),
-        },
-        {
-            label: '🔄 Check All Captcha',
-            click: () => captchaHealthCheck(),
-        },
-        { type: 'separator' },
-        {
-            label: 'Quit',
-            click: () => { app.isQuitting = true; app.quit(); },
-        },
-    ]);
+    const contextMenu = Menu.buildFromTemplate(
+        config.accounts.map((acc) => ({
+            label: acc,
+            click: () => createShopeeWindow(acc, true),
+        })),
+    );
 
     tray.setContextMenu(contextMenu);
     updateTrayTooltip();
-    tray.on('double-click', () => {
-        // Show first account
-        if (config.accounts.length > 0) {
-            createShopeeWindow(config.accounts[0], true);
-        }
-    });
 }
 
 // === App lifecycle ===

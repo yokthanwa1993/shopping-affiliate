@@ -1,0 +1,52 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', sans-serif; padding: 16px; background: #f8f8ff; color: #333; }
+h2 { color: #0f1689; margin-bottom: 12px; font-size: 18px; }
+h3 { font-size: 14px; margin-bottom: 8px; }
+
+.section { margin-bottom: 12px; }
+label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: #555; }
+
+textarea, input[type="text"], input:not([type]) {
+    width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;
+    font-size: 13px; font-family: inherit;
+}
+textarea:focus, input:focus { outline: none; border-color: #f57224; }
+
+.buttons { display: flex; gap: 8px; margin-bottom: 12px; }
+button {
+    padding: 8px 16px; border: none; border-radius: 4px;
+    font-size: 13px; cursor: pointer; font-weight: 600;
+}
+#btnShorten { background: #f57224; color: white; }
+#btnShorten:hover { background: #e0651b; }
+#btnShorten:disabled { background: #ccc; }
+#btnClear { background: #eee; color: #333; }
+
+.result { margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.result input { flex: 1; background: #fff; }
+.result button { background: #0f1689; color: white; white-space: nowrap; }
+.hidden { display: none; }
+
+.status { font-size: 12px; min-height: 18px; }
+.status.ok { color: #28a745; }
+.status.err { color: #dc3545; }
+.status.loading { color: #f57224; }
+
+hr { border: none; border-top: 1px solid #ddd; margin: 16px 0; }
+
+.agent-section input[type="text"], .agent-section input:not([type]):not([type="checkbox"]) { margin-bottom: 8px; }
+.agent-buttons { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.agent-buttons label { display: flex; align-items: center; gap: 4px; font-size: 12px; margin: 0; }
+.agent-status { font-size: 12px; font-weight: 600; }
+.agent-status.running { color: #28a745; }
+.agent-status.stopped { color: #999; }
+
+.logs {
+    margin-top: 12px; background: #1e1e1e; color: #d4d4d4;
+    font-family: 'Consolas', monospace; font-size: 11px;
+    padding: 8px; border-radius: 4px; max-height: 200px;
+    overflow-y: auto; white-space: pre-wrap;
+}
+.logs .ok { color: #4ec9b0; }
+.logs .err { color: #f48771; }
+.logs .warn { color: #dcdcaa; }

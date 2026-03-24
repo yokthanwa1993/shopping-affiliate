@@ -1,0 +1,12 @@
+name = "lazada-short"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[durable_objects]
+bindings = [
+  { name = "JOB_BRIDGE", class_name = "JobBridge" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["JobBridge"]
