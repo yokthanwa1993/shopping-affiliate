@@ -15,6 +15,12 @@ export type GalleryIndexVideo = {
     publicUrl: string
     thumbnailUrl?: string
     shopeeLink?: string
+    lazadaLink?: string
+    shopeeOriginalLink?: string
+    lazadaOriginalLink?: string
+    shopeeConvertedAt?: string
+    lazadaConvertedAt?: string
+    lazadaMemberId?: string
     category?: string
     title?: string
     original_only?: boolean
@@ -29,6 +35,12 @@ type GalleryIndexDbRow = {
     category?: string
     duration?: number
     shopee_link?: string
+    lazada_link?: string
+    shopee_original_link?: string
+    lazada_original_link?: string
+    shopee_converted_at?: string
+    lazada_converted_at?: string
+    lazada_member_id?: string
     public_url?: string
     original_url?: string
     thumbnail_url?: string
@@ -49,6 +61,12 @@ type GalleryIndexUpsertRow = {
     category: string
     duration: number
     shopeeLink: string
+    lazadaLink: string
+    shopeeOriginalLink: string
+    lazadaOriginalLink: string
+    shopeeConvertedAt: string
+    lazadaConvertedAt: string
+    lazadaMemberId: string
     hasLink: number
     publicUrl: string
     originalUrl: string
@@ -115,7 +133,9 @@ export type GalleryThumbnailBackfillItem = {
 let ensureGalleryIndexTablePromise: Promise<void> | null = null
 
 const SHOPEE_LINK_KEYS = ['shopeeLink', 'shopee_link', 'shopeeUrl', 'shopee_url', 'shopee', 'link'] as const
-const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)?(?:shopee\.co\.th|s\.shopee\.co\.th)\S*/i
+const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*shopee\.(?:co\.th|co\.id|com\.my|ph|sg|vn)\S*/i
+const LAZADA_LINK_KEYS = ['lazadaLink', 'lazada_link', 'lazadaUrl', 'lazada_url', 'lazada'] as const
+const LAZADA_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*(?:lazada\.(?:co\.th|co\.id|com\.my|com\.ph|sg|vn)|lzd\.co)\S*/i
 const UPSERT_GALLERY_INDEX_SQL = `INSERT INTO gallery_index (
     namespace_id,
     video_id,
@@ -126,6 +146,12 @@ const UPSERT_GALLERY_INDEX_SQL = `INSERT INTO gallery_index (
     category,
     duration,
     shopee_link,
+    lazada_link,
+    shopee_original_link,
+    lazada_original_link,
+    shopee_converted_at,
+    lazada_converted_at,
+    lazada_member_id,
     has_link,
     public_url,
     original_url,
@@ -138,7 +164,7 @@ const UPSERT_GALLERY_INDEX_SQL = `INSERT INTO gallery_index (
     created_at,
     updated_at,
     last_synced_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+ ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 ON CONFLICT(namespace_id, video_id) DO UPDATE SET
     owner_email = excluded.owner_email,
     is_owner_linked = excluded.is_owner_linked,
@@ -147,6 +173,12 @@ ON CONFLICT(namespace_id, video_id) DO UPDATE SET
     category = excluded.category,
     duration = excluded.duration,
     shopee_link = excluded.shopee_link,
+    lazada_link = excluded.lazada_link,
+    shopee_original_link = excluded.shopee_original_link,
+    lazada_original_link = excluded.lazada_original_link,
+    shopee_converted_at = excluded.shopee_converted_at,
+    lazada_converted_at = excluded.lazada_converted_at,
+    lazada_member_id = excluded.lazada_member_id,
     has_link = excluded.has_link,
     public_url = excluded.public_url,
     original_url = excluded.original_url,
@@ -204,10 +236,33 @@ function pickFirstShopeeUrl(value: unknown): string | null {
     return null
 }
 
+function pickFirstLazadaUrl(value: unknown): string | null {
+    if (typeof value === 'string') {
+        const match = value.match(LAZADA_LINK_RE)
+        return match ? match[0].trim() : null
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const hit = pickFirstLazadaUrl(item)
+            if (hit) return hit
+        }
+    }
+    return null
+}
+
 function normalizeMetaShopeeLink(meta: Record<string, unknown>): string {
     for (const key of SHOPEE_LINK_KEYS) {
         const value = meta[key]
         const found = pickFirstShopeeUrl(value)
+        if (found) return found
+    }
+    return ''
+}
+
+function normalizeMetaLazadaLink(meta: Record<string, unknown>): string {
+    for (const key of LAZADA_LINK_KEYS) {
+        const value = meta[key]
+        const found = pickFirstLazadaUrl(value)
         if (found) return found
     }
     return ''
@@ -241,6 +296,12 @@ function mapGalleryIndexRowToVideo(row: GalleryIndexDbRow): GalleryIndexVideo | 
         publicUrl: normalizeText(row.public_url),
         thumbnailUrl: normalizeText(row.thumbnail_url) || undefined,
         shopeeLink: normalizeText(row.shopee_link) || undefined,
+        lazadaLink: normalizeText(row.lazada_link) || undefined,
+        shopeeOriginalLink: normalizeText(row.shopee_original_link) || undefined,
+        lazadaOriginalLink: normalizeText(row.lazada_original_link) || undefined,
+        shopeeConvertedAt: normalizeText(row.shopee_converted_at) || undefined,
+        lazadaConvertedAt: normalizeText(row.lazada_converted_at) || undefined,
+        lazadaMemberId: normalizeText(row.lazada_member_id) || undefined,
         category: normalizeText(row.category) || undefined,
         title: normalizeText(row.title) || undefined,
         original_only: Number(row.is_original_only || 0) === 1 || undefined,
@@ -269,6 +330,12 @@ export async function ensureGalleryIndexTable(db: D1Database): Promise<void> {
                 category TEXT NOT NULL DEFAULT '',
                 duration REAL NOT NULL DEFAULT 0,
                 shopee_link TEXT NOT NULL DEFAULT '',
+                lazada_link TEXT NOT NULL DEFAULT '',
+                shopee_original_link TEXT NOT NULL DEFAULT '',
+                lazada_original_link TEXT NOT NULL DEFAULT '',
+                shopee_converted_at TEXT NOT NULL DEFAULT '',
+                lazada_converted_at TEXT NOT NULL DEFAULT '',
+                lazada_member_id TEXT NOT NULL DEFAULT '',
                 has_link INTEGER NOT NULL DEFAULT 0,
                 public_url TEXT NOT NULL DEFAULT '',
                 original_url TEXT NOT NULL DEFAULT '',
@@ -284,6 +351,25 @@ export async function ensureGalleryIndexTable(db: D1Database): Promise<void> {
                 PRIMARY KEY (namespace_id, video_id)
             )`
         ).run()
+
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN lazada_link TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN shopee_original_link TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN lazada_original_link TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN shopee_converted_at TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN lazada_converted_at TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN lazada_member_id TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
 
         await db.prepare(
             'CREATE INDEX IF NOT EXISTS idx_gallery_index_owner_link_updated ON gallery_index(is_owner_linked, has_link, updated_at DESC, created_at DESC)'
@@ -506,6 +592,12 @@ async function buildGalleryIndexUpsertRow(params: {
     const publicUrl = normalizeText(meta.publicUrl) || derivedPublicUrl || originalUrl
     const thumbnailUrl = normalizeText(meta.thumbnailUrl) || derivedThumbnailUrl
     const shopeeLink = normalizeMetaShopeeLink(meta)
+    const lazadaLink = normalizeMetaLazadaLink(meta)
+    const shopeeOriginalLink = pickFirstShopeeUrl(meta.shopeeOriginalLink || meta.shopee_original_link || '') || ''
+    const lazadaOriginalLink = pickFirstLazadaUrl(meta.lazadaOriginalLink || meta.lazada_original_link || '') || ''
+    const shopeeConvertedAt = normalizeText(meta.shopeeConvertedAt || meta.shopee_converted_at || '')
+    const lazadaConvertedAt = normalizeText(meta.lazadaConvertedAt || meta.lazada_converted_at || '')
+    const lazadaMemberId = normalizeText(meta.lazadaMemberId || meta.lazada_member_id || '')
     const createdAt = normalizeTimestamp(
         meta.createdAt,
         knownState.metaUploadedAt,
@@ -536,7 +628,13 @@ async function buildGalleryIndexUpsertRow(params: {
         category: normalizeText(meta.category),
         duration: Math.max(0, parseFiniteNumber(meta.duration, 0)),
         shopeeLink,
-        hasLink: shopeeLink ? 1 : 0,
+        lazadaLink,
+        shopeeOriginalLink,
+        lazadaOriginalLink,
+        shopeeConvertedAt,
+        lazadaConvertedAt,
+        lazadaMemberId,
+        hasLink: shopeeLink || lazadaLink ? 1 : 0,
         publicUrl,
         originalUrl: originalUrl || publicUrl,
         thumbnailUrl,
@@ -563,6 +661,12 @@ async function upsertGalleryIndexRows(db: D1Database, rows: GalleryIndexUpsertRo
         row.category,
         row.duration,
         row.shopeeLink,
+        row.lazadaLink,
+        row.shopeeOriginalLink,
+        row.lazadaOriginalLink,
+        row.shopeeConvertedAt,
+        row.lazadaConvertedAt,
+        row.lazadaMemberId,
         row.hasLink,
         row.publicUrl,
         row.originalUrl,
@@ -602,6 +706,12 @@ export async function syncGalleryIndexEntry(env: Env, namespaceId: string, video
         category: row.category,
         duration: row.duration,
         shopee_link: row.shopeeLink,
+        lazada_link: row.lazadaLink,
+        shopee_original_link: row.shopeeOriginalLink,
+        lazada_original_link: row.lazadaOriginalLink,
+        shopee_converted_at: row.shopeeConvertedAt,
+        lazada_converted_at: row.lazadaConvertedAt,
+        lazada_member_id: row.lazadaMemberId,
         public_url: row.publicUrl,
         original_url: row.originalUrl,
         thumbnail_url: row.thumbnailUrl,
@@ -673,6 +783,12 @@ export async function listGalleryIndexVideos(db: D1Database, options: {
             category,
             duration,
             shopee_link,
+            lazada_link,
+            shopee_original_link,
+            lazada_original_link,
+            shopee_converted_at,
+            lazada_converted_at,
+            lazada_member_id,
             public_url,
             original_url,
             thumbnail_url,
@@ -718,6 +834,12 @@ export async function getGalleryIndexPage(db: D1Database, options: {
                 category,
                 duration,
                 shopee_link,
+                lazada_link,
+                shopee_original_link,
+                lazada_original_link,
+                shopee_converted_at,
+                lazada_converted_at,
+                lazada_member_id,
                 public_url,
                 original_url,
                 thumbnail_url,
