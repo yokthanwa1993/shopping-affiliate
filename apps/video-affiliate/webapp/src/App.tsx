@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 
 
 const WORKER_URL = String(import.meta.env.VITE_WORKER_URL || 'https://video-affiliate-worker.onlyy-gor.workers.dev')
@@ -58,13 +58,18 @@ const getStoredShortlinkBaseUrl = (botScope = getBotScopeFromLocation()) => {
   try { return String(localStorage.getItem(scopedStorageKey('shortlink_base_url', botScope)) || '').trim() } catch { return '' }
 }
 
+const getStoredShortlinkAccount = (botScope = getBotScopeFromLocation()) => {
+  try { return String(localStorage.getItem(scopedStorageKey('shortlink_account', botScope)) || '').trim() } catch { return '' }
+}
+
+const getStoredLazadaShortlinkBaseUrl = (botScope = getBotScopeFromLocation()) => {
+  try { return String(localStorage.getItem(scopedStorageKey('lazada_shortlink_base_url', botScope)) || '').trim() } catch { return '' }
+}
+
 const getStoredShortlinkExpectedUtmId = (botScope = getBotScopeFromLocation()) => {
   try { return String(localStorage.getItem(scopedStorageKey('shortlink_expected_utm_id', botScope)) || '').trim() } catch { return '' }
 }
 
-<<<<<<< HEAD
-const CACHE_VERSION = 'v5'
-=======
 const getStoredLazadaExpectedMemberId = (botScope = getBotScopeFromLocation()) => {
   try { return String(localStorage.getItem(scopedStorageKey('lazada_expected_member_id', botScope)) || '').trim() } catch { return '' }
 }
@@ -75,16 +80,16 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
 }
 
 const CACHE_VERSION = 'v6'
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
 const GALLERY_BATCH_SIZE = 24
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
+const FORCE_SYSTEM_WIDE_GALLERY = false
 
 const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
-  if (systemWide || getStoredShortlinkBaseUrl(botScope)) {
+  if (FORCE_SYSTEM_WIDE_GALLERY || systemWide || hasStoredAffiliateShortlinkConfig(botScope)) {
     return []
   }
 
@@ -143,6 +148,19 @@ interface Video {
   publicUrl: string
   thumbnailUrl?: string
   shopeeLink?: string
+  lazadaLink?: string
+  shopeeOriginalLink?: string
+  lazadaOriginalLink?: string
+  shortlink_status?: string
+  shortlink_expected_utm_id?: string
+  lazada_expected_member_id?: string
+  has_shopee_source?: boolean
+  has_lazada_source?: boolean
+  shopee_ready?: boolean
+  lazada_ready?: boolean
+  gallery_ready?: boolean
+  pending_bucket?: 'has-lazada' | 'missing-lazada'
+  lazadaMemberId?: string
   category?: string
   title?: string
   keepInPostedTab?: boolean
@@ -172,9 +190,12 @@ interface InboxVideo {
 interface GalleryPageResponse {
   videos?: Video[]
   total?: number
+  overall_total?: number
   offset?: number
   limit?: number
   has_more?: boolean
+  shopee_total?: number
+  lazada_total?: number
   with_link_total?: number
   without_link_total?: number
 }
@@ -183,6 +204,48 @@ interface SystemGalleryStats {
   total: number
   withLink: number
   withoutLink: number
+  shopeeTotal: number
+  lazadaTotal: number
+}
+
+function normalizeGallerySearchQuery(value: string | null | undefined): string {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+function matchesGallerySearch(video: Partial<Video> & Record<string, unknown>, query: string): boolean {
+  const needle = normalizeGallerySearchQuery(query)
+  if (!needle) return true
+
+  const haystacks = [
+    video.id,
+    video.namespace_id,
+    video.owner_email,
+    video.title,
+    video.script,
+    video.category,
+    video.shopeeLink,
+    video.lazadaLink,
+  ]
+
+  return haystacks.some((value) => normalizeGallerySearchQuery(String(value || '')).includes(needle))
+}
+
+function buildFacebookLogUrl(item: Pick<PostHistory, 'fb_reel_url' | 'fb_post_id'>): string {
+  const reelUrlRaw = String(item.fb_reel_url || '').trim()
+  if (reelUrlRaw) {
+    if (/^https?:\/\//i.test(reelUrlRaw)) return reelUrlRaw
+    if (reelUrlRaw.startsWith('/')) return `https://www.facebook.com${reelUrlRaw}`
+    if (reelUrlRaw.startsWith('www.')) return `https://${reelUrlRaw}`
+    return `https://www.facebook.com/${reelUrlRaw.replace(/^\/+/, '')}`
+  }
+  if (item.fb_post_id) return `https://www.facebook.com/watch/?v=${item.fb_post_id}`
+  return ''
+}
+
+function buildFacebookPageProfileUrl(pageId: string): string {
+  const normalizedPageId = String(pageId || '').trim()
+  if (!normalizedPageId) return ''
+  return `https://www.facebook.com/profile.php?id=${encodeURIComponent(normalizedPageId)}`
 }
 
 interface GlobalOriginalVideo {
@@ -219,6 +282,8 @@ interface PostHistory {
   comment_delay_seconds?: number | null
   comment_due_at?: string | null
   shopee_link?: string | null
+  lazada_link?: string | null
+  lazada_member_id?: string | null
   shortlink_utm_source?: string | null
   shortlink_status?: string | null
   shortlink_error?: string | null
@@ -260,7 +325,8 @@ type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
 type GeminiKeySource = 'workspace' | 'none'
 type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment'
 
-const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)?(?:shopee\.co\.th|s\.shopee\.co\.th)\S*/i
+const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*shopee\.(?:co\.th|co\.id|com\.my|ph|sg|vn)\S*/i
+const LAZADA_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*(?:lazada\.(?:co\.th|co\.id|com\.my|com\.ph|sg|vn)|lzd\.co)\S*/i
 
 const extractShopeeLink = (value: unknown): string => {
   if (typeof value === 'string') {
@@ -270,6 +336,20 @@ const extractShopeeLink = (value: unknown): string => {
   if (Array.isArray(value)) {
     for (const item of value) {
       const hit = extractShopeeLink(item)
+      if (hit) return hit
+    }
+  }
+  return ''
+}
+
+const extractLazadaLink = (value: unknown): string => {
+  if (typeof value === 'string') {
+    const hit = value.match(LAZADA_LINK_RE)
+    return hit ? hit[0].trim() : ''
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = extractLazadaLink(item)
       if (hit) return hit
     }
   }
@@ -292,6 +372,208 @@ const getVideoShopeeLink = (video: Record<string, unknown>): string => {
   return ''
 }
 
+const getVideoLazadaLink = (video: Record<string, unknown>): string => {
+  const candidates: unknown[] = [
+    video.lazadaLink,
+    video.lazada_link,
+    video.lazadaUrl,
+    video.lazada_url,
+    video.lazada,
+  ]
+  for (const candidate of candidates) {
+    const hit = extractLazadaLink(candidate)
+    if (hit) return hit
+  }
+  return ''
+}
+
+const hasVideoAffiliateLink = (video: Record<string, unknown>): boolean => {
+  return !!getVideoShopeeLink(video) || !!getVideoLazadaLink(video)
+}
+
+const normalizeShortlinkExpectedUtmIdClient = (rawValue: string): string => {
+  const value = String(rawValue || '').trim().replace(/^an_/i, '')
+  if (!value || !/^\d+$/.test(value)) return ''
+  return value
+}
+
+const normalizeLazadaMemberIdClient = (rawValue: string): string => {
+  const value = String(rawValue || '').trim()
+  if (!value || !/^\d+$/.test(value)) return ''
+  return value
+}
+
+const isLikelyConvertedShopeeLink = (link: string, expectedUtmId = ''): boolean => {
+  const rawLink = extractShopeeLink(link)
+  if (!rawLink) return false
+
+  try {
+    const parsed = new URL(rawLink)
+    const host = parsed.hostname.toLowerCase()
+    const path = parsed.pathname.toLowerCase()
+    if (host.startsWith('s.shopee.')) return true
+    if (path.startsWith('/opaanlp/')) return true
+    if (path.startsWith('/universal-link/')) return true
+
+    const expected = normalizeShortlinkExpectedUtmIdClient(expectedUtmId)
+    const actual = normalizeShortlinkExpectedUtmIdClient(String(parsed.searchParams.get('utm_source') || ''))
+    if (expected && actual && expected === actual) return true
+  } catch {
+    return false
+  }
+
+  return false
+}
+
+const extractLazadaTrackingSourceClient = (link: string): string => {
+  const rawLink = extractLazadaLink(link)
+  if (!rawLink) return ''
+
+  const matchMarker = (value: string): string => {
+    const decoded = (() => {
+      try {
+        return decodeURIComponent(value)
+      } catch {
+        return value
+      }
+    })()
+
+    const exact = decoded.match(/(mm_\d+_\d+_\d+!\d+)/i)
+    if (exact) return String(exact[1] || '').trim()
+    const fallback = decoded.match(/(mm_\d+_\d+_\d+)/i)
+    return fallback ? String(fallback[1] || '').trim() : ''
+  }
+
+  const direct = matchMarker(rawLink)
+  if (direct) return direct
+
+  try {
+    const parsed = new URL(rawLink)
+    for (const key of ['exlaz', 'laz_trackid', 'utm_source']) {
+      const hit = matchMarker(String(parsed.searchParams.get(key) || ''))
+      if (hit) return hit
+    }
+  } catch {
+    return ''
+  }
+
+  return ''
+}
+
+const isLikelyConvertedLazadaLink = (link: string): boolean => {
+  const rawLink = extractLazadaLink(link)
+  if (!rawLink) return false
+
+  try {
+    const parsed = new URL(rawLink)
+    const host = parsed.hostname.toLowerCase()
+    if (host === 'lzd.co' || host.endsWith('.lzd.co')) return true
+    if (host.startsWith('s.lazada.')) return true
+  } catch {
+    return false
+  }
+
+  return !!extractLazadaTrackingSourceClient(rawLink)
+}
+
+const getVideoSourceShopeeLink = (video: Record<string, unknown>): string => {
+  const candidates: unknown[] = [
+    video.shopeeOriginalLink,
+    video.shopee_original_link,
+    video.shopeeSourceLink,
+    video.shopee_source_link,
+    video.shopeeLink,
+    video.shopee_link,
+    video.shopeeUrl,
+    video.shopee_url,
+    video.shopee,
+    video.link,
+  ]
+  for (const candidate of candidates) {
+    const hit = extractShopeeLink(candidate)
+    if (hit) return hit
+  }
+  return ''
+}
+
+const getVideoSourceLazadaLink = (video: Record<string, unknown>): string => {
+  const candidates: unknown[] = [
+    video.lazadaOriginalLink,
+    video.lazada_original_link,
+    video.lazadaSourceLink,
+    video.lazada_source_link,
+    video.lazadaLink,
+    video.lazada_link,
+    video.lazadaUrl,
+    video.lazada_url,
+    video.lazada,
+  ]
+  for (const candidate of candidates) {
+    const hit = extractLazadaLink(candidate)
+    if (hit) return hit
+  }
+  return ''
+}
+
+const getVideoAffiliateConversionState = (
+  video: Partial<Video> & Record<string, unknown>,
+  expectedUtmId = '',
+  expectedLazadaMemberId = '',
+) => {
+  const hasPlayable = !!resolvePlayableVideoUrl(video)
+  const shopeeSourceLink = getVideoSourceShopeeLink(video)
+  const shopeeCurrentLink = getVideoShopeeLink(video)
+  const hasShopeeSource = !!shopeeSourceLink
+  const hasManagedShopeeConversion = !!String(
+    video.shopeeConvertedAt || video.shopee_converted_at || video.shopeeOriginalLink || video.shopee_original_link || ''
+  ).trim()
+  const shopeeReady = !!shopeeCurrentLink && isLikelyConvertedShopeeLink(shopeeCurrentLink, expectedUtmId)
+
+  const lazadaSourceLink = getVideoSourceLazadaLink(video)
+  const lazadaCurrentLink = getVideoLazadaLink(video)
+  const hasLazadaSource = !!lazadaSourceLink
+  const hasManagedLazadaConversion = !!String(
+    video.lazadaConvertedAt || video.lazada_converted_at || video.lazadaOriginalLink || video.lazada_original_link || ''
+  ).trim()
+  const lazadaMemberId = normalizeLazadaMemberIdClient(String(video.lazadaMemberId || video.lazada_member_id || ''))
+  const lazadaReady = !!lazadaCurrentLink && !!lazadaMemberId && isLikelyConvertedLazadaLink(lazadaCurrentLink) && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId)
+
+  const missingShopeeSource = hasPlayable && !hasShopeeSource
+  const galleryReady = hasPlayable && hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady
+  const missingLazadaSource = hasPlayable && !hasLazadaSource
+
+  return {
+    hasPlayable,
+    hasShopeeSource,
+    hasManagedShopeeConversion,
+    shopeeReady,
+    hasLazadaSource,
+    hasManagedLazadaConversion,
+    lazadaMemberId,
+    lazadaReady,
+    missingShopeeSource,
+    missingLazadaSource,
+    awaitingConversion: hasPlayable && (missingShopeeSource || !galleryReady),
+    galleryReady,
+  }
+}
+
+const isVideoAwaitingAffiliateConversion = (
+  video: Partial<Video> & Record<string, unknown>,
+  expectedUtmId = '',
+  expectedLazadaMemberId = '',
+): boolean => {
+  return getVideoAffiliateConversionState(video, expectedUtmId, expectedLazadaMemberId).awaitingConversion
+}
+
+const getInitialGallerySearchInput = (): string => {
+  try {
+    return String(new URL(window.location.href).searchParams.get('q') || '').trim()
+  } catch {
+    return ''
+  }
+}
+
 function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
   const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
   return Number.isFinite(ts) ? ts : 0
@@ -301,10 +583,10 @@ function pickPreferredGalleryVideo(
   current: Partial<Video> & Record<string, unknown>,
   next: Partial<Video> & Record<string, unknown>,
 ) {
-  const currentHasLink = !!getVideoShopeeLink(current)
-  const nextHasLink = !!getVideoShopeeLink(next)
-  if (currentHasLink !== nextHasLink) {
-    return nextHasLink ? next : current
+  const currentLinkRank = getVideoLazadaLink(current) ? 2 : getVideoShopeeLink(current) ? 1 : 0
+  const nextLinkRank = getVideoLazadaLink(next) ? 2 : getVideoShopeeLink(next) ? 1 : 0
+  if (currentLinkRank !== nextLinkRank) {
+    return nextLinkRank > currentLinkRank ? next : current
   }
 
   const currentHasThumbnail = !!String(current.thumbnailUrl || '').trim()
@@ -327,14 +609,14 @@ function pickPreferredGalleryVideo(
 function dedupeGalleryVideos(rows: Video[]): Video[] {
   const byId = new Map<string, Video>()
   for (const video of rows || []) {
-    const id = String(video?.id || '').trim()
-    if (!id) continue
-    const prev = byId.get(id)
+    const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
+    if (!key) continue
+    const prev = byId.get(key)
     if (!prev) {
-      byId.set(id, video)
+      byId.set(key, video)
       continue
     }
-    byId.set(id, pickPreferredGalleryVideo(prev as Video & Record<string, unknown>, video as Video & Record<string, unknown>) as Video)
+    byId.set(key, pickPreferredGalleryVideo(prev as Video & Record<string, unknown>, video as Video & Record<string, unknown>) as Video)
   }
   return Array.from(byId.values()).sort((a, b) => getGalleryVideoSortMs(b as Video & Record<string, unknown>) - getGalleryVideoSortMs(a as Video & Record<string, unknown>))
 }
@@ -567,6 +849,10 @@ function VideoCard({
   const [savingShopee, setSavingShopee] = useState(false)
   const [deletingShopeeLink, setDeletingShopeeLink] = useState(false)
   const [localShopee, setLocalShopee] = useState(getVideoShopeeLink(video as unknown as Record<string, unknown>))
+  const [lazadaInput, setLazadaInput] = useState('')
+  const [savingLazada, setSavingLazada] = useState(false)
+  const [deletingLazadaLink, setDeletingLazadaLink] = useState(false)
+  const [localLazada, setLocalLazada] = useState(getVideoLazadaLink(video as unknown as Record<string, unknown>))
   const [localCats, setLocalCats] = useState<string[]>([])
   const [fetchedCats, setFetchedCats] = useState<string[]>([])
   const [editingTitle, setEditingTitle] = useState(false)
@@ -584,6 +870,10 @@ function VideoCard({
   useEffect(() => {
     setLocalShopee(getVideoShopeeLink(video as unknown as Record<string, unknown>))
   }, [video.id, video.shopeeLink])
+
+  useEffect(() => {
+    setLocalLazada(getVideoLazadaLink(video as unknown as Record<string, unknown>))
+  }, [video.id, video.lazadaLink])
 
   useEffect(() => {
     setPlaybackUrl(resolvePlayableVideoUrl(video as Video & Record<string, unknown>))
@@ -676,6 +966,103 @@ function VideoCard({
       alert('ลบลิงก์ไม่สำเร็จ: ' + (e instanceof Error ? e.message : 'Network error'))
     } finally {
       setDeletingShopeeLink(false)
+    }
+  }
+
+  const handleSaveLazada = async () => {
+    if (!lazadaInput.trim()) return
+    setSavingLazada(true)
+    try {
+      const nowIso = new Date().toISOString()
+      const resp = await apiFetch(buildVideoApiUrl(), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lazadaLink: lazadaInput.trim(),
+          namespace_id: videoNamespaceId,
+        })
+      })
+      const data = await resp.json().catch(() => ({ error: 'Unknown error' }))
+      if (resp.ok) {
+        const savedVideo = data && typeof data === 'object' && 'video' in data && data.video && typeof data.video === 'object'
+          ? data.video as Record<string, unknown>
+          : null
+        const savedLazada = savedVideo
+          ? (getVideoLazadaLink(savedVideo) || String(savedVideo.lazadaLink || savedVideo.lazada_link || '').trim())
+          : lazadaInput.trim()
+        const savedUpdatedAt = savedVideo
+          ? String(savedVideo.updatedAt || savedVideo.updated_at || nowIso).trim() || nowIso
+          : nowIso
+        const savedNamespaceId = savedVideo
+          ? String(savedVideo.namespace_id || videoNamespaceId || '').trim() || videoNamespaceId
+          : videoNamespaceId
+
+        if (!savedLazada) {
+          throw new Error('Worker did not persist Lazada link')
+        }
+
+        video.lazadaLink = savedLazada
+        video.updatedAt = savedUpdatedAt
+        if (savedNamespaceId) video.namespace_id = savedNamespaceId
+        setLocalLazada(savedLazada)
+        setLazadaInput('')
+        onUpdate(video.id, savedNamespaceId, {
+          lazadaLink: savedLazada,
+          updatedAt: savedUpdatedAt
+        })
+      } else {
+        alert('บันทึกไม่สำเร็จ: ' + ((data as { error?: string }).error || resp.status))
+      }
+    } catch (e) {
+      console.error('Save Lazada failed:', e)
+      alert('บันทึกไม่สำเร็จ: ' + (e instanceof Error ? e.message : 'Network error'))
+    } finally {
+      setSavingLazada(false)
+    }
+  }
+
+  const handleDeleteLazadaLink = async () => {
+    if (!localLazada) return
+    if (!confirm('ยืนยันลบลิงก์ Lazada ออกจากวิดีโอนี้?')) return
+    setDeletingLazadaLink(true)
+    try {
+      const nowIso = new Date().toISOString()
+      const resp = await apiFetch(buildVideoApiUrl(), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lazadaLink: '', namespace_id: videoNamespaceId })
+      })
+      const data = await resp.json().catch(() => ({ error: 'Unknown error' }))
+      if (resp.ok) {
+        const savedVideo = data && typeof data === 'object' && 'video' in data && data.video && typeof data.video === 'object'
+          ? data.video as Record<string, unknown>
+          : null
+        const savedUpdatedAt = savedVideo
+          ? String(savedVideo.updatedAt || savedVideo.updated_at || nowIso).trim() || nowIso
+          : nowIso
+        const savedNamespaceId = savedVideo
+          ? String(savedVideo.namespace_id || videoNamespaceId || '').trim() || videoNamespaceId
+          : videoNamespaceId
+        const remainingLazada = savedVideo ? getVideoLazadaLink(savedVideo) : ''
+
+        if (remainingLazada) {
+          throw new Error('Worker still returned Lazada link after delete')
+        }
+
+        video.lazadaLink = ''
+        video.updatedAt = savedUpdatedAt
+        if (savedNamespaceId) video.namespace_id = savedNamespaceId
+        setLocalLazada('')
+        setLazadaInput('')
+        onUpdate(video.id, savedNamespaceId, { lazadaLink: '', updatedAt: savedUpdatedAt })
+      } else {
+        alert('ลบลิงก์ไม่สำเร็จ: ' + ((data as { error?: string }).error || resp.status))
+      }
+    } catch (e) {
+      console.error('Delete lazada link failed:', e)
+      alert('ลบลิงก์ไม่สำเร็จ: ' + (e instanceof Error ? e.message : 'Network error'))
+    } finally {
+      setDeletingLazadaLink(false)
     }
   }
 
@@ -783,6 +1170,21 @@ function VideoCard({
               }}
             />
           </div>
+          <div className="mt-3 flex items-center gap-2">
+            <div className="min-w-0 flex-1 rounded-xl bg-white/10 px-3 py-2">
+              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-white/50">Video ID</p>
+              <p className="truncate text-sm font-semibold text-white">{video.id}</p>
+            </div>
+            <button
+              onClick={() => navigator.clipboard.writeText(video.id)}
+              className="shrink-0 rounded-xl bg-white/15 p-3 active:scale-95 transition-transform"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          </div>
           {/* Category chips */}
           <div className="flex gap-1.5 mt-2 flex-wrap">
             {fetchedCats.map(cat => (
@@ -796,6 +1198,7 @@ function VideoCard({
             ))}
           </div>
           {/* Shopee Link */}
+          <p className="mt-3 mb-1 px-1 text-[11px] font-bold uppercase tracking-[0.18em] text-white/45">Shopee Link</p>
           {savingShopee ? (
             <div className="flex items-center justify-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
               <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
@@ -882,6 +1285,89 @@ function VideoCard({
               </button>
             </div>
           )}
+          <p className="mt-3 mb-1 px-1 text-[11px] font-bold uppercase tracking-[0.18em] text-white/45">Lazada Link</p>
+          {savingLazada ? (
+            <div className="flex items-center justify-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
+              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              <span className="text-white/60 text-sm">กำลังบันทึก...</span>
+            </div>
+          ) : localLazada ? (
+            <div className="flex items-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
+              <span className="text-white text-sm truncate flex-1">{localLazada}</span>
+              <button
+                onClick={() => { setLazadaInput(''); setLocalLazada('') }}
+                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                  <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+              <a
+                href={localLazada}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                  <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M15 3h6v6" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M10 14L21 3" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </a>
+              <button
+                onClick={() => navigator.clipboard.writeText(localLazada)}
+                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+              <button
+                onClick={handleDeleteLazadaLink}
+                disabled={deletingLazadaLink}
+                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform disabled:opacity-60"
+              >
+                {deletingLazadaLink ? (
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                    <path d="M3 6h18" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4h4v2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 mt-3">
+              <div
+                contentEditable
+                suppressContentEditableWarning
+                onPaste={(e) => {
+                  e.preventDefault()
+                  const text = e.clipboardData.getData('text/plain').trim()
+                  if (text) setLazadaInput(text)
+                }}
+                onBeforeInput={(e) => e.preventDefault()}
+                onDrop={(e) => e.preventDefault()}
+                className="flex-1 bg-white/10 text-white text-sm px-3 py-2.5 rounded-xl outline-none min-h-[40px] break-all"
+                style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
+                inputMode="none"
+              >
+                {lazadaInput && <span className="text-white">{lazadaInput}</span>}
+              </div>
+              <button
+                onClick={handleSaveLazada}
+                disabled={!lazadaInput.trim()}
+                className="shrink-0 bg-black text-white text-sm font-bold px-4 py-2.5 rounded-xl active:scale-95 transition-all disabled:opacity-50"
+              >
+                บันทึก
+              </button>
+            </div>
+          )}
           {/* Delete button */}
           <button
             onClick={handleDelete}
@@ -918,8 +1404,8 @@ function VideoCard({
           />
         </div>
       )}
-      {getVideoShopeeLink(video as unknown as Record<string, unknown>) && (
-        <div className="absolute bottom-2 left-2 bg-orange-500 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg border border-white/20">
+      {(getVideoLazadaLink(video as unknown as Record<string, unknown>) || getVideoShopeeLink(video as unknown as Record<string, unknown>)) && (
+        <div className={`absolute bottom-2 left-2 text-white w-6 h-6 rounded-full flex items-center justify-center shadow-lg border border-white/20 ${getVideoLazadaLink(video as unknown as Record<string, unknown>) ? 'bg-blue-500' : 'bg-orange-500'}`}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" />
             <path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" />
@@ -1311,12 +1797,30 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
 
         {/* Page Logo */}
         <div className="flex flex-col items-center mb-4">
-          <img
-            src={page.image_url || getGraphPageImageUrl(page.id)}
-            alt={page.name}
-            onError={(e) => onPageImageError(e, page.id)}
-            className="w-24 h-24 rounded-full object-cover shadow-sm"
-          />
+          {buildFacebookPageProfileUrl(page.id) ? (
+            <a
+              href={buildFacebookPageProfileUrl(page.id)}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`เปิดหน้าเพจ ${page.name} บน Facebook`}
+              title="เปิดหน้าเพจบน Facebook"
+              className="rounded-full focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-offset-2"
+            >
+              <img
+                src={page.image_url || getGraphPageImageUrl(page.id)}
+                alt={page.name}
+                onError={(e) => onPageImageError(e, page.id)}
+                className="w-24 h-24 rounded-full object-cover shadow-sm cursor-pointer transition-transform active:scale-95"
+              />
+            </a>
+          ) : (
+            <img
+              src={page.image_url || getGraphPageImageUrl(page.id)}
+              alt={page.name}
+              onError={(e) => onPageImageError(e, page.id)}
+              className="w-24 h-24 rounded-full object-cover shadow-sm"
+            />
+          )}
         </div>
 
         {/* Auto Post toggle */}
@@ -2066,18 +2570,26 @@ function App() {
     setGeminiApiKeyLoading(false)
     setGeminiApiKeySaving(false)
     setGeminiApiKeyMaxChars(512)
-    setShortlinkBaseUrlDraft('')
     setShortlinkBaseUrlCurrent('')
+    setLazadaShortlinkBaseUrlCurrent('')
+    setShortlinkAccountCurrent('')
+    setShortlinkAccountDraft('')
+    setShortlinkExpectedUtmIdCurrent('')
+    setShortlinkExpectedUtmIdDraft('')
+    setLazadaExpectedMemberIdCurrent('')
+    setLazadaExpectedMemberIdDraft('')
     setShortlinkEnabled(false)
     setShortlinkUpdatedAt('')
     setShortlinkMessage('')
     setShortlinkLoading(false)
     setShortlinkSaving(false)
-    setShortlinkMaxChars(512)
+    setShortlinkAccountMaxChars(64)
+    setShortlinkExpectedUtmIdMaxChars(32)
+    setLazadaExpectedMemberIdMaxChars(32)
     setPages([])
     setVideos([])
     setUsedVideos([])
-    setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0 })
+    setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
     setSystemGalleryHasMore(false)
     setGalleryLoadingMore(false)
     setGalleryVisibleCount(GALLERY_BATCH_SIZE)
@@ -2138,19 +2650,22 @@ function App() {
   const [geminiApiKeyLoading, setGeminiApiKeyLoading] = useState(false)
   const [geminiApiKeySaving, setGeminiApiKeySaving] = useState(false)
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
-  const [shortlinkBaseUrlDraft, setShortlinkBaseUrlDraft] = useState(() => getStoredShortlinkBaseUrl(botScope))
+  const [shortlinkAccountDraft, setShortlinkAccountDraft] = useState(() => getStoredShortlinkAccount(botScope))
+  const [shortlinkAccountCurrent, setShortlinkAccountCurrent] = useState(() => getStoredShortlinkAccount(botScope))
   const [shortlinkBaseUrlCurrent, setShortlinkBaseUrlCurrent] = useState(() => getStoredShortlinkBaseUrl(botScope))
+  const [lazadaShortlinkBaseUrlCurrent, setLazadaShortlinkBaseUrlCurrent] = useState(() => getStoredLazadaShortlinkBaseUrl(botScope))
   const [shortlinkExpectedUtmIdDraft, setShortlinkExpectedUtmIdDraft] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
   const [shortlinkExpectedUtmIdCurrent, setShortlinkExpectedUtmIdCurrent] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
-  const [shortlinkEnabled, setShortlinkEnabled] = useState(() => !!getStoredShortlinkBaseUrl(botScope))
+  const [lazadaExpectedMemberIdDraft, setLazadaExpectedMemberIdDraft] = useState(() => getStoredLazadaExpectedMemberId(botScope))
+  const [lazadaExpectedMemberIdCurrent, setLazadaExpectedMemberIdCurrent] = useState(() => getStoredLazadaExpectedMemberId(botScope))
+  const [shortlinkEnabled, setShortlinkEnabled] = useState(() => hasStoredAffiliateShortlinkConfig(botScope))
   const [shortlinkUpdatedAt, setShortlinkUpdatedAt] = useState('')
   const [shortlinkMessage, setShortlinkMessage] = useState('')
   const [shortlinkLoading, setShortlinkLoading] = useState(false)
   const [shortlinkSaving, setShortlinkSaving] = useState(false)
-  const [shortlinkRequired, setShortlinkRequired] = useState(false)
-  const [shortlinkRequirementSaving, setShortlinkRequirementSaving] = useState(false)
-  const [shortlinkMaxChars, setShortlinkMaxChars] = useState(512)
+  const [shortlinkAccountMaxChars, setShortlinkAccountMaxChars] = useState(64)
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
+  const [lazadaExpectedMemberIdMaxChars, setLazadaExpectedMemberIdMaxChars] = useState(32)
   const [logoutLoading, setLogoutLoading] = useState(false)
   const getInitialSettingsSection = (): SettingsSection => {
     const pathTab = window.location.pathname.replace('/', '')
@@ -2167,9 +2682,10 @@ function App() {
     return []
   })
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null)
+  const [retryingLogId, setRetryingLogId] = useState<number | null>(null)
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null)
   const [videos, setVideos] = useState<Video[]>(() => {
-    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), !!getStoredShortlinkBaseUrl(botScope))
+    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), hasStoredAffiliateShortlinkConfig(botScope))
   })
   const [usedVideos, setUsedVideos] = useState<Video[]>(() => {
     const ns = getStoredNamespace()
@@ -2179,13 +2695,10 @@ function App() {
   const [globalOriginalVideos, setGlobalOriginalVideos] = useState<GlobalOriginalVideo[]>([])
   const [globalOriginalLoading, setGlobalOriginalLoading] = useState(false)
   const [processingVideos, setProcessingVideos] = useState<Video[]>([])
-<<<<<<< HEAD
-=======
   const [pendingShortlinkVideos, setPendingShortlinkVideos] = useState<Video[]>([])
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
   const [retryingProcessingId, setRetryingProcessingId] = useState<string | null>(null)
   const [loading, setLoading] = useState(() => {
-    if (getStoredShortlinkBaseUrl(botScope)) {
+    if (FORCE_SYSTEM_WIDE_GALLERY || hasStoredAffiliateShortlinkConfig(botScope)) {
       return readCache<Video[]>(systemGalleryCacheKey(botScope), []).length === 0
     }
     const ns = getStoredNamespace(botScope)
@@ -2198,9 +2711,10 @@ function App() {
     return readCache<Video[]>(globalCacheKey('gallery'), []).length === 0
   })
   const [galleryLoading, setGalleryLoading] = useState(() => {
-    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), !!getStoredShortlinkBaseUrl(botScope)).length === 0
+    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), hasStoredAffiliateShortlinkConfig(botScope)).length === 0
   })
-  const [systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0 })
+  const [systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+  const [, setSystemGalleryOverallTotal] = useState(0)
   const [systemGalleryHasMore, setSystemGalleryHasMore] = useState(false)
   const [galleryLoadingMore, setGalleryLoadingMore] = useState(false)
   // Get today's date in YYYY-MM-DD format for Thailand timezone
@@ -2212,6 +2726,7 @@ function App() {
 
 
   const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('unused')
+  const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null)
@@ -2233,11 +2748,32 @@ function App() {
   }
 
   const [tab, _setTab] = useState<TabName>(getInitialTab())
+  const syncAppUrl = (
+    nextTab: TabName,
+    nextSearchInput: string,
+    historyMode: 'push' | 'replace' = 'replace',
+  ) => {
+    const url = new URL(window.location.href)
+    url.pathname = `/${nextTab}`
+    if (nextTab === 'gallery') {
+      const trimmedSearch = String(nextSearchInput || '').trim()
+      if (trimmedSearch) url.searchParams.set('q', trimmedSearch)
+      else url.searchParams.delete('q')
+    } else {
+      url.searchParams.delete('q')
+    }
+    const nextUrl = url.toString()
+    if (nextUrl !== window.location.href) {
+      if (historyMode === 'push') {
+        window.history.pushState(null, '', nextUrl)
+      } else {
+        window.history.replaceState(null, '', nextUrl)
+      }
+    }
+  }
   const setTab = (t: TabName) => {
     _setTab(t)
-    const url = new URL(window.location.href)
-    url.pathname = `/${t}`
-    window.history.pushState(null, '', url.toString())
+    syncAppUrl(t, gallerySearchInput, 'push')
   }
   const [pages, setPages] = useState<FacebookPage[]>([])
   const [inboxVideos, setInboxVideos] = useState<InboxVideo[]>([])
@@ -2261,12 +2797,17 @@ function App() {
   const loadTeamRequestRef = useRef(0)
   const lastUsedFetchAtRef = useRef(0)
   const lastGlobalOriginalFetchAtRef = useRef(0)
-  const systemWideGalleryMode = !!String(shortlinkBaseUrlCurrent || '').trim()
+  const systemWideGalleryMode = FORCE_SYSTEM_WIDE_GALLERY
   const systemWideGalleryModeRef = useRef(systemWideGalleryMode)
   const mainScrollRef = useRef<HTMLDivElement | null>(null)
   const galleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const systemGalleryRequestRef = useRef(0)
   const systemGalleryLoadedCountRef = useRef(videos.length)
+  const deferredGallerySearchInput = useDeferredValue(gallerySearchInput)
+  const gallerySearchQuery = useMemo(
+    () => normalizeGallerySearchQuery(deferredGallerySearchInput),
+    [deferredGallerySearchInput]
+  )
 
   useEffect(() => {
     systemWideGalleryModeRef.current = systemWideGalleryMode
@@ -2274,6 +2815,19 @@ function App() {
   useEffect(() => {
     systemGalleryLoadedCountRef.current = videos.length
   }, [videos.length])
+  useEffect(() => {
+    const urlSearch = getInitialGallerySearchInput()
+    if (tab === 'gallery') {
+      if (urlSearch) {
+        setGallerySearchInput(urlSearch)
+        return
+      }
+    }
+    setGallerySearchInput('')
+  }, [botScope, namespaceId, tab])
+  useEffect(() => {
+    syncAppUrl(tab, gallerySearchInput)
+  }, [tab, gallerySearchInput])
 
   const tg = window.Telegram?.WebApp
   const hydrateNamespaceCaches = (ns: string) => {
@@ -2282,7 +2836,7 @@ function App() {
     const cachedVideos = readGalleryCacheForScope(
       botScope,
       scopedNamespace,
-      !!String(shortlinkBaseUrlCurrent || getStoredShortlinkBaseUrl(botScope) || '').trim()
+      !!String(shortlinkAccountCurrent || shortlinkBaseUrlCurrent || lazadaShortlinkBaseUrlCurrent || getStoredShortlinkAccount(botScope) || getStoredShortlinkBaseUrl(botScope) || getStoredLazadaShortlinkBaseUrl(botScope) || '').trim()
     )
     const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
@@ -2307,10 +2861,19 @@ function App() {
       if (shortlinkBaseUrlCurrent) localStorage.setItem(scopedStorageKey('shortlink_base_url', botScope), shortlinkBaseUrlCurrent)
       else localStorage.removeItem(scopedStorageKey('shortlink_base_url', botScope))
 
+      if (shortlinkAccountCurrent) localStorage.setItem(scopedStorageKey('shortlink_account', botScope), shortlinkAccountCurrent)
+      else localStorage.removeItem(scopedStorageKey('shortlink_account', botScope))
+
+      if (lazadaShortlinkBaseUrlCurrent) localStorage.setItem(scopedStorageKey('lazada_shortlink_base_url', botScope), lazadaShortlinkBaseUrlCurrent)
+      else localStorage.removeItem(scopedStorageKey('lazada_shortlink_base_url', botScope))
+
       if (shortlinkExpectedUtmIdCurrent) localStorage.setItem(scopedStorageKey('shortlink_expected_utm_id', botScope), shortlinkExpectedUtmIdCurrent)
       else localStorage.removeItem(scopedStorageKey('shortlink_expected_utm_id', botScope))
+
+      if (lazadaExpectedMemberIdCurrent) localStorage.setItem(scopedStorageKey('lazada_expected_member_id', botScope), lazadaExpectedMemberIdCurrent)
+      else localStorage.removeItem(scopedStorageKey('lazada_expected_member_id', botScope))
     } catch { }
-  }, [botScope, shortlinkBaseUrlCurrent, shortlinkExpectedUtmIdCurrent])
+  }, [botScope, shortlinkAccountCurrent, shortlinkBaseUrlCurrent, lazadaShortlinkBaseUrlCurrent, shortlinkExpectedUtmIdCurrent, lazadaExpectedMemberIdCurrent])
 
   useEffect(() => {
     if (systemWideGalleryMode) {
@@ -2404,19 +2967,21 @@ function App() {
   useEffect(() => {
     setTokenState(getToken(botScope))
     const storedNamespace = getStoredNamespace(botScope)
+    const storedShortlinkAccount = getStoredShortlinkAccount(botScope)
     const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
-    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, !!storedShortlinkBaseUrl)
+    const storedLazadaShortlinkBaseUrl = getStoredLazadaShortlinkBaseUrl(botScope)
+    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, !!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
     setNamespaceId(storedNamespace)
     setVideos(cachedVideos)
     setGalleryLoading(cachedVideos.length === 0)
     const storedShortlinkExpectedUtmId = getStoredShortlinkExpectedUtmId(botScope)
+    const storedLazadaExpectedMemberId = getStoredLazadaExpectedMemberId(botScope)
+    setShortlinkAccountCurrent(storedShortlinkAccount)
+    setShortlinkAccountDraft(storedShortlinkAccount)
     setShortlinkBaseUrlCurrent(storedShortlinkBaseUrl)
-    setShortlinkBaseUrlDraft(storedShortlinkBaseUrl)
+    setLazadaShortlinkBaseUrlCurrent(storedLazadaShortlinkBaseUrl)
     setShortlinkExpectedUtmIdCurrent(storedShortlinkExpectedUtmId)
     setShortlinkExpectedUtmIdDraft(storedShortlinkExpectedUtmId)
-<<<<<<< HEAD
-    setShortlinkEnabled(!!storedShortlinkBaseUrl)
-=======
     setLazadaExpectedMemberIdCurrent(storedLazadaExpectedMemberId)
     setLazadaExpectedMemberIdDraft(storedLazadaExpectedMemberId)
     setShortlinkEnabled(!!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
@@ -2424,7 +2989,6 @@ function App() {
     setInboxLoading(true)
     setProcessingVideos([])
     setPendingShortlinkVideos([])
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
     setMeEmail('')
     setIsOwner(false)
     setTeamMembers([])
@@ -2561,7 +3125,7 @@ function App() {
     setVideos(cachedVideos)
     setGalleryLoading(cachedVideos.length === 0)
     if (!systemWideGalleryMode) {
-      setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0 })
+      setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
       setSystemGalleryHasMore(false)
       setGalleryLoadingMore(false)
     }
@@ -2570,7 +3134,7 @@ function App() {
   useEffect(() => {
     if (tab !== 'gallery' || isOwner && categoryFilter === 'all-original') return
     setGalleryVisibleCount(GALLERY_BATCH_SIZE)
-  }, [tab, botScope, namespaceId, categoryFilter, systemWideGalleryMode, isOwner])
+  }, [tab, botScope, namespaceId, categoryFilter, systemWideGalleryMode, isOwner, gallerySearchQuery])
 
   useEffect(() => {
     if (authBootstrapping || !token || tab !== 'dashboard') return
@@ -2609,9 +3173,10 @@ function App() {
         return
       }
 
-      const procData = processingResp.ok ? await processingResp.json() : { videos: [] }
+      const procData = processingResp.ok ? await processingResp.json() : { videos: [], pending_shortlink_videos: [] }
       const queueData = queueResp.ok ? await queueResp.json() : { queue: [] }
       setProcessingVideos([...(procData.videos || []), ...(queueData.queue || [])])
+      setPendingShortlinkVideos(dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : []))
     } catch {
       // Keep previous processing snapshot on transient errors.
     } finally {
@@ -2730,6 +3295,7 @@ function App() {
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
       params.set('link_filter', 'all')
+      if (gallerySearchQuery) params.set('q', gallerySearchQuery)
 
       const resp = await apiFetch(`${WORKER_URL}/api/gallery?${params.toString()}`)
       if (resp.status === 401) {
@@ -2746,9 +3312,12 @@ function App() {
       setVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : dedupeGalleryVideos([...prev, ...nextVideos]))
       setSystemGalleryStats({
         total: Number(data.total || 0),
+        shopeeTotal: Number(data.shopee_total || 0),
+        lazadaTotal: Number(data.lazada_total || 0),
         withLink: Number(data.with_link_total || 0),
         withoutLink: Number(data.without_link_total || 0),
       })
+      setSystemGalleryOverallTotal(Number(data.overall_total || data.total || 0))
       setSystemGalleryHasMore(hasMore)
     } catch {
       // Keep current gallery snapshot on transient errors.
@@ -2796,7 +3365,10 @@ function App() {
       const tasks: Promise<void>[] = [historyTask]
       if (!options.skipGallery) {
         const galleryTask = (async () => {
-          const galleryEndpoint = `${WORKER_URL}/api/gallery`
+          const params = new URLSearchParams()
+          params.set('offset', '0')
+          params.set('limit', '5000')
+          const galleryEndpoint = `${WORKER_URL}/api/gallery?${params.toString()}`
           const galleryResp = await apiFetch(galleryEndpoint)
           if (galleryResp.status === 401) {
             await onUnauthorized()
@@ -2827,6 +3399,18 @@ function App() {
     }
   }
 
+  async function refreshPostHistorySnapshot() {
+    const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?_ts=${Date.now()}`)
+    if (historyResp.status === 401) {
+      await recoverSessionOrLogout()
+      return
+    }
+    if (historyResp.ok) {
+      const data = await historyResp.json()
+      setPostHistory(data.history || [])
+    }
+  }
+
   useEffect(() => {
     if (authBootstrapping || !token) return
     if (tab !== 'gallery') return
@@ -2843,7 +3427,7 @@ function App() {
 
     void loadUsedVideos({ force: categoryFilter === 'used' })
     if (isOwner) void loadGlobalOriginalVideos()
-  }, [tab, categoryFilter, token, authBootstrapping, isOwner, systemWideGalleryMode])
+  }, [tab, categoryFilter, token, authBootstrapping, isOwner, systemWideGalleryMode, gallerySearchQuery])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3213,25 +3797,38 @@ function App() {
         return
       }
       const data = await resp.json() as {
+        account?: string
         base_url?: string
+        lazada_base_url?: string
         enabled?: boolean
+        lazada_enabled?: boolean
         required?: boolean
         expected_utm_id?: string
+        lazada_expected_member_id?: string
         updated_at?: string
+        max_account_chars?: number
         max_chars?: number
         max_expected_utm_chars?: number
+        max_lazada_member_id_chars?: number
       }
+      const account = String(data.account || '')
       const baseUrl = String(data.base_url || '')
+      const lazadaBaseUrl = String(data.lazada_base_url || '')
       const expectedUtmId = String(data.expected_utm_id || '')
+      const lazadaExpectedMemberId = String(data.lazada_expected_member_id || '')
+      setShortlinkAccountCurrent(account)
+      setShortlinkAccountDraft(account)
       setShortlinkBaseUrlCurrent(baseUrl)
-      setShortlinkBaseUrlDraft(baseUrl)
+      setLazadaShortlinkBaseUrlCurrent(lazadaBaseUrl)
       setShortlinkExpectedUtmIdCurrent(expectedUtmId)
       setShortlinkExpectedUtmIdDraft(expectedUtmId)
-      setShortlinkEnabled(!!data.enabled && !!baseUrl)
-      setShortlinkRequired(data.required === true)
+      setLazadaExpectedMemberIdCurrent(lazadaExpectedMemberId)
+      setLazadaExpectedMemberIdDraft(lazadaExpectedMemberId)
+      setShortlinkEnabled((!!data.enabled && !!baseUrl) || (!!data.lazada_enabled && !!lazadaBaseUrl))
       setShortlinkUpdatedAt(String(data.updated_at || ''))
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setShortlinkMaxChars(data.max_chars)
+      if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
+      if (typeof data.max_lazada_member_id_chars === 'number' && data.max_lazada_member_id_chars > 0) setLazadaExpectedMemberIdMaxChars(data.max_lazada_member_id_chars)
       setShortlinkMessage('')
     } catch {
       setShortlinkMessage('โหลด Shortlink URL ไม่สำเร็จ')
@@ -3240,21 +3837,22 @@ function App() {
     }
   }
 
-  async function saveShortlinkSettings(nextBaseUrl: string) {
+  async function saveShortlinkSettings(nextAccount: string) {
     const session = getToken()
     if (!session || !isOwner) return
-    const trimmed = String(nextBaseUrl || '').trim()
+    const trimmedAccount = String(nextAccount || '').trim().toUpperCase()
     const expectedTrimmed = String(shortlinkExpectedUtmIdDraft || '').trim()
+    const lazadaExpectedMemberIdTrimmed = String(lazadaExpectedMemberIdDraft || '').trim()
     setShortlinkSaving(true)
     setShortlinkMessage('')
     try {
-      const isClear = !trimmed && !expectedTrimmed
+      const isClear = !trimmedAccount && !expectedTrimmed && !lazadaExpectedMemberIdTrimmed
       const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink`, isClear ? {
         method: 'DELETE',
       } : {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ base_url: trimmed, expected_utm_id: expectedTrimmed }),
+        body: JSON.stringify({ account: trimmedAccount, expected_utm_id: expectedTrimmed, lazada_expected_member_id: lazadaExpectedMemberIdTrimmed }),
       })
 
       if (resp.status === 401) {
@@ -3272,82 +3870,48 @@ function App() {
       }
 
       const data = await resp.json() as {
+        account?: string
         base_url?: string
+        lazada_base_url?: string
         enabled?: boolean
+        lazada_enabled?: boolean
         required?: boolean
         expected_utm_id?: string
+        lazada_expected_member_id?: string
         updated_at?: string
+        max_account_chars?: number
         max_chars?: number
         max_expected_utm_chars?: number
+        max_lazada_member_id_chars?: number
       }
+      const account = String(data.account || '')
       const baseUrl = String(data.base_url || '')
+      const lazadaBaseUrl = String(data.lazada_base_url || '')
       const expectedUtmId = String(data.expected_utm_id || '')
+      const lazadaExpectedMemberId = String(data.lazada_expected_member_id || '')
+      setShortlinkAccountCurrent(account)
+      setShortlinkAccountDraft(account)
       setShortlinkBaseUrlCurrent(baseUrl)
-      setShortlinkBaseUrlDraft(baseUrl)
+      setLazadaShortlinkBaseUrlCurrent(lazadaBaseUrl)
       setShortlinkExpectedUtmIdCurrent(expectedUtmId)
       setShortlinkExpectedUtmIdDraft(expectedUtmId)
-      setShortlinkEnabled(!!data.enabled && !!baseUrl)
-      setShortlinkRequired(data.required === true)
+      setLazadaExpectedMemberIdCurrent(lazadaExpectedMemberId)
+      setLazadaExpectedMemberIdDraft(lazadaExpectedMemberId)
+      setShortlinkEnabled((!!data.enabled && !!baseUrl) || (!!data.lazada_enabled && !!lazadaBaseUrl))
       setShortlinkUpdatedAt(String(data.updated_at || ''))
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setShortlinkMaxChars(data.max_chars)
+      if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
+      if (typeof data.max_lazada_member_id_chars === 'number' && data.max_lazada_member_id_chars > 0) setLazadaExpectedMemberIdMaxChars(data.max_lazada_member_id_chars)
       setShortlinkMessage(isClear ? 'ล้างค่า Shortlink แล้ว' : 'บันทึกค่า Shortlink แล้ว')
+      setVideos([])
+      setUsedVideos([])
+      setGalleryLoading(true)
+      void loadAll()
+      void loadProcessingSnapshot()
     } catch {
       setShortlinkMessage('บันทึกค่า Shortlink ไม่สำเร็จ')
     } finally {
       setShortlinkSaving(false)
-    }
-  }
-
-  async function saveShortlinkRequirement(nextRequired: boolean) {
-    const session = getToken()
-    if (!session || !isOwner) return
-    setShortlinkRequirementSaving(true)
-    setShortlinkMessage('')
-    try {
-      const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink/requirement`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ required: nextRequired }),
-      })
-      if (resp.status === 401) {
-        await recoverSessionOrLogout()
-        return
-      }
-      if (resp.status === 403) {
-        setShortlinkMessage('บัญชีนี้ไม่มีสิทธิ์แก้การบังคับย่อลิงก์')
-        return
-      }
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({})) as { error?: string }
-        setShortlinkMessage(data.error || 'บันทึกการบังคับย่อลิงก์ไม่สำเร็จ')
-        return
-      }
-      const data = await resp.json() as {
-        base_url?: string
-        enabled?: boolean
-        required?: boolean
-        expected_utm_id?: string
-        updated_at?: string
-        max_chars?: number
-        max_expected_utm_chars?: number
-      }
-      const baseUrl = String(data.base_url || '')
-      const expectedUtmId = String(data.expected_utm_id || '')
-      setShortlinkBaseUrlCurrent(baseUrl)
-      setShortlinkBaseUrlDraft(baseUrl)
-      setShortlinkExpectedUtmIdCurrent(expectedUtmId)
-      setShortlinkExpectedUtmIdDraft(expectedUtmId)
-      setShortlinkEnabled(!!data.enabled && !!baseUrl)
-      setShortlinkRequired(data.required === true)
-      setShortlinkUpdatedAt(String(data.updated_at || ''))
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setShortlinkMaxChars(data.max_chars)
-      if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
-      setShortlinkMessage(nextRequired ? 'เปิดบังคับย่อลิงก์ก่อนโพสต์แล้ว' : 'ปิดบังคับย่อลิงก์ก่อนโพสต์แล้ว')
-    } catch {
-      setShortlinkMessage('บันทึกการบังคับย่อลิงก์ไม่สำเร็จ')
-    } finally {
-      setShortlinkRequirementSaving(false)
     }
   }
 
@@ -3428,35 +3992,11 @@ function App() {
     return remainingSeconds > 0 ? remainingSeconds : null
   }
 
-  const looksLikeTokenProblem = (value?: string | null) => {
-    const msg = String(value || '').trim().toLowerCase()
-    if (!msg) return false
-    return [
-      'token',
-      'oauth',
-      'expired',
-      'invalid',
-      'permission',
-      'access denied',
-      'session',
-      'access_token_missing',
-      'code":190',
-      'error_subcode',
-    ].some((keyword) => msg.includes(keyword))
-  }
-
   const hasPageTokenIssue = (page: FacebookPage) => {
     const latest = postHistory.find((item) => item.page_id === page.id)
     if (!latest) return false
-    const tokenIssue = looksLikeTokenProblem(latest.comment_error) || looksLikeTokenProblem(latest.error_message)
-    if (!tokenIssue) return false
-
-    const latestPostedAtMs = Date.parse(String(latest.posted_at || ''))
-    const pageUpdatedAtMs = Date.parse(String(page.updated_at || ''))
-    if (Number.isFinite(latestPostedAtMs) && Number.isFinite(pageUpdatedAtMs) && latestPostedAtMs <= pageUpdatedAtMs) {
-      return false
-    }
-    return true
+    // Only show orange when the latest post actually failed
+    return latest.status === 'failed'
   }
 
   const handleSavePage = (updatedPage: FacebookPage) => {
@@ -3543,8 +4083,28 @@ function App() {
     const previousVideo = videos.find((video) =>
       matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
     )
+    const previousPendingVideo = pendingShortlinkVideos.find((video) =>
+      matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+    )
+    const nextCandidate = (previousVideo || previousPendingVideo)
+      ? { ...(previousVideo || previousPendingVideo), ...fields } as Video
+      : null
+    const nextCandidateExpectedUtmId = String((nextCandidate as unknown as Record<string, unknown> | null)?.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
+    const nextCandidateExpectedLazadaMemberId = String((nextCandidate as unknown as Record<string, unknown> | null)?.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
 
     setVideos((prev) => {
+      const hasExistingVideo = prev.some((video) =>
+        matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+      )
+
+      if (!hasExistingVideo && nextCandidate && !isVideoAwaitingAffiliateConversion(
+        nextCandidate as unknown as Record<string, unknown>,
+        nextCandidateExpectedUtmId,
+        nextCandidateExpectedLazadaMemberId,
+      )) {
+        return dedupeGalleryVideos([nextCandidate, ...prev])
+      }
+
       return prev.flatMap((video) => {
         if (!matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)) {
           return [video]
@@ -3555,6 +4115,35 @@ function App() {
       })
     })
 
+    setPendingShortlinkVideos((prev) => {
+      const updated = prev.flatMap((video) => {
+        if (!matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)) {
+          return [video]
+        }
+
+        const nextVideo = { ...video, ...fields }
+        const nextVideoExpectedUtmId = String((nextVideo as unknown as Record<string, unknown>).shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
+        const nextVideoExpectedLazadaMemberId = String((nextVideo as unknown as Record<string, unknown>).lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
+        return isVideoAwaitingAffiliateConversion(
+          nextVideo as unknown as Record<string, unknown>,
+          nextVideoExpectedUtmId,
+          nextVideoExpectedLazadaMemberId,
+        ) ? [nextVideo] : []
+      })
+
+      if (!nextCandidate) return updated
+      const alreadyTracked = updated.some((video) =>
+        matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+      )
+      if (alreadyTracked) return updated
+
+      return isVideoAwaitingAffiliateConversion(
+        nextCandidate as unknown as Record<string, unknown>,
+        nextCandidateExpectedUtmId,
+        nextCandidateExpectedLazadaMemberId,
+      ) ? dedupeGalleryVideos([nextCandidate, ...updated]) : updated
+    })
+
     setUsedVideos((prev) => prev.map((video) =>
       matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
         ? { ...video, ...fields }
@@ -3563,8 +4152,8 @@ function App() {
 
     if (!systemWideGalleryMode || !previousVideo) return
 
-    const previousHasLink = !!getVideoShopeeLink(previousVideo as unknown as Record<string, unknown>)
-    const nextHasLink = !!getVideoShopeeLink({ ...previousVideo, ...fields } as unknown as Record<string, unknown>)
+    const previousHasLink = hasVideoAffiliateLink(previousVideo as unknown as Record<string, unknown>)
+    const nextHasLink = hasVideoAffiliateLink({ ...previousVideo, ...fields } as unknown as Record<string, unknown>)
     if (previousHasLink !== nextHasLink) {
       setSystemGalleryStats((prev) => ({
         ...prev,
@@ -3575,15 +4164,12 @@ function App() {
 
   }
 
-<<<<<<< HEAD
-=======
   const pendingShortlinkIdentitySet = useMemo(() => {
     return new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
   }, [pendingShortlinkVideos])
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
   const usedVideoIdSet = useMemo(() => {
-    return new Set(usedVideos.map((video) => String(video.id || '')))
+    return new Set(usedVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
   }, [usedVideos])
   const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
   const {
@@ -3596,51 +4182,59 @@ function App() {
       return Number.isFinite(ts) ? ts : 0
     }
     const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-    const sourceVideos = dedupeGalleryVideos(videos)
-    const galleryMissingLinkVideos = sortNewestFirst(
-      sourceVideos.filter((video) => !getVideoShopeeLink(video as unknown as Record<string, unknown>))
+    const sourceVideos = dedupeGalleryVideos(videos).filter((video) =>
+      !pendingShortlinkIdentitySet.has(getVideoIdentityKey(video as Video & Record<string, unknown>))
     )
     const unusedVideos = sortNewestFirst(
       sourceVideos.filter((video) =>
-        !usedVideoIdSet.has(String(video.id || '')) &&
-        !isKeepInPostedTab(video) &&
-        !!getVideoShopeeLink(video as unknown as Record<string, unknown>)
+        !usedVideoIdSet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)) &&
+        !isKeepInPostedTab(video)
       )
     )
     const galleryPinnedPostedVideos = sortNewestFirst(
       sourceVideos.filter((video) =>
-        !usedVideoIdSet.has(String(video.id || '')) &&
+        !usedVideoIdSet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)) &&
         isKeepInPostedTab(video)
       )
     )
     const galleryUsedMergedVideos: Video[] = [
       ...usedVideos,
       ...galleryPinnedPostedVideos,
-      ...galleryMissingLinkVideos.filter((video) => !usedVideoIdSet.has(String(video.id || '')))
     ]
     const dedupedUsedVideos = sortNewestFirst(
-      galleryUsedMergedVideos.filter((video, index, arr) => arr.findIndex((v) => String(v.id || '') === String(video.id || '')) === index)
+      galleryUsedMergedVideos.filter((video, index, arr) => arr.findIndex((v) =>
+        getVideoIdentityKey(v as Video & Record<string, unknown>) === getVideoIdentityKey(video as Video & Record<string, unknown>)
+      ) === index)
     )
-    const availableVideos = systemWideGalleryMode
+    const baseVideos = systemWideGalleryMode
       ? sourceVideos
       : (categoryFilter === 'used' || categoryFilter === 'missing-link')
         ? dedupedUsedVideos
         : unusedVideos
+    const availableVideos = gallerySearchQuery
+      ? baseVideos.filter((video) => matchesGallerySearch(video as Video & Record<string, unknown>, gallerySearchQuery))
+      : baseVideos
 
     return {
       galleryUnusedVideos: unusedVideos,
       galleryUsedVideos: dedupedUsedVideos,
+      galleryBaseVideos: baseVideos,
       galleryAvailableVideos: availableVideos,
     }
-  }, [videos, usedVideos, usedVideoIdSet, systemWideGalleryMode, categoryFilter])
+  }, [videos, usedVideos, usedVideoIdSet, pendingShortlinkIdentitySet, systemWideGalleryMode, categoryFilter, gallerySearchQuery])
   const showGalleryFilterBar = tab === 'gallery' && (
     !systemWideGalleryMode && (
       galleryLoading ||
       (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0)
     )
   )
-  const galleryHeaderOffset = showGalleryFilterBar ? 164 : 104
+  const galleryHeaderOffset = tab === 'gallery'
+    ? (showGalleryFilterBar ? 184 : 124)
+    : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
+  const galleryViewTotal = systemWideGalleryMode
+    ? Number(systemGalleryStats.total || 0)
+    : galleryAvailableVideos.length
   const galleryVisibleVideos = useMemo(() => {
     if (systemWideGalleryMode) return galleryAvailableVideos
     return galleryAvailableVideos.slice(0, galleryVisibleCount)
@@ -3648,9 +4242,7 @@ function App() {
   const galleryHasMore = systemWideGalleryMode
     ? systemGalleryHasMore
     : galleryVisibleVideos.length < galleryAvailableVideos.length
-  const galleryCurrentTotal = systemWideGalleryMode
-    ? systemGalleryStats.total
-    : galleryAvailableVideos.length
+  const galleryCurrentTotal = galleryViewTotal
   const appViewportStyle = {
     height: 'var(--tg-viewport-stable-height, 100dvh)',
     minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
@@ -3772,11 +4364,6 @@ function App() {
 
       {!videoViewerOpen && (
         <div style={headerTopPaddingStyle} className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5">
-<<<<<<< HEAD
-          <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
-            {tab === 'dashboard' ? 'Dashboard' : tab === 'processing' ? 'Processing' : tab === 'gallery' ? 'Gallery' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
-          </h1>
-=======
           {tab === 'gallery' && !isAllOriginalMode ? (
             <div className="pb-3">
               <div className="relative">
@@ -3811,7 +4398,6 @@ function App() {
               {tab === 'dashboard' ? 'Dashboard' : tab === 'inbox' ? 'คลังต้นฉบับ' : tab === 'processing' ? 'Processing' : tab === 'logs' ? 'Activity Logs' : 'Settings'}
             </h1>
           )}
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
           {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
               <button
@@ -3969,8 +4555,6 @@ function App() {
 
         {tab === 'processing' && (
           <div className="px-4">
-<<<<<<< HEAD
-=======
             <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
               <div className="rounded-2xl bg-gray-100 p-1">
                 <div className="rounded-[18px] bg-white px-3 py-3 text-sm font-bold text-blue-600 shadow-sm">
@@ -3979,35 +4563,12 @@ function App() {
               </div>
             </div>
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             {loading ? (
               <div className="space-y-3">
                 {[1, 2].map(i => (
                   <div key={i} className="bg-gray-100 rounded-2xl p-4 h-28 animate-pulse" />
                 ))}
               </div>
-<<<<<<< HEAD
-            ) : processingVideos.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-[50vh]">
-                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                  <span className="text-4xl grayscale opacity-50">⚙️</span>
-                </div>
-                <p className="text-gray-900 font-bold text-lg">No Processing Videos</p>
-                <p className="text-gray-400 text-sm mt-1">Videos currently being dubbed will appear here</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {processingVideos.map((video: any) => (
-                  <ProcessingCard
-                    key={video.id}
-                    video={video}
-                    onCancel={handleCancelJob}
-                    onReprocess={handleReprocessJob}
-                    retrying={retryingProcessingId === video.id}
-                  />
-                ))}
-              </div>
-=======
             ) : (
               processingVideos.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-[50vh]">
@@ -4030,13 +4591,22 @@ function App() {
                   ))}
                 </div>
               )
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             )}
           </div>
         )}
 
         {tab === 'gallery' && (
           <div className="px-4">
+            {!isAllOriginalMode && gallerySearchQuery && (
+              <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+                <div className="flex flex-wrap gap-2">
+                  <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
+                    ผลลัพธ์ {galleryCurrentTotal.toLocaleString('th-TH')}
+                  </span>
+                </div>
+              </div>
+            )}
+
             {isAllOriginalMode ? (
               globalOriginalLoading && globalOriginalVideos.length === 0 ? (
                 <div className="grid grid-cols-3 gap-3">
@@ -4071,23 +4641,22 @@ function App() {
                   <span className="text-4xl grayscale opacity-50">🎬</span>
                 </div>
                 <p className="text-gray-900 font-bold text-lg">
-                  {systemWideGalleryMode
+                  {gallerySearchQuery
+                    ? 'ไม่พบคลิปที่ค้นหา'
+                    : systemWideGalleryMode
                     ? 'ยังไม่มีคลิปใน Gallery'
                     : categoryFilter === 'used'
                       ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
-                      : 'ไม่มีคลิปพร้อมโพสต์'}
+                      : 'ยังไม่มีคลิปในรายการ'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
-                  {systemWideGalleryMode
+                  {gallerySearchQuery
+                    ? 'ลองค้นหาด้วย video id หรือคำจากชื่อคลิปใหม่อีกครั้ง'
+                    : systemWideGalleryMode
                     ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
-<<<<<<< HEAD
-                      ? 'คลิปที่โพสต์สำเร็จ และคลิปที่ยังไม่มีลิ้งจะแสดงที่นี่'
-                      : 'คลิปที่มี Shopee link และยังไม่โพสต์จะแสดงที่นี่'}
-=======
                       ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
                       : 'จะแสดงเฉพาะคลิปที่มี Shopee และ Lazada link ครบพร้อมโพสต์'}
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 </p>
               </div>
             ) : (
@@ -4209,17 +4778,7 @@ function App() {
                     const postedDate = new Date(item.posted_at)
                     const thaiDate = new Date(postedDate.getTime() + 7 * 60 * 60 * 1000)
                     const timeStr = `${thaiDate.getUTCHours().toString().padStart(2, '0')}:${thaiDate.getUTCMinutes().toString().padStart(2, '0')}`
-                    const fbLink = (() => {
-                      const reelUrlRaw = String(item.fb_reel_url || '').trim()
-                      if (reelUrlRaw) {
-                        if (/^https?:\/\//i.test(reelUrlRaw)) return reelUrlRaw
-                        if (reelUrlRaw.startsWith('/')) return `https://www.facebook.com${reelUrlRaw}`
-                        if (reelUrlRaw.startsWith('www.')) return `https://${reelUrlRaw}`
-                        return `https://www.facebook.com/${reelUrlRaw.replace(/^\/+/, '')}`
-                      }
-                      if (item.fb_post_id) return `https://www.facebook.com/watch/?v=${item.fb_post_id}`
-                      return ''
-                    })()
+                    const fbLink = buildFacebookLogUrl(item)
                     const postMeta = getSimpleStatusMeta(getPostLogTone(item), 'post', item.status)
                     const commentCountdownSeconds = getCommentCountdownSeconds(item, logNowMs)
                     const baseCommentMeta = getSimpleStatusMeta(getCommentLogTone(item.comment_status), 'comment', item.comment_status)
@@ -4235,11 +4794,11 @@ function App() {
                       ? `COMMENT ${formatCountdownClock(commentCountdownSeconds)}`
                       : 'COMMENT'
                     const isExpanded = expandedLogId === item.id
-                    const postActor = String(item.post_profile_name || item.post_profile_id || item.post_token_hint || '').trim() || '-'
-                    const commentActor = String(item.comment_profile_name || item.comment_profile_id || item.comment_token_hint || '').trim() || '-'
                     const triggerSource = String(item.trigger_source || '').trim().toLowerCase()
                     const triggerSourceLabel = triggerSource === 'force_post'
                       ? 'FORCE_POST'
+                      : triggerSource === 'retry_post'
+                        ? 'REPOST'
                       : triggerSource === 'cron'
                         ? 'CRON'
                         : triggerSource === 'queue'
@@ -4247,6 +4806,8 @@ function App() {
                           : '-'
                     const triggerSourceCls = triggerSource === 'force_post'
                       ? 'bg-orange-50 text-orange-700'
+                      : triggerSource === 'retry_post'
+                        ? 'bg-amber-50 text-amber-700'
                       : triggerSource === 'cron'
                         ? 'bg-sky-50 text-sky-700'
                         : triggerSource === 'queue'
@@ -4254,6 +4815,7 @@ function App() {
                           : 'bg-gray-100 text-gray-500'
                     const showCommentError = item.comment_error && item.comment_error.trim().length > 0
                     const showPostError = item.error_message && item.error_message.trim().length > 0
+                    const canRetryPost = item.status !== 'posting' && deletingLogId !== item.id && retryingLogId !== item.id
 
                     return (
                       <div key={item.id} className="rounded-2xl border border-gray-100 bg-white shadow-sm">
@@ -4316,13 +4878,56 @@ function App() {
                               </a>
                             )}
                             <button
-                              disabled={deletingLogId === item.id}
+                              disabled={!canRetryPost}
+                              onClick={async (e) => {
+                                e.stopPropagation()
+                                if (!canRetryPost) return
+                                setRetryingLogId(item.id)
+                                try {
+                                  const resp = await apiFetch(`${WORKER_URL}/api/post-history/${item.id}/retry-post`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({}),
+                                  })
+                                  const data = await resp.json().catch(() => ({}))
+                                  if (!resp.ok) {
+                                    throw new Error(String(data?.details || data?.error || resp.status))
+                                  }
+                                  await refreshPostHistorySnapshot()
+                                  alert(data?.fb_reel_url
+                                    ? `โพสต์อีกครั้งสำเร็จ\n${data.fb_reel_url}`
+                                    : 'โพสต์อีกครั้งสำเร็จ')
+                                } catch (err) {
+                                  alert(err instanceof Error ? err.message : String(err))
+                                } finally {
+                                  setRetryingLogId(null)
+                                }
+                              }}
+                              className={`w-8 h-8 rounded-lg flex items-center justify-center active:scale-90 transition-transform ${
+                                canRetryPost ? 'bg-amber-50' : 'bg-gray-100 opacity-60'
+                              }`}
+                              title="โพสต์อีกครั้ง"
+                              aria-label="โพสต์อีกครั้ง"
+                            >
+                              {retryingLogId === item.id ? (
+                                <div className="w-3.5 h-3.5 border-2 border-amber-500 border-t-transparent rounded-full animate-spin" />
+                              ) : (
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={canRetryPost ? '#f59e0b' : '#94a3b8'} strokeWidth="2">
+                                  <path d="M3 12a9 9 0 0 1 15.3-6.3L21 8" strokeLinecap="round" strokeLinejoin="round" />
+                                  <path d="M21 3v5h-5" strokeLinecap="round" strokeLinejoin="round" />
+                                  <path d="M21 12a9 9 0 0 1-15.3 6.3L3 16" strokeLinecap="round" strokeLinejoin="round" />
+                                  <path d="M8 16H3v5" strokeLinecap="round" strokeLinejoin="round" />
+                                </svg>
+                              )}
+                            </button>
+                            <button
+                              disabled={deletingLogId === item.id || retryingLogId === item.id}
                               onClick={async (e) => {
                                 e.stopPropagation()
                                 setDeletingLogId(item.id)
                                 try {
                                   await apiFetch(`${WORKER_URL}/api/post-history/${item.id}`, { method: 'DELETE' })
-                                  setPostHistory(prev => prev.filter(h => h.id !== item.id))
+                                  await refreshPostHistorySnapshot()
                                 } finally {
                                   setDeletingLogId(null)
                                 }
@@ -4337,9 +4942,6 @@ function App() {
                                 </svg>
                               )}
                             </button>
-                            <div className="text-gray-400 text-xs w-5 text-center">
-                              {isExpanded ? '−' : '+'}
-                            </div>
                           </div>
                         </div>
 
@@ -4347,20 +4949,7 @@ function App() {
                           <div className="px-3 pb-3 pt-2 border-t border-gray-100 text-xs text-gray-500 space-y-2">
                             <p><span className="font-semibold text-gray-700">Source:</span> {triggerSourceLabel}</p>
                             <p><span className="font-semibold text-gray-700">โพสต์:</span> {postMeta.label}</p>
-                            <p><span className="font-semibold text-gray-700">โพสต์ด้วย:</span> {postActor}</p>
-                            <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์:</span> {commentMeta.label}</p>
-<<<<<<< HEAD
-                            <p><span className="font-semibold text-gray-700">คอมเม้นต์ด้วย:</span> {commentActor}</p>
-                            <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
-                            <p><span className="font-semibold text-gray-700">UTM Source:</span> {shortlinkUtmSource || '-'}</p>
-                            <p><span className="font-semibold text-gray-700">UTM ที่ตั้งค่า:</span> {shortlinkExpectedUtmId || '-'}</p>
-                            <p><span className="font-semibold text-gray-700">UTM ตรวจสอบ:</span> {shortlinkUtmMatchLabel}</p>
-                            <p><span className="font-semibold text-gray-700">ลิงก์ย่อ:</span> {shortlinkUtmSource ? 'ยืนยันแล้ว' : 'ไม่พบข้อมูล'}</p>
-                            <p><span className="font-semibold text-gray-700">สถานะย่อลิงก์:</span> {shortlinkStatusLabel}</p>
-                            <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ที่คอมเมนต์:</span> {item.shopee_link || '-'}</p>
-                            {item.shortlink_error && <p className="text-red-500"><span className="font-semibold text-red-600">Shortlink Error:</span> {item.shortlink_error}</p>}
-=======
                             <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ที่คอมเมนต์:</span> {item.shopee_link || '-'}</p>
                             {item.lazada_link && <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ Lazada ที่คอมเมนต์:</span> {item.lazada_link}</p>}
                             <div className="rounded-xl bg-blue-50/80 p-2.5 text-[11px] text-blue-900">
@@ -4391,11 +4980,11 @@ function App() {
                             </div>
                             <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>
                             <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                             {item.comment_fb_id && <p><span className="font-semibold text-gray-700">Comment ID:</span> {item.comment_fb_id}</p>}
                             {showCommentError && <p className="text-red-500"><span className="font-semibold text-red-600">คอมเม้นต์ผิดพลาด:</span> {item.comment_error}</p>}
                             {showPostError && <p className="text-red-500"><span className="font-semibold text-red-600">โพสต์ผิดพลาด:</span> {item.error_message}</p>}
-                            {item.fb_post_id && <p><span className="font-semibold text-gray-700">Video ID:</span> {item.fb_post_id}</p>}
+                            {item.fb_post_id && <p><span className="font-semibold text-gray-700">Facebook Post ID:</span> {item.fb_post_id}</p>}
+                            {item.fb_reel_url && <p className="break-all"><span className="font-semibold text-gray-700">Facebook Reel URL:</span> {buildFacebookLogUrl(item)}</p>}
                             <p><span className="font-semibold text-gray-700">Post History ID:</span> {item.id}</p>
                           </div>
                         )}
@@ -4618,17 +5207,6 @@ function App() {
                 )}
                 {isOwner && (
                   <SettingsMenuItem
-<<<<<<< HEAD
-                    icon="🔗"
-                    title="Shopee Shortlink"
-                    subtitle={shortlinkEnabled ? shortlinkBaseUrlCurrent : 'ยังไม่ตั้งค่า'}
-                    onClick={() => setSettingsSection('shortlink')}
-                  />
-                )}
-                {isOwner && (
-                  <SettingsMenuItem
-=======
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                     icon="🎙️"
                     title="Voice Prompt"
                     subtitle={voicePromptSource === 'custom' ? 'กำลังใช้ prompt แบบกำหนดเอง' : 'กำลังใช้ prompt ค่าเริ่มต้น'}
@@ -4662,13 +5240,8 @@ function App() {
                         ? 'Team'
                         : settingsSection === 'gemini'
                           ? 'Gemini API Key'
-<<<<<<< HEAD
-                          : settingsSection === 'shortlink'
-                            ? 'Shopee Shortlink'
-=======
                           : settingsSection === 'comment'
                             ? 'Comment Template'
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                             : 'Voice Prompt'}
                   </p>
                 </div>
@@ -4829,22 +5402,30 @@ function App() {
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ระบบจะย่อลิ้ง Shopee ก่อนคอมเมนต์ตอนโพสต์จริง โดยใช้ URL นี้แยกตาม workspace ของแต่ละ owner
+                        ใส่แค่ 3 ค่าให้ workspace นี้: account, Shopee UTM และ Lazada member_id
                       </p>
                       {shortlinkLoading ? (
                         <p className="text-sm text-gray-400 py-3">กำลังโหลด Shortlink URL...</p>
                       ) : (
                         <>
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-semibold text-gray-600">Shortlink account</p>
+                            <p className="text-[11px] text-gray-400">เช่น `CHEARB` หรือ `SIAMNEWS`</p>
+                          </div>
                           <input
-                            type="url"
-                            value={shortlinkBaseUrlDraft}
+                            type="text"
+                            value={shortlinkAccountDraft}
                             onChange={(e) => {
-                              setShortlinkBaseUrlDraft(e.target.value)
+                              setShortlinkAccountDraft(e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, ''))
                               if (shortlinkMessage) setShortlinkMessage('')
                             }}
-                            placeholder="https://chearb-shopee-shortlink.yokthanwa1993-bc9.workers.dev/"
+                            placeholder="CHEARB"
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-semibold text-gray-600">Shopee expected UTM ID</p>
+                            <p className="text-[11px] text-gray-400">ใส่เฉพาะตัวเลข เช่น `15130770000`</p>
+                          </div>
                           <input
                             type="text"
                             inputMode="numeric"
@@ -4856,43 +5437,25 @@ function App() {
                             placeholder="15130770000"
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
-                          <p className="text-[11px] text-gray-500 break-all">
-                            URL ปัจจุบัน: {shortlinkBaseUrlCurrent || '-'}
-                          </p>
-                          <p className="text-[11px] text-gray-500 break-all">
-                            UTM ID ปัจจุบัน: {shortlinkExpectedUtmIdCurrent || '-'}
-                          </p>
-                          <p className="text-[11px] text-gray-500">
-                            ใส่เฉพาะตัวเลข เช่น 15130770000 ระบบจะเช็คกับค่า `an_15130770000`
-                          </p>
-                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 flex items-center justify-between gap-2">
-                            <div className="min-w-0">
-                              <p className="text-xs font-semibold text-gray-800">บังคับย่อลิงก์ก่อนโพสต์</p>
-                              <p className="text-[11px] text-gray-500">
-                                {shortlinkRequired ? 'เปิด: ย่อไม่ผ่านจะไม่โพสต์' : 'ปิด: ย่อไม่ผ่านยังโพสต์ได้'}
-                              </p>
-                            </div>
-                            <button
-                              onClick={() => {
-                                if (shortlinkRequirementSaving) return
-                                void saveShortlinkRequirement(!shortlinkRequired)
-                              }}
-                              disabled={shortlinkRequirementSaving}
-                              className={`relative inline-flex h-6 w-11 rounded-full transition-colors overflow-hidden ${shortlinkRequired ? 'bg-blue-500' : 'bg-gray-300'} ${shortlinkRequirementSaving ? 'opacity-50' : ''}`}
-                              aria-label="สลับบังคับย่อลิงก์"
-                            >
-                              <span
-                                className={`absolute left-0.5 top-0.5 h-5 w-5 bg-white rounded-full shadow transition-transform ${shortlinkRequired ? 'translate-x-5' : 'translate-x-0'}`}
-                              />
-                            </button>
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-semibold text-gray-600">Lazada expected member_id</p>
+                            <p className="text-[11px] text-gray-400">ใส่ member_id ของ Lazada เช่น `199431090`</p>
                           </div>
-                          <div className="flex items-center justify-between text-[11px] text-gray-400">
-                            <span>สถานะ: {shortlinkEnabled ? 'เปิดใช้งาน' : 'ปิดใช้งาน'}</span>
-                            <span>{shortlinkBaseUrlDraft.length}/{shortlinkMaxChars}</span>
-                          </div>
-                          <div className="flex items-center justify-between text-[11px] text-gray-400">
-                            <span>UTM ID</span>
-                            <span>{shortlinkExpectedUtmIdDraft.length}/{shortlinkExpectedUtmIdMaxChars}</span>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={lazadaExpectedMemberIdDraft}
+                            onChange={(e) => {
+                              setLazadaExpectedMemberIdDraft(e.target.value.replace(/[^\d]/g, ''))
+                              if (shortlinkMessage) setShortlinkMessage('')
+                            }}
+                            placeholder="199431090"
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                          />
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
+                            <p>Account ปัจจุบัน: <span className="font-semibold text-gray-700">{shortlinkAccountCurrent || '-'}</span></p>
+                            <p>Shopee UTM ปัจจุบัน: <span className="font-semibold text-gray-700">{shortlinkExpectedUtmIdCurrent || '-'}</span></p>
+                            <p>Lazada member_id ปัจจุบัน: <span className="font-semibold text-gray-700">{lazadaExpectedMemberIdCurrent || '-'}</span></p>
                           </div>
                           {shortlinkUpdatedAt && (
                             <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(shortlinkUpdatedAt).toLocaleString()}</p>
@@ -4907,16 +5470,18 @@ function App() {
                               onClick={() => {
                                 if (
                                   shortlinkSaving ||
-                                  shortlinkBaseUrlDraft.length > shortlinkMaxChars ||
-                                  shortlinkExpectedUtmIdDraft.length > shortlinkExpectedUtmIdMaxChars
+                                  shortlinkAccountDraft.length > shortlinkAccountMaxChars ||
+                                  shortlinkExpectedUtmIdDraft.length > shortlinkExpectedUtmIdMaxChars ||
+                                  lazadaExpectedMemberIdDraft.length > lazadaExpectedMemberIdMaxChars
                                 ) return
-                                void saveShortlinkSettings(shortlinkBaseUrlDraft)
+                                void saveShortlinkSettings(shortlinkAccountDraft)
                               }}
                               disabled={
                                 shortlinkSaving ||
-                                shortlinkBaseUrlDraft.length > shortlinkMaxChars ||
+                                shortlinkAccountDraft.length > shortlinkAccountMaxChars ||
                                 shortlinkExpectedUtmIdDraft.length > shortlinkExpectedUtmIdMaxChars ||
-                                (!shortlinkBaseUrlDraft.trim() && !shortlinkExpectedUtmIdDraft.trim())
+                                lazadaExpectedMemberIdDraft.length > lazadaExpectedMemberIdMaxChars ||
+                                (!shortlinkAccountDraft.trim() && !shortlinkExpectedUtmIdDraft.trim() && !lazadaExpectedMemberIdDraft.trim())
                               }
                               className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
                             >
@@ -4927,7 +5492,7 @@ function App() {
                                 if (shortlinkSaving) return
                                 void saveShortlinkSettings('')
                               }}
-                              disabled={shortlinkSaving || (!shortlinkEnabled && !shortlinkExpectedUtmIdCurrent)}
+                              disabled={shortlinkSaving || (!shortlinkEnabled && !shortlinkExpectedUtmIdCurrent && !lazadaExpectedMemberIdCurrent && !shortlinkAccountCurrent)}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               ล้างค่า

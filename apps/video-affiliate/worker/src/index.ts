@@ -6,11 +6,8 @@ import { Buffer as NodeBuffer } from 'node:buffer'
 import { BotBucket } from './utils/botBucket'
 import {
     deleteGalleryIndexEntry,
-<<<<<<< HEAD
-=======
     ensureGalleryIndexTable,
     getVideoOriginalUrlForNamespace,
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
     getGalleryIndexSummary,
     listGalleryIndexVideos,
     listGalleryIndexVideosMissingThumbnails,
@@ -96,12 +93,10 @@ const app = new Hono<{ Bindings: Env, Variables: { botId: string; bucket: R2Buck
 const MAX_VOICE_PROMPT_CHARS = 12000
 const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_SHORTLINK_BASE_URL_CHARS = 512
+const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
-<<<<<<< HEAD
-=======
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
 // CORS
 app.use('*', async (c, next) => {
@@ -539,8 +534,6 @@ function buildScopedWebAppUrl(baseUrl: string, botScope: string) {
     }
 }
 
-<<<<<<< HEAD
-=======
 function buildScopedGalleryWebAppUrl(baseUrl: string, botScope: string, store: 'shopee' | 'lazada', videoId?: string) {
     const scopedBaseUrl = buildScopedWebAppUrl(baseUrl, botScope)
     try {
@@ -586,7 +579,6 @@ function buildScopedTabWebAppUrl(baseUrl: string, botScope: string, tab: string,
     }
 }
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 // Push sync from BrowserSaving after tag updates.
 // Default mode is metadata-only (no heavy Graph calls).
 app.post('/api/pages/tag-sync', async (c) => {
@@ -728,8 +720,6 @@ app.post('/api/pages/profile-sync', async (c) => {
     }
 })
 
-<<<<<<< HEAD
-=======
 app.post('/api/pages/profile-token-health', async (c) => {
     return c.json({ error: 'direct_page_management_only' }, 410)
     let body: any = {}
@@ -878,7 +868,6 @@ app.post('/api/pages/profile-token-health', async (c) => {
     })
 })
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 // TEMP MIGRATION ENDPOINT
 app.get('/api/migrate-bucket-back', async (c) => {
     const fromPrefix = c.req.query('from') || '8328894625/'
@@ -1030,10 +1019,15 @@ function hasGalleryVideoThumbnail(video: Record<string, unknown> | null | undefi
 }
 
 function pickPreferredSystemGalleryVideo(current: Record<string, unknown>, next: Record<string, unknown>): Record<string, unknown> {
-    const currentHasLink = !!normalizeMetaShopeeLink(current)
-    const nextHasLink = !!normalizeMetaShopeeLink(next)
-    if (currentHasLink !== nextHasLink) {
-        return nextHasLink ? next : current
+    const getCommerceRank = (video: Record<string, unknown>) => {
+        if (normalizeMetaLazadaLink(video)) return 2
+        if (normalizeMetaShopeeLink(video)) return 1
+        return 0
+    }
+    const currentLinkRank = getCommerceRank(current)
+    const nextLinkRank = getCommerceRank(next)
+    if (currentLinkRank !== nextLinkRank) {
+        return nextLinkRank > currentLinkRank ? next : current
     }
 
     const currentHasThumbnail = hasGalleryVideoThumbnail(current)
@@ -1186,6 +1180,35 @@ function hasShopeeLinkInMeta(meta: Record<string, unknown>): boolean {
     return !!normalizeMetaShopeeLink(meta)
 }
 
+function hasLazadaLinkInMeta(meta: Record<string, unknown>): boolean {
+    return !!normalizeMetaLazadaLink(meta)
+}
+
+function hasAffiliateLinkInMeta(meta: Record<string, unknown>): boolean {
+    return hasShopeeLinkInMeta(meta) || hasLazadaLinkInMeta(meta)
+}
+
+function normalizeGallerySearchQuery(value: string | null | undefined): string {
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+function matchesGallerySearchQuery(video: Record<string, unknown>, query: string): boolean {
+    const needle = normalizeGallerySearchQuery(query)
+    if (!needle) return true
+
+    const haystacks = [
+        video.id,
+        video.video_id,
+        video.title,
+        video.script,
+        video.category,
+        video.owner_email,
+        video.namespace_id,
+    ]
+
+    return haystacks.some((value) => normalizeGallerySearchQuery(String(value || '')).includes(needle))
+}
+
 function parseNonNegativeInt(value: string | null | undefined, fallback: number): number {
     const parsed = Number.parseInt(String(value || '').trim(), 10)
     if (!Number.isFinite(parsed) || parsed < 0) return fallback
@@ -1314,16 +1337,14 @@ async function pickRandomGalleryVideoForPosting(params: {
 }): Promise<{ id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId: string } | null> {
     const namespaceId = String(params.namespaceId || '').trim() || 'default'
     const candidateIds = uniqueVideoIds(params.candidateIds).filter((id) => !params.excludedVideoIds.has(id))
-    if (candidateIds.length === 0 && params.excludedVideoIds.size === 0) return null
+    if (candidateIds.length === 0) return null
+    const allowedIds = new Set(candidateIds)
 
-    if (await isSystemGalleryEnabledForNamespace(params.env.DB, namespaceId)) {
-        const systemPicked = await pickRandomPostableVideoFromSystem(params.env, params.excludedVideoIds)
-        if (systemPicked) return systemPicked
+    const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(params.env.DB, namespaceId)
+    if (!shortlinkEnabled) {
+        return null
     }
 
-<<<<<<< HEAD
-    return pickRandomPostableVideoFromNamespaceGallery(params.bucket, candidateIds, namespaceId)
-=======
     const galleryVideos = await listNamespaceGalleryVideos(params.env, namespaceId)
     const candidates = galleryVideos.filter((video) => {
         const id = String(video?.id || '').trim()
@@ -1456,7 +1477,6 @@ async function resolveGalleryVideoForRepost(params: {
     }
 
     return null
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 }
 
 function getVideoPublicUrlForNamespace(r2BaseUrl: string, namespaceId: string, videoId: string): string {
@@ -1473,18 +1493,12 @@ function getVideoThumbnailUrlForNamespace(r2BaseUrl: string, namespaceId: string
 
 async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
-<<<<<<< HEAD
-    if (!normalizedNamespaceId) return false
-    const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(db, normalizedNamespaceId)
-    return !!String(baseUrl || '').trim()
-=======
     void db
     return !!normalizedNamespaceId
 }
 
 function isUnifiedGalleryEnabled(): boolean {
     return true
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 }
 
 async function getNamespaceOwnerEmailMap(db: D1Database): Promise<Map<string, string>> {
@@ -1575,8 +1589,6 @@ async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string,
     return deduped
 }
 
-<<<<<<< HEAD
-=======
 async function ensureNamespaceVideoStateTable(db: D1Database): Promise<void> {
     await db.prepare(
         `CREATE TABLE IF NOT EXISTS namespace_video_state (
@@ -1745,7 +1757,6 @@ async function clearNamespaceVideoState(db: D1Database, namespaceId: string): Pr
     await db.prepare('DELETE FROM namespace_video_state WHERE namespace_id = ?').bind(normalizedNamespaceId).run()
 }
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 async function getOwnerLinkedSystemGalleryVideos(env: Env): Promise<Array<Record<string, unknown>>> {
     const indexedVideos = await listGalleryIndexVideos(env.DB, { onlyOwnerLinked: true }).catch(() => [])
     if (indexedVideos.length > 0) {
@@ -1791,6 +1802,7 @@ async function getOwnerLinkedSystemGalleryVideos(env: Env): Promise<Array<Record
                 title: '',
                 category: '',
                 shopeeLink: '',
+                lazadaLink: '',
                 originalUrl,
                 publicUrl: originalUrl,
                 createdAt: uploadedAt,
@@ -2258,6 +2270,26 @@ app.post('/admin/api/gallery/index/rebuild', async (c) => {
     return c.json({ ok: true, ...result })
 })
 
+app.post('/admin/api/affiliate-conversion/run', async (c) => {
+    await processPendingAffiliateConversions(c.env)
+    const result = await rebuildGalleryIndexFromR2(c.env)
+    await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+    await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+    return c.json({ ok: true, ...result })
+})
+
+app.post('/admin/api/scheduled/run', async (c) => {
+    try {
+        await watchdogStuckJobs(c.env)
+        await handleScheduled(c.env)
+        return c.json({ ok: true, ran_at: new Date().toISOString() })
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[ADMIN-SCHEDULED] failed: ${message}`)
+        return c.json({ ok: false, error: message }, 500)
+    }
+})
+
 app.post('/admin/api/gallery/thumbnails/backfill', async (c) => {
     const body = await c.req.json().catch(() => ({})) as { limit?: number }
     const limit = Math.min(Math.max(Number(body.limit || 12), 1), 50)
@@ -2402,11 +2434,7 @@ app.post('/admin/api/comments/retry', async (c) => {
                 results.push({ id: historyId, ok: false, error: err })
                 continue
             }
-<<<<<<< HEAD
-            const shortShopeeLink = await shortenShopeeLinkForNamespace({
-=======
             const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 env: c.env,
                 namespaceId: botId,
                 shopeeLink,
@@ -2418,10 +2446,7 @@ app.post('/admin/api/comments/retry', async (c) => {
                 namespaceId: botId,
                 fbVideoId: targetId,
                 shopeeLink: shortShopeeLink,
-<<<<<<< HEAD
-=======
                 lazadaLink: String(row.lazada_link || '').trim(),
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 commentToken,
                 pageId,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
@@ -3126,8 +3151,10 @@ app.get('/api/settings/shopee-shortlink', async (c) => {
     const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
     return c.json({
         ...settings,
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
         max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
         max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
     })
 })
 
@@ -3136,15 +3163,33 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
     if (!ownerCheck.ok) return ownerCheck.response
 
     const body = await c.req.json().catch(() => ({})) as {
+        account?: string
+        accountName?: string
         base_url?: string
         baseUrl?: string
+        lazada_base_url?: string
+        lazadaBaseUrl?: string
         expected_utm_id?: string
         expectedUtmId?: string
+        lazada_expected_member_id?: string
+        lazadaExpectedMemberId?: string
     }
+    const hasAccount = Object.prototype.hasOwnProperty.call(body, 'account') || Object.prototype.hasOwnProperty.call(body, 'accountName')
     const hasBaseUrl = Object.prototype.hasOwnProperty.call(body, 'base_url') || Object.prototype.hasOwnProperty.call(body, 'baseUrl')
+    const hasLazadaBaseUrl = Object.prototype.hasOwnProperty.call(body, 'lazada_base_url') || Object.prototype.hasOwnProperty.call(body, 'lazadaBaseUrl')
     const hasExpectedUtmId = Object.prototype.hasOwnProperty.call(body, 'expected_utm_id') || Object.prototype.hasOwnProperty.call(body, 'expectedUtmId')
-    if (!hasBaseUrl && !hasExpectedUtmId) {
+    const hasLazadaExpectedMemberId = Object.prototype.hasOwnProperty.call(body, 'lazada_expected_member_id') || Object.prototype.hasOwnProperty.call(body, 'lazadaExpectedMemberId')
+    if (!hasAccount && !hasBaseUrl && !hasLazadaBaseUrl && !hasExpectedUtmId && !hasLazadaExpectedMemberId) {
         return c.json({ error: 'Shortlink settings payload is required' }, 400)
+    }
+
+    const accountInput = String(hasAccount ? (body.account ?? body.accountName ?? '') : '').trim()
+    if (accountInput.length > MAX_SHORTLINK_ACCOUNT_CHARS) {
+        return c.json({ error: `Shortlink account too long (max ${MAX_SHORTLINK_ACCOUNT_CHARS} chars)` }, 400)
+    }
+    const normalizedAccount = accountInput ? normalizeShortlinkAccount(accountInput) : ''
+    if (accountInput && !normalizedAccount) {
+        return c.json({ error: 'Shortlink account ใช้ได้เฉพาะ A-Z, 0-9, _ และ - เช่น CHEARB' }, 400)
     }
 
     const baseUrl = String(hasBaseUrl ? (body.base_url ?? body.baseUrl ?? '') : '').trim()
@@ -3153,6 +3198,13 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
     }
     const normalizedBaseUrl = baseUrl ? normalizeShortlinkBaseUrl(baseUrl) : ''
     if (baseUrl && !normalizedBaseUrl) return c.json({ error: 'Shortlink base URL is invalid' }, 400)
+
+    const lazadaBaseUrl = String(hasLazadaBaseUrl ? (body.lazada_base_url ?? body.lazadaBaseUrl ?? '') : '').trim()
+    if (lazadaBaseUrl.length > MAX_SHORTLINK_BASE_URL_CHARS) {
+        return c.json({ error: `Lazada shortlink base URL too long (max ${MAX_SHORTLINK_BASE_URL_CHARS} chars)` }, 400)
+    }
+    const normalizedLazadaBaseUrl = lazadaBaseUrl ? normalizeShortlinkBaseUrl(lazadaBaseUrl) : ''
+    if (lazadaBaseUrl && !normalizedLazadaBaseUrl) return c.json({ error: 'Lazada shortlink base URL is invalid' }, 400)
 
     const expectedUtmIdInput = String(hasExpectedUtmId ? (body.expected_utm_id ?? body.expectedUtmId ?? '') : '').trim()
     if (expectedUtmIdInput.length > MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS) {
@@ -3163,19 +3215,45 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
         return c.json({ error: 'Expected UTM ID must be digits only เช่น 15130770000' }, 400)
     }
 
+    const lazadaExpectedMemberIdInput = String(hasLazadaExpectedMemberId ? (body.lazada_expected_member_id ?? body.lazadaExpectedMemberId ?? '') : '').trim()
+    if (lazadaExpectedMemberIdInput.length > MAX_LAZADA_MEMBER_ID_CHARS) {
+        return c.json({ error: `Lazada member_id too long (max ${MAX_LAZADA_MEMBER_ID_CHARS} chars)` }, 400)
+    }
+    const normalizedLazadaExpectedMemberId = lazadaExpectedMemberIdInput ? normalizeLazadaMemberId(lazadaExpectedMemberIdInput) : ''
+    if (lazadaExpectedMemberIdInput && !normalizedLazadaExpectedMemberId) {
+        return c.json({ error: 'Lazada member_id must be digits only เช่น 199431090' }, 400)
+    }
+
     const namespaceId = c.get('botId')
+    if (hasAccount) {
+        await setNamespaceAffiliateShortlinkAccount(c.env.DB, namespaceId, normalizedAccount)
+        if (!hasBaseUrl) {
+            await setNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId, '')
+        }
+        if (!hasLazadaBaseUrl) {
+            await setNamespaceLazadaShortlinkBaseUrl(c.env.DB, namespaceId, '')
+        }
+    }
     if (hasBaseUrl) {
         await setNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId, normalizedBaseUrl)
     }
+    if (hasLazadaBaseUrl) {
+        await setNamespaceLazadaShortlinkBaseUrl(c.env.DB, namespaceId, normalizedLazadaBaseUrl)
+    }
     if (hasExpectedUtmId) {
         await setNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, namespaceId, normalizedExpectedUtmId)
+    }
+    if (hasLazadaExpectedMemberId) {
+        await setNamespaceLazadaExpectedMemberId(c.env.DB, namespaceId, normalizedLazadaExpectedMemberId)
     }
     const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
         max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
         max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
     })
 })
 
@@ -3191,8 +3269,10 @@ app.put('/api/settings/shopee-shortlink/requirement', async (c) => {
     return c.json({
         ok: true,
         ...settings,
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
         max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
         max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
     })
 })
 
@@ -3201,15 +3281,21 @@ app.delete('/api/settings/shopee-shortlink', async (c) => {
     if (!ownerCheck.ok) return ownerCheck.response
 
     const namespaceId = c.get('botId')
+    await setNamespaceAffiliateShortlinkAccount(c.env.DB, namespaceId, '')
     await setNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId, '')
+    await setNamespaceLazadaShortlinkBaseUrl(c.env.DB, namespaceId, '')
     await setNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId, false)
     await setNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, namespaceId, '')
+    await setNamespaceLazadaExpectedMemberId(c.env.DB, namespaceId, '')
+    await clearNamespaceVideoState(c.env.DB, namespaceId)
     const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
         max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
         max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
     })
 })
 
@@ -3610,8 +3696,6 @@ app.post('/api/telegram/:token?', async (c) => {
 
         const pendingCategoryKey = `_pending_category/${chatId}.json`
         const waitingVideoKey = `_waiting_video/${chatId}.json`
-<<<<<<< HEAD
-=======
         type WaitingVideoState = {
             id: string
             videoUrl: string
@@ -3620,14 +3704,11 @@ app.post('/api/telegram/:token?', async (c) => {
             shopeeLink?: string
             lazadaLink?: string
         }
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const extractShopeeLink = (input: string): string => {
             const raw = String(input || '')
             const match = raw.match(/https?:\/\/\S*shopee\S+/i) || raw.match(/https?:\/\/shope\.ee\S+/i)
             return String(match?.[0] || '').trim()
         }
-<<<<<<< HEAD
-=======
         const extractLazadaLink = (input: string): string => {
             const raw = String(input || '')
             const match = raw.match(/https?:\/\/\S*(?:lazada|lzd\.co)\S+/i)
@@ -3775,7 +3856,6 @@ app.post('/api/telegram/:token?', async (c) => {
                 },
             })
         }
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         const CATEGORIES = await getCategories(c.get('bucket'))
 
@@ -3811,81 +3891,6 @@ app.post('/api/telegram/:token?', async (c) => {
             return c.text('ok')
         }
 
-<<<<<<< HEAD
-        const handleExecution = async (shopeeLink: string) => {
-            const normalizedShopeeLink = String(shopeeLink || '').trim()
-            if (!normalizedShopeeLink) return false
-            const waitingVideoStr = await c.get('bucket').get(waitingVideoKey)
-            if (waitingVideoStr) {
-                const { videoUrl } = await waitingVideoStr.json() as { videoUrl: string }
-                await c.get('bucket').delete(waitingVideoKey)
-
-                const videoId = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
-
-                // เช็คว่ามี pipeline กำลังรันอยู่ไหม (ข้าม status: failed)
-                const processingList = await c.get('bucket').list({ prefix: '_processing/' })
-                let isRunning = false
-                for (const obj of processingList.objects) {
-                    const file = await c.get('bucket').get(obj.key)
-                    if (!file) continue
-                    const data = await file.json() as any
-                    if (data.status !== 'failed') { isRunning = true; break }
-                }
-
-                if (isRunning) {
-                    // มีอันกำลังทำอยู่ → เข้าคิวรอ
-                    await c.get('bucket').put(`_queue/${videoId}.json`, JSON.stringify({
-                        id: videoId,
-                        videoUrl,
-                        shopeeLink: normalizedShopeeLink,
-                        chatId,
-                        createdAt: new Date().toISOString(),
-                        status: 'queued'
-                    }), {
-                        httpMetadata: { contentType: 'application/json' },
-                    })
-                    await sendTelegram(token, 'sendMessage', {
-                        chat_id: chatId,
-                        text: 'กำลังประมวลผลวีดีโอ ✅',
-                    })
-                } else {
-                    // ไม่มีอันกำลังทำ → เริ่มเลย
-                    await c.get('bucket').put(`_processing/${videoId}.json`, JSON.stringify({
-                        id: videoId,
-                        videoUrl,
-                        shopeeLink: normalizedShopeeLink,
-                        chatId,
-                        createdAt: new Date().toISOString(),
-                        status: 'processing'
-                    }), {
-                        httpMetadata: { contentType: 'application/json' },
-                    })
-                    await sendTelegram(token, 'sendMessage', {
-                        chat_id: chatId,
-                        text: 'กำลังประมวลผลวีดีโอ ✅',
-                    })
-                    c.executionCtx.waitUntil(runPipeline(c.env, videoUrl, chatId, 0, videoId, c.get('botId'), normalizedShopeeLink))
-                }
-
-                await recordLinkSubmission({
-                    db: c.env.DB,
-                    namespaceId: c.get('botId'),
-                    telegramId: String(chatId),
-                    videoId,
-                    shopeeLink: normalizedShopeeLink,
-                }).catch((e) => {
-                    console.error(`[DASHBOARD] failed to record link submission: ${e instanceof Error ? e.message : String(e)}`)
-                })
-                await c.get('bucket').put(dedupKey, 'processing')
-                return true
-            }
-            return false
-        }
-
-        // Helper สำหรับรวมการเซฟวิดีโอที่รอลิงก์ Shopee
-        const handleVideoInput = async (videoUrl: string, immediateShopeeLink?: string) => {
-            const hasWaitingVideo = await c.get('bucket').head(waitingVideoKey)
-=======
         // Helper สำหรับรวมการเซฟวิดีโอที่รอลิงก์ affiliate links
         const handleVideoInput = async (
             videoUrl: string,
@@ -3966,31 +3971,15 @@ app.post('/api/telegram/:token?', async (c) => {
             }
 
             const hasWaitingVideo = await getWaitingVideoState()
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             if (hasWaitingVideo) {
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
-                    text: '❌ ยังมีวิดีโอที่รอลิงก์ Shopee อยู่ 1 รายการ\nกรุณาส่งลิงก์ของคลิปก่อนหน้าให้ครบก่อน',
+                    text: '❌ ยังมีวิดีโอที่รอลิงก์ค้างอยู่ 1 รายการ\nกรุณาส่งลิงก์ Shopee และ Lazada ของคลิปก่อนหน้าให้ครบก่อน',
                 })
                 await c.get('bucket').put(dedupKey, 'processing')
                 return
             }
 
-<<<<<<< HEAD
-            await c.get('bucket').put(waitingVideoKey, JSON.stringify({ videoUrl }), {
-                httpMetadata: { contentType: 'application/json' },
-            })
-
-            if (immediateShopeeLink) {
-                const executed = await handleExecution(immediateShopeeLink)
-                if (executed) return
-            }
-
-            await sendTelegram(token, 'sendMessage', {
-                chat_id: chatId,
-                text: 'ส่งลิ้ง Shopee ของคลิปนี้มาเลย 🛒',
-            })
-=======
             const inboxItem = await upsertInboxFromWaitingState(waitingState)
 
             if (inboxItem.status === 'ready') {
@@ -4010,7 +3999,6 @@ app.post('/api/telegram/:token?', async (c) => {
 
             await saveWaitingVideoState(waitingState)
             await promptWaitingLink(waitingState)
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             await c.get('bucket').put(dedupKey, 'processing')
         }
 
@@ -4023,15 +4011,11 @@ app.post('/api/telegram/:token?', async (c) => {
             if (fileInfo.ok && fileInfo.result) {
                 const videoUrl = `https://api.telegram.org/file/bot${token}/${fileInfo.result.file_path}`
                 const shopeeFromCaption = extractShopeeLink(msg.caption || '')
-<<<<<<< HEAD
-                await handleVideoInput(videoUrl, shopeeFromCaption || undefined)
-=======
                 const lazadaFromCaption = extractLazadaLink(msg.caption || '')
                 await handleVideoInput(videoUrl, 'telegram_video', 'Telegram video', {
                     shopeeLink: shopeeFromCaption || undefined,
                     lazadaLink: lazadaFromCaption || undefined,
                 })
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             }
             return c.text('ok')
         }
@@ -4040,26 +4024,14 @@ app.post('/api/telegram/:token?', async (c) => {
         const xhsMatch = text.match(/https?:\/\/(xhslink\.com|www\.xiaohongshu\.com)\S+/)
         if (xhsMatch) {
             const videoUrl = xhsMatch[0]
-<<<<<<< HEAD
-            await handleVideoInput(videoUrl)
-=======
             await handleVideoInput(videoUrl, 'xhs_url', videoUrl, {
                 shopeeLink: extractShopeeLink(text) || undefined,
                 lazadaLink: extractLazadaLink(text) || undefined,
             })
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             return c.text('ok')
         }
 
-        // กรณีส่ง Shopee link 
         const shopeeLink = extractShopeeLink(text)
-<<<<<<< HEAD
-        if (shopeeLink) {
-
-            // ถ้ารอวิดีโออยู่ แล้วส่ง Shopee Link -> สั่งทำ Pipeline หักเข้า Background
-            const executed = await handleExecution(shopeeLink)
-            if (executed) return c.text('ok')
-=======
         const lazadaLink = extractLazadaLink(text)
         if (shopeeLink || lazadaLink) {
             const waitingState = await getWaitingVideoState()
@@ -4093,10 +4065,9 @@ app.post('/api/telegram/:token?', async (c) => {
                 await c.get('bucket').put(dedupKey, 'processing')
                 return c.text('ok')
             }
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
-                text: '❌ ไม่มีวิดีโอที่รอลิงก์ Shopee\n\nส่งวิดีโอหรือลิงก์ XHS มาก่อน',
+                text: '❌ ไม่มีวิดีโอที่รอลิงก์ Shopee/Lazada\n\nส่งวิดีโอหรือลิงก์ XHS มาก่อน',
             })
             await c.get('bucket').put(dedupKey, 'processing')
             return c.text('ok')
@@ -4105,7 +4076,7 @@ app.post('/api/telegram/:token?', async (c) => {
         if (text === '/skip') {
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
-                text: '❌ ปิดคำสั่ง /skip แล้ว\nทุกคลิปต้องมี Shopee link ก่อนเริ่มประมวลผล',
+                text: '❌ ปิดคำสั่ง /skip แล้ว\nทุกคลิปต้องมี Shopee และ Lazada link ก่อนเริ่มประมวลผล',
             })
             return c.text('ok')
         }
@@ -4114,18 +4085,21 @@ app.post('/api/telegram/:token?', async (c) => {
         if (text === '/start') {
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
-                text: '👋 สวัสดี! ส่งลิงก์วิดีโอจาก Xiaohongshu หรืออัพโหลดวิดีโอมาเลย',
+                text: '👋 สวัสดี! ส่งลิงก์วิดีโอจาก Xiaohongshu หรืออัพโหลดวิดีโอมาเลย เดี๋ยวระบบจะถามทั้งลิงก์ Shopee และ Lazada ต่อให้',
             })
             return c.text('ok')
         }
 
         // ข้อความอื่น
         if (text.trim()) {
-            const hasPending = await c.get('bucket').head(waitingVideoKey)
-            if (hasPending) {
+            const pendingState = await getWaitingVideoState()
+            if (pendingState) {
+                const missing = getMissingWaitingLink(pendingState)
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
-                    text: '❌ ลิงก์ Shopee ไม่ถูกต้อง\n\nส่งลิงก์ที่ขึ้นต้นด้วย https://s.shopee.co.th/... หรือ https://shopee.co.th/...',
+                    text: missing === 'lazada'
+                        ? '❌ ลิงก์ Lazada ไม่ถูกต้อง\n\nส่งลิงก์ที่ขึ้นต้นด้วย https://s.lazada.co.th/... หรือ https://www.lazada...'
+                        : '❌ ลิงก์ Shopee ไม่ถูกต้อง\n\nส่งลิงก์ที่ขึ้นต้นด้วย https://s.shopee.co.th/... หรือ https://shopee.co.th/...',
                 })
             } else {
                 await sendTelegram(token, 'sendMessage', {
@@ -4711,7 +4685,10 @@ async function ensureInboxVideoProcessingStarted(params: {
 
 app.get('/api/processing', async (c) => {
     try {
-        const list = await c.get('bucket').list({ prefix: '_processing/' })
+        const [list, pendingShortlinkVideos] = await Promise.all([
+            c.get('bucket').list({ prefix: '_processing/' }),
+            listVideosAwaitingAffiliateConversion(c.env, String(c.get('botId') || '').trim(), { systemWide: true }),
+        ])
         const prefix = '_processing/'
         const tasks = await Promise.all(
             list.objects.map(async obj => {
@@ -4756,7 +4733,7 @@ app.get('/api/processing', async (c) => {
             const bt = new Date(String(b.createdAt || '')).getTime()
             return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
         })
-        return c.json({ videos }, 200, { 'Cache-Control': 'no-store' })
+        return c.json({ videos, pending_shortlink_videos: pendingShortlinkVideos }, 200, { 'Cache-Control': 'no-store' })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
     }
@@ -4850,6 +4827,7 @@ app.post('/api/processing/:id/reprocess', async (c) => {
             id?: string
             videoUrl?: string
             shopeeLink?: string
+            lazadaLink?: string
             chatId?: number
             retryCount?: number
         }
@@ -4864,6 +4842,7 @@ app.post('/api/processing/:id/reprocess', async (c) => {
             id,
             videoUrl,
             shopeeLink: String(job.shopeeLink || '').trim(),
+            lazadaLink: String(job.lazadaLink || '').trim(),
             chatId,
             createdAt: new Date().toISOString(),
             status: 'queued',
@@ -4907,15 +4886,49 @@ app.get('/api/stats', async (c) => {
 // Refresh gallery cache for a specific video (called by container after pipeline completes)
 app.post('/api/gallery/refresh/:id', async (c) => {
     try {
-        await updateGalleryCache(c.get('bucket'), c.req.param('id'))
-        await syncGalleryIndexEntry(c.env, String(c.get('botId') || ''), c.req.param('id')).catch((error) => {
-            console.log(`[GALLERY-REFRESH] sync gallery index failed video=${c.req.param('id')}: ${error instanceof Error ? error.message : String(error)}`)
+        const videoId = String(c.req.param('id') || '').trim()
+        const namespaceId = String(c.get('botId') || '').trim()
+        const linkContextObj = await c.get('bucket').get(`_link_context/${videoId}.json`)
+        const linkContext = linkContextObj
+            ? await linkContextObj.json() as { chatId?: number; shopeeLink?: string; lazadaLink?: string }
+            : null
+
+        if (videoId && linkContext) {
+            const metaObj = await c.get('bucket').get(`videos/${videoId}.json`)
+            if (metaObj) {
+                const meta = await metaObj.json() as Record<string, unknown>
+                const shopeeLink = String(linkContext.shopeeLink || '').trim()
+                const lazadaLink = String(linkContext.lazadaLink || '').trim()
+                let changed = false
+                if (shopeeLink && !normalizeMetaShopeeLink(meta)) {
+                    meta.shopeeLink = shopeeLink
+                    if (!String(meta.linkSubmittedAt || '').trim()) {
+                        meta.linkSubmittedAt = new Date().toISOString()
+                    }
+                    changed = true
+                }
+                if (lazadaLink && !normalizeMetaLazadaLink(meta)) {
+                    meta.lazadaLink = lazadaLink
+                    changed = true
+                }
+                if (changed) {
+                    meta.id = String(meta.id || videoId).trim() || videoId
+                    meta.namespace_id = String(meta.namespace_id || namespaceId).trim() || namespaceId
+                    meta.updatedAt = new Date().toISOString()
+                    await c.get('bucket').put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
+                        httpMetadata: { contentType: 'application/json' },
+                    })
+                }
+            }
+        }
+
+        await updateGalleryCache(c.get('bucket'), videoId)
+        await syncGalleryIndexEntry(c.env, namespaceId, videoId).catch((error) => {
+            console.log(`[GALLERY-REFRESH] sync gallery index failed video=${videoId}: ${error instanceof Error ? error.message : String(error)}`)
         })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
 
-<<<<<<< HEAD
-=======
         if (linkContext && Number(linkContext.chatId || 0) > 0) {
             let botToken = c.env.TELEGRAM_BOT_TOKEN
             try {
@@ -4942,7 +4955,6 @@ app.post('/api/gallery/refresh/:id', async (c) => {
         }
         await c.get('bucket').delete(`_link_context/${videoId}.json`).catch(() => { })
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
         c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
 
@@ -5006,89 +5018,79 @@ app.put('/api/categories', async (c) => {
 // ==================== GALLERY API (R2) ====================
 
 app.get('/api/gallery', async (c) => {
-    const r2Url = c.env.R2_PUBLIC_URL
-    const botId = c.get('botId')
+    const currentNamespaceId = String(c.get('botId') || '').trim()
     const offset = parseNonNegativeInt(c.req.query('offset'), 0)
     const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
-    const limit = Math.min(Math.max(requestedLimit, 1), 120)
+    const limit = Math.min(Math.max(requestedLimit, 1), 5000)
+    const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
     const linkFilterRaw = String(c.req.query('link_filter') || '').trim().toLowerCase()
     const linkFilter = linkFilterRaw === 'no-link'
         ? 'no-link'
         : linkFilterRaw === 'with-link'
             ? 'with-link'
             : 'all'
-    const fixUrls = (data: any) => {
-        const s = JSON.stringify(data)
-        // Fix old pub URLs to new bucket with botId prefix
-        return JSON.parse(s.replace(/https:\/\/pub-[a-f0-9]+\.r2\.dev\/videos\//g, `${r2Url}/${botId}/videos/`))
-    }
+    const storeFilterRaw = String(c.req.query('store_filter') || '').trim().toLowerCase()
+    const storeFilter = storeFilterRaw === 'lazada'
+        ? 'lazada'
+        : storeFilterRaw === 'shopee'
+            ? 'shopee'
+            : 'all'
     try {
-        const systemWideEnabled = await isSystemGalleryEnabledForNamespace(c.env.DB, botId)
-        if (systemWideEnabled) {
-            // Fallback once while gallery_index is still warming or not backfilled yet.
-            c.executionCtx.waitUntil(rebuildGalleryIndexFromR2(c.env).catch((error) => {
-                console.log(`[GALLERY-INDEX] warmup rebuild failed: ${error instanceof Error ? error.message : String(error)}`)
-            }))
+        // Fallback once while gallery_index is still warming or not backfilled yet.
+        c.executionCtx.waitUntil(rebuildGalleryIndexFromR2(c.env).catch((error) => {
+            console.log(`[GALLERY-INDEX] warmup rebuild failed: ${error instanceof Error ? error.message : String(error)}`)
+        }))
 
-            const videos = await getOwnerLinkedSystemGalleryVideos(c.env)
-            const withLinkVideos = videos.filter((video) => hasShopeeLinkInMeta(video as Record<string, unknown>))
-            const withoutLinkVideos = videos.filter((video) => !hasShopeeLinkInMeta(video as Record<string, unknown>))
-            const filteredVideos = linkFilter === 'no-link'
-                ? withoutLinkVideos
-                : linkFilter === 'with-link'
-                    ? withLinkVideos
-                    : videos
-            const page = sliceGalleryPage(filteredVideos, offset, limit)
+        const videos = await listNamespaceGalleryVideos(c.env, currentNamespaceId)
+        const namespaceIds = Array.from(new Set(videos.map((video) => String((video as Record<string, unknown>).namespace_id || '').trim()).filter(Boolean)))
+        const expectedRows = await Promise.all(namespaceIds.map(async (candidateNamespaceId) => ({
+            namespaceId: candidateNamespaceId,
+            expectedUtmId: await resolveNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, candidateNamespaceId).catch(() => ''),
+            expectedLazadaMemberId: await resolveNamespaceLazadaExpectedMemberId(c.env.DB, candidateNamespaceId).catch(() => ''),
+        })))
+        const expectedUtmIdByNamespace = new Map(expectedRows.map((row) => [row.namespaceId, row.expectedUtmId]))
+        const expectedLazadaMemberIdByNamespace = new Map(expectedRows.map((row) => [row.namespaceId, row.expectedLazadaMemberId]))
 
-            return c.json({
-                videos: page.videos,
-                total: filteredVideos.length,
-                offset,
-                limit,
-                has_more: page.hasMore,
-                with_link_total: withLinkVideos.length,
-                without_link_total: withoutLinkVideos.length,
-            }, 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
-        }
-
-        // "ยังไม่ได้ใช้" = video_id ที่ยังไม่มี fb_post_id จริง
-        const postedIds = await getConfirmedPostedVideoIds({
-            db: c.env.DB,
-            namespaceId: botId,
+        const readyVideos = videos.filter((video) => {
+            const row = video as Record<string, unknown>
+            const namespaceId = String(row.namespace_id || '').trim()
+            const expectedUtmId = expectedUtmIdByNamespace.get(namespaceId)
+            const expectedLazadaMemberId = expectedLazadaMemberIdByNamespace.get(namespaceId)
+            return getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId).galleryReady
         })
 
-        const cached = await c.get('bucket').get('_cache/gallery.json')
-        if (cached) {
-            const data = await cached.json() as { videos: any[] }
-            const filteredVideos = dedupeVideosById(data.videos || [])
-                .filter((v: any) => !postedIds.has(String(v?.id || '').trim()))
-            if (c.req.query('offset') !== undefined || c.req.query('limit') !== undefined) {
-                const page = sliceGalleryPage(filteredVideos, offset, limit)
-                return c.json(fixUrls({
-                    videos: page.videos,
-                    total: filteredVideos.length,
-                    offset,
-                    limit,
-                    has_more: page.hasMore,
-                }), 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
-            }
-            return c.json(fixUrls({ videos: filteredVideos }), 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
-        }
+        const overallTotal = readyVideos.length
+        const shopeeVideos = readyVideos.filter((video) => !hasLazadaLinkInMeta(video as Record<string, unknown>))
+        const lazadaVideos = readyVideos.filter((video) => hasLazadaLinkInMeta(video as Record<string, unknown>))
+        const searchedVideos = searchQuery
+            ? readyVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
+            : readyVideos
+        const storeScopedVideos = storeFilter === 'lazada'
+            ? searchedVideos.filter((video) => hasLazadaLinkInMeta(video as Record<string, unknown>))
+            : storeFilter === 'shopee'
+                ? searchedVideos.filter((video) => !hasLazadaLinkInMeta(video as Record<string, unknown>))
+                : searchedVideos
+        const withLinkVideos = storeScopedVideos.filter((video) => hasAffiliateLinkInMeta(video as Record<string, unknown>))
+        const withoutLinkVideos = storeScopedVideos.filter((video) => !hasAffiliateLinkInMeta(video as Record<string, unknown>))
+        const filteredVideos = linkFilter === 'no-link'
+            ? withoutLinkVideos
+            : linkFilter === 'with-link'
+                ? withLinkVideos
+                : storeScopedVideos
+        const page = sliceGalleryPage(filteredVideos, offset, limit)
 
-        const videos = await rebuildGalleryCache(c.get('bucket'))
-        const filteredVideos = videos
-            .filter((v: any) => !postedIds.has(String((v as any)?.id || '').trim()))
-        if (c.req.query('offset') !== undefined || c.req.query('limit') !== undefined) {
-            const page = sliceGalleryPage(filteredVideos, offset, limit)
-            return c.json(fixUrls({
-                videos: page.videos,
-                total: filteredVideos.length,
-                offset,
-                limit,
-                has_more: page.hasMore,
-            }))
-        }
-        return c.json(fixUrls({ videos: filteredVideos }))
+        return c.json({
+            videos: page.videos,
+            total: filteredVideos.length,
+            overall_total: overallTotal,
+            offset,
+            limit,
+            has_more: page.hasMore,
+            shopee_total: shopeeVideos.length,
+            lazada_total: lazadaVideos.length,
+            with_link_total: withLinkVideos.length,
+            without_link_total: withoutLinkVideos.length,
+        }, 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) })
     }
@@ -5096,13 +5098,7 @@ app.get('/api/gallery', async (c) => {
 
 app.get('/api/gallery/system', async (c) => {
     try {
-        const namespaceId = c.get('botId')
-        const enabled = await isSystemGalleryEnabledForNamespace(c.env.DB, namespaceId)
-        if (!enabled) {
-            return c.json({ error: 'system_gallery_not_enabled' }, 403)
-        }
-
-        const videos = await getOwnerLinkedSystemGalleryVideos(c.env)
+        const videos = await getAllSystemGalleryVideos(c.env)
         return c.json({ videos }, 200, { 'Cache-Control': 'private, max-age=30', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
@@ -5161,12 +5157,12 @@ app.post('/api/gallery/restore-links', async (c) => {
         }
 
         const videos = dedupeVideosById(await getAllSystemGalleryVideos(c.env))
-        const currentWithLink = videos.reduce((sum, video) => sum + (normalizeMetaShopeeLink(video) ? 1 : 0), 0)
+        const currentWithLink = videos.reduce((sum, video) => sum + (hasAffiliateLinkInMeta(video) ? 1 : 0), 0)
 
         const restoreTargets = videos.filter((video) => {
             const videoId = String(video?.id || '').trim()
             if (!videoId) return false
-            if (normalizeMetaShopeeLink(video)) return false
+            if (hasAffiliateLinkInMeta(video)) return false
             return exactMatchLinks.has(videoId)
         })
 
@@ -5244,7 +5240,7 @@ app.post('/api/gallery/restore-links', async (c) => {
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
 
         const finalVideos = dedupeVideosById(await getAllSystemGalleryVideos(c.env))
-        const finalWithLink = finalVideos.reduce((sum, video) => sum + (normalizeMetaShopeeLink(video) ? 1 : 0), 0)
+        const finalWithLink = finalVideos.reduce((sum, video) => sum + (hasAffiliateLinkInMeta(video) ? 1 : 0), 0)
 
         return c.json({
             success: true,
@@ -5270,26 +5266,9 @@ app.get('/api/gallery/used', async (c) => {
         return JSON.parse(s.replace(/https:\/\/pub-[a-f0-9]+\.r2\.dev\/videos\//g, `${r2Url}/${botId}/videos/`))
     }
     try {
-        // "โพสต์แล้ว" = video_id ที่มี fb_post_id จริง
-        const postedIds = Array.from(await getConfirmedPostedVideoIds({
-            db: c.env.DB,
-            namespaceId: botId,
-        }))
-
-        // Fast path: read one cached gallery object and filter by posted IDs.
-        // This avoids N R2 reads when history is large.
-        const postedIdSet = new Set(postedIds)
-        const cached = await c.get('bucket').get('_cache/gallery.json')
-        let sourceVideos: any[] = []
-        if (cached) {
-            const data = await cached.json() as { videos?: any[] }
-            sourceVideos = data.videos || []
-        } else {
-            sourceVideos = await rebuildGalleryCache(c.get('bucket'))
-        }
-
-        const videos = dedupeVideosById(sourceVideos)
-            .filter((v: any) => postedIdSet.has(String(v?.id || '').trim()))
+        const readyVideos = await listNamespaceGalleryVideos(c.env, botId)
+        const videos = dedupeVideosById(readyVideos)
+            .filter((video: any) => !!String(video?.postedAt || video?.posted_at || '').trim())
 
         // Sort by createdAt desc
         videos.sort((a: any, b: any) => {
@@ -5402,12 +5381,12 @@ app.get('/api/gallery/all-original', getAllOriginalGallery)
 app.put('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
     try {
-        const body = await c.req.json() as { shopeeLink?: string; category?: string; title?: string; keepInPostedTab?: boolean; namespace_id?: string; namespaceId?: string }
+        const body = await c.req.json() as { shopeeLink?: string; lazadaLink?: string; category?: string; title?: string; keepInPostedTab?: boolean; namespace_id?: string; namespaceId?: string }
         const currentNamespaceId = c.get('botId')
         const requestedNamespaceId = String(body.namespace_id ?? body.namespaceId ?? c.req.query('namespace_id') ?? '').trim()
         const targetNamespaceId = requestedNamespaceId || currentNamespaceId
         if (targetNamespaceId !== currentNamespaceId) {
-            const enabled = await isSystemGalleryEnabledForNamespace(c.env.DB, currentNamespaceId)
+            const enabled = isUnifiedGalleryEnabled()
             if (!enabled) return c.json({ error: 'cross_namespace_gallery_not_enabled' }, 403)
         }
         const targetBucket = targetNamespaceId === currentNamespaceId
@@ -5433,6 +5412,8 @@ app.put('/api/gallery/:id', async (c) => {
                 ? getVideoPublicUrlForNamespace(c.env.R2_PUBLIC_URL, targetNamespaceId, id)
                 : (originalUrl || getVideoPublicUrlForNamespace(c.env.R2_PUBLIC_URL, targetNamespaceId, id))
             meta = {
+                id,
+                namespace_id: targetNamespaceId,
                 createdAt: uploadedAt,
                 updatedAt: uploadedAt,
                 duration: 0,
@@ -5444,12 +5425,50 @@ app.put('/api/gallery/:id', async (c) => {
                 thumbnailUrl: thumbObj ? getVideoThumbnailUrlForNamespace(c.env.R2_PUBLIC_URL, targetNamespaceId, id) : '',
             }
         }
+        meta.id = String(meta.id || id).trim() || id
+        meta.namespace_id = String(meta.namespace_id || targetNamespaceId).trim() || targetNamespaceId
+        const shopeeExpectedUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, targetNamespaceId).catch(() => '')
         let changed = false
         if (body.shopeeLink !== undefined) {
             const normalizedShopeeLink = String(body.shopeeLink || '').trim()
-            meta.shopeeLink = normalizedShopeeLink
             if (normalizedShopeeLink) {
+                meta.shopeeLink = normalizedShopeeLink
+                meta.shopeeOriginalLink = isLikelyConvertedShopeeLink(normalizedShopeeLink, shopeeExpectedUtmId)
+                    ? (getVideoSourceShopeeLink(meta) || normalizedShopeeLink)
+                    : normalizedShopeeLink
                 meta.linkSubmittedAt = new Date().toISOString()
+                if (isLikelyConvertedShopeeLink(normalizedShopeeLink, shopeeExpectedUtmId)) {
+                    meta.shopeeConvertedAt = new Date().toISOString()
+                    delete meta.shopeeConversionError
+                } else {
+                    delete meta.shopeeConvertedAt
+                }
+            } else {
+                meta.shopeeLink = ''
+                delete meta.shopeeOriginalLink
+                delete meta.shopeeConvertedAt
+                delete meta.shopeeConversionError
+            }
+            changed = true
+        }
+        if (body.lazadaLink !== undefined) {
+            const normalizedLazadaLink = String(body.lazadaLink || '').trim()
+            if (normalizedLazadaLink) {
+                meta.lazadaLink = normalizedLazadaLink
+                meta.lazadaOriginalLink = isLikelyConvertedLazadaLink(normalizedLazadaLink)
+                    ? (getVideoSourceLazadaLink(meta) || normalizedLazadaLink)
+                    : normalizedLazadaLink
+                if (isLikelyConvertedLazadaLink(normalizedLazadaLink)) {
+                    meta.lazadaConvertedAt = new Date().toISOString()
+                    delete meta.lazadaConversionError
+                } else {
+                    delete meta.lazadaConvertedAt
+                }
+            } else {
+                meta.lazadaLink = ''
+                delete meta.lazadaOriginalLink
+                delete meta.lazadaConvertedAt
+                delete meta.lazadaConversionError
             }
             changed = true
         }
@@ -5481,7 +5500,16 @@ app.put('/api/gallery/:id', async (c) => {
         })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
-        return c.json({ success: true })
+        return c.json({
+            success: true,
+            video: {
+                ...meta,
+                id: String(meta.id || id).trim() || id,
+                namespace_id: String(meta.namespace_id || targetNamespaceId).trim() || targetNamespaceId,
+                shopeeLink: normalizeMetaShopeeLink(meta) || String(meta.shopeeLink || '').trim() || undefined,
+                lazadaLink: normalizeMetaLazadaLink(meta) || String(meta.lazadaLink || '').trim() || undefined,
+            },
+        })
     } catch {
         return c.json({ error: 'Failed to update video' }, 500)
     }
@@ -5494,7 +5522,7 @@ app.delete('/api/gallery/:id', async (c) => {
         const requestedNamespaceId = String(c.req.query('namespace_id') || '').trim()
         const targetNamespaceId = requestedNamespaceId || currentNamespaceId
         if (targetNamespaceId !== currentNamespaceId) {
-            const enabled = await isSystemGalleryEnabledForNamespace(c.env.DB, currentNamespaceId)
+            const enabled = isUnifiedGalleryEnabled()
             if (!enabled) return c.json({ error: 'cross_namespace_gallery_not_enabled' }, 403)
         }
         const bucket = targetNamespaceId === currentNamespaceId
@@ -5527,7 +5555,7 @@ app.get('/api/gallery/:id', async (c) => {
         const requestedNamespaceId = String(c.req.query('namespace_id') || '').trim()
         const targetNamespaceId = requestedNamespaceId || currentNamespaceId
         if (targetNamespaceId !== currentNamespaceId) {
-            const enabled = await isSystemGalleryEnabledForNamespace(c.env.DB, currentNamespaceId)
+            const enabled = isUnifiedGalleryEnabled()
             if (!enabled) return c.json({ error: 'cross_namespace_gallery_not_enabled' }, 403)
         }
         const bucket = targetNamespaceId === currentNamespaceId
@@ -5535,8 +5563,12 @@ app.get('/api/gallery/:id', async (c) => {
             : new BotBucket(c.env.BUCKET, targetNamespaceId) as unknown as R2Bucket
         const metaObj = await bucket.get(`videos/${id}.json`)
         if (!metaObj) return c.json({ error: 'ไม่พบวิดีโอ' }, 404)
-        const metadata = await metaObj.json()
-        return c.json(metadata)
+        const metadata = await metaObj.json() as Record<string, unknown>
+        return c.json({
+            ...metadata,
+            id: String(metadata.id || id).trim() || id,
+            namespace_id: String(metadata.namespace_id || targetNamespaceId).trim() || targetNamespaceId,
+        })
     } catch {
         return c.json({ error: 'ไม่พบวิดีโอ' }, 404)
     }
@@ -5558,14 +5590,15 @@ const NS_SETTING_PAGES_TOKEN_POOL_V1 = 'pages_token_pool_v1'
 const NS_SETTING_PAGES_HIDDEN_TAGGED_PROFILES_V1 = 'pages_hidden_tagged_profiles_v1'
 const NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1 = 'pages_linked_tagged_profiles_v1'
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
-<<<<<<< HEAD
-=======
 const NS_SETTING_COMMENT_TEMPLATE = 'comment_template_v1'
 const NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT = 'affiliate_shortlink_account_v1'
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_utm_id_v1'
+const NS_SETTING_LAZADA_SHORTLINK_BASE_URL = 'lazada_shortlink_base_url_v1'
+const NS_SETTING_LAZADA_EXPECTED_MEMBER_ID = 'lazada_expected_member_id_v1'
+const DEFAULT_SHOPEE_SHORTLINK_WORKER_URL = 'https://short.yokthanwa1993-bc9.workers.dev/'
+const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://lazada-short.yokthanwa1993-bc9.workers.dev/'
 const DEFAULT_PAGES_SYNC_POST_SELECTORS = 'tag:post'
 const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
@@ -5794,11 +5827,44 @@ function normalizeShortlinkBaseUrl(rawValue: string): string {
     }
 }
 
+function normalizeShortlinkAccount(rawValue: string): string {
+    const value = String(rawValue || '').trim().toUpperCase()
+    if (!value) return ''
+    if (!/^[A-Z0-9_-]+$/.test(value)) return ''
+    return value.slice(0, MAX_SHORTLINK_ACCOUNT_CHARS)
+}
+
+function extractShortlinkAccountFromBaseUrl(rawValue: string): string {
+    const value = String(rawValue || '').trim()
+    if (!value) return ''
+    try {
+        const url = new URL(value)
+        return normalizeShortlinkAccount(String(url.searchParams.get('account') || ''))
+    } catch {
+        return ''
+    }
+}
+
+function deriveAffiliateShortlinkBaseUrl(kind: 'shopee' | 'lazada', account: string): string {
+    const normalizedAccount = normalizeShortlinkAccount(account)
+    if (!normalizedAccount) return ''
+    const url = new URL(kind === 'lazada' ? DEFAULT_LAZADA_SHORTLINK_WORKER_URL : DEFAULT_SHOPEE_SHORTLINK_WORKER_URL)
+    url.searchParams.set('account', normalizedAccount)
+    return url.toString()
+}
+
 function normalizeShortlinkExpectedUtmId(rawValue: string): string {
     const value = String(rawValue || '').trim().replace(/^an_/i, '')
     if (!value) return ''
     if (!/^\d+$/.test(value)) return ''
     return value.slice(0, MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS)
+}
+
+function normalizeLazadaMemberId(rawValue: string): string {
+    const value = String(rawValue || '').trim()
+    if (!value) return ''
+    if (!/^\d+$/.test(value)) return ''
+    return value.slice(0, MAX_LAZADA_MEMBER_ID_CHARS)
 }
 
 function computeShortlinkUtmMatchValue(expectedUtmId: string, actualUtmSource?: string | null): number | null {
@@ -5808,8 +5874,6 @@ function computeShortlinkUtmMatchValue(expectedUtmId: string, actualUtmSource?: 
     return actual === expected ? 1 : 0
 }
 
-<<<<<<< HEAD
-=======
 function extractShopeeUtmSourceFromLink(link: string): string {
     try {
         return String(new URL(String(link || '').trim()).searchParams.get('utm_source') || '').trim()
@@ -6001,12 +6065,33 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
     console.log('[AFFILIATE-CONVERT] Shortlink conversion disabled; keeping original user links')
 }
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 async function getNamespaceShopeeShortlinkBaseUrlEntry(db: D1Database, namespaceId: string): Promise<{ baseUrl: string; updatedAt: string | null }> {
     await ensureNamespaceSettingsTable(db)
     const row = await db.prepare(
         'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
     ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_BASE_URL).first() as { value?: string; updated_at?: string } | null
+    return {
+        baseUrl: normalizeShortlinkBaseUrl(String(row?.value || '')),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
+async function getNamespaceAffiliateShortlinkAccountEntry(db: D1Database, namespaceId: string): Promise<{ account: string; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT).first() as { value?: string; updated_at?: string } | null
+    return {
+        account: normalizeShortlinkAccount(String(row?.value || '')),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
+async function getNamespaceLazadaShortlinkBaseUrlEntry(db: D1Database, namespaceId: string): Promise<{ baseUrl: string; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_LAZADA_SHORTLINK_BASE_URL).first() as { value?: string; updated_at?: string } | null
     return {
         baseUrl: normalizeShortlinkBaseUrl(String(row?.value || '')),
         updatedAt: String(row?.updated_at || '').trim() || null,
@@ -6024,6 +6109,29 @@ async function getNamespaceShopeeShortlinkExpectedUtmIdEntry(db: D1Database, nam
     }
 }
 
+async function getNamespaceLazadaExpectedMemberIdEntry(db: D1Database, namespaceId: string): Promise<{ expectedMemberId: string; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_LAZADA_EXPECTED_MEMBER_ID).first() as { value?: string; updated_at?: string } | null
+    return {
+        expectedMemberId: normalizeLazadaMemberId(String(row?.value || '')),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
+async function resolveNamespaceAffiliateShortlinkAccount(db: D1Database, namespaceId: string): Promise<string> {
+    const entry = await getNamespaceAffiliateShortlinkAccountEntry(db, namespaceId)
+    if (entry.account) return entry.account
+
+    const [shopeeRow, lazadaRow] = await Promise.all([
+        getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId),
+        getNamespaceLazadaShortlinkBaseUrlEntry(db, namespaceId),
+    ])
+
+    return extractShortlinkAccountFromBaseUrl(shopeeRow.baseUrl) || extractShortlinkAccountFromBaseUrl(lazadaRow.baseUrl) || ''
+}
+
 async function getNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: string): Promise<boolean> {
     await ensureNamespaceSettingsTable(db)
     const row = await db.prepare(
@@ -6036,6 +6144,36 @@ async function getNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: 
 async function resolveNamespaceShopeeShortlinkExpectedUtmId(db: D1Database, namespaceId: string): Promise<string> {
     const row = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
     return row.expectedUtmId
+}
+
+async function resolveNamespaceLazadaExpectedMemberId(db: D1Database, namespaceId: string): Promise<string> {
+    const row = await getNamespaceLazadaExpectedMemberIdEntry(db, namespaceId)
+    return row.expectedMemberId
+}
+
+async function resolveNamespaceLazadaShortlinkBaseUrl(db: D1Database, namespaceId: string): Promise<string> {
+    const account = await resolveNamespaceAffiliateShortlinkAccount(db, namespaceId)
+    if (account) return deriveAffiliateShortlinkBaseUrl('lazada', account)
+    const row = await getNamespaceLazadaShortlinkBaseUrlEntry(db, namespaceId)
+    return row.baseUrl
+}
+
+async function setNamespaceAffiliateShortlinkAccount(db: D1Database, namespaceId: string, rawAccount: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const account = normalizeShortlinkAccount(rawAccount)
+    if (!account) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT).run()
+        return
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT, account).run()
 }
 
 async function setNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: string, required: boolean): Promise<void> {
@@ -6072,6 +6210,24 @@ async function setNamespaceShopeeShortlinkExpectedUtmId(db: D1Database, namespac
     ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID, expectedUtmId).run()
 }
 
+async function setNamespaceLazadaExpectedMemberId(db: D1Database, namespaceId: string, rawExpectedMemberId: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const expectedMemberId = normalizeLazadaMemberId(rawExpectedMemberId)
+    if (!expectedMemberId) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_LAZADA_EXPECTED_MEMBER_ID).run()
+        return
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_LAZADA_EXPECTED_MEMBER_ID, expectedMemberId).run()
+}
+
 async function setNamespaceShopeeShortlinkBaseUrl(db: D1Database, namespaceId: string, rawBaseUrl: string): Promise<void> {
     await ensureNamespaceSettingsTable(db)
     const baseUrl = normalizeShortlinkBaseUrl(rawBaseUrl).slice(0, MAX_SHORTLINK_BASE_URL_CHARS)
@@ -6090,25 +6246,55 @@ async function setNamespaceShopeeShortlinkBaseUrl(db: D1Database, namespaceId: s
     ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_BASE_URL, baseUrl).run()
 }
 
+async function setNamespaceLazadaShortlinkBaseUrl(db: D1Database, namespaceId: string, rawBaseUrl: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const baseUrl = normalizeShortlinkBaseUrl(rawBaseUrl).slice(0, MAX_SHORTLINK_BASE_URL_CHARS)
+    if (!baseUrl) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_LAZADA_SHORTLINK_BASE_URL).run()
+        return
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_LAZADA_SHORTLINK_BASE_URL, baseUrl).run()
+}
+
 async function resolveNamespaceShopeeShortlinkBaseUrl(db: D1Database, namespaceId: string): Promise<string> {
+    const account = await resolveNamespaceAffiliateShortlinkAccount(db, namespaceId)
+    if (account) return deriveAffiliateShortlinkBaseUrl('shopee', account)
     const row = await getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId)
     return row.baseUrl
 }
 
 async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: string) {
+    const accountEntry = await getNamespaceAffiliateShortlinkAccountEntry(db, namespaceId)
+    const derivedAccount = accountEntry.account || await resolveNamespaceAffiliateShortlinkAccount(db, namespaceId)
     const row = await getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId)
+    const lazadaRow = await getNamespaceLazadaShortlinkBaseUrlEntry(db, namespaceId)
     const required = await getNamespaceShopeeShortlinkRequired(db, namespaceId)
     const expected = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
-    const updatedAt = [row.updatedAt, expected.updatedAt]
+    const lazadaExpected = await getNamespaceLazadaExpectedMemberIdEntry(db, namespaceId)
+    const effectiveShopeeBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('shopee', derivedAccount) : row.baseUrl
+    const effectiveLazadaBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('lazada', derivedAccount) : lazadaRow.baseUrl
+    const updatedAt = [accountEntry.updatedAt, row.updatedAt, lazadaRow.updatedAt, expected.updatedAt, lazadaExpected.updatedAt]
         .map((value) => String(value || '').trim())
         .filter(Boolean)
         .sort()
         .at(-1) || null
     return {
-        base_url: row.baseUrl,
-        enabled: !!row.baseUrl,
+        account: derivedAccount,
+        base_url: effectiveShopeeBaseUrl,
+        lazada_base_url: effectiveLazadaBaseUrl,
+        enabled: !!effectiveShopeeBaseUrl,
+        lazada_enabled: !!effectiveLazadaBaseUrl,
         required,
         expected_utm_id: expected.expectedUtmId,
+        lazada_expected_member_id: lazadaExpected.expectedMemberId,
         updated_at: updatedAt,
     }
 }
@@ -6342,7 +6528,12 @@ function normalizeCommentTokenPool(tokens: string[]): string[] {
 }
 
 function normalizeDirectVideoTokenPool(tokens: string[]): string[] {
-    return uniqueTokens(normalizeCommentTokenPool(tokens).filter((token) => isCommentRoleToken(token)))
+    // Accept ALL valid tokens for /videos posting — not just EAAD6V.
+    // Sort EAAD6V first (preferred), then non-EAAD6V as fallback.
+    const valid = normalizeCommentTokenPool(tokens)
+    const eaad6 = valid.filter((t) => isCommentRoleToken(t))
+    const others = valid.filter((t) => !isCommentRoleToken(t))
+    return uniqueTokens([...eaad6, ...others])
 }
 
 function preferCommentToken(existingRaw: string, candidateRaw: string): string {
@@ -6603,12 +6794,18 @@ function filterProfilesForTaggedPage(params: {
     const linkedProfileIds = hasLinkedEntry
         ? getLinkedTaggedProfileIdsForPage(linkedProfiles, normalizedPageId)
         : new Set<string>()
+    const hasActiveLinkedProfile = hasLinkedEntry && (params.profiles || []).some((profile) => {
+        const profileId = String(profile.id || '').trim().toLowerCase()
+        if (!profileId) return false
+        if (hiddenProfileIds.has(profileId)) return false
+        return linkedProfileIds.has(profileId)
+    })
 
     return (params.profiles || []).filter((profile) => {
         const profileId = String(profile.id || '').trim().toLowerCase()
         if (!profileId) return false
         if (hiddenProfileIds.has(profileId)) return false
-        if (hasLinkedEntry) return linkedProfileIds.has(profileId)
+        if (hasLinkedEntry && hasActiveLinkedProfile) return linkedProfileIds.has(profileId)
         return matchesProfileToPage(profile, normalizedPageId, normalizedPageName)
     })
 }
@@ -6687,21 +6884,17 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
             .filter(Boolean)
     )
 
-    let rebuiltCommentTokens = normalizeCommentTokenPool(
-        Array.from(byProfileId.values())
-            .filter((item) => item.roles.includes('comment') && !!String(item.comment_token || '').trim())
-            .map((item) => String(item.comment_token || '').trim())
-            .filter(Boolean)
-    )
-
-    if (rebuiltCommentTokens.length === 0) {
-        rebuiltCommentTokens = normalizeDirectVideoTokenPool(
-            Array.from(byProfileId.values())
-                .filter((item) => item.roles.includes('post') && !!String(item.comment_token || '').trim())
-                .map((item) => String(item.comment_token || '').trim())
-                .filter(Boolean)
-        )
-    }
+    // Unified token pool: include ALL tokens from ALL profiles (both EAAD6V and non-EAAD6V).
+    // Both token types can post via /videos endpoint. No role-gating.
+    const allProfileValues = Array.from(byProfileId.values())
+    const rebuiltCommentTokens = normalizeDirectVideoTokenPool([
+        ...allProfileValues
+            .filter((item) => !!String(item.comment_token || '').trim())
+            .map((item) => String(item.comment_token || '').trim()),
+        ...allProfileValues
+            .filter((item) => !!String(item.post_token || '').trim())
+            .map((item) => String(item.post_token || '').trim()),
+    ].filter(Boolean))
 
     const existingPage = await env.DB.prepare(
         'SELECT access_token FROM pages WHERE id = ? AND bot_id = ?'
@@ -6981,57 +7174,6 @@ async function getPostedVideoIds(params: {
     return out
 }
 
-async function getPostedVideoIds(params: {
-    db: D1Database
-    namespaceId?: string
-    pageId?: string
-    withinDays?: number
-}): Promise<Set<string>> {
-    const namespaceId = String(params.namespaceId || '').trim()
-    const pageId = String(params.pageId || '').trim()
-    const hasNamespace = !!namespaceId
-    const hasPage = !!pageId
-    const withinDays = Number(params.withinDays || 0)
-    const cutoffMs = withinDays > 0 ? (Date.now() - withinDays * 24 * 60 * 60 * 1000) : null
-
-    const where: string[] = [
-        `(
-            status IN ('success', 'posting')
-            OR TRIM(COALESCE(fb_post_id, '')) <> ''
-            OR TRIM(COALESCE(fb_reel_url, '')) <> ''
-        )`,
-    ]
-    const binds: string[] = []
-
-    if (hasNamespace) {
-        where.push('bot_id = ?')
-        binds.push(namespaceId)
-    }
-    if (hasPage) {
-        where.push('page_id = ?')
-        binds.push(pageId)
-    }
-
-    const sql = `SELECT video_id, posted_at
-        FROM post_history
-        WHERE ${where.join('\n          AND ')}`
-
-    const result = await params.db.prepare(sql).bind(...binds).all() as {
-        results?: Array<{ video_id?: string; posted_at?: string }>
-    }
-
-    const out = new Set<string>()
-    for (const row of result.results || []) {
-        const id = String(row?.video_id || '').trim()
-        if (cutoffMs !== null) {
-            const postedAtMs = Date.parse(String(row?.posted_at || ''))
-            if (!Number.isFinite(postedAtMs) || postedAtMs < cutoffMs) continue
-        }
-        if (id) out.add(id)
-    }
-    return out
-}
-
 async function getConfirmedPostedVideoIds(params: {
     db: D1Database
     namespaceId?: string
@@ -7120,7 +7262,14 @@ async function getRecentPagePostGuard(params: {
     const ageSeconds = Number.isFinite(postedAtMs)
         ? Math.max(0, Math.floor((Date.now() - postedAtMs) / 1000))
         : Number.POSITIVE_INFINITY
-    const blocked = !!row && Number.isFinite(postedAtMs) && ageSeconds <= withinSeconds
+    const status = String(row?.status || '').trim().toLowerCase()
+    const postingStaleSeconds = 15 * 60
+    const blocked = !!row
+        && Number.isFinite(postedAtMs)
+        && (
+            ageSeconds <= withinSeconds ||
+            (status === 'posting' && ageSeconds <= postingStaleSeconds)
+        )
 
     return {
         blocked,
@@ -7128,6 +7277,33 @@ async function getRecentPagePostGuard(params: {
         postedAt: postedAt || null,
         historyId: typeof row?.id === 'number' ? row.id : null,
     }
+}
+
+async function failStalePostingRows(db: D1Database, namespaceId: string, pageId: string, staleSeconds = 15 * 60): Promise<void> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedNamespaceId || !normalizedPageId) return
+
+    await db.prepare(
+        `UPDATE post_history
+         SET status = 'failed',
+             error_message = CASE
+                 WHEN TRIM(COALESCE(error_message, '')) = '' THEN 'stale_posting_timeout'
+                 ELSE error_message
+             END,
+             comment_status = CASE
+                 WHEN comment_status = 'pending' THEN 'failed'
+                 ELSE comment_status
+             END,
+             comment_error = CASE
+                 WHEN comment_status = 'pending' AND TRIM(COALESCE(comment_error, '')) = '' THEN 'stale_posting_timeout'
+                 ELSE comment_error
+             END
+         WHERE bot_id = ?
+           AND page_id = ?
+           AND status = 'posting'
+           AND posted_at < datetime('now', ?)`
+    ).bind(normalizedNamespaceId, normalizedPageId, `-${Math.max(60, staleSeconds)} seconds`).run()
 }
 
 async function ensureLinkSubmissionsTable(db: D1Database): Promise<void> {
@@ -7377,10 +7553,47 @@ type BrowserSavingProfileRecord = {
     postcron_token?: string // legacy fallback
 }
 
+type BrowserSavingProfileTokenHealthResult = {
+    profile_id: string
+    profile_name: string
+    namespace_id: string
+    page_id: string
+    page_name: string
+    page_found: boolean
+    has_issue: boolean
+    issues: string[]
+    issue_summary: string
+    has_local_postcron_token: boolean
+    has_local_comment_token: boolean
+    has_page_post_token: boolean
+    has_page_comment_token: boolean
+    explicitly_linked: boolean
+}
+
 function looksLikeBrowserSavingProfileId(raw: string): boolean {
     const value = String(raw || '').trim()
-    // Accept standard UUID format used by BrowserSaving profile IDs.
+    // BrowserSaving has both UUID ids and older 32-char hex ids.
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+        || /^[0-9a-f]{32}$/i.test(value)
+}
+
+function describeProfileTokenHealthIssue(code: string): string {
+    switch (String(code || '').trim()) {
+        case 'local_postcron_missing':
+            return 'ไม่มี postcron token ใน BrowserSaving'
+        case 'local_comment_missing':
+            return 'ไม่มี comment token ใน BrowserSaving'
+        case 'page_not_found':
+            return 'หาเพจนี้ใน Mini App ไม่เจอ'
+        case 'profile_not_linked':
+            return 'โปรไฟล์นี้ยังไม่ถูกผูกกับเพจใน Mini App'
+        case 'miniapp_post_token_missing':
+            return 'เพจนี้ยังไม่มี token ฝั่งโพสต์ใน Mini App'
+        case 'miniapp_comment_token_missing':
+            return 'เพจนี้ยังไม่มี token ฝั่งคอมเมนต์ใน Mini App'
+        default:
+            return String(code || '').trim() || 'token_issue'
+    }
 }
 
 function parseBrowserSavingTagSelector(raw: string): string | null {
@@ -7648,12 +7861,6 @@ function normalizeCommentTemplate(rawTemplate: string): string {
         .trim()
 }
 
-<<<<<<< HEAD
-function buildShopeeCommentMessage(shopeeLink: string): string {
-    const link = String(shopeeLink || '').trim()
-    const prefix = pickRandomCommentTemplate()
-    return `${prefix}\n${link}`
-=======
 function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string, lazadaLink = ''): string {
     const template = normalizeCommentTemplate(rawTemplate) || DEFAULT_COMMENT_TEMPLATE
     const shopee = String(shopeeLink || '').trim()
@@ -7771,7 +7978,6 @@ async function shortenLazadaLinkForNamespace(params: {
 
     writeTrace({ utmSource: null, memberId: null, status: 'fallback', error: lastError })
     return originalLink
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 }
 
 async function shortenShopeeLinkForNamespace(params: {
@@ -7850,8 +8056,6 @@ async function shortenShopeeLinkForNamespace(params: {
     return originalLink
 }
 
-<<<<<<< HEAD
-=======
 async function resolvePostingShopeeLinkForNamespace(params: {
     env: Env
     namespaceId: string
@@ -7891,7 +8095,6 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     return link
 }
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 function pickProfilePostToken(profile: BrowserSavingProfileRecord): string {
     // Postcron token only — used as fallback via /video_reels
     // EAAD6V is in commentTokens → primary via /videos
@@ -7957,10 +8160,22 @@ function matchesProfileToPage(profile: BrowserSavingProfileRecord, pageId: strin
     const pageIdFromAvatar = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''))
     if (targetId && pageIdFromAvatar && pageIdFromAvatar === targetId) return true
 
-    const profilePageName = normalizePageName(String(profile.page_name || profile.name || ''))
-    if (targetName && profilePageName && profilePageName === targetName) return true
+    const storedPageName = normalizePageName(getExplicitTaggedProfilePageName(profile))
+    if (targetName && storedPageName && storedPageName === targetName) return true
 
     return false
+}
+
+function getExplicitTaggedProfilePageName(profile: BrowserSavingProfileRecord): string {
+    const storedPageName = String(profile.page_name || '').trim()
+    if (!storedPageName) return ''
+
+    const profileName = String(profile.name || '').trim()
+    if (profileName && normalizePageName(storedPageName) === normalizePageName(profileName)) {
+        return ''
+    }
+
+    return storedPageName
 }
 
 function pickTargetPageForProfile(
@@ -7969,7 +8184,7 @@ function pickTargetPageForProfile(
 ): { id: string; name: string; access_token: string } | null {
     if (!Array.isArray(accounts) || accounts.length === 0) return null
 
-    const targetNameRaw = String(profile.page_name || '').trim()
+    const targetNameRaw = getExplicitTaggedProfilePageName(profile)
     const targetName = targetNameRaw.toLowerCase()
     if (targetName) {
         const exact = accounts.find((account) => String(account?.name || '').trim().toLowerCase() === targetName)
@@ -7999,6 +8214,69 @@ function pickTargetPageForProfile(
         const accessToken = String(only.access_token || '').trim()
         const name = String(only.name || '').trim() || targetNameRaw || id
         if (id && accessToken) return { id, name, access_token: accessToken }
+    }
+
+    return null
+}
+
+async function resolveTaggedPageIdentityFromProfileMetadata(
+    profile: BrowserSavingProfileRecord,
+): Promise<{ id: string; name: string; image_url: string } | null> {
+    const profileId = String(profile.id || '').trim()
+    const storedPageName = getExplicitTaggedProfilePageName(profile)
+    const storedPageNameKey = normalizePageName(storedPageName)
+    const avatarUrl = String(profile.page_avatar_url || '').trim()
+
+    const pageIdFromAvatar = parsePageIdFromAvatarUrl(avatarUrl)
+    if (pageIdFromAvatar && storedPageName) {
+        return {
+            id: pageIdFromAvatar,
+            name: storedPageName || pageIdFromAvatar || profileId,
+            image_url: avatarUrl || `https://graph.facebook.com/${encodeURIComponent(pageIdFromAvatar)}/picture?type=large`,
+        }
+    }
+
+    const postToken = pickProfilePostToken(profile)
+    if (postToken) {
+        try {
+            const identity = await fetchMeIdentityViaHttp(postToken)
+            const pageId = String(identity?.id || '').trim()
+            const pageName = String(identity?.name || '').trim()
+            const pageNameKey = normalizePageName(pageName)
+            const matchesStoredHint = !!pageId && !!storedPageNameKey && !!pageNameKey && storedPageNameKey === pageNameKey
+            if (matchesStoredHint) {
+                return {
+                    id: pageId,
+                    name: pageName || storedPageName || pageId || profileId,
+                    image_url: avatarUrl || `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`,
+                }
+            }
+        } catch {
+            // keep fallback below
+        }
+    }
+
+    const lookupCandidates = uniqueTokens([
+        postToken,
+        pickProfileCommentToken(profile),
+    ])
+
+    for (const candidate of lookupCandidates) {
+        if (!candidate) continue
+        try {
+            const accounts = await fetchMeAccountsViaHttp(candidate)
+            const matched = pickTargetPageForProfile(profile, accounts)
+            if (!matched?.id) continue
+            const pageId = String(matched.id || '').trim()
+            const pageName = String(matched.name || '').trim() || storedPageName || pageId || profileId
+            return {
+                id: pageId,
+                name: pageName,
+                image_url: avatarUrl || `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`,
+            }
+        } catch {
+            // try next candidate
+        }
     }
 
     return null
@@ -8146,18 +8424,44 @@ async function syncTaggedPagesFromProfileMetadata(env: Env, namespaceId: string)
 
     await env.DB.prepare("DELETE FROM pages WHERE bot_id = ? AND id LIKE 'tagged-%'").bind(ns).run().catch(() => { })
 
+    // First, collect all verified page ids from /me/accounts across all profiles
+    const verifiedPageIds = new Set<string>()
+    for (const profile of selectedProfiles) {
+        const tokenCandidates = uniqueTokens([
+            pickProfilePostToken(profile),
+            pickProfileCommentToken(profile),
+        ])
+        for (const token of tokenCandidates) {
+            if (!token) continue
+            try {
+                const accounts = await fetchMeAccountsViaHttp(token)
+                for (const account of accounts) {
+                    const aid = String(account?.id || '').trim()
+                    if (aid) verifiedPageIds.add(aid)
+                }
+                break // got accounts, no need to try more tokens
+            } catch {
+                // try next token
+            }
+        }
+    }
+
     const pageMap = new Map<string, { id: string; name: string; image_url: string }>()
     for (const profile of selectedProfiles) {
         const profileId = String(profile.id || '').trim()
         if (!profileId) continue
-        const pageIdFromAvatar = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''))
-        if (!pageIdFromAvatar) continue
-        const pageName = String(profile.page_name || '').trim() || String(profile.name || '').trim() || pageIdFromAvatar || profileId
+        const resolvedPage = await resolveTaggedPageIdentityFromProfileMetadata(profile)
+        if (!resolvedPage?.id) continue
+        const pageId = String(resolvedPage.id || '').trim()
+
+        // Skip if this id is not a verified Facebook Page (could be a personal profile)
+        if (!verifiedPageIds.has(pageId)) continue
+
+        const pageName = String(resolvedPage.name || '').trim() || getExplicitTaggedProfilePageName(profile) || pageId || profileId
         const pageNameKey = normalizePageName(pageName)
-        const pageId = pageIdFromAvatar
         const pageKey = pageNameKey || pageId
-        const imageUrl = String(profile.page_avatar_url || '').trim() ||
-            (pageIdFromAvatar ? `https://graph.facebook.com/${encodeURIComponent(pageIdFromAvatar)}/picture?type=large` : '')
+        const imageUrl = String(resolvedPage.image_url || '').trim() ||
+            `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`
 
         const existing = pageMap.get(pageKey)
         if (!existing) {
@@ -8250,7 +8554,8 @@ function extractProfileIdsFromTagAmbiguousError(raw: string): string[] {
     const out: string[] = []
     const seen = new Set<string>()
     const matches = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || []
-    for (const idRaw of matches) {
+    const legacyMatches = text.match(/[0-9a-f]{32}/gi) || []
+    for (const idRaw of [...matches, ...legacyMatches]) {
         const id = String(idRaw || '').trim()
         if (!looksLikeBrowserSavingProfileId(id)) continue
         const key = id.toLowerCase()
@@ -9031,15 +9336,28 @@ async function autoSyncPagesForNamespace(
             const postTokenPoolByPage = new Map<string, string[]>()
             const commentTokenPoolByPage = new Map<string, string[]>()
 
+            // Build per-page token pools from all tagged profiles.
+            // allResolvedPageIds contains only verified Facebook Pages from /me/accounts.
+            const allResolvedPageIds = new Set<string>()
+            for (const pid of postResolved.byId.keys()) allResolvedPageIds.add(pid)
+            for (const pid of commentResolved.byId.keys()) allResolvedPageIds.add(pid)
+
             // Source-of-truth for page listing = tagged profiles metadata.
-            // Even if token resolution fails, page should still appear in UI.
+            // Only add pages that are verified via /me/accounts (allResolvedPageIds)
+            // to prevent personal profiles from being added to the pages table.
             const addPageFromProfile = (profile: BrowserSavingProfileRecord) => {
                 const profileId = String(profile.id || '').trim()
                 if (!profileId) return
 
+                const pageName = getExplicitTaggedProfilePageName(profile)
+                if (!pageName) return
+
                 const pageIdFromAvatar = parsePageIdFromAvatarUrl(String(profile.page_avatar_url || ''))
                 if (!pageIdFromAvatar) return
-                const pageName = String(profile.page_name || '').trim() || String(profile.name || '').trim() || pageIdFromAvatar || profileId
+
+                // Skip if this id is not a verified Facebook Page from /me/accounts
+                if (!allResolvedPageIds.has(pageIdFromAvatar)) return
+
                 const pageNameKey = normalizePageName(pageName)
                 const pageId = pageIdFromAvatar
                 const pageKey = pageNameKey || pageId
@@ -9067,11 +9385,6 @@ async function autoSyncPagesForNamespace(
             for (const profile of postProfiles) addPageFromProfile(profile)
             for (const profile of commentProfiles) addPageFromProfile(profile)
 
-            // Build per-page token pools from all tagged profiles.
-            const allResolvedPageIds = new Set<string>()
-            for (const pid of postResolved.byId.keys()) allResolvedPageIds.add(pid)
-            for (const pid of commentResolved.byId.keys()) allResolvedPageIds.add(pid)
-
             for (const pageId of allResolvedPageIds) {
                 const postRecords = postResolved.byId.get(pageId) || []
                 const commentRecords = commentResolved.byId.get(pageId) || []
@@ -9080,9 +9393,13 @@ async function autoSyncPagesForNamespace(
                 if (!baseRecord) continue
 
                 const postTokens = normalizePostTokenPool(postRecords.map((r) => String(r.access_token || '').trim()))
-                const commentTokens = normalizeCommentTokenPool(commentRecords.map((r) => String(r.access_token || '').trim()))
+                // Unified: merge ALL resolved page tokens (from both post and comment profiles)
+                // into comment pool. Both token types work for /videos posting.
+                const commentTokens = normalizeDirectVideoTokenPool([
+                    ...commentRecords.map((r) => String(r.access_token || '').trim()),
+                    ...postRecords.map((r) => String(r.access_token || '').trim()),
+                ])
 
-                // Strict role: post fallback can use only post-tag profiles.
                 const mergedPostTokens = uniqueTokens([...postTokens])
 
                 postTokenPoolByPage.set(pageId, mergedPostTokens)
@@ -9167,7 +9484,7 @@ async function autoSyncPagesForNamespace(
                 if (isLikelyNumericFacebookId(currentId)) continue
 
                 const matchingProfiles = Array.from(profileById.values()).filter((profile) => {
-                    const profilePageName = normalizePageName(String(profile.page_name || profile.name || ''))
+                    const profilePageName = normalizePageName(getExplicitTaggedProfilePageName(profile))
                     return !!profilePageName && profilePageName === pageKey
                 })
                 if (matchingProfiles.length === 0) continue
@@ -9287,9 +9604,12 @@ async function autoSyncPagesForNamespace(
                         ...(postTokenPoolByPage.get(pageId) || []),
                         page.access_token,
                     ])
-                    const discoveredCommentTokenPool = normalizeCommentTokenPool([
+                    // Unified: merge ALL tokens (comment + post) into comment pool
+                    const discoveredCommentTokenPool = normalizeDirectVideoTokenPool([
                         ...(commentTokenPoolByPage.get(pageId) || []),
                         String(commentTokenByPage.get(pageId) || '').trim(),
+                        ...(postTokenPoolByPage.get(pageId) || []),
+                        page.access_token,
                     ])
                     const postTokenPool = discoveredPostTokenPool.length > 0
                         ? normalizePostTokenPool([
@@ -9298,11 +9618,11 @@ async function autoSyncPagesForNamespace(
                         ])
                         : normalizePostTokenPool(existingPool[pageId]?.post_tokens || [])
                     const commentTokenPool = discoveredCommentTokenPool.length > 0
-                        ? normalizeCommentTokenPool([
+                        ? normalizeDirectVideoTokenPool([
                             ...discoveredCommentTokenPool,
                             ...(existingPool[pageId]?.comment_tokens || []),
                         ])
-                        : normalizeCommentTokenPool(existingPool[pageId]?.comment_tokens || [])
+                        : normalizeDirectVideoTokenPool(existingPool[pageId]?.comment_tokens || [])
 
                     const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
                         ? String(page.access_token || '').trim()
@@ -9512,12 +9832,13 @@ async function autoSyncPagesForNamespace(
             page.access_token,
             ...(existingEntry.post_tokens || []),
         ])
-        const commentTokenPool = commentTokenRaw
-            ? normalizeCommentTokenPool([
-                commentTokenRaw,
-                ...(existingEntry.comment_tokens || []),
-            ])
-            : normalizeCommentTokenPool(existingEntry.comment_tokens || [])
+        // Unified: merge ALL tokens (comment + post) into comment pool
+        const commentTokenPool = normalizeDirectVideoTokenPool([
+            commentTokenRaw,
+            page.access_token,
+            ...(existingEntry.comment_tokens || []),
+            ...(existingEntry.post_tokens || []),
+        ])
         const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
             ? String(page.access_token || '').trim()
             : ''
@@ -9703,6 +10024,7 @@ async function postShopeeCommentStrict(params: {
     namespaceId?: string
     fbVideoId: string
     shopeeLink: string
+    lazadaLink?: string
     commentToken?: string | null
     pageId?: string
     logPrefix: string
@@ -9740,11 +10062,7 @@ async function postShopeeCommentStrict(params: {
         const result = await facebookGraphRawPost<{ id?: string }>(
             `${FB_GRAPH_V19}/${tid}/comments`,
             {
-<<<<<<< HEAD
-                message: buildShopeeCommentMessage(params.shopeeLink),
-=======
                 message: commentMessage,
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 access_token: commentToken,
             },
         )
@@ -9801,6 +10119,7 @@ async function postShopeeCommentWithFallback(params: {
     namespaceId?: string
     fbVideoId: string
     shopeeLink: string
+    lazadaLink?: string
     commentTokens: string[]
     pageId?: string
     logPrefix: string
@@ -9847,6 +10166,7 @@ async function postShopeeCommentWithFallback(params: {
             namespaceId: params.namespaceId,
             fbVideoId: params.fbVideoId,
             shopeeLink: params.shopeeLink,
+            lazadaLink: params.lazadaLink,
             commentToken: token,
             pageId: params.pageId,
             logPrefix: `${params.logPrefix}${commentTokens.length > 1 ? `(${i + 1}/${commentTokens.length})` : ''}`,
@@ -9892,6 +10212,8 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN shortlink_error TEXT',
                 'ALTER TABLE post_history ADD COLUMN shortlink_expected_utm_id TEXT',
                 'ALTER TABLE post_history ADD COLUMN shortlink_utm_match INTEGER',
+                'ALTER TABLE post_history ADD COLUMN lazada_link TEXT',
+                'ALTER TABLE post_history ADD COLUMN lazada_member_id TEXT',
                 'ALTER TABLE post_history ADD COLUMN comment_delay_seconds INTEGER',
                 'ALTER TABLE post_history ADD COLUMN comment_due_at TEXT',
             ]
@@ -9989,12 +10311,8 @@ async function reconcilePostingHistoryRows(params: {
                 let commentFbId: string | null = null
 
                 if (shopeeLink) {
-<<<<<<< HEAD
-                    const shortShopeeLink = await shortenShopeeLinkForNamespace({
-=======
                     const lazadaLink = metaToString(meta, 'lazadaLink')
                     const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                         env,
                         namespaceId: botId,
                         shopeeLink,
@@ -10005,6 +10323,7 @@ async function reconcilePostingHistoryRows(params: {
                         namespaceId: botId,
                         fbVideoId: recoveredCommentTargetId,
                         shopeeLink: shortShopeeLink,
+                        lazadaLink,
                         commentTokens: recoveredCommentTokens,
                         pageId: row.page_id,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
@@ -10031,6 +10350,7 @@ async function reconcilePostingHistoryRows(params: {
                     commentFbId,
                     row.id,
                 ).run()
+                await markNamespaceVideoPosted(env.DB, String(row.bot_id || ''), String(row.video_id || ''), new Date().toISOString())
 
                 await clearVideoShopeeLink(bucket, row.video_id)
                 continue
@@ -10584,59 +10904,29 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     description: string
     logPrefix: string
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
-    const directCandidates = normalizeDirectVideoTokenPool(params.commentTokens || [])
-    const fallbackCandidates = normalizePostTokenPool(params.postTokens || [])
-    let directError: unknown = null
-    let fallbackError: unknown = null
+    // Unified: merge ALL tokens from both pools into one list.
+    // EAAD6V (Facebook Lite) tokens first, then non-EAAD6V as fallback.
+    // All go through the same /videos endpoint — no separate attempts.
+    const allTokens = uniqueTokens([
+        ...(params.commentTokens || []),
+        ...(params.postTokens || []),
+    ]).filter((t) => isTokenValid(String(t || '').trim()))
+    const candidates = uniqueTokens([
+        ...allTokens.filter((t) => isCommentRoleToken(t)),
+        ...allTokens.filter((t) => !isCommentRoleToken(t)),
+    ])
 
-    if (directCandidates.length > 0) {
-        try {
-            return await publishReelViaVideosEndpointWithTokenFallback({
-                pageId: params.pageId,
-                accessTokens: directCandidates,
-                videoBuffer: params.videoBuffer,
-                description: params.description,
-                logPrefix: params.logPrefix,
-            })
-        } catch (err) {
-            directError = err
-        }
+    if (candidates.length === 0) {
+        throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
     }
 
-    if (fallbackCandidates.length > 0) {
-        try {
-            return await publishReelDirectWithTokenFallback({
-                pageId: params.pageId,
-                postTokens: fallbackCandidates,
-                videoBuffer: params.videoBuffer,
-                description: params.description,
-                logPrefix: params.logPrefix,
-            })
-        } catch (err) {
-            fallbackError = err
-        }
-    }
-
-    if (directError && fallbackError) {
-        const directMsg = parseFacebookErrorLike(directError)?.message || (directError instanceof Error ? directError.message : String(directError))
-        const fallbackMsg = parseFacebookErrorLike(fallbackError)?.message || (fallbackError instanceof Error ? fallbackError.message : String(fallbackError))
-        throw new Error(`comment_primary_and_post_fallback_failed: ${directMsg} | ${fallbackMsg}`)
-    }
-
-    if (fallbackError) throw fallbackError
-    if (directError) throw directError
-
-    if (directCandidates.length > 0) {
-        return publishReelViaVideosEndpointWithTokenFallback({
-            pageId: params.pageId,
-            accessTokens: directCandidates,
-            videoBuffer: params.videoBuffer,
-            description: params.description,
-            logPrefix: params.logPrefix,
-        })
-    }
-
-    throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
+    return publishReelViaVideosEndpointWithTokenFallback({
+        pageId: params.pageId,
+        accessTokens: candidates,
+        videoBuffer: params.videoBuffer,
+        description: params.description,
+        logPrefix: params.logPrefix,
+    })
 }
 
 function metaToString(meta: Record<string, unknown>, key: string): string {
@@ -10645,7 +10935,9 @@ function metaToString(meta: Record<string, unknown>, key: string): string {
 }
 
 const SHOPEE_LINK_KEYS = ['shopeeLink', 'shopee_link', 'shopeeUrl', 'shopee_url', 'shopee', 'link'] as const
-const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)?(?:shopee\.co\.th|s\.shopee\.co\.th)\S*/i
+const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*shopee\.(?:co\.th|co\.id|com\.my|ph|sg|vn)\S*/i
+const LAZADA_LINK_KEYS = ['lazadaLink', 'lazada_link', 'lazadaUrl', 'lazada_url', 'lazada'] as const
+const LAZADA_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*(?:lazada\.(?:co\.th|co\.id|com\.my|com\.ph|sg|vn)|lzd\.co)\S*/i
 
 function pickFirstShopeeUrl(value: unknown): string | null {
     if (typeof value === 'string') {
@@ -10661,6 +10953,20 @@ function pickFirstShopeeUrl(value: unknown): string | null {
     return null
 }
 
+function pickFirstLazadaUrl(value: unknown): string | null {
+    if (typeof value === 'string') {
+        const match = value.match(LAZADA_LINK_RE)
+        return match ? match[0].trim() : null
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const hit = pickFirstLazadaUrl(item)
+            if (hit) return hit
+        }
+    }
+    return null
+}
+
 function normalizeMetaShopeeLink(meta: Record<string, unknown>): string | null {
     for (const key of SHOPEE_LINK_KEYS) {
         const value = meta[key]
@@ -10670,8 +10976,6 @@ function normalizeMetaShopeeLink(meta: Record<string, unknown>): string | null {
     return null
 }
 
-<<<<<<< HEAD
-=======
 function normalizeMetaLazadaLink(meta: Record<string, unknown>): string | null {
     for (const key of LAZADA_LINK_KEYS) {
         const value = meta[key]
@@ -10681,7 +10985,6 @@ function normalizeMetaLazadaLink(meta: Record<string, unknown>): string | null {
     return null
 }
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 async function resolveShopeeLinkForRetry(params: {
     db: D1Database
     bucket: R2Bucket
@@ -10810,39 +11113,7 @@ app.get('/api/pages', async (c) => {
         const pages = (((await c.env.DB.prepare(
             'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
-<<<<<<< HEAD
-        const current = await loadPages()
-
-        // Tag mode is source-of-truth from BrowserSaving profile tags.
-        // Keep this endpoint fast with metadata-only sync for immediate UI.
-        if (hasTagSelector) {
-            await syncTaggedPagesFromProfileMetadata(c.env, botId).catch((e) => {
-                console.log(`[PAGES] quick tag-metadata sync failed: ${String(e)}`)
-            })
-            const refreshed = await loadPages()
-            if (refreshed.length > 0) return c.json({ pages: refreshed })
-            return c.json({ pages: current })
-        }
-
-        if (current.length > 0) return c.json({ pages: current })
-
-        const syncPromise = autoSyncPagesForNamespace(c.env, botId)
-        const timeoutMs = 8000
-        const timed = await Promise.race([
-            syncPromise.then(() => true).catch(() => false),
-            waitMs(timeoutMs).then(() => false),
-        ])
-        if (!timed) {
-            c.executionCtx.waitUntil(syncPromise.catch(() => undefined))
-            return c.json({ pages: current })
-        }
-
-        const refreshed = await loadPages()
-
-        return c.json({ pages: refreshed })
-=======
         return c.json({ pages })
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
     } catch (e) {
         return c.json({ error: 'Failed to fetch pages' }, 500)
     }
@@ -11141,10 +11412,14 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
                     .filter((item) => item.post_token_scoped && item.roles.includes('post'))
                     .map((item) => String(item.post_token || '').trim()),
             ])
-            const discoveredCommentTokens = normalizeCommentTokenPool([
+            // Unified: include ALL resolved tokens (both comment and post) in comment pool
+            const discoveredCommentTokens = normalizeDirectVideoTokenPool([
                 ...resolvedItems
                     .filter((item) => item.roles.includes('comment'))
                     .map((item) => String((item as any).comment_page_token || '').trim()),
+                ...resolvedItems
+                    .filter((item) => item.post_token_scoped && item.roles.includes('post'))
+                    .map((item) => String(item.post_token || '').trim()),
             ])
 
             const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
@@ -11855,8 +12130,6 @@ app.delete('/api/post-history/:id', async (c) => {
     }
 })
 
-<<<<<<< HEAD
-=======
 app.post('/api/post-history/:id/retry-post', async (c) => {
     const id = c.req.param('id')
     const env = c.env
@@ -12306,7 +12579,6 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
     }
 })
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 app.get('/api/pages/:id/history', async (c) => {
     const pageId = c.req.param('id')
     try {
@@ -12497,6 +12769,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let selectedCaption = ''
     let attemptPostedAtIso = ''
     let normalizedShopeeLink = ''
+    let normalizedLazadaLink = ''
     let selectedVideoNamespaceId = ''
     let commentTokenHint: string | null = null
     let skipComment = false
@@ -12561,17 +12834,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
             throw new Error('access_token_missing')
         }
 
-<<<<<<< HEAD
-        const postedIds = await getPostedVideoIds({
-            db: env.DB,
-            namespaceId: botId,
-            pageId: page.id,
-            withinDays: 30,
-        })
-
-        const allVideoIds = await listAllVideoJsonIds(c.get('bucket'))
-        const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
-=======
         const namespacePostedIds = await getPostedVideoIds({
             db: env.DB,
             namespaceId: botId,
@@ -12581,51 +12843,28 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         const allVideoIds = await listAllVideoJsonIds(c.get('bucket'))
         const unpostedVideos = allVideoIds.filter(id => !namespacePostedIds.has(id))
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const pickedVideo = await pickRandomGalleryVideoForPosting({
             env,
             namespaceId: botId,
             bucket: c.get('bucket'),
             candidateIds: unpostedVideos,
-<<<<<<< HEAD
-            excludedVideoIds: postedIds,
-=======
             excludedVideoIds: namespacePostedIds,
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         })
         if (!pickedVideo) return c.json({ error: 'No readable video metadata left' }, 404)
         const unpostedId = pickedVideo.id
         const meta = pickedVideo.meta
         selectedVideoId = unpostedId
         selectedVideoNamespaceId = String(pickedVideo.sourceNamespaceId || botId).trim() || botId
-<<<<<<< HEAD
-        const shortlinkRequired = await getNamespaceShopeeShortlinkRequired(env.DB, botId)
-        const expectedShortlinkUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, botId)
-        const forceShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
-        normalizedShopeeLink = pickedVideo.shopeeLink
-            ? await shortenShopeeLinkForNamespace({
-                env,
-                namespaceId: botId,
-                shopeeLink: pickedVideo.shopeeLink,
-                logPrefix: 'FORCE-POST',
-                trace: forceShortlinkTrace,
-            })
-            : ''
-        const normalizedShopeeUtmSource = forceShortlinkTrace.utmSource || null
-        const normalizedShopeeStatus = forceShortlinkTrace.status || (normalizedShopeeLink ? 'fallback' : 'disabled')
-        const normalizedShopeeError = forceShortlinkTrace.error || null
-        const normalizedShopeeUtmMatch = computeShortlinkUtmMatchValue(expectedShortlinkUtmId, normalizedShopeeUtmSource)
-=======
         normalizedShopeeLink = pickedVideo.shopeeLink || ''
         const normalizedShopeeUtmSource = null
         const normalizedShopeeStatus = null
         const normalizedShopeeError = null
         const normalizedShopeeUtmMatch = null
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const title = metaToString(meta, 'title')
         const script = metaToString(meta, 'script')
         const publicUrl = metaToString(meta, 'publicUrl')
         const category = metaToString(meta, 'category')
+        normalizedLazadaLink = metaToString(meta, 'lazadaLink')
 
         if (!publicUrl) {
             return c.json({ error: 'Video public URL missing' }, 400)
@@ -12644,6 +12883,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 : 'AI Dubbed Video'
         caption += `\n#สินค้า #ของน่าใช้ #ช็อปปิ้งออนไลน์${category ? ` #${category}` : ''}`
         selectedCaption = caption
+        const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
 
         await ensurePostHistoryTraceColumns(env.DB)
         commentTokenHint = deriveCommentTokenHint(pageCommentToken)
@@ -12657,7 +12897,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         ).bind(
             page.id,
             unpostedId,
@@ -12673,6 +12913,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
             initialCommentError,
             null,
             normalizedShopeeLink || null,
+            normalizedLazadaLink || null,
+            normalizedLazadaMemberId || null,
             normalizedShopeeUtmSource,
             normalizedShopeeStatus,
             normalizedShopeeError,
@@ -12680,13 +12922,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
             normalizedShopeeUtmMatch,
         ).run()
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ?').bind(nowStr, page.id).run()
-<<<<<<< HEAD
-
-        if (pickedVideo.shopeeLink && shortlinkRequired && normalizedShopeeStatus !== 'shortened') {
-            throw new Error(`shortlink_required_failed${normalizedShopeeError ? `: ${normalizedShopeeError}` : ''}`)
-        }
-=======
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         // Handle legacy publicUrl without namespace path
         let realVideoUrl = publicUrl
@@ -12764,6 +12999,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 namespaceId: botId,
                 fbVideoId: commentTargetId,
                 shopeeLink: normalizedShopeeLink,
+                lazadaLink: normalizedLazadaLink,
                 commentTokens: commentTokenCandidates,
                 pageId: page.id,
                 logPrefix: 'FORCE-POST',
@@ -12817,10 +13053,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             page.id,
             unpostedId,
         ).run()
-<<<<<<< HEAD
-=======
         await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         await clearVideoShopeeLink(c.get('bucket'), unpostedId)
         return c.json({ success: true, page: page.name, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId, fb_reel_url: fbReelUrl })
@@ -12883,6 +13116,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                             namespaceId: botId,
                             fbVideoId: commentTargetId,
                             shopeeLink: normalizedShopeeLink,
+                            lazadaLink: normalizedLazadaLink,
                             commentTokens: commentTokenCandidates,
                             pageId,
                             logPrefix: 'FORCE-POST-RECOVER',
@@ -12934,10 +13168,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         pageId,
                         selectedVideoId,
                     ).run()
-<<<<<<< HEAD
-=======
                     await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
                     await clearVideoShopeeLink(new BotBucket(env.BUCKET, selectedVideoNamespaceId || botId) as unknown as R2Bucket, selectedVideoId)
                     return c.json({
@@ -12983,9 +13214,10 @@ app.post('/api/manual-post-reel', async (c) => {
             caption?: string
             commentToken?: string
             shopeeLink?: string
+            lazadaLink?: string
         }
 
-        const { pageId, accessToken, videoUrl, caption, commentToken, shopeeLink } = body
+        const { pageId, accessToken, videoUrl, caption, commentToken, shopeeLink, lazadaLink } = body
 
         if (!pageId || !accessToken || !videoUrl) {
             return c.json({ error: 'Missing required fields: pageId, accessToken, videoUrl' }, 400)
@@ -12994,30 +13226,14 @@ app.post('/api/manual-post-reel', async (c) => {
         console.log(`[MANUAL-REEL] Starting for page ${pageId}`)
         console.log(`[MANUAL-REEL] Video: ${videoUrl}`)
         const namespaceId = String(c.get('botId') || '').trim()
-        const shortlinkRequired = namespaceId ? await getNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId) : false
-        const manualShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         const effectiveShopeeLink = shopeeLink
-<<<<<<< HEAD
-            ? await shortenShopeeLinkForNamespace({
-=======
             ? await resolvePostingShopeeLinkForNamespace({
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 env: c.env,
                 namespaceId,
                 shopeeLink,
                 logPrefix: 'MANUAL-REEL',
-<<<<<<< HEAD
-                trace: manualShortlinkTrace,
-=======
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             })
             : ''
-        if (shopeeLink && shortlinkRequired && manualShortlinkTrace.status !== 'shortened') {
-            return c.json({
-                error: `shortlink_required_failed${manualShortlinkTrace.error ? `: ${manualShortlinkTrace.error}` : ''}`,
-                stage: 'shortlink',
-            }, 400)
-        }
 
         // Step 1: Init upload
         let initData: { video_id?: string; upload_url?: string }
@@ -13084,6 +13300,7 @@ app.post('/api/manual-post-reel', async (c) => {
         // Step 4: Auto comment (if shopeeLink provided)
         let commentResult: string | null = null
         if (shopeeLink) {
+            const effectiveLazadaLink = String(lazadaLink || '').trim()
             const commentWaitMs = getRandomCommentDelayMs()
             console.log(`[MANUAL-REEL] Waiting ${Math.ceil(commentWaitMs / 1000)}s before commenting...`)
             await waitMs(commentWaitMs)
@@ -13093,6 +13310,7 @@ app.post('/api/manual-post-reel', async (c) => {
                     namespaceId: c.get('botId'),
                     fbVideoId: fbVideoId || confirmedPostId,
                     shopeeLink: effectiveShopeeLink,
+                    lazadaLink: effectiveLazadaLink,
                     commentTokens: [commentToken || ''],
                     pageId,
                     logPrefix: 'MANUAL-REEL',
@@ -13279,8 +13497,6 @@ async function handleScheduled(env: Env) {
     for (const page of pages) {
         // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
         const botId = page.bot_id || 'default';
-<<<<<<< HEAD
-=======
         await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
         const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
         if (!shortlinkEnabled) {
@@ -13310,7 +13526,6 @@ async function handleScheduled(env: Env) {
             continue
         }
 
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const recentPostGuard = await getRecentPagePostGuard({
             db: env.DB,
             namespaceId: botId,
@@ -13459,17 +13674,6 @@ async function handleScheduled(env: Env) {
             customMetadata: { createdAt: nowISO }
         })
 
-<<<<<<< HEAD
-        // 2. Get a video that hasn't been posted to this page in the last 30 days
-        // ใช้ video จาก cache แล้ว
-        const postedIds = await getPostedVideoIds({
-            db: env.DB,
-            namespaceId: botId,
-            pageId: page.id,
-            withinDays: 30,
-        })
-        console.log(`[CRON] Page ${page.name}: videos already posted to this page in last 30 days: ${Array.from(postedIds).join(', ') || 'none'}`)
-=======
         // 2. Get a video that hasn't been posted anywhere in this namespace in the last 30 days
         const namespacePostedIds = await getPostedVideoIds({
             db: env.DB,
@@ -13477,26 +13681,17 @@ async function handleScheduled(env: Env) {
             withinDays: 30,
         })
         console.log(`[CRON] Page ${page.name}: videos already posted in namespace ${botId} in last 30 days: ${Array.from(namespacePostedIds).join(', ') || 'none'}`)
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         const allVideoIds = videoNamespaceNewestFirstCache[botId] || videoNamespaceCache[botId] || []
         console.log(`[CRON] Page ${page.name}: found ${allVideoIds.length} videos in R2`)
 
-<<<<<<< HEAD
-        const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
-=======
         const unpostedVideos = allVideoIds.filter(id => !namespacePostedIds.has(id))
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const pickedVideo = await pickRandomGalleryVideoForPosting({
             env,
             namespaceId: botId,
             bucket: botBucket,
             candidateIds: unpostedVideos,
-<<<<<<< HEAD
-            excludedVideoIds: postedIds,
-=======
             excludedVideoIds: namespacePostedIds,
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         })
         if (!pickedVideo) {
             console.log(`[CRON] Page ${page.name}: no readable video metadata left`)
@@ -13527,34 +13722,17 @@ async function handleScheduled(env: Env) {
 
         // Get video metadata
         const meta = pickedVideo.meta
-<<<<<<< HEAD
-        const shortlinkRequired = await getNamespaceShopeeShortlinkRequired(env.DB, botId)
-        const expectedShortlinkUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, botId)
-        const cronShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
-        const normalizedShopeeLink = pickedVideo.shopeeLink
-            ? await shortenShopeeLinkForNamespace({
-                env,
-                namespaceId: botId,
-                shopeeLink: pickedVideo.shopeeLink,
-                logPrefix: `CRON ${page.name}`,
-                trace: cronShortlinkTrace,
-            })
-            : ''
-        const normalizedShopeeUtmSource = cronShortlinkTrace.utmSource || null
-        const normalizedShopeeStatus = cronShortlinkTrace.status || (normalizedShopeeLink ? 'fallback' : 'disabled')
-        const normalizedShopeeError = cronShortlinkTrace.error || null
-        const normalizedShopeeUtmMatch = computeShortlinkUtmMatchValue(expectedShortlinkUtmId, normalizedShopeeUtmSource)
-=======
         const normalizedShopeeLink = pickedVideo.shopeeLink || ''
         const normalizedShopeeUtmSource = null
         const normalizedShopeeStatus = null
         const normalizedShopeeError = null
         const normalizedShopeeUtmMatch = null
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const title = metaToString(meta, 'title')
         const script = metaToString(meta, 'script')
         const publicUrl = metaToString(meta, 'publicUrl')
         const category = metaToString(meta, 'category')
+        const normalizedLazadaLink = metaToString(meta, 'lazadaLink')
+        const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
 
         // Generate short caption from script (no Shopee link)
         let apiKey = geminiApiKeyByNamespace.get(botId)
@@ -13616,7 +13794,7 @@ async function handleScheduled(env: Env) {
         const initialCommentError = initialCommentState.error
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         ).bind(
             page.id,
             unpostedId,
@@ -13632,6 +13810,8 @@ async function handleScheduled(env: Env) {
             initialCommentError,
             null,
             normalizedShopeeLink || null,
+            normalizedLazadaLink || null,
+            normalizedLazadaMemberId || null,
             normalizedShopeeUtmSource,
             normalizedShopeeStatus,
             normalizedShopeeError,
@@ -13643,10 +13823,6 @@ async function handleScheduled(env: Env) {
         let fbVideoId = ''
         let postingTokenUsed = String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
         try {
-            if (pickedVideo.shopeeLink && shortlinkRequired && normalizedShopeeStatus !== 'shortened') {
-                throw new Error(`shortlink_required_failed${normalizedShopeeError ? `: ${normalizedShopeeError}` : ''}`)
-            }
-
             // Download video and publish via EAAD6 /videos first, then fall back to the legacy post token flow if needed.
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')
             if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
@@ -13721,6 +13897,7 @@ async function handleScheduled(env: Env) {
                         namespaceId: botId,
                         fbVideoId: commentTargetId,
                         shopeeLink: normalizedShopeeLink,
+                        lazadaLink: normalizedLazadaLink,
                         commentTokens: commentTokenCandidates,
                         pageId: page.id,
                         logPrefix: `CRON ${page.name}`,
@@ -13773,10 +13950,7 @@ async function handleScheduled(env: Env) {
                 unpostedId,
                 botId,
             ).run()
-<<<<<<< HEAD
-=======
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
             await clearVideoShopeeLink(botBucket, unpostedId)
             console.log(`[CRON] Page ${page.name}: posted successfully (fb_video_id: ${fbVideoId}, post_id: ${confirmedPostId})`)
@@ -13844,6 +14018,7 @@ async function handleScheduled(env: Env) {
                                 namespaceId: botId,
                                 fbVideoId: commentTargetId,
                                 shopeeLink: normalizedShopeeLink,
+                                lazadaLink: normalizedLazadaLink,
                                 commentTokens: commentTokenCandidates,
                                 pageId: page.id,
                                 logPrefix: `CRON ${page.name} RECOVER`,
@@ -13895,10 +14070,7 @@ async function handleScheduled(env: Env) {
                         unpostedId,
                         botId,
                     ).run()
-<<<<<<< HEAD
-=======
                     await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
                     await clearVideoShopeeLink(botBucket, unpostedId)
                     console.log(`[CRON] Page ${page.name}: recovered as success (fb_video_id: ${fbVideoId}, post_id: ${recoveredPostId})`)
@@ -13987,7 +14159,7 @@ async function watchdogStuckJobs(env: Env) {
 
                 const job = await data.json() as {
                     id: string; videoUrl: string; chatId: number;
-                    shopeeLink?: string; updatedAt?: string; createdAt?: string;
+                    shopeeLink?: string; lazadaLink?: string; updatedAt?: string; createdAt?: string;
                     retryCount?: number; step?: number; stepName?: string; status?: string;
                 }
 
@@ -14020,6 +14192,7 @@ async function watchdogStuckJobs(env: Env) {
                         videoUrl: job.videoUrl,
                         chatId: job.chatId,
                         shopeeLink: job.shopeeLink || '',
+                        lazadaLink: job.lazadaLink || '',
                         createdAt: new Date().toISOString(),
                         status: 'queued',
                         retryCount,
@@ -14043,8 +14216,7 @@ export default {
     scheduled: async (event: ScheduledEvent, env: Env, _ctx: ExecutionContext) => {
         // Watchdog ทำงานก่อน → ตรวจจับ job ค้าง + retry
         await watchdogStuckJobs(env)
-        // Background sync tokens/page mapping from BrowserSaving tags.
-        await autoSyncPagesFromBrowserSavingTags(env)
+        // Token sync ถูกย้ายไปทำจาก Telegram mini app (กดซิงค์เอง) เท่านั้น
         await handleScheduled(env)
     },
 }

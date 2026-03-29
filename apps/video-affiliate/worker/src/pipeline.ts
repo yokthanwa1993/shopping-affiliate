@@ -58,6 +58,43 @@ async function ensureNamespaceSettingsTable(db: D1Database) {
     ).run()
 }
 
+function buildScopedWebAppUrl(baseUrl: string, botScope: string) {
+    const scope = String(botScope || '').trim()
+    if (!scope) return baseUrl
+    try {
+        const url = new URL(baseUrl)
+        url.searchParams.set('bot', scope)
+        return url.toString()
+    } catch {
+        return `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}bot=${encodeURIComponent(scope)}`
+    }
+}
+
+function buildScopedGalleryWebAppUrl(baseUrl: string, botScope: string, videoId: string, store: 'shopee' | 'lazada' = 'lazada') {
+    const scopedBaseUrl = buildScopedWebAppUrl(baseUrl, botScope)
+    try {
+        const url = new URL(scopedBaseUrl)
+        url.pathname = '/gallery'
+        url.searchParams.set('store', store)
+        const trimmedVideoId = String(videoId || '').trim()
+        if (trimmedVideoId) {
+            url.searchParams.set('q', trimmedVideoId)
+        } else {
+            url.searchParams.delete('q')
+        }
+        return url.toString()
+    } catch {
+        const params = new URLSearchParams()
+        const scope = String(botScope || '').trim()
+        const trimmedVideoId = String(videoId || '').trim()
+        if (scope) params.set('bot', scope)
+        params.set('store', store)
+        if (trimmedVideoId) params.set('q', trimmedVideoId)
+        const query = params.toString()
+        return `${baseUrl.replace(/\/+$/, '')}/gallery${query ? `?${query}` : ''}`
+    }
+}
+
 export async function getVoicePromptTemplate(db: D1Database, namespaceId: string): Promise<{ prompt: string; source: 'custom' | 'default'; updatedAt: string | null }> {
     await ensureNamespaceSettingsTable(db)
     const row = await db.prepare(
@@ -143,6 +180,22 @@ async function listAllByPrefix(bucket: R2Bucket, prefix: string): Promise<R2Obje
     return objects
 }
 
+function normalizeGalleryCacheVideo(
+    key: string,
+    raw: Record<string, unknown>,
+    namespaceId?: string,
+): Record<string, unknown> {
+    const derivedId = String(key.match(/^videos\/(.+)\.json$/)?.[1] || '').trim()
+    const normalizedId = String(raw.id || derivedId).trim() || derivedId
+    const normalizedNamespaceId = String(raw.namespace_id || namespaceId || '').trim()
+
+    return {
+        ...raw,
+        ...(normalizedId ? { id: normalizedId } : {}),
+        ...(normalizedNamespaceId ? { namespace_id: normalizedNamespaceId } : {}),
+    }
+}
+
 /** Rebuild _cache/gallery.json — อ่าน .json ทั้งหมดแล้วรวมเป็นไฟล์เดียว */
 export async function rebuildGalleryCache(bucket: R2Bucket, botId?: string): Promise<unknown[]> {
     const b = botId ? new (await import('./utils/botBucket')).BotBucket(bucket, botId) : bucket
@@ -153,7 +206,8 @@ export async function rebuildGalleryCache(bucket: R2Bucket, botId?: string): Pro
         if (!obj.key.endsWith('.json')) continue
         const metaObj = await b.get(obj.key)
         if (!metaObj) continue
-        videos.push(await metaObj.json())
+        const rawVideo = await metaObj.json() as Record<string, unknown>
+        videos.push(normalizeGalleryCacheVideo(obj.key, rawVideo, botId))
     }
 
     videos.sort((a: any, b: any) =>
@@ -198,10 +252,15 @@ export async function updateGalleryCache(bucket: R2Bucket, videoId: string, botI
 
     // Upsert: แทนที่ตัวเดิม หรือเพิ่มใหม่
     const idx = videos.findIndex(v => v.id === videoId)
+    const existingVideo = idx >= 0 ? videos[idx] : undefined
+    const normalizedVideo = normalizeGalleryCacheVideo(`videos/${videoId}.json`, {
+        ...(existingVideo || {}),
+        ...updatedVideo,
+    }, String(updatedVideo.namespace_id || existingVideo?.namespace_id || botId || '').trim() || undefined)
     if (idx >= 0) {
-        videos[idx] = updatedVideo
+        videos[idx] = normalizedVideo
     } else {
-        videos.unshift(updatedVideo) // เพิ่มใหม่ที่หัว (ล่าสุด)
+        videos.unshift(normalizedVideo) // เพิ่มใหม่ที่หัว (ล่าสุด)
     }
 
     // Sort by createdAt desc
@@ -224,6 +283,7 @@ export async function runPipeline(
     videoId: string,
     botId: string,
     shopeeLink?: string | null,
+    lazadaLink?: string | null,
 ) {
     let token = env.TELEGRAM_BOT_TOKEN
     try {
@@ -268,9 +328,6 @@ export async function runPipeline(
             model,
             script_prompt: voicePrompt,
             r2_public_url: env.R2_PUBLIC_URL,
-<<<<<<< HEAD
-            worker_url: 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev',
-=======
             worker_url: String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev',
             completion_webapp_url: buildScopedGalleryWebAppUrl(
                 env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
@@ -278,10 +335,10 @@ export async function runPipeline(
                 videoId,
                 'lazada',
             ),
->>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             video_id: videoId,
             bot_id: botId,
             shopee_link: String(shopeeLink || '').trim() || undefined,
+            lazada_link: String(lazadaLink || '').trim() || undefined,
         })
 
         // Health check ก่อน — รอ Container boot สูงสุด 3 ครั้ง × 3 วินาที = 9 วินาที
@@ -357,6 +414,7 @@ export async function runPipeline(
                 id: videoId,
                 videoUrl,
                 shopeeLink: String(shopeeLink || '').trim() || undefined,
+                lazadaLink: String(lazadaLink || '').trim() || undefined,
                 chatId,
                 status: 'failed',
                 error: errMsg,
@@ -424,7 +482,7 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
     const jobData = await botBucket.get(oldest.key)
     if (!jobData) return false
 
-    const job = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string }
+    const job = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string }
 
     // ย้ายจาก _queue → _processing
     await botBucket.delete(oldest.key)
@@ -437,7 +495,7 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
     })
 
     // เริ่ม pipeline — need to await directly since we're in waitUntil already
-    await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink)
+    await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink, job.lazadaLink)
 
     return true
 }
