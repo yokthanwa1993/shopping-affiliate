@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 
 
-const WORKER_URL = 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev'
+const WORKER_URL = String(import.meta.env.VITE_WORKER_URL || 'https://video-affiliate-worker.onlyy-gor.workers.dev')
+  .trim()
+  .replace(/\/+$/, '')
+
+const COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER = '{{shopee_link}}'
+const COMMENT_TEMPLATE_LAZADA_PLACEHOLDER = '{{lazada_link}}'
+const DEFAULT_COMMENT_TEMPLATE = `📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้ 👇
+🧡 Shopee : {{shopee_link}}
+💙 Lazada : {{lazada_link}}
+
+✨ ของจริงงานดีนะ ลองเข้าไปส่องก่อน 👀🛍️
+🛡️ เพจเราเป็น Partner Shopee & Lazada ปลอดภัย ✅💯`
 
 const getBotScopeFromLocation = () => {
   try {
@@ -51,7 +62,20 @@ const getStoredShortlinkExpectedUtmId = (botScope = getBotScopeFromLocation()) =
   try { return String(localStorage.getItem(scopedStorageKey('shortlink_expected_utm_id', botScope)) || '').trim() } catch { return '' }
 }
 
+<<<<<<< HEAD
 const CACHE_VERSION = 'v5'
+=======
+const getStoredLazadaExpectedMemberId = (botScope = getBotScopeFromLocation()) => {
+  try { return String(localStorage.getItem(scopedStorageKey('lazada_expected_member_id', botScope)) || '').trim() } catch { return '' }
+}
+
+const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation()) => {
+  void botScope
+  return false
+}
+
+const CACHE_VERSION = 'v6'
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
@@ -122,6 +146,27 @@ interface Video {
   category?: string
   title?: string
   keepInPostedTab?: boolean
+}
+
+interface InboxVideo {
+  id: string
+  videoUrl?: string
+  previewUrl?: string
+  createdAt: string
+  updatedAt?: string
+  status: string
+  sourceType?: string
+  sourceLabel?: string
+  shopeeLink?: string
+  lazadaLink?: string
+  hasShopeeLink?: boolean
+  hasLazadaLink?: boolean
+  readyToProcess?: boolean
+  processingStatus?: 'idle' | 'queued' | 'processing'
+  processingActive?: boolean
+  archiveState?: 'original' | 'processed'
+  canStartProcessing?: boolean
+  canDelete?: boolean
 }
 
 interface GalleryPageResponse {
@@ -211,19 +256,9 @@ interface FacebookPage {
   updated_at?: string
 }
 
-interface TaggedPageProfile {
-  profile_id: string
-  profile_name: string
-  facebook_name?: string
-  roles: Array<'post' | 'comment'>
-  tags: string[]
-  token?: string
-  postcron_token?: string
-}
-
 type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
 type GeminiKeySource = 'workspace' | 'none'
-type SettingsSection = 'menu' | 'account' | 'team' | 'gemini' | 'shortlink' | 'voice'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment'
 
 const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)?(?:shopee\.co\.th|s\.shopee\.co\.th)\S*/i
 
@@ -360,6 +395,19 @@ const DashboardIconFilled = () => (
     <path d="M3 10a1 1 0 011-1h1.5a1 1 0 011 1v10H4a1 1 0 01-1-1v-9zM9 4a1 1 0 011-1h1.5a1 1 0 011 1v16H9V4zM15 13a1 1 0 011-1h1.5a1 1 0 011 1v7H15v-7zM21 16a1 1 0 011-1h.5a1 1 0 011 1v4h-1.5a1 1 0 01-1-1v-3z" />
   </svg>
 )
+const InboxIcon = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+    <path d="M4 5.5h16v10.5a2 2 0 01-2 2H6a2 2 0 01-2-2V5.5z" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M4 14h4l2 3h4l2-3h4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M12 8v4" strokeLinecap="round" strokeLinejoin="round" />
+    <path d="M9.5 10.5L12 13l2.5-2.5" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+)
+const InboxIconFilled = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M4 5a2 2 0 012-2h12a2 2 0 012 2v9.5a2.5 2.5 0 01-2.5 2.5h-2.36a1 1 0 00-.8.4L13.5 19a1 1 0 01-1.6 0l-1.84-2.45a1 1 0 00-.8-.4H6.5A2.5 2.5 0 014 13.5V5zm8 2.75a.75.75 0 00-.75.75v2.69l-.72-.72a.75.75 0 10-1.06 1.06l2 2a.75.75 0 001.06 0l2-2a.75.75 0 10-1.06-1.06l-.72.72V8.5a.75.75 0 00-.75-.75z" />
+  </svg>
+)
 const VideoIcon = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
     <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" strokeLinecap="round" strokeLinejoin="round" />
@@ -389,16 +437,6 @@ const ListIcon = () => (
 const ListIconFilled = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
     <path fillRule="evenodd" d="M3 5.25a.75.75 0 01.75-.75h16.5a.75.75 0 010 1.5H3.75A.75.75 0 013 5.25zm0 4.5A.75.75 0 013.75 9h16.5a.75.75 0 010 1.5H3.75A.75.75 0 013 9.75zm0 4.5a.75.75 0 01.75-.75h16.5a.75.75 0 010 1.5H3.75a.75.75 0 01-.75-.75zm0 4.5a.75.75 0 01.75-.75h16.5a.75.75 0 010 1.5H3.75a.75.75 0 01-.75-.75z" clipRule="evenodd" />
-  </svg>
-)
-const PagesIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
-const PagesIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" />
   </svg>
 )
 const SettingsIcon = () => (
@@ -482,18 +520,13 @@ function Thumb({ url, fallback }: { id: string; url?: string; fallback: string }
   const src = failed ? '' : inferThumbnailUrl(url, fallback)
 
   if (!src) {
-    if (fallback) {
-      return (
-        <video
-          src={`${fallback}#t=0.1`}
-          className="w-full h-full object-cover"
-          preload="metadata"
-          muted
-          playsInline
-        />
-      )
-    }
-    return <div className="w-full h-full bg-gray-100" />
+    return (
+      <div className="w-full h-full bg-gradient-to-br from-slate-200 via-slate-100 to-white flex items-center justify-center">
+        <div className="rounded-full bg-white/85 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 shadow-sm">
+          No Thumb
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -981,8 +1014,7 @@ function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOri
 
 // Add Page Token Popup
 function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
-  const [postProfileId, setPostProfileId] = useState('')
-  const [commentProfileId, setCommentProfileId] = useState('')
+  const [userToken, setUserToken] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<{
@@ -993,12 +1025,8 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
   } | null>(null)
 
   const handleImport = async () => {
-    if (!postProfileId.trim()) {
-      setError('กรุณาใส่ Post Profile ID')
-      return
-    }
-    if (!commentProfileId.trim()) {
-      setError('กรุณาใส่ Comment Profile ID')
+    if (!userToken.trim()) {
+      setError('กรุณาวาง Facebook User Token')
       return
     }
 
@@ -1010,8 +1038,7 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          post_profile_id: postProfileId.trim(),
-          comment_profile_id: commentProfileId.trim(),
+          user_token: userToken.trim(),
         })
       })
 
@@ -1057,57 +1084,20 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 
         {/* Instructions */}
         <p className="text-sm text-gray-500">
-          ใส่ BrowserSaving Profile ID (UUID) หรือใช้ tag เช่น <code>tag:post</code> และ <code>tag:comment</code>
+          วาง Facebook User Token แล้วระบบจะดึงรายการเพจผ่าน <code>me/accounts</code> และใช้ token เดียวกันสำหรับโพสต์กับคอมเมนต์
         </p>
 
-        {/* Post Profile ID Input — paste only, no keyboard */}
+        {/* User Token Input */}
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Post Profile ID</label>
-          <div
-            contentEditable
-            suppressContentEditableWarning
-            onPaste={(e) => {
-              e.preventDefault()
-              const text = e.clipboardData.getData('text/plain').trim()
-              if (text) setPostProfileId(text)
-            }}
-            onBeforeInput={(e) => e.preventDefault()}
-            onDrop={(e) => e.preventDefault()}
-            className="w-full p-3 border border-gray-200 rounded-xl text-sm min-h-[80px] break-all focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
-            inputMode="none"
-          >
-            {postProfileId && <span className="text-gray-900">{postProfileId}</span>}
-          </div>
-          {postProfileId && (
-            <button onClick={() => setPostProfileId('')} className="text-xs text-red-400 mt-1 ml-1">ล้าง</button>
-          )}
-          <p className="text-[11px] text-gray-500 mt-1">ตัวอย่าง: <code>tag:post</code> หรือ UUID โปรไฟล์</p>
-        </div>
-
-        {/* Comment Profile ID Input — paste only, no keyboard */}
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Comment Profile ID</label>
-          <div
-            contentEditable
-            suppressContentEditableWarning
-            onPaste={(e) => {
-              e.preventDefault()
-              const text = e.clipboardData.getData('text/plain').trim()
-              if (text) setCommentProfileId(text)
-            }}
-            onBeforeInput={(e) => e.preventDefault()}
-            onDrop={(e) => e.preventDefault()}
-            className="w-full p-3 border border-gray-200 rounded-xl text-sm min-h-[80px] break-all focus:outline-none focus:ring-2 focus:ring-blue-500"
-            style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
-            inputMode="none"
-          >
-            {commentProfileId && <span className="text-gray-900">{commentProfileId}</span>}
-          </div>
-          {commentProfileId && (
-            <button onClick={() => setCommentProfileId('')} className="text-xs text-red-400 mt-1 ml-1">ล้าง</button>
-          )}
-          <p className="text-[11px] text-gray-500 mt-1">ตัวอย่าง: <code>tag:comment</code> หรือ UUID โปรไฟล์</p>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Facebook User Token</label>
+          <textarea
+            value={userToken}
+            onChange={(e) => setUserToken(e.target.value)}
+            rows={5}
+            placeholder="วาง Facebook User Token ที่นี่..."
+            className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-sm font-mono text-gray-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+          />
+          <p className="text-[11px] text-gray-500 mt-1">ระบบจะดึงเพจผ่าน Graph API <code>me/accounts</code></p>
         </div>
 
         {/* Error */}
@@ -1194,15 +1184,8 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [accessToken, setAccessToken] = useState(page.access_token || '')
   const [saving, setSaving] = useState(false)
   const [forcingPost, setForcingPost] = useState(false)
-  const [tokenInspector, setTokenInspector] = useState<'access' | null>(null)
   const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
-  const [editingTaggedProfile, setEditingTaggedProfile] = useState<{ mode: 'access'; profile: TaggedPageProfile } | null>(null)
-  const [editingTaggedTokenValue, setEditingTaggedTokenValue] = useState('')
-  const [taggedTokenMutation, setTaggedTokenMutation] = useState<'save' | 'delete' | 'unlink' | null>(null)
-  const [taggedProfiles, setTaggedProfiles] = useState<TaggedPageProfile[]>([])
-  const [taggedLoading, setTaggedLoading] = useState(true)
-  const [taggedError, setTaggedError] = useState('')
 
   // Hours 1-24 for display
   const hourOptions = Array.from({ length: 24 }, (_, i) => i + 1)
@@ -1212,114 +1195,6 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     if (!token) return 'ไม่มีโทเค้น'
     return `${token.slice(0, 20)}...`
   }
-
-  const allTaggedProfiles = taggedProfiles
-  const profilesWithToken = allTaggedProfiles.filter((profile) => String(profile.token || '').trim()).length
-  const profilesWithPostcronToken = allTaggedProfiles.filter((profile) => String(profile.postcron_token || '').trim()).length
-
-  const inspectorProfiles = allTaggedProfiles
-  const inspectorProfilesWithToken = profilesWithToken
-  const inspectorProfilesWithPostcronToken = profilesWithPostcronToken
-
-  const refreshPageAfterTaggedTokenChange = async () => {
-    try {
-      const pageResp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}`)
-      if (!pageResp.ok) return
-      const pageData = await pageResp.json().catch(() => ({})) as { page?: FacebookPage }
-      if (!pageData.page) return
-      setAccessToken(pageData.page.access_token || '')
-      onSave(pageData.page)
-    } catch {
-      // ignore refresh failures after token update
-    }
-  }
-
-  const mutateTaggedProfileToken = async (profileId: string, nextToken: string, mutation: 'save' | 'delete') => {
-    setTaggedTokenMutation(mutation)
-    try {
-      const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}/token`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: nextToken, mode: 'comment' }),
-      })
-      const data = await resp.json().catch(() => ({})) as { error?: string; token?: string; postcron_token?: string }
-      if (!resp.ok) {
-        throw new Error(String(data?.error || (mutation === 'delete' ? 'ลบ token ไม่สำเร็จ' : 'บันทึก token ไม่สำเร็จ')))
-      }
-
-      const savedToken = String(data?.token ?? nextToken).trim()
-      const savedPostcronToken = String(data?.postcron_token || '').trim()
-      setTaggedProfiles((prev) => prev.map((item) => {
-        if (item.profile_id !== profileId) return item
-        return {
-          ...item,
-          token: savedToken,
-          postcron_token: savedPostcronToken,
-        }
-      }))
-      await refreshPageAfterTaggedTokenChange()
-      setEditingTaggedProfile(null)
-      setEditingTaggedTokenValue('')
-      alert(mutation === 'delete' ? 'ลบ token โปรไฟล์สำเร็จ' : 'บันทึก token โปรไฟล์สำเร็จ')
-    } catch (err) {
-      alert(err instanceof Error ? err.message : String(err))
-    } finally {
-      setTaggedTokenMutation(null)
-    }
-  }
-
-  const unlinkTaggedProfileFromPage = async (profileId: string) => {
-    setTaggedTokenMutation('unlink')
-    try {
-      const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles/${encodeURIComponent(profileId)}`, {
-        method: 'DELETE',
-      })
-      const data = await resp.json().catch(() => ({})) as { error?: string }
-      if (!resp.ok) {
-        throw new Error(String(data?.error || 'ลบโปรไฟล์ออกจากเพจไม่สำเร็จ'))
-      }
-
-      setTaggedProfiles((prev) => prev.filter((item) => item.profile_id !== profileId))
-      await refreshPageAfterTaggedTokenChange()
-      setEditingTaggedProfile(null)
-      setEditingTaggedTokenValue('')
-      alert('ลบโปรไฟล์ออกจากเพจสำเร็จ ถ้าอยากให้กลับมา ให้กดซิงค์โทเค็นใหม่')
-    } catch (err) {
-      alert(err instanceof Error ? err.message : String(err))
-    } finally {
-      setTaggedTokenMutation(null)
-    }
-  }
-
-  useEffect(() => {
-    let cancelled = false
-
-    const loadTaggedProfiles = async () => {
-      setTaggedLoading(true)
-      setTaggedError('')
-      try {
-        const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/tag-profiles`)
-        const data = await resp.json().catch(() => ({})) as {
-          profiles?: TaggedPageProfile[]
-          error?: string
-        }
-        if (!resp.ok) {
-          throw new Error(String(data?.error || 'โหลดโปรไฟล์ BrowserSaving ไม่สำเร็จ'))
-        }
-        if (cancelled) return
-        setTaggedProfiles(Array.isArray(data?.profiles) ? data.profiles : [])
-      } catch (err) {
-        if (cancelled) return
-        setTaggedProfiles([])
-        setTaggedError(err instanceof Error ? err.message : String(err))
-      } finally {
-        if (!cancelled) setTaggedLoading(false)
-      }
-    }
-
-    loadTaggedProfiles()
-    return () => { cancelled = true }
-  }, [page.id])
 
   const toggleHour = (hour: number) => {
     const newMap = { ...hourMinutes }
@@ -1336,44 +1211,46 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const handleSave = async () => {
     setSaving(true)
     try {
-      const accessTokenChanged = accessToken.trim() !== String(page.access_token || '').trim()
       const normalizedInterval = normalizeInterval(intervalMinutes)
       const schedulePostHours = scheduleMode === 'interval'
         ? `every:${normalizedInterval}`
         : postHoursString
+      const nextToken = accessToken.trim()
+      const accessTokenChanged = nextToken !== String(page.access_token || '').trim()
+      const payload: Record<string, unknown> = {
+        post_hours: schedulePostHours,
+        post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
+        is_active: isActive,
+      }
+      if (accessTokenChanged) {
+        payload.access_token = nextToken
+      }
+
       const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          post_hours: schedulePostHours,
-          post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
-          is_active: isActive,
-          access_token: accessToken || undefined,
-        })
+        body: JSON.stringify(payload)
       })
-      if (resp.ok) {
-        const data = await resp.json().catch(() => ({})) as any
-        const savedPage = data?.page || {
-          ...page,
-          post_hours: schedulePostHours,
-          post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : page.post_interval_minutes,
-          is_active: isActive ? 1 : 0,
-          access_token: accessToken,
-        }
-
-        setAccessToken(savedPage.access_token || '')
-        setScheduleMode(detectScheduleMode(savedPage.post_hours))
-        setIntervalMinutes(parseInterval(savedPage.post_hours, savedPage.post_interval_minutes || normalizedInterval))
-        onSave(savedPage)
-
-        if (accessTokenChanged && data?.resolved?.access_token === 'browsersaving_profile_id') {
-          alert('Access Token: ดึงจาก BrowserSaving Profile ID และแปลงเป็น Page Token แล้ว')
-        }
-
-        onBack()
+      const data = await resp.json().catch(() => ({})) as any
+      if (!resp.ok) {
+        throw new Error(String(data?.details || data?.error || 'บันทึกเพจไม่สำเร็จ'))
       }
+
+      const savedPage = data?.page || {
+        ...page,
+        post_hours: schedulePostHours,
+        post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : page.post_interval_minutes,
+        is_active: isActive ? 1 : 0,
+        access_token: nextToken,
+      }
+
+      setAccessToken(savedPage.access_token || '')
+      setScheduleMode(detectScheduleMode(savedPage.post_hours))
+      setIntervalMinutes(parseInterval(savedPage.post_hours, savedPage.post_interval_minutes || normalizedInterval))
+      onSave(savedPage)
+      onBack()
     } catch (e) {
-      console.error('Save failed:', e)
+      alert(e instanceof Error ? e.message : String(e))
     } finally {
       setSaving(false)
     }
@@ -1469,185 +1346,28 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           </div>
         </div>
 
-        {/* Tokens */}
-        <div className="bg-white border border-gray-100 rounded-2xl mb-3 overflow-hidden">
-          <button
-            onClick={() => setTokenInspector('access')}
-            className="w-full flex items-center justify-between p-4 active:bg-gray-50 transition-colors"
-          >
-            <div className="text-left">
-              <p className="text-sm font-bold text-gray-900">Access Token</p>
-              <p className="text-xs text-gray-400 mt-0.5">
-                {taggedLoading
-                  ? 'กำลังโหลดจาก BrowserSaving...'
-                  : `จาก BrowserSaving: access ${profilesWithToken}/${allTaggedProfiles.length} | postcron ${profilesWithPostcronToken}/${allTaggedProfiles.length}`}
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-bold text-gray-900">Page/User Token</p>
+              <p className={`text-xs mt-1 font-mono break-all ${accessToken.trim() ? 'text-gray-500' : 'text-orange-600 font-bold'}`}>
+                {renderTokenPreview(accessToken)}
+              </p>
+              <p className="text-[11px] text-gray-400 mt-2">
+                วาง Facebook User Token หรือ Page Token ได้เลย ระบบจะดึง page token ผ่าน <code>me/accounts</code> ให้เองถ้าจำเป็น
               </p>
             </div>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><path d="M9 18l6-6-6-6" strokeLinecap="round" strokeLinejoin="round" /></svg>
-          </button>
+            <button
+              onClick={() => {
+                setEditingToken('access')
+                setEditingTokenValue(accessToken)
+              }}
+              className="shrink-0 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-bold text-blue-600 active:scale-95"
+            >
+              แก้ไข
+            </button>
+          </div>
         </div>
-
-        {/* Token Inspector Popup */}
-        {tokenInspector && (
-          <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center px-5" onClick={() => setTokenInspector(null)}>
-            <div className="bg-white rounded-2xl w-full max-w-md max-h-[80vh] p-4 flex flex-col" onClick={(e) => e.stopPropagation()}>
-              <div className="mb-3">
-                <h3 className="font-bold text-gray-900 text-base text-center">
-                  Tokens จาก BrowserSaving
-                </h3>
-                <p className="text-xs text-gray-500 text-center mt-1">
-                  {taggedLoading
-                    ? 'กำลังโหลด...'
-                    : `access ${inspectorProfilesWithToken}/${inspectorProfiles.length} | postcron ${inspectorProfilesWithPostcronToken}/${inspectorProfiles.length}`}
-                </p>
-              </div>
-
-              <div className="flex-1 overflow-y-auto space-y-2 pr-1">
-                {taggedError ? (
-                  <p className="text-xs text-red-500">{taggedError}</p>
-                ) : taggedLoading ? (
-                  <p className="text-xs text-gray-400">กำลังโหลดรายการโปรไฟล์...</p>
-                ) : inspectorProfiles.length === 0 ? (
-                  <p className="text-xs text-gray-400">ไม่พบโปรไฟล์ BrowserSaving ที่แมตช์กับเพจนี้</p>
-                ) : (
-                  inspectorProfiles.map((profile) => {
-                    const currentToken = profile.token
-                    const currentPostcronToken = profile.postcron_token
-                    return (
-                      <div
-                        key={`access-${profile.profile_id}`}
-                        onClick={() => {
-                          setEditingTaggedProfile({ mode: 'access', profile })
-                          setEditingTaggedTokenValue(String(currentToken || '').trim())
-                        }}
-                        className="w-full rounded-xl border border-gray-100 bg-gray-50/60 p-3 text-left active:scale-[0.99] transition-all cursor-pointer"
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0 flex-1">
-                            <p className="text-sm font-bold text-gray-900 truncate">{profile.profile_name || profile.profile_id}</p>
-                            <p className="text-[11px] text-gray-500 truncate">{profile.facebook_name || profile.profile_id}</p>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={async (e) => {
-                              e.stopPropagation()
-                              if (taggedTokenMutation) return
-                              if (!window.confirm('ลบโปรไฟล์นี้ออกจากเพจนี้ใช่ไหม? ถ้าอยากให้กลับมา ให้กดซิงค์โทเค็นใหม่')) return
-                              await unlinkTaggedProfileFromPage(profile.profile_id)
-                            }}
-                            disabled={!!taggedTokenMutation}
-                            className="shrink-0 w-8 h-8 rounded-lg border border-red-200 bg-red-50 text-red-500 flex items-center justify-center active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                            title="ลบออกจากเพจ"
-                          >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M3 6h18" strokeLinecap="round" />
-                              <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" strokeLinecap="round" />
-                              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" strokeLinecap="round" />
-                              <path d="M10 11v6M14 11v6" strokeLinecap="round" />
-                            </svg>
-                          </button>
-                        </div>
-                        <div className="mt-2 flex items-center justify-between gap-2">
-                          <span className="text-[11px] text-gray-500">Access Token</span>
-                          <span className={`text-[11px] font-mono truncate ${currentToken ? 'text-gray-800' : 'text-orange-600 font-bold'}`}>
-                            {renderTokenPreview(currentToken)}
-                          </span>
-                        </div>
-                        <div className="mt-1 flex items-center justify-between gap-2">
-                          <span className="text-[11px] text-gray-500">Postcron Token</span>
-                          <span className={`text-[11px] font-mono truncate ${currentPostcronToken ? 'text-gray-800' : 'text-orange-600 font-bold'}`}>
-                            {renderTokenPreview(currentPostcronToken)}
-                          </span>
-                        </div>
-                        <p className="mt-1 text-[11px] text-blue-500">แตะเพื่อแก้ไข token โปรไฟล์นี้</p>
-                      </div>
-                    )
-                  })
-                )}
-              </div>
-
-              <div className="flex gap-2 mt-3">
-                <button
-                  onClick={() => {
-                    setTokenInspector(null)
-                    setEditingToken('access')
-                    setEditingTokenValue(accessToken)
-                  }}
-                  className="flex-1 py-2.5 rounded-xl font-bold text-sm border border-blue-200 text-blue-600 active:scale-95 transition-all"
-                >
-                  แก้ไขค่า Token หลัก
-                </button>
-                <button
-                  onClick={() => setTokenInspector(null)}
-                  className="flex-1 py-2.5 rounded-xl font-bold text-sm bg-gray-900 text-white active:scale-95 transition-all"
-                >
-                  ปิด
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Tagged Profile Token Edit Popup */}
-        {editingTaggedProfile && (
-          <div
-            className="fixed inset-0 bg-black/40 z-[60] flex items-center justify-center px-6"
-            onClick={() => { if (!taggedTokenMutation) setEditingTaggedProfile(null) }}
-          >
-            <div className="bg-white rounded-2xl w-full max-w-md p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
-              <h3 className="font-bold text-gray-900 text-base text-center">
-                แก้ไข Token (โปรไฟล์)
-              </h3>
-              <p className="text-xs text-gray-500 text-center -mt-2">
-                {editingTaggedProfile.profile.profile_name || editingTaggedProfile.profile.profile_id}
-              </p>
-              <textarea
-                value={editingTaggedTokenValue}
-                onChange={(e) => { setEditingTaggedTokenValue(e.target.value); e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px' }}
-                placeholder={'วาง Token (โพสต์/คอมเมนต์) หรือเว้นว่างเพื่อล้าง...'}
-                rows={2}
-                className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all resize-none overflow-hidden"
-              />
-              <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
-                <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Postcron Token</p>
-                <p className={`mt-1 text-xs font-mono break-all ${editingTaggedProfile.profile.postcron_token ? 'text-gray-700' : 'text-orange-600 font-bold'}`}>
-                  {editingTaggedProfile.profile.postcron_token || 'ไม่มีโทเค้น'}
-                </p>
-              </div>
-              <div className="flex gap-3">
-                <button
-                  onClick={() => setEditingTaggedProfile(null)}
-                  disabled={!!taggedTokenMutation}
-                  className="flex-1 py-3 rounded-xl font-bold text-sm border border-gray-200 text-gray-600 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  ยกเลิก
-                </button>
-                <button
-                  onClick={async () => {
-                    const profileId = editingTaggedProfile.profile.profile_id
-                    if (!window.confirm('ลบโปรไฟล์นี้ออกจากเพจนี้ใช่ไหม? ถ้าอยากให้กลับมา ให้กดซิงค์โทเค็นใหม่')) return
-                    await unlinkTaggedProfileFromPage(profileId)
-                  }}
-                  disabled={!!taggedTokenMutation}
-                  className="flex-1 py-3 rounded-xl font-bold text-sm bg-red-500 text-white active:scale-95 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {taggedTokenMutation === 'unlink' ? 'กำลังลบ...' : 'ลบออกจากเพจ'}
-                </button>
-                <button
-                  onClick={async () => {
-                    const profileId = editingTaggedProfile.profile.profile_id
-                    const nextToken = editingTaggedTokenValue.trim()
-                    await mutateTaggedProfileToken(profileId, nextToken, 'save')
-                  }}
-                  disabled={!!taggedTokenMutation}
-                  className="flex-1 py-3 rounded-xl font-bold text-sm bg-blue-600 text-white active:scale-95 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  {taggedTokenMutation === 'save' ? 'กำลังบันทึก...' : 'บันทึก'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* Token Edit Popup */}
         {editingToken && (
@@ -1661,11 +1381,14 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 value={editingTokenValue}
                 onChange={(e) => { setEditingTokenValue(e.target.value); e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px' }}
                 placeholder={
-                  'วาง Page/User Token หรือ BrowserSaving Profile ID (UUID) ที่นี่...'
+                  'วาง Facebook User Token หรือ Page Token ที่นี่...'
                 }
                 rows={2}
                 className="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm font-mono outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all resize-none overflow-hidden"
               />
+              <p className="text-[11px] text-gray-400">
+                ถ้าวาง User Token ระบบจะ resolve ให้เป็น token ของเพจนี้อัตโนมัติ
+              </p>
               <div className="flex gap-3">
                 <button
                   onClick={() => setEditingToken(null)}
@@ -1766,6 +1489,194 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         </button>
       </div>
     </div>
+  )
+}
+
+function InboxCard({
+  video,
+  onStart,
+  onDelete,
+  starting,
+  deleting,
+  onExpandedChange,
+}: {
+  video: InboxVideo
+  onStart: (id: string) => void
+  onDelete: (id: string) => void
+  starting: boolean
+  deleting: boolean
+  onExpandedChange?: (expanded: boolean) => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const processingStatus = String(video.processingStatus || 'idle').trim().toLowerCase()
+  const processingActive = video.processingActive === true || processingStatus === 'queued' || processingStatus === 'processing'
+  const archiveState = String(video.archiveState || 'original').trim().toLowerCase()
+  const processedArchive = archiveState === 'processed'
+  const canStartProcessing = video.canStartProcessing !== false && !processedArchive
+  const canDelete = video.canDelete !== false
+  const ready = video.readyToProcess === true || video.status === 'ready'
+  const missingLinks = [
+    video.hasShopeeLink ? null : 'Shopee',
+    video.hasLazadaLink ? null : 'Lazada',
+  ].filter(Boolean).join(' / ')
+  const sourceLabel = String(video.sourceLabel || (video.sourceType === 'xhs_url' ? 'Xiaohongshu link' : 'Telegram video')).trim()
+  const previewUrl = String(video.previewUrl || (video.sourceType === 'telegram_video' ? video.videoUrl || '' : '')).trim()
+  const createdAtLabel = new Date(video.createdAt).toLocaleString('th-TH', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  const statusBadge = processingStatus === 'processing'
+    ? { label: 'กำลังทำ', cls: 'bg-violet-500/95 text-white' }
+    : processingStatus === 'queued'
+      ? { label: 'อยู่ในคิว', cls: 'bg-sky-500/95 text-white' }
+      : processedArchive
+        ? { label: 'ทำเสร็จแล้ว', cls: 'bg-emerald-500/95 text-white' }
+      : ready
+        ? { label: 'พร้อมทำ', cls: 'bg-blue-500/95 text-white' }
+        : { label: 'รอลิงก์', cls: 'bg-amber-400/95 text-slate-950' }
+  const detailStatusBadge = processingStatus === 'processing'
+    ? { label: 'กำลังประมวลผล', cls: 'bg-violet-500 text-white' }
+    : processingStatus === 'queued'
+      ? { label: 'รอคิวประมวลผล', cls: 'bg-sky-500 text-white' }
+      : processedArchive
+        ? { label: 'ประมวลผลเสร็จแล้ว', cls: 'bg-emerald-500 text-white' }
+      : ready
+        ? { label: 'พร้อมประมวลผล', cls: 'bg-blue-500 text-white' }
+        : { label: `รอลิงก์ ${missingLinks || ''}`.trim(), cls: 'bg-amber-400 text-slate-950' }
+  const actionLabel = processingStatus === 'processing'
+    ? 'อยู่ใน Processing'
+    : processingStatus === 'queued'
+      ? 'อยู่ในคิว Processing'
+      : processedArchive
+        ? 'อยู่ใน Gallery แล้ว'
+      : ready
+        ? 'ส่งเข้า Processing'
+        : 'รอลิงก์ให้ครบก่อน'
+
+  useEffect(() => {
+    onExpandedChange?.(expanded)
+    return () => onExpandedChange?.(false)
+  }, [expanded, onExpandedChange])
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200 text-left"
+      >
+        {previewUrl ? (
+          <Thumb id={video.id} fallback={previewUrl} />
+        ) : (
+          <div className={`w-full h-full flex flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
+            <div className="rounded-full bg-white/18 px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.22em] text-white">
+              {video.sourceType === 'xhs_url' ? 'XHS' : 'ต้นฉบับ'}
+            </div>
+            <p className="mt-3 px-4 text-center text-xs font-semibold text-white/90 line-clamp-3">
+              {video.sourceType === 'xhs_url' ? 'Xiaohongshu Link' : 'Telegram Video'}
+            </p>
+          </div>
+        )}
+
+        <div className="absolute left-2 top-2">
+          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${statusBadge.cls}`}>
+            {statusBadge.label}
+          </span>
+        </div>
+
+        <div className="absolute right-2 top-2 flex items-center gap-1">
+          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${video.hasShopeeLink ? 'bg-emerald-500/95 text-white' : 'bg-black/55 text-white'}`}>
+            S
+          </span>
+          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${video.hasLazadaLink ? 'bg-sky-500/95 text-white' : 'bg-black/55 text-white'}`}>
+            L
+          </span>
+        </div>
+
+        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
+          <p className="truncate text-[11px] font-extrabold">{video.id}</p>
+          <p className="mt-0.5 truncate text-[10px] text-white/75">{createdAtLabel}</p>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="relative w-[88%] max-w-sm">
+            <button
+              onClick={() => setExpanded(false)}
+              className="mx-auto mb-3 w-11 h-11 bg-white/20 rounded-full flex items-center justify-center backdrop-blur-sm"
+            >
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
+                <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+
+            <div className="aspect-[9/16] rounded-2xl overflow-hidden bg-black">
+              {previewUrl ? (
+                <video
+                  src={previewUrl}
+                  className="w-full h-full object-cover"
+                  controls
+                  autoPlay
+                  playsInline
+                />
+              ) : (
+                <div className={`w-full h-full flex flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
+                  <div className="rounded-full bg-white/18 px-4 py-2 text-xs font-extrabold uppercase tracking-[0.22em] text-white">
+                    {video.sourceType === 'xhs_url' ? 'XHS' : 'ต้นฉบับ'}
+                  </div>
+                  <p className="mt-3 px-6 text-center text-sm font-semibold text-white/90 break-all line-clamp-4">
+                    {sourceLabel}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 rounded-xl bg-white/12 text-white px-3 py-3 space-y-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${detailStatusBadge.cls}`}>
+                  {detailStatusBadge.label}
+                </span>
+                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasShopeeLink ? 'bg-emerald-500 text-white' : 'bg-white/15 text-white/70'}`}>
+                  Shopee
+                </span>
+                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasLazadaLink ? 'bg-sky-500 text-white' : 'bg-white/15 text-white/70'}`}>
+                  Lazada
+                </span>
+              </div>
+              <p className="text-sm font-semibold truncate">ID: {video.id}</p>
+              <p className="text-xs text-white/75">{createdAtLabel}</p>
+              <p className="text-xs text-white/85 break-all line-clamp-3">{sourceLabel}</p>
+              {(video.shopeeLink || video.lazadaLink) && (
+                <div className="space-y-1 pt-1 text-[11px] text-white/70">
+                  {video.shopeeLink && <p className="truncate">Shopee: {video.shopeeLink}</p>}
+                  {video.lazadaLink && <p className="truncate">Lazada: {video.lazadaLink}</p>}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 flex gap-2">
+              <button
+                onClick={() => onDelete(video.id)}
+                disabled={deleting || starting || !canDelete}
+                className="flex-1 rounded-xl border border-white/20 bg-white/10 py-3 text-sm font-bold text-white active:scale-95 transition-transform disabled:opacity-40"
+              >
+                {canDelete ? (deleting ? 'กำลังลบ...' : 'ลบ') : 'เก็บถาวร'}
+              </button>
+              <button
+                onClick={() => onStart(video.id)}
+                disabled={!ready || starting || deleting || processingActive || !canStartProcessing}
+                className={`flex-[1.35] rounded-xl py-3 text-sm font-bold transition-transform ${ready && !starting && !deleting && !processingActive && canStartProcessing ? 'bg-blue-500 text-white active:scale-95' : 'bg-white/15 text-white/45'}`}
+              >
+                {starting ? 'กำลังส่งเข้า Processing...' : actionLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -1886,6 +1797,7 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
   const tg = (window as any).Telegram?.WebApp
   const tgUser = tg?.initDataUnsafe?.user
   const botScope = getBotScopeFromLocation()
+  const prefersTelegramAutoAuth = Boolean(tgUser && botScope)
 
   const handleSubmit = async () => {
     if (!email.trim()) return
@@ -1952,47 +1864,66 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
 
       {/* Bottom — input + button อยู่เหนือคีย์บอร์ดเสมอ */}
       <div className="px-6 pb-8 space-y-3">
-        <div className="relative">
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => { setEmail(e.target.value); setError('') }}
-            onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-            placeholder="your@email.com"
-            autoComplete="email"
-            inputMode="email"
-            className="w-full bg-gray-50 border-2 border-gray-100 focus:border-blue-500 focus:bg-white rounded-2xl px-5 py-4 text-base outline-none transition-all text-center font-medium placeholder:text-gray-300"
-          />
-          {email.trim() && (
+        {prefersTelegramAutoAuth ? (
+          <>
+            <div className="rounded-3xl border border-blue-100 bg-gradient-to-br from-blue-50 to-indigo-50 px-5 py-5 text-center">
+              <p className="text-sm font-semibold text-gray-800">Workspace นี้เข้าใช้งานผ่าน Telegram อัตโนมัติ</p>
+              <p className="mt-2 text-sm text-gray-500">ถ้ายังไม่เข้า ให้กลับไปที่แชตแล้วกดปุ่มเปิด Workspace ใหม่อีกครั้ง</p>
+            </div>
+
             <button
-              onClick={() => { setEmail(''); setError('') }}
-              className="absolute right-4 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full bg-gray-200 flex items-center justify-center"
+              onClick={() => window.location.reload()}
+              className="w-full py-4 rounded-2xl font-bold text-base text-white active:scale-[0.97] transition-all relative overflow-hidden"
+              style={{ background: 'linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)', boxShadow: '0 8px 24px rgba(99,102,241,0.35)' }}
             >
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="3" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+              ลองเชื่อมต่อใหม่
             </button>
-          )}
-        </div>
+          </>
+        ) : (
+          <>
+            <div className="relative">
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => { setEmail(e.target.value); setError('') }}
+                onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
+                placeholder="your@email.com"
+                autoComplete="email"
+                inputMode="email"
+                className="w-full bg-gray-50 border-2 border-gray-100 focus:border-blue-500 focus:bg-white rounded-2xl px-5 py-4 text-base outline-none transition-all text-center font-medium placeholder:text-gray-300"
+              />
+              {email.trim() && (
+                <button
+                  onClick={() => { setEmail(''); setError('') }}
+                  className="absolute right-4 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full bg-gray-200 flex items-center justify-center"
+                >
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="3" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+                </button>
+              )}
+            </div>
 
-        {error && (
-          <div className="flex items-center justify-center gap-1.5">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>
-            <p className="text-sm text-red-500 font-medium">{error}</p>
-          </div>
+            {error && (
+              <div className="flex items-center justify-center gap-1.5">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>
+                <p className="text-sm text-red-500 font-medium">{error}</p>
+              </div>
+            )}
+
+            <button
+              onClick={handleSubmit}
+              disabled={!email.trim() || loading}
+              className="w-full py-4 rounded-2xl font-bold text-base text-white active:scale-[0.97] transition-all disabled:opacity-40 relative overflow-hidden"
+              style={{ background: 'linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)', boxShadow: '0 8px 24px rgba(99,102,241,0.35)' }}
+            >
+              {loading ? (
+                <span className="flex items-center justify-center gap-2">
+                  <svg className="animate-spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round" /></svg>
+                  กำลังเข้าสู่ระบบ...
+                </span>
+              ) : 'เข้าสู่ระบบ'}
+            </button>
+          </>
         )}
-
-        <button
-          onClick={handleSubmit}
-          disabled={!email.trim() || loading}
-          className="w-full py-4 rounded-2xl font-bold text-base text-white active:scale-[0.97] transition-all disabled:opacity-40 relative overflow-hidden"
-          style={{ background: 'linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)', boxShadow: '0 8px 24px rgba(99,102,241,0.35)' }}
-        >
-          {loading ? (
-            <span className="flex items-center justify-center gap-2">
-              <svg className="animate-spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round" /></svg>
-              กำลังเข้าสู่ระบบ...
-            </span>
-          ) : 'เข้าสู่ระบบ'}
-        </button>
       </div>
     </div>
   )
@@ -2053,6 +1984,34 @@ function App() {
   });
   const [authBootstrapping, setAuthBootstrapping] = useState(true)
 
+  const bindTelegramSession = async (sessionToken: string, telegramId: string | number | undefined, botId: string) => {
+    const normalizedSessionToken = normalizeSessionToken(sessionToken)
+    const normalizedBotId = String(botId || '').trim()
+    if (!normalizedSessionToken || !telegramId || !normalizedBotId) return normalizedSessionToken
+    try {
+      const resp = await fetch(`${WORKER_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-auth-token': normalizedSessionToken,
+        },
+        body: JSON.stringify({
+          tg_id: telegramId,
+          bot_id: normalizedBotId,
+        }),
+      })
+      if (!resp.ok) return normalizedSessionToken
+      const data = await resp.json().catch(() => ({})) as { session_token?: string }
+      const reboundToken = normalizeSessionToken(data.session_token)
+      if (reboundToken && reboundToken !== normalizedSessionToken) {
+        localStorage.setItem(scopedStorageKey('auth_token', botScope), reboundToken)
+        setTokenState(reboundToken)
+        return reboundToken
+      }
+    } catch { }
+    return normalizedSessionToken
+  }
+
   const applySessionToken = (value: string) => {
     const session = normalizeSessionToken(value)
     if (!session) return
@@ -2091,6 +2050,14 @@ function App() {
     setVoicePromptLoading(false)
     setVoicePromptSaving(false)
     setVoicePromptMaxChars(12000)
+    setCommentTemplate(DEFAULT_COMMENT_TEMPLATE)
+    setCommentTemplateDraft(DEFAULT_COMMENT_TEMPLATE)
+    setCommentTemplateSource('default')
+    setCommentTemplateUpdatedAt('')
+    setCommentTemplateMessage('')
+    setCommentTemplateLoading(false)
+    setCommentTemplateSaving(false)
+    setCommentTemplateMaxChars(4000)
     setGeminiApiKeyDraft('')
     setGeminiApiKeyMasked('')
     setGeminiApiKeySource('none')
@@ -2155,6 +2122,14 @@ function App() {
   const [voicePromptLoading, setVoicePromptLoading] = useState(false)
   const [voicePromptSaving, setVoicePromptSaving] = useState(false)
   const [voicePromptMaxChars, setVoicePromptMaxChars] = useState(12000)
+  const [commentTemplate, setCommentTemplate] = useState(DEFAULT_COMMENT_TEMPLATE)
+  const [commentTemplateDraft, setCommentTemplateDraft] = useState(DEFAULT_COMMENT_TEMPLATE)
+  const [commentTemplateSource, setCommentTemplateSource] = useState<'default' | 'custom'>('default')
+  const [commentTemplateUpdatedAt, setCommentTemplateUpdatedAt] = useState('')
+  const [commentTemplateMessage, setCommentTemplateMessage] = useState('')
+  const [commentTemplateLoading, setCommentTemplateLoading] = useState(false)
+  const [commentTemplateSaving, setCommentTemplateSaving] = useState(false)
+  const [commentTemplateMaxChars, setCommentTemplateMaxChars] = useState(4000)
   const [geminiApiKeyDraft, setGeminiApiKeyDraft] = useState('')
   const [geminiApiKeyMasked, setGeminiApiKeyMasked] = useState('')
   const [geminiApiKeySource, setGeminiApiKeySource] = useState<GeminiKeySource>('none')
@@ -2177,7 +2152,14 @@ function App() {
   const [shortlinkMaxChars, setShortlinkMaxChars] = useState(512)
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>('menu')
+  const getInitialSettingsSection = (): SettingsSection => {
+    const pathTab = window.location.pathname.replace('/', '')
+    const params = new URLSearchParams(window.location.search)
+    const tabParam = params.get('tab')
+    if (pathTab === 'pages' || tabParam === 'pages') return 'pages'
+    return 'menu'
+  }
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(getInitialSettingsSection)
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
   const [postHistory, setPostHistory] = useState<PostHistory[]>(() => {
     const ns = getStoredNamespace()
@@ -2197,6 +2179,10 @@ function App() {
   const [globalOriginalVideos, setGlobalOriginalVideos] = useState<GlobalOriginalVideo[]>([])
   const [globalOriginalLoading, setGlobalOriginalLoading] = useState(false)
   const [processingVideos, setProcessingVideos] = useState<Video[]>([])
+<<<<<<< HEAD
+=======
+  const [pendingShortlinkVideos, setPendingShortlinkVideos] = useState<Video[]>([])
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
   const [retryingProcessingId, setRetryingProcessingId] = useState<string | null>(null)
   const [loading, setLoading] = useState(() => {
     if (getStoredShortlinkBaseUrl(botScope)) {
@@ -2233,14 +2219,16 @@ function App() {
   const [logNowMs, setLogNowMs] = useState(() => Date.now())
   const [visibleLogCount, setVisibleLogCount] = useState(0)
   // Read initial tab from URL path or query param
-  type TabName = 'dashboard' | 'processing' | 'gallery' | 'logs' | 'pages' | 'settings'
+  type TabName = 'dashboard' | 'inbox' | 'processing' | 'gallery' | 'logs' | 'settings'
   const getInitialTab = (): TabName => {
-    const validTabs: TabName[] = ['dashboard', 'processing', 'gallery', 'logs', 'pages', 'settings']
-    const pathTab = window.location.pathname.replace('/', '') as TabName
-    if (validTabs.includes(pathTab)) return pathTab
+    const validTabs: TabName[] = ['dashboard', 'inbox', 'processing', 'gallery', 'logs', 'settings']
+    const pathTab = window.location.pathname.replace('/', '')
+    if (pathTab === 'pages') return 'settings'
+    if (validTabs.includes(pathTab as TabName)) return pathTab as TabName
     const params = new URLSearchParams(window.location.search)
-    const tabParam = params.get('tab') as TabName
-    if (tabParam && validTabs.includes(tabParam)) return tabParam
+    const tabParam = params.get('tab')
+    if (tabParam === 'pages') return 'settings'
+    if (tabParam && validTabs.includes(tabParam as TabName)) return tabParam as TabName
     return 'dashboard'
   }
 
@@ -2252,16 +2240,21 @@ function App() {
     window.history.pushState(null, '', url.toString())
   }
   const [pages, setPages] = useState<FacebookPage[]>([])
+  const [inboxVideos, setInboxVideos] = useState<InboxVideo[]>([])
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
+  const [inboxLoading, setInboxLoading] = useState(false)
   const [pagesLoading, setPagesLoading] = useState(false)
   const [deletePageId, setDeletePageId] = useState<string | null>(null)
   const [deletingPageId, setDeletingPageId] = useState<string | null>(null)
+  const [startingInboxId, setStartingInboxId] = useState<string | null>(null)
+  const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const [galleryVisibleCount, setGalleryVisibleCount] = useState(GALLERY_BATCH_SIZE)
   const loadAllInFlightRef = useRef(false)
   const loadAllPendingRef = useRef(false)
   const processingFetchInFlightRef = useRef(false)
+  const inboxFetchInFlightRef = useRef(false)
   const usedFetchInFlightRef = useRef(false)
   const globalOriginalFetchInFlightRef = useRef(false)
   const loadPagesRequestRef = useRef(0)
@@ -2421,11 +2414,29 @@ function App() {
     setShortlinkBaseUrlDraft(storedShortlinkBaseUrl)
     setShortlinkExpectedUtmIdCurrent(storedShortlinkExpectedUtmId)
     setShortlinkExpectedUtmIdDraft(storedShortlinkExpectedUtmId)
+<<<<<<< HEAD
     setShortlinkEnabled(!!storedShortlinkBaseUrl)
+=======
+    setLazadaExpectedMemberIdCurrent(storedLazadaExpectedMemberId)
+    setLazadaExpectedMemberIdDraft(storedLazadaExpectedMemberId)
+    setShortlinkEnabled(!!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
+    setInboxVideos([])
+    setInboxLoading(true)
+    setProcessingVideos([])
+    setPendingShortlinkVideos([])
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
     setMeEmail('')
     setIsOwner(false)
     setTeamMembers([])
     setNewMemberEmail('')
+    setCommentTemplate(DEFAULT_COMMENT_TEMPLATE)
+    setCommentTemplateDraft(DEFAULT_COMMENT_TEMPLATE)
+    setCommentTemplateSource('default')
+    setCommentTemplateUpdatedAt('')
+    setCommentTemplateMessage('')
+    setCommentTemplateLoading(false)
+    setCommentTemplateSaving(false)
+    setCommentTemplateMaxChars(4000)
     setAuthBootstrapping(true)
   }, [botScope])
 
@@ -2433,10 +2444,12 @@ function App() {
     let cancelled = false
 
     const bootstrapAuth = async () => {
+      const tgId = tg?.initDataUnsafe?.user?.id
       const session = getToken(botScope)
       if (session) {
         try {
-          const meResp = await fetch(`${WORKER_URL}/api/me`, { headers: { 'x-auth-token': session } })
+          const reboundSession = await bindTelegramSession(session, tgId, botScope)
+          const meResp = await fetch(`${WORKER_URL}/api/me`, { headers: { 'x-auth-token': reboundSession } })
           if (meResp.ok) {
             const me = await meResp.json().catch(() => ({})) as any
             const ns = String(me?.namespace_id || '').trim()
@@ -2450,7 +2463,6 @@ function App() {
         } catch { }
       }
 
-      const tgId = tg?.initDataUnsafe?.user?.id
       if (tgId) {
         try {
           const autoResp = await fetch(`${WORKER_URL}/api/auth/login`, {
@@ -2494,20 +2506,33 @@ function App() {
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    void loadAll({ skipGallery: systemWideGalleryMode })
     loadTeam()
-    if (tab === 'pages') loadPages()
-
-    const interval = setInterval(() => {
-      void loadAll({ skipGallery: systemWideGalleryMode })
-    }, 10000)
-    return () => clearInterval(interval)
+    if (tab === 'settings' && settingsSection === 'pages') loadPages()
   }, [token, authBootstrapping, tab, systemWideGalleryMode])
 
-  // Reload pages when switching to Pages tab
+  // Reload pages when opening Pages inside Settings
   useEffect(() => {
     if (authBootstrapping || !token) return
-    if (tab === 'pages') loadPages()
+    if (tab === 'settings' && settingsSection === 'pages') loadPages()
+  }, [tab, settingsSection, token, authBootstrapping])
+
+  useEffect(() => {
+    if (authBootstrapping || !token) return
+    if (tab === 'inbox') void loadInboxSnapshot()
+  }, [tab, token, authBootstrapping])
+
+  useEffect(() => {
+    if (authBootstrapping || !token) return
+    if (tab !== 'inbox' && tab !== 'processing') return
+
+    const refresh = () => {
+      void loadInboxSnapshot()
+      void loadProcessingSnapshot()
+    }
+
+    refresh()
+    const timer = window.setInterval(refresh, 15000)
+    return () => window.clearInterval(timer)
   }, [tab, token, authBootstrapping])
 
   useEffect(() => {
@@ -2517,7 +2542,7 @@ function App() {
   }, [tab, settingsSection])
 
   useEffect(() => {
-    if (!isOwner && (settingsSection === 'team' || settingsSection === 'gemini' || settingsSection === 'shortlink' || settingsSection === 'voice')) {
+    if (!isOwner && (settingsSection === 'team' || settingsSection === 'gemini' || settingsSection === 'shortlink' || settingsSection === 'voice' || settingsSection === 'comment')) {
       setSettingsSection('menu')
     }
   }, [isOwner, settingsSection])
@@ -2527,6 +2552,7 @@ function App() {
     void loadShortlinkSettings()
     if (!isOwner) return
     void loadVoicePrompt()
+    void loadCommentTemplate()
     void loadGeminiApiKey()
   }, [token, authBootstrapping, isOwner])
 
@@ -2590,6 +2616,33 @@ function App() {
       // Keep previous processing snapshot on transient errors.
     } finally {
       processingFetchInFlightRef.current = false
+    }
+  }
+
+  async function loadInboxSnapshot() {
+    if (inboxFetchInFlightRef.current) return
+    const session = getToken()
+    if (!session) return
+
+    const shouldShowLoading = inboxVideos.length === 0
+    if (shouldShowLoading) setInboxLoading(true)
+
+    inboxFetchInFlightRef.current = true
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.ok) {
+        const data = await resp.json() as { videos?: InboxVideo[] }
+        setInboxVideos(Array.isArray(data.videos) ? data.videos : [])
+      }
+    } catch {
+      // Keep previous inbox snapshot on transient errors.
+    } finally {
+      inboxFetchInFlightRef.current = false
+      if (shouldShowLoading) setInboxLoading(false)
     }
   }
 
@@ -2762,6 +2815,7 @@ function App() {
       if (!unauthorized) setLoading(false)
     } finally {
       loadAllInFlightRef.current = false
+      void loadInboxSnapshot()
       void loadProcessingSnapshot()
       if (!systemWideGalleryModeRef.current) {
         void loadUsedVideos()
@@ -2918,6 +2972,93 @@ function App() {
       setVoicePromptMessage('โหลด prompt ไม่สำเร็จ')
     } finally {
       setVoicePromptLoading(false)
+    }
+  }
+
+  async function loadCommentTemplate() {
+    const session = getToken()
+    if (!session || !isOwner) return
+    setCommentTemplateMessage('')
+    setCommentTemplateLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-template`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setCommentTemplateMessage('บัญชีนี้ไม่มีสิทธิ์แก้เทมเพลตคอมเมนต์')
+        return
+      }
+      if (!resp.ok) {
+        setCommentTemplateMessage('โหลดเทมเพลตคอมเมนต์ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as {
+        template?: string
+        source?: 'default' | 'custom'
+        updated_at?: string
+        max_chars?: number
+      }
+      const template = String(data.template || DEFAULT_COMMENT_TEMPLATE)
+      setCommentTemplate(template)
+      setCommentTemplateDraft(template)
+      setCommentTemplateSource(data.source === 'custom' ? 'custom' : 'default')
+      setCommentTemplateUpdatedAt(String(data.updated_at || ''))
+      setCommentTemplateMessage('')
+      if (typeof data.max_chars === 'number' && data.max_chars > 0) setCommentTemplateMaxChars(data.max_chars)
+    } catch {
+      setCommentTemplateMessage('โหลดเทมเพลตคอมเมนต์ไม่สำเร็จ')
+    } finally {
+      setCommentTemplateLoading(false)
+    }
+  }
+
+  async function saveCommentTemplate(nextTemplate: string) {
+    const session = getToken()
+    if (!session || !isOwner) return
+    setCommentTemplateSaving(true)
+    setCommentTemplateMessage('')
+    try {
+      const trimmed = String(nextTemplate || '').trim()
+      const isReset = !trimmed
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-template`, isReset ? {
+        method: 'DELETE',
+      } : {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template: nextTemplate }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setCommentTemplateMessage('บัญชีนี้ไม่มีสิทธิ์แก้เทมเพลตคอมเมนต์')
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setCommentTemplateMessage(data.error || 'บันทึกเทมเพลตคอมเมนต์ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as {
+        template?: string
+        source?: 'default' | 'custom'
+        updated_at?: string
+        max_chars?: number
+      }
+      const template = String(data.template || DEFAULT_COMMENT_TEMPLATE)
+      setCommentTemplate(template)
+      setCommentTemplateDraft(template)
+      setCommentTemplateSource(data.source === 'custom' ? 'custom' : 'default')
+      setCommentTemplateUpdatedAt(String(data.updated_at || ''))
+      if (typeof data.max_chars === 'number' && data.max_chars > 0) setCommentTemplateMaxChars(data.max_chars)
+      setCommentTemplateMessage(isReset ? 'รีเซ็ตเทมเพลตคอมเมนต์เป็นค่าเริ่มต้นแล้ว' : 'บันทึกเทมเพลตคอมเมนต์แล้ว')
+    } catch {
+      setCommentTemplateMessage('บันทึกเทมเพลตคอมเมนต์ไม่สำเร็จ')
+    } finally {
+      setCommentTemplateSaving(false)
     }
   }
 
@@ -3359,6 +3500,45 @@ function App() {
     }
   }
 
+  const handleStartInboxVideo = async (id: string) => {
+    setStartingInboxId(id)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}/process`, {
+        method: 'POST',
+      })
+      const data = await resp.json().catch(() => ({})) as { error?: string; job?: { status?: string } }
+      if (!resp.ok) {
+        throw new Error(String(data.error || 'ส่งเข้า Processing ไม่สำเร็จ'))
+      }
+      await Promise.all([loadInboxSnapshot(), loadProcessingSnapshot()])
+      alert(data.job?.status === 'queued' ? 'ส่งเข้า Processing แล้ว และคลิปยังอยู่ในคลังต้นฉบับ' : 'เริ่มประมวลผลแล้ว โดยเก็บคลิปไว้ในคลังต้นฉบับ')
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setStartingInboxId(null)
+    }
+  }
+
+  const handleDeleteInboxVideo = async (id: string) => {
+    const ok = window.confirm('ยืนยันลบวิดีโอนี้ออกจากคลังต้นฉบับ?')
+    if (!ok) return
+    setDeletingInboxId(id)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      })
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        throw new Error(String(data.error || 'ลบจาก Inbox ไม่สำเร็จ'))
+      }
+      setInboxVideos((prev) => prev.filter((video) => video.id !== id))
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeletingInboxId(null)
+    }
+  }
+
   const updateGalleryVideoState = (id: string, targetNamespaceId: string | undefined, fields: Partial<Video>) => {
     const previousVideo = videos.find((video) =>
       matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
@@ -3395,6 +3575,13 @@ function App() {
 
   }
 
+<<<<<<< HEAD
+=======
+  const pendingShortlinkIdentitySet = useMemo(() => {
+    return new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
+  }, [pendingShortlinkVideos])
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
   const usedVideoIdSet = useMemo(() => {
     return new Set(usedVideos.map((video) => String(video.id || '')))
   }, [usedVideos])
@@ -3585,9 +3772,46 @@ function App() {
 
       {!videoViewerOpen && (
         <div style={headerTopPaddingStyle} className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5">
+<<<<<<< HEAD
           <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
             {tab === 'dashboard' ? 'Dashboard' : tab === 'processing' ? 'Processing' : tab === 'gallery' ? 'Gallery' : tab === 'logs' ? 'Activity Logs' : tab === 'pages' ? 'Pages' : 'Settings'}
           </h1>
+=======
+          {tab === 'gallery' && !isAllOriginalMode ? (
+            <div className="pb-3">
+              <div className="relative">
+                <input
+                  type="text"
+                  value={gallerySearchInput}
+                  onChange={(e) => setGallerySearchInput(e.target.value)}
+                  placeholder="ค้นหา video id หรือชื่อคลิป"
+                  className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 pr-11 text-sm font-medium text-gray-900 outline-none transition-all placeholder:text-gray-400 focus:border-blue-400 focus:bg-white"
+                />
+                {gallerySearchInput.trim() ? (
+                  <button
+                    onClick={() => setGallerySearchInput('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-gray-200 p-1.5 active:scale-95"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2.5" strokeLinecap="round">
+                      <path d="M18 6L6 18M6 6l12 12" />
+                    </svg>
+                  </button>
+                ) : (
+                  <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="11" cy="11" r="8" />
+                      <path d="M21 21l-4.35-4.35" />
+                    </svg>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
+              {tab === 'dashboard' ? 'Dashboard' : tab === 'inbox' ? 'คลังต้นฉบับ' : tab === 'processing' ? 'Processing' : tab === 'logs' ? 'Activity Logs' : 'Settings'}
+            </h1>
+          )}
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
           {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
               <button
@@ -3695,14 +3919,74 @@ function App() {
           </div>
         )}
 
+        {tab === 'inbox' && (
+          <div className="px-4">
+            <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+              <div className="flex flex-wrap gap-2">
+                <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-bold text-blue-700">
+                  ต้นฉบับ {inboxVideos.length}
+                </span>
+                <span className="rounded-full bg-violet-50 px-3 py-1 text-xs font-bold text-violet-700">
+                  อยู่ใน Processing {inboxVideos.filter((video) => video.processingActive).length}
+                </span>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-gray-500">
+                เก็บวิดีโอที่ผู้ใช้ส่งมาไว้ตลอด แยกจากหน้า Processing แม้จะส่งเข้าไปประมวลผลแล้วก็ยังอยู่ที่นี่
+              </p>
+            </div>
+
+            {inboxLoading ? (
+              <div className="grid grid-cols-3 gap-3">
+                {[1, 2, 3, 4, 5, 6].map((i) => (
+                  <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />
+                ))}
+              </div>
+            ) : inboxVideos.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-[50vh]">
+                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                  <span className="text-4xl grayscale opacity-50">📥</span>
+                </div>
+                <p className="text-gray-900 font-bold text-lg">ยังไม่มีวิดีโอต้นฉบับ</p>
+                <p className="text-gray-400 text-sm mt-1 text-center">ส่งวิดีโอหรือ XHS link มาทาง Telegram แล้วระบบจะเก็บไว้ที่นี่ถาวร แยกจากหน้า Processing</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-3 gap-3">
+                {inboxVideos.map((video) => (
+                  <InboxCard
+                    key={video.id}
+                    video={video}
+                    onStart={handleStartInboxVideo}
+                    onDelete={handleDeleteInboxVideo}
+                    starting={startingInboxId === video.id}
+                    deleting={deletingInboxId === video.id}
+                    onExpandedChange={setVideoViewerOpen}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === 'processing' && (
           <div className="px-4">
+<<<<<<< HEAD
+=======
+            <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+              <div className="rounded-2xl bg-gray-100 p-1">
+                <div className="rounded-[18px] bg-white px-3 py-3 text-sm font-bold text-blue-600 shadow-sm">
+                  กำลังประมวลผล ({processingVideos.length})
+                </div>
+              </div>
+            </div>
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             {loading ? (
               <div className="space-y-3">
                 {[1, 2].map(i => (
                   <div key={i} className="bg-gray-100 rounded-2xl p-4 h-28 animate-pulse" />
                 ))}
               </div>
+<<<<<<< HEAD
             ) : processingVideos.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-[50vh]">
                 <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
@@ -3723,6 +4007,30 @@ function App() {
                   />
                 ))}
               </div>
+=======
+            ) : (
+              processingVideos.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-[50vh]">
+                  <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                    <span className="text-4xl grayscale opacity-50">⚙️</span>
+                  </div>
+                  <p className="text-gray-900 font-bold text-lg">No Processing Videos</p>
+                  <p className="text-gray-400 text-sm mt-1">Videos currently being dubbed will appear here</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {processingVideos.map((video: any) => (
+                    <ProcessingCard
+                      key={video.id}
+                      video={video}
+                      onCancel={handleCancelJob}
+                      onReprocess={handleReprocessJob}
+                      retrying={retryingProcessingId === video.id}
+                    />
+                  ))}
+                </div>
+              )
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             )}
           </div>
         )}
@@ -3773,8 +4081,13 @@ function App() {
                   {systemWideGalleryMode
                     ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
+<<<<<<< HEAD
                       ? 'คลิปที่โพสต์สำเร็จ และคลิปที่ยังไม่มีลิ้งจะแสดงที่นี่'
                       : 'คลิปที่มี Shopee link และยังไม่โพสต์จะแสดงที่นี่'}
+=======
+                      ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
+                      : 'จะแสดงเฉพาะคลิปที่มี Shopee และ Lazada link ครบพร้อมโพสต์'}
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 </p>
               </div>
             ) : (
@@ -3939,37 +4252,6 @@ function App() {
                         : triggerSource === 'queue'
                           ? 'bg-violet-50 text-violet-700'
                           : 'bg-gray-100 text-gray-500'
-                    const shortlinkUtmSource = (() => {
-                      const direct = String(item.shortlink_utm_source || '').trim()
-                      if (direct) return direct
-                      const link = String(item.shopee_link || '').trim()
-                      if (!link) return ''
-                      try {
-                        return String(new URL(link).searchParams.get('utm_source') || '').trim()
-                      } catch {
-                        return ''
-                      }
-                    })()
-                    const normalizeShortlinkUtmId = (value: string) => String(value || '').trim().replace(/^an_/i, '').trim()
-                    const shortlinkExpectedUtmId = String(item.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
-                    const shortlinkUtmMatch = (() => {
-                      if (!shortlinkExpectedUtmId) return null
-                      if (typeof item.shortlink_utm_match === 'number') return item.shortlink_utm_match === 1
-                      if (typeof item.shortlink_utm_match === 'string') return item.shortlink_utm_match === '1'
-                      if (!shortlinkUtmSource) return false
-                      return normalizeShortlinkUtmId(shortlinkUtmSource) === normalizeShortlinkUtmId(shortlinkExpectedUtmId)
-                    })()
-                    const shortlinkUtmMatchLabel = shortlinkExpectedUtmId
-                      ? (shortlinkUtmMatch ? '✅ ตรงกับ workspace' : '❌ ไม่ตรงกับ workspace')
-                      : '-'
-                    const shortlinkStatus = String(item.shortlink_status || '').trim().toLowerCase()
-                    const shortlinkStatusLabel = shortlinkStatus === 'shortened'
-                      ? 'ผ่าน'
-                      : shortlinkStatus === 'fallback'
-                        ? 'ไม่ผ่าน (ใช้ลิงก์เดิม)'
-                        : shortlinkStatus === 'disabled'
-                          ? 'ปิดการใช้งาน'
-                          : '-'
                     const showCommentError = item.comment_error && item.comment_error.trim().length > 0
                     const showPostError = item.error_message && item.error_message.trim().length > 0
 
@@ -4068,6 +4350,7 @@ function App() {
                             <p><span className="font-semibold text-gray-700">โพสต์ด้วย:</span> {postActor}</p>
                             <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์:</span> {commentMeta.label}</p>
+<<<<<<< HEAD
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์ด้วย:</span> {commentActor}</p>
                             <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
                             <p><span className="font-semibold text-gray-700">UTM Source:</span> {shortlinkUtmSource || '-'}</p>
@@ -4077,6 +4360,38 @@ function App() {
                             <p><span className="font-semibold text-gray-700">สถานะย่อลิงก์:</span> {shortlinkStatusLabel}</p>
                             <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ที่คอมเมนต์:</span> {item.shopee_link || '-'}</p>
                             {item.shortlink_error && <p className="text-red-500"><span className="font-semibold text-red-600">Shortlink Error:</span> {item.shortlink_error}</p>}
+=======
+                            <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ที่คอมเมนต์:</span> {item.shopee_link || '-'}</p>
+                            {item.lazada_link && <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ Lazada ที่คอมเมนต์:</span> {item.lazada_link}</p>}
+                            <div className="rounded-xl bg-blue-50/80 p-2.5 text-[11px] text-blue-900">
+                              <p><span className="font-semibold">Gallery Video ID:</span> {item.video_id || '-'}</p>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {item.video_id && (
+                                  <>
+                                    <button
+                                      onClick={() => navigator.clipboard.writeText(String(item.video_id || ''))}
+                                      className="rounded-lg bg-white px-2.5 py-1 font-semibold text-blue-700 active:scale-95"
+                                    >
+                                      Copy ID
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setCategoryFilter('used')
+                                        setGallerySearchInput(String(item.video_id || ''))
+                                        setExpandedLogId(null)
+                                        setTab('gallery')
+                                      }}
+                                      className="rounded-lg bg-blue-600 px-2.5 py-1 font-semibold text-white active:scale-95"
+                                    >
+                                      ค้นหาใน Gallery
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                            <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>
+                            <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                             {item.comment_fb_id && <p><span className="font-semibold text-gray-700">Comment ID:</span> {item.comment_fb_id}</p>}
                             {showCommentError && <p className="text-red-500"><span className="font-semibold text-red-600">คอมเม้นต์ผิดพลาด:</span> {item.comment_error}</p>}
                             {showPostError && <p className="text-red-500"><span className="font-semibold text-red-600">โพสต์ผิดพลาด:</span> {item.error_message}</p>}
@@ -4096,8 +4411,30 @@ function App() {
           </div>
         )}
 
-        {tab === 'pages' && (
-          <div className="px-4" onClick={() => deletePageId && setDeletePageId(null)}>
+        {tab === 'settings' && settingsSection === 'pages' && (
+          <div className="px-4 space-y-3" onClick={() => deletePageId && setDeletePageId(null)}>
+            <div className="flex items-center gap-3 px-1">
+              <button
+                onClick={() => setSettingsSection('menu')}
+                className="w-9 h-9 rounded-xl border border-gray-200 bg-white flex items-center justify-center active:scale-95"
+                aria-label="ย้อนกลับ"
+              >
+                <BackIcon />
+              </button>
+              <div className="min-w-0 flex-1">
+                <p className="text-lg font-bold text-gray-900">Pages</p>
+                <p className="text-xs text-gray-400">
+                  {pagesLoading ? 'กำลังโหลดเพจ...' : `${pages.length} เพจใน workspace นี้`}
+                </p>
+              </div>
+              <button
+                onClick={() => setShowAddPagePopup(true)}
+                className="shrink-0 rounded-xl bg-blue-600 px-3.5 py-2 text-sm font-bold text-white active:scale-95"
+              >
+                เพิ่มเพจ
+              </button>
+            </div>
+
             {pagesLoading ? (
               <div className="grid grid-cols-3 gap-4">
                 {[1, 2, 3, 4, 5, 6].map(i => (
@@ -4108,7 +4445,7 @@ function App() {
               <div className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-5 text-center">
                 <p className="text-sm font-semibold text-gray-700">ยังไม่พบเพจใน workspace นี้</p>
                 <p className="text-xs text-gray-500 mt-1">
-                  ระบบจะซิงก์อัตโนมัติจาก BrowserSaving tag:post และ tag:comment ภายในประมาณ 1 นาที
+                  กด "เพิ่มเพจ" แล้ววาง Facebook User Token เพื่อดึงรายการเพจผ่าน <code>me/accounts</code>
                 </p>
               </div>
             ) : (
@@ -4227,7 +4564,7 @@ function App() {
           </div>
         )}
 
-        {tab === 'settings' && (
+        {tab === 'settings' && settingsSection !== 'pages' && (
           <div className="px-5 space-y-4">
             {settingsSection === 'menu' ? (
               <>
@@ -4253,6 +4590,12 @@ function App() {
                     </button>
                   </div>
                 )}
+                <SettingsMenuItem
+                  icon="📄"
+                  title="Pages"
+                  subtitle="เพิ่มเพจและตั้งค่า Auto Post"
+                  onClick={() => setSettingsSection('pages')}
+                />
                 {isOwner && (
                   <SettingsMenuItem
                     icon="👥"
@@ -4275,6 +4618,7 @@ function App() {
                 )}
                 {isOwner && (
                   <SettingsMenuItem
+<<<<<<< HEAD
                     icon="🔗"
                     title="Shopee Shortlink"
                     subtitle={shortlinkEnabled ? shortlinkBaseUrlCurrent : 'ยังไม่ตั้งค่า'}
@@ -4283,10 +4627,20 @@ function App() {
                 )}
                 {isOwner && (
                   <SettingsMenuItem
+=======
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                     icon="🎙️"
                     title="Voice Prompt"
                     subtitle={voicePromptSource === 'custom' ? 'กำลังใช้ prompt แบบกำหนดเอง' : 'กำลังใช้ prompt ค่าเริ่มต้น'}
                     onClick={() => setSettingsSection('voice')}
+                  />
+                )}
+                {isOwner && (
+                  <SettingsMenuItem
+                    icon="💬"
+                    title="Comment Template"
+                    subtitle={commentTemplateSource === 'custom' ? 'กำลังใช้เทมเพลตคอมเมนต์ที่กำหนดเอง' : 'กำลังใช้เทมเพลตคอมเมนต์ค่าเริ่มต้น'}
+                    onClick={() => setSettingsSection('comment')}
                   />
                 )}
                 <p className="text-gray-300 text-xs font-medium text-center pt-2">Version 2.0.1 (Build 240)</p>
@@ -4308,8 +4662,13 @@ function App() {
                         ? 'Team'
                         : settingsSection === 'gemini'
                           ? 'Gemini API Key'
+<<<<<<< HEAD
                           : settingsSection === 'shortlink'
                             ? 'Shopee Shortlink'
+=======
+                          : settingsSection === 'comment'
+                            ? 'Comment Template'
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                             : 'Voice Prompt'}
                   </p>
                 </div>
@@ -4580,6 +4939,79 @@ function App() {
                   </div>
                 )}
 
+                {settingsSection === 'comment' && isOwner && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <p className="text-xs text-gray-500 leading-relaxed">
+                        ตั้งค่าข้อความคอมเมนต์ที่ระบบใช้ตอนโพสต์ลิงก์อัตโนมัติ เทมเพลตนี้จะมีผลกับงานถัดไปทันที
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <span className="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] font-semibold text-gray-700">{COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER} จำเป็น</span>
+                        <span className="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] font-semibold text-gray-700">{COMMENT_TEMPLATE_LAZADA_PLACEHOLDER} ถ้ามีลิงก์</span>
+                      </div>
+                      {commentTemplateLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลดเทมเพลตคอมเมนต์...</p>
+                      ) : (
+                        <>
+                          <textarea
+                            value={commentTemplateDraft}
+                            onChange={(e) => {
+                              setCommentTemplateDraft(e.target.value)
+                              if (commentTemplateMessage) setCommentTemplateMessage('')
+                            }}
+                            rows={9}
+                            placeholder={DEFAULT_COMMENT_TEMPLATE}
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                          />
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
+                            <p>ต้องมี <span className="font-semibold text-gray-700">{COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER}</span> อย่างน้อย 1 จุด</p>
+                            <p>ถ้าไม่ต้องการ Lazada ในบางโพสต์ ปล่อย <span className="font-semibold text-gray-700">{COMMENT_TEMPLATE_LAZADA_PLACEHOLDER}</span> ไว้ได้ ระบบจะใส่เฉพาะตอนมีลิงก์</p>
+                          </div>
+                          <div className="flex items-center justify-between text-[11px] text-gray-400">
+                            <span>{commentTemplateSource === 'custom' ? 'กำลังใช้เทมเพลตคอมเมนต์ที่กำหนดเอง' : 'กำลังใช้เทมเพลตคอมเมนต์ค่าเริ่มต้น'}</span>
+                            <span>{commentTemplateDraft.length}/{commentTemplateMaxChars}</span>
+                          </div>
+                          {commentTemplateUpdatedAt && (
+                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(commentTemplateUpdatedAt).toLocaleString()}</p>
+                          )}
+                          {commentTemplateMessage && (
+                            <p className={`text-xs ${commentTemplateMessage.includes('ไม่สำเร็จ') || commentTemplateMessage.includes('ไม่มีสิทธิ์') || commentTemplateMessage.includes('ต้องมี') ? 'text-red-500' : 'text-green-600'}`}>
+                              {commentTemplateMessage}
+                            </p>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => {
+                                if (commentTemplateSaving || commentTemplateDraft.length > commentTemplateMaxChars) return
+                                void saveCommentTemplate(commentTemplateDraft)
+                              }}
+                              disabled={
+                                commentTemplateSaving ||
+                                commentTemplateDraft.length > commentTemplateMaxChars ||
+                                !commentTemplateDraft.trim() ||
+                                commentTemplateDraft === commentTemplate
+                              }
+                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              {commentTemplateSaving ? 'กำลังบันทึก...' : 'บันทึกเทมเพลต'}
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (commentTemplateSaving) return
+                                void saveCommentTemplate('')
+                              }}
+                              disabled={commentTemplateSaving || commentTemplateSource === 'default'}
+                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              รีเซ็ตค่าเริ่มต้น
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {settingsSection === 'voice' && isOwner && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
@@ -4656,6 +5088,13 @@ function App() {
               onClick={() => setTab('dashboard')}
             />
             <NavItem
+              icon={<InboxIcon />}
+              iconActive={<InboxIconFilled />}
+              label="ต้นฉบับ"
+              active={tab === 'inbox'}
+              onClick={() => setTab('inbox')}
+            />
+            <NavItem
               icon={<ProcessIcon />}
               iconActive={<ProcessIconFilled />}
               label="Processing"
@@ -4675,13 +5114,6 @@ function App() {
               label="Logs"
               active={tab === 'logs'}
               onClick={() => setTab('logs')}
-            />
-            <NavItem
-              icon={<PagesIcon />}
-              iconActive={<PagesIconFilled />}
-              label="Pages"
-              active={tab === 'pages'}
-              onClick={() => setTab('pages')}
             />
             <NavItem
               icon={<SettingsIcon />}

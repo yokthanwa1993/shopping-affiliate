@@ -1,5 +1,6 @@
 {
     "name": "video-affiliate-worker",
+    "account_id": "bc047db265944dddff5f07cfa6ef45aa",
     "main": "src/index.ts",
     "compatibility_date": "2026-02-14",
     "compatibility_flags": [
@@ -14,7 +15,7 @@
     "containers": [
         {
             "class_name": "MergeContainer",
-            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-03-12.01",
+            "image": "registry.cloudflare.com/bc047db265944dddff5f07cfa6ef45aa/video-affiliate-worker-mergecontainer:v2026-03-29.01",
             "instance_type": "standard-2",
             "max_instances": 2
         }
@@ -28,12 +29,6 @@
             }
         ]
     },
-    "services": [
-        {
-            "binding": "BROWSERSAVING_SERVICE",
-            "service": "browsersaving-worker"
-        }
-    ],
     // DO migrations
     "migrations": [
         {
@@ -48,7 +43,7 @@
         {
             "binding": "DB",
             "database_name": "video-affiliate-db",
-            "database_id": "742796ce-d973-49d3-bc38-7a44a576d67f"
+            "database_id": "313a798a-3a03-447c-8329-296afb8eead8"
         }
     ],
     // R2 Bucket
@@ -61,9 +56,10 @@
     // Environment variables
     "vars": {
         "CORS_ORIGIN": "*",
-        "R2_PUBLIC_URL": "https://pub-bcebfe413008439fafe39af7765f4e0a.r2.dev",
+        "WORKER_URL": "https://video-affiliate-worker.onlyy-gor.workers.dev",
+        "R2_PUBLIC_URL": "https://pub-14b6c1dd39f14ed7a219a84afc93c182.r2.dev",
         "GEMINI_MODEL": "gemini-3-flash-preview",
-        "WEBAPP_URL": "https://video-affiliate-webapp.pages.dev",
+        "WEBAPP_URL": "https://video-affiliate-webapp-38v.pages.dev",
         "BROWSERSAVING_WORKER_URL": "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev",
         "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com"
     },

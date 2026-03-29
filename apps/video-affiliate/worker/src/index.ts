@@ -6,6 +6,11 @@ import { Buffer as NodeBuffer } from 'node:buffer'
 import { BotBucket } from './utils/botBucket'
 import {
     deleteGalleryIndexEntry,
+<<<<<<< HEAD
+=======
+    ensureGalleryIndexTable,
+    getVideoOriginalUrlForNamespace,
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
     getGalleryIndexSummary,
     listGalleryIndexVideos,
     listGalleryIndexVideosMissingThumbnails,
@@ -92,6 +97,11 @@ const MAX_VOICE_PROMPT_CHARS = 12000
 const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_SHORTLINK_BASE_URL_CHARS = 512
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
+<<<<<<< HEAD
+=======
+const MAX_LAZADA_MEMBER_ID_CHARS = 32
+const MAX_COMMENT_TEMPLATE_CHARS = 4000
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
 // CORS
 app.use('*', async (c, next) => {
@@ -239,6 +249,87 @@ async function upsertTelegramBotSession(
     ).bind(telegramId, botScope, email, namespaceId, sessionToken).run()
 }
 
+async function upsertUserSessionByTelegram(
+    db: D1Database,
+    telegramId: string,
+    email: string,
+    namespaceId: string,
+    sessionToken: string,
+) {
+    const telegramIdValue = Number(String(telegramId || '').trim())
+    if (!Number.isFinite(telegramIdValue)) {
+        await db.prepare(
+            'INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, ?)'
+        ).bind(email, namespaceId, sessionToken).run()
+        return
+    }
+
+    const existingTgRow = await db.prepare(
+        'SELECT email FROM users WHERE telegram_id = ?'
+    ).bind(telegramIdValue).first() as { email?: string } | null
+
+    if (existingTgRow) {
+        await db.prepare(
+            'UPDATE users SET email = ?, namespace_id = ?, session_token = ? WHERE telegram_id = ?'
+        ).bind(email, namespaceId, sessionToken, telegramIdValue).run()
+        return
+    }
+
+    await db.prepare(
+        'INSERT INTO users (telegram_id, email, namespace_id, session_token) VALUES (?, ?, ?, ?)'
+    ).bind(telegramIdValue, email, namespaceId, sessionToken).run()
+}
+
+async function bindTelegramToExistingSession(
+    db: D1Database,
+    sessionToken: string,
+    telegramId: string,
+    botScope: string,
+) {
+    const normalizedSessionToken = String(sessionToken || '').trim()
+    const normalizedTelegramId = String(telegramId || '').trim()
+    const normalizedBotScope = String(botScope || '').trim()
+    if (!normalizedSessionToken.startsWith('sess_') || !normalizedTelegramId || !normalizedBotScope) return null
+
+    const currentUser = await db.prepare(
+        'SELECT email, namespace_id, session_token FROM users WHERE session_token = ? LIMIT 1'
+    ).bind(normalizedSessionToken).first() as { email?: string; namespace_id?: string; session_token?: string } | null
+
+    const email = String(currentUser?.email || '').trim().toLowerCase()
+    const namespaceId = String(currentUser?.namespace_id || '').trim()
+    const effectiveSessionToken = String(currentUser?.session_token || '').trim() || normalizedSessionToken
+    if (!email || !namespaceId || namespaceId !== normalizedBotScope) return null
+
+    await upsertUserSessionByTelegram(db, normalizedTelegramId, email, namespaceId, effectiveSessionToken)
+    await upsertTelegramBotSession(db, normalizedTelegramId, normalizedBotScope, email, namespaceId, effectiveSessionToken)
+    return {
+        session_token: effectiveSessionToken,
+        namespace_id: namespaceId,
+        email,
+    }
+}
+
+async function hasTelegramWorkspaceAccess(
+    db: D1Database,
+    telegramId: string,
+    botScope: string,
+): Promise<boolean> {
+    const normalizedTelegramId = String(telegramId || '').trim()
+    const normalizedBotScope = String(botScope || '').trim()
+    if (!normalizedTelegramId || !normalizedBotScope) return false
+
+    const scoped = await getTelegramBotSession(db, normalizedTelegramId, normalizedBotScope).catch(() => null)
+    if (String(scoped?.email || '').trim()) return true
+
+    const telegramIdValue = Number(normalizedTelegramId)
+    if (!Number.isFinite(telegramIdValue)) return false
+
+    const user = await db.prepare(
+        'SELECT email FROM users WHERE telegram_id = ? AND namespace_id = ? LIMIT 1'
+    ).bind(telegramIdValue, normalizedBotScope).first() as { email?: string } | null
+    return !!String(user?.email || '').trim()
+}
+
 async function clearTelegramBotSessionByScope(db: D1Database, telegramId: string, botScope: string) {
     const current = await getTelegramBotSession(db, telegramId, botScope)
     const sessionToken = String(current?.session_token || '').trim()
@@ -295,6 +386,147 @@ async function resolveTelegramWorkspaceSession(db: D1Database, telegramId: strin
     }
 }
 
+async function resolveOwnerEmailForNamespace(db: D1Database, namespaceId: string): Promise<string> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return ''
+
+    try {
+        const mapped = await db.prepare(
+            `SELECT email
+             FROM email_namespaces
+             WHERE namespace_id = ?
+             ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+             LIMIT 1`
+        ).bind(normalizedNamespaceId).first() as { email?: string } | null
+        const mappedEmail = String(mapped?.email || '').trim().toLowerCase()
+        if (mappedEmail) return mappedEmail
+    } catch {
+        // ignore older db states
+    }
+
+    const allowed = await db.prepare(
+        `SELECT ae.email
+         FROM allowed_emails ae
+         WHERE EXISTS (
+            SELECT 1
+            FROM users u
+            WHERE u.email = ae.email
+              AND u.namespace_id = ?
+         )
+         ORDER BY datetime(ae.created_at) DESC
+         LIMIT 1`
+    ).bind(normalizedNamespaceId).first() as { email?: string } | null
+    const allowedEmail = String(allowed?.email || '').trim().toLowerCase()
+    if (allowedEmail) return allowedEmail
+
+    const user = await db.prepare(
+        `SELECT email
+         FROM users
+         WHERE namespace_id = ?
+           AND TRIM(COALESCE(email, '')) <> ''
+         ORDER BY datetime(created_at) ASC, telegram_id ASC
+         LIMIT 1`
+    ).bind(normalizedNamespaceId).first() as { email?: string } | null
+    return String(user?.email || '').trim().toLowerCase()
+}
+
+async function claimOrValidateChannelOwner(
+    db: D1Database,
+    botId: string,
+    telegramId: string,
+    displayName?: string,
+): Promise<{ allowed: boolean; claimed: boolean; ownerTelegramId: string }> {
+    const normalizedBotId = String(botId || '').trim()
+    const normalizedTelegramId = String(telegramId || '').trim()
+    if (!normalizedBotId || !normalizedTelegramId) {
+        return { allowed: false, claimed: false, ownerTelegramId: '' }
+    }
+
+    const channel = await db.prepare(
+        'SELECT owner_telegram_id FROM channels WHERE bot_id = ? LIMIT 1'
+    ).bind(normalizedBotId).first() as { owner_telegram_id?: string | number } | null
+
+    if (!channel) {
+        return { allowed: false, claimed: false, ownerTelegramId: '' }
+    }
+
+    const currentOwnerTelegramId = String(channel.owner_telegram_id || '').trim()
+    if (currentOwnerTelegramId && currentOwnerTelegramId !== normalizedTelegramId) {
+        return { allowed: false, claimed: false, ownerTelegramId: currentOwnerTelegramId }
+    }
+
+    let claimed = false
+    if (!currentOwnerTelegramId) {
+        await db.prepare(
+            "UPDATE channels SET owner_telegram_id = ? WHERE bot_id = ? AND TRIM(COALESCE(owner_telegram_id, '')) = ''"
+        ).bind(normalizedTelegramId, normalizedBotId).run()
+        claimed = true
+    }
+
+    const resolvedOwnerTelegramId = claimed ? normalizedTelegramId : currentOwnerTelegramId
+    const telegramIdValue = Number(normalizedTelegramId)
+    if (Number.isFinite(telegramIdValue)) {
+        await db.prepare(
+            'INSERT INTO allowed_users (telegram_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING'
+        ).bind(telegramIdValue, String(displayName || 'owner').trim() || 'owner').run().catch(() => { })
+    }
+
+    return {
+        allowed: true,
+        claimed,
+        ownerTelegramId: resolvedOwnerTelegramId || normalizedTelegramId,
+    }
+}
+
+async function provisionTelegramOwnerSession(
+    db: D1Database,
+    telegramId: string,
+    botScope: string,
+    displayName?: string,
+) {
+    const normalizedTelegramId = String(telegramId || '').trim()
+    const normalizedBotScope = String(botScope || '').trim()
+    if (!normalizedTelegramId || !normalizedBotScope) return null
+
+    const ownerAccess = await claimOrValidateChannelOwner(db, normalizedBotScope, normalizedTelegramId, displayName)
+    if (!ownerAccess.allowed) return null
+
+    const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedBotScope)
+    if (!ownerEmail) return null
+
+    await db.prepare('INSERT OR IGNORE INTO allowed_emails (email) VALUES (?)').bind(ownerEmail).run().catch(() => { })
+    await upsertOwnerNamespaceMapping(db, ownerEmail, normalizedBotScope).catch(() => { })
+
+    const sessionToken = 'sess_' + crypto.randomUUID().replace(/-/g, '')
+    const telegramIdValue = Number(normalizedTelegramId)
+    const existingTgRow = Number.isFinite(telegramIdValue)
+        ? await db.prepare('SELECT email FROM users WHERE telegram_id = ?').bind(telegramIdValue).first() as { email?: string } | null
+        : null
+
+    if (existingTgRow) {
+        await db.prepare(
+            'UPDATE users SET email = ?, namespace_id = ?, session_token = ? WHERE telegram_id = ?'
+        ).bind(ownerEmail, normalizedBotScope, sessionToken, telegramIdValue).run()
+    } else if (Number.isFinite(telegramIdValue)) {
+        await db.prepare(
+            'INSERT INTO users (telegram_id, email, namespace_id, session_token) VALUES (?, ?, ?, ?)'
+        ).bind(telegramIdValue, ownerEmail, normalizedBotScope, sessionToken).run()
+    } else {
+        await db.prepare(
+            'INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, ?)'
+        ).bind(ownerEmail, normalizedBotScope, sessionToken).run()
+    }
+
+    await upsertTelegramBotSession(db, normalizedTelegramId, normalizedBotScope, ownerEmail, normalizedBotScope, sessionToken)
+
+    return {
+        session_token: sessionToken,
+        namespace_id: normalizedBotScope,
+        email: ownerEmail,
+        claimed_owner: ownerAccess.claimed,
+    }
+}
+
 function buildScopedWebAppUrl(baseUrl: string, botScope: string) {
     const scope = String(botScope || '').trim()
     if (!scope) return baseUrl
@@ -307,9 +539,58 @@ function buildScopedWebAppUrl(baseUrl: string, botScope: string) {
     }
 }
 
+<<<<<<< HEAD
+=======
+function buildScopedGalleryWebAppUrl(baseUrl: string, botScope: string, store: 'shopee' | 'lazada', videoId?: string) {
+    const scopedBaseUrl = buildScopedWebAppUrl(baseUrl, botScope)
+    try {
+        const url = new URL(scopedBaseUrl)
+        url.pathname = '/gallery'
+        url.searchParams.set('store', store)
+        const trimmedVideoId = String(videoId || '').trim()
+        if (trimmedVideoId) url.searchParams.set('q', trimmedVideoId)
+        else url.searchParams.delete('q')
+        return url.toString()
+    } catch {
+        const params = new URLSearchParams()
+        const scope = String(botScope || '').trim()
+        const trimmedVideoId = String(videoId || '').trim()
+        if (scope) params.set('bot', scope)
+        params.set('store', store)
+        if (trimmedVideoId) params.set('q', trimmedVideoId)
+        return `${baseUrl.replace(/\/+$/, '')}/gallery?${params.toString()}`
+    }
+}
+
+function buildScopedTabWebAppUrl(baseUrl: string, botScope: string, tab: string, extraParams?: Record<string, string>) {
+    const scopedBaseUrl = buildScopedWebAppUrl(baseUrl, botScope)
+    try {
+        const url = new URL(scopedBaseUrl)
+        url.pathname = `/${String(tab || '').trim().replace(/^\/+/, '') || ''}`
+        for (const [key, value] of Object.entries(extraParams || {})) {
+            const normalizedValue = String(value || '').trim()
+            if (normalizedValue) url.searchParams.set(key, normalizedValue)
+            else url.searchParams.delete(key)
+        }
+        return url.toString()
+    } catch {
+        const params = new URLSearchParams()
+        const scope = String(botScope || '').trim()
+        if (scope) params.set('bot', scope)
+        for (const [key, value] of Object.entries(extraParams || {})) {
+            const normalizedValue = String(value || '').trim()
+            if (normalizedValue) params.set(key, normalizedValue)
+        }
+        const query = params.toString()
+        return `${baseUrl.replace(/\/+$/, '')}/${String(tab || '').trim().replace(/^\/+/, '')}${query ? `?${query}` : ''}`
+    }
+}
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 // Push sync from BrowserSaving after tag updates.
 // Default mode is metadata-only (no heavy Graph calls).
 app.post('/api/pages/tag-sync', async (c) => {
+    return c.json({ error: 'direct_page_management_only' }, 410)
     let body: any = {}
     try {
         body = await c.req.json()
@@ -370,6 +651,7 @@ app.post('/api/pages/tag-sync', async (c) => {
 })
 
 app.post('/api/pages/profile-sync', async (c) => {
+    return c.json({ error: 'direct_page_management_only' }, 410)
     let body: any = {}
     try {
         body = await c.req.json()
@@ -446,6 +728,157 @@ app.post('/api/pages/profile-sync', async (c) => {
     }
 })
 
+<<<<<<< HEAD
+=======
+app.post('/api/pages/profile-token-health', async (c) => {
+    return c.json({ error: 'direct_page_management_only' }, 410)
+    let body: any = {}
+    try {
+        body = await c.req.json()
+    } catch {
+        body = {}
+    }
+
+    const configuredSecret = String(c.env.TAG_SYNC_PUSH_SECRET || '').trim()
+    const providedSecret = String(c.req.header('x-tag-sync-secret') || '').trim()
+
+    let namespaceId = ''
+    if (configuredSecret && providedSecret === configuredSecret) {
+        namespaceId = String(body?.namespace_id || body?.namespaceId || c.req.header('x-bot-id') || '').trim()
+        const email = String(body?.email || '').trim().toLowerCase()
+        if (!namespaceId && email) {
+            const namespaces = await resolveNamespacesForTagSync(c.env.DB, { email })
+            namespaceId = String(namespaces[0] || '').trim()
+        }
+    } else {
+        const owner = await requireOwnerSession(c)
+        if (!owner.ok) return owner.response
+        namespaceId = String(c.get('botId') || '').trim()
+    }
+
+    if (!namespaceId) return c.json({ error: 'namespace_not_found' }, 400)
+
+    const inputProfiles = Array.isArray(body?.profiles) ? body.profiles : []
+    if (inputProfiles.length === 0) {
+        return c.json({ success: true, namespace_id: namespaceId, profiles: [] })
+    }
+
+    const pages = (((await c.env.DB.prepare(
+        'SELECT id, name, access_token FROM pages WHERE bot_id = ?'
+    ).bind(namespaceId).all()).results || []) as Array<{ id?: string; name?: string; access_token?: string | null }>)
+
+    const pagesById = new Map<string, { id: string; name: string; access_token: string }>()
+    const pagesByName = new Map<string, Array<{ id: string; name: string; access_token: string }>>()
+    for (const row of pages) {
+        const id = String(row?.id || '').trim()
+        if (!id) continue
+        const name = String(row?.name || '').trim() || id
+        const accessToken = String(row?.access_token || '').trim()
+        const normalizedName = normalizePageName(name)
+        const pageRecord = { id, name, access_token: accessToken }
+        pagesById.set(id, pageRecord)
+        if (!pagesByName.has(normalizedName)) pagesByName.set(normalizedName, [])
+        pagesByName.get(normalizedName)!.push(pageRecord)
+    }
+
+    const linkedProfiles = await getNamespaceLinkedTaggedProfiles(c.env.DB, namespaceId)
+    const tokenPool = await getNamespacePagesTokenPool(c.env.DB, namespaceId)
+
+    // Query latest post per page to check for actual post failures
+    const latestPostByPage = new Map<string, { status: string; error_message: string }>()
+    try {
+        const { results: latestPosts } = await c.env.DB.prepare(
+            `SELECT page_id, status, error_message FROM post_history WHERE bot_id = ? AND id IN (SELECT MAX(id) FROM post_history WHERE bot_id = ? GROUP BY page_id)`
+        ).bind(namespaceId, namespaceId).all<{ page_id: string; status: string; error_message: string | null }>()
+        for (const row of (latestPosts || [])) {
+            const pid = String(row?.page_id || '').trim()
+            if (pid) latestPostByPage.set(pid, { status: String(row?.status || '').trim(), error_message: String(row?.error_message || '').trim() })
+        }
+    } catch (err) {
+        console.log(`[PROFILE-TOKEN-HEALTH] failed to query latest post_history: ${String(err)}`)
+    }
+
+    const results: BrowserSavingProfileTokenHealthResult[] = []
+
+    for (const rawProfile of inputProfiles as BrowserSavingProfileRecord[]) {
+        const profileId = String(rawProfile?.id || '').trim()
+        if (!profileId) continue
+
+        const profileName = String(rawProfile?.name || '').trim() || profileId
+        const tags = normalizeBrowserSavingProfileTags(rawProfile?.tags)
+        const wantsPost = tags.includes('post')
+        const wantsComment = tags.includes('comment')
+        const localPostcronToken = pickProfilePostcronToken(rawProfile)
+        const localCommentToken = pickProfileCommentToken(rawProfile)
+        const localPageId = parsePageIdFromAvatarUrl(String(rawProfile?.page_avatar_url || ''))
+        const localPageName = getExplicitTaggedProfilePageName(rawProfile)
+        const normalizedLocalPageName = normalizePageName(localPageName)
+
+        let matchedPage = localPageId ? pagesById.get(localPageId) : undefined
+        if (!matchedPage && normalizedLocalPageName) {
+            const namedMatches = pagesByName.get(normalizedLocalPageName) || []
+            if (namedMatches.length > 0) matchedPage = namedMatches[0]
+        }
+
+        const pageId = String(matchedPage?.id || localPageId || '').trim()
+        const pageName = String(matchedPage?.name || localPageName || '').trim()
+        const pageFound = !!matchedPage
+
+        let hasPagePostToken = false
+        let hasPageCommentToken = false
+        let explicitlyLinked = false
+
+        if (matchedPage) {
+            const linkedEntryExists = hasLinkedTaggedProfilesEntryForPage(linkedProfiles, matchedPage.id)
+            const linkedProfileIds = linkedEntryExists
+                ? getLinkedTaggedProfileIdsForPage(linkedProfiles, matchedPage.id)
+                : new Set<string>()
+            explicitlyLinked = linkedEntryExists ? linkedProfileIds.has(profileId.toLowerCase()) : false
+
+            const pagePoolEntry = tokenPool[matchedPage.id] || { post_tokens: [], comment_tokens: [] }
+            hasPagePostToken = normalizePostTokenPool([
+                String(matchedPage.access_token || '').trim(),
+                ...((pagePoolEntry.post_tokens || []).map((item) => String(item || '').trim())),
+            ]).length > 0
+            hasPageCommentToken = normalizeCommentTokenPool(
+                (pagePoolEntry.comment_tokens || []).map((item) => String(item || '').trim()),
+            ).length > 0
+        }
+
+        // Only flag as issue when the latest post for this page actually failed
+        const latestPost = pageId ? latestPostByPage.get(pageId) : undefined
+        const hasPostFailure = latestPost?.status === 'failed'
+        const issues: string[] = []
+        if (hasPostFailure) {
+            issues.push(latestPost.error_message || 'โพสต์ล่าสุดไม่สำเร็จ')
+        }
+
+        results.push({
+            profile_id: profileId,
+            profile_name: profileName,
+            namespace_id: namespaceId,
+            page_id: pageId,
+            page_name: pageName,
+            page_found: pageFound,
+            has_issue: hasPostFailure,
+            issues,
+            issue_summary: issues[0] || '',
+            has_local_postcron_token: !!localPostcronToken,
+            has_local_comment_token: !!localCommentToken,
+            has_page_post_token: hasPagePostToken,
+            has_page_comment_token: hasPageCommentToken,
+            explicitly_linked: explicitlyLinked,
+        })
+    }
+
+    return c.json({
+        success: true,
+        namespace_id: namespaceId,
+        profiles: results,
+    })
+})
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 // TEMP MIGRATION ENDPOINT
 app.get('/api/migrate-bucket-back', async (c) => {
     const fromPrefix = c.req.query('from') || '8328894625/'
@@ -620,6 +1053,26 @@ function pickPreferredSystemGalleryVideo(current: Record<string, unknown>, next:
     return nextNamespaceId.localeCompare(currentNamespaceId) <= 0 ? next : current
 }
 
+function normalizeVideoDuplicateValue(value: unknown): string {
+    return String(value || '').trim().replace(/#.*$/, '')
+}
+
+function getNamespaceVideoDuplicateKey(video: Record<string, unknown>): string {
+    const namespaceId = String(video.namespace_id || video.namespaceId || '').trim()
+    const originalUrl = normalizeVideoDuplicateValue(video.originalUrl || video.original_url)
+    if (namespaceId && originalUrl) return `${namespaceId}::original::${originalUrl}`
+
+    const sourceType = String(video.sourceType || video.source_type || '').trim().toLowerCase()
+    const sourceLabel = normalizeVideoDuplicateValue(video.sourceLabel || video.source_label)
+    const videoUrl = normalizeVideoDuplicateValue(video.videoUrl || video.video_url)
+    const previewUrl = normalizeVideoDuplicateValue(video.previewUrl || video.preview_url)
+
+    if (namespaceId && sourceType === 'xhs_url' && sourceLabel) return `${namespaceId}::xhs::${sourceLabel}`
+    if (namespaceId && videoUrl) return `${namespaceId}::video::${videoUrl}`
+    if (namespaceId && previewUrl) return `${namespaceId}::preview::${previewUrl}`
+    return ''
+}
+
 function dedupeSystemGalleryVideos(videos: any[]): any[] {
     const byVideoId = new Map<string, Record<string, unknown>>()
     for (const rawVideo of videos || []) {
@@ -634,7 +1087,22 @@ function dedupeSystemGalleryVideos(videos: any[]): any[] {
         byVideoId.set(id, pickPreferredSystemGalleryVideo(prev, video))
     }
 
-    return Array.from(byVideoId.values()).sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a))
+    const bySourceKey = new Map<string, Record<string, unknown>>()
+    for (const video of byVideoId.values()) {
+        const sourceKey = getNamespaceVideoDuplicateKey(video)
+        if (!sourceKey) {
+            bySourceKey.set(`id::${String(video.id || '').trim()}`, video)
+            continue
+        }
+        const previous = bySourceKey.get(sourceKey)
+        if (!previous) {
+            bySourceKey.set(sourceKey, video)
+            continue
+        }
+        bySourceKey.set(sourceKey, pickPreferredSystemGalleryVideo(previous, video))
+    }
+
+    return Array.from(bySourceKey.values()).sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a))
 }
 
 function shuffleInPlace<T>(items: T[]): T[] {
@@ -853,7 +1321,142 @@ async function pickRandomGalleryVideoForPosting(params: {
         if (systemPicked) return systemPicked
     }
 
+<<<<<<< HEAD
     return pickRandomPostableVideoFromNamespaceGallery(params.bucket, candidateIds, namespaceId)
+=======
+    const galleryVideos = await listNamespaceGalleryVideos(params.env, namespaceId)
+    const candidates = galleryVideos.filter((video) => {
+        const id = String(video?.id || '').trim()
+        return !!id && allowedIds.has(id) && !params.excludedVideoIds.has(id)
+    })
+    if (candidates.length > 0) {
+        shuffleInPlace(candidates)
+        const picked = candidates[0] as Record<string, unknown>
+        return {
+            id: String(picked.id || '').trim(),
+            meta: picked,
+            shopeeLink: normalizeMetaShopeeLink(picked) || '',
+            sourceNamespaceId: String((picked as any).sourceNamespaceId || (picked as any).source_namespace_id || namespaceId).trim() || namespaceId,
+        }
+    }
+
+    return null
+}
+
+async function resolveGalleryVideoForRepost(params: {
+    env: Env
+    fallbackNamespaceId: string
+    videoId: string
+}): Promise<{ id: string; meta: Record<string, unknown>; shopeeLink: string; sourceNamespaceId: string } | null> {
+    const videoId = String(params.videoId || '').trim()
+    const fallbackNamespaceId = String(params.fallbackNamespaceId || '').trim() || 'default'
+    if (!videoId) return null
+
+    const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(params.env.DB, fallbackNamespaceId)
+    if (!shortlinkEnabled) {
+        return null
+    }
+
+    const namespaceGalleryVideos = await listNamespaceGalleryVideos(params.env, fallbackNamespaceId)
+    const namespaceHit = namespaceGalleryVideos.find((video) => String(video.id || '').trim() === videoId)
+    if (namespaceHit) {
+        return {
+            id: videoId,
+            meta: namespaceHit,
+            shopeeLink: normalizeMetaShopeeLink(namespaceHit as Record<string, unknown>) || '',
+            sourceNamespaceId: fallbackNamespaceId,
+        }
+    }
+
+    await ensureGalleryIndexTable(params.env.DB)
+    const galleryRow = await params.env.DB.prepare(
+        `SELECT
+            namespace_id,
+            owner_email,
+            script,
+            title,
+            category,
+            duration,
+            shopee_link,
+            public_url,
+            original_url,
+            thumbnail_url,
+            created_at,
+            updated_at
+         FROM gallery_index
+         WHERE video_id = ?
+         ORDER BY CASE WHEN namespace_id = ? THEN 0 ELSE 1 END,
+                  COALESCE(updated_at, created_at) DESC,
+                  namespace_id ASC
+         LIMIT 1`
+    ).bind(videoId, fallbackNamespaceId).first() as {
+        namespace_id?: string
+        owner_email?: string
+        script?: string
+        title?: string
+        category?: string
+        duration?: number
+        shopee_link?: string
+        public_url?: string
+        original_url?: string
+        thumbnail_url?: string
+        created_at?: string
+        updated_at?: string
+    } | null
+
+    const namespaceCandidates = uniqueVideoIds([
+        String(galleryRow?.namespace_id || '').trim(),
+        fallbackNamespaceId,
+    ])
+
+    for (const namespaceId of namespaceCandidates) {
+        if (!namespaceId) continue
+        const bucket = namespaceId === fallbackNamespaceId
+            ? new BotBucket(params.env.BUCKET, fallbackNamespaceId) as unknown as R2Bucket
+            : new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
+
+        const metaObj = await bucket.get(`videos/${videoId}.json`)
+        if (!metaObj && namespaceId !== String(galleryRow?.namespace_id || '').trim()) {
+            continue
+        }
+
+        let meta: Record<string, unknown> = {
+            id: videoId,
+            namespace_id: namespaceId,
+            owner_email: String(galleryRow?.owner_email || '').trim(),
+            script: String(galleryRow?.script || '').trim(),
+            title: String(galleryRow?.title || '').trim(),
+            category: String(galleryRow?.category || '').trim(),
+            duration: Number(galleryRow?.duration || 0),
+            shopeeLink: String(galleryRow?.shopee_link || '').trim(),
+            publicUrl: String(galleryRow?.public_url || '').trim(),
+            originalUrl: String(galleryRow?.original_url || '').trim(),
+            thumbnailUrl: String(galleryRow?.thumbnail_url || '').trim(),
+            createdAt: String(galleryRow?.created_at || '').trim(),
+            updatedAt: String(galleryRow?.updated_at || '').trim(),
+        }
+        if (metaObj) {
+            try {
+                meta = {
+                    ...meta,
+                    ...(await metaObj.json() as Record<string, unknown>),
+                }
+            } catch {
+                // Keep index-derived metadata as fallback.
+            }
+        }
+
+        const shopeeLink = normalizeMetaShopeeLink(meta) || String(galleryRow?.shopee_link || '').trim()
+        return {
+            id: videoId,
+            meta,
+            shopeeLink,
+            sourceNamespaceId: namespaceId,
+        }
+    }
+
+    return null
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 }
 
 function getVideoPublicUrlForNamespace(r2BaseUrl: string, namespaceId: string, videoId: string): string {
@@ -870,9 +1473,18 @@ function getVideoThumbnailUrlForNamespace(r2BaseUrl: string, namespaceId: string
 
 async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
+<<<<<<< HEAD
     if (!normalizedNamespaceId) return false
     const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(db, normalizedNamespaceId)
     return !!String(baseUrl || '').trim()
+=======
+    void db
+    return !!normalizedNamespaceId
+}
+
+function isUnifiedGalleryEnabled(): boolean {
+    return true
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 }
 
 async function getNamespaceOwnerEmailMap(db: D1Database): Promise<Map<string, string>> {
@@ -963,6 +1575,177 @@ async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string,
     return deduped
 }
 
+<<<<<<< HEAD
+=======
+async function ensureNamespaceVideoStateTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS namespace_video_state (
+            namespace_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            shopee_link TEXT NOT NULL DEFAULT '',
+            lazada_link TEXT NOT NULL DEFAULT '',
+            shopee_original_link TEXT NOT NULL DEFAULT '',
+            lazada_original_link TEXT NOT NULL DEFAULT '',
+            shopee_converted_at TEXT NOT NULL DEFAULT '',
+            lazada_converted_at TEXT NOT NULL DEFAULT '',
+            lazada_member_id TEXT NOT NULL DEFAULT '',
+            posted_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (namespace_id, video_id)
+        )`
+    ).run()
+}
+
+type NamespaceVideoStateRow = {
+    namespace_id?: string
+    video_id?: string
+    shopee_link?: string
+    lazada_link?: string
+    shopee_original_link?: string
+    lazada_original_link?: string
+    shopee_converted_at?: string
+    lazada_converted_at?: string
+    lazada_member_id?: string
+    posted_at?: string
+}
+
+async function listNamespaceVideoStates(db: D1Database, namespaceId: string): Promise<NamespaceVideoStateRow[]> {
+    await ensureNamespaceVideoStateTable(db)
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return []
+    const res = await db.prepare(
+        `SELECT namespace_id, video_id, shopee_link, lazada_link, shopee_original_link, lazada_original_link,
+                shopee_converted_at, lazada_converted_at, lazada_member_id, posted_at
+         FROM namespace_video_state
+         WHERE namespace_id = ?`
+    ).bind(normalizedNamespaceId).all() as { results?: NamespaceVideoStateRow[] }
+    return Array.isArray(res.results) ? res.results : []
+}
+
+async function upsertNamespaceVideoState(db: D1Database, namespaceId: string, videoId: string, fields: Partial<NamespaceVideoStateRow>): Promise<void> {
+    await ensureNamespaceVideoStateTable(db)
+    const current = await db.prepare(
+        `SELECT shopee_link, lazada_link, shopee_original_link, lazada_original_link,
+                shopee_converted_at, lazada_converted_at, lazada_member_id, posted_at
+         FROM namespace_video_state WHERE namespace_id = ? AND video_id = ?`
+    ).bind(namespaceId, videoId).first() as NamespaceVideoStateRow | null
+
+    const next = {
+        shopee_link: String(fields.shopee_link ?? current?.shopee_link ?? '').trim(),
+        lazada_link: String(fields.lazada_link ?? current?.lazada_link ?? '').trim(),
+        shopee_original_link: String(fields.shopee_original_link ?? current?.shopee_original_link ?? '').trim(),
+        lazada_original_link: String(fields.lazada_original_link ?? current?.lazada_original_link ?? '').trim(),
+        shopee_converted_at: String(fields.shopee_converted_at ?? current?.shopee_converted_at ?? '').trim(),
+        lazada_converted_at: String(fields.lazada_converted_at ?? current?.lazada_converted_at ?? '').trim(),
+        lazada_member_id: String(fields.lazada_member_id ?? current?.lazada_member_id ?? '').trim(),
+        posted_at: String(fields.posted_at ?? current?.posted_at ?? '').trim(),
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_video_state (
+            namespace_id, video_id, shopee_link, lazada_link, shopee_original_link, lazada_original_link,
+            shopee_converted_at, lazada_converted_at, lazada_member_id, posted_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(namespace_id, video_id) DO UPDATE SET
+            shopee_link = excluded.shopee_link,
+            lazada_link = excluded.lazada_link,
+            shopee_original_link = excluded.shopee_original_link,
+            lazada_original_link = excluded.lazada_original_link,
+            shopee_converted_at = excluded.shopee_converted_at,
+            lazada_converted_at = excluded.lazada_converted_at,
+            lazada_member_id = excluded.lazada_member_id,
+            posted_at = CASE WHEN excluded.posted_at <> '' THEN excluded.posted_at ELSE namespace_video_state.posted_at END,
+            updated_at = datetime('now')`
+    ).bind(
+        namespaceId,
+        videoId,
+        next.shopee_link,
+        next.lazada_link,
+        next.shopee_original_link,
+        next.lazada_original_link,
+        next.shopee_converted_at,
+        next.lazada_converted_at,
+        next.lazada_member_id,
+        next.posted_at,
+    ).run()
+}
+
+async function markNamespaceVideoPosted(db: D1Database, namespaceId: string, videoId: string, postedAt: string): Promise<void> {
+    const normalizedPostedAt = String(postedAt || '').trim()
+    if (!namespaceId || !videoId || !normalizedPostedAt) return
+    await upsertNamespaceVideoState(db, namespaceId, videoId, { posted_at: normalizedPostedAt })
+}
+
+async function seedNamespaceVideoStateFromLegacy(db: D1Database, namespaceId: string): Promise<void> {
+    await ensureNamespaceVideoStateTable(db)
+    const existing = await db.prepare('SELECT COUNT(*) AS total FROM namespace_video_state WHERE namespace_id = ?').bind(namespaceId).first() as { total?: number } | null
+    if (Number(existing?.total || 0) > 0) return
+
+    const legacyRows = await db.prepare(
+        `SELECT namespace_id, video_id, shopee_link, lazada_link, shopee_original_link, lazada_original_link,
+                shopee_converted_at, lazada_converted_at, lazada_member_id
+         FROM gallery_index
+         WHERE namespace_id = ? AND (TRIM(shopee_converted_at) <> '' OR TRIM(lazada_converted_at) <> '')`
+    ).bind(namespaceId).all() as { results?: NamespaceVideoStateRow[] }
+
+    for (const row of legacyRows.results || []) {
+        const videoId = String(row.video_id || '').trim()
+        if (!videoId) continue
+        await upsertNamespaceVideoState(db, namespaceId, videoId, row)
+    }
+}
+
+async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promise<Array<Record<string, unknown>>> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return []
+
+    await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId)
+    const [sourceVideos, stateRows] = await Promise.all([
+        getAllSystemGalleryVideos(env),
+        listNamespaceVideoStates(env.DB, normalizedNamespaceId),
+    ])
+
+    const stateByVideoId = new Map(
+        stateRows
+            .map((row) => [String(row.video_id || '').trim(), row] as const)
+            .filter(([videoId]) => !!videoId)
+    )
+
+    const readyVideos = dedupeSystemGalleryVideos(sourceVideos)
+        .filter((video) => String((video as Record<string, unknown>).namespace_id || '').trim() === normalizedNamespaceId)
+        .map((video) => {
+            const source = video as Record<string, unknown>
+            const videoId = String(source.id || '').trim()
+            const row = stateByVideoId.get(videoId)
+            return {
+                ...source,
+                id: videoId,
+                namespace_id: normalizedNamespaceId,
+                sourceNamespaceId: String(source.namespace_id || '').trim() || normalizedNamespaceId,
+                shopeeLink: String(row?.shopee_link || normalizeMetaShopeeLink(source) || '').trim(),
+                lazadaLink: String(row?.lazada_link || normalizeMetaLazadaLink(source) || '').trim(),
+                shopeeOriginalLink: String(row?.shopee_original_link || source.shopeeOriginalLink || source.shopee_original_link || '').trim(),
+                lazadaOriginalLink: String(row?.lazada_original_link || source.lazadaOriginalLink || source.lazada_original_link || '').trim(),
+                shopeeConvertedAt: String(row?.shopee_converted_at || source.shopeeConvertedAt || source.shopee_converted_at || '').trim(),
+                lazadaConvertedAt: String(row?.lazada_converted_at || source.lazadaConvertedAt || source.lazada_converted_at || '').trim(),
+                lazadaMemberId: String(row?.lazada_member_id || source.lazadaMemberId || source.lazada_member_id || '').trim(),
+                postedAt: String(row?.posted_at || source.postedAt || source.posted_at || '').trim(),
+            }
+        })
+        .filter((video) => getVideoAffiliateConversionState(video).galleryReady)
+
+    return readyVideos.sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a))
+}
+
+async function clearNamespaceVideoState(db: D1Database, namespaceId: string): Promise<void> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return
+    await ensureNamespaceVideoStateTable(db)
+    await db.prepare('DELETE FROM namespace_video_state WHERE namespace_id = ?').bind(normalizedNamespaceId).run()
+}
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 async function getOwnerLinkedSystemGalleryVideos(env: Env): Promise<Array<Record<string, unknown>>> {
     const indexedVideos = await listGalleryIndexVideos(env.DB, { onlyOwnerLinked: true }).catch(() => [])
     if (indexedVideos.length > 0) {
@@ -1088,6 +1871,88 @@ async function pickRandomPostableVideoFromSystem(
 // ==================== ADMIN PANEL ====================
 
 const ADMIN_AUTH_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+async function issueAdminAccessToken(bucket: R2Bucket, chatId?: string): Promise<string> {
+    const token = 'adm_' + crypto.randomUUID().replace(/-/g, '')
+    await bucket.put(`_admin_session/${token}.json`, JSON.stringify({
+        chat_id: String(chatId || '').trim(),
+        expires_at: Date.now() + ADMIN_AUTH_TTL_MS,
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    return token
+}
+
+async function validateAdminAccessToken(bucket: R2Bucket, rawToken: string): Promise<boolean> {
+    const token = String(rawToken || '').trim()
+    if (!token) return false
+    const sessionObj = await bucket.get(`_admin_session/${token}.json`).catch(() => null)
+    if (!sessionObj) return false
+
+    try {
+        const payload = await sessionObj.json() as { expires_at?: number }
+        const expiresAt = Number(payload?.expires_at || 0)
+        if (!expiresAt || Date.now() > expiresAt) {
+            await bucket.delete(`_admin_session/${token}.json`).catch(() => { })
+            return false
+        }
+        return true
+    } catch {
+        await bucket.delete(`_admin_session/${token}.json`).catch(() => { })
+        return false
+    }
+}
+
+async function issueAdminAccessTokenForGrant(env: Env, chatId: string): Promise<string | null> {
+    const normalizedChatId = String(chatId || '').trim()
+    if (!normalizedChatId) return null
+
+    const grantKey = `_admin_grant/${normalizedChatId}.json`
+    const grantObj = await env.BUCKET.get(grantKey)
+    if (!grantObj) return null
+
+    try {
+        const grant = await grantObj.json() as { expires_at?: number }
+        const expiresAt = Number(grant?.expires_at || 0)
+        if (!expiresAt || Date.now() > expiresAt) {
+            await env.BUCKET.delete(grantKey).catch(() => { })
+            return null
+        }
+    } catch {
+        await env.BUCKET.delete(grantKey).catch(() => { })
+        return null
+    }
+
+    await env.BUCKET.put(grantKey, JSON.stringify({ expires_at: Date.now() + ADMIN_AUTH_TTL_MS }), {
+        httpMetadata: { contentType: 'application/json' },
+    }).catch(() => { })
+
+    return issueAdminAccessToken(env.BUCKET, normalizedChatId)
+}
+
+async function issueAdminAccessTokenForLaunch(env: Env, launchTokenRaw: string): Promise<string | null> {
+    const launchToken = String(launchTokenRaw || '').trim()
+    if (!launchToken) return null
+
+    const launchKey = `_admin_launch/${launchToken}.json`
+    const launchObj = await env.BUCKET.get(launchKey)
+    if (!launchObj) return null
+
+    try {
+        const payload = await launchObj.json() as { chat_id?: string; expires_at?: number }
+        const expiresAt = Number(payload?.expires_at || 0)
+        if (!expiresAt || Date.now() > expiresAt) {
+            await env.BUCKET.delete(launchKey).catch(() => { })
+            return null
+        }
+
+        await env.BUCKET.delete(launchKey).catch(() => { })
+        return issueAdminAccessToken(env.BUCKET, String(payload?.chat_id || '').trim())
+    } catch {
+        await env.BUCKET.delete(launchKey).catch(() => { })
+        return null
+    }
+}
 
 async function buildAdminDataPayload(env: Env) {
     const teamsRes = await env.DB.prepare(
@@ -1307,45 +2172,17 @@ async function backfillGalleryThumbnail(env: Env, namespaceId: string, videoId: 
 app.get('/admin', async (c) => {
     const launchToken = String(c.req.query('launch') || '').trim()
     if (launchToken) {
-        const launchKey = `_admin_launch/${launchToken}.json`
-        const launchObj = await c.env.BUCKET.get(launchKey)
-
-        if (launchObj) {
-            let expiresAt = 0
-            try {
-                const payload = await launchObj.json() as any
-                expiresAt = Number(payload?.expires_at || 0)
-            } catch {
-                expiresAt = 0
-            }
-
-            if (expiresAt && Date.now() <= expiresAt) {
-                const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-                const adminToken = String(setting?.value || '').trim()
-                await c.env.BUCKET.delete(launchKey).catch(() => { })
-
-                if (adminToken) {
-                    const redirectUrl = new URL(c.req.url)
-                    redirectUrl.searchParams.delete('launch')
-                    redirectUrl.searchParams.set('t', adminToken)
-                    redirectUrl.searchParams.set('v', String(Date.now()))
-                    return c.redirect(redirectUrl.toString(), 302)
-                }
-            } else {
-                await c.env.BUCKET.delete(launchKey).catch(() => { })
-            }
+        const adminToken = await issueAdminAccessTokenForLaunch(c.env, launchToken)
+        if (adminToken) {
+            const redirectUrl = new URL(c.req.url)
+            redirectUrl.searchParams.delete('launch')
+            redirectUrl.searchParams.set('t', adminToken)
+            redirectUrl.searchParams.set('v', String(Date.now()))
+            return c.redirect(redirectUrl.toString(), 302)
         }
     }
 
-    const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-    const adminToken = String(setting?.value || '').trim()
-    let html = ADMIN_HTML
-    if (adminToken) {
-        const safeToken = JSON.stringify(adminToken).replace(/</g, '\\u003c')
-        html = ADMIN_HTML.replace('<script>', `<script>window.__ADMIN_DIRECT_TOKEN__=${safeToken};</script>\n<script>`)
-    }
-
-    return new Response(html, {
+    return new Response(ADMIN_HTML, {
         headers: {
             'content-type': 'text/html; charset=UTF-8',
             'cache-control': 'no-store, no-cache, must-revalidate, max-age=0',
@@ -1369,7 +2206,12 @@ const adminAuthMiddleware = async (c: any, next: any) => {
     const adminToken = c.req.query('t') || c.req.header('x-admin-token')
     if (!adminToken) return c.json({ error: 'Unauthorized' }, 401)
     const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-    if (!setting || adminToken.trim() !== setting.value?.trim()) return c.json({ error: 'Unauthorized' }, 401)
+    const tokenValue = String(adminToken || '').trim()
+    if (setting?.value && tokenValue === String(setting.value || '').trim()) {
+        await next()
+        return
+    }
+    if (!await validateAdminAccessToken(c.env.BUCKET, tokenValue)) return c.json({ error: 'Unauthorized' }, 401)
     await next()
 }
 
@@ -1384,32 +2226,8 @@ app.post('/admin/api/auto-auth', async (c) => {
     const body = await c.req.json().catch(() => ({})) as { chat_id?: string | number }
     const chatId = String(body?.chat_id || '').trim()
     if (!chatId) return c.json({ error: 'Invalid chat_id' }, 400)
-
-    const grantKey = `_admin_grant/${chatId}.json`
-    const grantObj = await c.env.BUCKET.get(grantKey)
-    if (!grantObj) return c.json({ error: 'Unauthorized' }, 401)
-
-    let expiresAt = 0
-    try {
-        const grant = await grantObj.json() as any
-        expiresAt = Number(grant?.expires_at || 0)
-    } catch {
-        expiresAt = 0
-    }
-
-    if (!expiresAt || Date.now() > expiresAt) {
-        await c.env.BUCKET.delete(grantKey).catch(() => { })
-        return c.json({ error: 'Grant expired' }, 401)
-    }
-
-    const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-    const adminToken = String(setting?.value || '').trim()
-    if (!adminToken) return c.json({ error: 'Admin password not set' }, 401)
-
-    await c.env.BUCKET.put(grantKey, JSON.stringify({ expires_at: Date.now() + ADMIN_AUTH_TTL_MS }), {
-        httpMetadata: { contentType: 'application/json' },
-    }).catch(() => { })
-
+    const adminToken = await issueAdminAccessTokenForGrant(c.env, chatId)
+    if (!adminToken) return c.json({ error: 'Unauthorized' }, 401)
     return c.json({ ok: true, token: adminToken })
 })
 
@@ -1417,29 +2235,8 @@ app.post('/admin/api/launch-auth', async (c) => {
     const body = await c.req.json().catch(() => ({})) as { launch_token?: string }
     const launchToken = String(body?.launch_token || '').trim()
     if (!launchToken) return c.json({ error: 'Invalid launch_token' }, 400)
-
-    const launchKey = `_admin_launch/${launchToken}.json`
-    const launchObj = await c.env.BUCKET.get(launchKey)
-    if (!launchObj) return c.json({ error: 'Unauthorized' }, 401)
-
-    let expiresAt = 0
-    try {
-        const payload = await launchObj.json() as any
-        expiresAt = Number(payload?.expires_at || 0)
-    } catch {
-        expiresAt = 0
-    }
-
-    if (!expiresAt || Date.now() > expiresAt) {
-        await c.env.BUCKET.delete(launchKey).catch(() => { })
-        return c.json({ error: 'Launch expired' }, 401)
-    }
-
-    const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-    const adminToken = String(setting?.value || '').trim()
-    if (!adminToken) return c.json({ error: 'Admin password not set' }, 401)
-
-    await c.env.BUCKET.delete(launchKey).catch(() => { })
+    const adminToken = await issueAdminAccessTokenForLaunch(c.env, launchToken)
+    if (!adminToken) return c.json({ error: 'Unauthorized' }, 401)
     return c.json({ ok: true, token: adminToken })
 })
 
@@ -1605,7 +2402,11 @@ app.post('/admin/api/comments/retry', async (c) => {
                 results.push({ id: historyId, ok: false, error: err })
                 continue
             }
+<<<<<<< HEAD
             const shortShopeeLink = await shortenShopeeLinkForNamespace({
+=======
+            const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 env: c.env,
                 namespaceId: botId,
                 shopeeLink,
@@ -1614,8 +2415,13 @@ app.post('/admin/api/comments/retry', async (c) => {
 
             const commentResult = await postShopeeCommentStrict({
                 env: c.env,
+                namespaceId: botId,
                 fbVideoId: targetId,
                 shopeeLink: shortShopeeLink,
+<<<<<<< HEAD
+=======
+                lazadaLink: String(row.lazada_link || '').trim(),
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 commentToken,
                 pageId,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
@@ -1931,7 +2737,16 @@ app.post('/api/auth/login', async (c) => {
             if (legacyUser?.session_token && legacyNamespaceId === botScope) {
                 return c.json({ session_token: String(legacyUser.session_token || '').trim() })
             }
-            return c.json({ error: 'Not registered' }, 401)
+            const existingSessionToken = String(c.req.header('x-auth-token') || '').trim()
+            const bound = await bindTelegramToExistingSession(c.env.DB, existingSessionToken, String(tg_id), botScope)
+            if (bound?.session_token) {
+                return c.json({ session_token: bound.session_token, rebound: true })
+            }
+            const provisioned = await provisionTelegramOwnerSession(c.env.DB, String(tg_id), botScope)
+            if (provisioned?.session_token) {
+                return c.json({ session_token: provisioned.session_token, is_owner: true, auto_provisioned: true })
+            }
+            return c.json({ error: 'Unauthorized' }, 401)
         }
         const user = await c.env.DB.prepare(
             'SELECT session_token FROM users WHERE telegram_id = ?'
@@ -1992,26 +2807,44 @@ app.post('/api/auth/login', async (c) => {
     const bindTgId = tg_id ? String(tg_id).trim() : '';
 
     if (bindTgId && botScope) {
-        await c.env.DB.prepare('INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, ?)')
-            .bind(emailLower, namespaceId, sessionToken).run()
+        await upsertUserSessionByTelegram(c.env.DB, bindTgId, emailLower, namespaceId, sessionToken)
         await upsertTelegramBotSession(c.env.DB, bindTgId, botScope, emailLower, namespaceId, sessionToken)
     } else if (bindTgId) {
-        // Upsert: ถ้า telegram_id นี้มีอยู่แล้ว → update, ถ้าไม่มี → insert ใหม่
-        // รองรับ 1 email login จากหลาย Telegram account
-        const existingTgRow = await c.env.DB.prepare('SELECT email FROM users WHERE telegram_id = ?').bind(Number(bindTgId)).first() as any;
-        if (existingTgRow) {
-            // telegram_id นี้เคย login → update email + session
-            await c.env.DB.prepare('UPDATE users SET email = ?, namespace_id = ?, session_token = ? WHERE telegram_id = ?')
-                .bind(emailLower, namespaceId, sessionToken, Number(bindTgId)).run();
-        } else {
-            // telegram_id ใหม่ → insert row ใหม่ (email เดียวกันมีได้หลาย row)
-            await c.env.DB.prepare('INSERT INTO users (telegram_id, email, namespace_id, session_token) VALUES (?, ?, ?, ?)')
-                .bind(Number(bindTgId), emailLower, namespaceId, sessionToken).run();
-        }
+        await upsertUserSessionByTelegram(c.env.DB, bindTgId, emailLower, namespaceId, sessionToken)
     } else {
-        // ไม่มี tg_id → insert โดยไม่ผูก telegram
-        await c.env.DB.prepare('INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, ?)')
-            .bind(emailLower, namespaceId, sessionToken).run();
+        // Reuse the bot-owner row when present so one owner email maps to one account row.
+        const existingEmailUser = await c.env.DB.prepare(
+            `SELECT u.telegram_id
+             FROM users u
+             LEFT JOIN channels ch
+               ON CAST(u.telegram_id AS TEXT) = CAST(ch.owner_telegram_id AS TEXT)
+             WHERE lower(trim(u.email)) = ?
+             ORDER BY
+               CASE WHEN ch.owner_telegram_id IS NOT NULL THEN 0 ELSE 1 END ASC,
+               datetime(u.created_at) ASC,
+               u.telegram_id ASC
+             LIMIT 1`
+        ).bind(emailLower).first() as { telegram_id?: number } | null
+
+        if (existingEmailUser?.telegram_id != null) {
+            await c.env.DB.prepare(
+                'UPDATE users SET email = ?, namespace_id = ?, session_token = ? WHERE telegram_id = ?'
+            ).bind(emailLower, namespaceId, sessionToken, Number(existingEmailUser.telegram_id)).run()
+            await c.env.DB.prepare(
+                `UPDATE telegram_bot_sessions
+                 SET email = ?, namespace_id = ?, session_token = ?, updated_at = datetime('now')
+                 WHERE telegram_id = ?`
+            ).bind(emailLower, namespaceId, sessionToken, String(existingEmailUser.telegram_id)).run().catch(() => { })
+
+            if (isOwner) {
+                await c.env.DB.prepare(
+                    'DELETE FROM users WHERE lower(trim(email)) = ? AND telegram_id <> ?'
+                ).bind(emailLower, Number(existingEmailUser.telegram_id)).run()
+            }
+        } else {
+            await c.env.DB.prepare('INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, ?)')
+                .bind(emailLower, namespaceId, sessionToken).run()
+        }
     }
 
     return c.json({ session_token: sessionToken, is_owner: isOwner })
@@ -2181,6 +3014,67 @@ app.put('/api/settings/voice-prompt', async (c) => {
     })
 })
 
+app.get('/api/settings/comment-template', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const namespaceId = c.get('botId')
+    const settings = await getNamespaceCommentTemplateSettings(c.env.DB, namespaceId)
+    return c.json({
+        ...settings,
+        max_chars: MAX_COMMENT_TEMPLATE_CHARS,
+        placeholders: {
+            shopee_link: COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
+            lazada_link: COMMENT_TEMPLATE_LAZADA_PLACEHOLDER,
+        },
+    })
+})
+
+app.put('/api/settings/comment-template', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const body = await c.req.json().catch(() => ({})) as { template?: string }
+    const template = normalizeCommentTemplate(String(body.template || ''))
+    if (template.length > MAX_COMMENT_TEMPLATE_CHARS) {
+        return c.json({ error: `Comment template too long (max ${MAX_COMMENT_TEMPLATE_CHARS} chars)` }, 400)
+    }
+    if (template && !template.includes(COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER)) {
+        return c.json({ error: `Comment template ต้องมี ${COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER} อย่างน้อย 1 จุด` }, 400)
+    }
+
+    const namespaceId = c.get('botId')
+    await setNamespaceCommentTemplate(c.env.DB, namespaceId, template)
+    const settings = await getNamespaceCommentTemplateSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        ...settings,
+        max_chars: MAX_COMMENT_TEMPLATE_CHARS,
+        placeholders: {
+            shopee_link: COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
+            lazada_link: COMMENT_TEMPLATE_LAZADA_PLACEHOLDER,
+        },
+    })
+})
+
+app.delete('/api/settings/comment-template', async (c) => {
+    const ownerCheck = await requireOwnerSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const namespaceId = c.get('botId')
+    await setNamespaceCommentTemplate(c.env.DB, namespaceId, '')
+    const settings = await getNamespaceCommentTemplateSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        ...settings,
+        max_chars: MAX_COMMENT_TEMPLATE_CHARS,
+        placeholders: {
+            shopee_link: COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
+            lazada_link: COMMENT_TEMPLATE_LAZADA_PLACEHOLDER,
+        },
+    })
+})
+
 app.get('/api/settings/gemini-key', async (c) => {
     const ownerCheck = await requireOwnerSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
@@ -2339,26 +3233,11 @@ app.post('/api/telegram/:token?', async (c) => {
     }
 
     const askAdminPassword = async () => {
-        await c.env.BUCKET.put(adminStateKey, JSON.stringify({ expires_at: Date.now() + ADMIN_AUTH_TTL_MS }), {
-            httpMetadata: { contentType: 'application/json' },
-        })
-        await sendTelegram(token, 'sendMessage', {
-            chat_id: chatId,
-            text: '🔐  Password',
-        })
+        await clearAdminAuthPending()
+        await sendAdminPanelLink()
     }
 
     const sendAdminPanelLink = async () => {
-        const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-        const password = String(setting?.value || '').trim()
-        if (!password) {
-            await sendTelegram(token, 'sendMessage', {
-                chat_id: chatId,
-                text: '❌ ยังไม่ได้ตั้งรหัสผ่านแอดมินในระบบ',
-            })
-            return
-        }
-
         await c.env.BUCKET.put(`_admin_grant/${chatId}.json`, JSON.stringify({ expires_at: Date.now() + ADMIN_AUTH_TTL_MS }), {
             httpMetadata: { contentType: 'application/json' },
         })
@@ -2374,52 +3253,13 @@ app.post('/api/telegram/:token?', async (c) => {
         const adminUrl = `${workerUrl}/admin?launch=${encodeURIComponent(launchToken)}&v=${Date.now()}`
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
-            text: '✅ รหัสถูกต้อง\nกดปุ่มด้านล่างเพื่อเปิด Admin Panel',
+            text: '✅ เปิด Admin Panel ได้เลย',
             reply_markup: { inline_keyboard: [[{ text: '⚙️ เปิด Admin Panel', web_app: { url: adminUrl } }]] },
         })
     }
 
-    const tryHandleAdminPasswordInput = async (inputText: string) => {
-        if (!inputText || inputText.startsWith('/')) return false
-
-        const pendingObj = await c.env.BUCKET.get(adminStateKey)
-        if (!pendingObj) return false
-
-        let expiresAt = 0
-        try {
-            const pending = await pendingObj.json() as any
-            expiresAt = Number(pending?.expires_at || 0)
-        } catch {
-            expiresAt = 0
-        }
-
-        if (!expiresAt || Date.now() > expiresAt) {
-            await clearAdminAuthPending()
-            return false
-        }
-
-        const setting = await c.env.DB.prepare("SELECT value FROM settings WHERE key = 'setting_password'").first() as any
-        const password = String(setting?.value || '').trim()
-        if (!password) {
-            await clearAdminAuthPending()
-            await sendTelegram(token, 'sendMessage', {
-                chat_id: chatId,
-                text: '❌ ยังไม่ได้ตั้งรหัสผ่านแอดมินในระบบ',
-            })
-            return true
-        }
-
-        if (inputText.trim() !== password) {
-            await sendTelegram(token, 'sendMessage', {
-                chat_id: chatId,
-                text: '❌ รหัสผ่านไม่ถูกต้อง ลองใหม่อีกครั้ง หรือพิมพ์ /canceladmin',
-            })
-            return true
-        }
-
-        await clearAdminAuthPending()
-        await sendAdminPanelLink()
-        return true
+    const tryHandleAdminPasswordInput = async (_inputText: string) => {
+        return false
     }
 
     // Check if this token belongs to a registered Channel Bot
@@ -2453,7 +3293,7 @@ app.post('/api/telegram/:token?', async (c) => {
                     text += `└ ID: \`${ch.bot_id}\`\n\n`
                     text += `เลือกดำเนินการกับบอทตัวนี้:`
 
-                    const webAppUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
+                    const webAppUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
 
                     const buttons = [
                         [{ text: `📱 เปิดหน้าจัดการระบบ (Mini App)`, web_app: { url: buildScopedWebAppUrl(webAppUrl, String(ch.bot_id || '')) } }],
@@ -2636,6 +3476,25 @@ app.post('/api/telegram/:token?', async (c) => {
     }
 
     // ==================== CHANNEL BOT (ช่องที่ลงทะเบียนแล้ว) ====================
+    const currentBotId = String(getBotId(token) || '').trim()
+    const hasScopedTelegramSession = currentBotId
+        ? await hasTelegramWorkspaceAccess(c.env.DB, String(chatId), currentBotId).catch(() => false)
+        : false
+    const ownerAccess = currentBotId && !hasScopedTelegramSession
+        ? await claimOrValidateChannelOwner(
+            c.env.DB,
+            currentBotId,
+            String(chatId),
+            String(msg?.from?.first_name || cb?.from?.first_name || 'owner'),
+        ).catch(() => null)
+        : null
+    if (currentBotId && !hasScopedTelegramSession && ownerAccess && !ownerAccess.allowed) {
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: '🚫 กรุณาเปิด Workspace แล้ว login ด้วยอีเมลก่อนใช้งานบอท',
+        }).catch(() => null)
+        return c.text('ok')
+    }
 
     // Handle callbacks (del_email:, close_setting)
     if (cb) {
@@ -2667,7 +3526,6 @@ app.post('/api/telegram/:token?', async (c) => {
     if (await tryHandleAdminPasswordInput(text)) return c.text('ok')
 
     // Auth state & user lookup (session_token NULL = logged out)
-    const currentBotId = String(getBotId(token) || '').trim()
     const userRecord = await resolveTelegramWorkspaceSession(c.env.DB, String(chatId), currentBotId)
 
     // /logout command — ล้าง session จาก bot side
@@ -2685,10 +3543,10 @@ app.post('/api/telegram/:token?', async (c) => {
                 await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE telegram_id = ?").bind(chatId).run()
             }
         }
-        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
+        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
-            text: '✅ ออกจากระบบแล้ว\n\nกด "เปิด Workspace" เพื่อ login ใหม่',
+            text: '✅ ออกจากระบบแล้ว\n\nกด "เปิด Workspace" เพื่อเข้าใช้งานอีกครั้ง',
             reply_markup: { inline_keyboard: [[{ text: '🚀 เปิด Workspace', web_app: { url: buildScopedWebAppUrl(appUrl, currentBotId) } }]] }
         })
         return c.text('ok')
@@ -2700,9 +3558,27 @@ app.post('/api/telegram/:token?', async (c) => {
         return c.text('ok')
     }
 
+    // /start and /menu should always surface the Mini App entrypoint.
+    if (text === '/start' || text === '/menu') {
+        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
+        const hasSession = Boolean(userRecord?.session_token)
+        await sendTelegram(token, 'sendMessage', {
+            chat_id: chatId,
+            text: hasSession
+                ? '🚀 กด "เปิด Workspace" เพื่อเข้าใช้งาน'
+                : '👋 กรุณาเปิด Workspace เพื่อเริ่มใช้งาน',
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '🚀 เปิด Workspace', web_app: { url: buildScopedWebAppUrl(appUrl, currentBotId) } }
+                ]]
+            }
+        })
+        return c.text('ok')
+    }
+
     // Block unauthenticated/logged-out users — send Mini App button to open Workspace
     if (!userRecord || !userRecord.session_token) {
-        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
+        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
             text: '👋 กรุณาเปิด Workspace เพื่อเริ่มใช้งาน',
@@ -2734,11 +3610,172 @@ app.post('/api/telegram/:token?', async (c) => {
 
         const pendingCategoryKey = `_pending_category/${chatId}.json`
         const waitingVideoKey = `_waiting_video/${chatId}.json`
+<<<<<<< HEAD
+=======
+        type WaitingVideoState = {
+            id: string
+            videoUrl: string
+            sourceType?: InboxVideoSourceType
+            sourceLabel?: string
+            shopeeLink?: string
+            lazadaLink?: string
+        }
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const extractShopeeLink = (input: string): string => {
             const raw = String(input || '')
             const match = raw.match(/https?:\/\/\S*shopee\S+/i) || raw.match(/https?:\/\/shope\.ee\S+/i)
             return String(match?.[0] || '').trim()
         }
+<<<<<<< HEAD
+=======
+        const extractLazadaLink = (input: string): string => {
+            const raw = String(input || '')
+            const match = raw.match(/https?:\/\/\S*(?:lazada|lzd\.co)\S+/i)
+            return String(match?.[0] || '').trim()
+        }
+        const normalizeWaitingVideoState = (input: Partial<WaitingVideoState> | null | undefined): WaitingVideoState | null => {
+            const id = String(input?.id || '').trim()
+            const videoUrl = String(input?.videoUrl || '').trim()
+            if (!id || !videoUrl) return null
+            const shopeeLink = extractShopeeLink(String(input?.shopeeLink || ''))
+            const lazadaLink = extractLazadaLink(String(input?.lazadaLink || ''))
+            const sourceType: InboxVideoSourceType = String(input?.sourceType || '').trim().toLowerCase() === 'xhs_url'
+                ? 'xhs_url'
+                : 'telegram_video'
+            const sourceLabel = sourceType === 'telegram_video'
+                ? 'Telegram video'
+                : String(input?.sourceLabel || '').trim().slice(0, 500)
+            return {
+                id,
+                videoUrl,
+                sourceType,
+                ...(sourceLabel ? { sourceLabel } : {}),
+                ...(shopeeLink ? { shopeeLink } : {}),
+                ...(lazadaLink ? { lazadaLink } : {}),
+            }
+        }
+        const getIntakeDuplicateKey = (input: Partial<WaitingVideoState> | Partial<InboxVideoRecord> | null | undefined): string => {
+            const sourceType: InboxVideoSourceType = String(input?.sourceType || '').trim().toLowerCase() === 'xhs_url'
+                ? 'xhs_url'
+                : 'telegram_video'
+            return getNamespaceVideoDuplicateKey({
+                namespace_id: String(c.get('botId') || '').trim(),
+                sourceType,
+                sourceLabel: String(input?.sourceLabel || '').trim(),
+                videoUrl: String(input?.videoUrl || '').trim(),
+            })
+        }
+        const getWaitingVideoState = async (): Promise<WaitingVideoState | null> => {
+            const waitingObj = await c.get('bucket').get(waitingVideoKey)
+            if (!waitingObj) return null
+            const waitingState = normalizeWaitingVideoState(await waitingObj.json() as Partial<WaitingVideoState>)
+            if (!waitingState) {
+                await c.get('bucket').delete(waitingVideoKey).catch(() => { })
+                return null
+            }
+            return waitingState
+        }
+        const saveWaitingVideoState = async (state: WaitingVideoState) => {
+            await c.get('bucket').put(waitingVideoKey, JSON.stringify(state), {
+                httpMetadata: { contentType: 'application/json' },
+            })
+        }
+        const clearWaitingVideoState = async () => {
+            await c.get('bucket').delete(waitingVideoKey).catch(() => { })
+        }
+        const findExistingDuplicateInboxVideo = async (state: WaitingVideoState): Promise<
+            | { kind: 'waiting'; item: WaitingVideoState }
+            | { kind: 'inbox'; item: InboxVideoRecord }
+            | null
+        > => {
+            const duplicateKey = getIntakeDuplicateKey(state)
+            if (!duplicateKey) return null
+
+            const waitingState = await getWaitingVideoState()
+            if (waitingState && getIntakeDuplicateKey(waitingState) === duplicateKey) {
+                return { kind: 'waiting', item: waitingState }
+            }
+
+            const inboxRecords = await listInboxVideoRecords(c.get('bucket'))
+            const existing = inboxRecords.find((record) => getIntakeDuplicateKey(record) === duplicateKey)
+            return existing ? { kind: 'inbox', item: existing } : null
+        }
+        const getMissingWaitingLink = (state: WaitingVideoState): 'shopee' | 'lazada' | null => {
+            if (!String(state.shopeeLink || '').trim()) return 'shopee'
+            if (!String(state.lazadaLink || '').trim()) return 'lazada'
+            return null
+        }
+        const promptWaitingLink = async (state: WaitingVideoState) => {
+            const missing = getMissingWaitingLink(state)
+            if (missing === 'lazada') {
+                await sendTelegram(token, 'sendMessage', {
+                    chat_id: chatId,
+                    text: 'ส่งลิ้ง Lazada ของคลิปนี้ต่อได้เลย 🧡',
+                })
+                return
+            }
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: 'ส่งลิ้ง Shopee ของคลิปนี้มาเลย 🛒',
+            })
+        }
+        const upsertInboxFromWaitingState = async (state: WaitingVideoState) => {
+            const existing = await getInboxVideoRecord(c.get('bucket'), state.id)
+            return putInboxVideoRecord(c.get('bucket'), {
+                ...existing,
+                id: state.id,
+                videoUrl: state.videoUrl,
+                chatId: Number(chatId),
+                createdAt: String(existing?.createdAt || '').trim() || new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                sourceType: state.sourceType,
+                sourceLabel: state.sourceLabel,
+                shopeeLink: state.shopeeLink,
+                lazadaLink: state.lazadaLink,
+                linkRecordedAt: existing?.linkRecordedAt,
+            })
+        }
+        const sendReadyInboxMessage = async (result: InboxProcessingStartResult) => {
+            const targetId = String(result.item.id || '').trim()
+            const processingUrl = buildScopedTabWebAppUrl(
+                c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                String(c.get('botId') || ''),
+                'processing',
+            )
+            const galleryUrl = buildScopedTabWebAppUrl(
+                c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                String(c.get('botId') || ''),
+                'gallery',
+                { q: targetId },
+            )
+            if (result.outcome === 'already_processed') {
+                await sendTelegram(token, 'sendMessage', {
+                    chat_id: chatId,
+                    text: '♻️ คลิปนี้เคยประมวลผลแล้ว\nผมอัปเดตลิงก์ให้รายการเดิมเรียบร้อย',
+                    reply_markup: {
+                        inline_keyboard: [[{ text: '🎞 เปิด Gallery', web_app: { url: galleryUrl } }]],
+                    },
+                })
+                return
+            }
+
+            const status = result.outcome === 'started' ? result.job.status : result.status
+            const text = result.outcome === 'already_running'
+                ? (status === 'queued'
+                    ? '♻️ คลิปนี้อยู่ในคิวประมวลผลแล้ว'
+                    : '♻️ คลิปนี้กำลังประมวลผลอยู่แล้ว')
+                : (status === 'queued'
+                    ? '✅ รับลิงก์ครบแล้ว\nผมส่งคลิปเข้า Queue ให้แล้ว ระบบจะประมวลผลอัตโนมัติ'
+                    : '✅ รับลิงก์ครบแล้ว\nผมเริ่มประมวลผลให้อัตโนมัติแล้ว')
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text,
+                reply_markup: {
+                    inline_keyboard: [[{ text: '⚙️ ดู Processing', web_app: { url: processingUrl } }]],
+                },
+            })
+        }
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         const CATEGORIES = await getCategories(c.get('bucket'))
 
@@ -2774,6 +3811,7 @@ app.post('/api/telegram/:token?', async (c) => {
             return c.text('ok')
         }
 
+<<<<<<< HEAD
         const handleExecution = async (shopeeLink: string) => {
             const normalizedShopeeLink = String(shopeeLink || '').trim()
             if (!normalizedShopeeLink) return false
@@ -2847,6 +3885,88 @@ app.post('/api/telegram/:token?', async (c) => {
         // Helper สำหรับรวมการเซฟวิดีโอที่รอลิงก์ Shopee
         const handleVideoInput = async (videoUrl: string, immediateShopeeLink?: string) => {
             const hasWaitingVideo = await c.get('bucket').head(waitingVideoKey)
+=======
+        // Helper สำหรับรวมการเซฟวิดีโอที่รอลิงก์ affiliate links
+        const handleVideoInput = async (
+            videoUrl: string,
+            sourceType: InboxVideoSourceType,
+            sourceLabel?: string,
+            initialLinks?: { shopeeLink?: string; lazadaLink?: string },
+        ) => {
+            const waitingState = normalizeWaitingVideoState({
+                id: crypto.randomUUID().replace(/-/g, '').slice(0, 8),
+                videoUrl,
+                sourceType,
+                sourceLabel,
+                shopeeLink: initialLinks?.shopeeLink,
+                lazadaLink: initialLinks?.lazadaLink,
+            })
+            if (!waitingState) {
+                await c.get('bucket').put(dedupKey, 'processing')
+                return
+            }
+
+            const duplicate = await findExistingDuplicateInboxVideo(waitingState)
+            if (duplicate?.kind === 'waiting') {
+                const mergedWaitingState = normalizeWaitingVideoState({
+                    ...duplicate.item,
+                    shopeeLink: initialLinks?.shopeeLink || duplicate.item.shopeeLink,
+                    lazadaLink: initialLinks?.lazadaLink || duplicate.item.lazadaLink,
+                })
+                if (mergedWaitingState) {
+                    if (getMissingWaitingLink(mergedWaitingState)) {
+                        await saveWaitingVideoState(mergedWaitingState)
+                        await sendTelegram(token, 'sendMessage', {
+                            chat_id: chatId,
+                            text: '♻️ คลิปนี้มีอยู่แล้วในรายการรอลิงก์ ผมอัปเดตข้อมูลให้รายการเดิมแทน',
+                        })
+                        await promptWaitingLink(mergedWaitingState)
+                    } else {
+                        const inboxItem = await upsertInboxFromWaitingState(mergedWaitingState)
+                        await clearWaitingVideoState()
+                        const processingResult = await ensureInboxVideoProcessingStarted({
+                            env: c.env,
+                            bucket: c.get('bucket'),
+                            executionCtx: c.executionCtx,
+                            botId: String(c.get('botId') || ''),
+                            item: inboxItem,
+                            skipIfAlreadyProcessed: true,
+                        })
+                        await sendReadyInboxMessage(processingResult)
+                    }
+                }
+                await c.get('bucket').put(dedupKey, 'processing')
+                return
+            }
+            if (duplicate?.kind === 'inbox') {
+                const mergedRecord = await putInboxVideoRecord(c.get('bucket'), {
+                    ...duplicate.item,
+                    shopeeLink: initialLinks?.shopeeLink || duplicate.item.shopeeLink,
+                    lazadaLink: initialLinks?.lazadaLink || duplicate.item.lazadaLink,
+                    updatedAt: new Date().toISOString(),
+                })
+                if (mergedRecord.status === 'ready') {
+                    const processingResult = await ensureInboxVideoProcessingStarted({
+                        env: c.env,
+                        bucket: c.get('bucket'),
+                        executionCtx: c.executionCtx,
+                        botId: String(c.get('botId') || ''),
+                        item: mergedRecord,
+                        skipIfAlreadyProcessed: true,
+                    })
+                    await sendReadyInboxMessage(processingResult)
+                } else {
+                    await sendTelegram(token, 'sendMessage', {
+                        chat_id: chatId,
+                        text: '♻️ คลิปนี้มีอยู่แล้วในคลังต้นฉบับ ผมอัปเดตลิงก์ให้รายการเดิมแทน',
+                    })
+                }
+                await c.get('bucket').put(dedupKey, 'processing')
+                return
+            }
+
+            const hasWaitingVideo = await getWaitingVideoState()
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             if (hasWaitingVideo) {
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
@@ -2856,6 +3976,7 @@ app.post('/api/telegram/:token?', async (c) => {
                 return
             }
 
+<<<<<<< HEAD
             await c.get('bucket').put(waitingVideoKey, JSON.stringify({ videoUrl }), {
                 httpMetadata: { contentType: 'application/json' },
             })
@@ -2869,6 +3990,27 @@ app.post('/api/telegram/:token?', async (c) => {
                 chat_id: chatId,
                 text: 'ส่งลิ้ง Shopee ของคลิปนี้มาเลย 🛒',
             })
+=======
+            const inboxItem = await upsertInboxFromWaitingState(waitingState)
+
+            if (inboxItem.status === 'ready') {
+                await clearWaitingVideoState()
+                const processingResult = await ensureInboxVideoProcessingStarted({
+                    env: c.env,
+                    bucket: c.get('bucket'),
+                    executionCtx: c.executionCtx,
+                    botId: String(c.get('botId') || ''),
+                    item: inboxItem,
+                    skipIfAlreadyProcessed: true,
+                })
+                await sendReadyInboxMessage(processingResult)
+                await c.get('bucket').put(dedupKey, 'processing')
+                return
+            }
+
+            await saveWaitingVideoState(waitingState)
+            await promptWaitingLink(waitingState)
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             await c.get('bucket').put(dedupKey, 'processing')
         }
 
@@ -2881,7 +4023,15 @@ app.post('/api/telegram/:token?', async (c) => {
             if (fileInfo.ok && fileInfo.result) {
                 const videoUrl = `https://api.telegram.org/file/bot${token}/${fileInfo.result.file_path}`
                 const shopeeFromCaption = extractShopeeLink(msg.caption || '')
+<<<<<<< HEAD
                 await handleVideoInput(videoUrl, shopeeFromCaption || undefined)
+=======
+                const lazadaFromCaption = extractLazadaLink(msg.caption || '')
+                await handleVideoInput(videoUrl, 'telegram_video', 'Telegram video', {
+                    shopeeLink: shopeeFromCaption || undefined,
+                    lazadaLink: lazadaFromCaption || undefined,
+                })
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             }
             return c.text('ok')
         }
@@ -2890,17 +4040,60 @@ app.post('/api/telegram/:token?', async (c) => {
         const xhsMatch = text.match(/https?:\/\/(xhslink\.com|www\.xiaohongshu\.com)\S+/)
         if (xhsMatch) {
             const videoUrl = xhsMatch[0]
+<<<<<<< HEAD
             await handleVideoInput(videoUrl)
+=======
+            await handleVideoInput(videoUrl, 'xhs_url', videoUrl, {
+                shopeeLink: extractShopeeLink(text) || undefined,
+                lazadaLink: extractLazadaLink(text) || undefined,
+            })
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             return c.text('ok')
         }
 
         // กรณีส่ง Shopee link 
         const shopeeLink = extractShopeeLink(text)
+<<<<<<< HEAD
         if (shopeeLink) {
 
             // ถ้ารอวิดีโออยู่ แล้วส่ง Shopee Link -> สั่งทำ Pipeline หักเข้า Background
             const executed = await handleExecution(shopeeLink)
             if (executed) return c.text('ok')
+=======
+        const lazadaLink = extractLazadaLink(text)
+        if (shopeeLink || lazadaLink) {
+            const waitingState = await getWaitingVideoState()
+            if (waitingState) {
+                const nextState = normalizeWaitingVideoState({
+                    ...waitingState,
+                    shopeeLink: shopeeLink || waitingState.shopeeLink,
+                    lazadaLink: lazadaLink || waitingState.lazadaLink,
+                })
+                if (!nextState) {
+                    await c.get('bucket').put(dedupKey, 'processing')
+                    return c.text('ok')
+                }
+                const inboxItem = await upsertInboxFromWaitingState(nextState)
+                if (inboxItem.status === 'ready') {
+                    await clearWaitingVideoState()
+                    const processingResult = await ensureInboxVideoProcessingStarted({
+                        env: c.env,
+                        bucket: c.get('bucket'),
+                        executionCtx: c.executionCtx,
+                        botId: String(c.get('botId') || ''),
+                        item: inboxItem,
+                        skipIfAlreadyProcessed: true,
+                    })
+                    await sendReadyInboxMessage(processingResult)
+                    await c.get('bucket').put(dedupKey, 'processing')
+                    return c.text('ok')
+                }
+                await saveWaitingVideoState(nextState)
+                await promptWaitingLink(nextState)
+                await c.get('bucket').put(dedupKey, 'processing')
+                return c.text('ok')
+            }
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
                 text: '❌ ไม่มีวิดีโอที่รอลิงก์ Shopee\n\nส่งวิดีโอหรือลิงก์ XHS มาก่อน',
@@ -2985,6 +4178,537 @@ function sanitizeProcessingError(raw: unknown): string {
         .replace(/AIza[0-9A-Za-z_-]{20,}/g, 'AIza***')
 }
 
+type InboxVideoStatus = 'awaiting_links' | 'ready'
+type InboxVideoSourceType = 'telegram_video' | 'xhs_url'
+type InboxProcessingState = 'idle' | 'queued' | 'processing'
+type InboxArchiveState = 'original' | 'processed'
+type InboxVideoRecord = {
+    id: string
+    videoUrl: string
+    chatId: number
+    createdAt: string
+    updatedAt: string
+    status: InboxVideoStatus
+    sourceType: InboxVideoSourceType
+    sourceLabel: string
+    shopeeLink?: string
+    lazadaLink?: string
+    linkRecordedAt?: string
+}
+
+function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | undefined): InboxVideoRecord | null {
+    const id = String(input?.id || '').trim()
+    const videoUrl = String(input?.videoUrl || '').trim()
+    const chatId = Number(input?.chatId || 0)
+    if (!id || !videoUrl || !Number.isFinite(chatId) || chatId <= 0) return null
+
+    const shopeeLink = pickFirstShopeeUrl(String(input?.shopeeLink || '')) || ''
+    const lazadaLink = pickFirstLazadaUrl(String(input?.lazadaLink || '')) || ''
+    const sourceTypeRaw = String(input?.sourceType || '').trim().toLowerCase()
+    const sourceType: InboxVideoSourceType = sourceTypeRaw === 'xhs_url' ? 'xhs_url' : 'telegram_video'
+    const sourceLabelInput = String(input?.sourceLabel || '').trim()
+    const sourceLabel = sourceType === 'telegram_video'
+        ? 'Telegram video'
+        : (sourceLabelInput || 'Xiaohongshu link').slice(0, 500)
+    const createdAt = String(input?.createdAt || '').trim() || new Date().toISOString()
+    const updatedAt = String(input?.updatedAt || '').trim() || createdAt
+    const status: InboxVideoStatus = shopeeLink && lazadaLink ? 'ready' : 'awaiting_links'
+
+    return {
+        id,
+        videoUrl,
+        chatId,
+        createdAt,
+        updatedAt,
+        status,
+        sourceType,
+        sourceLabel,
+        ...(shopeeLink ? { shopeeLink } : {}),
+        ...(lazadaLink ? { lazadaLink } : {}),
+        ...(String(input?.linkRecordedAt || '').trim() ? { linkRecordedAt: String(input?.linkRecordedAt || '').trim() } : {}),
+    }
+}
+
+async function getInboxVideoRecord(bucket: R2Bucket, id: string): Promise<InboxVideoRecord | null> {
+    const normalizedId = String(id || '').trim()
+    if (!normalizedId) return null
+    const obj = await bucket.get(`_inbox/${normalizedId}.json`)
+    if (!obj) return null
+    const raw = await obj.json().catch(() => null) as Partial<InboxVideoRecord> | null
+    const record = normalizeInboxVideoRecord(raw)
+    if (!record) {
+        await bucket.delete(`_inbox/${normalizedId}.json`).catch(() => { })
+        return null
+    }
+    return record
+}
+
+async function putInboxVideoRecord(bucket: R2Bucket, input: Partial<InboxVideoRecord>): Promise<InboxVideoRecord> {
+    const record = normalizeInboxVideoRecord(input)
+    if (!record) throw new Error('invalid_inbox_video_record')
+    await bucket.put(`_inbox/${record.id}.json`, JSON.stringify(record), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    return record
+}
+
+async function listInboxVideoRecords(bucket: R2Bucket): Promise<InboxVideoRecord[]> {
+    const list = await bucket.list({ prefix: '_inbox/' })
+    const tasks = await Promise.all(list.objects.map(async (obj) => {
+        const record = await getInboxVideoRecord(bucket, obj.key.replace(/^_inbox\//, '').replace(/\.json$/i, ''))
+        return record
+    }))
+    return tasks
+        .filter((item): item is InboxVideoRecord => !!item)
+        .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())
+}
+
+type NamespaceOriginalAsset = {
+    id: string
+    originalUrl: string
+    previewUrl: string
+    hasProcessedVideo: boolean
+    originalUploadedAt: string
+    processedUploadedAt: string
+}
+
+async function listNamespaceOriginalAssetMap(env: Env, bucket: R2Bucket, namespaceId: string): Promise<Map<string, NamespaceOriginalAsset>> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return new Map()
+
+    const objects = await listAllVideoObjects(bucket)
+    const byId = new Map<string, {
+        hasOriginalVideo: boolean
+        hasProcessedVideo: boolean
+        originalUploadedAt: string
+        processedUploadedAt: string
+    }>()
+
+    for (const obj of objects) {
+        const key = String(obj.key || '').trim()
+        if (!key) continue
+
+        const originalMatch = key.match(/^videos\/(.+)_original\.mp4$/)
+        if (originalMatch) {
+            const id = String(originalMatch[1] || '').trim()
+            if (!id) continue
+            const current = byId.get(id) || {
+                hasOriginalVideo: false,
+                hasProcessedVideo: false,
+                originalUploadedAt: '',
+                processedUploadedAt: '',
+            }
+            current.hasOriginalVideo = true
+            current.originalUploadedAt = String(obj.uploaded?.toISOString?.() || current.originalUploadedAt || '').trim()
+            byId.set(id, current)
+            continue
+        }
+
+        const processedMatch = key.match(/^videos\/(.+)\.mp4$/)
+        if (!processedMatch) continue
+        const id = String(processedMatch[1] || '').trim()
+        if (!id || id.endsWith('_thumb') || id.endsWith('_original')) continue
+
+        const current = byId.get(id) || {
+            hasOriginalVideo: false,
+            hasProcessedVideo: false,
+            originalUploadedAt: '',
+            processedUploadedAt: '',
+        }
+        current.hasProcessedVideo = true
+        current.processedUploadedAt = String(obj.uploaded?.toISOString?.() || current.processedUploadedAt || '').trim()
+        byId.set(id, current)
+    }
+
+    const result = new Map<string, NamespaceOriginalAsset>()
+    for (const [id, asset] of byId.entries()) {
+        if (!asset.hasOriginalVideo) continue
+        result.set(id, {
+            id,
+            originalUrl: getVideoOriginalUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, id),
+            previewUrl: getVideoOriginalUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, id),
+            hasProcessedVideo: asset.hasProcessedVideo,
+            originalUploadedAt: asset.originalUploadedAt,
+            processedUploadedAt: asset.processedUploadedAt,
+        })
+    }
+    return result
+}
+
+async function getInboxProcessingStateMap(bucket: R2Bucket): Promise<Map<string, InboxProcessingState>> {
+    const stateMap = new Map<string, InboxProcessingState>()
+
+    const applyState = async (prefix: '_queue/' | '_processing/', fallbackState: InboxProcessingState) => {
+        const list = await bucket.list({ prefix })
+        for (const obj of list.objects) {
+            const id = obj.key.replace(prefix, '').replace(/\.json$/i, '').trim()
+            if (!id) continue
+
+            let nextState = fallbackState
+            try {
+                const payload = await bucket.get(obj.key)
+                const json = payload ? await payload.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown> : {}
+                const rawStatus = String(json.status || '').trim().toLowerCase()
+                if (rawStatus === 'failed') continue
+                if (rawStatus === 'queued') nextState = 'queued'
+                else if (rawStatus === 'processing') nextState = 'processing'
+            } catch {
+                // fall back to the prefix-derived state
+            }
+
+            stateMap.set(id, nextState)
+        }
+    }
+
+    await applyState('_queue/', 'queued')
+    await applyState('_processing/', 'processing')
+    return stateMap
+}
+
+function toInboxVideoResponse(
+    record: InboxVideoRecord,
+    processingState: InboxProcessingState = 'idle',
+    options?: {
+        previewUrl?: string
+        originalUrl?: string
+        archiveState?: InboxArchiveState
+        canStartProcessing?: boolean
+        canDelete?: boolean
+    },
+) {
+    const archiveState = options?.archiveState === 'processed' ? 'processed' : 'original'
+    const canStartProcessing = options?.canStartProcessing !== false
+    const canDelete = options?.canDelete !== false
+    return {
+        id: record.id,
+        videoUrl: record.videoUrl,
+        previewUrl: String(options?.previewUrl || record.videoUrl || '').trim(),
+        originalUrl: String(options?.originalUrl || '').trim(),
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        status: record.status,
+        sourceType: record.sourceType,
+        sourceLabel: record.sourceLabel,
+        shopeeLink: String(record.shopeeLink || '').trim(),
+        lazadaLink: String(record.lazadaLink || '').trim(),
+        hasShopeeLink: !!String(record.shopeeLink || '').trim(),
+        hasLazadaLink: !!String(record.lazadaLink || '').trim(),
+        readyToProcess: record.status === 'ready',
+        processingStatus: processingState,
+        processingActive: processingState === 'queued' || processingState === 'processing',
+        archiveState,
+        canStartProcessing,
+        canDelete,
+    }
+}
+
+function pickPreferredInboxArchiveVideo(current: Record<string, unknown>, next: Record<string, unknown>): Record<string, unknown> {
+    const currentCanDelete = current.canDelete === true ? 1 : 0
+    const nextCanDelete = next.canDelete === true ? 1 : 0
+    if (currentCanDelete !== nextCanDelete) {
+        return nextCanDelete > currentCanDelete ? next : current
+    }
+
+    const currentReady = current.readyToProcess === true ? 1 : 0
+    const nextReady = next.readyToProcess === true ? 1 : 0
+    if (currentReady !== nextReady) {
+        return nextReady > currentReady ? next : current
+    }
+
+    const currentTs = new Date(String(current.updatedAt || current.createdAt || '')).getTime()
+    const nextTs = new Date(String(next.updatedAt || next.createdAt || '')).getTime()
+    if (currentTs !== nextTs) {
+        return nextTs >= currentTs ? next : current
+    }
+
+    return String(next.id || '').localeCompare(String(current.id || '')) <= 0 ? next : current
+}
+
+function getInboxArchiveDuplicateKey(video: Record<string, unknown>): string {
+    const originalUrl = normalizeVideoDuplicateValue(video.originalUrl || video.original_url)
+    if (originalUrl) return `original::${originalUrl}`
+
+    const sourceType = String(video.sourceType || video.source_type || '').trim().toLowerCase()
+    const sourceLabel = normalizeVideoDuplicateValue(video.sourceLabel || video.source_label)
+    const videoUrl = normalizeVideoDuplicateValue(video.videoUrl || video.video_url)
+    const previewUrl = normalizeVideoDuplicateValue(video.previewUrl || video.preview_url)
+
+    if (sourceType === 'xhs_url' && sourceLabel) return `xhs::${sourceLabel}`
+    if (videoUrl) return `video::${videoUrl}`
+    if (previewUrl) return `preview::${previewUrl}`
+    return `id::${String(video.id || '').trim()}`
+}
+
+function dedupeInboxArchiveVideos(videos: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+    const byKey = new Map<string, Record<string, unknown>>()
+
+    for (const video of videos) {
+        const dedupeKey = getInboxArchiveDuplicateKey(video)
+        const previous = byKey.get(dedupeKey)
+        if (!previous) {
+            byKey.set(dedupeKey, video)
+            continue
+        }
+        byKey.set(dedupeKey, pickPreferredInboxArchiveVideo(previous, video))
+    }
+
+    return Array.from(byKey.values()).sort((a, b) => {
+        const at = new Date(String(a.updatedAt || a.createdAt || '')).getTime()
+        const bt = new Date(String(b.updatedAt || b.createdAt || '')).getTime()
+        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
+    })
+}
+
+async function listNamespaceOriginalArchiveVideos(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+}): Promise<Array<Record<string, unknown>>> {
+    const normalizedNamespaceId = String(params.namespaceId || '').trim()
+    if (!normalizedNamespaceId) return []
+
+    const [inboxRecords, processingStateMap, namespaceStates, originalAssetMap] = await Promise.all([
+        listInboxVideoRecords(params.bucket),
+        getInboxProcessingStateMap(params.bucket),
+        listNamespaceVideoStates(params.env.DB, normalizedNamespaceId),
+        listNamespaceOriginalAssetMap(params.env, params.bucket, normalizedNamespaceId),
+    ])
+
+    const stateByVideoId = new Map(
+        namespaceStates
+            .map((row) => [String(row.video_id || '').trim(), row] as const)
+            .filter(([videoId]) => !!videoId)
+    )
+    const merged = new Map<string, Record<string, unknown>>()
+    const assetEntries = Array.from(originalAssetMap.entries())
+    const metaEntries = await Promise.all(assetEntries.map(async ([id, asset]) => {
+        const metaObj = await params.bucket.get(`videos/${id}.json`).catch(() => null)
+        const meta = metaObj ? await metaObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown> : {}
+        return { id, asset, meta }
+    }))
+    const metaById = new Map(metaEntries.map((entry) => [entry.id, entry.meta]))
+
+    for (const record of inboxRecords) {
+        const asset = originalAssetMap.get(record.id)
+        const meta = metaById.get(record.id) || {}
+        const previewUrl = asset?.previewUrl || record.videoUrl
+        merged.set(record.id, toInboxVideoResponse(record, processingStateMap.get(record.id) || 'idle', {
+            previewUrl,
+            originalUrl: String(meta.originalUrl || meta.original_url || '').trim(),
+            archiveState: asset?.hasProcessedVideo ? 'processed' : 'original',
+            canStartProcessing: !asset?.hasProcessedVideo,
+            canDelete: true,
+        }))
+    }
+
+    for (const { id, asset, meta } of metaEntries) {
+        if (merged.has(id)) continue
+
+        const row = stateByVideoId.get(id)
+        const shopeeLink = String(row?.shopee_link || normalizeMetaShopeeLink(meta) || '').trim()
+        const lazadaLink = String(row?.lazada_link || normalizeMetaLazadaLink(meta) || '').trim()
+        const createdAt = String(meta.createdAt || asset.originalUploadedAt || asset.processedUploadedAt || new Date().toISOString()).trim()
+        const updatedAt = String(meta.updatedAt || asset.processedUploadedAt || asset.originalUploadedAt || createdAt).trim()
+        const title = String(meta.title || '').trim()
+        const sourceLabel = title || 'Original video'
+
+        merged.set(id, {
+            id,
+            videoUrl: asset.originalUrl,
+            previewUrl: asset.previewUrl,
+            originalUrl: String(meta.originalUrl || meta.original_url || '').trim(),
+            createdAt,
+            updatedAt,
+            status: shopeeLink && lazadaLink ? 'ready' : 'awaiting_links',
+            sourceType: 'telegram_video',
+            sourceLabel,
+            shopeeLink,
+            lazadaLink,
+            hasShopeeLink: !!shopeeLink,
+            hasLazadaLink: !!lazadaLink,
+            readyToProcess: shopeeLink && lazadaLink && !asset.hasProcessedVideo,
+            processingStatus: processingStateMap.get(id) || 'idle',
+            processingActive: (processingStateMap.get(id) || 'idle') !== 'idle',
+            archiveState: asset.hasProcessedVideo ? 'processed' : 'original',
+            canStartProcessing: !asset.hasProcessedVideo,
+            canDelete: false,
+        })
+    }
+
+    return dedupeInboxArchiveVideos(Array.from(merged.values())).map((video) => {
+        const { originalUrl: _originalUrl, ...rest } = video
+        return rest
+    })
+}
+
+async function hasActiveProcessingJob(bucket: R2Bucket): Promise<boolean> {
+    const processingList = await bucket.list({ prefix: '_processing/' })
+    for (const obj of processingList.objects) {
+        const file = await bucket.get(obj.key)
+        if (!file) continue
+        const data = await file.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        if (String(data.status || '').trim() !== 'failed') return true
+    }
+    return false
+}
+
+async function recordInboxLinkSubmissionIfNeeded(params: {
+    db: D1Database
+    bucket: R2Bucket
+    namespaceId: string
+    item: InboxVideoRecord
+}): Promise<InboxVideoRecord> {
+    if (params.item.status !== 'ready' || String(params.item.linkRecordedAt || '').trim()) return params.item
+
+    await recordLinkSubmission({
+        db: params.db,
+        namespaceId: params.namespaceId,
+        telegramId: String(params.item.chatId),
+        videoId: params.item.id,
+        shopeeLink: String(params.item.shopeeLink || '').trim(),
+    }).catch((e) => {
+        console.error(`[DASHBOARD] failed to record inbox link submission: ${e instanceof Error ? e.message : String(e)}`)
+    })
+
+    const nextRecord = await putInboxVideoRecord(params.bucket, {
+        ...params.item,
+        linkRecordedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+    })
+    return nextRecord
+}
+
+async function startInboxVideoProcessing(params: {
+    env: Env
+    bucket: R2Bucket
+    executionCtx: ExecutionContext
+    botId: string
+    item: InboxVideoRecord
+}): Promise<{ status: 'queued' | 'processing'; id: string }> {
+    const nowIso = new Date().toISOString()
+    const item = normalizeInboxVideoRecord(params.item)
+    if (!item || item.status !== 'ready') throw new Error('inbox_video_not_ready')
+
+    await params.bucket.put(`_link_context/${item.id}.json`, JSON.stringify({
+        id: item.id,
+        videoUrl: item.videoUrl,
+        shopeeLink: String(item.shopeeLink || '').trim(),
+        lazadaLink: String(item.lazadaLink || '').trim(),
+        chatId: item.chatId,
+        createdAt: nowIso,
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+
+    if (await hasActiveProcessingJob(params.bucket)) {
+        await params.bucket.put(`_queue/${item.id}.json`, JSON.stringify({
+            id: item.id,
+            videoUrl: item.videoUrl,
+            shopeeLink: String(item.shopeeLink || '').trim(),
+            lazadaLink: String(item.lazadaLink || '').trim(),
+            chatId: item.chatId,
+            createdAt: nowIso,
+            status: 'queued',
+        }), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+        return { status: 'queued', id: item.id }
+    }
+
+    await params.bucket.put(`_processing/${item.id}.json`, JSON.stringify({
+        id: item.id,
+        videoUrl: item.videoUrl,
+        shopeeLink: String(item.shopeeLink || '').trim(),
+        lazadaLink: String(item.lazadaLink || '').trim(),
+        chatId: item.chatId,
+        createdAt: nowIso,
+        status: 'processing',
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    params.executionCtx.waitUntil(
+        runPipeline(
+            params.env,
+            item.videoUrl,
+            item.chatId,
+            0,
+            item.id,
+            params.botId,
+            String(item.shopeeLink || '').trim(),
+            String(item.lazadaLink || '').trim(),
+        )
+    )
+    return { status: 'processing', id: item.id }
+}
+
+type InboxProcessingStartResult =
+    | { outcome: 'started'; item: InboxVideoRecord; job: { status: 'queued' | 'processing'; id: string } }
+    | { outcome: 'already_running'; item: InboxVideoRecord; status: InboxProcessingState; id: string }
+    | { outcome: 'already_processed'; item: InboxVideoRecord; id: string }
+
+async function ensureInboxVideoProcessingStarted(params: {
+    env: Env
+    bucket: R2Bucket
+    executionCtx: ExecutionContext
+    botId: string
+    item: InboxVideoRecord
+    skipIfAlreadyProcessed?: boolean
+}): Promise<InboxProcessingStartResult> {
+    const botId = String(params.botId || '').trim()
+    if (!botId) throw new Error('missing_bot_id')
+
+    const rawItem = normalizeInboxVideoRecord(params.item)
+    if (!rawItem || rawItem.status !== 'ready') throw new Error('inbox_video_not_ready')
+
+    const item = await recordInboxLinkSubmissionIfNeeded({
+        db: params.env.DB,
+        bucket: params.bucket,
+        namespaceId: botId,
+        item: rawItem,
+    })
+
+    const processingStateMap = await getInboxProcessingStateMap(params.bucket)
+    const currentProcessingState = processingStateMap.get(item.id) || 'idle'
+    if (currentProcessingState !== 'idle') {
+        return { outcome: 'already_running', item, status: currentProcessingState, id: item.id }
+    }
+
+    if (params.skipIfAlreadyProcessed) {
+        const assetMap = await listNamespaceOriginalAssetMap(params.env, params.bucket, botId).catch(() => new Map<string, NamespaceOriginalAsset>())
+        if (assetMap.get(item.id)?.hasProcessedVideo) {
+            await putInboxVideoRecord(params.bucket, {
+                ...item,
+                updatedAt: new Date().toISOString(),
+            }).catch(() => { })
+            return { outcome: 'already_processed', item, id: item.id }
+        }
+    }
+
+    const started = await startInboxVideoProcessing({
+        env: params.env,
+        bucket: params.bucket,
+        executionCtx: params.executionCtx,
+        botId,
+        item,
+    })
+
+    await putInboxVideoRecord(params.bucket, {
+        ...item,
+        updatedAt: new Date().toISOString(),
+    }).catch(() => { })
+
+    const waitingKey = `_waiting_video/${item.chatId}.json`
+    const waitingObj = await params.bucket.get(waitingKey)
+    if (waitingObj) {
+        const waiting = await waitingObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        if (String(waiting.id || '').trim() === item.id) {
+            await params.bucket.delete(waitingKey).catch(() => { })
+        }
+    }
+
+    return { outcome: 'started', item, job: started }
+}
+
 app.get('/api/processing', async (c) => {
     try {
         const list = await c.get('bucket').list({ prefix: '_processing/' })
@@ -3033,6 +4757,72 @@ app.get('/api/processing', async (c) => {
             return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
         })
         return c.json({ videos }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ error: String(e) }, 500)
+    }
+})
+
+app.get('/api/inbox', async (c) => {
+    try {
+        const videos = await listNamespaceOriginalArchiveVideos({
+            env: c.env,
+            bucket: c.get('bucket'),
+            namespaceId: String(c.get('botId') || '').trim(),
+        })
+        return c.json({
+            videos,
+        }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ error: String(e), videos: [] }, 500)
+    }
+})
+
+app.post('/api/inbox/:id/process', async (c) => {
+    try {
+        const id = String(c.req.param('id') || '').trim()
+        if (!id) return c.json({ error: 'missing_id' }, 400)
+
+        const item = await getInboxVideoRecord(c.get('bucket'), id)
+        if (!item) return c.json({ error: 'inbox_video_not_found' }, 404)
+        if (item.status !== 'ready') return c.json({ error: 'inbox_video_not_ready' }, 400)
+
+        const result = await ensureInboxVideoProcessingStarted({
+            env: c.env,
+            bucket: c.get('bucket'),
+            executionCtx: c.executionCtx,
+            botId: String(c.get('botId') || '').trim(),
+            item,
+        })
+        if (result.outcome === 'already_running') {
+            return c.json({ ok: true, job: { status: result.status, id } })
+        }
+        if (result.outcome === 'already_processed') {
+            return c.json({ ok: true, job: { status: 'processed', id } })
+        }
+        return c.json({ ok: true, job: result.job })
+    } catch (e) {
+        return c.json({ error: String(e) }, 500)
+    }
+})
+
+app.delete('/api/inbox/:id', async (c) => {
+    try {
+        const id = String(c.req.param('id') || '').trim()
+        if (!id) return c.json({ error: 'missing_id' }, 400)
+
+        const item = await getInboxVideoRecord(c.get('bucket'), id)
+        if (!item) return c.json({ error: 'inbox_video_not_found' }, 404)
+
+        await c.get('bucket').delete(`_inbox/${id}.json`)
+        const waitingKey = `_waiting_video/${item.chatId}.json`
+        const waitingObj = await c.get('bucket').get(waitingKey)
+        if (waitingObj) {
+            const waiting = await waitingObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+            if (String(waiting.id || '').trim() === id) {
+                await c.get('bucket').delete(waitingKey).catch(() => { })
+            }
+        }
+        return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
     }
@@ -3124,6 +4914,35 @@ app.post('/api/gallery/refresh/:id', async (c) => {
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
 
+<<<<<<< HEAD
+=======
+        if (linkContext && Number(linkContext.chatId || 0) > 0) {
+            let botToken = c.env.TELEGRAM_BOT_TOKEN
+            try {
+                const ch = await c.env.DB.prepare('SELECT bot_token FROM channels WHERE bot_id = ?').bind(namespaceId).first() as { bot_token?: string } | null
+                if (String(ch?.bot_token || '').trim()) {
+                    botToken = String(ch?.bot_token || '').trim()
+                }
+            } catch {
+                // fall back to default token
+            }
+            const completionUrl = buildScopedGalleryWebAppUrl(
+                c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                namespaceId,
+                'lazada',
+                videoId,
+            )
+            await sendTelegram(botToken, 'sendMessage', {
+                chat_id: Number(linkContext.chatId || 0),
+                text: `✅ ประมวลผลเสร็จแล้ว\nVideo ID: ${videoId}`,
+                reply_markup: {
+                    inline_keyboard: [[{ text: '🧡 เปิด Gallery Lazada', web_app: { url: completionUrl } }]],
+                },
+            }).catch(() => null)
+        }
+        await c.get('bucket').delete(`_link_context/${videoId}.json`).catch(() => { })
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
         c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
 
@@ -3739,6 +5558,11 @@ const NS_SETTING_PAGES_TOKEN_POOL_V1 = 'pages_token_pool_v1'
 const NS_SETTING_PAGES_HIDDEN_TAGGED_PROFILES_V1 = 'pages_hidden_tagged_profiles_v1'
 const NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1 = 'pages_linked_tagged_profiles_v1'
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
+<<<<<<< HEAD
+=======
+const NS_SETTING_COMMENT_TEMPLATE = 'comment_template_v1'
+const NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT = 'affiliate_shortlink_account_v1'
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_utm_id_v1'
@@ -3918,6 +5742,45 @@ async function getNamespaceGeminiApiKeySettings(db: D1Database, namespaceId: str
     }
 }
 
+async function getNamespaceCommentTemplateEntry(db: D1Database, namespaceId: string): Promise<{ template: string; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).first() as { value?: string; updated_at?: string } | null
+    return {
+        template: normalizeCommentTemplate(String(row?.value || '')),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
+async function setNamespaceCommentTemplate(db: D1Database, namespaceId: string, rawTemplate: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const template = normalizeCommentTemplate(rawTemplate).slice(0, MAX_COMMENT_TEMPLATE_CHARS)
+    if (!template) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).run()
+        return
+    }
+
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE, template).run()
+}
+
+async function getNamespaceCommentTemplateSettings(db: D1Database, namespaceId: string) {
+    const workspace = await getNamespaceCommentTemplateEntry(db, namespaceId)
+    const source: 'default' | 'custom' = workspace.template ? 'custom' : 'default'
+    return {
+        template: workspace.template || DEFAULT_COMMENT_TEMPLATE,
+        source,
+        updated_at: workspace.updatedAt,
+    }
+}
+
 function normalizeShortlinkBaseUrl(rawValue: string): string {
     const value = String(rawValue || '').trim()
     if (!value) return ''
@@ -3945,6 +5808,200 @@ function computeShortlinkUtmMatchValue(expectedUtmId: string, actualUtmSource?: 
     return actual === expected ? 1 : 0
 }
 
+<<<<<<< HEAD
+=======
+function extractShopeeUtmSourceFromLink(link: string): string {
+    try {
+        return String(new URL(String(link || '').trim()).searchParams.get('utm_source') || '').trim()
+    } catch {
+        return ''
+    }
+}
+
+function getVideoSourceShopeeLink(video: Record<string, unknown>): string {
+    return pickFirstShopeeUrl(
+        video.shopeeOriginalLink ||
+        video.shopee_original_link ||
+        video.shopeeSourceLink ||
+        video.shopee_source_link ||
+        video.shopeeLink ||
+        video.shopee_link ||
+        video.shopeeUrl ||
+        video.shopee_url ||
+        video.shopee ||
+        video.link ||
+        ''
+    ) || ''
+}
+
+function getVideoSourceLazadaLink(video: Record<string, unknown>): string {
+    return pickFirstLazadaUrl(
+        video.lazadaOriginalLink ||
+        video.lazada_original_link ||
+        video.lazadaSourceLink ||
+        video.lazada_source_link ||
+        video.lazadaLink ||
+        video.lazada_link ||
+        video.lazadaUrl ||
+        video.lazada_url ||
+        video.lazada ||
+        ''
+    ) || ''
+}
+
+function extractLazadaTrackingSourceFromLink(link: string): string {
+    const rawLink = pickFirstLazadaUrl(link) || String(link || '').trim()
+    if (!rawLink) return ''
+
+    const matchMarker = (value: string): string => {
+        const decoded = (() => {
+            try {
+                return decodeURIComponent(value)
+            } catch {
+                return value
+            }
+        })()
+
+        const exact = decoded.match(/(mm_\d+_\d+_\d+!\d+)/i)
+        if (exact) return String(exact[1] || '').trim()
+        const fallback = decoded.match(/(mm_\d+_\d+_\d+)/i)
+        return fallback ? String(fallback[1] || '').trim() : ''
+    }
+
+    const direct = matchMarker(rawLink)
+    if (direct) return direct
+
+    try {
+        const parsed = new URL(rawLink)
+        for (const key of ['exlaz', 'laz_trackid', 'utm_source']) {
+            const hit = matchMarker(String(parsed.searchParams.get(key) || ''))
+            if (hit) return hit
+        }
+    } catch {
+        return ''
+    }
+
+    return ''
+}
+
+function isLikelyConvertedShopeeLink(link: string, expectedUtmId = ''): boolean {
+    const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
+    if (!rawLink) return false
+
+    try {
+        const parsed = new URL(rawLink)
+        const host = parsed.hostname.toLowerCase()
+        const path = parsed.pathname.toLowerCase()
+        if (host.startsWith('s.shopee.')) return true
+        if (path.startsWith('/opaanlp/')) return true
+        if (path.startsWith('/universal-link/')) return true
+    } catch {
+        // ignore invalid URL parsing here and continue to UTM-based check
+    }
+
+    const expected = normalizeShortlinkExpectedUtmId(expectedUtmId)
+    const actual = normalizeShortlinkExpectedUtmId(extractShopeeUtmSourceFromLink(rawLink))
+    return !!expected && !!actual && expected === actual
+}
+
+function isLikelyConvertedLazadaLink(link: string): boolean {
+    const rawLink = pickFirstLazadaUrl(link) || String(link || '').trim()
+    if (!rawLink) return false
+
+    try {
+        const parsed = new URL(rawLink)
+        const host = parsed.hostname.toLowerCase()
+        if (host === 'lzd.co' || host.endsWith('.lzd.co')) return true
+        if (host.startsWith('s.lazada.')) return true
+    } catch {
+        return false
+    }
+
+    return !!extractLazadaTrackingSourceFromLink(rawLink)
+}
+
+function getVideoAffiliateConversionState(video: Record<string, unknown>, expectedUtmId = '', expectedLazadaMemberId = '') {
+    void expectedUtmId
+    void expectedLazadaMemberId
+    const publicUrl = String(video.publicUrl || video.public_url || '').trim()
+    const hasPlayable = !!publicUrl
+
+    const shopeeSourceLink = getVideoSourceShopeeLink(video)
+    const shopeeCurrentLink = pickFirstShopeeUrl(
+        video.shopeeLink || video.shopee_link || video.shopeeUrl || video.shopee_url || video.shopee || video.link || ''
+    ) || shopeeSourceLink || ''
+    const hasShopeeSource = !!shopeeSourceLink
+    const hasManagedShopeeConversion = !!shopeeCurrentLink
+    const shopeeReady = !!shopeeCurrentLink
+
+    const lazadaSourceLink = getVideoSourceLazadaLink(video)
+    const lazadaCurrentLink = pickFirstLazadaUrl(
+        video.lazadaLink || video.lazada_link || video.lazadaUrl || video.lazada_url || video.lazada || ''
+    ) || lazadaSourceLink || ''
+    const hasLazadaSource = !!lazadaSourceLink
+    const hasManagedLazadaConversion = !!lazadaCurrentLink
+    const lazadaMemberId = normalizeLazadaMemberId(String(video.lazadaMemberId || video.lazada_member_id || ''))
+    const lazadaReady = !!lazadaCurrentLink
+
+    const missingShopeeSource = hasPlayable && !hasShopeeSource
+    const galleryReady = hasPlayable && hasShopeeSource && shopeeReady && hasLazadaSource && lazadaReady
+    const needsShopeeConversion = false
+    const needsLazadaConversion = false
+    const missingLazadaSource = hasPlayable && !hasLazadaSource
+    const awaitingConversion = false
+
+    return {
+        hasPlayable,
+        shopeeSourceLink,
+        shopeeCurrentLink,
+        hasShopeeSource,
+        hasManagedShopeeConversion,
+        shopeeReady,
+        lazadaSourceLink,
+        lazadaCurrentLink,
+        hasLazadaSource,
+        hasManagedLazadaConversion,
+        lazadaMemberId,
+        lazadaReady,
+        missingShopeeSource,
+        missingLazadaSource,
+        needsShopeeConversion,
+        needsLazadaConversion,
+        awaitingConversion,
+        galleryReady,
+    }
+}
+
+function isVideoAwaitingAffiliateConversion(video: Record<string, unknown>, expectedUtmId = '', expectedLazadaMemberId = ''): boolean {
+    return getVideoAffiliateConversionState(video, expectedUtmId, expectedLazadaMemberId).awaitingConversion
+}
+
+async function listVideosAwaitingAffiliateConversion(env: Env, namespaceId: string, options: { systemWide?: boolean } = {}): Promise<Array<Record<string, unknown>>> {
+    void env
+    void namespaceId
+    void options
+    return []
+}
+
+async function persistAffiliateVideoMeta(env: Env, namespaceId: string, videoId: string, meta: Record<string, unknown>): Promise<void> {
+    const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
+    await bucket.put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    await updateGalleryCache(bucket, videoId)
+    await syncGalleryIndexEntry(env, namespaceId, videoId).catch((error) => {
+        console.log(`[AFFILIATE-CONVERT] sync gallery index failed ns=${namespaceId} video=${videoId}: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    await env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+    await env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+}
+
+async function processPendingAffiliateConversions(env: Env): Promise<void> {
+    void env
+    console.log('[AFFILIATE-CONVERT] Shortlink conversion disabled; keeping original user links')
+}
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 async function getNamespaceShopeeShortlinkBaseUrlEntry(db: D1Database, namespaceId: string): Promise<{ baseUrl: string; updatedAt: string | null }> {
     await ensureNamespaceSettingsTable(db)
     const row = await db.prepare(
@@ -4866,50 +6923,62 @@ async function initReelUploadWithPostingTokenAutoRecover(params: {
     tried: number
 }> {
     const initialTokens = normalizePostTokenPool(params.postTokens || [])
-    try {
-        return await initReelUploadWithPostingTokenFallback({
-            pageId: params.pageId,
-            postTokens: initialTokens,
-            logPrefix: params.logPrefix,
-        })
-    } catch (firstErr) {
-        if (!shouldAttemptFacebookBarrierAutoRecover(firstErr)) throw firstErr
+    return initReelUploadWithPostingTokenFallback({
+        pageId: params.pageId,
+        postTokens: initialTokens,
+        logPrefix: params.logPrefix,
+    })
+}
 
-        console.warn(`[${params.logPrefix}] checkpoint/automated barrier detected. Trying BrowserSaving auto-recover + retry...`)
+async function getPostedVideoIds(params: {
+    db: D1Database
+    namespaceId?: string
+    pageId?: string
+    withinDays?: number
+}): Promise<Set<string>> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const hasNamespace = !!namespaceId
+    const hasPage = !!pageId
+    const withinDays = Number(params.withinDays || 0)
+    const cutoffMs = withinDays > 0 ? (Date.now() - withinDays * 24 * 60 * 60 * 1000) : null
 
-        let recoveredTokens = initialTokens
-        try {
-            const refreshed = await refreshPagePostTokensFromBrowserSaving({
-                env: params.env,
-                db: params.db,
-                namespaceId: params.namespaceId,
-                pageId: params.pageId,
-                pageName: params.pageName,
-                currentPostTokens: initialTokens,
-                logPrefix: params.logPrefix,
-            })
-            recoveredTokens = refreshed.postTokens
-            console.log(
-                `[${params.logPrefix}] checkpoint recover success: profiles=${refreshed.profileCount} tokens=${recoveredTokens.length} warnings=${refreshed.errors.length}`,
-            )
-        } catch (recoverErr) {
-            console.error(`[${params.logPrefix}] checkpoint recover failed: ${recoverErr instanceof Error ? recoverErr.message : String(recoverErr)}`)
-            throw firstErr
-        }
+    const where: string[] = [
+        `(
+            status IN ('success', 'posting')
+            OR TRIM(COALESCE(fb_post_id, '')) <> ''
+            OR TRIM(COALESCE(fb_reel_url, '')) <> ''
+        )`,
+    ]
+    const binds: string[] = []
 
-        try {
-            const retried = await initReelUploadWithPostingTokenFallback({
-                pageId: params.pageId,
-                postTokens: recoveredTokens,
-                logPrefix: `${params.logPrefix} RECOVER-RETRY`,
-            })
-            return retried
-        } catch (retryErr) {
-            const firstMsg = getFacebookErrorMessage(firstErr)
-            const retryMsg = getFacebookErrorMessage(retryErr)
-            throw new Error(`post_retry_after_checkpoint_failed: ${firstMsg || 'unknown_first_error'} | ${retryMsg || 'unknown_retry_error'}`)
-        }
+    if (hasNamespace) {
+        where.push('bot_id = ?')
+        binds.push(namespaceId)
     }
+    if (hasPage) {
+        where.push('page_id = ?')
+        binds.push(pageId)
+    }
+
+    const sql = `SELECT video_id, posted_at
+        FROM post_history
+        WHERE ${where.join('\n          AND ')}`
+
+    const result = await params.db.prepare(sql).bind(...binds).all() as {
+        results?: Array<{ video_id?: string; posted_at?: string }>
+    }
+
+    const out = new Set<string>()
+    for (const row of result.results || []) {
+        const id = String(row?.video_id || '').trim()
+        if (cutoffMs !== null) {
+            const postedAtMs = Date.parse(String(row?.posted_at || ''))
+            if (!Number.isFinite(postedAtMs) || postedAtMs < cutoffMs) continue
+        }
+        if (id) out.add(id)
+    }
+    return out
 }
 
 async function getPostedVideoIds(params: {
@@ -5561,128 +7630,148 @@ function normalizePageName(raw: string): string {
 }
 
 const COMMENT_MESSAGE_TEMPLATE_TEXT = `
-📌 พิกัดอยู่ตรงนี้ :
-🔎 เผื่อใครกำลังหาอยู่ :
-✨ ของน่าสนใจ ลองดู :
-📍 แปะพิกัดไว้ให้ :
-💬 มีคนถามมา เลยเอามาแปะ :
-🛒 ลองดูตัวนี้ :
-👀 ใครกำลังมองหาอยู่ :
-📦 เจอมาเลยเอามาฝาก :
-💡 เผื่อมีคนสนใจ :
-⭐ ตัวนี้น่าสนใจดี :
-📍 เผื่อกำลังหาอยู่ :
-🔗 แปะลิงก์ไว้ตรงนี้ :
-🧾 เผื่อมีคนกำลังหา :
-🛍️ ตัวนี้น่าลอง :
-👇 ลองดูรายละเอียด :
-📢 เอามาฝากเผื่อถูกใจ :
-🔎 ลองเข้าไปดู :
-🧩 เผื่อใครกำลังมองหา :
-📌 ของน่าสนใจเลย :
-🛒 ใครกำลังดูอยู่ :
-⭐ เผื่อมีคนอยากรู้ :
-📍 ตัวนี้น่าสนใจ :
-🔗 ลิงก์อยู่ตรงนี้ :
-💬 เผื่อมีคนกำลังหาอยู่ :
-👀 ลองเข้าไปส่องดู :
-📦 เจอแล้วเอามาแชร์ :
-🛍️ แปะพิกัดไว้ :
-✨ ของน่าสนใจอีกตัว :
-📌 เผื่อกำลังมองหา :
-🔎 ลองดูข้อมูล :
-🧾 ใครกำลังหาอยู่ :
-👇 กดดูรายละเอียด :
-📢 เผื่อมีคนสนใจตัวนี้ :
-🛒 ตัวนี้ดูโอเค :
-📍 ลองดูตัวนี้ :
-⭐ ของดีอีกตัว :
-💡 เผื่อกำลังเลือกอยู่ :
-🔗 ลองเข้าไปดูข้อมูล :
-📦 แปะไว้เผื่อมีคนถาม :
-👀 ใครกำลังหาแบบนี้ :
-🛍️ เผื่อถูกใจ :
-📌 ตัวนี้น่าสนใจนะ :
-🔎 เผื่อกำลังดูอยู่ :
-📍 ลองดูรายละเอียด :
-⭐ เผื่อกำลังมองหาอยู่ :
-💬 เอามาฝากเผื่อสนใจ :
-🛒 เผื่อใครกำลังหา :
-📦 ลองเข้าไปดูรายละเอียด :
-👇 พิกัดตามนี้ :
-✨ ตัวนี้น่าสนใจดีนะ :
-📌 เผื่อกำลังสนใจ :
-🔗 ลองดูตัวนี้ก่อน :
-🛍️ เผื่อมีคนกำลังมองหา :
-👀 แปะไว้ให้ดู :
-📍 ของน่าสนใจ :
-⭐ ลองเข้าไปดูหน่อย :
-🔎 เผื่อกำลังหาแบบนี้ :
-💡 เอามาแชร์ :
-🛒 เผื่อกำลังตัดสินใจ :
-📦 ของดีอีกตัวหนึ่ง :
-👇 ใครสนใจลองดู :
-📌 ลองดูข้อมูลก่อน :
-🛍️ เผื่อกำลังมองหาอยู่ :
-🔗 พิกัดตามลิงก์นี้ :
-⭐ ตัวนี้ดูดีนะ :
-👀 เผื่อใครสนใจ :
-📍 แปะลิงก์ไว้ :
-🛒 ลองดูเผื่อถูกใจ :
-🔎 ของน่าสนใจมาก :
-📦 เผื่อกำลังหาอยู่พอดี :
-💬 ลองดูตัวนี้ก่อน :
-⭐ เผื่อมีคนกำลังหา :
-📌 ของน่าสนใจเลย :
-🛍️ ลองเข้าไปส่อง :
-👇 เผื่อมีคนอยากรู้ :
-🔗 เผื่อใครกำลังเล็ง :
-📍 ตัวนี้น่าสนใจจริง :
-🛒 ลองดูข้อมูลเพิ่มเติม :
-👀 เผื่อกำลังหาอยู่พอดี :
-📦 เอามาฝาก :
-⭐ ลองเข้าไปดูตัวนี้ :
-📌 เผื่อมีคนกำลังสนใจ :
-🛍️ ของน่าสนใจอีกชิ้น :
-🔎 ลองดูรายละเอียดก่อน :
-👇 เผื่อใครกำลังมองหา :
-📍 ลองดูเผื่อใช่ :
-⭐ เผื่อกำลังจะซื้อ :
-🛒 ตัวนี้ดูน่าสนใจ :
-🔗 เผื่อมีคนกำลังหาอยู่ :
-📦 ลองดูตัวนี้นะ :
-👀 เผื่อกำลังเล็งอยู่ :
-📌 ของน่าสนใจมาก :
-🛍️ ใครกำลังดูอยู่ :
-⭐ ลองเข้าไปดูข้อมูล :
-🔎 เผื่อใครกำลังหาแบบนี้ :
-👇 ลองดูตัวนี้ :
-📍 เผื่อมีคนกำลังสนใจ :
-🛒 ลองดูเผื่อโอเค :
-📦 แปะพิกัดให้ :
-⭐ เผื่อใครกำลังมองหาอยู่ :
+📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้ 👇
+🧡 Shopee : {{shopee_link}}
+💙 Lazada : {{lazada_link}}
+
+✨ ของจริงงานดีนะ ลองเข้าไปส่องก่อน 👀🛍️
+🛡️ เพจเราเป็น Partner Shopee & Lazada ปลอดภัย ✅💯
 `
 
-const COMMENT_MESSAGE_TEMPLATES = COMMENT_MESSAGE_TEMPLATE_TEXT
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
+const DEFAULT_COMMENT_TEMPLATE = COMMENT_MESSAGE_TEMPLATE_TEXT.trim()
+const COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER = '{{shopee_link}}'
+const COMMENT_TEMPLATE_LAZADA_PLACEHOLDER = '{{lazada_link}}'
 
-function pickRandomCommentTemplate(): string {
-    if (COMMENT_MESSAGE_TEMPLATES.length === 0) return '📍 พิกัดอยู่ตรงนี้ :'
-    try {
-        const buf = new Uint32Array(1)
-        crypto.getRandomValues(buf)
-        return COMMENT_MESSAGE_TEMPLATES[buf[0] % COMMENT_MESSAGE_TEMPLATES.length]
-    } catch {
-        return COMMENT_MESSAGE_TEMPLATES[Math.floor(Math.random() * COMMENT_MESSAGE_TEMPLATES.length)]
-    }
+function normalizeCommentTemplate(rawTemplate: string): string {
+    return String(rawTemplate || '')
+        .replace(/\r\n?/g, '\n')
+        .trim()
 }
 
+<<<<<<< HEAD
 function buildShopeeCommentMessage(shopeeLink: string): string {
     const link = String(shopeeLink || '').trim()
     const prefix = pickRandomCommentTemplate()
     return `${prefix}\n${link}`
+=======
+function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string, lazadaLink = ''): string {
+    const template = normalizeCommentTemplate(rawTemplate) || DEFAULT_COMMENT_TEMPLATE
+    const shopee = String(shopeeLink || '').trim()
+    const lazada = String(lazadaLink || '').trim()
+
+    const renderedLines = template
+        .split('\n')
+        .map((line) =>
+            line
+                .split(COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER).join(shopee)
+                .split(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER).join(lazada)
+        )
+        .filter((line) => {
+            const trimmed = line.trim()
+            if (!trimmed) return true
+            if (!shopee && /shopee/i.test(trimmed) && /[:：]\s*$/.test(trimmed)) return false
+            if (!lazada && /lazada/i.test(trimmed) && /[:：]\s*$/.test(trimmed)) return false
+            return true
+        })
+
+    return renderedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string, shopeeLink: string, lazadaLink = ''): Promise<string> {
+    const shopee = String(shopeeLink || '').trim()
+    if (!shopee) return ''
+    const settings = namespaceId
+        ? await getNamespaceCommentTemplateSettings(db, namespaceId).catch(() => ({
+            template: DEFAULT_COMMENT_TEMPLATE,
+            source: 'default' as const,
+            updated_at: null,
+        }))
+        : { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null }
+    return renderAffiliateCommentTemplate(settings.template, shopee, lazadaLink)
+}
+
+async function shortenLazadaLinkForNamespace(params: {
+    env: Env
+    namespaceId: string
+    lazadaLink: string
+    logPrefix: string
+    trace?: {
+        utmSource?: string | null
+        memberId?: string | null
+        status?: 'disabled' | 'shortened' | 'fallback'
+        error?: string | null
+    }
+}): Promise<string> {
+    const writeTrace = (payload: { utmSource?: string | null; memberId?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null }) => {
+        if (!params.trace) return
+        if (payload.utmSource !== undefined) params.trace.utmSource = payload.utmSource
+        if (payload.memberId !== undefined) params.trace.memberId = payload.memberId
+        if (payload.status) params.trace.status = payload.status
+        if (payload.error !== undefined) params.trace.error = payload.error
+    }
+
+    const originalLink = getVideoSourceLazadaLink({ lazadaLink: params.lazadaLink }) || String(params.lazadaLink || '').trim()
+    if (!originalLink) {
+        writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
+        return ''
+    }
+
+    const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
+    if (!baseUrl) {
+        writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
+        return originalLink
+    }
+
+    const requestUrl = new URL(baseUrl)
+    requestUrl.searchParams.set('url', originalLink)
+    requestUrl.searchParams.set('sub1', deriveShortlinkSub1(params.namespaceId))
+
+    let lastError: string | null = null
+    const maxAttempts = 5
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+            if (attempt > 1) {
+                const backoffMs = Math.min(2500, 250 * Math.pow(2, attempt - 2))
+                await waitMs(backoffMs)
+            }
+            const resp = await fetchWithTimeout(requestUrl.toString(), {}, 15000, 'lazada_shortlink')
+            if (!resp.ok) {
+                const errText = await resp.text().catch(() => '')
+                throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
+            }
+            const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+            const shortLink = pickFirstLazadaUrl(
+                String(
+                    data.shortLink ||
+                    data.shortlink ||
+                    data.short_link ||
+                    data.promotionLink ||
+                    data.promotionUrl ||
+                    data.promotionURL ||
+                    data.shortUrl ||
+                    data.short_url ||
+                    data.url ||
+                    ''
+                )
+            ) || ''
+            const utmSource = String(data.utm_source || data.utmSource || '').trim() || extractLazadaTrackingSourceFromLink(shortLink) || null
+            const memberId = String(data.member_id || data.memberId || '').trim() || null
+            if (shortLink) {
+                writeTrace({ utmSource, memberId, status: 'shortened', error: null })
+                return shortLink
+            }
+            throw new Error('missing_short_link_in_response')
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            lastError = msg
+            console.log(`[${params.logPrefix}] Lazada shortlink attempt ${attempt}/${maxAttempts} failed: ${msg}`)
+            if (attempt >= maxAttempts) break
+        }
+    }
+
+    writeTrace({ utmSource: null, memberId: null, status: 'fallback', error: lastError })
+    return originalLink
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 }
 
 async function shortenShopeeLinkForNamespace(params: {
@@ -5761,6 +7850,48 @@ async function shortenShopeeLinkForNamespace(params: {
     return originalLink
 }
 
+<<<<<<< HEAD
+=======
+async function resolvePostingShopeeLinkForNamespace(params: {
+    env: Env
+    namespaceId: string
+    shopeeLink: string
+    logPrefix: string
+    trace?: {
+        utmSource?: string | null
+        status?: 'disabled' | 'shortened' | 'fallback'
+        error?: string | null
+    }
+}): Promise<string> {
+    const writeTrace = (payload: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null }) => {
+        if (!params.trace) return
+        if (payload.utmSource !== undefined) params.trace.utmSource = payload.utmSource
+        if (payload.status) params.trace.status = payload.status
+        if (payload.error !== undefined) params.trace.error = payload.error
+    }
+
+    const link = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
+    if (!link) {
+        writeTrace({ utmSource: null, status: 'disabled', error: null })
+        return ''
+    }
+
+    const expectedUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, params.namespaceId).catch(() => '')
+    const extractedUtmSource = extractShopeeUtmSourceFromLink(link) || null
+    const normalizedExpectedUtmId = normalizeShortlinkExpectedUtmId(expectedUtmId)
+    const inferredUtmSource = normalizedExpectedUtmId ? `an_${normalizedExpectedUtmId}` : null
+
+    if (isLikelyConvertedShopeeLink(link, expectedUtmId)) {
+        writeTrace({ utmSource: extractedUtmSource || inferredUtmSource, status: 'shortened', error: null })
+        return link
+    }
+
+    console.log(`[${params.logPrefix}] Using gallery Shopee link directly (no live shortlink conversion during posting)`)
+    writeTrace({ utmSource: extractedUtmSource, status: 'fallback', error: null })
+    return link
+}
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 function pickProfilePostToken(profile: BrowserSavingProfileRecord): string {
     // Postcron token only — used as fallback via /video_reels
     // EAAD6V is in commentTokens → primary via /videos
@@ -6472,35 +8603,10 @@ async function resolveUserTokenInput(
     rawInput: string,
     mode: BrowserSavingTokenMode = 'post',
 ): Promise<{ token: string; source: 'browsersaving_profile_id' | 'provided_as_is'; reason?: string }> {
+    void env
+    void mode
     const input = String(rawInput || '').trim()
     if (!input) return { token: '', source: 'provided_as_is', reason: 'empty_token' }
-
-    const tag = parseBrowserSavingTagSelector(input)
-    if (tag) {
-        const resolved = await resolveBrowserSavingProfileTokenByTag(env, tag, mode)
-        const resolvedToken = String(resolved.token || '').trim()
-        if (!isTokenString(resolvedToken)) {
-            throw new Error(`${mode}_token_invalid_from_tag`)
-        }
-        return {
-            token: resolvedToken,
-            source: 'browsersaving_profile_id',
-            reason: resolved.reason,
-        }
-    }
-
-    if (looksLikeBrowserSavingProfileId(input)) {
-        const resolved = await resolveBrowserSavingProfileToken(env, input, mode)
-        const resolvedToken = String(resolved.token || '').trim()
-        if (!isTokenString(resolvedToken)) {
-            throw new Error(`${mode}_token_invalid_from_profile`)
-        }
-        return {
-            token: resolvedToken,
-            source: 'browsersaving_profile_id',
-            reason: resolved.reason,
-        }
-    }
 
     if (!isTokenString(input)) {
         throw new Error('token_empty')
@@ -7594,6 +9700,7 @@ async function resolveCommentTargetIdViaGraph(params: {
 
 async function postShopeeCommentStrict(params: {
     env: Env
+    namespaceId?: string
     fbVideoId: string
     shopeeLink: string
     commentToken?: string | null
@@ -7615,6 +9722,16 @@ async function postShopeeCommentStrict(params: {
         return { ok: false, error: 'comment_target_missing', code: 0, subcode: 0 }
     }
 
+    const commentMessage = await buildAffiliateCommentMessage(
+        params.env.DB,
+        String(params.namespaceId || '').trim(),
+        params.shopeeLink,
+        params.lazadaLink,
+    )
+    if (!commentMessage) {
+        return { ok: false, error: 'comment_message_empty', code: 0, subcode: 0 }
+    }
+
     const tried = new Set<string>()
     const tryPostComment = async (targetId: string) => {
         const tid = String(targetId || '').trim()
@@ -7623,7 +9740,11 @@ async function postShopeeCommentStrict(params: {
         const result = await facebookGraphRawPost<{ id?: string }>(
             `${FB_GRAPH_V19}/${tid}/comments`,
             {
+<<<<<<< HEAD
                 message: buildShopeeCommentMessage(params.shopeeLink),
+=======
+                message: commentMessage,
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 access_token: commentToken,
             },
         )
@@ -7677,6 +9798,7 @@ async function postShopeeCommentStrict(params: {
 
 async function postShopeeCommentWithFallback(params: {
     env: Env
+    namespaceId?: string
     fbVideoId: string
     shopeeLink: string
     commentTokens: string[]
@@ -7722,6 +9844,7 @@ async function postShopeeCommentWithFallback(params: {
         const token = commentTokens[i]
         const result = await postShopeeCommentStrict({
             env: params.env,
+            namespaceId: params.namespaceId,
             fbVideoId: params.fbVideoId,
             shopeeLink: params.shopeeLink,
             commentToken: token,
@@ -7782,34 +9905,8 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
 }
 
 async function resolvePostHistoryProfileByToken(env: Env, token?: string | null): Promise<{ profileId: string | null; profileName: string | null }> {
-    const normalized = String(token || '').trim()
-    if (!normalized) {
-        return { profileId: null, profileName: null }
-    }
-
-    try {
-        const profiles = await fetchBrowserSavingProfiles(env) as Array<Record<string, unknown>>
-        for (const profile of profiles || []) {
-            const profileTokens = uniqueTokens([
-                String(profile.access_token || ''),
-                String(profile.facebook_token || ''),
-                String(profile.postcron_token || ''),
-            ])
-            if (!profileTokens.some((candidate) => candidate.toLowerCase() === normalized.toLowerCase())) {
-                continue
-            }
-
-            const profileId = String(profile.id || profile.profile_id || '').trim()
-            const profileName = String(profile.name || profile.profile_name || profile.email || '').trim()
-            return {
-                profileId: profileId || null,
-                profileName: profileName || null,
-            }
-        }
-    } catch (error) {
-        console.log(`[POST-HISTORY] resolve profile by token failed: ${error instanceof Error ? error.message : String(error)}`)
-    }
-
+    void env
+    void token
     return { profileId: null, profileName: null }
 }
 
@@ -7892,7 +9989,12 @@ async function reconcilePostingHistoryRows(params: {
                 let commentFbId: string | null = null
 
                 if (shopeeLink) {
+<<<<<<< HEAD
                     const shortShopeeLink = await shortenShopeeLinkForNamespace({
+=======
+                    const lazadaLink = metaToString(meta, 'lazadaLink')
+                    const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                         env,
                         namespaceId: botId,
                         shopeeLink,
@@ -7900,6 +10002,7 @@ async function reconcilePostingHistoryRows(params: {
                     })
                     const commentResult = await postShopeeCommentWithFallback({
                         env,
+                        namespaceId: botId,
                         fbVideoId: recoveredCommentTargetId,
                         shopeeLink: shortShopeeLink,
                         commentTokens: recoveredCommentTokens,
@@ -8567,6 +10670,18 @@ function normalizeMetaShopeeLink(meta: Record<string, unknown>): string | null {
     return null
 }
 
+<<<<<<< HEAD
+=======
+function normalizeMetaLazadaLink(meta: Record<string, unknown>): string | null {
+    for (const key of LAZADA_LINK_KEYS) {
+        const value = meta[key]
+        const found = pickFirstLazadaUrl(value)
+        if (found) return found
+    }
+    return null
+}
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 async function resolveShopeeLinkForRetry(params: {
     db: D1Database
     bucket: R2Bucket
@@ -8692,15 +10807,10 @@ async function notifyCommentTokenIssue(
 app.get('/api/pages', async (c) => {
     try {
         const botId = c.get('botId')
-        const syncCfg = await getNamespacePagesSyncConfig(c.env.DB, botId).catch(() => null)
-        const hasTagSelector = Boolean(syncCfg) && (
-            syncCfg!.postSelectors.some((s) => parseBrowserSavingTagSelector(s) !== null) ||
-            syncCfg!.commentSelectors.some((s) => parseBrowserSavingTagSelector(s) !== null)
-        )
-
-        const loadPages = async () => (((await c.env.DB.prepare(
+        const pages = (((await c.env.DB.prepare(
             'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
+<<<<<<< HEAD
         const current = await loadPages()
 
         // Tag mode is source-of-truth from BrowserSaving profile tags.
@@ -8730,6 +10840,9 @@ app.get('/api/pages', async (c) => {
         const refreshed = await loadPages()
 
         return c.json({ pages: refreshed })
+=======
+        return c.json({ pages })
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
     } catch (e) {
         return c.json({ error: 'Failed to fetch pages' }, 500)
     }
@@ -8845,6 +10958,7 @@ app.get('/api/pages/:id', async (c) => {
 })
 
 app.get('/api/pages/:id/tag-profiles', async (c) => {
+    return c.json({ error: 'direct_page_management_only' }, 410)
     const pageId = String(c.req.param('id') || '').trim()
     const botId = c.get('botId')
 
@@ -9088,6 +11202,7 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
 })
 
 app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
+    return c.json({ error: 'direct_page_management_only' }, 410)
     const pageId = String(c.req.param('id') || '').trim()
     const profileId = String(c.req.param('profileId') || '').trim()
     const botId = c.get('botId')
@@ -9250,6 +11365,7 @@ app.put('/api/pages/:id/tag-profiles/:profileId/token', async (c) => {
 })
 
 app.delete('/api/pages/:id/tag-profiles/:profileId', async (c) => {
+    return c.json({ error: 'direct_page_management_only' }, 410)
     const pageId = String(c.req.param('id') || '').trim()
     const profileId = String(c.req.param('profileId') || '').trim()
     const botId = c.get('botId')
@@ -9395,13 +11511,25 @@ app.put('/api/pages/:id', async (c) => {
             const rawToken = String(access_token || '').trim()
             if (rawToken) {
                 const accessResolved = await resolvePageScopedToken(rawToken, id, c.env, 'post')
+                const resolvedAccessToken = String(accessResolved.token || '').trim()
+                if (!resolvedAccessToken) {
+                    return c.json({
+                        error: 'invalid_access_token',
+                        details: String(accessResolved.reason || 'page_not_found_in_me_accounts'),
+                    }, 400)
+                }
+
                 await c.env.DB.prepare(
                     'UPDATE pages SET access_token = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-                ).bind(accessResolved.token, id, c.get('botId')).run()
-                effectivePostToken = String(accessResolved.token || '').trim()
+                ).bind(resolvedAccessToken, id, c.get('botId')).run()
+                effectivePostToken = resolvedAccessToken
                 nextPostTokenPool = normalizePostTokenPool([
-                    effectivePostToken,
+                    resolvedAccessToken,
                     ...nextPostTokenPool,
+                ])
+                nextCommentTokenPool = normalizeDirectVideoTokenPool([
+                    resolvedAccessToken,
+                    ...nextCommentTokenPool,
                 ])
                 resolved.access_token = accessResolved.source
                 if (accessResolved.reason) resolved_details.access_token = accessResolved.reason
@@ -9411,20 +11539,25 @@ app.put('/api/pages/:id', async (c) => {
                 ).bind('', id, c.get('botId')).run()
                 effectivePostToken = ''
                 nextPostTokenPool = []
+                if (comment_token === undefined) {
+                    nextCommentTokenPool = []
+                    resolved.comment_token = 'provided_as_is'
+                }
                 resolved.access_token = 'provided_as_is'
             }
         }
 
-        if (comment_token !== undefined) {
-            const rawCommentToken = String(comment_token || '').trim()
+        if (comment_token !== undefined || access_token !== undefined) {
+            const rawCommentToken = String(comment_token ?? access_token ?? '').trim()
             if (rawCommentToken) {
                 const resolvedCommentToken = await resolveCommentPageTokenForPage(c.env, id, rawCommentToken)
-                nextCommentTokenPool = normalizeCommentTokenPool([
+                nextCommentTokenPool = normalizeDirectVideoTokenPool([
                     resolvedCommentToken,
+                    effectivePostToken,
                     ...nextCommentTokenPool,
                 ])
                 resolved.comment_token = 'resolved_for_page'
-            } else {
+            } else if (comment_token !== undefined) {
                 nextCommentTokenPool = []
                 resolved.comment_token = 'provided_as_is'
             }
@@ -9503,49 +11636,17 @@ app.delete('/api/pages/:id', async (c) => {
 app.post('/api/pages/import', async (c) => {
     try {
         const body = await c.req.json()
-        const { user_token, post_profile_id, comment_profile_id, post_user_token, comment_user_token } = body || {}
+        const { user_token, post_user_token, comment_user_token } = body || {}
         const botId = c.get('botId')
-
-        const legacyInput = String(user_token || '').trim()
-        const postRawInput = String(post_profile_id || post_user_token || legacyInput).trim()
-        const commentRawInput = String(comment_profile_id || comment_user_token || '').trim()
+        const postRawInput = String(post_user_token || user_token || '').trim()
+        const commentRawInput = String(comment_user_token || postRawInput).trim()
 
         if (!postRawInput) {
-            return c.json({ error: 'Post profile ID/token is required' }, 400)
-        }
-        if (!commentRawInput) {
-            return c.json({ error: 'Comment profile ID/token is required' }, 400)
+            return c.json({ error: 'User token is required' }, 400)
         }
 
-        let postImportToken = postRawInput
-        let postImportSource: 'browsersaving_profile_id' | 'provided_as_is' = 'provided_as_is'
-        let postImportReason = ''
-        try {
-            const resolved = await resolveUserTokenInput(c.env, postRawInput, 'post')
-            postImportToken = resolved.token
-            postImportSource = resolved.source
-            postImportReason = String(resolved.reason || '')
-        } catch (e) {
-            return c.json({
-                error: 'Failed to resolve post token input',
-                details: e instanceof Error ? e.message : String(e),
-            }, 400)
-        }
-
-        let commentImportToken = commentRawInput
-        let commentImportSource: 'browsersaving_profile_id' | 'provided_as_is' = 'provided_as_is'
-        let commentImportReason = ''
-        try {
-            const resolved = await resolveUserTokenInput(c.env, commentRawInput, 'comment')
-            commentImportToken = resolved.token
-            commentImportSource = resolved.source
-            commentImportReason = String(resolved.reason || '')
-        } catch (e) {
-            return c.json({
-                error: 'Failed to resolve comment token input',
-                details: e instanceof Error ? e.message : String(e),
-            }, 400)
-        }
+        const postImportToken = postRawInput
+        const commentImportToken = commentRawInput || postImportToken
 
         let fbPages: Array<{ id?: string; name?: string; picture?: { data?: { url?: string } }; access_token?: string }> = []
         try {
@@ -9568,23 +11669,6 @@ app.post('/api/pages/import', async (c) => {
         const invalidPostTokenPages: { id: string; name: string; reason: string }[] = []
         const commentPageTokenById = new Map<string, string>()
         const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
-        const explicitSelectorInputs = [postRawInput, commentRawInput].filter((input) => {
-            return looksLikeBrowserSavingProfileId(input) || parseBrowserSavingTagSelector(input) !== null
-        })
-        const shouldPersistLinkedProfiles = explicitSelectorInputs.length > 0
-        const tagSelectorInputs = explicitSelectorInputs.filter((input) => parseBrowserSavingTagSelector(input) !== null)
-        let browserSavingProfiles: BrowserSavingProfileRecord[] = []
-        if (tagSelectorInputs.length > 0) {
-            try {
-                browserSavingProfiles = await fetchBrowserSavingProfilesForNamespace(c.env, c.env.DB, botId)
-            } catch (e) {
-                console.log(`[PAGES-IMPORT] fetch BrowserSaving profiles for linked profile map failed: ${e instanceof Error ? e.message : String(e)}`)
-            }
-        }
-        const linkedTaggedProfiles = shouldPersistLinkedProfiles
-            ? await getNamespaceLinkedTaggedProfiles(c.env.DB, botId)
-            : null
-        const pageIdsToClearHidden = new Set<string>()
 
         if (String(commentImportToken || '').trim()) {
             try {
@@ -9628,17 +11712,14 @@ app.post('/api/pages/import', async (c) => {
                     pageAccessToken,
                     ...(existingEntry.post_tokens || []),
                 ]),
-                comment_tokens: pageCommentTokenRaw
-                    ? normalizeCommentTokenPool([
-                        pageCommentTokenRaw,
-                        ...(existingEntry.comment_tokens || []),
-                    ])
-                    : normalizeCommentTokenPool(existingEntry.comment_tokens || []),
+                comment_tokens: normalizeDirectVideoTokenPool([
+                    pageCommentTokenRaw,
+                    pageAccessToken,
+                    ...(existingEntry.comment_tokens || []),
+                    ...(existingEntry.post_tokens || []),
+                ]),
                 updated_at: new Date().toISOString(),
             }
-            const explicitLinkedProfileIds = shouldPersistLinkedProfiles
-                ? collectExplicitLinkedProfileIdsForPage(browserSavingProfiles, explicitSelectorInputs, pageId, pageName)
-                : []
 
             const existingInNamespace = await c.env.DB.prepare(
                 'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
@@ -9648,10 +11729,6 @@ app.post('/api/pages/import', async (c) => {
                 await c.env.DB.prepare(
                     'UPDATE pages SET access_token = ?, image_url = ?, name = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
                 ).bind(primaryToken, pageImageUrl, pageName, pageId, botId).run()
-                if (linkedTaggedProfiles && explicitLinkedProfileIds.length > 0) {
-                    linkedTaggedProfiles[pageId] = explicitLinkedProfileIds
-                    pageIdsToClearHidden.add(pageId)
-                }
                 updated.push({ id: pageId, name: pageName, reason: 'updated' })
                 continue
             }
@@ -9672,23 +11749,11 @@ app.post('/api/pages/import', async (c) => {
                 await c.env.DB.prepare(
                     'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?)'
                 ).bind(pageId, pageName, pageImageUrl, primaryToken, botId).run()
-                if (linkedTaggedProfiles && explicitLinkedProfileIds.length > 0) {
-                    linkedTaggedProfiles[pageId] = explicitLinkedProfileIds
-                    pageIdsToClearHidden.add(pageId)
-                }
                 imported.push({ id: pageId, name: pageName })
             }
         }
 
         await setNamespacePagesTokenPool(c.env.DB, botId, tokenPool)
-        if (linkedTaggedProfiles) {
-            await setNamespaceLinkedTaggedProfiles(c.env.DB, botId, linkedTaggedProfiles)
-        }
-        for (const syncedPageId of pageIdsToClearHidden) {
-            await clearNamespaceHiddenTaggedProfilesForPage(c.env.DB, botId, syncedPageId).catch((e) => {
-                console.log(`[PAGES-IMPORT] clear hidden profiles failed page=${syncedPageId}: ${e instanceof Error ? e.message : String(e)}`)
-            })
-        }
 
         return c.json({
             success: true,
@@ -9696,10 +11761,8 @@ app.post('/api/pages/import', async (c) => {
             updated: updated.length,
             conflicts: conflicts.length,
             invalid_post_token_pages: invalidPostTokenPages.length,
-            source: postImportSource,
-            source_reason: postImportReason || undefined,
-            source_comment: commentImportSource,
-            source_comment_reason: commentImportReason || undefined,
+            source: 'provided_as_is',
+            source_comment: 'provided_as_is',
             pages: [...imported, ...updated],
             conflict_pages: conflicts,
             invalid_pages: invalidPostTokenPages,
@@ -9792,6 +11855,458 @@ app.delete('/api/post-history/:id', async (c) => {
     }
 })
 
+<<<<<<< HEAD
+=======
+app.post('/api/post-history/:id/retry-post', async (c) => {
+    const id = c.req.param('id')
+    const env = c.env
+    const botId = String(c.get('botId') || '').trim()
+    let pageId = ''
+    let pageName = ''
+    let pageAccessToken = ''
+    let pageCommentToken: string | null = null
+    let selectedVideoId = ''
+    let selectedVideoNamespaceId = ''
+    let selectedCaption = ''
+    let attemptPostedAtIso = ''
+    let normalizedShopeeLink = ''
+    let normalizedLazadaLink = ''
+    let fbVideoId = ''
+    let postingTokenUsed = ''
+    let hasCommentToken = false
+    let commentTokenCandidates: string[] = []
+    let retryHistoryId: number | null = null
+    let skipComment = false
+
+    try {
+        const body = await c.req.json().catch(() => ({})) as { skipComment?: boolean }
+        skipComment = body.skipComment === true
+
+        const sourceRow = await env.DB.prepare(
+            `SELECT
+                ph.id,
+                ph.page_id,
+                ph.video_id,
+                ph.shopee_link,
+                ph.posted_at,
+                p.name AS page_name,
+                p.access_token
+             FROM post_history ph
+             JOIN pages p ON p.id = ph.page_id
+             WHERE ph.id = ?
+               AND p.bot_id = ?
+             LIMIT 1`
+        ).bind(id, botId).first() as {
+            id?: number
+            page_id?: string
+            video_id?: string
+            shopee_link?: string | null
+            posted_at?: string
+            page_name?: string
+            access_token?: string
+        } | null
+
+        if (!sourceRow?.page_id || !sourceRow?.video_id) {
+            return c.json({ error: 'History not found' }, 404)
+        }
+
+        pageId = String(sourceRow.page_id || '').trim()
+        pageName = String(sourceRow.page_name || pageId).trim()
+        pageAccessToken = String(sourceRow.access_token || '').trim()
+        selectedVideoId = String(sourceRow.video_id || '').trim()
+
+        const activePosting = await env.DB.prepare(
+            `SELECT id
+             FROM post_history
+             WHERE bot_id = ?
+               AND page_id = ?
+               AND status = 'posting'
+             ORDER BY posted_at DESC, id DESC
+             LIMIT 1`
+        ).bind(botId, pageId).first() as { id?: number } | null
+        if (typeof activePosting?.id === 'number') {
+            return c.json({
+                error: 'page_already_posting',
+                details: { history_id: activePosting.id },
+            }, 409)
+        }
+
+        const page = await env.DB.prepare(
+            'SELECT id, name, access_token FROM pages WHERE id = ? AND bot_id = ? LIMIT 1'
+        ).bind(pageId, botId).first() as { id?: string; name?: string; access_token?: string } | null
+        if (!page?.id) {
+            return c.json({ error: 'Page not found' }, 404)
+        }
+
+        const videoRef = await resolveGalleryVideoForRepost({
+            env,
+            fallbackNamespaceId: botId,
+            videoId: selectedVideoId,
+        })
+        if (!videoRef) {
+            return c.json({ error: 'Video metadata not found for repost' }, 404)
+        }
+        selectedVideoNamespaceId = String(videoRef.sourceNamespaceId || botId).trim() || botId
+        const sourceBucket = selectedVideoNamespaceId === botId
+            ? c.get('bucket')
+            : new BotBucket(env.BUCKET, selectedVideoNamespaceId) as unknown as R2Bucket
+        const meta = videoRef.meta
+        const rawShopeeLink = pickFirstShopeeUrl(String(sourceRow.shopee_link || '').trim()) || videoRef.shopeeLink || ''
+
+        normalizedShopeeLink = rawShopeeLink
+        const normalizedShopeeUtmSource = null
+        const normalizedShopeeStatus = null
+        const normalizedShopeeError = null
+        const normalizedShopeeUtmMatch = null
+
+        const title = metaToString(meta, 'title')
+        const script = metaToString(meta, 'script')
+        const publicUrl = metaToString(meta, 'publicUrl')
+        const category = metaToString(meta, 'category')
+        normalizedLazadaLink = metaToString(meta, 'lazadaLink')
+        if (!publicUrl) {
+            return c.json({ error: 'Video public URL missing' }, 400)
+        }
+
+        const apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId)
+        if (!title && script && !apiKey) {
+            return c.json({ error: 'Gemini API key not configured for this workspace' }, 400)
+        }
+        const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
+        let caption = title
+            ? title
+            : script
+                ? await generateCaption(script, apiKey, model)
+                : 'AI Dubbed Video'
+        caption += `\n#สินค้า #ของน่าใช้ #ช็อปปิ้งออนไลน์${category ? ` #${category}` : ''}`
+        selectedCaption = caption
+
+        const tokenCandidates = await ensurePageTokenCandidates({
+            env,
+            db: env.DB,
+            namespaceId: botId,
+            pageId: pageId,
+            pageName: pageName,
+            primaryToken: pageAccessToken,
+            logPrefix: 'RETRY-POST',
+        })
+        commentTokenCandidates = tokenCandidates.commentTokens
+        pageCommentToken = commentTokenCandidates[0] || null
+        const fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
+            ? tokenCandidates.postTokens
+            : normalizePostTokenPool([pageAccessToken])
+        const directVideoTokenCandidates = normalizeDirectVideoTokenPool(commentTokenCandidates)
+        const primaryPostingTokenCandidates = directVideoTokenCandidates.length > 0
+            ? directVideoTokenCandidates
+            : fallbackPostTokenCandidates
+        if (primaryPostingTokenCandidates.length === 0) {
+            throw new Error('access_token_missing')
+        }
+
+        await ensurePostHistoryTraceColumns(env.DB)
+        const commentTokenHint = deriveCommentTokenHint(pageCommentToken)
+        const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
+        hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
+        const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
+        const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
+        attemptPostedAtIso = new Date().toISOString()
+        const inserted = await env.DB.prepare(
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+            pageId,
+            selectedVideoId,
+            attemptPostedAtIso,
+            'posting',
+            'retry_post',
+            botId,
+            initialPostTokenHint,
+            initialPostProfile.profileId,
+            initialPostProfile.profileName,
+            initialCommentState.status,
+            commentTokenHint,
+            initialCommentState.error,
+            null,
+            normalizedShopeeLink || null,
+            normalizedLazadaLink || null,
+            normalizedLazadaMemberId || null,
+            normalizedShopeeUtmSource,
+            normalizedShopeeStatus,
+            normalizedShopeeError,
+            null,
+            normalizedShopeeUtmMatch,
+        ).run() as { meta?: { last_row_id?: number } }
+        retryHistoryId = Number(inserted?.meta?.last_row_id || 0) || null
+        await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(attemptPostedAtIso, pageId, botId).run()
+
+        let realVideoUrl = publicUrl
+        if (!realVideoUrl || !realVideoUrl.includes(`/${selectedVideoNamespaceId}/videos/`)) {
+            realVideoUrl = getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, selectedVideoNamespaceId, selectedVideoId)
+        }
+
+        const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'retry_post_download_video')
+        if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
+        const videoBuffer = await videoResp.arrayBuffer()
+        if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
+
+        postingTokenUsed = String(primaryPostingTokenCandidates[0] || '').trim()
+        const reelResult = await publishReelWithCommentTokenPrimaryFallback({
+            pageId,
+            commentTokens: commentTokenCandidates,
+            postTokens: fallbackPostTokenCandidates,
+            videoBuffer,
+            description: caption,
+            logPrefix: 'RETRY-POST',
+        })
+        postingTokenUsed = reelResult.postingToken
+        const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
+
+        fbVideoId = reelResult.id
+        const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+        const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
+        const scheduledCommentDelaySeconds = normalizedShopeeLink && !skipComment && hasCommentToken
+            ? getRandomCommentDelaySeconds()
+            : null
+        const scheduledCommentDueAt = scheduledCommentDelaySeconds
+            ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
+            : null
+        const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+        await env.DB.prepare(
+            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE id = ? AND status = 'posting'"
+        ).bind(
+            confirmedPostId,
+            fbReelUrl,
+            deriveCommentTokenHint(postingTokenUsed),
+            postingProfile.profileId,
+            postingProfile.profileName,
+            postReadyCommentState.status,
+            deriveCommentTokenHint(pageCommentToken),
+            postReadyCommentState.error,
+            scheduledCommentDelaySeconds,
+            scheduledCommentDueAt,
+            retryHistoryId,
+        ).run()
+
+        let commentStatus = postReadyCommentState.status
+        let commentError: string | null = postReadyCommentState.error
+        let commentFbId: string | null = null
+        let commentTokenUsed = String(pageCommentToken || '').trim()
+        let commentProfileId: string | null = null
+        let commentProfileName: string | null = null
+        const commentTargetId = fbVideoId || confirmedPostId
+
+        if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+            const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
+            console.log(`[RETRY-POST] Waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
+            await waitMs(commentWaitMs)
+            await env.DB.prepare(
+                "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE id = ? AND status = 'posting'"
+            ).bind(
+                deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                retryHistoryId,
+            ).run()
+            const commentResult = await postShopeeCommentWithFallback({
+                env,
+                namespaceId: botId,
+                fbVideoId: commentTargetId,
+                shopeeLink: normalizedShopeeLink,
+                lazadaLink: normalizedLazadaLink,
+                commentTokens: commentTokenCandidates,
+                pageId,
+                logPrefix: 'RETRY-POST',
+            })
+            if (!commentResult.ok) {
+                commentStatus = 'failed'
+                commentError = commentResult.error || 'comment_failed'
+                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                commentProfileId = commentProfile.profileId
+                commentProfileName = commentProfile.profileName
+                await notifyCommentTokenIssue(
+                    env,
+                    botId,
+                    pageId,
+                    pageName || pageId,
+                    commentError,
+                ).catch((notifyErr) => {
+                    console.error(`[RETRY-POST] notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+                })
+            } else {
+                commentStatus = 'success'
+                commentFbId = commentResult.id || null
+                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                commentProfileId = commentProfile.profileId
+                commentProfileName = commentProfile.profileName
+            }
+        } else if (skipComment) {
+            commentStatus = 'skipped'
+            commentError = null
+        }
+
+        await env.DB.prepare(
+            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status = 'posting'"
+        ).bind(
+            confirmedPostId,
+            fbReelUrl,
+            deriveCommentTokenHint(postingTokenUsed),
+            postingProfile.profileId,
+            postingProfile.profileName,
+            commentStatus,
+            deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+            commentProfileId,
+            commentProfileName,
+            commentError,
+            commentFbId,
+            retryHistoryId,
+        ).run()
+        await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
+
+        await clearVideoShopeeLink(sourceBucket, selectedVideoId)
+        return c.json({
+            success: true,
+            reposted_from_history_id: Number(id),
+            history_id: retryHistoryId,
+            page: pageName,
+            video_id: selectedVideoId,
+            fb_video_id: fbVideoId,
+            fb_post_id: confirmedPostId,
+            fb_reel_url: fbReelUrl,
+        })
+    } catch (e) {
+        const errorMsg = e instanceof Error ? e.message : String(e)
+
+        if (pageAccessToken && pageId && selectedVideoId && retryHistoryId) {
+            try {
+                let recoveredPostId = ''
+                let recoveredReelUrl = ''
+
+                if (fbVideoId) {
+                    const recovered = await pollPublishedReelAfterProcessing({
+                        accessToken: pageAccessToken,
+                        fbVideoId,
+                        logPrefix: 'RETRY-POST-RECOVER',
+                    })
+                    if (recovered.published && recovered.post_id) {
+                        recoveredPostId = String(recovered.post_id || '').trim() || fbVideoId
+                        recoveredReelUrl = String(recovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
+                    }
+                }
+
+                if (!recoveredPostId && selectedCaption) {
+                    const feedRecovered = await recoverPublishedReelFromRecentFeed({
+                        accessToken: pageAccessToken,
+                        pageId,
+                        expectedCaption: selectedCaption,
+                        notBeforeIso: attemptPostedAtIso,
+                        logPrefix: 'RETRY-POST-RECOVER-FEED',
+                    })
+                    if (feedRecovered.published && feedRecovered.post_id) {
+                        recoveredPostId = String(feedRecovered.post_id || '').trim()
+                        recoveredReelUrl = String(feedRecovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
+                    }
+                }
+
+                if (recoveredPostId) {
+                    const recoveredCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+                    let commentStatus = recoveredCommentState.status
+                    let commentError: string | null = recoveredCommentState.error
+                    let commentFbId: string | null = null
+                    let commentTokenUsed = String(pageCommentToken || '').trim()
+                    let commentProfileId: string | null = null
+                    let commentProfileName: string | null = null
+                    const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
+
+                    if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+                        const commentWaitMs = getRandomCommentDelayMs()
+                        await waitMs(commentWaitMs)
+                        const commentResult = await postShopeeCommentWithFallback({
+                            env,
+                            namespaceId: botId,
+                            fbVideoId: commentTargetId,
+                            shopeeLink: normalizedShopeeLink,
+                            lazadaLink: normalizedLazadaLink,
+                            commentTokens: commentTokenCandidates,
+                            pageId,
+                            logPrefix: 'RETRY-POST-RECOVER',
+                        })
+                        if (!commentResult.ok) {
+                            commentStatus = 'failed'
+                            commentError = commentResult.error || 'comment_failed'
+                            commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                            const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                            commentProfileId = commentProfile.profileId
+                            commentProfileName = commentProfile.profileName
+                            await notifyCommentTokenIssue(
+                                env,
+                                botId,
+                                pageId,
+                                pageName || pageId,
+                                commentError,
+                            ).catch((notifyErr) => {
+                                console.error(`[RETRY-POST-RECOVER] notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+                            })
+                        } else {
+                            commentStatus = 'success'
+                            commentFbId = commentResult.id || null
+                            commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                            const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                            commentProfileId = commentProfile.profileId
+                            commentProfileName = commentProfile.profileName
+                        }
+                    }
+
+                    const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
+                    await env.DB.prepare(
+                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status IN ('posting','failed')"
+                    ).bind(
+                        recoveredPostId,
+                        recoveredReelUrl || `https://www.facebook.com/reel/${recoveredPostId}`,
+                        deriveCommentTokenHint(postingTokenUsed),
+                        recoveredPostProfile.profileId,
+                        recoveredPostProfile.profileName,
+                        commentStatus,
+                        deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                        commentProfileId,
+                        commentProfileName,
+                        commentError,
+                        commentFbId,
+                        retryHistoryId,
+                    ).run()
+                    await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
+
+                    const sourceBucket = selectedVideoNamespaceId === botId
+                        ? c.get('bucket')
+                        : new BotBucket(env.BUCKET, selectedVideoNamespaceId || botId) as unknown as R2Bucket
+                    await clearVideoShopeeLink(sourceBucket, selectedVideoId)
+                    return c.json({
+                        success: true,
+                        recovered: true,
+                        reposted_from_history_id: Number(id),
+                        history_id: retryHistoryId,
+                        page: pageName || pageId,
+                        video_id: selectedVideoId,
+                        fb_video_id: fbVideoId,
+                        fb_post_id: recoveredPostId,
+                        fb_reel_url: recoveredReelUrl || `https://www.facebook.com/reel/${recoveredPostId}`,
+                    })
+                }
+            } catch (recoverErr) {
+                console.error(`[RETRY-POST-RECOVER] failed: ${recoverErr instanceof Error ? recoverErr.message : String(recoverErr)}`)
+            }
+        }
+
+        if (retryHistoryId) {
+            await env.DB.prepare(
+                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+            ).bind(errorMsg, retryHistoryId).run().catch(() => { })
+        }
+
+        return c.json({ error: 'Retry post failed', details: errorMsg }, 500)
+    }
+})
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 app.get('/api/pages/:id/history', async (c) => {
     const pageId = c.req.param('id')
     try {
@@ -10046,6 +12561,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             throw new Error('access_token_missing')
         }
 
+<<<<<<< HEAD
         const postedIds = await getPostedVideoIds({
             db: env.DB,
             namespaceId: botId,
@@ -10055,18 +12571,34 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         const allVideoIds = await listAllVideoJsonIds(c.get('bucket'))
         const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
+=======
+        const namespacePostedIds = await getPostedVideoIds({
+            db: env.DB,
+            namespaceId: botId,
+            withinDays: 30,
+        })
+        console.log(`[FORCE-POST] Page ${page.name}: videos already posted in namespace ${botId} in last 30 days: ${Array.from(namespacePostedIds).join(', ') || 'none'}`)
+
+        const allVideoIds = await listAllVideoJsonIds(c.get('bucket'))
+        const unpostedVideos = allVideoIds.filter(id => !namespacePostedIds.has(id))
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const pickedVideo = await pickRandomGalleryVideoForPosting({
             env,
             namespaceId: botId,
             bucket: c.get('bucket'),
             candidateIds: unpostedVideos,
+<<<<<<< HEAD
             excludedVideoIds: postedIds,
+=======
+            excludedVideoIds: namespacePostedIds,
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         })
         if (!pickedVideo) return c.json({ error: 'No readable video metadata left' }, 404)
         const unpostedId = pickedVideo.id
         const meta = pickedVideo.meta
         selectedVideoId = unpostedId
         selectedVideoNamespaceId = String(pickedVideo.sourceNamespaceId || botId).trim() || botId
+<<<<<<< HEAD
         const shortlinkRequired = await getNamespaceShopeeShortlinkRequired(env.DB, botId)
         const expectedShortlinkUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, botId)
         const forceShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
@@ -10083,6 +12615,13 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const normalizedShopeeStatus = forceShortlinkTrace.status || (normalizedShopeeLink ? 'fallback' : 'disabled')
         const normalizedShopeeError = forceShortlinkTrace.error || null
         const normalizedShopeeUtmMatch = computeShortlinkUtmMatchValue(expectedShortlinkUtmId, normalizedShopeeUtmSource)
+=======
+        normalizedShopeeLink = pickedVideo.shopeeLink || ''
+        const normalizedShopeeUtmSource = null
+        const normalizedShopeeStatus = null
+        const normalizedShopeeError = null
+        const normalizedShopeeUtmMatch = null
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const title = metaToString(meta, 'title')
         const script = metaToString(meta, 'script')
         const publicUrl = metaToString(meta, 'publicUrl')
@@ -10137,14 +12676,17 @@ app.post('/api/pages/:id/force-post', async (c) => {
             normalizedShopeeUtmSource,
             normalizedShopeeStatus,
             normalizedShopeeError,
-            expectedShortlinkUtmId || null,
+            null,
             normalizedShopeeUtmMatch,
         ).run()
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ?').bind(nowStr, page.id).run()
+<<<<<<< HEAD
 
         if (pickedVideo.shopeeLink && shortlinkRequired && normalizedShopeeStatus !== 'shortened') {
             throw new Error(`shortlink_required_failed${normalizedShopeeError ? `: ${normalizedShopeeError}` : ''}`)
         }
+=======
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         // Handle legacy publicUrl without namespace path
         let realVideoUrl = publicUrl
@@ -10219,6 +12761,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             ).run()
             const commentResult = await postShopeeCommentWithFallback({
                 env,
+                namespaceId: botId,
                 fbVideoId: commentTargetId,
                 shopeeLink: normalizedShopeeLink,
                 commentTokens: commentTokenCandidates,
@@ -10274,6 +12817,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
             page.id,
             unpostedId,
         ).run()
+<<<<<<< HEAD
+=======
+        await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         await clearVideoShopeeLink(c.get('bucket'), unpostedId)
         return c.json({ success: true, page: page.name, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId, fb_reel_url: fbReelUrl })
@@ -10333,6 +12880,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         await waitMs(commentWaitMs)
                         const commentResult = await postShopeeCommentWithFallback({
                             env,
+                            namespaceId: botId,
                             fbVideoId: commentTargetId,
                             shopeeLink: normalizedShopeeLink,
                             commentTokens: commentTokenCandidates,
@@ -10386,6 +12934,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         pageId,
                         selectedVideoId,
                     ).run()
+<<<<<<< HEAD
+=======
+                    await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
                     await clearVideoShopeeLink(new BotBucket(env.BUCKET, selectedVideoNamespaceId || botId) as unknown as R2Bucket, selectedVideoId)
                     return c.json({
@@ -10445,12 +12997,19 @@ app.post('/api/manual-post-reel', async (c) => {
         const shortlinkRequired = namespaceId ? await getNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId) : false
         const manualShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         const effectiveShopeeLink = shopeeLink
+<<<<<<< HEAD
             ? await shortenShopeeLinkForNamespace({
+=======
+            ? await resolvePostingShopeeLinkForNamespace({
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
                 env: c.env,
                 namespaceId,
                 shopeeLink,
                 logPrefix: 'MANUAL-REEL',
+<<<<<<< HEAD
                 trace: manualShortlinkTrace,
+=======
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             })
             : ''
         if (shopeeLink && shortlinkRequired && manualShortlinkTrace.status !== 'shortened') {
@@ -10531,6 +13090,7 @@ app.post('/api/manual-post-reel', async (c) => {
             try {
                 const res = await postShopeeCommentWithFallback({
                     env: c.env,
+                    namespaceId: c.get('botId'),
                     fbVideoId: fbVideoId || confirmedPostId,
                     shopeeLink: effectiveShopeeLink,
                     commentTokens: [commentToken || ''],
@@ -10632,6 +13192,7 @@ async function handleScheduled(env: Env) {
                 console.log(`[CRON] Pending comment ${data.fbVideoId}: using comment token ${pendingCommentToken.slice(0, 30)}...`)
                 const result = await postShopeeCommentStrict({
                     env,
+                    namespaceId: String(data.namespaceId || data.botId || '').trim(),
                     fbVideoId: data.fbVideoId,
                     shopeeLink: data.shopeeLink,
                     commentToken: pendingCommentToken,
@@ -10718,6 +13279,38 @@ async function handleScheduled(env: Env) {
     for (const page of pages) {
         // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
         const botId = page.bot_id || 'default';
+<<<<<<< HEAD
+=======
+        await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
+        const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
+        if (!shortlinkEnabled) {
+            await env.DB.prepare(
+                `UPDATE post_history
+                 SET status = 'failed',
+                     error_message = 'shortlink_disabled_gallery_empty',
+                     comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
+                     comment_error = CASE WHEN comment_status = 'pending' THEN 'shortlink_disabled_gallery_empty' ELSE comment_error END
+                 WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
+            ).bind(botId, page.id).run().catch(() => { })
+            console.log(`[CRON] Page ${page.name}: skip (shortlink disabled for namespace ${botId})`)
+            continue
+        }
+
+        const namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
+        if (namespaceGalleryVideos.length === 0) {
+            await env.DB.prepare(
+                `UPDATE post_history
+                 SET status = 'failed',
+                     error_message = 'gallery_empty',
+                     comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
+                     comment_error = CASE WHEN comment_status = 'pending' THEN 'gallery_empty' ELSE comment_error END
+                 WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
+            ).bind(botId, page.id).run().catch(() => { })
+            console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
+            continue
+        }
+
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const recentPostGuard = await getRecentPagePostGuard({
             db: env.DB,
             namespaceId: botId,
@@ -10866,6 +13459,7 @@ async function handleScheduled(env: Env) {
             customMetadata: { createdAt: nowISO }
         })
 
+<<<<<<< HEAD
         // 2. Get a video that hasn't been posted to this page in the last 30 days
         // ใช้ video จาก cache แล้ว
         const postedIds = await getPostedVideoIds({
@@ -10875,17 +13469,34 @@ async function handleScheduled(env: Env) {
             withinDays: 30,
         })
         console.log(`[CRON] Page ${page.name}: videos already posted to this page in last 30 days: ${Array.from(postedIds).join(', ') || 'none'}`)
+=======
+        // 2. Get a video that hasn't been posted anywhere in this namespace in the last 30 days
+        const namespacePostedIds = await getPostedVideoIds({
+            db: env.DB,
+            namespaceId: botId,
+            withinDays: 30,
+        })
+        console.log(`[CRON] Page ${page.name}: videos already posted in namespace ${botId} in last 30 days: ${Array.from(namespacePostedIds).join(', ') || 'none'}`)
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
         const allVideoIds = videoNamespaceNewestFirstCache[botId] || videoNamespaceCache[botId] || []
         console.log(`[CRON] Page ${page.name}: found ${allVideoIds.length} videos in R2`)
 
+<<<<<<< HEAD
         const unpostedVideos = allVideoIds.filter(id => !postedIds.has(id))
+=======
+        const unpostedVideos = allVideoIds.filter(id => !namespacePostedIds.has(id))
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const pickedVideo = await pickRandomGalleryVideoForPosting({
             env,
             namespaceId: botId,
             bucket: botBucket,
             candidateIds: unpostedVideos,
+<<<<<<< HEAD
             excludedVideoIds: postedIds,
+=======
+            excludedVideoIds: namespacePostedIds,
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         })
         if (!pickedVideo) {
             console.log(`[CRON] Page ${page.name}: no readable video metadata left`)
@@ -10916,6 +13527,7 @@ async function handleScheduled(env: Env) {
 
         // Get video metadata
         const meta = pickedVideo.meta
+<<<<<<< HEAD
         const shortlinkRequired = await getNamespaceShopeeShortlinkRequired(env.DB, botId)
         const expectedShortlinkUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, botId)
         const cronShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
@@ -10932,6 +13544,13 @@ async function handleScheduled(env: Env) {
         const normalizedShopeeStatus = cronShortlinkTrace.status || (normalizedShopeeLink ? 'fallback' : 'disabled')
         const normalizedShopeeError = cronShortlinkTrace.error || null
         const normalizedShopeeUtmMatch = computeShortlinkUtmMatchValue(expectedShortlinkUtmId, normalizedShopeeUtmSource)
+=======
+        const normalizedShopeeLink = pickedVideo.shopeeLink || ''
+        const normalizedShopeeUtmSource = null
+        const normalizedShopeeStatus = null
+        const normalizedShopeeError = null
+        const normalizedShopeeUtmMatch = null
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
         const title = metaToString(meta, 'title')
         const script = metaToString(meta, 'script')
         const publicUrl = metaToString(meta, 'publicUrl')
@@ -11016,7 +13635,7 @@ async function handleScheduled(env: Env) {
             normalizedShopeeUtmSource,
             normalizedShopeeStatus,
             normalizedShopeeError,
-            expectedShortlinkUtmId || null,
+            null,
             normalizedShopeeUtmMatch,
         ).run()
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
@@ -11099,6 +13718,7 @@ async function handleScheduled(env: Env) {
                     ).run()
                     const commentResult = await postShopeeCommentWithFallback({
                         env,
+                        namespaceId: botId,
                         fbVideoId: commentTargetId,
                         shopeeLink: normalizedShopeeLink,
                         commentTokens: commentTokenCandidates,
@@ -11153,6 +13773,10 @@ async function handleScheduled(env: Env) {
                 unpostedId,
                 botId,
             ).run()
+<<<<<<< HEAD
+=======
+            await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
             await clearVideoShopeeLink(botBucket, unpostedId)
             console.log(`[CRON] Page ${page.name}: posted successfully (fb_video_id: ${fbVideoId}, post_id: ${confirmedPostId})`)
@@ -11217,6 +13841,7 @@ async function handleScheduled(env: Env) {
                             await waitMs(commentWaitMs)
                             const commentResult = await postShopeeCommentWithFallback({
                                 env,
+                                namespaceId: botId,
                                 fbVideoId: commentTargetId,
                                 shopeeLink: normalizedShopeeLink,
                                 commentTokens: commentTokenCandidates,
@@ -11270,6 +13895,10 @@ async function handleScheduled(env: Env) {
                         unpostedId,
                         botId,
                     ).run()
+<<<<<<< HEAD
+=======
+                    await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
 
                     await clearVideoShopeeLink(botBucket, unpostedId)
                     console.log(`[CRON] Page ${page.name}: recovered as success (fb_video_id: ${fbVideoId}, post_id: ${recoveredPostId})`)

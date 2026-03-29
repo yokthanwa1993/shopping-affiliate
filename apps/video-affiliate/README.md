@@ -8,8 +8,8 @@
 - `webapp/` — React + Vite (Mini App UI)
 
 ## Production
-- Worker: `https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev`
-- Webapp: `https://video-affiliate-webapp.pages.dev`
+- Worker: `https://video-affiliate-worker.onlyy-gor.workers.dev`
+- Webapp: `https://video-affiliate-webapp-38v.pages.dev`
 
 ## Deploy
 ### Worker
@@ -42,4 +42,4 @@ wrangler containers push video-affiliate-worker-mergecontainer:v{VERSION}
 - ใช้ `video-affiliate-*` ทุกจุด
 - หลีกเลี่ยงชื่อ legacy ใน runtime และเอกสาร
 
-ดูรายละเอียดเชิงระบบที่ [AGENTS.md](/Users/yok/Developer/shopping-affiliate/apps/video-affiliate/AGENTS.md)
+ดูรายละเอียดเชิงระบบที่ [AGENTS.md](/Users/yok/Developer/video-affiliate/AGENTS.md)

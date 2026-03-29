@@ -1,7 +1,12 @@
-const botToken = "8328894625:AAEgMQwFeBkTLTYP-s5feVUsc7B64jTInAs";
-const chatId = 1344057381;
+const botToken = process.env.BOT_TOKEN;
+const chatId = Number(process.env.CHAT_ID || 0);
+const workerUrl = process.env.WORKER_URL || "https://video-affiliate-worker.onlyy-gor.workers.dev";
 
-fetch('https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev/api/telegram', {
+if (!botToken || !chatId) {
+    throw new Error("Set BOT_TOKEN and CHAT_ID before running this script");
+}
+
+fetch(`${workerUrl}/api/telegram/${botToken}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

@@ -32,6 +32,7 @@ export type Env = {
     MERGE_CONTAINER: DurableObjectNamespace
     BROWSERSAVING_SERVICE?: Fetcher
     TELEGRAM_BOT_TOKEN: string
+    WORKER_URL?: string
     R2_PUBLIC_URL: string
     R2_ACCOUNT_ID: string
     R2_ACCESS_KEY_ID: string
@@ -267,7 +268,17 @@ export async function runPipeline(
             model,
             script_prompt: voicePrompt,
             r2_public_url: env.R2_PUBLIC_URL,
+<<<<<<< HEAD
             worker_url: 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev',
+=======
+            worker_url: String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev',
+            completion_webapp_url: buildScopedGalleryWebAppUrl(
+                env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                botId,
+                videoId,
+                'lazada',
+            ),
+>>>>>>> f9bc937 (update video-affiliate deploy and bot processing flow)
             video_id: videoId,
             bot_id: botId,
             shopee_link: String(shopeeLink || '').trim() || undefined,
