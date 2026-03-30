@@ -75,8 +75,12 @@ const getStoredLazadaExpectedMemberId = (botScope = getBotScopeFromLocation()) =
 }
 
 const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation()) => {
-  void botScope
-  return false
+  const account = getStoredShortlinkAccount(botScope)
+  const shopeeBase = getStoredShortlinkBaseUrl(botScope)
+  const lazadaBase = getStoredLazadaShortlinkBaseUrl(botScope)
+  const utmId = getStoredShortlinkExpectedUtmId(botScope)
+  const memberId = getStoredLazadaExpectedMemberId(botScope)
+  return !!(account || shopeeBase || lazadaBase || utmId || memberId)
 }
 
 const CACHE_VERSION = 'v6'
@@ -86,7 +90,7 @@ const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedSt
 const GALLERY_BATCH_SIZE = 24
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
-const FORCE_SYSTEM_WIDE_GALLERY = false
+const FORCE_SYSTEM_WIDE_GALLERY = true
 
 const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
   if (FORCE_SYSTEM_WIDE_GALLERY || systemWide || hasStoredAffiliateShortlinkConfig(botScope)) {
