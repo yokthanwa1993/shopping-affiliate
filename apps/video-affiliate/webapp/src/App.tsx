@@ -1,7 +1,7 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 
 
-const WORKER_URL = String(import.meta.env.VITE_WORKER_URL || 'https://video-affiliate-worker.onlyy-gor.workers.dev')
+const WORKER_URL = String(import.meta.env.VITE_WORKER_URL || 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev')
   .trim()
   .replace(/\/+$/, '')
 
@@ -191,6 +191,9 @@ interface GalleryPageResponse {
   videos?: Video[]
   total?: number
   overall_total?: number
+  ready_total?: number
+  inventory_total?: number
+  library_total?: number
   offset?: number
   limit?: number
   has_more?: boolean
@@ -206,6 +209,21 @@ interface SystemGalleryStats {
   withoutLink: number
   shopeeTotal: number
   lazadaTotal: number
+}
+
+interface GallerySummaryStats {
+  libraryTotal: number
+  inventoryTotal: number
+  readyTotal: number
+}
+
+interface ProcessingSummaryStats {
+  libraryTotal: number
+  inventoryTotal: number
+  readyTotal: number
+  pendingTotal: number
+  pendingHasLazadaTotal: number
+  pendingMissingLazadaTotal: number
 }
 
 function normalizeGallerySearchQuery(value: string | null | undefined): string {
@@ -2589,7 +2607,17 @@ function App() {
     setPages([])
     setVideos([])
     setUsedVideos([])
+    setPendingShortlinkVideos([])
     setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+    setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+    setProcessingSummary({
+      libraryTotal: 0,
+      inventoryTotal: 0,
+      readyTotal: 0,
+      pendingTotal: 0,
+      pendingHasLazadaTotal: 0,
+      pendingMissingLazadaTotal: 0,
+    })
     setSystemGalleryHasMore(false)
     setGalleryLoadingMore(false)
     setGalleryVisibleCount(GALLERY_BATCH_SIZE)
@@ -2714,7 +2742,15 @@ function App() {
     return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), hasStoredAffiliateShortlinkConfig(botScope)).length === 0
   })
   const [systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
-  const [, setSystemGalleryOverallTotal] = useState(0)
+  const [gallerySummary, setGallerySummary] = useState<GallerySummaryStats>({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+  const [processingSummary, setProcessingSummary] = useState<ProcessingSummaryStats>({
+    libraryTotal: 0,
+    inventoryTotal: 0,
+    readyTotal: 0,
+    pendingTotal: 0,
+    pendingHasLazadaTotal: 0,
+    pendingMissingLazadaTotal: 0,
+  })
   const [systemGalleryHasMore, setSystemGalleryHasMore] = useState(false)
   const [galleryLoadingMore, setGalleryLoadingMore] = useState(false)
   // Get today's date in YYYY-MM-DD format for Thailand timezone
@@ -2726,6 +2762,7 @@ function App() {
 
 
   const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('unused')
+  const [processingView, setProcessingView] = useState<'processing' | 'pending'>('processing')
   const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
@@ -2989,6 +3026,15 @@ function App() {
     setInboxLoading(true)
     setProcessingVideos([])
     setPendingShortlinkVideos([])
+    setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+    setProcessingSummary({
+      libraryTotal: 0,
+      inventoryTotal: 0,
+      readyTotal: 0,
+      pendingTotal: 0,
+      pendingHasLazadaTotal: 0,
+      pendingMissingLazadaTotal: 0,
+    })
     setMeEmail('')
     setIsOwner(false)
     setTeamMembers([])
@@ -3126,6 +3172,7 @@ function App() {
     setGalleryLoading(cachedVideos.length === 0)
     if (!systemWideGalleryMode) {
       setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+      setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
       setSystemGalleryHasMore(false)
       setGalleryLoadingMore(false)
     }
@@ -3175,8 +3222,18 @@ function App() {
 
       const procData = processingResp.ok ? await processingResp.json() : { videos: [], pending_shortlink_videos: [] }
       const queueData = queueResp.ok ? await queueResp.json() : { queue: [] }
-      setProcessingVideos([...(procData.videos || []), ...(queueData.queue || [])])
-      setPendingShortlinkVideos(dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : []))
+      const processingVideos = [...(procData.videos || []), ...(queueData.queue || [])]
+      const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
+      setProcessingVideos(processingVideos)
+      setPendingShortlinkVideos(pendingVideos)
+      setProcessingSummary({
+        libraryTotal: Number(procData.library_total || 0),
+        inventoryTotal: Number(procData.inventory_total || 0),
+        readyTotal: Number(procData.ready_total || 0),
+        pendingTotal: Number(procData.pending_total || pendingVideos.length),
+        pendingHasLazadaTotal: Number(procData.pending_has_lazada_total || 0),
+        pendingMissingLazadaTotal: Number(procData.pending_missing_lazada_total || 0),
+      })
     } catch {
       // Keep previous processing snapshot on transient errors.
     } finally {
@@ -3317,7 +3374,11 @@ function App() {
         withLink: Number(data.with_link_total || 0),
         withoutLink: Number(data.without_link_total || 0),
       })
-      setSystemGalleryOverallTotal(Number(data.overall_total || data.total || 0))
+      setGallerySummary({
+        libraryTotal: Number(data.library_total || 0),
+        inventoryTotal: Number(data.inventory_total || 0),
+        readyTotal: Number(data.ready_total || data.overall_total || 0),
+      })
       setSystemGalleryHasMore(hasMore)
     } catch {
       // Keep current gallery snapshot on transient errors.
@@ -4222,6 +4283,21 @@ function App() {
       galleryAvailableVideos: availableVideos,
     }
   }, [videos, usedVideos, usedVideoIdSet, pendingShortlinkIdentitySet, systemWideGalleryMode, categoryFilter, gallerySearchQuery])
+  const pendingShortlinkWithLazadaVideos = useMemo(() => {
+    return pendingShortlinkVideos.filter((video) => {
+      const row = video as Video & Record<string, unknown>
+      if (String(row.pending_bucket || '').trim() === 'has-lazada') return true
+      return !!getVideoSourceLazadaLink(row) || !!getVideoLazadaLink(row)
+    })
+  }, [pendingShortlinkVideos])
+  const pendingShortlinkMissingLazadaVideos = useMemo(() => {
+    const withLazadaKeys = new Set(
+      pendingShortlinkWithLazadaVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>))
+    )
+    return pendingShortlinkVideos.filter((video) =>
+      !withLazadaKeys.has(getVideoIdentityKey(video as Video & Record<string, unknown>))
+    )
+  }, [pendingShortlinkVideos, pendingShortlinkWithLazadaVideos])
   const showGalleryFilterBar = tab === 'gallery' && (
     !systemWideGalleryMode && (
       galleryLoading ||
@@ -4235,6 +4311,12 @@ function App() {
   const galleryViewTotal = systemWideGalleryMode
     ? Number(systemGalleryStats.total || 0)
     : galleryAvailableVideos.length
+  const namespaceGalleryLibraryTotal = processingSummary.libraryTotal
+  const namespaceGalleryInventoryTotal = processingSummary.inventoryTotal
+  const namespaceGalleryReadyTotal = processingSummary.readyTotal
+  const systemGalleryLibraryTotal = gallerySummary.libraryTotal
+  const systemGalleryLazadaTotal = Number(systemGalleryStats.lazadaTotal || 0)
+  const systemGalleryMissingLazadaTotal = Math.max(0, systemGalleryLibraryTotal - systemGalleryLazadaTotal)
   const galleryVisibleVideos = useMemo(() => {
     if (systemWideGalleryMode) return galleryAvailableVideos
     return galleryAvailableVideos.slice(0, galleryVisibleCount)
@@ -4404,7 +4486,7 @@ function App() {
                 onClick={() => setCategoryFilter('unused')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                ยังไม่ได้ใช้ ({galleryUnusedVideos.length})
+                พร้อมโพสต์ ({galleryUnusedVideos.length})
               </button>
               <button
                 onClick={() => setCategoryFilter('used')}
@@ -4556,10 +4638,41 @@ function App() {
         {tab === 'processing' && (
           <div className="px-4">
             <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-              <div className="rounded-2xl bg-gray-100 p-1">
-                <div className="rounded-[18px] bg-white px-3 py-3 text-sm font-bold text-blue-600 shadow-sm">
+              <div className="flex flex-wrap gap-2">
+                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-700">
+                  คลังทั้งหมด {processingSummary.libraryTotal.toLocaleString('th-TH')}
+                </span>
+                {processingSummary.inventoryTotal > 0 && processingSummary.inventoryTotal !== processingSummary.libraryTotal && (
+                  <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-700">
+                    หลังรวมคลิปซ้ำ {processingSummary.inventoryTotal.toLocaleString('th-TH')}
+                  </span>
+                )}
+                <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
+                  พร้อมโพสต์ {processingSummary.readyTotal.toLocaleString('th-TH')}
+                </span>
+                <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
+                  รอแปลงลิงก์ {processingSummary.pendingTotal.toLocaleString('th-TH')}
+                </span>
+              </div>
+              <p className="mt-3 text-xs leading-5 text-gray-500">
+                หน้า Processing จะรวมคลิปที่ยังขาด Lazada link หรือยังแปลง shortlink ไม่ครบ ส่วนคลิปที่พร้อมโพสต์จะอยู่หน้า Gallery
+              </p>
+            </div>
+
+            <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+              <div className="grid grid-cols-2 gap-1 rounded-2xl bg-gray-100 p-1">
+                <button
+                  onClick={() => setProcessingView('processing')}
+                  className={`rounded-[18px] px-3 py-3 text-sm font-bold transition-all ${processingView === 'processing' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
+                >
                   กำลังประมวลผล ({processingVideos.length})
-                </div>
+                </button>
+                <button
+                  onClick={() => setProcessingView('pending')}
+                  className={`rounded-[18px] px-3 py-3 text-sm font-bold transition-all ${processingView === 'pending' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
+                >
+                  รอแปลงลิงก์ ({pendingShortlinkVideos.length})
+                </button>
               </div>
             </div>
 
@@ -4569,6 +4682,78 @@ function App() {
                   <div key={i} className="bg-gray-100 rounded-2xl p-4 h-28 animate-pulse" />
                 ))}
               </div>
+            ) : processingView === 'pending' ? (
+              pendingShortlinkVideos.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-[50vh]">
+                  <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                    <span className="text-4xl grayscale opacity-50">🔗</span>
+                  </div>
+                  <p className="text-gray-900 font-bold text-lg">ยังไม่มีคลิปรอแปลงลิงก์</p>
+                  <p className="text-gray-400 text-sm mt-1 text-center">คลิปที่ยังขาด Lazada link หรือยังแปลง shortlink ไม่ครบจะมาอยู่หน้านี้</p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+                    <div className="flex flex-wrap gap-2">
+                      <span className="rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-700">
+                        ใส่ลิงก์ Lazada แล้ว ({pendingShortlinkWithLazadaVideos.length})
+                      </span>
+                      <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
+                        ยังไม่ได้ใส่ Lazada ({pendingShortlinkMissingLazadaVideos.length})
+                      </span>
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-gray-500">
+                      กลุ่มแรกคือคลิปที่มี Lazada แล้วและกำลังรอแปลง shortlink ให้ครบ กลุ่มที่สองคือคลิปที่ยังต้องใส่ Lazada link ก่อนถึงจะพร้อมเข้า Gallery
+                    </p>
+                  </div>
+
+                  {pendingShortlinkWithLazadaVideos.length > 0 && (
+                    <div>
+                      <p className="mb-3 text-sm font-bold text-gray-900">ใส่ลิงก์ Lazada แล้ว</p>
+                      <div className="grid grid-cols-3 gap-3">
+                        {pendingShortlinkWithLazadaVideos.map((video) => (
+                          <VideoCard
+                            key={`pending-has-${getVideoIdentityKey(video as Video & Record<string, unknown>)}`}
+                            video={video}
+                            currentNamespaceId={namespaceId}
+                            formatDuration={formatDuration}
+                            onDelete={(id, targetNamespaceId) => {
+                              setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                              setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                              setPendingShortlinkVideos((prev) => prev.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                            }}
+                            onUpdate={updateGalleryVideoState}
+                            onExpandedChange={setVideoViewerOpen}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {pendingShortlinkMissingLazadaVideos.length > 0 && (
+                    <div>
+                      <p className="mb-3 text-sm font-bold text-gray-900">ยังไม่ได้ใส่ Lazada</p>
+                      <div className="grid grid-cols-3 gap-3">
+                        {pendingShortlinkMissingLazadaVideos.map((video) => (
+                          <VideoCard
+                            key={`pending-missing-${getVideoIdentityKey(video as Video & Record<string, unknown>)}`}
+                            video={video}
+                            currentNamespaceId={namespaceId}
+                            formatDuration={formatDuration}
+                            onDelete={(id, targetNamespaceId) => {
+                              setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                              setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                              setPendingShortlinkVideos((prev) => prev.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                            }}
+                            onUpdate={updateGalleryVideoState}
+                            onExpandedChange={setVideoViewerOpen}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
             ) : (
               processingVideos.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-[50vh]">
@@ -4597,6 +4782,43 @@ function App() {
 
         {tab === 'gallery' && (
           <div className="px-4">
+            {!isAllOriginalMode && !gallerySearchQuery && (
+              <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+                <div className="flex flex-wrap gap-2">
+                  {systemWideGalleryMode && (
+                    <>
+                      <span className="rounded-full bg-cyan-50 px-3 py-1 text-xs font-bold text-cyan-700">
+                        รวมทุก namespace {systemGalleryLibraryTotal.toLocaleString('th-TH')}
+                      </span>
+                      <span className="rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-700">
+                        มี Lazada {systemGalleryLazadaTotal.toLocaleString('th-TH')}
+                      </span>
+                      <span className="rounded-full bg-orange-50 px-3 py-1 text-xs font-bold text-orange-700">
+                        ไม่มี Lazada {systemGalleryMissingLazadaTotal.toLocaleString('th-TH')}
+                      </span>
+                    </>
+                  )}
+                  <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-700">
+                    คลังทั้งหมด {namespaceGalleryLibraryTotal.toLocaleString('th-TH')}
+                  </span>
+                  {namespaceGalleryInventoryTotal > 0 && namespaceGalleryInventoryTotal !== namespaceGalleryLibraryTotal && (
+                    <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-700">
+                      หลังรวมคลิปซ้ำ {namespaceGalleryInventoryTotal.toLocaleString('th-TH')}
+                    </span>
+                  )}
+                  <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
+                    พร้อมโพสต์ {namespaceGalleryReadyTotal.toLocaleString('th-TH')}
+                  </span>
+                  <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
+                    รอแปลงลิงก์ {processingSummary.pendingTotal.toLocaleString('th-TH')}
+                  </span>
+                </div>
+                <p className="mt-3 text-xs leading-5 text-gray-500">
+                  Gallery จะแสดงเฉพาะคลิปที่มี Shopee และ Lazada ครบพร้อมโพสต์แล้ว ส่วนคลิปที่ยังไม่ครบจะอยู่หน้า Processing
+                </p>
+              </div>
+            )}
+
             {!isAllOriginalMode && gallerySearchQuery && (
               <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
                 <div className="flex flex-wrap gap-2">
@@ -4647,7 +4869,7 @@ function App() {
                     ? 'ยังไม่มีคลิปใน Gallery'
                     : categoryFilter === 'used'
                       ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
-                      : 'ยังไม่มีคลิปในรายการ'}
+                      : 'ยังไม่มีคลิปพร้อมโพสต์'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
                   {gallerySearchQuery
