@@ -4638,28 +4638,6 @@ function App() {
         {tab === 'processing' && (
           <div className="px-4">
             <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-              <div className="flex flex-wrap gap-2">
-                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-700">
-                  คลังทั้งหมด {processingSummary.libraryTotal.toLocaleString('th-TH')}
-                </span>
-                {processingSummary.inventoryTotal > 0 && processingSummary.inventoryTotal !== processingSummary.libraryTotal && (
-                  <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-700">
-                    หลังรวมคลิปซ้ำ {processingSummary.inventoryTotal.toLocaleString('th-TH')}
-                  </span>
-                )}
-                <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
-                  พร้อมโพสต์ {processingSummary.readyTotal.toLocaleString('th-TH')}
-                </span>
-                <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
-                  รอแปลงลิงก์ {processingSummary.pendingTotal.toLocaleString('th-TH')}
-                </span>
-              </div>
-              <p className="mt-3 text-xs leading-5 text-gray-500">
-                หน้า Processing จะรวมคลิปที่ยังขาด Lazada link หรือยังแปลง shortlink ไม่ครบ ส่วนคลิปที่พร้อมโพสต์จะอยู่หน้า Gallery
-              </p>
-            </div>
-
-            <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
               <div className="grid grid-cols-2 gap-1 rounded-2xl bg-gray-100 p-1">
                 <button
                   onClick={() => setProcessingView('processing')}
