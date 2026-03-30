@@ -5395,6 +5395,16 @@ function App() {
                 )}
                 {isOwner && (
                   <SettingsMenuItem
+                    icon="🔗"
+                    title="Shortlink"
+                    subtitle={shortlinkAccountCurrent
+                      ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
+                      : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'}
+                    onClick={() => setSettingsSection('shortlink')}
+                  />
+                )}
+                {isOwner && (
+                  <SettingsMenuItem
                     icon="🔑"
                     title="Gemini API Key"
                     subtitle={
@@ -5442,7 +5452,9 @@ function App() {
                           ? 'Gemini API Key'
                           : settingsSection === 'comment'
                             ? 'Comment Template'
-                            : 'Voice Prompt'}
+                            : settingsSection === 'shortlink'
+                              ? 'Shortlink'
+                              : 'Voice Prompt'}
                   </p>
                 </div>
 
