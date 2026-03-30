@@ -1775,6 +1775,83 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
     }
 }
 
+async function getSystemGalleryInventory(env: Env): Promise<{
+    sourceTotal: number
+    videos: Array<Record<string, unknown>>
+}> {
+    const rawSourceVideos = await getAllSystemGalleryVideos(env)
+    const sourceVideos = dedupeSystemGalleryVideos(rawSourceVideos)
+    const namespaceIds = Array.from(new Set(
+        sourceVideos
+            .map((video) => String((video as Record<string, unknown>).namespace_id || '').trim())
+            .filter(Boolean)
+    ))
+
+    const namespaceRows = await Promise.all(namespaceIds.map(async (namespaceId) => {
+        await seedNamespaceVideoStateFromLegacy(env.DB, namespaceId)
+        const [stateRows, expectedUtmId, expectedLazadaMemberId] = await Promise.all([
+            listNamespaceVideoStates(env.DB, namespaceId),
+            resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, namespaceId).catch(() => ''),
+            resolveNamespaceLazadaExpectedMemberId(env.DB, namespaceId).catch(() => ''),
+        ])
+        return { namespaceId, stateRows, expectedUtmId, expectedLazadaMemberId }
+    }))
+
+    const stateByVideoKey = new Map<string, NamespaceVideoStateRow>()
+    const expectedUtmIdByNamespace = new Map<string, string>()
+    const expectedLazadaMemberIdByNamespace = new Map<string, string>()
+
+    for (const row of namespaceRows) {
+        expectedUtmIdByNamespace.set(row.namespaceId, row.expectedUtmId)
+        expectedLazadaMemberIdByNamespace.set(row.namespaceId, row.expectedLazadaMemberId)
+        for (const state of row.stateRows) {
+            const videoId = String(state.video_id || '').trim()
+            if (!videoId) continue
+            stateByVideoKey.set(`${row.namespaceId}:${videoId}`, state)
+        }
+    }
+
+    const inventoryVideos = sourceVideos.map((video) => {
+        const source = video as Record<string, unknown>
+        const namespaceId = String(source.namespace_id || '').trim()
+        const videoId = String(source.id || '').trim()
+        const row = stateByVideoKey.get(`${namespaceId}:${videoId}`)
+        const expectedUtmId = expectedUtmIdByNamespace.get(namespaceId) || ''
+        const expectedLazadaMemberId = expectedLazadaMemberIdByNamespace.get(namespaceId) || ''
+        const merged = {
+            ...source,
+            id: videoId,
+            namespace_id: namespaceId,
+            sourceNamespaceId: String(source.namespace_id || '').trim() || namespaceId,
+            shopeeLink: String(row?.shopee_link || normalizeMetaShopeeLink(source) || '').trim(),
+            lazadaLink: String(row?.lazada_link || normalizeMetaLazadaLink(source) || '').trim(),
+            shopeeOriginalLink: String(row?.shopee_original_link || source.shopeeOriginalLink || source.shopee_original_link || '').trim(),
+            lazadaOriginalLink: String(row?.lazada_original_link || source.lazadaOriginalLink || source.lazada_original_link || '').trim(),
+            shopeeConvertedAt: String(row?.shopee_converted_at || source.shopeeConvertedAt || source.shopee_converted_at || '').trim(),
+            lazadaConvertedAt: String(row?.lazada_converted_at || source.lazadaConvertedAt || source.lazada_converted_at || '').trim(),
+            lazadaMemberId: String(row?.lazada_member_id || source.lazadaMemberId || source.lazada_member_id || '').trim(),
+            postedAt: String(row?.posted_at || source.postedAt || source.posted_at || '').trim(),
+            shortlink_expected_utm_id: expectedUtmId,
+            lazada_expected_member_id: expectedLazadaMemberId,
+        }
+        const conversionState = getVideoAffiliateConversionState(merged, expectedUtmId, expectedLazadaMemberId)
+        return {
+            ...merged,
+            has_shopee_source: conversionState.hasShopeeSource,
+            shopee_ready: conversionState.shopeeReady,
+            has_lazada_source: conversionState.hasLazadaSource,
+            lazada_ready: conversionState.lazadaReady,
+            gallery_ready: conversionState.galleryReady,
+            pending_bucket: conversionState.hasLazadaSource ? 'has-lazada' : 'missing-lazada',
+        }
+    })
+
+    return {
+        sourceTotal: rawSourceVideos.length,
+        videos: inventoryVideos.sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a)),
+    }
+}
+
 async function clearNamespaceVideoState(db: D1Database, namespaceId: string): Promise<void> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return
@@ -5200,8 +5277,48 @@ app.get('/api/gallery', async (c) => {
 
 app.get('/api/gallery/system', async (c) => {
     try {
-        const videos = await getAllSystemGalleryVideos(c.env)
-        return c.json({ videos }, 200, { 'Cache-Control': 'private, max-age=30', 'Vary': 'x-auth-token' })
+        const token = c.req.header('x-auth-token') || ''
+        if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
+
+        const me = await c.env.DB.prepare(
+            'SELECT email FROM users WHERE session_token = ?'
+        ).bind(token).first() as { email?: string } | null
+        if (!me?.email) return c.json({ error: 'Unauthorized' }, 401)
+
+        const sysAdmin = await isSystemAdmin(c.env.DB, me.email)
+        if (!sysAdmin) return c.json({ error: 'Forbidden' }, 403)
+
+        const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
+        const inventory = await getSystemGalleryInventory(c.env)
+        const allVideos = inventory.videos
+        const readyTotal = allVideos.filter((video) => Boolean((video as Record<string, unknown>).gallery_ready)).length
+        const searchedVideos = searchQuery
+            ? allVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
+            : allVideos
+        const pendingVideos = allVideos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
+        const pendingHasLazadaTotal = pendingVideos.filter((video) =>
+            String((video as Record<string, unknown>).pending_bucket || '').trim() === 'has-lazada'
+        ).length
+        const withLinkTotal = allVideos.filter((video) => hasAffiliateLinkInMeta(video as Record<string, unknown>)).length
+
+        return c.json({
+            videos: searchedVideos,
+            total: searchedVideos.length,
+            overall_total: allVideos.length,
+            ready_total: readyTotal,
+            pending_total: pendingVideos.length,
+            pending_has_lazada_total: pendingHasLazadaTotal,
+            pending_missing_lazada_total: Math.max(0, pendingVideos.length - pendingHasLazadaTotal),
+            inventory_total: allVideos.length,
+            library_total: inventory.sourceTotal,
+            shopee_total: Math.max(0, allVideos.length - readyTotal),
+            lazada_total: readyTotal,
+            with_link_total: withLinkTotal,
+            without_link_total: Math.max(0, allVideos.length - withLinkTotal),
+            has_more: false,
+            offset: 0,
+            limit: searchedVideos.length,
+        }, 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
     }
