@@ -2766,7 +2766,6 @@ function App() {
 
 
   const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('unused')
-  const [processingView, setProcessingView] = useState<'processing' | 'pending'>('processing')
   const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
@@ -4287,21 +4286,6 @@ function App() {
       galleryAvailableVideos: availableVideos,
     }
   }, [videos, usedVideos, usedVideoIdSet, pendingShortlinkIdentitySet, systemWideGalleryMode, categoryFilter, gallerySearchQuery])
-  const pendingShortlinkWithLazadaVideos = useMemo(() => {
-    return pendingShortlinkVideos.filter((video) => {
-      const row = video as Video & Record<string, unknown>
-      if (String(row.pending_bucket || '').trim() === 'has-lazada') return true
-      return !!getVideoSourceLazadaLink(row) || !!getVideoLazadaLink(row)
-    })
-  }, [pendingShortlinkVideos])
-  const pendingShortlinkMissingLazadaVideos = useMemo(() => {
-    const withLazadaKeys = new Set(
-      pendingShortlinkWithLazadaVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>))
-    )
-    return pendingShortlinkVideos.filter((video) =>
-      !withLazadaKeys.has(getVideoIdentityKey(video as Video & Record<string, unknown>))
-    )
-  }, [pendingShortlinkVideos, pendingShortlinkWithLazadaVideos])
   const showGalleryFilterBar = tab === 'gallery' && (
     !systemWideGalleryMode && (
       galleryLoading ||
@@ -4641,123 +4625,32 @@ function App() {
 
         {tab === 'processing' && (
           <div className="px-4">
-            <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-              <div className="grid grid-cols-2 gap-1 rounded-2xl bg-gray-100 p-1">
-                <button
-                  onClick={() => setProcessingView('processing')}
-                  className={`rounded-[18px] px-3 py-3 text-sm font-bold transition-all ${processingView === 'processing' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
-                >
-                  กำลังประมวลผล ({processingVideos.length})
-                </button>
-                <button
-                  onClick={() => setProcessingView('pending')}
-                  className={`rounded-[18px] px-3 py-3 text-sm font-bold transition-all ${processingView === 'pending' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
-                >
-                  รอแปลงลิงก์ ({pendingShortlinkVideos.length})
-                </button>
-              </div>
-            </div>
-
             {loading ? (
               <div className="space-y-3">
                 {[1, 2].map(i => (
                   <div key={i} className="bg-gray-100 rounded-2xl p-4 h-28 animate-pulse" />
                 ))}
               </div>
-            ) : processingView === 'pending' ? (
-              pendingShortlinkVideos.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-[50vh]">
-                  <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                    <span className="text-4xl grayscale opacity-50">🔗</span>
-                  </div>
-                  <p className="text-gray-900 font-bold text-lg">ยังไม่มีคลิปรอแปลงลิงก์</p>
-                  <p className="text-gray-400 text-sm mt-1 text-center">คลิปที่ยังขาด Lazada link หรือยังแปลง shortlink ไม่ครบจะมาอยู่หน้านี้</p>
+            ) : processingVideos.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-[50vh]">
+                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                  <span className="text-4xl grayscale opacity-50">⚙️</span>
                 </div>
-              ) : (
-                <div className="space-y-4">
-                  <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-                    <div className="flex flex-wrap gap-2">
-                      <span className="rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-700">
-                        ใส่ลิงก์ Lazada แล้ว ({pendingShortlinkWithLazadaVideos.length})
-                      </span>
-                      <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
-                        ยังไม่ได้ใส่ Lazada ({pendingShortlinkMissingLazadaVideos.length})
-                      </span>
-                    </div>
-                    <p className="mt-3 text-xs leading-5 text-gray-500">
-                      กลุ่มแรกคือคลิปที่มี Lazada แล้วและกำลังรอแปลง shortlink ให้ครบ กลุ่มที่สองคือคลิปที่ยังต้องใส่ Lazada link ก่อนถึงจะพร้อมเข้า Gallery
-                    </p>
-                  </div>
-
-                  {pendingShortlinkWithLazadaVideos.length > 0 && (
-                    <div>
-                      <p className="mb-3 text-sm font-bold text-gray-900">ใส่ลิงก์ Lazada แล้ว</p>
-                      <div className="grid grid-cols-3 gap-3">
-                        {pendingShortlinkWithLazadaVideos.map((video) => (
-                          <VideoCard
-                            key={`pending-has-${getVideoIdentityKey(video as Video & Record<string, unknown>)}`}
-                            video={video}
-                            currentNamespaceId={namespaceId}
-                            formatDuration={formatDuration}
-                            onDelete={(id, targetNamespaceId) => {
-                              setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                              setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                              setPendingShortlinkVideos((prev) => prev.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                            }}
-                            onUpdate={updateGalleryVideoState}
-                            onExpandedChange={setVideoViewerOpen}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {pendingShortlinkMissingLazadaVideos.length > 0 && (
-                    <div>
-                      <p className="mb-3 text-sm font-bold text-gray-900">ยังไม่ได้ใส่ Lazada</p>
-                      <div className="grid grid-cols-3 gap-3">
-                        {pendingShortlinkMissingLazadaVideos.map((video) => (
-                          <VideoCard
-                            key={`pending-missing-${getVideoIdentityKey(video as Video & Record<string, unknown>)}`}
-                            video={video}
-                            currentNamespaceId={namespaceId}
-                            formatDuration={formatDuration}
-                            onDelete={(id, targetNamespaceId) => {
-                              setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                              setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                              setPendingShortlinkVideos((prev) => prev.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                            }}
-                            onUpdate={updateGalleryVideoState}
-                            onExpandedChange={setVideoViewerOpen}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )
+                <p className="text-gray-900 font-bold text-lg">No Processing Videos</p>
+                <p className="text-gray-400 text-sm mt-1">Videos currently being dubbed will appear here</p>
+              </div>
             ) : (
-              processingVideos.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-[50vh]">
-                  <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                    <span className="text-4xl grayscale opacity-50">⚙️</span>
-                  </div>
-                  <p className="text-gray-900 font-bold text-lg">No Processing Videos</p>
-                  <p className="text-gray-400 text-sm mt-1">Videos currently being dubbed will appear here</p>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {processingVideos.map((video: any) => (
-                    <ProcessingCard
-                      key={video.id}
-                      video={video}
-                      onCancel={handleCancelJob}
-                      onReprocess={handleReprocessJob}
-                      retrying={retryingProcessingId === video.id}
-                    />
-                  ))}
-                </div>
-              )
+              <div className="space-y-3">
+                {processingVideos.map((video: any) => (
+                  <ProcessingCard
+                    key={video.id}
+                    video={video}
+                    onCancel={handleCancelJob}
+                    onReprocess={handleReprocessJob}
+                    retrying={retryingProcessingId === video.id}
+                  />
+                ))}
+              </div>
             )}
           </div>
         )}
