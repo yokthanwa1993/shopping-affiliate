@@ -167,6 +167,7 @@ interface Video {
   lazadaMemberId?: string
   category?: string
   title?: string
+  postedAt?: string
   keepInPostedTab?: boolean
 }
 
@@ -343,7 +344,7 @@ interface FacebookPage {
   updated_at?: string
 }
 
-type GalleryFilter = 'missing-link' | 'unused' | 'used' | 'all-original'
+type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type GeminiKeySource = 'workspace' | 'none'
 type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment'
 
@@ -2708,6 +2709,7 @@ function App() {
   }
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(getInitialSettingsSection)
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
+  const [isSystemAdmin, setIsSystemAdmin] = useState(false)
   const [postHistory, setPostHistory] = useState<PostHistory[]>(() => {
     const ns = getStoredNamespace()
     if (ns) return readCache<PostHistory[]>(nsCacheKey('history', ns), [])
@@ -2843,6 +2845,7 @@ function App() {
   const galleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const systemGalleryRequestRef = useRef(0)
   const systemGalleryLoadedCountRef = useRef(videos.length)
+  const systemAdminGalleryDefaultAppliedRef = useRef(false)
   const deferredGallerySearchInput = useDeferredValue(gallerySearchInput)
   const gallerySearchQuery = useMemo(
     () => normalizeGallerySearchQuery(deferredGallerySearchInput),
@@ -3040,6 +3043,7 @@ function App() {
     })
     setMeEmail('')
     setIsOwner(false)
+    setIsSystemAdmin(false)
     setTeamMembers([])
     setNewMemberEmail('')
     setCommentTemplate(DEFAULT_COMMENT_TEMPLATE)
@@ -3066,6 +3070,9 @@ function App() {
           if (meResp.ok) {
             const me = await meResp.json().catch(() => ({})) as any
             const ns = String(me?.namespace_id || '').trim()
+            setIsOwner(!!me?.is_owner)
+            setIsSystemAdmin(!!me?.is_system_admin)
+            if (me?.email) setMeEmail(String(me.email))
             if (ns) {
               setNamespaceId(ns)
               hydrateNamespaceCaches(ns)
@@ -3097,6 +3104,9 @@ function App() {
               if (meResp.ok) {
                 const me = await meResp.json().catch(() => ({})) as any
                 const ns = String(me?.namespace_id || '').trim()
+                setIsOwner(!!me?.is_owner)
+                setIsSystemAdmin(!!me?.is_system_admin)
+                if (me?.email) setMeEmail(String(me.email))
                 if (ns) {
                   setNamespaceId(ns)
                   hydrateNamespaceCaches(ns)
@@ -3200,6 +3210,16 @@ function App() {
       setCategoryFilter('missing-lazada')
     }
   }, [isOwner, categoryFilter])
+
+  useEffect(() => {
+    if (!systemWideGalleryMode || !isSystemAdmin) {
+      systemAdminGalleryDefaultAppliedRef.current = false
+      return
+    }
+    if (systemAdminGalleryDefaultAppliedRef.current) return
+    systemAdminGalleryDefaultAppliedRef.current = true
+    setCategoryFilter('ready')
+  }, [systemWideGalleryMode, isSystemAdmin])
 
   async function recoverSessionOrLogout() {
     clearSession()
@@ -3339,6 +3359,58 @@ function App() {
     if (!session) return
 
     const reset = !!options.reset
+    const useAdminSystemRoute = systemWideGalleryMode && isSystemAdmin
+    if (useAdminSystemRoute) {
+      if (reset) {
+        setGalleryLoading(true)
+      }
+      setGalleryLoadingMore(false)
+      try {
+        const params = new URLSearchParams()
+        if (gallerySearchQuery) params.set('q', gallerySearchQuery)
+        const resp = await apiFetch(`${WORKER_URL}/api/gallery/system${params.toString() ? `?${params.toString()}` : ''}`)
+        if (resp.status === 401) {
+          await recoverSessionOrLogout()
+          return
+        }
+        if (resp.status === 403) {
+          setVideos([])
+          setUsedVideos([])
+          setPendingShortlinkVideos([])
+          setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+          setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+          setSystemGalleryHasMore(false)
+          return
+        }
+        if (!resp.ok) return
+
+        const data = await resp.json() as GalleryPageResponse
+        const nextVideos = Array.isArray(data.videos) ? data.videos : []
+        setVideos(dedupeGalleryVideos(nextVideos))
+        setUsedVideos([])
+        setPendingShortlinkVideos([])
+        setSystemGalleryStats({
+          total: Number(data.total || 0),
+          shopeeTotal: Number(data.shopee_total || 0),
+          lazadaTotal: Number(data.lazada_total || 0),
+          withLink: Number(data.with_link_total || 0),
+          withoutLink: Number(data.without_link_total || 0),
+        })
+        setGallerySummary({
+          libraryTotal: Number(data.library_total || 0),
+          inventoryTotal: Number(data.inventory_total || 0),
+          readyTotal: Number(data.ready_total || 0),
+        })
+        setSystemGalleryHasMore(false)
+      } catch {
+        // Keep current gallery snapshot on transient errors.
+      } finally {
+        setGalleryLoading(false)
+        setGalleryLoadingMore(false)
+      }
+      return
+    }
+
     const requestId = reset ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
     if (reset) {
       setGalleryLoading(true)
@@ -3491,7 +3563,7 @@ function App() {
 
     void loadUsedVideos({ force: categoryFilter === 'used' })
     if (isOwner) void loadGlobalOriginalVideos()
-  }, [tab, categoryFilter, token, authBootstrapping, isOwner, systemWideGalleryMode, gallerySearchQuery])
+  }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3565,6 +3637,7 @@ function App() {
         const me = await meResp.json() as any
         if (requestId === loadTeamRequestRef.current) {
           setIsOwner(!!me.is_owner)
+          setIsSystemAdmin(!!me.is_system_admin)
           if (me.email) setMeEmail(me.email)
           const ns = String(me.namespace_id || '').trim()
           if (ns && ns !== namespaceId) {
@@ -4228,14 +4301,9 @@ function App() {
 
   }
 
-  const pendingShortlinkIdentitySet = useMemo(() => {
-    return new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
-  }, [pendingShortlinkVideos])
-
-  const usedVideoIdSet = useMemo(() => {
-    return new Set(usedVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
-  }, [usedVideos])
   const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
+  const hasVideoBeenPosted = (video: Partial<Video> & Record<string, unknown>) =>
+    !!String(video.postedAt || video.posted_at || '').trim()
   const {
     galleryMissingLazadaVideos,
     galleryPendingShortlinkVideos,
@@ -4253,7 +4321,9 @@ function App() {
     const postedVideos = sortNewestFirst(
       dedupeGalleryVideos([
         ...usedVideos,
-        ...sourceVideos.filter((video) => isKeepInPostedTab(video)),
+        ...sourceVideos.filter((video) =>
+          isKeepInPostedTab(video) || hasVideoBeenPosted(video as Video & Record<string, unknown>)
+        ),
       ])
     )
     const postedIdentitySet = new Set(postedVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
@@ -4273,7 +4343,10 @@ function App() {
       activeVideos.filter((video) => {
         const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
         const row = video as Video & Record<string, unknown>
-        return !pendingIdentitySet.has(key) && !!getVideoSourceLazadaLink(row)
+        const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
+        const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
+        const conversionState = getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId)
+        return !pendingIdentitySet.has(key) && conversionState.galleryReady
       })
     )
 
@@ -4284,7 +4357,9 @@ function App() {
         const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
         if (missingSet.has(key) || readySet.has(key)) return false
         const row = video as Video & Record<string, unknown>
-        return !!getVideoSourceLazadaLink(row) || !!getVideoLazadaLink(row) || pendingIdentitySet.has(key)
+        const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
+        const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
+        return isVideoAwaitingAffiliateConversion(row, expectedUtmId, expectedLazadaMemberId) || pendingIdentitySet.has(key)
       })
     )
 
@@ -4306,9 +4381,10 @@ function App() {
       galleryUsedVideos: postedVideos,
       galleryAvailableVideos: availableVideos,
     }
-  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery])
+  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery, shortlinkExpectedUtmIdCurrent, lazadaExpectedMemberIdCurrent])
+  const useSystemWideAdminGallery = systemWideGalleryMode && isSystemAdmin
   const showGalleryFilterBar = tab === 'gallery' && (
-    !systemWideGalleryMode && (
+    (useSystemWideAdminGallery || !systemWideGalleryMode) && (
       galleryLoading ||
       (galleryMissingLazadaVideos.length > 0 || galleryPendingShortlinkVideos.length > 0 || galleryReadyVideos.length > 0 || galleryUsedVideos.length > 0)
     )
@@ -4320,16 +4396,17 @@ function App() {
   const galleryViewTotal = galleryAvailableVideos.length
   const namespaceGalleryLibraryTotal = processingSummary.libraryTotal
   const namespaceGalleryInventoryTotal = processingSummary.inventoryTotal
-  const namespaceGalleryReadyTotal = processingSummary.readyTotal
   const systemGalleryLibraryTotal = gallerySummary.libraryTotal
   const systemGalleryLazadaTotal = Number(systemGalleryStats.lazadaTotal || 0)
   const systemGalleryMissingLazadaTotal = Math.max(0, systemGalleryLibraryTotal - systemGalleryLazadaTotal)
+  const gallerySummaryLibraryTotal = useSystemWideAdminGallery ? systemGalleryLibraryTotal : namespaceGalleryLibraryTotal
+  const gallerySummaryInventoryTotal = useSystemWideAdminGallery ? gallerySummary.inventoryTotal : namespaceGalleryInventoryTotal
   const galleryVisibleVideos = useMemo(() => {
     if (systemWideGalleryMode) return galleryAvailableVideos
     return galleryAvailableVideos.slice(0, galleryVisibleCount)
   }, [systemWideGalleryMode, galleryAvailableVideos, galleryVisibleCount])
   const galleryHasMore = systemWideGalleryMode
-    ? systemGalleryHasMore
+    ? (useSystemWideAdminGallery ? false : systemGalleryHasMore)
     : galleryVisibleVideos.length < galleryAvailableVideos.length
   const galleryCurrentTotal = galleryViewTotal
   const appViewportStyle = {
@@ -4496,7 +4573,7 @@ function App() {
                 ไม่มีลิ้งลา ({galleryMissingLazadaVideos.length})
               </button>
               <button
-                onClick={() => setCategoryFilter('used')}
+                onClick={() => setCategoryFilter('pending-shortlink')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'pending-shortlink' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
                 รอย่อลิ้ง ({galleryPendingShortlinkVideos.length})
@@ -4691,7 +4768,7 @@ function App() {
             {!isAllOriginalMode && !gallerySearchQuery && (
               <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
                 <div className="flex flex-wrap gap-2">
-                  {systemWideGalleryMode && (
+                  {useSystemWideAdminGallery && (
                     <>
                       <span className="rounded-full bg-cyan-50 px-3 py-1 text-xs font-bold text-cyan-700">
                         รวมทุก namespace {systemGalleryLibraryTotal.toLocaleString('th-TH')}
@@ -4705,11 +4782,11 @@ function App() {
                     </>
                   )}
                   <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-700">
-                    คลังทั้งหมด {namespaceGalleryLibraryTotal.toLocaleString('th-TH')}
+                    คลังทั้งหมด {gallerySummaryLibraryTotal.toLocaleString('th-TH')}
                   </span>
-                  {namespaceGalleryInventoryTotal > 0 && namespaceGalleryInventoryTotal !== namespaceGalleryLibraryTotal && (
+                  {gallerySummaryInventoryTotal > 0 && gallerySummaryInventoryTotal !== gallerySummaryLibraryTotal && (
                     <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-700">
-                      หลังรวมคลิปซ้ำ {namespaceGalleryInventoryTotal.toLocaleString('th-TH')}
+                      หลังรวมคลิปซ้ำ {gallerySummaryInventoryTotal.toLocaleString('th-TH')}
                     </span>
                   )}
                   <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
@@ -4720,7 +4797,9 @@ function App() {
                   </span>
                 </div>
                 <p className="mt-3 text-xs leading-5 text-gray-500">
-                  Flow ใหม่: ไม่มีลิ้งลา → รอย่อลิ้ง → รอโพสต์ → โพสต์แล้ว และทุกแท็บรวมกันคือจำนวนวิดีโอทั้งหมดของระบบ
+                  {useSystemWideAdminGallery
+                    ? 'Flow ใหม่: ไม่มีลิ้งลา → รอย่อลิ้ง → รอโพสต์ → โพสต์แล้ว และทุกแท็บรวมกันคือจำนวนวิดีโอทั้งหมดของระบบ'
+                    : 'Flow ใหม่: ไม่มีลิ้งลา → รอย่อลิ้ง → รอโพสต์ → โพสต์แล้ว ภายใน workspace นี้'}
                 </p>
               </div>
             )}
@@ -4771,7 +4850,7 @@ function App() {
                 <p className="text-gray-900 font-bold text-lg">
                   {gallerySearchQuery
                     ? 'ไม่พบคลิปที่ค้นหา'
-                    : systemWideGalleryMode
+                    : useSystemWideAdminGallery && !showGalleryFilterBar
                     ? 'ยังไม่มีคลิปใน Gallery'
                     : categoryFilter === 'used'
                       ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
@@ -4784,7 +4863,7 @@ function App() {
                 <p className="text-gray-400 text-sm mt-1">
                   {gallerySearchQuery
                     ? 'ลองค้นหาด้วย video id หรือคำจากชื่อคลิปใหม่อีกครั้ง'
-                    : systemWideGalleryMode
+                    : useSystemWideAdminGallery && !showGalleryFilterBar
                     ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
                       ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
@@ -4803,7 +4882,7 @@ function App() {
                       key={getVideoIdentityKey(video as unknown as Record<string, unknown>)}
                       video={video}
                       currentNamespaceId={namespaceId}
-                      showWorkspaceBadge={systemWideGalleryMode}
+                      showWorkspaceBadge={useSystemWideAdminGallery}
                       formatDuration={formatDuration}
                       keepInPostedOnLinkSave={!systemWideGalleryMode && categoryFilter === 'used'}
                       onDelete={(id, targetNamespaceId) => {
