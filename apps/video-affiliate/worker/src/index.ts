@@ -134,6 +134,18 @@ app.use('*', async (c, next) => {
     await next();
 })
 
+async function isSystemAdmin(db: D1Database, email: string): Promise<boolean> {
+    const row = await db.prepare('SELECT 1 AS ok FROM system_admins WHERE email = ? LIMIT 1')
+        .bind(String(email || '').trim().toLowerCase()).first()
+    return !!row
+}
+
+async function isNamespaceOwner(db: D1Database, email: string): Promise<boolean> {
+    const row = await db.prepare('SELECT 1 AS ok FROM email_namespaces WHERE email = ? LIMIT 1')
+        .bind(String(email || '').trim().toLowerCase()).first()
+    return !!row
+}
+
 async function requireOwnerSession(c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>) {
     const token = c.req.header('x-auth-token') || ''
     if (!token.startsWith('sess_')) {
@@ -143,8 +155,8 @@ async function requireOwnerSession(c: Context<{ Bindings: Env, Variables: { botI
     if (!user?.email) {
         return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
     }
-    const isOwner = await c.env.DB.prepare('SELECT 1 AS ok FROM allowed_emails WHERE email = ?').bind(String(user.email).trim().toLowerCase()).first()
-    if (!isOwner) {
+    const ownerOk = await isNamespaceOwner(c.env.DB, user.email)
+    if (!ownerOk) {
         return { ok: false as const, response: c.json({ error: 'Forbidden' }, 403) }
     }
     return { ok: true as const }
@@ -399,21 +411,6 @@ async function resolveOwnerEmailForNamespace(db: D1Database, namespaceId: string
         // ignore older db states
     }
 
-    const allowed = await db.prepare(
-        `SELECT ae.email
-         FROM allowed_emails ae
-         WHERE EXISTS (
-            SELECT 1
-            FROM users u
-            WHERE u.email = ae.email
-              AND u.namespace_id = ?
-         )
-         ORDER BY datetime(ae.created_at) DESC
-         LIMIT 1`
-    ).bind(normalizedNamespaceId).first() as { email?: string } | null
-    const allowedEmail = String(allowed?.email || '').trim().toLowerCase()
-    if (allowedEmail) return allowedEmail
-
     const user = await db.prepare(
         `SELECT email
          FROM users
@@ -489,7 +486,6 @@ async function provisionTelegramOwnerSession(
     const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedBotScope)
     if (!ownerEmail) return null
 
-    await db.prepare('INSERT OR IGNORE INTO allowed_emails (email) VALUES (?)').bind(ownerEmail).run().catch(() => { })
     await upsertOwnerNamespaceMapping(db, ownerEmail, normalizedBotScope).catch(() => { })
 
     const sessionToken = 'sess_' + crypto.randomUUID().replace(/-/g, '')
@@ -1493,8 +1489,9 @@ function getVideoThumbnailUrlForNamespace(r2BaseUrl: string, namespaceId: string
 
 async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
-    void db
-    return !!normalizedNamespaceId
+    if (!normalizedNamespaceId) return false
+    const settings = await getNamespaceShopeeShortlinkSettings(db, normalizedNamespaceId).catch(() => null)
+    return !!String(settings?.base_url || '').trim() && !!String(settings?.lazada_base_url || '').trim()
 }
 
 function isUnifiedGalleryEnabled(): boolean {
@@ -1712,10 +1709,23 @@ async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promis
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return []
 
+    const inventory = await getNamespaceGalleryInventory(env, normalizedNamespaceId)
+    return inventory.videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready)
+}
+
+async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Promise<{
+    sourceTotal: number
+    videos: Array<Record<string, unknown>>
+}> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return { sourceTotal: 0, videos: [] }
+
     await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId)
-    const [sourceVideos, stateRows] = await Promise.all([
+    const [sourceVideos, stateRows, expectedUtmId, expectedLazadaMemberId] = await Promise.all([
         getAllSystemGalleryVideos(env),
         listNamespaceVideoStates(env.DB, normalizedNamespaceId),
+        resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, normalizedNamespaceId).catch(() => ''),
+        resolveNamespaceLazadaExpectedMemberId(env.DB, normalizedNamespaceId).catch(() => ''),
     ])
 
     const stateByVideoId = new Map(
@@ -1724,13 +1734,14 @@ async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promis
             .filter(([videoId]) => !!videoId)
     )
 
-    const readyVideos = dedupeSystemGalleryVideos(sourceVideos)
+    const namespaceSourceVideos = sourceVideos
         .filter((video) => String((video as Record<string, unknown>).namespace_id || '').trim() === normalizedNamespaceId)
+    const inventoryVideos = dedupeSystemGalleryVideos(namespaceSourceVideos)
         .map((video) => {
             const source = video as Record<string, unknown>
             const videoId = String(source.id || '').trim()
             const row = stateByVideoId.get(videoId)
-            return {
+            const merged = {
                 ...source,
                 id: videoId,
                 namespace_id: normalizedNamespaceId,
@@ -1743,11 +1754,25 @@ async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promis
                 lazadaConvertedAt: String(row?.lazada_converted_at || source.lazadaConvertedAt || source.lazada_converted_at || '').trim(),
                 lazadaMemberId: String(row?.lazada_member_id || source.lazadaMemberId || source.lazada_member_id || '').trim(),
                 postedAt: String(row?.posted_at || source.postedAt || source.posted_at || '').trim(),
+                shortlink_expected_utm_id: expectedUtmId,
+                lazada_expected_member_id: expectedLazadaMemberId,
+            }
+            const conversionState = getVideoAffiliateConversionState(merged, expectedUtmId, expectedLazadaMemberId)
+            return {
+                ...merged,
+                has_shopee_source: conversionState.hasShopeeSource,
+                shopee_ready: conversionState.shopeeReady,
+                has_lazada_source: conversionState.hasLazadaSource,
+                lazada_ready: conversionState.lazadaReady,
+                gallery_ready: conversionState.galleryReady,
+                pending_bucket: conversionState.hasLazadaSource ? 'has-lazada' : 'missing-lazada',
             }
         })
-        .filter((video) => getVideoAffiliateConversionState(video).galleryReady)
 
-    return readyVideos.sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a))
+    return {
+        sourceTotal: namespaceSourceVideos.length,
+        videos: inventoryVideos.sort((a, b) => getGalleryVideoSortMs(b) - getGalleryVideoSortMs(a)),
+    }
 }
 
 async function clearNamespaceVideoState(db: D1Database, namespaceId: string): Promise<void> {
@@ -1969,39 +1994,30 @@ async function issueAdminAccessTokenForLaunch(env: Env, launchTokenRaw: string):
 async function buildAdminDataPayload(env: Env) {
     const teamsRes = await env.DB.prepare(
         `SELECT
-            ae.email,
-            ae.created_at,
+            en.email,
+            en.created_at,
+            en.namespace_id,
             (
                 SELECT u.telegram_id
                 FROM users u
-                WHERE u.email = ae.email
+                WHERE u.email = en.email
                 ORDER BY datetime(u.created_at) DESC, u.telegram_id DESC
                 LIMIT 1
             ) AS telegram_id,
-            COALESCE(
-                (
-                    SELECT en.namespace_id
-                    FROM email_namespaces en
-                    WHERE en.email = ae.email
-                    LIMIT 1
-                ),
-                (
-                    SELECT u2.namespace_id
-                    FROM users u2
-                    WHERE u2.email = ae.email
-                    ORDER BY datetime(u2.created_at) ASC, u2.telegram_id ASC
-                    LIMIT 1
-                )
-            ) AS namespace_id,
             EXISTS(
                 SELECT 1
                 FROM users us
-                WHERE us.email = ae.email
+                WHERE us.email = en.email
                   AND us.session_token IS NOT NULL
                   AND TRIM(us.session_token) <> ''
-            ) AS active_session
-         FROM allowed_emails ae
-         ORDER BY ae.created_at DESC`
+            ) AS active_session,
+            EXISTS(
+                SELECT 1
+                FROM system_admins sa
+                WHERE sa.email = en.email
+            ) AS is_system_admin
+         FROM email_namespaces en
+         ORDER BY en.created_at DESC`
     ).all()
 
     const pagesTotalRes = await env.DB.prepare(
@@ -2256,6 +2272,99 @@ app.use('/admin/api/*', adminAuthMiddleware)
 
 app.get('/admin/api/ping', async (c) => {
     return c.json({ ok: true, now: new Date().toISOString() })
+})
+
+// One-time migration: unify namespace IDs to timestamp+random format
+app.post('/admin/api/migrate-namespaces', async (c) => {
+    const db = c.env.DB
+    const bucket = c.env.BUCKET
+
+    // Find namespace IDs that are NOT in timestamp+random format (19 digits)
+    const allNamespaces = await db.prepare(
+        'SELECT DISTINCT namespace_id FROM email_namespaces'
+    ).all() as { results: Array<{ namespace_id: string }> }
+
+    const toMigrate: Array<{ oldId: string; newId: string }> = []
+    for (const row of allNamespaces.results || []) {
+        const nsId = String(row.namespace_id || '').trim()
+        // Valid format: 19-digit numeric string (13-digit timestamp + 6-digit random)
+        if (!nsId || /^\d{16,20}$/.test(nsId)) continue
+        const newId = createOwnerWorkspaceId()
+        toMigrate.push({ oldId: nsId, newId })
+    }
+
+    if (toMigrate.length === 0) {
+        return c.json({ ok: true, message: 'No namespaces need migration', migrated: [] })
+    }
+
+    const results: Array<{ oldId: string; newId: string; tables: Record<string, number>; r2_copied: number }> = []
+
+    for (const { oldId, newId } of toMigrate) {
+        const tables: Record<string, number> = {}
+
+        // Update all DB tables
+        const updates: Array<{ table: string; sql: string }> = [
+            { table: 'email_namespaces', sql: 'UPDATE email_namespaces SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'users', sql: 'UPDATE users SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'team_members', sql: 'UPDATE team_members SET owner_namespace_id = ? WHERE owner_namespace_id = ?' },
+            { table: 'namespace_settings', sql: 'UPDATE namespace_settings SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'pages', sql: 'UPDATE pages SET bot_id = ? WHERE bot_id = ?' },
+            { table: 'post_queue', sql: 'UPDATE post_queue SET bot_id = ? WHERE bot_id = ?' },
+            { table: 'post_history', sql: 'UPDATE post_history SET bot_id = ? WHERE bot_id = ?' },
+            { table: 'gallery_index', sql: 'UPDATE gallery_index SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'namespace_video_state', sql: 'UPDATE namespace_video_state SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'link_submissions', sql: 'UPDATE link_submissions SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'telegram_bot_sessions(namespace)', sql: 'UPDATE telegram_bot_sessions SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'telegram_bot_sessions(scope)', sql: 'UPDATE telegram_bot_sessions SET bot_scope = ? WHERE bot_scope = ?' },
+        ]
+
+        for (const { table, sql } of updates) {
+            try {
+                const result = await db.prepare(sql).bind(newId, oldId).run()
+                tables[table] = Number(result?.meta?.changes || 0)
+            } catch (e) {
+                tables[table + '_error'] = 0
+            }
+        }
+
+        // Migrate R2 objects: copy from old prefix to new prefix
+        let r2Copied = 0
+        let cursor: string | undefined
+        const oldKeys: string[] = []
+        while (true) {
+            const listRes = await bucket.list({ prefix: `${oldId}/`, cursor, limit: 100 })
+            for (const obj of listRes.objects || []) {
+                const oldKey = obj.key
+                const newKey = `${newId}/${oldKey.substring(oldId.length + 1)}`
+                try {
+                    const data = await bucket.get(oldKey)
+                    if (data) {
+                        await bucket.put(newKey, data.body, {
+                            httpMetadata: data.httpMetadata,
+                            customMetadata: data.customMetadata,
+                        })
+                        oldKeys.push(oldKey)
+                        r2Copied++
+                    }
+                } catch { /* skip failed copies */ }
+            }
+            if (!listRes.truncated) break
+            cursor = listRes.cursor
+            if (!cursor) break
+        }
+
+        // Delete old R2 objects after successful copy
+        if (oldKeys.length > 0) {
+            for (let i = 0; i < oldKeys.length; i += 100) {
+                const batch = oldKeys.slice(i, i + 100)
+                await bucket.delete(batch).catch(() => { })
+            }
+        }
+
+        results.push({ oldId, newId, tables, r2_copied: r2Copied })
+    }
+
+    return c.json({ ok: true, migrated: results })
 })
 
 app.get('/admin/api/gallery/index/status', async (c) => {
@@ -2612,27 +2721,24 @@ app.post('/admin/api/emails', async (c) => {
         return c.json({ error: `Password must be at least ${MIN_OWNER_PASSWORD_LENGTH} characters` }, 400)
     }
 
-    const existingAllowed = await c.env.DB.prepare(
-        'SELECT email FROM allowed_emails WHERE email = ? LIMIT 1'
-    ).bind(emailLower).first() as { email?: string } | null
+    const existingNamespace = await c.env.DB.prepare(
+        'SELECT namespace_id FROM email_namespaces WHERE email = ? LIMIT 1'
+    ).bind(emailLower).first() as { namespace_id?: string } | null
     const existingUsers = await c.env.DB.prepare(
         'SELECT COUNT(*) AS total FROM users WHERE email = ?'
     ).bind(emailLower).first() as { total?: number } | null
 
-    const insertedAllowed = !existingAllowed?.email
+    const isNew = !existingNamespace?.namespace_id
     const insertedUser = Number(existingUsers?.total || 0) === 0
 
     try {
-        if (insertedAllowed) {
-            await c.env.DB.prepare('INSERT OR IGNORE INTO allowed_emails (email) VALUES (?)').bind(emailLower).run()
-        }
-        if (insertedAllowed) {
+        if (isNew) {
             await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(emailLower).run().catch(() => { })
         }
         const namespaceId = await ensureOwnerWorkspaceUsesEmailNamespace(
             c.env.DB,
             emailLower,
-            { preferExistingNamespace: !insertedAllowed }
+            { preferExistingNamespace: !isNew }
         )
 
         await c.env.DB.prepare('UPDATE users SET namespace_id = ? WHERE email = ?')
@@ -2644,13 +2750,16 @@ app.post('/admin/api/emails', async (c) => {
             ).bind(emailLower, namespaceId).run()
         }
 
+        // Keep allowed_emails in sync for backward compatibility during transition
+        await c.env.DB.prepare('INSERT OR IGNORE INTO allowed_emails (email) VALUES (?)').bind(emailLower).run().catch(() => { })
+
         await provisionBrowserSavingOwnerAccount(c.env, emailLower, rawPassword)
 
         return c.json({
             ok: true,
             email: emailLower,
             namespace_id: namespaceId,
-            created: insertedAllowed || insertedUser,
+            created: isNew || insertedUser,
         })
     } catch (error) {
         if (insertedUser) {
@@ -2658,8 +2767,8 @@ app.post('/admin/api/emails', async (c) => {
                 "DELETE FROM users WHERE email = ? AND (session_token IS NULL OR TRIM(session_token) = '')"
             ).bind(emailLower).run().catch(() => { })
         }
-        if (insertedAllowed) {
-            await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(emailLower).run().catch(() => { })
+        if (isNew) {
+            await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(emailLower).run().catch(() => { })
         }
         return c.json({ error: error instanceof Error ? error.message : String(error) }, 500)
     }
@@ -2676,7 +2785,7 @@ app.put('/admin/api/emails/:email/password', async (c) => {
     }
 
     const owner = await c.env.DB.prepare(
-        'SELECT email FROM allowed_emails WHERE email = ? LIMIT 1'
+        'SELECT email FROM email_namespaces WHERE email = ? LIMIT 1'
     ).bind(email).first() as { email?: string } | null
 
     if (!owner?.email) {
@@ -2696,10 +2805,8 @@ app.delete('/admin/api/users/:email', async (c) => {
     // Fallback: legacy behavior if we cannot resolve a namespace.
     if (!namespaceId) {
         await c.env.DB.prepare('DELETE FROM users WHERE email = ?').bind(email).run()
-        try {
-            await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run()
-        } catch { /* ignore when migration is not applied yet */ }
-        await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(email).run()
+        await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run().catch(() => { })
+        await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(email).run().catch(() => { })
         await c.env.DB.prepare('DELETE FROM team_members WHERE email = ?').bind(email).run()
         return c.json({ ok: true, mode: 'legacy_user_delete' })
     }
@@ -2728,11 +2835,12 @@ app.delete('/admin/api/users/:email', async (c) => {
         deleted.email_namespaces = 0
     }
 
-    let removedAllowedEmails = 0
+    let removedOwnerEmails = 0
     for (const ownerEmail of ownerEmails) {
-        removedAllowedEmails += toChanges(await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(ownerEmail).run())
+        removedOwnerEmails += toChanges(await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(ownerEmail).run().catch(() => ({ meta: { changes: 0 } })))
+        removedOwnerEmails += toChanges(await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(ownerEmail).run().catch(() => ({ meta: { changes: 0 } })))
     }
-    deleted.allowed_emails = removedAllowedEmails
+    deleted.owner_emails = removedOwnerEmails
 
     const r2Deleted = await deleteNamespaceR2Objects(c.env.BUCKET, namespaceId)
 
@@ -2784,40 +2892,26 @@ app.post('/api/auth/login', async (c) => {
     if (!email || !email.includes('@')) return c.json({ error: 'Invalid email' }, 400)
     const emailLower = email.toLowerCase()
 
-    // Check owner (allowed_emails) or team member
-    const allowed = await c.env.DB.prepare('SELECT email FROM allowed_emails WHERE email = ?').bind(emailLower).first() as any
-    const isOwner = !!allowed
-    const teamMember = !isOwner ? await c.env.DB.prepare('SELECT owner_namespace_id FROM team_members WHERE email = ?').bind(emailLower).first() as any : null
-    if (!allowed && !teamMember) return c.json({ error: 'Email not allowed' }, 403)
+    // Check if team member first, otherwise treat as namespace owner
+    const teamMember = await c.env.DB.prepare('SELECT owner_namespace_id FROM team_members WHERE email = ?').bind(emailLower).first() as any
+    const isOwner = !teamMember
 
     const sessionToken = 'sess_' + crypto.randomUUID().replace(/-/g, '')
 
     // Resolve canonical namespace:
-    // - Owner: email is the workspace id
     // - Team member: always use owner namespace
+    // - Owner (anyone not a team member): ensure namespace via email_namespaces
     let namespaceId: string | null = null
 
-    if (isOwner) {
-        namespaceId = await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, emailLower, { preferExistingNamespace: true })
-    } else if (teamMember?.owner_namespace_id) {
+    if (teamMember?.owner_namespace_id) {
         namespaceId = String(teamMember.owner_namespace_id)
+    } else {
+        // Every non-team-member is a namespace owner - ensure they have a proper namespace
+        namespaceId = await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, emailLower, { preferExistingNamespace: true })
     }
 
-    // Priority #2: team member fallback by telegram row (legacy support only)
-    if (!namespaceId && !isOwner && tg_id) {
-        const byTg = await c.env.DB.prepare('SELECT namespace_id FROM users WHERE telegram_id = ?').bind(String(tg_id)).first() as any
-        if (byTg?.namespace_id) namespaceId = String(byTg.namespace_id)
-    }
-
-    // Priority #3: create new namespace once
-    if (!namespaceId) {
-        namespaceId = isOwner
-            ? await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, emailLower, { preferExistingNamespace: false })
-            : (tg_id ? String(tg_id) : emailLower)
-    }
-
-    // Persist canonical email mapping for owners only
-    if (isOwner) {
+    // Persist canonical email mapping for all namespace owners
+    if (isOwner && namespaceId) {
         try {
             await upsertOwnerNamespaceMapping(c.env.DB, emailLower, namespaceId)
         } catch (e) {
@@ -2872,7 +2966,8 @@ app.post('/api/auth/login', async (c) => {
         }
     }
 
-    return c.json({ session_token: sessionToken, is_owner: isOwner })
+    const sysAdmin = isOwner ? await isSystemAdmin(c.env.DB, emailLower) : false
+    return c.json({ session_token: sessionToken, is_owner: isOwner, is_system_admin: sysAdmin })
 })
 
 app.post('/api/auth/logout', async (c) => {
@@ -2888,79 +2983,50 @@ app.post('/api/auth/resolve-email', async (c) => {
     const email = String(body.email || '').trim().toLowerCase()
     if (!email) return c.json({ error: 'email_required' }, 400)
 
-    const owner = await c.env.DB.prepare(
-        'SELECT email FROM allowed_emails WHERE lower(trim(email)) = ? LIMIT 1'
-    ).bind(email).first() as { email?: string } | null
+    // Check if team member first
+    const team = await c.env.DB.prepare(
+        'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(email).first() as { owner_namespace_id?: string } | null
 
-    if (owner?.email) {
-        const ownerNamespace = await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, email, { preferExistingNamespace: true })
-
-        await c.env.DB.prepare('UPDATE users SET namespace_id = ? WHERE email = ?')
-            .bind(ownerNamespace, email).run()
-
-        const existingOwnerUser = await c.env.DB.prepare(
-            'SELECT 1 AS ok FROM users WHERE lower(trim(email)) = ? LIMIT 1'
-        ).bind(email).first() as { ok?: number } | null
-
-        if (!existingOwnerUser?.ok) {
-            await c.env.DB.prepare(
-                "INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, '')"
-            ).bind(email, ownerNamespace).run()
-        }
-
+    if (team?.owner_namespace_id) {
+        // Team member: resolve via owner namespace
+        const teamRows = await c.env.DB.prepare(
+            'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ?'
+        ).bind(email).all() as { results: Array<{ owner_namespace_id: string }> }
+        const teamNamespaces = Array.from(new Set(
+            (teamRows.results || []).map(r => String(r.owner_namespace_id || '').trim()).filter(Boolean)
+        ))
         return c.json({
             success: true,
-            namespace_id: ownerNamespace,
-            namespaces: [ownerNamespace],
-            is_owner: true,
-            is_team_member: false,
-        })
-    }
-
-    const user = await c.env.DB.prepare(
-        'SELECT telegram_id, email, namespace_id FROM users WHERE lower(trim(email)) = ? LIMIT 1'
-    ).bind(email).first() as { telegram_id?: number; email?: string; namespace_id?: string } | null
-
-    if (!user?.namespace_id) {
-
-        const team = await c.env.DB.prepare(
-            'SELECT email, owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
-        ).bind(email).first() as { email?: string; owner_namespace_id?: string } | null
-
-        if (!team?.owner_namespace_id) {
-            return c.json({ error: 'email_not_found', success: false }, 404)
-        }
-
-        return c.json({
-            success: true,
-            namespace_id: team.owner_namespace_id,
-            namespaces: [team.owner_namespace_id],
+            namespace_id: teamNamespaces[0],
+            namespaces: teamNamespaces,
             is_owner: false,
             is_team_member: true,
         })
     }
 
-    const teamRows = await c.env.DB.prepare(
-        'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ?'
-    ).bind(email).all() as { results: Array<{ owner_namespace_id: string }> }
-    const teamNamespaces = (teamRows.results || [])
-        .map(r => String(r.owner_namespace_id || '').trim())
-        .filter(Boolean)
-    const uniqueTeamNamespaces = Array.from(new Set(teamNamespaces))
+    // Namespace owner (anyone not a team member)
+    const ownerNamespace = await ensureOwnerWorkspaceUsesEmailNamespace(c.env.DB, email, { preferExistingNamespace: true })
 
-    if (uniqueTeamNamespaces.length === 0) {
-        return c.json({ error: 'email_not_found', success: false }, 404)
+    await c.env.DB.prepare('UPDATE users SET namespace_id = ? WHERE email = ?')
+        .bind(ownerNamespace, email).run()
+
+    const existingOwnerUser = await c.env.DB.prepare(
+        'SELECT 1 AS ok FROM users WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(email).first() as { ok?: number } | null
+
+    if (!existingOwnerUser?.ok) {
+        await c.env.DB.prepare(
+            "INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, '')"
+        ).bind(email, ownerNamespace).run()
     }
-
-    const userNamespace = String(user.namespace_id || '').trim()
-    const primaryNamespace = uniqueTeamNamespaces.includes(userNamespace) ? userNamespace : uniqueTeamNamespaces[0]
 
     return c.json({
         success: true,
-        namespace_id: primaryNamespace,
-        namespaces: uniqueTeamNamespaces,
-        is_owner: false,
-        is_team_member: true,
+        namespace_id: ownerNamespace,
+        namespaces: [ownerNamespace],
+        is_owner: true,
+        is_team_member: false,
     })
 })
 
@@ -2999,8 +3065,9 @@ app.get('/api/me', async (c) => {
     if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
     const user = await c.env.DB.prepare('SELECT email, namespace_id FROM users WHERE session_token = ?').bind(token).first() as any
     if (!user) return c.json({ error: 'Not found' }, 404)
-    const isOwner = await c.env.DB.prepare('SELECT email FROM allowed_emails WHERE email = ?').bind(user.email).first()
-    return c.json({ email: user.email, namespace_id: user.namespace_id, is_owner: !!isOwner })
+    const ownerOk = await isNamespaceOwner(c.env.DB, user.email)
+    const sysAdmin = ownerOk ? await isSystemAdmin(c.env.DB, user.email) : false
+    return c.json({ email: user.email, namespace_id: user.namespace_id, is_owner: ownerOk, is_system_admin: sysAdmin })
 })
 
 app.get('/api/settings/voice-prompt', async (c) => {
@@ -3379,7 +3446,7 @@ app.post('/api/telegram/:token?', async (c) => {
                     text += `└ ID: \`${ch.bot_id}\`\n\n`
                     text += `เลือกดำเนินการกับบอทตัวนี้:`
 
-                    const webAppUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
+                    const webAppUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
 
                     const buttons = [
                         [{ text: `📱 เปิดหน้าจัดการระบบ (Mini App)`, web_app: { url: buildScopedWebAppUrl(webAppUrl, String(ch.bot_id || '')) } }],
@@ -3587,7 +3654,8 @@ app.post('/api/telegram/:token?', async (c) => {
         const action = cb.data as string
         if (action.startsWith('del_email:')) {
             const email = action.replace('del_email:', '')
-            await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(email).run()
+            await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run().catch(() => { })
+            await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(email).run().catch(() => { })
             await c.env.DB.prepare('DELETE FROM users WHERE email = ?').bind(email).run()
             await sendTelegram(token, 'editMessageText', { chat_id: chatId, message_id: cb.message.message_id, text: `🗑 ลบ ${email} แล้ว` })
         } else if (action === 'close_setting') {
@@ -3629,7 +3697,7 @@ app.post('/api/telegram/:token?', async (c) => {
                 await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE telegram_id = ?").bind(chatId).run()
             }
         }
-        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
+        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
             text: '✅ ออกจากระบบแล้ว\n\nกด "เปิด Workspace" เพื่อเข้าใช้งานอีกครั้ง',
@@ -3646,7 +3714,7 @@ app.post('/api/telegram/:token?', async (c) => {
 
     // /start and /menu should always surface the Mini App entrypoint.
     if (text === '/start' || text === '/menu') {
-        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
+        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
         const hasSession = Boolean(userRecord?.session_token)
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
@@ -3664,7 +3732,7 @@ app.post('/api/telegram/:token?', async (c) => {
 
     // Block unauthenticated/logged-out users — send Mini App button to open Workspace
     if (!userRecord || !userRecord.session_token) {
-        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev'
+        const appUrl = c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev'
         await sendTelegram(token, 'sendMessage', {
             chat_id: chatId,
             text: '👋 กรุณาเปิด Workspace เพื่อเริ่มใช้งาน',
@@ -3819,12 +3887,12 @@ app.post('/api/telegram/:token?', async (c) => {
         const sendReadyInboxMessage = async (result: InboxProcessingStartResult) => {
             const targetId = String(result.item.id || '').trim()
             const processingUrl = buildScopedTabWebAppUrl(
-                c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev',
                 String(c.get('botId') || ''),
                 'processing',
             )
             const galleryUrl = buildScopedTabWebAppUrl(
-                c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev',
                 String(c.get('botId') || ''),
                 'gallery',
                 { q: targetId },
@@ -4685,10 +4753,16 @@ async function ensureInboxVideoProcessingStarted(params: {
 
 app.get('/api/processing', async (c) => {
     try {
-        const [list, pendingShortlinkVideos] = await Promise.all([
+        const namespaceId = String(c.get('botId') || '').trim()
+        const [list, inventory] = await Promise.all([
             c.get('bucket').list({ prefix: '_processing/' }),
-            listVideosAwaitingAffiliateConversion(c.env, String(c.get('botId') || '').trim(), { systemWide: true }),
+            getNamespaceGalleryInventory(c.env, namespaceId),
         ])
+        const pendingShortlinkVideos = inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
+        const readyVideos = inventory.videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready)
+        const pendingHasLazadaTotal = pendingShortlinkVideos.filter((video) =>
+            String((video as Record<string, unknown>).pending_bucket || '').trim() === 'has-lazada'
+        ).length
         const prefix = '_processing/'
         const tasks = await Promise.all(
             list.objects.map(async obj => {
@@ -4733,7 +4807,17 @@ app.get('/api/processing', async (c) => {
             const bt = new Date(String(b.createdAt || '')).getTime()
             return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
         })
-        return c.json({ videos, pending_shortlink_videos: pendingShortlinkVideos }, 200, { 'Cache-Control': 'no-store' })
+        return c.json({
+            videos,
+            pending_shortlink_videos: pendingShortlinkVideos,
+            processing_total: videos.length,
+            pending_total: pendingShortlinkVideos.length,
+            pending_has_lazada_total: pendingHasLazadaTotal,
+            pending_missing_lazada_total: Math.max(0, pendingShortlinkVideos.length - pendingHasLazadaTotal),
+            ready_total: readyVideos.length,
+            inventory_total: inventory.videos.length,
+            library_total: inventory.sourceTotal,
+        }, 200, { 'Cache-Control': 'no-store' })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
     }
@@ -4900,15 +4984,22 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                 const shopeeLink = String(linkContext.shopeeLink || '').trim()
                 const lazadaLink = String(linkContext.lazadaLink || '').trim()
                 let changed = false
+                const nextStateFields: Partial<NamespaceVideoStateRow> = {}
                 if (shopeeLink && !normalizeMetaShopeeLink(meta)) {
                     meta.shopeeLink = shopeeLink
+                    meta.shopeeOriginalLink = getVideoSourceShopeeLink(meta) || shopeeLink
                     if (!String(meta.linkSubmittedAt || '').trim()) {
                         meta.linkSubmittedAt = new Date().toISOString()
                     }
+                    nextStateFields.shopee_link = shopeeLink
+                    nextStateFields.shopee_original_link = String(meta.shopeeOriginalLink || '').trim()
                     changed = true
                 }
                 if (lazadaLink && !normalizeMetaLazadaLink(meta)) {
                     meta.lazadaLink = lazadaLink
+                    meta.lazadaOriginalLink = getVideoSourceLazadaLink(meta) || lazadaLink
+                    nextStateFields.lazada_link = lazadaLink
+                    nextStateFields.lazada_original_link = String(meta.lazadaOriginalLink || '').trim()
                     changed = true
                 }
                 if (changed) {
@@ -4918,6 +5009,7 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                     await c.get('bucket').put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
                         httpMetadata: { contentType: 'application/json' },
                     })
+                    await upsertNamespaceVideoState(c.env.DB, namespaceId, videoId, nextStateFields)
                 }
             }
         }
@@ -4940,7 +5032,7 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                 // fall back to default token
             }
             const completionUrl = buildScopedGalleryWebAppUrl(
-                c.env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                c.env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev',
                 namespaceId,
                 'lazada',
                 videoId,
@@ -4954,6 +5046,12 @@ app.post('/api/gallery/refresh/:id', async (c) => {
             }).catch(() => null)
         }
         await c.get('bucket').delete(`_link_context/${videoId}.json`).catch(() => { })
+
+        if (videoId) {
+            c.executionCtx.waitUntil(processPendingAffiliateConversions(c.env).catch((error) => {
+                console.log(`[GALLERY-REFRESH] affiliate conversion failed video=${videoId}: ${error instanceof Error ? error.message : String(error)}`)
+            }))
+        }
 
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
         c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
@@ -5041,7 +5139,8 @@ app.get('/api/gallery', async (c) => {
             console.log(`[GALLERY-INDEX] warmup rebuild failed: ${error instanceof Error ? error.message : String(error)}`)
         }))
 
-        const videos = await listNamespaceGalleryVideos(c.env, currentNamespaceId)
+        const inventory = await getNamespaceGalleryInventory(c.env, currentNamespaceId)
+        const videos = inventory.videos
         const namespaceIds = Array.from(new Set(videos.map((video) => String((video as Record<string, unknown>).namespace_id || '').trim()).filter(Boolean)))
         const expectedRows = await Promise.all(namespaceIds.map(async (candidateNamespaceId) => ({
             namespaceId: candidateNamespaceId,
@@ -5083,6 +5182,9 @@ app.get('/api/gallery', async (c) => {
             videos: page.videos,
             total: filteredVideos.length,
             overall_total: overallTotal,
+            ready_total: overallTotal,
+            inventory_total: videos.length,
+            library_total: inventory.sourceTotal,
             offset,
             limit,
             has_more: page.hasMore,
@@ -5294,10 +5396,8 @@ const getAllOriginalGallery = async (
         ).bind(token).first() as { email?: string } | null
         if (!me?.email) return c.json({ error: 'Unauthorized' }, 401)
 
-        const isOwner = await c.env.DB.prepare(
-            'SELECT 1 FROM allowed_emails WHERE email = ? LIMIT 1'
-        ).bind(String(me.email).trim().toLowerCase()).first()
-        if (!isOwner) return c.json({ error: 'Forbidden' }, 403)
+        const ownerCheck = await isNamespaceOwner(c.env.DB, me.email)
+        if (!ownerCheck) return c.json({ error: 'Forbidden' }, 403)
 
         const cacheKey = '_admin_cache/all_original_videos.json'
         const cached = await c.env.BUCKET.get(cacheKey)
@@ -5428,7 +5528,10 @@ app.put('/api/gallery/:id', async (c) => {
         meta.id = String(meta.id || id).trim() || id
         meta.namespace_id = String(meta.namespace_id || targetNamespaceId).trim() || targetNamespaceId
         const shopeeExpectedUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, targetNamespaceId).catch(() => '')
+        const lazadaExpectedMemberId = await resolveNamespaceLazadaExpectedMemberId(c.env.DB, targetNamespaceId).catch(() => '')
         let changed = false
+        let touchedAffiliateFields = false
+        const nextStateFields: Partial<NamespaceVideoStateRow> = {}
         if (body.shopeeLink !== undefined) {
             const normalizedShopeeLink = String(body.shopeeLink || '').trim()
             if (normalizedShopeeLink) {
@@ -5437,19 +5540,27 @@ app.put('/api/gallery/:id', async (c) => {
                     ? (getVideoSourceShopeeLink(meta) || normalizedShopeeLink)
                     : normalizedShopeeLink
                 meta.linkSubmittedAt = new Date().toISOString()
+                nextStateFields.shopee_link = normalizedShopeeLink
+                nextStateFields.shopee_original_link = String(meta.shopeeOriginalLink || '').trim()
                 if (isLikelyConvertedShopeeLink(normalizedShopeeLink, shopeeExpectedUtmId)) {
                     meta.shopeeConvertedAt = new Date().toISOString()
                     delete meta.shopeeConversionError
+                    nextStateFields.shopee_converted_at = String(meta.shopeeConvertedAt || '').trim()
                 } else {
                     delete meta.shopeeConvertedAt
+                    nextStateFields.shopee_converted_at = ''
                 }
             } else {
                 meta.shopeeLink = ''
                 delete meta.shopeeOriginalLink
                 delete meta.shopeeConvertedAt
                 delete meta.shopeeConversionError
+                nextStateFields.shopee_link = ''
+                nextStateFields.shopee_original_link = ''
+                nextStateFields.shopee_converted_at = ''
             }
             changed = true
+            touchedAffiliateFields = true
         }
         if (body.lazadaLink !== undefined) {
             const normalizedLazadaLink = String(body.lazadaLink || '').trim()
@@ -5458,19 +5569,36 @@ app.put('/api/gallery/:id', async (c) => {
                 meta.lazadaOriginalLink = isLikelyConvertedLazadaLink(normalizedLazadaLink)
                     ? (getVideoSourceLazadaLink(meta) || normalizedLazadaLink)
                     : normalizedLazadaLink
+                nextStateFields.lazada_link = normalizedLazadaLink
+                nextStateFields.lazada_original_link = String(meta.lazadaOriginalLink || '').trim()
                 if (isLikelyConvertedLazadaLink(normalizedLazadaLink)) {
+                    const inferredMemberId = normalizeLazadaMemberId(
+                        String(meta.lazadaMemberId || meta.lazada_member_id || lazadaExpectedMemberId || '')
+                    )
+                    if (inferredMemberId) {
+                        meta.lazadaMemberId = inferredMemberId
+                        nextStateFields.lazada_member_id = inferredMemberId
+                    }
                     meta.lazadaConvertedAt = new Date().toISOString()
                     delete meta.lazadaConversionError
+                    nextStateFields.lazada_converted_at = String(meta.lazadaConvertedAt || '').trim()
                 } else {
                     delete meta.lazadaConvertedAt
+                    nextStateFields.lazada_converted_at = ''
                 }
             } else {
                 meta.lazadaLink = ''
                 delete meta.lazadaOriginalLink
                 delete meta.lazadaConvertedAt
                 delete meta.lazadaConversionError
+                if (!lazadaExpectedMemberId) delete meta.lazadaMemberId
+                nextStateFields.lazada_link = ''
+                nextStateFields.lazada_original_link = ''
+                nextStateFields.lazada_converted_at = ''
+                nextStateFields.lazada_member_id = ''
             }
             changed = true
+            touchedAffiliateFields = true
         }
         if (body.keepInPostedTab !== undefined) {
             if (body.keepInPostedTab) {
@@ -5498,6 +5626,12 @@ app.put('/api/gallery/:id', async (c) => {
         await syncGalleryIndexEntry(c.env, targetNamespaceId, id).catch((error) => {
             console.log(`[GALLERY-PUT] sync gallery index failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
         })
+        if (touchedAffiliateFields) {
+            await upsertNamespaceVideoState(c.env.DB, targetNamespaceId, id, nextStateFields)
+            c.executionCtx.waitUntil(processPendingAffiliateConversions(c.env).catch((error) => {
+                console.log(`[GALLERY-PUT] affiliate conversion failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
+            }))
+        }
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
         return c.json({
@@ -5598,7 +5732,7 @@ const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_u
 const NS_SETTING_LAZADA_SHORTLINK_BASE_URL = 'lazada_shortlink_base_url_v1'
 const NS_SETTING_LAZADA_EXPECTED_MEMBER_ID = 'lazada_expected_member_id_v1'
 const DEFAULT_SHOPEE_SHORTLINK_WORKER_URL = 'https://short.yokthanwa1993-bc9.workers.dev/'
-const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://lazada-short.yokthanwa1993-bc9.workers.dev/'
+const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://lazada.wwoom.com/'
 const DEFAULT_PAGES_SYNC_POST_SELECTORS = 'tag:post'
 const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
@@ -5985,34 +6119,32 @@ function isLikelyConvertedLazadaLink(link: string): boolean {
 }
 
 function getVideoAffiliateConversionState(video: Record<string, unknown>, expectedUtmId = '', expectedLazadaMemberId = '') {
-    void expectedUtmId
-    void expectedLazadaMemberId
     const publicUrl = String(video.publicUrl || video.public_url || '').trim()
     const hasPlayable = !!publicUrl
 
     const shopeeSourceLink = getVideoSourceShopeeLink(video)
-    const shopeeCurrentLink = pickFirstShopeeUrl(
-        video.shopeeLink || video.shopee_link || video.shopeeUrl || video.shopee_url || video.shopee || video.link || ''
-    ) || shopeeSourceLink || ''
+    const shopeeCurrentLink = normalizeMetaShopeeLink(video) || ''
     const hasShopeeSource = !!shopeeSourceLink
-    const hasManagedShopeeConversion = !!shopeeCurrentLink
-    const shopeeReady = !!shopeeCurrentLink
+    const hasManagedShopeeConversion = !!String(
+        video.shopeeConvertedAt || video.shopee_converted_at || video.shopeeOriginalLink || video.shopee_original_link || ''
+    ).trim()
+    const shopeeReady = !!shopeeCurrentLink && isLikelyConvertedShopeeLink(shopeeCurrentLink, expectedUtmId)
 
     const lazadaSourceLink = getVideoSourceLazadaLink(video)
-    const lazadaCurrentLink = pickFirstLazadaUrl(
-        video.lazadaLink || video.lazada_link || video.lazadaUrl || video.lazada_url || video.lazada || ''
-    ) || lazadaSourceLink || ''
+    const lazadaCurrentLink = normalizeMetaLazadaLink(video) || ''
     const hasLazadaSource = !!lazadaSourceLink
-    const hasManagedLazadaConversion = !!lazadaCurrentLink
+    const hasManagedLazadaConversion = !!String(
+        video.lazadaConvertedAt || video.lazada_converted_at || video.lazadaOriginalLink || video.lazada_original_link || ''
+    ).trim()
     const lazadaMemberId = normalizeLazadaMemberId(String(video.lazadaMemberId || video.lazada_member_id || ''))
-    const lazadaReady = !!lazadaCurrentLink
+    const lazadaReady = !!lazadaCurrentLink && !!lazadaMemberId && isLikelyConvertedLazadaLink(lazadaCurrentLink) && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId)
 
     const missingShopeeSource = hasPlayable && !hasShopeeSource
-    const galleryReady = hasPlayable && hasShopeeSource && shopeeReady && hasLazadaSource && lazadaReady
-    const needsShopeeConversion = false
-    const needsLazadaConversion = false
     const missingLazadaSource = hasPlayable && !hasLazadaSource
-    const awaitingConversion = false
+    const needsShopeeConversion = hasPlayable && hasShopeeSource && hasManagedShopeeConversion && !shopeeReady
+    const needsLazadaConversion = hasPlayable && hasLazadaSource && hasManagedLazadaConversion && !lazadaReady
+    const galleryReady = hasPlayable && hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady
+    const awaitingConversion = hasPlayable && (missingShopeeSource || !galleryReady)
 
     return {
         hasPlayable,
@@ -6041,10 +6173,12 @@ function isVideoAwaitingAffiliateConversion(video: Record<string, unknown>, expe
 }
 
 async function listVideosAwaitingAffiliateConversion(env: Env, namespaceId: string, options: { systemWide?: boolean } = {}): Promise<Array<Record<string, unknown>>> {
-    void env
-    void namespaceId
     void options
-    return []
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return []
+
+    const inventory = await getNamespaceGalleryInventory(env, normalizedNamespaceId)
+    return inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
 }
 
 async function persistAffiliateVideoMeta(env: Env, namespaceId: string, videoId: string, meta: Record<string, unknown>): Promise<void> {
@@ -6061,8 +6195,139 @@ async function persistAffiliateVideoMeta(env: Env, namespaceId: string, videoId:
 }
 
 async function processPendingAffiliateConversions(env: Env): Promise<void> {
-    void env
-    console.log('[AFFILIATE-CONVERT] Shortlink conversion disabled; keeping original user links')
+    const videos = await getAllSystemGalleryVideos(env)
+    const namespaceIds = Array.from(new Set(
+        videos
+            .map((video) => String((video as Record<string, unknown>).namespace_id || '').trim())
+            .filter(Boolean)
+    ))
+
+    for (const namespaceId of namespaceIds) {
+        const pendingVideos = await listVideosAwaitingAffiliateConversion(env, namespaceId, { systemWide: true }).catch(() => [])
+        if (pendingVideos.length === 0) continue
+
+        const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
+        const expectedUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, namespaceId).catch(() => '')
+        const expectedLazadaMemberId = await resolveNamespaceLazadaExpectedMemberId(env.DB, namespaceId).catch(() => '')
+
+        for (const pendingVideo of pendingVideos) {
+            const videoId = String(pendingVideo.id || '').trim()
+            if (!videoId) continue
+
+            const metaObj = await bucket.get(`videos/${videoId}.json`)
+            const meta = metaObj
+                ? await metaObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+                : {}
+            const nextMeta: Record<string, unknown> = {
+                ...meta,
+                id: videoId,
+                namespace_id: namespaceId,
+            }
+
+            let changed = false
+            const nowIso = new Date().toISOString()
+            const nextStateFields: Partial<NamespaceVideoStateRow> = {}
+            const conversionState = getVideoAffiliateConversionState(pendingVideo, expectedUtmId, expectedLazadaMemberId)
+
+            if (conversionState.hasShopeeSource) {
+                const sourceShopeeLink = conversionState.shopeeSourceLink || getVideoSourceShopeeLink(nextMeta) || ''
+                if (sourceShopeeLink) {
+                    nextMeta.shopeeOriginalLink = sourceShopeeLink
+                    nextStateFields.shopee_original_link = sourceShopeeLink
+                    const trace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
+                    const resolvedShopeeLink = conversionState.shopeeReady
+                        ? (conversionState.shopeeCurrentLink || sourceShopeeLink)
+                        : await shortenShopeeLinkForNamespace({
+                            env,
+                            namespaceId,
+                            shopeeLink: sourceShopeeLink,
+                            logPrefix: `AFFILIATE-CONVERT ${namespaceId}/${videoId} SHOPEE`,
+                            trace,
+                        })
+                    const effectiveShopeeLink = resolvedShopeeLink || sourceShopeeLink
+                    nextMeta.shopeeLink = effectiveShopeeLink
+                    nextStateFields.shopee_link = effectiveShopeeLink
+                    if (isLikelyConvertedShopeeLink(effectiveShopeeLink, expectedUtmId)) {
+                        const convertedAt = String(
+                            pendingVideo.shopeeConvertedAt ||
+                            pendingVideo.shopee_converted_at ||
+                            nextMeta.shopeeConvertedAt ||
+                            nextMeta.shopee_converted_at ||
+                            nowIso
+                        ).trim() || nowIso
+                        nextMeta.shopeeConvertedAt = convertedAt
+                        delete nextMeta.shopeeConversionError
+                        nextStateFields.shopee_converted_at = convertedAt
+                    } else {
+                        delete nextMeta.shopeeConvertedAt
+                        nextMeta.shopeeConversionError = String(trace.error || '').trim()
+                        nextStateFields.shopee_converted_at = ''
+                    }
+                    changed = true
+                }
+            }
+
+            if (conversionState.hasLazadaSource) {
+                const sourceLazadaLink = conversionState.lazadaSourceLink || getVideoSourceLazadaLink(nextMeta) || ''
+                if (sourceLazadaLink) {
+                    nextMeta.lazadaOriginalLink = sourceLazadaLink
+                    nextStateFields.lazada_original_link = sourceLazadaLink
+                    const trace: { utmSource?: string | null; memberId?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
+                    const resolvedLazadaLink = conversionState.lazadaReady
+                        ? (conversionState.lazadaCurrentLink || sourceLazadaLink)
+                        : await shortenLazadaLinkForNamespace({
+                            env,
+                            namespaceId,
+                            lazadaLink: sourceLazadaLink,
+                            logPrefix: `AFFILIATE-CONVERT ${namespaceId}/${videoId} LAZADA`,
+                            trace,
+                        })
+                    const effectiveLazadaLink = resolvedLazadaLink || sourceLazadaLink
+                    const nextMemberId = normalizeLazadaMemberId(String(
+                        trace.memberId ||
+                        pendingVideo.lazadaMemberId ||
+                        pendingVideo.lazada_member_id ||
+                        nextMeta.lazadaMemberId ||
+                        nextMeta.lazada_member_id ||
+                        ''
+                    ))
+                    nextMeta.lazadaLink = effectiveLazadaLink
+                    nextStateFields.lazada_link = effectiveLazadaLink
+                    if (nextMemberId) {
+                        nextMeta.lazadaMemberId = nextMemberId
+                        nextStateFields.lazada_member_id = nextMemberId
+                    }
+                    if (
+                        isLikelyConvertedLazadaLink(effectiveLazadaLink) &&
+                        !!nextMemberId &&
+                        (!expectedLazadaMemberId || nextMemberId === expectedLazadaMemberId)
+                    ) {
+                        const convertedAt = String(
+                            pendingVideo.lazadaConvertedAt ||
+                            pendingVideo.lazada_converted_at ||
+                            nextMeta.lazadaConvertedAt ||
+                            nextMeta.lazada_converted_at ||
+                            nowIso
+                        ).trim() || nowIso
+                        nextMeta.lazadaConvertedAt = convertedAt
+                        delete nextMeta.lazadaConversionError
+                        nextStateFields.lazada_converted_at = convertedAt
+                    } else {
+                        delete nextMeta.lazadaConvertedAt
+                        nextMeta.lazadaConversionError = String(trace.error || '').trim()
+                        nextStateFields.lazada_converted_at = ''
+                    }
+                    changed = true
+                }
+            }
+
+            if (!changed) continue
+
+            nextMeta.updatedAt = nowIso
+            await persistAffiliateVideoMeta(env, namespaceId, videoId, nextMeta)
+            await upsertNamespaceVideoState(env.DB, namespaceId, videoId, nextStateFields)
+        }
+    }
 }
 
 async function getNamespaceShopeeShortlinkBaseUrlEntry(db: D1Database, namespaceId: string): Promise<{ baseUrl: string; updatedAt: string | null }> {
@@ -13361,6 +13626,12 @@ app.post('/api/manual-post-reel', async (c) => {
 async function handleScheduled(env: Env) {
     console.log('[CRON] Starting auto-post check...')
     const dedupCommentTargets = new Set<string>()
+
+    try {
+        await processPendingAffiliateConversions(env)
+    } catch (error) {
+        console.error(`[CRON] Affiliate conversion failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
 
     // Keep Container warm — ping /health ทุก 1 นาที ไม่ให้ sleep
     try {

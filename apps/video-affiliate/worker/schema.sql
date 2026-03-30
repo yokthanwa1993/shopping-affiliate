@@ -96,6 +96,12 @@ CREATE TABLE IF NOT EXISTS allowed_emails (
   created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- System-wide admins (can see all namespaces)
+CREATE TABLE IF NOT EXISTS system_admins (
+  email TEXT PRIMARY KEY,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS users (
   telegram_id INTEGER PRIMARY KEY,
   email TEXT NOT NULL,

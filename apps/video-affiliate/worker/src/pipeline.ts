@@ -330,7 +330,7 @@ export async function runPipeline(
             r2_public_url: env.R2_PUBLIC_URL,
             worker_url: String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev',
             completion_webapp_url: buildScopedGalleryWebAppUrl(
-                env.WEBAPP_URL || 'https://video-affiliate-webapp-38v.pages.dev',
+                env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev',
                 botId,
                 videoId,
                 'lazada',

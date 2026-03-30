@@ -2765,7 +2765,7 @@ function App() {
   }
 
 
-  const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('unused')
+  const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('missing-lazada')
   const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
@@ -3197,7 +3197,7 @@ function App() {
 
   useEffect(() => {
     if (!isOwner && categoryFilter === 'all-original') {
-      setCategoryFilter('unused')
+      setCategoryFilter('missing-lazada')
     }
   }, [isOwner, categoryFilter])
 
@@ -4237,7 +4237,9 @@ function App() {
   }, [usedVideos])
   const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
   const {
-    galleryUnusedVideos,
+    galleryMissingLazadaVideos,
+    galleryPendingShortlinkVideos,
+    galleryReadyVideos,
     galleryUsedVideos,
     galleryAvailableVideos,
   } = useMemo(() => {
@@ -4246,59 +4248,76 @@ function App() {
       return Number.isFinite(ts) ? ts : 0
     }
     const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-    const sourceVideos = dedupeGalleryVideos(videos).filter((video) =>
-      !pendingShortlinkIdentitySet.has(getVideoIdentityKey(video as Video & Record<string, unknown>))
+    const sourceVideos = dedupeGalleryVideos(videos)
+    const pendingIdentitySet = new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
+    const postedVideos = sortNewestFirst(
+      dedupeGalleryVideos([
+        ...usedVideos,
+        ...sourceVideos.filter((video) => isKeepInPostedTab(video)),
+      ])
     )
-    const unusedVideos = sortNewestFirst(
-      sourceVideos.filter((video) =>
-        !usedVideoIdSet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)) &&
-        !isKeepInPostedTab(video)
-      )
+    const postedIdentitySet = new Set(postedVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
+
+    const activeVideos = sortNewestFirst(
+      sourceVideos.filter((video) => !postedIdentitySet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)))
     )
-    const galleryPinnedPostedVideos = sortNewestFirst(
-      sourceVideos.filter((video) =>
-        !usedVideoIdSet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)) &&
-        isKeepInPostedTab(video)
-      )
+
+    const missingLazadaVideos = sortNewestFirst(
+      activeVideos.filter((video) => {
+        const row = video as Video & Record<string, unknown>
+        return !getVideoSourceLazadaLink(row) && !getVideoLazadaLink(row)
+      })
     )
-    const galleryUsedMergedVideos: Video[] = [
-      ...usedVideos,
-      ...galleryPinnedPostedVideos,
-    ]
-    const dedupedUsedVideos = sortNewestFirst(
-      galleryUsedMergedVideos.filter((video, index, arr) => arr.findIndex((v) =>
-        getVideoIdentityKey(v as Video & Record<string, unknown>) === getVideoIdentityKey(video as Video & Record<string, unknown>)
-      ) === index)
+
+    const readyVideos = sortNewestFirst(
+      activeVideos.filter((video) => {
+        const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
+        const row = video as Video & Record<string, unknown>
+        return !pendingIdentitySet.has(key) && !!getVideoSourceLazadaLink(row)
+      })
     )
-    const baseVideos = systemWideGalleryMode
-      ? sourceVideos
-      : (categoryFilter === 'used' || categoryFilter === 'missing-link')
-        ? dedupedUsedVideos
-        : unusedVideos
+
+    const missingSet = new Set(missingLazadaVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
+    const readySet = new Set(readyVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
+    const pendingShortlinkVideosAll = sortNewestFirst(
+      activeVideos.filter((video) => {
+        const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
+        if (missingSet.has(key) || readySet.has(key)) return false
+        const row = video as Video & Record<string, unknown>
+        return !!getVideoSourceLazadaLink(row) || !!getVideoLazadaLink(row) || pendingIdentitySet.has(key)
+      })
+    )
+
+    const baseVideos = categoryFilter === 'used'
+      ? postedVideos
+      : categoryFilter === 'ready'
+        ? readyVideos
+        : categoryFilter === 'pending-shortlink'
+          ? pendingShortlinkVideosAll
+          : missingLazadaVideos
     const availableVideos = gallerySearchQuery
       ? baseVideos.filter((video) => matchesGallerySearch(video as Video & Record<string, unknown>, gallerySearchQuery))
       : baseVideos
 
     return {
-      galleryUnusedVideos: unusedVideos,
-      galleryUsedVideos: dedupedUsedVideos,
-      galleryBaseVideos: baseVideos,
+      galleryMissingLazadaVideos: missingLazadaVideos,
+      galleryPendingShortlinkVideos: pendingShortlinkVideosAll,
+      galleryReadyVideos: readyVideos,
+      galleryUsedVideos: postedVideos,
       galleryAvailableVideos: availableVideos,
     }
-  }, [videos, usedVideos, usedVideoIdSet, pendingShortlinkIdentitySet, systemWideGalleryMode, categoryFilter, gallerySearchQuery])
+  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery])
   const showGalleryFilterBar = tab === 'gallery' && (
     !systemWideGalleryMode && (
       galleryLoading ||
-      (galleryUnusedVideos.length > 0 || galleryUsedVideos.length > 0)
+      (galleryMissingLazadaVideos.length > 0 || galleryPendingShortlinkVideos.length > 0 || galleryReadyVideos.length > 0 || galleryUsedVideos.length > 0)
     )
   )
   const galleryHeaderOffset = tab === 'gallery'
     ? (showGalleryFilterBar ? 184 : 124)
     : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
-  const galleryViewTotal = systemWideGalleryMode
-    ? Number(systemGalleryStats.total || 0)
-    : galleryAvailableVideos.length
+  const galleryViewTotal = galleryAvailableVideos.length
   const namespaceGalleryLibraryTotal = processingSummary.libraryTotal
   const namespaceGalleryInventoryTotal = processingSummary.inventoryTotal
   const namespaceGalleryReadyTotal = processingSummary.readyTotal
@@ -4471,10 +4490,22 @@ function App() {
           {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
               <button
-                onClick={() => setCategoryFilter('unused')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'unused' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                onClick={() => setCategoryFilter('missing-lazada')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'missing-lazada' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                พร้อมโพสต์ ({galleryUnusedVideos.length})
+                ไม่มีลิ้งลา ({galleryMissingLazadaVideos.length})
+              </button>
+              <button
+                onClick={() => setCategoryFilter('used')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'pending-shortlink' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                รอย่อลิ้ง ({galleryPendingShortlinkVideos.length})
+              </button>
+              <button
+                onClick={() => setCategoryFilter('ready')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'ready' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                รอโพสต์ ({galleryReadyVideos.length})
               </button>
               <button
                 onClick={() => setCategoryFilter('used')}
@@ -4682,14 +4713,14 @@ function App() {
                     </span>
                   )}
                   <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
-                    พร้อมโพสต์ {namespaceGalleryReadyTotal.toLocaleString('th-TH')}
+                    รอโพสต์ {galleryReadyVideos.length.toLocaleString('th-TH')}
                   </span>
                   <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
-                    รอแปลงลิงก์ {processingSummary.pendingTotal.toLocaleString('th-TH')}
+                    รอย่อลิ้ง {galleryPendingShortlinkVideos.length.toLocaleString('th-TH')}
                   </span>
                 </div>
                 <p className="mt-3 text-xs leading-5 text-gray-500">
-                  Gallery จะแสดงเฉพาะคลิปที่มี Shopee และ Lazada ครบพร้อมโพสต์แล้ว ส่วนคลิปที่ยังไม่ครบจะอยู่หน้า Processing
+                  Flow ใหม่: ไม่มีลิ้งลา → รอย่อลิ้ง → รอโพสต์ → โพสต์แล้ว และทุกแท็บรวมกันคือจำนวนวิดีโอทั้งหมดของระบบ
                 </p>
               </div>
             )}
@@ -4744,7 +4775,11 @@ function App() {
                     ? 'ยังไม่มีคลิปใน Gallery'
                     : categoryFilter === 'used'
                       ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
-                      : 'ยังไม่มีคลิปพร้อมโพสต์'}
+                      : categoryFilter === 'ready'
+                        ? 'ยังไม่มีคลิปรอโพสต์'
+                        : categoryFilter === 'pending-shortlink'
+                          ? 'ยังไม่มีคลิปรอย่อลิ้ง'
+                          : 'ยังไม่มีคลิปไม่มีลิ้งลา'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
                   {gallerySearchQuery
@@ -4753,7 +4788,11 @@ function App() {
                     ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
                       ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
-                      : 'จะแสดงเฉพาะคลิปที่มี Shopee และ Lazada link ครบพร้อมโพสต์'}
+                      : categoryFilter === 'ready'
+                        ? 'คลิปที่ย่อลิ้งครบแล้วและพร้อมโพสต์จะแสดงที่นี่'
+                        : categoryFilter === 'pending-shortlink'
+                          ? 'คลิปที่มี Lazada แล้วแต่ยังย่อลิ้งไม่ครบจะแสดงที่นี่'
+                          : 'คลิปที่ยังไม่มี Lazada link จะแสดงที่นี่'}
                 </p>
               </div>
             ) : (
