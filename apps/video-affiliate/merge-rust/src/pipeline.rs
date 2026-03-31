@@ -99,6 +99,85 @@ async fn r2_put(worker_url: &str, token: &str, bot_id: &str, key: &str, data: Ve
     Ok(())
 }
 
+fn looks_like_html_document(bytes: &[u8]) -> bool {
+    let prefix_len = bytes.len().min(256);
+    let prefix = String::from_utf8_lossy(&bytes[..prefix_len])
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .to_ascii_lowercase();
+    prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<?xml")
+}
+
+fn content_type_is_video_like(content_type: &str) -> bool {
+    let normalized = content_type.trim().to_ascii_lowercase();
+    normalized.starts_with("video/")
+        || normalized.contains("application/octet-stream")
+        || normalized.contains("binary/octet-stream")
+}
+
+fn validate_downloaded_video(bytes: &[u8], content_type: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if bytes.is_empty() {
+        return Err("ดาวน์โหลดวิดีโอได้ไฟล์ว่าง".into());
+    }
+
+    if looks_like_html_document(bytes) {
+        return Err("ดาวน์โหลดได้เป็นหน้า HTML ไม่ใช่ไฟล์วิดีโอจริง".into());
+    }
+
+    let normalized = content_type.trim().to_ascii_lowercase();
+    if !normalized.is_empty()
+        && !content_type_is_video_like(&normalized)
+        && (
+            normalized.starts_with("text/")
+            || normalized.contains("html")
+            || normalized.contains("json")
+            || normalized.contains("xml")
+        )
+    {
+        return Err(format!("ดาวน์โหลดได้ content-type ไม่ใช่วิดีโอ: {}", content_type).into());
+    }
+
+    Ok(())
+}
+
+async fn download_video_bytes(
+    client: &Client,
+    req: &PipelineRequest,
+    bot_id: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(120),
+        client
+            .get(&req.video_url)
+            .header("x-auth-token", &req.token)
+            .header("x-bot-id", bot_id)
+            .send(),
+    )
+    .await
+    .map_err(|_| "ดาวน์โหลดวิดีโอ timeout (120s)")?
+    .map_err(|e| format!("ดาวน์โหลดวิดีโอล้มเหลว: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("ดาวน์โหลดวิดีโอล้มเหลว: HTTP {}", status).into());
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("ดาวน์โหลดวิดีโอล้มเหลว: {}", e))?;
+    validate_downloaded_video(bytes.as_ref(), &content_type)?;
+    Ok(bytes.to_vec())
+}
+
 async fn update_step(worker_url: &str, token: &str, bot_id: &str, video_id: &str, step: f64, step_name: &str) {
     let url = format!("{}/api/r2-proxy/_processing/{}.json", worker_url, video_id);
     let client = Client::new();
@@ -140,6 +219,36 @@ async fn gemini_upload_bytes(
     } else {
         Err(format!("Upload failed: {}", json).into())
     }
+}
+
+fn extract_gemini_file_state(json: &Value) -> Option<String> {
+    json.get("state")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .or_else(|| {
+            json.get("state")
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .or_else(|| {
+            json.get("file")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .or_else(|| {
+            json.get("file")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.get("name"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+}
+
+fn is_gemini_file_not_ready_error(status: u16, err: &str) -> bool {
+    status == 400
+        && (
+            err.contains("FAILED_PRECONDITION")
+            || err.contains("not in an ACTIVE state")
+            || err.contains("usage is not allowed")
+        )
 }
 
 fn extract_srt_payload(raw: &str) -> String {
@@ -256,7 +365,7 @@ async fn gemini_srt_from_audio(
 
     let mut resp_text = String::new();
     let mut last_err = String::new();
-    for attempt in 0..3 {
+    for attempt in 0..6 {
         if attempt > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(5 * attempt)).await;
             println!("[PIPELINE] gemini_srt retry #{}", attempt);
@@ -281,6 +390,9 @@ async fn gemini_srt_from_audio(
             let err = res.text().await?;
             last_err = format!("Gemini SRT Error: {}", err);
             println!("[PIPELINE] gemini_srt attempt {} failed ({}): {}", attempt, status, err);
+            if is_gemini_file_not_ready_error(status, &err) {
+                continue;
+            }
             if status != 503 && status != 500 && status != 429 {
                 return Err(last_err.into());
             }
@@ -296,22 +408,30 @@ async fn gemini_srt_from_audio(
     Ok(normalized)
 }
 
-async fn gemini_wait(file_uri: &str, api_key: &str) -> String {
+async fn gemini_wait(file_uri: &str, api_key: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let file_name = file_uri.split("/files/").last().unwrap_or("");
     let url = format!("https://generativelanguage.googleapis.com/v1beta/files/{}?key={}", file_name, api_key);
     let client = Client::new();
+    let mut last_state = String::new();
     
-    for _ in 0..24 { // max 2 mins (24 * 5s)
+    for attempt in 0..36 { // max 3 mins (36 * 5s)
         if let Ok(res) = client.get(&url).send().await {
             if let Ok(json) = res.json::<Value>().await {
-                if json.get("state").and_then(|s| s.as_str()) == Some("ACTIVE") {
-                    return file_uri.to_string();
+                if let Some(state) = extract_gemini_file_state(&json) {
+                    last_state = state.clone();
+                    if state == "ACTIVE" {
+                        return Ok(file_uri.to_string());
+                    }
+                    if state == "FAILED" {
+                        return Err(format!("Gemini file processing failed: {}", json).into());
+                    }
+                    println!("[PIPELINE] gemini_wait attempt {} state={}", attempt, state);
                 }
             }
         }
         sleep(Duration::from_secs(5)).await;
     }
-    file_uri.to_string()
+    Err(format!("Gemini file did not become ACTIVE in time (last_state={})", if last_state.is_empty() { "unknown" } else { &last_state }).into())
 }
 
 fn render_script_prompt_template(template: &str, duration: f64, min_chars: i32, max_chars: i32) -> String {
@@ -392,7 +512,7 @@ async fn gemini_script(
 
     let mut resp_text = String::new();
     let mut last_err = String::new();
-    for attempt in 0..3 {
+    for attempt in 0..6 {
         if attempt > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(5 * attempt)).await;
             println!("[PIPELINE] gemini_script retry #{}", attempt);
@@ -409,6 +529,9 @@ async fn gemini_script(
             let err = res.text().await?;
             last_err = format!("Gemini Script Error: {}", err);
             println!("[PIPELINE] gemini_script attempt {} failed ({}): {}", attempt, status, err);
+            if is_gemini_file_not_ready_error(status, &err) {
+                continue;
+            }
             if status != 503 && status != 500 && status != 429 {
                 return Err(last_err.into());
             }
@@ -1123,15 +1246,9 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(15))
         .build()?;
-    let video_bytes = tokio::time::timeout(
-        Duration::from_secs(120),
-        client.get(&req.video_url).send()
-    ).await
-        .map_err(|_| "ดาวน์โหลดวิดีโอ timeout (120s)")?
-        ?.bytes().await
-        .map_err(|e| format!("ดาวน์โหลดวิดีโอล้มเหลว: {}", e))?;
-    
-    let _ = r2_put(worker_url, token, &bot_id, &format!("videos/{}_original.mp4", video_id), video_bytes.to_vec(), "video/mp4").await;
+    let video_bytes = download_video_bytes(&client, &req, &bot_id).await?;
+
+    let _ = r2_put(worker_url, token, &bot_id, &format!("videos/{}_original.mp4", video_id), video_bytes.clone(), "video/mp4").await;
     let tmp_dir = tempdir()?;
     let tmp_path = tmp_dir.path();
     let video_path = tmp_path.join("video.mp4");
@@ -1160,7 +1277,7 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
 
         let gemini_uri = gemini_upload_bytes(&video_bytes, "video/mp4", &req.api_key).await?;
         update_step(worker_url, token, &bot_id, &video_id, 2.3, "🔍 รอ Gemini ประมวลผล...").await;
-        let gemini_uri = gemini_wait(&gemini_uri, &req.api_key).await;
+        let gemini_uri = gemini_wait(&gemini_uri, &req.api_key).await?;
 
         update_step(worker_url, token, &bot_id, &video_id, 2.7, "🔍 สร้างบทพากย์...").await;
         let pack = gemini_script(
@@ -1208,7 +1325,7 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
         let t_sync = std::time::Instant::now();
         let adjusted_bytes = fs::read(&adjusted).await?;
         let audio_uri = gemini_upload_bytes(&adjusted_bytes, "audio/wav", &req.api_key).await?;
-        let audio_uri = gemini_wait(&audio_uri, &req.api_key).await;
+        let audio_uri = gemini_wait(&audio_uri, &req.api_key).await?;
         raw_srt = gemini_srt_from_audio(&audio_uri, &subtitle_lines, &req.api_key, &model, a_dur).await?;
         println!(
             "[PIPELINE] Gemini audio sync -> {} chars, {} blocks ({:.1}s)",

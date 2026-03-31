@@ -1,6 +1,6 @@
 # Stage 1: Rust (build for the active target platform)
 FROM rust:1.85-bookworm AS rust-builder
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -11,7 +11,7 @@ RUN cargo build --release
 
 # Stage 2: Runtime Image
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates wget libssl3 fontconfig fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 

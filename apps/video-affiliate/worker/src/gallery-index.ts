@@ -222,6 +222,10 @@ export function getVideoThumbnailUrlForNamespace(r2BaseUrl: string, namespaceId:
     return buildScopedVideoAssetUrl(r2BaseUrl, namespaceId, `${videoId}_thumb.webp`)
 }
 
+export function getVideoOriginalThumbnailUrlForNamespace(r2BaseUrl: string, namespaceId: string, videoId: string): string {
+    return buildScopedVideoAssetUrl(r2BaseUrl, namespaceId, `${videoId}_original_thumb.webp`)
+}
+
 function pickFirstShopeeUrl(value: unknown): string | null {
     if (typeof value === 'string') {
         const match = value.match(SHOPEE_LINK_RE)
@@ -437,7 +441,7 @@ async function resolveOwnerEmailForNamespace(db: D1Database, namespaceId: string
     return ''
 }
 
-function parseGalleryScanKey(key: string): { namespaceId: string; videoId: string; kind: 'meta' | 'public' | 'original' | 'thumb' } | null {
+function parseGalleryScanKey(key: string): { namespaceId: string; videoId: string; kind: 'meta' | 'public' | 'original' | 'thumb' | 'original-thumb' } | null {
     const raw = String(key || '').trim()
     if (!raw) return null
 
@@ -457,6 +461,13 @@ function parseGalleryScanKey(key: string): { namespaceId: string; videoId: strin
 
     if (!namespaceId || !rest) return null
 
+    if (rest.endsWith('_original_thumb.webp')) {
+        return {
+            namespaceId,
+            videoId: rest.slice(0, -'_original_thumb.webp'.length),
+            kind: 'original-thumb',
+        }
+    }
     if (rest.endsWith('_original.mp4')) {
         return {
             namespaceId,
@@ -505,6 +516,11 @@ async function scanAllGalleryVideos(bucket: R2Bucket): Promise<GalleryScanEntry[
                 hasPublicVideo: false,
                 hasOriginalVideo: false,
                 hasThumbnail: false,
+            }
+
+            if (parsed.kind === 'original-thumb') {
+                byVideo.set(dedupeKey, existing)
+                continue
             }
 
             const uploadedAt = obj.uploaded.toISOString()

@@ -1,0 +1,7 @@
+tunnel: fa3c58f4-f45f-49a1-a49a-4fb7999d5a50
+credentials-file: /Users/yok-macmini/.cloudflared/fa3c58f4-f45f-49a1-a49a-4fb7999d5a50.json
+
+ingress:
+  - hostname: short.wwoom.com
+    service: http://127.0.0.1:8800
+  - service: http_status:404

@@ -1,0 +1,1 @@
+ALTER TABLE line_users ADD COLUMN email TEXT NOT NULL DEFAULT '';

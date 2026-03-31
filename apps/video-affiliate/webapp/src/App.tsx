@@ -1,9 +1,17 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction, type SyntheticEvent } from 'react'
 
 
 const WORKER_URL = String(import.meta.env.VITE_WORKER_URL || 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev')
   .trim()
   .replace(/\/+$/, '')
+
+const LINE_LIFF_ID = '2009652996-DJtEhoDn'
+const GALLERY_HEADER_TOP_GAP = 8
+const VERTICAL_VIEWER_FRAME_STYLE = {
+  width: '100%',
+  maxWidth: 'calc((56svh * 9) / 16)',
+  aspectRatio: '9 / 16',
+} as const
 
 const COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER = '{{shopee_link}}'
 const COMMENT_TEMPLATE_LAZADA_PLACEHOLDER = '{{lazada_link}}'
@@ -140,6 +148,41 @@ const onPageImageError = (
   img.src = PAGE_IMAGE_PLACEHOLDER
 }
 
+function useViewerHistory(expanded: boolean, setExpanded: Dispatch<SetStateAction<boolean>>) {
+  const pushedViewerHistoryRef = useRef(false)
+  const closingFromPopStateRef = useRef(false)
+
+  useEffect(() => {
+    if (!expanded) return
+
+    const currentState = window.history.state
+    const nextState = currentState && typeof currentState === 'object'
+      ? { ...currentState, __viewer_overlay: true }
+      : { __viewer_overlay: true }
+
+    closingFromPopStateRef.current = false
+    window.history.pushState(nextState, '', window.location.href)
+    pushedViewerHistoryRef.current = true
+
+    const handlePopState = () => {
+      if (!pushedViewerHistoryRef.current) return
+      closingFromPopStateRef.current = true
+      pushedViewerHistoryRef.current = false
+      setExpanded(false)
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => {
+      window.removeEventListener('popstate', handlePopState)
+      if (pushedViewerHistoryRef.current && !closingFromPopStateRef.current) {
+        pushedViewerHistoryRef.current = false
+        window.history.back()
+      }
+      closingFromPopStateRef.current = false
+    }
+  }, [expanded, setExpanded])
+}
+
 interface Video {
   id: string
   namespace_id?: string
@@ -155,6 +198,7 @@ interface Video {
   lazadaLink?: string
   shopeeOriginalLink?: string
   lazadaOriginalLink?: string
+  shortlink_required?: boolean
   shortlink_status?: string
   shortlink_expected_utm_id?: string
   lazada_expected_member_id?: string
@@ -171,10 +215,15 @@ interface Video {
   keepInPostedTab?: boolean
 }
 
+type GalleryAssetVariant = 'public' | 'original' | 'thumb' | 'original-thumb'
+
 interface InboxVideo {
   id: string
+  namespace_id?: string
   videoUrl?: string
   previewUrl?: string
+  originalUrl?: string
+  thumbnailUrl?: string
   createdAt: string
   updatedAt?: string
   status: string
@@ -185,9 +234,6 @@ interface InboxVideo {
   hasShopeeLink?: boolean
   hasLazadaLink?: boolean
   readyToProcess?: boolean
-  processingStatus?: 'idle' | 'queued' | 'processing'
-  processingActive?: boolean
-  archiveState?: 'original' | 'processed'
   canStartProcessing?: boolean
   canDelete?: boolean
 }
@@ -346,7 +392,30 @@ interface FacebookPage {
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type GeminiKeySource = 'workspace' | 'none'
-type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment' | 'approvals'
+
+const getSettingsSectionTitle = (section: SettingsSection): string => {
+  switch (section) {
+    case 'account':
+      return 'Account'
+    case 'pages':
+      return 'Pages'
+    case 'team':
+      return 'Team'
+    case 'gemini':
+      return 'Gemini API Key'
+    case 'shortlink':
+      return 'Shortlink'
+    case 'comment':
+      return 'Comment Template'
+    case 'voice':
+      return 'Voice Prompt'
+    case 'approvals':
+      return 'อนุมัติสมาชิก'
+    default:
+      return 'ตั้งค่า'
+  }
+}
 
 const SHOPEE_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*shopee\.(?:co\.th|co\.id|com\.my|ph|sg|vn)\S*/i
 const LAZADA_LINK_RE = /https?:\/\/(?:[^"\s<>]+\.)*(?:lazada\.(?:co\.th|co\.id|com\.my|com\.ph|sg|vn)|lzd\.co)\S*/i
@@ -538,45 +607,75 @@ const getVideoSourceLazadaLink = (video: Record<string, unknown>): string => {
   return ''
 }
 
+const getBooleanFlag = (value: unknown): boolean | null => {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes') return true
+  if (normalized === 'false' || normalized === '0' || normalized === 'no') return false
+  return null
+}
+
+const isVideoShortlinkRequired = (
+  video: Partial<Video> & Record<string, unknown>,
+  fallback = false,
+): boolean => {
+  return getBooleanFlag(video.shortlink_required) ?? fallback
+}
+
 const getVideoAffiliateConversionState = (
   video: Partial<Video> & Record<string, unknown>,
   expectedUtmId = '',
   expectedLazadaMemberId = '',
+  options: { requireManagedLinks?: boolean } = {},
 ) => {
   const hasPlayable = !!resolvePlayableVideoUrl(video)
   const shopeeSourceLink = getVideoSourceShopeeLink(video)
   const shopeeCurrentLink = getVideoShopeeLink(video)
   const hasShopeeSource = !!shopeeSourceLink
+  const hasShopeeLink = !!(shopeeCurrentLink || shopeeSourceLink)
   const hasManagedShopeeConversion = !!String(
     video.shopeeConvertedAt || video.shopee_converted_at || video.shopeeOriginalLink || video.shopee_original_link || ''
   ).trim()
-  const shopeeReady = !!shopeeCurrentLink && isLikelyConvertedShopeeLink(shopeeCurrentLink, expectedUtmId)
+  const requireManagedLinks = options.requireManagedLinks ?? isVideoShortlinkRequired(video)
+  const shopeeReady = requireManagedLinks
+    ? (!!shopeeCurrentLink && isLikelyConvertedShopeeLink(shopeeCurrentLink, expectedUtmId))
+    : hasShopeeLink
 
   const lazadaSourceLink = getVideoSourceLazadaLink(video)
   const lazadaCurrentLink = getVideoLazadaLink(video)
   const hasLazadaSource = !!lazadaSourceLink
+  const hasLazadaLink = !!(lazadaCurrentLink || lazadaSourceLink)
   const hasManagedLazadaConversion = !!String(
     video.lazadaConvertedAt || video.lazada_converted_at || video.lazadaOriginalLink || video.lazada_original_link || ''
   ).trim()
   const lazadaMemberId = normalizeLazadaMemberIdClient(String(video.lazadaMemberId || video.lazada_member_id || ''))
-  const lazadaReady = !!lazadaCurrentLink && !!lazadaMemberId && isLikelyConvertedLazadaLink(lazadaCurrentLink) && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId)
+  const lazadaReady = requireManagedLinks
+    ? (!!lazadaCurrentLink && !!lazadaMemberId && isLikelyConvertedLazadaLink(lazadaCurrentLink) && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId))
+    : hasLazadaLink
 
-  const missingShopeeSource = hasPlayable && !hasShopeeSource
-  const galleryReady = hasPlayable && hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady
-  const missingLazadaSource = hasPlayable && !hasLazadaSource
+  const missingShopeeSource = hasPlayable && !hasShopeeLink
+  const galleryReady = requireManagedLinks
+    ? (hasPlayable && hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady)
+    : (hasPlayable && hasShopeeLink && hasLazadaLink)
+  const missingLazadaSource = hasPlayable && !hasLazadaLink
 
   return {
     hasPlayable,
+    requireManagedLinks,
     hasShopeeSource,
+    hasShopeeLink,
     hasManagedShopeeConversion,
     shopeeReady,
     hasLazadaSource,
+    hasLazadaLink,
     hasManagedLazadaConversion,
     lazadaMemberId,
     lazadaReady,
     missingShopeeSource,
     missingLazadaSource,
-    awaitingConversion: hasPlayable && (missingShopeeSource || !galleryReady),
+    awaitingConversion: requireManagedLinks && hasPlayable && (missingShopeeSource || !galleryReady),
     galleryReady,
   }
 }
@@ -644,16 +743,60 @@ function dedupeGalleryVideos(rows: Video[]): Video[] {
   return Array.from(byId.values()).sort((a, b) => getGalleryVideoSortMs(b as Video & Record<string, unknown>) - getGalleryVideoSortMs(a as Video & Record<string, unknown>))
 }
 
+const buildGalleryAssetProxyUrl = (
+  videoId: string,
+  namespaceId: string | undefined,
+  variant: GalleryAssetVariant,
+) => {
+  const id = String(videoId || '').trim()
+  const ns = String(namespaceId || '').trim()
+  if (!id || !ns) return ''
+  try {
+    const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(id)}/asset/${variant}`)
+    url.searchParams.set('namespace_id', ns)
+    return url.toString()
+  } catch {
+    return `${WORKER_URL}/api/gallery/${encodeURIComponent(id)}/asset/${variant}?namespace_id=${encodeURIComponent(ns)}`
+  }
+}
+
+const resolveGalleryAssetProxyUrl = (
+  video: Partial<Video> & Record<string, unknown>,
+  variant: GalleryAssetVariant,
+) => {
+  const id = String(video.id || video.video_id || '').trim()
+  const namespaceId = String(video.namespace_id || '').trim()
+  return buildGalleryAssetProxyUrl(id, namespaceId, variant)
+}
+
+const resolveThumbnailDisplayUrl = (video: Partial<Video> & Record<string, unknown>) => {
+  const proxied = resolveGalleryAssetProxyUrl(video, 'thumb')
+  if (proxied) return proxied
+  return String(video.thumbnailUrl || '').trim()
+}
+
+const resolveInboxThumbnailDisplayUrl = (video: Partial<InboxVideo> & Record<string, unknown>) => {
+  const proxied = resolveGalleryAssetProxyUrl(video, 'original-thumb')
+  if (proxied) return proxied
+  return String(video.thumbnailUrl || '').trim()
+}
+
 const resolvePlayableVideoUrl = (video: Partial<Video> & Record<string, unknown>) => {
+  const proxied = resolveGalleryAssetProxyUrl(video, 'public')
+  if (proxied) return proxied
   const publicUrl = String(video.publicUrl || '').trim()
   const originalUrl = String(video.originalUrl || '').trim()
   return publicUrl || originalUrl || ''
 }
 
 const resolveFallbackVideoUrl = (video: Partial<Video> & Record<string, unknown>, currentUrl?: string) => {
+  const proxiedPublicUrl = resolveGalleryAssetProxyUrl(video, 'public')
+  const proxiedOriginalUrl = resolveGalleryAssetProxyUrl(video, 'original')
   const publicUrl = String(video.publicUrl || '').trim()
   const originalUrl = String(video.originalUrl || '').trim()
   const current = String(currentUrl || '').trim()
+  if (current && current === proxiedPublicUrl && proxiedOriginalUrl && proxiedOriginalUrl !== proxiedPublicUrl) return proxiedOriginalUrl
+  if (current && current === proxiedOriginalUrl && proxiedPublicUrl && proxiedPublicUrl !== proxiedOriginalUrl) return proxiedPublicUrl
   if (current && current === publicUrl && originalUrl && originalUrl !== publicUrl) return originalUrl
   if (current && current === originalUrl && publicUrl && publicUrl !== originalUrl) return publicUrl
   return ''
@@ -664,6 +807,11 @@ const getVideoIdentityKey = (video: Partial<Video> & Record<string, unknown>) =>
   const namespaceId = String(video.namespace_id || '').trim()
   return namespaceId ? `${namespaceId}:${id}` : id
 }
+
+const filterDeletedGalleryVideos = (
+  rows: Video[],
+  deletedKeys: ReadonlySet<string>,
+) => rows.filter((video) => !deletedKeys.has(getVideoIdentityKey(video as Video & Record<string, unknown>)))
 
 const matchesVideoIdentity = (video: Partial<Video> & Record<string, unknown>, id: string, namespaceId?: string) => {
   return String(video.id || '').trim() === String(id || '').trim()
@@ -755,11 +903,6 @@ const SettingsIconFilled = () => (
     <path fillRule="evenodd" d="M11.078 2.25c-.917 0-1.699.663-1.85 1.567L9.05 4.889c-.02.12-.115.26-.297.348a7.493 7.493 0 00-.986.57c-.166.115-.334.126-.45.083L6.3 5.508a1.875 1.875 0 00-2.282.819l-.922 1.597a1.875 1.875 0 00.432 2.385l.84.692c.095.078.17.229.154.43a7.598 7.598 0 000 1.139c.015.2-.059.352-.153.43l-.841.692a1.875 1.875 0 00-.432 2.385l.922 1.597a1.875 1.875 0 002.282.818l1.019-.382c.115-.043.283-.031.45.082.312.214.641.405.985.57.182.088.277.228.297.35l.178 1.071c.151.904.933 1.567 1.85 1.567h1.844c.916 0 1.699-.663 1.85-1.567l.178-1.072c.02-.12.114-.26.297-.349.344-.165.673-.356.985-.57.167-.114.335-.125.45-.082l1.02.382a1.875 1.875 0 002.28-.819l.923-1.597a1.875 1.875 0 00-.432-2.385l-.84-.692c-.095-.078-.17-.229-.154-.43a7.614 7.614 0 000-1.139c-.016-.2.059-.352.153-.43l.84-.692c.708-.582.891-1.59.433-2.385l-.922-1.597a1.875 1.875 0 00-2.282-.818l-1.02.382c-.114.043-.282.031-.449-.083a7.49 7.49 0 00-.985-.57c-.183-.087-.277-.227-.297-.348l-.179-1.072a1.875 1.875 0 00-1.85-1.567h-1.843zM12 15.75a3.75 3.75 0 100-7.5 3.75 3.75 0 000 7.5z" clipRule="evenodd" />
   </svg>
 )
-const BackIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-    <path d="M15 19l-7-7 7-7" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
 const CloseIcon = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
     <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
@@ -816,7 +959,13 @@ function inferThumbnailUrl(url: string | undefined, fallback: string): string {
   if (direct) return direct
   const source = String(fallback || '').trim()
   if (!source) return ''
-  return source.replace(/(?:_original)?\.mp4(?:#.*)?$/i, '_thumb.webp')
+  if (/\/asset\/original(?:\?|$)/i.test(source)) {
+    return source.replace(/\/asset\/original(?=\?|$)/i, '/asset/original-thumb')
+  }
+  if (/_original\.mp4(?:[?#].*)?$/i.test(source)) {
+    return source.replace(/_original\.mp4/i, '_original_thumb.webp')
+  }
+  return source.replace(/\.mp4(?:[?#].*)?$/i, '_thumb.webp')
 }
 
 // Grid thumbnails stay image-only. If a thumb is missing, show a lightweight placeholder.
@@ -854,6 +1003,7 @@ function VideoCard({
   formatDuration,
   onDelete,
   onUpdate,
+  onImport,
   onExpandedChange,
   keepInPostedOnLinkSave = false
 }: {
@@ -863,11 +1013,13 @@ function VideoCard({
   formatDuration: (s: number) => string
   onDelete: (id: string, namespaceId?: string) => void
   onUpdate: (id: string, namespaceId: string | undefined, fields: Partial<Video>) => void
+  onImport?: (videoId: string, sourceNamespaceId: string) => void
   onExpandedChange?: (expanded: boolean) => void
   keepInPostedOnLinkSave?: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [importing, setImporting] = useState(false)
   const [shopeeInput, setShopeeInput] = useState('')
   const [savingShopee, setSavingShopee] = useState(false)
   const [deletingShopeeLink, setDeletingShopeeLink] = useState(false)
@@ -882,6 +1034,7 @@ function VideoCard({
   const [localTitle, setLocalTitle] = useState(video.title || '')
   const [savingTitle, setSavingTitle] = useState(false)
   const [playbackUrl, setPlaybackUrl] = useState(resolvePlayableVideoUrl(video as Video & Record<string, unknown>))
+  const playbackPosterUrl = resolveThumbnailDisplayUrl(video as Video & Record<string, unknown>)
   const videoNamespaceId = String(video.namespace_id || '').trim() || undefined
   const videoStorageId = videoNamespaceId ? `${videoNamespaceId}:${video.id}` : video.id
   const buildVideoApiUrl = () => {
@@ -900,7 +1053,7 @@ function VideoCard({
 
   useEffect(() => {
     setPlaybackUrl(resolvePlayableVideoUrl(video as Video & Record<string, unknown>))
-  }, [video.id, video.publicUrl, video.originalUrl])
+  }, [video.id, video.namespace_id, video.publicUrl, video.originalUrl])
 
   useEffect(() => {
     if (expanded) {
@@ -913,6 +1066,7 @@ function VideoCard({
     onExpandedChange?.(expanded)
     return () => onExpandedChange?.(false)
   }, [expanded, onExpandedChange])
+  useViewerHistory(expanded, setExpanded)
 
   const toggleCategory = async (cat: string) => {
     const next = localCats.includes(cat) ? localCats.filter(c => c !== cat) : [...localCats, cat]
@@ -1128,286 +1282,328 @@ function VideoCard({
 
   if (expanded) {
     return (
-      <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
-        <div className="relative w-[85%] max-w-sm">
-          {/* Close button */}
-          <button
-            onClick={() => setExpanded(false)}
-            className="mx-auto mb-3 w-11 h-11 bg-white/20 rounded-full flex items-center justify-center backdrop-blur-sm"
-          >
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
-              <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
-          {/* Editable Title */}
-          <div className="mb-2">
-            {editingTitle ? (
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={localTitle}
-                  onChange={(e) => setLocalTitle(e.target.value)}
-                  autoFocus
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleSaveTitle(localTitle)
-                    if (e.key === 'Escape') { setEditingTitle(false); setLocalTitle(video.title || '') }
+      <div className="fixed inset-0 z-50 bg-[#fafafa] text-gray-900">
+        <div className="mx-auto flex h-full w-full max-w-md flex-col bg-[#fafafa]">
+          <div
+            aria-hidden="true"
+            className="sticky top-0 z-10 bg-[#fafafa]"
+            style={{ height: 'calc(env(safe-area-inset-top, 0px) + 8px)' }}
+          />
+          <div data-allow-touch-scroll="true" className="flex-1 overflow-y-auto app-scroll">
+            <div
+              className="space-y-4 px-4"
+              style={{
+                paddingTop: '8px',
+                paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 24px)',
+              }}
+            >
+              <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+                <p className="mb-2 text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">Caption</p>
+                {editingTitle ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={localTitle}
+                      onChange={(e) => setLocalTitle(e.target.value)}
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleSaveTitle(localTitle)
+                        if (e.key === 'Escape') { setEditingTitle(false); setLocalTitle(video.title || '') }
+                      }}
+                      className="flex-1 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-900 outline-none focus:border-blue-400 focus:bg-white"
+                      placeholder="ใส่แคปชั่น..."
+                    />
+                    <button
+                      onClick={() => handleSaveTitle(localTitle)}
+                      disabled={savingTitle}
+                      className="shrink-0 rounded-xl bg-blue-600 px-3 py-2 text-xs font-bold text-white active:scale-95 transition-all disabled:opacity-50"
+                    >
+                      {savingTitle ? '...' : 'OK'}
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setEditingTitle(true)}
+                    className="flex w-full items-start gap-2 rounded-xl bg-gray-50 px-3 py-3 text-left active:scale-[0.99] transition-transform"
+                  >
+                    <p className={`flex-1 text-sm ${localTitle ? 'text-gray-900' : 'text-gray-400'} line-clamp-3`}>
+                      {localTitle || 'แตะเพื่อเพิ่มแคปชั่น...'}
+                    </p>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="mt-0.5 shrink-0 text-gray-400">
+                      <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+
+              <div
+                className="mx-auto overflow-hidden rounded-[28px] border border-gray-200 bg-white shadow-sm"
+                style={VERTICAL_VIEWER_FRAME_STYLE}
+              >
+                <video
+                  src={playbackUrl}
+                  className="block h-full w-full bg-white object-contain"
+                  controls
+                  autoPlay
+                  playsInline
+                  preload="metadata"
+                  poster={playbackPosterUrl || undefined}
+                  onError={() => {
+                    const fallbackUrl = resolveFallbackVideoUrl(video as Video & Record<string, unknown>, playbackUrl)
+                    if (fallbackUrl && fallbackUrl !== playbackUrl) {
+                      setPlaybackUrl(fallbackUrl)
+                    }
                   }}
-                  className="flex-1 bg-white/10 text-white text-sm px-3 py-2 rounded-xl outline-none border border-white/20 focus:border-blue-400"
-                  placeholder="ใส่แคปชั่น..."
                 />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <div className="min-w-0 flex-1 rounded-2xl border border-gray-200 bg-white px-3 py-2.5 shadow-sm">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Video ID</p>
+                  <p className="truncate text-sm font-semibold text-gray-900">{video.id}</p>
+                </div>
                 <button
-                  onClick={() => handleSaveTitle(localTitle)}
-                  disabled={savingTitle}
-                  className="shrink-0 bg-blue-500 text-white text-xs font-bold px-3 py-2 rounded-xl active:scale-95 transition-all disabled:opacity-50"
+                  onClick={() => navigator.clipboard.writeText(video.id)}
+                  className="shrink-0 rounded-2xl border border-gray-200 bg-white p-3 text-gray-600 shadow-sm active:scale-95 transition-transform"
                 >
-                  {savingTitle ? '...' : 'OK'}
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
+                    <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
                 </button>
               </div>
-            ) : (
-              <button
-                onClick={() => setEditingTitle(true)}
-                className="w-full text-left flex items-center gap-2 group"
-              >
-                <p className={`flex-1 text-sm ${localTitle ? 'text-white' : 'text-white/40'} line-clamp-2`}>
-                  {localTitle || 'แตะเพื่อเพิ่มแคปชั่น...'}
-                </p>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" className="shrink-0 opacity-40 group-active:opacity-80">
-                  <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-            )}
-          </div>
-          <div className="aspect-[3/4] rounded-2xl overflow-hidden">
-            <video
-              src={playbackUrl}
-              className="w-full h-full object-cover"
-              controls
-              autoPlay
-              playsInline
-              onError={() => {
-                const fallbackUrl = resolveFallbackVideoUrl(video as Video & Record<string, unknown>, playbackUrl)
-                if (fallbackUrl && fallbackUrl !== playbackUrl) {
-                  setPlaybackUrl(fallbackUrl)
-                }
-              }}
-            />
-          </div>
-          <div className="mt-3 flex items-center gap-2">
-            <div className="min-w-0 flex-1 rounded-xl bg-white/10 px-3 py-2">
-              <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-white/50">Video ID</p>
-              <p className="truncate text-sm font-semibold text-white">{video.id}</p>
-            </div>
-            <button
-              onClick={() => navigator.clipboard.writeText(video.id)}
-              className="shrink-0 rounded-xl bg-white/15 p-3 active:scale-95 transition-transform"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
-          </div>
-          {/* Category chips */}
-          <div className="flex gap-1.5 mt-2 flex-wrap">
-            {fetchedCats.map(cat => (
-              <button
-                key={cat}
-                onClick={() => toggleCategory(cat)}
-                className={`px-2.5 py-1 rounded-full text-xs font-bold transition-all active:scale-95 ${localCats.includes(cat) ? 'bg-blue-500 text-white' : 'bg-white/30 text-white'}`}
-              >
-                #{cat}
-              </button>
-            ))}
-          </div>
-          {/* Shopee Link */}
-          <p className="mt-3 mb-1 px-1 text-[11px] font-bold uppercase tracking-[0.18em] text-white/45">Shopee Link</p>
-          {savingShopee ? (
-            <div className="flex items-center justify-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
-              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-              <span className="text-white/60 text-sm">กำลังบันทึก...</span>
-            </div>
-          ) : localShopee ? (
-            <div className="flex items-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
-              <span className="text-white text-sm truncate flex-1">{localShopee}</span>
-              {/* แก้ไข */}
-              <button
-                onClick={() => { setShopeeInput(''); setLocalShopee('') }}
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-              {/* เปิดลิงก์ */}
-              <a
-                href={localShopee}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M15 3h6v6" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M10 14L21 3" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </a>
-              {/* คัดลอก */}
-              <button
-                onClick={() => navigator.clipboard.writeText(localShopee)}
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-              {/* ลบลิ้ง Shopee */}
-              <button
-                onClick={handleDeleteShopeeLink}
-                disabled={deletingShopeeLink}
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform disabled:opacity-60"
-              >
-                {deletingShopeeLink ? (
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+
+              <div className="flex flex-wrap gap-1.5">
+                {fetchedCats.map(cat => (
+                  <button
+                    key={cat}
+                    onClick={() => toggleCategory(cat)}
+                    className={`rounded-full px-2.5 py-1 text-xs font-bold transition-all active:scale-95 ${localCats.includes(cat) ? 'bg-blue-500 text-white shadow-sm' : 'bg-white text-gray-700 border border-gray-200'}`}
+                  >
+                    #{cat}
+                  </button>
+                ))}
+              </div>
+
+              <div>
+                <p className="mb-1 px-1 text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">Shopee Link</p>
+                {savingShopee ? (
+                  <div className="mt-3 flex items-center justify-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-3 shadow-sm">
+                    <div className="h-4 w-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                    <span className="text-sm text-gray-500">กำลังบันทึก...</span>
+                  </div>
+                ) : localShopee ? (
+                  <div className="mt-3 flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2.5 shadow-sm">
+                    <span className="flex-1 truncate text-sm text-gray-900">{localShopee}</span>
+                    <button
+                      onClick={() => { setShopeeInput(''); setLocalShopee('') }}
+                      className="shrink-0 rounded-lg bg-gray-100 p-2 text-gray-600 active:scale-90 transition-transform"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                    <a
+                      href={localShopee}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="shrink-0 rounded-lg bg-gray-100 p-2 text-gray-600 active:scale-90 transition-transform"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M15 3h6v6" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M10 14L21 3" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </a>
+                    <button
+                      onClick={() => navigator.clipboard.writeText(localShopee)}
+                      className="shrink-0 rounded-lg bg-gray-100 p-2 text-gray-600 active:scale-90 transition-transform"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={handleDeleteShopeeLink}
+                      disabled={deletingShopeeLink}
+                      className="shrink-0 rounded-lg bg-red-50 p-2 text-red-500 active:scale-90 transition-transform disabled:opacity-60"
+                    >
+                      {deletingShopeeLink ? (
+                        <div className="h-4 w-4 rounded-full border-2 border-red-500 border-t-transparent animate-spin" />
+                      ) : (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M3 6h18" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4h4v2" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
                 ) : (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                    <path d="M3 6h18" strokeLinecap="round" strokeLinejoin="round" />
-                    <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" strokeLinecap="round" strokeLinejoin="round" />
-                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4h4v2" strokeLinecap="round" strokeLinejoin="round" />
-                    <path d="M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
+                  <div className="mt-3 flex items-center gap-2">
+                    <div
+                      contentEditable
+                      suppressContentEditableWarning
+                      onPaste={(e) => {
+                        e.preventDefault()
+                        const text = e.clipboardData.getData('text/plain').trim()
+                        if (text) setShopeeInput(text)
+                      }}
+                      onBeforeInput={(e) => e.preventDefault()}
+                      onDrop={(e) => e.preventDefault()}
+                      className="min-h-[44px] flex-1 break-all rounded-2xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-900 outline-none"
+                      style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
+                      inputMode="none"
+                    >
+                      {shopeeInput && <span className="text-gray-900">{shopeeInput}</span>}
+                    </div>
+                    <button
+                      onClick={handleSaveShopee}
+                      disabled={!shopeeInput.trim()}
+                      className="shrink-0 rounded-2xl bg-blue-600 px-4 py-2.5 text-sm font-bold text-white active:scale-95 transition-all disabled:opacity-50"
+                    >
+                      บันทึก
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <p className="mb-1 px-1 text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">Lazada Link</p>
+                {savingLazada ? (
+                  <div className="mt-3 flex items-center justify-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-3 shadow-sm">
+                    <div className="h-4 w-4 rounded-full border-2 border-blue-500 border-t-transparent animate-spin" />
+                    <span className="text-sm text-gray-500">กำลังบันทึก...</span>
+                  </div>
+                ) : localLazada ? (
+                  <div className="mt-3 flex items-center gap-2 rounded-2xl border border-gray-200 bg-white px-3 py-2.5 shadow-sm">
+                    <span className="flex-1 truncate text-sm text-gray-900">{localLazada}</span>
+                    <button
+                      onClick={() => { setLazadaInput(''); setLocalLazada('') }}
+                      className="shrink-0 rounded-lg bg-gray-100 p-2 text-gray-600 active:scale-90 transition-transform"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                    <a
+                      href={localLazada}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="shrink-0 rounded-lg bg-gray-100 p-2 text-gray-600 active:scale-90 transition-transform"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M15 3h6v6" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M10 14L21 3" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </a>
+                    <button
+                      onClick={() => navigator.clipboard.writeText(localLazada)}
+                      className="shrink-0 rounded-lg bg-gray-100 p-2 text-gray-600 active:scale-90 transition-transform"
+                    >
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={handleDeleteLazadaLink}
+                      disabled={deletingLazadaLink}
+                      className="shrink-0 rounded-lg bg-red-50 p-2 text-red-500 active:scale-90 transition-transform disabled:opacity-60"
+                    >
+                      {deletingLazadaLink ? (
+                        <div className="h-4 w-4 rounded-full border-2 border-red-500 border-t-transparent animate-spin" />
+                      ) : (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M3 6h18" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4h4v2" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="mt-3 flex items-center gap-2">
+                    <div
+                      contentEditable
+                      suppressContentEditableWarning
+                      onPaste={(e) => {
+                        e.preventDefault()
+                        const text = e.clipboardData.getData('text/plain').trim()
+                        if (text) setLazadaInput(text)
+                      }}
+                      onBeforeInput={(e) => e.preventDefault()}
+                      onDrop={(e) => e.preventDefault()}
+                      className="min-h-[44px] flex-1 break-all rounded-2xl border border-gray-200 bg-white px-3 py-2.5 text-sm text-gray-900 outline-none"
+                      style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
+                      inputMode="none"
+                    >
+                      {lazadaInput && <span className="text-gray-900">{lazadaInput}</span>}
+                    </div>
+                    <button
+                      onClick={handleSaveLazada}
+                      disabled={!lazadaInput.trim()}
+                      className="shrink-0 rounded-2xl bg-blue-600 px-4 py-2.5 text-sm font-bold text-white active:scale-95 transition-all disabled:opacity-50"
+                    >
+                      บันทึก
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {onImport && showWorkspaceBadge && videoNamespaceId && videoNamespaceId !== currentNamespaceId && (
+                <button
+                  onClick={async () => {
+                    setImporting(true)
+                    try {
+                      await onImport(video.id, videoNamespaceId)
+                    } finally {
+                      setImporting(false)
+                    }
+                  }}
+                  disabled={importing}
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-500 py-3 text-sm font-bold text-white active:scale-95 transition-all disabled:opacity-60"
+                >
+                  {importing ? (
+                    <div className="h-4 w-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                  ) : (
+                    <>
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" strokeLinecap="round" strokeLinejoin="round" />
+                        <polyline points="7 10 12 15 17 10" strokeLinecap="round" strokeLinejoin="round" />
+                        <line x1="12" y1="15" x2="12" y2="3" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      นำเข้า Workspace ของฉัน
+                    </>
+                  )}
+                </button>
+              )}
+
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                className="flex w-full items-center justify-center gap-2 rounded-2xl bg-red-500 py-3 text-sm font-bold text-white active:scale-95 transition-all"
+              >
+                {deleting ? (
+                  <div className="h-4 w-4 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                ) : (
+                  <>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+                      <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    ลบวีดีโอ
+                  </>
                 )}
               </button>
             </div>
-          ) : (
-            <div className="flex items-center gap-2 mt-3">
-              <div
-                contentEditable
-                suppressContentEditableWarning
-                onPaste={(e) => {
-                  e.preventDefault()
-                  const text = e.clipboardData.getData('text/plain').trim()
-                  if (text) setShopeeInput(text)
-                }}
-                onBeforeInput={(e) => e.preventDefault()}
-                onDrop={(e) => e.preventDefault()}
-                className="flex-1 bg-white/10 text-white text-sm px-3 py-2.5 rounded-xl outline-none min-h-[40px] break-all"
-                style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
-                inputMode="none"
-              >
-                {shopeeInput && <span className="text-white">{shopeeInput}</span>}
-              </div>
-              <button
-                onClick={handleSaveShopee}
-                disabled={!shopeeInput.trim()}
-                className="shrink-0 bg-black text-white text-sm font-bold px-4 py-2.5 rounded-xl active:scale-95 transition-all disabled:opacity-50"
-              >
-                บันทึก
-              </button>
-            </div>
-          )}
-          <p className="mt-3 mb-1 px-1 text-[11px] font-bold uppercase tracking-[0.18em] text-white/45">Lazada Link</p>
-          {savingLazada ? (
-            <div className="flex items-center justify-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
-              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-              <span className="text-white/60 text-sm">กำลังบันทึก...</span>
-            </div>
-          ) : localLazada ? (
-            <div className="flex items-center gap-2 mt-3 bg-white/10 rounded-xl px-3 py-2.5">
-              <span className="text-white text-sm truncate flex-1">{localLazada}</span>
-              <button
-                onClick={() => { setLazadaInput(''); setLocalLazada('') }}
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-              <a
-                href={localLazada}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M15 3h6v6" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M10 14L21 3" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </a>
-              <button
-                onClick={() => navigator.clipboard.writeText(localLazada)}
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-              <button
-                onClick={handleDeleteLazadaLink}
-                disabled={deletingLazadaLink}
-                className="shrink-0 bg-white/20 rounded-lg p-2 active:scale-90 transition-transform disabled:opacity-60"
-              >
-                {deletingLazadaLink ? (
-                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                    <path d="M3 6h18" strokeLinecap="round" strokeLinejoin="round" />
-                    <path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2" strokeLinecap="round" strokeLinejoin="round" />
-                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4h4v2" strokeLinecap="round" strokeLinejoin="round" />
-                    <path d="M10 11v6M14 11v6" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                )}
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 mt-3">
-              <div
-                contentEditable
-                suppressContentEditableWarning
-                onPaste={(e) => {
-                  e.preventDefault()
-                  const text = e.clipboardData.getData('text/plain').trim()
-                  if (text) setLazadaInput(text)
-                }}
-                onBeforeInput={(e) => e.preventDefault()}
-                onDrop={(e) => e.preventDefault()}
-                className="flex-1 bg-white/10 text-white text-sm px-3 py-2.5 rounded-xl outline-none min-h-[40px] break-all"
-                style={{ WebkitUserSelect: 'text', userSelect: 'text' }}
-                inputMode="none"
-              >
-                {lazadaInput && <span className="text-white">{lazadaInput}</span>}
-              </div>
-              <button
-                onClick={handleSaveLazada}
-                disabled={!lazadaInput.trim()}
-                className="shrink-0 bg-black text-white text-sm font-bold px-4 py-2.5 rounded-xl active:scale-95 transition-all disabled:opacity-50"
-              >
-                บันทึก
-              </button>
-            </div>
-          )}
-          {/* Delete button */}
-          <button
-            onClick={handleDelete}
-            disabled={deleting}
-            className="w-full mt-2 py-3 rounded-xl bg-red-500 text-white text-sm font-bold flex items-center justify-center gap-2 active:scale-95 transition-all"
-          >
-            {deleting ? (
-              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
-                  <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                ลบวีดีโอ
-              </>
-            )}
-          </button>
+          </div>
         </div>
       </div>
     )
@@ -1418,7 +1614,7 @@ function VideoCard({
       className="relative aspect-[9/16] rounded-2xl overflow-hidden cursor-pointer bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200"
       onClick={() => setExpanded(true)}
     >
-      <Thumb id={video.id} url={video.thumbnailUrl} fallback={resolvePlayableVideoUrl(video as Video & Record<string, unknown>)} />
+      <Thumb id={video.id} url={resolveThumbnailDisplayUrl(video as Video & Record<string, unknown>)} fallback={resolvePlayableVideoUrl(video as Video & Record<string, unknown>)} />
       {showWorkspaceBadge && (
         <div className="absolute top-2 left-2">
           <VideoWorkspaceBadge
@@ -1450,11 +1646,15 @@ function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOri
   const createdLabel = Number.isNaN(createdAt.getTime())
     ? '-'
     : createdAt.toLocaleString('th-TH', { hour12: false })
+  const originalPlaybackUrl = resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original') || video.original_url
+  const originalPosterUrl = resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original-thumb')
+    || resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'thumb')
 
   useEffect(() => {
     onExpandedChange?.(expanded)
     return () => onExpandedChange?.(false)
   }, [expanded, onExpandedChange])
+  useViewerHistory(expanded, setExpanded)
 
   return (
     <>
@@ -1464,7 +1664,7 @@ function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOri
         className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200 text-left"
       >
         <video
-          src={`${video.original_url}#t=0.1`}
+          src={`${originalPlaybackUrl}#t=0.1`}
           className="w-full h-full object-cover"
           preload="metadata"
           muted
@@ -1481,22 +1681,15 @@ function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOri
       {expanded && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
           <div className="relative w-[88%] max-w-sm">
-            <button
-              onClick={() => setExpanded(false)}
-              className="mx-auto mb-3 w-11 h-11 bg-white/20 rounded-full flex items-center justify-center backdrop-blur-sm"
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
-                <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
-
             <div className="aspect-[9/16] rounded-2xl overflow-hidden bg-black">
               <video
-                src={video.original_url}
+                src={originalPlaybackUrl}
                 className="w-full h-full object-cover"
                 controls
                 autoPlay
                 playsInline
+                preload="metadata"
+                poster={originalPosterUrl || undefined}
               />
             </div>
 
@@ -1507,7 +1700,7 @@ function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOri
             </div>
 
             <a
-              href={video.original_url}
+              href={originalPlaybackUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="mt-3 w-full inline-flex items-center justify-center rounded-xl bg-blue-500 text-white py-3 text-sm font-bold active:scale-95 transition-transform"
@@ -1809,12 +2002,6 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
 
   return (
     <div className="h-full flex flex-col px-5">
-      {/* Back button */}
-      <div className="flex items-center mb-4">
-        <button onClick={onBack} className="p-1 text-gray-400">
-          <BackIcon />
-        </button>
-      </div>
       {/* Scrollable content area */}
       <div className="flex-1 overflow-y-auto min-h-0 app-scroll">
 
@@ -1999,17 +2186,11 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
       </div>{/* End scrollable content */}
 
       {/* Bottom buttons */}
-      <div className="pb-2 flex gap-3">
-        <button
-          onClick={onBack}
-          className="py-4 px-5 rounded-2xl font-bold text-base border border-gray-200 text-gray-600 active:scale-95 transition-all"
-        >
-          <BackIcon />
-        </button>
+      <div className="pb-2">
         <button
           onClick={handleSave}
           disabled={saving}
-          className={`flex-1 py-4 rounded-2xl font-bold text-base transition-all ${saving ? 'bg-gray-400 text-white' : 'bg-blue-600 text-white active:scale-95'
+          className={`w-full py-4 rounded-2xl font-bold text-base transition-all ${saving ? 'bg-gray-400 text-white' : 'bg-blue-600 text-white active:scale-95'
             }`}
         >
           {saving ? 'กำลังบันทึก...' : 'Save'}
@@ -2029,63 +2210,55 @@ function InboxCard({
 }: {
   video: InboxVideo
   onStart: (id: string) => void
-  onDelete: (id: string) => void
+  onDelete: (id: string, namespaceId?: string) => void
   starting: boolean
   deleting: boolean
   onExpandedChange?: (expanded: boolean) => void
 }) {
   const [expanded, setExpanded] = useState(false)
-  const processingStatus = String(video.processingStatus || 'idle').trim().toLowerCase()
-  const processingActive = video.processingActive === true || processingStatus === 'queued' || processingStatus === 'processing'
-  const archiveState = String(video.archiveState || 'original').trim().toLowerCase()
-  const processedArchive = archiveState === 'processed'
-  const canStartProcessing = video.canStartProcessing !== false && !processedArchive
   const canDelete = video.canDelete !== false
-  const ready = video.readyToProcess === true || video.status === 'ready'
+  const canStartProcessing = video.canStartProcessing !== false
+  const ready = video.readyToProcess === true || video.status === 'ready' || (video.hasShopeeLink === true && video.hasLazadaLink === true)
   const missingLinks = [
     video.hasShopeeLink ? null : 'Shopee',
     video.hasLazadaLink ? null : 'Lazada',
   ].filter(Boolean).join(' / ')
   const sourceLabel = String(video.sourceLabel || (video.sourceType === 'xhs_url' ? 'Xiaohongshu link' : 'Telegram video')).trim()
-  const previewUrl = String(video.previewUrl || (video.sourceType === 'telegram_video' ? video.videoUrl || '' : '')).trim()
+  const sourceBadge = video.sourceType === 'xhs_url'
+    ? { label: 'XHS', cls: 'bg-rose-500/95 text-white' }
+    : video.sourceType === 'line_video'
+      ? { label: 'LINE', cls: 'bg-emerald-500/95 text-white' }
+      : { label: 'ต้นฉบับ', cls: 'bg-slate-900/85 text-white' }
+  const playbackUrl = String(
+    resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original')
+    || video.originalUrl
+    || video.videoUrl
+    || video.previewUrl
+    || ''
+  ).trim()
+  const thumbnailUrl = String(
+    resolveInboxThumbnailDisplayUrl(video as unknown as Record<string, unknown>)
+    || video.thumbnailUrl
+    || ''
+  ).trim()
+  const playbackPosterUrl = thumbnailUrl
   const createdAtLabel = new Date(video.createdAt).toLocaleString('th-TH', {
     day: '2-digit',
     month: 'short',
     hour: '2-digit',
     minute: '2-digit',
   })
-  const statusBadge = processingStatus === 'processing'
-    ? { label: 'กำลังทำ', cls: 'bg-violet-500/95 text-white' }
-    : processingStatus === 'queued'
-      ? { label: 'อยู่ในคิว', cls: 'bg-sky-500/95 text-white' }
-      : processedArchive
-        ? { label: 'ทำเสร็จแล้ว', cls: 'bg-emerald-500/95 text-white' }
-      : ready
-        ? { label: 'พร้อมทำ', cls: 'bg-blue-500/95 text-white' }
-        : { label: 'รอลิงก์', cls: 'bg-amber-400/95 text-slate-950' }
-  const detailStatusBadge = processingStatus === 'processing'
-    ? { label: 'กำลังประมวลผล', cls: 'bg-violet-500 text-white' }
-    : processingStatus === 'queued'
-      ? { label: 'รอคิวประมวลผล', cls: 'bg-sky-500 text-white' }
-      : processedArchive
-        ? { label: 'ประมวลผลเสร็จแล้ว', cls: 'bg-emerald-500 text-white' }
-      : ready
-        ? { label: 'พร้อมประมวลผล', cls: 'bg-blue-500 text-white' }
-        : { label: `รอลิงก์ ${missingLinks || ''}`.trim(), cls: 'bg-amber-400 text-slate-950' }
-  const actionLabel = processingStatus === 'processing'
-    ? 'อยู่ใน Processing'
-    : processingStatus === 'queued'
-      ? 'อยู่ในคิว Processing'
-      : processedArchive
-        ? 'อยู่ใน Gallery แล้ว'
-      : ready
-        ? 'ส่งเข้า Processing'
-        : 'รอลิงก์ให้ครบก่อน'
+  const actionLabel = !ready
+    ? 'ลิงก์ยังไม่ครบ'
+    : canStartProcessing
+      ? 'ส่งเข้า Processing'
+      : 'เก็บในคลังต้นฉบับ'
 
   useEffect(() => {
     onExpandedChange?.(expanded)
     return () => onExpandedChange?.(false)
   }, [expanded, onExpandedChange])
+  useViewerHistory(expanded, setExpanded)
 
   return (
     <>
@@ -2094,8 +2267,8 @@ function InboxCard({
         onClick={() => setExpanded(true)}
         className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200 text-left"
       >
-        {previewUrl ? (
-          <Thumb id={video.id} fallback={previewUrl} />
+        {thumbnailUrl || playbackUrl ? (
+          <Thumb id={video.id} url={thumbnailUrl} fallback={playbackUrl} />
         ) : (
           <div className={`w-full h-full flex flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
             <div className="rounded-full bg-white/18 px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.22em] text-white">
@@ -2108,8 +2281,8 @@ function InboxCard({
         )}
 
         <div className="absolute left-2 top-2">
-          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${statusBadge.cls}`}>
-            {statusBadge.label}
+          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${sourceBadge.cls}`}>
+            {sourceBadge.label}
           </span>
         </div>
 
@@ -2129,76 +2302,117 @@ function InboxCard({
       </button>
 
       {expanded && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
-          <div className="relative w-[88%] max-w-sm">
-            <button
-              onClick={() => setExpanded(false)}
-              className="mx-auto mb-3 w-11 h-11 bg-white/20 rounded-full flex items-center justify-center backdrop-blur-sm"
-            >
-              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
-                <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </button>
+        <div className="fixed inset-0 z-50 bg-[#fafafa] text-gray-900">
+          <div className="mx-auto flex h-full w-full max-w-md flex-col bg-[#fafafa]">
+            <div
+              aria-hidden="true"
+              className="sticky top-0 z-10 bg-[#fafafa]"
+              style={{ height: 'calc(env(safe-area-inset-top, 0px) + 8px)' }}
+            />
+            <div data-allow-touch-scroll="true" className="flex-1 overflow-y-auto app-scroll">
+              <div
+                className="space-y-4 px-4"
+                style={{
+                  paddingTop: '8px',
+                  paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 24px)',
+                }}
+              >
+                <div
+                  className="mx-auto overflow-hidden rounded-[28px] border border-gray-200 bg-white shadow-sm"
+                  style={VERTICAL_VIEWER_FRAME_STYLE}
+                >
+                  {playbackUrl ? (
+                    <video
+                      src={playbackUrl}
+                      className="block h-full w-full bg-white object-contain"
+                      controls
+                      autoPlay
+                      playsInline
+                      preload="metadata"
+                      poster={playbackPosterUrl || undefined}
+                    />
+                  ) : (
+                    <div className={`flex min-h-[320px] w-full flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
+                      <div className="rounded-full bg-white/18 px-4 py-2 text-xs font-extrabold uppercase tracking-[0.22em] text-white">
+                        {video.sourceType === 'xhs_url' ? 'XHS' : 'ต้นฉบับ'}
+                      </div>
+                      <p className="mt-3 px-6 text-center text-sm font-semibold text-white/90 break-all line-clamp-4">
+                        {sourceLabel}
+                      </p>
+                    </div>
+                  )}
+                </div>
 
-            <div className="aspect-[9/16] rounded-2xl overflow-hidden bg-black">
-              {previewUrl ? (
-                <video
-                  src={previewUrl}
-                  className="w-full h-full object-cover"
-                  controls
-                  autoPlay
-                  playsInline
-                />
-              ) : (
-                <div className={`w-full h-full flex flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
-                  <div className="rounded-full bg-white/18 px-4 py-2 text-xs font-extrabold uppercase tracking-[0.22em] text-white">
-                    {video.sourceType === 'xhs_url' ? 'XHS' : 'ต้นฉบับ'}
+                <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${sourceBadge.cls.replace('/95', '').replace('/85', '')}`}>
+                      {sourceBadge.label}
+                    </span>
+                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasShopeeLink ? 'bg-emerald-500 text-white' : 'bg-gray-100 text-gray-500'}`}>
+                      Shopee
+                    </span>
+                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasLazadaLink ? 'bg-sky-500 text-white' : 'bg-gray-100 text-gray-500'}`}>
+                      Lazada
+                    </span>
                   </div>
-                  <p className="mt-3 px-6 text-center text-sm font-semibold text-white/90 break-all line-clamp-4">
-                    {sourceLabel}
-                  </p>
+                  <div className={`rounded-xl px-3 py-3 ${ready ? 'bg-blue-50 text-blue-900' : 'bg-amber-50 text-amber-900'}`}>
+                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-60">คลังต้นฉบับ</p>
+                    <p className="mt-1 text-sm font-semibold">
+                      {!ready
+                        ? `คลิปต้นฉบับถูกเก็บในระบบแล้ว เหลือลิงก์ ${missingLinks || 'Shopee / Lazada'}`
+                        : canStartProcessing
+                          ? 'คลิปต้นฉบับถูกเก็บในระบบแล้ว และพร้อมส่งเข้า Processing ได้ทันที'
+                          : 'คลิปต้นฉบับถูกเก็บในระบบแล้ว รายการนี้ใช้ดูย้อนหลังในคลังต้นฉบับได้เลย'}
+                    </p>
+                  </div>
+                  <div className="rounded-xl bg-gray-50 px-3 py-3">
+                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Source</p>
+                    <p className="mt-1 text-sm font-semibold text-gray-900 break-all">{sourceLabel}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="min-w-0 flex-1 rounded-xl bg-gray-50 px-3 py-2.5">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Video ID</p>
+                      <p className="truncate text-sm font-semibold text-gray-900">{video.id}</p>
+                    </div>
+                    <div className="rounded-xl bg-gray-50 px-3 py-2.5 text-xs font-medium text-gray-500">
+                      {createdAtLabel}
+                    </div>
+                  </div>
+                  {(video.shopeeLink || video.lazadaLink) && (
+                    <div className="space-y-2 text-[11px] text-gray-600">
+                      {video.shopeeLink && (
+                        <div className="rounded-xl bg-gray-50 px-3 py-2.5">
+                          <p className="font-bold uppercase tracking-[0.18em] text-[10px] text-gray-400">Shopee</p>
+                          <p className="mt-1 truncate">{video.shopeeLink}</p>
+                        </div>
+                      )}
+                      {video.lazadaLink && (
+                        <div className="rounded-xl bg-gray-50 px-3 py-2.5">
+                          <p className="font-bold uppercase tracking-[0.18em] text-[10px] text-gray-400">Lazada</p>
+                          <p className="mt-1 truncate">{video.lazadaLink}</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
 
-            <div className="mt-3 rounded-xl bg-white/12 text-white px-3 py-3 space-y-2">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${detailStatusBadge.cls}`}>
-                  {detailStatusBadge.label}
-                </span>
-                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasShopeeLink ? 'bg-emerald-500 text-white' : 'bg-white/15 text-white/70'}`}>
-                  Shopee
-                </span>
-                <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasLazadaLink ? 'bg-sky-500 text-white' : 'bg-white/15 text-white/70'}`}>
-                  Lazada
-                </span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onDelete(video.id, video.namespace_id)}
+                    disabled={deleting || starting || !canDelete}
+                    className="flex-1 rounded-2xl border border-gray-200 bg-white py-3 text-sm font-bold text-gray-700 shadow-sm active:scale-95 transition-transform disabled:opacity-40"
+                  >
+                    {canDelete ? (deleting ? 'กำลังลบ...' : 'ลบ') : 'เก็บถาวร'}
+                  </button>
+                  <button
+                    onClick={() => onStart(video.id)}
+                    disabled={!ready || starting || deleting || !canStartProcessing}
+                    className={`flex-[1.35] rounded-2xl py-3 text-sm font-bold transition-transform ${ready && !starting && !deleting && canStartProcessing ? 'bg-blue-500 text-white active:scale-95 shadow-sm' : 'bg-gray-200 text-gray-400'}`}
+                  >
+                    {starting ? 'กำลังส่งเข้า Processing...' : actionLabel}
+                  </button>
+                </div>
               </div>
-              <p className="text-sm font-semibold truncate">ID: {video.id}</p>
-              <p className="text-xs text-white/75">{createdAtLabel}</p>
-              <p className="text-xs text-white/85 break-all line-clamp-3">{sourceLabel}</p>
-              {(video.shopeeLink || video.lazadaLink) && (
-                <div className="space-y-1 pt-1 text-[11px] text-white/70">
-                  {video.shopeeLink && <p className="truncate">Shopee: {video.shopeeLink}</p>}
-                  {video.lazadaLink && <p className="truncate">Lazada: {video.lazadaLink}</p>}
-                </div>
-              )}
-            </div>
-
-            <div className="mt-3 flex gap-2">
-              <button
-                onClick={() => onDelete(video.id)}
-                disabled={deleting || starting || !canDelete}
-                className="flex-1 rounded-xl border border-white/20 bg-white/10 py-3 text-sm font-bold text-white active:scale-95 transition-transform disabled:opacity-40"
-              >
-                {canDelete ? (deleting ? 'กำลังลบ...' : 'ลบ') : 'เก็บถาวร'}
-              </button>
-              <button
-                onClick={() => onStart(video.id)}
-                disabled={!ready || starting || deleting || processingActive || !canStartProcessing}
-                className={`flex-[1.35] rounded-xl py-3 text-sm font-bold transition-transform ${ready && !starting && !deleting && !processingActive && canStartProcessing ? 'bg-blue-500 text-white active:scale-95' : 'bg-white/15 text-white/45'}`}
-              >
-                {starting ? 'กำลังส่งเข้า Processing...' : actionLabel}
-              </button>
             </div>
           </div>
         </div>
@@ -2316,145 +2530,7 @@ function ProcessingCard({
   );
 }
 
-function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
-  const [email, setEmail] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-
-  const tg = (window as any).Telegram?.WebApp
-  const tgUser = tg?.initDataUnsafe?.user
-  const botScope = getBotScopeFromLocation()
-  const prefersTelegramAutoAuth = Boolean(tgUser && botScope)
-
-  const handleSubmit = async () => {
-    if (!email.trim()) return
-    setLoading(true)
-    setError('')
-    try {
-      const res = await fetch(`${WORKER_URL}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email.trim().toLowerCase(),
-          tg_id: tgUser?.id,
-          bot_id: botScope || undefined,
-        })
-      })
-      const data = await res.json() as any
-      if (!res.ok) {
-        setError(data.error || 'เข้าสู่ระบบไม่สำเร็จ')
-        return
-      }
-      onLogin(data.session_token)
-    } catch {
-      setError('ไม่สามารถเชื่อมต่อได้')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div
-      className="flex flex-col bg-white font-['Sukhumvit_Set','Kanit',sans-serif]"
-      style={{ height: '100dvh' }}
-    >
-      {/* Hero — flex-1 ย่อลงเมื่อคีย์บอร์ดขึ้น */}
-      <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-8 gap-4">
-        {/* Logo */}
-        <div className="relative">
-          <div className="w-20 h-20 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-[28px] flex items-center justify-center shadow-2xl shadow-blue-300/50">
-            <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M15 10l4.553-2.069A1 1 0 0121 8.87V15.13a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z" />
-            </svg>
-          </div>
-          {/* Glow */}
-          <div className="absolute inset-0 rounded-[28px] bg-gradient-to-br from-blue-400 to-indigo-500 blur-xl opacity-30 -z-10 scale-110" />
-        </div>
-
-        {/* Title */}
-        <div className="text-center">
-          <h1 className="text-3xl font-black text-gray-900 tracking-tight">เฉียบ AI</h1>
-          <p className="text-sm text-gray-400 mt-1.5 font-medium">ระบบสร้างคอนเทนต์ด้วย AI</p>
-        </div>
-
-        {/* Telegram greeting chip */}
-        {tgUser && (
-          <div className="flex items-center gap-2.5 bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 px-4 py-2 rounded-full">
-            <div className="w-7 h-7 rounded-full bg-gradient-to-br from-blue-400 to-indigo-500 flex items-center justify-center text-white text-xs font-black shadow-sm">
-              {tgUser.first_name.charAt(0).toUpperCase()}
-            </div>
-            <span className="text-sm text-blue-600 font-semibold">สวัสดี {tgUser.first_name}</span>
-            <span className="text-base">👋</span>
-          </div>
-        )}
-      </div>
-
-      {/* Bottom — input + button อยู่เหนือคีย์บอร์ดเสมอ */}
-      <div className="px-6 pb-8 space-y-3">
-        {prefersTelegramAutoAuth ? (
-          <>
-            <div className="rounded-3xl border border-blue-100 bg-gradient-to-br from-blue-50 to-indigo-50 px-5 py-5 text-center">
-              <p className="text-sm font-semibold text-gray-800">Workspace นี้เข้าใช้งานผ่าน Telegram อัตโนมัติ</p>
-              <p className="mt-2 text-sm text-gray-500">ถ้ายังไม่เข้า ให้กลับไปที่แชตแล้วกดปุ่มเปิด Workspace ใหม่อีกครั้ง</p>
-            </div>
-
-            <button
-              onClick={() => window.location.reload()}
-              className="w-full py-4 rounded-2xl font-bold text-base text-white active:scale-[0.97] transition-all relative overflow-hidden"
-              style={{ background: 'linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)', boxShadow: '0 8px 24px rgba(99,102,241,0.35)' }}
-            >
-              ลองเชื่อมต่อใหม่
-            </button>
-          </>
-        ) : (
-          <>
-            <div className="relative">
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => { setEmail(e.target.value); setError('') }}
-                onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-                placeholder="your@email.com"
-                autoComplete="email"
-                inputMode="email"
-                className="w-full bg-gray-50 border-2 border-gray-100 focus:border-blue-500 focus:bg-white rounded-2xl px-5 py-4 text-base outline-none transition-all text-center font-medium placeholder:text-gray-300"
-              />
-              {email.trim() && (
-                <button
-                  onClick={() => { setEmail(''); setError('') }}
-                  className="absolute right-4 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full bg-gray-200 flex items-center justify-center"
-                >
-                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#6B7280" strokeWidth="3" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-                </button>
-              )}
-            </div>
-
-            {error && (
-              <div className="flex items-center justify-center gap-1.5">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></svg>
-                <p className="text-sm text-red-500 font-medium">{error}</p>
-              </div>
-            )}
-
-            <button
-              onClick={handleSubmit}
-              disabled={!email.trim() || loading}
-              className="w-full py-4 rounded-2xl font-bold text-base text-white active:scale-[0.97] transition-all disabled:opacity-40 relative overflow-hidden"
-              style={{ background: 'linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)', boxShadow: '0 8px 24px rgba(99,102,241,0.35)' }}
-            >
-              {loading ? (
-                <span className="flex items-center justify-center gap-2">
-                  <svg className="animate-spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round" /></svg>
-                  กำลังเข้าสู่ระบบ...
-                </span>
-              ) : 'เข้าสู่ระบบ'}
-            </button>
-          </>
-        )}
-      </div>
-    </div>
-  )
-}
+// LoginScreen removed — LINE login only
 
 function SettingsMenuItem({
   icon,
@@ -2486,6 +2562,37 @@ function SettingsMenuItem({
         <path d="M9 6l6 6-6 6" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
     </button>
+  )
+}
+
+function SettingsMenuSkeleton() {
+  return (
+    <>
+      <div className="flex items-center justify-between gap-3 p-4 bg-white rounded-2xl border border-gray-200 animate-pulse">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
+          <div className="w-12 h-12 rounded-full bg-gray-200 flex-shrink-0" />
+          <div className="flex-1 min-w-0 space-y-2">
+            <div className="h-4 w-40 max-w-full rounded bg-gray-200" />
+            <div className="h-5 w-16 rounded-md bg-gray-100" />
+          </div>
+        </div>
+        <div className="w-20 h-10 rounded-xl bg-red-50 border border-red-100" />
+      </div>
+      {Array.from({ length: 6 }, (_, index) => (
+        <div
+          key={`settings-skeleton-${index}`}
+          className="w-full flex items-center gap-3 rounded-2xl border border-gray-200 bg-white px-4 py-3 animate-pulse"
+        >
+          <div className="w-10 h-10 rounded-xl bg-gray-100 flex-shrink-0" />
+          <div className="min-w-0 flex-1 space-y-2">
+            <div className="h-4 w-28 rounded bg-gray-200" />
+            <div className="h-3 w-40 max-w-full rounded bg-gray-100" />
+          </div>
+          <div className="w-4 h-4 rounded bg-gray-100 flex-shrink-0" />
+        </div>
+      ))}
+      <p className="text-gray-300 text-xs font-medium text-center pt-2">Version 2.0.1 (Build 240)</p>
+    </>
   )
 }
 
@@ -2539,13 +2646,6 @@ function App() {
     return normalizedSessionToken
   }
 
-  const applySessionToken = (value: string) => {
-    const session = normalizeSessionToken(value)
-    if (!session) return
-    localStorage.setItem(scopedStorageKey('auth_token', botScope), session)
-    setTokenState(session)
-  }
-
   const clearSession = (clearCaches = false) => {
     const currentNs = namespaceId || getStoredNamespace(botScope)
     localStorage.removeItem(scopedStorageKey('auth_token', botScope))
@@ -2567,6 +2667,8 @@ function App() {
     setTokenState('')
     setNamespaceId('')
     setMeEmail('')
+    setMeDisplayName('')
+    setMePictureUrl('')
     setIsOwner(false)
     setTeamMembers([])
     setVoicePrompt('')
@@ -2633,12 +2735,7 @@ function App() {
     setGalleryLoading(true)
   }
 
-  const handleLogin = (t: string) => {
-    applySessionToken(t)
-    setAuthBootstrapping(false)
-    loadTeam()
-    loadAll()
-  };
+  // handleLogin removed — LINE login only
 
   const handleLogout = async () => {
     if (logoutLoading) return
@@ -2655,10 +2752,93 @@ function App() {
     }
   }
 
+  const [invitingTeam, setInvitingTeam] = useState(false)
+  const handleInviteTeam = async () => {
+    setInvitingTeam(true)
+    try {
+      const liff = (window as any).liff
+      if (!liff || !liff.shareTargetPicker) {
+        setInvitingTeam(false)
+        // Fallback: copy invite link
+        const url = 'https://liff.line.me/2009652996-DJtEhoDn'
+        try { await navigator.clipboard.writeText(url) } catch {}
+        alert('คัดลอกลิงก์เชิญแล้ว ส่งให้เพื่อนได้เลย!\n' + url)
+        return
+      }
+
+      const inviteUrl = `https://liff.line.me/2009652996-DJtEhoDn/dashboard?invite=${namespaceId}`
+      await liff.shareTargetPicker([{
+        type: 'flex',
+        altText: 'เชิญเข้าร่วม Affiliate AiBot',
+        contents: {
+          type: 'bubble',
+          hero: {
+            type: 'box',
+            layout: 'vertical',
+            paddingAll: '20px',
+            backgroundColor: '#3B82F6',
+            contents: [{
+              type: 'text',
+              text: 'Affiliate AiBot',
+              color: '#FFFFFF',
+              weight: 'bold',
+              size: 'xl',
+              align: 'center'
+            }]
+          },
+          body: {
+            type: 'box',
+            layout: 'vertical',
+            contents: [
+              {
+                type: 'text',
+                text: 'คุณได้รับเชิญให้เข้าร่วมใช้งาน',
+                size: 'sm',
+                color: '#666666',
+                align: 'center'
+              },
+              {
+                type: 'text',
+                text: 'ระบบสร้างคอนเทนต์ด้วย AI',
+                size: 'sm',
+                color: '#666666',
+                align: 'center',
+                margin: 'sm'
+              }
+            ]
+          },
+          footer: {
+            type: 'box',
+            layout: 'vertical',
+            contents: [{
+              type: 'button',
+              action: {
+                type: 'uri',
+                label: 'เข้าใช้งานเลย',
+                uri: inviteUrl
+              },
+              style: 'primary',
+              color: '#06C755'
+            }]
+          }
+        }
+      }])
+      // บันทึก pending invite
+      await apiFetch(`${WORKER_URL}/api/team/invite`, { method: 'POST' }).catch(() => {})
+      void loadTeam()
+    } catch (e) {
+      console.error('shareTargetPicker error:', e)
+    } finally {
+      setInvitingTeam(false)
+    }
+  }
+
   const [isOwner, setIsOwner] = useState(false)
   const [meEmail, setMeEmail] = useState('')
-  const [teamMembers, setTeamMembers] = useState<{ email: string; created_at: string }[]>([])
-  const [newMemberEmail, setNewMemberEmail] = useState('')
+  const [meDisplayName, setMeDisplayName] = useState('')
+  const [mePictureUrl, setMePictureUrl] = useState('')
+  const [teamMembers, setTeamMembers] = useState<{ email: string; created_at: string; display_name?: string; picture_url?: string; status?: string }[]>([])
+  // newMemberEmail removed — using LINE shareTargetPicker
   const [voicePrompt, setVoicePrompt] = useState('')
   const [voicePromptDraft, setVoicePromptDraft] = useState('')
   const [voicePromptSource, setVoicePromptSource] = useState<'default' | 'custom'>('default')
@@ -2700,16 +2880,26 @@ function App() {
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [lazadaExpectedMemberIdMaxChars, setLazadaExpectedMemberIdMaxChars] = useState(32)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const getInitialSettingsSection = (): SettingsSection => {
+  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'voice', 'comment', 'approvals']
+  const getSettingsSectionFromLocation = (): SettingsSection => {
     const pathTab = window.location.pathname.replace('/', '')
     const params = new URLSearchParams(window.location.search)
+    const sectionParam = String(params.get('section') || '').trim()
     const tabParam = params.get('tab')
+    if (sectionParam && validSettingsSections.includes(sectionParam as SettingsSection)) return sectionParam as SettingsSection
     if (pathTab === 'pages' || tabParam === 'pages') return 'pages'
     return 'menu'
   }
+  const getSelectedPageIdFromLocation = () => String(new URLSearchParams(window.location.search).get('page_id') || '').trim()
+  const getInitialSettingsSection = (): SettingsSection => getSelectedPageIdFromLocation() ? 'pages' : getSettingsSectionFromLocation()
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(getInitialSettingsSection)
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
   const [isSystemAdmin, setIsSystemAdmin] = useState(false)
+  const [pendingApproval, setPendingApproval] = useState(false)
+  const [pendingUsers, setPendingUsers] = useState<Array<{ line_user_id: string; display_name: string; picture_url: string; created_at: string }>>([])
+  const [pendingUsersLoading, setPendingUsersLoading] = useState(false)
+  const [approvingUserId, setApprovingUserId] = useState<string | null>(null)
+  const [rejectingUserId, setRejectingUserId] = useState<string | null>(null)
   const [postHistory, setPostHistory] = useState<PostHistory[]>(() => {
     const ns = getStoredNamespace()
     if (ns) return readCache<PostHistory[]>(nsCacheKey('history', ns), [])
@@ -2747,9 +2937,9 @@ function App() {
   const [galleryLoading, setGalleryLoading] = useState(() => {
     return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), hasStoredAffiliateShortlinkConfig(botScope)).length === 0
   })
-  const [systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
-  const [gallerySummary, setGallerySummary] = useState<GallerySummaryStats>({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
-  const [processingSummary, setProcessingSummary] = useState<ProcessingSummaryStats>({
+  const [_systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+  const [, setGallerySummary] = useState<GallerySummaryStats>({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+  const [, setProcessingSummary] = useState<ProcessingSummaryStats>({
     libraryTotal: 0,
     inventoryTotal: 0,
     readyTotal: 0,
@@ -2767,7 +2957,7 @@ function App() {
   }
 
 
-  const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('missing-lazada')
+  const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('ready')
   const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
@@ -2775,25 +2965,55 @@ function App() {
   const [logDateFilter, setLogDateFilter] = useState<string>(getTodayString())
   const [logNowMs, setLogNowMs] = useState(() => Date.now())
   const [visibleLogCount, setVisibleLogCount] = useState(0)
+  const [galleryHeaderHeight, setGalleryHeaderHeight] = useState(0)
   // Read initial tab from URL path or query param
   type TabName = 'dashboard' | 'inbox' | 'processing' | 'gallery' | 'logs' | 'settings'
+  const validTabs: TabName[] = ['dashboard', 'inbox', 'processing', 'gallery', 'logs', 'settings']
+  const matchTab = (val: string): TabName | null => {
+    const t = val.replace(/^\/+/, '').replace(/\?.*/, '').split('/').pop() || ''
+    if (t === 'pages') return 'settings'
+    if (validTabs.includes(t as TabName)) return t as TabName
+    return null
+  }
   const getInitialTab = (): TabName => {
-    const validTabs: TabName[] = ['dashboard', 'inbox', 'processing', 'gallery', 'logs', 'settings']
-    const pathTab = window.location.pathname.replace('/', '')
-    if (pathTab === 'pages') return 'settings'
-    if (validTabs.includes(pathTab as TabName)) return pathTab as TabName
+    // 1. URL path
+    const fromPath = matchTab(window.location.pathname)
+    if (fromPath) { try { localStorage.setItem('_liff_tab', fromPath) } catch {} return fromPath }
+
+    // 2. ?tab= param
     const params = new URLSearchParams(window.location.search)
-    const tabParam = params.get('tab')
-    if (tabParam === 'pages') return 'settings'
-    if (tabParam && validTabs.includes(tabParam as TabName)) return tabParam as TabName
+    const fromParam = matchTab(params.get('tab') || '')
+    if (fromParam) { try { localStorage.setItem('_liff_tab', fromParam) } catch {} return fromParam }
+
+    // 3. ?liff.state= (LIFF encodes the extra path here during redirect)
+    const liffState = params.get('liff.state') || ''
+    if (liffState) {
+      const fromLiff = matchTab(decodeURIComponent(liffState))
+      if (fromLiff) { try { localStorage.setItem('_liff_tab', fromLiff) } catch {} return fromLiff }
+    }
+
+    // 4. localStorage (survives LIFF multi-redirect)
+    try {
+      const saved = localStorage.getItem('_liff_tab')
+      if (saved && validTabs.includes(saved as TabName)) {
+        localStorage.removeItem('_liff_tab')
+        return saved as TabName
+      }
+    } catch {}
+
     return 'dashboard'
   }
 
   const [tab, _setTab] = useState<TabName>(getInitialTab())
+  const [selectedPageHistoryId, setSelectedPageHistoryId] = useState<string>(getSelectedPageIdFromLocation)
   const syncAppUrl = (
     nextTab: TabName,
     nextSearchInput: string,
     historyMode: 'push' | 'replace' = 'replace',
+    options?: {
+      settingsSection?: SettingsSection
+      pageId?: string | null
+    },
   ) => {
     const url = new URL(window.location.href)
     url.pathname = `/${nextTab}`
@@ -2803,6 +3023,22 @@ function App() {
       else url.searchParams.delete('q')
     } else {
       url.searchParams.delete('q')
+    }
+    const nextPageId = nextTab === 'settings'
+      ? String((options?.pageId ?? selectedPageHistoryId) || '').trim()
+      : ''
+    const nextSettingsSection = nextTab === 'settings'
+      ? (nextPageId ? 'pages' : (options?.settingsSection ?? settingsSection))
+      : 'menu'
+    if (nextTab === 'settings' && nextSettingsSection !== 'menu') {
+      url.searchParams.set('section', nextSettingsSection)
+    } else {
+      url.searchParams.delete('section')
+    }
+    if (nextTab === 'settings' && nextPageId) {
+      url.searchParams.set('page_id', nextPageId)
+    } else {
+      url.searchParams.delete('page_id')
     }
     const nextUrl = url.toString()
     if (nextUrl !== window.location.href) {
@@ -2814,11 +3050,36 @@ function App() {
     }
   }
   const setTab = (t: TabName) => {
+    if (t !== 'settings') {
+      setSelectedPage(null)
+      setSelectedPageHistoryId('')
+      setSettingsSection('menu')
+    }
     _setTab(t)
     syncAppUrl(t, gallerySearchInput, 'push')
   }
+  const openSettingsSection = (section: SettingsSection) => {
+    setSelectedPage(null)
+    setSelectedPageHistoryId('')
+    setSettingsSection(section)
+    syncAppUrl('settings', gallerySearchInput, 'push', { settingsSection: section, pageId: null })
+  }
+  const openSelectedPage = (page: FacebookPage) => {
+    setSettingsSection('pages')
+    setSelectedPage(page)
+    setSelectedPageHistoryId(page.id)
+    syncAppUrl('settings', gallerySearchInput, 'push', { settingsSection: 'pages', pageId: page.id })
+  }
+  const closeSelectedPage = () => {
+    setSelectedPage(null)
+    setSelectedPageHistoryId('')
+    syncAppUrl('settings', gallerySearchInput, 'replace', { settingsSection: 'pages', pageId: null })
+  }
   const [pages, setPages] = useState<FacebookPage[]>([])
   const [inboxVideos, setInboxVideos] = useState<InboxVideo[]>([])
+  const [systemInboxVideos, setSystemInboxVideos] = useState<InboxVideo[]>([])
+  const [systemInboxLoading, setSystemInboxLoading] = useState(false)
+  // inboxFilter removed — single view
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
   const [inboxLoading, setInboxLoading] = useState(false)
@@ -2842,10 +3103,12 @@ function App() {
   const systemWideGalleryMode = FORCE_SYSTEM_WIDE_GALLERY
   const systemWideGalleryModeRef = useRef(systemWideGalleryMode)
   const mainScrollRef = useRef<HTMLDivElement | null>(null)
+  const galleryHeaderRef = useRef<HTMLDivElement | null>(null)
   const galleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const systemGalleryRequestRef = useRef(0)
   const systemGalleryLoadedCountRef = useRef(videos.length)
   const systemAdminGalleryDefaultAppliedRef = useRef(false)
+  const deletedGalleryKeysRef = useRef<Set<string>>(new Set())
   const deferredGallerySearchInput = useDeferredValue(gallerySearchInput)
   const gallerySearchQuery = useMemo(
     () => normalizeGallerySearchQuery(deferredGallerySearchInput),
@@ -2869,8 +3132,45 @@ function App() {
     setGallerySearchInput('')
   }, [botScope, namespaceId, tab])
   useEffect(() => {
-    syncAppUrl(tab, gallerySearchInput)
-  }, [tab, gallerySearchInput])
+    syncAppUrl(tab, gallerySearchInput, 'replace', {
+      settingsSection,
+      pageId: selectedPageHistoryId,
+    })
+  }, [tab, gallerySearchInput, settingsSection, selectedPageHistoryId])
+  useEffect(() => {
+    const handlePopState = () => {
+      const nextTab = matchTab(window.location.pathname)
+        || matchTab(new URLSearchParams(window.location.search).get('tab') || '')
+        || 'dashboard'
+      _setTab(nextTab)
+      if (nextTab === 'gallery') {
+        setGallerySearchInput(getInitialGallerySearchInput())
+      } else {
+        setGallerySearchInput('')
+      }
+      if (nextTab !== 'settings') {
+        setSettingsSection('menu')
+        setSelectedPageHistoryId('')
+        setSelectedPage(null)
+        return
+      }
+      const nextPageId = getSelectedPageIdFromLocation()
+      setSettingsSection(nextPageId ? 'pages' : getSettingsSectionFromLocation())
+      setSelectedPageHistoryId(nextPageId)
+      if (!nextPageId) setSelectedPage(null)
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+  useEffect(() => {
+    if (!selectedPageHistoryId) {
+      setSelectedPage((prev) => (prev ? null : prev))
+      return
+    }
+    const matchedPage = pages.find((page) => page.id === selectedPageHistoryId) || null
+    if (!matchedPage) return
+    setSelectedPage((prev) => (prev?.id === matchedPage.id ? prev : matchedPage))
+  }, [pages, selectedPageHistoryId])
 
   const tg = window.Telegram?.WebApp
   const hydrateNamespaceCaches = (ns: string) => {
@@ -2939,19 +3239,91 @@ function App() {
 
   useEffect(() => {
     if (tg) {
-      tg.ready()
-      tg.expand()
+      try {
+        tg.ready()
+      } catch (e) {
+        console.log('Telegram ready error:', e)
+      }
+      try {
+        tg.expand()
+      } catch (e) {
+        console.log('Telegram expand error:', e)
+      }
+      try {
+        tg.disableVerticalSwipes()
+      } catch (e) {
+        console.log('Telegram vertical swipe lock error:', e)
+      }
       try {
         tg.requestFullscreen()
-        tg.disableVerticalSwipes()
+      } catch (e) {
+        console.log('Telegram fullscreen error:', e)
+      }
+      try {
         tg.setHeaderColor('#ffffff')
         tg.setBackgroundColor('#ffffff')
         tg.setBottomBarColor('#ffffff')
       } catch (e) {
-        console.log('Setup error:', e)
+        console.log('Telegram theme setup error:', e)
       }
     }
   }, [tg])
+
+  useEffect(() => {
+    let lastTouchY = 0
+
+    const getScrollContainer = (target: EventTarget | null): HTMLElement | null => {
+      let current = target instanceof HTMLElement ? target : null
+      while (current) {
+        if (current.matches('.app-scroll, [data-allow-touch-scroll="true"]')) {
+          return current
+        }
+        current = current.parentElement
+      }
+      return null
+    }
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        lastTouchY = e.touches[0].clientY
+      }
+    }
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length !== 1) return
+
+      const currentY = e.touches[0].clientY
+      const deltaY = currentY - lastTouchY
+      lastTouchY = currentY
+
+      const scrollContainer = getScrollContainer(e.target)
+      if (!scrollContainer) {
+        e.preventDefault()
+        return
+      }
+
+      const canScroll = scrollContainer.scrollHeight > scrollContainer.clientHeight + 1
+      if (!canScroll) {
+        e.preventDefault()
+        return
+      }
+
+      const atTop = scrollContainer.scrollTop <= 0
+      const atBottom = scrollContainer.scrollTop + scrollContainer.clientHeight >= scrollContainer.scrollHeight - 1
+
+      if ((atTop && deltaY > 0) || (atBottom && deltaY < 0)) {
+        e.preventDefault()
+      }
+    }
+
+    document.addEventListener('touchstart', handleTouchStart, { passive: true, capture: true })
+    document.addEventListener('touchmove', handleTouchMove, { passive: false, capture: true })
+
+    return () => {
+      document.removeEventListener('touchstart', handleTouchStart, true)
+      document.removeEventListener('touchmove', handleTouchMove, true)
+    }
+  }, [])
 
   const filteredLogHistory = useMemo(() => {
     return postHistory.filter((item) => {
@@ -3042,10 +3414,11 @@ function App() {
       pendingMissingLazadaTotal: 0,
     })
     setMeEmail('')
+    setMeDisplayName('')
+    setMePictureUrl('')
     setIsOwner(false)
     setIsSystemAdmin(false)
     setTeamMembers([])
-    setNewMemberEmail('')
     setCommentTemplate(DEFAULT_COMMENT_TEMPLATE)
     setCommentTemplateDraft(DEFAULT_COMMENT_TEMPLATE)
     setCommentTemplateSource('default')
@@ -3061,6 +3434,108 @@ function App() {
     let cancelled = false
 
     const bootstrapAuth = async () => {
+      // LIFF auto-login FIRST (LINE MINI App) — must run before anything else
+      if (typeof window !== 'undefined' && (window as any).liff) {
+        try {
+          const liff = (window as any).liff
+          await liff.init({ liffId: LINE_LIFF_ID })
+
+          // Try multiple ways to get LINE userId
+          let lineUserId = ''
+          let displayName = ''
+          let pictureUrl = ''
+          let idToken = ''
+
+          // Method 1: getProfile (requires login)
+          if (liff.isLoggedIn()) {
+            try {
+              const profile = await liff.getProfile()
+              lineUserId = profile.userId || ''
+              displayName = profile.displayName || ''
+              pictureUrl = profile.pictureUrl || ''
+              idToken = liff.getIDToken() || ''
+            } catch { }
+          }
+
+          // Method 2: getContext (works in-client without login)
+          if (!lineUserId) {
+            try {
+              const ctx = liff.getContext()
+              lineUserId = ctx?.userId || ''
+            } catch { }
+          }
+
+          // Method 3: getDecodedIDToken
+          if (!lineUserId) {
+            try {
+              const decoded = liff.getDecodedIDToken()
+              lineUserId = decoded?.sub || ''
+              displayName = decoded?.name || ''
+              pictureUrl = decoded?.picture || ''
+            } catch { }
+          }
+
+          // If still no userId and in client, try login with redirect back
+          if (!lineUserId && liff.isInClient() && !liff.isLoggedIn()) {
+            liff.login({ redirectUri: window.location.href })
+            return
+          }
+
+          if (lineUserId) {
+            const liffResp = await fetch(`${WORKER_URL}/api/line/liff-login`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                line_user_id: lineUserId,
+                display_name: displayName,
+                picture_url: pictureUrl,
+                id_token: idToken,
+                invite_namespace: new URLSearchParams(window.location.search).get('invite') || '',
+              }),
+            })
+
+            if (liffResp.ok) {
+              const liffData = await liffResp.json().catch(() => ({})) as any
+
+              // Handle pending approval status
+              if (liffData?.status === 'pending') {
+                setPendingApproval(true)
+                if (liffData?.line_display_name) setMeDisplayName(String(liffData.line_display_name))
+                if (liffData?.line_picture_url) setMePictureUrl(String(liffData.line_picture_url))
+                if (!cancelled) setAuthBootstrapping(false)
+                return
+              }
+
+              const liffSession = normalizeSessionToken(liffData?.session_token)
+              if (liffSession) {
+                localStorage.setItem(scopedStorageKey('auth_token', botScope), liffSession)
+                setTokenState(liffSession)
+
+                const ns = String(liffData?.namespace_id || '').trim()
+                setIsOwner(!!liffData?.is_owner)
+                setIsSystemAdmin(!!liffData?.is_system_admin)
+                if (liffData?.email) setMeEmail(String(liffData.email))
+                if (liffData?.line_display_name) setMeDisplayName(String(liffData.line_display_name))
+                if (liffData?.line_picture_url) setMePictureUrl(String(liffData.line_picture_url))
+                if (ns) {
+                  setNamespaceId(ns)
+                  hydrateNamespaceCaches(ns)
+                }
+                // Jump to tab from URL params
+                const liffTab = new URLSearchParams(window.location.search).get('tab') as TabName | null
+                if (liffTab && ['dashboard','inbox','processing','gallery','logs','settings'].includes(liffTab)) {
+                  _setTab(liffTab)
+                }
+                if (!cancelled) setAuthBootstrapping(false)
+                return
+              }
+            }
+          }
+        } catch (e) {
+          console.error('LIFF init error:', e)
+        }
+      }
+
       const tgId = tg?.initDataUnsafe?.user?.id
       const session = getToken(botScope)
       if (session) {
@@ -3073,6 +3548,8 @@ function App() {
             setIsOwner(!!me?.is_owner)
             setIsSystemAdmin(!!me?.is_system_admin)
             if (me?.email) setMeEmail(String(me.email))
+            if (me?.line_display_name) setMeDisplayName(String(me.line_display_name))
+            if (me?.line_picture_url) setMePictureUrl(String(me.line_picture_url))
             if (ns) {
               setNamespaceId(ns)
               hydrateNamespaceCaches(ns)
@@ -3107,6 +3584,8 @@ function App() {
                 setIsOwner(!!me?.is_owner)
                 setIsSystemAdmin(!!me?.is_system_admin)
                 if (me?.email) setMeEmail(String(me.email))
+                if (me?.line_display_name) setMeDisplayName(String(me.line_display_name))
+                if (me?.line_picture_url) setMePictureUrl(String(me.line_picture_url))
                 if (ns) {
                   setNamespaceId(ns)
                   hydrateNamespaceCaches(ns)
@@ -3165,10 +3644,26 @@ function App() {
   }, [tab, settingsSection])
 
   useEffect(() => {
-    if (!isOwner && (settingsSection === 'team' || settingsSection === 'gemini' || settingsSection === 'shortlink' || settingsSection === 'voice' || settingsSection === 'comment')) {
+    if (authBootstrapping) return
+    if (!isOwner && settingsSection === 'shortlink') {
       setSettingsSection('menu')
     }
-  }, [isOwner, settingsSection])
+    if (!isSystemAdmin && settingsSection === 'approvals') {
+      setSettingsSection('menu')
+    }
+  }, [authBootstrapping, isOwner, isSystemAdmin, settingsSection])
+
+  useEffect(() => {
+    if (authBootstrapping || !token || !isSystemAdmin) return
+    void loadPendingUsers()
+  }, [token, authBootstrapping, isSystemAdmin])
+
+  useEffect(() => {
+    if (authBootstrapping || !token || !isSystemAdmin) return
+    if (tab === 'settings' && settingsSection === 'approvals') {
+      void loadPendingUsers()
+    }
+  }, [tab, settingsSection, token, authBootstrapping, isSystemAdmin])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3207,9 +3702,16 @@ function App() {
 
   useEffect(() => {
     if (!isOwner && categoryFilter === 'all-original') {
-      setCategoryFilter('missing-lazada')
+      setCategoryFilter('ready')
     }
   }, [isOwner, categoryFilter])
+
+  useEffect(() => {
+    if (isSystemAdmin) return
+    if (categoryFilter === 'pending-shortlink') {
+      setCategoryFilter('ready')
+    }
+  }, [isSystemAdmin, categoryFilter])
 
   useEffect(() => {
     if (!systemWideGalleryMode || !isSystemAdmin) {
@@ -3220,6 +3722,21 @@ function App() {
     systemAdminGalleryDefaultAppliedRef.current = true
     setCategoryFilter('ready')
   }, [systemWideGalleryMode, isSystemAdmin])
+
+  // Update LINE title bar based on current tab / settings submenu
+  useEffect(() => {
+    const titles: Record<string, string> = {
+      dashboard: 'แดชบอร์ด',
+      inbox: 'คลังต้นฉบับ',
+      processing: 'ประมวลผล',
+      gallery: 'Gallery',
+      logs: 'ประวัติ',
+      settings: 'ตั้งค่า',
+    }
+    document.title = tab === 'settings'
+      ? getSettingsSectionTitle(settingsSection)
+      : (titles[tab] || 'เฉียบ AI')
+  }, [tab, settingsSection])
 
   async function recoverSessionOrLogout() {
     clearSession()
@@ -3289,6 +3806,66 @@ function App() {
       inboxFetchInFlightRef.current = false
       if (shouldShowLoading) setInboxLoading(false)
     }
+  }
+
+  async function loadSystemInbox() {
+    if (!token || !isSystemAdmin) return
+    setSystemInboxLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox/system`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.ok) {
+        const data = await resp.json() as { videos?: InboxVideo[] }
+        setSystemInboxVideos(Array.isArray(data.videos) ? data.videos : [])
+      }
+    } catch {}
+    finally { setSystemInboxLoading(false) }
+  }
+
+  async function loadPendingUsers() {
+    if (!token || !isSystemAdmin) return
+    setPendingUsersLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/admin/pending-users`)
+      if (resp.ok) {
+        const data = await resp.json() as { users?: Array<{ line_user_id: string; display_name: string; picture_url: string; created_at: string }> }
+        setPendingUsers(Array.isArray(data.users) ? data.users : [])
+      }
+    } catch {}
+    finally { setPendingUsersLoading(false) }
+  }
+
+  async function approveUser(lineUserId: string) {
+    setApprovingUserId(lineUserId)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/admin/approve-user`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ line_user_id: lineUserId }),
+      })
+      if (resp.ok) {
+        setPendingUsers(prev => prev.filter(u => u.line_user_id !== lineUserId))
+      }
+    } catch {}
+    finally { setApprovingUserId(null) }
+  }
+
+  async function rejectUser(lineUserId: string) {
+    setRejectingUserId(lineUserId)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/admin/reject-user`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ line_user_id: lineUserId }),
+      })
+      if (resp.ok) {
+        setPendingUsers(prev => prev.filter(u => u.line_user_id !== lineUserId))
+      }
+    } catch {}
+    finally { setRejectingUserId(null) }
   }
 
   async function loadUsedVideos(options: { force?: boolean } = {}) {
@@ -3385,7 +3962,10 @@ function App() {
         if (!resp.ok) return
 
         const data = await resp.json() as GalleryPageResponse
-        const nextVideos = Array.isArray(data.videos) ? data.videos : []
+        const nextVideos = filterDeletedGalleryVideos(
+          Array.isArray(data.videos) ? data.videos : [],
+          deletedGalleryKeysRef.current,
+        )
         setVideos(dedupeGalleryVideos(nextVideos))
         setUsedVideos([])
         setPendingShortlinkVideos([])
@@ -3439,7 +4019,10 @@ function App() {
       const data = await resp.json() as GalleryPageResponse
       if (requestId !== systemGalleryRequestRef.current) return
 
-      const nextVideos = Array.isArray(data.videos) ? data.videos : []
+      const nextVideos = filterDeletedGalleryVideos(
+        Array.isArray(data.videos) ? data.videos : [],
+        deletedGalleryKeysRef.current,
+      )
       const hasMore = !!data.has_more && nextVideos.length > 0
       setVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : dedupeGalleryVideos([...prev, ...nextVideos]))
       setSystemGalleryStats({
@@ -3512,7 +4095,10 @@ function App() {
           }
           if (galleryResp.ok) {
             const data = await galleryResp.json() as { videos?: Video[] }
-            setVideos(dedupeGalleryVideos(Array.isArray(data.videos) ? data.videos : []))
+            setVideos(dedupeGalleryVideos(filterDeletedGalleryVideos(
+              Array.isArray(data.videos) ? data.videos : [],
+              deletedGalleryKeysRef.current,
+            )))
           }
           if (!unauthorized) setGalleryLoading(false)
         })()
@@ -3564,6 +4150,12 @@ function App() {
     void loadUsedVideos({ force: categoryFilter === 'used' })
     if (isOwner) void loadGlobalOriginalVideos()
   }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
+
+  useEffect(() => {
+    if (authBootstrapping || !token || !isSystemAdmin) return
+    if (tab !== 'inbox') return
+    void loadSystemInbox()
+  }, [tab, token, authBootstrapping, isSystemAdmin])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3639,6 +4231,8 @@ function App() {
           setIsOwner(!!me.is_owner)
           setIsSystemAdmin(!!me.is_system_admin)
           if (me.email) setMeEmail(me.email)
+          if (me.line_display_name) setMeDisplayName(String(me.line_display_name))
+          if (me.line_picture_url) setMePictureUrl(String(me.line_picture_url))
           const ns = String(me.namespace_id || '').trim()
           if (ns && ns !== namespaceId) {
             setNamespaceId(ns)
@@ -3659,7 +4253,7 @@ function App() {
 
   async function loadVoicePrompt() {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setVoicePromptMessage('')
     setVoicePromptLoading(true)
     try {
@@ -3698,7 +4292,7 @@ function App() {
 
   async function loadCommentTemplate() {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setCommentTemplateMessage('')
     setCommentTemplateLoading(true)
     try {
@@ -3737,7 +4331,7 @@ function App() {
 
   async function saveCommentTemplate(nextTemplate: string) {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setCommentTemplateSaving(true)
     setCommentTemplateMessage('')
     try {
@@ -3785,7 +4379,7 @@ function App() {
 
   async function saveVoicePrompt(nextPrompt: string) {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setVoicePromptSaving(true)
     setVoicePromptMessage('')
     try {
@@ -3829,7 +4423,7 @@ function App() {
 
   async function loadGeminiApiKey() {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setGeminiApiKeyMessage('')
     setGeminiApiKeyLoading(true)
     try {
@@ -3867,7 +4461,7 @@ function App() {
 
   async function saveGeminiApiKey(nextApiKey: string) {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     const trimmed = String(nextApiKey || '').trim()
     setGeminiApiKeySaving(true)
     setGeminiApiKeyMessage('')
@@ -4188,7 +4782,14 @@ function App() {
         throw new Error(String(data.error || 'ส่งเข้า Processing ไม่สำเร็จ'))
       }
       await Promise.all([loadInboxSnapshot(), loadProcessingSnapshot()])
-      alert(data.job?.status === 'queued' ? 'ส่งเข้า Processing แล้ว และคลิปยังอยู่ในคลังต้นฉบับ' : 'เริ่มประมวลผลแล้ว โดยเก็บคลิปไว้ในคลังต้นฉบับ')
+      const status = String(data.job?.status || '').trim().toLowerCase()
+      if (status === 'processed') {
+        alert('คลิปนี้อยู่ใน Gallery แล้ว โดยคลิปต้นฉบับยังอยู่ในคลังต้นฉบับตามเดิม')
+      } else if (status === 'queued') {
+        alert('ส่งเข้า Processing แล้ว คลิปต้นฉบับยังอยู่ในคลังต้นฉบับตามเดิม')
+      } else {
+        alert('เริ่มประมวลผลแล้ว คลิปต้นฉบับยังอยู่ในคลังต้นฉบับตามเดิม')
+      }
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e))
     } finally {
@@ -4196,19 +4797,30 @@ function App() {
     }
   }
 
-  const handleDeleteInboxVideo = async (id: string) => {
+  const handleDeleteInboxVideo = async (id: string, namespaceId?: string) => {
     const ok = window.confirm('ยืนยันลบวิดีโอนี้ออกจากคลังต้นฉบับ?')
     if (!ok) return
     setDeletingInboxId(id)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}`, {
+      const url = new URL(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}`)
+      if (namespaceId) url.searchParams.set('namespace_id', namespaceId)
+      const resp = await apiFetch(url.toString(), {
         method: 'DELETE',
       })
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({})) as { error?: string }
         throw new Error(String(data.error || 'ลบจาก Inbox ไม่สำเร็จ'))
       }
-      setInboxVideos((prev) => prev.filter((video) => video.id !== id))
+      setInboxVideos((prev) => prev.filter((video) => {
+        const sameId = String(video.id || '').trim() === String(id || '').trim()
+        const sameNamespace = !namespaceId || String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
+        return !(sameId && sameNamespace)
+      }))
+      setSystemInboxVideos((prev) => prev.filter((video) => {
+        const sameId = String(video.id || '').trim() === String(id || '').trim()
+        const sameNamespace = !namespaceId || String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
+        return !(sameId && sameNamespace)
+      }))
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e))
     } finally {
@@ -4301,26 +4913,53 @@ function App() {
 
   }
 
+  async function handleImportVideo(videoId: string, sourceNamespaceId: string) {
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/gallery/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: videoId, source_namespace_id: sourceNamespaceId }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}))
+        alert(`นำเข้าไม่สำเร็จ: ${(err as { error?: string }).error || 'Unknown error'}`)
+        return
+      }
+      alert('นำเข้าสำเร็จ!')
+      void loadSystemGalleryPage({ reset: true })
+    } catch {
+      alert('นำเข้าไม่สำเร็จ')
+    }
+  }
+
   const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
   const hasVideoBeenPosted = (video: Partial<Video> & Record<string, unknown>) =>
     !!String(video.postedAt || video.posted_at || '').trim()
+  // Admin ดู Gallery/Processing เฉพาะของตัวเอง (ใช้ shortlink ID ตัวเอง)
+  // คลังต้นฉบับยังเห็นทุก workspace ผ่าน systemInboxVideos
+  const useSystemWideAdminGallery = false
   const {
     galleryMissingLazadaVideos,
     galleryPendingShortlinkVideos,
     galleryReadyVideos,
     galleryUsedVideos,
     galleryAvailableVideos,
+    galleryShortlinkRequired,
   } = useMemo(() => {
     const getGallerySortTs = (video: Video) => {
       const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
       return Number.isFinite(ts) ? ts : 0
     }
     const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-    const sourceVideos = dedupeGalleryVideos(videos)
+    const sourceVideos = dedupeGalleryVideos(filterDeletedGalleryVideos(videos, deletedGalleryKeysRef.current))
     const pendingIdentitySet = new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
     const postedVideos = sortNewestFirst(
       dedupeGalleryVideos([
-        ...usedVideos,
+        ...filterDeletedGalleryVideos(usedVideos, deletedGalleryKeysRef.current),
         ...sourceVideos.filter((video) =>
           isKeepInPostedTab(video) || hasVideoBeenPosted(video as Video & Record<string, unknown>)
         ),
@@ -4332,10 +4971,20 @@ function App() {
       sourceVideos.filter((video) => !postedIdentitySet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)))
     )
 
+    const shortlinkRequiredVideos = activeVideos.filter((video) =>
+      isVideoShortlinkRequired(video as Video & Record<string, unknown>, isSystemAdmin)
+    )
+    const galleryShortlinkRequired = shortlinkRequiredVideos.length > 0
+
     const missingLazadaVideos = sortNewestFirst(
       activeVideos.filter((video) => {
         const row = video as Video & Record<string, unknown>
-        return !getVideoSourceLazadaLink(row) && !getVideoLazadaLink(row)
+        const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
+        const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
+        const conversionState = getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId, {
+          requireManagedLinks: isVideoShortlinkRequired(row, isSystemAdmin),
+        })
+        return !conversionState.galleryReady && (conversionState.missingShopeeSource || conversionState.missingLazadaSource)
       })
     )
 
@@ -4345,7 +4994,9 @@ function App() {
         const row = video as Video & Record<string, unknown>
         const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
         const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
-        const conversionState = getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId)
+        const conversionState = getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId, {
+          requireManagedLinks: isVideoShortlinkRequired(row, isSystemAdmin),
+        })
         return !pendingIdentitySet.has(key) && conversionState.galleryReady
       })
     )
@@ -4363,13 +5014,18 @@ function App() {
       })
     )
 
-    const baseVideos = categoryFilter === 'used'
-      ? postedVideos
-      : categoryFilter === 'ready'
-        ? readyVideos
-        : categoryFilter === 'pending-shortlink'
-          ? pendingShortlinkVideosAll
-          : missingLazadaVideos
+    const allUnpostedVideos = sortNewestFirst(
+      activeVideos.slice()
+    )
+    const baseVideos = useSystemWideAdminGallery
+      ? (categoryFilter === 'used' ? postedVideos : allUnpostedVideos)
+      : categoryFilter === 'used'
+        ? postedVideos
+        : categoryFilter === 'ready'
+          ? readyVideos
+          : categoryFilter === 'pending-shortlink' && galleryShortlinkRequired
+            ? pendingShortlinkVideosAll
+            : missingLazadaVideos
     const availableVideos = gallerySearchQuery
       ? baseVideos.filter((video) => matchesGallerySearch(video as Video & Record<string, unknown>, gallerySearchQuery))
       : baseVideos
@@ -4380,27 +5036,19 @@ function App() {
       galleryReadyVideos: readyVideos,
       galleryUsedVideos: postedVideos,
       galleryAvailableVideos: availableVideos,
+      galleryShortlinkRequired,
     }
-  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery, shortlinkExpectedUtmIdCurrent, lazadaExpectedMemberIdCurrent])
-  const useSystemWideAdminGallery = systemWideGalleryMode && isSystemAdmin
+  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery, shortlinkExpectedUtmIdCurrent, lazadaExpectedMemberIdCurrent, useSystemWideAdminGallery, isSystemAdmin])
   const showGalleryFilterBar = tab === 'gallery' && (
     (useSystemWideAdminGallery || !systemWideGalleryMode) && (
       galleryLoading ||
       (galleryMissingLazadaVideos.length > 0 || galleryPendingShortlinkVideos.length > 0 || galleryReadyVideos.length > 0 || galleryUsedVideos.length > 0)
     )
   )
-  const galleryHeaderOffset = tab === 'gallery'
-    ? (showGalleryFilterBar ? 184 : 124)
-    : 104
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
+  const shouldShowGalleryHeader = !videoViewerOpen && tab === 'gallery' && (showGalleryFilterBar || !isAllOriginalMode)
+  const galleryHeaderOffset = shouldShowGalleryHeader ? galleryHeaderHeight : 0
   const galleryViewTotal = galleryAvailableVideos.length
-  const namespaceGalleryLibraryTotal = processingSummary.libraryTotal
-  const namespaceGalleryInventoryTotal = processingSummary.inventoryTotal
-  const systemGalleryLibraryTotal = gallerySummary.libraryTotal
-  const systemGalleryLazadaTotal = Number(systemGalleryStats.lazadaTotal || 0)
-  const systemGalleryMissingLazadaTotal = Math.max(0, systemGalleryLibraryTotal - systemGalleryLazadaTotal)
-  const gallerySummaryLibraryTotal = useSystemWideAdminGallery ? systemGalleryLibraryTotal : namespaceGalleryLibraryTotal
-  const gallerySummaryInventoryTotal = useSystemWideAdminGallery ? gallerySummary.inventoryTotal : namespaceGalleryInventoryTotal
   const galleryVisibleVideos = useMemo(() => {
     if (systemWideGalleryMode) return galleryAvailableVideos
     return galleryAvailableVideos.slice(0, galleryVisibleCount)
@@ -4414,12 +5062,51 @@ function App() {
     minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
   } as const
   const headerTopPaddingStyle = {
-    paddingTop: 'calc(env(safe-area-inset-top, 0px) + 52px)',
+    paddingTop: `calc(env(safe-area-inset-top, 0px) + ${GALLERY_HEADER_TOP_GAP}px)`,
   } as const
   const mainContentPaddingStyle = {
-    paddingTop: `calc(env(safe-area-inset-top, 0px) + ${galleryHeaderOffset}px)`,
-    paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 6rem)',
+    paddingTop: shouldShowGalleryHeader
+      ? `${galleryHeaderOffset}px`
+      : 'env(safe-area-inset-top, 0px)',
+    paddingBottom: videoViewerOpen
+      ? '0px'
+      : 'calc(env(safe-area-inset-bottom, 0px) + 72px)',
   } as const
+
+  useEffect(() => {
+    if (!shouldShowGalleryHeader) {
+      setGalleryHeaderHeight(0)
+      return
+    }
+
+    const header = galleryHeaderRef.current
+    if (!header) return
+
+    const updateHeight = () => {
+      const nextHeight = Math.ceil(header.getBoundingClientRect().height)
+      setGalleryHeaderHeight((prev) => (prev === nextHeight ? prev : nextHeight))
+    }
+
+    updateHeight()
+    const rafId = window.requestAnimationFrame(updateHeight)
+    window.addEventListener('resize', updateHeight)
+
+    if (typeof ResizeObserver === 'undefined') {
+      return () => {
+        window.cancelAnimationFrame(rafId)
+        window.removeEventListener('resize', updateHeight)
+      }
+    }
+
+    const observer = new ResizeObserver(() => updateHeight())
+    observer.observe(header)
+
+    return () => {
+      observer.disconnect()
+      window.cancelAnimationFrame(rafId)
+      window.removeEventListener('resize', updateHeight)
+    }
+  }, [shouldShowGalleryHeader])
 
   useEffect(() => {
     if (tab !== 'gallery' || isAllOriginalMode || galleryLoading || !galleryHasMore) return
@@ -4489,10 +5176,22 @@ function App() {
         <div style={{ paddingTop: 'calc(env(safe-area-inset-top, 0px) + 52px)' }} className="flex-1 pb-6 flex flex-col overflow-hidden">
           <PageDetail
             page={selectedPage}
-            onBack={() => setSelectedPage(null)}
+            onBack={closeSelectedPage}
             onSave={handleSavePage}
           />
         </div>
+      </div>
+    )
+  }
+
+  // ========== PENDING APPROVAL GATE ==========
+  if (pendingApproval) {
+    return (
+      <div style={{ height: '100dvh' }} className="flex flex-col items-center justify-center bg-white gap-4 px-8 font-['Sukhumvit_Set','Kanit',sans-serif]">
+        <div className="w-20 h-20 bg-amber-50 rounded-full flex items-center justify-center text-4xl">&#x23F3;</div>
+        <h1 className="text-xl font-bold text-gray-900">รอการอนุมัติ</h1>
+        <p className="text-sm text-gray-500 text-center">บัญชีของคุณกำลังรอการอนุมัติจากแอดมิน<br/>กรุณารอสักครู่</p>
+        <button onClick={() => window.location.reload()} className="mt-4 px-6 py-3 rounded-2xl bg-gray-100 text-sm font-bold text-gray-700 active:scale-95 transition-transform">ลองใหม่</button>
       </div>
     )
   }
@@ -4501,8 +5200,8 @@ function App() {
   if (authBootstrapping && !token) {
     return (
       <div
-        style={{ height: 'var(--tg-viewport-stable-height, 100dvh)', minHeight: 'var(--tg-viewport-stable-height, 100dvh)' }}
-        className="bg-white flex items-center justify-center font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden"
+        style={appViewportStyle}
+        className="fixed inset-0 bg-white flex items-center justify-center font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden"
       >
         <div className="flex flex-col items-center gap-3 text-gray-500">
           <div className="w-7 h-7 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
@@ -4514,12 +5213,35 @@ function App() {
 
   if (!token) {
     return (
-      <LoginScreen onLogin={handleLogin} />
+      <div style={appViewportStyle} className="fixed inset-0 flex flex-col bg-white font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden">
+        <div className="flex-1 flex flex-col items-center justify-center px-8 gap-6">
+          {/* Logo */}
+          <div className="w-20 h-20 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-[28px] flex items-center justify-center shadow-2xl shadow-blue-300/50">
+            <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M15 10l4.553-2.069A1 1 0 0121 8.87V15.13a1 1 0 01-1.447.9L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z" />
+            </svg>
+          </div>
+          <div className="text-center">
+            <h1 className="text-3xl font-black text-gray-900">เฉียบ AI</h1>
+            <p className="text-sm text-gray-400 mt-1.5">ระบบสร้างคอนเทนต์ด้วย AI</p>
+          </div>
+        </div>
+        <div className="px-6 pb-8">
+          <a
+            href="https://liff.line.me/2009652996-DJtEhoDn"
+            className="w-full py-4 rounded-2xl font-bold text-base text-white flex items-center justify-center gap-2"
+            style={{ background: '#06C755' }}
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="white"><path d="M19.365 9.863c.349 0 .63.285.63.631 0 .345-.281.63-.63.63H17.61v1.125h1.755c.349 0 .63.283.63.63 0 .344-.281.629-.63.629h-2.386c-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.627-.63h2.386c.349 0 .63.285.63.63 0 .349-.281.63-.63.63H17.61v1.125h1.755zm-3.855 3.016c0 .27-.174.51-.432.596-.064.021-.133.031-.199.031-.211 0-.391-.09-.51-.25l-2.443-3.317v2.94c0 .344-.279.629-.631.629-.346 0-.626-.285-.626-.629V8.108c0-.27.173-.51.43-.595.06-.023.136-.033.194-.033.195 0 .375.104.495.254l2.462 3.33V8.108c0-.345.282-.63.63-.63.345 0 .63.285.63.63v4.771zm-5.741 0c0 .344-.282.629-.631.629-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.627-.63.349 0 .631.285.631.63v4.771zm-2.466.629H4.917c-.345 0-.63-.285-.63-.629V8.108c0-.345.285-.63.63-.63.348 0 .63.285.63.63v4.141h1.756c.348 0 .629.283.629.63 0 .344-.282.629-.629.629M24 10.314C24 4.943 18.615.572 12 .572S0 4.943 0 10.314c0 4.811 4.27 8.842 10.035 9.608.391.082.923.258 1.058.59.12.301.079.766.038 1.08l-.164 1.02c-.045.301-.24 1.186 1.049.645 1.291-.539 6.916-4.078 9.436-6.975C23.176 14.393 24 12.458 24 10.314"/></svg>
+            เข้าสู่ระบบด้วย LINE
+          </a>
+        </div>
+      </div>
     )
   }
 
   return (
-    <div style={appViewportStyle} className="bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden">
+    <div style={appViewportStyle} className="fixed inset-0 bg-white flex flex-col font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden">
       {/* Add Page Popup */}
       {showAddPagePopup && (
         <AddPagePopup
@@ -4528,9 +5250,13 @@ function App() {
         />
       )}
 
-      {!videoViewerOpen && (
-        <div style={headerTopPaddingStyle} className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5">
-          {tab === 'gallery' && !isAllOriginalMode ? (
+      {shouldShowGalleryHeader && (
+        <div
+          ref={galleryHeaderRef}
+          style={headerTopPaddingStyle}
+          className="fixed top-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-b border-gray-100 z-50 px-5"
+        >
+          {tab === 'gallery' && !isAllOriginalMode && (
             <div className="pb-3">
               <div className="relative">
                 <input
@@ -4559,25 +5285,39 @@ function App() {
                 )}
               </div>
             </div>
-          ) : (
-            <h1 className="text-2xl font-extrabold text-gray-900 text-center pb-3">
-              {tab === 'dashboard' ? 'Dashboard' : tab === 'inbox' ? 'คลังต้นฉบับ' : tab === 'processing' ? 'Processing' : tab === 'logs' ? 'Activity Logs' : 'Settings'}
-            </h1>
           )}
-          {tab === 'gallery' && showGalleryFilterBar && (
+          {tab === 'gallery' && showGalleryFilterBar && useSystemWideAdminGallery && (
+            <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
+              <button
+                onClick={() => setCategoryFilter('ready')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter !== 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                ยังไม่โพสต์ ({galleryAvailableVideos.length})
+              </button>
+              <button
+                onClick={() => setCategoryFilter('used')}
+                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                โพสต์แล้ว ({galleryUsedVideos.length})
+              </button>
+            </div>
+          )}
+          {tab === 'gallery' && showGalleryFilterBar && !useSystemWideAdminGallery && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
               <button
                 onClick={() => setCategoryFilter('missing-lazada')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'missing-lazada' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                ไม่มีลิ้งลา ({galleryMissingLazadaVideos.length})
+                ลิงก์ไม่ครบ ({galleryMissingLazadaVideos.length})
               </button>
-              <button
-                onClick={() => setCategoryFilter('pending-shortlink')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'pending-shortlink' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                รอย่อลิ้ง ({galleryPendingShortlinkVideos.length})
-              </button>
+              {galleryShortlinkRequired && (
+                <button
+                  onClick={() => setCategoryFilter('pending-shortlink')}
+                  className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'pending-shortlink' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  รอย่อลิ้ง ({galleryPendingShortlinkVideos.length})
+                </button>
+              )}
               <button
                 onClick={() => setCategoryFilter('ready')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'ready' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
@@ -4683,22 +5423,40 @@ function App() {
           </div>
         )}
 
-        {tab === 'inbox' && (
+        {tab === 'inbox' && isSystemAdmin && (
           <div className="px-4">
-            <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-              <div className="flex flex-wrap gap-2">
-                <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-bold text-blue-700">
-                  ต้นฉบับ {inboxVideos.length}
-                </span>
-                <span className="rounded-full bg-violet-50 px-3 py-1 text-xs font-bold text-violet-700">
-                  อยู่ใน Processing {inboxVideos.filter((video) => video.processingActive).length}
-                </span>
+            {systemInboxLoading ? (
+              <div className="grid grid-cols-3 gap-3">
+                {[1,2,3,4,5,6].map(i => <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />)}
               </div>
-              <p className="mt-3 text-xs leading-5 text-gray-500">
-                เก็บวิดีโอที่ผู้ใช้ส่งมาไว้ตลอด แยกจากหน้า Processing แม้จะส่งเข้าไปประมวลผลแล้วก็ยังอยู่ที่นี่
-              </p>
-            </div>
+            ) : systemInboxVideos.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-[50vh]">
+                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                  <span className="text-4xl grayscale opacity-50">📥</span>
+                </div>
+                <p className="text-gray-900 font-bold text-lg">ยังไม่มีวิดีโอต้นฉบับ</p>
+                <p className="text-gray-400 text-sm mt-1 text-center">ส่งวิดีโอหรือลิงก์ XHS มาทาง LINE แล้วจะแสดงที่นี่</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-3 gap-3">
+                {systemInboxVideos.map(video => (
+                  <InboxCard
+                    key={video.id}
+                    video={video}
+                    onStart={handleStartInboxVideo}
+                    onDelete={handleDeleteInboxVideo}
+                    starting={startingInboxId === video.id}
+                    deleting={deletingInboxId === video.id}
+                    onExpandedChange={setVideoViewerOpen}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
+        {tab === 'inbox' && !isSystemAdmin && (
+          <div className="px-4">
             {inboxLoading ? (
               <div className="grid grid-cols-3 gap-3">
                 {[1, 2, 3, 4, 5, 6].map((i) => (
@@ -4765,55 +5523,6 @@ function App() {
 
         {tab === 'gallery' && (
           <div className="px-4">
-            {!isAllOriginalMode && !gallerySearchQuery && (
-              <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-                <div className="flex flex-wrap gap-2">
-                  {useSystemWideAdminGallery && (
-                    <>
-                      <span className="rounded-full bg-cyan-50 px-3 py-1 text-xs font-bold text-cyan-700">
-                        รวมทุก namespace {systemGalleryLibraryTotal.toLocaleString('th-TH')}
-                      </span>
-                      <span className="rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-700">
-                        มี Lazada {systemGalleryLazadaTotal.toLocaleString('th-TH')}
-                      </span>
-                      <span className="rounded-full bg-orange-50 px-3 py-1 text-xs font-bold text-orange-700">
-                        ไม่มี Lazada {systemGalleryMissingLazadaTotal.toLocaleString('th-TH')}
-                      </span>
-                    </>
-                  )}
-                  <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-bold text-slate-700">
-                    คลังทั้งหมด {gallerySummaryLibraryTotal.toLocaleString('th-TH')}
-                  </span>
-                  {gallerySummaryInventoryTotal > 0 && gallerySummaryInventoryTotal !== gallerySummaryLibraryTotal && (
-                    <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-bold text-indigo-700">
-                      หลังรวมคลิปซ้ำ {gallerySummaryInventoryTotal.toLocaleString('th-TH')}
-                    </span>
-                  )}
-                  <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
-                    รอโพสต์ {galleryReadyVideos.length.toLocaleString('th-TH')}
-                  </span>
-                  <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700">
-                    รอย่อลิ้ง {galleryPendingShortlinkVideos.length.toLocaleString('th-TH')}
-                  </span>
-                </div>
-                <p className="mt-3 text-xs leading-5 text-gray-500">
-                  {useSystemWideAdminGallery
-                    ? 'Flow ใหม่: ไม่มีลิ้งลา → รอย่อลิ้ง → รอโพสต์ → โพสต์แล้ว และทุกแท็บรวมกันคือจำนวนวิดีโอทั้งหมดของระบบ'
-                    : 'Flow ใหม่: ไม่มีลิ้งลา → รอย่อลิ้ง → รอโพสต์ → โพสต์แล้ว ภายใน workspace นี้'}
-                </p>
-              </div>
-            )}
-
-            {!isAllOriginalMode && gallerySearchQuery && (
-              <div className="mb-3 rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
-                <div className="flex flex-wrap gap-2">
-                  <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">
-                    ผลลัพธ์ {galleryCurrentTotal.toLocaleString('th-TH')}
-                  </span>
-                </div>
-              </div>
-            )}
-
             {isAllOriginalMode ? (
               globalOriginalLoading && globalOriginalVideos.length === 0 ? (
                 <div className="grid grid-cols-3 gap-3">
@@ -4856,9 +5565,9 @@ function App() {
                       ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
                       : categoryFilter === 'ready'
                         ? 'ยังไม่มีคลิปรอโพสต์'
-                        : categoryFilter === 'pending-shortlink'
+                        : categoryFilter === 'pending-shortlink' && galleryShortlinkRequired
                           ? 'ยังไม่มีคลิปรอย่อลิ้ง'
-                          : 'ยังไม่มีคลิปไม่มีลิ้งลา'}
+                          : 'ยังไม่มีคลิปที่ลิงก์ยังไม่ครบ'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
                   {gallerySearchQuery
@@ -4868,10 +5577,12 @@ function App() {
                     : categoryFilter === 'used'
                       ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
                       : categoryFilter === 'ready'
-                        ? 'คลิปที่ย่อลิ้งครบแล้วและพร้อมโพสต์จะแสดงที่นี่'
-                        : categoryFilter === 'pending-shortlink'
+                        ? galleryShortlinkRequired
+                          ? 'คลิปที่ย่อลิ้งครบแล้วและพร้อมโพสต์จะแสดงที่นี่'
+                          : 'คลิปที่ประมวลผลเสร็จและลิงก์ครบแล้วจะพร้อมโพสต์ทันที'
+                        : categoryFilter === 'pending-shortlink' && galleryShortlinkRequired
                           ? 'คลิปที่มี Lazada แล้วแต่ยังย่อลิ้งไม่ครบจะแสดงที่นี่'
-                          : 'คลิปที่ยังไม่มี Lazada link จะแสดงที่นี่'}
+                          : 'คลิปที่ยังมีลิงก์ไม่ครบจะแสดงที่นี่'}
                 </p>
               </div>
             ) : (
@@ -4886,10 +5597,13 @@ function App() {
                       formatDuration={formatDuration}
                       keepInPostedOnLinkSave={!systemWideGalleryMode && categoryFilter === 'used'}
                       onDelete={(id, targetNamespaceId) => {
-                        setVideos(videos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
-                        setUsedVideos(usedVideos.filter(v => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, targetNamespaceId)));
+                        const deletedKey = targetNamespaceId ? `${targetNamespaceId}:${id}` : id
+                        deletedGalleryKeysRef.current.add(deletedKey)
+                        setVideos(videos.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
+                        setUsedVideos(usedVideos.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
                       }}
                       onUpdate={updateGalleryVideoState}
+                      onImport={useSystemWideAdminGallery ? handleImportVideo : undefined}
                       onExpandedChange={setVideoViewerOpen}
                     />
                   ))}
@@ -5217,20 +5931,7 @@ function App() {
 
         {tab === 'settings' && settingsSection === 'pages' && (
           <div className="px-4 space-y-3" onClick={() => deletePageId && setDeletePageId(null)}>
-            <div className="flex items-center gap-3 px-1">
-              <button
-                onClick={() => setSettingsSection('menu')}
-                className="w-9 h-9 rounded-xl border border-gray-200 bg-white flex items-center justify-center active:scale-95"
-                aria-label="ย้อนกลับ"
-              >
-                <BackIcon />
-              </button>
-              <div className="min-w-0 flex-1">
-                <p className="text-lg font-bold text-gray-900">Pages</p>
-                <p className="text-xs text-gray-400">
-                  {pagesLoading ? 'กำลังโหลดเพจ...' : `${pages.length} เพจใน workspace นี้`}
-                </p>
-              </div>
+            <div className="flex justify-end px-1">
               <button
                 onClick={() => setShowAddPagePopup(true)}
                 className="shrink-0 rounded-xl bg-blue-600 px-3.5 py-2 text-sm font-bold text-white active:scale-95"
@@ -5294,7 +5995,7 @@ function App() {
                   return (
                     <button
                       key={page.id}
-                      onClick={() => !isDeleting && setSelectedPage(page)}
+                      onClick={() => !isDeleting && openSelectedPage(page)}
                       onTouchStart={onTouchStart}
                       onTouchEnd={onTouchEnd}
                       onTouchMove={onTouchEnd}
@@ -5371,119 +6072,108 @@ function App() {
         {tab === 'settings' && settingsSection !== 'pages' && (
           <div className="px-5 space-y-4">
             {settingsSection === 'menu' ? (
-              <>
-                {meEmail && (
-                  <div className="flex items-center justify-between gap-3 p-4 bg-white rounded-2xl border border-gray-200">
-                    <div className="flex items-center min-w-0">
-                      <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white text-xl font-bold shadow-lg flex-shrink-0">
-                        {meEmail.charAt(0).toUpperCase()}
+              authBootstrapping ? (
+                <SettingsMenuSkeleton />
+              ) : (
+                <>
+                  {(meEmail || meDisplayName) && (
+                    <div className="flex items-center justify-between gap-3 p-4 bg-white rounded-2xl border border-gray-200">
+                      <div className="flex items-center gap-3 min-w-0">
+                        {mePictureUrl ? (
+                          <img src={mePictureUrl} className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
+                        ) : (
+                          <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold text-lg flex-shrink-0">
+                            {(meDisplayName || meEmail).charAt(0).toUpperCase()}
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="font-bold text-gray-900 truncate">{meDisplayName || meEmail}</p>
+                          <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
+                            {isSystemAdmin ? 'Admin' : isOwner ? 'Member' : 'Team'}
+                          </p>
+                        </div>
                       </div>
-                      <div className="ml-4 min-w-0">
-                        <p className="font-semibold text-gray-900 text-sm truncate">{meEmail}</p>
-                        <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
-                          {isOwner ? 'Owner' : 'Member'}
-                        </p>
-                      </div>
+                      <button
+                        onClick={handleLogout}
+                        disabled={logoutLoading}
+                        className="px-4 py-2 rounded-xl border border-red-200 bg-red-50 text-red-600 text-sm font-semibold active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        {logoutLoading ? 'กำลังออก...' : 'Logout'}
+                      </button>
                     </div>
-                    <button
-                      onClick={handleLogout}
-                      disabled={logoutLoading}
-                      className="px-4 py-2 rounded-xl border border-red-200 bg-red-50 text-red-600 text-sm font-semibold active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
-                    >
-                      {logoutLoading ? 'กำลังออก...' : 'Logout'}
-                    </button>
-                  </div>
-                )}
-                <SettingsMenuItem
-                  icon="📄"
-                  title="Pages"
-                  subtitle="เพิ่มเพจและตั้งค่า Auto Post"
-                  onClick={() => setSettingsSection('pages')}
-                />
-                {isOwner && (
+                  )}
+                  <SettingsMenuItem
+                    icon="📄"
+                    title="Pages"
+                    subtitle="เพิ่มเพจและตั้งค่า Auto Post"
+                    onClick={() => openSettingsSection('pages')}
+                  />
                   <SettingsMenuItem
                     icon="👥"
                     title="Team"
                     subtitle={`${teamMembers.length} สมาชิก`}
-                    onClick={() => setSettingsSection('team')}
+                    onClick={() => openSettingsSection('team')}
                   />
-                )}
-                {isOwner && (
-                  <SettingsMenuItem
-                    icon="🔗"
-                    title="Shortlink"
-                    subtitle={shortlinkAccountCurrent
-                      ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
-                      : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'}
-                    onClick={() => setSettingsSection('shortlink')}
-                  />
-                )}
-                {isOwner && (
+                  {isOwner && (
+                    <SettingsMenuItem
+                      icon="🔗"
+                      title="Shortlink"
+                      subtitle={shortlinkAccountCurrent
+                        ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
+                        : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'}
+                      onClick={() => openSettingsSection('shortlink')}
+                    />
+                  )}
                   <SettingsMenuItem
                     icon="🔑"
                     title="Gemini API Key"
                     subtitle={
                       geminiApiKeySource === 'workspace'
                         ? 'แหล่งที่ใช้งาน: Owner นี้เท่านั้น'
-                          : 'ยังไม่ตั้งค่า'
+                        : 'ยังไม่ตั้งค่า'
                     }
-                    onClick={() => setSettingsSection('gemini')}
+                    onClick={() => openSettingsSection('gemini')}
                   />
-                )}
-                {isOwner && (
                   <SettingsMenuItem
                     icon="🎙️"
                     title="Voice Prompt"
                     subtitle={voicePromptSource === 'custom' ? 'กำลังใช้ prompt แบบกำหนดเอง' : 'กำลังใช้ prompt ค่าเริ่มต้น'}
-                    onClick={() => setSettingsSection('voice')}
+                    onClick={() => openSettingsSection('voice')}
                   />
-                )}
-                {isOwner && (
                   <SettingsMenuItem
                     icon="💬"
                     title="Comment Template"
                     subtitle={commentTemplateSource === 'custom' ? 'กำลังใช้เทมเพลตคอมเมนต์ที่กำหนดเอง' : 'กำลังใช้เทมเพลตคอมเมนต์ค่าเริ่มต้น'}
-                    onClick={() => setSettingsSection('comment')}
+                    onClick={() => openSettingsSection('comment')}
                   />
-                )}
-                <p className="text-gray-300 text-xs font-medium text-center pt-2">Version 2.0.1 (Build 240)</p>
-              </>
+                  {isSystemAdmin && (
+                    <SettingsMenuItem
+                      icon="&#x2705;"
+                      title="อนุมัติสมาชิก"
+                      subtitle={`${pendingUsers.length} คนรออนุมัติ`}
+                      onClick={() => openSettingsSection('approvals')}
+                    />
+                  )}
+                  <p className="text-gray-300 text-xs font-medium text-center pt-2">Version 2.0.1 (Build 240)</p>
+                </>
+              )
             ) : (
               <>
-                <div className="flex items-center gap-3 pt-1">
-                  <button
-                    onClick={() => setSettingsSection('menu')}
-                    className="w-9 h-9 rounded-xl border border-gray-200 bg-white flex items-center justify-center active:scale-95"
-                    aria-label="ย้อนกลับ"
-                  >
-                    <BackIcon />
-                  </button>
-                  <p className="text-lg font-bold text-gray-900">
-                    {settingsSection === 'account'
-                      ? 'Account'
-                      : settingsSection === 'team'
-                        ? 'Team'
-                        : settingsSection === 'gemini'
-                          ? 'Gemini API Key'
-                          : settingsSection === 'comment'
-                            ? 'Comment Template'
-                            : settingsSection === 'shortlink'
-                              ? 'Shortlink'
-                              : 'Voice Prompt'}
-                  </p>
-                </div>
-
                 {settingsSection === 'account' && (
                   <div className="space-y-3">
-                    {meEmail ? (
-                      <div className="flex items-center p-4 bg-gray-50 rounded-3xl border border-gray-100">
-                        <div className="w-14 h-14 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center text-white text-xl font-bold shadow-lg flex-shrink-0">
-                          {meEmail.charAt(0).toUpperCase()}
-                        </div>
-                        <div className="ml-4 min-w-0">
-                          <p className="font-semibold text-gray-900 text-sm truncate">{meEmail}</p>
+                    {(meEmail || meDisplayName) ? (
+                      <div className="flex items-center gap-3 p-4 bg-gray-50 rounded-3xl border border-gray-100">
+                        {mePictureUrl ? (
+                          <img src={mePictureUrl} className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
+                        ) : (
+                          <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold text-lg flex-shrink-0">
+                            {(meDisplayName || meEmail).charAt(0).toUpperCase()}
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="font-bold text-gray-900 truncate">{meDisplayName || meEmail}</p>
                           <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
-                            {isOwner ? 'Owner' : 'Member'}
+                            {isSystemAdmin ? 'Admin' : isOwner ? 'Member' : 'Team'}
                           </p>
                         </div>
                       </div>
@@ -5502,63 +6192,67 @@ function App() {
                   </div>
                 )}
 
-                {settingsSection === 'team' && isOwner && (
+                {settingsSection === 'team' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       {teamMembers.length === 0 && (
                         <p className="text-sm text-gray-400 text-center py-2">ยังไม่มีสมาชิกในทีม</p>
                       )}
-                      {teamMembers.map((m) => (
-                        <div key={m.email} className="flex items-center justify-between">
-                          <span className="text-sm font-medium text-gray-900">{m.email}</span>
+                      {teamMembers.map((m: any) => (
+                        <div key={m.email} className="flex items-center gap-3">
+                          {m.status === 'pending' ? (
+                            <div className="w-10 h-10 rounded-full bg-amber-50 flex items-center justify-center text-xl">⏳</div>
+                          ) : m.picture_url ? (
+                            <img src={m.picture_url} className="w-10 h-10 rounded-full object-cover" />
+                          ) : (
+                            <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center text-gray-500 font-bold text-sm">
+                              {(m.display_name || m.email || '?').charAt(0).toUpperCase()}
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-bold text-gray-900 truncate">
+                              {m.status === 'pending' ? 'คำเชิญ' : (m.display_name || m.email)}
+                            </p>
+                            <p className="text-xs text-gray-400 truncate">
+                              {m.status === 'pending' ? (
+                                <span className="text-amber-500 font-semibold">รอตอบรับ · {new Date(m.created_at).toLocaleDateString('th-TH', { day: 'numeric', month: 'short' })}</span>
+                              ) : m.display_name ? m.email : ''}
+                            </p>
+                          </div>
                           <button
                             onClick={async () => {
                               await apiFetch(`${WORKER_URL}/api/team/${encodeURIComponent(m.email)}`, { method: 'DELETE' })
                               setTeamMembers(prev => prev.filter(x => x.email !== m.email))
                             }}
-                            className="w-8 h-8 rounded-lg bg-red-50 text-red-500 flex items-center justify-center active:scale-90 transition-transform"
+                            className="px-3 py-1.5 rounded-xl bg-red-50 text-red-500 text-xs font-bold active:scale-90 transition-transform"
                           >
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
-                            </svg>
+                            ลบ
                           </button>
                         </div>
                       ))}
-                      <div className="flex gap-2 pt-1">
-                        <input
-                          type="email"
-                          value={newMemberEmail}
-                          onChange={(e) => setNewMemberEmail(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' && newMemberEmail.trim().includes('@')) {
-                              e.currentTarget.blur()
-                            }
-                          }}
-                          placeholder="อีเมลสมาชิกใหม่"
-                          className="flex-1 bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                        />
-                        <button
-                          onClick={async () => {
-                            if (!newMemberEmail.trim() || !newMemberEmail.includes('@')) return
-                            await apiFetch(`${WORKER_URL}/api/team`, {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ email: newMemberEmail.trim() })
-                            })
-                            await loadTeam()
-                            setNewMemberEmail('')
-                          }}
-                          disabled={!newMemberEmail.trim() || !newMemberEmail.includes('@')}
-                          className="bg-gray-900 text-white px-4 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-30"
-                        >
-                          เพิ่ม
-                        </button>
-                      </div>
+                      <button
+                        onClick={handleInviteTeam}
+                        disabled={invitingTeam}
+                        className="w-full py-3 rounded-2xl font-bold text-base text-white flex items-center justify-center gap-2 active:scale-[0.97] transition-all disabled:opacity-60"
+                        style={{ background: '#06C755' }}
+                      >
+                        {invitingTeam ? (
+                          <>
+                            <svg className="animate-spin" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" strokeLinecap="round" /></svg>
+                            กำลังเปิด...
+                          </>
+                        ) : (
+                          <>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M19.365 9.863c.349 0 .63.285.63.631 0 .345-.281.63-.63.63H17.61v1.125h1.755c.349 0 .63.283.63.63 0 .344-.281.629-.63.629h-2.386c-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.627-.63h2.386c.349 0 .63.285.63.63 0 .349-.281.63-.63.63H17.61v1.125h1.755zm-3.855 3.016c0 .27-.174.51-.432.596-.064.021-.133.031-.199.031-.211 0-.391-.09-.51-.25l-2.443-3.317v2.94c0 .344-.279.629-.631.629-.346 0-.626-.285-.626-.629V8.108c0-.27.173-.51.43-.595.06-.023.136-.033.194-.033.195 0 .375.104.495.254l2.462 3.33V8.108c0-.345.282-.63.63-.63.345 0 .63.285.63.63v4.771zm-5.741 0c0 .344-.282.629-.631.629-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.627-.63.349 0 .631.285.631.63v4.771zm-2.466.629H4.917c-.345 0-.63-.285-.63-.629V8.108c0-.345.285-.63.63-.63.348 0 .63.285.63.63v4.141h1.756c.348 0 .629.283.629.63 0 .344-.282.629-.629.629M24 10.314C24 4.943 18.615.572 12 .572S0 4.943 0 10.314c0 4.811 4.27 8.842 10.035 9.608.391.082.923.258 1.058.59.12.301.079.766.038 1.08l-.164 1.02c-.045.301-.24 1.186 1.049.645 1.291-.539 6.916-4.078 9.436-6.975C23.176 14.393 24 12.458 24 10.314"/></svg>
+                            เชิญเพื่อนผ่าน LINE
+                          </>
+                        )}
+                      </button>
                     </div>
                   </div>
                 )}
 
-                {settingsSection === 'gemini' && isOwner && (
+                {settingsSection === 'gemini' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
@@ -5731,7 +6425,7 @@ function App() {
                   </div>
                 )}
 
-                {settingsSection === 'comment' && isOwner && (
+                {settingsSection === 'comment' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
@@ -5804,7 +6498,7 @@ function App() {
                   </div>
                 )}
 
-                {settingsSection === 'voice' && isOwner && (
+                {settingsSection === 'voice' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
@@ -5863,6 +6557,60 @@ function App() {
                     </div>
                   </div>
                 )}
+
+                {settingsSection === 'approvals' && isSystemAdmin && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <p className="text-xs text-gray-500 leading-relaxed">
+                        สมาชิกใหม่ที่ลงทะเบียนผ่าน LINE จะต้องได้รับการอนุมัติก่อนใช้งาน
+                      </p>
+                      {pendingUsersLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลดรายชื่อ...</p>
+                      ) : pendingUsers.length === 0 ? (
+                        <div className="text-center py-8">
+                          <div className="w-14 h-14 bg-green-50 rounded-full flex items-center justify-center text-2xl mx-auto mb-3">&#x2705;</div>
+                          <p className="text-sm text-gray-500">ไม่มีสมาชิกที่รออนุมัติ</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {pendingUsers.map((user) => (
+                            <div key={user.line_user_id} className="flex items-center gap-3 p-3 rounded-xl bg-gray-50 border border-gray-100">
+                              {user.picture_url ? (
+                                <img src={user.picture_url} className="w-10 h-10 rounded-full object-cover flex-shrink-0" />
+                              ) : (
+                                <div className="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center text-gray-500 font-bold text-sm flex-shrink-0">
+                                  {(user.display_name || '?').charAt(0).toUpperCase()}
+                                </div>
+                              )}
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-semibold text-gray-900 truncate">{user.display_name || 'ไม่มีชื่อ'}</p>
+                                {user.created_at && (
+                                  <p className="text-[11px] text-gray-400">{new Date(user.created_at + 'Z').toLocaleString()}</p>
+                                )}
+                              </div>
+                              <div className="flex gap-1.5 flex-shrink-0">
+                                <button
+                                  onClick={() => approveUser(user.line_user_id)}
+                                  disabled={approvingUserId === user.line_user_id || rejectingUserId === user.line_user_id}
+                                  className="px-3 py-1.5 rounded-lg bg-green-500 text-white text-xs font-bold active:scale-95 transition-all disabled:opacity-50"
+                                >
+                                  {approvingUserId === user.line_user_id ? '...' : 'อนุมัติ'}
+                                </button>
+                                <button
+                                  onClick={() => rejectUser(user.line_user_id)}
+                                  disabled={approvingUserId === user.line_user_id || rejectingUserId === user.line_user_id}
+                                  className="px-3 py-1.5 rounded-lg bg-red-500 text-white text-xs font-bold active:scale-95 transition-all disabled:opacity-50"
+                                >
+                                  {rejectingUserId === user.line_user_id ? '...' : 'ปฏิเสธ'}
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -5870,12 +6618,15 @@ function App() {
       </div>
 
       {!videoViewerOpen && (
-        <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-t border-gray-100 safe-bottom z-40">
-          <div className="flex pt-2 pb-1">
+        <div
+          className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 z-40"
+          style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
+        >
+          <div className="flex pt-1 pb-0">
             <NavItem
               icon={<DashboardIcon />}
               iconActive={<DashboardIconFilled />}
-              label="Dashboard"
+              label="แดชบอร์ด"
               active={tab === 'dashboard'}
               onClick={() => setTab('dashboard')}
             />
@@ -5889,28 +6640,28 @@ function App() {
             <NavItem
               icon={<ProcessIcon />}
               iconActive={<ProcessIconFilled />}
-              label="Processing"
+              label="ประมวลผล"
               active={tab === 'processing'}
               onClick={() => setTab('processing')}
             />
             <NavItem
               icon={<VideoIcon />}
               iconActive={<VideoIconFilled />}
-              label="Gallery"
+              label="แกลลี่"
               active={tab === 'gallery'}
               onClick={() => setTab('gallery')}
             />
             <NavItem
               icon={<ListIcon />}
               iconActive={<ListIconFilled />}
-              label="Logs"
+              label="ประวัติ"
               active={tab === 'logs'}
               onClick={() => setTab('logs')}
             />
             <NavItem
               icon={<SettingsIcon />}
               iconActive={<SettingsIconFilled />}
-              label="Settings"
+              label="ตั้งค่า"
               active={tab === 'settings'}
               onClick={() => setTab('settings')}
             />
@@ -5934,7 +6685,7 @@ function NavItem({ icon, iconActive, label, active, onClick }: {
       className={`flex-1 py-2 flex flex-col items-center relative group`}
       style={{ WebkitTapHighlightColor: 'transparent' }}
     >
-      <div className={`text-2xl mb-1 transition-all duration-300 ${active ? 'text-blue-600 scale-110' : 'text-gray-400 group-active:scale-95'}`}>
+      <div className={`text-5xl mb-0.5 transition-all duration-300 ${active ? 'text-blue-600 scale-110' : 'text-gray-400 group-active:scale-95'}`}>
         {active ? iconActive : icon}
       </div>
       <span className={`text-[10px] font-bold tracking-wide transition-colors ${active ? 'text-blue-600' : 'text-gray-400'}`}>

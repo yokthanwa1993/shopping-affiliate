@@ -43,6 +43,8 @@ export type Env = {
     BROWSERSAVING_WORKER_URL?: string
     BROWSERSAVING_API_URL?: string
     TAG_SYNC_PUSH_SECRET?: string
+    LINE_CHANNEL_SECRET?: string
+    LINE_CHANNEL_ACCESS_TOKEN?: string
 }
 
 async function ensureNamespaceSettingsTable(db: D1Database) {
@@ -92,6 +94,58 @@ function buildScopedGalleryWebAppUrl(baseUrl: string, botScope: string, videoId:
         if (trimmedVideoId) params.set('q', trimmedVideoId)
         const query = params.toString()
         return `${baseUrl.replace(/\/+$/, '')}/gallery${query ? `?${query}` : ''}`
+    }
+}
+
+function buildWorkerGalleryAssetUrl(workerUrl: string, botId: string, videoId: string, variant: 'original' | 'public' = 'original'): string {
+    const base = String(workerUrl || '').trim().replace(/\/+$/, '')
+    const normalizedBotId = String(botId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!base || !normalizedBotId || !normalizedVideoId) return ''
+    return `${base}/api/gallery/${encodeURIComponent(normalizedVideoId)}/asset/${variant}?namespace_id=${encodeURIComponent(normalizedBotId)}`
+}
+
+function resolvePipelineSourceUrl(workerUrl: string, botId: string, videoUrl: string, videoId: string): string {
+    const normalizedUrl = String(videoUrl || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedUrl || !normalizedVideoId) return normalizedUrl
+
+    if (
+        normalizedUrl.includes(`/videos/${normalizedVideoId}_original.mp4`) ||
+        normalizedUrl.includes(`/videos/${normalizedVideoId}_line_original.mp4`)
+    ) {
+        return buildWorkerGalleryAssetUrl(workerUrl, botId, normalizedVideoId, 'original') || normalizedUrl
+    }
+
+    if (normalizedUrl.includes(`/videos/${normalizedVideoId}.mp4`)) {
+        return buildWorkerGalleryAssetUrl(workerUrl, botId, normalizedVideoId, 'public') || normalizedUrl
+    }
+
+    return normalizedUrl
+}
+
+async function fetchWithTimeout(
+    fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+    timeoutMs: number,
+    label: string,
+): Promise<Response> {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(`${label}_timeout_${timeoutMs}ms`), timeoutMs)
+    try {
+        return await fetcher(input, {
+            ...(init || {}),
+            signal: controller.signal,
+        })
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (message.includes('aborted') || message.includes('timeout')) {
+            throw new Error(`${label}_timeout_${timeoutMs}ms`)
+        }
+        throw error
+    } finally {
+        clearTimeout(timeoutId)
     }
 }
 
@@ -315,6 +369,9 @@ export async function runPipeline(
             directVideoUrl = resolved
         }
 
+        const workerUrl = String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev'
+        directVideoUrl = resolvePipelineSourceUrl(workerUrl, botId, directVideoUrl, videoId)
+
         // ส่งงานทั้งหมดไป Container /pipeline — รัน background ไม่มี time limit
         const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
         const containerStub = env.MERGE_CONTAINER.get(containerId)
@@ -328,7 +385,7 @@ export async function runPipeline(
             model,
             script_prompt: voicePrompt,
             r2_public_url: env.R2_PUBLIC_URL,
-            worker_url: String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev',
+            worker_url: workerUrl,
             completion_webapp_url: buildScopedGalleryWebAppUrl(
                 env.WEBAPP_URL || 'https://video-affiliate-webapp.pages.dev',
                 botId,
@@ -345,7 +402,13 @@ export async function runPipeline(
         let containerReady = false
         for (let i = 0; i < 3; i++) {
             try {
-                const hResp = await containerStub.fetch('http://container/health')
+                const hResp = await fetchWithTimeout(
+                    containerStub.fetch.bind(containerStub),
+                    'http://container/health',
+                    undefined,
+                    5000,
+                    'container_health',
+                )
                 const hText = await hResp.text()
                 if (!hText.startsWith('<') && hResp.ok) {
                     const hJson = JSON.parse(hText) as { build?: string; status?: string; pipeline_engine_version?: string }
@@ -378,11 +441,17 @@ export async function runPipeline(
         }
 
         // Dispatch pipeline
-        const resp = await containerStub.fetch('http://container/pipeline', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: payload,
-        })
+        const resp = await fetchWithTimeout(
+            containerStub.fetch.bind(containerStub),
+            'http://container/pipeline',
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: payload,
+            },
+            15000,
+            'container_dispatch',
+        )
 
         const body = await resp.text()
         if (body.startsWith('<') || !resp.ok) {
@@ -490,6 +559,8 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
         ...job,
         status: 'processing',
         createdAt: new Date().toISOString(),
+        step: 0,
+        stepName: '⏳ กำลังเชื่อมต่อเครื่องประมวลผล...',
     }), {
         httpMetadata: { contentType: 'application/json' },
     })
@@ -498,4 +569,26 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
     await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink, job.lazadaLink)
 
     return true
+}
+
+export async function warmPipelineContainer(env: Env): Promise<void> {
+    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+    const containerStub = env.MERGE_CONTAINER.get(containerId)
+    try {
+        const resp = await fetchWithTimeout(
+            containerStub.fetch.bind(containerStub),
+            'http://container/health',
+            undefined,
+            5000,
+            'container_warmup',
+        )
+        const body = await resp.text().catch(() => '')
+        if (resp.ok && !body.startsWith('<')) {
+            console.log('[PIPELINE] Warmed processing container')
+        } else {
+            console.log(`[PIPELINE] Warmup response status=${resp.status}`)
+        }
+    } catch (error) {
+        console.log(`[PIPELINE] Warmup skipped: ${error instanceof Error ? error.message : String(error)}`)
+    }
 }

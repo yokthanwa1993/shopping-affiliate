@@ -15,7 +15,7 @@
     "containers": [
         {
             "class_name": "MergeContainer",
-            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-03-12.01",
+            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-03-31.054153",
             "instance_type": "standard-2",
             "max_instances": 2
         }
@@ -75,4 +75,6 @@
     // Secrets (set via `wrangler secret put`):
     // TELEGRAM_BOT_TOKEN
     // TAG_SYNC_PUSH_SECRET
+    // LINE_CHANNEL_SECRET
+    // LINE_CHANNEL_ACCESS_TOKEN
 }

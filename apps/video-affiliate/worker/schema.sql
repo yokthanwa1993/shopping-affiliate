@@ -243,3 +243,25 @@ ON gallery_index(is_owner_linked, has_thumbnail, updated_at DESC, created_at DES
 
 CREATE INDEX IF NOT EXISTS idx_gallery_index_namespace_updated
 ON gallery_index(namespace_id, updated_at DESC, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS imported_videos (
+    namespace_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    source_namespace_id TEXT NOT NULL,
+    imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+    imported_by TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (namespace_id, video_id)
+);
+
+CREATE TABLE IF NOT EXISTS line_users (
+    line_user_id TEXT PRIMARY KEY,
+    namespace_id TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    picture_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_line_users_namespace ON line_users(namespace_id);
