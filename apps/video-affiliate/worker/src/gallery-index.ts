@@ -604,8 +604,12 @@ async function buildGalleryIndexUpsertRow(params: {
         ? getVideoThumbnailUrlForNamespace(params.env.R2_PUBLIC_URL, namespaceId, videoId)
         : ''
 
-    const originalUrl = normalizeText(meta.originalUrl) || derivedOriginalUrl || derivedPublicUrl
-    const publicUrl = normalizeText(meta.publicUrl) || derivedPublicUrl || originalUrl
+    const originalUrl = hasOriginalVideo
+        ? (normalizeText(meta.originalUrl) || derivedOriginalUrl || derivedPublicUrl)
+        : ''
+    const publicUrl = hasPublicVideo
+        ? (normalizeText(meta.publicUrl) || derivedPublicUrl)
+        : ''
     const thumbnailUrl = normalizeText(meta.thumbnailUrl) || derivedThumbnailUrl
     const shopeeLink = normalizeMetaShopeeLink(meta)
     const lazadaLink = normalizeMetaLazadaLink(meta)
@@ -746,6 +750,7 @@ function buildGalleryWhereClause(options: {
     linkFilter?: GalleryIndexLinkFilter
     hasThumbnail?: boolean
     playableOnly?: boolean
+    requirePublicVideo?: boolean
 }) {
     const clauses: string[] = []
     const binds: Array<string | number> = []
@@ -758,6 +763,7 @@ function buildGalleryWhereClause(options: {
     }
     if (options.hasThumbnail === true) clauses.push('has_thumbnail = 1')
     if (options.hasThumbnail === false) clauses.push('has_thumbnail = 0')
+    if (options.requirePublicVideo) clauses.push('has_public_video = 1')
     if (options.playableOnly) clauses.push('(has_original_video = 1 OR has_public_video = 1)')
 
     return {
@@ -771,6 +777,7 @@ async function queryGalleryIndexCount(db: D1Database, options: {
     linkFilter?: GalleryIndexLinkFilter
     hasThumbnail?: boolean
     playableOnly?: boolean
+    requirePublicVideo?: boolean
 }): Promise<number> {
     await ensureGalleryIndexTable(db)
     const { whereSql, binds } = buildGalleryWhereClause(options)
@@ -786,6 +793,7 @@ export async function listGalleryIndexVideos(db: D1Database, options: {
     onlyOwnerLinked?: boolean
     linkFilter?: GalleryIndexLinkFilter
     playableOnly?: boolean
+    requirePublicVideo?: boolean
 } = {}): Promise<GalleryIndexVideo[]> {
     await ensureGalleryIndexTable(db)
     const { whereSql, binds } = buildGalleryWhereClause(options)
@@ -820,6 +828,7 @@ export async function listGalleryIndexVideos(db: D1Database, options: {
 
     const videos: GalleryIndexVideo[] = []
     for (const row of result.results || []) {
+        if (options.requirePublicVideo && Number(row.has_public_video || 0) !== 1) continue
         if (!hasPlayableGalleryAssetRow(row)) continue
         const video = mapGalleryIndexRowToVideo(row)
         if (video) videos.push(video)
@@ -833,6 +842,7 @@ export async function getGalleryIndexPage(db: D1Database, options: {
     onlyOwnerLinked?: boolean
     linkFilter?: GalleryIndexLinkFilter
     playableOnly?: boolean
+    requirePublicVideo?: boolean
 }): Promise<GalleryIndexPageResult> {
     await ensureGalleryIndexTable(db)
     const offset = Math.max(0, Number(options.offset || 0))
@@ -869,13 +879,14 @@ export async function getGalleryIndexPage(db: D1Database, options: {
              ORDER BY COALESCE(updated_at, created_at) DESC, namespace_id ASC, video_id ASC
              LIMIT ? OFFSET ?`
         ).bind(...binds, limit, offset).all() as Promise<{ results?: GalleryIndexDbRow[] }>,
-        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'all', playableOnly: options.playableOnly }),
-        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'with-link', playableOnly: options.playableOnly }),
-        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'no-link', playableOnly: options.playableOnly }),
+        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'all', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
+        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'with-link', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
+        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'no-link', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
     ])
 
     const videos: GalleryIndexVideo[] = []
     for (const row of rowsRes.results || []) {
+        if (options.requirePublicVideo && Number(row.has_public_video || 0) !== 1) continue
         if (!hasPlayableGalleryAssetRow(row)) continue
         const video = mapGalleryIndexRowToVideo(row)
         if (video) videos.push(video)

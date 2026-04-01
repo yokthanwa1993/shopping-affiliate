@@ -15,6 +15,8 @@ const VERTICAL_VIEWER_FRAME_STYLE = {
 
 const COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER = '{{shopee_link}}'
 const COMMENT_TEMPLATE_LAZADA_PLACEHOLDER = '{{lazada_link}}'
+const DEFAULT_GEMINI_KEY_SLOTS = 5
+const createEmptyGeminiKeySlots = (count = DEFAULT_GEMINI_KEY_SLOTS) => Array.from({ length: Math.max(0, count) }, () => '')
 const DEFAULT_COMMENT_TEMPLATE = `📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้ 👇
 🧡 Shopee : {{shopee_link}}
 💙 Lazada : {{lazada_link}}
@@ -118,6 +120,35 @@ const apiFetch = async (url: string, options: RequestInit = {}) => {
   return fetch(url, { ...options, headers, cache: 'no-store' })
 };
 
+const copyPlainText = async (value: string): Promise<boolean> => {
+  const text = String(value || '').trim()
+  if (!text) return false
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Fallback below for webviews that block Clipboard API.
+  }
+
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', 'true')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
+    const copied = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return copied
+  } catch {
+    return false
+  }
+}
+
 const PAGE_IMAGE_PLACEHOLDER = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
     <rect width="120" height="120" rx="24" fill="#f1f5f9"/>
@@ -213,6 +244,7 @@ interface Video {
   title?: string
   postedAt?: string
   keepInPostedTab?: boolean
+  original_only?: boolean
 }
 
 type GalleryAssetVariant = 'public' | 'original' | 'thumb' | 'original-thumb'
@@ -220,6 +252,9 @@ type GalleryAssetVariant = 'public' | 'original' | 'thumb' | 'original-thumb'
 interface InboxVideo {
   id: string
   namespace_id?: string
+  importedFromNamespaceId?: string
+  duplicateNamespaceIds?: string[]
+  dedupedFromOtherNamespace?: boolean
   videoUrl?: string
   previewUrl?: string
   originalUrl?: string
@@ -236,6 +271,127 @@ interface InboxVideo {
   readyToProcess?: boolean
   canStartProcessing?: boolean
   canDelete?: boolean
+}
+
+function isInboxVideoOwnedByCurrentNamespace(video: InboxVideo, currentNamespaceId?: string): boolean {
+  const videoNamespaceId = String(video.namespace_id || '').trim()
+  const namespaceId = String(currentNamespaceId || '').trim()
+  return !!videoNamespaceId && !!namespaceId && videoNamespaceId === namespaceId
+}
+
+function compareInboxVideosForSystemView(a: InboxVideo, b: InboxVideo, currentNamespaceId?: string): number {
+  void currentNamespaceId
+  const aTs = new Date(String(a.createdAt || a.updatedAt || '')).getTime()
+  const bTs = new Date(String(b.createdAt || b.updatedAt || '')).getTime()
+  return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
+}
+
+function parseImportedNamespaceIdFromSourceLabel(sourceLabel?: string): string | undefined {
+  const label = String(sourceLabel || '').trim()
+  if (!label) return undefined
+  const match = label.match(/imported from\s+([A-Za-z0-9_:-]+)/i)
+  const importedNamespaceId = String(match?.[1] || '').trim()
+  return importedNamespaceId || undefined
+}
+
+function dedupeSystemInboxVideos(videos: InboxVideo[], currentNamespaceId?: string): InboxVideo[] {
+  const namespaceId = String(currentNamespaceId || '').trim()
+  const groups = new Map<string, InboxVideo[]>()
+
+  for (const video of videos) {
+    const videoId = String(video.id || '').trim()
+    if (!videoId) continue
+    const items = groups.get(videoId) || []
+    items.push(video)
+    groups.set(videoId, items)
+  }
+
+  return Array.from(groups.values())
+    .map((items) => {
+      const sortedItems = items
+        .slice()
+        .sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId))
+      const preferredOwnVideo = namespaceId
+        ? sortedItems.find((item) => isInboxVideoOwnedByCurrentNamespace(item, namespaceId))
+        : undefined
+      const selected = preferredOwnVideo || sortedItems[0]
+      const namespaceIds = Array.from(new Set(
+        sortedItems
+          .map((item) => String(item.namespace_id || '').trim())
+          .filter(Boolean)
+      ))
+      const fallbackThumbVideo = sortedItems.find((item) => !!String(item.thumbnailUrl || '').trim())
+      const fallbackPlaybackVideo = sortedItems.find((item) => (
+        !!String(item.originalUrl || '').trim()
+        || !!String(item.previewUrl || '').trim()
+        || !!String(item.videoUrl || '').trim()
+      ))
+      const selectedNamespaceId = String(selected.namespace_id || '').trim()
+      const importedFromNamespaceId = String(
+        selected.importedFromNamespaceId
+        || parseImportedNamespaceIdFromSourceLabel(selected.sourceLabel)
+        || namespaceIds.find((id) => id && id !== selectedNamespaceId)
+        || ''
+      ).trim() || undefined
+
+      return {
+        ...selected,
+        thumbnailUrl: String(selected.thumbnailUrl || fallbackThumbVideo?.thumbnailUrl || '').trim() || undefined,
+        originalUrl: String(selected.originalUrl || fallbackPlaybackVideo?.originalUrl || '').trim() || undefined,
+        previewUrl: String(selected.previewUrl || fallbackPlaybackVideo?.previewUrl || '').trim() || undefined,
+        videoUrl: String(selected.videoUrl || fallbackPlaybackVideo?.videoUrl || '').trim() || undefined,
+        importedFromNamespaceId,
+        duplicateNamespaceIds: namespaceIds,
+        dedupedFromOtherNamespace: !!(
+          importedFromNamespaceId
+          && isInboxVideoOwnedByCurrentNamespace(selected, namespaceId)
+        ),
+      } satisfies InboxVideo
+    })
+    .sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId))
+}
+
+function getInboxVideoIdentityKey(id: string, namespaceId?: string): string {
+  const normalizedId = String(id || '').trim()
+  const normalizedNamespaceId = String(namespaceId || '').trim()
+  return normalizedNamespaceId ? `${normalizedNamespaceId}:${normalizedId}` : normalizedId
+}
+
+function InboxOwnershipIcon({
+  own,
+  className = '',
+}: {
+  own: boolean
+  className?: string
+}) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.1"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      {own ? (
+        <>
+          <path d="M3 10.5 12 3l9 7.5" />
+          <path d="M5 9.5V20h14V9.5" />
+          <path d="M9 20v-5.5h6V20" />
+        </>
+      ) : (
+        <>
+          <path d="m12 3-8 4 8 4 8-4-8-4Z" />
+          <path d="m4 12 8 4 8-4" />
+          <path d="m4 17 8 4 8-4" />
+        </>
+      )}
+    </svg>
+  )
 }
 
 interface GalleryPageResponse {
@@ -266,6 +422,121 @@ interface GallerySummaryStats {
   libraryTotal: number
   inventoryTotal: number
   readyTotal: number
+}
+
+function AccountIdentityRow({
+  label,
+  value,
+  copied,
+  onCopy,
+}: {
+  label: string
+  value: string
+  copied: boolean
+  onCopy: () => void
+}) {
+  const text = String(value || '').trim()
+  if (!text) return null
+
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      className="flex w-full items-center gap-3 rounded-[22px] border border-slate-200 bg-slate-50/90 px-3.5 py-3 text-left shadow-sm transition-transform active:scale-[0.99]"
+    >
+      <div className="min-w-0 flex-1">
+        <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400">{label}</p>
+        <p className="mt-1 truncate font-mono text-[13px] font-semibold text-slate-700">{text}</p>
+      </div>
+      <span className={`flex h-10 min-w-[84px] items-center justify-center rounded-2xl border px-3 text-[12px] font-bold shadow-sm ${copied ? 'border-emerald-200 bg-emerald-50 text-emerald-600' : 'border-blue-200 bg-white text-blue-600'}`}>
+        {copied ? 'คัดลอกแล้ว' : 'Copy'}
+      </span>
+    </button>
+  )
+}
+
+function SettingsAccountCard({
+  displayName,
+  email,
+  pictureUrl,
+  roleLabel,
+  roleClassName,
+  namespaceId,
+  lineUserId,
+  copiedIdentityField,
+  onCopyNamespace,
+  onCopyLine,
+}: {
+  displayName: string
+  email: string
+  pictureUrl: string
+  roleLabel: string
+  roleClassName: string
+  namespaceId: string
+  lineUserId: string
+  copiedIdentityField: string | null
+  onCopyNamespace: () => void
+  onCopyLine: () => void
+}) {
+  const primaryText = String(displayName || lineUserId || email || '').trim()
+  if (!primaryText) return null
+
+  return (
+    <div className="rounded-[30px] border border-gray-200 bg-white p-4 shadow-sm">
+      <div className="relative overflow-hidden rounded-[26px] border border-slate-100 bg-gradient-to-br from-white via-slate-50 to-blue-50/80 px-4 py-5">
+        <div className="absolute -right-8 -top-8 h-28 w-28 rounded-full bg-blue-100/70 blur-2xl" />
+        <div className="absolute -left-8 bottom-0 h-20 w-20 rounded-full bg-sky-50 blur-2xl" />
+        <div className="relative flex flex-col items-center text-center">
+          {pictureUrl ? (
+            <img src={pictureUrl} className="h-20 w-20 rounded-full border-4 border-white object-cover shadow-sm" />
+          ) : (
+            <div className="flex h-20 w-20 items-center justify-center rounded-full border-4 border-white bg-blue-100 text-2xl font-bold text-blue-600 shadow-sm">
+              {primaryText.charAt(0).toUpperCase()}
+            </div>
+          )}
+          <div className="mt-4 space-y-2">
+            <p className="break-words text-[27px] font-black leading-tight tracking-tight text-gray-900">{primaryText}</p>
+            <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${roleClassName}`}>
+              {roleLabel}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 space-y-3">
+        <AccountIdentityRow
+          label="Namespace ID"
+          value={namespaceId}
+          copied={copiedIdentityField === 'namespace'}
+          onCopy={onCopyNamespace}
+        />
+        <AccountIdentityRow
+          label="LINE UID"
+          value={lineUserId}
+          copied={copiedIdentityField === 'line'}
+          onCopy={onCopyLine}
+        />
+      </div>
+    </div>
+  )
+}
+
+function SettingsLogoutButton({
+  onLogout,
+  logoutLoading,
+}: {
+  onLogout: () => void
+  logoutLoading: boolean
+}) {
+  return (
+    <button
+      onClick={onLogout}
+      disabled={logoutLoading}
+      className="flex h-12 w-full items-center justify-center rounded-2xl border border-red-200 bg-red-50 text-sm font-bold text-red-600 shadow-sm active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      {logoutLoading ? 'กำลังออกจากระบบ...' : 'Logout'}
+    </button>
+  )
 }
 
 interface ProcessingSummaryStats {
@@ -353,6 +624,8 @@ interface PostHistory {
   shopee_link?: string | null
   lazada_link?: string | null
   lazada_member_id?: string | null
+  lazada_expected_member_id?: string | null
+  lazada_member_match?: number | null
   shortlink_utm_source?: string | null
   shortlink_status?: string | null
   shortlink_error?: string | null
@@ -364,7 +637,34 @@ interface PostHistory {
 interface DashboardAdminStat {
   telegram_id: string
   email: string
+  display_name?: string
+  picture_url?: string
+  line_user_id?: string
   links: number
+}
+
+interface TeamMember {
+  email: string
+  created_at: string
+  display_name?: string
+  picture_url?: string
+  line_user_id?: string
+  status?: string
+}
+
+type SystemMemberRole = 'admin' | 'member' | 'team'
+
+interface SystemMember {
+  line_user_id: string
+  display_name?: string
+  picture_url?: string
+  email?: string
+  namespace_id?: string
+  status?: string
+  created_at?: string
+  updated_at?: string
+  role?: SystemMemberRole
+  team_owner_namespace_id?: string
 }
 
 interface DashboardData {
@@ -391,8 +691,107 @@ interface FacebookPage {
 }
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
-type GeminiKeySource = 'workspace' | 'none'
-type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment' | 'approvals'
+type GeminiKeySource = 'system' | 'legacy' | 'none'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment' | 'members'
+type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
+type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
+type VoicePacePreset = 'slow' | 'balanced' | 'fast'
+type VoiceTonePreset = 'bright' | 'playful' | 'warm' | 'confident' | 'luxury' | 'friendly' | 'funny' | 'sales'
+
+type VoiceProfile = {
+  voice_name: string
+  persona: VoicePersonaPreset
+  tones: VoiceTonePreset[]
+  pace: VoicePacePreset
+}
+
+type GeminiVoiceOption = {
+  name: string
+  descriptor: string
+}
+
+const DEFAULT_VOICE_PROFILE: VoiceProfile = {
+  voice_name: 'Puck',
+  persona: 'female',
+  tones: ['bright', 'friendly'],
+  pace: 'balanced',
+}
+const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
+
+const createDefaultVoiceProfile = (): VoiceProfile => ({
+  ...DEFAULT_VOICE_PROFILE,
+  tones: [...DEFAULT_VOICE_PROFILE.tones],
+})
+
+const VOICE_PERSONA_OPTIONS: Array<{ value: VoicePersonaPreset; label: string; hint: string }> = [
+  { value: 'female', label: 'ผู้หญิง', hint: 'นุ่มลื่น ชัดถ้อย' },
+  { value: 'male', label: 'ผู้ชาย', hint: 'มั่นใจ กระชับ' },
+  { value: 'kathoey', label: 'กระเทย', hint: 'แพรวพราว มีสีสัน' },
+]
+
+const VOICE_TONE_OPTIONS: Array<{ value: VoiceTonePreset; label: string }> = [
+  { value: 'bright', label: 'สดใส' },
+  { value: 'playful', label: 'ขี้เล่น' },
+  { value: 'warm', label: 'อบอุ่น' },
+  { value: 'confident', label: 'มั่นใจ' },
+  { value: 'luxury', label: 'พรีเมียม' },
+  { value: 'friendly', label: 'เป็นกันเอง' },
+  { value: 'funny', label: 'ตลก' },
+  { value: 'sales', label: 'ขายเก่ง' },
+]
+
+const VOICE_PACE_OPTIONS: Array<{ value: VoicePacePreset; label: string; hint: string }> = [
+  { value: 'slow', label: 'ช้า', hint: 'เว้นจังหวะชัด' },
+  { value: 'balanced', label: 'กลาง', hint: 'ธรรมชาติ' },
+  { value: 'fast', label: 'เร็ว', hint: 'กระชับทันคลิป' },
+]
+
+const normalizeVoiceProfile = (raw: Partial<VoiceProfile> | null | undefined): VoiceProfile => {
+  const voiceName = String(raw?.voice_name || '').trim() || DEFAULT_VOICE_PROFILE.voice_name
+  const persona = String(raw?.persona || '').trim()
+  const pace = String(raw?.pace || '').trim()
+  const tones = Array.isArray(raw?.tones) ? raw?.tones : []
+  const uniqueTones = Array.from(new Set(
+    tones
+      .map((tone) => String(tone || '').trim())
+      .filter((tone): tone is VoiceTonePreset => VOICE_TONE_OPTIONS.some((option) => option.value === tone))
+  )).slice(0, 3)
+
+  return {
+    voice_name: voiceName,
+    persona: VOICE_PERSONA_OPTIONS.some((option) => option.value === persona) ? persona as VoicePersonaPreset : DEFAULT_VOICE_PROFILE.persona,
+    tones: uniqueTones.length > 0 ? uniqueTones : [...DEFAULT_VOICE_PROFILE.tones],
+    pace: VOICE_PACE_OPTIONS.some((option) => option.value === pace) ? pace as VoicePacePreset : DEFAULT_VOICE_PROFILE.pace,
+  }
+}
+
+const voiceProfilesEqual = (left: VoiceProfile, right: VoiceProfile) =>
+  left.voice_name === right.voice_name &&
+  left.persona === right.persona &&
+  left.pace === right.pace &&
+  left.tones.length === right.tones.length &&
+  left.tones.every((tone, index) => tone === right.tones[index])
+
+const getVoicePersonaMeta = (persona: VoicePersonaPreset) =>
+  VOICE_PERSONA_OPTIONS.find((option) => option.value === persona) || VOICE_PERSONA_OPTIONS[0]
+
+const getVoiceToneLabel = (tone: VoiceTonePreset) =>
+  VOICE_TONE_OPTIONS.find((option) => option.value === tone)?.label || tone
+
+const getVoiceOptionMeta = (voiceName: string, voiceOptions: GeminiVoiceOption[]) =>
+  voiceOptions.find((option) => option.name === voiceName)
+
+const summarizeVoiceSettings = (
+  profile: VoiceProfile,
+  source: VoiceSettingsSource,
+  voiceOptions: GeminiVoiceOption[],
+) => {
+  if (source === 'legacy') return 'กำลังใช้ prompt เสียงแบบเก่า'
+  const voiceMeta = getVoiceOptionMeta(profile.voice_name, voiceOptions)
+  const persona = getVoicePersonaMeta(profile.persona)
+  const toneText = profile.tones.slice(0, 2).map(getVoiceToneLabel).join(' · ')
+  return [voiceMeta ? `${voiceMeta.name} ${voiceMeta.descriptor}` : profile.voice_name, persona.label, toneText].filter(Boolean).join(' • ')
+}
 
 const getSettingsSectionTitle = (section: SettingsSection): string => {
   switch (section) {
@@ -409,9 +808,9 @@ const getSettingsSectionTitle = (section: SettingsSection): string => {
     case 'comment':
       return 'Comment Template'
     case 'voice':
-      return 'Voice Prompt'
-    case 'approvals':
-      return 'อนุมัติสมาชิก'
+      return 'เสียงพากย์'
+    case 'members':
+      return 'สมาชิก'
     default:
       return 'ตั้งค่า'
   }
@@ -630,7 +1029,7 @@ const getVideoAffiliateConversionState = (
   expectedLazadaMemberId = '',
   options: { requireManagedLinks?: boolean } = {},
 ) => {
-  const hasPlayable = !!resolvePlayableVideoUrl(video)
+  const hasPlayable = !!String(video.publicUrl || video.public_url || '').trim()
   const shopeeSourceLink = getVideoSourceShopeeLink(video)
   const shopeeCurrentLink = getVideoShopeeLink(video)
   const hasShopeeSource = !!shopeeSourceLink
@@ -656,9 +1055,7 @@ const getVideoAffiliateConversionState = (
     : hasLazadaLink
 
   const missingShopeeSource = hasPlayable && !hasShopeeLink
-  const galleryReady = requireManagedLinks
-    ? (hasPlayable && hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady)
-    : (hasPlayable && hasShopeeLink && hasLazadaLink)
+  const galleryReady = hasPlayable
   const missingLazadaSource = hasPlayable && !hasLazadaLink
 
   return {
@@ -1641,7 +2038,7 @@ function VideoCard({
 
 function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOriginalVideo; onExpandedChange?: (expanded: boolean) => void }) {
   const [expanded, setExpanded] = useState(false)
-  const ownerLabel = String(video.owner_email || '').trim() || `namespace: ${video.namespace_id}`
+  const ownerLabel = `namespace: ${String(video.namespace_id || '').trim() || '-'}`
   const createdAt = new Date(video.created_at)
   const createdLabel = Number.isNaN(createdAt.getTime())
     ? '-'
@@ -2207,13 +2604,17 @@ function InboxCard({
   starting,
   deleting,
   onExpandedChange,
+  viewMode,
+  currentNamespaceId,
 }: {
   video: InboxVideo
-  onStart: (id: string) => void
+  onStart: (id: string, namespaceId?: string) => void
   onDelete: (id: string, namespaceId?: string) => void
   starting: boolean
   deleting: boolean
   onExpandedChange?: (expanded: boolean) => void
+  viewMode?: 'default' | 'processed'
+  currentNamespaceId?: string
 }) {
   const [expanded, setExpanded] = useState(false)
   const canDelete = video.canDelete !== false
@@ -2224,6 +2625,7 @@ function InboxCard({
     video.hasLazadaLink ? null : 'Lazada',
   ].filter(Boolean).join(' / ')
   const sourceLabel = String(video.sourceLabel || (video.sourceType === 'xhs_url' ? 'Xiaohongshu link' : 'Telegram video')).trim()
+  const isProcessedView = viewMode === 'processed'
   const sourceBadge = video.sourceType === 'xhs_url'
     ? { label: 'XHS', cls: 'bg-rose-500/95 text-white' }
     : video.sourceType === 'line_video'
@@ -2248,6 +2650,17 @@ function InboxCard({
     hour: '2-digit',
     minute: '2-digit',
   })
+  const isOwnNamespaceVideo = isInboxVideoOwnedByCurrentNamespace(video, currentNamespaceId)
+  const importedFromNamespaceId = String(
+    video.importedFromNamespaceId
+    || parseImportedNamespaceIdFromSourceLabel(video.sourceLabel)
+    || ''
+  ).trim()
+  const isImportedFromOtherNamespace = !!importedFromNamespaceId && isOwnNamespaceVideo
+  const showsOwnNamespaceBadge = isOwnNamespaceVideo && !isImportedFromOtherNamespace
+  const ownershipBadge = showsOwnNamespaceBadge
+    ? { cls: 'bg-blue-500/95 text-white', title: 'ของฉัน' }
+    : { cls: 'bg-violet-500/95 text-white', title: 'Namespace อื่น' }
   const actionLabel = !ready
     ? 'ลิงก์ยังไม่ครบ'
     : canStartProcessing
@@ -2280,10 +2693,21 @@ function InboxCard({
           </div>
         )}
 
-        <div className="absolute left-2 top-2">
-          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${sourceBadge.cls}`}>
-            {sourceBadge.label}
-          </span>
+        <div className="absolute left-2 top-2 flex flex-col items-start gap-1.5">
+          {isProcessedView ? (
+            <span title={ownershipBadge.title} className={`inline-flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-bold shadow-lg backdrop-blur-sm ${ownershipBadge.cls}`}>
+              <InboxOwnershipIcon own={showsOwnNamespaceBadge} />
+            </span>
+          ) : (
+            <>
+              <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${sourceBadge.cls}`}>
+                {sourceBadge.label}
+              </span>
+              <span title={ownershipBadge.title} className={`inline-flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-bold shadow-lg backdrop-blur-sm ${ownershipBadge.cls}`}>
+                <InboxOwnershipIcon own={showsOwnNamespaceBadge} />
+              </span>
+            </>
+          )}
         </div>
 
         <div className="absolute right-2 top-2 flex items-center gap-1">
@@ -2348,6 +2772,9 @@ function InboxCard({
                     <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${sourceBadge.cls.replace('/95', '').replace('/85', '')}`}>
                       {sourceBadge.label}
                     </span>
+                    <span title={ownershipBadge.title} className={`inline-flex h-7 w-7 items-center justify-center rounded-full text-[11px] font-bold ${showsOwnNamespaceBadge ? 'bg-blue-500 text-white' : 'bg-violet-500 text-white'}`}>
+                      <InboxOwnershipIcon own={showsOwnNamespaceBadge} />
+                    </span>
                     <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasShopeeLink ? 'bg-emerald-500 text-white' : 'bg-gray-100 text-gray-500'}`}>
                       Shopee
                     </span>
@@ -2368,6 +2795,12 @@ function InboxCard({
                   <div className="rounded-xl bg-gray-50 px-3 py-3">
                     <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Source</p>
                     <p className="mt-1 text-sm font-semibold text-gray-900 break-all">{sourceLabel}</p>
+                    {!!String(video.namespace_id || '').trim() && (
+                      <p className="mt-2 text-[11px] font-medium text-gray-500 break-all">Namespace: {video.namespace_id}</p>
+                    )}
+                    {isImportedFromOtherNamespace && (
+                      <p className="mt-1 text-[11px] font-medium text-violet-600 break-all">นำเข้าจาก: {importedFromNamespaceId}</p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="min-w-0 flex-1 rounded-xl bg-gray-50 px-3 py-2.5">
@@ -2405,7 +2838,7 @@ function InboxCard({
                     {canDelete ? (deleting ? 'กำลังลบ...' : 'ลบ') : 'เก็บถาวร'}
                   </button>
                   <button
-                    onClick={() => onStart(video.id)}
+                    onClick={() => onStart(video.id, video.namespace_id)}
                     disabled={!ready || starting || deleting || !canStartProcessing}
                     className={`flex-[1.35] rounded-2xl py-3 text-sm font-bold transition-transform ${ready && !starting && !deleting && canStartProcessing ? 'bg-blue-500 text-white active:scale-95 shadow-sm' : 'bg-gray-200 text-gray-400'}`}
                   >
@@ -2670,15 +3103,23 @@ function App() {
     setMeDisplayName('')
     setMePictureUrl('')
     setIsOwner(false)
+    setIsSystemAdmin(false)
+    setIsTeamMember(false)
     setTeamMembers([])
-    setVoicePrompt('')
-    setVoicePromptDraft('')
-    setVoicePromptSource('default')
-    setVoicePromptUpdatedAt('')
-    setVoicePromptMessage('')
-    setVoicePromptLoading(false)
-    setVoicePromptSaving(false)
-    setVoicePromptMaxChars(12000)
+    setSystemMembers([])
+    setVoiceProfile(createDefaultVoiceProfile())
+    setVoiceProfileDraft(createDefaultVoiceProfile())
+    setVoiceSettingsSource('default')
+    setVoiceSettingsUpdatedAt('')
+    setVoiceSettingsMessage('')
+    setVoiceSettingsLoading(false)
+    setVoiceSettingsSaving(false)
+    setVoiceOptions([])
+    setLegacyVoicePromptActive(false)
+    if (voicePreviewUrl) URL.revokeObjectURL(voicePreviewUrl)
+    setVoicePreviewUrl('')
+    setVoicePreviewLoading(false)
+    setVoicePreviewMessage('')
     setCommentTemplate(DEFAULT_COMMENT_TEMPLATE)
     setCommentTemplateDraft(DEFAULT_COMMENT_TEMPLATE)
     setCommentTemplateSource('default')
@@ -2687,14 +3128,15 @@ function App() {
     setCommentTemplateLoading(false)
     setCommentTemplateSaving(false)
     setCommentTemplateMaxChars(4000)
-    setGeminiApiKeyDraft('')
-    setGeminiApiKeyMasked('')
+    setGeminiApiKeyDrafts(createEmptyGeminiKeySlots())
+    setGeminiApiKeyMaskedList(createEmptyGeminiKeySlots())
     setGeminiApiKeySource('none')
     setGeminiApiKeyUpdatedAt('')
     setGeminiApiKeyMessage('')
     setGeminiApiKeyLoading(false)
     setGeminiApiKeySaving(false)
     setGeminiApiKeyMaxChars(512)
+    setGeminiApiKeyMaxSlots(DEFAULT_GEMINI_KEY_SLOTS)
     setShortlinkBaseUrlCurrent('')
     setLazadaShortlinkBaseUrlCurrent('')
     setShortlinkAccountCurrent('')
@@ -2837,16 +3279,23 @@ function App() {
   const [meEmail, setMeEmail] = useState('')
   const [meDisplayName, setMeDisplayName] = useState('')
   const [mePictureUrl, setMePictureUrl] = useState('')
-  const [teamMembers, setTeamMembers] = useState<{ email: string; created_at: string; display_name?: string; picture_url?: string; status?: string }[]>([])
+  const [meLineUserId, setMeLineUserId] = useState('')
+  const [copiedIdentityField, setCopiedIdentityField] = useState<'namespace' | 'line' | ''>('')
+  const [isTeamMember, setIsTeamMember] = useState(false)
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([])
   // newMemberEmail removed — using LINE shareTargetPicker
-  const [voicePrompt, setVoicePrompt] = useState('')
-  const [voicePromptDraft, setVoicePromptDraft] = useState('')
-  const [voicePromptSource, setVoicePromptSource] = useState<'default' | 'custom'>('default')
-  const [voicePromptUpdatedAt, setVoicePromptUpdatedAt] = useState('')
-  const [voicePromptMessage, setVoicePromptMessage] = useState('')
-  const [voicePromptLoading, setVoicePromptLoading] = useState(false)
-  const [voicePromptSaving, setVoicePromptSaving] = useState(false)
-  const [voicePromptMaxChars, setVoicePromptMaxChars] = useState(12000)
+  const [voiceProfile, setVoiceProfile] = useState<VoiceProfile>(() => createDefaultVoiceProfile())
+  const [voiceProfileDraft, setVoiceProfileDraft] = useState<VoiceProfile>(() => createDefaultVoiceProfile())
+  const [voiceSettingsSource, setVoiceSettingsSource] = useState<VoiceSettingsSource>('default')
+  const [voiceSettingsUpdatedAt, setVoiceSettingsUpdatedAt] = useState('')
+  const [voiceSettingsMessage, setVoiceSettingsMessage] = useState('')
+  const [voiceSettingsLoading, setVoiceSettingsLoading] = useState(false)
+  const [voiceSettingsSaving, setVoiceSettingsSaving] = useState(false)
+  const [voiceOptions, setVoiceOptions] = useState<GeminiVoiceOption[]>([])
+  const [legacyVoicePromptActive, setLegacyVoicePromptActive] = useState(false)
+  const [voicePreviewUrl, setVoicePreviewUrl] = useState('')
+  const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
+  const [voicePreviewMessage, setVoicePreviewMessage] = useState('')
   const [commentTemplate, setCommentTemplate] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateDraft, setCommentTemplateDraft] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateSource, setCommentTemplateSource] = useState<'default' | 'custom'>('default')
@@ -2855,14 +3304,16 @@ function App() {
   const [commentTemplateLoading, setCommentTemplateLoading] = useState(false)
   const [commentTemplateSaving, setCommentTemplateSaving] = useState(false)
   const [commentTemplateMaxChars, setCommentTemplateMaxChars] = useState(4000)
-  const [geminiApiKeyDraft, setGeminiApiKeyDraft] = useState('')
-  const [geminiApiKeyMasked, setGeminiApiKeyMasked] = useState('')
+  const copiedIdentityTimerRef = useRef<number | null>(null)
+  const [geminiApiKeyDrafts, setGeminiApiKeyDrafts] = useState<string[]>(() => createEmptyGeminiKeySlots())
+  const [geminiApiKeyMaskedList, setGeminiApiKeyMaskedList] = useState<string[]>(() => createEmptyGeminiKeySlots())
   const [geminiApiKeySource, setGeminiApiKeySource] = useState<GeminiKeySource>('none')
   const [geminiApiKeyUpdatedAt, setGeminiApiKeyUpdatedAt] = useState('')
   const [geminiApiKeyMessage, setGeminiApiKeyMessage] = useState('')
   const [geminiApiKeyLoading, setGeminiApiKeyLoading] = useState(false)
   const [geminiApiKeySaving, setGeminiApiKeySaving] = useState(false)
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
+  const [geminiApiKeyMaxSlots, setGeminiApiKeyMaxSlots] = useState(DEFAULT_GEMINI_KEY_SLOTS)
   const [shortlinkAccountDraft, setShortlinkAccountDraft] = useState(() => getStoredShortlinkAccount(botScope))
   const [shortlinkAccountCurrent, setShortlinkAccountCurrent] = useState(() => getStoredShortlinkAccount(botScope))
   const [shortlinkBaseUrlCurrent, setShortlinkBaseUrlCurrent] = useState(() => getStoredShortlinkBaseUrl(botScope))
@@ -2870,6 +3321,12 @@ function App() {
   const [shortlinkExpectedUtmIdDraft, setShortlinkExpectedUtmIdDraft] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
   const [shortlinkExpectedUtmIdCurrent, setShortlinkExpectedUtmIdCurrent] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
   const [lazadaExpectedMemberIdDraft, setLazadaExpectedMemberIdDraft] = useState(() => getStoredLazadaExpectedMemberId(botScope))
+
+  useEffect(() => {
+    return () => {
+      if (voicePreviewUrl) URL.revokeObjectURL(voicePreviewUrl)
+    }
+  }, [voicePreviewUrl])
   const [lazadaExpectedMemberIdCurrent, setLazadaExpectedMemberIdCurrent] = useState(() => getStoredLazadaExpectedMemberId(botScope))
   const [shortlinkEnabled, setShortlinkEnabled] = useState(() => hasStoredAffiliateShortlinkConfig(botScope))
   const [shortlinkUpdatedAt, setShortlinkUpdatedAt] = useState('')
@@ -2880,7 +3337,7 @@ function App() {
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [lazadaExpectedMemberIdMaxChars, setLazadaExpectedMemberIdMaxChars] = useState(32)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'voice', 'comment', 'approvals']
+  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'voice', 'comment', 'members']
   const getSettingsSectionFromLocation = (): SettingsSection => {
     const pathTab = window.location.pathname.replace('/', '')
     const params = new URLSearchParams(window.location.search)
@@ -2896,10 +3353,11 @@ function App() {
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
   const [isSystemAdmin, setIsSystemAdmin] = useState(false)
   const [pendingApproval, setPendingApproval] = useState(false)
-  const [pendingUsers, setPendingUsers] = useState<Array<{ line_user_id: string; display_name: string; picture_url: string; created_at: string }>>([])
-  const [pendingUsersLoading, setPendingUsersLoading] = useState(false)
+  const [systemMembers, setSystemMembers] = useState<SystemMember[]>([])
+  const [systemMembersLoading, setSystemMembersLoading] = useState(false)
   const [approvingUserId, setApprovingUserId] = useState<string | null>(null)
   const [rejectingUserId, setRejectingUserId] = useState<string | null>(null)
+  const [savingMemberRoleId, setSavingMemberRoleId] = useState<string | null>(null)
   const [postHistory, setPostHistory] = useState<PostHistory[]>(() => {
     const ns = getStoredNamespace()
     if (ns) return readCache<PostHistory[]>(nsCacheKey('history', ns), [])
@@ -2954,6 +3412,27 @@ function App() {
     const now = new Date()
     const thaiTime = new Date(now.getTime() + 7 * 60 * 60 * 1000)
     return thaiTime.toISOString().split('T')[0]
+  }
+
+  useEffect(() => {
+    return () => {
+      if (copiedIdentityTimerRef.current !== null) {
+        window.clearTimeout(copiedIdentityTimerRef.current)
+      }
+    }
+  }, [])
+
+  const handleCopyAccountIdentity = async (field: 'namespace' | 'line', value: string) => {
+    const copied = await copyPlainText(value)
+    if (!copied) return
+    if (copiedIdentityTimerRef.current !== null) {
+      window.clearTimeout(copiedIdentityTimerRef.current)
+    }
+    setCopiedIdentityField(field)
+    copiedIdentityTimerRef.current = window.setTimeout(() => {
+      setCopiedIdentityField('')
+      copiedIdentityTimerRef.current = null
+    }, 1500)
   }
 
 
@@ -3017,6 +3496,9 @@ function App() {
   ) => {
     const url = new URL(window.location.href)
     url.pathname = `/${nextTab}`
+    // Clear LIFF legacy routing params once the app owns navigation.
+    url.searchParams.delete('tab')
+    url.searchParams.delete('liff.state')
     if (nextTab === 'gallery') {
       const trimmedSearch = String(nextSearchInput || '').trim()
       if (trimmedSearch) url.searchParams.set('q', trimmedSearch)
@@ -3079,7 +3561,6 @@ function App() {
   const [inboxVideos, setInboxVideos] = useState<InboxVideo[]>([])
   const [systemInboxVideos, setSystemInboxVideos] = useState<InboxVideo[]>([])
   const [systemInboxLoading, setSystemInboxLoading] = useState(false)
-  // inboxFilter removed — single view
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
   const [inboxLoading, setInboxLoading] = useState(false)
@@ -3418,7 +3899,9 @@ function App() {
     setMePictureUrl('')
     setIsOwner(false)
     setIsSystemAdmin(false)
+    setIsTeamMember(false)
     setTeamMembers([])
+    setSystemMembers([])
     setCommentTemplate(DEFAULT_COMMENT_TEMPLATE)
     setCommentTemplateDraft(DEFAULT_COMMENT_TEMPLATE)
     setCommentTemplateSource('default')
@@ -3514,17 +3997,14 @@ function App() {
                 const ns = String(liffData?.namespace_id || '').trim()
                 setIsOwner(!!liffData?.is_owner)
                 setIsSystemAdmin(!!liffData?.is_system_admin)
+                setIsTeamMember(!!liffData?.is_team_member)
                 if (liffData?.email) setMeEmail(String(liffData.email))
                 if (liffData?.line_display_name) setMeDisplayName(String(liffData.line_display_name))
                 if (liffData?.line_picture_url) setMePictureUrl(String(liffData.line_picture_url))
+                if (liffData?.line_user_id) setMeLineUserId(String(liffData.line_user_id))
                 if (ns) {
                   setNamespaceId(ns)
                   hydrateNamespaceCaches(ns)
-                }
-                // Jump to tab from URL params
-                const liffTab = new URLSearchParams(window.location.search).get('tab') as TabName | null
-                if (liffTab && ['dashboard','inbox','processing','gallery','logs','settings'].includes(liffTab)) {
-                  _setTab(liffTab)
                 }
                 if (!cancelled) setAuthBootstrapping(false)
                 return
@@ -3547,9 +4027,11 @@ function App() {
             const ns = String(me?.namespace_id || '').trim()
             setIsOwner(!!me?.is_owner)
             setIsSystemAdmin(!!me?.is_system_admin)
+            setIsTeamMember(!!me?.is_team_member)
             if (me?.email) setMeEmail(String(me.email))
             if (me?.line_display_name) setMeDisplayName(String(me.line_display_name))
             if (me?.line_picture_url) setMePictureUrl(String(me.line_picture_url))
+            if (me?.line_user_id) setMeLineUserId(String(me.line_user_id))
             if (ns) {
               setNamespaceId(ns)
               hydrateNamespaceCaches(ns)
@@ -3648,31 +4130,36 @@ function App() {
     if (!isOwner && settingsSection === 'shortlink') {
       setSettingsSection('menu')
     }
-    if (!isSystemAdmin && settingsSection === 'approvals') {
+    if (!isSystemAdmin && settingsSection === 'gemini') {
+      setSettingsSection('menu')
+    }
+    if (!isSystemAdmin && settingsSection === 'members') {
       setSettingsSection('menu')
     }
   }, [authBootstrapping, isOwner, isSystemAdmin, settingsSection])
 
   useEffect(() => {
     if (authBootstrapping || !token || !isSystemAdmin) return
-    void loadPendingUsers()
+    void loadSystemMembers()
   }, [token, authBootstrapping, isSystemAdmin])
 
   useEffect(() => {
     if (authBootstrapping || !token || !isSystemAdmin) return
-    if (tab === 'settings' && settingsSection === 'approvals') {
-      void loadPendingUsers()
+    if (tab === 'settings' && settingsSection === 'members') {
+      void loadSystemMembers()
     }
   }, [tab, settingsSection, token, authBootstrapping, isSystemAdmin])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
     void loadShortlinkSettings()
-    if (!isOwner) return
     void loadVoicePrompt()
     void loadCommentTemplate()
-    void loadGeminiApiKey()
-  }, [token, authBootstrapping, isOwner])
+    if (!isOwner) return
+    if (isSystemAdmin) {
+      void loadGeminiApiKey()
+    }
+  }, [token, authBootstrapping, isOwner, isSystemAdmin])
 
   useEffect(() => {
     const cachedVideos = readGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
@@ -3733,10 +4220,13 @@ function App() {
       logs: 'ประวัติ',
       settings: 'ตั้งค่า',
     }
+    const settingsTitle = settingsSection === 'shortlink'
+      ? (isSystemAdmin ? 'Shortlink' : 'Affiliate ID')
+      : getSettingsSectionTitle(settingsSection)
     document.title = tab === 'settings'
-      ? getSettingsSectionTitle(settingsSection)
+      ? settingsTitle
       : (titles[tab] || 'เฉียบ AI')
-  }, [tab, settingsSection])
+  }, [tab, settingsSection, isSystemAdmin])
 
   async function recoverSessionOrLogout() {
     clearSession()
@@ -3825,20 +4315,20 @@ function App() {
     finally { setSystemInboxLoading(false) }
   }
 
-  async function loadPendingUsers() {
+  async function loadSystemMembers() {
     if (!token || !isSystemAdmin) return
-    setPendingUsersLoading(true)
+    setSystemMembersLoading(true)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/admin/pending-users`)
+      const resp = await apiFetch(`${WORKER_URL}/api/admin/members`)
       if (resp.ok) {
-        const data = await resp.json() as { users?: Array<{ line_user_id: string; display_name: string; picture_url: string; created_at: string }> }
-        setPendingUsers(Array.isArray(data.users) ? data.users : [])
+        const data = await resp.json() as { members?: SystemMember[] }
+        setSystemMembers(Array.isArray(data.members) ? data.members : [])
       }
     } catch {}
-    finally { setPendingUsersLoading(false) }
+    finally { setSystemMembersLoading(false) }
   }
 
-  async function approveUser(lineUserId: string) {
+  async function approveSystemMember(lineUserId: string) {
     setApprovingUserId(lineUserId)
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/admin/approve-user`, {
@@ -3847,13 +4337,13 @@ function App() {
         body: JSON.stringify({ line_user_id: lineUserId }),
       })
       if (resp.ok) {
-        setPendingUsers(prev => prev.filter(u => u.line_user_id !== lineUserId))
+        await loadSystemMembers()
       }
     } catch {}
     finally { setApprovingUserId(null) }
   }
 
-  async function rejectUser(lineUserId: string) {
+  async function rejectSystemMember(lineUserId: string) {
     setRejectingUserId(lineUserId)
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/admin/reject-user`, {
@@ -3862,10 +4352,25 @@ function App() {
         body: JSON.stringify({ line_user_id: lineUserId }),
       })
       if (resp.ok) {
-        setPendingUsers(prev => prev.filter(u => u.line_user_id !== lineUserId))
+        await loadSystemMembers()
       }
     } catch {}
     finally { setRejectingUserId(null) }
+  }
+
+  async function saveSystemMemberRole(lineUserId: string, role: SystemMemberRole) {
+    setSavingMemberRoleId(lineUserId)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/admin/members/role`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ line_user_id: lineUserId, role }),
+      })
+      if (resp.ok) {
+        await loadSystemMembers()
+      }
+    } catch {}
+    finally { setSavingMemberRoleId(null) }
   }
 
   async function loadUsedVideos(options: { force?: boolean } = {}) {
@@ -4230,9 +4735,11 @@ function App() {
         if (requestId === loadTeamRequestRef.current) {
           setIsOwner(!!me.is_owner)
           setIsSystemAdmin(!!me.is_system_admin)
+          setIsTeamMember(!!me.is_team_member)
           if (me.email) setMeEmail(me.email)
           if (me.line_display_name) setMeDisplayName(String(me.line_display_name))
           if (me.line_picture_url) setMePictureUrl(String(me.line_picture_url))
+          if (me.line_user_id) setMeLineUserId(String(me.line_user_id))
           const ns = String(me.namespace_id || '').trim()
           if (ns && ns !== namespaceId) {
             setNamespaceId(ns)
@@ -4254,8 +4761,8 @@ function App() {
   async function loadVoicePrompt() {
     const session = getToken()
     if (!session) return
-    setVoicePromptMessage('')
-    setVoicePromptLoading(true)
+    setVoiceSettingsMessage('')
+    setVoiceSettingsLoading(true)
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/settings/voice-prompt`)
       if (resp.status === 401) {
@@ -4263,30 +4770,32 @@ function App() {
         return
       }
       if (resp.status === 403) {
-        setVoicePromptMessage('บัญชีนี้ไม่มีสิทธิ์แก้ prompt พากย์เสียง')
+        setVoiceSettingsMessage('บัญชีนี้ไม่มีสิทธิ์แก้เสียงพากย์')
         return
       }
       if (!resp.ok) {
-        setVoicePromptMessage('โหลด prompt ไม่สำเร็จ')
+        setVoiceSettingsMessage('โหลดเสียงพากย์ไม่สำเร็จ')
         return
       }
       const data = await resp.json() as {
-        prompt?: string
-        source?: 'default' | 'custom'
+        profile?: Partial<VoiceProfile>
+        source?: VoiceSettingsSource
         updated_at?: string
-        max_chars?: number
+        legacy_prompt_active?: boolean
+        voice_options?: GeminiVoiceOption[]
       }
-      const prompt = String(data.prompt || '')
-      setVoicePrompt(prompt)
-      setVoicePromptDraft(prompt)
-      setVoicePromptSource(data.source === 'custom' ? 'custom' : 'default')
-      setVoicePromptUpdatedAt(String(data.updated_at || ''))
-      setVoicePromptMessage('')
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setVoicePromptMaxChars(data.max_chars)
+      const nextProfile = normalizeVoiceProfile(data.profile)
+      setVoiceProfile(nextProfile)
+      setVoiceProfileDraft({ ...nextProfile, tones: [...nextProfile.tones] })
+      setVoiceSettingsSource(data.source === 'structured' || data.source === 'legacy' ? data.source : 'default')
+      setVoiceSettingsUpdatedAt(String(data.updated_at || ''))
+      setLegacyVoicePromptActive(!!data.legacy_prompt_active || data.source === 'legacy')
+      setVoiceOptions(Array.isArray(data.voice_options) ? data.voice_options : [])
+      setVoiceSettingsMessage('')
     } catch {
-      setVoicePromptMessage('โหลด prompt ไม่สำเร็จ')
+      setVoiceSettingsMessage('โหลดเสียงพากย์ไม่สำเร็จ')
     } finally {
-      setVoicePromptLoading(false)
+      setVoiceSettingsLoading(false)
     }
   }
 
@@ -4377,47 +4886,87 @@ function App() {
     }
   }
 
-  async function saveVoicePrompt(nextPrompt: string) {
+  async function saveVoicePrompt(nextProfile?: VoiceProfile | null, options: { reset?: boolean } = {}) {
     const session = getToken()
     if (!session) return
-    setVoicePromptSaving(true)
-    setVoicePromptMessage('')
+    setVoiceSettingsSaving(true)
+    setVoiceSettingsMessage('')
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/settings/voice-prompt`, {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/voice-prompt`, options.reset ? {
+        method: 'DELETE',
+      } : {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: nextPrompt }),
+        body: JSON.stringify({ profile: nextProfile }),
       })
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
       if (resp.status === 403) {
-        setVoicePromptMessage('บัญชีนี้ไม่มีสิทธิ์แก้ prompt พากย์เสียง')
+        setVoiceSettingsMessage('บัญชีนี้ไม่มีสิทธิ์แก้เสียงพากย์')
         return
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({})) as { error?: string }
-        setVoicePromptMessage(data.error || 'บันทึก prompt ไม่สำเร็จ')
+        setVoiceSettingsMessage(data.error || 'บันทึกเสียงพากย์ไม่สำเร็จ')
         return
       }
       const data = await resp.json() as {
-        prompt?: string
-        source?: 'default' | 'custom'
+        profile?: Partial<VoiceProfile>
+        source?: VoiceSettingsSource
         updated_at?: string
-        max_chars?: number
+        legacy_prompt_active?: boolean
+        voice_options?: GeminiVoiceOption[]
       }
-      const prompt = String(data.prompt || '')
-      setVoicePrompt(prompt)
-      setVoicePromptDraft(prompt)
-      setVoicePromptSource(data.source === 'custom' ? 'custom' : 'default')
-      setVoicePromptUpdatedAt(String(data.updated_at || new Date().toISOString()))
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setVoicePromptMaxChars(data.max_chars)
-      setVoicePromptMessage('บันทึก prompt แล้ว (งานถัดไปจะใช้ทันที)')
+      const savedProfile = normalizeVoiceProfile(data.profile)
+      setVoiceProfile(savedProfile)
+      setVoiceProfileDraft({ ...savedProfile, tones: [...savedProfile.tones] })
+      setVoiceSettingsSource(data.source === 'structured' || data.source === 'legacy' ? data.source : 'default')
+      setVoiceSettingsUpdatedAt(String(data.updated_at || new Date().toISOString()))
+      setLegacyVoicePromptActive(!!data.legacy_prompt_active || data.source === 'legacy')
+      setVoiceOptions(Array.isArray(data.voice_options) ? data.voice_options : [])
+      setVoiceSettingsMessage(options.reset ? 'รีเซ็ตเสียงพากย์เป็นค่าเริ่มต้นแล้ว' : 'บันทึกเสียงพากย์แล้ว (งานถัดไปจะใช้ทันที)')
     } catch {
-      setVoicePromptMessage('บันทึก prompt ไม่สำเร็จ')
+      setVoiceSettingsMessage('บันทึกเสียงพากย์ไม่สำเร็จ')
     } finally {
-      setVoicePromptSaving(false)
+      setVoiceSettingsSaving(false)
+    }
+  }
+
+  async function previewVoiceProfile(profile: VoiceProfile) {
+    const session = getToken()
+    if (!session) return
+    setVoicePreviewLoading(true)
+    setVoicePreviewMessage('')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/voice-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile, text: DEFAULT_VOICE_PREVIEW_TEXT }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setVoicePreviewMessage(data.error || 'สร้างเสียงตัวอย่างไม่สำเร็จ')
+        return
+      }
+      const blob = await resp.blob()
+      const nextUrl = URL.createObjectURL(blob)
+      if (voicePreviewUrl) URL.revokeObjectURL(voicePreviewUrl)
+      setVoicePreviewUrl(nextUrl)
+      setVoicePreviewMessage('สร้างเสียงตัวอย่างแล้ว')
+      setTimeout(() => {
+        const audio = document.getElementById('voice-preview-audio') as HTMLAudioElement | null
+        void audio?.play().catch(() => {})
+      }, 50)
+    } catch {
+      setVoicePreviewMessage('สร้างเสียงตัวอย่างไม่สำเร็จ')
+    } finally {
+      setVoicePreviewLoading(false)
     }
   }
 
@@ -4442,15 +4991,24 @@ function App() {
       }
       const data = await resp.json() as {
         masked_key?: string
+        masked_keys?: string[]
         source?: GeminiKeySource
         updated_at?: string
         max_chars?: number
+        max_slots?: number
       }
-      setGeminiApiKeyMasked(String(data.masked_key || ''))
-      setGeminiApiKeySource(data.source === 'workspace' ? 'workspace' : 'none')
+      const maxSlots = typeof data.max_slots === 'number' && data.max_slots > 0
+        ? Math.max(1, Math.min(5, data.max_slots))
+        : DEFAULT_GEMINI_KEY_SLOTS
+      const maskedKeys = Array.isArray(data.masked_keys)
+        ? data.masked_keys.map((value) => String(value || ''))
+        : [String(data.masked_key || '')]
+      setGeminiApiKeyMaskedList([...maskedKeys.slice(0, maxSlots), ...createEmptyGeminiKeySlots(Math.max(0, maxSlots - maskedKeys.length))])
+      setGeminiApiKeySource(data.source === 'system' || data.source === 'legacy' ? data.source : 'none')
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
-      setGeminiApiKeyDraft('')
+      setGeminiApiKeyMaxSlots(maxSlots)
+      setGeminiApiKeyDrafts(createEmptyGeminiKeySlots(maxSlots))
       setGeminiApiKeyMessage('')
     } catch {
       setGeminiApiKeyMessage('โหลด Gemini API key ไม่สำเร็จ')
@@ -4459,20 +5017,22 @@ function App() {
     }
   }
 
-  async function saveGeminiApiKey(nextApiKey: string) {
+  async function saveGeminiApiKeys(nextApiKeys: string[]) {
     const session = getToken()
     if (!session) return
-    const trimmed = String(nextApiKey || '').trim()
+    const trimmedKeys = nextApiKeys
+      .map((value) => String(value || '').trim())
+      .slice(0, geminiApiKeyMaxSlots)
     setGeminiApiKeySaving(true)
     setGeminiApiKeyMessage('')
     try {
-      const isClear = !trimmed
+      const isClear = trimmedKeys.every((value) => !value)
       const resp = await apiFetch(`${WORKER_URL}/api/settings/gemini-key`, isClear ? {
         method: 'DELETE',
       } : {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: trimmed }),
+        body: JSON.stringify({ api_keys: trimmedKeys, preserve_existing: true }),
       })
 
       if (resp.status === 401) {
@@ -4491,16 +5051,25 @@ function App() {
 
       const data = await resp.json() as {
         masked_key?: string
+        masked_keys?: string[]
         source?: GeminiKeySource
         updated_at?: string
         max_chars?: number
+        max_slots?: number
       }
-      setGeminiApiKeyMasked(String(data.masked_key || ''))
-      setGeminiApiKeySource(data.source === 'workspace' ? 'workspace' : 'none')
+      const maxSlots = typeof data.max_slots === 'number' && data.max_slots > 0
+        ? Math.max(1, Math.min(5, data.max_slots))
+        : DEFAULT_GEMINI_KEY_SLOTS
+      const maskedKeys = Array.isArray(data.masked_keys)
+        ? data.masked_keys.map((value) => String(value || ''))
+        : [String(data.masked_key || '')]
+      setGeminiApiKeyMaskedList([...maskedKeys.slice(0, maxSlots), ...createEmptyGeminiKeySlots(Math.max(0, maxSlots - maskedKeys.length))])
+      setGeminiApiKeySource(data.source === 'system' || data.source === 'legacy' ? data.source : 'none')
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
-      setGeminiApiKeyDraft('')
-      setGeminiApiKeyMessage(isClear ? 'ล้าง Gemini API key ระดับ workspace แล้ว' : 'บันทึก Gemini API key แล้ว')
+      setGeminiApiKeyMaxSlots(maxSlots)
+      setGeminiApiKeyDrafts(createEmptyGeminiKeySlots(maxSlots))
+      setGeminiApiKeyMessage(isClear ? 'ล้าง Gemini API key กลางของระบบแล้ว' : 'บันทึก Gemini API key กลางของระบบแล้ว')
     } catch {
       setGeminiApiKeyMessage('บันทึก Gemini API key ไม่สำเร็จ')
     } finally {
@@ -4763,22 +5332,31 @@ function App() {
       const resp = await apiFetch(`${WORKER_URL}/api/processing/${encodeURIComponent(id)}/reprocess`, {
         method: 'POST',
       })
-      if (!resp.ok) return
+      const data = await resp.json().catch(() => ({})) as { error?: string }
+      if (!resp.ok) {
+        throw new Error(String(data.error || 'ประมวลผลใหม่ไม่สำเร็จ'))
+      }
       await loadProcessingSnapshot()
-    } catch {
+    } catch (error) {
+      alert(error instanceof Error ? error.message : 'ประมวลผลใหม่ไม่สำเร็จ')
     } finally {
       setRetryingProcessingId(null)
     }
   }
 
-  const handleStartInboxVideo = async (id: string) => {
-    setStartingInboxId(id)
+  const handleStartInboxVideo = async (id: string, videoNamespaceId?: string) => {
+    const inboxIdentityKey = getInboxVideoIdentityKey(id, videoNamespaceId)
+    setStartingInboxId(inboxIdentityKey)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}/process`, {
+      const nsParam = videoNamespaceId && videoNamespaceId !== namespaceId ? `?namespace_id=${encodeURIComponent(videoNamespaceId)}` : ''
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}/process${nsParam}`, {
         method: 'POST',
       })
-      const data = await resp.json().catch(() => ({})) as { error?: string; job?: { status?: string } }
+      const data = await resp.json().catch(() => ({})) as { error?: string; message?: string; details?: string[]; job?: { status?: string } }
       if (!resp.ok) {
+        if (data.error === 'shortlink_failed') {
+          throw new Error(`${data.message || 'ย่อลิ้งไม่ผ่าน'}\n${(data.details || []).join('\n')}`)
+        }
         throw new Error(String(data.error || 'ส่งเข้า Processing ไม่สำเร็จ'))
       }
       await Promise.all([loadInboxSnapshot(), loadProcessingSnapshot()])
@@ -4800,7 +5378,8 @@ function App() {
   const handleDeleteInboxVideo = async (id: string, namespaceId?: string) => {
     const ok = window.confirm('ยืนยันลบวิดีโอนี้ออกจากคลังต้นฉบับ?')
     if (!ok) return
-    setDeletingInboxId(id)
+    const inboxIdentityKey = getInboxVideoIdentityKey(id, namespaceId)
+    setDeletingInboxId(inboxIdentityKey)
     try {
       const url = new URL(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}`)
       if (namespaceId) url.searchParams.set('namespace_id', namespaceId)
@@ -4943,8 +5522,6 @@ function App() {
   // คลังต้นฉบับยังเห็นทุก workspace ผ่าน systemInboxVideos
   const useSystemWideAdminGallery = false
   const {
-    galleryMissingLazadaVideos,
-    galleryPendingShortlinkVideos,
     galleryReadyVideos,
     galleryUsedVideos,
     galleryAvailableVideos,
@@ -4955,7 +5532,11 @@ function App() {
       return Number.isFinite(ts) ? ts : 0
     }
     const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-    const sourceVideos = dedupeGalleryVideos(filterDeletedGalleryVideos(videos, deletedGalleryKeysRef.current))
+    const sourceVideos = dedupeGalleryVideos(
+      filterDeletedGalleryVideos(videos, deletedGalleryKeysRef.current).filter((video) =>
+        getBooleanFlag((video as Video & Record<string, unknown>).original_only) !== true
+      )
+    )
     const pendingIdentitySet = new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
     const postedVideos = sortNewestFirst(
       dedupeGalleryVideos([
@@ -5031,8 +5612,6 @@ function App() {
       : baseVideos
 
     return {
-      galleryMissingLazadaVideos: missingLazadaVideos,
-      galleryPendingShortlinkVideos: pendingShortlinkVideosAll,
       galleryReadyVideos: readyVideos,
       galleryUsedVideos: postedVideos,
       galleryAvailableVideos: availableVideos,
@@ -5040,10 +5619,8 @@ function App() {
     }
   }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery, shortlinkExpectedUtmIdCurrent, lazadaExpectedMemberIdCurrent, useSystemWideAdminGallery, isSystemAdmin])
   const showGalleryFilterBar = tab === 'gallery' && (
-    (useSystemWideAdminGallery || !systemWideGalleryMode) && (
-      galleryLoading ||
-      (galleryMissingLazadaVideos.length > 0 || galleryPendingShortlinkVideos.length > 0 || galleryReadyVideos.length > 0 || galleryUsedVideos.length > 0)
-    )
+    galleryLoading ||
+    (galleryReadyVideos.length > 0 || galleryUsedVideos.length > 0)
   )
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
   const shouldShowGalleryHeader = !videoViewerOpen && tab === 'gallery' && (showGalleryFilterBar || !isAllOriginalMode)
@@ -5286,43 +5863,13 @@ function App() {
               </div>
             </div>
           )}
-          {tab === 'gallery' && showGalleryFilterBar && useSystemWideAdminGallery && (
+          {tab === 'gallery' && showGalleryFilterBar && (
             <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
               <button
                 onClick={() => setCategoryFilter('ready')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter !== 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                ยังไม่โพสต์ ({galleryAvailableVideos.length})
-              </button>
-              <button
-                onClick={() => setCategoryFilter('used')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                โพสต์แล้ว ({galleryUsedVideos.length})
-              </button>
-            </div>
-          )}
-          {tab === 'gallery' && showGalleryFilterBar && !useSystemWideAdminGallery && (
-            <div className="flex bg-gray-100 p-1 mt-1 mb-2 rounded-xl gap-1">
-              <button
-                onClick={() => setCategoryFilter('missing-lazada')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'missing-lazada' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                ลิงก์ไม่ครบ ({galleryMissingLazadaVideos.length})
-              </button>
-              {galleryShortlinkRequired && (
-                <button
-                  onClick={() => setCategoryFilter('pending-shortlink')}
-                  className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'pending-shortlink' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                >
-                  รอย่อลิ้ง ({galleryPendingShortlinkVideos.length})
-                </button>
-              )}
-              <button
-                onClick={() => setCategoryFilter('ready')}
-                className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'ready' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-              >
-                รอโพสต์ ({galleryReadyVideos.length})
+                ยังไม่โพสต์ ({galleryReadyVideos.length})
               </button>
               <button
                 onClick={() => setCategoryFilter('used')}
@@ -5401,14 +5948,25 @@ function App() {
                 </div>
 
                 <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-                  <p className="text-sm font-bold text-gray-900 mb-3">แอดมินส่งลิงก์ต่อวัน</p>
+                  <p className="text-sm font-bold text-gray-900 mb-3">ผู้ส่งลิงก์ต่อวัน</p>
                   {dashboardData?.admins?.length ? (
                     <div className="space-y-2">
                       {dashboardData.admins.map((admin) => (
                         <div key={`${admin.telegram_id}:${admin.email}`} className="flex items-center justify-between rounded-xl bg-gray-50 px-3 py-2">
-                          <div className="min-w-0">
-                            <p className="text-sm font-semibold text-gray-900 truncate">{admin.email}</p>
-                            <p className="text-[11px] text-gray-400 truncate">TG: {admin.telegram_id}</p>
+                          <div className="min-w-0 flex items-center gap-3">
+                            {admin.picture_url ? (
+                              <img src={admin.picture_url} className="h-10 w-10 rounded-full object-cover shrink-0" />
+                            ) : (
+                              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-bold text-blue-600">
+                                {(String(admin.display_name || admin.line_user_id || '?').trim().charAt(0) || '?').toUpperCase()}
+                              </div>
+                            )}
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-gray-900 truncate">{admin.display_name || admin.line_user_id || 'LINE User'}</p>
+                              <p className="text-[11px] text-gray-400 truncate">
+                                {admin.line_user_id ? `LINE UID: ${admin.line_user_id}` : `TG ID: ${admin.telegram_id}`}
+                              </p>
+                            </div>
                           </div>
                           <span className="text-xs font-bold text-white bg-black px-2.5 py-1 rounded-full">{admin.links} ลิงก์</span>
                         </div>
@@ -5429,7 +5987,10 @@ function App() {
               <div className="grid grid-cols-3 gap-3">
                 {[1,2,3,4,5,6].map(i => <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />)}
               </div>
-            ) : systemInboxVideos.length === 0 ? (
+            ) : (() => {
+              const filtered = dedupeSystemInboxVideos(systemInboxVideos, namespaceId)
+                .filter((video) => !!String(video.thumbnailUrl || '').trim())
+              return filtered.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-[50vh]">
                 <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
                   <span className="text-4xl grayscale opacity-50">📥</span>
@@ -5439,19 +6000,21 @@ function App() {
               </div>
             ) : (
               <div className="grid grid-cols-3 gap-3">
-                {systemInboxVideos.map(video => (
+                {filtered.map(video => (
                   <InboxCard
-                    key={video.id}
+                    key={`${String(video.namespace_id || '').trim()}:${video.id}`}
                     video={video}
                     onStart={handleStartInboxVideo}
                     onDelete={handleDeleteInboxVideo}
-                    starting={startingInboxId === video.id}
-                    deleting={deletingInboxId === video.id}
+                    starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
+                    deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
                     onExpandedChange={setVideoViewerOpen}
+                    viewMode="processed"
+                    currentNamespaceId={namespaceId}
                   />
                 ))}
               </div>
-            )}
+            )})()}
           </div>
         )}
 
@@ -5479,9 +6042,10 @@ function App() {
                     video={video}
                     onStart={handleStartInboxVideo}
                     onDelete={handleDeleteInboxVideo}
-                    starting={startingInboxId === video.id}
-                    deleting={deletingInboxId === video.id}
+                    starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
+                    deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
                     onExpandedChange={setVideoViewerOpen}
+                    currentNamespaceId={namespaceId}
                   />
                 ))}
               </div>
@@ -5745,6 +6309,32 @@ function App() {
                     const showCommentError = item.comment_error && item.comment_error.trim().length > 0
                     const showPostError = item.error_message && item.error_message.trim().length > 0
                     const canRetryPost = item.status !== 'posting' && deletingLogId !== item.id && retryingLogId !== item.id
+                    const actualShopeeAffiliateId = String(item.shortlink_utm_source || '').trim().replace(/^an_/i, '')
+                    const actualLazadaAffiliateId = String(item.lazada_member_id || '').trim()
+                    const expectedShopeeAffiliateId = String(item.shortlink_expected_utm_id || '').trim()
+                    const expectedLazadaAffiliateId = String(item.lazada_expected_member_id || '').trim()
+                    const showAffiliateCheck = Boolean(
+                      item.shortlink_status ||
+                      item.shortlink_error ||
+                      expectedShopeeAffiliateId ||
+                      actualShopeeAffiliateId ||
+                      expectedLazadaAffiliateId ||
+                      actualLazadaAffiliateId
+                    )
+                    const affiliateStatusLabel = item.shortlink_status === 'verified'
+                      ? 'ผ่าน'
+                      : item.shortlink_status === 'failed'
+                        ? 'ไม่ผ่าน'
+                        : item.shortlink_status === 'skipped'
+                          ? 'ข้าม'
+                          : '-'
+                    const affiliateStatusClass = item.shortlink_status === 'verified'
+                      ? 'bg-emerald-50 text-emerald-700'
+                      : item.shortlink_status === 'failed'
+                        ? 'bg-red-50 text-red-700'
+                        : 'bg-gray-100 text-gray-600'
+                    const shopeeMatchLabel = item.shortlink_utm_match === 1 ? 'ตรง' : item.shortlink_utm_match === 0 ? 'ไม่ตรง' : '-'
+                    const lazadaMatchLabel = item.lazada_member_match === 1 ? 'ตรง' : item.lazada_member_match === 0 ? 'ไม่ตรง' : '-'
 
                     return (
                       <div key={item.id} className="rounded-2xl border border-gray-100 bg-white shadow-sm">
@@ -5909,6 +6499,19 @@ function App() {
                             </div>
                             <p><span className="font-semibold text-gray-700">Post Token:</span> {item.post_token_hint || '-'}</p>
                             <p><span className="font-semibold text-gray-700">Comment Token:</span> {item.comment_token_hint || '-'}</p>
+                            {showAffiliateCheck && (
+                              <div className="rounded-xl bg-gray-50 px-3 py-2.5 space-y-1.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <p className="font-semibold text-gray-700">Affiliate Check</p>
+                                  <span className={`inline-flex items-center rounded-lg px-2 py-1 text-[10px] font-bold ${affiliateStatusClass}`}>
+                                    {affiliateStatusLabel}
+                                  </span>
+                                </div>
+                                <p><span className="font-semibold text-gray-700">Shopee ID:</span> expected {expectedShopeeAffiliateId || '-'} / actual {actualShopeeAffiliateId || '-'} / {shopeeMatchLabel}</p>
+                                <p><span className="font-semibold text-gray-700">Lazada ID:</span> expected {expectedLazadaAffiliateId || '-'} / actual {actualLazadaAffiliateId || '-'} / {lazadaMatchLabel}</p>
+                                {item.shortlink_error && <p className="text-red-500 break-all"><span className="font-semibold text-red-600">Affiliate error:</span> {item.shortlink_error}</p>}
+                              </div>
+                            )}
                             {item.comment_fb_id && <p><span className="font-semibold text-gray-700">Comment ID:</span> {item.comment_fb_id}</p>}
                             {showCommentError && <p className="text-red-500"><span className="font-semibold text-red-600">คอมเม้นต์ผิดพลาด:</span> {item.comment_error}</p>}
                             {showPostError && <p className="text-red-500"><span className="font-semibold text-red-600">โพสต์ผิดพลาด:</span> {item.error_message}</p>}
@@ -6076,31 +6679,19 @@ function App() {
                 <SettingsMenuSkeleton />
               ) : (
                 <>
-                  {(meEmail || meDisplayName) && (
-                    <div className="flex items-center justify-between gap-3 p-4 bg-white rounded-2xl border border-gray-200">
-                      <div className="flex items-center gap-3 min-w-0">
-                        {mePictureUrl ? (
-                          <img src={mePictureUrl} className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
-                        ) : (
-                          <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold text-lg flex-shrink-0">
-                            {(meDisplayName || meEmail).charAt(0).toUpperCase()}
-                          </div>
-                        )}
-                        <div className="flex-1 min-w-0">
-                          <p className="font-bold text-gray-900 truncate">{meDisplayName || meEmail}</p>
-                          <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
-                            {isSystemAdmin ? 'Admin' : isOwner ? 'Member' : 'Team'}
-                          </p>
-                        </div>
-                      </div>
-                      <button
-                        onClick={handleLogout}
-                        disabled={logoutLoading}
-                        className="px-4 py-2 rounded-xl border border-red-200 bg-red-50 text-red-600 text-sm font-semibold active:scale-95 disabled:opacity-60 disabled:cursor-not-allowed"
-                      >
-                        {logoutLoading ? 'กำลังออก...' : 'Logout'}
-                      </button>
-                    </div>
+                  {(meDisplayName || meLineUserId || meEmail) && (
+                    <SettingsAccountCard
+                      displayName={meDisplayName}
+                      email={meEmail}
+                      pictureUrl={mePictureUrl}
+                      roleLabel={isSystemAdmin ? 'Admin' : isTeamMember && !isOwner ? 'Team' : 'Member'}
+                      roleClassName={isSystemAdmin ? 'bg-purple-50 text-purple-600' : (isTeamMember && !isOwner) ? 'bg-gray-100 text-gray-600' : 'bg-blue-50 text-blue-600'}
+                      namespaceId={namespaceId}
+                      lineUserId={meLineUserId}
+                      copiedIdentityField={copiedIdentityField}
+                      onCopyNamespace={() => void handleCopyAccountIdentity('namespace', namespaceId)}
+                      onCopyLine={() => void handleCopyAccountIdentity('line', meLineUserId)}
+                    />
                   )}
                   <SettingsMenuItem
                     icon="📄"
@@ -6117,27 +6708,37 @@ function App() {
                   {isOwner && (
                     <SettingsMenuItem
                       icon="🔗"
-                      title="Shortlink"
-                      subtitle={shortlinkAccountCurrent
-                        ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
-                        : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'}
+                      title={isSystemAdmin ? 'Shortlink' : 'Affiliate ID'}
+                      subtitle={isSystemAdmin
+                        ? (
+                          shortlinkAccountCurrent
+                            ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
+                            : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'
+                        )
+                        : (
+                          shortlinkExpectedUtmIdCurrent || lazadaExpectedMemberIdCurrent
+                            ? `Shopee ID ${shortlinkExpectedUtmIdCurrent || '-'} • Lazada ID ${lazadaExpectedMemberIdCurrent || '-'}`
+                            : 'ตั้งค่า Shopee ID และ Lazada ID'
+                        )}
                       onClick={() => openSettingsSection('shortlink')}
                     />
                   )}
-                  <SettingsMenuItem
-                    icon="🔑"
-                    title="Gemini API Key"
-                    subtitle={
-                      geminiApiKeySource === 'workspace'
-                        ? 'แหล่งที่ใช้งาน: Owner นี้เท่านั้น'
-                        : 'ยังไม่ตั้งค่า'
-                    }
-                    onClick={() => openSettingsSection('gemini')}
-                  />
+                  {isSystemAdmin && (
+                    <SettingsMenuItem
+                      icon="🔑"
+                      title="Gemini API Key"
+                      subtitle={
+                        geminiApiKeySource === 'system' || geminiApiKeySource === 'legacy'
+                          ? `ใช้ร่วมทุก namespace • ${geminiApiKeyMaskedList.filter(Boolean).length}/${geminiApiKeyMaxSlots} key`
+                          : 'ตั้งค่า Gemini key กลางของระบบ'
+                      }
+                      onClick={() => openSettingsSection('gemini')}
+                    />
+                  )}
                   <SettingsMenuItem
                     icon="🎙️"
-                    title="Voice Prompt"
-                    subtitle={voicePromptSource === 'custom' ? 'กำลังใช้ prompt แบบกำหนดเอง' : 'กำลังใช้ prompt ค่าเริ่มต้น'}
+                    title="เสียงพากย์"
+                    subtitle={summarizeVoiceSettings(voiceProfile, voiceSettingsSource, voiceOptions)}
                     onClick={() => openSettingsSection('voice')}
                   />
                   <SettingsMenuItem
@@ -6149,46 +6750,48 @@ function App() {
                   {isSystemAdmin && (
                     <SettingsMenuItem
                       icon="&#x2705;"
-                      title="อนุมัติสมาชิก"
-                      subtitle={`${pendingUsers.length} คนรออนุมัติ`}
-                      onClick={() => openSettingsSection('approvals')}
+                      title="สมาชิก"
+                      subtitle={
+                        systemMembers.length > 0
+                          ? `${systemMembers.length} คนในระบบ • รออนุมัติ ${systemMembers.filter((member) => String(member.status || '').trim() === 'pending').length} คน`
+                          : 'ดูสมาชิกทั้งหมดของระบบและจัดการ role'
+                      }
+                      onClick={() => openSettingsSection('members')}
                     />
                   )}
                   <p className="text-gray-300 text-xs font-medium text-center pt-2">Version 2.0.1 (Build 240)</p>
+                  <SettingsLogoutButton
+                    onLogout={handleLogout}
+                    logoutLoading={logoutLoading}
+                  />
                 </>
               )
             ) : (
               <>
                 {settingsSection === 'account' && (
                   <div className="space-y-3">
-                    {(meEmail || meDisplayName) ? (
-                      <div className="flex items-center gap-3 p-4 bg-gray-50 rounded-3xl border border-gray-100">
-                        {mePictureUrl ? (
-                          <img src={mePictureUrl} className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
-                        ) : (
-                          <div className="w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 font-bold text-lg flex-shrink-0">
-                            {(meDisplayName || meEmail).charAt(0).toUpperCase()}
-                          </div>
-                        )}
-                        <div className="flex-1 min-w-0">
-                          <p className="font-bold text-gray-900 truncate">{meDisplayName || meEmail}</p>
-                          <p className={`font-medium text-xs px-2 py-0.5 rounded-md inline-block mt-1 ${isOwner ? 'text-blue-500 bg-blue-50' : 'text-gray-500 bg-gray-100'}`}>
-                            {isSystemAdmin ? 'Admin' : isOwner ? 'Member' : 'Team'}
-                          </p>
-                        </div>
-                      </div>
+                    {(meDisplayName || meLineUserId || meEmail) ? (
+                      <SettingsAccountCard
+                        displayName={meDisplayName}
+                        email={meEmail}
+                        pictureUrl={mePictureUrl}
+                        roleLabel={isSystemAdmin ? 'Admin' : isTeamMember && !isOwner ? 'Team' : 'Member'}
+                        roleClassName={isSystemAdmin ? 'bg-purple-50 text-purple-600' : (isTeamMember && !isOwner) ? 'bg-gray-100 text-gray-600' : 'bg-blue-50 text-blue-600'}
+                        namespaceId={namespaceId}
+                        lineUserId={meLineUserId}
+                        copiedIdentityField={copiedIdentityField}
+                        onCopyNamespace={() => void handleCopyAccountIdentity('namespace', namespaceId)}
+                        onCopyLine={() => void handleCopyAccountIdentity('line', meLineUserId)}
+                      />
                     ) : (
                       <div className="bg-white border border-gray-100 rounded-2xl p-4 text-sm text-gray-500">
                         ไม่พบบัญชีผู้ใช้
                       </div>
                     )}
-                    <button
-                      onClick={handleLogout}
-                      disabled={logoutLoading}
-                      className="w-full h-12 rounded-2xl bg-red-500 text-white font-bold active:scale-[0.99] disabled:opacity-60 disabled:cursor-not-allowed"
-                    >
-                      {logoutLoading ? 'กำลังออกจากระบบ...' : 'Logout'}
-                    </button>
+                    <SettingsLogoutButton
+                      onLogout={handleLogout}
+                      logoutLoading={logoutLoading}
+                    />
                   </div>
                 )}
 
@@ -6198,7 +6801,7 @@ function App() {
                       {teamMembers.length === 0 && (
                         <p className="text-sm text-gray-400 text-center py-2">ยังไม่มีสมาชิกในทีม</p>
                       )}
-                      {teamMembers.map((m: any) => (
+                      {teamMembers.map((m) => (
                         <div key={m.email} className="flex items-center gap-3">
                           {m.status === 'pending' ? (
                             <div className="w-10 h-10 rounded-full bg-amber-50 flex items-center justify-center text-xl">⏳</div>
@@ -6206,17 +6809,19 @@ function App() {
                             <img src={m.picture_url} className="w-10 h-10 rounded-full object-cover" />
                           ) : (
                             <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center text-gray-500 font-bold text-sm">
-                              {(m.display_name || m.email || '?').charAt(0).toUpperCase()}
+                              {(m.display_name || m.line_user_id || '?').charAt(0).toUpperCase()}
                             </div>
                           )}
                           <div className="flex-1 min-w-0">
                             <p className="text-sm font-bold text-gray-900 truncate">
-                              {m.status === 'pending' ? 'คำเชิญ' : (m.display_name || m.email)}
+                              {m.status === 'pending' ? 'คำเชิญ' : (m.display_name || m.line_user_id || 'LINE User')}
                             </p>
                             <p className="text-xs text-gray-400 truncate">
                               {m.status === 'pending' ? (
                                 <span className="text-amber-500 font-semibold">รอตอบรับ · {new Date(m.created_at).toLocaleDateString('th-TH', { day: 'numeric', month: 'short' })}</span>
-                              ) : m.display_name ? m.email : ''}
+                              ) : (
+                                m.line_user_id ? `LINE UID: ${m.line_user_id}` : `namespace member`
+                              )}
                             </p>
                           </div>
                           <button
@@ -6252,36 +6857,53 @@ function App() {
                   </div>
                 )}
 
-                {settingsSection === 'gemini' && (
+                {settingsSection === 'gemini' && isSystemAdmin && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ตั้งค่า Gemini key แยกตาม owner/workspace ของใครของมัน ถ้าไม่ตั้งค่า ระบบจะไม่ประมวลผลคลิป และจะไม่ fallback ไปใช้ key กลาง
+                        ตั้งค่า Gemini key กลางของระบบได้สูงสุด 5 key และทุก namespace จะใช้ชุดนี้ร่วมกัน ถ้า key แรกมีปัญหา ระบบจะขยับไปใช้อีก key ทันที
+                      </p>
+                      <p className="text-[11px] text-gray-400 leading-relaxed">
+                        กรอกเฉพาะช่องที่อยากเปลี่ยนได้ ช่องที่เว้นว่างจะใช้ค่าเดิมต่อ
                       </p>
                       {geminiApiKeyLoading ? (
                         <p className="text-sm text-gray-400 py-3">กำลังโหลด Gemini API key...</p>
                       ) : (
                         <>
-                          <input
-                            type="password"
-                            value={geminiApiKeyDraft}
-                            onChange={(e) => {
-                              setGeminiApiKeyDraft(e.target.value)
-                              if (geminiApiKeyMessage) setGeminiApiKeyMessage('')
-                            }}
-                            placeholder={geminiApiKeyMasked
-                              ? `${geminiApiKeyMasked} (กรอกใหม่เพื่อแทนค่าเดิม)`
-                              : 'AIza...'}
-                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                          />
-                          <p className="text-[11px] text-gray-500 break-all">
-                            คีย์ปัจจุบัน: {geminiApiKeyMasked || '-'}
-                          </p>
+                          <div className="space-y-2">
+                            {Array.from({ length: geminiApiKeyMaxSlots }, (_, index) => {
+                              const masked = geminiApiKeyMaskedList[index] || ''
+                              const value = geminiApiKeyDrafts[index] || ''
+                              return (
+                                <div key={`gemini-slot-${index}`} className="space-y-1">
+                                  <div className="flex items-center justify-between">
+                                    <p className="text-[11px] font-bold text-gray-500">Key {index + 1}</p>
+                                    <p className="text-[11px] text-gray-400">{value.length}/{geminiApiKeyMaxChars}</p>
+                                  </div>
+                                  <input
+                                    type="password"
+                                    value={value}
+                                    onChange={(e) => {
+                                      const next = [...geminiApiKeyDrafts]
+                                      next[index] = e.target.value
+                                      setGeminiApiKeyDrafts(next)
+                                      if (geminiApiKeyMessage) setGeminiApiKeyMessage('')
+                                    }}
+                                    placeholder={masked ? `${masked} (กรอกใหม่เพื่อแทนค่าเดิม)` : 'AIza...'}
+                                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                                  />
+                                  {masked && (
+                                    <p className="text-[11px] text-gray-400 break-all">คีย์ปัจจุบัน: {masked}</p>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
                           <div className="flex items-center justify-between text-[11px] text-gray-400">
                             <span>
-                              แหล่งที่ใช้งาน: {geminiApiKeySource === 'workspace' ? 'Owner นี้เท่านั้น' : 'ยังไม่ตั้งค่า'}
+                              แหล่งที่ใช้งาน: {geminiApiKeySource === 'system' ? 'กลางของระบบ' : geminiApiKeySource === 'legacy' ? 'กำลังใช้คีย์เก่าของ admin' : 'ยังไม่ตั้งค่า'}
                             </span>
-                            <span>{geminiApiKeyDraft.length}/{geminiApiKeyMaxChars}</span>
+                            <span>ใช้งานอยู่ {geminiApiKeyMaskedList.filter(Boolean).length}/{geminiApiKeyMaxSlots}</span>
                           </div>
                           {geminiApiKeyUpdatedAt && (
                             <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(geminiApiKeyUpdatedAt).toLocaleString()}</p>
@@ -6294,10 +6916,10 @@ function App() {
                           <div className="flex gap-2">
                             <button
                               onClick={() => {
-                                if (geminiApiKeySaving || geminiApiKeyDraft.length > geminiApiKeyMaxChars) return
-                                void saveGeminiApiKey(geminiApiKeyDraft)
+                                if (geminiApiKeySaving || geminiApiKeyDrafts.some((value) => value.length > geminiApiKeyMaxChars)) return
+                                void saveGeminiApiKeys(geminiApiKeyDrafts)
                               }}
-                              disabled={geminiApiKeySaving || geminiApiKeyDraft.length > geminiApiKeyMaxChars || !geminiApiKeyDraft.trim()}
+                              disabled={geminiApiKeySaving || geminiApiKeyDrafts.some((value) => value.length > geminiApiKeyMaxChars) || geminiApiKeyDrafts.every((value) => !String(value || '').trim())}
                               className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
                             >
                               {geminiApiKeySaving ? 'กำลังบันทึก...' : 'บันทึก Gemini API key'}
@@ -6305,9 +6927,9 @@ function App() {
                             <button
                               onClick={() => {
                                 if (geminiApiKeySaving) return
-                                void saveGeminiApiKey('')
+                                void saveGeminiApiKeys([])
                               }}
-                              disabled={geminiApiKeySaving || (geminiApiKeySource === 'none' && !geminiApiKeyMasked)}
+                              disabled={geminiApiKeySaving || (geminiApiKeySource === 'none' && geminiApiKeyMaskedList.every((value) => !value))}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               ล้างค่า
@@ -6323,28 +6945,34 @@ function App() {
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ใส่แค่ 3 ค่าให้ workspace นี้: account, Shopee UTM และ Lazada member_id
+                        {isSystemAdmin
+                          ? 'ใส่ค่า affiliate ของ workspace นี้เพื่อให้ระบบเช็กก่อนโพสต์ทุกครั้ง ส่วน account ใช้เฉพาะ workspace ที่ต้องย่อลิงก์'
+                          : 'ใส่ Shopee ID กับ Lazada ID ของ workspace นี้ เพื่อให้ระบบเช็กก่อนโพสต์ทุกครั้ง โดย member จะไม่มีการย่อลิงก์'}
                       </p>
                       {shortlinkLoading ? (
-                        <p className="text-sm text-gray-400 py-3">กำลังโหลด Shortlink URL...</p>
+                        <p className="text-sm text-gray-400 py-3">{isSystemAdmin ? 'กำลังโหลด Shortlink...' : 'กำลังโหลด Affiliate ID...'}</p>
                       ) : (
                         <>
+                          {isSystemAdmin && (
+                            <>
+                              <div className="space-y-1">
+                                <p className="text-[11px] font-semibold text-gray-600">Shortlink account</p>
+                                <p className="text-[11px] text-gray-400">เช่น `CHEARB` หรือ `SIAMNEWS`</p>
+                              </div>
+                              <input
+                                type="text"
+                                value={shortlinkAccountDraft}
+                                onChange={(e) => {
+                                  setShortlinkAccountDraft(e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, ''))
+                                  if (shortlinkMessage) setShortlinkMessage('')
+                                }}
+                                placeholder="CHEARB"
+                                className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                              />
+                            </>
+                          )}
                           <div className="space-y-1">
-                            <p className="text-[11px] font-semibold text-gray-600">Shortlink account</p>
-                            <p className="text-[11px] text-gray-400">เช่น `CHEARB` หรือ `SIAMNEWS`</p>
-                          </div>
-                          <input
-                            type="text"
-                            value={shortlinkAccountDraft}
-                            onChange={(e) => {
-                              setShortlinkAccountDraft(e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, ''))
-                              if (shortlinkMessage) setShortlinkMessage('')
-                            }}
-                            placeholder="CHEARB"
-                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                          />
-                          <div className="space-y-1">
-                            <p className="text-[11px] font-semibold text-gray-600">Shopee expected UTM ID</p>
+                            <p className="text-[11px] font-semibold text-gray-600">{isSystemAdmin ? 'Shopee expected UTM ID' : 'Shopee ID'}</p>
                             <p className="text-[11px] text-gray-400">ใส่เฉพาะตัวเลข เช่น `15130770000`</p>
                           </div>
                           <input
@@ -6359,7 +6987,7 @@ function App() {
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
                           <div className="space-y-1">
-                            <p className="text-[11px] font-semibold text-gray-600">Lazada expected member_id</p>
+                            <p className="text-[11px] font-semibold text-gray-600">{isSystemAdmin ? 'Lazada expected member_id' : 'Lazada ID'}</p>
                             <p className="text-[11px] text-gray-400">ใส่ member_id ของ Lazada เช่น `199431090`</p>
                           </div>
                           <input
@@ -6374,9 +7002,11 @@ function App() {
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
-                            <p>Account ปัจจุบัน: <span className="font-semibold text-gray-700">{shortlinkAccountCurrent || '-'}</span></p>
-                            <p>Shopee UTM ปัจจุบัน: <span className="font-semibold text-gray-700">{shortlinkExpectedUtmIdCurrent || '-'}</span></p>
-                            <p>Lazada member_id ปัจจุบัน: <span className="font-semibold text-gray-700">{lazadaExpectedMemberIdCurrent || '-'}</span></p>
+                            {isSystemAdmin && (
+                              <p>Account ปัจจุบัน: <span className="font-semibold text-gray-700">{shortlinkAccountCurrent || '-'}</span></p>
+                            )}
+                            <p>{isSystemAdmin ? 'Shopee UTM ปัจจุบัน' : 'Shopee ID ปัจจุบัน'}: <span className="font-semibold text-gray-700">{shortlinkExpectedUtmIdCurrent || '-'}</span></p>
+                            <p>{isSystemAdmin ? 'Lazada member_id ปัจจุบัน' : 'Lazada ID ปัจจุบัน'}: <span className="font-semibold text-gray-700">{lazadaExpectedMemberIdCurrent || '-'}</span></p>
                           </div>
                           {shortlinkUpdatedAt && (
                             <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(shortlinkUpdatedAt).toLocaleString()}</p>
@@ -6502,51 +7132,174 @@ function App() {
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        แก้ prompt ที่ใช้สร้างบทพากย์ได้ทันที งานถัดไปจะใช้ค่าล่าสุดโดยไม่ต้อง rebuild container
+                        ตั้งค่าเสียงของ workspace นี้ได้เลย งานถัดไปจะใช้ทันที โดยเลือก `voice_name` ของ Gemini จริง พร้อม preset น้ำเสียงของระบบ
                       </p>
-                      {voicePromptLoading ? (
-                        <p className="text-sm text-gray-400 py-3">กำลังโหลด prompt...</p>
+                      {voiceSettingsLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลดเสียงพากย์...</p>
                       ) : (
                         <>
-                          <textarea
-                            value={voicePromptDraft}
-                            onChange={(e) => {
-                              setVoicePromptDraft(e.target.value)
-                              if (voicePromptMessage) setVoicePromptMessage('')
-                            }}
-                            rows={10}
-                            placeholder="ใส่ prompt พากย์เสียงที่ต้องการ"
-                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                          />
-                          <div className="flex items-center justify-between text-[11px] text-gray-400">
-                            <span>{voicePromptSource === 'custom' ? 'กำลังใช้ prompt แบบกำหนดเอง' : 'กำลังใช้ prompt ค่าเริ่มต้น'}</span>
-                            <span>{voicePromptDraft.length}/{voicePromptMaxChars}</span>
-                          </div>
-                          {voicePromptUpdatedAt && (
-                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(voicePromptUpdatedAt).toLocaleString()}</p>
+                          {legacyVoicePromptActive && (
+                            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-[12px] text-amber-700">
+                              workspace นี้ยังใช้ `voice prompt` แบบเก่าอยู่ กดบันทึกครั้งเดียวเพื่อย้ายมาใช้ preset ใหม่
+                            </div>
                           )}
-                          {voicePromptMessage && (
-                            <p className={`text-xs ${voicePromptMessage.includes('ไม่สำเร็จ') || voicePromptMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
-                              {voicePromptMessage}
+
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-semibold text-gray-600">Gemini voice</p>
+                            <select
+                              value={voiceProfileDraft.voice_name}
+                              onChange={(e) => {
+                                setVoiceProfileDraft((prev) => ({ ...prev, voice_name: e.target.value }))
+                                if (voiceSettingsMessage) setVoiceSettingsMessage('')
+                              }}
+                              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                            >
+                              {(voiceOptions.length > 0 ? voiceOptions : [{ name: 'Puck', descriptor: 'Upbeat' }]).map((option) => (
+                                <option key={option.name} value={option.name}>
+                                  {option.name} • {option.descriptor}
+                                </option>
+                              ))}
+                            </select>
+                            <p className="text-[11px] text-gray-400">
+                              เสียงจริงจาก Gemini: {getVoiceOptionMeta(voiceProfileDraft.voice_name, voiceOptions)?.descriptor || 'Upbeat'}
+                            </p>
+                          </div>
+
+                          <div className="space-y-2">
+                            <p className="text-[11px] font-semibold text-gray-600">เพศเสียง</p>
+                            <div className="grid grid-cols-3 gap-2">
+                              {VOICE_PERSONA_OPTIONS.map((option) => {
+                                const active = voiceProfileDraft.persona === option.value
+                                return (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setVoiceProfileDraft((prev) => ({ ...prev, persona: option.value }))
+                                      if (voiceSettingsMessage) setVoiceSettingsMessage('')
+                                    }}
+                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-700'}`}
+                                  >
+                                    <p className="text-sm font-semibold">{option.label}</p>
+                                    <p className="text-[11px] text-gray-400">{option.hint}</p>
+                                  </button>
+                                )
+                              })}
+                            </div>
+                            <p className="text-[11px] text-gray-400">ตัวเลือกนี้เป็น preset ของระบบเพื่อกำกับคาแรกเตอร์ ไม่ใช่ field gender ตรงของ Google</p>
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <p className="text-[11px] font-semibold text-gray-600">โทนเสียง</p>
+                              <p className="text-[11px] text-gray-400">เลือกได้สูงสุด 3</p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {VOICE_TONE_OPTIONS.map((option) => {
+                                const active = voiceProfileDraft.tones.includes(option.value)
+                                const limitReached = !active && voiceProfileDraft.tones.length >= 3
+                                return (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setVoiceProfileDraft((prev) => {
+                                        const exists = prev.tones.includes(option.value)
+                                        if (exists) {
+                                          if (prev.tones.length === 1) return prev
+                                          return { ...prev, tones: prev.tones.filter((tone) => tone !== option.value) }
+                                        }
+                                        if (prev.tones.length >= 3) return prev
+                                        return { ...prev, tones: [...prev.tones, option.value] }
+                                      })
+                                      if (voiceSettingsMessage) setVoiceSettingsMessage('')
+                                    }}
+                                    disabled={limitReached}
+                                    className={`rounded-full border px-3 py-1.5 text-[12px] font-semibold transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-600'} ${limitReached ? 'opacity-40' : ''}`}
+                                  >
+                                    {active ? '✓ ' : ''}{option.label}
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="space-y-2">
+                            <p className="text-[11px] font-semibold text-gray-600">จังหวะการพูด</p>
+                            <div className="grid grid-cols-3 gap-2">
+                              {VOICE_PACE_OPTIONS.map((option) => {
+                                const active = voiceProfileDraft.pace === option.value
+                                return (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setVoiceProfileDraft((prev) => ({ ...prev, pace: option.value }))
+                                      if (voiceSettingsMessage) setVoiceSettingsMessage('')
+                                    }}
+                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-700'}`}
+                                  >
+                                    <p className="text-sm font-semibold">{option.label}</p>
+                                    <p className="text-[11px] text-gray-400">{option.hint}</p>
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
+                            <p>ใช้ค่าแยกตาม workspace นี้</p>
+                            <p>Google Gemini TTS ใช้ `voice_name` จริง ส่วนเพศเสียง/โทน/จังหวะเป็น preset ที่ระบบเอาไปกำกับสคริปต์และน้ำเสียงให้อัตโนมัติ</p>
+                          </div>
+
+                          {voiceSettingsUpdatedAt && (
+                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(voiceSettingsUpdatedAt).toLocaleString()}</p>
+                          )}
+                          {voicePreviewUrl && (
+                            <audio
+                              id="voice-preview-audio"
+                              controls
+                              src={voicePreviewUrl}
+                              className="w-full"
+                            />
+                          )}
+                          {voicePreviewMessage && (
+                            <p className={`text-xs ${voicePreviewMessage.includes('ไม่สำเร็จ') ? 'text-red-500' : 'text-blue-600'}`}>
+                              {voicePreviewMessage}
+                            </p>
+                          )}
+                          {voiceSettingsMessage && (
+                            <p className={`text-xs ${voiceSettingsMessage.includes('ไม่สำเร็จ') || voiceSettingsMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
+                              {voiceSettingsMessage}
                             </p>
                           )}
                           <div className="flex gap-2">
                             <button
                               onClick={() => {
-                                if (voicePromptSaving || voicePromptDraft.length > voicePromptMaxChars) return
-                                void saveVoicePrompt(voicePromptDraft)
+                                if (voicePreviewLoading) return
+                                void previewVoiceProfile(voiceProfileDraft)
                               }}
-                              disabled={voicePromptSaving || voicePromptDraft.length > voicePromptMaxChars || voicePromptDraft === voicePrompt}
-                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                              disabled={voicePreviewLoading}
+                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-white active:scale-95 transition-all disabled:opacity-40"
                             >
-                              {voicePromptSaving ? 'กำลังบันทึก...' : 'บันทึก Prompt'}
+                              {voicePreviewLoading ? 'กำลังสร้างตัวอย่าง...' : 'ฟังตัวอย่าง'}
                             </button>
                             <button
                               onClick={() => {
-                                if (voicePromptSaving) return
-                                void saveVoicePrompt('')
+                                if (voiceSettingsSaving) return
+                                void saveVoicePrompt(voiceProfileDraft)
                               }}
-                              disabled={voicePromptSaving}
+                              disabled={voiceSettingsSaving || (!legacyVoicePromptActive && voiceProfilesEqual(voiceProfileDraft, voiceProfile))}
+                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              {voiceSettingsSaving ? 'กำลังบันทึก...' : 'บันทึกเสียงพากย์'}
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (voiceSettingsSaving) return
+                                void saveVoicePrompt(null, { reset: true })
+                              }}
+                              disabled={voiceSettingsSaving}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               รีเซ็ตค่าเริ่มต้น
@@ -6558,57 +7311,129 @@ function App() {
                   </div>
                 )}
 
-                {settingsSection === 'approvals' && isSystemAdmin && (
-                  <div className="space-y-3">
-                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                {settingsSection === 'members' && isSystemAdmin && (
+                  <div className="-mx-4 space-y-3">
+                    <div className="px-4">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        สมาชิกใหม่ที่ลงทะเบียนผ่าน LINE จะต้องได้รับการอนุมัติก่อนใช้งาน
+                        ดูสมาชิกทั้งหมดของระบบ เปลี่ยน role และอนุมัติสมาชิกใหม่ได้ในหน้านี้เลย
                       </p>
-                      {pendingUsersLoading ? (
-                        <p className="text-sm text-gray-400 py-3">กำลังโหลดรายชื่อ...</p>
-                      ) : pendingUsers.length === 0 ? (
-                        <div className="text-center py-8">
+                    </div>
+                      {systemMembersLoading ? (
+                        <p className="px-4 text-sm text-gray-400 py-3">กำลังโหลดรายชื่อ...</p>
+                      ) : systemMembers.length === 0 ? (
+                        <div className="px-4 text-center py-8">
                           <div className="w-14 h-14 bg-green-50 rounded-full flex items-center justify-center text-2xl mx-auto mb-3">&#x2705;</div>
-                          <p className="text-sm text-gray-500">ไม่มีสมาชิกที่รออนุมัติ</p>
+                          <p className="text-sm text-gray-500">ยังไม่มีสมาชิกในระบบ</p>
                         </div>
                       ) : (
-                        <div className="space-y-2">
-                          {pendingUsers.map((user) => (
-                            <div key={user.line_user_id} className="flex items-center gap-3 p-3 rounded-xl bg-gray-50 border border-gray-100">
-                              {user.picture_url ? (
-                                <img src={user.picture_url} className="w-10 h-10 rounded-full object-cover flex-shrink-0" />
-                              ) : (
-                                <div className="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center text-gray-500 font-bold text-sm flex-shrink-0">
-                                  {(user.display_name || '?').charAt(0).toUpperCase()}
+                        <div className="bg-white">
+                          {systemMembers.map((member, index) => {
+                            const role = (member.role || 'member') as SystemMemberRole
+                            const status = String(member.status || '').trim() || 'approved'
+                            const isPending = status === 'pending'
+                            const isCurrentUser = String(member.line_user_id || '').trim() === String(meLineUserId || '').trim()
+                            const isBusy = approvingUserId === member.line_user_id || rejectingUserId === member.line_user_id || savingMemberRoleId === member.line_user_id
+                            const roleOptions: Array<{ value: SystemMemberRole; label: string }> = [
+                              { value: 'admin', label: 'Admin' },
+                              { value: 'member', label: 'Member' },
+                              { value: 'team', label: 'Team' },
+                            ]
+
+                            return (
+                              <div
+                                key={member.line_user_id}
+                                className={`bg-white px-4 py-3 ${index === 0 ? '' : 'border-t border-gray-100'}`}
+                              >
+                                <div className="flex items-start gap-3">
+                                  {member.picture_url ? (
+                                    <img src={member.picture_url} className="w-12 h-12 rounded-full object-cover flex-shrink-0" />
+                                  ) : (
+                                    <div className="w-12 h-12 rounded-full bg-gray-200 flex items-center justify-center text-gray-500 font-bold text-sm flex-shrink-0">
+                                      {(member.display_name || member.line_user_id || '?').charAt(0).toUpperCase()}
+                                    </div>
+                                  )}
+
+                                  <div className="flex-1 min-w-0 space-y-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <p className="text-sm font-semibold text-gray-900 truncate">{member.display_name || 'ไม่มีชื่อ'}</p>
+                                      {isCurrentUser && (
+                                        <span className="inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-600">คุณ</span>
+                                      )}
+                                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold ${isPending ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                                        {isPending ? 'Pending' : 'Approved'}
+                                      </span>
+                                    </div>
+
+                                    <div className="space-y-1">
+                                      <p className="text-[11px] text-gray-400 break-all">UID: {member.line_user_id || '-'}</p>
+                                      <p className="text-[11px] text-gray-400 break-all">Namespace: {member.namespace_id || '-'}</p>
+                                    </div>
+
+                                    {(isPending || rejectingUserId === member.line_user_id) && (
+                                      <div className="flex gap-2 pt-1">
+                                        <button
+                                          onClick={() => void approveSystemMember(String(member.line_user_id || ''))}
+                                          disabled={approvingUserId === member.line_user_id || rejectingUserId === member.line_user_id}
+                                          className="px-3 py-1.5 rounded-lg bg-green-500 text-white text-xs font-bold active:scale-95 transition-all disabled:opacity-50"
+                                        >
+                                          {approvingUserId === member.line_user_id ? '...' : 'อนุมัติ'}
+                                        </button>
+                                        <button
+                                          onClick={() => void rejectSystemMember(String(member.line_user_id || ''))}
+                                          disabled={approvingUserId === member.line_user_id || rejectingUserId === member.line_user_id}
+                                          className="px-3 py-1.5 rounded-lg bg-red-500 text-white text-xs font-bold active:scale-95 transition-all disabled:opacity-50"
+                                        >
+                                          {rejectingUserId === member.line_user_id ? '...' : 'ปฏิเสธ'}
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  <div className="w-[104px] rounded-2xl border border-gray-100 bg-gray-50 p-1.5 flex-shrink-0">
+                                    <div className="space-y-1">
+                                      {roleOptions.map((option) => {
+                                        const active = role === option.value
+                                        return (
+                                          <button
+                                            key={option.value}
+                                            type="button"
+                                            onClick={() => {
+                                              if (isBusy || isCurrentUser || active) return
+                                              void saveSystemMemberRole(String(member.line_user_id || ''), option.value)
+                                            }}
+                                            disabled={isBusy || isCurrentUser}
+                                            className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-[11px] font-bold transition-all ${
+                                              active
+                                                ? option.value === 'admin'
+                                                  ? 'bg-purple-500 text-white'
+                                                  : option.value === 'team'
+                                                    ? 'bg-gray-800 text-white'
+                                                    : 'bg-blue-500 text-white'
+                                                : 'bg-white text-gray-600 border border-gray-200 disabled:opacity-40'
+                                            }`}
+                                          >
+                                            <span>{option.label}</span>
+                                            <span className={`flex h-4 w-4 items-center justify-center rounded-full border text-[10px] ${
+                                              active
+                                                ? 'border-white/60 bg-white/20 text-white'
+                                                : 'border-gray-300 bg-white text-transparent'
+                                            }`}>
+                                              ✓
+                                            </span>
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                    {savingMemberRoleId === member.line_user_id && (
+                                      <p className="pt-1 text-center text-[10px] font-semibold text-gray-400">กำลังบันทึก...</p>
+                                    )}
+                                  </div>
                                 </div>
-                              )}
-                              <div className="flex-1 min-w-0">
-                                <p className="text-sm font-semibold text-gray-900 truncate">{user.display_name || 'ไม่มีชื่อ'}</p>
-                                {user.created_at && (
-                                  <p className="text-[11px] text-gray-400">{new Date(user.created_at + 'Z').toLocaleString()}</p>
-                                )}
                               </div>
-                              <div className="flex gap-1.5 flex-shrink-0">
-                                <button
-                                  onClick={() => approveUser(user.line_user_id)}
-                                  disabled={approvingUserId === user.line_user_id || rejectingUserId === user.line_user_id}
-                                  className="px-3 py-1.5 rounded-lg bg-green-500 text-white text-xs font-bold active:scale-95 transition-all disabled:opacity-50"
-                                >
-                                  {approvingUserId === user.line_user_id ? '...' : 'อนุมัติ'}
-                                </button>
-                                <button
-                                  onClick={() => rejectUser(user.line_user_id)}
-                                  disabled={approvingUserId === user.line_user_id || rejectingUserId === user.line_user_id}
-                                  className="px-3 py-1.5 rounded-lg bg-red-500 text-white text-xs font-bold active:scale-95 transition-all disabled:opacity-50"
-                                >
-                                  {rejectingUserId === user.line_user_id ? '...' : 'ปฏิเสธ'}
-                                </button>
-                              </div>
-                            </div>
-                          ))}
+                            )
+                          })}
                         </div>
                       )}
-                    </div>
                   </div>
                 )}
               </>

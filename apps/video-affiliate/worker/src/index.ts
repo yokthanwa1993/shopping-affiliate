@@ -17,6 +17,8 @@ import {
 import { getBotId } from './utils/botAuth'
 import {
     type Env,
+    buildTtsPromptTemplate,
+    GEMINI_TTS_VOICE_OPTIONS,
     rebuildGalleryCache,
     updateGalleryCache,
     removeFromGalleryCache,
@@ -24,7 +26,15 @@ import {
     runPipeline,
     processNextInQueue,
     warmPipelineContainer,
-    getVoicePromptTemplate,
+    clearNamespaceVoiceSettings,
+    getNamespaceVoiceSettings,
+    getSystemGeminiApiKeys,
+    normalizeVoiceProfile,
+    type VoicePacePreset,
+    type VoicePersonaPreset,
+    type VoiceProfile,
+    type VoiceTonePreset,
+    setNamespaceVoiceSettings,
     setVoicePromptTemplate,
 } from './pipeline'
 import { ADMIN_HTML } from './admin-page'
@@ -93,11 +103,75 @@ async function getFacebookAdsApi(): Promise<FacebookSdkApi> {
 const app = new Hono<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>()
 const MAX_VOICE_PROMPT_CHARS = 12000
 const MAX_GEMINI_API_KEY_CHARS = 512
+const MAX_GEMINI_API_KEY_SLOTS = 5
 const MAX_SHORTLINK_BASE_URL_CHARS = 512
 const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
+const VOICE_PREVIEW_TTS_MODEL = 'gemini-2.5-flash-preview-tts'
+const MAX_VOICE_PREVIEW_TEXT_CHARS = 280
+const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
+
+function buildWavFromPcm16le(pcmBytes: Uint8Array, sampleRate = 24000, channels = 1, bitsPerSample = 16): Uint8Array {
+    const byteRate = sampleRate * channels * (bitsPerSample / 8)
+    const blockAlign = channels * (bitsPerSample / 8)
+    const buffer = new ArrayBuffer(44 + pcmBytes.byteLength)
+    const view = new DataView(buffer)
+    const bytes = new Uint8Array(buffer)
+    const writeAscii = (offset: number, value: string) => {
+        for (let i = 0; i < value.length; i += 1) {
+            view.setUint8(offset + i, value.charCodeAt(i))
+        }
+    }
+
+    writeAscii(0, 'RIFF')
+    view.setUint32(4, 36 + pcmBytes.byteLength, true)
+    writeAscii(8, 'WAVE')
+    writeAscii(12, 'fmt ')
+    view.setUint32(16, 16, true)
+    view.setUint16(20, 1, true)
+    view.setUint16(22, channels, true)
+    view.setUint32(24, sampleRate, true)
+    view.setUint32(28, byteRate, true)
+    view.setUint16(32, blockAlign, true)
+    view.setUint16(34, bitsPerSample, true)
+    writeAscii(36, 'data')
+    view.setUint32(40, pcmBytes.byteLength, true)
+    bytes.set(pcmBytes, 44)
+    return bytes
+}
+
+async function requestGeminiTtsPreview(apiKey: string, promptText: string, voiceName: string): Promise<Uint8Array> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${VOICE_PREVIEW_TTS_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            contents: [{ parts: [{ text: promptText }] }],
+            generationConfig: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: {
+                            voiceName,
+                        },
+                    },
+                },
+            },
+        }),
+    })
+    const data = await resp.json().catch(() => ({})) as any
+    if (!resp.ok) {
+        const message = String(data?.error?.message || data?.message || `gemini_tts_failed_${resp.status}`)
+        throw new Error(message)
+    }
+    const b64 = String(data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || '').trim()
+    if (!b64) {
+        throw new Error('gemini_tts_preview_empty')
+    }
+    return new Uint8Array(NodeBuffer.from(b64, 'base64'))
+}
 
 // CORS
 app.use('*', async (c, next) => {
@@ -147,16 +221,49 @@ async function isNamespaceOwner(db: D1Database, email: string): Promise<boolean>
     return !!row
 }
 
+async function isTeamMemberEmail(db: D1Database, email: string): Promise<boolean> {
+    const normalizedEmail = String(email || '').trim().toLowerCase()
+    if (!normalizedEmail) return false
+    const row = await db.prepare('SELECT 1 AS ok FROM team_members WHERE lower(trim(email)) = ? LIMIT 1')
+        .bind(normalizedEmail)
+        .first()
+        .catch(() => null)
+    return !!row
+}
+
+async function isNamespaceOwnerIdentity(db: D1Database, email: string, namespaceId: string): Promise<boolean> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return false
+
+    const normalizedEmail = String(email || '').trim().toLowerCase()
+    if (await isTeamMemberEmail(db, normalizedEmail)) return false
+
+    const hasLineOwner = normalizedEmail ? await db.prepare(
+        `SELECT 1 AS ok
+         FROM line_users
+         WHERE namespace_id = ?
+           AND lower(trim(email)) = ?
+         LIMIT 1`
+    ).bind(normalizedNamespaceId, normalizedEmail).first().catch(() => null) : null
+    if (hasLineOwner) return true
+
+    if (!normalizedEmail) return false
+    const mapped = await db.prepare(
+        'SELECT 1 AS ok FROM email_namespaces WHERE email = ? AND namespace_id = ? LIMIT 1'
+    ).bind(normalizedEmail, normalizedNamespaceId).first().catch(() => null)
+    return !!mapped
+}
+
 async function requireOwnerSession(c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>) {
     const token = c.req.header('x-auth-token') || ''
     if (!token.startsWith('sess_')) {
         return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
     }
-    const user = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(token).first() as { email?: string } | null
-    if (!user?.email) {
+    const user = await c.env.DB.prepare('SELECT email, namespace_id FROM users WHERE session_token = ?').bind(token).first() as { email?: string; namespace_id?: string } | null
+    if (!user?.namespace_id) {
         return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
     }
-    const ownerOk = await isNamespaceOwner(c.env.DB, user.email)
+    const ownerOk = await isNamespaceOwnerIdentity(c.env.DB, String(user.email || ''), String(user.namespace_id || ''))
     if (!ownerOk) {
         return { ok: false as const, response: c.json({ error: 'Forbidden' }, 403) }
     }
@@ -173,6 +280,132 @@ async function requireAuthSession(c: Context<{ Bindings: Env, Variables: { botId
         return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
     }
     return { ok: true as const }
+}
+
+async function requireSystemAdminSession(c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>) {
+    const token = c.req.header('x-auth-token') || ''
+    if (!token.startsWith('sess_')) {
+        return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
+    }
+    const user = await c.env.DB.prepare(
+        'SELECT email, namespace_id FROM users WHERE session_token = ?'
+    ).bind(token).first().catch(() => null) as { email?: string; namespace_id?: string } | null
+    if (!user?.email || !user?.namespace_id) {
+        return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
+    }
+    const sysAdmin = await isSystemAdmin(c.env.DB, String(user.email))
+    if (!sysAdmin) {
+        return { ok: false as const, response: c.json({ error: 'Forbidden' }, 403) }
+    }
+    return {
+        ok: true as const,
+        email: String(user.email || '').trim().toLowerCase(),
+        namespaceId: String(user.namespace_id || '').trim(),
+    }
+}
+
+async function upsertUserWorkspaceByEmail(db: D1Database, emailRaw: string, namespaceId: string): Promise<void> {
+    const email = String(emailRaw || '').trim().toLowerCase()
+    const ns = String(namespaceId || '').trim()
+    if (!email || !ns) return
+
+    const existing = await db.prepare(
+        'SELECT 1 AS ok FROM users WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(email).first().catch(() => null) as { ok?: number } | null
+
+    if (existing?.ok) {
+        await db.prepare(
+            'UPDATE users SET namespace_id = ? WHERE lower(trim(email)) = ?'
+        ).bind(ns, email).run().catch(() => { })
+        return
+    }
+
+    await db.prepare(
+        "INSERT INTO users (email, namespace_id, session_token) VALUES (?, ?, '')"
+    ).bind(email, ns).run().catch(() => { })
+}
+
+async function resolveManagedWorkspaceForRole(
+    db: D1Database,
+    emailRaw: string,
+    currentNamespaceId: string,
+    adminNamespaceId: string
+): Promise<string> {
+    const email = String(emailRaw || '').trim().toLowerCase()
+    const currentNamespace = String(currentNamespaceId || '').trim()
+    const adminNamespace = String(adminNamespaceId || '').trim()
+
+    const mapped = await db.prepare(
+        'SELECT namespace_id FROM email_namespaces WHERE email = ? LIMIT 1'
+    ).bind(email).first().catch(() => null) as { namespace_id?: string } | null
+    const mappedNamespace = String(mapped?.namespace_id || '').trim()
+    if (mappedNamespace) return mappedNamespace
+
+    if (currentNamespace && currentNamespace !== adminNamespace) return currentNamespace
+    return createOwnerWorkspaceId()
+}
+
+async function assignLineUserRole(
+    db: D1Database,
+    lineUserIdRaw: string,
+    targetRoleRaw: string,
+    adminNamespaceIdRaw: string
+): Promise<{
+    line_user_id: string
+    namespace_id: string
+    role: 'admin' | 'member' | 'team'
+    status: 'approved'
+  }> {
+    const lineUserId = String(lineUserIdRaw || '').trim()
+    const adminNamespaceId = String(adminNamespaceIdRaw || '').trim()
+    const targetRole = String(targetRoleRaw || '').trim().toLowerCase()
+    if (!lineUserId) throw new Error('line_user_id required')
+    if (!adminNamespaceId) throw new Error('admin_namespace_id required')
+    if (!['admin', 'member', 'team'].includes(targetRole)) throw new Error('invalid_role')
+
+    await ensureLineUsersTable(db)
+    const lineUser = await db.prepare(
+        'SELECT email, namespace_id FROM line_users WHERE line_user_id = ? LIMIT 1'
+    ).bind(lineUserId).first().catch(() => null) as { email?: string; namespace_id?: string } | null
+
+    const email = String(lineUser?.email || '').trim().toLowerCase()
+    const currentNamespaceId = String(lineUser?.namespace_id || '').trim()
+    if (!email) throw new Error('member_not_found')
+
+    let targetNamespaceId = currentNamespaceId
+
+    if (targetRole === 'team') {
+        targetNamespaceId = adminNamespaceId
+        await db.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run().catch(() => { })
+        await db.prepare('DELETE FROM system_admins WHERE lower(trim(email)) = ?').bind(email).run().catch(() => { })
+        await db.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ?').bind(email).run().catch(() => { })
+        await db.prepare(
+            'INSERT OR IGNORE INTO team_members (owner_namespace_id, email) VALUES (?, ?)'
+        ).bind(adminNamespaceId, email).run().catch(() => { })
+    } else {
+        targetNamespaceId = await resolveManagedWorkspaceForRole(db, email, currentNamespaceId, adminNamespaceId)
+        await upsertOwnerNamespaceMapping(db, email, targetNamespaceId)
+        await db.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ?').bind(email).run().catch(() => { })
+        if (targetRole === 'admin') {
+            await db.prepare('INSERT OR IGNORE INTO system_admins (email) VALUES (?)').bind(email).run().catch(() => { })
+        } else {
+            await db.prepare('DELETE FROM system_admins WHERE lower(trim(email)) = ?').bind(email).run().catch(() => { })
+        }
+    }
+
+    await db.prepare(
+        `UPDATE line_users
+         SET namespace_id = ?, status = 'approved', updated_at = datetime('now')
+         WHERE line_user_id = ?`
+    ).bind(targetNamespaceId, lineUserId).run().catch(() => { })
+    await upsertUserWorkspaceByEmail(db, email, targetNamespaceId)
+
+    return {
+        line_user_id: lineUserId,
+        namespace_id: targetNamespaceId,
+        role: targetRole as 'admin' | 'member' | 'team',
+        status: 'approved',
+    }
 }
 
 async function resolveNamespacesForTagSync(
@@ -1580,6 +1813,30 @@ function buildWorkerGalleryAssetUrl(workerUrl: string, namespaceId: string, vide
     }
 }
 
+function resolvePostingVideoDownloadUrl(
+    env: Env,
+    namespaceId: string,
+    videoId: string,
+    rawPublicUrl = '',
+): string {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    const workerAssetUrl = buildWorkerGalleryAssetUrl(
+        String(env.WORKER_URL || '').trim(),
+        normalizedNamespaceId,
+        normalizedVideoId,
+        'public',
+    )
+    if (workerAssetUrl) return workerAssetUrl
+
+    const publicUrl = String(rawPublicUrl || '').trim()
+    if (publicUrl && publicUrl.includes(`/${normalizedNamespaceId}/videos/`)) {
+        return publicUrl
+    }
+
+    return getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, normalizedVideoId)
+}
+
 function parseSingleRangeHeader(rangeHeader: string, size: number): { offset: number; length: number; end: number } | 'unsatisfiable' | null {
     const normalized = String(rangeHeader || '').trim()
     if (!normalized) return null
@@ -1683,7 +1940,7 @@ async function getNamespaceOwnerEmailMap(db: D1Database): Promise<Map<string, st
 }
 
 async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string, unknown>>> {
-    const indexedVideos = await listGalleryIndexVideos(env.DB).catch(() => [])
+    const indexedVideos = await listGalleryIndexVideos(env.DB, { requirePublicVideo: true }).catch(() => [])
     if (indexedVideos.length > 0) {
         return indexedVideos as Array<Record<string, unknown>>
     }
@@ -1694,7 +1951,12 @@ async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string,
         const payload = await cached.json().catch(() => ({})) as { created_at?: string; videos?: Array<Record<string, unknown>> }
         const createdAt = payload?.created_at ? new Date(payload.created_at).getTime() : 0
         if (createdAt > 0 && (Date.now() - createdAt) < 60_000) {
-            return Array.isArray(payload.videos) ? payload.videos : []
+            return Array.isArray(payload.videos)
+                ? payload.videos.filter((video) =>
+                    !!String((video as Record<string, unknown>).publicUrl || (video as Record<string, unknown>).public_url || '').trim()
+                    && !getBooleanFlag((video as Record<string, unknown>).original_only)
+                )
+                : []
         }
     }
 
@@ -1737,7 +1999,10 @@ async function getAllSystemGalleryVideos(env: Env): Promise<Array<Record<string,
         cursor = listed.truncated ? listed.cursor : undefined
     } while (cursor)
 
-    const deduped = dedupeVideosById(videos).sort((a, b) => {
+    const deduped = dedupeVideosById(videos).filter((video) =>
+        !!String((video as Record<string, unknown>).publicUrl || (video as Record<string, unknown>).public_url || '').trim()
+        && !getBooleanFlag((video as Record<string, unknown>).original_only)
+    ).sort((a, b) => {
         const aTs = new Date(String(a.updatedAt || a.createdAt || '')).getTime()
         const bTs = new Date(String(b.updatedAt || b.createdAt || '')).getTime()
         return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
@@ -2150,6 +2415,7 @@ async function pickRandomPostableVideoFromSystem(
     const videos = await listGalleryIndexVideos(env.DB, {
         onlyOwnerLinked: true,
         linkFilter: 'with-link',
+        requirePublicVideo: true,
     }).catch(() => [])
     const candidates = dedupeSystemGalleryVideos(videos).filter((video) => {
         const id = String(video?.id || '').trim()
@@ -2454,6 +2720,24 @@ async function storeOriginalVideoBuffer(params: {
     return getVideoOriginalUrlForNamespace(params.env.R2_PUBLIC_URL, params.namespaceId, params.videoId)
 }
 
+function isLikelyInvalidStoredVideoObject(obj: Pick<R2Object, 'size' | 'httpMetadata'> | null | undefined): boolean {
+    if (!obj) return true
+
+    const size = Number(obj.size || 0)
+    if (size > 0 && size < 1024) return true
+
+    const contentType = String(obj.httpMetadata?.contentType || '').trim().toLowerCase()
+    if (
+        contentType &&
+        !contentType.startsWith('video/') &&
+        !contentType.includes('application/octet-stream')
+    ) {
+        return true
+    }
+
+    return false
+}
+
 async function storeThumbnailForSourceUrl(params: {
     env: Env
     bucket: R2Bucket
@@ -2533,6 +2817,7 @@ async function materializeOriginalVideoAsset(params: {
     const originalKey = getPrimaryOriginalVideoAssetKey(normalizedVideoId)
     const currentOriginal = await bucket.head(originalKey).catch(() => null)
     const originalUrl = getVideoOriginalUrlForNamespace(params.env.R2_PUBLIC_URL, normalizedNamespaceId, normalizedVideoId)
+    const hasUsableOriginal = !isLikelyInvalidStoredVideoObject(currentOriginal)
     let downloadUrl = normalizedSourceUrl
     let thumbnailSourceUrl = normalizedSourceUrl
 
@@ -2556,7 +2841,7 @@ async function materializeOriginalVideoAsset(params: {
         } catch { }
     }
 
-    if (!currentOriginal) {
+    if (!hasUsableOriginal) {
         const headers: Record<string, string> = {}
 
         if (params.sourceType === 'xhs_url') {
@@ -2762,16 +3047,29 @@ app.post('/admin/api/migrate-namespaces', async (c) => {
     const db = c.env.DB
     const bucket = c.env.BUCKET
 
-    // Find namespace IDs that are NOT in timestamp+random format (19 digits)
-    const allNamespaces = await db.prepare(
-        'SELECT DISTINCT namespace_id FROM email_namespaces'
-    ).all() as { results: Array<{ namespace_id: string }> }
+    // Collect namespace IDs from every workspace mapping table so legacy orphan rows
+    // in users/line_users are migrated too.
+    const namespaceIds = new Set<string>()
+    const namespaceSources = [
+        'SELECT DISTINCT namespace_id FROM email_namespaces',
+        'SELECT DISTINCT namespace_id FROM users',
+        'SELECT DISTINCT namespace_id FROM line_users',
+    ]
+    for (const sql of namespaceSources) {
+        try {
+            const rows = await db.prepare(sql).all() as { results?: Array<{ namespace_id?: string }> }
+            for (const row of rows.results || []) {
+                const nsId = String(row?.namespace_id || '').trim()
+                if (nsId) namespaceIds.add(nsId)
+            }
+        } catch {
+            // Skip missing tables in older DB states.
+        }
+    }
 
     const toMigrate: Array<{ oldId: string; newId: string }> = []
-    for (const row of allNamespaces.results || []) {
-        const nsId = String(row.namespace_id || '').trim()
-        // Valid format: 19-digit numeric string (13-digit timestamp + 6-digit random)
-        if (!nsId || /^\d{16,20}$/.test(nsId)) continue
+    for (const nsId of namespaceIds) {
+        if (!nsId || CANONICAL_WORKSPACE_ID_PATTERN.test(nsId)) continue
         const newId = createOwnerWorkspaceId()
         toMigrate.push({ oldId: nsId, newId })
     }
@@ -2789,14 +3087,18 @@ app.post('/admin/api/migrate-namespaces', async (c) => {
         const updates: Array<{ table: string; sql: string }> = [
             { table: 'email_namespaces', sql: 'UPDATE email_namespaces SET namespace_id = ? WHERE namespace_id = ?' },
             { table: 'users', sql: 'UPDATE users SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'line_users', sql: 'UPDATE line_users SET namespace_id = ? WHERE namespace_id = ?' },
             { table: 'team_members', sql: 'UPDATE team_members SET owner_namespace_id = ? WHERE owner_namespace_id = ?' },
             { table: 'namespace_settings', sql: 'UPDATE namespace_settings SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'channels', sql: 'UPDATE channels SET bot_id = ? WHERE bot_id = ?' },
             { table: 'pages', sql: 'UPDATE pages SET bot_id = ? WHERE bot_id = ?' },
             { table: 'post_queue', sql: 'UPDATE post_queue SET bot_id = ? WHERE bot_id = ?' },
             { table: 'post_history', sql: 'UPDATE post_history SET bot_id = ? WHERE bot_id = ?' },
             { table: 'gallery_index', sql: 'UPDATE gallery_index SET namespace_id = ? WHERE namespace_id = ?' },
             { table: 'namespace_video_state', sql: 'UPDATE namespace_video_state SET namespace_id = ? WHERE namespace_id = ?' },
             { table: 'link_submissions', sql: 'UPDATE link_submissions SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'imported_videos(namespace)', sql: 'UPDATE imported_videos SET namespace_id = ? WHERE namespace_id = ?' },
+            { table: 'imported_videos(source)', sql: 'UPDATE imported_videos SET source_namespace_id = ? WHERE source_namespace_id = ?' },
             { table: 'telegram_bot_sessions(namespace)', sql: 'UPDATE telegram_bot_sessions SET namespace_id = ? WHERE namespace_id = ?' },
             { table: 'telegram_bot_sessions(scope)', sql: 'UPDATE telegram_bot_sessions SET bot_scope = ? WHERE bot_scope = ?' },
         ]
@@ -2846,6 +3148,9 @@ app.post('/admin/api/migrate-namespaces', async (c) => {
 
         results.push({ oldId, newId, tables, r2_copied: r2Copied })
     }
+
+    await bucket.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+    await bucket.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
 
     return c.json({ ok: true, migrated: results })
 })
@@ -3069,6 +3374,7 @@ app.get('/admin/api/data', async (c) => {
 
 const toChanges = (result: any) => Number(result?.meta?.changes || 0)
 const MIN_OWNER_PASSWORD_LENGTH = 6
+const CANONICAL_WORKSPACE_ID_PATTERN = /^\d{19}$/
 const createOwnerWorkspaceId = (): string => {
     const timestamp = Date.now().toString()
     const suffix = Math.floor(100000 + Math.random() * 900000).toString()
@@ -3294,7 +3600,7 @@ app.delete('/admin/api/users/:email', async (c) => {
         await c.env.DB.prepare('DELETE FROM users WHERE email = ?').bind(email).run()
         await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run().catch(() => { })
         await c.env.DB.prepare('DELETE FROM allowed_emails WHERE email = ?').bind(email).run().catch(() => { })
-        await c.env.DB.prepare('DELETE FROM team_members WHERE email = ?').bind(email).run()
+        await c.env.DB.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ?').bind(email).run()
         return c.json({ ok: true, mode: 'legacy_user_delete' })
     }
 
@@ -3313,6 +3619,15 @@ app.delete('/admin/api/users/:email', async (c) => {
     deleted.post_history = toChanges(await c.env.DB.prepare('DELETE FROM post_history WHERE bot_id = ?').bind(namespaceId).run())
     deleted.pages = toChanges(await c.env.DB.prepare('DELETE FROM pages WHERE bot_id = ?').bind(namespaceId).run())
     deleted.channels = toChanges(await c.env.DB.prepare('DELETE FROM channels WHERE bot_id = ?').bind(namespaceId).run())
+    deleted.namespace_settings = toChanges(await c.env.DB.prepare('DELETE FROM namespace_settings WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.gallery_index = toChanges(await c.env.DB.prepare('DELETE FROM gallery_index WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.namespace_video_state = toChanges(await c.env.DB.prepare('DELETE FROM namespace_video_state WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.link_submissions = toChanges(await c.env.DB.prepare('DELETE FROM link_submissions WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.imported_videos_namespace = toChanges(await c.env.DB.prepare('DELETE FROM imported_videos WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.imported_videos_source = toChanges(await c.env.DB.prepare('DELETE FROM imported_videos WHERE source_namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.telegram_sessions_namespace = toChanges(await c.env.DB.prepare('DELETE FROM telegram_bot_sessions WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.telegram_sessions_scope = toChanges(await c.env.DB.prepare('DELETE FROM telegram_bot_sessions WHERE bot_scope = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.line_users = toChanges(await c.env.DB.prepare('DELETE FROM line_users WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
     deleted.team_members_owner = toChanges(await c.env.DB.prepare('DELETE FROM team_members WHERE owner_namespace_id = ?').bind(namespaceId).run())
     deleted.users_namespace = toChanges(await c.env.DB.prepare('DELETE FROM users WHERE namespace_id = ?').bind(namespaceId).run())
 
@@ -3380,7 +3695,7 @@ app.post('/api/auth/login', async (c) => {
     const emailLower = email.toLowerCase()
 
     // Check if team member first, otherwise treat as namespace owner
-    const teamMember = await c.env.DB.prepare('SELECT owner_namespace_id FROM team_members WHERE email = ?').bind(emailLower).first() as any
+    const teamMember = await c.env.DB.prepare('SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ?').bind(emailLower).first() as any
     const isOwner = !teamMember
 
     const sessionToken = 'sess_' + crypto.randomUUID().replace(/-/g, '')
@@ -3522,9 +3837,12 @@ app.post('/api/auth/resolve-email', async (c) => {
 app.get('/api/team', async (c) => {
     const namespaceId = c.get('botId')
     const { results } = await c.env.DB.prepare(
-        `SELECT t.email, t.created_at, COALESCE(l.display_name, '') as display_name, COALESCE(l.picture_url, '') as picture_url
+        `SELECT t.email, t.created_at,
+                COALESCE(l.display_name, '') as display_name,
+                COALESCE(l.picture_url, '') as picture_url,
+                COALESCE(l.line_user_id, '') as line_user_id
          FROM team_members t
-         LEFT JOIN line_users l ON l.email = t.email
+         LEFT JOIN line_users l ON lower(trim(l.email)) = lower(trim(t.email))
          WHERE t.owner_namespace_id = ? ORDER BY t.created_at DESC`
     ).bind(namespaceId).all()
     const members = (results || []).map((m: any) => ({
@@ -3555,10 +3873,11 @@ app.delete('/api/team/:email', async (c) => {
     const email = decodeURIComponent(c.req.param('email'))
     const namespaceId = c.get('botId')
     // Also clear their session if logged in
-    await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE email = ? AND namespace_id = ?")
-        .bind(email, namespaceId).run()
-    await c.env.DB.prepare('DELETE FROM team_members WHERE email = ? AND owner_namespace_id = ?')
-        .bind(email, namespaceId).run()
+    const normalizedEmail = String(email || '').trim().toLowerCase()
+    await c.env.DB.prepare("UPDATE users SET session_token = '' WHERE lower(trim(email)) = ? AND namespace_id = ?")
+        .bind(normalizedEmail, namespaceId).run()
+    await c.env.DB.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ? AND owner_namespace_id = ?')
+        .bind(normalizedEmail, namespaceId).run()
     return c.json({ ok: true })
 })
 
@@ -3567,16 +3886,23 @@ app.get('/api/me', async (c) => {
     if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
     const user = await c.env.DB.prepare('SELECT email, namespace_id FROM users WHERE session_token = ?').bind(token).first() as any
     if (!user) return c.json({ error: 'Not found' }, 404)
-    const ownerOk = await isNamespaceOwner(c.env.DB, user.email)
+    const ownerOk = await isNamespaceOwnerIdentity(c.env.DB, String(user.email || ''), String(user.namespace_id || ''))
     const sysAdmin = ownerOk ? await isSystemAdmin(c.env.DB, user.email) : false
     await ensureLineUsersTable(c.env.DB)
     const lineUser = await c.env.DB.prepare(
         `SELECT line_user_id, display_name, picture_url
          FROM line_users
-         WHERE namespace_id = ?
+         WHERE lower(trim(email)) = ?
          ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
          LIMIT 1`
-    ).bind(String(user.namespace_id || '').trim()).first().catch(() => null) as any
+    ).bind(String(user.email || '').trim().toLowerCase()).first().catch(() => null) as any
+        || await c.env.DB.prepare(
+            `SELECT line_user_id, display_name, picture_url
+             FROM line_users
+             WHERE namespace_id = ?
+             ORDER BY datetime(updated_at) DESC, datetime(created_at) DESC
+             LIMIT 1`
+        ).bind(String(user.namespace_id || '').trim()).first().catch(() => null) as any
     let lineDisplayName = String(lineUser?.display_name || '').trim()
     let linePictureUrl = String(lineUser?.picture_url || '').trim()
     const lineUserId = String(lineUser?.line_user_id || '').trim()
@@ -3594,8 +3920,8 @@ app.get('/api/me', async (c) => {
     }
     // Check if user is a team member of any namespace
     const teamRow = await c.env.DB.prepare(
-        'SELECT owner_namespace_id FROM team_members WHERE email = ? LIMIT 1'
-    ).bind(String(user.email || '').trim()).first().catch(() => null) as { owner_namespace_id?: string } | null
+        'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(String(user.email || '').trim().toLowerCase()).first().catch(() => null) as { owner_namespace_id?: string } | null
     const isTeamMember = !!teamRow
 
     return c.json({
@@ -3606,6 +3932,7 @@ app.get('/api/me', async (c) => {
         is_team_member: isTeamMember,
         line_display_name: lineDisplayName,
         line_picture_url: linePictureUrl,
+        line_user_id: lineUserId,
     })
 })
 
@@ -3614,11 +3941,15 @@ app.get('/api/settings/voice-prompt', async (c) => {
     if (!ownerCheck.ok) return ownerCheck.response
 
     const namespaceId = c.get('botId')
-    const promptMeta = await getVoicePromptTemplate(c.env.DB, namespaceId)
+    const settings = await getNamespaceVoiceSettings(c.env.DB, namespaceId)
     return c.json({
-        prompt: promptMeta.prompt,
-        source: promptMeta.source,
-        updated_at: promptMeta.updatedAt,
+        profile: settings.profile,
+        prompt: settings.scriptPrompt,
+        tts_prompt_template: settings.ttsPromptTemplate,
+        source: settings.source,
+        updated_at: settings.updatedAt,
+        legacy_prompt_active: settings.legacyPromptActive,
+        voice_options: GEMINI_TTS_VOICE_OPTIONS,
         max_chars: MAX_VOICE_PROMPT_CHARS,
     })
 })
@@ -3627,22 +3958,112 @@ app.put('/api/settings/voice-prompt', async (c) => {
     const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
-    const body = await c.req.json().catch(() => ({})) as { prompt?: string }
+    const body = await c.req.json().catch(() => ({})) as {
+        prompt?: string
+        profile?: Partial<VoiceProfile>
+        voice_name?: string
+        persona?: VoicePersonaPreset
+        tones?: VoiceTonePreset[]
+        pace?: VoicePacePreset
+    }
+    const namespaceId = c.get('botId')
+    const hasStructuredProfile = !!body.profile || !!body.voice_name || !!body.persona || Array.isArray(body.tones) || !!body.pace
+    if (hasStructuredProfile) {
+        const latest = await setNamespaceVoiceSettings(c.env.DB, namespaceId, body.profile || {
+            voice_name: body.voice_name,
+            persona: body.persona,
+            tones: body.tones,
+            pace: body.pace,
+        })
+        return c.json({
+            ok: true,
+            profile: latest.profile,
+            prompt: latest.scriptPrompt,
+            tts_prompt_template: latest.ttsPromptTemplate,
+            source: latest.source,
+            updated_at: latest.updatedAt,
+            legacy_prompt_active: latest.legacyPromptActive,
+            voice_options: GEMINI_TTS_VOICE_OPTIONS,
+            max_chars: MAX_VOICE_PROMPT_CHARS,
+        })
+    }
+
     const prompt = String(body.prompt || '').trim()
     if (prompt.length > MAX_VOICE_PROMPT_CHARS) {
         return c.json({ error: `Prompt too long (max ${MAX_VOICE_PROMPT_CHARS} chars)` }, 400)
     }
 
-    const namespaceId = c.get('botId')
     await setVoicePromptTemplate(c.env.DB, namespaceId, prompt)
-    const latest = await getVoicePromptTemplate(c.env.DB, namespaceId)
+    const latest = await getNamespaceVoiceSettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
-        prompt: latest.prompt,
+        profile: latest.profile,
+        prompt: latest.scriptPrompt,
+        tts_prompt_template: latest.ttsPromptTemplate,
         source: latest.source,
         updated_at: latest.updatedAt,
+        legacy_prompt_active: latest.legacyPromptActive,
+        voice_options: GEMINI_TTS_VOICE_OPTIONS,
         max_chars: MAX_VOICE_PROMPT_CHARS,
     })
+})
+
+app.delete('/api/settings/voice-prompt', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const namespaceId = c.get('botId')
+    const latest = await clearNamespaceVoiceSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        profile: latest.profile,
+        prompt: latest.scriptPrompt,
+        tts_prompt_template: latest.ttsPromptTemplate,
+        source: latest.source,
+        updated_at: latest.updatedAt,
+        legacy_prompt_active: latest.legacyPromptActive,
+        voice_options: GEMINI_TTS_VOICE_OPTIONS,
+        max_chars: MAX_VOICE_PROMPT_CHARS,
+    })
+})
+
+app.post('/api/settings/voice-preview', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const namespaceId = c.get('botId')
+    const body = await c.req.json().catch(() => ({})) as {
+        profile?: Partial<VoiceProfile>
+        text?: string
+    }
+    const stored = await getNamespaceVoiceSettings(c.env.DB, namespaceId)
+    const profile = normalizeVoiceProfile(body.profile || stored.profile)
+    const previewText = String(body.text || '').trim().slice(0, MAX_VOICE_PREVIEW_TEXT_CHARS) || DEFAULT_VOICE_PREVIEW_TEXT
+    const promptText = buildTtsPromptTemplate(profile).replace('{{script}}', previewText)
+    const apiKeys = await getSystemGeminiApiKeys(c.env.DB).catch(() => [])
+    if (!apiKeys.length) {
+        return c.json({ error: 'ยังไม่ได้ตั้ง Gemini API key กลางของระบบ' }, 400)
+    }
+
+    let lastError = 'voice_preview_failed'
+    for (const apiKey of apiKeys) {
+        try {
+            const pcm = await requestGeminiTtsPreview(apiKey, promptText, profile.voice_name)
+            const wav = buildWavFromPcm16le(pcm)
+            return new Response(wav, {
+                status: 200,
+                headers: {
+                    'Content-Type': 'audio/wav',
+                    'Cache-Control': 'no-store',
+                    'x-voice-name': profile.voice_name,
+                },
+            })
+        } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error)
+        }
+    }
+
+    return c.json({ error: lastError }, 502)
 })
 
 app.get('/api/settings/comment-template', async (c) => {
@@ -3707,48 +4128,78 @@ app.delete('/api/settings/comment-template', async (c) => {
 })
 
 app.get('/api/settings/gemini-key', async (c) => {
-    const ownerCheck = await requireAuthSession(c)
-    if (!ownerCheck.ok) return ownerCheck.response
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
 
     const namespaceId = c.get('botId')
     const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     return c.json({
         ...settings,
         max_chars: MAX_GEMINI_API_KEY_CHARS,
+        max_slots: MAX_GEMINI_API_KEY_SLOTS,
     })
 })
 
 app.put('/api/settings/gemini-key', async (c) => {
-    const ownerCheck = await requireAuthSession(c)
-    if (!ownerCheck.ok) return ownerCheck.response
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
 
-    const body = await c.req.json().catch(() => ({})) as { api_key?: string; apiKey?: string }
-    const apiKey = String(body.api_key ?? body.apiKey ?? '').trim()
-    if (apiKey.length > MAX_GEMINI_API_KEY_CHARS) {
-        return c.json({ error: `Gemini API key too long (max ${MAX_GEMINI_API_KEY_CHARS} chars)` }, 400)
+    const body = await c.req.json().catch(() => ({})) as { api_key?: string; apiKey?: string; api_keys?: string[]; apiKeys?: string[]; preserve_existing?: boolean }
+    const rawIncomingKeys = Array.isArray(body.api_keys)
+        ? body.api_keys
+        : Array.isArray(body.apiKeys)
+            ? body.apiKeys
+            : [String(body.api_key ?? body.apiKey ?? '').trim()]
+    const preserveExisting = body.preserve_existing !== false
+
+    for (const raw of rawIncomingKeys) {
+        const key = String(raw || '').trim()
+        if (key.length > MAX_GEMINI_API_KEY_CHARS) {
+            return c.json({ error: `Gemini API key too long (max ${MAX_GEMINI_API_KEY_CHARS} chars)` }, 400)
+        }
     }
 
     const namespaceId = c.get('botId')
-    await setNamespaceGeminiApiKey(c.env.DB, namespaceId, apiKey)
+    const incomingTrimmed = rawIncomingKeys.map((value) => String(value || '').trim())
+    const nextKeys = incomingTrimmed.some(Boolean)
+        ? preserveExisting
+            ? (() => {
+                const build = async () => {
+                    const existing = (await getSystemGeminiApiKeyEntries(c.env.DB)).keys
+                    const merged: string[] = []
+                    for (let index = 0; index < MAX_GEMINI_API_KEY_SLOTS; index += 1) {
+                        const incoming = String(incomingTrimmed[index] || '').trim()
+                        const current = String(existing[index] || '').trim()
+                        merged.push(incoming || current)
+                    }
+                    return merged
+                }
+                return build()
+            })()
+            : Promise.resolve(incomingTrimmed)
+        : Promise.resolve([])
+    await setSystemGeminiApiKeys(c.env.DB, await nextKeys)
     const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
         max_chars: MAX_GEMINI_API_KEY_CHARS,
+        max_slots: MAX_GEMINI_API_KEY_SLOTS,
     })
 })
 
 app.delete('/api/settings/gemini-key', async (c) => {
-    const ownerCheck = await requireAuthSession(c)
-    if (!ownerCheck.ok) return ownerCheck.response
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
 
     const namespaceId = c.get('botId')
-    await setNamespaceGeminiApiKey(c.env.DB, namespaceId, '')
+    await setSystemGeminiApiKeys(c.env.DB, [])
     const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
         max_chars: MAX_GEMINI_API_KEY_CHARS,
+        max_slots: MAX_GEMINI_API_KEY_SLOTS,
     })
 })
 
@@ -3937,8 +4388,7 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
     const existing = await db.prepare('SELECT namespace_id FROM line_users WHERE line_user_id = ?')
         .bind(lineUserId).first() as { namespace_id?: string } | null
     if (existing?.namespace_id) return existing.namespace_id
-    // Create a new namespace using a short random ID prefixed with "line_"
-    const namespaceId = 'line_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+    const namespaceId = createOwnerWorkspaceId()
     await db.prepare(
         'INSERT INTO line_users (line_user_id, namespace_id, display_name) VALUES (?, ?, ?)'
     ).bind(lineUserId, namespaceId, String(displayName || '').trim().slice(0, 200)).run()
@@ -3992,18 +4442,27 @@ function getLineAffiliateTheme(kind: LineAffiliateLinkKind) {
     }
 }
 
-function buildLineAffiliatePromptFlex(params: {
+function buildLineCompactFlexCard(params: {
+    altText?: string
+    pillText: string
     title: string
-    brand: LineAffiliateLinkKind
-    message?: string
-    hint?: string
-    footer?: string
+    message: string
+    primary: string
+    primaryDark: string
+    surface: string
+    detailLabel?: string
+    detailText?: string
+    actionLabel?: string
+    actionUrl?: string
 }): LineReplyMessage {
-    const theme = getLineAffiliateTheme(params.brand)
-    const footer = params.footer || `วางลิงก์ ${theme.brand} ของคลิปนี้ตอบกลับมาในแชตนี้ได้เลย`
+    const detailLabel = String(params.detailLabel || '').trim()
+    const detailText = String(params.detailText || '').trim()
+    const actionLabel = String(params.actionLabel || '').trim()
+    const actionUrl = String(params.actionUrl || '').trim()
+
     return {
         type: 'flex',
-        altText: `${params.title} ส่งลิงก์ ${theme.brand} ของคลิปนี้มาเลย`,
+        altText: params.altText || `${params.title} ${params.message}`,
         contents: {
             type: 'bubble',
             size: 'mega',
@@ -4011,6 +4470,7 @@ function buildLineAffiliatePromptFlex(params: {
                 type: 'box',
                 layout: 'vertical',
                 spacing: 'md',
+                paddingAll: '16px',
                 contents: [
                     {
                         type: 'box',
@@ -4018,29 +4478,28 @@ function buildLineAffiliatePromptFlex(params: {
                         spacing: 'md',
                         paddingAll: '16px',
                         cornerRadius: '20px',
-                        backgroundColor: theme.primary,
+                        backgroundColor: params.primary,
                         contents: [
                             {
                                 type: 'box',
                                 layout: 'horizontal',
-                                alignItems: 'center',
-                                spacing: 'sm',
+                                justifyContent: 'center',
                                 contents: [
                                     {
                                         type: 'box',
                                         layout: 'vertical',
-                                        cornerRadius: '16px',
+                                        cornerRadius: '999px',
                                         paddingTop: '4px',
                                         paddingBottom: '4px',
-                                        paddingStart: '10px',
-                                        paddingEnd: '10px',
+                                        paddingStart: '12px',
+                                        paddingEnd: '12px',
                                         backgroundColor: '#FFFFFF',
                                         contents: [{
                                             type: 'text',
-                                            text: `${theme.icon} ${theme.brand}`,
+                                            text: params.pillText,
                                             size: 'xs',
                                             weight: 'bold',
-                                            color: theme.primaryDark,
+                                            color: params.primaryDark,
                                             align: 'center',
                                         }],
                                     },
@@ -4056,57 +4515,84 @@ function buildLineAffiliatePromptFlex(params: {
                             },
                             {
                                 type: 'text',
-                                text: params.message || `ส่งลิงก์ ${theme.brand} ของคลิปนี้มาเลย`,
+                                text: params.message,
                                 size: 'sm',
                                 wrap: true,
                                 color: '#FFF7F5',
                             },
                         ],
                     },
-                    {
+                    ...(detailLabel && detailText ? [{
                         type: 'box',
                         layout: 'vertical',
-                        spacing: 'sm',
+                        spacing: 'xs',
                         paddingAll: '14px',
                         cornerRadius: '16px',
-                        backgroundColor: theme.tint,
+                        backgroundColor: params.surface,
                         contents: [
                             {
                                 type: 'text',
-                                text: 'ขั้นตอนนี้',
+                                text: detailLabel,
                                 size: 'xs',
                                 weight: 'bold',
-                                color: theme.primary,
+                                color: params.primary,
                             },
                             {
                                 type: 'text',
-                                text: params.hint || `ส่งเฉพาะลิงก์ ${theme.brand} ของคลิปนี้ก่อน`,
-                                size: 'sm',
+                                text: detailText,
+                                size: 'md',
+                                weight: 'bold',
                                 wrap: true,
-                                color: theme.note,
+                                color: '#111827',
                             },
                         ],
-                    },
-                    {
-                        type: 'box',
-                        layout: 'vertical',
-                        paddingAll: '12px',
-                        cornerRadius: '14px',
-                        backgroundColor: theme.tintStrong,
-                        contents: [{
-                            type: 'text',
-                            text: footer,
-                            size: 'sm',
-                            weight: 'bold',
-                            wrap: true,
-                            color: theme.primaryDark,
-                            align: 'center',
-                        }],
-                    },
+                    }] : []),
                 ],
             },
+            ...(actionLabel && actionUrl ? {
+                footer: {
+                    type: 'box',
+                    layout: 'vertical',
+                    spacing: 'sm',
+                    paddingTop: '0px',
+                    paddingBottom: '16px',
+                    paddingStart: '16px',
+                    paddingEnd: '16px',
+                    contents: [
+                        {
+                            type: 'button',
+                            style: 'primary',
+                            height: 'sm',
+                            color: params.primary,
+                            action: {
+                                type: 'uri',
+                                label: actionLabel,
+                                uri: actionUrl,
+                            },
+                        },
+                    ],
+                },
+            } : {}),
         },
     }
+}
+
+function buildLineAffiliatePromptFlex(params: {
+    title: string
+    brand: LineAffiliateLinkKind
+    message?: string
+}): LineReplyMessage {
+    const theme = getLineAffiliateTheme(params.brand)
+    const message = params.message || `ส่งลิงก์ ${theme.brand} มาเลย`
+    return buildLineCompactFlexCard({
+        altText: `${params.title} ${message}`,
+        pillText: `${theme.icon} ${theme.brand}`,
+        title: params.title,
+        message,
+        primary: theme.primary,
+        primaryDark: theme.primaryDark,
+        surface: theme.tint,
+    })
 }
 
 function buildLineProcessingReadyFlex(params: {
@@ -4123,158 +4609,21 @@ function buildLineProcessingReadyFlex(params: {
     const primary = processed ? '#0F766E' : '#2563EB'
     const primaryDark = processed ? '#115E59' : '#1D4ED8'
     const surface = processed ? '#ECFDF5' : '#EFF6FF'
-    const surfaceStrong = processed ? '#D1FAE5' : '#DBEAFE'
     const statusText = String(params.statusLabel || '').trim()
-    const detailNote = String(params.note || '').trim()
     const videoId = String(params.videoId || '').trim()
-    return {
-        type: 'flex',
-        altText: params.title,
-        contents: {
-            type: 'bubble',
-            size: 'mega',
-            header: {
-                type: 'box',
-                layout: 'vertical',
-                spacing: 'sm',
-                paddingAll: '18px',
-                backgroundColor: primary,
-                contents: [
-                    {
-                        type: 'box',
-                        layout: 'horizontal',
-                        justifyContent: 'space-between',
-                        alignItems: 'center',
-                        contents: [
-                            {
-                                type: 'text',
-                                text: processed ? 'พร้อมใช้งาน' : 'Processing',
-                                size: 'xs',
-                                weight: 'bold',
-                                color: '#FFFFFFB3',
-                            },
-                            {
-                                type: 'box',
-                                layout: 'vertical',
-                                paddingTop: '4px',
-                                paddingBottom: '4px',
-                                paddingStart: '10px',
-                                paddingEnd: '10px',
-                                cornerRadius: '999px',
-                                backgroundColor: '#FFFFFF',
-                                contents: [{
-                                    type: 'text',
-                                    text: statusText,
-                                    size: 'xs',
-                                    weight: 'bold',
-                                    color: primaryDark,
-                                    align: 'center',
-                                }],
-                            },
-                        ],
-                    },
-                    {
-                        type: 'text',
-                        text: params.title,
-                        size: 'xl',
-                        weight: 'bold',
-                        wrap: true,
-                        color: '#FFFFFF',
-                    },
-                    {
-                        type: 'text',
-                        text: params.message,
-                        size: 'sm',
-                        wrap: true,
-                        color: '#FFFFFFE6',
-                    },
-                ],
-            },
-            body: {
-                type: 'box',
-                layout: 'vertical',
-                spacing: 'md',
-                paddingAll: '16px',
-                contents: [
-                    videoId
-                        ? {
-                            type: 'box',
-                            layout: 'vertical',
-                            spacing: 'xs',
-                            paddingAll: '14px',
-                            cornerRadius: '16px',
-                            backgroundColor: surface,
-                            contents: [
-                                {
-                                    type: 'text',
-                                    text: 'Video ID',
-                                    size: 'xs',
-                                    weight: 'bold',
-                                    color: primary,
-                                },
-                                {
-                                    type: 'text',
-                                    text: videoId,
-                                    size: 'md',
-                                    weight: 'bold',
-                                    wrap: true,
-                                    color: '#111827',
-                                },
-                            ],
-                        }
-                        : {
-                            type: 'separator',
-                            color: '#FFFFFF',
-                        },
-                    {
-                        type: 'box',
-                        layout: 'vertical',
-                        spacing: 'xs',
-                        paddingAll: '14px',
-                        cornerRadius: '16px',
-                        backgroundColor: surfaceStrong,
-                        contents: [
-                            {
-                                type: 'text',
-                                text: processed ? 'อัปเดตล่าสุด' : 'ขั้นตอนถัดไป',
-                                size: 'xs',
-                                weight: 'bold',
-                                color: primaryDark,
-                            },
-                            {
-                                type: 'text',
-                                text: detailNote || (processed
-                                    ? 'เปิด Gallery เพื่อตรวจสอบคลิปที่อัปเดตลิงก์แล้ว'
-                                    : 'กดปุ่มด้านล่างเพื่อเปิดหน้าประมวลผลและดูสถานะแบบเรียลไทม์'),
-                                size: 'sm',
-                                wrap: true,
-                                color: '#1F2937',
-                            },
-                        ],
-                    },
-                ],
-            },
-            footer: {
-                type: 'box',
-                layout: 'vertical',
-                spacing: 'sm',
-                paddingAll: '16px',
-                contents: [
-                    {
-                        type: 'button',
-                        style: 'primary',
-                        height: 'sm',
-                        color: primary,
-                        action: {
-                            type: 'uri',
-                            label: params.actionLabel,
-                            uri: params.actionUrl,
-                        },
-                    },
-                ],
-            },
-        },
-    }
+    return buildLineCompactFlexCard({
+        altText: `${params.title} ${params.message}`,
+        pillText: processed ? '✅ Gallery' : `⚙️ ${statusText || 'Processing'}`,
+        title: params.title,
+        message: params.message,
+        primary,
+        primaryDark,
+        surface,
+        detailLabel: videoId ? 'Video ID' : '',
+        detailText: videoId,
+        actionLabel: params.actionLabel,
+        actionUrl: params.actionUrl,
+    })
 }
 
 async function replyLineProcessingResult(params: {
@@ -4291,12 +4640,11 @@ async function replyLineProcessingResult(params: {
         await lineReply(params.replyToken, params.channelAccessToken, [
             buildLineProcessingReadyFlex({
                 title: 'อัปเดตลิงก์เรียบร้อยแล้ว',
-                statusLabel: 'พร้อมใช้งาน',
-                message: 'คลิปนี้เคยประมวลผลแล้ว ผมอัปเดตลิงก์ให้รายการเดิมเรียบร้อย',
+                statusLabel: 'พร้อมใช้',
+                message: 'เปิด Gallery ได้เลย',
                 actionLabel: 'เปิด Gallery',
                 actionUrl: galleryUrl,
                 videoId,
-                note: 'ตรวจสอบคลิปเดิมหรือคัดลอกลิงก์จากหน้า Gallery ได้ทันที',
                 theme: 'processed',
             }),
         ])
@@ -4310,22 +4658,13 @@ async function replyLineProcessingResult(params: {
     await lineReply(params.replyToken, params.channelAccessToken, [
         buildLineProcessingReadyFlex({
             title: alreadyRunning
-                ? 'คลิปนี้อยู่ระหว่างประมวลผลแล้ว'
+                ? (queued ? 'รอคิวประมวลผล' : 'กำลังประมวลผลอยู่')
                 : 'รับลิงก์ครบแล้ว',
-            statusLabel: queued ? 'อยู่ในคิว' : 'กำลังประมวลผล',
-            message: alreadyRunning
-                ? (queued
-                    ? 'คลิปนี้อยู่ในคิวประมวลผลแล้ว ผมจะรันต่อให้อัตโนมัติ'
-                    : 'คลิปนี้กำลังประมวลผลอยู่แล้ว ไม่ต้องส่งซ้ำ')
-                : (queued
-                    ? 'ผมส่งคลิปเข้า Queue ให้แล้ว ระบบจะประมวลผลให้อัตโนมัติ'
-                    : 'ผมเริ่มประมวลผลให้อัตโนมัติแล้ว'),
-            actionLabel: 'เปิดหน้าประมวลผล',
+            statusLabel: queued ? 'รอคิว' : 'Processing',
+            message: 'เปิด Processing ได้เลย',
+            actionLabel: 'เปิด Processing',
             actionUrl: processingUrl,
             videoId,
-            note: queued
-                ? 'เปิดหน้า Processing เพื่อติดตามคิวและสถานะของคลิปนี้'
-                : 'เปิดหน้า Processing เพื่อติดตามความคืบหน้าของคลิปนี้แบบเรียลไทม์',
             theme: 'processing',
         }),
     ])
@@ -4351,6 +4690,33 @@ async function lineReply(
         },
         body: JSON.stringify({ replyToken, messages: enriched }),
     })
+}
+
+async function linePushMessage(
+    channelAccessToken: string,
+    lineUserId: string,
+    messages: LineReplyMessage[],
+): Promise<{ ok: boolean; error?: string }> {
+    const token = String(channelAccessToken || '').trim()
+    const userId = String(lineUserId || '').trim()
+    if (!token || !userId) return { ok: false, error: 'missing_token_or_user_id' }
+    try {
+        const resp = await fetch('https://api.line.me/v2/bot/message/push', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+            },
+            body: JSON.stringify({ to: userId, messages }),
+        })
+        if (!resp.ok) {
+            const errText = await resp.text().catch(() => '')
+            return { ok: false, error: `HTTP ${resp.status}: ${errText.slice(0, 200)}` }
+        }
+        return { ok: true }
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
 }
 
 async function fetchLineUserProfile(
@@ -4459,8 +4825,8 @@ app.post('/api/line/liff-login', async (c) => {
 
     // Check if this LINE user is linked to an existing email account
     const linkedRow = await c.env.DB.prepare(
-        'SELECT email, status FROM line_users WHERE line_user_id = ?'
-    ).bind(lineUserId).first().catch(() => null) as { email?: string; status?: string } | null
+        'SELECT email, status, namespace_id FROM line_users WHERE line_user_id = ?'
+    ).bind(lineUserId).first().catch(() => null) as { email?: string; status?: string; namespace_id?: string } | null
     const linkedEmail = String(linkedRow?.email || '').trim()
     const existingStatus = String(linkedRow?.status || '').trim()
 
@@ -4482,62 +4848,82 @@ app.post('/api/line/liff-login', async (c) => {
         if (!namespaceId) {
             namespaceId = await resolveLineNamespace(c.env.DB, lineUserId, displayName)
         }
-        isOwner = await isNamespaceOwner(c.env.DB, email)
+        isOwner = await isNamespaceOwnerIdentity(c.env.DB, email, namespaceId)
         isSysAdmin = isOwner ? await isSystemAdmin(c.env.DB, email) : false
     } else {
         email = `line_${lineUserId}@line.local`
         const inviteNs = String(body.invite_namespace || '').trim()
+        const syntheticSysAdmin = await isSystemAdmin(c.env.DB, email)
 
-        // Check if already a team member somewhere
-        const existingTeam = await c.env.DB.prepare(
-            'SELECT owner_namespace_id FROM team_members WHERE email = ? LIMIT 1'
-        ).bind(email).first().catch(() => null) as { owner_namespace_id?: string } | null
-
-        if (inviteNs && !linkedRow) {
-            // New user from invite link → join inviter's namespace as Team
-            namespaceId = inviteNs
-            isOwner = false
-            // Add as team member
+        if (syntheticSysAdmin) {
+            const syntheticTeamMember = await isTeamMemberEmail(c.env.DB, email)
+            namespaceId = await resolveManagedWorkspaceForRole(
+                c.env.DB,
+                email,
+                String(linkedRow?.namespace_id || '').trim(),
+                syntheticTeamMember ? String(linkedRow?.namespace_id || '').trim() : ''
+            )
+            await upsertOwnerNamespaceMapping(c.env.DB, email, namespaceId)
             await c.env.DB.prepare(
-                `INSERT INTO team_members (owner_namespace_id, email) VALUES (?, ?) ON CONFLICT DO NOTHING`
-            ).bind(inviteNs, email).run().catch(() => {})
-            // Remove one pending invite
-            const pending = await c.env.DB.prepare(
-                `SELECT email FROM team_members WHERE owner_namespace_id = ? AND email LIKE 'invite_%' LIMIT 1`
-            ).bind(inviteNs).first() as { email?: string } | null
-            if (pending?.email) {
-                await c.env.DB.prepare(
-                    `DELETE FROM team_members WHERE owner_namespace_id = ? AND email = ?`
-                ).bind(inviteNs, pending.email).run().catch(() => {})
-            }
-        } else if (existingTeam?.owner_namespace_id) {
-            // Existing team member → use team namespace
-            namespaceId = existingTeam.owner_namespace_id
-            isOwner = false
-        } else {
-            // Regular new user → create own namespace as Member
-            namespaceId = await resolveLineNamespace(c.env.DB, lineUserId, displayName)
-            await c.env.DB.prepare(
-                `INSERT INTO email_namespaces (email, namespace_id) VALUES (?, ?) ON CONFLICT(email) DO UPDATE SET namespace_id = excluded.namespace_id`
-            ).bind(email, namespaceId).run().catch(() => { })
+                'DELETE FROM team_members WHERE lower(trim(email)) = ?'
+            ).bind(email).run().catch(() => { })
             isOwner = true
+            isSysAdmin = true
+        } else {
+            // Check if already a team member somewhere
+            const existingTeam = await c.env.DB.prepare(
+                'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
+            ).bind(String(email || '').trim().toLowerCase()).first().catch(() => null) as { owner_namespace_id?: string } | null
+
+            if (inviteNs) {
+                // Invite link always wins for synthetic LINE accounts.
+                // This fixes users who first entered as standalone Member and later accepted a Team invite.
+                namespaceId = inviteNs
+                isOwner = false
+                await c.env.DB.prepare(
+                    `DELETE FROM email_namespaces WHERE email = ?`
+                ).bind(email).run().catch(() => { })
+                await c.env.DB.prepare(
+                    `DELETE FROM team_members WHERE lower(trim(email)) = ? AND owner_namespace_id <> ?`
+                ).bind(email, inviteNs).run().catch(() => { })
+                // Add as team member
+                await c.env.DB.prepare(
+                    `INSERT INTO team_members (owner_namespace_id, email) VALUES (?, ?) ON CONFLICT DO NOTHING`
+                ).bind(inviteNs, email).run().catch(() => {})
+                // Remove one pending invite
+                const pending = await c.env.DB.prepare(
+                    `SELECT email FROM team_members WHERE owner_namespace_id = ? AND email LIKE 'invite_%' LIMIT 1`
+                ).bind(inviteNs).first() as { email?: string } | null
+                if (pending?.email) {
+                    await c.env.DB.prepare(
+                        `DELETE FROM team_members WHERE owner_namespace_id = ? AND email = ?`
+                    ).bind(inviteNs, pending.email).run().catch(() => {})
+                }
+            } else if (existingTeam?.owner_namespace_id) {
+                // Existing team member → use team namespace
+                namespaceId = existingTeam.owner_namespace_id
+                isOwner = false
+            } else {
+                // Regular new user → create own namespace as Member
+                namespaceId = await resolveLineNamespace(c.env.DB, lineUserId, displayName)
+                await c.env.DB.prepare(
+                    `INSERT INTO email_namespaces (email, namespace_id) VALUES (?, ?) ON CONFLICT(email) DO UPDATE SET namespace_id = excluded.namespace_id`
+                ).bind(email, namespaceId).run().catch(() => { })
+                isOwner = true
+            }
+            isSysAdmin = false
         }
-        isSysAdmin = false
     }
 
-    // Determine approval status
-    // System admins are always auto-approved
+    // Team members (invited) are auto-approved, Members (self-registered) need admin approval
     const isAdminEmail = isSysAdmin || (hasRealLink && await isSystemAdmin(c.env.DB, email))
+    const isTeamMember = !isOwner && !!namespaceId // came from invite or existing team
     let userStatus: string
-    if (isAdminEmail) {
+    if (isAdminEmail || isTeamMember) {
         userStatus = 'approved'
     } else if (existingStatus === 'approved') {
         userStatus = 'approved'
-    } else if (linkedRow) {
-        // Existing user but not yet approved
-        userStatus = existingStatus || 'pending'
     } else {
-        // Brand new user
         userStatus = 'pending'
     }
 
@@ -4589,6 +4975,8 @@ app.post('/api/line/liff-login', async (c) => {
         email,
         is_owner: isOwner,
         is_system_admin: isSysAdmin,
+        is_team_member: isTeamMember,
+        line_user_id: lineUserId,
         line_display_name: displayName,
         line_picture_url: pictureUrl,
     })
@@ -4596,13 +4984,44 @@ app.post('/api/line/liff-login', async (c) => {
 
 // ==================== USER APPROVAL ADMIN ENDPOINTS ====================
 
+app.get('/api/admin/members', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    await ensureLineUsersTable(c.env.DB)
+    const { results } = await c.env.DB.prepare(
+        `WITH team_roles AS (
+            SELECT lower(trim(email)) AS email_key, MIN(owner_namespace_id) AS owner_namespace_id
+            FROM team_members
+            GROUP BY lower(trim(email))
+        )
+         SELECT
+            l.line_user_id,
+            l.display_name,
+            l.picture_url,
+            l.email,
+            l.namespace_id,
+            l.status,
+            l.created_at,
+            l.updated_at,
+            tr.owner_namespace_id AS team_owner_namespace_id,
+            CASE
+                WHEN sa.email IS NOT NULL THEN 'admin'
+                WHEN tr.owner_namespace_id IS NOT NULL THEN 'team'
+                ELSE 'member'
+            END AS role
+         FROM line_users l
+         LEFT JOIN team_roles tr ON tr.email_key = lower(trim(l.email))
+         LEFT JOIN system_admins sa ON lower(trim(sa.email)) = lower(trim(l.email))
+         ORDER BY datetime(l.updated_at) DESC, datetime(l.created_at) DESC
+         LIMIT 500`
+    ).all()
+    return c.json({ members: results || [] })
+})
+
 app.get('/api/admin/pending-users', async (c) => {
-    const token = c.req.header('x-auth-token') || ''
-    if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
-    const me = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(token).first() as { email?: string } | null
-    if (!me?.email) return c.json({ error: 'Unauthorized' }, 401)
-    const sysAdmin = await isSystemAdmin(c.env.DB, String(me.email))
-    if (!sysAdmin) return c.json({ error: 'Forbidden' }, 403)
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
 
     await ensureLineUsersTable(c.env.DB)
     const { results } = await c.env.DB.prepare(
@@ -4616,12 +5035,8 @@ app.get('/api/admin/pending-users', async (c) => {
 })
 
 app.post('/api/admin/approve-user', async (c) => {
-    const token = c.req.header('x-auth-token') || ''
-    if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
-    const me = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(token).first() as { email?: string } | null
-    if (!me?.email) return c.json({ error: 'Unauthorized' }, 401)
-    const sysAdmin = await isSystemAdmin(c.env.DB, String(me.email))
-    if (!sysAdmin) return c.json({ error: 'Forbidden' }, 403)
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
 
     const body = await c.req.json().catch(() => ({})) as { line_user_id?: string }
     const lineUserId = String(body.line_user_id || '').trim()
@@ -4632,27 +5047,69 @@ app.post('/api/admin/approve-user', async (c) => {
         `UPDATE line_users SET status = 'approved', updated_at = datetime('now') WHERE line_user_id = ?`
     ).bind(lineUserId).run()
 
+    const approvedUser = await c.env.DB.prepare(
+        'SELECT email, namespace_id FROM line_users WHERE line_user_id = ?'
+    ).bind(lineUserId).first() as { email?: string; namespace_id?: string } | null
+    const approvedEmail = String(approvedUser?.email || '').trim().toLowerCase()
+    const approvedNamespaceId = String(approvedUser?.namespace_id || '').trim()
+    const isTeam = approvedEmail
+        ? await isTeamMemberEmail(c.env.DB, approvedEmail)
+        : false
+
+    if (approvedEmail && approvedNamespaceId && !isTeam) {
+        await c.env.DB.prepare(
+            `INSERT INTO email_namespaces (email, namespace_id) VALUES (?, ?) ON CONFLICT(email) DO UPDATE SET namespace_id = excluded.namespace_id`
+        ).bind(approvedEmail, approvedNamespaceId).run().catch(() => { })
+    }
+    if (approvedEmail && approvedNamespaceId) {
+        await upsertUserWorkspaceByEmail(c.env.DB, approvedEmail, approvedNamespaceId)
+    }
+
     return c.json({ ok: true })
 })
 
 app.post('/api/admin/reject-user', async (c) => {
-    const token = c.req.header('x-auth-token') || ''
-    if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
-    const me = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(token).first() as { email?: string } | null
-    if (!me?.email) return c.json({ error: 'Unauthorized' }, 401)
-    const sysAdmin = await isSystemAdmin(c.env.DB, String(me.email))
-    if (!sysAdmin) return c.json({ error: 'Forbidden' }, 403)
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
 
     const body = await c.req.json().catch(() => ({})) as { line_user_id?: string }
     const lineUserId = String(body.line_user_id || '').trim()
     if (!lineUserId) return c.json({ error: 'line_user_id required' }, 400)
 
     await ensureLineUsersTable(c.env.DB)
+    const rejectedUser = await c.env.DB.prepare(
+        'SELECT email FROM line_users WHERE line_user_id = ? LIMIT 1'
+    ).bind(lineUserId).first().catch(() => null) as { email?: string } | null
+    const rejectedEmail = String(rejectedUser?.email || '').trim().toLowerCase()
     await c.env.DB.prepare(
         `DELETE FROM line_users WHERE line_user_id = ?`
     ).bind(lineUserId).run()
+    if (rejectedEmail) {
+        await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(rejectedEmail).run().catch(() => { })
+        await c.env.DB.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ?').bind(rejectedEmail).run().catch(() => { })
+        await c.env.DB.prepare('DELETE FROM system_admins WHERE lower(trim(email)) = ?').bind(rejectedEmail).run().catch(() => { })
+        await c.env.DB.prepare('DELETE FROM users WHERE lower(trim(email)) = ?').bind(rejectedEmail).run().catch(() => { })
+    }
 
     return c.json({ ok: true })
+})
+
+app.post('/api/admin/members/role', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    const body = await c.req.json().catch(() => ({})) as { line_user_id?: string; role?: string }
+    const lineUserId = String(body.line_user_id || '').trim()
+    const role = String(body.role || '').trim().toLowerCase()
+    if (!lineUserId) return c.json({ error: 'line_user_id required' }, 400)
+    if (!['admin', 'member', 'team'].includes(role)) return c.json({ error: 'invalid_role' }, 400)
+
+    try {
+        const result = await assignLineUserRole(c.env.DB, lineUserId, role, adminCheck.namespaceId)
+        return c.json({ ok: true, ...result })
+    } catch (error) {
+        return c.json({ error: error instanceof Error ? error.message : String(error) }, 400)
+    }
 })
 
 async function handleLineEvent(event: any, env: Env, channelAccessToken: string) {
@@ -4759,7 +5216,7 @@ async function handleLineVideoMessage(params: {
         await putInboxVideoRecord(bucket, {
             id: videoId,
             videoUrl: originalVideoUrl,
-            chatId: Number(lineUserId.replace(/\D/g, '').slice(0, 15)) || 1,
+            chatId: deriveLineSubmissionChatId(lineUserId),
             sourceType: 'line_video',
             sourceLabel: 'LINE video',
             createdAt: new Date().toISOString(),
@@ -4781,8 +5238,7 @@ async function handleLineVideoMessage(params: {
             buildLineAffiliatePromptFlex({
                 title: 'รับวิดีโอแล้ว',
                 brand: 'shopee',
-                message: 'ส่งลิงก์ Shopee ของคลิปนี้มาเลย',
-                hint: 'ผมกำลังรอลิงก์ Shopee ของคลิปนี้อยู่',
+                message: 'ส่งลิงก์ Shopee มาเลย',
             }),
         ])
     } catch (e) {
@@ -4862,7 +5318,7 @@ async function handleLineTextMessage(params: {
         const inboxRecord = await putInboxVideoRecord(bucket, {
             id: videoId,
             videoUrl: r2VideoUrl,
-            chatId: Number(lineUserId.replace(/\D/g, '').slice(0, 15)) || 1,
+            chatId: deriveLineSubmissionChatId(lineUserId),
             sourceType: 'xhs_url',
             sourceLabel: xhsUrl,
             shopeeLink: shopeeLink || undefined,
@@ -4905,14 +5361,11 @@ async function handleLineTextMessage(params: {
 
             await lineReply(replyToken, channelAccessToken, [
                 buildLineAffiliatePromptFlex({
-                    title: 'รับลิงก์ XHS แล้ว',
+                    title: 'รับ XHS แล้ว',
                     brand: shopeeLink ? 'lazada' : 'shopee',
                     message: shopeeLink
-                        ? 'ส่งลิงก์ Lazada ของคลิปนี้ต่อได้เลย'
-                        : 'ส่งลิงก์ Shopee ของคลิปนี้มาเลย',
-                    hint: shopeeLink
-                        ? 'ขั้นตอนนี้รอลิงก์ Lazada ของคลิปนี้อยู่'
-                        : 'ขั้นตอนนี้รอลิงก์ Shopee ของคลิปนี้อยู่',
+                        ? 'ส่งลิงก์ Lazada มาเลย'
+                        : 'ส่งลิงก์ Shopee มาเลย',
                 }),
             ])
         }
@@ -4946,14 +5399,11 @@ async function handleLineTextMessage(params: {
             const hasLazada = !!String(waitingState?.lazadaLink || '').trim()
             await lineReply(replyToken, channelAccessToken, [
                 buildLineAffiliatePromptFlex({
-                    title: 'ยังรอลิงก์ affiliate ของคลิปนี้อยู่',
+                    title: hasShopee ? 'รอ Lazada' : 'รอ Shopee',
                     brand: hasShopee ? 'lazada' : 'shopee',
                     message: hasShopee
-                        ? 'ส่งลิงก์ Lazada ของคลิปนี้ต่อได้เลย'
-                        : 'ส่งลิงก์ Shopee ของคลิปนี้มาเลย',
-                    hint: hasShopee
-                        ? 'ผมกำลังรอลิงก์ Lazada ของคลิปนี้อยู่'
-                        : 'ผมกำลังรอลิงก์ Shopee ของคลิปนี้อยู่',
+                        ? 'ส่งลิงก์ Lazada มาเลย'
+                        : 'ส่งลิงก์ Shopee มาเลย',
                 }),
             ])
             return
@@ -5005,8 +5455,7 @@ async function handleLineTextMessage(params: {
             buildLineAffiliatePromptFlex({
                 title: 'รับลิงก์ Lazada แล้ว',
                 brand: 'shopee',
-                message: 'ส่งลิงก์ Shopee ของคลิปนี้มาต่อเลย',
-                hint: 'ตอนนี้เหลือ Shopee link ของคลิปนี้อีกลิงก์เดียว',
+                message: 'ส่งลิงก์ Shopee มาเลย',
             }),
         ])
         return
@@ -5022,8 +5471,7 @@ async function handleLineTextMessage(params: {
             buildLineAffiliatePromptFlex({
                 title: 'รับลิงก์ Shopee แล้ว',
                 brand: 'lazada',
-                message: 'ส่งลิงก์ Lazada ของคลิปนี้ต่อได้เลย',
-                hint: 'ตอนนี้เหลือ Lazada link ของคลิปนี้อีกลิงก์เดียว',
+                message: 'ส่งลิงก์ Lazada มาเลย',
             }),
         ])
         return
@@ -5034,7 +5482,7 @@ async function handleLineTextMessage(params: {
         const inboxRecord = await putInboxVideoRecord(bucket, {
             id: waitingState.id,
             videoUrl: waitingState.videoUrl,
-            chatId: Number(lineUserId.replace(/\D/g, '').slice(0, 15)) || 1,
+            chatId: deriveLineSubmissionChatId(lineUserId),
             sourceType: (waitingState.sourceType as any) || 'line_video',
             sourceLabel: waitingState.sourceLabel || 'LINE video',
             shopeeLink: updatedShopee,
@@ -5567,13 +6015,13 @@ app.post('/api/telegram/:token?', async (c) => {
             if (missing === 'lazada') {
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
-                    text: 'ส่งลิ้ง Lazada ของคลิปนี้ต่อได้เลย 🧡',
+                    text: 'ส่งลิงก์ Lazada มาเลย',
                 })
                 return
             }
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
-                text: 'ส่งลิ้ง Shopee ของคลิปนี้มาเลย 🛒',
+                text: 'ส่งลิงก์ Shopee มาเลย',
             })
         }
         const upsertInboxFromWaitingState = async (state: WaitingVideoState) => {
@@ -5961,6 +6409,8 @@ type InboxVideoRecord = {
     sourceLabel: string
     shopeeLink?: string
     lazadaLink?: string
+    shopeeOriginalLink?: string
+    lazadaOriginalLink?: string
     linkRecordedAt?: string
 }
 
@@ -5968,10 +6418,12 @@ function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | und
     const id = String(input?.id || '').trim()
     const videoUrl = String(input?.videoUrl || '').trim()
     const chatId = Number(input?.chatId || 0)
-    if (!id || !videoUrl || !Number.isFinite(chatId) || chatId <= 0) return null
+    if (!id || !videoUrl || !Number.isFinite(chatId) || chatId < 0) return null
 
     const shopeeLink = pickFirstShopeeUrl(String(input?.shopeeLink || '')) || ''
     const lazadaLink = pickFirstLazadaUrl(String(input?.lazadaLink || '')) || ''
+    const shopeeOriginalLink = pickFirstShopeeUrl(String(input?.shopeeOriginalLink || '')) || shopeeLink
+    const lazadaOriginalLink = pickFirstLazadaUrl(String(input?.lazadaOriginalLink || '')) || lazadaLink
     const sourceTypeRaw = String(input?.sourceType || '').trim().toLowerCase()
     const sourceType: InboxVideoSourceType = sourceTypeRaw === 'xhs_url' ? 'xhs_url' : sourceTypeRaw === 'line_video' ? 'line_video' : 'telegram_video'
     const sourceLabelInput = String(input?.sourceLabel || '').trim()
@@ -5995,6 +6447,8 @@ function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | und
         sourceLabel,
         ...(shopeeLink ? { shopeeLink } : {}),
         ...(lazadaLink ? { lazadaLink } : {}),
+        ...(shopeeOriginalLink ? { shopeeOriginalLink } : {}),
+        ...(lazadaOriginalLink ? { lazadaOriginalLink } : {}),
         ...(String(input?.linkRecordedAt || '').trim() ? { linkRecordedAt: String(input?.linkRecordedAt || '').trim() } : {}),
     }
 }
@@ -6429,13 +6883,26 @@ async function hasActiveProcessingJob(bucket: R2Bucket): Promise<boolean> {
     return false
 }
 
+async function getProcessingJobStatus(bucket: R2Bucket, id: string): Promise<string> {
+    const normalizedId = String(id || '').trim()
+    if (!normalizedId) return ''
+    const obj = await bucket.get(`_processing/${normalizedId}.json`).catch(() => null)
+    if (!obj) return ''
+    const data = await obj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+    return String(data.status || '').trim().toLowerCase()
+}
+
 async function recordInboxLinkSubmissionIfNeeded(params: {
     db: D1Database
     bucket: R2Bucket
     namespaceId: string
     item: InboxVideoRecord
 }): Promise<InboxVideoRecord> {
-    if (params.item.status !== 'ready' || String(params.item.linkRecordedAt || '').trim()) return params.item
+    if (
+        params.item.status !== 'ready'
+        || String(params.item.linkRecordedAt || '').trim()
+        || Number(params.item.chatId || 0) <= 0
+    ) return params.item
 
     await recordLinkSubmission({
         db: params.db,
@@ -6455,6 +6922,237 @@ async function recordInboxLinkSubmissionIfNeeded(params: {
     return nextRecord
 }
 
+async function copyBucketObjectIfMissing(params: {
+    sourceBucket: R2Bucket
+    targetBucket: R2Bucket
+    sourceKey: string
+    targetKey: string
+    fallbackContentType?: string
+    replaceIfSizeDiffers?: boolean
+}): Promise<boolean> {
+    const sourceKey = String(params.sourceKey || '').trim()
+    const targetKey = String(params.targetKey || '').trim()
+    if (!sourceKey || !targetKey) return false
+
+    const sourceHead = await params.sourceBucket.head(sourceKey).catch(() => null)
+    if (!sourceHead) return false
+
+    const existing = await params.targetBucket.head(targetKey).catch(() => null)
+    const shouldReplaceExisting = !!existing && (
+        isLikelyInvalidStoredVideoObject(existing)
+        || (
+            params.replaceIfSizeDiffers === true
+            && Number(existing.size || 0) !== Number(sourceHead.size || 0)
+        )
+    )
+    if (existing && !shouldReplaceExisting) return true
+
+    const obj = await params.sourceBucket.get(sourceKey).catch(() => null)
+    if (!obj || !obj.body) return false
+
+    const contentType = String(
+        obj.httpMetadata?.contentType
+        || sourceHead.httpMetadata?.contentType
+        || params.fallbackContentType
+        || ''
+    ).trim()
+    await params.targetBucket.put(targetKey, obj.body, contentType
+        ? { httpMetadata: { contentType } }
+        : undefined
+    )
+    return true
+}
+
+async function syncImportedOriginalIntoNamespace(params: {
+    env: Env
+    targetNamespaceId: string
+    targetBucket: R2Bucket
+    sourceNamespaceId: string
+    sourceVideo: Record<string, unknown>
+    sourceBucket?: R2Bucket
+}): Promise<InboxVideoRecord | null> {
+    const targetNamespaceId = String(params.targetNamespaceId || '').trim()
+    const sourceNamespaceId = String(params.sourceNamespaceId || '').trim()
+    const videoId = String(params.sourceVideo.id || '').trim()
+    if (!targetNamespaceId || !sourceNamespaceId || !videoId || targetNamespaceId === sourceNamespaceId) return null
+
+    const sourceBucket = params.sourceBucket || (new BotBucket(params.env.BUCKET, sourceNamespaceId) as unknown as R2Bucket)
+    const sourceOriginalKey = await resolveGalleryAssetKey(sourceBucket, videoId, 'original').catch(() => '')
+    if (!sourceOriginalKey) return null
+    const sourceOriginalHead = await sourceBucket.head(sourceOriginalKey).catch(() => null)
+    if (!sourceOriginalHead) return null
+
+    const targetOriginalKey = getPrimaryOriginalVideoAssetKey(videoId)
+    await copyBucketObjectIfMissing({
+        sourceBucket,
+        targetBucket: params.targetBucket,
+        sourceKey: sourceOriginalKey,
+        targetKey: targetOriginalKey,
+        fallbackContentType: sourceOriginalHead.httpMetadata?.contentType || 'video/mp4',
+        replaceIfSizeDiffers: true,
+    })
+
+    const sourceOriginalThumbKey = await resolveGalleryAssetKey(sourceBucket, videoId, 'original-thumb').catch(() => '')
+    if (sourceOriginalThumbKey) {
+        await copyBucketObjectIfMissing({
+            sourceBucket,
+            targetBucket: params.targetBucket,
+            sourceKey: sourceOriginalThumbKey,
+            targetKey: getOriginalThumbnailAssetKey(videoId),
+            fallbackContentType: 'image/webp',
+            replaceIfSizeDiffers: true,
+        }).catch(() => false)
+    }
+
+    const existing = await getInboxVideoRecord(params.targetBucket, videoId).catch(() => null)
+    const sourceTypeRaw = String(params.sourceVideo.sourceType || params.sourceVideo.source_type || '').trim().toLowerCase()
+    const sourceType: InboxVideoSourceType = sourceTypeRaw === 'xhs_url'
+        ? 'xhs_url'
+        : sourceTypeRaw === 'telegram_video'
+            ? 'telegram_video'
+            : 'line_video'
+    const sourceLabelBase = String(
+        params.sourceVideo.sourceLabel ||
+        params.sourceVideo.source_label ||
+        params.sourceVideo.title ||
+        ''
+    ).trim()
+    const importedLabel = (sourceLabelBase
+        ? `${sourceLabelBase} • imported from ${sourceNamespaceId}`
+        : `imported from ${sourceNamespaceId}`
+    ).slice(0, 500)
+    const shopeeLink = getVideoSourceShopeeLink(params.sourceVideo) || ''
+    const lazadaLink = getVideoSourceLazadaLink(params.sourceVideo) || ''
+    const createdAt = String(existing?.createdAt || params.sourceVideo.createdAt || params.sourceVideo.created_at || '').trim() || new Date().toISOString()
+    const updatedAt = new Date().toISOString()
+
+    const nextRecord = await putInboxVideoRecord(params.targetBucket, {
+        id: videoId,
+        videoUrl: getVideoOriginalUrlForNamespace(params.env.R2_PUBLIC_URL, targetNamespaceId, videoId),
+        chatId: Number(existing?.chatId || 0),
+        createdAt,
+        updatedAt,
+        sourceType,
+        sourceLabel: importedLabel,
+        shopeeLink,
+        lazadaLink,
+        shopeeOriginalLink: shopeeLink,
+        lazadaOriginalLink: lazadaLink,
+        linkRecordedAt: String(existing?.linkRecordedAt || createdAt).trim() || createdAt,
+    })
+
+    await ensureImportedVideosTable(params.env.DB)
+    await params.env.DB.prepare(
+        `INSERT INTO imported_videos (namespace_id, video_id, source_namespace_id, imported_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(namespace_id, video_id) DO UPDATE SET
+            source_namespace_id = excluded.source_namespace_id,
+            imported_at = excluded.imported_at`
+    ).bind(targetNamespaceId, videoId, sourceNamespaceId, updatedAt).run().catch(() => { })
+
+    return nextRecord
+}
+
+async function prepareInboxVideoForManagedLinks(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    item: InboxVideoRecord
+    logPrefix: string
+}): Promise<InboxVideoRecord | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const item = normalizeInboxVideoRecord(params.item)
+    if (!namespaceId || !item || item.status !== 'ready') return null
+
+    const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false)
+    if (!shortlinkRequired) return item
+
+    const sourceShopeeLink = pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || ''
+    const sourceLazadaLink = pickFirstLazadaUrl(String(item.lazadaOriginalLink || item.lazadaLink || '')) || ''
+    if (!sourceShopeeLink || !sourceLazadaLink) return null
+
+    const [expectedUtmId, expectedLazadaMemberId] = await Promise.all([
+        resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, namespaceId).catch(() => ''),
+        resolveNamespaceLazadaExpectedMemberId(params.env.DB, namespaceId).catch(() => ''),
+    ])
+    const normalizedExpectedUtmId = normalizeShortlinkExpectedUtmId(expectedUtmId)
+
+    const nextConvertedAt = new Date().toISOString()
+    const shopeeTrace: {
+        utmSource?: string | null
+        status?: 'disabled' | 'shortened' | 'fallback'
+        error?: string | null
+    } = {}
+    let nextShopeeLink = await shortenShopeeLinkForNamespace({
+        env: params.env,
+        namespaceId,
+        shopeeLink: sourceShopeeLink,
+        logPrefix: `${params.logPrefix} SHOPEE`,
+        trace: shopeeTrace,
+    })
+    const shopeeReady = (
+        !!nextShopeeLink
+        && nextShopeeLink !== sourceShopeeLink
+        && shopeeTrace.status === 'shortened'
+        && (
+            !normalizedExpectedUtmId
+            || normalizeShortlinkExpectedUtmId(String(shopeeTrace.utmSource || '')) === normalizedExpectedUtmId
+        )
+    )
+    if (!shopeeReady) {
+        console.log(`[${params.logPrefix}] Admin managed Shopee shortlink not ready for ${item.id}`)
+        return null
+    }
+
+    let lazadaTrace: {
+        utmSource?: string | null
+        memberId?: string | null
+        status?: 'disabled' | 'shortened' | 'fallback'
+        error?: string | null
+    } = {}
+    let nextLazadaLink = await shortenLazadaLinkForNamespace({
+        env: params.env,
+        namespaceId,
+        lazadaLink: sourceLazadaLink,
+        logPrefix: `${params.logPrefix} LAZADA`,
+        trace: lazadaTrace,
+    })
+    const normalizedMemberId = normalizeLazadaMemberId(String(lazadaTrace.memberId || ''))
+    const lazadaReady = !!nextLazadaLink && (
+        nextLazadaLink !== sourceLazadaLink
+        && lazadaTrace.status === 'shortened'
+        && isLikelyConvertedLazadaLink(nextLazadaLink)
+        && (!expectedLazadaMemberId || normalizedMemberId === expectedLazadaMemberId)
+    )
+    if (!lazadaReady) {
+        console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}`)
+        return null
+    }
+
+    await upsertNamespaceVideoState(params.env.DB, namespaceId, item.id, {
+        shopee_link: nextShopeeLink,
+        lazada_link: nextLazadaLink,
+        shopee_original_link: sourceShopeeLink,
+        lazada_original_link: sourceLazadaLink,
+        shopee_converted_at: nextConvertedAt,
+        lazada_converted_at: nextConvertedAt,
+        lazada_member_id: normalizedMemberId,
+    })
+
+    if (nextShopeeLink === item.shopeeLink && nextLazadaLink === item.lazadaLink) {
+        return item
+    }
+
+    return putInboxVideoRecord(params.bucket, {
+        ...item,
+        shopeeLink: nextShopeeLink,
+        lazadaLink: nextLazadaLink,
+        shopeeOriginalLink: sourceShopeeLink,
+        lazadaOriginalLink: sourceLazadaLink,
+        updatedAt: new Date().toISOString(),
+    })
+}
+
 async function startInboxVideoProcessing(params: {
     env: Env
     bucket: R2Bucket
@@ -6471,6 +7169,8 @@ async function startInboxVideoProcessing(params: {
         videoUrl: item.videoUrl,
         shopeeLink: String(item.shopeeLink || '').trim(),
         lazadaLink: String(item.lazadaLink || '').trim(),
+        shopeeOriginalLink: String(item.shopeeOriginalLink || item.shopeeLink || '').trim(),
+        lazadaOriginalLink: String(item.lazadaOriginalLink || item.lazadaLink || '').trim(),
         chatId: item.chatId,
         createdAt: nowIso,
     }), {
@@ -6740,9 +7440,119 @@ app.post('/api/inbox/:id/process', async (c) => {
         const id = String(c.req.param('id') || '').trim()
         if (!id) return c.json({ error: 'missing_id' }, 400)
 
-        const item = await getInboxVideoRecord(c.get('bucket'), id)
+        const requestedNamespaceId = String(c.req.query('namespace_id') || '').trim()
+        const currentNamespaceId = String(c.get('botId') || '').trim()
+        let processBucket = c.get('bucket')
+
+        // Try current namespace first
+        let item = await getInboxVideoRecord(processBucket, id)
+
+        // If not found and a different namespace was requested, look there and copy to current
+        if (!item && requestedNamespaceId && requestedNamespaceId !== currentNamespaceId) {
+            const sourceBucket = new BotBucket(c.env.BUCKET, requestedNamespaceId) as unknown as R2Bucket
+            const sourceItem = await getInboxVideoRecord(sourceBucket, id)
+            if (sourceItem) {
+                item = await syncImportedOriginalIntoNamespace({
+                    env: c.env,
+                    targetNamespaceId: currentNamespaceId,
+                    targetBucket: processBucket,
+                    sourceNamespaceId: requestedNamespaceId,
+                    sourceBucket,
+                    sourceVideo: {
+                        ...sourceItem,
+                        id,
+                    },
+                }).catch(() => null)
+                if (!item) {
+                    item = await putInboxVideoRecord(processBucket, {
+                        ...sourceItem,
+                        updatedAt: new Date().toISOString(),
+                    })
+                }
+            }
+        }
+
+        // If still not found, check all namespaces (for system inbox videos)
+        if (!item) {
+            const sysAdmin = await isSystemAdmin(c.env.DB, (await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(c.req.header('x-auth-token') || '').first() as any)?.email || '').catch(() => false)
+            if (sysAdmin) {
+                const allNamespaces = await c.env.DB.prepare('SELECT DISTINCT namespace_id FROM line_users').all().catch(() => ({ results: [] }))
+                for (const row of (allNamespaces.results || [])) {
+                    const ns = String((row as any).namespace_id || '').trim()
+                    if (!ns || ns === currentNamespaceId) continue
+                    const srcBucket = new BotBucket(c.env.BUCKET, ns) as unknown as R2Bucket
+                    const srcItem = await getInboxVideoRecord(srcBucket, id).catch(() => null)
+                    if (srcItem) {
+                        item = await syncImportedOriginalIntoNamespace({
+                            env: c.env,
+                            targetNamespaceId: currentNamespaceId,
+                            targetBucket: processBucket,
+                            sourceNamespaceId: ns,
+                            sourceBucket: srcBucket,
+                            sourceVideo: {
+                                ...srcItem,
+                                id,
+                            },
+                        }).catch(() => null)
+                        if (!item) {
+                            item = await putInboxVideoRecord(processBucket, {
+                                ...srcItem,
+                                updatedAt: new Date().toISOString(),
+                            })
+                        }
+                        break
+                    }
+                }
+            }
+        }
+
         if (!item) return c.json({ error: 'inbox_video_not_found' }, 404)
         if (item.status !== 'ready') return c.json({ error: 'inbox_video_not_ready' }, 400)
+
+        // Pre-check: verify shortlink API is reachable before processing
+        const namespaceId = String(c.get('botId') || '').trim()
+        const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(c.env.DB, namespaceId).catch(() => false)
+        if (shortlinkRequired) {
+            const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId).catch(() => '')
+            if (baseUrl) {
+                try {
+                    const healthUrl = new URL(baseUrl)
+                    healthUrl.pathname = '/health'
+                    healthUrl.search = ''
+                    const healthResp = await fetchWithTimeout(healthUrl.toString(), {}, 8000, 'shortlink_health')
+                    if (!healthResp.ok) {
+                        return c.json({
+                            error: 'shortlink_failed',
+                            message: 'ระบบย่อลิ้งไม่พร้อม กรุณาลองใหม่',
+                            details: [`HTTP ${healthResp.status}`],
+                        }, 400)
+                    }
+                } catch (e) {
+                    return c.json({
+                        error: 'shortlink_failed',
+                        message: 'เชื่อมต่อระบบย่อลิ้งไม่ได้ กรุณาลองใหม่',
+                        details: [e instanceof Error ? e.message : String(e)],
+                    }, 400)
+                }
+            }
+        }
+
+        if (shortlinkRequired) {
+            const prepared = await prepareInboxVideoForManagedLinks({
+                env: c.env,
+                bucket: processBucket,
+                namespaceId,
+                item,
+                logPrefix: `INBOX-PROCESS ${namespaceId}/${id}`,
+            }).catch(() => null)
+            if (!prepared) {
+                return c.json({
+                    error: 'shortlink_failed',
+                    message: 'ย่อลิ้ง Shopee/Lazada สำหรับ workspace นี้ไม่ผ่าน กรุณาลองใหม่',
+                }, 400)
+            }
+            item = prepared
+        }
 
         const result = await ensureInboxVideoProcessingStarted({
             env: c.env,
@@ -6869,17 +7679,28 @@ app.post('/api/processing/:id/reprocess', async (c) => {
             retryCount?: number
         }
 
-        const videoUrl = String(job.videoUrl || '').trim()
-        const chatId = Number(job.chatId || 0)
-        if (!videoUrl || !Number.isFinite(chatId) || chatId <= 0) {
+        const linkContextObj = await c.get('bucket').get(`_link_context/${id}.json`).catch(() => null)
+        const linkContext = linkContextObj
+            ? await linkContextObj.json().catch(() => ({} as Record<string, unknown>)) as {
+                videoUrl?: string
+                shopeeLink?: string
+                lazadaLink?: string
+                chatId?: number
+            }
+            : null
+
+        const videoUrl = String(job.videoUrl || linkContext?.videoUrl || '').trim()
+        const chatIdRaw = Number(job.chatId ?? linkContext?.chatId ?? 0)
+        const chatId = Number.isFinite(chatIdRaw) && chatIdRaw >= 0 ? chatIdRaw : 0
+        if (!videoUrl) {
             return c.json({ error: 'processing_payload_invalid' }, 400)
         }
 
         const queuedJob = {
             id,
             videoUrl,
-            shopeeLink: String(job.shopeeLink || '').trim(),
-            lazadaLink: String(job.lazadaLink || '').trim(),
+            shopeeLink: String(job.shopeeLink || linkContext?.shopeeLink || '').trim(),
+            lazadaLink: String(job.lazadaLink || linkContext?.lazadaLink || '').trim(),
             chatId,
             createdAt: new Date().toISOString(),
             status: 'queued',
@@ -6927,7 +7748,13 @@ app.post('/api/gallery/refresh/:id', async (c) => {
         const namespaceId = String(c.get('botId') || '').trim()
         const linkContextObj = await c.get('bucket').get(`_link_context/${videoId}.json`)
         const linkContext = linkContextObj
-            ? await linkContextObj.json() as { chatId?: number; shopeeLink?: string; lazadaLink?: string }
+            ? await linkContextObj.json() as {
+                chatId?: number
+                shopeeLink?: string
+                lazadaLink?: string
+                shopeeOriginalLink?: string
+                lazadaOriginalLink?: string
+            }
             : null
 
         if (videoId && linkContext) {
@@ -6936,11 +7763,13 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                 const meta = await metaObj.json() as Record<string, unknown>
                 const shopeeLink = String(linkContext.shopeeLink || '').trim()
                 const lazadaLink = String(linkContext.lazadaLink || '').trim()
+                const shopeeOriginalLink = pickFirstShopeeUrl(String(linkContext.shopeeOriginalLink || shopeeLink || '')) || ''
+                const lazadaOriginalLink = pickFirstLazadaUrl(String(linkContext.lazadaOriginalLink || lazadaLink || '')) || ''
                 let changed = false
                 const nextStateFields: Partial<NamespaceVideoStateRow> = {}
                 if (shopeeLink && !normalizeMetaShopeeLink(meta)) {
                     meta.shopeeLink = shopeeLink
-                    meta.shopeeOriginalLink = getVideoSourceShopeeLink(meta) || shopeeLink
+                    meta.shopeeOriginalLink = getVideoSourceShopeeLink(meta) || shopeeOriginalLink || shopeeLink
                     if (!String(meta.linkSubmittedAt || '').trim()) {
                         meta.linkSubmittedAt = new Date().toISOString()
                     }
@@ -6950,7 +7779,7 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                 }
                 if (lazadaLink && !normalizeMetaLazadaLink(meta)) {
                     meta.lazadaLink = lazadaLink
-                    meta.lazadaOriginalLink = getVideoSourceLazadaLink(meta) || lazadaLink
+                    meta.lazadaOriginalLink = getVideoSourceLazadaLink(meta) || lazadaOriginalLink || lazadaLink
                     nextStateFields.lazada_link = lazadaLink
                     nextStateFields.lazada_original_link = String(meta.lazadaOriginalLink || '').trim()
                     changed = true
@@ -7764,9 +8593,7 @@ app.delete('/api/gallery/:id', async (c) => {
         await Promise.all([
             bucket.delete(`videos/${id}.json`),
             bucket.delete(`videos/${id}.mp4`),
-            bucket.delete(`videos/${id}_original_thumb.webp`),
             bucket.delete(`videos/${id}_thumb.webp`),
-            ...getOriginalVideoAssetKeys(id).map((key) => bucket.delete(key)),
         ])
         await removeFromGalleryCache(bucket, id).catch(() => { })
         await syncGalleryIndexEntry(c.env, targetNamespaceId, id).catch((error) => {
@@ -7841,6 +8668,7 @@ const NS_SETTING_PAGES_TOKEN_POOL_V1 = 'pages_token_pool_v1'
 const NS_SETTING_PAGES_HIDDEN_TAGGED_PROFILES_V1 = 'pages_hidden_tagged_profiles_v1'
 const NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1 = 'pages_linked_tagged_profiles_v1'
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
+const NS_SETTING_GEMINI_API_KEYS = 'gemini_api_keys_v2'
 const NS_SETTING_COMMENT_TEMPLATE = 'comment_template_v1'
 const NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT = 'affiliate_shortlink_account_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
@@ -7848,8 +8676,10 @@ const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_utm_id_v1'
 const NS_SETTING_LAZADA_SHORTLINK_BASE_URL = 'lazada_shortlink_base_url_v1'
 const NS_SETTING_LAZADA_EXPECTED_MEMBER_ID = 'lazada_expected_member_id_v1'
-const DEFAULT_SHOPEE_SHORTLINK_WORKER_URL = 'https://short.yokthanwa1993-bc9.workers.dev/'
-const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://lazada.wwoom.com/'
+const DEFAULT_SHOPEE_SHORTLINK_WORKER_URL = 'https://short.wwoom.com/'
+const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://short.wwoom.com/'
+const ADMIN_SHORTLINK_ACCOUNT = 'CHEARB'
+const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
 const DEFAULT_PAGES_SYNC_POST_SELECTORS = 'tag:post'
 const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
@@ -7988,13 +8818,106 @@ async function getNamespaceGeminiApiKeyEntry(db: D1Database, namespaceId: string
     }
 }
 
-async function setNamespaceGeminiApiKey(db: D1Database, namespaceId: string, rawApiKey: string): Promise<void> {
+function normalizeGeminiApiKeyList(rawKeys: unknown): string[] {
+    const source = Array.isArray(rawKeys)
+        ? rawKeys
+        : typeof rawKeys === 'string'
+            ? [rawKeys]
+            : []
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const raw of source) {
+        const key = String(raw || '').trim().slice(0, MAX_GEMINI_API_KEY_CHARS)
+        if (!key) continue
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(key)
+        if (out.length >= MAX_GEMINI_API_KEY_SLOTS) break
+    }
+    return out
+}
+
+async function getLegacySystemGeminiApiKeys(db: D1Database): Promise<{ keys: string[]; updatedAt: string | null }> {
     await ensureNamespaceSettingsTable(db)
-    const apiKey = String(rawApiKey || '').trim().slice(0, MAX_GEMINI_API_KEY_CHARS)
-    if (!apiKey) {
+    const rows = await db.prepare(
+        `SELECT ns.value, ns.updated_at
+         FROM namespace_settings ns
+         INNER JOIN users u
+           ON u.namespace_id = ns.namespace_id
+         INNER JOIN system_admins sa
+           ON lower(trim(sa.email)) = lower(trim(u.email))
+         WHERE ns.key = ?
+           AND trim(coalesce(ns.value, '')) <> ''
+         ORDER BY datetime(ns.updated_at) DESC, datetime(ns.created_at) DESC`
+    ).bind(NS_SETTING_GEMINI_API_KEY).all() as {
+        results?: Array<{ value?: string; updated_at?: string }>
+    }
+
+    const keys = normalizeGeminiApiKeyList((rows.results || []).map((row) => row?.value || ''))
+    const updatedAt = String(rows.results?.[0]?.updated_at || '').trim() || null
+    return { keys, updatedAt }
+}
+
+async function clearLegacySystemGeminiApiKeys(db: D1Database): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    await db.prepare(
+        `DELETE FROM namespace_settings
+         WHERE key = ?
+           AND namespace_id IN (
+             SELECT DISTINCT u.namespace_id
+             FROM users u
+             INNER JOIN system_admins sa
+               ON lower(trim(sa.email)) = lower(trim(u.email))
+             WHERE trim(coalesce(u.namespace_id, '')) <> ''
+           )`
+    ).bind(NS_SETTING_GEMINI_API_KEY).run()
+}
+
+async function getSystemGeminiApiKeyEntries(db: D1Database): Promise<{ keys: string[]; updatedAt: string | null; source: 'system' | 'legacy' | 'none' }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(SYSTEM_GEMINI_NAMESPACE_ID, NS_SETTING_GEMINI_API_KEYS).first() as { value?: string; updated_at?: string } | null
+
+    let parsed: unknown = []
+    try {
+        parsed = JSON.parse(String(row?.value || '[]'))
+    } catch {
+        parsed = []
+    }
+    const keys = normalizeGeminiApiKeyList(parsed)
+    if (keys.length > 0) {
+        return {
+            keys,
+            updatedAt: String(row?.updated_at || '').trim() || null,
+            source: 'system',
+        }
+    }
+
+    const legacy = await getLegacySystemGeminiApiKeys(db)
+    if (legacy.keys.length > 0) {
+        return {
+            keys: legacy.keys,
+            updatedAt: legacy.updatedAt,
+            source: 'legacy',
+        }
+    }
+
+    return {
+        keys: [],
+        updatedAt: null,
+        source: 'none',
+    }
+}
+
+async function setSystemGeminiApiKeys(db: D1Database, rawKeys: unknown): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const keys = normalizeGeminiApiKeyList(rawKeys)
+    if (keys.length === 0) {
         await db.prepare(
             'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
-        ).bind(namespaceId, NS_SETTING_GEMINI_API_KEY).run()
+        ).bind(SYSTEM_GEMINI_NAMESPACE_ID, NS_SETTING_GEMINI_API_KEYS).run()
+        await clearLegacySystemGeminiApiKeys(db)
         return
     }
 
@@ -8003,26 +8926,32 @@ async function setNamespaceGeminiApiKey(db: D1Database, namespaceId: string, raw
          VALUES (?, ?, ?, datetime('now'), datetime('now'))
          ON CONFLICT(namespace_id, key)
          DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
-    ).bind(namespaceId, NS_SETTING_GEMINI_API_KEY, apiKey).run()
+    ).bind(
+        SYSTEM_GEMINI_NAMESPACE_ID,
+        NS_SETTING_GEMINI_API_KEYS,
+        JSON.stringify(keys),
+    ).run()
+}
+
+async function resolveNamespaceGeminiApiKeys(db: D1Database, _namespaceId: string): Promise<string[]> {
+    const system = await getSystemGeminiApiKeyEntries(db)
+    return system.keys
 }
 
 async function resolveNamespaceGeminiApiKey(db: D1Database, namespaceId: string): Promise<string> {
-    const workspace = await getNamespaceGeminiApiKeyEntry(db, namespaceId)
-    if (workspace.key) return workspace.key
-    return ''
+    const keys = await resolveNamespaceGeminiApiKeys(db, namespaceId)
+    return keys[0] || ''
 }
 
-async function getNamespaceGeminiApiKeySettings(db: D1Database, namespaceId: string) {
-    const workspace = await getNamespaceGeminiApiKeyEntry(db, namespaceId)
-    const effective = workspace.key
-    const source: 'workspace' | 'none' = workspace.key
-        ? 'workspace'
-        : 'none'
+async function getNamespaceGeminiApiKeySettings(db: D1Database, _namespaceId: string) {
+    const system = await getSystemGeminiApiKeyEntries(db)
     return {
-        has_key: !!effective,
-        masked_key: maskApiKeyForDisplay(effective),
-        source,
-        updated_at: workspace.updatedAt,
+        has_key: system.keys.length > 0,
+        keys_count: system.keys.length,
+        masked_key: maskApiKeyForDisplay(system.keys[0] || ''),
+        masked_keys: system.keys.map((key) => maskApiKeyForDisplay(key)),
+        source: system.source,
+        updated_at: system.updatedAt,
     }
 }
 
@@ -8125,6 +9054,99 @@ function computeShortlinkUtmMatchValue(expectedUtmId: string, actualUtmSource?: 
     return actual === expected ? 1 : 0
 }
 
+function computeLazadaMemberMatchValue(expectedMemberId: string, actualMemberId?: string | null): number | null {
+    const expected = normalizeLazadaMemberId(expectedMemberId)
+    if (!expected) return null
+    const actual = normalizeLazadaMemberId(actualMemberId || '')
+    return actual === expected ? 1 : 0
+}
+
+function decodeHtmlEntities(value: string): string {
+    return String(value || '')
+        .replace(/&amp;/gi, '&')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+}
+
+function extractOriginalLinkFromHtml(html: string): string {
+    const source = String(html || '')
+    if (!source) return ''
+
+    const patterns = [
+        /<link[^>]+rel=["']origin["'][^>]+href=["']([^"']+)["']/i,
+        /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
+        /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+name=["']twitter:url["'][^>]+content=["']([^"']+)["']/i,
+    ]
+
+    for (const pattern of patterns) {
+        const match = source.match(pattern)
+        const value = decodeHtmlEntities(match && match[1] ? match[1] : '').trim()
+        if (value) return value
+    }
+
+    return ''
+}
+
+function buildAffiliateResolveHeaders(): HeadersInit {
+    return {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+}
+
+async function resolveOriginalAffiliateLink(rawLink: string, logPrefix: string): Promise<string> {
+    const input = String(rawLink || '').trim()
+    if (!input) return ''
+    try {
+        const resp = await fetchWithTimeout(input, {
+            method: 'GET',
+            redirect: 'follow',
+            headers: buildAffiliateResolveHeaders(),
+        }, 15000, `${logPrefix}_resolve_original`)
+        const finalUrl = String(resp.url || '').trim()
+        const contentType = String(resp.headers.get('content-type') || '').toLowerCase()
+        if (contentType.includes('text/html')) {
+            const html = await resp.text().catch(() => '')
+            const extracted = extractOriginalLinkFromHtml(html)
+            if (extracted) return extracted
+        }
+        return finalUrl || input
+    } catch {
+        return input
+    }
+}
+
+async function resolveAffiliateRedirectLink(rawLink: string, logPrefix: string): Promise<string> {
+    const input = String(rawLink || '').trim()
+    if (!input) return ''
+    try {
+        const resp = await fetchWithTimeout(input, {
+            method: 'GET',
+            redirect: 'follow',
+            headers: buildAffiliateResolveHeaders(),
+        }, 15000, `${logPrefix}_resolve_redirect`)
+        return String(resp.url || '').trim() || input
+    } catch {
+        return input
+    }
+}
+
+async function resolveAffiliateTrackingLink(rawLink: string, logPrefix: string): Promise<string> {
+    const current = String(rawLink || '').trim()
+    if (!current) return ''
+    const redirectedFirst = await resolveAffiliateRedirectLink(current, logPrefix)
+    if (redirectedFirst && redirectedFirst !== current) {
+        return redirectedFirst
+    }
+    const extracted = await resolveOriginalAffiliateLink(current, logPrefix)
+    const candidate = extracted || current
+    const redirected = await resolveAffiliateRedirectLink(candidate, logPrefix)
+    return redirected || candidate || current
+}
+
 function extractShopeeUtmSourceFromLink(link: string): string {
     try {
         return String(new URL(String(link || '').trim()).searchParams.get('utm_source') || '').trim()
@@ -8199,15 +9221,49 @@ function extractLazadaTrackingSourceFromLink(link: string): string {
     return ''
 }
 
+function extractLazadaMemberIdFromLink(link: string): string {
+    const rawLink = String(link || '').trim()
+    if (!rawLink) return ''
+
+    const matchMemberId = (value: string): string => {
+        const decoded = (() => {
+            try {
+                return decodeURIComponent(value)
+            } catch {
+                return value
+            }
+        })()
+
+        const exact = decoded.match(/mm_(\d+)_/i)
+        if (exact) return String(exact[1] || '').trim()
+        const direct = decoded.match(/[?&]member_id=(\d+)/i)
+        if (direct) return String(direct[1] || '').trim()
+        return ''
+    }
+
+    const direct = matchMemberId(rawLink)
+    if (direct) return direct
+
+    try {
+        const parsed = new URL(rawLink)
+        for (const key of ['exlaz', 'laz_trackid', 'utm_source', 'member_id', 'sub_aff_id', 'aff_trace_key']) {
+            const hit = matchMemberId(String(parsed.searchParams.get(key) || ''))
+            if (hit) return hit
+        }
+    } catch {
+        return ''
+    }
+
+    return ''
+}
+
 function isLikelyConvertedShopeeLink(link: string, expectedUtmId = ''): boolean {
     const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
     if (!rawLink) return false
 
     try {
         const parsed = new URL(rawLink)
-        const host = parsed.hostname.toLowerCase()
         const path = parsed.pathname.toLowerCase()
-        if (host.startsWith('s.shopee.')) return true
         if (path.startsWith('/opaanlp/')) return true
         if (path.startsWith('/universal-link/')) return true
     } catch {
@@ -8227,7 +9283,12 @@ function isLikelyConvertedLazadaLink(link: string): boolean {
         const parsed = new URL(rawLink)
         const host = parsed.hostname.toLowerCase()
         if (host === 'lzd.co' || host.endsWith('.lzd.co')) return true
-        if (host.startsWith('s.lazada.')) return true
+        if (host.startsWith('s.lazada.')) {
+            return parsed.searchParams.has('cc')
+                || parsed.searchParams.has('t')
+                || !!extractLazadaTrackingSourceFromLink(rawLink)
+        }
+        if (host.includes('lazada.')) return !!extractLazadaTrackingSourceFromLink(rawLink)
     } catch {
         return false
     }
@@ -8256,37 +9317,48 @@ function getVideoAffiliateConversionState(
 
     const shopeeSourceLink = getVideoSourceShopeeLink(video)
     const shopeeCurrentLink = normalizeMetaShopeeLink(video) || ''
+    const shopeeCurrentDiffersFromSource = !!shopeeCurrentLink && !!shopeeSourceLink && shopeeCurrentLink !== shopeeSourceLink
     const hasShopeeSource = !!shopeeSourceLink
     const hasShopeeLink = !!(shopeeCurrentLink || shopeeSourceLink)
-    const hasManagedShopeeConversion = !!String(
-        video.shopeeConvertedAt || video.shopee_converted_at || video.shopeeOriginalLink || video.shopee_original_link || ''
-    ).trim()
+    const shopeeConvertedAt = String(video.shopeeConvertedAt || video.shopee_converted_at || '').trim()
+    const hasManagedShopeeConversion = shopeeCurrentDiffersFromSource && !!shopeeConvertedAt
     const explicitShortlinkRequired = getBooleanFlag(video.shortlink_required)
     const requireManagedLinks = options.requireManagedLinks ?? explicitShortlinkRequired ?? true
     const shopeeReady = requireManagedLinks
-        ? (!!shopeeCurrentLink && isLikelyConvertedShopeeLink(shopeeCurrentLink, expectedUtmId))
+        ? (shopeeCurrentDiffersFromSource && !!shopeeConvertedAt)
         : hasShopeeLink
 
     const lazadaSourceLink = getVideoSourceLazadaLink(video)
     const lazadaCurrentLink = normalizeMetaLazadaLink(video) || ''
+    const lazadaCurrentDiffersFromSource = !!lazadaCurrentLink && !!lazadaSourceLink && lazadaCurrentLink !== lazadaSourceLink
     const hasLazadaSource = !!lazadaSourceLink
     const hasLazadaLink = !!(lazadaCurrentLink || lazadaSourceLink)
-    const hasManagedLazadaConversion = !!String(
-        video.lazadaConvertedAt || video.lazada_converted_at || video.lazadaOriginalLink || video.lazada_original_link || ''
-    ).trim()
+    const lazadaConvertedAt = String(video.lazadaConvertedAt || video.lazada_converted_at || '').trim()
+    const hasManagedLazadaConversion = lazadaCurrentDiffersFromSource && !!lazadaConvertedAt
     const lazadaMemberId = normalizeLazadaMemberId(String(video.lazadaMemberId || video.lazada_member_id || ''))
     const lazadaReady = requireManagedLinks
-        ? (!!lazadaCurrentLink && !!lazadaMemberId && isLikelyConvertedLazadaLink(lazadaCurrentLink) && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId))
+        ? (
+            lazadaCurrentDiffersFromSource
+            && !!lazadaCurrentLink
+            && !!lazadaConvertedAt
+            && isLikelyConvertedLazadaLink(lazadaCurrentLink)
+            && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId)
+        )
         : hasLazadaLink
 
     const missingShopeeSource = hasPlayable && !hasShopeeLink
     const missingLazadaSource = hasPlayable && !hasLazadaLink
     const needsShopeeConversion = requireManagedLinks && hasPlayable && hasShopeeSource && hasManagedShopeeConversion && !shopeeReady
     const needsLazadaConversion = requireManagedLinks && hasPlayable && hasLazadaSource && hasManagedLazadaConversion && !lazadaReady
-    const galleryReady = requireManagedLinks
-        ? (hasPlayable && hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady)
-        : (hasPlayable && hasShopeeLink && hasLazadaLink)
-    const awaitingConversion = requireManagedLinks && hasPlayable && (missingShopeeSource || !galleryReady)
+    const shortlinkReady = hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady
+    const galleryReady = hasPlayable && (!requireManagedLinks || shortlinkReady)
+    const awaitingConversion = requireManagedLinks && hasPlayable && (
+        missingShopeeSource
+        || missingLazadaSource
+        || !shopeeReady
+        || !lazadaReady
+        || !galleryReady
+    )
 
     return {
         hasPlayable,
@@ -8325,7 +9397,14 @@ async function listVideosAwaitingAffiliateConversion(env: Env, namespaceId: stri
     if (!shortlinkRequired) return []
 
     const inventory = await getNamespaceGalleryInventory(env, normalizedNamespaceId)
-    return inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
+    return inventory.videos.filter((video) => {
+        const record = video as Record<string, unknown>
+        return isVideoAwaitingAffiliateConversion(
+            record,
+            String(record.shortlink_expected_utm_id || '').trim(),
+            String(record.lazada_expected_member_id || '').trim(),
+        )
+    })
 }
 
 async function persistAffiliateVideoMeta(env: Env, namespaceId: string, videoId: string, meta: Record<string, unknown>): Promise<void> {
@@ -8384,19 +9463,24 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                     nextMeta.shopeeOriginalLink = sourceShopeeLink
                     nextStateFields.shopee_original_link = sourceShopeeLink
                     const trace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
-                    const resolvedShopeeLink = conversionState.shopeeReady
-                        ? (conversionState.shopeeCurrentLink || sourceShopeeLink)
-                        : await shortenShopeeLinkForNamespace({
-                            env,
-                            namespaceId,
-                            shopeeLink: sourceShopeeLink,
-                            logPrefix: `AFFILIATE-CONVERT ${namespaceId}/${videoId} SHOPEE`,
-                            trace,
-                        })
-                    const effectiveShopeeLink = resolvedShopeeLink || sourceShopeeLink
+                    const resolvedShopeeLink = await shortenShopeeLinkForNamespace({
+                        env,
+                        namespaceId,
+                        shopeeLink: sourceShopeeLink,
+                        logPrefix: `AFFILIATE-CONVERT ${namespaceId}/${videoId} SHOPEE`,
+                        trace,
+                    })
+                    const effectiveShopeeLink = resolvedShopeeLink || conversionState.shopeeCurrentLink || sourceShopeeLink
                     nextMeta.shopeeLink = effectiveShopeeLink
                     nextStateFields.shopee_link = effectiveShopeeLink
-                    if (isLikelyConvertedShopeeLink(effectiveShopeeLink, expectedUtmId)) {
+                    const shopeeConvertedReady = !!effectiveShopeeLink
+                        && effectiveShopeeLink !== sourceShopeeLink
+                        && trace.status === 'shortened'
+                        && (
+                            !expectedUtmId
+                            || normalizeShortlinkExpectedUtmId(String(trace.utmSource || '')) === normalizeShortlinkExpectedUtmId(expectedUtmId)
+                        )
+                    if (shopeeConvertedReady) {
                         const convertedAt = String(
                             pendingVideo.shopeeConvertedAt ||
                             pendingVideo.shopee_converted_at ||
@@ -8422,16 +9506,14 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                     nextMeta.lazadaOriginalLink = sourceLazadaLink
                     nextStateFields.lazada_original_link = sourceLazadaLink
                     const trace: { utmSource?: string | null; memberId?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
-                    const resolvedLazadaLink = conversionState.lazadaReady
-                        ? (conversionState.lazadaCurrentLink || sourceLazadaLink)
-                        : await shortenLazadaLinkForNamespace({
-                            env,
-                            namespaceId,
-                            lazadaLink: sourceLazadaLink,
-                            logPrefix: `AFFILIATE-CONVERT ${namespaceId}/${videoId} LAZADA`,
-                            trace,
-                        })
-                    const effectiveLazadaLink = resolvedLazadaLink || sourceLazadaLink
+                    const resolvedLazadaLink = await shortenLazadaLinkForNamespace({
+                        env,
+                        namespaceId,
+                        lazadaLink: sourceLazadaLink,
+                        logPrefix: `AFFILIATE-CONVERT ${namespaceId}/${videoId} LAZADA`,
+                        trace,
+                    })
+                    const effectiveLazadaLink = resolvedLazadaLink || conversionState.lazadaCurrentLink || sourceLazadaLink
                     const nextMemberId = normalizeLazadaMemberId(String(
                         trace.memberId ||
                         pendingVideo.lazadaMemberId ||
@@ -8446,10 +9528,13 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                         nextMeta.lazadaMemberId = nextMemberId
                         nextStateFields.lazada_member_id = nextMemberId
                     }
+                    const lazadaConvertedReady = !!effectiveLazadaLink
+                        && effectiveLazadaLink !== sourceLazadaLink
+                        && trace.status === 'shortened'
+                        && isLikelyConvertedLazadaLink(effectiveLazadaLink)
+                        && (!expectedLazadaMemberId || nextMemberId === expectedLazadaMemberId)
                     if (
-                        isLikelyConvertedLazadaLink(effectiveLazadaLink) &&
-                        !!nextMemberId &&
-                        (!expectedLazadaMemberId || nextMemberId === expectedLazadaMemberId)
+                        lazadaConvertedReady
                     ) {
                         const convertedAt = String(
                             pendingVideo.lazadaConvertedAt ||
@@ -8475,6 +9560,130 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
             nextMeta.updatedAt = nowIso
             await persistAffiliateVideoMeta(env, namespaceId, videoId, nextMeta)
             await upsertNamespaceVideoState(env.DB, namespaceId, videoId, nextStateFields)
+        }
+    }
+}
+
+async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): Promise<void> {
+    // 1. Find primary admin namespace
+    const adminRow = await env.DB.prepare(
+        `SELECT sa.email, en.namespace_id
+         FROM system_admins sa
+         JOIN email_namespaces en ON en.email = sa.email
+         LIMIT 1`
+    ).first() as { email?: string; namespace_id?: string } | null
+    const adminNamespaceId = String(adminRow?.namespace_id || '').trim()
+    if (!adminNamespaceId) return
+
+    const adminBucket = new BotBucket(env.BUCKET, adminNamespaceId) as unknown as R2Bucket
+    let importedCount = 0
+    const namespaceIds = new Set<string>()
+    try {
+        const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
+        for (const row of results || []) {
+            const namespaceId = String((row as any)?.namespace_id || '').trim()
+            if (namespaceId) namespaceIds.add(namespaceId)
+        }
+    } catch { /* best effort */ }
+
+    for (const sourceNamespaceId of namespaceIds) {
+        if (!sourceNamespaceId || sourceNamespaceId === adminNamespaceId) continue
+
+        const sourceBucket = new BotBucket(env.BUCKET, sourceNamespaceId) as unknown as R2Bucket
+        const sourceVideos = await listNamespaceOriginalArchiveVideos({
+            env,
+            bucket: sourceBucket,
+            namespaceId: sourceNamespaceId,
+        }).catch(() => [])
+
+        for (const sourceVideo of sourceVideos) {
+            const videoId = String(sourceVideo.id || '').trim()
+            if (!videoId) continue
+
+            const [existingGallery, existingQueue, existingProcessingStatus, existingInbox] = await Promise.all([
+                adminBucket.head(`videos/${videoId}.json`).catch(() => null),
+                adminBucket.head(`_queue/${videoId}.json`).catch(() => null),
+                getProcessingJobStatus(adminBucket, videoId).catch(() => ''),
+                getInboxVideoRecord(adminBucket, videoId).catch(() => null),
+            ])
+            const hasExistingActiveProcessing = existingProcessingStatus && existingProcessingStatus !== 'failed'
+            if (existingGallery || existingQueue || hasExistingActiveProcessing) continue
+
+            const synced = await syncImportedOriginalIntoNamespace({
+                env,
+                targetNamespaceId: adminNamespaceId,
+                targetBucket: adminBucket,
+                sourceNamespaceId,
+                sourceBucket,
+                sourceVideo: {
+                    ...sourceVideo,
+                    id: videoId,
+                },
+            }).catch(() => null)
+            if (!synced) continue
+
+            if (!existingInbox) {
+                importedCount++
+                console.log(`[AUTO-IMPORT] Copied original ${videoId} from ${sourceNamespaceId} -> ${adminNamespaceId}`)
+            }
+        }
+    }
+
+    if (importedCount > 0) {
+        console.log(`[AUTO-IMPORT] Added ${importedCount} original videos to admin namespace`)
+    }
+
+    // 2. Auto-process ONE admin video at a time (shortlink first, then process)
+    if (!ctx) return
+
+    // Check if already processing
+    const isProcessing = await hasActiveProcessingJob(adminBucket)
+    if (isProcessing) {
+        console.log('[AUTO-IMPORT] Admin already has active processing job, skipping')
+        return
+    }
+
+    const inboxVideos = await listInboxVideoRecords(adminBucket)
+    for (const nextVideo of inboxVideos) {
+        if (nextVideo.status !== 'ready') continue
+        const [hasProcessed, existingProcessingStatus] = await Promise.all([
+            adminBucket.head(`videos/${nextVideo.id}.mp4`).catch(() => null),
+            getProcessingJobStatus(adminBucket, nextVideo.id).catch(() => ''),
+        ])
+        if (hasProcessed) continue
+        if (existingProcessingStatus && existingProcessingStatus !== 'failed') {
+            console.log(`[AUTO-IMPORT] Skip ${nextVideo.id}: existing processing record present`)
+            continue
+        }
+
+        const prepared = await prepareInboxVideoForManagedLinks({
+            env,
+            bucket: adminBucket,
+            namespaceId: adminNamespaceId,
+            item: nextVideo,
+            logPrefix: `AUTO-IMPORT ${adminNamespaceId}/${nextVideo.id}`,
+        }).catch(() => null)
+        if (!prepared) continue
+
+        try {
+            const result = await ensureInboxVideoProcessingStarted({
+                env,
+                bucket: adminBucket,
+                executionCtx: ctx,
+                botId: adminNamespaceId,
+                item: prepared,
+                skipIfAlreadyProcessed: true,
+            })
+            if (result.outcome === 'already_running') {
+                console.log(`[AUTO-IMPORT] ${nextVideo.id} already ${result.status}`)
+            } else if (result.outcome === 'already_processed') {
+                console.log(`[AUTO-IMPORT] ${nextVideo.id} already processed`)
+            } else {
+                console.log(`[AUTO-IMPORT] Started processing ${nextVideo.id}: ${result.job.status}`)
+            }
+            break
+        } catch (e) {
+            console.error(`[AUTO-IMPORT] Failed to start processing ${nextVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
         }
     }
 }
@@ -8543,7 +9752,16 @@ async function resolveNamespaceAffiliateShortlinkAccount(db: D1Database, namespa
         getNamespaceLazadaShortlinkBaseUrlEntry(db, namespaceId),
     ])
 
-    return extractShortlinkAccountFromBaseUrl(shopeeRow.baseUrl) || extractShortlinkAccountFromBaseUrl(lazadaRow.baseUrl) || ''
+    const extracted = extractShortlinkAccountFromBaseUrl(shopeeRow.baseUrl) || extractShortlinkAccountFromBaseUrl(lazadaRow.baseUrl) || ''
+    if (extracted) return extracted
+
+    // Hardcoded fallback: admin namespace uses CHEARB
+    const ownerEmail = await resolveOwnerEmailForNamespace(db, namespaceId).catch(() => '')
+    if (ownerEmail) {
+        const admin = await isSystemAdmin(db, ownerEmail)
+        if (admin) return ADMIN_SHORTLINK_ACCOUNT
+    }
+    return ''
 }
 
 async function getNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: string): Promise<boolean> {
@@ -8909,8 +10127,8 @@ function isCommentRoleToken(token: string): boolean {
 }
 
 function isPostRoleToken(token: string): boolean {
-    // Post role = Postcron tokens (NOT EAAD6V) — used for fallback via /video_reels
-    // EAAD6V tokens go through comment role → primary posting via /videos
+    // Post role = page-scoped tokens (non-EAAD6). These are now preferred for
+    // both reel posting and comment resolution, with EAAD6 kept as legacy fallback.
     const normalized = String(token || '').trim()
     return !!normalized && isTokenValid(normalized) && !isCommentRoleToken(normalized)
 }
@@ -8936,18 +10154,38 @@ function isRoleTokenForMode(token: string, mode: BrowserSavingTokenMode): boolea
 }
 
 function normalizeCommentTokenPool(tokens: string[]): string[] {
-    // Comment tokens are validated against the target page via /me/accounts at use time.
-    // Do not infer invalidity from the prefix alone.
-    return uniqueTokens(tokens.filter((token) => isResolvedCommentToken(token)))
+    // Runtime now only accepts page-scoped tokens (EAACh/other non-EAAD6).
+    // Keep legacy EAAD6 out of both posting and comment flows entirely.
+    return uniqueTokens(tokens.filter((token) => isPostRoleToken(token)))
 }
 
 function normalizeDirectVideoTokenPool(tokens: string[]): string[] {
-    // Accept ALL valid tokens for /videos posting — not just EAAD6V.
-    // Sort EAAD6V first (preferred), then non-EAAD6V as fallback.
-    const valid = normalizeCommentTokenPool(tokens)
-    const eaad6 = valid.filter((t) => isCommentRoleToken(t))
-    const others = valid.filter((t) => !isCommentRoleToken(t))
-    return uniqueTokens([...eaad6, ...others])
+    // Direct video posting/comment now runs with page-scoped tokens only.
+    return normalizeCommentTokenPool(tokens)
+}
+
+function buildPreferredCommentTokenPool(params: {
+    primaryToken?: string | null
+    postTokens?: string[]
+    commentTokens?: string[]
+}): string[] {
+    return normalizeDirectVideoTokenPool([
+        String(params.primaryToken || '').trim(),
+        ...normalizePostTokenPool(params.postTokens || []),
+        ...normalizeCommentTokenPool(params.commentTokens || []),
+    ])
+}
+
+function buildPrimaryPostingTokenCandidates(params: {
+    primaryToken?: string | null
+    postTokens?: string[]
+    commentTokens?: string[]
+}): string[] {
+    return normalizeDirectVideoTokenPool([
+        String(params.primaryToken || '').trim(),
+        ...normalizePostTokenPool(params.postTokens || []),
+        ...normalizeCommentTokenPool(params.commentTokens || []),
+    ])
 }
 
 function preferCommentToken(existingRaw: string, candidateRaw: string): string {
@@ -9298,17 +10536,15 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
             .filter(Boolean)
     )
 
-    // Unified token pool: include ALL tokens from ALL profiles (both EAAD6V and non-EAAD6V).
-    // Both token types can post via /videos endpoint. No role-gating.
     const allProfileValues = Array.from(byProfileId.values())
-    const rebuiltCommentTokens = normalizeDirectVideoTokenPool([
-        ...allProfileValues
-            .filter((item) => !!String(item.comment_token || '').trim())
-            .map((item) => String(item.comment_token || '').trim()),
-        ...allProfileValues
-            .filter((item) => !!String(item.post_token || '').trim())
-            .map((item) => String(item.post_token || '').trim()),
-    ].filter(Boolean))
+    const rebuiltCommentTokens = buildPreferredCommentTokenPool({
+        postTokens: rebuiltPostTokens,
+        commentTokens: [
+            ...allProfileValues
+                .filter((item) => !!String(item.comment_token || '').trim())
+                .map((item) => String(item.comment_token || '').trim()),
+        ],
+    })
 
     const existingPage = await env.DB.prepare(
         'SELECT access_token FROM pages WHERE id = ? AND bot_id = ?'
@@ -9355,10 +10591,15 @@ async function getPageTokenCandidates(params: {
     const storedPostTokens = normalizePostTokenPool(entry?.post_tokens || [])
     const storedCommentTokens = normalizeCommentTokenPool(entry?.comment_tokens || [])
 
-    const postTokens = storedPostTokens.length > 0
-        ? storedPostTokens
-        : normalizePostTokenPool([primaryToken])
-    const commentTokens = storedCommentTokens
+    const postTokens = normalizePostTokenPool([
+        primaryToken,
+        ...storedPostTokens,
+    ])
+    const commentTokens = buildPreferredCommentTokenPool({
+        primaryToken,
+        postTokens,
+        commentTokens: storedCommentTokens,
+    })
     const tokens = uniqueTokens([
         ...postTokens,
         ...commentTokens,
@@ -9396,7 +10637,11 @@ async function ensurePageTokenCandidates(params: {
         )
         const fallbackPostTokens = normalizePostTokenPool([String(params.primaryToken || '').trim()])
         const postTokens = rebuilt.postTokens.length > 0 ? rebuilt.postTokens : fallbackPostTokens
-        const commentTokens = rebuilt.commentTokens
+        const commentTokens = buildPreferredCommentTokenPool({
+            primaryToken: params.primaryToken,
+            postTokens,
+            commentTokens: rebuilt.commentTokens,
+        })
         candidates = {
             tokens: uniqueTokens([...postTokens, ...commentTokens]),
             postTokens,
@@ -9741,6 +10986,14 @@ async function ensureLinkSubmissionsTable(db: D1Database): Promise<void> {
     await db.prepare(
         'CREATE UNIQUE INDEX IF NOT EXISTS uq_link_submissions_ns_video ON link_submissions(namespace_id, video_id)'
     ).run()
+}
+
+function deriveLineSubmissionActorId(lineUserId: string): string {
+    return String(lineUserId || '').replace(/\D/g, '').slice(0, 15)
+}
+
+function deriveLineSubmissionChatId(lineUserId: string): number {
+    return Number(deriveLineSubmissionActorId(lineUserId)) || 1
 }
 
 async function recordLinkSubmission(params: {
@@ -10375,8 +11628,9 @@ async function shortenLazadaLinkForNamespace(params: {
                     ''
                 )
             ) || ''
+            const affiliateId = String(data.id || data.affiliate_id || data.affiliateId || '').trim()
             const utmSource = String(data.utm_source || data.utmSource || '').trim() || extractLazadaTrackingSourceFromLink(shortLink) || null
-            const memberId = String(data.member_id || data.memberId || '').trim() || null
+            const memberId = String(data.member_id || data.memberId || affiliateId || '').trim() || null
             if (shortLink) {
                 writeTrace({ utmSource, memberId, status: 'shortened', error: null })
                 return shortLink
@@ -10452,7 +11706,8 @@ async function shortenShopeeLinkForNamespace(params: {
                     ''
                 )
             ) || ''
-            const utmSource = String(data.utm_source || data.utmSource || '').trim() || null
+            const affiliateId = String(data.id || data.affiliate_id || data.affiliateId || '').trim()
+            const utmSource = String(data.utm_source || data.utmSource || '').trim() || (affiliateId ? `an_${affiliateId}` : '') || null
             if (shortLink) {
                 writeTrace({ utmSource, status: 'shortened', error: null })
                 return shortLink
@@ -10507,6 +11762,203 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     console.log(`[${params.logPrefix}] Using gallery Shopee link directly (no live shortlink conversion during posting)`)
     writeTrace({ utmSource: extractedUtmSource, status: 'fallback', error: null })
     return link
+}
+
+type PostingAffiliatePlatformVerification = {
+    inputLink: string
+    resolvedLink: string
+    expectedId: string
+    actualId: string
+    status: 'skipped' | 'missing_link' | 'verified' | 'mismatch' | 'error'
+    match: number | null
+    error: string | null
+}
+
+type PostingAffiliateVerificationResult = {
+    ok: boolean
+    status: 'skipped' | 'verified' | 'failed'
+    error: string | null
+    shopee: PostingAffiliatePlatformVerification
+    lazada: PostingAffiliatePlatformVerification
+}
+
+async function verifyAffiliateLinksForPosting(params: {
+    env: Env
+    namespaceId: string
+    shopeeLink?: string | null
+    lazadaLink?: string | null
+    logPrefix: string
+}): Promise<PostingAffiliateVerificationResult> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const shopeeInputLink = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
+    const lazadaInputLink = pickFirstLazadaUrl(params.lazadaLink || '') || String(params.lazadaLink || '').trim()
+
+    const [expectedShopeeId, expectedLazadaMemberId] = await Promise.all([
+        resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, namespaceId).catch(() => ''),
+        resolveNamespaceLazadaExpectedMemberId(params.env.DB, namespaceId).catch(() => ''),
+    ])
+
+    const shopee: PostingAffiliatePlatformVerification = {
+        inputLink: shopeeInputLink,
+        resolvedLink: '',
+        expectedId: expectedShopeeId,
+        actualId: '',
+        status: !shopeeInputLink ? 'missing_link' : !expectedShopeeId ? 'skipped' : 'error',
+        match: computeShortlinkUtmMatchValue(expectedShopeeId, null),
+        error: null,
+    }
+
+    if (shopeeInputLink && expectedShopeeId) {
+        try {
+            shopee.resolvedLink = await resolveAffiliateTrackingLink(shopeeInputLink, `${params.logPrefix}_shopee`)
+            const actualUtmSource = extractShopeeUtmSourceFromLink(shopee.resolvedLink)
+            shopee.actualId = normalizeShortlinkExpectedUtmId(actualUtmSource)
+            shopee.match = computeShortlinkUtmMatchValue(expectedShopeeId, actualUtmSource)
+            shopee.status = shopee.match === 1 ? 'verified' : 'mismatch'
+            if (shopee.status !== 'verified') {
+                shopee.error = `Shopee affiliate id ไม่ตรง (expected ${expectedShopeeId}, actual ${shopee.actualId || '-'})`
+            }
+        } catch (e) {
+            shopee.status = 'error'
+            shopee.match = 0
+            shopee.error = `Shopee verify failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+    }
+
+    const lazada: PostingAffiliatePlatformVerification = {
+        inputLink: lazadaInputLink,
+        resolvedLink: '',
+        expectedId: expectedLazadaMemberId,
+        actualId: '',
+        status: !lazadaInputLink ? 'missing_link' : !expectedLazadaMemberId ? 'skipped' : 'error',
+        match: computeLazadaMemberMatchValue(expectedLazadaMemberId, null),
+        error: null,
+    }
+
+    if (lazadaInputLink && expectedLazadaMemberId) {
+        try {
+            lazada.resolvedLink = await resolveAffiliateTrackingLink(lazadaInputLink, `${params.logPrefix}_lazada`)
+            lazada.actualId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(lazada.resolvedLink))
+            lazada.match = computeLazadaMemberMatchValue(expectedLazadaMemberId, lazada.actualId)
+            lazada.status = lazada.match === 1 ? 'verified' : 'mismatch'
+            if (lazada.status !== 'verified') {
+                lazada.error = `Lazada affiliate id ไม่ตรง (expected ${expectedLazadaMemberId}, actual ${lazada.actualId || '-'})`
+            }
+        } catch (e) {
+            lazada.status = 'error'
+            lazada.match = 0
+            lazada.error = `Lazada verify failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+    }
+
+    const blockingErrors = [shopee.error, lazada.error].filter((value) => !!String(value || '').trim())
+    const verifiedAny = shopee.status === 'verified' || lazada.status === 'verified'
+    const ok = blockingErrors.length === 0
+    const status: 'skipped' | 'verified' | 'failed' = ok
+        ? (verifiedAny ? 'verified' : 'skipped')
+        : 'failed'
+    const error = blockingErrors.join(' | ') || null
+
+    if (!ok) {
+        console.log(`[${params.logPrefix}] affiliate verification blocked posting: ${error}`)
+    } else if (verifiedAny) {
+        console.log(`[${params.logPrefix}] affiliate verification OK shopee=${shopee.actualId || '-'} lazada=${lazada.actualId || '-'}`)
+    }
+
+    return {
+        ok,
+        status,
+        error,
+        shopee,
+        lazada,
+    }
+}
+
+async function updatePostHistoryAffiliateVerificationById(db: D1Database, historyId: number, verification: PostingAffiliateVerificationResult): Promise<void> {
+    if (!Number.isFinite(historyId) || historyId <= 0) return
+    await ensurePostHistoryTraceColumns(db)
+    await db.prepare(
+        `UPDATE post_history
+         SET shopee_link = ?,
+             lazada_link = ?,
+             shortlink_utm_source = ?,
+             shortlink_status = ?,
+             shortlink_error = ?,
+             shortlink_expected_utm_id = ?,
+             shortlink_utm_match = ?,
+             lazada_member_id = ?,
+             lazada_expected_member_id = ?,
+             lazada_member_match = ?
+         WHERE id = ?`
+    ).bind(
+        verification.shopee.inputLink || null,
+        verification.lazada.inputLink || null,
+        verification.shopee.actualId ? `an_${verification.shopee.actualId}` : null,
+        verification.status,
+        verification.error,
+        verification.shopee.expectedId || null,
+        verification.shopee.match,
+        verification.lazada.actualId || null,
+        verification.lazada.expectedId || null,
+        verification.lazada.match,
+        historyId,
+    ).run()
+}
+
+async function updatePostHistoryAffiliateVerificationByPostingKey(
+    db: D1Database,
+    pageId: string,
+    videoId: string,
+    verification: PostingAffiliateVerificationResult,
+    botId?: string,
+): Promise<void> {
+    const normalizedPageId = String(pageId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    const normalizedBotId = String(botId || '').trim()
+    if (!normalizedPageId || !normalizedVideoId) return
+    await ensurePostHistoryTraceColumns(db)
+    const sql = normalizedBotId
+        ? `UPDATE post_history
+           SET shopee_link = ?,
+               lazada_link = ?,
+               shortlink_utm_source = ?,
+               shortlink_status = ?,
+               shortlink_error = ?,
+               shortlink_expected_utm_id = ?,
+               shortlink_utm_match = ?,
+               lazada_member_id = ?,
+               lazada_expected_member_id = ?,
+               lazada_member_match = ?
+           WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?`
+        : `UPDATE post_history
+           SET shopee_link = ?,
+               lazada_link = ?,
+               shortlink_utm_source = ?,
+               shortlink_status = ?,
+               shortlink_error = ?,
+               shortlink_expected_utm_id = ?,
+               shortlink_utm_match = ?,
+               lazada_member_id = ?,
+               lazada_expected_member_id = ?,
+               lazada_member_match = ?
+           WHERE page_id = ? AND video_id = ? AND status = 'posting'`
+
+    const bindings = [
+        verification.shopee.inputLink || null,
+        verification.lazada.inputLink || null,
+        verification.shopee.actualId ? `an_${verification.shopee.actualId}` : null,
+        verification.status,
+        verification.error,
+        verification.shopee.expectedId || null,
+        verification.shopee.match,
+        verification.lazada.actualId || null,
+        verification.lazada.expectedId || null,
+        verification.lazada.match,
+        normalizedPageId,
+        normalizedVideoId,
+    ]
+    if (normalizedBotId) bindings.push(normalizedBotId)
+    await db.prepare(sql).bind(...bindings).run()
 }
 
 function pickProfilePostToken(profile: BrowserSavingProfileRecord): string {
@@ -11818,10 +13270,10 @@ async function autoSyncPagesForNamespace(
                 const postTokens = normalizePostTokenPool(postRecords.map((r) => String(r.access_token || '').trim()))
                 // Unified: merge ALL resolved page tokens (from both post and comment profiles)
                 // into comment pool. Both token types work for /videos posting.
-                const commentTokens = normalizeDirectVideoTokenPool([
-                    ...commentRecords.map((r) => String(r.access_token || '').trim()),
-                    ...postRecords.map((r) => String(r.access_token || '').trim()),
-                ])
+                const commentTokens = buildPreferredCommentTokenPool({
+                    postTokens,
+                    commentTokens: commentRecords.map((r) => String(r.access_token || '').trim()),
+                })
 
                 const mergedPostTokens = uniqueTokens([...postTokens])
 
@@ -12028,29 +13480,38 @@ async function autoSyncPagesForNamespace(
                         page.access_token,
                     ])
                     // Unified: merge ALL tokens (comment + post) into comment pool
-                    const discoveredCommentTokenPool = normalizeDirectVideoTokenPool([
-                        ...(commentTokenPoolByPage.get(pageId) || []),
-                        String(commentTokenByPage.get(pageId) || '').trim(),
-                        ...(postTokenPoolByPage.get(pageId) || []),
-                        page.access_token,
-                    ])
+                    const discoveredCommentTokenPool = buildPreferredCommentTokenPool({
+                        primaryToken: page.access_token,
+                        postTokens: postTokenPoolByPage.get(pageId) || [],
+                        commentTokens: [
+                            ...(commentTokenPoolByPage.get(pageId) || []),
+                            String(commentTokenByPage.get(pageId) || '').trim(),
+                        ],
+                    })
                     const postTokenPool = discoveredPostTokenPool.length > 0
                         ? normalizePostTokenPool([
                             ...discoveredPostTokenPool,
                             ...(existingPool[pageId]?.post_tokens || []),
                         ])
                         : normalizePostTokenPool(existingPool[pageId]?.post_tokens || [])
-                    const commentTokenPool = discoveredCommentTokenPool.length > 0
-                        ? normalizeDirectVideoTokenPool([
-                            ...discoveredCommentTokenPool,
-                            ...(existingPool[pageId]?.comment_tokens || []),
-                        ])
-                        : normalizeDirectVideoTokenPool(existingPool[pageId]?.comment_tokens || [])
-
                     const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
                         ? String(page.access_token || '').trim()
                         : ''
                     const primaryToken = String(postTokenPool[0] || existingAccessToken || discoveredPrimaryToken || '').trim()
+                    const commentTokenPool = discoveredCommentTokenPool.length > 0
+                        ? buildPreferredCommentTokenPool({
+                            primaryToken,
+                            postTokens: postTokenPool,
+                            commentTokens: [
+                                ...discoveredCommentTokenPool,
+                                ...(existingPool[pageId]?.comment_tokens || []),
+                            ],
+                        })
+                        : buildPreferredCommentTokenPool({
+                            primaryToken,
+                            postTokens: postTokenPool,
+                            commentTokens: existingPool[pageId]?.comment_tokens || [],
+                        })
 
                     const existingInNamespace = await env.DB.prepare(
                         'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
@@ -12256,12 +13717,14 @@ async function autoSyncPagesForNamespace(
             ...(existingEntry.post_tokens || []),
         ])
         // Unified: merge ALL tokens (comment + post) into comment pool
-        const commentTokenPool = normalizeDirectVideoTokenPool([
-            commentTokenRaw,
-            page.access_token,
-            ...(existingEntry.comment_tokens || []),
-            ...(existingEntry.post_tokens || []),
-        ])
+        const commentTokenPool = buildPreferredCommentTokenPool({
+            primaryToken: page.access_token,
+            postTokens: existingEntry.post_tokens || [],
+            commentTokens: [
+                commentTokenRaw,
+                ...(existingEntry.comment_tokens || []),
+            ],
+        })
         const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
             ? String(page.access_token || '').trim()
             : ''
@@ -12637,6 +14100,8 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN shortlink_utm_match INTEGER',
                 'ALTER TABLE post_history ADD COLUMN lazada_link TEXT',
                 'ALTER TABLE post_history ADD COLUMN lazada_member_id TEXT',
+                'ALTER TABLE post_history ADD COLUMN lazada_expected_member_id TEXT',
+                'ALTER TABLE post_history ADD COLUMN lazada_member_match INTEGER',
                 'ALTER TABLE post_history ADD COLUMN comment_delay_seconds INTEGER',
                 'ALTER TABLE post_history ADD COLUMN comment_due_at TEXT',
             ]
@@ -13327,17 +14792,10 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     description: string
     logPrefix: string
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
-    // Unified: merge ALL tokens from both pools into one list.
-    // EAAD6V (Facebook Lite) tokens first, then non-EAAD6V as fallback.
-    // All go through the same /videos endpoint — no separate attempts.
-    const allTokens = uniqueTokens([
-        ...(params.commentTokens || []),
-        ...(params.postTokens || []),
-    ]).filter((t) => isTokenValid(String(t || '').trim()))
-    const candidates = uniqueTokens([
-        ...allTokens.filter((t) => isCommentRoleToken(t)),
-        ...allTokens.filter((t) => !isCommentRoleToken(t)),
-    ])
+    const candidates = buildPrimaryPostingTokenCandidates({
+        postTokens: params.postTokens,
+        commentTokens: params.commentTokens,
+    })
 
     if (candidates.length === 0) {
         throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
@@ -13552,8 +15010,9 @@ app.get('/api/dashboard', async (c) => {
 
         await ensureLinkSubmissionsTable(c.env.DB)
         await ensureTelegramBotSessionsTable(c.env.DB)
+        await ensureLineUsersTable(c.env.DB)
 
-        const [postsAllRow, postsOnDateRow, linksAllRow, linksOnDateRow, usersRes, scopedSessionsRes, linksByAdminRes] = await Promise.all([
+        const [postsAllRow, postsOnDateRow, linksAllRow, linksOnDateRow, usersRes, scopedSessionsRes, lineUsersRes, linksByAdminRes] = await Promise.all([
             c.env.DB.prepare(
                 "SELECT COUNT(*) AS total FROM post_history WHERE bot_id = ? AND status IN ('success','posting')"
             ).bind(botId).first() as Promise<{ total?: number } | null>,
@@ -13572,6 +15031,9 @@ app.get('/api/dashboard', async (c) => {
             c.env.DB.prepare(
                 'SELECT telegram_id, email FROM telegram_bot_sessions WHERE namespace_id = ? AND telegram_id IS NOT NULL AND TRIM(telegram_id) <> \'\''
             ).bind(botId).all() as Promise<{ results?: Array<{ telegram_id?: string | number; email?: string }> }>,
+            c.env.DB.prepare(
+                'SELECT line_user_id, display_name, picture_url, email FROM line_users WHERE namespace_id = ?'
+            ).bind(botId).all() as Promise<{ results?: Array<{ line_user_id?: string; display_name?: string; picture_url?: string; email?: string }> }>,
             c.env.DB.prepare(
                 "SELECT telegram_id, COUNT(*) AS total FROM link_submissions WHERE namespace_id = ? AND date(datetime(created_at, '+7 hours')) = ? GROUP BY telegram_id"
             ).bind(botId, targetDate).all() as Promise<{ results?: Array<{ telegram_id?: string | number; total?: number }> }>,
@@ -13593,7 +15055,32 @@ app.get('/api/dashboard', async (c) => {
             }
         }
 
-        const adminMap = new Map<string, { telegram_id: string; email: string; links: number }>()
+        const lineProfileByActorId = new Map<string, {
+            line_user_id: string
+            display_name: string
+            picture_url: string
+            email: string
+        }>()
+        for (const row of lineUsersRes.results || []) {
+            const lineUserId = String(row?.line_user_id || '').trim()
+            const actorId = deriveLineSubmissionActorId(lineUserId)
+            if (!lineUserId || !actorId || lineProfileByActorId.has(actorId)) continue
+            lineProfileByActorId.set(actorId, {
+                line_user_id: lineUserId,
+                display_name: String(row?.display_name || '').trim(),
+                picture_url: String(row?.picture_url || '').trim(),
+                email: String(row?.email || '').trim().toLowerCase(),
+            })
+        }
+
+        const adminMap = new Map<string, {
+            telegram_id: string
+            email: string
+            display_name: string
+            picture_url: string
+            line_user_id: string
+            links: number
+        }>()
         for (const row of linksByAdminRes.results || []) {
             const telegramId = String(row?.telegram_id || '').trim()
             const count = Math.max(0, Number(row?.total || 0))
@@ -13605,20 +15092,23 @@ app.get('/api/dashboard', async (c) => {
                 continue
             }
 
-            const email = telegramId
-                ? (emailByTelegram.get(telegramId) || `telegram:${telegramId}`)
-                : 'unknown'
+            const lineProfile = telegramId ? lineProfileByActorId.get(telegramId) : undefined
+            const email = lineProfile?.email || (telegramId ? (emailByTelegram.get(telegramId) || `telegram:${telegramId}`) : 'unknown')
+            const displayName = String(lineProfile?.display_name || '').trim() || email
 
             adminMap.set(key, {
                 telegram_id: telegramId || '-',
                 email,
+                display_name: displayName,
+                picture_url: String(lineProfile?.picture_url || '').trim(),
+                line_user_id: String(lineProfile?.line_user_id || '').trim(),
                 links: count,
             })
         }
 
         const admins = Array.from(adminMap.values()).sort((a, b) => {
             if (b.links !== a.links) return b.links - a.links
-            return a.email.localeCompare(b.email)
+            return a.display_name.localeCompare(b.display_name)
         })
 
         return c.json({
@@ -13835,15 +15325,13 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
                     .filter((item) => item.post_token_scoped && item.roles.includes('post'))
                     .map((item) => String(item.post_token || '').trim()),
             ])
-            // Unified: include ALL resolved tokens (both comment and post) in comment pool
-            const discoveredCommentTokens = normalizeDirectVideoTokenPool([
-                ...resolvedItems
+            const discoveredCommentTokens = buildPreferredCommentTokenPool({
+                primaryToken: storedAccessScoped,
+                postTokens: discoveredPostTokens,
+                commentTokens: resolvedItems
                     .filter((item) => item.roles.includes('comment'))
                     .map((item) => String((item as any).comment_page_token || '').trim()),
-                ...resolvedItems
-                    .filter((item) => item.post_token_scoped && item.roles.includes('post'))
-                    .map((item) => String(item.post_token || '').trim()),
-            ])
+            })
 
             const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
             const existingEntry = tokenPool[String(page.id || '')] || { post_tokens: [], comment_tokens: [] }
@@ -14225,10 +15713,11 @@ app.put('/api/pages/:id', async (c) => {
                     resolvedAccessToken,
                     ...nextPostTokenPool,
                 ])
-                nextCommentTokenPool = normalizeDirectVideoTokenPool([
-                    resolvedAccessToken,
-                    ...nextCommentTokenPool,
-                ])
+                nextCommentTokenPool = buildPreferredCommentTokenPool({
+                    primaryToken: resolvedAccessToken,
+                    postTokens: nextPostTokenPool,
+                    commentTokens: nextCommentTokenPool,
+                })
                 resolved.access_token = accessResolved.source
                 if (accessResolved.reason) resolved_details.access_token = accessResolved.reason
             } else {
@@ -14249,11 +15738,14 @@ app.put('/api/pages/:id', async (c) => {
             const rawCommentToken = String(comment_token ?? access_token ?? '').trim()
             if (rawCommentToken) {
                 const resolvedCommentToken = await resolveCommentPageTokenForPage(c.env, id, rawCommentToken)
-                nextCommentTokenPool = normalizeDirectVideoTokenPool([
-                    resolvedCommentToken,
-                    effectivePostToken,
-                    ...nextCommentTokenPool,
-                ])
+                nextCommentTokenPool = buildPreferredCommentTokenPool({
+                    primaryToken: effectivePostToken,
+                    postTokens: nextPostTokenPool,
+                    commentTokens: [
+                        resolvedCommentToken,
+                        ...nextCommentTokenPool,
+                    ],
+                })
                 resolved.comment_token = 'resolved_for_page'
             } else if (comment_token !== undefined) {
                 nextCommentTokenPool = []
@@ -14405,17 +15897,20 @@ app.post('/api/pages/import', async (c) => {
             const pageCommentTokenRaw = String(commentPageTokenById.get(pageId) || '').trim()
             const primaryToken = String(pageAccessToken || '').trim()
             const existingEntry = tokenPool[pageId] || { post_tokens: [], comment_tokens: [] }
+            const nextPostTokens = normalizePostTokenPool([
+                pageAccessToken,
+                ...(existingEntry.post_tokens || []),
+            ])
             tokenPool[pageId] = {
-                post_tokens: normalizePostTokenPool([
-                    pageAccessToken,
-                    ...(existingEntry.post_tokens || []),
-                ]),
-                comment_tokens: normalizeDirectVideoTokenPool([
-                    pageCommentTokenRaw,
-                    pageAccessToken,
-                    ...(existingEntry.comment_tokens || []),
-                    ...(existingEntry.post_tokens || []),
-                ]),
+                post_tokens: nextPostTokens,
+                comment_tokens: buildPreferredCommentTokenPool({
+                    primaryToken: pageAccessToken,
+                    postTokens: nextPostTokens,
+                    commentTokens: [
+                        pageCommentTokenRaw,
+                        ...(existingEntry.comment_tokens || []),
+                    ],
+                }),
                 updated_at: new Date().toISOString(),
             }
 
@@ -14660,19 +16155,15 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const publicUrl = metaToString(meta, 'publicUrl')
         const category = metaToString(meta, 'category')
         normalizedLazadaLink = metaToString(meta, 'lazadaLink')
-        if (!publicUrl) {
-            return c.json({ error: 'Video public URL missing' }, 400)
-        }
-
-        const apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId)
-        if (!title && script && !apiKey) {
-            return c.json({ error: 'Gemini API key not configured for this workspace' }, 400)
+        const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
+        if (!title && script && apiKeys.length === 0) {
+            return c.json({ error: 'Gemini API key กลางของระบบยังไม่ได้ตั้งค่า' }, 400)
         }
         const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
         let caption = title
             ? title
             : script
-                ? await generateCaption(script, apiKey, model)
+                ? await generateCaption(script, apiKeys, model)
                 : 'AI Dubbed Video'
         caption += `\n#สินค้า #ของน่าใช้ #ช็อปปิ้งออนไลน์${category ? ` #${category}` : ''}`
         selectedCaption = caption
@@ -14691,10 +16182,11 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
             ? tokenCandidates.postTokens
             : normalizePostTokenPool([pageAccessToken])
-        const directVideoTokenCandidates = normalizeDirectVideoTokenPool(commentTokenCandidates)
-        const primaryPostingTokenCandidates = directVideoTokenCandidates.length > 0
-            ? directVideoTokenCandidates
-            : fallbackPostTokenCandidates
+        const primaryPostingTokenCandidates = buildPrimaryPostingTokenCandidates({
+            primaryToken: pageAccessToken,
+            postTokens: fallbackPostTokenCandidates,
+            commentTokens: commentTokenCandidates,
+        })
         if (primaryPostingTokenCandidates.length === 0) {
             throw new Error('access_token_missing')
         }
@@ -14733,12 +16225,32 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             normalizedShopeeUtmMatch,
         ).run() as { meta?: { last_row_id?: number } }
         retryHistoryId = Number(inserted?.meta?.last_row_id || 0) || null
+
+        const affiliateVerification = await verifyAffiliateLinksForPosting({
+            env,
+            namespaceId: botId,
+            shopeeLink: normalizedShopeeLink,
+            lazadaLink: normalizedLazadaLink,
+            logPrefix: 'RETRY-POST VERIFY',
+        })
+        if (retryHistoryId) {
+            await updatePostHistoryAffiliateVerificationById(env.DB, retryHistoryId, affiliateVerification)
+        }
+        if (!affiliateVerification.ok) {
+            if (retryHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(affiliateVerification.error || 'affiliate_verification_failed', retryHistoryId).run().catch(() => { })
+            }
+            return c.json({
+                error: 'affiliate_verification_failed',
+                details: affiliateVerification.error || 'Affiliate verification failed',
+            }, 400)
+        }
+
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(attemptPostedAtIso, pageId, botId).run()
 
-        let realVideoUrl = publicUrl
-        if (!realVideoUrl || !realVideoUrl.includes(`/${selectedVideoNamespaceId}/videos/`)) {
-            realVideoUrl = getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, selectedVideoNamespaceId, selectedVideoId)
-        }
+        const realVideoUrl = resolvePostingVideoDownloadUrl(env, selectedVideoNamespaceId, selectedVideoId, publicUrl)
 
         const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'retry_post_download_video')
         if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
@@ -15077,33 +16589,38 @@ app.get('/api/scheduler/process', async (c) => {
 })
 
 // Generate short caption from long script using Gemini
-async function generateCaption(script: string, apiKey: string, model: string): Promise<string> {
-    try {
-        const resp = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: `สร้างแคปชั่น Facebook Reels จาก script นี้ 1 บรรทัด มี emoji ดึงดูด จบประโยคสมบูรณ์ ห้ามตัดคำกลางคัน ตอบแค่แคปชั่น:\n\n${script}` }] }],
-                    generationConfig: { temperature: 0.9, maxOutputTokens: 1024 },
-                }),
-            }
-        )
-        const result = await resp.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }
-        const caption = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
-        return caption || script.slice(0, 100)
-    } catch {
-        return script.slice(0, 100)
+async function generateCaption(script: string, apiKeys: string[], model: string): Promise<string> {
+    const normalizedKeys = normalizeGeminiApiKeyList(apiKeys)
+    for (const apiKey of normalizedKeys) {
+        try {
+            const resp = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: `สร้างแคปชั่น Facebook Reels จาก script นี้ 1 บรรทัด มี emoji ดึงดูด จบประโยคสมบูรณ์ ห้ามตัดคำกลางคัน ตอบแค่แคปชั่น:\n\n${script}` }] }],
+                        generationConfig: { temperature: 0.9, maxOutputTokens: 1024 },
+                    }),
+                }
+            )
+            if (!resp.ok) continue
+            const result = await resp.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }
+            const caption = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+            if (caption) return caption
+        } catch {
+            // try next key
+        }
     }
+    return script.slice(0, 100)
 }
 
 // Generate title for ONE video at a time (call repeatedly to process all)
 app.post('/api/generate-title/:id', async (c) => {
     const env = c.env
     const id = c.req.param('id')
-    const apiKey = await resolveNamespaceGeminiApiKey(env.DB, String(c.get('botId') || ''))
-    if (!apiKey) return c.json({ error: 'Gemini API key not configured for this workspace' }, 400)
+    const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, String(c.get('botId') || ''))
+    if (apiKeys.length === 0) return c.json({ error: 'Gemini API key กลางของระบบยังไม่ได้ตั้งค่า' }, 400)
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
 
     const obj = await env.BUCKET.get(`videos/${id}.json`)
@@ -15112,15 +16629,17 @@ app.post('/api/generate-title/:id', async (c) => {
     if (!meta.script) return c.json({ error: 'no script' }, 400)
 
     const script = (meta.script as string).slice(0, 300)
-    const resp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                contents: [{
-                    parts: [{
-                        text: `จาก script รีวิวสินค้านี้ ช่วยเขียนแคปชั่น Facebook Reels ให้หน่อย
+    let title = ''
+    for (const apiKey of apiKeys) {
+        const resp = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [{
+                            text: `จาก script รีวิวสินค้านี้ ช่วยเขียนแคปชั่น Facebook Reels ให้หน่อย
 
 ตัวอย่างแคปชั่นที่ดี:
 - "🔧 ประแจ 8 in 1 ตัวเดียวครบ ไม่ต้องหาหลายอัน!"
@@ -15134,14 +16653,17 @@ app.post('/api/generate-title/:id', async (c) => {
 - ตอบแค่แคปชั่น ไม่ต้องใส่เครื่องหมายคำพูด
 
 script: ${script}`
-                    }]
-                }],
-                generationConfig: { temperature: 0.9, maxOutputTokens: 1024 },
-            }),
-        }
-    )
-    const result = await resp.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }
-    let title = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ''
+                        }]
+                    }],
+                    generationConfig: { temperature: 0.9, maxOutputTokens: 1024 },
+                }),
+            }
+        )
+        if (!resp.ok) continue
+        const result = await resp.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }
+        title = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ''
+        if (title) break
+    }
     if (title.startsWith('"') && title.endsWith('"')) title = title.slice(1, -1)
     if (title.startsWith('\u201c') && title.endsWith('\u201d')) title = title.slice(1, -1)
 
@@ -15248,11 +16770,11 @@ app.post('/api/pages/:id/force-post', async (c) => {
         fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
             ? tokenCandidates.postTokens
             : normalizePostTokenPool([pageAccessToken])
-        const directVideoTokenCandidates = normalizeDirectVideoTokenPool(commentTokenCandidates)
-        primaryPostingTokenCandidates = directVideoTokenCandidates
-        if (primaryPostingTokenCandidates.length === 0) {
-            primaryPostingTokenCandidates = fallbackPostTokenCandidates
-        }
+        primaryPostingTokenCandidates = buildPrimaryPostingTokenCandidates({
+            primaryToken: pageAccessToken,
+            postTokens: fallbackPostTokenCandidates,
+            commentTokens: commentTokenCandidates,
+        })
         if (primaryPostingTokenCandidates.length === 0) {
             throw new Error('access_token_missing')
         }
@@ -15289,20 +16811,16 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const category = metaToString(meta, 'category')
         normalizedLazadaLink = metaToString(meta, 'lazadaLink')
 
-        if (!publicUrl) {
-            return c.json({ error: 'Video public URL missing' }, 400)
-        }
-
         // Use title if available, otherwise generate caption from script
-        const apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId)
-        if (!title && script && !apiKey) {
-            return c.json({ error: 'Gemini API key not configured for this workspace' }, 400)
+        const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
+        if (!title && script && apiKeys.length === 0) {
+            return c.json({ error: 'Gemini API key กลางของระบบยังไม่ได้ตั้งค่า' }, 400)
         }
         const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
         let caption = title
             ? title
             : script
-                ? await generateCaption(script, apiKey, model)
+                ? await generateCaption(script, apiKeys, model)
                 : 'AI Dubbed Video'
         caption += `\n#สินค้า #ของน่าใช้ #ช็อปปิ้งออนไลน์${category ? ` #${category}` : ''}`
         selectedCaption = caption
@@ -15344,15 +16862,35 @@ app.post('/api/pages/:id/force-post', async (c) => {
             null,
             normalizedShopeeUtmMatch,
         ).run()
+
+        const affiliateVerification = await verifyAffiliateLinksForPosting({
+            env,
+            namespaceId: botId,
+            shopeeLink: normalizedShopeeLink,
+            lazadaLink: normalizedLazadaLink,
+            logPrefix: 'FORCE-POST VERIFY',
+        })
+        await updatePostHistoryAffiliateVerificationByPostingKey(env.DB, page.id, unpostedId, affiliateVerification)
+        if (!affiliateVerification.ok) {
+            await env.DB.prepare(
+                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting'"
+            ).bind(
+                affiliateVerification.error || 'affiliate_verification_failed',
+                page.id,
+                unpostedId,
+            ).run().catch(() => { })
+            return c.json({
+                error: 'affiliate_verification_failed',
+                details: affiliateVerification.error || 'Affiliate verification failed',
+            }, 400)
+        }
+
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ?').bind(nowStr, page.id).run()
 
         // Handle legacy publicUrl without namespace path
-        let realVideoUrl = publicUrl
-        if (!realVideoUrl || !realVideoUrl.includes(`/${selectedVideoNamespaceId}/videos/`)) {
-            realVideoUrl = getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, selectedVideoNamespaceId, unpostedId)
-        }
+        const realVideoUrl = resolvePostingVideoDownloadUrl(env, selectedVideoNamespaceId, unpostedId, publicUrl)
 
-        // Post via EAAD6 /videos first, then fall back to the legacy post token flow if needed.
+        // Prefer the stored page-scoped token pool, then fall back to legacy tokens if needed.
         const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'force_download_video')
         if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
         const videoBuffer = await videoResp.arrayBuffer()
@@ -15649,6 +17187,23 @@ app.post('/api/manual-post-reel', async (c) => {
         console.log(`[MANUAL-REEL] Starting for page ${pageId}`)
         console.log(`[MANUAL-REEL] Video: ${videoUrl}`)
         const namespaceId = String(c.get('botId') || '').trim()
+        const affiliateVerification = await verifyAffiliateLinksForPosting({
+            env: c.env,
+            namespaceId,
+            shopeeLink: shopeeLink || '',
+            lazadaLink: lazadaLink || '',
+            logPrefix: 'MANUAL-REEL VERIFY',
+        })
+        if (!affiliateVerification.ok) {
+            return c.json({
+                error: 'affiliate_verification_failed',
+                details: affiliateVerification.error || 'Affiliate verification failed',
+                shopee_expected_id: affiliateVerification.shopee.expectedId || null,
+                shopee_actual_id: affiliateVerification.shopee.actualId || null,
+                lazada_expected_member_id: affiliateVerification.lazada.expectedId || null,
+                lazada_actual_member_id: affiliateVerification.lazada.actualId || null,
+            }, 400)
+        }
         const effectiveShopeeLink = shopeeLink
             ? await resolvePostingShopeeLinkForNamespace({
                 env: c.env,
@@ -15781,9 +17336,15 @@ app.post('/api/manual-post-reel', async (c) => {
 
 // ==================== SCHEDULED HANDLER (CRON) ====================
 
-async function handleScheduled(env: Env) {
+async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     console.log('[CRON] Starting auto-post check...')
     const dedupCommentTargets = new Set<string>()
+
+    try {
+        await autoImportAndProcessForAdmin(env, ctx)
+    } catch (error) {
+        console.error(`[CRON] Auto-import for admin failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
 
     try {
         await processPendingAffiliateConversions(env)
@@ -15923,7 +17484,7 @@ async function handleScheduled(env: Env) {
     // Get all video namespaces (default + any telegram_ids that have videos)
     const videoNamespaceCache: Record<string, string[]> = {}
     const videoNamespaceNewestFirstCache: Record<string, string[]> = {}
-    const geminiApiKeyByNamespace = new Map<string, string>()
+    const geminiApiKeysByNamespace = new Map<string, string[]>()
 
     for (const page of pages) {
         // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
@@ -16166,13 +17727,13 @@ async function handleScheduled(env: Env) {
         const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
 
         // Generate short caption from script (no Shopee link)
-        let apiKey = geminiApiKeyByNamespace.get(botId)
-        if (!apiKey) {
-            apiKey = await resolveNamespaceGeminiApiKey(env.DB, botId)
-            geminiApiKeyByNamespace.set(botId, apiKey)
+        let apiKeys = geminiApiKeysByNamespace.get(botId)
+        if (!apiKeys) {
+            apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
+            geminiApiKeysByNamespace.set(botId, apiKeys)
         }
-        if (!title && script && !apiKey) {
-            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (Gemini API key missing for workspace ${botId})`)
+        if (!title && script && apiKeys.length === 0) {
+            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (Gemini API key กลางของระบบยังไม่ได้ตั้งค่า)`)
             await botBucket.delete(dedupKey).catch(() => { })
             continue
         }
@@ -16180,15 +17741,12 @@ async function handleScheduled(env: Env) {
         let caption = title
             ? title
             : script
-                ? await generateCaption(script, apiKey, geminiModel)
+                ? await generateCaption(script, apiKeys, geminiModel)
                 : 'AI Dubbed Video'
         caption += `\n#สินค้า #ของน่าใช้ #ช็อปปิ้งออนไลน์${category ? ` #${category}` : ''}`
 
         // Handle legacy publicUrls without botId or wrong domain
-        let realVideoUrl = publicUrl
-        if (!realVideoUrl || !realVideoUrl.includes(`/${sourceNamespaceId}/videos/`)) {
-            realVideoUrl = getVideoPublicUrlForNamespace(env.R2_PUBLIC_URL, sourceNamespaceId, unpostedId)
-        }
+        const realVideoUrl = resolvePostingVideoDownloadUrl(env, sourceNamespaceId, unpostedId, publicUrl)
         if (!realVideoUrl) {
             throw new Error('Video public URL missing')
         }
@@ -16208,10 +17766,11 @@ async function handleScheduled(env: Env) {
         const fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
             ? tokenCandidates.postTokens
             : normalizePostTokenPool([String(page.access_token || '')])
-        const directVideoTokenCandidates = normalizeDirectVideoTokenPool(commentTokenCandidates)
-        const primaryPostingTokenCandidates = directVideoTokenCandidates.length > 0
-            ? directVideoTokenCandidates
-            : fallbackPostTokenCandidates
+        const primaryPostingTokenCandidates = buildPrimaryPostingTokenCandidates({
+            primaryToken: String(page.access_token || ''),
+            postTokens: fallbackPostTokenCandidates,
+            commentTokens: commentTokenCandidates,
+        })
         await ensurePostHistoryTraceColumns(env.DB)
         const commentTokenHint = deriveCommentTokenHint(commentTokenCandidates[0] || null)
         const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
@@ -16249,12 +17808,35 @@ async function handleScheduled(env: Env) {
             null,
             normalizedShopeeUtmMatch,
         ).run()
+
+        const affiliateVerification = await verifyAffiliateLinksForPosting({
+            env,
+            namespaceId: botId,
+            shopeeLink: normalizedShopeeLink,
+            lazadaLink: normalizedLazadaLink,
+            logPrefix: `CRON ${page.name} VERIFY`,
+        })
+        await updatePostHistoryAffiliateVerificationByPostingKey(env.DB, page.id, unpostedId, affiliateVerification, botId)
+        if (!affiliateVerification.ok) {
+            await env.DB.prepare(
+                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
+            ).bind(
+                affiliateVerification.error || 'affiliate_verification_failed',
+                page.id,
+                unpostedId,
+                botId,
+            ).run().catch(() => { })
+            console.error(`[CRON] Page ${page.name}: affiliate verification failed - ${affiliateVerification.error || 'unknown'}`)
+            await botBucket.delete(dedupKey).catch(() => { })
+            continue
+        }
+
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
 
         let fbVideoId = ''
         let postingTokenUsed = String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
         try {
-            // Download video and publish via EAAD6 /videos first, then fall back to the legacy post token flow if needed.
+            // Download video and publish via the preferred page-scoped token pool first.
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')
             if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
             const videoBuffer = await videoResp.arrayBuffer()
@@ -16537,6 +18119,7 @@ export class MergeContainer extends Container {
 /** Watchdog: ตรวจจับ job ค้าง → ย้ายกลับ queue เพื่อ retry (สูงสุด 3 ครั้ง) */
 async function watchdogStuckJobs(env: Env) {
     const MAX_RETRIES = 3
+    const FAILED_RETRY_DELAY_MS = 60 * 1000
     const STARTUP_STUCK_THRESHOLD_MS = 60 * 1000 // งานที่ยังไม่ส่ง progress callback เลย ให้ retry เร็ว
     const STUCK_THRESHOLD_MS = 10 * 60 * 1000 // 10 นาที
     const now = Date.now()
@@ -16595,7 +18178,31 @@ async function watchdogStuckJobs(env: Env) {
                     retryCount?: number; step?: number; stepName?: string; status?: string;
                 }
 
-                if (job.status === 'failed') continue // ข้ามที่ mark failed แล้ว
+                if (job.status === 'failed') {
+                    const failedAt = String(job.updatedAt || job.createdAt || '').trim() || obj.uploaded.toISOString()
+                    const elapsedSinceFailure = now - new Date(failedAt).getTime()
+                    if (elapsedSinceFailure < FAILED_RETRY_DELAY_MS) continue
+
+                    const nextRetryCount = Number(job.retryCount || 0) + 1
+                    if (!String(job.videoUrl || '').trim()) continue
+                    if (nextRetryCount > MAX_RETRIES) continue
+
+                    await botBucket.delete(obj.key)
+                    await botBucket.put(`_queue/${job.id}.json`, JSON.stringify({
+                        id: job.id,
+                        videoUrl: job.videoUrl,
+                        chatId: Number(job.chatId || 0),
+                        shopeeLink: job.shopeeLink || '',
+                        lazadaLink: job.lazadaLink || '',
+                        createdAt: new Date().toISOString(),
+                        status: 'queued',
+                        retryCount: nextRetryCount,
+                    }), {
+                        httpMetadata: { contentType: 'application/json' },
+                    })
+                    console.log(`[WATCHDOG] Failed job ${job.id} moved back to queue (retry #${nextRetryCount})`)
+                    continue
+                }
 
                 const createdAt = String(job.createdAt || '').trim() || obj.uploaded.toISOString()
                 const updatedAt = String(job.updatedAt || '').trim()
@@ -16664,6 +18271,6 @@ export default {
         await watchdogStuckJobs(env)
         await warmPipelineContainer(env)
         // Token sync ถูกย้ายไปทำจาก Telegram mini app (กดซิงค์เอง) เท่านั้น
-        await handleScheduled(env)
+        await handleScheduled(env, _ctx)
     },
 }

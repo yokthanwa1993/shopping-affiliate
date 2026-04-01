@@ -5,10 +5,124 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-03-12.01'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-04-01.02'
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
+const VOICE_PROFILE_KEY = 'voice_profile_v2'
 const GEMINI_API_KEY_SETTING_KEY = 'gemini_api_key_v1'
+const GEMINI_API_KEYS_SETTING_KEY = 'gemini_api_keys_v2'
+const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
+const MAX_GEMINI_API_KEY_CHARS = 512
+const MAX_GEMINI_API_KEY_SLOTS = 5
 const MAX_VOICE_PROMPT_CHARS = 12000
+const MAX_VOICE_TONE_SELECTIONS = 3
+
+export type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
+export type VoicePacePreset = 'slow' | 'balanced' | 'fast'
+export type VoiceTonePreset =
+    | 'bright'
+    | 'playful'
+    | 'warm'
+    | 'confident'
+    | 'luxury'
+    | 'friendly'
+    | 'funny'
+    | 'sales'
+export type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
+
+export type VoiceProfile = {
+    voice_name: string
+    persona: VoicePersonaPreset
+    tones: VoiceTonePreset[]
+    pace: VoicePacePreset
+}
+
+export type GeminiTtsVoiceOption = {
+    name: string
+    descriptor: string
+}
+
+export type NamespaceVoiceSettings = {
+    profile: VoiceProfile
+    scriptPrompt: string
+    ttsPromptTemplate: string
+    source: VoiceSettingsSource
+    updatedAt: string | null
+    legacyPromptActive: boolean
+}
+
+export const GEMINI_TTS_VOICE_OPTIONS: GeminiTtsVoiceOption[] = [
+    { name: 'Zephyr', descriptor: 'Bright' },
+    { name: 'Puck', descriptor: 'Upbeat' },
+    { name: 'Charon', descriptor: 'Informative' },
+    { name: 'Kore', descriptor: 'Firm' },
+    { name: 'Fenrir', descriptor: 'Excitable' },
+    { name: 'Leda', descriptor: 'Youthful' },
+    { name: 'Orus', descriptor: 'Firm' },
+    { name: 'Aoede', descriptor: 'Breezy' },
+    { name: 'Callirrhoe', descriptor: 'Easy-going' },
+    { name: 'Autonoe', descriptor: 'Bright' },
+    { name: 'Enceladus', descriptor: 'Breathy' },
+    { name: 'Iapetus', descriptor: 'Clear' },
+    { name: 'Umbriel', descriptor: 'Easy-going' },
+    { name: 'Algieba', descriptor: 'Smooth' },
+    { name: 'Despina', descriptor: 'Smooth' },
+    { name: 'Erinome', descriptor: 'Clear' },
+    { name: 'Algenib', descriptor: 'Gravelly' },
+    { name: 'Rasalgethi', descriptor: 'Informative' },
+    { name: 'Laomedeia', descriptor: 'Upbeat' },
+    { name: 'Achernar', descriptor: 'Soft' },
+    { name: 'Alnilam', descriptor: 'Firm' },
+    { name: 'Schedar', descriptor: 'Even' },
+    { name: 'Gacrux', descriptor: 'Mature' },
+    { name: 'Pulcherrima', descriptor: 'Forward' },
+    { name: 'Achird', descriptor: 'Friendly' },
+    { name: 'Zubenelgenubi', descriptor: 'Casual' },
+    { name: 'Vindemiatrix', descriptor: 'Gentle' },
+    { name: 'Sadachbia', descriptor: 'Lively' },
+    { name: 'Sadaltager', descriptor: 'Knowledgeable' },
+    { name: 'Sulafat', descriptor: 'Warm' },
+]
+
+export const DEFAULT_VOICE_PROFILE: VoiceProfile = {
+    voice_name: 'Puck',
+    persona: 'female',
+    tones: ['bright', 'friendly'],
+    pace: 'balanced',
+}
+
+const VOICE_NAME_SET = new Set(GEMINI_TTS_VOICE_OPTIONS.map((option) => option.name))
+const VOICE_PERSONA_SET = new Set<VoicePersonaPreset>(['female', 'male', 'kathoey'])
+const VOICE_PACE_SET = new Set<VoicePacePreset>(['slow', 'balanced', 'fast'])
+const VOICE_TONE_SET = new Set<VoiceTonePreset>(['bright', 'playful', 'warm', 'confident', 'luxury', 'friendly', 'funny', 'sales'])
+
+const VOICE_PERSONA_SCRIPT_GUIDE: Record<VoicePersonaPreset, string> = {
+    female: 'ใช้โทนผู้หญิงร่วมสมัย ฟังลื่น ชัดถ้อยชัดคำ แต่ไม่หวานเลี่ยน',
+    male: 'ใช้โทนผู้ชายมั่นใจ กระชับ ชัดเจน ฟังน่าเชื่อถือ',
+    kathoey: 'ใช้โทนพิธีกรสายบันเทิงมั่นใจ มีสีสัน แพรวพราว แต่ยังเป็นมืออาชีพและขายของได้จริง',
+}
+
+const VOICE_PERSONA_TTS_GUIDE: Record<VoicePersonaPreset, string> = {
+    female: 'ผู้หญิงร่วมสมัย นุ่มลื่น ชัดถ้อยชัดคำ',
+    male: 'ผู้ชายมั่นใจ กระชับ ชัดเจน',
+    kathoey: 'มั่นใจ แพรวพราว มีสีสัน และมีจังหวะความบันเทิง',
+}
+
+const VOICE_TONE_SCRIPT_GUIDE: Record<VoiceTonePreset, string> = {
+    bright: 'สดใส มีแสงในน้ำเสียง',
+    playful: 'ขี้เล่น มีลูกล้อเล็กน้อย',
+    warm: 'อบอุ่น ฟังเข้าถึงง่าย',
+    confident: 'มั่นใจ หนักแน่น',
+    luxury: 'พรีเมียม ดูมีราคา',
+    friendly: 'เป็นกันเอง ไม่แข็ง',
+    funny: 'ตลกแบบพอดี มีจังหวะคอมเมนต์',
+    sales: 'มีแรงขายแบบเนียน ๆ ชวนคลิก',
+}
+
+const VOICE_PACE_SCRIPT_GUIDE: Record<VoicePacePreset, string> = {
+    slow: 'พูดช้ากว่าปกติเล็กน้อย เว้นจังหวะชัด',
+    balanced: 'พูดจังหวะกลาง ฟังลื่นเป็นธรรมชาติ',
+    fast: 'พูดค่อนข้างเร็ว กระชับ ทันภาพคลิปสั้น',
+}
 
 export const DEFAULT_VOICE_PROMPT_TEMPLATE = `คุณคือคอนเทนต์ครีเอเตอร์และนักพากย์มืออาชีพสำหรับคลิปสั้นแนว Reels
 
@@ -58,6 +172,70 @@ async function ensureNamespaceSettingsTable(db: D1Database) {
             PRIMARY KEY (namespace_id, key)
         )`
     ).run()
+}
+
+export function normalizeVoiceProfile(rawProfile: unknown): VoiceProfile {
+    const raw = rawProfile && typeof rawProfile === 'object' ? rawProfile as Record<string, unknown> : {}
+    const voiceName = String(raw.voice_name || '').trim()
+    const persona = String(raw.persona || '').trim() as VoicePersonaPreset
+    const pace = String(raw.pace || '').trim() as VoicePacePreset
+    const tonesRaw = Array.isArray(raw.tones) ? raw.tones : []
+    const tones: VoiceTonePreset[] = []
+    const seenTones = new Set<VoiceTonePreset>()
+
+    for (const toneRaw of tonesRaw) {
+        const tone = String(toneRaw || '').trim() as VoiceTonePreset
+        if (!VOICE_TONE_SET.has(tone) || seenTones.has(tone)) continue
+        seenTones.add(tone)
+        tones.push(tone)
+        if (tones.length >= MAX_VOICE_TONE_SELECTIONS) break
+    }
+
+    return {
+        voice_name: VOICE_NAME_SET.has(voiceName) ? voiceName : DEFAULT_VOICE_PROFILE.voice_name,
+        persona: VOICE_PERSONA_SET.has(persona) ? persona : DEFAULT_VOICE_PROFILE.persona,
+        tones: tones.length > 0 ? tones : [...DEFAULT_VOICE_PROFILE.tones],
+        pace: VOICE_PACE_SET.has(pace) ? pace : DEFAULT_VOICE_PROFILE.pace,
+    }
+}
+
+function stringifyVoiceProfile(profile: VoiceProfile): string {
+    return JSON.stringify({
+        version: 2,
+        voice_name: profile.voice_name,
+        persona: profile.persona,
+        tones: profile.tones,
+        pace: profile.pace,
+    })
+}
+
+function buildStructuredVoicePrompt(profile: VoiceProfile): string {
+    const toneGuide = profile.tones.map((tone) => VOICE_TONE_SCRIPT_GUIDE[tone]).join(', ')
+    return `${DEFAULT_VOICE_PROMPT_TEMPLATE}
+
+แนวพากย์ของ workspace นี้:
+- บุคลิกเสียง: ${VOICE_PERSONA_SCRIPT_GUIDE[profile.persona]}
+- โทนเสียง: ${toneGuide}
+- จังหวะการพูด: ${VOICE_PACE_SCRIPT_GUIDE[profile.pace]}
+- Voice ของ Gemini TTS ที่เลือก: ${profile.voice_name}
+
+ข้อกำชับเพิ่ม:
+- ให้ถ้อยคำและจังหวะประโยคสอดคล้องกับแนวเสียงนี้ แต่ยังต้องอิงภาพจริงเป็นหลัก
+- ถ้าคลิปสั้นมาก ให้ตัดคำฟุ่มเฟือยออกและทำให้ฟังลื่นที่สุด
+- ถ้าคลิปมีจังหวะขายของชัด ให้ CTA สั้น กระชับ และไม่ฝืนภาพ`
+}
+
+export function buildTtsPromptTemplate(profile: VoiceProfile): string {
+    const toneGuide = profile.tones.map((tone) => VOICE_TONE_SCRIPT_GUIDE[tone]).join(', ')
+    return `หน้าที่ของคุณคืออ่านเฉพาะบทพากย์ภาษาไทยด้านล่างตามต้นฉบับ ห้ามอ่านคำอธิบายหรือหัวข้อออกเสียง
+
+บุคลิกเสียง: ${VOICE_PERSONA_TTS_GUIDE[profile.persona]}
+โทนเสียง: ${toneGuide}
+จังหวะการพูด: ${VOICE_PACE_SCRIPT_GUIDE[profile.pace]}
+ให้เสียงฟังเป็นธรรมชาติ ชัดคำ และตรงจังหวะคลิปสั้น
+
+บทพากย์:
+{{script}}`
 }
 
 function buildScopedWebAppUrl(baseUrl: string, botScope: string) {
@@ -149,17 +327,91 @@ async function fetchWithTimeout(
     }
 }
 
-export async function getVoicePromptTemplate(db: D1Database, namespaceId: string): Promise<{ prompt: string; source: 'custom' | 'default'; updatedAt: string | null }> {
+async function getStoredVoicePromptRow(db: D1Database, namespaceId: string): Promise<{ value?: string; updated_at?: string } | null> {
     await ensureNamespaceSettingsTable(db)
-    const row = await db.prepare(
+    return db.prepare(
         'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
     ).bind(namespaceId, VOICE_PROMPT_KEY).first() as { value?: string; updated_at?: string } | null
+}
 
-    const custom = String(row?.value || '').trim()
-    if (custom) {
-        return { prompt: custom.slice(0, MAX_VOICE_PROMPT_CHARS), source: 'custom', updatedAt: row?.updated_at || null }
+async function getStoredVoiceProfileRow(db: D1Database, namespaceId: string): Promise<{ value?: string; updated_at?: string } | null> {
+    await ensureNamespaceSettingsTable(db)
+    return db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, VOICE_PROFILE_KEY).first() as { value?: string; updated_at?: string } | null
+}
+
+export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: string): Promise<NamespaceVoiceSettings> {
+    const profileRow = await getStoredVoiceProfileRow(db, namespaceId)
+    if (profileRow?.value) {
+        try {
+            const profile = normalizeVoiceProfile(JSON.parse(String(profileRow.value || '{}')))
+            return {
+                profile,
+                scriptPrompt: buildStructuredVoicePrompt(profile),
+                ttsPromptTemplate: buildTtsPromptTemplate(profile),
+                source: 'structured',
+                updatedAt: profileRow.updated_at || null,
+                legacyPromptActive: false,
+            }
+        } catch {
+            // fall through to default / legacy
+        }
     }
-    return { prompt: DEFAULT_VOICE_PROMPT_TEMPLATE, source: 'default', updatedAt: null }
+
+    const legacyRow = await getStoredVoicePromptRow(db, namespaceId)
+    const legacyPrompt = String(legacyRow?.value || '').trim()
+    if (legacyPrompt) {
+        return {
+            profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
+            scriptPrompt: legacyPrompt.slice(0, MAX_VOICE_PROMPT_CHARS),
+            ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+            source: 'legacy',
+            updatedAt: legacyRow?.updated_at || null,
+            legacyPromptActive: true,
+        }
+    }
+
+    return {
+        profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
+        scriptPrompt: buildStructuredVoicePrompt(DEFAULT_VOICE_PROFILE),
+        ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+        source: 'default',
+        updatedAt: null,
+        legacyPromptActive: false,
+    }
+}
+
+export async function setNamespaceVoiceSettings(db: D1Database, namespaceId: string, rawProfile: unknown): Promise<NamespaceVoiceSettings> {
+    await ensureNamespaceSettingsTable(db)
+    const profile = normalizeVoiceProfile(rawProfile)
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, VOICE_PROFILE_KEY, stringifyVoiceProfile(profile)).run()
+    await db.prepare(
+        'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, VOICE_PROMPT_KEY).run()
+    return getNamespaceVoiceSettings(db, namespaceId)
+}
+
+export async function clearNamespaceVoiceSettings(db: D1Database, namespaceId: string): Promise<NamespaceVoiceSettings> {
+    await ensureNamespaceSettingsTable(db)
+    await db.prepare(
+        'DELETE FROM namespace_settings WHERE namespace_id = ? AND key IN (?, ?)'
+    ).bind(namespaceId, VOICE_PROFILE_KEY, VOICE_PROMPT_KEY).run()
+    return getNamespaceVoiceSettings(db, namespaceId)
+}
+
+export async function getVoicePromptTemplate(db: D1Database, namespaceId: string): Promise<{ prompt: string; source: 'custom' | 'default'; updatedAt: string | null }> {
+    const settings = await getNamespaceVoiceSettings(db, namespaceId)
+    return {
+        prompt: settings.scriptPrompt,
+        source: settings.source === 'default' ? 'default' : 'custom',
+        updatedAt: settings.updatedAt,
+    }
 }
 
 export async function setVoicePromptTemplate(db: D1Database, namespaceId: string, rawPrompt: string) {
@@ -167,12 +419,15 @@ export async function setVoicePromptTemplate(db: D1Database, namespaceId: string
     const prompt = String(rawPrompt || '').trim()
     if (!prompt) {
         await db.prepare(
-            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
-        ).bind(namespaceId, VOICE_PROMPT_KEY).run()
-        return { prompt: DEFAULT_VOICE_PROMPT_TEMPLATE, source: 'default' as const }
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key IN (?, ?)'
+        ).bind(namespaceId, VOICE_PROMPT_KEY, VOICE_PROFILE_KEY).run()
+        return { prompt: buildStructuredVoicePrompt(DEFAULT_VOICE_PROFILE), source: 'default' as const }
     }
 
     const normalized = prompt.slice(0, MAX_VOICE_PROMPT_CHARS)
+    await db.prepare(
+        'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, VOICE_PROFILE_KEY).run()
     await db.prepare(
         `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
          VALUES (?, ?, ?, datetime('now'), datetime('now'))
@@ -189,6 +444,57 @@ async function getNamespaceGeminiApiKey(db: D1Database, namespaceId: string): Pr
         'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
     ).bind(namespaceId, GEMINI_API_KEY_SETTING_KEY).first() as { value?: string } | null
     return String(row?.value || '').trim()
+}
+
+function normalizeGeminiApiKeys(rawKeys: unknown): string[] {
+    const source = Array.isArray(rawKeys)
+        ? rawKeys
+        : typeof rawKeys === 'string'
+            ? [rawKeys]
+            : []
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const raw of source) {
+        const key = String(raw || '').trim().slice(0, MAX_GEMINI_API_KEY_CHARS)
+        if (!key) continue
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(key)
+        if (out.length >= MAX_GEMINI_API_KEY_SLOTS) break
+    }
+    return out
+}
+
+async function getLegacySystemGeminiApiKeys(db: D1Database): Promise<string[]> {
+    await ensureNamespaceSettingsTable(db)
+    const rows = await db.prepare(
+        `SELECT ns.value
+         FROM namespace_settings ns
+         INNER JOIN users u
+           ON u.namespace_id = ns.namespace_id
+         INNER JOIN system_admins sa
+           ON lower(trim(sa.email)) = lower(trim(u.email))
+         WHERE ns.key = ?
+           AND trim(coalesce(ns.value, '')) <> ''
+         ORDER BY datetime(ns.updated_at) DESC, datetime(ns.created_at) DESC`
+    ).bind(GEMINI_API_KEY_SETTING_KEY).all() as { results?: Array<{ value?: string }> }
+    return normalizeGeminiApiKeys((rows.results || []).map((row) => row?.value || ''))
+}
+
+export async function getSystemGeminiApiKeys(db: D1Database): Promise<string[]> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(SYSTEM_GEMINI_NAMESPACE_ID, GEMINI_API_KEYS_SETTING_KEY).first() as { value?: string } | null
+    let parsed: unknown = []
+    try {
+        parsed = JSON.parse(String(row?.value || '[]'))
+    } catch {
+        parsed = []
+    }
+    const keys = normalizeGeminiApiKeys(parsed)
+    if (keys.length > 0) return keys
+    return getLegacySystemGeminiApiKeys(db)
 }
 
 // ==================== Telegram Helpers ====================
@@ -351,14 +657,20 @@ export async function runPipeline(
     } catch (e) {
         console.log(`[PIPELINE] DB lookup failed, using default token: ${e}`)
     }
-    const apiKey = await getNamespaceGeminiApiKey(env.DB, botId).catch(() => '')
-    if (!apiKey) {
-        throw new Error('ยังไม่ได้ตั้ง Gemini API key สำหรับ workspace นี้')
+    const apiKeys = await getSystemGeminiApiKeys(env.DB).catch(() => [])
+    if (apiKeys.length === 0) {
+        throw new Error('ยังไม่ได้ตั้ง Gemini API key กลางของระบบ')
     }
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
-    const voicePrompt = await getVoicePromptTemplate(env.DB, botId)
-        .then((v) => v.prompt)
-        .catch(() => DEFAULT_VOICE_PROMPT_TEMPLATE)
+    const voiceSettings = await getNamespaceVoiceSettings(env.DB, botId)
+        .catch(() => ({
+            profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
+            scriptPrompt: buildStructuredVoicePrompt(DEFAULT_VOICE_PROFILE),
+            ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+            source: 'default' as const,
+            updatedAt: null,
+            legacyPromptActive: false,
+        }))
 
     try {
         // ถ้าเป็น XHS link → resolve URL จริงก่อน (เร็ว ~1-2 วินาที)
@@ -381,9 +693,12 @@ export async function runPipeline(
             video_url: directVideoUrl,
             chat_id: chatId,
             msg_id: statusMsgId,
-            api_key: apiKey,
+            api_key: apiKeys[0],
+            api_keys: apiKeys,
             model,
-            script_prompt: voicePrompt,
+            script_prompt: voiceSettings.scriptPrompt,
+            voice_name: voiceSettings.profile.voice_name,
+            tts_prompt_template: voiceSettings.ttsPromptTemplate,
             r2_public_url: env.R2_PUBLIC_URL,
             worker_url: workerUrl,
             completion_webapp_url: buildScopedGalleryWebAppUrl(

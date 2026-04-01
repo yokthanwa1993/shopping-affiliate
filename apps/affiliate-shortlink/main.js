@@ -28,6 +28,161 @@ let shopeeWindow = null;
 let lazadaWindow = null;
 let apiServer = null;
 
+function decodeHtmlEntities(value) {
+    return String(value || '')
+        .replace(/&amp;/gi, '&')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>');
+}
+
+function extractOriginalLinkFromHtml(html) {
+    const source = String(html || '');
+    if (!source) return '';
+
+    const patterns = [
+        /<link[^>]+rel=["']origin["'][^>]+href=["']([^"']+)["']/i,
+        /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i,
+        /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+name=["']twitter:url["'][^>]+content=["']([^"']+)["']/i,
+    ];
+
+    for (const pattern of patterns) {
+        const match = source.match(pattern);
+        const value = decodeHtmlEntities(match && match[1] ? match[1] : '').trim();
+        if (value) return value;
+    }
+
+    return '';
+}
+
+async function resolveOriginalLink(inputUrl) {
+    const raw = String(inputUrl || '').trim();
+    if (!raw) return '';
+
+    try {
+        const resp = await fetch(raw, {
+            method: 'GET',
+            redirect: 'follow',
+            headers: {
+                'User-Agent': CHROME_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            },
+        });
+
+        const finalUrl = String(resp.url || '').trim();
+        const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('text/html')) {
+            const html = await resp.text();
+            const extracted = extractOriginalLinkFromHtml(html);
+            if (extracted) return extracted;
+        }
+
+        return finalUrl || raw;
+    } catch {
+        return raw;
+    }
+}
+
+async function resolveRedirectUrl(inputUrl) {
+    const raw = String(inputUrl || '').trim();
+    if (!raw) return '';
+
+    try {
+        const resp = await fetch(raw, {
+            method: 'GET',
+            redirect: 'follow',
+            headers: {
+                'User-Agent': CHROME_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            },
+        });
+        return String(resp.url || '').trim() || raw;
+    } catch {
+        return raw;
+    }
+}
+
+async function resolveTrackingLink(inputUrl) {
+    const current = String(inputUrl || '').trim();
+    if (!current) return '';
+
+    const extracted = await resolveOriginalLink(current);
+    const candidate = extracted || current;
+    const redirected = await resolveRedirectUrl(candidate);
+    return redirected || candidate || current;
+}
+
+function normalizeShopeeOriginalLink(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+        const parsed = new URL(raw);
+        const match = parsed.pathname.match(/\/(?:universal-link\/)?product\/(\d+)\/(\d+)/i)
+            || parsed.pathname.match(/\/opaanlp\/(\d+)\/(\d+)/i)
+            || parsed.pathname.match(/-i[./](\d+)[./](\d+)/i);
+        if (match) {
+            return `https://shopee.co.th/product/${match[1]}/${match[2]}`;
+        }
+        return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+        return raw;
+    }
+}
+
+function normalizeLazadaOriginalLink(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+        const parsed = new URL(raw);
+        return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+        return raw;
+    }
+}
+
+function normalizeAffiliateId(value) {
+    const raw = String(value || '').trim().replace(/^an_/i, '');
+    const match = raw.match(/(\d{6,})/);
+    return match ? match[1] : '';
+}
+
+function buildShopeeShortlinkPayload(params) {
+    const link = String(params.link || '').trim();
+    const longLink = String(params.longLink || '').trim() || link;
+    const originalLink = normalizeShopeeOriginalLink(longLink) || longLink || link;
+    const id = normalizeAffiliateId(params.id || params.utmSource || '');
+    return {
+        link,
+        longLink,
+        originalLink,
+        shortLink: String(params.shortLink || '').trim(),
+        id,
+        utm_source: String(params.utmSource || '').trim(),
+        account: String(params.account || '').trim(),
+        sub1: String(params.sub1 || '').trim(),
+    };
+}
+
+function buildLazadaShortlinkPayload(params) {
+    const link = String(params.link || '').trim();
+    const longLink = String(params.longLink || '').trim() || link;
+    const originalLink = normalizeLazadaOriginalLink(longLink) || longLink || link;
+    const id = normalizeAffiliateId(params.id || params.memberId || '');
+    return {
+        link,
+        longLink,
+        originalLink,
+        shortLink: String(params.shortLink || '').trim(),
+        id,
+        member_id: params.memberId ?? null,
+        promotionCode: String(params.promotionCode || '').trim(),
+        account: String(params.account || '').trim(),
+        sub1: String(params.sub1 || '').trim(),
+    };
+}
+
 // ==================== BROWSER WINDOWS ====================
 function createShopeeWindow(show = false) {
     if (shopeeWindow && !shopeeWindow.isDestroyed()) {
@@ -103,23 +258,36 @@ async function shortenShopee(productUrl) {
         await new Promise(r => setTimeout(r, 3000));
     }
 
-    // Get csrf token from session cookies (httpOnly cookies can't be read via document.cookie)
-    const ses = session.fromPartition(shopeeSession);
-    const cookies = await ses.cookies.get({ domain: '.shopee.co.th', name: 'csrftoken' });
-    const csrfToken = cookies.length > 0 ? cookies[0].value : null;
-    if (!csrfToken) {
-        throw new Error('No csrftoken cookie - not logged in to Shopee Affiliate');
-    }
-
     const safeUrl = productUrl.replace(/'/g, "\\'");
-    const js = `(async function(productUrl, csrfToken) {
+    const js = `(async function(productUrl) {
+        // Try multiple ways to find csrf token
+        var csrfToken = null;
+
+        // 1. document.cookie
+        var m = document.cookie.match(/csrftoken=([^;]+)/);
+        if (m) csrfToken = m[1];
+
+        // 2. meta tag
+        if (!csrfToken) {
+            var meta = document.querySelector('meta[name="csrf-token"]') || document.querySelector('meta[name="csrftoken"]');
+            if (meta) csrfToken = meta.getAttribute('content');
+        }
+
+        // 3. window.__INITIAL_STATE__ or similar
+        if (!csrfToken && window.__INITIAL_STATE__ && window.__INITIAL_STATE__.csrfToken) {
+            csrfToken = window.__INITIAL_STATE__.csrfToken;
+        }
+
+        // Build headers
+        var headers = {
+            'Content-Type': 'application/json',
+            'affiliate-program-type': '1'
+        };
+        if (csrfToken) headers['csrf-token'] = csrfToken;
+
         var resp = await fetch('https://affiliate.shopee.co.th/api/v3/gql?q=batchCustomLink', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'affiliate-program-type': '1',
-                'csrf-token': csrfToken
-            },
+            headers: headers,
             credentials: 'include',
             body: JSON.stringify({
                 operationName: 'batchGetCustomLink',
@@ -136,7 +304,7 @@ async function shortenShopee(productUrl) {
         var r = results[0];
         if (r.failCode && r.failCode !== 0) throw new Error('failCode: ' + r.failCode);
         return { shortLink: r.shortLink || '', longLink: r.longLink || '', originalLink: productUrl };
-    })('${safeUrl}', '${csrfToken}')`;
+    })('${safeUrl}')`;
 
     const result = await executeInWindow(win, js);
 
@@ -184,9 +352,16 @@ function extractMemberId(data) {
     return null;
 }
 
-function extractUtmSource(shortLink) {
+function extractMemberIdFromUrl(value) {
+    const raw = decodeURIComponent(String(value || '').trim());
+    if (!raw) return null;
+    const match = raw.match(/mm_(\d+)_/);
+    return match ? match[1] : null;
+}
+
+function extractUtmSource(value) {
     try {
-        const u = new URL(shortLink);
+        const u = new URL(value);
         return u.searchParams.get('utm_source') || '';
     } catch { return ''; }
 }
@@ -212,45 +387,80 @@ function startApiServer() {
                 return;
             }
 
+            // Debug cookies
+            if (pathname === '/debug') {
+                const ses = session.fromPartition(shopeeSession);
+                const allCookies = await ses.cookies.get({});
+                const shopeeUrl = shopeeWindow && !shopeeWindow.isDestroyed() ? shopeeWindow.webContents.getURL() : 'N/A';
+                let docCookie = '';
+                try { docCookie = await shopeeWindow.webContents.executeJavaScript('document.cookie'); } catch(e) { docCookie = e.message; }
+                res.end(JSON.stringify({
+                    shopeeUrl,
+                    totalCookies: allCookies.length,
+                    cookieNames: allCookies.map(c => ({ name: c.name, domain: c.domain })),
+                    documentCookie: docCookie,
+                }, null, 2));
+                return;
+            }
+
             // Lazada: GET / or GET /shorten
             if ((pathname === '/' || pathname === '/shorten') && query.url && query.url.includes('lazada')) {
+                const resolvedOriginalLink = await resolveOriginalLink(query.url);
                 const d = await shortenLazada(query.url);
-                res.end(JSON.stringify({
-                    originalLink: query.url,
+                const resolvedShortLink = await resolveTrackingLink(d.promotionLink);
+                res.end(JSON.stringify(buildLazadaShortlinkPayload({
+                    link: query.url,
+                    longLink: resolvedOriginalLink,
                     shortLink: d.promotionLink,
-                    redirectLink: d.promotionLink,
-                    longLink: query.url,
-                    member_id: extractMemberId(d),
+                    memberId: extractMemberIdFromUrl(resolvedShortLink) || extractMemberId(d),
                     promotionCode: d.promotionCode || '',
                     account: query.account || '',
                     sub1: query.sub1 || '',
-                }));
+                })));
                 return;
             }
 
             // Shopee: GET /shopee or GET / with shopee URL
             if (pathname === '/shopee' || pathname === '/shopee/shorten' || ((pathname === '/' || pathname === '/shorten') && query.url && query.url.includes('shopee'))) {
                 const d = await shortenShopee(query.url);
-                res.end(JSON.stringify({
-                    originalLink: query.url,
-                    shortLink: d.shortLink,
-                    redirectLink: d.shortLink,
+                const resolvedShortLink = await resolveTrackingLink(d.shortLink);
+                res.end(JSON.stringify(buildShopeeShortlinkPayload({
+                    link: query.url,
                     longLink: d.longLink || '',
-                    utm_source: extractUtmSource(d.shortLink),
+                    shortLink: d.shortLink,
+                    utmSource: extractUtmSource(resolvedShortLink),
                     account: query.account || '',
                     sub1: query.sub1 || '',
-                }));
+                })));
                 return;
             }
 
             // Auto-detect: GET /?url=...
             if ((pathname === '/' || pathname === '/shorten') && query.url) {
+                const resolvedOriginalLink = await resolveOriginalLink(query.url);
                 if (query.url.includes('shopee')) {
                     const d = await shortenShopee(query.url);
-                    res.end(JSON.stringify({ originalLink: query.url, shortLink: d.shortLink, redirectLink: d.shortLink, longLink: d.longLink || '', utm_source: extractUtmSource(d.shortLink), account: query.account || '', sub1: query.sub1 || '' }));
+                    const resolvedShortLink = await resolveTrackingLink(d.shortLink);
+                    res.end(JSON.stringify(buildShopeeShortlinkPayload({
+                        link: query.url,
+                        longLink: d.longLink || resolvedOriginalLink || '',
+                        shortLink: d.shortLink,
+                        utmSource: extractUtmSource(resolvedShortLink),
+                        account: query.account || '',
+                        sub1: query.sub1 || '',
+                    })));
                 } else {
                     const d = await shortenLazada(query.url);
-                    res.end(JSON.stringify({ originalLink: query.url, shortLink: d.promotionLink, redirectLink: d.promotionLink, longLink: query.url, member_id: extractMemberId(d), promotionCode: d.promotionCode || '', account: query.account || '', sub1: query.sub1 || '' }));
+                    const resolvedShortLink = await resolveTrackingLink(d.promotionLink);
+                    res.end(JSON.stringify(buildLazadaShortlinkPayload({
+                        link: query.url,
+                        longLink: resolvedOriginalLink,
+                        shortLink: d.promotionLink,
+                        memberId: extractMemberIdFromUrl(resolvedShortLink) || extractMemberId(d),
+                        promotionCode: d.promotionCode || '',
+                        account: query.account || '',
+                        sub1: query.sub1 || '',
+                    })));
                 }
                 return;
             }

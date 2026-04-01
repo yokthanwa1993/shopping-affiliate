@@ -22,13 +22,17 @@ pub struct PipelineRequest {
     pub chat_id: u64,
     pub msg_id: Option<u64>,
     pub api_key: String,
+    pub api_keys: Option<Vec<String>>,
     pub model: Option<String>,
     pub r2_public_url: String,
     pub worker_url: String,
     pub bot_id: Option<String>,
     pub video_id: Option<String>,
     pub shopee_link: Option<String>,
+    pub lazada_link: Option<String>,
     pub script_prompt: Option<String>,
+    pub voice_name: Option<String>,
+    pub tts_prompt_template: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +46,32 @@ struct ScriptPack {
     title: String,
     category: String,
     subtitle_lines: Vec<String>,
+}
+
+fn normalize_gemini_api_keys(keys: Option<&Vec<String>>, fallback: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(raw_keys) = keys {
+        for raw in raw_keys {
+            let key = raw.trim().to_string();
+            if key.is_empty() || seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key.clone());
+            out.push(key);
+            if out.len() >= 5 {
+                break;
+            }
+        }
+    }
+
+    let fallback = fallback.trim().to_string();
+    if out.is_empty() && !fallback.is_empty() {
+        out.push(fallback);
+    }
+
+    out
 }
 
 fn parse_env_bool(value: &str) -> Option<bool> {
@@ -570,14 +600,36 @@ async fn gemini_script(
     })
 }
 
-async fn gemini_tts(script: &str, api_key: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn build_tts_input(script: &str, template: Option<&str>) -> String {
+    let trimmed_script = script.trim();
+    let trimmed_template = template.unwrap_or("").trim();
+    if trimmed_template.is_empty() {
+        return trimmed_script.to_string();
+    }
+    if trimmed_template.contains("{{script}}") {
+        return trimmed_template.replace("{{script}}", trimmed_script);
+    }
+    format!("{}\n\nบทพากย์:\n{}", trimmed_template, trimmed_script)
+}
+
+async fn gemini_tts(
+    script: &str,
+    api_key: &str,
+    voice_name: Option<&str>,
+    tts_prompt_template: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={}", api_key);
     let client = Client::new();
+    let selected_voice = voice_name
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Puck");
+    let prompt_text = build_tts_input(script, tts_prompt_template);
     let payload = json!({
-        "contents": [{"parts": [{"text": script}]}],
+        "contents": [{"parts": [{"text": prompt_text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": selected_voice}}}
         }
     });
 
@@ -1237,6 +1289,8 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
     let bot_id = req.bot_id.clone().unwrap_or_else(|| "default".to_string());
     let token = &req.token;
     let worker_url = &req.worker_url;
+    let gemini_api_keys = normalize_gemini_api_keys(req.api_keys.as_ref(), &req.api_key);
+    let mock_mode = gemini_api_keys.len() == 1 && gemini_api_keys.get(0).map(|k| k == "mock").unwrap_or(false);
     
     // 1. Download
     update_step(worker_url, token, &bot_id, &video_id, 1.0, "📥 ดาวน์โหลดวิดีโอ").await;
@@ -1256,8 +1310,9 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
     let duration = get_duration(&video_path).await;
 
     let model = req.model.unwrap_or_else(|| "gemini-3-flash-preview".to_string());
+    let mut selected_gemini_key = String::new();
 
-    let (script, subtitle_lines, title, category, a_dur, wav_audio) = if req.api_key == "mock" {
+    let (script, subtitle_lines, title, category, a_dur, wav_audio) = if mock_mode {
         let wav = tmp_path.join("audio.wav");
         Command::new("ffmpeg").args(&["-y", "-i", video_path.to_str().unwrap(), "-f", "s16le", "-ar", "24000", "-ac", "1", wav.to_str().unwrap()]).output().await?;
         let d = get_duration(&wav).await;
@@ -1271,35 +1326,72 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
             wav,
         )
     } else {
+        if gemini_api_keys.is_empty() {
+            return Err("ยังไม่ได้ตั้ง Gemini API key กลางของระบบ".into());
+        }
+
         // 2. Analyze
         update_step(worker_url, token, &bot_id, &video_id, 2.0, "🔍 อัปโหลดวิดีโอไป Gemini...").await;
         edit_status(token, req.chat_id, req.msg_id, "📥 ดาวน์โหลดวิดีโอ ✅\n🔍 กำลังวิเคราะห์วิดีโอ").await;
+        let mut analyze_result = None;
+        let mut last_gemini_err = String::new();
+        for (index, api_key) in gemini_api_keys.iter().enumerate() {
+            println!("[PIPELINE] Gemini key slot {} analyze start", index + 1);
+            let attempt = async {
+                let gemini_uri = gemini_upload_bytes(&video_bytes, "video/mp4", api_key).await?;
+                update_step(worker_url, token, &bot_id, &video_id, 2.3, "🔍 รอ Gemini ประมวลผล...").await;
+                let gemini_uri = gemini_wait(&gemini_uri, api_key).await?;
 
-        let gemini_uri = gemini_upload_bytes(&video_bytes, "video/mp4", &req.api_key).await?;
-        update_step(worker_url, token, &bot_id, &video_id, 2.3, "🔍 รอ Gemini ประมวลผล...").await;
-        let gemini_uri = gemini_wait(&gemini_uri, &req.api_key).await?;
+                update_step(worker_url, token, &bot_id, &video_id, 2.7, "🔍 สร้างบทพากย์...").await;
+                let pack = gemini_script(
+                    &gemini_uri,
+                    api_key,
+                    &model,
+                    duration,
+                    req.script_prompt.as_deref(),
+                ).await?;
 
-        update_step(worker_url, token, &bot_id, &video_id, 2.7, "🔍 สร้างบทพากย์...").await;
-        let pack = gemini_script(
-            &gemini_uri,
-            &req.api_key,
-            &model,
-            duration,
-            req.script_prompt.as_deref(),
-        ).await?;
-        
-        // 3. TTS
-        update_step(worker_url, token, &bot_id, &video_id, 3.0, "🎙 กำลังสร้างเสียงพากย์ไทย...").await;
-        edit_status(token, req.chat_id, req.msg_id, "📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 กำลังสร้างเสียงพากย์").await;
-        
-        let tts_b64 = gemini_tts(&pack.script, &req.api_key).await?;
-        let raw_audio = tmp_path.join("audio.raw");
-        fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;
-        
-        let wav = tmp_path.join("audio.wav");
-        Command::new("ffmpeg").args(&["-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", raw_audio.to_str().unwrap(), wav.to_str().unwrap()]).output().await?;
-        let d = get_duration(&wav).await;
-        (pack.script, pack.subtitle_lines, pack.title, pack.category, d, wav)
+                update_step(worker_url, token, &bot_id, &video_id, 3.0, "🎙 กำลังสร้างเสียงพากย์ไทย...").await;
+                edit_status(token, req.chat_id, req.msg_id, "📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 กำลังสร้างเสียงพากย์").await;
+
+                let tts_b64 = gemini_tts(
+                    &pack.script,
+                    api_key,
+                    req.voice_name.as_deref(),
+                    req.tts_prompt_template.as_deref(),
+                ).await?;
+                let raw_audio = tmp_path.join("audio.raw");
+                fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;
+
+                let wav = tmp_path.join("audio.wav");
+                Command::new("ffmpeg").args(&["-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", raw_audio.to_str().unwrap(), wav.to_str().unwrap()]).output().await?;
+                let d = get_duration(&wav).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((pack.script, pack.subtitle_lines, pack.title, pack.category, d, wav))
+            }.await;
+
+            match attempt {
+                Ok(result) => {
+                    selected_gemini_key = api_key.clone();
+                    analyze_result = Some(result);
+                    break;
+                }
+                Err(err) => {
+                    last_gemini_err = err.to_string();
+                    println!("[PIPELINE] Gemini key slot {} analyze failed: {}", index + 1, last_gemini_err);
+                }
+            }
+        }
+
+        match analyze_result {
+            Some(result) => result,
+            None => {
+                return Err(if last_gemini_err.is_empty() {
+                    "Gemini pipeline failed".into()
+                } else {
+                    last_gemini_err.into()
+                });
+            }
+        }
     };
 
     // 4. Merge Prep
@@ -1321,12 +1413,36 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
     edit_status(token, req.chat_id, req.msg_id, "🎬 ตัดต่อ: กำลังฝังซับไตเติ้ล").await;
 
     let mut raw_srt = String::new();
-    if req.api_key != "mock" {
+    if !mock_mode {
         let t_sync = std::time::Instant::now();
         let adjusted_bytes = fs::read(&adjusted).await?;
-        let audio_uri = gemini_upload_bytes(&adjusted_bytes, "audio/wav", &req.api_key).await?;
-        let audio_uri = gemini_wait(&audio_uri, &req.api_key).await?;
-        raw_srt = gemini_srt_from_audio(&audio_uri, &subtitle_lines, &req.api_key, &model, a_dur).await?;
+        let mut audio_sync_keys = gemini_api_keys.clone();
+        if !selected_gemini_key.is_empty() {
+            audio_sync_keys.retain(|key| key != &selected_gemini_key);
+            audio_sync_keys.insert(0, selected_gemini_key.clone());
+        }
+        let mut last_audio_sync_err = String::new();
+        for (index, api_key) in audio_sync_keys.iter().enumerate() {
+            let attempt = async {
+                let audio_uri = gemini_upload_bytes(&adjusted_bytes, "audio/wav", api_key).await?;
+                let audio_uri = gemini_wait(&audio_uri, api_key).await?;
+                gemini_srt_from_audio(&audio_uri, &subtitle_lines, api_key, &model, a_dur).await
+            }.await;
+
+            match attempt {
+                Ok(srt) => {
+                    raw_srt = srt;
+                    break;
+                }
+                Err(err) => {
+                    last_audio_sync_err = err.to_string();
+                    println!("[PIPELINE] Gemini key slot {} audio sync failed: {}", index + 1, last_audio_sync_err);
+                }
+            }
+        }
+        if raw_srt.trim().is_empty() && !last_audio_sync_err.is_empty() {
+            return Err(last_audio_sync_err.into());
+        }
         println!(
             "[PIPELINE] Gemini audio sync -> {} chars, {} blocks ({:.1}s)",
             raw_srt.len(),
@@ -1547,6 +1663,7 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
         "category": category, "duration": duration,
         "originalUrl": req.video_url, "publicUrl": public_url,
         "thumbnailUrl": thumb_url,
+        "voiceName": req.voice_name.clone().unwrap_or_else(|| "Puck".to_string()),
         "chatId": req.chat_id,
         "pipelineEngineVersion": PIPELINE_ENGINE_VERSION,
         "debugTimingKey": format!("debug/{}/timing.json", video_id),

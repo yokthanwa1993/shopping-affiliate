@@ -6769,7 +6769,7 @@ pub fn run() {
         .setup(|app| {
             // Start HTTP API server for remote launching
             let state = app.state::<AppState>().inner().clone();
-            tokio::spawn(start_http_api_server(state));
+            tauri::async_runtime::spawn(start_http_api_server(state));
 
             // Minimize to system tray on close
             let window = app.get_webview_window("main").unwrap();
@@ -6798,7 +6798,7 @@ pub fn run() {
                         let url_str = url.to_string();
                         let state_clone = state.clone();
                         log::info!("Received deep link: {}", url_str);
-                        tokio::spawn(async move {
+                        tauri::async_runtime::spawn(async move {
                             handle_deep_link(&url_str, &state_clone).await;
                         });
                     }
