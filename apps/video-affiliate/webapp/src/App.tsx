@@ -1,9 +1,16 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction, type SyntheticEvent } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
+import { API_BASE_URL } from './apiBaseUrl'
+import { useViewerHistory } from './app/hooks/useViewerHistory'
+import { Thumb } from './app/components/Thumb'
+import { getInboxVideoIdentityKey } from './app/inboxUtils'
+import type { DashboardData, InboxVideo } from './app/sharedTypes'
+import { DashboardTab } from './app/tabs/DashboardTab'
+import { InboxTab } from './app/tabs/InboxTab'
+import { ProcessingTab } from './app/tabs/ProcessingTab'
+import { BottomNav } from './app/components/BottomNav'
 
 
-const WORKER_URL = String(import.meta.env.VITE_WORKER_URL || 'https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev')
-  .trim()
-  .replace(/\/+$/, '')
+const WORKER_URL = API_BASE_URL
 
 const LINE_LIFF_ID = '2009652996-DJtEhoDn'
 const GALLERY_HEADER_TOP_GAP = 8
@@ -93,17 +100,24 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
   return !!(account || shopeeBase || lazadaBase || utmId || memberId)
 }
 
-const CACHE_VERSION = 'v6'
+const CACHE_VERSION = 'v8'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
+const nsInboxCacheKey = (namespaceId: string) => `inbox_cache:${CACHE_VERSION}:${namespaceId}`
+const dashboardCacheKey = (namespaceId: string) => `dashboard_cache:${CACHE_VERSION}:${namespaceId}`
+const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`inbox_system_cache:${CACHE_VERSION}`, botScope)
 const GALLERY_BATCH_SIZE = 24
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
 const FORCE_SYSTEM_WIDE_GALLERY = true
 
 const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
-  if (FORCE_SYSTEM_WIDE_GALLERY || systemWide || hasStoredAffiliateShortlinkConfig(botScope)) {
+  if (FORCE_SYSTEM_WIDE_GALLERY || systemWide) {
+    return dedupeGalleryVideos(readCache<Video[]>(systemGalleryCacheKey(botScope), []))
+  }
+
+  if (hasStoredAffiliateShortlinkConfig(botScope)) {
     return []
   }
 
@@ -117,8 +131,14 @@ const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespac
 
 const apiFetch = async (url: string, options: RequestInit = {}) => {
   const headers = { ...options.headers, 'x-auth-token': getToken() }
-  return fetch(url, { ...options, headers, cache: 'no-store' })
-};
+  const method = String(options.method || 'GET').toUpperCase()
+  return fetch(url, {
+    ...options,
+    headers,
+    credentials: 'include',
+    cache: method === 'GET' || method === 'HEAD' ? options.cache : 'no-store',
+  })
+}
 
 const copyPlainText = async (value: string): Promise<boolean> => {
   const text = String(value || '').trim()
@@ -179,41 +199,6 @@ const onPageImageError = (
   img.src = PAGE_IMAGE_PLACEHOLDER
 }
 
-function useViewerHistory(expanded: boolean, setExpanded: Dispatch<SetStateAction<boolean>>) {
-  const pushedViewerHistoryRef = useRef(false)
-  const closingFromPopStateRef = useRef(false)
-
-  useEffect(() => {
-    if (!expanded) return
-
-    const currentState = window.history.state
-    const nextState = currentState && typeof currentState === 'object'
-      ? { ...currentState, __viewer_overlay: true }
-      : { __viewer_overlay: true }
-
-    closingFromPopStateRef.current = false
-    window.history.pushState(nextState, '', window.location.href)
-    pushedViewerHistoryRef.current = true
-
-    const handlePopState = () => {
-      if (!pushedViewerHistoryRef.current) return
-      closingFromPopStateRef.current = true
-      pushedViewerHistoryRef.current = false
-      setExpanded(false)
-    }
-
-    window.addEventListener('popstate', handlePopState)
-    return () => {
-      window.removeEventListener('popstate', handlePopState)
-      if (pushedViewerHistoryRef.current && !closingFromPopStateRef.current) {
-        pushedViewerHistoryRef.current = false
-        window.history.back()
-      }
-      closingFromPopStateRef.current = false
-    }
-  }, [expanded, setExpanded])
-}
-
 interface Video {
   id: string
   namespace_id?: string
@@ -248,151 +233,6 @@ interface Video {
 }
 
 type GalleryAssetVariant = 'public' | 'original' | 'thumb' | 'original-thumb'
-
-interface InboxVideo {
-  id: string
-  namespace_id?: string
-  importedFromNamespaceId?: string
-  duplicateNamespaceIds?: string[]
-  dedupedFromOtherNamespace?: boolean
-  videoUrl?: string
-  previewUrl?: string
-  originalUrl?: string
-  thumbnailUrl?: string
-  createdAt: string
-  updatedAt?: string
-  status: string
-  sourceType?: string
-  sourceLabel?: string
-  shopeeLink?: string
-  lazadaLink?: string
-  hasShopeeLink?: boolean
-  hasLazadaLink?: boolean
-  readyToProcess?: boolean
-  canStartProcessing?: boolean
-  canDelete?: boolean
-}
-
-function isInboxVideoOwnedByCurrentNamespace(video: InboxVideo, currentNamespaceId?: string): boolean {
-  const videoNamespaceId = String(video.namespace_id || '').trim()
-  const namespaceId = String(currentNamespaceId || '').trim()
-  return !!videoNamespaceId && !!namespaceId && videoNamespaceId === namespaceId
-}
-
-function compareInboxVideosForSystemView(a: InboxVideo, b: InboxVideo, currentNamespaceId?: string): number {
-  void currentNamespaceId
-  const aTs = new Date(String(a.createdAt || a.updatedAt || '')).getTime()
-  const bTs = new Date(String(b.createdAt || b.updatedAt || '')).getTime()
-  return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
-}
-
-function parseImportedNamespaceIdFromSourceLabel(sourceLabel?: string): string | undefined {
-  const label = String(sourceLabel || '').trim()
-  if (!label) return undefined
-  const match = label.match(/imported from\s+([A-Za-z0-9_:-]+)/i)
-  const importedNamespaceId = String(match?.[1] || '').trim()
-  return importedNamespaceId || undefined
-}
-
-function dedupeSystemInboxVideos(videos: InboxVideo[], currentNamespaceId?: string): InboxVideo[] {
-  const namespaceId = String(currentNamespaceId || '').trim()
-  const groups = new Map<string, InboxVideo[]>()
-
-  for (const video of videos) {
-    const videoId = String(video.id || '').trim()
-    if (!videoId) continue
-    const items = groups.get(videoId) || []
-    items.push(video)
-    groups.set(videoId, items)
-  }
-
-  return Array.from(groups.values())
-    .map((items) => {
-      const sortedItems = items
-        .slice()
-        .sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId))
-      const preferredOwnVideo = namespaceId
-        ? sortedItems.find((item) => isInboxVideoOwnedByCurrentNamespace(item, namespaceId))
-        : undefined
-      const selected = preferredOwnVideo || sortedItems[0]
-      const namespaceIds = Array.from(new Set(
-        sortedItems
-          .map((item) => String(item.namespace_id || '').trim())
-          .filter(Boolean)
-      ))
-      const fallbackThumbVideo = sortedItems.find((item) => !!String(item.thumbnailUrl || '').trim())
-      const fallbackPlaybackVideo = sortedItems.find((item) => (
-        !!String(item.originalUrl || '').trim()
-        || !!String(item.previewUrl || '').trim()
-        || !!String(item.videoUrl || '').trim()
-      ))
-      const selectedNamespaceId = String(selected.namespace_id || '').trim()
-      const importedFromNamespaceId = String(
-        selected.importedFromNamespaceId
-        || parseImportedNamespaceIdFromSourceLabel(selected.sourceLabel)
-        || namespaceIds.find((id) => id && id !== selectedNamespaceId)
-        || ''
-      ).trim() || undefined
-
-      return {
-        ...selected,
-        thumbnailUrl: String(selected.thumbnailUrl || fallbackThumbVideo?.thumbnailUrl || '').trim() || undefined,
-        originalUrl: String(selected.originalUrl || fallbackPlaybackVideo?.originalUrl || '').trim() || undefined,
-        previewUrl: String(selected.previewUrl || fallbackPlaybackVideo?.previewUrl || '').trim() || undefined,
-        videoUrl: String(selected.videoUrl || fallbackPlaybackVideo?.videoUrl || '').trim() || undefined,
-        importedFromNamespaceId,
-        duplicateNamespaceIds: namespaceIds,
-        dedupedFromOtherNamespace: !!(
-          importedFromNamespaceId
-          && isInboxVideoOwnedByCurrentNamespace(selected, namespaceId)
-        ),
-      } satisfies InboxVideo
-    })
-    .sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId))
-}
-
-function getInboxVideoIdentityKey(id: string, namespaceId?: string): string {
-  const normalizedId = String(id || '').trim()
-  const normalizedNamespaceId = String(namespaceId || '').trim()
-  return normalizedNamespaceId ? `${normalizedNamespaceId}:${normalizedId}` : normalizedId
-}
-
-function InboxOwnershipIcon({
-  own,
-  className = '',
-}: {
-  own: boolean
-  className?: string
-}) {
-  return (
-    <svg
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.1"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      {own ? (
-        <>
-          <path d="M3 10.5 12 3l9 7.5" />
-          <path d="M5 9.5V20h14V9.5" />
-          <path d="M9 20v-5.5h6V20" />
-        </>
-      ) : (
-        <>
-          <path d="m12 3-8 4 8 4 8-4-8-4Z" />
-          <path d="m4 12 8 4 8-4" />
-          <path d="m4 17 8 4 8-4" />
-        </>
-      )}
-    </svg>
-  )
-}
 
 interface GalleryPageResponse {
   videos?: Video[]
@@ -634,15 +474,6 @@ interface PostHistory {
   error_message?: string | null
 }
 
-interface DashboardAdminStat {
-  telegram_id: string
-  email: string
-  display_name?: string
-  picture_url?: string
-  line_user_id?: string
-  links: number
-}
-
 interface TeamMember {
   email: string
   created_at: string
@@ -665,17 +496,6 @@ interface SystemMember {
   updated_at?: string
   role?: SystemMemberRole
   team_owner_namespace_id?: string
-}
-
-interface DashboardData {
-  date: string
-  totals: {
-    posts_all: number
-    posts_on_date: number
-    links_all: number
-    links_on_date: number
-  }
-  admins: DashboardAdminStat[]
 }
 
 interface FacebookPage {
@@ -1234,72 +1054,6 @@ declare global {
   }
 }
 
-// Icons
-const DashboardIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
-    <path d="M4 20V10M10 20V4M16 20v-7M22 20v-4" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
-const DashboardIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M3 10a1 1 0 011-1h1.5a1 1 0 011 1v10H4a1 1 0 01-1-1v-9zM9 4a1 1 0 011-1h1.5a1 1 0 011 1v16H9V4zM15 13a1 1 0 011-1h1.5a1 1 0 011 1v7H15v-7zM21 16a1 1 0 011-1h.5a1 1 0 011 1v4h-1.5a1 1 0 01-1-1v-3z" />
-  </svg>
-)
-const InboxIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-    <path d="M4 5.5h16v10.5a2 2 0 01-2 2H6a2 2 0 01-2-2V5.5z" strokeLinecap="round" strokeLinejoin="round" />
-    <path d="M4 14h4l2 3h4l2-3h4" strokeLinecap="round" strokeLinejoin="round" />
-    <path d="M12 8v4" strokeLinecap="round" strokeLinejoin="round" />
-    <path d="M9.5 10.5L12 13l2.5-2.5" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
-const InboxIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M4 5a2 2 0 012-2h12a2 2 0 012 2v9.5a2.5 2.5 0 01-2.5 2.5h-2.36a1 1 0 00-.8.4L13.5 19a1 1 0 01-1.6 0l-1.84-2.45a1 1 0 00-.8-.4H6.5A2.5 2.5 0 014 13.5V5zm8 2.75a.75.75 0 00-.75.75v2.69l-.72-.72a.75.75 0 10-1.06 1.06l2 2a.75.75 0 001.06 0l2-2a.75.75 0 10-1.06-1.06l-.72.72V8.5a.75.75 0 00-.75-.75z" />
-  </svg>
-)
-const VideoIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
-const VideoIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M4 6a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 14l5.293 2.646A1 1 0 0021 15.75V8.25a1 1 0 00-1.707-.896L14 10v4z" />
-  </svg>
-)
-const ProcessIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
-  </svg>
-)
-const ProcessIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l1.903 1.903h-3.183a.75.75 0 100 1.5h4.992a.75.75 0 00.75-.75V4.356a.75.75 0 00-1.5 0v3.18l-1.9-1.9A9 9 0 003.306 9.67a.75.75 0 101.45.388zm15.408 3.352a.75.75 0 00-.919.53 7.5 7.5 0 01-12.548 3.364l-1.902-1.903h3.183a.75.75 0 000-1.5H2.984a.75.75 0 00-.75.75v4.992a.75.75 0 001.5 0v-3.18l1.9 1.9a9 9 0 0015.059-4.035.75.75 0 00-.53-.918z" clipRule="evenodd" />
-  </svg>
-)
-
-const ListIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
-const ListIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path fillRule="evenodd" d="M3 5.25a.75.75 0 01.75-.75h16.5a.75.75 0 010 1.5H3.75A.75.75 0 013 5.25zm0 4.5A.75.75 0 013.75 9h16.5a.75.75 0 010 1.5H3.75A.75.75 0 013 9.75zm0 4.5a.75.75 0 01.75-.75h16.5a.75.75 0 010 1.5H3.75a.75.75 0 01-.75-.75zm0 4.5a.75.75 0 01.75-.75h16.5a.75.75 0 010 1.5H3.75a.75.75 0 01-.75-.75z" clipRule="evenodd" />
-  </svg>
-)
-const SettingsIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-    <path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" strokeLinecap="round" strokeLinejoin="round" />
-    <path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-)
-const SettingsIconFilled = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-    <path fillRule="evenodd" d="M11.078 2.25c-.917 0-1.699.663-1.85 1.567L9.05 4.889c-.02.12-.115.26-.297.348a7.493 7.493 0 00-.986.57c-.166.115-.334.126-.45.083L6.3 5.508a1.875 1.875 0 00-2.282.819l-.922 1.597a1.875 1.875 0 00.432 2.385l.84.692c.095.078.17.229.154.43a7.598 7.598 0 000 1.139c.015.2-.059.352-.153.43l-.841.692a1.875 1.875 0 00-.432 2.385l.922 1.597a1.875 1.875 0 002.282.818l1.019-.382c.115-.043.283-.031.45.082.312.214.641.405.985.57.182.088.277.228.297.35l.178 1.071c.151.904.933 1.567 1.85 1.567h1.844c.916 0 1.699-.663 1.85-1.567l.178-1.072c.02-.12.114-.26.297-.349.344-.165.673-.356.985-.57.167-.114.335-.125.45-.082l1.02.382a1.875 1.875 0 002.28-.819l.923-1.597a1.875 1.875 0 00-.432-2.385l-.84-.692c-.095-.078-.17-.229-.154-.43a7.614 7.614 0 000-1.139c-.016-.2.059-.352.153-.43l.84-.692c.708-.582.891-1.59.433-2.385l-.922-1.597a1.875 1.875 0 00-2.282-.818l-1.02.382c-.114.043-.282.031-.449-.083a7.49 7.49 0 00-.985-.57c-.183-.087-.277-.227-.297-.348l-.179-1.072a1.875 1.875 0 00-1.85-1.567h-1.843zM12 15.75a3.75 3.75 0 100-7.5 3.75 3.75 0 000 7.5z" clipRule="evenodd" />
-  </svg>
-)
 const CloseIcon = () => (
   <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
     <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" strokeLinejoin="round" />
@@ -1348,47 +1102,6 @@ function VideoWorkspaceBadge({
       {isCurrentWorkspace ? <WorkspaceCurrentIcon /> : <WorkspaceOtherIcon />}
       {showLabel && <span>{label}</span>}
     </div>
-  )
-}
-
-function inferThumbnailUrl(url: string | undefined, fallback: string): string {
-  const direct = String(url || '').trim()
-  if (direct) return direct
-  const source = String(fallback || '').trim()
-  if (!source) return ''
-  if (/\/asset\/original(?:\?|$)/i.test(source)) {
-    return source.replace(/\/asset\/original(?=\?|$)/i, '/asset/original-thumb')
-  }
-  if (/_original\.mp4(?:[?#].*)?$/i.test(source)) {
-    return source.replace(/_original\.mp4/i, '_original_thumb.webp')
-  }
-  return source.replace(/\.mp4(?:[?#].*)?$/i, '_thumb.webp')
-}
-
-// Grid thumbnails stay image-only. If a thumb is missing, show a lightweight placeholder.
-function Thumb({ url, fallback }: { id: string; url?: string; fallback: string }) {
-  const [failed, setFailed] = useState(false)
-  const src = failed ? '' : inferThumbnailUrl(url, fallback)
-
-  if (!src) {
-    return (
-      <div className="w-full h-full bg-gradient-to-br from-slate-200 via-slate-100 to-white flex items-center justify-center">
-        <div className="rounded-full bg-white/85 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500 shadow-sm">
-          No Thumb
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <img
-      src={src}
-      className="w-full h-full object-cover"
-      loading="lazy"
-      decoding="async"
-      alt=""
-      onError={() => setFailed(true)}
-    />
   )
 }
 
@@ -2597,372 +2310,6 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   )
 }
 
-function InboxCard({
-  video,
-  onStart,
-  onDelete,
-  starting,
-  deleting,
-  onExpandedChange,
-  viewMode,
-  currentNamespaceId,
-}: {
-  video: InboxVideo
-  onStart: (id: string, namespaceId?: string) => void
-  onDelete: (id: string, namespaceId?: string) => void
-  starting: boolean
-  deleting: boolean
-  onExpandedChange?: (expanded: boolean) => void
-  viewMode?: 'default' | 'processed'
-  currentNamespaceId?: string
-}) {
-  const [expanded, setExpanded] = useState(false)
-  const canDelete = video.canDelete !== false
-  const canStartProcessing = video.canStartProcessing !== false
-  const ready = video.readyToProcess === true || video.status === 'ready' || (video.hasShopeeLink === true && video.hasLazadaLink === true)
-  const missingLinks = [
-    video.hasShopeeLink ? null : 'Shopee',
-    video.hasLazadaLink ? null : 'Lazada',
-  ].filter(Boolean).join(' / ')
-  const sourceLabel = String(video.sourceLabel || (video.sourceType === 'xhs_url' ? 'Xiaohongshu link' : 'Telegram video')).trim()
-  const isProcessedView = viewMode === 'processed'
-  const sourceBadge = video.sourceType === 'xhs_url'
-    ? { label: 'XHS', cls: 'bg-rose-500/95 text-white' }
-    : video.sourceType === 'line_video'
-      ? { label: 'LINE', cls: 'bg-emerald-500/95 text-white' }
-      : { label: 'ต้นฉบับ', cls: 'bg-slate-900/85 text-white' }
-  const playbackUrl = String(
-    resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original')
-    || video.originalUrl
-    || video.videoUrl
-    || video.previewUrl
-    || ''
-  ).trim()
-  const thumbnailUrl = String(
-    resolveInboxThumbnailDisplayUrl(video as unknown as Record<string, unknown>)
-    || video.thumbnailUrl
-    || ''
-  ).trim()
-  const playbackPosterUrl = thumbnailUrl
-  const createdAtLabel = new Date(video.createdAt).toLocaleString('th-TH', {
-    day: '2-digit',
-    month: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-  const isOwnNamespaceVideo = isInboxVideoOwnedByCurrentNamespace(video, currentNamespaceId)
-  const importedFromNamespaceId = String(
-    video.importedFromNamespaceId
-    || parseImportedNamespaceIdFromSourceLabel(video.sourceLabel)
-    || ''
-  ).trim()
-  const isImportedFromOtherNamespace = !!importedFromNamespaceId && isOwnNamespaceVideo
-  const showsOwnNamespaceBadge = isOwnNamespaceVideo && !isImportedFromOtherNamespace
-  const ownershipBadge = showsOwnNamespaceBadge
-    ? { cls: 'bg-blue-500/95 text-white', title: 'ของฉัน' }
-    : { cls: 'bg-violet-500/95 text-white', title: 'Namespace อื่น' }
-  const actionLabel = !ready
-    ? 'ลิงก์ยังไม่ครบ'
-    : canStartProcessing
-      ? 'ส่งเข้า Processing'
-      : 'เก็บในคลังต้นฉบับ'
-
-  useEffect(() => {
-    onExpandedChange?.(expanded)
-    return () => onExpandedChange?.(false)
-  }, [expanded, onExpandedChange])
-  useViewerHistory(expanded, setExpanded)
-
-  return (
-    <>
-      <button
-        type="button"
-        onClick={() => setExpanded(true)}
-        className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200 text-left"
-      >
-        {thumbnailUrl || playbackUrl ? (
-          <Thumb id={video.id} url={thumbnailUrl} fallback={playbackUrl} />
-        ) : (
-          <div className={`w-full h-full flex flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
-            <div className="rounded-full bg-white/18 px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.22em] text-white">
-              {video.sourceType === 'xhs_url' ? 'XHS' : 'ต้นฉบับ'}
-            </div>
-            <p className="mt-3 px-4 text-center text-xs font-semibold text-white/90 line-clamp-3">
-              {video.sourceType === 'xhs_url' ? 'Xiaohongshu Link' : 'Telegram Video'}
-            </p>
-          </div>
-        )}
-
-        <div className="absolute left-2 top-2 flex flex-col items-start gap-1.5">
-          {isProcessedView ? (
-            <span title={ownershipBadge.title} className={`inline-flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-bold shadow-lg backdrop-blur-sm ${ownershipBadge.cls}`}>
-              <InboxOwnershipIcon own={showsOwnNamespaceBadge} />
-            </span>
-          ) : (
-            <>
-              <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${sourceBadge.cls}`}>
-                {sourceBadge.label}
-              </span>
-              <span title={ownershipBadge.title} className={`inline-flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-bold shadow-lg backdrop-blur-sm ${ownershipBadge.cls}`}>
-                <InboxOwnershipIcon own={showsOwnNamespaceBadge} />
-              </span>
-            </>
-          )}
-        </div>
-
-        <div className="absolute right-2 top-2 flex items-center gap-1">
-          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${video.hasShopeeLink ? 'bg-emerald-500/95 text-white' : 'bg-black/55 text-white'}`}>
-            S
-          </span>
-          <span className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-bold shadow-lg backdrop-blur-sm ${video.hasLazadaLink ? 'bg-sky-500/95 text-white' : 'bg-black/55 text-white'}`}>
-            L
-          </span>
-        </div>
-
-        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/45 to-transparent px-3 pb-3 pt-8 text-white">
-          <p className="truncate text-[11px] font-extrabold">{video.id}</p>
-          <p className="mt-0.5 truncate text-[10px] text-white/75">{createdAtLabel}</p>
-        </div>
-      </button>
-
-      {expanded && (
-        <div className="fixed inset-0 z-50 bg-[#fafafa] text-gray-900">
-          <div className="mx-auto flex h-full w-full max-w-md flex-col bg-[#fafafa]">
-            <div
-              aria-hidden="true"
-              className="sticky top-0 z-10 bg-[#fafafa]"
-              style={{ height: 'calc(env(safe-area-inset-top, 0px) + 8px)' }}
-            />
-            <div data-allow-touch-scroll="true" className="flex-1 overflow-y-auto app-scroll">
-              <div
-                className="space-y-4 px-4"
-                style={{
-                  paddingTop: '8px',
-                  paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 24px)',
-                }}
-              >
-                <div
-                  className="mx-auto overflow-hidden rounded-[28px] border border-gray-200 bg-white shadow-sm"
-                  style={VERTICAL_VIEWER_FRAME_STYLE}
-                >
-                  {playbackUrl ? (
-                    <video
-                      src={playbackUrl}
-                      className="block h-full w-full bg-white object-contain"
-                      controls
-                      autoPlay
-                      playsInline
-                      preload="metadata"
-                      poster={playbackPosterUrl || undefined}
-                    />
-                  ) : (
-                    <div className={`flex min-h-[320px] w-full flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
-                      <div className="rounded-full bg-white/18 px-4 py-2 text-xs font-extrabold uppercase tracking-[0.22em] text-white">
-                        {video.sourceType === 'xhs_url' ? 'XHS' : 'ต้นฉบับ'}
-                      </div>
-                      <p className="mt-3 px-6 text-center text-sm font-semibold text-white/90 break-all line-clamp-4">
-                        {sourceLabel}
-                      </p>
-                    </div>
-                  )}
-                </div>
-
-                <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm space-y-3">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${sourceBadge.cls.replace('/95', '').replace('/85', '')}`}>
-                      {sourceBadge.label}
-                    </span>
-                    <span title={ownershipBadge.title} className={`inline-flex h-7 w-7 items-center justify-center rounded-full text-[11px] font-bold ${showsOwnNamespaceBadge ? 'bg-blue-500 text-white' : 'bg-violet-500 text-white'}`}>
-                      <InboxOwnershipIcon own={showsOwnNamespaceBadge} />
-                    </span>
-                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasShopeeLink ? 'bg-emerald-500 text-white' : 'bg-gray-100 text-gray-500'}`}>
-                      Shopee
-                    </span>
-                    <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-bold ${video.hasLazadaLink ? 'bg-sky-500 text-white' : 'bg-gray-100 text-gray-500'}`}>
-                      Lazada
-                    </span>
-                  </div>
-                  <div className={`rounded-xl px-3 py-3 ${ready ? 'bg-blue-50 text-blue-900' : 'bg-amber-50 text-amber-900'}`}>
-                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-60">คลังต้นฉบับ</p>
-                    <p className="mt-1 text-sm font-semibold">
-                      {!ready
-                        ? `คลิปต้นฉบับถูกเก็บในระบบแล้ว เหลือลิงก์ ${missingLinks || 'Shopee / Lazada'}`
-                        : canStartProcessing
-                          ? 'คลิปต้นฉบับถูกเก็บในระบบแล้ว และพร้อมส่งเข้า Processing ได้ทันที'
-                          : 'คลิปต้นฉบับถูกเก็บในระบบแล้ว รายการนี้ใช้ดูย้อนหลังในคลังต้นฉบับได้เลย'}
-                    </p>
-                  </div>
-                  <div className="rounded-xl bg-gray-50 px-3 py-3">
-                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Source</p>
-                    <p className="mt-1 text-sm font-semibold text-gray-900 break-all">{sourceLabel}</p>
-                    {!!String(video.namespace_id || '').trim() && (
-                      <p className="mt-2 text-[11px] font-medium text-gray-500 break-all">Namespace: {video.namespace_id}</p>
-                    )}
-                    {isImportedFromOtherNamespace && (
-                      <p className="mt-1 text-[11px] font-medium text-violet-600 break-all">นำเข้าจาก: {importedFromNamespaceId}</p>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="min-w-0 flex-1 rounded-xl bg-gray-50 px-3 py-2.5">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">Video ID</p>
-                      <p className="truncate text-sm font-semibold text-gray-900">{video.id}</p>
-                    </div>
-                    <div className="rounded-xl bg-gray-50 px-3 py-2.5 text-xs font-medium text-gray-500">
-                      {createdAtLabel}
-                    </div>
-                  </div>
-                  {(video.shopeeLink || video.lazadaLink) && (
-                    <div className="space-y-2 text-[11px] text-gray-600">
-                      {video.shopeeLink && (
-                        <div className="rounded-xl bg-gray-50 px-3 py-2.5">
-                          <p className="font-bold uppercase tracking-[0.18em] text-[10px] text-gray-400">Shopee</p>
-                          <p className="mt-1 truncate">{video.shopeeLink}</p>
-                        </div>
-                      )}
-                      {video.lazadaLink && (
-                        <div className="rounded-xl bg-gray-50 px-3 py-2.5">
-                          <p className="font-bold uppercase tracking-[0.18em] text-[10px] text-gray-400">Lazada</p>
-                          <p className="mt-1 truncate">{video.lazadaLink}</p>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => onDelete(video.id, video.namespace_id)}
-                    disabled={deleting || starting || !canDelete}
-                    className="flex-1 rounded-2xl border border-gray-200 bg-white py-3 text-sm font-bold text-gray-700 shadow-sm active:scale-95 transition-transform disabled:opacity-40"
-                  >
-                    {canDelete ? (deleting ? 'กำลังลบ...' : 'ลบ') : 'เก็บถาวร'}
-                  </button>
-                  <button
-                    onClick={() => onStart(video.id, video.namespace_id)}
-                    disabled={!ready || starting || deleting || !canStartProcessing}
-                    className={`flex-[1.35] rounded-2xl py-3 text-sm font-bold transition-transform ${ready && !starting && !deleting && canStartProcessing ? 'bg-blue-500 text-white active:scale-95 shadow-sm' : 'bg-gray-200 text-gray-400'}`}
-                  >
-                    {starting ? 'กำลังส่งเข้า Processing...' : actionLabel}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  )
-}
-
-function ProcessingCard({
-  video,
-  onCancel,
-  onReprocess,
-  retrying,
-}: {
-  video: any,
-  onCancel: (id: string, isQueued: boolean) => void,
-  onReprocess: (id: string) => void,
-  retrying: boolean,
-}) {
-  const displayProgress = video.status === 'queued' ? 0 : Math.max(5, Math.min(100, Math.floor(((video.step || 0) / 5) * 100)));
-
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const start = new Date(video.createdAt).getTime();
-    const tick = () => setElapsed(Math.floor((Date.now() - start) / 1000));
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => clearInterval(id);
-  }, [video.createdAt]);
-  const fmtElapsed = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`;
-
-  return (
-    <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm relative flex flex-col gap-3">
-      {/* Top Row: ID + Cancel form */}
-      <div className="flex justify-between items-start">
-        <div className="flex items-center gap-3">
-          <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${video.status === 'failed' ? 'bg-red-50 text-red-500' : video.status === 'queued' ? 'bg-amber-50 text-amber-500' : 'bg-blue-50 text-blue-500'}`}>
-            {video.status === 'failed' ? '❌' : video.status === 'queued' ? '⏳' : (
-              <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent animate-spin rounded-full" />
-            )}
-          </div>
-          <div className="flex flex-col">
-            <p className="font-extrabold text-gray-900 text-sm">ID: {video.id}</p>
-            <p className="text-[10px] text-gray-400 font-medium">เริ่มเมื่อ {new Date(video.createdAt).toLocaleTimeString('th-TH')}</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {video.status === 'failed' && (
-            <button
-              onClick={() => onReprocess(video.id)}
-              disabled={retrying}
-              title="ประมวลผลใหม่"
-              className="p-2 rounded-full bg-blue-50 text-blue-500 hover:bg-blue-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {retrying ? (
-                <div className="w-3.5 h-3.5 border-2 border-blue-500 border-t-transparent animate-spin rounded-full" />
-              ) : (
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 2v6h-6" />
-                  <path d="M3 11a9 9 0 0 1 15-6.7L21 8" />
-                  <path d="M3 22v-6h6" />
-                  <path d="M21 13a9 9 0 0 1-15 6.7L3 16" />
-                </svg>
-              )}
-            </button>
-          )}
-          <button
-            onClick={() => onCancel(video.id, video.status === 'queued')}
-            title={video.status === 'failed' ? 'ลบประวัติ' : 'ยกเลิก'}
-            className={`p-2 rounded-full transition-colors ${video.status === 'failed' ? 'bg-red-50 text-red-500 hover:bg-red-100' : 'bg-gray-50 text-gray-400 hover:bg-red-50 hover:text-red-500'}`}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
-          </button>
-        </div>
-      </div>
-
-      {/* Middle Row: Status Text + Link + % */}
-      <div className="flex justify-between items-end mt-1">
-        <div className="flex flex-col gap-1.5 flex-1 pr-4 min-w-0">
-          <div className="flex items-center gap-1.5">
-            {video.status === 'failed' ? (
-              <span className="text-xs bg-red-50 text-red-600 px-2 py-0.5 rounded-md font-bold shrink-0 truncate">{video.error || 'ล้มเหลว'}</span>
-            ) : video.status === 'queued' ? (
-              <span className="text-xs bg-amber-50 text-amber-600 px-2 py-0.5 rounded-md font-bold shrink-0">กำลังรอคิว...</span>
-            ) : (
-              <div className="flex items-center gap-1.5 min-w-0">
-                <span className="text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-md font-bold shrink-0 truncate break-all line-clamp-1">{video.stepName || 'กำลังประมวลผล...'}</span>
-                <span className="text-xs font-mono font-bold text-gray-400 shrink-0">{fmtElapsed}</span>
-              </div>
-            )}
-          </div>
-          <p className="text-[10px] text-gray-500 flex items-center gap-1.5 truncate">
-            <span className="w-4 h-4 rounded-full bg-gray-50 flex items-center justify-center shrink-0"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" /><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
-            <span className="truncate">{video.shopeeLink || 'ไม่มีลิงก์ Shopee'}</span>
-          </p>
-        </div>
-
-        {video.status !== 'failed' && (
-          <div className="text-right shrink-0">
-            <span className="text-lg font-black text-blue-600">{video.status === 'queued' ? '0' : displayProgress}%</span>
-          </div>
-        )}
-      </div>
-
-      {/* Bottom Row: Progress Bar */}
-      {video.status !== 'failed' && (
-        <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden relative">
-          <div
-            className={`h-2.5 rounded-full transition-all duration-300 ease-linear ${video.status === 'queued' ? 'bg-amber-400' : 'bg-gradient-to-r from-blue-500 to-indigo-500'}`}
-            style={{ width: `${Math.max(2, displayProgress)}%` }}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 // LoginScreen removed — LINE login only
 
 function SettingsMenuItem({
@@ -3440,7 +2787,10 @@ function App() {
   const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
-  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null)
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(() => {
+    const ns = getStoredNamespace(botScope)
+    return ns ? readCache<DashboardData | null>(dashboardCacheKey(ns), null) : null
+  })
   const [logDateFilter, setLogDateFilter] = useState<string>(getTodayString())
   const [logNowMs, setLogNowMs] = useState(() => Date.now())
   const [visibleLogCount, setVisibleLogCount] = useState(0)
@@ -3558,8 +2908,11 @@ function App() {
     syncAppUrl('settings', gallerySearchInput, 'replace', { settingsSection: 'pages', pageId: null })
   }
   const [pages, setPages] = useState<FacebookPage[]>([])
-  const [inboxVideos, setInboxVideos] = useState<InboxVideo[]>([])
-  const [systemInboxVideos, setSystemInboxVideos] = useState<InboxVideo[]>([])
+  const [inboxVideos, setInboxVideos] = useState<InboxVideo[]>(() => {
+    const ns = getStoredNamespace(botScope)
+    return ns ? readCache<InboxVideo[]>(nsInboxCacheKey(ns), []) : []
+  })
+  const [systemInboxVideos, setSystemInboxVideos] = useState<InboxVideo[]>(() => readCache<InboxVideo[]>(systemInboxCacheKey(botScope), []))
   const [systemInboxLoading, setSystemInboxLoading] = useState(false)
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
@@ -3571,8 +2924,6 @@ function App() {
   const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const [galleryVisibleCount, setGalleryVisibleCount] = useState(GALLERY_BATCH_SIZE)
-  const loadAllInFlightRef = useRef(false)
-  const loadAllPendingRef = useRef(false)
   const processingFetchInFlightRef = useRef(false)
   const inboxFetchInFlightRef = useRef(false)
   const usedFetchInFlightRef = useRef(false)
@@ -3582,7 +2933,6 @@ function App() {
   const lastUsedFetchAtRef = useRef(0)
   const lastGlobalOriginalFetchAtRef = useRef(0)
   const systemWideGalleryMode = FORCE_SYSTEM_WIDE_GALLERY
-  const systemWideGalleryModeRef = useRef(systemWideGalleryMode)
   const mainScrollRef = useRef<HTMLDivElement | null>(null)
   const galleryHeaderRef = useRef<HTMLDivElement | null>(null)
   const galleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
@@ -3596,9 +2946,6 @@ function App() {
     [deferredGallerySearchInput]
   )
 
-  useEffect(() => {
-    systemWideGalleryModeRef.current = systemWideGalleryMode
-  }, [systemWideGalleryMode])
   useEffect(() => {
     systemGalleryLoadedCountRef.current = videos.length
   }, [videos.length])
@@ -3664,11 +3011,16 @@ function App() {
     )
     const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
+    const cachedInbox = readCache<InboxVideo[]>(nsInboxCacheKey(scopedNamespace), [])
+    const cachedDashboard = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace), null)
     setVideos(cachedVideos)
     setUsedVideos(cachedUsedVideos)
     setPostHistory(cachedHistory)
+    setInboxVideos(cachedInbox)
+    setDashboardData(cachedDashboard)
     setGalleryLoading(cachedVideos.length === 0)
-    if (cachedVideos.length > 0 || cachedUsedVideos.length > 0 || cachedHistory.length > 0) {
+    setInboxLoading(cachedInbox.length === 0)
+    if (cachedVideos.length > 0 || cachedUsedVideos.length > 0 || cachedHistory.length > 0 || cachedInbox.length > 0 || !!cachedDashboard) {
       setLoading(false)
     }
   }
@@ -3701,7 +3053,7 @@ function App() {
 
   useEffect(() => {
     if (systemWideGalleryMode) {
-      try { localStorage.removeItem(systemGalleryCacheKey(botScope)) } catch { }
+      writeCache(systemGalleryCacheKey(botScope), videos)
       return
     }
     if (!namespaceId) return
@@ -3717,6 +3069,20 @@ function App() {
     if (!namespaceId) return
     writeCache(nsCacheKey('history', namespaceId), postHistory)
   }, [namespaceId, postHistory])
+
+  useEffect(() => {
+    if (!namespaceId) return
+    writeCache(nsInboxCacheKey(namespaceId), inboxVideos)
+  }, [namespaceId, inboxVideos])
+
+  useEffect(() => {
+    if (!namespaceId) return
+    writeCache(dashboardCacheKey(namespaceId), dashboardData)
+  }, [namespaceId, dashboardData])
+
+  useEffect(() => {
+    writeCache(systemInboxCacheKey(botScope), systemInboxVideos)
+  }, [botScope, systemInboxVideos])
 
   useEffect(() => {
     if (tg) {
@@ -3867,8 +3233,14 @@ function App() {
     const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
     const storedLazadaShortlinkBaseUrl = getStoredLazadaShortlinkBaseUrl(botScope)
     const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, !!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
+    const cachedInbox = storedNamespace ? readCache<InboxVideo[]>(nsInboxCacheKey(storedNamespace), []) : []
+    const cachedDashboard = storedNamespace ? readCache<DashboardData | null>(dashboardCacheKey(storedNamespace), null) : null
+    const cachedSystemInbox = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
     setNamespaceId(storedNamespace)
     setVideos(cachedVideos)
+    setInboxVideos(cachedInbox)
+    setSystemInboxVideos(cachedSystemInbox)
+    setDashboardData(cachedDashboard)
     setGalleryLoading(cachedVideos.length === 0)
     const storedShortlinkExpectedUtmId = getStoredShortlinkExpectedUtmId(botScope)
     const storedLazadaExpectedMemberId = getStoredLazadaExpectedMemberId(botScope)
@@ -3881,8 +3253,7 @@ function App() {
     setLazadaExpectedMemberIdCurrent(storedLazadaExpectedMemberId)
     setLazadaExpectedMemberIdDraft(storedLazadaExpectedMemberId)
     setShortlinkEnabled(!!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
-    setInboxVideos([])
-    setInboxLoading(true)
+    setInboxLoading(cachedInbox.length === 0)
     setProcessingVideos([])
     setPendingShortlinkVideos([])
     setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
@@ -4090,15 +3461,35 @@ function App() {
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    loadTeam()
-    if (tab === 'settings' && settingsSection === 'pages') loadPages()
-  }, [token, authBootstrapping, tab, systemWideGalleryMode])
-
-  // Reload pages when opening Pages inside Settings
-  useEffect(() => {
-    if (authBootstrapping || !token) return
-    if (tab === 'settings' && settingsSection === 'pages') loadPages()
-  }, [tab, settingsSection, token, authBootstrapping])
+    if (tab !== 'settings') return
+    if (settingsSection === 'pages') {
+      void loadPages()
+      return
+    }
+    if (settingsSection === 'team' || settingsSection === 'menu') {
+      void loadTeam()
+      return
+    }
+    if (settingsSection === 'shortlink') {
+      void loadShortlinkSettings()
+      return
+    }
+    if (settingsSection === 'voice') {
+      void loadVoicePrompt()
+      return
+    }
+    if (settingsSection === 'comment') {
+      void loadCommentTemplate()
+      return
+    }
+    if (settingsSection === 'gemini' && isSystemAdmin) {
+      void loadGeminiApiKey()
+      return
+    }
+    if (settingsSection === 'members' && isSystemAdmin) {
+      void loadSystemMembers()
+    }
+  }, [tab, settingsSection, token, authBootstrapping, isSystemAdmin])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -4139,29 +3530,6 @@ function App() {
   }, [authBootstrapping, isOwner, isSystemAdmin, settingsSection])
 
   useEffect(() => {
-    if (authBootstrapping || !token || !isSystemAdmin) return
-    void loadSystemMembers()
-  }, [token, authBootstrapping, isSystemAdmin])
-
-  useEffect(() => {
-    if (authBootstrapping || !token || !isSystemAdmin) return
-    if (tab === 'settings' && settingsSection === 'members') {
-      void loadSystemMembers()
-    }
-  }, [tab, settingsSection, token, authBootstrapping, isSystemAdmin])
-
-  useEffect(() => {
-    if (authBootstrapping || !token) return
-    void loadShortlinkSettings()
-    void loadVoicePrompt()
-    void loadCommentTemplate()
-    if (!isOwner) return
-    if (isSystemAdmin) {
-      void loadGeminiApiKey()
-    }
-  }, [token, authBootstrapping, isOwner, isSystemAdmin])
-
-  useEffect(() => {
     const cachedVideos = readGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
     setVideos(cachedVideos)
     setGalleryLoading(cachedVideos.length === 0)
@@ -4186,6 +3554,11 @@ function App() {
     }, 30000)
     return () => clearInterval(timer)
   }, [tab, token, authBootstrapping, dashboardDateFilter])
+
+  useEffect(() => {
+    if (authBootstrapping || !token || tab !== 'logs') return
+    void refreshPostHistorySnapshot()
+  }, [tab, token, authBootstrapping, logDateFilter])
 
   useEffect(() => {
     if (!isOwner && categoryFilter === 'all-original') {
@@ -4300,7 +3673,8 @@ function App() {
 
   async function loadSystemInbox() {
     if (!token || !isSystemAdmin) return
-    setSystemInboxLoading(true)
+    const shouldShowLoading = systemInboxVideos.length === 0
+    if (shouldShowLoading) setSystemInboxLoading(true)
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/inbox/system`)
       if (resp.status === 401) {
@@ -4312,7 +3686,9 @@ function App() {
         setSystemInboxVideos(Array.isArray(data.videos) ? data.videos : [])
       }
     } catch {}
-    finally { setSystemInboxLoading(false) }
+    finally {
+      if (shouldShowLoading) setSystemInboxLoading(false)
+    }
   }
 
   async function loadSystemMembers() {
@@ -4554,80 +3930,34 @@ function App() {
   }
 
   async function loadAll(options: { skipGallery?: boolean } = {}) {
-    if (loadAllInFlightRef.current) {
-      loadAllPendingRef.current = true
-      return
-    }
-    loadAllInFlightRef.current = true
-
     const session = getToken()
-    if (!session) {
-      setLoading(false)
-      loadAllInFlightRef.current = false
-      return
-    }
+    if (!session) return
     try {
-      let unauthorized = false
-      const onUnauthorized = async () => {
-        if (unauthorized) return
-        unauthorized = true
-        await recoverSessionOrLogout()
-      }
-
-      const historyTask = (async () => {
-        const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?_ts=${Date.now()}`)
-        if (historyResp.status === 401) {
-          await onUnauthorized()
-          return
-        }
-        if (historyResp.ok) {
-          const data = await historyResp.json()
-          setPostHistory(data.history || [])
-        }
-      })()
-
-      const tasks: Promise<void>[] = [historyTask]
-      if (!options.skipGallery) {
-        const galleryTask = (async () => {
-          const params = new URLSearchParams()
-          params.set('offset', '0')
-          params.set('limit', '5000')
-          const galleryEndpoint = `${WORKER_URL}/api/gallery?${params.toString()}`
-          const galleryResp = await apiFetch(galleryEndpoint)
-          if (galleryResp.status === 401) {
-            await onUnauthorized()
-            return
+      const tasks: Promise<unknown>[] = []
+      if (tab === 'logs') tasks.push(refreshPostHistorySnapshot())
+      if (!options.skipGallery && tab === 'gallery') {
+        if (categoryFilter === 'all-original' && isOwner) {
+          tasks.push(loadGlobalOriginalVideos({ force: true }))
+        } else {
+          tasks.push(loadSystemGalleryPage({ reset: true }))
+          if (!systemWideGalleryMode && categoryFilter === 'used') {
+            tasks.push(loadUsedVideos({ force: true }))
           }
-          if (galleryResp.ok) {
-            const data = await galleryResp.json() as { videos?: Video[] }
-            setVideos(dedupeGalleryVideos(filterDeletedGalleryVideos(
-              Array.isArray(data.videos) ? data.videos : [],
-              deletedGalleryKeysRef.current,
-            )))
-          }
-          if (!unauthorized) setGalleryLoading(false)
-        })()
-        tasks.push(galleryTask)
+        }
       }
-
+      if (tab === 'inbox') tasks.push(loadInboxSnapshot())
+      if (tab === 'processing') tasks.push(loadProcessingSnapshot())
       await Promise.allSettled(tasks)
-      if (!unauthorized) setLoading(false)
     } finally {
-      loadAllInFlightRef.current = false
-      void loadInboxSnapshot()
-      void loadProcessingSnapshot()
-      if (!systemWideGalleryModeRef.current) {
-        void loadUsedVideos()
-      }
-      if (loadAllPendingRef.current) {
-        loadAllPendingRef.current = false
-        void loadAll(options)
-      }
+      setLoading(false)
     }
   }
 
   async function refreshPostHistorySnapshot() {
-    const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?_ts=${Date.now()}`)
+    const params = new URLSearchParams()
+    params.set('date', logDateFilter)
+    params.set('limit', '100')
+    const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?${params.toString()}`)
     if (historyResp.status === 401) {
       await recoverSessionOrLogout()
       return
@@ -4662,17 +3992,10 @@ function App() {
     void loadSystemInbox()
   }, [tab, token, authBootstrapping, isSystemAdmin])
 
-  useEffect(() => {
-    if (authBootstrapping || !token) return
-    void loadAll({ skipGallery: systemWideGalleryMode })
-  }, [systemWideGalleryMode, token, authBootstrapping])
-
-
-
   async function loadDashboard(dateValue = dashboardDateFilter, options: { silent?: boolean } = {}) {
     const session = getToken()
     if (!session) return
-    if (!options.silent) setDashboardLoading(true)
+    if (!options.silent && !dashboardData) setDashboardLoading(true)
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/dashboard?date=${encodeURIComponent(dateValue)}`)
       if (resp.status === 401) {
@@ -4722,31 +4045,14 @@ function App() {
     const session = getToken(botScope)
     if (!session) return
     try {
-      const meResp = await apiFetch(`${WORKER_URL}/api/me`)
-      if (meResp.status === 401 || meResp.status === 404) {
+      const teamResp = await apiFetch(`${WORKER_URL}/api/team`)
+      if (teamResp.status === 401) {
         if (requestId === loadTeamRequestRef.current) {
           setTeamMembers([])
         }
         await recoverSessionOrLogout()
         return
       }
-      if (meResp.ok) {
-        const me = await meResp.json() as any
-        if (requestId === loadTeamRequestRef.current) {
-          setIsOwner(!!me.is_owner)
-          setIsSystemAdmin(!!me.is_system_admin)
-          setIsTeamMember(!!me.is_team_member)
-          if (me.email) setMeEmail(me.email)
-          if (me.line_display_name) setMeDisplayName(String(me.line_display_name))
-          if (me.line_picture_url) setMePictureUrl(String(me.line_picture_url))
-          if (me.line_user_id) setMeLineUserId(String(me.line_user_id))
-          const ns = String(me.namespace_id || '').trim()
-          if (ns && ns !== namespaceId) {
-            setNamespaceId(ns)
-          }
-        }
-      }
-      const teamResp = await apiFetch(`${WORKER_URL}/api/team`)
       if (teamResp.ok) {
         const data = await teamResp.json() as any
         if (requestId === loadTeamRequestRef.current) {
@@ -5886,203 +5192,51 @@ function App() {
       <div ref={mainScrollRef} style={mainContentPaddingStyle} className="flex-1 [&::-webkit-scrollbar]:hidden overflow-y-auto app-scroll">
 
         {tab === 'dashboard' && (
-          <div className="px-4 space-y-4">
-            <div className="bg-white border border-gray-200 rounded-2xl p-3 shadow-sm">
-              <div className="flex items-center gap-2">
-                <div className="flex-1 relative">
-                  <input
-                    type="date"
-                    value={dashboardDateFilter}
-                    onChange={(e) => setDashboardDateFilter(e.target.value)}
-                    className="absolute inset-0 opacity-0 w-full h-full cursor-pointer"
-                  />
-                  <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3 flex items-center gap-3 active:scale-95 transition-all">
-                    <div className="w-10 h-10 bg-blue-50 rounded-xl flex items-center justify-center">
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2">
-                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
-                        <line x1="16" y1="2" x2="16" y2="6" />
-                        <line x1="8" y1="2" x2="8" y2="6" />
-                        <line x1="3" y1="10" x2="21" y2="10" />
-                      </svg>
-                    </div>
-                    <div className="flex-1">
-                      <p className="text-[11px] text-gray-400 font-medium">เลือกวันที่รายงาน</p>
-                      <p className="text-sm font-bold text-gray-900">{dashboardDateFilter}</p>
-                    </div>
-                  </div>
-                </div>
-                <button
-                  onClick={() => setDashboardDateFilter(getTodayString())}
-                  className="shrink-0 bg-blue-500 text-white px-4 py-3 rounded-2xl text-sm font-bold active:scale-95 transition-all shadow-sm shadow-blue-200"
-                >
-                  วันนี้
-                </button>
-              </div>
-            </div>
-
-            {dashboardLoading && !dashboardData ? (
-              <div className="space-y-3">
-                {[1, 2, 3].map((i) => (
-                  <div key={i} className="h-24 rounded-2xl bg-gray-100 animate-pulse" />
-                ))}
-              </div>
-            ) : (
-              <>
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-                    <p className="text-xs text-gray-400 font-semibold">โพสต์ทั้งหมด</p>
-                    <p className="mt-2 text-2xl font-extrabold text-gray-900">{dashboardData?.totals.posts_all || 0}</p>
-                  </div>
-                  <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-                    <p className="text-xs text-gray-400 font-semibold">โพสต์วันนี้</p>
-                    <p className="mt-2 text-2xl font-extrabold text-blue-600">{dashboardData?.totals.posts_on_date || 0}</p>
-                  </div>
-                  <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-                    <p className="text-xs text-gray-400 font-semibold">ลิงก์ทั้งหมด</p>
-                    <p className="mt-2 text-2xl font-extrabold text-gray-900">{dashboardData?.totals.links_all || 0}</p>
-                  </div>
-                  <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-                    <p className="text-xs text-gray-400 font-semibold">ลิงก์วันนี้</p>
-                    <p className="mt-2 text-2xl font-extrabold text-emerald-600">{dashboardData?.totals.links_on_date || 0}</p>
-                  </div>
-                </div>
-
-                <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-                  <p className="text-sm font-bold text-gray-900 mb-3">ผู้ส่งลิงก์ต่อวัน</p>
-                  {dashboardData?.admins?.length ? (
-                    <div className="space-y-2">
-                      {dashboardData.admins.map((admin) => (
-                        <div key={`${admin.telegram_id}:${admin.email}`} className="flex items-center justify-between rounded-xl bg-gray-50 px-3 py-2">
-                          <div className="min-w-0 flex items-center gap-3">
-                            {admin.picture_url ? (
-                              <img src={admin.picture_url} className="h-10 w-10 rounded-full object-cover shrink-0" />
-                            ) : (
-                              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-bold text-blue-600">
-                                {(String(admin.display_name || admin.line_user_id || '?').trim().charAt(0) || '?').toUpperCase()}
-                              </div>
-                            )}
-                            <div className="min-w-0">
-                              <p className="text-sm font-semibold text-gray-900 truncate">{admin.display_name || admin.line_user_id || 'LINE User'}</p>
-                              <p className="text-[11px] text-gray-400 truncate">
-                                {admin.line_user_id ? `LINE UID: ${admin.line_user_id}` : `TG ID: ${admin.telegram_id}`}
-                              </p>
-                            </div>
-                          </div>
-                          <span className="text-xs font-bold text-white bg-black px-2.5 py-1 rounded-full">{admin.links} ลิงก์</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-sm text-gray-400">ยังไม่มีข้อมูลลิงก์ในวันที่เลือก</p>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
+          <DashboardTab
+            dashboardDateFilter={dashboardDateFilter}
+            onDashboardDateChange={setDashboardDateFilter}
+            onSelectToday={() => setDashboardDateFilter(getTodayString())}
+            dashboardLoading={dashboardLoading}
+            dashboardData={dashboardData}
+          />
         )}
 
-        {tab === 'inbox' && isSystemAdmin && (
-          <div className="px-4">
-            {systemInboxLoading ? (
-              <div className="grid grid-cols-3 gap-3">
-                {[1,2,3,4,5,6].map(i => <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />)}
-              </div>
-            ) : (() => {
-              const filtered = dedupeSystemInboxVideos(systemInboxVideos, namespaceId)
-                .filter((video) => !!String(video.thumbnailUrl || '').trim())
-              return filtered.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-[50vh]">
-                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                  <span className="text-4xl grayscale opacity-50">📥</span>
-                </div>
-                <p className="text-gray-900 font-bold text-lg">ยังไม่มีวิดีโอต้นฉบับ</p>
-                <p className="text-gray-400 text-sm mt-1 text-center">ส่งวิดีโอหรือลิงก์ XHS มาทาง LINE แล้วจะแสดงที่นี่</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-3 gap-3">
-                {filtered.map(video => (
-                  <InboxCard
-                    key={`${String(video.namespace_id || '').trim()}:${video.id}`}
-                    video={video}
-                    onStart={handleStartInboxVideo}
-                    onDelete={handleDeleteInboxVideo}
-                    starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-                    deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-                    onExpandedChange={setVideoViewerOpen}
-                    viewMode="processed"
-                    currentNamespaceId={namespaceId}
-                  />
-                ))}
-              </div>
-            )})()}
-          </div>
-        )}
-
-        {tab === 'inbox' && !isSystemAdmin && (
-          <div className="px-4">
-            {inboxLoading ? (
-              <div className="grid grid-cols-3 gap-3">
-                {[1, 2, 3, 4, 5, 6].map((i) => (
-                  <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />
-                ))}
-              </div>
-            ) : inboxVideos.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-[50vh]">
-                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                  <span className="text-4xl grayscale opacity-50">📥</span>
-                </div>
-                <p className="text-gray-900 font-bold text-lg">ยังไม่มีวิดีโอต้นฉบับ</p>
-                <p className="text-gray-400 text-sm mt-1 text-center">ส่งวิดีโอหรือ XHS link มาทาง Telegram แล้วระบบจะเก็บไว้ที่นี่ถาวร แยกจากหน้า Processing</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-3 gap-3">
-                {inboxVideos.map((video) => (
-                  <InboxCard
-                    key={video.id}
-                    video={video}
-                    onStart={handleStartInboxVideo}
-                    onDelete={handleDeleteInboxVideo}
-                    starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-                    deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-                    onExpandedChange={setVideoViewerOpen}
-                    currentNamespaceId={namespaceId}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+        {tab === 'inbox' && (
+          <InboxTab
+            isSystemAdmin={isSystemAdmin}
+            systemInboxLoading={systemInboxLoading}
+            systemInboxVideos={systemInboxVideos}
+            inboxLoading={inboxLoading}
+            inboxVideos={inboxVideos}
+            namespaceId={namespaceId}
+            startingInboxId={startingInboxId}
+            deletingInboxId={deletingInboxId}
+            onStartInboxVideo={handleStartInboxVideo}
+            onDeleteInboxVideo={handleDeleteInboxVideo}
+            onExpandedChange={setVideoViewerOpen}
+            resolvePlaybackUrl={(video) => String(
+              resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original')
+              || video.originalUrl
+              || video.videoUrl
+              || video.previewUrl
+              || ''
+            ).trim()}
+            resolveThumbnailUrl={(video) => String(
+              resolveInboxThumbnailDisplayUrl(video as unknown as Record<string, unknown>)
+              || video.thumbnailUrl
+              || ''
+            ).trim()}
+          />
         )}
 
         {tab === 'processing' && (
-          <div className="px-4">
-            {loading ? (
-              <div className="space-y-3">
-                {[1, 2].map(i => (
-                  <div key={i} className="bg-gray-100 rounded-2xl p-4 h-28 animate-pulse" />
-                ))}
-              </div>
-            ) : processingVideos.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-[50vh]">
-                <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-                  <span className="text-4xl grayscale opacity-50">⚙️</span>
-                </div>
-                <p className="text-gray-900 font-bold text-lg">No Processing Videos</p>
-                <p className="text-gray-400 text-sm mt-1">Videos currently being dubbed will appear here</p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {processingVideos.map((video: any) => (
-                  <ProcessingCard
-                    key={video.id}
-                    video={video}
-                    onCancel={handleCancelJob}
-                    onReprocess={handleReprocessJob}
-                    retrying={retryingProcessingId === video.id}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
+          <ProcessingTab
+            loading={loading}
+            processingVideos={processingVideos}
+            onCancel={handleCancelJob}
+            onReprocess={handleReprocessJob}
+            retryingProcessingId={retryingProcessingId}
+          />
         )}
 
         {tab === 'gallery' && (
@@ -7443,84 +6597,9 @@ function App() {
       </div>
 
       {!videoViewerOpen && (
-        <div
-          className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 z-40"
-          style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
-        >
-          <div className="flex pt-1 pb-0">
-            <NavItem
-              icon={<DashboardIcon />}
-              iconActive={<DashboardIconFilled />}
-              label="แดชบอร์ด"
-              active={tab === 'dashboard'}
-              onClick={() => setTab('dashboard')}
-            />
-            <NavItem
-              icon={<InboxIcon />}
-              iconActive={<InboxIconFilled />}
-              label="ต้นฉบับ"
-              active={tab === 'inbox'}
-              onClick={() => setTab('inbox')}
-            />
-            <NavItem
-              icon={<ProcessIcon />}
-              iconActive={<ProcessIconFilled />}
-              label="ประมวลผล"
-              active={tab === 'processing'}
-              onClick={() => setTab('processing')}
-            />
-            <NavItem
-              icon={<VideoIcon />}
-              iconActive={<VideoIconFilled />}
-              label="แกลลี่"
-              active={tab === 'gallery'}
-              onClick={() => setTab('gallery')}
-            />
-            <NavItem
-              icon={<ListIcon />}
-              iconActive={<ListIconFilled />}
-              label="ประวัติ"
-              active={tab === 'logs'}
-              onClick={() => setTab('logs')}
-            />
-            <NavItem
-              icon={<SettingsIcon />}
-              iconActive={<SettingsIconFilled />}
-              label="ตั้งค่า"
-              active={tab === 'settings'}
-              onClick={() => setTab('settings')}
-            />
-          </div>
-        </div>
+        <BottomNav tab={tab} onChangeTab={setTab} />
       )}
     </div>
-  )
-}
-
-function NavItem({ icon, iconActive, label, active, onClick }: {
-  icon: React.ReactNode;
-  iconActive: React.ReactNode;
-  label: string;
-  active: boolean;
-  onClick: () => void
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`flex-1 py-2 flex flex-col items-center relative group`}
-      style={{ WebkitTapHighlightColor: 'transparent' }}
-    >
-      <div className={`text-5xl mb-0.5 transition-all duration-300 ${active ? 'text-blue-600 scale-110' : 'text-gray-400 group-active:scale-95'}`}>
-        {active ? iconActive : icon}
-      </div>
-      <span className={`text-[10px] font-bold tracking-wide transition-colors ${active ? 'text-blue-600' : 'text-gray-400'}`}>
-        {label}
-      </span>
-      {/* Active Line */}
-      {active && (
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-blue-600 rounded-b-lg shadow-blue-400 shadow-[0_0_10px_rgba(37,99,235,0.5)]"></div>
-      )}
-    </button>
   )
 }
 
