@@ -54,6 +54,7 @@ export function InboxCard({
       : { label: 'ต้นฉบับ', cls: 'bg-slate-900/85 text-white' }
   const playbackUrl = String(resolvePlaybackUrl(video) || video.originalUrl || video.videoUrl || video.previewUrl || '').trim()
   const thumbnailUrl = String(resolveThumbnailUrl(video) || video.thumbnailUrl || '').trim()
+  const fallbackThumbnailUrl = String(video.fallbackThumbnailUrl || '').trim()
   const playbackPosterUrl = thumbnailUrl
   const createdAtLabel = new Date(video.createdAt).toLocaleString('th-TH', {
     day: '2-digit',
@@ -92,7 +93,7 @@ export function InboxCard({
         className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200 text-left"
       >
         {thumbnailUrl || playbackUrl ? (
-          <Thumb url={thumbnailUrl} fallback={playbackUrl} />
+          <Thumb url={thumbnailUrl} fallback={playbackUrl} secondaryUrl={fallbackThumbnailUrl} />
         ) : (
           <div className={`w-full h-full flex flex-col items-center justify-center ${video.sourceType === 'xhs_url' ? 'bg-gradient-to-br from-rose-500 via-orange-400 to-amber-300' : 'bg-gradient-to-br from-slate-700 to-slate-900'}`}>
             <div className="rounded-full bg-white/18 px-3 py-2 text-[10px] font-extrabold uppercase tracking-[0.22em] text-white">

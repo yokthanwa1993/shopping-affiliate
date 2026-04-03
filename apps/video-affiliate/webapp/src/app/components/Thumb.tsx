@@ -14,9 +14,24 @@ export function inferThumbnailUrl(url: string | undefined, fallback: string): st
   return source.replace(/\.mp4(?:[?#].*)?$/i, '_thumb.webp')
 }
 
-export function Thumb({ url, fallback }: { id?: string; url?: string; fallback: string }) {
-  const [failed, setFailed] = useState(false)
-  const src = failed ? '' : inferThumbnailUrl(url, fallback)
+export function Thumb({
+  url,
+  fallback,
+  secondaryUrl,
+}: {
+  id?: string
+  url?: string
+  fallback: string
+  secondaryUrl?: string
+}) {
+  const primarySrc = inferThumbnailUrl(url, fallback)
+  const normalizedSecondaryUrl = String(secondaryUrl || '').trim()
+  const [attempt, setAttempt] = useState<0 | 1 | 2>(0)
+  const src = attempt === 0
+    ? primarySrc
+    : attempt === 1
+      ? normalizedSecondaryUrl
+      : ''
 
   if (!src) {
     return (
@@ -35,7 +50,13 @@ export function Thumb({ url, fallback }: { id?: string; url?: string; fallback: 
       loading="lazy"
       decoding="async"
       alt=""
-      onError={() => setFailed(true)}
+      onError={() => {
+        if (attempt === 0 && normalizedSecondaryUrl && normalizedSecondaryUrl !== primarySrc) {
+          setAttempt(1)
+          return
+        }
+        setAttempt(2)
+      }}
     />
   )
 }

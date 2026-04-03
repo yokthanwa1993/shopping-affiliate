@@ -44,7 +44,10 @@ export function InboxTab({
 }) {
   if (isSystemAdmin) {
     const filtered = dedupeSystemInboxVideos(systemInboxVideos, namespaceId)
-      .filter((video) => !!String(video.thumbnailUrl || '').trim())
+      .filter((video) => (
+        !!String(video.thumbnailUrl || '').trim()
+        || !!String(video.fallbackThumbnailUrl || '').trim()
+      ))
 
     return (
       <div className="px-4">

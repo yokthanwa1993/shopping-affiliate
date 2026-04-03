@@ -28,6 +28,7 @@ export interface InboxVideo {
   previewUrl?: string
   originalUrl?: string
   thumbnailUrl?: string
+  fallbackThumbnailUrl?: string
   createdAt: string
   updatedAt?: string
   status: string

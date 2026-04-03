@@ -2149,6 +2149,50 @@ function buildWorkerGalleryAssetUrl(workerUrl: string, namespaceId: string, vide
     }
 }
 
+function buildWorkerGalleryFrameUrl(
+    workerUrl: string,
+    namespaceId: string,
+    videoId: string,
+    options?: {
+        seed?: string
+        format?: 'webp' | 'jpg'
+        width?: number
+        height?: number
+        timeSeconds?: number
+    },
+): string {
+    const normalizedWorkerUrl = String(workerUrl || '').trim().replace(/\/+$/, '')
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedWorkerUrl || !normalizedNamespaceId || !normalizedVideoId) return ''
+
+    const normalizedSeed = String(options?.seed || '').trim()
+    const requestedFormat = options?.format === 'jpg' ? 'jpg' : 'webp'
+    const width = Number.isFinite(options?.width) ? Math.max(120, Math.min(1440, Math.round(Number(options?.width)))) : undefined
+    const height = Number.isFinite(options?.height) ? Math.max(160, Math.min(2560, Math.round(Number(options?.height)))) : undefined
+    const timeSeconds = Number.isFinite(options?.timeSeconds) ? Math.max(0, Number(options?.timeSeconds)) : undefined
+
+    try {
+        const url = new URL(`${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame`)
+        url.searchParams.set('namespace_id', normalizedNamespaceId)
+        if (normalizedSeed) url.searchParams.set('seed', normalizedSeed)
+        if (requestedFormat) url.searchParams.set('format', requestedFormat)
+        if (width) url.searchParams.set('w', String(width))
+        if (height) url.searchParams.set('h', String(height))
+        if (Number.isFinite(timeSeconds)) url.searchParams.set('t', String(timeSeconds))
+        return url.toString()
+    } catch {
+        const params = new URLSearchParams()
+        params.set('namespace_id', normalizedNamespaceId)
+        if (normalizedSeed) params.set('seed', normalizedSeed)
+        if (requestedFormat) params.set('format', requestedFormat)
+        if (width) params.set('w', String(width))
+        if (height) params.set('h', String(height))
+        if (Number.isFinite(timeSeconds)) params.set('t', String(timeSeconds))
+        return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame?${params.toString()}`
+    }
+}
+
 function resolvePostingVideoDownloadUrl(
     env: Env,
     namespaceId: string,
@@ -5385,17 +5429,12 @@ function buildLineCoverOptionPreviewUrl(params: {
     const videoId = String(params.videoId || '').trim()
     const seed = String(params.option?.seed || '').trim()
     if (!workerUrl || !namespaceId || !videoId || !seed) return ''
-    try {
-        const url = new URL(`${workerUrl}/api/gallery/${encodeURIComponent(videoId)}/frame`)
-        url.searchParams.set('namespace_id', namespaceId)
-        url.searchParams.set('seed', seed)
-        url.searchParams.set('format', 'jpg')
-        url.searchParams.set('w', '540')
-        url.searchParams.set('h', '960')
-        return url.toString()
-    } catch {
-        return `${workerUrl}/api/gallery/${encodeURIComponent(videoId)}/frame?namespace_id=${encodeURIComponent(namespaceId)}&seed=${encodeURIComponent(seed)}&format=jpg&w=540&h=960`
-    }
+    return buildWorkerGalleryFrameUrl(workerUrl, namespaceId, videoId, {
+        seed,
+        format: 'jpg',
+        width: 540,
+        height: 960,
+    })
 }
 
 function buildLineCoverPickerFlex(params: {
@@ -8694,6 +8733,17 @@ function buildInboxVideoResponseForNamespace(
     const normalizedNamespaceId = String(namespaceId || '').trim()
     const originalUrl = getVideoOriginalUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, record.id)
     const fallbackUrl = String(originalUrl || record.videoUrl || '').trim()
+    const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
+        String(env.WORKER_URL || '').trim(),
+        normalizedNamespaceId,
+        record.id,
+        {
+            seed: `${normalizedNamespaceId}:${record.id}:original`,
+            format: 'jpg',
+            width: 540,
+            height: 960,
+        },
+    )
     return {
         ...toInboxVideoResponse(record, {
             namespaceId: normalizedNamespaceId,
@@ -8703,6 +8753,7 @@ function buildInboxVideoResponseForNamespace(
             canStartProcessing: true,
             canDelete: true,
         }),
+        ...(fallbackThumbnailUrl ? { fallbackThumbnailUrl } : {}),
         ...(ownerEmail ? { owner_email: ownerEmail } : {}),
     }
 }
@@ -8841,6 +8892,21 @@ async function listNamespaceOriginalArchiveVideos(params: {
             canStartProcessing: true,
             canDelete: true,
         }))
+        const current = merged.get(record.id)
+        if (current) {
+            const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
+                String(params.env.WORKER_URL || '').trim(),
+                normalizedNamespaceId,
+                record.id,
+                {
+                    seed: `${normalizedNamespaceId}:${record.id}:original`,
+                    format: 'jpg',
+                    width: 540,
+                    height: 960,
+                },
+            )
+            if (fallbackThumbnailUrl) current.fallbackThumbnailUrl = fallbackThumbnailUrl
+        }
     }
 
     for (const { id, asset, meta } of metaEntries) {
@@ -8868,6 +8934,17 @@ async function listNamespaceOriginalArchiveVideos(params: {
             previewUrl: asset.originalUrl,
             originalUrl: asset.originalUrl || String(meta.originalUrl || meta.original_url || '').trim(),
             thumbnailUrl: asset.previewUrl || String(meta.originalThumbnailUrl || meta.original_thumbnail_url || '').trim(),
+            fallbackThumbnailUrl: buildWorkerGalleryFrameUrl(
+                String(params.env.WORKER_URL || '').trim(),
+                normalizedNamespaceId,
+                id,
+                {
+                    seed: `${normalizedNamespaceId}:${id}:original`,
+                    format: 'jpg',
+                    width: 540,
+                    height: 960,
+                },
+            ),
             createdAt,
             updatedAt,
             status: shopeeLink && lazadaLink ? 'ready' : 'awaiting_links',
@@ -9580,7 +9657,10 @@ app.get('/api/inbox/system', async (c) => {
         if (!cachedVideos.length) {
             await writeSystemInboxSnapshot(bucket, currentNamespaceId, dedupedVideos).catch(() => { })
         }
-        const visibleVideos = dedupedVideos.filter((video) => !!String(video.thumbnailUrl || '').trim())
+        const visibleVideos = dedupedVideos.filter((video) => (
+            !!String(video.thumbnailUrl || '').trim()
+            || !!String((video as Record<string, unknown>).fallbackThumbnailUrl || '').trim()
+        ))
         const page = sliceGalleryPage(visibleVideos, offset, limit)
         c.executionCtx.waitUntil(Promise.all(
             page.videos.slice(0, 8).map((video) => {
@@ -11078,7 +11158,51 @@ app.get('/api/gallery/:id/asset/:variant', async (c) => {
 
     const bucket = new BotBucket(c.env.BUCKET, targetNamespaceId) as unknown as R2Bucket
     const key = await resolveGalleryAssetKey(bucket, id, variant)
-    return buildGalleryAssetResponse(bucket, key, variant, c.req.header('range'))
+    const response = await buildGalleryAssetResponse(bucket, key, variant, c.req.header('range'))
+    if (
+        response.status === 404
+        && (variant === 'original-thumb' || variant === 'thumb')
+    ) {
+        try {
+            const frameUrl = buildWorkerGalleryFrameUrl(
+                String(c.env.WORKER_URL || '').trim(),
+                targetNamespaceId,
+                id,
+                {
+                    seed: `${targetNamespaceId}:${id}:${variant}`,
+                    format: 'webp',
+                    width: 540,
+                    height: 960,
+                },
+            )
+            if (!frameUrl) return response
+            const thumbBytes = await generateThumbnailViaContainer(
+                c.env,
+                buildWorkerGalleryAssetUrl(
+                    String(c.env.WORKER_URL || '').trim(),
+                    targetNamespaceId,
+                    id,
+                    variant === 'thumb' ? 'public' : 'original',
+                ),
+                `${targetNamespaceId}:${id}:${variant}`,
+                undefined,
+                'webp',
+                540,
+                960,
+            )
+            return new Response(thumbBytes, {
+                status: 200,
+                headers: {
+                    'Content-Type': 'image/webp',
+                    'Cache-Control': 'public, max-age=300, stale-while-revalidate=86400',
+                    'Access-Control-Allow-Origin': '*',
+                },
+            })
+        } catch {
+            return response
+        }
+    }
+    return response
 })
 
 app.get('/api/gallery/:id/frame', async (c) => {
