@@ -5083,6 +5083,32 @@ function App() {
   }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length])
 
   useEffect(() => {
+    if (tab !== 'inbox' || inboxLoading || !inboxHasMore || isSystemAdmin) return
+
+    const root = mainScrollRef.current
+    if (!root) return
+
+    let rafId = 0
+    const maybeLoadMore = () => {
+      if (rafId) return
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0
+        if (inboxLoadingMore) return
+        const distanceToBottom = root.scrollHeight - root.scrollTop - root.clientHeight
+        if (distanceToBottom > 420) return
+        void loadInboxSnapshot()
+      })
+    }
+
+    maybeLoadMore()
+    root.addEventListener('scroll', maybeLoadMore, { passive: true })
+    return () => {
+      root.removeEventListener('scroll', maybeLoadMore)
+      if (rafId) window.cancelAnimationFrame(rafId)
+    }
+  }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length])
+
+  useEffect(() => {
     if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin) return
 
     const root = mainScrollRef.current
@@ -5101,6 +5127,32 @@ function App() {
 
     observer.observe(target)
     return () => observer.disconnect()
+  }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
+
+  useEffect(() => {
+    if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin) return
+
+    const root = mainScrollRef.current
+    if (!root) return
+
+    let rafId = 0
+    const maybeLoadMore = () => {
+      if (rafId) return
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0
+        if (systemInboxLoadingMore) return
+        const distanceToBottom = root.scrollHeight - root.scrollTop - root.clientHeight
+        if (distanceToBottom > 420) return
+        void loadSystemInbox()
+      })
+    }
+
+    maybeLoadMore()
+    root.addEventListener('scroll', maybeLoadMore, { passive: true })
+    return () => {
+      root.removeEventListener('scroll', maybeLoadMore)
+      if (rafId) window.cancelAnimationFrame(rafId)
+    }
   }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
 
   // If viewing a specific page detail

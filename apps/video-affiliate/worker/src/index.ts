@@ -9578,9 +9578,10 @@ app.get('/api/inbox/system', async (c) => {
             ? cachedVideos
             : await buildSystemInboxSnapshot(c.env, currentNamespaceId)
         if (!cachedVideos.length) {
-            c.executionCtx.waitUntil(writeSystemInboxSnapshot(bucket, currentNamespaceId, dedupedVideos).catch(() => { }))
+            await writeSystemInboxSnapshot(bucket, currentNamespaceId, dedupedVideos).catch(() => { })
         }
-        const page = sliceGalleryPage(dedupedVideos, offset, limit)
+        const visibleVideos = dedupedVideos.filter((video) => !!String(video.thumbnailUrl || '').trim())
+        const page = sliceGalleryPage(visibleVideos, offset, limit)
         c.executionCtx.waitUntil(Promise.all(
             page.videos.slice(0, 8).map((video) => {
                 const videoId = String(video.id || '').trim()
@@ -9598,7 +9599,7 @@ app.get('/api/inbox/system', async (c) => {
 
         return c.json({
             videos: page.videos,
-            total: dedupedVideos.length,
+            total: visibleVideos.length,
             offset,
             limit,
             has_more: page.hasMore,
