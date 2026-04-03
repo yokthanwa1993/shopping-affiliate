@@ -3647,6 +3647,34 @@ function App() {
   }, [tab, token, authBootstrapping])
 
   useEffect(() => {
+    if (authBootstrapping || !token) return
+    if (tab !== 'gallery') return
+
+    const refreshGalleryView = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      if (categoryFilter === 'all-original') {
+        if (isOwner) void loadGlobalOriginalVideos({ force: true })
+        return
+      }
+      void loadGallerySnapshotBundle()
+    }
+
+    refreshGalleryView()
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return
+      refreshGalleryView()
+    }
+    const timer = window.setInterval(refreshGalleryView, 12000)
+    window.addEventListener('focus', refreshGalleryView)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refreshGalleryView)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [tab, token, authBootstrapping, categoryFilter, isOwner, gallerySearchQuery])
+
+  useEffect(() => {
     if (tab !== 'settings' && settingsSection !== 'menu') {
       setSettingsSection('menu')
     }
@@ -3823,12 +3851,11 @@ function App() {
       if (requestId !== inboxRequestRef.current) return
 
       const nextVideos = Array.isArray(data.videos) ? data.videos : []
-      const nextTotal = Number(data.total || 0)
       setInboxVideos((prev) => {
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
-        setInboxHasMore(merged.length < nextTotal)
         return merged
       })
+      setInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
@@ -3872,12 +3899,11 @@ function App() {
       if (requestId !== systemInboxRequestRef.current) return
 
       const nextVideos = Array.isArray(data.videos) ? data.videos : []
-      const nextTotal = Number(data.total || 0)
       setSystemInboxVideos((prev) => {
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
-        setSystemInboxHasMore(merged.length < nextTotal)
         return merged
       })
+      setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
@@ -4000,6 +4026,10 @@ function App() {
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
       if (gallerySearchQuery) params.set('q', gallerySearchQuery)
+      if (offset === 0) {
+        params.set('fresh', '1')
+        params.set('_ts', String(Date.now()))
+      }
 
       const useAdminSystemRoute = useSystemWideAdminGallery && isSystemAdmin
       const requestParams = new URLSearchParams(params)
@@ -4081,6 +4111,10 @@ function App() {
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
       if (gallerySearchQuery) params.set('q', gallerySearchQuery)
+      if (offset === 0) {
+        params.set('fresh', '1')
+        params.set('_ts', String(Date.now()))
+      }
 
       const useAdminSystemRoute = useSystemWideAdminGallery && isSystemAdmin
       const requestParams = new URLSearchParams(params)
@@ -5323,6 +5357,19 @@ function App() {
   }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
 
   useEffect(() => {
+    if (tab !== 'inbox' || inboxLoading || inboxLoadingMore || !inboxHasMore || isSystemAdmin) return
+
+    const root = mainScrollRef.current
+    if (!root) return
+    if (root.scrollHeight > root.clientHeight + 120) return
+
+    const timer = window.setTimeout(() => {
+      void loadInboxSnapshot()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [tab, inboxLoading, inboxLoadingMore, inboxHasMore, isSystemAdmin, inboxVideos.length])
+
+  useEffect(() => {
     if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin) return
 
     const root = mainScrollRef.current
@@ -5347,6 +5394,19 @@ function App() {
       if (rafId) window.cancelAnimationFrame(rafId)
     }
   }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
+
+  useEffect(() => {
+    if (tab !== 'inbox' || systemInboxLoading || systemInboxLoadingMore || !systemInboxHasMore || !isSystemAdmin) return
+
+    const root = mainScrollRef.current
+    if (!root) return
+    if (root.scrollHeight > root.clientHeight + 120) return
+
+    const timer = window.setTimeout(() => {
+      void loadSystemInbox()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [tab, systemInboxLoading, systemInboxLoadingMore, systemInboxHasMore, isSystemAdmin, systemInboxVideos.length])
 
   // If viewing a specific page detail
   if (selectedPage) {

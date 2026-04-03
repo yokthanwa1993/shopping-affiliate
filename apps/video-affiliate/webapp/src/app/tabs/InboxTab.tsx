@@ -1,6 +1,6 @@
 import type { RefObject } from 'react'
 import { InboxCard } from '../components/InboxCard'
-import { dedupeSystemInboxVideos, getInboxVideoIdentityKey } from '../inboxUtils'
+import { getInboxVideoIdentityKey } from '../inboxUtils'
 import type { InboxVideo } from '../sharedTypes'
 
 export function InboxTab({
@@ -43,11 +43,10 @@ export function InboxTab({
   resolveThumbnailUrl: (video: InboxVideo) => string
 }) {
   if (isSystemAdmin) {
-    const filtered = dedupeSystemInboxVideos(systemInboxVideos, namespaceId)
-      .filter((video) => (
-        !!String(video.thumbnailUrl || '').trim()
-        || !!String(video.fallbackThumbnailUrl || '').trim()
-      ))
+    const filtered = systemInboxVideos.filter((video) => (
+      !!String(video.thumbnailUrl || '').trim()
+      || !!String(video.fallbackThumbnailUrl || '').trim()
+    ))
 
     return (
       <div className="px-4">

@@ -11307,6 +11307,7 @@ app.get('/api/gallery', async (c) => {
     const offset = parseNonNegativeInt(c.req.query('offset'), 0)
     const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
     const limit = Math.min(Math.max(requestedLimit, 1), 120)
+    const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
     const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
     const linkFilterRaw = String(c.req.query('link_filter') || '').trim().toLowerCase()
     const linkFilter = linkFilterRaw === 'no-link'
@@ -11389,7 +11390,12 @@ app.get('/api/gallery', async (c) => {
             lazada_total: lazadaVideos.length,
             with_link_total: withLinkVideos.length,
             without_link_total: withoutLinkVideos.length,
-        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
+        }, 200, {
+            'Cache-Control': forceFresh || offset === 0
+                ? 'private, no-store'
+                : 'private, max-age=15, stale-while-revalidate=60',
+            'Vary': 'x-auth-token',
+        })
     } catch (e) {
         return c.json({ videos: [], error: String(e) })
     }
@@ -11400,6 +11406,7 @@ app.get('/api/gallery/system', async (c) => {
         const offset = parseNonNegativeInt(c.req.query('offset'), 0)
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
+        const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
         const view = String(c.req.query('view') || '').trim().toLowerCase() === 'used' ? 'used' : 'ready'
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
@@ -11450,7 +11457,12 @@ app.get('/api/gallery/system', async (c) => {
             offset,
             limit,
             view,
-        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
+        }, 200, {
+            'Cache-Control': forceFresh || offset === 0
+                ? 'private, no-store'
+                : 'private, max-age=15, stale-while-revalidate=60',
+            'Vary': 'x-auth-token',
+        })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
     }
@@ -11683,6 +11695,7 @@ app.get('/api/gallery/used', async (c) => {
     const offset = parseNonNegativeInt(c.req.query('offset'), 0)
     const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
     const limit = Math.min(Math.max(requestedLimit, 1), 120)
+    const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
     const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
     const fixUrls = (data: any) => {
         const s = JSON.stringify(data)
@@ -11710,7 +11723,12 @@ app.get('/api/gallery/used', async (c) => {
             offset,
             limit,
             has_more: page.hasMore,
-        }), 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
+        }), 200, {
+            'Cache-Control': forceFresh || offset === 0
+                ? 'private, no-store'
+                : 'private, max-age=15, stale-while-revalidate=60',
+            'Vary': 'x-auth-token',
+        })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
     }
