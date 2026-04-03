@@ -367,7 +367,7 @@ async fn gemini_srt_from_audio(
          ข้อบังคับ:\n\
          1) ใช้ข้อความซับจากรายการด้านล่างนี้เท่านั้น (ห้ามเปลี่ยนคำ ห้ามเพิ่ม ห้ามลด)\n\
          2) คืนผลลัพธ์เป็น SRT ล้วนๆ เท่านั้น (ไม่ต้องมี markdown)\n\
-         3) เริ่มซับที่ 00:00:00,000\n\
+         3) timecode ต้องตรงกับเสียงจริง รวมถึงช่วงเงียบก่อนเริ่มพูดและช่วงเว้นระหว่างประโยค\n\
          4) จบบรรทัดสุดท้ายไม่เกิน {duration:.3} วินาที\n\
          5) timecode ต้องเรียงต่อเนื่อง ไม่ย้อนเวลา\n\n\
          รายการซับที่ต้องใช้:\n\
@@ -389,7 +389,7 @@ async fn gemini_srt_from_audio(
             ]
         }],
         "generationConfig": {
-            "temperature": 0.1
+            "temperature": 0.0
         }
     });
 
@@ -824,6 +824,51 @@ fn parse_srt_blocks_with_text(srt: &str) -> Vec<(f64, f64, String)> {
     blocks
 }
 
+fn extract_speech_timing_blocks(srt: &str) -> Vec<(f64, f64, usize)> {
+    parse_srt_blocks_with_text(srt)
+        .into_iter()
+        .filter(|(_, _, text)| !is_non_speech_cue(text))
+        .filter_map(|(start, end, text)| {
+            let chars = visible_chars_len(&text);
+            if end > start && chars > 0 {
+                Some((start, end, chars))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn map_char_offset_to_timing_time(
+    target_chars: usize,
+    timing_blocks: &[(f64, f64, usize)],
+    fallback_end: f64,
+) -> f64 {
+    if timing_blocks.is_empty() {
+        return 0.0;
+    }
+
+    if target_chars == 0 {
+        return timing_blocks[0].0.max(0.0).min(fallback_end);
+    }
+
+    let mut seen = 0usize;
+    for (start, end, chars) in timing_blocks {
+        let block_chars = (*chars).max(1);
+        let next_seen = seen.saturating_add(block_chars);
+        if target_chars <= next_seen {
+            let within = (target_chars.saturating_sub(seen) as f64 / block_chars as f64).clamp(0.0, 1.0);
+            return (start + ((end - start) * within)).max(0.0).min(fallback_end);
+        }
+        seen = next_seen;
+    }
+
+    timing_blocks
+        .last()
+        .map(|(_, end, _)| (*end).max(0.0).min(fallback_end))
+        .unwrap_or(fallback_end)
+}
+
 fn is_non_speech_cue(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
@@ -975,6 +1020,67 @@ fn build_srt_from_lines_with_timing(
     }
 
     let fallback_duration = fallback_duration.max(1.0);
+    let timing_blocks = extract_speech_timing_blocks(timing_srt);
+    if !timing_blocks.is_empty() {
+        let max_end = timing_blocks
+            .last()
+            .map(|(_, end, _)| *end)
+            .unwrap_or(fallback_duration)
+            .min(fallback_duration)
+            .max(0.1);
+
+        if timing_blocks.len() == chunks.len() {
+            let mut out = String::new();
+            let mut cursor = timing_blocks[0].0.max(0.0).min(max_end);
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let (mapped_start, mapped_end, _) = timing_blocks[idx];
+                let start = mapped_start.max(cursor).min(max_end);
+                let end = mapped_end.max(start + 0.12).min(max_end);
+                if end <= start {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "{}\n{} --> {}\n{}\n\n",
+                    idx + 1,
+                    format_srt_time(start),
+                    format_srt_time(end),
+                    chunk
+                ));
+                cursor = end;
+            }
+            return out;
+        }
+
+        let mut out = String::new();
+        let mut consumed_chars = 0usize;
+        let mut cursor = timing_blocks[0].0.max(0.0).min(max_end);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let chunk_chars = chunk.chars().count().max(1);
+            let mapped_start = map_char_offset_to_timing_time(consumed_chars, &timing_blocks, max_end);
+            let mapped_end = if idx == chunks.len() - 1 {
+                max_end
+            } else {
+                map_char_offset_to_timing_time(consumed_chars.saturating_add(chunk_chars), &timing_blocks, max_end)
+            };
+            let start = mapped_start.max(cursor);
+            let end = mapped_end.max(start + 0.12).min(max_end);
+            if end <= start {
+                continue;
+            }
+            out.push_str(&format!(
+                "{}\n{} --> {}\n{}\n\n",
+                idx + 1,
+                format_srt_time(start),
+                format_srt_time(end),
+                chunk
+            ));
+            cursor = end;
+            consumed_chars = consumed_chars.saturating_add(chunk_chars);
+        }
+
+        return out;
+    }
+
     let (timing_start, timing_end) = extract_speech_srt_time_span(timing_srt)
         .unwrap_or((0.0, fallback_duration));
     let timing_span = (timing_end - timing_start).max(0.0);
@@ -1075,6 +1181,21 @@ mod tests {
         let span = extract_speech_srt_time_span(timing_srt).expect("speech span expected");
         assert!((span.0 - 0.0).abs() < 0.001);
         assert!((span.1 - 2.0).abs() < 0.001, "music cue tail must not stretch speech span");
+    }
+
+    #[test]
+    fn deterministic_srt_preserves_real_timing_blocks_when_available() {
+        let timing_srt = "\
+1\n00:00:00,400 --> 00:00:00,900\nหนึ่ง\n\n\
+2\n00:00:01,500 --> 00:00:02,000\nสอง\n\n\
+3\n00:00:02,600 --> 00:00:03,000\nสาม\n\n";
+        let lines = vec!["หนึ่ง".to_string(), "สอง".to_string(), "สาม".to_string()];
+        let out = build_srt_from_lines_with_timing(&lines, timing_srt, 3.5, 15);
+        let times = extract_time_lines(&out);
+        assert_eq!(times.len(), 3);
+        assert!((times[0].0 - 0.4).abs() < 0.05, "first block should keep real start");
+        assert!((times[1].0 - 1.5).abs() < 0.05, "second block should preserve pause gap");
+        assert!((times[2].0 - 2.6).abs() < 0.05, "third block should preserve late start");
     }
 
     #[test]
@@ -1484,9 +1605,9 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
 
     if final_srt_text.trim().is_empty() {
         final_srt_text = if subtitle_lines.is_empty() {
-            build_srt_from_script_with_timing(&script, "", speech_dur, 15)
+            build_srt_from_script_with_timing(&script, &raw_srt, speech_dur, 15)
         } else {
-            build_srt_from_lines_with_timing(&subtitle_lines, "", speech_dur, 15)
+            build_srt_from_lines_with_timing(&subtitle_lines, &raw_srt, speech_dur, 15)
         };
     }
 
