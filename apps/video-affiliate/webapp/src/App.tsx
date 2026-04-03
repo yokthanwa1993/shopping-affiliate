@@ -107,6 +107,7 @@ const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedSt
 const nsInboxCacheKey = (namespaceId: string) => `inbox_cache:${CACHE_VERSION}:${namespaceId}`
 const dashboardCacheKey = (namespaceId: string) => `dashboard_cache:${CACHE_VERSION}:${namespaceId}`
 const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`inbox_system_cache:${CACHE_VERSION}`, botScope)
+const processingCacheKey = (namespaceId: string) => `processing_cache:${CACHE_VERSION}:${namespaceId}`
 const GALLERY_BATCH_SIZE = 24
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
@@ -2513,7 +2514,9 @@ function App() {
     setPages([])
     setVideos([])
     setUsedVideos([])
+    setProcessingVideos([])
     setPendingShortlinkVideos([])
+    setProcessingLoading(true)
     setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
     setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
     setProcessingSummary({
@@ -2739,8 +2742,15 @@ function App() {
   })
   const [globalOriginalVideos, setGlobalOriginalVideos] = useState<GlobalOriginalVideo[]>([])
   const [globalOriginalLoading, setGlobalOriginalLoading] = useState(false)
-  const [processingVideos, setProcessingVideos] = useState<Video[]>([])
+  const [processingVideos, setProcessingVideos] = useState<Video[]>(() => {
+    const ns = getStoredNamespace(botScope)
+    return ns ? readCache<Video[]>(processingCacheKey(ns), []) : []
+  })
   const [pendingShortlinkVideos, setPendingShortlinkVideos] = useState<Video[]>([])
+  const [processingLoading, setProcessingLoading] = useState(() => {
+    const ns = getStoredNamespace(botScope)
+    return ns ? readCache<Video[]>(processingCacheKey(ns), []).length === 0 : true
+  })
   const [retryingProcessingId, setRetryingProcessingId] = useState<string | null>(null)
   const [loading, setLoading] = useState(() => {
     if (FORCE_SYSTEM_WIDE_GALLERY) {
@@ -3099,6 +3109,11 @@ function App() {
   }, [namespaceId, dashboardData])
 
   useEffect(() => {
+    if (!namespaceId) return
+    writeCache(processingCacheKey(namespaceId), processingVideos)
+  }, [namespaceId, processingVideos])
+
+  useEffect(() => {
     writeCache(systemInboxCacheKey(botScope), systemInboxVideos)
   }, [botScope, systemInboxVideos])
 
@@ -3250,6 +3265,7 @@ function App() {
     const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, false)
     const cachedInbox = storedNamespace ? readCache<InboxVideo[]>(nsInboxCacheKey(storedNamespace), []) : []
     const cachedDashboard = storedNamespace ? readCache<DashboardData | null>(dashboardCacheKey(storedNamespace), null) : null
+    const cachedProcessing = storedNamespace ? readCache<Video[]>(processingCacheKey(storedNamespace), []) : []
     const cachedSystemInbox = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
     const storedShortlinkAccount = getStoredShortlinkAccount(botScope)
     const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
@@ -3259,6 +3275,8 @@ function App() {
     setInboxVideos(cachedInbox)
     setSystemInboxVideos(cachedSystemInbox)
     setDashboardData(cachedDashboard)
+    setProcessingVideos(cachedProcessing)
+    setProcessingLoading(cachedProcessing.length === 0)
     setGalleryLoading(cachedVideos.length === 0)
     const storedShortlinkExpectedUtmId = getStoredShortlinkExpectedUtmId(botScope)
     const storedLazadaExpectedMemberId = getStoredLazadaExpectedMemberId(botScope)
@@ -3554,6 +3572,11 @@ function App() {
       : []
     setVideos(cachedVideos)
     setUsedVideos(cachedUsedVideos)
+    const cachedProcessing = namespaceId
+      ? readCache<Video[]>(processingCacheKey(namespaceId), [])
+      : []
+    setProcessingVideos(cachedProcessing)
+    setProcessingLoading(cachedProcessing.length === 0)
     setGalleryReadyTotalCount(cachedVideos.length)
     setGalleryUsedTotalCount(cachedUsedVideos.length)
     setGalleryLoading(cachedVideos.length === 0)
@@ -3634,9 +3657,11 @@ function App() {
     if (!session) return
 
     processingFetchInFlightRef.current = true
+    const shouldShowLoading = processingVideos.length === 0
+    if (shouldShowLoading) setProcessingLoading(true)
     try {
       const [processingResp, queueResp] = await Promise.all([
-        apiFetch(`${WORKER_URL}/api/processing`),
+        apiFetch(`${WORKER_URL}/api/processing?summary=0`),
         apiFetch(`${WORKER_URL}/api/queue`)
       ])
 
@@ -3662,6 +3687,7 @@ function App() {
     } catch {
       // Keep previous processing snapshot on transient errors.
     } finally {
+      if (shouldShowLoading) setProcessingLoading(false)
       processingFetchInFlightRef.current = false
     }
   }
@@ -5264,7 +5290,7 @@ function App() {
 
         {tab === 'processing' && (
           <ProcessingTab
-            loading={loading}
+            loading={processingLoading}
             processingVideos={processingVideos}
             onCancel={handleCancelJob}
             onReprocess={handleReprocessJob}

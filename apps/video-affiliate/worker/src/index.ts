@@ -8707,6 +8707,91 @@ function buildInboxVideoResponseForNamespace(
     }
 }
 
+const SYSTEM_INBOX_CACHE_TTL_MS = 15 * 1000
+
+function getSystemInboxCacheKey(namespaceId: string): string {
+    const normalizedNamespaceId = String(namespaceId || '').trim() || 'default'
+    return `_admin_cache/system_inbox_${normalizedNamespaceId}.json`
+}
+
+async function buildSystemInboxSnapshot(
+    env: Env,
+    currentNamespaceId: string,
+): Promise<Array<Record<string, unknown>>> {
+    const namespaceIds = new Set<string>()
+    try {
+        const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
+        for (const row of results || []) {
+            const id = String((row as any)?.namespace_id || '').trim()
+            if (id) namespaceIds.add(id)
+        }
+    } catch { /* email_namespaces table may not exist */ }
+    if (currentNamespaceId) namespaceIds.add(currentNamespaceId)
+
+    const namespaceEmailMap = await getNamespaceOwnerEmailMap(env.DB)
+    const hiddenImportedSourceKeys = new Set<string>()
+    if (currentNamespaceId) {
+        await ensureImportedVideosTable(env.DB)
+        const importedRows = await env.DB.prepare(
+            'SELECT video_id, source_namespace_id FROM imported_videos WHERE namespace_id = ?'
+        ).bind(currentNamespaceId).all().catch(() => ({ results: [] as Array<{ video_id?: string; source_namespace_id?: string }> }))
+        for (const row of importedRows.results || []) {
+            const videoId = String((row as any)?.video_id || '').trim()
+            const sourceNamespaceId = String((row as any)?.source_namespace_id || '').trim()
+            if (!videoId || !sourceNamespaceId) continue
+            hiddenImportedSourceKeys.add(`${sourceNamespaceId}:${videoId}`)
+        }
+    }
+
+    const allVideos: Array<Record<string, unknown>> = []
+    await Promise.all(Array.from(namespaceIds).map(async (nsId) => {
+        const bucket = new BotBucket(env.BUCKET, nsId) as unknown as R2Bucket
+        const records = await listInboxVideoRecords(bucket)
+        for (const record of records) {
+            const videoId = String(record.id || '').trim()
+            if (nsId !== currentNamespaceId && videoId && hiddenImportedSourceKeys.has(`${nsId}:${videoId}`)) {
+                continue
+            }
+            allVideos.push(buildInboxVideoResponseForNamespace(
+                env,
+                record,
+                nsId,
+                namespaceEmailMap.get(nsId) || '',
+            ))
+        }
+    }))
+
+    return dedupeSystemInboxVideos(allVideos, currentNamespaceId)
+}
+
+async function readSystemInboxSnapshot(
+    bucket: R2Bucket,
+    currentNamespaceId: string,
+): Promise<{ videos: Array<Record<string, unknown>>; builtAtMs: number } | null> {
+    const cacheObj = await bucket.get(getSystemInboxCacheKey(currentNamespaceId)).catch(() => null)
+    if (!cacheObj) return null
+    const payload = await cacheObj.json().catch(() => null) as { builtAt?: string; videos?: Array<Record<string, unknown>> } | null
+    const videos = Array.isArray(payload?.videos) ? payload!.videos : []
+    const builtAtMs = Date.parse(String(payload?.builtAt || ''))
+    return {
+        videos,
+        builtAtMs: Number.isFinite(builtAtMs) ? builtAtMs : 0,
+    }
+}
+
+async function writeSystemInboxSnapshot(
+    bucket: R2Bucket,
+    currentNamespaceId: string,
+    videos: Array<Record<string, unknown>>,
+): Promise<void> {
+    await bucket.put(getSystemInboxCacheKey(currentNamespaceId), JSON.stringify({
+        builtAt: new Date().toISOString(),
+        videos,
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
+
 async function listNamespaceOriginalArchiveVideos(params: {
     env: Env
     bucket: R2Bucket
@@ -9340,18 +9425,8 @@ async function ensureInboxVideoProcessingStarted(params: {
 app.get('/api/processing', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
-        const [list, inventory, shortlinkRequired] = await Promise.all([
-            c.get('bucket').list({ prefix: '_processing/' }),
-            getNamespaceGalleryInventory(c.env, namespaceId),
-            isNamespaceAffiliateShortlinkRequired(c.env.DB, namespaceId).catch(() => false),
-        ])
-        const pendingShortlinkVideos = shortlinkRequired
-            ? inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
-            : []
-        const readyVideos = inventory.videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready)
-        const pendingHasLazadaTotal = pendingShortlinkVideos.filter((video) =>
-            String((video as Record<string, unknown>).pending_bucket || '').trim() === 'has-lazada'
-        ).length
+        const includeSummary = String(c.req.query('summary') || '').trim() === '1'
+        const list = await c.get('bucket').list({ prefix: '_processing/' })
         const prefix = '_processing/'
         const tasks = await Promise.all(
             list.objects.map(async obj => {
@@ -9396,6 +9471,27 @@ app.get('/api/processing', async (c) => {
             const bt = new Date(String(b.createdAt || '')).getTime()
             return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
         })
+        let pendingShortlinkVideos: Array<Record<string, unknown>> = []
+        let pendingHasLazadaTotal = 0
+        let readyTotal = 0
+        let inventoryTotal = 0
+        let libraryTotal = 0
+
+        if (includeSummary && namespaceId) {
+            const [inventory, shortlinkRequired] = await Promise.all([
+                getNamespaceGalleryInventory(c.env, namespaceId),
+                isNamespaceAffiliateShortlinkRequired(c.env.DB, namespaceId).catch(() => false),
+            ])
+            pendingShortlinkVideos = shortlinkRequired
+                ? inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
+                : []
+            readyTotal = inventory.videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready).length
+            inventoryTotal = inventory.videos.length
+            libraryTotal = inventory.sourceTotal
+            pendingHasLazadaTotal = pendingShortlinkVideos.filter((video) =>
+                String((video as Record<string, unknown>).pending_bucket || '').trim() === 'has-lazada'
+            ).length
+        }
         return c.json({
             videos,
             pending_shortlink_videos: pendingShortlinkVideos,
@@ -9403,10 +9499,10 @@ app.get('/api/processing', async (c) => {
             pending_total: pendingShortlinkVideos.length,
             pending_has_lazada_total: pendingHasLazadaTotal,
             pending_missing_lazada_total: Math.max(0, pendingShortlinkVideos.length - pendingHasLazadaTotal),
-            ready_total: readyVideos.length,
-            inventory_total: inventory.videos.length,
-            library_total: inventory.sourceTotal,
-        }, 200, { 'Cache-Control': 'no-store' })
+            ready_total: readyTotal,
+            inventory_total: inventoryTotal,
+            library_total: libraryTotal,
+        }, 200, { 'Cache-Control': 'private, max-age=5, stale-while-revalidate=15', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
     }
@@ -9461,60 +9557,39 @@ app.get('/api/inbox/system', async (c) => {
         if (!sysAdmin) return c.json({ error: 'Forbidden' }, 403)
         const currentNamespaceId = String(me.namespace_id || c.get('botId') || '').trim()
 
-        const namespaceIds = new Set<string>()
-        try {
-            const { results } = await c.env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
-            for (const row of results || []) {
-                const id = String((row as any)?.namespace_id || '').trim()
-                if (id) namespaceIds.add(id)
-            }
-        } catch { /* email_namespaces table may not exist */ }
-        if (currentNamespaceId) namespaceIds.add(currentNamespaceId)
+        const bucket = c.get('bucket')
+        const cachedSnapshot = await readSystemInboxSnapshot(bucket, currentNamespaceId).catch(() => null)
+        const cachedVideos = cachedSnapshot?.videos || []
+        const cacheAgeMs = cachedSnapshot ? Math.max(0, Date.now() - cachedSnapshot.builtAtMs) : Number.POSITIVE_INFINITY
+        const shouldRefreshCache = !cachedSnapshot || cacheAgeMs > SYSTEM_INBOX_CACHE_TTL_MS
 
-        const namespaceEmailMap = await getNamespaceOwnerEmailMap(c.env.DB)
-        const hiddenImportedSourceKeys = new Set<string>()
-        if (currentNamespaceId) {
-            await ensureImportedVideosTable(c.env.DB)
-            const importedRows = await c.env.DB.prepare(
-                'SELECT video_id, source_namespace_id FROM imported_videos WHERE namespace_id = ?'
-            ).bind(currentNamespaceId).all().catch(() => ({ results: [] as Array<{ video_id?: string; source_namespace_id?: string }> }))
-            for (const row of importedRows.results || []) {
-                const videoId = String((row as any)?.video_id || '').trim()
-                const sourceNamespaceId = String((row as any)?.source_namespace_id || '').trim()
-                if (!videoId || !sourceNamespaceId) continue
-                hiddenImportedSourceKeys.add(`${sourceNamespaceId}:${videoId}`)
-            }
+        if (shouldRefreshCache) {
+            c.executionCtx.waitUntil((async () => {
+                try {
+                    const freshVideos = await buildSystemInboxSnapshot(c.env, currentNamespaceId)
+                    await writeSystemInboxSnapshot(bucket, currentNamespaceId, freshVideos)
+                } catch (error) {
+                    console.log(`[SYSTEM-INBOX-CACHE] refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+                }
+            })())
         }
 
-        const allVideos: Array<Record<string, unknown>> = []
-        await Promise.all(Array.from(namespaceIds).map(async (nsId) => {
-            const bucket = new BotBucket(c.env.BUCKET, nsId) as unknown as R2Bucket
-            const records = await listInboxVideoRecords(bucket)
-            for (const record of records) {
-                const videoId = String(record.id || '').trim()
-                if (nsId !== currentNamespaceId && videoId && hiddenImportedSourceKeys.has(`${nsId}:${videoId}`)) {
-                    continue
-                }
-                allVideos.push(buildInboxVideoResponseForNamespace(
-                    c.env,
-                    record,
-                    nsId,
-                    namespaceEmailMap.get(nsId) || '',
-                ))
-            }
-        }))
-
-        const dedupedVideos = dedupeSystemInboxVideos(allVideos, currentNamespaceId)
+        const dedupedVideos: Array<Record<string, unknown>> = cachedVideos.length > 0
+            ? cachedVideos
+            : await buildSystemInboxSnapshot(c.env, currentNamespaceId)
+        if (!cachedVideos.length) {
+            c.executionCtx.waitUntil(writeSystemInboxSnapshot(bucket, currentNamespaceId, dedupedVideos).catch(() => { }))
+        }
         const page = sliceGalleryPage(dedupedVideos, offset, limit)
         c.executionCtx.waitUntil(Promise.all(
             page.videos.slice(0, 8).map((video) => {
                 const videoId = String(video.id || '').trim()
                 const namespaceId = String(video.namespace_id || '').trim()
                 if (!videoId || !namespaceId) return Promise.resolve('')
-                const bucket = new BotBucket(c.env.BUCKET, namespaceId) as unknown as R2Bucket
+                const scopedBucket = new BotBucket(c.env.BUCKET, namespaceId) as unknown as R2Bucket
                 return promoteSelectedInboxCoverToOriginalThumbnail({
                     env: c.env,
-                    bucket,
+                    bucket: scopedBucket,
                     namespaceId,
                     videoId,
                 }).catch(() => '')
