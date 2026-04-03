@@ -26,7 +26,15 @@ pub struct ThumbnailRequest {
     #[serde(default)]
     pub overlay_y_pct: Option<f64>,
     #[serde(default)]
-    pub overlay_accent: String,
+    pub overlay_font_id: String,
+    #[serde(default)]
+    pub overlay_text_color: String,
+    #[serde(default)]
+    pub overlay_bg_color: String,
+    #[serde(default)]
+    pub overlay_bg_opacity: Option<f64>,
+    #[serde(default)]
+    pub overlay_size_scale: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -164,7 +172,7 @@ fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize) -
         .join("\n")
 }
 
-fn normalize_overlay_accent(input: &str) -> String {
+fn normalize_overlay_color(input: &str, fallback: &str) -> String {
     let trimmed = input.trim();
     let uppercase = trimmed.to_ascii_uppercase();
     if uppercase.len() == 7
@@ -173,7 +181,24 @@ fn normalize_overlay_accent(input: &str) -> String {
     {
         uppercase
     } else {
-        "#E53935".to_string()
+        fallback.to_string()
+    }
+}
+
+fn normalize_overlay_bg_opacity(input: Option<f64>) -> f64 {
+    input.unwrap_or(0.94).clamp(0.0, 1.0)
+}
+
+fn normalize_overlay_size_scale(input: Option<f64>) -> f64 {
+    input.unwrap_or(1.0).clamp(0.8, 1.35)
+}
+
+fn resolve_overlay_fontfile(font_id: &str) -> &'static str {
+    match font_id.trim().to_ascii_lowercase().as_str() {
+        "sukhumvit-bold" => "/usr/local/share/fonts/SukhumvitSet-Bold.ttf",
+        "sukhumvit-semibold" => "/usr/local/share/fonts/SukhumvitSet-SemiBold.ttf",
+        "fc-iconic-bold" => "/usr/local/share/fonts/FC-Iconic-Bold.ttf",
+        _ => "/usr/local/share/fonts/FC-Iconic-Bold.ttf",
     }
 }
 
@@ -182,7 +207,11 @@ fn build_thumbnail_filter(
     overlay_text: &str,
     overlay_text_path: Option<&str>,
     overlay_y_pct: Option<f64>,
-    overlay_accent: &str,
+    overlay_font_id: &str,
+    overlay_text_color: &str,
+    overlay_bg_color: &str,
+    overlay_bg_opacity: Option<f64>,
+    overlay_size_scale: Option<f64>,
     target_width: u32,
     target_height: u32,
 ) -> String {
@@ -195,25 +224,53 @@ fn build_thumbnail_filter(
     };
 
     let y_pct = overlay_y_pct.unwrap_or(72.0).clamp(10.0, 90.0);
-    let panel_h = ((target_height as f64) * 0.15).round().max(110.0) as i32;
-    let font_size = ((target_width as f64) * 0.075).round().max(34.0) as i32;
+    let size_scale = normalize_overlay_size_scale(overlay_size_scale);
+    let line_count = overlay_text.lines().count().max(1) as f64;
+    let longest_line_chars = overlay_text
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+    let mut font_size = (((target_width as f64) * 0.075) * size_scale).round().max(34.0);
+    let max_text_width = (target_width as f64) * 0.82;
+    let estimated_char_width = font_size * 0.62;
+    let estimated_text_width = longest_line_chars * estimated_char_width;
+    if estimated_text_width > max_text_width {
+        font_size *= (max_text_width / estimated_text_width).clamp(0.72, 1.0);
+    }
+    let estimated_text_height = line_count * font_size * 1.18;
+    let max_text_height = (target_height as f64) * 0.22;
+    if estimated_text_height > max_text_height {
+        font_size *= (max_text_height / estimated_text_height).clamp(0.72, 1.0);
+    }
+    let font_size = font_size.round().max(28.0) as i32;
+    let panel_h = ((((font_size as f64) * 1.32 * line_count) + ((font_size as f64) * 0.95)).max(96.0)).round() as i32;
     let line_spacing = ((font_size as f64) * 0.18).round().max(6.0) as i32;
     let border_w = ((font_size as f64) * 0.08).round().max(2.0) as i32;
+    let box_border_w = ((font_size as f64) * 0.34).round().max(12.0) as i32;
     let raw_panel_y = ((target_height as f64) * (y_pct / 100.0)).round() as i32 - (panel_h / 2);
     let max_panel_y = (target_height as i32 - panel_h - 12).max(12);
     let panel_y = raw_panel_y.clamp(12, max_panel_y);
-    let accent = normalize_overlay_accent(overlay_accent);
+    let text_color = normalize_overlay_color(overlay_text_color, "#FFFFFF");
+    let bg_color = normalize_overlay_color(overlay_bg_color, "#E53935");
+    let bg_opacity = normalize_overlay_bg_opacity(overlay_bg_opacity);
+    let fontfile = resolve_overlay_fontfile(overlay_font_id);
 
     format!(
-        "{base_filter},drawbox=x=0:y={panel_y}:w=iw:h={panel_h}:color={accent}@0.94:t=fill,drawtext=fontfile=/usr/local/share/fonts/FC-Iconic-Bold.ttf:textfile={text_path}:fontcolor=white:fontsize={font_size}:line_spacing={line_spacing}:x=(w-text_w)/2:y={panel_y}+({panel_h}-text_h)/2:borderw={border_w}:bordercolor=black@0.22",
+        "{base_filter},drawtext=fontfile={fontfile}:textfile={text_path}:fontcolor={text_color}:fontsize={font_size}:line_spacing={line_spacing}:x=(w-text_w)/2:y={panel_y}+({panel_h}-text_h)/2:borderw={border_w}:bordercolor=black@0.22:box=1:boxcolor={bg_color}@{bg_opacity}:boxborderw={box_border_w}",
         base_filter = base_filter,
+        fontfile = fontfile,
         panel_y = panel_y,
         panel_h = panel_h,
-        accent = accent,
         text_path = text_path,
+        text_color = text_color,
+        bg_color = bg_color,
+        bg_opacity = format!("{:.2}", bg_opacity),
         font_size = font_size,
         line_spacing = line_spacing,
         border_w = border_w,
+        box_border_w = box_border_w,
     )
 }
 
@@ -309,7 +366,11 @@ pub async fn handle_thumbnail(
         &overlay_text,
         overlay_text_path.as_ref().and_then(|path| path.to_str()),
         payload.overlay_y_pct,
-        &payload.overlay_accent,
+        &payload.overlay_font_id,
+        &payload.overlay_text_color,
+        &payload.overlay_bg_color,
+        payload.overlay_bg_opacity,
+        payload.overlay_size_scale,
         target_width,
         target_height,
     );

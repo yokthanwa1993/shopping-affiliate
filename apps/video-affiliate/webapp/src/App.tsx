@@ -500,17 +500,26 @@ interface FacebookPage {
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
-type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'comment' | 'members'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'cover' | 'comment' | 'members'
 type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
 type VoicePacePreset = 'slow' | 'balanced' | 'fast'
 type VoiceTonePreset = 'bright' | 'playful' | 'warm' | 'confident' | 'luxury' | 'friendly' | 'funny' | 'sales'
+type CoverTextFontId = 'fc-iconic-bold' | 'sukhumvit-bold' | 'sukhumvit-semibold'
 
 type VoiceProfile = {
   voice_name: string
   persona: VoicePersonaPreset
   tones: VoiceTonePreset[]
   pace: VoicePacePreset
+}
+
+type CoverTextStyleSettings = {
+  font_id: CoverTextFontId
+  text_color: string
+  background_color: string
+  background_opacity: number
+  size_scale: number
 }
 
 type GeminiVoiceOption = {
@@ -525,11 +534,60 @@ const DEFAULT_VOICE_PROFILE: VoiceProfile = {
   pace: 'balanced',
 }
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
+const DEFAULT_COVER_TEXT_STYLE: CoverTextStyleSettings = {
+  font_id: 'fc-iconic-bold',
+  text_color: '#FFFFFF',
+  background_color: '#E53935',
+  background_opacity: 0.94,
+  size_scale: 1,
+}
+
+const COVER_TEXT_FONT_OPTIONS: Array<{ value: CoverTextFontId; label: string; hint: string }> = [
+  { value: 'fc-iconic-bold', label: 'FC Iconic Bold', hint: 'เด่น หนา ชัด' },
+  { value: 'sukhumvit-bold', label: 'Sukhumvit Bold', hint: 'ไทยโมเดิร์น หนานุ่ม' },
+  { value: 'sukhumvit-semibold', label: 'Sukhumvit SemiBold', hint: 'เรียบสะอาด อ่านง่าย' },
+]
 
 const createDefaultVoiceProfile = (): VoiceProfile => ({
   ...DEFAULT_VOICE_PROFILE,
   tones: [...DEFAULT_VOICE_PROFILE.tones],
 })
+
+const createDefaultCoverTextStyle = (): CoverTextStyleSettings => ({
+  ...DEFAULT_COVER_TEXT_STYLE,
+})
+
+const normalizeCoverHexColor = (value: unknown, fallback: string) => {
+  const normalized = String(value || '').trim().toUpperCase()
+  return /^#[0-9A-F]{6}$/.test(normalized) ? normalized : fallback
+}
+
+const normalizeCoverTextFontId = (value: unknown): CoverTextFontId =>
+  COVER_TEXT_FONT_OPTIONS.find((option) => option.value === value)?.value || DEFAULT_COVER_TEXT_STYLE.font_id
+
+const normalizeCoverTextStyle = (raw: Partial<CoverTextStyleSettings> | null | undefined): CoverTextStyleSettings => ({
+  font_id: normalizeCoverTextFontId(raw?.font_id),
+  text_color: normalizeCoverHexColor(raw?.text_color, DEFAULT_COVER_TEXT_STYLE.text_color),
+  background_color: normalizeCoverHexColor(raw?.background_color, DEFAULT_COVER_TEXT_STYLE.background_color),
+  background_opacity: Number.isFinite(raw?.background_opacity)
+    ? Math.max(0, Math.min(1, Math.round(Number(raw?.background_opacity) * 100) / 100))
+    : DEFAULT_COVER_TEXT_STYLE.background_opacity,
+  size_scale: Number.isFinite(raw?.size_scale)
+    ? Math.max(0.8, Math.min(1.35, Math.round(Number(raw?.size_scale) * 100) / 100))
+    : DEFAULT_COVER_TEXT_STYLE.size_scale,
+})
+
+const coverTextStylesEqual = (left: CoverTextStyleSettings, right: CoverTextStyleSettings) =>
+  left.font_id === right.font_id &&
+  left.text_color === right.text_color &&
+  left.background_color === right.background_color &&
+  left.background_opacity === right.background_opacity &&
+  left.size_scale === right.size_scale
+
+const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
+  const fontLabel = COVER_TEXT_FONT_OPTIONS.find((option) => option.value === style.font_id)?.label || style.font_id
+  return `${fontLabel} • พื้นหลัง ${Math.round(style.background_opacity * 100)}% • ขนาด ${Math.round(style.size_scale * 100)}%`
+}
 
 const VOICE_PERSONA_OPTIONS: Array<{ value: VoicePersonaPreset; label: string; hint: string }> = [
   { value: 'female', label: 'ผู้หญิง', hint: 'นุ่มลื่น ชัดถ้อย' },
@@ -617,6 +675,8 @@ const getSettingsSectionTitle = (section: SettingsSection): string => {
       return 'Comment Template'
     case 'voice':
       return 'เสียงพากย์'
+    case 'cover':
+      return 'ข้อความบนปก'
     case 'members':
       return 'สมาชิก'
     default:
@@ -2662,6 +2722,12 @@ function App() {
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('')
   const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
   const [voicePreviewMessage, setVoicePreviewMessage] = useState('')
+  const [coverTextStyle, setCoverTextStyle] = useState<CoverTextStyleSettings>(() => createDefaultCoverTextStyle())
+  const [coverTextStyleDraft, setCoverTextStyleDraft] = useState<CoverTextStyleSettings>(() => createDefaultCoverTextStyle())
+  const [coverTextStyleUpdatedAt, setCoverTextStyleUpdatedAt] = useState('')
+  const [coverTextStyleMessage, setCoverTextStyleMessage] = useState('')
+  const [coverTextStyleLoading, setCoverTextStyleLoading] = useState(false)
+  const [coverTextStyleSaving, setCoverTextStyleSaving] = useState(false)
   const [commentTemplate, setCommentTemplate] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateDraft, setCommentTemplateDraft] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateSource, setCommentTemplateSource] = useState<'default' | 'custom'>('default')
@@ -2703,7 +2769,7 @@ function App() {
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [lazadaExpectedMemberIdMaxChars, setLazadaExpectedMemberIdMaxChars] = useState(32)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'voice', 'comment', 'members']
+  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'voice', 'cover', 'comment', 'members']
   const getSettingsSectionFromLocation = (): SettingsSection => {
     const pathTab = window.location.pathname.replace('/', '')
     const params = new URLSearchParams(window.location.search)
@@ -3514,6 +3580,10 @@ function App() {
       void loadVoicePrompt()
       return
     }
+    if (settingsSection === 'cover') {
+      void loadCoverTextStyle()
+      return
+    }
     if (settingsSection === 'comment') {
       void loadCommentTemplate()
       return
@@ -4209,6 +4279,84 @@ function App() {
       setVoiceSettingsMessage('โหลดเสียงพากย์ไม่สำเร็จ')
     } finally {
       setVoiceSettingsLoading(false)
+    }
+  }
+
+  async function loadCoverTextStyle() {
+    const session = getToken()
+    if (!session) return
+    setCoverTextStyleMessage('')
+    setCoverTextStyleLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/cover-template`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setCoverTextStyleMessage('บัญชีนี้ไม่มีสิทธิ์แก้ข้อความบนปก')
+        return
+      }
+      if (!resp.ok) {
+        setCoverTextStyleMessage('โหลดการตั้งค่าข้อความบนปกไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as {
+        text_style?: Partial<CoverTextStyleSettings>
+        updated_at?: string
+        text_style_updated_at?: string
+      }
+      const nextStyle = normalizeCoverTextStyle(data.text_style)
+      setCoverTextStyle(nextStyle)
+      setCoverTextStyleDraft({ ...nextStyle })
+      setCoverTextStyleUpdatedAt(String(data.text_style_updated_at || data.updated_at || ''))
+      setCoverTextStyleMessage('')
+    } catch {
+      setCoverTextStyleMessage('โหลดการตั้งค่าข้อความบนปกไม่สำเร็จ')
+    } finally {
+      setCoverTextStyleLoading(false)
+    }
+  }
+
+  async function saveCoverTextStyle(nextStyle: CoverTextStyleSettings) {
+    const session = getToken()
+    if (!session) return
+    setCoverTextStyleSaving(true)
+    setCoverTextStyleMessage('')
+    try {
+      const normalizedStyle = normalizeCoverTextStyle(nextStyle)
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/cover-template`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text_style: normalizedStyle }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setCoverTextStyleMessage('บัญชีนี้ไม่มีสิทธิ์แก้ข้อความบนปก')
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setCoverTextStyleMessage(data.error || 'บันทึกการตั้งค่าข้อความบนปกไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as {
+        text_style?: Partial<CoverTextStyleSettings>
+        updated_at?: string
+        text_style_updated_at?: string
+      }
+      const savedStyle = normalizeCoverTextStyle(data.text_style)
+      setCoverTextStyle(savedStyle)
+      setCoverTextStyleDraft({ ...savedStyle })
+      setCoverTextStyleUpdatedAt(String(data.text_style_updated_at || data.updated_at || new Date().toISOString()))
+      setCoverTextStyleMessage('บันทึกการตั้งค่าข้อความบนปกแล้ว')
+    } catch {
+      setCoverTextStyleMessage('บันทึกการตั้งค่าข้อความบนปกไม่สำเร็จ')
+    } finally {
+      setCoverTextStyleSaving(false)
     }
   }
 
@@ -5998,6 +6146,14 @@ function App() {
                     subtitle={summarizeVoiceSettings(voiceProfile, voiceSettingsSource, voiceOptions)}
                     onClick={() => openSettingsSection('voice')}
                   />
+                  {isOwner && (
+                    <SettingsMenuItem
+                      icon="🖍️"
+                      title="ข้อความบนปก"
+                      subtitle={summarizeCoverTextStyle(coverTextStyle)}
+                      onClick={() => openSettingsSection('cover')}
+                    />
+                  )}
                   <SettingsMenuItem
                     icon="💬"
                     title="Comment Template"
@@ -6557,6 +6713,168 @@ function App() {
                                 void saveVoicePrompt(null, { reset: true })
                               }}
                               disabled={voiceSettingsSaving}
+                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              รีเซ็ตค่าเริ่มต้น
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {settingsSection === 'cover' && isOwner && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <p className="text-xs text-gray-500 leading-relaxed">
+                        ตั้งค่าสไตล์ข้อความบนปกของ workspace นี้ได้เลย เวลาผู้ใช้พิมพ์คำบนปก ระบบจะใช้ฟอนต์ สีตัวหนังสือ สีพื้นหลัง และความโปร่งใสจากค่านี้ทันที โดยกล่องพื้นหลังจะพอดีกับความยาวข้อความอัตโนมัติ
+                      </p>
+                      {coverTextStyleLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลดการตั้งค่าข้อความบนปก...</p>
+                      ) : (
+                        <>
+                          <div className="space-y-2">
+                            <p className="text-[11px] font-semibold text-gray-600">ฟอนต์</p>
+                            <div className="grid grid-cols-1 gap-2">
+                              {COVER_TEXT_FONT_OPTIONS.map((option) => {
+                                const active = coverTextStyleDraft.font_id === option.value
+                                return (
+                                  <button
+                                    key={option.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, font_id: option.value }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-700'}`}
+                                  >
+                                    <p className="text-sm font-semibold">{option.label}</p>
+                                    <p className="text-[11px] text-gray-400">{option.hint}</p>
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <label className="space-y-1">
+                              <span className="text-[11px] font-semibold text-gray-600">สีตัวหนังสือ</span>
+                              <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                                <input
+                                  type="color"
+                                  value={coverTextStyleDraft.text_color}
+                                  onChange={(e) => {
+                                    setCoverTextStyleDraft((prev) => ({ ...prev, text_color: normalizeCoverHexColor(e.target.value, prev.text_color) }))
+                                    if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                  }}
+                                  className="h-8 w-10 rounded border-0 bg-transparent p-0"
+                                />
+                                <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.text_color}</span>
+                              </div>
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[11px] font-semibold text-gray-600">พื้นหลังข้อความ</span>
+                              <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                                <input
+                                  type="color"
+                                  value={coverTextStyleDraft.background_color}
+                                  onChange={(e) => {
+                                    setCoverTextStyleDraft((prev) => ({ ...prev, background_color: normalizeCoverHexColor(e.target.value, prev.background_color) }))
+                                    if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                  }}
+                                  className="h-8 w-10 rounded border-0 bg-transparent p-0"
+                                />
+                                <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.background_color}</span>
+                              </div>
+                            </label>
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <p className="text-[11px] font-semibold text-gray-600">ความโปร่งใสพื้นหลัง</p>
+                              <p className="text-[11px] text-gray-400">{Math.round(coverTextStyleDraft.background_opacity * 100)}%</p>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={100}
+                              step={1}
+                              value={Math.round(coverTextStyleDraft.background_opacity * 100)}
+                              onChange={(e) => {
+                                const next = Math.max(0, Math.min(100, Number(e.target.value || 0)))
+                                setCoverTextStyleDraft((prev) => ({ ...prev, background_opacity: Math.round((next / 100) * 100) / 100 }))
+                                if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                              }}
+                              className="w-full accent-blue-600"
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <p className="text-[11px] font-semibold text-gray-600">ขนาดข้อความพื้นฐาน</p>
+                              <p className="text-[11px] text-gray-400">{Math.round(coverTextStyleDraft.size_scale * 100)}%</p>
+                            </div>
+                            <input
+                              type="range"
+                              min={80}
+                              max={135}
+                              step={1}
+                              value={Math.round(coverTextStyleDraft.size_scale * 100)}
+                              onChange={(e) => {
+                                const next = Math.max(80, Math.min(135, Number(e.target.value || 100)))
+                                setCoverTextStyleDraft((prev) => ({ ...prev, size_scale: Math.round((next / 100) * 100) / 100 }))
+                                if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                              }}
+                              className="w-full accent-blue-600"
+                            />
+                            <p className="text-[11px] text-gray-400">ระบบจะย่อหรือขยายต่อให้อัตโนมัติตามความยาวข้อความ เพื่อให้ข้อความยาวยังอ่านได้</p>
+                          </div>
+
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-2">
+                            <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างสไตล์</p>
+                            <div className="rounded-2xl bg-slate-900/90 px-4 py-6 flex items-center justify-center">
+                              <span
+                                className="inline-flex items-center justify-center rounded-lg px-4 py-2 text-center font-bold"
+                                style={{
+                                  color: coverTextStyleDraft.text_color,
+                                  backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
+                                  fontSize: `${Math.round(26 * coverTextStyleDraft.size_scale)}px`,
+                                }}
+                              >
+                                ข้อความบนปกตัวอย่าง
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-gray-400">พื้นหลังของข้อความจริงจะพอดีกับความกว้างข้อความอัตโนมัติ</p>
+                          </div>
+
+                          {coverTextStyleUpdatedAt && (
+                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(coverTextStyleUpdatedAt).toLocaleString()}</p>
+                          )}
+                          {coverTextStyleMessage && (
+                            <p className={`text-xs ${coverTextStyleMessage.includes('ไม่สำเร็จ') || coverTextStyleMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
+                              {coverTextStyleMessage}
+                            </p>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => {
+                                if (coverTextStyleSaving) return
+                                void saveCoverTextStyle(coverTextStyleDraft)
+                              }}
+                              disabled={coverTextStyleSaving || coverTextStylesEqual(coverTextStyleDraft, coverTextStyle)}
+                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              {coverTextStyleSaving ? 'กำลังบันทึก...' : 'บันทึกข้อความบนปก'}
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (coverTextStyleSaving) return
+                                const next = createDefaultCoverTextStyle()
+                                setCoverTextStyleDraft(next)
+                                void saveCoverTextStyle(next)
+                              }}
+                              disabled={coverTextStyleSaving}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               รีเซ็ตค่าเริ่มต้น

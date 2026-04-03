@@ -1472,6 +1472,119 @@ function pickGalleryVideoForPostingByOrder(
     }
 }
 
+function orderGalleryVideosForPosting(
+    videos: Array<Record<string, unknown>>,
+    postingOrder: NamespacePostingOrder,
+): Array<Record<string, unknown>> {
+    const ordered = [...(videos || [])].filter((video) => !!String(video?.id || '').trim())
+    if (postingOrder === 'random') {
+        for (let index = ordered.length - 1; index > 0; index -= 1) {
+            const swapIndex = Math.floor(Math.random() * (index + 1))
+            const current = ordered[index]
+            ordered[index] = ordered[swapIndex]
+            ordered[swapIndex] = current
+        }
+        return ordered
+    }
+
+    ordered.sort((current, next) => {
+        const currentTs = getGalleryVideoSortMs(current)
+        const nextTs = getGalleryVideoSortMs(next)
+        if (currentTs !== nextTs) {
+            return postingOrder === 'newest_first'
+                ? nextTs - currentTs
+                : currentTs - nextTs
+        }
+        const currentId = String(current?.id || '').trim()
+        const nextId = String(next?.id || '').trim()
+        return postingOrder === 'newest_first'
+            ? nextId.localeCompare(currentId)
+            : currentId.localeCompare(nextId)
+    })
+    return ordered
+}
+
+async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
+    namespaceId: string
+    pageId: string
+    videoId: string
+    sourceFingerprint?: string
+}): Promise<{ id: number | null; fbPostId: string | null; postedAt: string | null } | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
+    if (!namespaceId || !pageId || !videoId) return null
+
+    const row = await db.prepare(
+        `SELECT ph.id, ph.fb_post_id, ph.posted_at
+         FROM post_history ph
+         LEFT JOIN namespace_video_state nvs
+           ON nvs.namespace_id = ph.bot_id
+          AND nvs.video_id = ph.video_id
+         WHERE ph.bot_id = ?
+           AND ph.page_id = ?
+           AND ph.status = 'success'
+           AND (
+               ph.video_id = ?
+               OR (? <> '' AND nvs.source_fingerprint = ?)
+           )
+         ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
+         LIMIT 1`
+    ).bind(namespaceId, pageId, videoId, sourceFingerprint, sourceFingerprint).first() as {
+        id?: number
+        fb_post_id?: string | null
+        posted_at?: string | null
+    } | null
+
+    if (!row) return null
+    return {
+        id: typeof row.id === 'number' ? row.id : null,
+        fbPostId: String(row.fb_post_id || '').trim() || null,
+        postedAt: String(row.posted_at || '').trim() || null,
+    }
+}
+
+async function claimGalleryVideoForPosting(params: {
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    videos: Array<Record<string, unknown>>
+    postingOrder: NamespacePostingOrder
+}): Promise<{ video: Record<string, unknown>; videoLockKey: string } | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    if (!namespaceId || !pageId) return null
+
+    const orderedVideos = orderGalleryVideosForPosting(params.videos, params.postingOrder)
+    for (const video of orderedVideos) {
+        const videoId = String(video?.id || '').trim()
+        if (!videoId) continue
+        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+            video?.sourceFingerprint || video?.source_fingerprint,
+        )
+
+        const existingSuccess = await getLatestSuccessfulPostHistoryRow(params.db, {
+            namespaceId,
+            pageId,
+            videoId,
+            sourceFingerprint,
+        })
+        if (existingSuccess) continue
+
+        const videoLockKey = await tryAcquirePostingLock(params.db, {
+            scope: 'video',
+            namespaceId,
+            videoId: sourceFingerprint || videoId,
+        })
+        if (!videoLockKey) continue
+
+        return { video, videoLockKey }
+    }
+
+    return null
+}
+
 function hasGalleryVideoThumbnail(video: Record<string, unknown> | null | undefined): boolean {
     return !!String(
         video?.thumbnailUrl
@@ -2162,6 +2275,7 @@ function buildWorkerGalleryFrameUrl(
         coverText?: string
         coverTextYPercent?: number
         coverTemplateId?: string
+        coverTextStyle?: Partial<CoverTextStyleSettings> | null
     },
 ): string {
     const normalizedWorkerUrl = String(workerUrl || '').trim().replace(/\/+$/, '')
@@ -2179,6 +2293,7 @@ function buildWorkerGalleryFrameUrl(
         ? Math.max(10, Math.min(90, Math.round(Number(options?.coverTextYPercent))))
         : undefined
     const coverTemplateId = normalizeCoverTemplateId(String(options?.coverTemplateId || ''))
+    const coverTextStyle = normalizeCoverTextStyle(options?.coverTextStyle, coverTemplateId)
 
     try {
         const url = new URL(`${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame`)
@@ -2190,7 +2305,14 @@ function buildWorkerGalleryFrameUrl(
         if (Number.isFinite(timeSeconds)) url.searchParams.set('t', String(timeSeconds))
         if (coverText) url.searchParams.set('ct', coverText)
         if (Number.isFinite(coverTextYPercent)) url.searchParams.set('cy', String(coverTextYPercent))
-        if (coverText) url.searchParams.set('tid', coverTemplateId)
+        if (coverText) {
+            url.searchParams.set('tid', coverTemplateId)
+            url.searchParams.set('tf', coverTextStyle.fontId)
+            url.searchParams.set('tc', coverTextStyle.textColor)
+            url.searchParams.set('bc', coverTextStyle.backgroundColor)
+            url.searchParams.set('bo', String(coverTextStyle.backgroundOpacity))
+            url.searchParams.set('ts', String(coverTextStyle.sizeScale))
+        }
         return url.toString()
     } catch {
         const params = new URLSearchParams()
@@ -2202,7 +2324,14 @@ function buildWorkerGalleryFrameUrl(
         if (Number.isFinite(timeSeconds)) params.set('t', String(timeSeconds))
         if (coverText) params.set('ct', coverText)
         if (Number.isFinite(coverTextYPercent)) params.set('cy', String(coverTextYPercent))
-        if (coverText) params.set('tid', coverTemplateId)
+        if (coverText) {
+            params.set('tid', coverTemplateId)
+            params.set('tf', coverTextStyle.fontId)
+            params.set('tc', coverTextStyle.textColor)
+            params.set('bc', coverTextStyle.backgroundColor)
+            params.set('bo', String(coverTextStyle.backgroundOpacity))
+            params.set('ts', String(coverTextStyle.sizeScale))
+        }
         return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame?${params.toString()}`
     }
 }
@@ -2479,6 +2608,7 @@ async function tryAcquireCronScheduleLock(db: D1Database, lockKey: string, names
     const normalizedNamespaceId = String(namespaceId || '').trim()
     const normalizedPageId = String(pageId || '').trim()
     if (!normalizedLockKey || !normalizedNamespaceId || !normalizedPageId) return false
+    const scopedLockKey = `${normalizedNamespaceId}::${normalizedLockKey}`
 
     await ensureCronScheduleLocksTable(db)
     await db.prepare(
@@ -2489,9 +2619,79 @@ async function tryAcquireCronScheduleLock(db: D1Database, lockKey: string, names
     const result = await db.prepare(
         `INSERT OR IGNORE INTO cron_schedule_locks (lock_key, namespace_id, page_id, created_at)
          VALUES (?, ?, ?, datetime('now'))`
-    ).bind(normalizedLockKey, normalizedNamespaceId, normalizedPageId).run()
+    ).bind(scopedLockKey, normalizedNamespaceId, normalizedPageId).run()
 
     return Number(result.meta?.changes || 0) > 0
+}
+
+type PostingLockScope = 'page' | 'video'
+
+async function ensurePostingLocksTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS posting_locks (
+            lock_key TEXT NOT NULL PRIMARY KEY,
+            namespace_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            page_id TEXT NOT NULL DEFAULT '',
+            video_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run()
+}
+
+function buildPostingLockKey(params: {
+    scope: PostingLockScope
+    namespaceId: string
+    pageId?: string
+    videoId?: string
+}): string {
+    const scope = String(params.scope || '').trim()
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const targetId = scope === 'page' ? pageId : videoId
+    return `${scope}::${namespaceId}::${targetId}`
+}
+
+async function tryAcquirePostingLock(db: D1Database, params: {
+    scope: PostingLockScope
+    namespaceId: string
+    pageId?: string
+    videoId?: string
+    ttlMinutes?: number
+}): Promise<string | null> {
+    const scope = params.scope
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const ttlMinutesRaw = Number(params.ttlMinutes)
+    const ttlMinutes = Number.isFinite(ttlMinutesRaw)
+        ? Math.max(5, Math.min(180, Math.floor(ttlMinutesRaw)))
+        : 30
+    const targetId = scope === 'page' ? pageId : videoId
+    if (!namespaceId || !targetId) return null
+
+    const lockKey = buildPostingLockKey({ scope, namespaceId, pageId, videoId })
+    await ensurePostingLocksTable(db)
+    await db.prepare(
+        `DELETE FROM posting_locks
+         WHERE datetime(created_at) < datetime('now', ?)`
+    ).bind(`-${ttlMinutes} minutes`).run().catch(() => { })
+
+    const result = await db.prepare(
+        `INSERT OR IGNORE INTO posting_locks (lock_key, namespace_id, scope, page_id, video_id, created_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    ).bind(lockKey, namespaceId, scope, pageId, videoId).run()
+
+    return Number(result.meta?.changes || 0) > 0 ? lockKey : null
+}
+
+async function releasePostingLock(db: D1Database, lockKey?: string | null): Promise<void> {
+    const normalizedLockKey = String(lockKey || '').trim()
+    if (!normalizedLockKey) return
+    await db.prepare(
+        `DELETE FROM posting_locks WHERE lock_key = ?`
+    ).bind(normalizedLockKey).run().catch(() => { })
 }
 
 type NamespaceVideoStateRow = {
@@ -3304,7 +3504,11 @@ async function generateThumbnailViaContainer(
     overlay?: {
         text?: string
         yPercent?: number
-        accentColor?: string
+        fontId?: CoverTextStyleFontId
+        textColor?: string
+        backgroundColor?: string
+        backgroundOpacity?: number
+        sizeScale?: number
     },
 ): Promise<NodeBuffer> {
     const containerId = env.MERGE_CONTAINER.idFromName('merge-worker-thumbnail-v2')
@@ -3315,7 +3519,11 @@ async function generateThumbnailViaContainer(
     const overlayYPercent = Number.isFinite(overlay?.yPercent)
         ? Math.max(10, Math.min(90, Math.round(Number(overlay?.yPercent))))
         : undefined
-    const overlayAccent = normalizeHexColor(String(overlay?.accentColor || '').trim())
+    const overlayFontId = normalizeCoverTextStyleFontId(overlay?.fontId)
+    const overlayTextColor = normalizeHexColor(String(overlay?.textColor || '').trim())
+    const overlayBackgroundColor = normalizeHexColor(String(overlay?.backgroundColor || '').trim())
+    const overlayBackgroundOpacity = normalizeCoverTextStyleBackgroundOpacity(overlay?.backgroundOpacity)
+    const overlaySizeScale = normalizeCoverTextStyleSizeScale(overlay?.sizeScale)
     const resp = await containerStub.fetch('http://container/thumbnail', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3328,7 +3536,11 @@ async function generateThumbnailViaContainer(
             ...(safeTargetHeight ? { target_height: safeTargetHeight } : {}),
             ...(overlayText ? { overlay_text: overlayText } : {}),
             ...(overlayText && Number.isFinite(overlayYPercent) ? { overlay_y_pct: overlayYPercent } : {}),
-            ...(overlayText && overlayAccent ? { overlay_accent: overlayAccent } : {}),
+            ...(overlayText ? { overlay_font_id: overlayFontId } : {}),
+            ...(overlayText && overlayTextColor ? { overlay_text_color: overlayTextColor } : {}),
+            ...(overlayText && overlayBackgroundColor ? { overlay_bg_color: overlayBackgroundColor } : {}),
+            ...(overlayText ? { overlay_bg_opacity: overlayBackgroundOpacity } : {}),
+            ...(overlayText ? { overlay_size_scale: overlaySizeScale } : {}),
         }),
     })
 
@@ -4936,10 +5148,21 @@ app.put('/api/settings/cover-template', async (c) => {
     const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
-    const body = await c.req.json().catch(() => ({})) as { template_id?: string; templateId?: string }
-    const templateId = normalizeCoverTemplateId(String(body.template_id || body.templateId || ''))
+    const body = await c.req.json().catch(() => ({})) as {
+        template_id?: string
+        templateId?: string
+        text_style?: Partial<CoverTextStyleSettings> & Record<string, unknown>
+        textStyle?: Partial<CoverTextStyleSettings> & Record<string, unknown>
+    }
     const namespaceId = c.get('botId')
+    const currentSettings = await getNamespaceCoverTemplateSettings(c.env.DB, namespaceId)
+    const templateId = body.template_id || body.templateId
+        ? normalizeCoverTemplateId(String(body.template_id || body.templateId || ''))
+        : normalizeCoverTemplateId(String(currentSettings?.template_id || ''))
     await setNamespaceCoverTemplate(c.env.DB, namespaceId, templateId)
+    if (body.text_style || body.textStyle) {
+        await setNamespaceCoverTextStyle(c.env.DB, namespaceId, body.text_style || body.textStyle, templateId)
+    }
     const settings = await getNamespaceCoverTemplateSettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
@@ -5299,6 +5522,7 @@ type LineWaitingVideoState = {
     selectedCoverOption?: LineCoverOption | null
     coverText?: string
     coverTemplateId?: string
+    coverTextStyle?: CoverTextStyleSettings
     coverTextPositionOptions?: LineCoverTextPositionOption[]
 }
 
@@ -5330,6 +5554,33 @@ function getLineAffiliateTheme(kind: LineAffiliateLinkKind) {
 function normalizeHexColor(input: string): string {
     const normalized = String(input || '').trim().toUpperCase()
     return /^#[0-9A-F]{6}$/.test(normalized) ? normalized : ''
+}
+
+function normalizeCoverTextStyleFontId(rawValue: unknown): CoverTextStyleFontId {
+    const normalized = String(rawValue || '').trim().toLowerCase()
+    switch (normalized) {
+        case 'sukhumvit-bold':
+        case 'sukhumvit-semibold':
+            return normalized
+        case 'fc-iconic-bold':
+        default:
+            return DEFAULT_COVER_TEXT_STYLE_FONT_ID
+    }
+}
+
+function normalizeCoverTextStyleBackgroundOpacity(rawValue: unknown): number {
+    const parsed = Number(rawValue)
+    if (!Number.isFinite(parsed)) return DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY
+    return Math.max(0, Math.min(1, Math.round(parsed * 100) / 100))
+}
+
+function normalizeCoverTextStyleSizeScale(rawValue: unknown): number {
+    const parsed = Number(rawValue)
+    if (!Number.isFinite(parsed)) return DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE
+    return Math.max(
+        COVER_TEXT_STYLE_SIZE_SCALE_MIN,
+        Math.min(COVER_TEXT_STYLE_SIZE_SCALE_MAX, Math.round(parsed * 100) / 100),
+    )
 }
 
 function normalizeLineCoverText(input: unknown): string {
@@ -5379,6 +5630,51 @@ function getLineCoverTemplateAccentColor(templateId: string): string {
         case 'template-1':
         default:
             return '#E53935'
+    }
+}
+
+function createDefaultCoverTextStyle(templateId: string): CoverTextStyleSettings {
+    const normalizedTemplateId = normalizeCoverTemplateId(templateId)
+    return {
+        fontId: DEFAULT_COVER_TEXT_STYLE_FONT_ID,
+        textColor: '#FFFFFF',
+        backgroundColor: getLineCoverTemplateAccentColor(normalizedTemplateId),
+        backgroundOpacity: DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY,
+        sizeScale: DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE,
+    }
+}
+
+function normalizeCoverTextStyle(
+    input: Partial<CoverTextStyleSettings> | Record<string, unknown> | null | undefined,
+    templateId: string,
+): CoverTextStyleSettings {
+    const defaults = createDefaultCoverTextStyle(templateId)
+    const normalizedTextColor = normalizeHexColor(String(
+        (input as Record<string, unknown> | null | undefined)?.textColor
+        ?? (input as Record<string, unknown> | null | undefined)?.text_color
+        ?? '',
+    ))
+    const normalizedBackgroundColor = normalizeHexColor(String(
+        (input as Record<string, unknown> | null | undefined)?.backgroundColor
+        ?? (input as Record<string, unknown> | null | undefined)?.background_color
+        ?? '',
+    ))
+
+    return {
+        fontId: normalizeCoverTextStyleFontId(
+            (input as Record<string, unknown> | null | undefined)?.fontId
+            ?? (input as Record<string, unknown> | null | undefined)?.font_id,
+        ),
+        textColor: normalizedTextColor || defaults.textColor,
+        backgroundColor: normalizedBackgroundColor || defaults.backgroundColor,
+        backgroundOpacity: normalizeCoverTextStyleBackgroundOpacity(
+            (input as Record<string, unknown> | null | undefined)?.backgroundOpacity
+            ?? (input as Record<string, unknown> | null | undefined)?.background_opacity,
+        ),
+        sizeScale: normalizeCoverTextStyleSizeScale(
+            (input as Record<string, unknown> | null | undefined)?.sizeScale
+            ?? (input as Record<string, unknown> | null | undefined)?.size_scale,
+        ),
     }
 }
 
@@ -5634,6 +5930,7 @@ function buildLineCoverTextPositionPreviewUrl(params: {
     coverText: string
     coverTextYPercent: number
     coverTemplateId?: string
+    coverTextStyle?: Partial<CoverTextStyleSettings> | null
 }): string {
     const coverText = normalizeLineCoverText(params.coverText)
     if (!coverText) return ''
@@ -5645,6 +5942,7 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         coverText,
         coverTextYPercent: params.coverTextYPercent,
         coverTemplateId: params.coverTemplateId,
+        coverTextStyle: params.coverTextStyle,
     })
 }
 
@@ -5934,6 +6232,7 @@ function buildLineCoverTextPositionPickerFlex(params: {
     option: LineCoverOption
     coverText: string
     coverTemplateId?: string
+    coverTextStyle?: Partial<CoverTextStyleSettings> | null
     positionOptions: LineCoverTextPositionOption[]
 }): LineReplyMessage {
     const coverText = normalizeLineCoverText(params.coverText)
@@ -5954,6 +6253,7 @@ function buildLineCoverTextPositionPickerFlex(params: {
                     coverText,
                     coverTextYPercent: positionOption.yPct,
                     coverTemplateId: params.coverTemplateId,
+                    coverTextStyle: params.coverTextStyle,
                 })
                 return {
                     type: 'bubble',
@@ -6378,6 +6678,7 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
                     ? 'caption'
                     : 'links'
     const selectedCoverOption = normalizeLineCoverOptions(input?.selectedCoverOption ? [input.selectedCoverOption] : [])[0] || null
+    const coverTemplateId = normalizeCoverTemplateId(String(input?.coverTemplateId || ''))
     return {
         id,
         videoUrl,
@@ -6392,7 +6693,8 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
         coverOptions: normalizeLineCoverOptions(input?.coverOptions),
         selectedCoverOption,
         coverText: normalizeLineCoverText(input?.coverText),
-        coverTemplateId: normalizeCoverTemplateId(String(input?.coverTemplateId || '')),
+        coverTemplateId,
+        coverTextStyle: normalizeCoverTextStyle(input?.coverTextStyle, coverTemplateId),
         coverTextPositionOptions: normalizeLineCoverTextPositionOptions(input?.coverTextPositionOptions),
     }
 }
@@ -6536,8 +6838,10 @@ async function promptLineCoverPicker(params: {
     const manualCaption = normalizeManualCaption(params.manualCaption)
     const coverTemplateSettings = await getNamespaceCoverTemplateSettings(params.env.DB, params.namespaceId).catch(() => ({
         template_id: DEFAULT_COVER_TEMPLATE_ID,
+        text_style: createDefaultCoverTextStyle(DEFAULT_COVER_TEMPLATE_ID),
     }))
     const coverTemplateId = normalizeCoverTemplateId(String(coverTemplateSettings?.template_id || waitingState.coverTemplateId || ''))
+    const coverTextStyle = normalizeCoverTextStyle(coverTemplateSettings?.text_style || waitingState.coverTextStyle, coverTemplateId)
     const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
         ...waitingState,
         manualCaption: manualCaption || '',
@@ -6547,6 +6851,7 @@ async function promptLineCoverPicker(params: {
         selectedCoverOption: null,
         coverText: '',
         coverTemplateId,
+        coverTextStyle,
         coverTextPositionOptions: [],
     })
 
@@ -6601,6 +6906,7 @@ async function promptLineCoverTextPositionOptions(params: {
     lineUserId: string
     waitingState: LineWaitingVideoState
     coverText: string
+    coverTextStyle?: Partial<CoverTextStyleSettings> | null
 }) {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState?.selectedCoverOption) throw new Error('line_cover_selected_option_missing')
@@ -6611,6 +6917,7 @@ async function promptLineCoverTextPositionOptions(params: {
         ...waitingState,
         awaitingStep: 'cover_text_position',
         coverText,
+        coverTextStyle: normalizeCoverTextStyle(params.coverTextStyle || waitingState.coverTextStyle, waitingState.coverTemplateId || DEFAULT_COVER_TEMPLATE_ID),
         coverTextPositionOptions: positionOptions,
     })
 
@@ -6622,6 +6929,7 @@ async function promptLineCoverTextPositionOptions(params: {
             option: waitingState.selectedCoverOption,
             coverText,
             coverTemplateId: nextWaitingState.coverTemplateId,
+            coverTextStyle: nextWaitingState.coverTextStyle,
             positionOptions: nextWaitingState.coverTextPositionOptions || positionOptions,
         }),
     ])
@@ -6636,6 +6944,7 @@ async function materializeSelectedLineCoverOptionAssets(params: {
     coverText?: string
     coverTextYPercent?: number
     coverTemplateId?: string
+    coverTextStyle?: Partial<CoverTextStyleSettings> | null
 }) {
     const namespaceId = String(params.namespaceId || '').trim()
     const videoId = String(params.videoId || '').trim()
@@ -6654,11 +6963,16 @@ async function materializeSelectedLineCoverOptionAssets(params: {
     const coverTextYPercent = Number.isFinite(params.coverTextYPercent)
         ? Math.max(10, Math.min(90, Math.round(Number(params.coverTextYPercent))))
         : undefined
+    const coverTextStyle = normalizeCoverTextStyle(params.coverTextStyle, params.coverTemplateId || DEFAULT_COVER_TEMPLATE_ID)
     const overlay = coverText
         ? {
             text: coverText,
             yPercent: coverTextYPercent,
-            accentColor: getLineCoverTemplateAccentColor(String(params.coverTemplateId || '')),
+            fontId: coverTextStyle.fontId,
+            textColor: coverTextStyle.textColor,
+            backgroundColor: coverTextStyle.backgroundColor,
+            backgroundOpacity: coverTextStyle.backgroundOpacity,
+            sizeScale: coverTextStyle.sizeScale,
         }
         : undefined
 
@@ -8001,6 +8315,7 @@ async function handleLinePostbackEvent(params: {
             coverText: waitingState.coverText,
             coverTextYPercent: selectedTextPosition.yPct,
             coverTemplateId: waitingState.coverTemplateId,
+            coverTextStyle: waitingState.coverTextStyle,
         })
         await finalizeLineWaitingVideoAndStartProcessing({
             env: params.env,
@@ -11846,6 +12161,13 @@ app.get('/api/gallery/:id/frame', async (c) => {
         ? Math.max(10, Math.min(90, Math.round(coverTextYPercentRaw)))
         : undefined
     const coverTemplateId = normalizeCoverTemplateId(String(c.req.query('tid') || c.req.query('template_id') || ''))
+    const coverTextStyle = normalizeCoverTextStyle({
+        font_id: c.req.query('tf') || c.req.query('font_id') || '',
+        text_color: c.req.query('tc') || c.req.query('text_color') || '',
+        background_color: c.req.query('bc') || c.req.query('bg_color') || '',
+        background_opacity: c.req.query('bo') || c.req.query('bg_opacity') || '',
+        size_scale: c.req.query('ts') || c.req.query('text_scale') || '',
+    }, coverTemplateId)
     if (!id || !targetNamespaceId) return c.text('Not found', 404)
 
     try {
@@ -11869,7 +12191,11 @@ app.get('/api/gallery/:id/frame', async (c) => {
                 ? {
                     text: coverText,
                     yPercent: coverTextYPercent,
-                    accentColor: getLineCoverTemplateAccentColor(coverTemplateId),
+                    fontId: coverTextStyle.fontId,
+                    textColor: coverTextStyle.textColor,
+                    backgroundColor: coverTextStyle.backgroundColor,
+                    backgroundOpacity: coverTextStyle.backgroundOpacity,
+                    sizeScale: coverTextStyle.sizeScale,
                 }
                 : undefined,
         )
@@ -11934,6 +12260,7 @@ const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
 const NS_SETTING_GEMINI_API_KEYS = 'gemini_api_keys_v2'
 const NS_SETTING_COMMENT_TEMPLATE = 'comment_template_v1'
 const NS_SETTING_COVER_TEMPLATE = 'cover_template_v1'
+const NS_SETTING_COVER_TEXT_STYLE = 'cover_text_style_v1'
 const NS_SETTING_POSTING_ORDER = 'posting_order_v1'
 const NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT = 'affiliate_shortlink_account_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
@@ -11946,6 +12273,11 @@ const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://short.wwoom.com/'
 const ADMIN_SHORTLINK_ACCOUNT = 'CHEARB'
 const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
 const DEFAULT_COVER_TEMPLATE_ID = 'template-1'
+const DEFAULT_COVER_TEXT_STYLE_FONT_ID = 'fc-iconic-bold'
+const DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY = 0.94
+const DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE = 1
+const COVER_TEXT_STYLE_SIZE_SCALE_MIN = 0.8
+const COVER_TEXT_STYLE_SIZE_SCALE_MAX = 1.35
 const DEFAULT_POSTING_ORDER: NamespacePostingOrder = 'oldest_first'
 const COVER_TEMPLATE_IDS = new Set([
     'template-1',
@@ -11962,6 +12294,16 @@ const DEFAULT_PAGES_SYNC_POST_SELECTORS = 'tag:post'
 const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
 const PAGES_TOKEN_MIGRATE_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+type CoverTextStyleFontId = 'fc-iconic-bold' | 'sukhumvit-bold' | 'sukhumvit-semibold'
+
+type CoverTextStyleSettings = {
+    fontId: CoverTextStyleFontId
+    textColor: string
+    backgroundColor: string
+    backgroundOpacity: number
+    sizeScale: number
+}
 
 type FacebookErrorLike = {
     message?: string
@@ -12288,6 +12630,29 @@ async function getNamespaceCoverTemplateEntry(db: D1Database, namespaceId: strin
     }
 }
 
+async function getNamespaceCoverTextStyleEntry(
+    db: D1Database,
+    namespaceId: string,
+    templateId: string,
+): Promise<{ style: CoverTextStyleSettings; updatedAt: string | null }> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_COVER_TEXT_STYLE).first() as { value?: string; updated_at?: string } | null
+    let parsed: Record<string, unknown> | null = null
+    if (row?.value) {
+        try {
+            parsed = JSON.parse(String(row.value || '')) as Record<string, unknown>
+        } catch {
+            parsed = null
+        }
+    }
+    return {
+        style: normalizeCoverTextStyle(parsed, templateId),
+        updatedAt: String(row?.updated_at || '').trim() || null,
+    }
+}
+
 async function setNamespaceCoverTemplate(db: D1Database, namespaceId: string, rawTemplateId: string): Promise<void> {
     await ensureNamespaceSettingsTable(db)
     const templateId = normalizeCoverTemplateId(rawTemplateId)
@@ -12299,12 +12664,46 @@ async function setNamespaceCoverTemplate(db: D1Database, namespaceId: string, ra
     ).bind(namespaceId, NS_SETTING_COVER_TEMPLATE, templateId).run()
 }
 
+async function setNamespaceCoverTextStyle(
+    db: D1Database,
+    namespaceId: string,
+    rawStyle: Partial<CoverTextStyleSettings> | Record<string, unknown> | null | undefined,
+    templateId: string,
+): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const style = normalizeCoverTextStyle(rawStyle, templateId)
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_COVER_TEXT_STYLE, JSON.stringify({
+        font_id: style.fontId,
+        text_color: style.textColor,
+        background_color: style.backgroundColor,
+        background_opacity: style.backgroundOpacity,
+        size_scale: style.sizeScale,
+    })).run()
+}
+
 async function getNamespaceCoverTemplateSettings(db: D1Database, namespaceId: string) {
     const workspace = await getNamespaceCoverTemplateEntry(db, namespaceId)
+    const textStyleEntry = await getNamespaceCoverTextStyleEntry(db, namespaceId, workspace.templateId)
+    const updatedAtCandidates = [workspace.updatedAt, textStyleEntry.updatedAt].filter(Boolean) as string[]
+    const updatedAt = updatedAtCandidates.sort().slice(-1)[0] || null
     return {
         template_id: workspace.templateId || DEFAULT_COVER_TEMPLATE_ID,
-        source: workspace.updatedAt ? 'custom' : 'default',
-        updated_at: workspace.updatedAt,
+        text_style: {
+            font_id: textStyleEntry.style.fontId,
+            text_color: textStyleEntry.style.textColor,
+            background_color: textStyleEntry.style.backgroundColor,
+            background_opacity: textStyleEntry.style.backgroundOpacity,
+            size_scale: textStyleEntry.style.sizeScale,
+        },
+        source: workspace.updatedAt || textStyleEntry.updatedAt ? 'custom' : 'default',
+        updated_at: updatedAt,
+        template_updated_at: workspace.updatedAt,
+        text_style_updated_at: textStyleEntry.updatedAt,
     }
 }
 
@@ -19688,6 +20087,8 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
     let commentTokenCandidates: string[] = []
     let retryHistoryId: number | null = null
     let skipComment = false
+    let pagePostingLockKey: string | null = null
+    let videoPostingLockKey: string | null = null
 
     try {
         const body = await c.req.json().catch(() => ({})) as { skipComment?: boolean }
@@ -19749,6 +20150,15 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             return c.json({ error: 'Page not found' }, 404)
         }
 
+        pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
+            scope: 'page',
+            namespaceId: botId,
+            pageId,
+        })
+        if (!pagePostingLockKey) {
+            return c.json({ error: 'page_already_posting' }, 409)
+        }
+
         const videoRef = await resolveGalleryVideoForRepost({
             env,
             fallbackNamespaceId: botId,
@@ -19762,6 +20172,38 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             ? c.get('bucket')
             : new BotBucket(env.BUCKET, selectedVideoNamespaceId) as unknown as R2Bucket
         const meta = await loadLatestVideoMetaForPosting(sourceBucket, selectedVideoId, videoRef.meta)
+        const sourceFingerprint = await resolveNamespaceVideoSourceFingerprint({
+            env,
+            namespaceId: botId,
+            videoId: selectedVideoId,
+            bucket: sourceBucket,
+            sourceMeta: meta,
+        })
+        const existingSuccess = await getLatestSuccessfulPostHistoryRow(env.DB, {
+            namespaceId: botId,
+            pageId,
+            videoId: selectedVideoId,
+            sourceFingerprint,
+        })
+        if (existingSuccess) {
+            return c.json({
+                error: 'video_already_posted',
+                details: {
+                    history_id: existingSuccess.id,
+                    fb_post_id: existingSuccess.fbPostId,
+                    posted_at: existingSuccess.postedAt,
+                },
+            }, 409)
+        }
+
+        videoPostingLockKey = await tryAcquirePostingLock(env.DB, {
+            scope: 'video',
+            namespaceId: botId,
+            videoId: sourceFingerprint || selectedVideoId,
+        })
+        if (!videoPostingLockKey) {
+            return c.json({ error: 'video_already_posting' }, 409)
+        }
         const rawShopeeLink = pickFirstShopeeUrl(String(sourceRow.shopee_link || '').trim()) || videoRef.shopeeLink || ''
 
         normalizedShopeeLink = rawShopeeLink
@@ -20133,6 +20575,9 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         }
 
         return c.json({ error: 'Retry post failed', details: errorMsg }, 500)
+    } finally {
+        await releasePostingLock(env.DB, videoPostingLockKey)
+        await releasePostingLock(env.DB, pagePostingLockKey)
     }
 })
 
@@ -20348,6 +20793,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let initialCommentStatus = 'not_configured'
     let initialCommentError: string | null = null
     let forceHistoryId: number | null = null
+    let pagePostingLockKey: string | null = null
+    let videoPostingLockKey: string | null = null
 
     try {
         // Check if skip comment
@@ -20375,6 +20822,14 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     posted_at: recentPostGuard.postedAt,
                 },
             }, 409)
+        }
+        pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
+            scope: 'page',
+            namespaceId: botId,
+            pageId: page.id,
+        })
+        if (!pagePostingLockKey) {
+            return c.json({ error: 'page_already_posting' }, 409)
         }
         pageName = page.name
         pageAccessToken = String(page.access_token || '').trim()
@@ -20408,8 +20863,16 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
         console.log(`[FORCE-POST] Page ${page.name}: posting_order=${postingOrder}`)
-        const pickedVideo = pickGalleryVideoForPostingByOrder(unpostedVideos as Array<Record<string, unknown>>, postingOrder)
-        if (!pickedVideo) return c.json({ error: 'No unposted gallery video left' }, 404)
+        const pickedVideoEntry = await claimGalleryVideoForPosting({
+            db: env.DB,
+            namespaceId: botId,
+            pageId: page.id,
+            videos: unpostedVideos as Array<Record<string, unknown>>,
+            postingOrder,
+        })
+        if (!pickedVideoEntry) return c.json({ error: 'No unposted gallery video left' }, 404)
+        const pickedVideo = pickedVideoEntry.video
+        videoPostingLockKey = pickedVideoEntry.videoLockKey
         const unpostedId = String(pickedVideo.id || '').trim()
         selectedVideoId = unpostedId
         selectedVideoNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
@@ -20790,6 +21253,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }
         } catch { }
         return c.json({ error: 'Post failed', details: errorMsg }, 500)
+    } finally {
+        await releasePostingLock(env.DB, videoPostingLockKey)
+        await releasePostingLock(env.DB, pagePostingLockKey)
     }
 })
 
@@ -21114,10 +21580,23 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
 
     const geminiApiKeysByNamespace = new Map<string, string[]>()
     const postingOrderByNamespace = new Map<string, NamespacePostingOrder>()
+    const reconciledNamespaces = new Set<string>()
 
     for (const page of pages) {
         // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
         const botId = page.bot_id || 'default';
+        if (!reconciledNamespaces.has(botId)) {
+            const namespaceBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+            await reconcilePostingHistoryRows({
+                env,
+                bucket: namespaceBucket,
+                botId,
+                logPrefix: 'CRON',
+            }).catch((error) => {
+                console.error(`[CRON] Reconcile failed for namespace ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+            })
+            reconciledNamespaces.add(botId)
+        }
         await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
         const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
         if (!shortlinkEnabled) {
@@ -21158,6 +21637,19 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             )
             continue
         }
+
+        const pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
+            scope: 'page',
+            namespaceId: botId,
+            pageId: String(page.id || ''),
+        })
+        if (!pagePostingLockKey) {
+            console.log(`[CRON] Page ${page.name}: skip (page lock busy)`)
+            continue
+        }
+        let videoPostingLockKey: string | null = null
+
+        try {
 
         // สร้าง bucket สำหรับ namespace นี้
         const botBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
@@ -21301,12 +21793,20 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             postingOrderByNamespace.set(botId, postingOrder)
         }
         console.log(`[CRON] Page ${page.name}: posting_order=${postingOrder}`)
-        const pickedVideo = pickGalleryVideoForPostingByOrder(unpostedVideos as Array<Record<string, unknown>>, postingOrder)
-        if (!pickedVideo) {
+        const pickedVideoEntry = await claimGalleryVideoForPosting({
+            db: env.DB,
+            namespaceId: botId,
+            pageId: String(page.id || ''),
+            videos: unpostedVideos as Array<Record<string, unknown>>,
+            postingOrder,
+        })
+        if (!pickedVideoEntry) {
             console.log(`[CRON] Page ${page.name}: no unposted gallery video left`)
             await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
             continue
         }
+        const pickedVideo = pickedVideoEntry.video
+        videoPostingLockKey = pickedVideoEntry.videoLockKey
         const unpostedId = String(pickedVideo.id || '').trim()
         const sourceNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
         const recentAttempts = await env.DB.prepare(
@@ -21731,6 +22231,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
 
             // Keep dedup key so this schedule window/interval bucket does not retry again after one failed attempt.
             console.log(`[CRON] Page ${page.name}: keep dedup key after failure, skip retries until next schedule window`)
+        }
+        } finally {
+            await releasePostingLock(env.DB, videoPostingLockKey)
+            await releasePostingLock(env.DB, pagePostingLockKey)
         }
     }
 

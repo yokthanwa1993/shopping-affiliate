@@ -23,6 +23,7 @@ COPY --from=rust-builder /usr/src/app/target/release/merge-rust /app/merge-rust
 # Copy font — register with fontconfig so libass can find it by family name
 RUN mkdir -p /usr/local/share/fonts
 COPY font.ttf /usr/local/share/fonts/FC-Iconic-Bold.ttf
+COPY fonts/*.ttf /usr/local/share/fonts/
 RUN fc-cache -fv
 
 EXPOSE 8080
