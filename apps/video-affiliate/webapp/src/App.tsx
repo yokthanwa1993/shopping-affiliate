@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 import { API_BASE_URL } from './apiBaseUrl'
-import type { AppTabRoute } from './app/appRoutes'
+import { getAppTabPath, type AppTabRoute } from './app/appRoutes'
 import { useViewerHistory } from './app/hooks/useViewerHistory'
 import { Thumb } from './app/components/Thumb'
 import { getInboxVideoIdentityKey } from './app/inboxUtils'
@@ -2955,7 +2955,7 @@ function App({
     },
   ) => {
     const url = new URL(window.location.href)
-    url.pathname = `/${nextTab}`
+    url.pathname = controlledTab ? getAppTabPath(nextTab) : `/${nextTab}`
     // Clear LIFF legacy routing params once the app owns navigation.
     url.searchParams.delete('tab')
     url.searchParams.delete('liff.state')

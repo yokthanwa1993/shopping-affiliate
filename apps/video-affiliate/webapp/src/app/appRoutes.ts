@@ -13,10 +13,7 @@ export function getAppTabPath(tab: AppTabRoute) {
   return tab === 'dashboard' ? '/' : `/${tab}`
 }
 
-export function getAppTabRouteFromLocation(pathname: string, search = ''): AppTabRoute {
-  const fromPath = normalizeAppTabRoute(pathname)
-  if (fromPath !== 'dashboard' || pathname === '/' || pathname === '') return fromPath
-
+export function getAppTabRouteFromSearch(search = ''): AppTabRoute {
   const params = new URLSearchParams(search)
   const fromParam = normalizeAppTabRoute(params.get('tab'))
   if (fromParam !== 'dashboard') return fromParam
@@ -38,4 +35,18 @@ export function getAppTabRouteFromLocation(pathname: string, search = ''): AppTa
   } catch {}
 
   return 'dashboard'
+}
+
+export function getAppTabRouteFromLocation(pathname: string, search = ''): AppTabRoute {
+  const fromPath = normalizeAppTabRoute(pathname)
+  if (fromPath !== 'dashboard' || pathname === '/' || pathname === '') return fromPath
+  return getAppTabRouteFromSearch(search)
+}
+
+export function stripLegacyTabSearchParams(search = '') {
+  const params = new URLSearchParams(search)
+  params.delete('tab')
+  params.delete('liff.state')
+  const next = params.toString()
+  return next ? `?${next}` : ''
 }
