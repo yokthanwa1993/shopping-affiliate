@@ -2159,6 +2159,9 @@ function buildWorkerGalleryFrameUrl(
         width?: number
         height?: number
         timeSeconds?: number
+        coverText?: string
+        coverTextYPercent?: number
+        coverTemplateId?: string
     },
 ): string {
     const normalizedWorkerUrl = String(workerUrl || '').trim().replace(/\/+$/, '')
@@ -2171,6 +2174,11 @@ function buildWorkerGalleryFrameUrl(
     const width = Number.isFinite(options?.width) ? Math.max(120, Math.min(1440, Math.round(Number(options?.width)))) : undefined
     const height = Number.isFinite(options?.height) ? Math.max(160, Math.min(2560, Math.round(Number(options?.height)))) : undefined
     const timeSeconds = Number.isFinite(options?.timeSeconds) ? Math.max(0, Number(options?.timeSeconds)) : undefined
+    const coverText = normalizeLineCoverText(options?.coverText)
+    const coverTextYPercent = Number.isFinite(options?.coverTextYPercent)
+        ? Math.max(10, Math.min(90, Math.round(Number(options?.coverTextYPercent))))
+        : undefined
+    const coverTemplateId = normalizeCoverTemplateId(String(options?.coverTemplateId || ''))
 
     try {
         const url = new URL(`${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame`)
@@ -2180,6 +2188,9 @@ function buildWorkerGalleryFrameUrl(
         if (width) url.searchParams.set('w', String(width))
         if (height) url.searchParams.set('h', String(height))
         if (Number.isFinite(timeSeconds)) url.searchParams.set('t', String(timeSeconds))
+        if (coverText) url.searchParams.set('ct', coverText)
+        if (Number.isFinite(coverTextYPercent)) url.searchParams.set('cy', String(coverTextYPercent))
+        if (coverText) url.searchParams.set('tid', coverTemplateId)
         return url.toString()
     } catch {
         const params = new URLSearchParams()
@@ -2189,6 +2200,9 @@ function buildWorkerGalleryFrameUrl(
         if (width) params.set('w', String(width))
         if (height) params.set('h', String(height))
         if (Number.isFinite(timeSeconds)) params.set('t', String(timeSeconds))
+        if (coverText) params.set('ct', coverText)
+        if (Number.isFinite(coverTextYPercent)) params.set('cy', String(coverTextYPercent))
+        if (coverText) params.set('tid', coverTemplateId)
         return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame?${params.toString()}`
     }
 }
@@ -2449,6 +2463,37 @@ async function ensureImportedVideosTable(db: D1Database): Promise<void> {
     ).run()
 }
 
+async function ensureCronScheduleLocksTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS cron_schedule_locks (
+            lock_key TEXT NOT NULL PRIMARY KEY,
+            namespace_id TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run()
+}
+
+async function tryAcquireCronScheduleLock(db: D1Database, lockKey: string, namespaceId: string, pageId: string): Promise<boolean> {
+    const normalizedLockKey = String(lockKey || '').trim()
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedLockKey || !normalizedNamespaceId || !normalizedPageId) return false
+
+    await ensureCronScheduleLocksTable(db)
+    await db.prepare(
+        `DELETE FROM cron_schedule_locks
+         WHERE datetime(created_at) < datetime('now', '-14 days')`
+    ).run().catch(() => { })
+
+    const result = await db.prepare(
+        `INSERT OR IGNORE INTO cron_schedule_locks (lock_key, namespace_id, page_id, created_at)
+         VALUES (?, ?, ?, datetime('now'))`
+    ).bind(normalizedLockKey, normalizedNamespaceId, normalizedPageId).run()
+
+    return Number(result.meta?.changes || 0) > 0
+}
+
 type NamespaceVideoStateRow = {
     namespace_id?: string
     video_id?: string
@@ -2461,6 +2506,24 @@ type NamespaceVideoStateRow = {
     lazada_member_id?: string
     source_fingerprint?: string
     posted_at?: string
+}
+
+function pickLatestIsoTimestamp(...values: unknown[]): string {
+    let latestValue = ''
+    let latestMs = Number.NEGATIVE_INFINITY
+
+    for (const value of values) {
+        const normalized = String(value || '').trim()
+        if (!normalized) continue
+        const ms = Date.parse(normalized)
+        if (!Number.isFinite(ms)) continue
+        if (ms > latestMs) {
+            latestMs = ms
+            latestValue = normalized
+        }
+    }
+
+    return latestValue
 }
 
 async function listNamespaceVideoStates(db: D1Database, namespaceId: string): Promise<NamespaceVideoStateRow[]> {
@@ -2673,6 +2736,28 @@ async function seedNamespaceVideoStateFromLegacy(db: D1Database, namespaceId: st
     }
 }
 
+async function listNamespaceLatestPostedAtByVideoIdFromHistory(db: D1Database, namespaceId: string): Promise<Map<string, string>> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return new Map()
+
+    const res = await db.prepare(
+        `SELECT video_id, MAX(posted_at) AS latest_posted_at
+         FROM post_history
+         WHERE bot_id = ?
+           AND status IN ('success', 'posting')
+           AND TRIM(COALESCE(video_id, '')) <> ''
+         GROUP BY video_id`
+    ).bind(normalizedNamespaceId).all() as {
+        results?: Array<{ video_id?: string; latest_posted_at?: string }>
+    }
+
+    return new Map(
+        (res.results || [])
+            .map((row) => [String(row.video_id || '').trim(), String(row.latest_posted_at || '').trim()] as const)
+            .filter(([videoId, postedAt]) => !!videoId && !!postedAt)
+    )
+}
+
 async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promise<Array<Record<string, unknown>>> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return []
@@ -2694,9 +2779,10 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
 
     await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId)
     const bucket = new BotBucket(env.BUCKET, normalizedNamespaceId) as unknown as R2Bucket
-    const [sourceVideos, stateRows, expectedUtmId, expectedLazadaMemberId, shortlinkRequired] = await Promise.all([
+    const [sourceVideos, stateRows, historyPostedAtByVideoId, expectedUtmId, expectedLazadaMemberId, shortlinkRequired] = await Promise.all([
         getAllSystemGalleryVideos(env),
         listNamespaceVideoStates(env.DB, normalizedNamespaceId),
+        listNamespaceLatestPostedAtByVideoIdFromHistory(env.DB, normalizedNamespaceId),
         resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, normalizedNamespaceId).catch(() => ''),
         resolveNamespaceLazadaExpectedMemberId(env.DB, normalizedNamespaceId).catch(() => ''),
         isNamespaceAffiliateShortlinkRequired(env.DB, normalizedNamespaceId).catch(() => false),
@@ -2736,7 +2822,13 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
             const videoId = String(source.id || '').trim()
             const row = stateByVideoId.get(videoId)
             const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(row?.source_fingerprint)
-            const postedAt = String(row?.posted_at || postedAtByFingerprint.get(sourceFingerprint) || source.postedAt || source.posted_at || '').trim()
+            const postedAt = pickLatestIsoTimestamp(
+                row?.posted_at,
+                historyPostedAtByVideoId.get(videoId),
+                postedAtByFingerprint.get(sourceFingerprint),
+                source.postedAt,
+                source.posted_at,
+            )
             const merged = {
                 ...source,
                 id: videoId,
@@ -3209,11 +3301,21 @@ async function generateThumbnailViaContainer(
     outputFormat?: 'webp' | 'jpg',
     targetWidth?: number,
     targetHeight?: number,
+    overlay?: {
+        text?: string
+        yPercent?: number
+        accentColor?: string
+    },
 ): Promise<NodeBuffer> {
     const containerId = env.MERGE_CONTAINER.idFromName('merge-worker-thumbnail-v2')
     const containerStub = env.MERGE_CONTAINER.get(containerId)
     const safeTargetWidth = Number.isFinite(targetWidth) ? Math.max(120, Math.min(1440, Math.round(Number(targetWidth)))) : undefined
     const safeTargetHeight = Number.isFinite(targetHeight) ? Math.max(160, Math.min(2560, Math.round(Number(targetHeight)))) : undefined
+    const overlayText = normalizeLineCoverText(overlay?.text)
+    const overlayYPercent = Number.isFinite(overlay?.yPercent)
+        ? Math.max(10, Math.min(90, Math.round(Number(overlay?.yPercent))))
+        : undefined
+    const overlayAccent = normalizeHexColor(String(overlay?.accentColor || '').trim())
     const resp = await containerStub.fetch('http://container/thumbnail', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3224,6 +3326,9 @@ async function generateThumbnailViaContainer(
             ...(Number.isFinite(seekSeconds) ? { seek_seconds: Number(seekSeconds) } : {}),
             ...(safeTargetWidth ? { target_width: safeTargetWidth } : {}),
             ...(safeTargetHeight ? { target_height: safeTargetHeight } : {}),
+            ...(overlayText ? { overlay_text: overlayText } : {}),
+            ...(overlayText && Number.isFinite(overlayYPercent) ? { overlay_y_pct: overlayYPercent } : {}),
+            ...(overlayText && overlayAccent ? { overlay_accent: overlayAccent } : {}),
         }),
     })
 
@@ -5160,13 +5265,24 @@ const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
         action: { type: 'message', label: 'สุ่มอีกครั้ง', text: 'สุ่มอีกครั้ง' },
     },
 ]
+const LINE_SKIP_ONLY_QUICK_REPLY_ITEMS = [
+    {
+        type: 'action',
+        action: { type: 'message', label: 'ข้าม', text: 'ข้าม' },
+    },
+]
 const MAX_LINE_MANUAL_CAPTION_CHARS = 1200
+const MAX_LINE_COVER_TEXT_CHARS = 80
 
 type LineReplyMessage = Record<string, unknown> & { type: string }
-type LineWaitingStep = 'links' | 'caption' | 'cover'
+type LineWaitingStep = 'links' | 'caption' | 'cover' | 'cover_text' | 'cover_text_position'
 type LineCoverOption = {
     optionId: string
     seed: string
+}
+type LineCoverTextPositionOption = {
+    optionId: string
+    yPct: number
 }
 type LineWaitingVideoState = {
     id: string
@@ -5180,6 +5296,10 @@ type LineWaitingVideoState = {
     awaitingStep?: LineWaitingStep
     coverPickerOpened?: boolean
     coverOptions?: LineCoverOption[]
+    selectedCoverOption?: LineCoverOption | null
+    coverText?: string
+    coverTemplateId?: string
+    coverTextPositionOptions?: LineCoverTextPositionOption[]
 }
 
 type LineAffiliateLinkKind = 'shopee' | 'lazada'
@@ -5204,6 +5324,61 @@ function getLineAffiliateTheme(kind: LineAffiliateLinkKind) {
         tint: '#EEF2FF',
         tintStrong: '#DCE4FF',
         note: '#1E3A8A',
+    }
+}
+
+function normalizeHexColor(input: string): string {
+    const normalized = String(input || '').trim().toUpperCase()
+    return /^#[0-9A-F]{6}$/.test(normalized) ? normalized : ''
+}
+
+function normalizeLineCoverText(input: unknown): string {
+    const normalized = String(input || '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+/g, ' ')
+        .trim()
+    if (!normalized) return ''
+    return normalized.slice(0, MAX_LINE_COVER_TEXT_CHARS)
+}
+
+function buildLineCoverTextPositionOptions(): LineCoverTextPositionOption[] {
+    return [20, 35, 50, 65, 80].map((yPct, index) => ({
+        optionId: String(index + 1),
+        yPct,
+    }))
+}
+
+function normalizeLineCoverTextPositionOptions(input: unknown): LineCoverTextPositionOption[] {
+    if (!Array.isArray(input)) return []
+    return input
+        .map((item, index) => {
+            const optionId = String((item as { optionId?: unknown })?.optionId || index + 1).trim()
+            const rawYPct = Number((item as { yPct?: unknown })?.yPct)
+            if (!optionId || !Number.isFinite(rawYPct)) return null
+            return {
+                optionId: optionId.slice(0, 16),
+                yPct: Math.max(10, Math.min(90, Math.round(rawYPct))),
+            }
+        })
+        .filter((item): item is LineCoverTextPositionOption => !!item)
+        .slice(0, 5)
+}
+
+function getLineCoverTemplateAccentColor(templateId: string): string {
+    const normalized = normalizeCoverTemplateId(templateId)
+    switch (normalized) {
+        case 'template-2': return '#14B8A6'
+        case 'template-3': return '#F97316'
+        case 'template-4': return '#8B5CF6'
+        case 'template-5': return '#EF4444'
+        case 'template-6': return '#F59E0B'
+        case 'template-7': return '#10B981'
+        case 'template-8': return '#0F172A'
+        case 'template-9': return '#EC4899'
+        case 'template-1':
+        default:
+            return '#E53935'
     }
 }
 
@@ -5418,6 +5593,20 @@ function parseLineCoverSelectionPostbackData(input: unknown): { videoId: string;
     }
 }
 
+function buildLineCoverTextPositionPostbackData(videoId: string, optionId: string): string {
+    return `cover_text_pos:${String(videoId || '').trim()}:${String(optionId || '').trim()}`
+}
+
+function parseLineCoverTextPositionPostbackData(input: unknown): { videoId: string; optionId: string } | null {
+    const normalized = String(input || '').trim()
+    const match = normalized.match(/^cover_text_pos:([A-Za-z0-9_-]+):([A-Za-z0-9_-]+)$/)
+    if (!match) return null
+    return {
+        videoId: String(match[1] || '').trim(),
+        optionId: String(match[2] || '').trim(),
+    }
+}
+
 function buildLineCoverOptionPreviewUrl(params: {
     workerUrl: string
     namespaceId: string
@@ -5434,6 +5623,28 @@ function buildLineCoverOptionPreviewUrl(params: {
         format: 'jpg',
         width: 540,
         height: 960,
+    })
+}
+
+function buildLineCoverTextPositionPreviewUrl(params: {
+    workerUrl: string
+    namespaceId: string
+    videoId: string
+    option: LineCoverOption
+    coverText: string
+    coverTextYPercent: number
+    coverTemplateId?: string
+}): string {
+    const coverText = normalizeLineCoverText(params.coverText)
+    if (!coverText) return ''
+    return buildWorkerGalleryFrameUrl(params.workerUrl, params.namespaceId, params.videoId, {
+        seed: String(params.option?.seed || '').trim(),
+        format: 'jpg',
+        width: 540,
+        height: 960,
+        coverText,
+        coverTextYPercent: params.coverTextYPercent,
+        coverTemplateId: params.coverTemplateId,
     })
 }
 
@@ -5706,6 +5917,143 @@ function buildLineCoverChoicePromptFlex(): LineReplyMessage {
         secondarySurface: '#DDE2EC',
         secondaryTextColor: '#111827',
     })
+}
+
+function buildLineCoverTextPromptMessage(): LineReplyMessage {
+    return {
+        type: 'text',
+        text: 'จะเพิ่มคำในปกไหม\nพิมพ์คำที่ต้องการมาได้เลย หรือกดข้าม',
+        quickReply: { items: LINE_SKIP_ONLY_QUICK_REPLY_ITEMS },
+    }
+}
+
+function buildLineCoverTextPositionPickerFlex(params: {
+    videoId: string
+    namespaceId: string
+    workerUrl: string
+    option: LineCoverOption
+    coverText: string
+    coverTemplateId?: string
+    positionOptions: LineCoverTextPositionOption[]
+}): LineReplyMessage {
+    const coverText = normalizeLineCoverText(params.coverText)
+    const positionOptions = normalizeLineCoverTextPositionOptions(params.positionOptions)
+    return {
+        type: 'flex',
+        altText: 'เลือกระดับความสูงของข้อความบนปก',
+        quickReply: { items: LINE_SKIP_ONLY_QUICK_REPLY_ITEMS },
+        contents: {
+            type: 'carousel',
+            contents: positionOptions.map((positionOption) => {
+                const postbackData = buildLineCoverTextPositionPostbackData(params.videoId, positionOption.optionId)
+                const previewUrl = buildLineCoverTextPositionPreviewUrl({
+                    workerUrl: params.workerUrl,
+                    namespaceId: params.namespaceId,
+                    videoId: params.videoId,
+                    option: params.option,
+                    coverText,
+                    coverTextYPercent: positionOption.yPct,
+                    coverTemplateId: params.coverTemplateId,
+                })
+                return {
+                    type: 'bubble',
+                    body: {
+                        type: 'box',
+                        layout: 'vertical',
+                        paddingAll: '0px',
+                        contents: [
+                            {
+                                type: 'image',
+                                url: previewUrl || `${params.workerUrl.replace(/\/+$/, '')}/api/gallery/${encodeURIComponent(params.videoId)}/asset/original-thumb?namespace_id=${encodeURIComponent(params.namespaceId)}`,
+                                size: 'full',
+                                aspectMode: 'cover',
+                                aspectRatio: '9:16',
+                                action: {
+                                    type: 'postback',
+                                    label: `เลือกตำแหน่ง ${positionOption.yPct}%`,
+                                    data: postbackData,
+                                    displayText: `เลือกระดับข้อความ ${positionOption.yPct}%`,
+                                },
+                            },
+                            {
+                                type: 'box',
+                                layout: 'horizontal',
+                                position: 'absolute',
+                                offsetTop: '12px',
+                                offsetStart: '12px',
+                                offsetEnd: '12px',
+                                justifyContent: 'center',
+                                contents: [
+                                    {
+                                        type: 'box',
+                                        layout: 'horizontal',
+                                        backgroundColor: '#111827CC',
+                                        cornerRadius: '999px',
+                                        paddingTop: '6px',
+                                        paddingBottom: '6px',
+                                        paddingStart: '12px',
+                                        paddingEnd: '12px',
+                                        contents: [
+                                            {
+                                                type: 'text',
+                                                text: `${positionOption.yPct}%`,
+                                                weight: 'bold',
+                                                size: 'sm',
+                                                color: '#FFFFFF',
+                                                align: 'center',
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                            {
+                                type: 'box',
+                                layout: 'horizontal',
+                                position: 'absolute',
+                                offsetStart: '12px',
+                                offsetEnd: '12px',
+                                offsetBottom: '12px',
+                                justifyContent: 'center',
+                                contents: [
+                                    {
+                                        type: 'box',
+                                        layout: 'vertical',
+                                        flex: 1,
+                                        contents: [],
+                                    },
+                                    {
+                                        type: 'box',
+                                        layout: 'vertical',
+                                        flex: 6,
+                                        contents: [
+                                            {
+                                                type: 'button',
+                                                style: 'primary',
+                                                color: '#2563EB',
+                                                height: 'sm',
+                                                action: {
+                                                    type: 'postback',
+                                                    label: 'ใช้ตำแหน่งนี้',
+                                                    data: postbackData,
+                                                    displayText: `เลือกระดับข้อความ ${positionOption.yPct}%`,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        type: 'box',
+                                        layout: 'vertical',
+                                        flex: 1,
+                                        contents: [],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }
+            }),
+        },
+    }
 }
 
 function buildLineCaptionPromptFlex(params?: {
@@ -6020,11 +6368,16 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
     const shopeeLink = pickFirstShopeeUrl(String(input?.shopeeLink || '')) || ''
     const lazadaLink = pickFirstLazadaUrl(String(input?.lazadaLink || '')) || ''
     const awaitingStepRaw = String(input?.awaitingStep || '').trim().toLowerCase()
-    const awaitingStep: LineWaitingStep = awaitingStepRaw === 'cover'
-        ? 'cover'
-        : (awaitingStepRaw === 'caption' || (shopeeLink && lazadaLink))
-            ? 'caption'
-            : 'links'
+    const awaitingStep: LineWaitingStep = awaitingStepRaw === 'cover_text_position'
+        ? 'cover_text_position'
+        : awaitingStepRaw === 'cover_text'
+            ? 'cover_text'
+            : awaitingStepRaw === 'cover'
+                ? 'cover'
+                : (awaitingStepRaw === 'caption' || (shopeeLink && lazadaLink))
+                    ? 'caption'
+                    : 'links'
+    const selectedCoverOption = normalizeLineCoverOptions(input?.selectedCoverOption ? [input.selectedCoverOption] : [])[0] || null
     return {
         id,
         videoUrl,
@@ -6037,6 +6390,10 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
         awaitingStep,
         coverPickerOpened: Boolean(input?.coverPickerOpened),
         coverOptions: normalizeLineCoverOptions(input?.coverOptions),
+        selectedCoverOption,
+        coverText: normalizeLineCoverText(input?.coverText),
+        coverTemplateId: normalizeCoverTemplateId(String(input?.coverTemplateId || '')),
+        coverTextPositionOptions: normalizeLineCoverTextPositionOptions(input?.coverTextPositionOptions),
     }
 }
 
@@ -6177,12 +6534,20 @@ async function promptLineCoverPicker(params: {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
     const manualCaption = normalizeManualCaption(params.manualCaption)
+    const coverTemplateSettings = await getNamespaceCoverTemplateSettings(params.env.DB, params.namespaceId).catch(() => ({
+        template_id: DEFAULT_COVER_TEMPLATE_ID,
+    }))
+    const coverTemplateId = normalizeCoverTemplateId(String(coverTemplateSettings?.template_id || waitingState.coverTemplateId || ''))
     const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
         ...waitingState,
         manualCaption: manualCaption || '',
         awaitingStep: 'cover',
         coverPickerOpened: false,
         coverOptions: normalizeLineCoverOptions(waitingState.coverOptions),
+        selectedCoverOption: null,
+        coverText: '',
+        coverTemplateId,
+        coverTextPositionOptions: [],
     })
 
     await lineReply(params.replyToken, params.channelAccessToken, [
@@ -6214,6 +6579,7 @@ async function promptLineCoverOptions(params: {
         awaitingStep: 'cover',
         coverPickerOpened: true,
         coverOptions,
+        coverTextPositionOptions: [],
     })
 
     await lineReply(params.replyToken, params.channelAccessToken, [
@@ -6226,12 +6592,50 @@ async function promptLineCoverOptions(params: {
     ])
 }
 
+async function promptLineCoverTextPositionOptions(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    channelAccessToken: string
+    replyToken: string
+    lineUserId: string
+    waitingState: LineWaitingVideoState
+    coverText: string
+}) {
+    const waitingState = normalizeLineWaitingVideoState(params.waitingState)
+    if (!waitingState?.selectedCoverOption) throw new Error('line_cover_selected_option_missing')
+    const coverText = normalizeLineCoverText(params.coverText)
+    if (!coverText) throw new Error('line_cover_text_missing')
+    const positionOptions = buildLineCoverTextPositionOptions()
+    const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
+        ...waitingState,
+        awaitingStep: 'cover_text_position',
+        coverText,
+        coverTextPositionOptions: positionOptions,
+    })
+
+    await lineReply(params.replyToken, params.channelAccessToken, [
+        buildLineCoverTextPositionPickerFlex({
+            videoId: waitingState.id,
+            namespaceId: params.namespaceId,
+            workerUrl: String(params.env.WORKER_URL || '').trim(),
+            option: waitingState.selectedCoverOption,
+            coverText,
+            coverTemplateId: nextWaitingState.coverTemplateId,
+            positionOptions: nextWaitingState.coverTextPositionOptions || positionOptions,
+        }),
+    ])
+}
+
 async function materializeSelectedLineCoverOptionAssets(params: {
     env: Env
     bucket: R2Bucket
     namespaceId: string
     videoId: string
     option: LineCoverOption
+    coverText?: string
+    coverTextYPercent?: number
+    coverTemplateId?: string
 }) {
     const namespaceId = String(params.namespaceId || '').trim()
     const videoId = String(params.videoId || '').trim()
@@ -6246,9 +6650,21 @@ async function materializeSelectedLineCoverOptionAssets(params: {
     )
     if (!originalVideoUrl) throw new Error('line_cover_option_original_url_missing')
 
+    const coverText = normalizeLineCoverText(params.coverText)
+    const coverTextYPercent = Number.isFinite(params.coverTextYPercent)
+        ? Math.max(10, Math.min(90, Math.round(Number(params.coverTextYPercent))))
+        : undefined
+    const overlay = coverText
+        ? {
+            text: coverText,
+            yPercent: coverTextYPercent,
+            accentColor: getLineCoverTemplateAccentColor(String(params.coverTemplateId || '')),
+        }
+        : undefined
+
     const [webpBytes, jpgBytes] = await Promise.all([
-        generateThumbnailViaContainer(params.env, originalVideoUrl, option.seed, undefined, 'webp', 1080, 1920),
-        generateThumbnailViaContainer(params.env, originalVideoUrl, option.seed, undefined, 'jpg', 1080, 1920).catch(() => null),
+        generateThumbnailViaContainer(params.env, originalVideoUrl, option.seed, undefined, 'webp', 1080, 1920, overlay),
+        generateThumbnailViaContainer(params.env, originalVideoUrl, option.seed, undefined, 'jpg', 1080, 1920, overlay).catch(() => null),
     ])
 
     await params.bucket.put(`_inbox_cover/${videoId}.webp`, webpBytes, {
@@ -6950,6 +7366,148 @@ async function handleLineTextMessage(params: {
     const lowerText = text.trim().toLowerCase()
     const waitingState = await getLineWaitingVideoState(bucket, lineUserId)
 
+    if (waitingState?.awaitingStep === 'cover_text_position') {
+        if (!waitingState.selectedCoverOption) {
+            await promptLineCoverPicker({
+                env,
+                bucket,
+                namespaceId,
+                channelAccessToken,
+                replyToken,
+                lineUserId,
+                waitingState,
+                manualCaption: waitingState.manualCaption,
+            }).catch(() => { })
+            return
+        }
+
+        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text)) {
+            try {
+                await materializeSelectedLineCoverOptionAssets({
+                    env,
+                    bucket,
+                    namespaceId,
+                    videoId: waitingState.id,
+                    option: waitingState.selectedCoverOption,
+                    coverTemplateId: waitingState.coverTemplateId,
+                })
+                await finalizeLineWaitingVideoAndStartProcessing({
+                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    manualCaption: waitingState.manualCaption,
+                })
+            } catch (e) {
+                console.error('[LINE] Cover text skip finalize error:', e instanceof Error ? e.message : String(e))
+                await lineReply(replyToken, channelAccessToken, [
+                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
+                ]).catch(() => { })
+            }
+            return
+        }
+
+        const coverTextCandidate = normalizeLineCoverText(stripLineAffiliateLinksFromText(text))
+        if (coverTextCandidate) {
+            try {
+                await promptLineCoverTextPositionOptions({
+                    env,
+                    bucket,
+                    namespaceId,
+                    channelAccessToken,
+                    replyToken,
+                    lineUserId,
+                    waitingState,
+                    coverText: coverTextCandidate,
+                })
+            } catch (e) {
+                console.error('[LINE] Cover text position refresh error:', e instanceof Error ? e.message : String(e))
+                await lineReply(replyToken, channelAccessToken, [
+                    { type: 'text', text: 'เกิดข้อผิดพลาดในการสร้างตัวเลือกความสูง กรุณาลองอีกครั้ง' },
+                ]).catch(() => { })
+            }
+            return
+        }
+
+        await lineReply(replyToken, channelAccessToken, [
+            buildLineCoverTextPositionPickerFlex({
+                videoId: waitingState.id,
+                namespaceId,
+                workerUrl: String(env.WORKER_URL || '').trim(),
+                option: waitingState.selectedCoverOption,
+                coverText: waitingState.coverText || '',
+                coverTemplateId: waitingState.coverTemplateId,
+                positionOptions: waitingState.coverTextPositionOptions && waitingState.coverTextPositionOptions.length > 0
+                    ? waitingState.coverTextPositionOptions
+                    : buildLineCoverTextPositionOptions(),
+            }),
+        ]).catch(() => { })
+        return
+    }
+
+    if (waitingState?.awaitingStep === 'cover_text') {
+        if (!waitingState.selectedCoverOption) {
+            await promptLineCoverPicker({
+                env,
+                bucket,
+                namespaceId,
+                channelAccessToken,
+                replyToken,
+                lineUserId,
+                waitingState,
+                manualCaption: waitingState.manualCaption,
+            }).catch(() => { })
+            return
+        }
+
+        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text)) {
+            try {
+                await materializeSelectedLineCoverOptionAssets({
+                    env,
+                    bucket,
+                    namespaceId,
+                    videoId: waitingState.id,
+                    option: waitingState.selectedCoverOption,
+                    coverTemplateId: waitingState.coverTemplateId,
+                })
+                await finalizeLineWaitingVideoAndStartProcessing({
+                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    manualCaption: waitingState.manualCaption,
+                })
+            } catch (e) {
+                console.error('[LINE] Cover text prompt skip error:', e instanceof Error ? e.message : String(e))
+                await lineReply(replyToken, channelAccessToken, [
+                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
+                ]).catch(() => { })
+            }
+            return
+        }
+
+        const coverTextCandidate = normalizeLineCoverText(stripLineAffiliateLinksFromText(text))
+        if (!coverTextCandidate || /^https?:\/\/\S+$/i.test(text)) {
+            await lineReply(replyToken, channelAccessToken, [
+                buildLineCoverTextPromptMessage(),
+            ]).catch(() => { })
+            return
+        }
+
+        try {
+            await promptLineCoverTextPositionOptions({
+                env,
+                bucket,
+                namespaceId,
+                channelAccessToken,
+                replyToken,
+                lineUserId,
+                waitingState,
+                coverText: coverTextCandidate,
+            })
+        } catch (e) {
+            console.error('[LINE] Cover text prompt error:', e instanceof Error ? e.message : String(e))
+            await lineReply(replyToken, channelAccessToken, [
+                { type: 'text', text: 'เกิดข้อผิดพลาดในการสร้างตัวเลือกความสูง กรุณาลองอีกครั้ง' },
+            ]).catch(() => { })
+        }
+        return
+    }
+
     // Cover step (must be before caption check)
     if (waitingState?.awaitingStep === 'cover') {
         if (!waitingState.coverPickerOpened && lowerText === 'เลือกปก') {
@@ -7334,18 +7892,84 @@ async function handleLinePostbackEvent(params: {
     data: string
 }) {
     const selection = parseLineCoverSelectionPostbackData(params.data)
-    if (!selection) return
+    const textPositionSelection = parseLineCoverTextPositionPostbackData(params.data)
+    if (!selection && !textPositionSelection) return
 
     const waitingState = await getLineWaitingVideoState(params.bucket, params.lineUserId)
-    if (!waitingState || waitingState.awaitingStep !== 'cover') {
+    if (!waitingState) {
         await lineReply(params.replyToken, params.channelAccessToken, [
             { type: 'text', text: 'ไม่มีงานที่รอเลือกปกแล้ว ลองส่งคลิปใหม่ได้เลย' },
         ]).catch(() => { })
         return
     }
 
-    if (String(waitingState.id || '').trim() !== selection.videoId) {
-        await promptLineCoverPicker({
+    if (selection) {
+        if (waitingState.awaitingStep !== 'cover') {
+            await lineReply(params.replyToken, params.channelAccessToken, [
+                { type: 'text', text: 'ไม่มีงานที่รอเลือกปกแล้ว ลองส่งคลิปใหม่ได้เลย' },
+            ]).catch(() => { })
+            return
+        }
+
+        if (String(waitingState.id || '').trim() !== selection.videoId) {
+            await promptLineCoverPicker({
+                env: params.env,
+                bucket: params.bucket,
+                namespaceId: params.namespaceId,
+                channelAccessToken: params.channelAccessToken,
+                replyToken: params.replyToken,
+                lineUserId: params.lineUserId,
+                waitingState,
+                manualCaption: waitingState.manualCaption,
+            }).catch(() => { })
+            return
+        }
+
+        const selectedOption = normalizeLineCoverOptions(waitingState.coverOptions)
+            .find((option) => String(option.optionId || '').trim() === selection.optionId)
+        if (!selectedOption) {
+            await promptLineCoverPicker({
+                env: params.env,
+                bucket: params.bucket,
+                namespaceId: params.namespaceId,
+                channelAccessToken: params.channelAccessToken,
+                replyToken: params.replyToken,
+                lineUserId: params.lineUserId,
+                waitingState,
+                manualCaption: waitingState.manualCaption,
+            }).catch(() => { })
+            return
+        }
+
+        try {
+            await putLineWaitingVideoState(params.bucket, params.lineUserId, {
+                ...waitingState,
+                awaitingStep: 'cover_text',
+                selectedCoverOption: selectedOption,
+                coverText: '',
+                coverTextPositionOptions: [],
+            })
+            await lineReply(params.replyToken, params.channelAccessToken, [
+                buildLineCoverTextPromptMessage(),
+            ])
+        } catch (e) {
+            console.error('[LINE] Cover option selection prompt error:', e instanceof Error ? e.message : String(e))
+            await lineReply(params.replyToken, params.channelAccessToken, [
+                { type: 'text', text: 'เกิดข้อผิดพลาดตอนเลือกปก กรุณาลองอีกครั้ง' },
+            ]).catch(() => { })
+        }
+        return
+    }
+
+    if (!textPositionSelection || waitingState.awaitingStep !== 'cover_text_position' || !waitingState.selectedCoverOption) {
+        await lineReply(params.replyToken, params.channelAccessToken, [
+            { type: 'text', text: 'ไม่มีงานที่รอเลือกความสูงข้อความแล้ว ลองส่งคลิปใหม่ได้เลย' },
+        ]).catch(() => { })
+        return
+    }
+
+    if (String(waitingState.id || '').trim() !== textPositionSelection.videoId) {
+        await promptLineCoverTextPositionOptions({
             env: params.env,
             bucket: params.bucket,
             namespaceId: params.namespaceId,
@@ -7353,24 +7977,17 @@ async function handleLinePostbackEvent(params: {
             replyToken: params.replyToken,
             lineUserId: params.lineUserId,
             waitingState,
-            manualCaption: waitingState.manualCaption,
+            coverText: waitingState.coverText || '',
         }).catch(() => { })
         return
     }
 
-    const selectedOption = normalizeLineCoverOptions(waitingState.coverOptions)
-        .find((option) => String(option.optionId || '').trim() === selection.optionId)
-    if (!selectedOption) {
-        await promptLineCoverPicker({
-            env: params.env,
-            bucket: params.bucket,
-            namespaceId: params.namespaceId,
-            channelAccessToken: params.channelAccessToken,
-            replyToken: params.replyToken,
-            lineUserId: params.lineUserId,
-            waitingState,
-            manualCaption: waitingState.manualCaption,
-        }).catch(() => { })
+    const selectedTextPosition = normalizeLineCoverTextPositionOptions(waitingState.coverTextPositionOptions)
+        .find((option) => String(option.optionId || '').trim() === textPositionSelection.optionId)
+    if (!selectedTextPosition) {
+        await lineReply(params.replyToken, params.channelAccessToken, [
+            { type: 'text', text: 'ไม่พบตัวเลือกตำแหน่งข้อความ ลองพิมพ์ข้อความใหม่อีกครั้ง' },
+        ]).catch(() => { })
         return
     }
 
@@ -7380,7 +7997,10 @@ async function handleLinePostbackEvent(params: {
             bucket: params.bucket,
             namespaceId: params.namespaceId,
             videoId: waitingState.id,
-            option: selectedOption,
+            option: waitingState.selectedCoverOption,
+            coverText: waitingState.coverText,
+            coverTextYPercent: selectedTextPosition.yPct,
+            coverTemplateId: waitingState.coverTemplateId,
         })
         await finalizeLineWaitingVideoAndStartProcessing({
             env: params.env,
@@ -7393,9 +8013,9 @@ async function handleLinePostbackEvent(params: {
             manualCaption: waitingState.manualCaption,
         })
     } catch (e) {
-        console.error('[LINE] Cover option selection error:', e instanceof Error ? e.message : String(e))
+        console.error('[LINE] Cover text position selection error:', e instanceof Error ? e.message : String(e))
         await lineReply(params.replyToken, params.channelAccessToken, [
-            { type: 'text', text: 'เกิดข้อผิดพลาดตอนเลือกปก กรุณาลองอีกครั้ง' },
+            { type: 'text', text: 'เกิดข้อผิดพลาดตอนบันทึกปกพร้อมข้อความ กรุณาลองอีกครั้ง' },
         ]).catch(() => { })
     }
 }
@@ -11220,6 +11840,12 @@ app.get('/api/gallery/:id/frame', async (c) => {
         const format = String(c.req.query('format') || c.req.query('fmt') || '').trim().toLowerCase()
         return format === 'jpg' || format === 'jpeg' ? 'jpg' : 'webp'
     })()
+    const coverText = normalizeLineCoverText(c.req.query('ct') || c.req.query('cover_text') || '')
+    const coverTextYPercentRaw = Number(c.req.query('cy') || c.req.query('text_y_pct') || '')
+    const coverTextYPercent = Number.isFinite(coverTextYPercentRaw)
+        ? Math.max(10, Math.min(90, Math.round(coverTextYPercentRaw)))
+        : undefined
+    const coverTemplateId = normalizeCoverTemplateId(String(c.req.query('tid') || c.req.query('template_id') || ''))
     if (!id || !targetNamespaceId) return c.text('Not found', 404)
 
     try {
@@ -11239,6 +11865,13 @@ app.get('/api/gallery/:id/frame', async (c) => {
             requestedFormat,
             targetWidth,
             targetHeight,
+            coverText
+                ? {
+                    text: coverText,
+                    yPercent: coverTextYPercent,
+                    accentColor: getLineCoverTemplateAccentColor(coverTemplateId),
+                }
+                : undefined,
         )
 
         return new Response(thumbBytes, {
@@ -13712,7 +14345,7 @@ async function failStalePostingRows(db: D1Database, namespaceId: string, pageId:
          WHERE bot_id = ?
            AND page_id = ?
            AND status = 'posting'
-           AND posted_at < datetime('now', ?)`
+           AND datetime(posted_at) < datetime('now', ?)`
     ).bind(normalizedNamespaceId, normalizedPageId, `-${Math.max(60, staleSeconds)} seconds`).run()
 }
 
@@ -19714,6 +20347,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let hasCommentToken = false
     let initialCommentStatus = 'not_configured'
     let initialCommentError: string | null = null
+    let forceHistoryId: number | null = null
 
     try {
         // Check if skip comment
@@ -19815,7 +20449,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Record attempt BEFORE posting (prevents duplicate on failure)
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
-        await env.DB.prepare(
+        const inserted = await env.DB.prepare(
             'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         ).bind(
             page.id,
@@ -19840,6 +20474,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             null,
             normalizedShopeeUtmMatch,
         ).run()
+        forceHistoryId = Number(inserted.meta?.last_row_id || 0) || null
 
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
@@ -19848,15 +20483,18 @@ app.post('/api/pages/:id/force-post', async (c) => {
             lazadaLink: normalizedLazadaLink,
             logPrefix: 'FORCE-POST VERIFY',
         })
-        await updatePostHistoryAffiliateVerificationByPostingKey(env.DB, page.id, unpostedId, affiliateVerification)
+        if (forceHistoryId) {
+            await updatePostHistoryAffiliateVerificationById(env.DB, forceHistoryId, affiliateVerification)
+        }
         if (!affiliateVerification.ok) {
-            await env.DB.prepare(
-                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting'"
-            ).bind(
-                affiliateVerification.error || 'affiliate_verification_failed',
-                page.id,
-                unpostedId,
-            ).run().catch(() => { })
+            if (forceHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(
+                    affiliateVerification.error || 'affiliate_verification_failed',
+                    forceHistoryId,
+                ).run().catch(() => { })
+            }
             return c.json({
                 error: 'affiliate_verification_failed',
                 details: affiliateVerification.error || 'Affiliate verification failed',
@@ -19903,22 +20541,23 @@ app.post('/api/pages/:id/force-post', async (c) => {
             ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
             : null
         const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
-        await env.DB.prepare(
-            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE page_id = ? AND video_id = ? AND status = 'posting'"
-        ).bind(
-            confirmedPostId,
-            fbReelUrl,
-            deriveCommentTokenHint(postingTokenUsed),
-            postingProfile.profileId,
-            postingProfile.profileName,
-            postReadyCommentState.status,
-            deriveCommentTokenHint(pageCommentToken),
-            postReadyCommentState.error,
-            scheduledCommentDelaySeconds,
-            scheduledCommentDueAt,
-            page.id,
-            unpostedId,
-        ).run()
+        if (forceHistoryId) {
+            await env.DB.prepare(
+                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE id = ? AND status = 'posting'"
+            ).bind(
+                confirmedPostId,
+                fbReelUrl,
+                deriveCommentTokenHint(postingTokenUsed),
+                postingProfile.profileId,
+                postingProfile.profileName,
+                postReadyCommentState.status,
+                deriveCommentTokenHint(pageCommentToken),
+                postReadyCommentState.error,
+                scheduledCommentDelaySeconds,
+                scheduledCommentDueAt,
+                forceHistoryId,
+            ).run()
+        }
 
         // Wait 10s for video to be processed before commenting (unless skipped)
         let commentStatus = postReadyCommentState.status
@@ -19933,13 +20572,14 @@ app.post('/api/pages/:id/force-post', async (c) => {
             const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
             console.log(`[FORCE-POST] Waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
             await waitMs(commentWaitMs)
-            await env.DB.prepare(
-                "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE page_id = ? AND video_id = ? AND status = 'posting'"
-            ).bind(
-                deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
-                page.id,
-                unpostedId,
-            ).run()
+            if (forceHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE id = ? AND status = 'posting'"
+                ).bind(
+                    deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                    forceHistoryId,
+                ).run()
+            }
             const commentResult = await postShopeeCommentWithFallback({
                 env,
                 namespaceId: botId,
@@ -19982,23 +20622,24 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }
 
         // Update to success
-        await env.DB.prepare(
-            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status = 'posting'"
-        ).bind(
-            confirmedPostId,
-            fbReelUrl,
-            deriveCommentTokenHint(postingTokenUsed),
-            postingProfile.profileId,
-            postingProfile.profileName,
-            commentStatus,
-            deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
-            commentProfileId,
-            commentProfileName,
-            commentError,
-            commentFbId,
-            page.id,
-            unpostedId,
-        ).run()
+        if (forceHistoryId) {
+            await env.DB.prepare(
+                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status = 'posting'"
+            ).bind(
+                confirmedPostId,
+                fbReelUrl,
+                deriveCommentTokenHint(postingTokenUsed),
+                postingProfile.profileId,
+                postingProfile.profileName,
+                commentStatus,
+                deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                commentProfileId,
+                commentProfileName,
+                commentError,
+                commentFbId,
+                forceHistoryId,
+            ).run()
+        }
         await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
 
         await clearVideoShopeeLink(c.get('bucket'), unpostedId)
@@ -20097,23 +20738,24 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     }
 
                     const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
-                    await env.DB.prepare(
-                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status IN ('posting','failed')"
-                    ).bind(
-                        recoveredPostId,
-                        recoveredReelUrl,
-                        deriveCommentTokenHint(postingTokenUsed),
-                        recoveredPostProfile.profileId,
-                        recoveredPostProfile.profileName,
-                        commentStatus,
-                        deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
-                        commentProfileId,
-                        commentProfileName,
-                        commentError,
-                        commentFbId,
-                        pageId,
-                        selectedVideoId,
-                    ).run()
+                    if (forceHistoryId) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status IN ('posting','failed')"
+                        ).bind(
+                            recoveredPostId,
+                            recoveredReelUrl,
+                            deriveCommentTokenHint(postingTokenUsed),
+                            recoveredPostProfile.profileId,
+                            recoveredPostProfile.profileName,
+                            commentStatus,
+                            deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                            commentProfileId,
+                            commentProfileName,
+                            commentError,
+                            commentFbId,
+                            forceHistoryId,
+                        ).run()
+                    }
                     await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
 
                     await clearVideoShopeeLink(new BotBucket(env.BUCKET, selectedVideoNamespaceId || botId) as unknown as R2Bucket, selectedVideoId)
@@ -20133,14 +20775,18 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }
 
         try {
-            if (selectedVideoId) {
+            if (forceHistoryId) {
                 await env.DB.prepare(
-                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting'"
-                ).bind(errorMsg, pageId, selectedVideoId).run()
-            } else {
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(errorMsg, forceHistoryId).run()
+            } else if (pageId && selectedVideoId && attemptPostedAtIso) {
                 await env.DB.prepare(
-                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = (SELECT id FROM post_history WHERE page_id = ? AND status = 'posting' ORDER BY id DESC LIMIT 1)"
-                ).bind(errorMsg, pageId).run()
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND bot_id = ? AND posted_at = ? AND status = 'posting'"
+                ).bind(errorMsg, pageId, selectedVideoId, botId, attemptPostedAtIso).run()
+            } else if (pageId && botId && attemptPostedAtIso) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND bot_id = ? AND posted_at = ? AND status = 'posting'"
+                ).bind(errorMsg, pageId, botId, attemptPostedAtIso).run()
             }
         } catch { }
         return c.json({ error: 'Post failed', details: errorMsg }, 500)
@@ -20629,6 +21275,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             dedupKey = `_cron_dedup/${page.id}/${todayStr}/${matchedSlot.hour}_${matchedSlot.minute}`
         }
 
+        const scheduleLockAcquired = await tryAcquireCronScheduleLock(env.DB, dedupKey, botId, String(page.id || ''))
+        if (!scheduleLockAcquired) {
+            console.log(`[CRON] Page ${page.name}: already locked for this schedule window`)
+            continue
+        }
         const existingDedup = await botBucket.head(dedupKey)
         if (existingDedup) {
             console.log(`[CRON] Page ${page.name}: already posted for this schedule window (dedup key exists)`)
@@ -20747,7 +21398,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const initialCommentStatus = initialCommentState.status
         const initialCommentError = initialCommentState.error
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
-        await env.DB.prepare(
+        const inserted = await env.DB.prepare(
             'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         ).bind(
             page.id,
@@ -20772,6 +21423,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             null,
             normalizedShopeeUtmMatch,
         ).run()
+        const cronHistoryId = Number(inserted.meta?.last_row_id || 0) || null
 
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
@@ -20780,16 +21432,18 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             lazadaLink: normalizedLazadaLink,
             logPrefix: `CRON ${page.name} VERIFY`,
         })
-        await updatePostHistoryAffiliateVerificationByPostingKey(env.DB, page.id, unpostedId, affiliateVerification, botId)
+        if (cronHistoryId) {
+            await updatePostHistoryAffiliateVerificationById(env.DB, cronHistoryId, affiliateVerification)
+        }
         if (!affiliateVerification.ok) {
-            await env.DB.prepare(
-                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
-            ).bind(
-                affiliateVerification.error || 'affiliate_verification_failed',
-                page.id,
-                unpostedId,
-                botId,
-            ).run().catch(() => { })
+            if (cronHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(
+                    affiliateVerification.error || 'affiliate_verification_failed',
+                    cronHistoryId,
+                ).run().catch(() => { })
+            }
             console.error(`[CRON] Page ${page.name}: affiliate verification failed - ${affiliateVerification.error || 'unknown'}`)
             await botBucket.delete(dedupKey).catch(() => { })
             continue
@@ -20833,23 +21487,23 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
                 : null
             const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, false)
-            await env.DB.prepare(
-                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
-            ).bind(
-                confirmedPostId,
-                fbReelUrl,
-                deriveCommentTokenHint(postingTokenUsed),
-                postingProfile.profileId,
-                postingProfile.profileName,
-                postReadyCommentState.status,
-                deriveCommentTokenHint(commentTokenCandidates[0] || null),
-                postReadyCommentState.error,
-                scheduledCommentDelaySeconds,
-                scheduledCommentDueAt,
-                page.id,
-                unpostedId,
-                botId,
-            ).run()
+            if (cronHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE id = ? AND status = 'posting'"
+                ).bind(
+                    confirmedPostId,
+                    fbReelUrl,
+                    deriveCommentTokenHint(postingTokenUsed),
+                    postingProfile.profileId,
+                    postingProfile.profileName,
+                    postReadyCommentState.status,
+                    deriveCommentTokenHint(commentTokenCandidates[0] || null),
+                    postReadyCommentState.error,
+                    scheduledCommentDelaySeconds,
+                    scheduledCommentDueAt,
+                    cronHistoryId,
+                ).run()
+            }
 
             // คอมเม้นท์เลยหลังรอ 10 วินาที
             let commentStatus = postReadyCommentState.status
@@ -20868,14 +21522,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
                     console.log(`[CRON] Page ${page.name}: waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
                     await waitMs(commentWaitMs)
-                    await env.DB.prepare(
-                        "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
-                    ).bind(
-                        deriveCommentTokenHint(commentTokenUsed),
-                        page.id,
-                        unpostedId,
-                        botId,
-                    ).run()
+                    if (cronHistoryId) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE id = ? AND status = 'posting'"
+                        ).bind(
+                            deriveCommentTokenHint(commentTokenUsed),
+                            cronHistoryId,
+                        ).run()
+                    }
                     const commentResult = await postShopeeCommentWithFallback({
                         env,
                         namespaceId: botId,
@@ -20916,24 +21570,24 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             }
 
             // Update to success
-            await env.DB.prepare(
-                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
-            ).bind(
-                confirmedPostId,
-                fbReelUrl,
-                deriveCommentTokenHint(postingTokenUsed),
-                postingProfile.profileId,
-                postingProfile.profileName,
-                commentStatus,
-                deriveCommentTokenHint(commentTokenUsed),
-                commentProfileId,
-                commentProfileName,
-                commentError,
-                commentFbId,
-                page.id,
-                unpostedId,
-                botId,
-            ).run()
+            if (cronHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status = 'posting'"
+                ).bind(
+                    confirmedPostId,
+                    fbReelUrl,
+                    deriveCommentTokenHint(postingTokenUsed),
+                    postingProfile.profileId,
+                    postingProfile.profileName,
+                    commentStatus,
+                    deriveCommentTokenHint(commentTokenUsed),
+                    commentProfileId,
+                    commentProfileName,
+                    commentError,
+                    commentFbId,
+                    cronHistoryId,
+                ).run()
+            }
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
 
             await clearVideoShopeeLink(botBucket, unpostedId)
@@ -21036,24 +21690,24 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     }
 
                     const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
-                    await env.DB.prepare(
-                        "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE page_id = ? AND video_id = ? AND status IN ('posting','failed') AND bot_id = ?"
-                    ).bind(
-                        recoveredPostId,
-                        recoveredReelUrl,
-                        deriveCommentTokenHint(postingTokenUsed),
-                        recoveredPostProfile.profileId,
-                        recoveredPostProfile.profileName,
-                        commentStatus,
-                        deriveCommentTokenHint(commentTokenUsed),
-                        commentProfileId,
-                        commentProfileName,
-                        commentError,
-                        commentFbId,
-                        page.id,
-                        unpostedId,
-                        botId,
-                    ).run()
+                    if (cronHistoryId) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status IN ('posting','failed')"
+                        ).bind(
+                            recoveredPostId,
+                            recoveredReelUrl,
+                            deriveCommentTokenHint(postingTokenUsed),
+                            recoveredPostProfile.profileId,
+                            recoveredPostProfile.profileName,
+                            commentStatus,
+                            deriveCommentTokenHint(commentTokenUsed),
+                            commentProfileId,
+                            commentProfileName,
+                            commentError,
+                            commentFbId,
+                            cronHistoryId,
+                        ).run()
+                    }
                     await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
 
                     await clearVideoShopeeLink(botBucket, unpostedId)
@@ -21069,9 +21723,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             }
 
             // Update to failed
-            await env.DB.prepare(
-                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE page_id = ? AND video_id = ? AND status = 'posting' AND bot_id = ?"
-            ).bind(errorMsg, page.id, unpostedId, botId).run()
+            if (cronHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(errorMsg, cronHistoryId).run()
+            }
 
             // Keep dedup key so this schedule window/interval bucket does not retry again after one failed attempt.
             console.log(`[CRON] Page ${page.name}: keep dedup key after failure, skip retries until next schedule window`)

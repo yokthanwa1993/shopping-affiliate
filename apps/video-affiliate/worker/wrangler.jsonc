@@ -2,10 +2,21 @@
     "name": "video-affiliate-worker",
     "account_id": "bc9db0f4b48f964b6e445dccc240af87",
     "main": "src/index.ts",
+    "workers_dev": true,
     "compatibility_date": "2026-02-14",
     "compatibility_flags": [
         "nodejs_compat",
         "global_fetch_strictly_public"
+    ],
+    "routes": [
+        {
+            "pattern": "api.oomnn.com/*",
+            "zone_name": "oomnn.com"
+        },
+        {
+            "pattern": "api.oomnn.com",
+            "zone_name": "oomnn.com"
+        }
     ],
     // Pipeline ใช้เวลา 2-3 นาที
     "limits": {
@@ -15,7 +26,7 @@
     "containers": [
         {
             "class_name": "MergeContainer",
-            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-04-01.192333",
+            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-04-03.143944",
             "instance_type": "standard-4",
             "max_instances": 2
         }
@@ -56,10 +67,11 @@
     // Environment variables
     "vars": {
         "CORS_ORIGIN": "*",
-        "WORKER_URL": "https://video-affiliate-worker.yokthanwa1993-bc9.workers.dev",
+        "WORKER_URL": "https://api.oomnn.com",
         "R2_PUBLIC_URL": "https://pub-14b6c1dd39f14ed7a219a84afc93c182.r2.dev",
         "GEMINI_MODEL": "gemini-3-flash-preview",
-        "WEBAPP_URL": "https://video-affiliate-webapp.pages.dev",
+        "WEBAPP_URL": "https://app.oomnn.com",
+        "WEBAPP_DESKTOP_URL": "https://web.oomnn.com",
         "BROWSERSAVING_WORKER_URL": "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev",
         "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com"
     },
