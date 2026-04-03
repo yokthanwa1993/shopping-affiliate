@@ -1,5 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 import { API_BASE_URL } from './apiBaseUrl'
+import type { AppTabRoute } from './app/appRoutes'
 import { useViewerHistory } from './app/hooks/useViewerHistory'
 import { Thumb } from './app/components/Thumb'
 import { getInboxVideoIdentityKey } from './app/inboxUtils'
@@ -2456,7 +2457,15 @@ function SettingsMenuSkeleton() {
   )
 }
 
-function App() {
+export type TabName = AppTabRoute
+
+function App({
+  controlledTab,
+  onControlledTabChange,
+}: {
+  controlledTab?: TabName
+  onControlledTabChange?: (tab: TabName) => void
+} = {}) {
   const botScope = getBotScopeFromLocation()
 
   const [token, setTokenState] = useState<string>(() => {
@@ -2898,7 +2907,6 @@ function App() {
   const [visibleLogCount, setVisibleLogCount] = useState(0)
   const [galleryHeaderHeight, setGalleryHeaderHeight] = useState(0)
   // Read initial tab from URL path or query param
-  type TabName = 'dashboard' | 'inbox' | 'processing' | 'gallery' | 'logs' | 'settings'
   const validTabs: TabName[] = ['dashboard', 'inbox', 'processing', 'gallery', 'logs', 'settings']
   const matchTab = (val: string): TabName | null => {
     const t = val.replace(/^\/+/, '').replace(/\?.*/, '').split('/').pop() || ''
@@ -2935,7 +2943,7 @@ function App() {
     return 'dashboard'
   }
 
-  const [tab, _setTab] = useState<TabName>(getInitialTab())
+  const [tab, _setTab] = useState<TabName>(controlledTab ?? getInitialTab())
   const [selectedPageHistoryId, setSelectedPageHistoryId] = useState<string>(getSelectedPageIdFromLocation)
   const syncAppUrl = (
     nextTab: TabName,
@@ -2990,6 +2998,10 @@ function App() {
       setSettingsSection('menu')
     }
     _setTab(t)
+    if (controlledTab) {
+      onControlledTabChange?.(t)
+      return
+    }
     syncAppUrl(t, gallerySearchInput, 'push')
   }
   const openSettingsSection = (section: SettingsSection) => {
@@ -3072,7 +3084,13 @@ function App() {
     })
   }, [tab, gallerySearchInput, settingsSection, selectedPageHistoryId])
   useEffect(() => {
+    if (controlledTab) {
+      _setTab(controlledTab)
+    }
+  }, [controlledTab])
+  useEffect(() => {
     const handlePopState = () => {
+      if (controlledTab) return
       const nextTab = matchTab(window.location.pathname)
         || matchTab(new URLSearchParams(window.location.search).get('tab') || '')
         || 'dashboard'
@@ -3095,7 +3113,7 @@ function App() {
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [])
+  }, [controlledTab])
   useEffect(() => {
     if (!selectedPageHistoryId) {
       setSelectedPage((prev) => (prev ? null : prev))
