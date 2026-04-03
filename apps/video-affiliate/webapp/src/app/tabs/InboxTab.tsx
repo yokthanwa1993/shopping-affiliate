@@ -1,3 +1,4 @@
+import type { RefObject } from 'react'
 import { InboxCard } from '../components/InboxCard'
 import { dedupeSystemInboxVideos, getInboxVideoIdentityKey } from '../inboxUtils'
 import type { InboxVideo } from '../sharedTypes'
@@ -6,8 +7,13 @@ export function InboxTab({
   isSystemAdmin,
   systemInboxLoading,
   systemInboxVideos,
+  systemInboxLoadingMore,
+  systemInboxHasMore,
   inboxLoading,
   inboxVideos,
+  inboxLoadingMore,
+  inboxHasMore,
+  loadMoreRef,
   namespaceId,
   startingInboxId,
   deletingInboxId,
@@ -20,8 +26,13 @@ export function InboxTab({
   isSystemAdmin: boolean
   systemInboxLoading: boolean
   systemInboxVideos: InboxVideo[]
+  systemInboxLoadingMore: boolean
+  systemInboxHasMore: boolean
   inboxLoading: boolean
   inboxVideos: InboxVideo[]
+  inboxLoadingMore: boolean
+  inboxHasMore: boolean
+  loadMoreRef: RefObject<HTMLDivElement | null>
   namespaceId?: string
   startingInboxId: string | null
   deletingInboxId: string | null
@@ -50,23 +61,34 @@ export function InboxTab({
             <p className="text-gray-400 text-sm mt-1 text-center">ส่งวิดีโอหรือลิงก์ XHS มาทาง LINE แล้วจะแสดงที่นี่</p>
           </div>
         ) : (
-          <div className="grid grid-cols-3 gap-3">
-            {filtered.map((video) => (
-              <InboxCard
-                key={`${String(video.namespace_id || '').trim()}:${video.id}`}
-                video={video}
-                onStart={onStartInboxVideo}
-                onDelete={onDeleteInboxVideo}
-                starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-                deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-                onExpandedChange={onExpandedChange}
-                viewMode="processed"
-                currentNamespaceId={namespaceId}
-                resolvePlaybackUrl={resolvePlaybackUrl}
-                resolveThumbnailUrl={resolveThumbnailUrl}
-              />
-            ))}
-          </div>
+          <>
+            <div className="grid grid-cols-3 gap-3">
+              {filtered.map((video) => (
+                <InboxCard
+                  key={`${String(video.namespace_id || '').trim()}:${video.id}`}
+                  video={video}
+                  onStart={onStartInboxVideo}
+                  onDelete={onDeleteInboxVideo}
+                  starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
+                  deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
+                  onExpandedChange={onExpandedChange}
+                  viewMode="processed"
+                  currentNamespaceId={namespaceId}
+                  resolvePlaybackUrl={resolvePlaybackUrl}
+                  resolveThumbnailUrl={resolveThumbnailUrl}
+                />
+              ))}
+            </div>
+            {systemInboxHasMore && (
+              <div ref={loadMoreRef} className={systemInboxLoadingMore ? 'py-5' : 'h-1'}>
+                {systemInboxLoadingMore && (
+                  <div className="flex items-center justify-center">
+                    <div className="w-8 h-8 border-[3px] border-blue-200 border-t-blue-500 rounded-full animate-spin" />
+                  </div>
+                )}
+              </div>
+            )}
+          </>
         )}
       </div>
     )
@@ -89,22 +111,33 @@ export function InboxTab({
           <p className="text-gray-400 text-sm mt-1 text-center">ส่งวิดีโอหรือ XHS link มาทาง Telegram แล้วระบบจะเก็บไว้ที่นี่ถาวร แยกจากหน้า Processing</p>
         </div>
       ) : (
-        <div className="grid grid-cols-3 gap-3">
-          {inboxVideos.map((video) => (
-            <InboxCard
-              key={video.id}
-              video={video}
-              onStart={onStartInboxVideo}
-              onDelete={onDeleteInboxVideo}
-              starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-              deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
-              onExpandedChange={onExpandedChange}
-              currentNamespaceId={namespaceId}
-              resolvePlaybackUrl={resolvePlaybackUrl}
-              resolveThumbnailUrl={resolveThumbnailUrl}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid grid-cols-3 gap-3">
+            {inboxVideos.map((video) => (
+              <InboxCard
+                key={video.id}
+                video={video}
+                onStart={onStartInboxVideo}
+                onDelete={onDeleteInboxVideo}
+                starting={startingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
+                deleting={deletingInboxId === getInboxVideoIdentityKey(video.id, video.namespace_id)}
+                onExpandedChange={onExpandedChange}
+                currentNamespaceId={namespaceId}
+                resolvePlaybackUrl={resolvePlaybackUrl}
+                resolveThumbnailUrl={resolveThumbnailUrl}
+              />
+            ))}
+          </div>
+          {inboxHasMore && (
+            <div ref={loadMoreRef} className={inboxLoadingMore ? 'py-5' : 'h-1'}>
+              {inboxLoadingMore && (
+                <div className="flex items-center justify-center">
+                  <div className="w-8 h-8 border-[3px] border-blue-200 border-t-blue-500 rounded-full animate-spin" />
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   )

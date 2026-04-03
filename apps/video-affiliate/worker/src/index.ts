@@ -8328,7 +8328,17 @@ async function listInboxVideoRecords(bucket: R2Bucket): Promise<InboxVideoRecord
     }))
     return tasks
         .filter((item): item is InboxVideoRecord => !!item)
-        .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())
+        .sort((a, b) => {
+            const aCreatedTs = new Date(String(a.createdAt || '')).getTime()
+            const bCreatedTs = new Date(String(b.createdAt || '')).getTime()
+            const aTs = Number.isFinite(aCreatedTs) && aCreatedTs > 0
+                ? aCreatedTs
+                : new Date(String(a.updatedAt || '')).getTime()
+            const bTs = Number.isFinite(bCreatedTs) && bCreatedTs > 0
+                ? bCreatedTs
+                : new Date(String(b.updatedAt || '')).getTime()
+            return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
+        })
 }
 
 type NamespaceOriginalAsset = {
@@ -8583,10 +8593,118 @@ function dedupeInboxArchiveVideos(videos: Array<Record<string, unknown>>): Array
     }
 
     return Array.from(byKey.values()).sort((a, b) => {
-        const at = new Date(String(a.updatedAt || a.createdAt || '')).getTime()
-        const bt = new Date(String(b.updatedAt || b.createdAt || '')).getTime()
+        const aCreatedTs = new Date(String(a.createdAt || '')).getTime()
+        const bCreatedTs = new Date(String(b.createdAt || '')).getTime()
+        const at = Number.isFinite(aCreatedTs) && aCreatedTs > 0
+            ? aCreatedTs
+            : new Date(String(a.updatedAt || '')).getTime()
+        const bt = Number.isFinite(bCreatedTs) && bCreatedTs > 0
+            ? bCreatedTs
+            : new Date(String(b.updatedAt || '')).getTime()
         return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
     })
+}
+
+function getInboxVideoSortMs(video: Record<string, unknown>): number {
+    const createdTs = new Date(String(video.createdAt || '')).getTime()
+    if (Number.isFinite(createdTs) && createdTs > 0) return createdTs
+    const updatedTs = new Date(String(video.updatedAt || '')).getTime()
+    return Number.isFinite(updatedTs) ? updatedTs : 0
+}
+
+function isInboxVideoOwnedByNamespace(video: Record<string, unknown>, namespaceId: string): boolean {
+    const videoNamespaceId = String(video.namespace_id || '').trim()
+    const currentNamespaceId = String(namespaceId || '').trim()
+    return !!videoNamespaceId && !!currentNamespaceId && videoNamespaceId === currentNamespaceId
+}
+
+function parseImportedNamespaceIdFromInboxSourceLabel(sourceLabel?: unknown): string {
+    const label = String(sourceLabel || '').trim()
+    if (!label) return ''
+    const match = label.match(/imported from\s+([A-Za-z0-9_:-]+)/i)
+    return String(match?.[1] || '').trim()
+}
+
+function dedupeSystemInboxVideos(
+    videos: Array<Record<string, unknown>>,
+    currentNamespaceId: string,
+): Array<Record<string, unknown>> {
+    const groups = new Map<string, Array<Record<string, unknown>>>()
+    const normalizedNamespaceId = String(currentNamespaceId || '').trim()
+
+    for (const video of videos) {
+        const videoId = String(video.id || '').trim()
+        if (!videoId) continue
+        const items = groups.get(videoId) || []
+        items.push(video)
+        groups.set(videoId, items)
+    }
+
+    return Array.from(groups.values())
+        .map((items) => {
+            const sortedItems = items
+                .slice()
+                .sort((a, b) => getInboxVideoSortMs(b) - getInboxVideoSortMs(a))
+            const preferredOwnVideo = normalizedNamespaceId
+                ? sortedItems.find((item) => isInboxVideoOwnedByNamespace(item, normalizedNamespaceId))
+                : undefined
+            const selected = preferredOwnVideo || sortedItems[0]
+            const namespaceIds = Array.from(new Set(
+                sortedItems
+                    .map((item) => String(item.namespace_id || '').trim())
+                    .filter(Boolean)
+            ))
+            const fallbackThumbVideo = sortedItems.find((item) => !!String(item.thumbnailUrl || '').trim())
+            const fallbackPlaybackVideo = sortedItems.find((item) => (
+                !!String(item.originalUrl || '').trim()
+                || !!String(item.previewUrl || '').trim()
+                || !!String(item.videoUrl || '').trim()
+            ))
+            const selectedNamespaceId = String(selected.namespace_id || '').trim()
+            const importedFromNamespaceId = String(
+                selected.importedFromNamespaceId
+                || parseImportedNamespaceIdFromInboxSourceLabel(selected.sourceLabel)
+                || namespaceIds.find((namespaceId) => namespaceId && namespaceId !== selectedNamespaceId)
+                || ''
+            ).trim() || undefined
+
+            return {
+                ...selected,
+                thumbnailUrl: String(selected.thumbnailUrl || fallbackThumbVideo?.thumbnailUrl || '').trim() || undefined,
+                originalUrl: String(selected.originalUrl || fallbackPlaybackVideo?.originalUrl || '').trim() || undefined,
+                previewUrl: String(selected.previewUrl || fallbackPlaybackVideo?.previewUrl || '').trim() || undefined,
+                videoUrl: String(selected.videoUrl || fallbackPlaybackVideo?.videoUrl || '').trim() || undefined,
+                importedFromNamespaceId,
+                duplicateNamespaceIds: namespaceIds,
+                dedupedFromOtherNamespace: !!(
+                    importedFromNamespaceId
+                    && isInboxVideoOwnedByNamespace(selected, normalizedNamespaceId)
+                ),
+            }
+        })
+        .sort((a, b) => getInboxVideoSortMs(b) - getInboxVideoSortMs(a))
+}
+
+function buildInboxVideoResponseForNamespace(
+    env: Env,
+    record: InboxVideoRecord,
+    namespaceId: string,
+    ownerEmail = '',
+): Record<string, unknown> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const originalUrl = getVideoOriginalUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, record.id)
+    const fallbackUrl = String(originalUrl || record.videoUrl || '').trim()
+    return {
+        ...toInboxVideoResponse(record, {
+            namespaceId: normalizedNamespaceId,
+            previewUrl: fallbackUrl,
+            thumbnailUrl: getVideoOriginalThumbnailUrlForNamespace(env.R2_PUBLIC_URL, normalizedNamespaceId, record.id),
+            originalUrl: fallbackUrl,
+            canStartProcessing: true,
+            canDelete: true,
+        }),
+        ...(ownerEmail ? { owner_email: ownerEmail } : {}),
+    }
 }
 
 async function listNamespaceOriginalArchiveVideos(params: {
@@ -9297,11 +9415,12 @@ app.get('/api/processing', async (c) => {
 app.get('/api/inbox', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
-        const videos = await listNamespaceOriginalArchiveVideos({
-            env: c.env,
-            bucket: c.get('bucket'),
-            namespaceId,
-        })
+        const offset = parseNonNegativeInt(c.req.query('offset'), 0)
+        const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
+        const limit = Math.min(Math.max(requestedLimit, 1), 120)
+        const records = await listInboxVideoRecords(c.get('bucket'))
+        const page = sliceGalleryPage(records, offset, limit)
+        const videos = page.videos.map((record) => buildInboxVideoResponseForNamespace(c.env, record, namespaceId))
         c.executionCtx.waitUntil(backfillNamespaceInboxOriginalAssets({
             env: c.env,
             bucket: c.get('bucket'),
@@ -9309,9 +9428,21 @@ app.get('/api/inbox', async (c) => {
         }).catch((error) => {
             console.log(`[INBOX-BACKFILL] namespace=${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
         }))
+        c.executionCtx.waitUntil(Promise.all(
+            page.videos.slice(0, 8).map((record) => promoteSelectedInboxCoverToOriginalThumbnail({
+                env: c.env,
+                bucket: c.get('bucket'),
+                namespaceId,
+                videoId: record.id,
+            }).catch(() => ''))
+        ))
         return c.json({
             videos,
-        }, 200, { 'Cache-Control': 'no-store' })
+            total: records.length,
+            offset,
+            limit,
+            has_more: page.hasMore,
+        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ error: String(e), videos: [] }, 500)
     }
@@ -9319,6 +9450,9 @@ app.get('/api/inbox', async (c) => {
 
 app.get('/api/inbox/system', async (c) => {
     try {
+        const offset = parseNonNegativeInt(c.req.query('offset'), 0)
+        const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
+        const limit = Math.min(Math.max(requestedLimit, 1), 120)
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
         const me = await c.env.DB.prepare('SELECT email, namespace_id FROM users WHERE session_token = ?').bind(token).first() as { email?: string; namespace_id?: string } | null
@@ -9335,6 +9469,7 @@ app.get('/api/inbox/system', async (c) => {
                 if (id) namespaceIds.add(id)
             }
         } catch { /* email_namespaces table may not exist */ }
+        if (currentNamespaceId) namespaceIds.add(currentNamespaceId)
 
         const namespaceEmailMap = await getNamespaceOwnerEmailMap(c.env.DB)
         const hiddenImportedSourceKeys = new Set<string>()
@@ -9360,29 +9495,39 @@ app.get('/api/inbox/system', async (c) => {
                 if (nsId !== currentNamespaceId && videoId && hiddenImportedSourceKeys.has(`${nsId}:${videoId}`)) {
                     continue
                 }
-                const originalUrl = getVideoOriginalUrlForNamespace(c.env.R2_PUBLIC_URL, nsId, videoId)
-                allVideos.push({
-                    ...toInboxVideoResponse(record, {
-                        namespaceId: nsId,
-                        previewUrl: originalUrl,
-                        originalUrl,
-                        thumbnailUrl: getVideoOriginalThumbnailUrlForNamespace(c.env.R2_PUBLIC_URL, nsId, videoId),
-                        canStartProcessing: true,
-                        canDelete: true,
-                    }),
-                    namespace_id: nsId,
-                    owner_email: namespaceEmailMap.get(nsId) || '',
-                })
+                allVideos.push(buildInboxVideoResponseForNamespace(
+                    c.env,
+                    record,
+                    nsId,
+                    namespaceEmailMap.get(nsId) || '',
+                ))
             }
         }))
 
-        allVideos.sort((a, b) => {
-            const aTs = new Date(String(a.updatedAt || a.createdAt || '')).getTime()
-            const bTs = new Date(String(b.updatedAt || b.createdAt || '')).getTime()
-            return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
-        })
+        const dedupedVideos = dedupeSystemInboxVideos(allVideos, currentNamespaceId)
+        const page = sliceGalleryPage(dedupedVideos, offset, limit)
+        c.executionCtx.waitUntil(Promise.all(
+            page.videos.slice(0, 8).map((video) => {
+                const videoId = String(video.id || '').trim()
+                const namespaceId = String(video.namespace_id || '').trim()
+                if (!videoId || !namespaceId) return Promise.resolve('')
+                const bucket = new BotBucket(c.env.BUCKET, namespaceId) as unknown as R2Bucket
+                return promoteSelectedInboxCoverToOriginalThumbnail({
+                    env: c.env,
+                    bucket,
+                    namespaceId,
+                    videoId,
+                }).catch(() => '')
+            })
+        ))
 
-        return c.json({ videos: allVideos }, 200, { 'Cache-Control': 'private, max-age=5, stale-while-revalidate=25' })
+        return c.json({
+            videos: page.videos,
+            total: dedupedVideos.length,
+            offset,
+            limit,
+            has_more: page.hasMore,
+        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ error: String(e), videos: [] }, 500)
     }
@@ -10115,7 +10260,7 @@ app.get('/api/gallery', async (c) => {
     const currentNamespaceId = String(c.get('botId') || '').trim()
     const offset = parseNonNegativeInt(c.req.query('offset'), 0)
     const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
-    const limit = Math.min(Math.max(requestedLimit, 1), 5000)
+    const limit = Math.min(Math.max(requestedLimit, 1), 120)
     const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
     const linkFilterRaw = String(c.req.query('link_filter') || '').trim().toLowerCase()
     const linkFilter = linkFilterRaw === 'no-link'
@@ -10137,7 +10282,10 @@ app.get('/api/gallery', async (c) => {
 
         const inventory = await getNamespaceGalleryInventory(c.env, currentNamespaceId)
         const videos = inventory.videos
-        const readyVideos = videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready)
+        const readyVideos = videos.filter((video) => {
+            const row = video as Record<string, unknown>
+            return !!row.gallery_ready && !String(row.postedAt || row.posted_at || '').trim()
+        })
 
         const overallTotal = readyVideos.length
         const shopeeVideos = readyVideos.filter((video) => !hasLazadaLinkInMeta(video as Record<string, unknown>))
@@ -10185,6 +10333,7 @@ app.get('/api/gallery', async (c) => {
             total: filteredVideos.length,
             overall_total: overallTotal,
             ready_total: overallTotal,
+            used_total: videos.filter((video) => !!String((video as Record<string, unknown>).postedAt || (video as Record<string, unknown>).posted_at || '').trim()).length,
             inventory_total: videos.length,
             library_total: inventory.sourceTotal,
             offset,
@@ -10194,7 +10343,7 @@ app.get('/api/gallery', async (c) => {
             lazada_total: lazadaVideos.length,
             with_link_total: withLinkVideos.length,
             without_link_total: withoutLinkVideos.length,
-        }, 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
+        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) })
     }
@@ -10202,6 +10351,10 @@ app.get('/api/gallery', async (c) => {
 
 app.get('/api/gallery/system', async (c) => {
     try {
+        const offset = parseNonNegativeInt(c.req.query('offset'), 0)
+        const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
+        const limit = Math.min(Math.max(requestedLimit, 1), 120)
+        const view = String(c.req.query('view') || '').trim().toLowerCase() === 'used' ? 'used' : 'ready'
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
 
@@ -10216,34 +10369,42 @@ app.get('/api/gallery/system', async (c) => {
         const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
         const inventory = await getSystemGalleryInventory(c.env)
         const allVideos = inventory.videos
-        const readyTotal = allVideos.filter((video) => Boolean((video as Record<string, unknown>).gallery_ready)).length
+        const readyVideos = allVideos.filter((video) => {
+            const row = video as Record<string, unknown>
+            return !!row.gallery_ready && !String(row.postedAt || row.posted_at || '').trim()
+        })
+        const usedVideos = allVideos.filter((video) => !!String((video as Record<string, unknown>).postedAt || (video as Record<string, unknown>).posted_at || '').trim())
+        const sourceVideos = view === 'used' ? usedVideos : readyVideos
         const searchedVideos = searchQuery
-            ? allVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
-            : allVideos
+            ? sourceVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
+            : sourceVideos
+        const page = sliceGalleryPage(searchedVideos, offset, limit)
         const pendingVideos = allVideos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
         const pendingHasLazadaTotal = pendingVideos.filter((video) =>
             String((video as Record<string, unknown>).pending_bucket || '').trim() === 'has-lazada'
         ).length
-        const withLinkTotal = allVideos.filter((video) => hasAffiliateLinkInMeta(video as Record<string, unknown>)).length
+        const withLinkTotal = sourceVideos.filter((video) => hasAffiliateLinkInMeta(video as Record<string, unknown>)).length
 
         return c.json({
-            videos: searchedVideos,
+            videos: page.videos,
             total: searchedVideos.length,
-            overall_total: allVideos.length,
-            ready_total: readyTotal,
+            overall_total: sourceVideos.length,
+            ready_total: readyVideos.length,
+            used_total: usedVideos.length,
             pending_total: pendingVideos.length,
             pending_has_lazada_total: pendingHasLazadaTotal,
             pending_missing_lazada_total: Math.max(0, pendingVideos.length - pendingHasLazadaTotal),
             inventory_total: allVideos.length,
             library_total: inventory.sourceTotal,
-            shopee_total: Math.max(0, allVideos.length - readyTotal),
-            lazada_total: readyTotal,
+            shopee_total: sourceVideos.filter((video) => !hasLazadaLinkInMeta(video as Record<string, unknown>)).length,
+            lazada_total: sourceVideos.filter((video) => hasLazadaLinkInMeta(video as Record<string, unknown>)).length,
             with_link_total: withLinkTotal,
-            without_link_total: Math.max(0, allVideos.length - withLinkTotal),
-            has_more: false,
-            offset: 0,
-            limit: searchedVideos.length,
-        }, 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
+            without_link_total: Math.max(0, sourceVideos.length - withLinkTotal),
+            has_more: page.hasMore,
+            offset,
+            limit,
+            view,
+        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
     }
@@ -10473,6 +10634,10 @@ app.post('/api/gallery/restore-links', async (c) => {
 app.get('/api/gallery/used', async (c) => {
     const r2Url = c.env.R2_PUBLIC_URL
     const botId = c.get('botId')
+    const offset = parseNonNegativeInt(c.req.query('offset'), 0)
+    const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
+    const limit = Math.min(Math.max(requestedLimit, 1), 120)
+    const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
     const fixUrls = (data: any) => {
         const s = JSON.stringify(data)
         return JSON.parse(s.replace(/https:\/\/pub-[a-f0-9]+\.r2\.dev\/videos\//g, `${r2Url}/${botId}/videos/`))
@@ -10487,7 +10652,19 @@ app.get('/api/gallery/used', async (c) => {
             return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
         })
 
-        return c.json(fixUrls({ videos }), 200, { 'Cache-Control': 'private, max-age=15', 'Vary': 'x-auth-token' })
+        const searchedVideos = searchQuery
+            ? videos.filter((video: any) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
+            : videos
+        const page = sliceGalleryPage(searchedVideos, offset, limit)
+
+        return c.json(fixUrls({
+            videos: page.videos,
+            total: searchedVideos.length,
+            overall_total: videos.length,
+            offset,
+            limit,
+            has_more: page.hasMore,
+        }), 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
     }

@@ -100,7 +100,7 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
   return !!(account || shopeeBase || lazadaBase || utmId || memberId)
 }
 
-const CACHE_VERSION = 'v8'
+const CACHE_VERSION = 'v10'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
@@ -110,15 +110,11 @@ const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStor
 const GALLERY_BATCH_SIZE = 24
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
-const FORCE_SYSTEM_WIDE_GALLERY = true
+const FORCE_SYSTEM_WIDE_GALLERY = false
 
 const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
   if (FORCE_SYSTEM_WIDE_GALLERY || systemWide) {
     return dedupeGalleryVideos(readCache<Video[]>(systemGalleryCacheKey(botScope), []))
-  }
-
-  if (hasStoredAffiliateShortlinkConfig(botScope)) {
-    return []
   }
 
   const scopedNamespace = String(namespaceId || getStoredNamespace(botScope) || '').trim()
@@ -239,6 +235,7 @@ interface GalleryPageResponse {
   total?: number
   overall_total?: number
   ready_total?: number
+  used_total?: number
   inventory_total?: number
   library_total?: number
   offset?: number
@@ -248,6 +245,14 @@ interface GalleryPageResponse {
   lazada_total?: number
   with_link_total?: number
   without_link_total?: number
+}
+
+interface InboxPageResponse {
+  videos?: InboxVideo[]
+  total?: number
+  offset?: number
+  limit?: number
+  has_more?: boolean
 }
 
 interface SystemGalleryStats {
@@ -390,24 +395,6 @@ interface ProcessingSummaryStats {
 
 function normalizeGallerySearchQuery(value: string | null | undefined): string {
   return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
-}
-
-function matchesGallerySearch(video: Partial<Video> & Record<string, unknown>, query: string): boolean {
-  const needle = normalizeGallerySearchQuery(query)
-  if (!needle) return true
-
-  const haystacks = [
-    video.id,
-    video.namespace_id,
-    video.owner_email,
-    video.title,
-    video.script,
-    video.category,
-    video.shopeeLink,
-    video.lazadaLink,
-  ]
-
-  return haystacks.some((value) => normalizeGallerySearchQuery(String(value || '')).includes(needle))
 }
 
 function buildFacebookLogUrl(item: Pick<PostHistory, 'fb_reel_url' | 'fb_post_id'>): string {
@@ -959,6 +946,29 @@ function dedupeGalleryVideos(rows: Video[]): Video[] {
   }
   return Array.from(byId.values()).sort((a, b) => getGalleryVideoSortMs(b as Video & Record<string, unknown>) - getGalleryVideoSortMs(a as Video & Record<string, unknown>))
 }
+
+const getInboxVideoSortMs = (video: Partial<InboxVideo> & Record<string, unknown>) => {
+  const createdTs = new Date(String(video.createdAt || '')).getTime()
+  if (Number.isFinite(createdTs) && createdTs > 0) return createdTs
+  const updatedTs = new Date(String(video.updatedAt || '')).getTime()
+  return Number.isFinite(updatedTs) ? updatedTs : 0
+}
+
+const mergeInboxVideos = (current: InboxVideo[], incoming: InboxVideo[]) => {
+  const byKey = new Map<string, InboxVideo>()
+  for (const video of current) {
+    byKey.set(getInboxVideoIdentityKey(video.id, video.namespace_id), video)
+  }
+  for (const video of incoming) {
+    byKey.set(getInboxVideoIdentityKey(video.id, video.namespace_id), video)
+  }
+  return Array.from(byKey.values()).sort((a, b) =>
+    getInboxVideoSortMs(b as InboxVideo & Record<string, unknown>) - getInboxVideoSortMs(a as InboxVideo & Record<string, unknown>)
+  )
+}
+
+const mergeGalleryPageVideos = (current: Video[], incoming: Video[]) =>
+  dedupeGalleryVideos([...current, ...incoming])
 
 const buildGalleryAssetProxyUrl = (
   videoId: string,
@@ -2516,7 +2526,13 @@ function App() {
     })
     setSystemGalleryHasMore(false)
     setGalleryLoadingMore(false)
-    setGalleryVisibleCount(GALLERY_BATCH_SIZE)
+    setGalleryReadyTotalCount(0)
+    setGalleryUsedTotalCount(0)
+    setGalleryUsedHasMore(false)
+    setInboxHasMore(false)
+    setInboxLoadingMore(false)
+    setSystemInboxHasMore(false)
+    setSystemInboxLoadingMore(false)
     setGlobalOriginalVideos([])
     setGlobalOriginalLoading(false)
     setPostHistory([])
@@ -2714,10 +2730,10 @@ function App() {
   const [retryingLogId, setRetryingLogId] = useState<number | null>(null)
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null)
   const [videos, setVideos] = useState<Video[]>(() => {
-    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), hasStoredAffiliateShortlinkConfig(botScope))
+    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), false)
   })
   const [usedVideos, setUsedVideos] = useState<Video[]>(() => {
-    const ns = getStoredNamespace()
+    const ns = getStoredNamespace(botScope)
     if (ns) return readCache<Video[]>(nsCacheKey('used', ns), [])
     return readCache<Video[]>(globalCacheKey('used'), [])
   })
@@ -2727,7 +2743,7 @@ function App() {
   const [pendingShortlinkVideos, setPendingShortlinkVideos] = useState<Video[]>([])
   const [retryingProcessingId, setRetryingProcessingId] = useState<string | null>(null)
   const [loading, setLoading] = useState(() => {
-    if (FORCE_SYSTEM_WIDE_GALLERY || hasStoredAffiliateShortlinkConfig(botScope)) {
+    if (FORCE_SYSTEM_WIDE_GALLERY) {
       return readCache<Video[]>(systemGalleryCacheKey(botScope), []).length === 0
     }
     const ns = getStoredNamespace(botScope)
@@ -2740,7 +2756,7 @@ function App() {
     return readCache<Video[]>(globalCacheKey('gallery'), []).length === 0
   })
   const [galleryLoading, setGalleryLoading] = useState(() => {
-    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), hasStoredAffiliateShortlinkConfig(botScope)).length === 0
+    return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), false).length === 0
   })
   const [_systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
   const [, setGallerySummary] = useState<GallerySummaryStats>({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
@@ -2917,27 +2933,29 @@ function App() {
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
   const [inboxLoading, setInboxLoading] = useState(false)
+  const [inboxLoadingMore, setInboxLoadingMore] = useState(false)
+  const [inboxHasMore, setInboxHasMore] = useState(false)
   const [pagesLoading, setPagesLoading] = useState(false)
   const [deletePageId, setDeletePageId] = useState<string | null>(null)
   const [deletingPageId, setDeletingPageId] = useState<string | null>(null)
   const [startingInboxId, setStartingInboxId] = useState<string | null>(null)
   const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
-  const [galleryVisibleCount, setGalleryVisibleCount] = useState(GALLERY_BATCH_SIZE)
   const processingFetchInFlightRef = useRef(false)
-  const inboxFetchInFlightRef = useRef(false)
-  const usedFetchInFlightRef = useRef(false)
+  const inboxRequestRef = useRef(0)
+  const systemInboxRequestRef = useRef(0)
   const globalOriginalFetchInFlightRef = useRef(false)
   const loadPagesRequestRef = useRef(0)
   const loadTeamRequestRef = useRef(0)
-  const lastUsedFetchAtRef = useRef(0)
   const lastGlobalOriginalFetchAtRef = useRef(0)
   const systemWideGalleryMode = FORCE_SYSTEM_WIDE_GALLERY
+  const useSystemWideAdminGallery = false
   const mainScrollRef = useRef<HTMLDivElement | null>(null)
   const galleryHeaderRef = useRef<HTMLDivElement | null>(null)
   const galleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
+  const inboxLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const systemGalleryRequestRef = useRef(0)
-  const systemGalleryLoadedCountRef = useRef(videos.length)
+  const usedGalleryRequestRef = useRef(0)
   const systemAdminGalleryDefaultAppliedRef = useRef(false)
   const deletedGalleryKeysRef = useRef<Set<string>>(new Set())
   const deferredGallerySearchInput = useDeferredValue(gallerySearchInput)
@@ -2945,10 +2963,12 @@ function App() {
     () => normalizeGallerySearchQuery(deferredGallerySearchInput),
     [deferredGallerySearchInput]
   )
+  const [systemInboxLoadingMore, setSystemInboxLoadingMore] = useState(false)
+  const [systemInboxHasMore, setSystemInboxHasMore] = useState(false)
+  const [galleryReadyTotalCount, setGalleryReadyTotalCount] = useState(videos.length)
+  const [galleryUsedTotalCount, setGalleryUsedTotalCount] = useState(usedVideos.length)
+  const [galleryUsedHasMore, setGalleryUsedHasMore] = useState(false)
 
-  useEffect(() => {
-    systemGalleryLoadedCountRef.current = videos.length
-  }, [videos.length])
   useEffect(() => {
     const urlSearch = getInitialGallerySearchInput()
     if (tab === 'gallery') {
@@ -3004,17 +3024,15 @@ function App() {
   const hydrateNamespaceCaches = (ns: string) => {
     const scopedNamespace = String(ns || '').trim()
     if (!scopedNamespace) return
-    const cachedVideos = readGalleryCacheForScope(
-      botScope,
-      scopedNamespace,
-      !!String(shortlinkAccountCurrent || shortlinkBaseUrlCurrent || lazadaShortlinkBaseUrlCurrent || getStoredShortlinkAccount(botScope) || getStoredShortlinkBaseUrl(botScope) || getStoredLazadaShortlinkBaseUrl(botScope) || '').trim()
-    )
+    const cachedVideos = readGalleryCacheForScope(botScope, scopedNamespace, false)
     const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
     const cachedInbox = readCache<InboxVideo[]>(nsInboxCacheKey(scopedNamespace), [])
     const cachedDashboard = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace), null)
     setVideos(cachedVideos)
     setUsedVideos(cachedUsedVideos)
+    setGalleryReadyTotalCount(cachedVideos.length)
+    setGalleryUsedTotalCount(cachedUsedVideos.length)
     setPostHistory(cachedHistory)
     setInboxVideos(cachedInbox)
     setDashboardData(cachedDashboard)
@@ -3229,13 +3247,13 @@ function App() {
   useEffect(() => {
     setTokenState(getToken(botScope))
     const storedNamespace = getStoredNamespace(botScope)
-    const storedShortlinkAccount = getStoredShortlinkAccount(botScope)
-    const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
-    const storedLazadaShortlinkBaseUrl = getStoredLazadaShortlinkBaseUrl(botScope)
-    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, !!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
+    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, false)
     const cachedInbox = storedNamespace ? readCache<InboxVideo[]>(nsInboxCacheKey(storedNamespace), []) : []
     const cachedDashboard = storedNamespace ? readCache<DashboardData | null>(dashboardCacheKey(storedNamespace), null) : null
     const cachedSystemInbox = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
+    const storedShortlinkAccount = getStoredShortlinkAccount(botScope)
+    const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
+    const storedLazadaShortlinkBaseUrl = getStoredLazadaShortlinkBaseUrl(botScope)
     setNamespaceId(storedNamespace)
     setVideos(cachedVideos)
     setInboxVideos(cachedInbox)
@@ -3493,15 +3511,15 @@ function App() {
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    if (tab === 'inbox') void loadInboxSnapshot()
-  }, [tab, token, authBootstrapping])
+    if (tab !== 'inbox' || isSystemAdmin) return
+    void loadInboxSnapshot({ reset: true })
+  }, [tab, token, authBootstrapping, isSystemAdmin])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    if (tab !== 'inbox' && tab !== 'processing') return
+    if (tab !== 'processing') return
 
     const refresh = () => {
-      void loadInboxSnapshot()
       void loadProcessingSnapshot()
     }
 
@@ -3531,20 +3549,24 @@ function App() {
 
   useEffect(() => {
     const cachedVideos = readGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
+    const cachedUsedVideos = namespaceId
+      ? dedupeGalleryVideos(readCache<Video[]>(nsCacheKey('used', namespaceId), []))
+      : []
     setVideos(cachedVideos)
+    setUsedVideos(cachedUsedVideos)
+    setGalleryReadyTotalCount(cachedVideos.length)
+    setGalleryUsedTotalCount(cachedUsedVideos.length)
     setGalleryLoading(cachedVideos.length === 0)
-    if (!systemWideGalleryMode) {
-      setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
-      setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
-      setSystemGalleryHasMore(false)
-      setGalleryLoadingMore(false)
-    }
+    setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+    setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+    setSystemGalleryHasMore(false)
+    setGalleryUsedHasMore(false)
+    setGalleryLoadingMore(false)
+    setSystemInboxHasMore(false)
+    setSystemInboxLoadingMore(false)
+    setInboxHasMore(false)
+    setInboxLoadingMore(false)
   }, [botScope, namespaceId, systemWideGalleryMode])
-
-  useEffect(() => {
-    if (tab !== 'gallery' || isOwner && categoryFilter === 'all-original') return
-    setGalleryVisibleCount(GALLERY_BATCH_SIZE)
-  }, [tab, botScope, namespaceId, categoryFilter, systemWideGalleryMode, isOwner, gallerySearchQuery])
 
   useEffect(() => {
     if (authBootstrapping || !token || tab !== 'dashboard') return
@@ -3644,50 +3666,82 @@ function App() {
     }
   }
 
-  async function loadInboxSnapshot() {
-    if (inboxFetchInFlightRef.current) return
+  async function loadInboxSnapshot(options: { reset?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
-    const shouldShowLoading = inboxVideos.length === 0
-    if (shouldShowLoading) setInboxLoading(true)
+    const reset = !!options.reset
+    const requestId = reset ? ++inboxRequestRef.current : inboxRequestRef.current
+    if (!reset && (inboxLoadingMore || !inboxHasMore)) return
 
-    inboxFetchInFlightRef.current = true
+    const offset = reset ? 0 : inboxVideos.length
+    const shouldShowLoading = reset && inboxVideos.length === 0
+    if (shouldShowLoading) setInboxLoading(true)
+    if (!reset) setInboxLoadingMore(true)
+
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/inbox`)
+      const params = new URLSearchParams()
+      params.set('offset', String(offset))
+      params.set('limit', String(GALLERY_BATCH_SIZE))
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox?${params.toString()}`)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
-      if (resp.ok) {
-        const data = await resp.json() as { videos?: InboxVideo[] }
-        setInboxVideos(Array.isArray(data.videos) ? data.videos : [])
-      }
+      if (!resp.ok) return
+
+      const data = await resp.json() as InboxPageResponse
+      if (requestId !== inboxRequestRef.current) return
+
+      const nextVideos = Array.isArray(data.videos) ? data.videos : []
+      setInboxVideos((prev) => reset ? nextVideos : mergeInboxVideos(prev, nextVideos))
+      setInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
-      inboxFetchInFlightRef.current = false
-      if (shouldShowLoading) setInboxLoading(false)
+      if (requestId === inboxRequestRef.current) {
+        if (shouldShowLoading) setInboxLoading(false)
+        if (!reset) setInboxLoadingMore(false)
+      }
     }
   }
 
-  async function loadSystemInbox() {
+  async function loadSystemInbox(options: { reset?: boolean } = {}) {
     if (!token || !isSystemAdmin) return
-    const shouldShowLoading = systemInboxVideos.length === 0
+
+    const reset = !!options.reset
+    const requestId = reset ? ++systemInboxRequestRef.current : systemInboxRequestRef.current
+    if (!reset && (systemInboxLoadingMore || !systemInboxHasMore)) return
+
+    const offset = reset ? 0 : systemInboxVideos.length
+    const shouldShowLoading = reset && systemInboxVideos.length === 0
     if (shouldShowLoading) setSystemInboxLoading(true)
+    if (!reset) setSystemInboxLoadingMore(true)
+
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/inbox/system`)
+      const params = new URLSearchParams()
+      params.set('offset', String(offset))
+      params.set('limit', String(GALLERY_BATCH_SIZE))
+      const resp = await apiFetch(`${WORKER_URL}/api/inbox/system?${params.toString()}`)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
-      if (resp.ok) {
-        const data = await resp.json() as { videos?: InboxVideo[] }
-        setSystemInboxVideos(Array.isArray(data.videos) ? data.videos : [])
+      if (!resp.ok) return
+
+      const data = await resp.json() as InboxPageResponse
+      if (requestId !== systemInboxRequestRef.current) return
+
+      const nextVideos = Array.isArray(data.videos) ? data.videos : []
+      setSystemInboxVideos((prev) => reset ? nextVideos : mergeInboxVideos(prev, nextVideos))
+      setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
+    } catch {
+      // Keep previous inbox snapshot on transient errors.
+    } finally {
+      if (requestId === systemInboxRequestRef.current) {
+        if (shouldShowLoading) setSystemInboxLoading(false)
+        if (!reset) setSystemInboxLoadingMore(false)
       }
-    } catch {}
-    finally {
-      if (shouldShowLoading) setSystemInboxLoading(false)
     }
   }
 
@@ -3749,33 +3803,6 @@ function App() {
     finally { setSavingMemberRoleId(null) }
   }
 
-  async function loadUsedVideos(options: { force?: boolean } = {}) {
-    const session = getToken()
-    if (!session) return
-
-    const now = Date.now()
-    if (!options.force && usedFetchInFlightRef.current) return
-    if (!options.force && now - lastUsedFetchAtRef.current < 30000) return
-
-    usedFetchInFlightRef.current = true
-    try {
-      const usedResp = await apiFetch(`${WORKER_URL}/api/gallery/used`)
-      if (usedResp.status === 401) {
-        await recoverSessionOrLogout()
-        return
-      }
-      if (usedResp.ok) {
-        const data = await usedResp.json()
-        setUsedVideos(data.videos || [])
-        lastUsedFetchAtRef.current = Date.now()
-      }
-    } catch {
-      // Keep previous used videos on transient errors.
-    } finally {
-      usedFetchInFlightRef.current = false
-    }
-  }
-
   async function loadGlobalOriginalVideos(options: { force?: boolean } = {}) {
     const session = getToken()
     if (!session || !isOwner) return
@@ -3812,87 +3839,48 @@ function App() {
     }
   }
 
-  async function loadSystemGalleryPage(options: { reset?: boolean } = {}) {
+  async function loadReadyGalleryPage(options: { reset?: boolean; silent?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
     const reset = !!options.reset
-    const useAdminSystemRoute = systemWideGalleryMode && isSystemAdmin
-    if (useAdminSystemRoute) {
-      if (reset) {
-        setGalleryLoading(true)
-      }
-      setGalleryLoadingMore(false)
-      try {
-        const params = new URLSearchParams()
-        if (gallerySearchQuery) params.set('q', gallerySearchQuery)
-        const resp = await apiFetch(`${WORKER_URL}/api/gallery/system${params.toString() ? `?${params.toString()}` : ''}`)
-        if (resp.status === 401) {
-          await recoverSessionOrLogout()
-          return
-        }
-        if (resp.status === 403) {
-          setVideos([])
-          setUsedVideos([])
-          setPendingShortlinkVideos([])
-          setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
-          setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
-          setSystemGalleryHasMore(false)
-          return
-        }
-        if (!resp.ok) return
-
-        const data = await resp.json() as GalleryPageResponse
-        const nextVideos = filterDeletedGalleryVideos(
-          Array.isArray(data.videos) ? data.videos : [],
-          deletedGalleryKeysRef.current,
-        )
-        setVideos(dedupeGalleryVideos(nextVideos))
-        setUsedVideos([])
-        setPendingShortlinkVideos([])
-        setSystemGalleryStats({
-          total: Number(data.total || 0),
-          shopeeTotal: Number(data.shopee_total || 0),
-          lazadaTotal: Number(data.lazada_total || 0),
-          withLink: Number(data.with_link_total || 0),
-          withoutLink: Number(data.without_link_total || 0),
-        })
-        setGallerySummary({
-          libraryTotal: Number(data.library_total || 0),
-          inventoryTotal: Number(data.inventory_total || 0),
-          readyTotal: Number(data.ready_total || 0),
-        })
-        setSystemGalleryHasMore(false)
-      } catch {
-        // Keep current gallery snapshot on transient errors.
-      } finally {
-        setGalleryLoading(false)
-        setGalleryLoadingMore(false)
-      }
-      return
-    }
-
     const requestId = reset ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
-    if (reset) {
-      setGalleryLoading(true)
-      setGalleryLoadingMore(false)
-      setSystemGalleryHasMore(false)
-    } else {
-      if (galleryLoadingMore || !systemGalleryHasMore) return
-      setGalleryLoadingMore(true)
-    }
+    if (!reset && (galleryLoadingMore || !systemGalleryHasMore)) return
+
+    const offset = reset ? 0 : videos.length
+    const shouldShowLoading = reset && !options.silent && videos.length === 0
+    if (shouldShowLoading) setGalleryLoading(true)
+    if (!reset && !options.silent) setGalleryLoadingMore(true)
 
     try {
-      const offset = reset ? 0 : systemGalleryLoadedCountRef.current
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
-      params.set('link_filter', 'all')
       if (gallerySearchQuery) params.set('q', gallerySearchQuery)
 
-      const resp = await apiFetch(`${WORKER_URL}/api/gallery?${params.toString()}`)
+      const useAdminSystemRoute = useSystemWideAdminGallery && isSystemAdmin
+      const requestParams = new URLSearchParams(params)
+      const url = useAdminSystemRoute
+        ? (() => {
+            requestParams.set('view', 'ready')
+            return `${WORKER_URL}/api/gallery/system?${requestParams.toString()}`
+          })()
+        : (() => {
+            requestParams.set('link_filter', 'all')
+            return `${WORKER_URL}/api/gallery?${requestParams.toString()}`
+          })()
+
+      const resp = await apiFetch(url)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403 && useAdminSystemRoute) {
+        setVideos([])
+        setGalleryReadyTotalCount(0)
+        setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
+        setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
+        setSystemGalleryHasMore(false)
         return
       }
       if (!resp.ok) return
@@ -3904,10 +3892,13 @@ function App() {
         Array.isArray(data.videos) ? data.videos : [],
         deletedGalleryKeysRef.current,
       )
-      const hasMore = !!data.has_more && nextVideos.length > 0
-      setVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : dedupeGalleryVideos([...prev, ...nextVideos]))
+      setVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos))
+      setGalleryReadyTotalCount(Number(data.ready_total || data.total || data.overall_total || 0))
+      if (typeof data.used_total === 'number') {
+        setGalleryUsedTotalCount(Number(data.used_total || 0))
+      }
       setSystemGalleryStats({
-        total: Number(data.total || 0),
+        total: Number(data.total || data.overall_total || 0),
         shopeeTotal: Number(data.shopee_total || 0),
         lazadaTotal: Number(data.lazada_total || 0),
         withLink: Number(data.with_link_total || 0),
@@ -3916,17 +3907,113 @@ function App() {
       setGallerySummary({
         libraryTotal: Number(data.library_total || 0),
         inventoryTotal: Number(data.inventory_total || 0),
-        readyTotal: Number(data.ready_total || data.overall_total || 0),
+        readyTotal: Number(data.ready_total || data.total || data.overall_total || 0),
       })
-      setSystemGalleryHasMore(hasMore)
+      setSystemGalleryHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep current gallery snapshot on transient errors.
     } finally {
       if (requestId === systemGalleryRequestRef.current) {
-        setGalleryLoading(false)
-        setGalleryLoadingMore(false)
+        if (shouldShowLoading) setGalleryLoading(false)
+        if (!reset && !options.silent) setGalleryLoadingMore(false)
       }
     }
+  }
+
+  async function loadUsedGalleryPage(options: { reset?: boolean; silent?: boolean } = {}) {
+    const session = getToken()
+    if (!session) return
+
+    const reset = !!options.reset
+    const requestId = reset ? ++usedGalleryRequestRef.current : usedGalleryRequestRef.current
+    if (!reset && (galleryLoadingMore || !galleryUsedHasMore)) return
+
+    const offset = reset ? 0 : usedVideos.length
+    const shouldShowLoading = reset && !options.silent && usedVideos.length === 0
+    if (shouldShowLoading) setGalleryLoading(true)
+    if (!reset && !options.silent) setGalleryLoadingMore(true)
+
+    try {
+      const params = new URLSearchParams()
+      params.set('offset', String(offset))
+      params.set('limit', String(GALLERY_BATCH_SIZE))
+      if (gallerySearchQuery) params.set('q', gallerySearchQuery)
+
+      const useAdminSystemRoute = useSystemWideAdminGallery && isSystemAdmin
+      const requestParams = new URLSearchParams(params)
+      const url = useAdminSystemRoute
+        ? (() => {
+            requestParams.set('view', 'used')
+            return `${WORKER_URL}/api/gallery/system?${requestParams.toString()}`
+          })()
+        : `${WORKER_URL}/api/gallery/used?${requestParams.toString()}`
+
+      const resp = await apiFetch(url)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403 && useAdminSystemRoute) {
+        setUsedVideos([])
+        setGalleryUsedTotalCount(0)
+        setGalleryUsedHasMore(false)
+        return
+      }
+      if (!resp.ok) return
+
+      const data = await resp.json() as GalleryPageResponse
+      if (requestId !== usedGalleryRequestRef.current) return
+
+      const nextVideos = filterDeletedGalleryVideos(
+        Array.isArray(data.videos) ? data.videos : [],
+        deletedGalleryKeysRef.current,
+      )
+      setUsedVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos))
+      setGalleryUsedTotalCount(Number(data.used_total || data.total || data.overall_total || 0))
+      if (typeof data.ready_total === 'number') {
+        setGalleryReadyTotalCount(Number(data.ready_total || 0))
+      }
+      setGalleryUsedHasMore(!!data.has_more && nextVideos.length > 0)
+    } catch {
+      // Keep current gallery snapshot on transient errors.
+    } finally {
+      if (requestId === usedGalleryRequestRef.current) {
+        if (shouldShowLoading) setGalleryLoading(false)
+        if (!reset && !options.silent) setGalleryLoadingMore(false)
+      }
+    }
+  }
+
+  async function loadGallerySnapshotBundle() {
+    const session = getToken()
+    if (!session) return
+
+    const shouldShowLoading = (categoryFilter === 'used' ? usedVideos.length === 0 : videos.length === 0)
+    if (shouldShowLoading) setGalleryLoading(true)
+    setGalleryLoadingMore(false)
+
+    try {
+      await Promise.all([
+        loadReadyGalleryPage({ reset: true, silent: categoryFilter === 'used' }),
+        loadUsedGalleryPage({ reset: true, silent: categoryFilter !== 'used' }),
+      ])
+    } finally {
+      if (shouldShowLoading) setGalleryLoading(false)
+    }
+  }
+
+  async function loadSystemGalleryPage(options: { reset?: boolean } = {}) {
+    if (options.reset) {
+      await loadGallerySnapshotBundle()
+      return
+    }
+
+    if (categoryFilter === 'used') {
+      await loadUsedGalleryPage()
+      return
+    }
+
+    await loadReadyGalleryPage()
   }
 
   async function loadAll(options: { skipGallery?: boolean } = {}) {
@@ -3939,13 +4026,12 @@ function App() {
         if (categoryFilter === 'all-original' && isOwner) {
           tasks.push(loadGlobalOriginalVideos({ force: true }))
         } else {
-          tasks.push(loadSystemGalleryPage({ reset: true }))
-          if (!systemWideGalleryMode && categoryFilter === 'used') {
-            tasks.push(loadUsedVideos({ force: true }))
-          }
+          tasks.push(loadGallerySnapshotBundle())
         }
       }
-      if (tab === 'inbox') tasks.push(loadInboxSnapshot())
+      if (tab === 'inbox') {
+        tasks.push(isSystemAdmin ? loadSystemInbox({ reset: true }) : loadInboxSnapshot({ reset: true }))
+      }
       if (tab === 'processing') tasks.push(loadProcessingSnapshot())
       await Promise.allSettled(tasks)
     } finally {
@@ -3977,19 +4063,14 @@ function App() {
       return
     }
 
-    if (systemWideGalleryMode) {
-      void loadSystemGalleryPage({ reset: true })
-      return
-    }
-
-    void loadUsedVideos({ force: categoryFilter === 'used' })
+    void loadGallerySnapshotBundle()
     if (isOwner) void loadGlobalOriginalVideos()
   }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
 
   useEffect(() => {
     if (authBootstrapping || !token || !isSystemAdmin) return
     if (tab !== 'inbox') return
-    void loadSystemInbox()
+    void loadSystemInbox({ reset: true })
   }, [tab, token, authBootstrapping, isSystemAdmin])
 
   async function loadDashboard(dateValue = dashboardDateFilter, options: { silent?: boolean } = {}) {
@@ -4665,7 +4746,10 @@ function App() {
         }
         throw new Error(String(data.error || 'ส่งเข้า Processing ไม่สำเร็จ'))
       }
-      await Promise.all([loadInboxSnapshot(), loadProcessingSnapshot()])
+      await Promise.all([
+        isSystemAdmin ? loadSystemInbox({ reset: true }) : loadInboxSnapshot({ reset: true }),
+        loadProcessingSnapshot(),
+      ])
       const status = String(data.job?.status || '').trim().toLowerCase()
       if (status === 'processed') {
         alert('คลิปนี้อยู่ใน Gallery แล้ว โดยคลิปต้นฉบับยังอยู่ในคลังต้นฉบับตามเดิม')
@@ -4821,125 +4905,36 @@ function App() {
     }
   }
 
-  const isKeepInPostedTab = (video: Video) => !!video.keepInPostedTab
-  const hasVideoBeenPosted = (video: Partial<Video> & Record<string, unknown>) =>
-    !!String(video.postedAt || video.posted_at || '').trim()
-  // Admin ดู Gallery/Processing เฉพาะของตัวเอง (ใช้ shortlink ID ตัวเอง)
-  // คลังต้นฉบับยังเห็นทุก workspace ผ่าน systemInboxVideos
-  const useSystemWideAdminGallery = false
-  const {
-    galleryReadyVideos,
-    galleryUsedVideos,
-    galleryAvailableVideos,
-    galleryShortlinkRequired,
-  } = useMemo(() => {
-    const getGallerySortTs = (video: Video) => {
-      const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
-      return Number.isFinite(ts) ? ts : 0
-    }
-    const sortNewestFirst = (rows: Video[]) => rows.sort((a, b) => getGallerySortTs(b) - getGallerySortTs(a))
-    const sourceVideos = dedupeGalleryVideos(
+  const { galleryAvailableVideos, galleryShortlinkRequired } = useMemo(() => {
+    const readyVideos = dedupeGalleryVideos(
       filterDeletedGalleryVideos(videos, deletedGalleryKeysRef.current).filter((video) =>
         getBooleanFlag((video as Video & Record<string, unknown>).original_only) !== true
       )
     )
-    const pendingIdentitySet = new Set(pendingShortlinkVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
-    const postedVideos = sortNewestFirst(
-      dedupeGalleryVideos([
-        ...filterDeletedGalleryVideos(usedVideos, deletedGalleryKeysRef.current),
-        ...sourceVideos.filter((video) =>
-          isKeepInPostedTab(video) || hasVideoBeenPosted(video as Video & Record<string, unknown>)
-        ),
-      ])
+    const postedVideos = dedupeGalleryVideos(
+      filterDeletedGalleryVideos(usedVideos, deletedGalleryKeysRef.current)
     )
-    const postedIdentitySet = new Set(postedVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
-
-    const activeVideos = sortNewestFirst(
-      sourceVideos.filter((video) => !postedIdentitySet.has(getVideoIdentityKey(video as Video & Record<string, unknown>)))
-    )
-
-    const shortlinkRequiredVideos = activeVideos.filter((video) =>
+    const galleryShortlinkRequired = readyVideos.some((video) =>
       isVideoShortlinkRequired(video as Video & Record<string, unknown>, isSystemAdmin)
     )
-    const galleryShortlinkRequired = shortlinkRequiredVideos.length > 0
-
-    const missingLazadaVideos = sortNewestFirst(
-      activeVideos.filter((video) => {
-        const row = video as Video & Record<string, unknown>
-        const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
-        const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
-        const conversionState = getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId, {
-          requireManagedLinks: isVideoShortlinkRequired(row, isSystemAdmin),
-        })
-        return !conversionState.galleryReady && (conversionState.missingShopeeSource || conversionState.missingLazadaSource)
-      })
-    )
-
-    const readyVideos = sortNewestFirst(
-      activeVideos.filter((video) => {
-        const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
-        const row = video as Video & Record<string, unknown>
-        const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
-        const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
-        const conversionState = getVideoAffiliateConversionState(row, expectedUtmId, expectedLazadaMemberId, {
-          requireManagedLinks: isVideoShortlinkRequired(row, isSystemAdmin),
-        })
-        return !pendingIdentitySet.has(key) && conversionState.galleryReady
-      })
-    )
-
-    const missingSet = new Set(missingLazadaVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
-    const readySet = new Set(readyVideos.map((video) => getVideoIdentityKey(video as Video & Record<string, unknown>)))
-    const pendingShortlinkVideosAll = sortNewestFirst(
-      activeVideos.filter((video) => {
-        const key = getVideoIdentityKey(video as Video & Record<string, unknown>)
-        if (missingSet.has(key) || readySet.has(key)) return false
-        const row = video as Video & Record<string, unknown>
-        const expectedUtmId = String(row.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
-        const expectedLazadaMemberId = String(row.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
-        return isVideoAwaitingAffiliateConversion(row, expectedUtmId, expectedLazadaMemberId) || pendingIdentitySet.has(key)
-      })
-    )
-
-    const allUnpostedVideos = sortNewestFirst(
-      activeVideos.slice()
-    )
-    const baseVideos = useSystemWideAdminGallery
-      ? (categoryFilter === 'used' ? postedVideos : allUnpostedVideos)
-      : categoryFilter === 'used'
-        ? postedVideos
-        : categoryFilter === 'ready'
-          ? readyVideos
-          : categoryFilter === 'pending-shortlink' && galleryShortlinkRequired
-            ? pendingShortlinkVideosAll
-            : missingLazadaVideos
-    const availableVideos = gallerySearchQuery
-      ? baseVideos.filter((video) => matchesGallerySearch(video as Video & Record<string, unknown>, gallerySearchQuery))
-      : baseVideos
+    const availableVideos = categoryFilter === 'used' ? postedVideos : readyVideos
 
     return {
-      galleryReadyVideos: readyVideos,
-      galleryUsedVideos: postedVideos,
       galleryAvailableVideos: availableVideos,
       galleryShortlinkRequired,
     }
-  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter, gallerySearchQuery, shortlinkExpectedUtmIdCurrent, lazadaExpectedMemberIdCurrent, useSystemWideAdminGallery, isSystemAdmin])
+  }, [videos, usedVideos, categoryFilter, isSystemAdmin])
   const showGalleryFilterBar = tab === 'gallery' && (
     galleryLoading ||
-    (galleryReadyVideos.length > 0 || galleryUsedVideos.length > 0)
+    galleryReadyTotalCount > 0 ||
+    galleryUsedTotalCount > 0
   )
   const isAllOriginalMode = categoryFilter === 'all-original' && isOwner
   const shouldShowGalleryHeader = !videoViewerOpen && tab === 'gallery' && (showGalleryFilterBar || !isAllOriginalMode)
   const galleryHeaderOffset = shouldShowGalleryHeader ? galleryHeaderHeight : 0
-  const galleryViewTotal = galleryAvailableVideos.length
-  const galleryVisibleVideos = useMemo(() => {
-    if (systemWideGalleryMode) return galleryAvailableVideos
-    return galleryAvailableVideos.slice(0, galleryVisibleCount)
-  }, [systemWideGalleryMode, galleryAvailableVideos, galleryVisibleCount])
-  const galleryHasMore = systemWideGalleryMode
-    ? (useSystemWideAdminGallery ? false : systemGalleryHasMore)
-    : galleryVisibleVideos.length < galleryAvailableVideos.length
-  const galleryCurrentTotal = galleryViewTotal
+  const galleryVisibleVideos = galleryAvailableVideos
+  const galleryHasMore = categoryFilter === 'used' ? galleryUsedHasMore : systemGalleryHasMore
+  const galleryCurrentTotal = categoryFilter === 'used' ? galleryUsedTotalCount : galleryReadyTotalCount
   const appViewportStyle = {
     height: 'var(--tg-viewport-stable-height, 100dvh)',
     minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
@@ -5001,11 +4996,7 @@ function App() {
     const observer = new IntersectionObserver((entries) => {
       const first = entries[0]
       if (!first?.isIntersecting) return
-      if (systemWideGalleryMode) {
-        void loadSystemGalleryPage()
-        return
-      }
-      setGalleryVisibleCount((prev) => Math.min(prev + GALLERY_BATCH_SIZE, galleryAvailableVideos.length))
+      void loadSystemGalleryPage()
     }, {
       root,
       rootMargin: '360px 0px',
@@ -5014,7 +5005,7 @@ function App() {
 
     observer.observe(target)
     return () => observer.disconnect()
-  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, videos.length, galleryLoadingMore])
+  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryLoadingMore, categoryFilter, videos.length, usedVideos.length])
 
   useEffect(() => {
     if (tab !== 'gallery' || isAllOriginalMode || galleryLoading || !galleryHasMore) return
@@ -5032,12 +5023,7 @@ function App() {
         const distanceToBottom = root.scrollHeight - root.scrollTop - root.clientHeight
         if (distanceToBottom > 480) return
 
-        if (systemWideGalleryMode) {
-          void loadSystemGalleryPage()
-          return
-        }
-
-        setGalleryVisibleCount((prev) => Math.min(prev + GALLERY_BATCH_SIZE, galleryAvailableVideos.length))
+        void loadSystemGalleryPage()
       })
     }
 
@@ -5047,7 +5033,49 @@ function App() {
       root.removeEventListener('scroll', maybeLoadMore)
       if (rafId) window.cancelAnimationFrame(rafId)
     }
-  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryAvailableVideos.length, systemWideGalleryMode, galleryLoadingMore])
+  }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryLoadingMore, categoryFilter, videos.length, usedVideos.length])
+
+  useEffect(() => {
+    if (tab !== 'inbox' || inboxLoading || !inboxHasMore || isSystemAdmin) return
+
+    const root = mainScrollRef.current
+    const target = inboxLoadMoreRef.current
+    if (!root || !target) return
+
+    const observer = new IntersectionObserver((entries) => {
+      const first = entries[0]
+      if (!first?.isIntersecting) return
+      void loadInboxSnapshot()
+    }, {
+      root,
+      rootMargin: '320px 0px',
+      threshold: 0.01,
+    })
+
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length])
+
+  useEffect(() => {
+    if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin) return
+
+    const root = mainScrollRef.current
+    const target = inboxLoadMoreRef.current
+    if (!root || !target) return
+
+    const observer = new IntersectionObserver((entries) => {
+      const first = entries[0]
+      if (!first?.isIntersecting) return
+      void loadSystemInbox()
+    }, {
+      root,
+      rootMargin: '320px 0px',
+      threshold: 0.01,
+    })
+
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
 
   // If viewing a specific page detail
   if (selectedPage) {
@@ -5175,13 +5203,13 @@ function App() {
                 onClick={() => setCategoryFilter('ready')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter !== 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                ยังไม่โพสต์ ({galleryReadyVideos.length})
+                ยังไม่โพสต์ ({galleryReadyTotalCount})
               </button>
               <button
                 onClick={() => setCategoryFilter('used')}
                 className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${categoryFilter === 'used' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
               >
-                โพสต์แล้ว ({galleryUsedVideos.length})
+                โพสต์แล้ว ({galleryUsedTotalCount})
               </button>
             </div>
           )}
@@ -5206,8 +5234,13 @@ function App() {
             isSystemAdmin={isSystemAdmin}
             systemInboxLoading={systemInboxLoading}
             systemInboxVideos={systemInboxVideos}
+            systemInboxLoadingMore={systemInboxLoadingMore}
+            systemInboxHasMore={systemInboxHasMore}
             inboxLoading={inboxLoading}
             inboxVideos={inboxVideos}
+            inboxLoadingMore={inboxLoadingMore}
+            inboxHasMore={inboxHasMore}
+            loadMoreRef={inboxLoadMoreRef}
             namespaceId={namespaceId}
             startingInboxId={startingInboxId}
             deletingInboxId={deletingInboxId}
@@ -5281,11 +5314,7 @@ function App() {
                     ? 'ยังไม่มีคลิปใน Gallery'
                     : categoryFilter === 'used'
                       ? 'ยังไม่มีคลิปที่โพสต์แล้ว'
-                      : categoryFilter === 'ready'
-                        ? 'ยังไม่มีคลิปรอโพสต์'
-                        : categoryFilter === 'pending-shortlink' && galleryShortlinkRequired
-                          ? 'ยังไม่มีคลิปรอย่อลิ้ง'
-                          : 'ยังไม่มีคลิปที่ลิงก์ยังไม่ครบ'}
+                      : 'ยังไม่มีคลิปรอโพสต์'}
                 </p>
                 <p className="text-gray-400 text-sm mt-1">
                   {gallerySearchQuery
@@ -5294,13 +5323,9 @@ function App() {
                     ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
                       ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
-                      : categoryFilter === 'ready'
-                        ? galleryShortlinkRequired
-                          ? 'คลิปที่ย่อลิ้งครบแล้วและพร้อมโพสต์จะแสดงที่นี่'
-                          : 'คลิปที่ประมวลผลเสร็จและลิงก์ครบแล้วจะพร้อมโพสต์ทันที'
-                        : categoryFilter === 'pending-shortlink' && galleryShortlinkRequired
-                          ? 'คลิปที่มี Lazada แล้วแต่ยังย่อลิ้งไม่ครบจะแสดงที่นี่'
-                          : 'คลิปที่ยังมีลิงก์ไม่ครบจะแสดงที่นี่'}
+                      : galleryShortlinkRequired
+                        ? 'คลิปที่ย่อลิ้งครบแล้วและพร้อมโพสต์จะแสดงที่นี่'
+                        : 'คลิปที่ประมวลผลเสร็จและลิงก์ครบแล้วจะพร้อมโพสต์ทันที'}
                 </p>
               </div>
             ) : (

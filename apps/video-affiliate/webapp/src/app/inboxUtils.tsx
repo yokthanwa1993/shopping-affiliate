@@ -8,8 +8,14 @@ export function isInboxVideoOwnedByCurrentNamespace(video: InboxVideo, currentNa
 
 export function compareInboxVideosForSystemView(a: InboxVideo, b: InboxVideo, currentNamespaceId?: string): number {
   void currentNamespaceId
-  const aTs = new Date(String(a.createdAt || a.updatedAt || '')).getTime()
-  const bTs = new Date(String(b.createdAt || b.updatedAt || '')).getTime()
+  const aCreatedTs = new Date(String(a.createdAt || '')).getTime()
+  const bCreatedTs = new Date(String(b.createdAt || '')).getTime()
+  const aTs = Number.isFinite(aCreatedTs) && aCreatedTs > 0
+    ? aCreatedTs
+    : new Date(String(a.updatedAt || '')).getTime()
+  const bTs = Number.isFinite(bCreatedTs) && bCreatedTs > 0
+    ? bCreatedTs
+    : new Date(String(b.updatedAt || '')).getTime()
   return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
 }
 
