@@ -505,7 +505,15 @@ type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
 type VoicePacePreset = 'slow' | 'balanced' | 'fast'
 type VoiceTonePreset = 'bright' | 'playful' | 'warm' | 'confident' | 'luxury' | 'friendly' | 'funny' | 'sales'
-type CoverTextFontId = 'kanit-bold' | 'prompt-bold' | 'sarabun-bold' | 'bai-jamjuree-bold'
+type CoverTextFontId =
+  | 'kanit-bold'
+  | 'prompt-bold'
+  | 'sarabun-bold'
+  | 'bai-jamjuree-bold'
+  | 'mitr-bold'
+  | 'krub-bold'
+  | 'chakra-petch-bold'
+  | 'ibm-plex-sans-thai-bold'
 
 type VoiceProfile = {
   voice_name: string
@@ -547,6 +555,10 @@ const COVER_TEXT_FONT_OPTIONS: Array<{ value: CoverTextFontId; label: string; hi
   { value: 'prompt-bold', label: 'Prompt Bold', hint: 'กลมทันสมัย อ่านง่าย', family: 'Prompt' },
   { value: 'sarabun-bold', label: 'Sarabun Bold', hint: 'สุภาพ คม ชัด', family: 'Sarabun' },
   { value: 'bai-jamjuree-bold', label: 'Bai Jamjuree Bold', hint: 'โมเดิร์น เท่ มีน้ำหนัก', family: 'Bai Jamjuree' },
+  { value: 'mitr-bold', label: 'Mitr Bold', hint: 'อวบแน่น เด่น เหมาะกับปกขายของ', family: 'Mitr' },
+  { value: 'krub-bold', label: 'Krub Bold', hint: 'มินิมอล อ่านง่าย ดูสะอาด', family: 'Krub' },
+  { value: 'chakra-petch-bold', label: 'Chakra Petch Bold', hint: 'เหลี่ยมเท่ มีคาแรกเตอร์', family: 'Chakra Petch' },
+  { value: 'ibm-plex-sans-thai-bold', label: 'IBM Plex Sans Thai Bold', hint: 'คม เนี้ยบ สไตล์มืออาชีพ', family: 'IBM Plex Sans Thai' },
 ]
 
 const createDefaultVoiceProfile = (): VoiceProfile => ({
@@ -1013,9 +1025,10 @@ function dedupeGalleryVideos(rows: Video[]): Video[] {
 }
 
 const getInboxVideoSortMs = (video: Partial<InboxVideo> & Record<string, unknown>) => {
+  const updatedTs = new Date(String(video.updatedAt || '')).getTime()
+  if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
   const createdTs = new Date(String(video.createdAt || '')).getTime()
   if (Number.isFinite(createdTs) && createdTs > 0) return createdTs
-  const updatedTs = new Date(String(video.updatedAt || '')).getTime()
   return Number.isFinite(updatedTs) ? updatedTs : 0
 }
 
@@ -3603,9 +3616,29 @@ function App() {
 
   useEffect(() => {
     if (authBootstrapping || !token) return
-    if (tab !== 'inbox' || isSystemAdmin) return
-    void loadInboxSnapshot({ reset: true })
-  }, [tab, token, authBootstrapping, isSystemAdmin])
+    if (tab !== 'inbox') return
+
+    const refreshInboxView = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      if (isSystemAdmin) {
+        void loadSystemInbox(systemInboxVideos.length === 0 ? { reset: true } : { refreshTop: true })
+        return
+      }
+      void loadInboxSnapshot(inboxVideos.length === 0 ? { reset: true } : { refreshTop: true })
+    }
+
+    refreshInboxView()
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return
+      refreshInboxView()
+    }
+    window.addEventListener('focus', refreshInboxView)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      window.removeEventListener('focus', refreshInboxView)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [tab, token, authBootstrapping, isSystemAdmin, inboxVideos.length, systemInboxVideos.length])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3766,23 +3799,26 @@ function App() {
     }
   }
 
-  async function loadInboxSnapshot(options: { reset?: boolean } = {}) {
+  async function loadInboxSnapshot(options: { reset?: boolean; refreshTop?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
     const reset = !!options.reset
-    const requestId = reset ? ++inboxRequestRef.current : inboxRequestRef.current
-    if (!reset && (inboxLoadingMore || !inboxHasMore)) return
+    const refreshTop = !!options.refreshTop
+    const requestId = reset || refreshTop ? ++inboxRequestRef.current : inboxRequestRef.current
+    if (!reset && !refreshTop && (inboxLoadingMore || !inboxHasMore)) return
+    if (refreshTop && inboxLoadingMore) return
 
-    const offset = reset ? 0 : inboxVideos.length
+    const offset = reset || refreshTop ? 0 : inboxVideos.length
     const shouldShowLoading = reset && inboxVideos.length === 0
     if (shouldShowLoading) setInboxLoading(true)
-    if (!reset) setInboxLoadingMore(true)
+    if (!reset && !refreshTop) setInboxLoadingMore(true)
 
     try {
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
+      if (offset === 0) params.set('_ts', String(Date.now()))
       const resp = await apiFetch(`${WORKER_URL}/api/inbox?${params.toString()}`)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
@@ -3794,34 +3830,44 @@ function App() {
       if (requestId !== inboxRequestRef.current) return
 
       const nextVideos = Array.isArray(data.videos) ? data.videos : []
-      setInboxVideos((prev) => reset ? nextVideos : mergeInboxVideos(prev, nextVideos))
-      setInboxHasMore(!!data.has_more && nextVideos.length > 0)
+      const nextTotal = Number(data.total || 0)
+      setInboxVideos((prev) => {
+        const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
+        setInboxHasMore(merged.length < nextTotal)
+        return merged
+      })
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
       if (requestId === inboxRequestRef.current) {
         if (shouldShowLoading) setInboxLoading(false)
-        if (!reset) setInboxLoadingMore(false)
+        if (!reset && !refreshTop) setInboxLoadingMore(false)
       }
     }
   }
 
-  async function loadSystemInbox(options: { reset?: boolean } = {}) {
+  async function loadSystemInbox(options: { reset?: boolean; refreshTop?: boolean } = {}) {
     if (!token || !isSystemAdmin) return
 
     const reset = !!options.reset
-    const requestId = reset ? ++systemInboxRequestRef.current : systemInboxRequestRef.current
-    if (!reset && (systemInboxLoadingMore || !systemInboxHasMore)) return
+    const refreshTop = !!options.refreshTop
+    const requestId = reset || refreshTop ? ++systemInboxRequestRef.current : systemInboxRequestRef.current
+    if (!reset && !refreshTop && (systemInboxLoadingMore || !systemInboxHasMore)) return
+    if (refreshTop && systemInboxLoadingMore) return
 
-    const offset = reset ? 0 : systemInboxVideos.length
+    const offset = reset || refreshTop ? 0 : systemInboxVideos.length
     const shouldShowLoading = reset && systemInboxVideos.length === 0
     if (shouldShowLoading) setSystemInboxLoading(true)
-    if (!reset) setSystemInboxLoadingMore(true)
+    if (!reset && !refreshTop) setSystemInboxLoadingMore(true)
 
     try {
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
+      if (offset === 0) {
+        params.set('fresh', '1')
+        params.set('_ts', String(Date.now()))
+      }
       const resp = await apiFetch(`${WORKER_URL}/api/inbox/system?${params.toString()}`)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
@@ -3833,14 +3879,18 @@ function App() {
       if (requestId !== systemInboxRequestRef.current) return
 
       const nextVideos = Array.isArray(data.videos) ? data.videos : []
-      setSystemInboxVideos((prev) => reset ? nextVideos : mergeInboxVideos(prev, nextVideos))
-      setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
+      const nextTotal = Number(data.total || 0)
+      setSystemInboxVideos((prev) => {
+        const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
+        setSystemInboxHasMore(merged.length < nextTotal)
+        return merged
+      })
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
       if (requestId === systemInboxRequestRef.current) {
         if (shouldShowLoading) setSystemInboxLoading(false)
-        if (!reset) setSystemInboxLoadingMore(false)
+        if (!reset && !refreshTop) setSystemInboxLoadingMore(false)
       }
     }
   }
@@ -4166,12 +4216,6 @@ function App() {
     void loadGallerySnapshotBundle()
     if (isOwner) void loadGlobalOriginalVideos()
   }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
-
-  useEffect(() => {
-    if (authBootstrapping || !token || !isSystemAdmin) return
-    if (tab !== 'inbox') return
-    void loadSystemInbox({ reset: true })
-  }, [tab, token, authBootstrapping, isSystemAdmin])
 
   async function loadDashboard(dateValue = dashboardDateFilter, options: { silent?: boolean } = {}) {
     const session = getToken()
@@ -6740,24 +6784,27 @@ function App() {
                         <>
                           <div className="space-y-2">
                             <p className="text-[11px] font-semibold text-gray-600">ฟอนต์</p>
-                            <div className="grid grid-cols-1 gap-2">
-                              {COVER_TEXT_FONT_OPTIONS.map((option) => {
-                                const active = coverTextStyleDraft.font_id === option.value
-                                return (
-                                  <button
-                                    key={option.value}
-                                    type="button"
-                                    onClick={() => {
-                                      setCoverTextStyleDraft((prev) => ({ ...prev, font_id: option.value }))
-                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
-                                    }}
-                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-700'}`}
-                                  >
-                                    <p className="text-sm font-semibold">{option.label}</p>
-                                    <p className="text-[11px] text-gray-400">{option.hint}</p>
-                                  </button>
-                                )
-                              })}
+                            <div className="space-y-2">
+                              <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                                <select
+                                  value={coverTextStyleDraft.font_id}
+                                  onChange={(e) => {
+                                    setCoverTextStyleDraft((prev) => ({ ...prev, font_id: normalizeCoverTextFontId(e.target.value) }))
+                                    if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                  }}
+                                  className="w-full bg-transparent text-sm font-semibold text-gray-800 outline-none"
+                                  style={{ fontFamily: `${getCoverTextFontFamily(coverTextStyleDraft.font_id)}, Kanit, sans-serif` }}
+                                >
+                                  {COVER_TEXT_FONT_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <p className="text-[11px] text-gray-400">
+                                {COVER_TEXT_FONT_OPTIONS.find((option) => option.value === coverTextStyleDraft.font_id)?.hint || ''}
+                              </p>
                             </div>
                           </div>
 

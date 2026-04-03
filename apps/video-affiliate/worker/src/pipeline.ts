@@ -154,6 +154,7 @@ export type Env = {
     GEMINI_MODEL: string
     CORS_ORIGIN: string
     WEBAPP_URL?: string
+    WEBAPP_DESKTOP_URL?: string
     BROWSERSAVING_WORKER_URL?: string
     BROWSERSAVING_API_URL?: string
     TAG_SYNC_PUSH_SECRET?: string
@@ -281,6 +282,106 @@ function buildWorkerGalleryAssetUrl(workerUrl: string, botId: string, videoId: s
     const normalizedVideoId = String(videoId || '').trim()
     if (!base || !normalizedBotId || !normalizedVideoId) return ''
     return `${base}/api/gallery/${encodeURIComponent(normalizedVideoId)}/asset/${variant}?namespace_id=${encodeURIComponent(normalizedBotId)}`
+}
+
+function getPipelineOriginalAssetKeys(videoId: string): string[] {
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedVideoId) return []
+    return [
+        `videos/${normalizedVideoId}_original.mp4`,
+        `videos/${normalizedVideoId}_line_original.mp4`,
+    ]
+}
+
+function looksLikeInternalOriginalSource(videoUrl: string, videoId: string): boolean {
+    const normalizedUrl = String(videoUrl || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedUrl || !normalizedVideoId) return false
+    return normalizedUrl.includes(`/videos/${normalizedVideoId}_original.mp4`)
+        || normalizedUrl.includes(`/videos/${normalizedVideoId}_line_original.mp4`)
+        || normalizedUrl.includes(`/api/gallery/${normalizedVideoId}/asset/original`)
+}
+
+async function readBucketJson(
+    bucket: R2Bucket,
+    key: string,
+): Promise<Record<string, unknown> | null> {
+    const obj = await bucket.get(key).catch(() => null)
+    if (!obj) return null
+    return obj.json().catch(() => null) as Promise<Record<string, unknown> | null>
+}
+
+async function ensurePipelineSourceUrlAvailable(
+    env: Env,
+    workerUrl: string,
+    botId: string,
+    videoId: string,
+    rawVideoUrl: string,
+): Promise<string> {
+    const normalizedVideoId = String(videoId || '').trim()
+    const normalizedVideoUrl = String(rawVideoUrl || '').trim()
+    if (!normalizedVideoId || !normalizedVideoUrl) return normalizedVideoUrl
+
+    const resolvedSourceUrl = resolvePipelineSourceUrl(workerUrl, botId, normalizedVideoUrl, normalizedVideoId)
+    if (!looksLikeInternalOriginalSource(normalizedVideoUrl, normalizedVideoId)) {
+        return resolvedSourceUrl || normalizedVideoUrl
+    }
+
+    const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+    const originalHeads = await Promise.all(
+        getPipelineOriginalAssetKeys(normalizedVideoId).map((key) => bucket.head(key).catch(() => null)),
+    )
+    if (originalHeads.some(Boolean)) {
+        return resolvedSourceUrl || normalizedVideoUrl
+    }
+
+    const [inbox, linkContext] = await Promise.all([
+        readBucketJson(bucket, `_inbox/${normalizedVideoId}.json`),
+        readBucketJson(bucket, `_link_context/${normalizedVideoId}.json`),
+    ])
+
+    const sourceType = String(inbox?.sourceType || linkContext?.sourceType || '').trim().toLowerCase()
+    const sourceLabel = String(inbox?.sourceLabel || linkContext?.sourceLabel || '').trim()
+    const fallbackExternalVideoUrl = String(linkContext?.videoUrl || inbox?.videoUrl || '').trim()
+
+    let recoveryUrl = ''
+    let headers: Record<string, string> | undefined
+
+    if (sourceType === 'xhs_url' && /xhslink\.com|xiaohongshu\.com/i.test(sourceLabel)) {
+        const resolved = await resolveXhsVideo(sourceLabel, env)
+        if (resolved) {
+            recoveryUrl = resolved
+            headers = { Referer: 'https://www.xiaohongshu.com/' }
+        }
+    } else if (fallbackExternalVideoUrl && !looksLikeInternalOriginalSource(fallbackExternalVideoUrl, normalizedVideoId)) {
+        recoveryUrl = fallbackExternalVideoUrl
+    }
+
+    if (!recoveryUrl) {
+        throw new Error('missing_original_video_asset_unrecoverable')
+    }
+
+    const resp = await fetch(recoveryUrl, headers ? { headers } : undefined)
+    if (!resp.ok || !resp.body) {
+        throw new Error(`missing_original_video_asset_recovery_failed_http_${resp.status}`)
+    }
+
+    const contentType = String(resp.headers.get('content-type') || '').trim().toLowerCase()
+    const bytes = await resp.arrayBuffer()
+    const isHtml = contentType.includes('html')
+        || contentType.includes('text/')
+        || bytes.byteLength < 1024
+    if (isHtml) {
+        throw new Error('missing_original_video_asset_recovery_invalid_content')
+    }
+
+    await bucket.put(`videos/${normalizedVideoId}_original.mp4`, bytes, {
+        httpMetadata: {
+            contentType: contentType.startsWith('video/') ? contentType : 'video/mp4',
+        },
+    })
+
+    return buildWorkerGalleryAssetUrl(workerUrl, botId, normalizedVideoId, 'original') || resolvedSourceUrl || normalizedVideoUrl
 }
 
 function resolvePipelineSourceUrl(workerUrl: string, botId: string, videoUrl: string, videoId: string): string {
@@ -682,7 +783,7 @@ export async function runPipeline(
         }
 
         const workerUrl = String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev'
-        directVideoUrl = resolvePipelineSourceUrl(workerUrl, botId, directVideoUrl, videoId)
+        directVideoUrl = await ensurePipelineSourceUrlAvailable(env, workerUrl, botId, videoId, directVideoUrl)
 
         // ส่งงานทั้งหมดไป Container /pipeline — รัน background ไม่มี time limit
         const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')

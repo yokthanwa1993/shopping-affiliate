@@ -5563,6 +5563,10 @@ function normalizeCoverTextStyleFontId(rawValue: unknown): CoverTextStyleFontId 
         case 'prompt-bold':
         case 'sarabun-bold':
         case 'bai-jamjuree-bold':
+        case 'mitr-bold':
+        case 'krub-bold':
+        case 'chakra-petch-bold':
+        case 'ibm-plex-sans-thai-bold':
             return normalized
         case 'fc-iconic-bold':
             return 'kanit-bold'
@@ -6277,83 +6281,10 @@ function buildLineCoverTextPositionPickerFlex(params: {
                                 aspectRatio: '9:16',
                                 action: {
                                     type: 'postback',
-                                    label: `เลือกตำแหน่ง ${positionOption.yPct}%`,
+                                    label: 'เลือกตำแหน่งนี้',
                                     data: postbackData,
-                                    displayText: `เลือกระดับข้อความ ${positionOption.yPct}%`,
+                                    displayText: 'เลือกตำแหน่งข้อความนี้',
                                 },
-                            },
-                            {
-                                type: 'box',
-                                layout: 'horizontal',
-                                position: 'absolute',
-                                offsetTop: '12px',
-                                offsetStart: '12px',
-                                offsetEnd: '12px',
-                                justifyContent: 'center',
-                                contents: [
-                                    {
-                                        type: 'box',
-                                        layout: 'horizontal',
-                                        backgroundColor: '#111827CC',
-                                        cornerRadius: '999px',
-                                        paddingTop: '6px',
-                                        paddingBottom: '6px',
-                                        paddingStart: '12px',
-                                        paddingEnd: '12px',
-                                        contents: [
-                                            {
-                                                type: 'text',
-                                                text: `${positionOption.yPct}%`,
-                                                weight: 'bold',
-                                                size: 'sm',
-                                                color: '#FFFFFF',
-                                                align: 'center',
-                                            },
-                                        ],
-                                    },
-                                ],
-                            },
-                            {
-                                type: 'box',
-                                layout: 'horizontal',
-                                position: 'absolute',
-                                offsetStart: '12px',
-                                offsetEnd: '12px',
-                                offsetBottom: '12px',
-                                justifyContent: 'center',
-                                contents: [
-                                    {
-                                        type: 'box',
-                                        layout: 'vertical',
-                                        flex: 1,
-                                        contents: [],
-                                    },
-                                    {
-                                        type: 'box',
-                                        layout: 'vertical',
-                                        flex: 6,
-                                        contents: [
-                                            {
-                                                type: 'button',
-                                                style: 'primary',
-                                                color: '#2563EB',
-                                                height: 'sm',
-                                                action: {
-                                                    type: 'postback',
-                                                    label: 'ใช้ตำแหน่งนี้',
-                                                    data: postbackData,
-                                                    displayText: `เลือกระดับข้อความ ${positionOption.yPct}%`,
-                                                },
-                                            },
-                                        ],
-                                    },
-                                    {
-                                        type: 'box',
-                                        layout: 'vertical',
-                                        flex: 1,
-                                        contents: [],
-                                    },
-                                ],
                             },
                         ],
                     },
@@ -6983,12 +6914,12 @@ async function materializeSelectedLineCoverOptionAssets(params: {
         }
         : undefined
 
-    const [webpBytes, jpgBytes] = await Promise.all([
+    const [finalCoverBytes, jpgBytes] = await Promise.all([
         generateThumbnailViaContainer(params.env, originalVideoUrl, option.seed, undefined, 'webp', 1080, 1920, overlay),
         generateThumbnailViaContainer(params.env, originalVideoUrl, option.seed, undefined, 'jpg', 1080, 1920, overlay).catch(() => null),
     ])
 
-    await params.bucket.put(`_inbox_cover/${videoId}.webp`, webpBytes, {
+    await params.bucket.put(`_inbox_cover/${videoId}.webp`, finalCoverBytes, {
         httpMetadata: { contentType: 'image/webp' },
     })
 
@@ -9587,9 +9518,10 @@ function dedupeInboxArchiveVideos(videos: Array<Record<string, unknown>>): Array
 }
 
 function getInboxVideoSortMs(video: Record<string, unknown>): number {
+    const updatedTs = new Date(String(video.updatedAt || '')).getTime()
+    if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
     const createdTs = new Date(String(video.createdAt || '')).getTime()
     if (Number.isFinite(createdTs) && createdTs > 0) return createdTs
-    const updatedTs = new Date(String(video.updatedAt || '')).getTime()
     return Number.isFinite(updatedTs) ? updatedTs : 0
 }
 
@@ -10133,8 +10065,8 @@ async function syncImportedOriginalIntoNamespace(params: {
     const manualCaption = existing
         ? normalizeManualCaption(existing.manualCaption || '')
         : sourceManualCaption
-    const createdAt = String(existing?.createdAt || params.sourceVideo.createdAt || params.sourceVideo.created_at || '').trim() || new Date().toISOString()
     const updatedAt = new Date().toISOString()
+    const createdAt = String(existing?.createdAt || '').trim() || updatedAt
 
     const nextRecord = await putInboxVideoRecord(params.targetBucket, {
         id: videoId,
@@ -10557,7 +10489,12 @@ app.get('/api/inbox', async (c) => {
             offset,
             limit,
             has_more: page.hasMore,
-        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
+        }, 200, {
+            'Cache-Control': offset === 0
+                ? 'private, no-store'
+                : 'private, max-age=15, stale-while-revalidate=60',
+            'Vary': 'x-auth-token',
+        })
     } catch (e) {
         return c.json({ error: String(e), videos: [] }, 500)
     }
@@ -10568,6 +10505,7 @@ app.get('/api/inbox/system', async (c) => {
         const offset = parseNonNegativeInt(c.req.query('offset'), 0)
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
+        const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
         const me = await c.env.DB.prepare('SELECT email, namespace_id FROM users WHERE session_token = ?').bind(token).first() as { email?: string; namespace_id?: string } | null
@@ -10577,7 +10515,9 @@ app.get('/api/inbox/system', async (c) => {
         const currentNamespaceId = String(me.namespace_id || c.get('botId') || '').trim()
 
         const bucket = c.get('bucket')
-        const cachedSnapshot = await readSystemInboxSnapshot(bucket, currentNamespaceId).catch(() => null)
+        const cachedSnapshot = forceFresh
+            ? null
+            : await readSystemInboxSnapshot(bucket, currentNamespaceId).catch(() => null)
         const cachedVideos = cachedSnapshot?.videos || []
         const cacheAgeMs = cachedSnapshot ? Math.max(0, Date.now() - cachedSnapshot.builtAtMs) : Number.POSITIVE_INFINITY
         const shouldRefreshCache = !cachedSnapshot || cacheAgeMs > SYSTEM_INBOX_CACHE_TTL_MS
@@ -10625,7 +10565,12 @@ app.get('/api/inbox/system', async (c) => {
             offset,
             limit,
             has_more: page.hasMore,
-        }, 200, { 'Cache-Control': 'private, max-age=15, stale-while-revalidate=60', 'Vary': 'x-auth-token' })
+        }, 200, {
+            'Cache-Control': forceFresh || offset === 0
+                ? 'private, no-store'
+                : 'private, max-age=15, stale-while-revalidate=60',
+            'Vary': 'x-auth-token',
+        })
     } catch (e) {
         return c.json({ error: String(e), videos: [] }, 500)
     }
@@ -12302,7 +12247,15 @@ const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
 const PAGES_TOKEN_MIGRATE_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000
 
-type CoverTextStyleFontId = 'kanit-bold' | 'prompt-bold' | 'sarabun-bold' | 'bai-jamjuree-bold'
+type CoverTextStyleFontId =
+    | 'kanit-bold'
+    | 'prompt-bold'
+    | 'sarabun-bold'
+    | 'bai-jamjuree-bold'
+    | 'mitr-bold'
+    | 'krub-bold'
+    | 'chakra-petch-bold'
+    | 'ibm-plex-sans-thai-bold'
 
 type CoverTextStyleSettings = {
     fontId: CoverTextStyleFontId
@@ -18758,15 +18711,41 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
     }
 
-    return publishReelViaVideosEndpointWithTokenFallback({
-        pageId: params.pageId,
-        accessTokens: candidates,
-        videoBuffer: params.videoBuffer,
-        thumbnailBuffer: params.thumbnailBuffer,
-        thumbnailContentType: params.thumbnailContentType,
-        description: params.description,
-        logPrefix: params.logPrefix,
-    })
+    try {
+        return await publishReelViaVideosEndpointWithTokenFallback({
+            pageId: params.pageId,
+            accessTokens: candidates,
+            videoBuffer: params.videoBuffer,
+            thumbnailBuffer: params.thumbnailBuffer,
+            thumbnailContentType: params.thumbnailContentType,
+            description: params.description,
+            logPrefix: params.logPrefix,
+        })
+    } catch (directErr) {
+        const directMessage = parseFacebookErrorLike(directErr)?.message || (directErr instanceof Error ? directErr.message : String(directErr))
+        const resumableCandidates = normalizePostTokenPool([
+            ...params.postTokens,
+            ...candidates,
+        ])
+        if (resumableCandidates.length === 0) {
+            throw directErr
+        }
+
+        console.warn(`[${params.logPrefix}] direct /videos publish failed, falling back to 3-step /video_reels (${directMessage})`)
+
+        try {
+            return await publishReelDirectWithTokenFallback({
+                pageId: params.pageId,
+                postTokens: resumableCandidates,
+                videoBuffer: params.videoBuffer,
+                description: params.description,
+                logPrefix: `${params.logPrefix} /video_reels`,
+            })
+        } catch (resumableErr) {
+            const resumableMessage = parseFacebookErrorLike(resumableErr)?.message || (resumableErr instanceof Error ? resumableErr.message : String(resumableErr))
+            throw new Error(`facebook_publish_all_paths_failed: direct=${directMessage} | video_reels=${resumableMessage}`)
+        }
+    }
 }
 
 async function loadPostingThumbnailAsset(params: {
@@ -18780,8 +18759,8 @@ async function loadPostingThumbnailAsset(params: {
 
     const bucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
     const candidates: Array<{ key: string; fallbackContentType: string }> = [
-        { key: `_inbox_cover/${videoId}_preview.jpg`, fallbackContentType: 'image/jpeg' },
         { key: `_inbox_cover/${videoId}.webp`, fallbackContentType: 'image/webp' },
+        { key: `_inbox_cover/${videoId}_preview.jpg`, fallbackContentType: 'image/jpeg' },
     ]
 
     for (const candidate of candidates) {

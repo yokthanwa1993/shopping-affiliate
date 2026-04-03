@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS namespace_video_state (
   shopee_converted_at TEXT NOT NULL DEFAULT '',
   lazada_converted_at TEXT NOT NULL DEFAULT '',
   lazada_member_id TEXT NOT NULL DEFAULT '',
+  source_fingerprint TEXT NOT NULL DEFAULT '',
   posted_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
