@@ -6964,6 +6964,12 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         captionProvidedAt: manualCaption ? nowIso : '',
         updatedAt: nowIso,
     })
+    await upsertSystemInboxSnapshotVideo({
+        env: params.env,
+        adminNamespaceId: params.namespaceId,
+        bucket: params.bucket,
+        record: inboxRecord,
+    }).catch(() => { })
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
     await promoteSelectedInboxCoverToOriginalThumbnail({
@@ -9720,6 +9726,30 @@ async function writeSystemInboxSnapshot(
     })
 }
 
+async function upsertSystemInboxSnapshotVideo(params: {
+    env: Env
+    adminNamespaceId: string
+    bucket: R2Bucket
+    record: InboxVideoRecord
+}): Promise<void> {
+    const adminNamespaceId = String(params.adminNamespaceId || '').trim()
+    if (!adminNamespaceId) return
+
+    const namespaceEmailMap = await getNamespaceOwnerEmailMap(params.env.DB)
+    const nextVideo = buildInboxVideoResponseForNamespace(
+        params.env,
+        params.record,
+        adminNamespaceId,
+        namespaceEmailMap.get(adminNamespaceId) || '',
+    )
+    const cachedSnapshot = await readSystemInboxSnapshot(params.bucket, adminNamespaceId).catch(() => null)
+    const mergedVideos = dedupeSystemInboxVideos([
+        nextVideo,
+        ...Array.isArray(cachedSnapshot?.videos) ? cachedSnapshot!.videos : [],
+    ], adminNamespaceId)
+    await writeSystemInboxSnapshot(params.bucket, adminNamespaceId, mergedVideos)
+}
+
 async function listNamespaceOriginalArchiveVideos(params: {
     env: Env
     bucket: R2Bucket
@@ -10089,6 +10119,12 @@ async function syncImportedOriginalIntoNamespace(params: {
             ? (String(existing?.captionProvidedAt || '').trim() || updatedAt)
             : String(existing?.captionProvidedAt || '').trim(),
     })
+    await upsertSystemInboxSnapshotVideo({
+        env: params.env,
+        adminNamespaceId: targetNamespaceId,
+        bucket: params.targetBucket,
+        record: nextRecord,
+    }).catch(() => { })
 
     await ensureImportedVideosTable(params.env.DB)
     await params.env.DB.prepare(

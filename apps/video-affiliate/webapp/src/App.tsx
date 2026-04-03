@@ -100,7 +100,7 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
   return !!(account || shopeeBase || lazadaBase || utmId || memberId)
 }
 
-const CACHE_VERSION = 'v10'
+const CACHE_VERSION = 'v11'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
@@ -3625,9 +3625,11 @@ function App() {
       if (document.visibilityState !== 'visible') return
       refreshInboxView()
     }
+    const timer = window.setInterval(refreshInboxView, 12000)
     window.addEventListener('focus', refreshInboxView)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
+      window.clearInterval(timer)
       window.removeEventListener('focus', refreshInboxView)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
@@ -3884,7 +3886,7 @@ function App() {
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
-      if (offset === 0) {
+      if (reset && offset === 0) {
         params.set('fresh', '1')
         params.set('_ts', String(Date.now()))
       }
@@ -3903,7 +3905,7 @@ function App() {
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
         return merged
       })
-      setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
+      setSystemInboxHasMore((reset ? false : systemInboxVideos.length > nextVideos.length) || (!!data.has_more && nextVideos.length > 0))
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
@@ -4008,18 +4010,19 @@ function App() {
     }
   }
 
-  async function loadReadyGalleryPage(options: { reset?: boolean; silent?: boolean } = {}) {
+  async function loadReadyGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
     const reset = !!options.reset
-    const requestId = reset ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
-    if (!reset && (galleryLoadingMore || !systemGalleryHasMore)) return
+    const refreshTop = !!options.refreshTop
+    const requestId = reset || refreshTop ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
+    if (!reset && !refreshTop && (galleryLoadingMore || !systemGalleryHasMore)) return
 
-    const offset = reset ? 0 : videos.length
+    const offset = reset || refreshTop ? 0 : videos.length
     const shouldShowLoading = reset && !options.silent && videos.length === 0
     if (shouldShowLoading) setGalleryLoading(true)
-    if (!reset && !options.silent) setGalleryLoadingMore(true)
+    if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(true)
 
     try {
       const params = new URLSearchParams()
@@ -4065,7 +4068,7 @@ function App() {
         Array.isArray(data.videos) ? data.videos : [],
         deletedGalleryKeysRef.current,
       )
-      setVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos))
+      setVideos((prev) => (reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos)))
       setGalleryReadyTotalCount(Number(data.ready_total || data.total || data.overall_total || 0))
       if (typeof data.used_total === 'number') {
         setGalleryUsedTotalCount(Number(data.used_total || 0))
@@ -4082,29 +4085,30 @@ function App() {
         inventoryTotal: Number(data.inventory_total || 0),
         readyTotal: Number(data.ready_total || data.total || data.overall_total || 0),
       })
-      setSystemGalleryHasMore(!!data.has_more && nextVideos.length > 0)
+      setSystemGalleryHasMore((refreshTop ? videos.length > nextVideos.length : false) || (!!data.has_more && nextVideos.length > 0))
     } catch {
       // Keep current gallery snapshot on transient errors.
     } finally {
       if (requestId === systemGalleryRequestRef.current) {
         if (shouldShowLoading) setGalleryLoading(false)
-        if (!reset && !options.silent) setGalleryLoadingMore(false)
+        if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(false)
       }
     }
   }
 
-  async function loadUsedGalleryPage(options: { reset?: boolean; silent?: boolean } = {}) {
+  async function loadUsedGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
     const reset = !!options.reset
-    const requestId = reset ? ++usedGalleryRequestRef.current : usedGalleryRequestRef.current
-    if (!reset && (galleryLoadingMore || !galleryUsedHasMore)) return
+    const refreshTop = !!options.refreshTop
+    const requestId = reset || refreshTop ? ++usedGalleryRequestRef.current : usedGalleryRequestRef.current
+    if (!reset && !refreshTop && (galleryLoadingMore || !galleryUsedHasMore)) return
 
-    const offset = reset ? 0 : usedVideos.length
+    const offset = reset || refreshTop ? 0 : usedVideos.length
     const shouldShowLoading = reset && !options.silent && usedVideos.length === 0
     if (shouldShowLoading) setGalleryLoading(true)
-    if (!reset && !options.silent) setGalleryLoadingMore(true)
+    if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(true)
 
     try {
       const params = new URLSearchParams()
@@ -4145,43 +4149,45 @@ function App() {
         Array.isArray(data.videos) ? data.videos : [],
         deletedGalleryKeysRef.current,
       )
-      setUsedVideos((prev) => reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos))
+      setUsedVideos((prev) => (reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos)))
       setGalleryUsedTotalCount(Number(data.used_total || data.total || data.overall_total || 0))
       if (typeof data.ready_total === 'number') {
         setGalleryReadyTotalCount(Number(data.ready_total || 0))
       }
-      setGalleryUsedHasMore(!!data.has_more && nextVideos.length > 0)
+      setGalleryUsedHasMore((refreshTop ? usedVideos.length > nextVideos.length : false) || (!!data.has_more && nextVideos.length > 0))
     } catch {
       // Keep current gallery snapshot on transient errors.
     } finally {
       if (requestId === usedGalleryRequestRef.current) {
         if (shouldShowLoading) setGalleryLoading(false)
-        if (!reset && !options.silent) setGalleryLoadingMore(false)
+        if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(false)
       }
     }
   }
 
-  async function loadGallerySnapshotBundle() {
+  async function loadGallerySnapshotBundle(options: { reset?: boolean; refreshTop?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
+    const reset = !!options.reset
+    const refreshTop = !!options.refreshTop
     const shouldShowLoading = (categoryFilter === 'used' ? usedVideos.length === 0 : videos.length === 0)
-    if (shouldShowLoading) setGalleryLoading(true)
-    setGalleryLoadingMore(false)
+    if (reset && shouldShowLoading) setGalleryLoading(true)
+    if (reset) setGalleryLoadingMore(false)
 
     try {
       await Promise.all([
-        loadReadyGalleryPage({ reset: true, silent: categoryFilter === 'used' }),
-        loadUsedGalleryPage({ reset: true, silent: categoryFilter !== 'used' }),
+        loadReadyGalleryPage({ reset, refreshTop, silent: categoryFilter === 'used' }),
+        loadUsedGalleryPage({ reset, refreshTop, silent: categoryFilter !== 'used' }),
       ])
     } finally {
-      if (shouldShowLoading) setGalleryLoading(false)
+      if (reset && shouldShowLoading) setGalleryLoading(false)
     }
   }
 
   async function loadSystemGalleryPage(options: { reset?: boolean } = {}) {
     if (options.reset) {
-      await loadGallerySnapshotBundle()
+      await loadGallerySnapshotBundle({ reset: true })
       return
     }
 
@@ -4203,7 +4209,7 @@ function App() {
         if (categoryFilter === 'all-original' && isOwner) {
           tasks.push(loadGlobalOriginalVideos({ force: true }))
         } else {
-          tasks.push(loadGallerySnapshotBundle())
+          tasks.push(loadGallerySnapshotBundle({ reset: true }))
         }
       }
       if (tab === 'inbox') {
@@ -4240,9 +4246,10 @@ function App() {
       return
     }
 
-    void loadGallerySnapshotBundle()
+    const hasCachedGallery = categoryFilter === 'used' ? usedVideos.length > 0 : videos.length > 0
+    void loadGallerySnapshotBundle(hasCachedGallery && !gallerySearchQuery ? { refreshTop: true } : { reset: true })
     if (isOwner) void loadGlobalOriginalVideos()
-  }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
+  }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery, usedVideos.length, videos.length])
 
   async function loadDashboard(dateValue = dashboardDateFilter, options: { silent?: boolean } = {}) {
     const session = getToken()
