@@ -5559,10 +5559,17 @@ function normalizeHexColor(input: string): string {
 function normalizeCoverTextStyleFontId(rawValue: unknown): CoverTextStyleFontId {
     const normalized = String(rawValue || '').trim().toLowerCase()
     switch (normalized) {
-        case 'sukhumvit-bold':
-        case 'sukhumvit-semibold':
+        case 'kanit-bold':
+        case 'prompt-bold':
+        case 'sarabun-bold':
+        case 'bai-jamjuree-bold':
             return normalized
         case 'fc-iconic-bold':
+            return 'kanit-bold'
+        case 'sukhumvit-bold':
+            return 'prompt-bold'
+        case 'sukhumvit-semibold':
+            return 'sarabun-bold'
         default:
             return DEFAULT_COVER_TEXT_STYLE_FONT_ID
     }
@@ -12273,7 +12280,7 @@ const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://short.wwoom.com/'
 const ADMIN_SHORTLINK_ACCOUNT = 'CHEARB'
 const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
 const DEFAULT_COVER_TEMPLATE_ID = 'template-1'
-const DEFAULT_COVER_TEXT_STYLE_FONT_ID = 'fc-iconic-bold'
+const DEFAULT_COVER_TEXT_STYLE_FONT_ID = 'kanit-bold'
 const DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY = 0.94
 const DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE = 1
 const COVER_TEXT_STYLE_SIZE_SCALE_MIN = 0.8
@@ -12295,7 +12302,7 @@ const DEFAULT_PAGES_SYNC_COMMENT_SELECTORS = 'tag:comment'
 const PAGES_SYNC_MIN_INTERVAL_MS = 30 * 60 * 1000
 const PAGES_TOKEN_MIGRATE_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000
 
-type CoverTextStyleFontId = 'fc-iconic-bold' | 'sukhumvit-bold' | 'sukhumvit-semibold'
+type CoverTextStyleFontId = 'kanit-bold' | 'prompt-bold' | 'sarabun-bold' | 'bai-jamjuree-bold'
 
 type CoverTextStyleSettings = {
     fontId: CoverTextStyleFontId

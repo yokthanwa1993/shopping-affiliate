@@ -195,10 +195,13 @@ fn normalize_overlay_size_scale(input: Option<f64>) -> f64 {
 
 fn resolve_overlay_fontfile(font_id: &str) -> &'static str {
     match font_id.trim().to_ascii_lowercase().as_str() {
-        "sukhumvit-bold" => "/usr/local/share/fonts/SukhumvitSet-Bold.ttf",
-        "sukhumvit-semibold" => "/usr/local/share/fonts/SukhumvitSet-SemiBold.ttf",
-        "fc-iconic-bold" => "/usr/local/share/fonts/FC-Iconic-Bold.ttf",
-        _ => "/usr/local/share/fonts/FC-Iconic-Bold.ttf",
+        "prompt-bold" => "/usr/local/share/fonts/Prompt-Bold.ttf",
+        "sarabun-bold" => "/usr/local/share/fonts/Sarabun-Bold.ttf",
+        "bai-jamjuree-bold" => "/usr/local/share/fonts/BaiJamjuree-Bold.ttf",
+        "fc-iconic-bold" | "kanit-bold" => "/usr/local/share/fonts/Kanit-Bold.ttf",
+        "sukhumvit-bold" => "/usr/local/share/fonts/Prompt-Bold.ttf",
+        "sukhumvit-semibold" => "/usr/local/share/fonts/Sarabun-Bold.ttf",
+        _ => "/usr/local/share/fonts/Kanit-Bold.ttf",
     }
 }
 

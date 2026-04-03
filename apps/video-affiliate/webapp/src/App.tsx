@@ -505,7 +505,7 @@ type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
 type VoicePacePreset = 'slow' | 'balanced' | 'fast'
 type VoiceTonePreset = 'bright' | 'playful' | 'warm' | 'confident' | 'luxury' | 'friendly' | 'funny' | 'sales'
-type CoverTextFontId = 'fc-iconic-bold' | 'sukhumvit-bold' | 'sukhumvit-semibold'
+type CoverTextFontId = 'kanit-bold' | 'prompt-bold' | 'sarabun-bold' | 'bai-jamjuree-bold'
 
 type VoiceProfile = {
   voice_name: string
@@ -535,17 +535,18 @@ const DEFAULT_VOICE_PROFILE: VoiceProfile = {
 }
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
 const DEFAULT_COVER_TEXT_STYLE: CoverTextStyleSettings = {
-  font_id: 'fc-iconic-bold',
+  font_id: 'kanit-bold',
   text_color: '#FFFFFF',
   background_color: '#E53935',
   background_opacity: 0.94,
   size_scale: 1,
 }
 
-const COVER_TEXT_FONT_OPTIONS: Array<{ value: CoverTextFontId; label: string; hint: string }> = [
-  { value: 'fc-iconic-bold', label: 'FC Iconic Bold', hint: 'เด่น หนา ชัด' },
-  { value: 'sukhumvit-bold', label: 'Sukhumvit Bold', hint: 'ไทยโมเดิร์น หนานุ่ม' },
-  { value: 'sukhumvit-semibold', label: 'Sukhumvit SemiBold', hint: 'เรียบสะอาด อ่านง่าย' },
+const COVER_TEXT_FONT_OPTIONS: Array<{ value: CoverTextFontId; label: string; hint: string; family: string }> = [
+  { value: 'kanit-bold', label: 'Kanit Bold', hint: 'หนา เด่น แบบคอนเทนต์ขายของ', family: 'Kanit' },
+  { value: 'prompt-bold', label: 'Prompt Bold', hint: 'กลมทันสมัย อ่านง่าย', family: 'Prompt' },
+  { value: 'sarabun-bold', label: 'Sarabun Bold', hint: 'สุภาพ คม ชัด', family: 'Sarabun' },
+  { value: 'bai-jamjuree-bold', label: 'Bai Jamjuree Bold', hint: 'โมเดิร์น เท่ มีน้ำหนัก', family: 'Bai Jamjuree' },
 ]
 
 const createDefaultVoiceProfile = (): VoiceProfile => ({
@@ -564,6 +565,9 @@ const normalizeCoverHexColor = (value: unknown, fallback: string) => {
 
 const normalizeCoverTextFontId = (value: unknown): CoverTextFontId =>
   COVER_TEXT_FONT_OPTIONS.find((option) => option.value === value)?.value || DEFAULT_COVER_TEXT_STYLE.font_id
+
+const getCoverTextFontFamily = (fontId: CoverTextFontId) =>
+  COVER_TEXT_FONT_OPTIONS.find((option) => option.value === fontId)?.family || 'Kanit'
 
 const normalizeCoverTextStyle = (raw: Partial<CoverTextStyleSettings> | null | undefined): CoverTextStyleSettings => ({
   font_id: normalizeCoverTextFontId(raw?.font_id),
@@ -6837,6 +6841,7 @@ function App() {
                               <span
                                 className="inline-flex items-center justify-center rounded-lg px-4 py-2 text-center font-bold"
                                 style={{
+                                  fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
                                   color: coverTextStyleDraft.text_color,
                                   backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
                                   fontSize: `${Math.round(26 * coverTextStyleDraft.size_scale)}px`,
