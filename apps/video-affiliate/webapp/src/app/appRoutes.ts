@@ -67,7 +67,6 @@ export function getMergedSearchParams(search = '') {
 export function getInviteNamespaceFromSearch(search = '') {
   return String(getMergedSearchParams(search).get('invite') || '').trim()
 }
-
 export function getAppTabRouteFromLocation(pathname: string, search = ''): AppTabRoute {
   const fromPath = normalizeAppTabRoute(pathname)
   if (fromPath !== 'dashboard' || pathname === '/' || pathname === '') return fromPath
