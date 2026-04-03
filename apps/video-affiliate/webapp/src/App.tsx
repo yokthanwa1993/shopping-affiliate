@@ -503,7 +503,6 @@ type GeminiKeySource = 'system' | 'legacy' | 'none'
 type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'cover' | 'comment' | 'members'
 type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
-type VoicePacePreset = 'slow' | 'balanced' | 'fast'
 type VoiceTonePreset = 'bright' | 'playful' | 'warm' | 'confident' | 'luxury' | 'friendly' | 'funny' | 'sales'
 type CoverTextFontId =
   | 'kanit-bold'
@@ -519,7 +518,7 @@ type VoiceProfile = {
   voice_name: string
   persona: VoicePersonaPreset
   tones: VoiceTonePreset[]
-  pace: VoicePacePreset
+  custom_style_prompt: string
 }
 
 type CoverTextStyleSettings = {
@@ -539,7 +538,7 @@ const DEFAULT_VOICE_PROFILE: VoiceProfile = {
   voice_name: 'Puck',
   persona: 'female',
   tones: ['bright', 'friendly'],
-  pace: 'balanced',
+  custom_style_prompt: '',
 }
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
 const DEFAULT_COVER_TEXT_STYLE: CoverTextStyleSettings = {
@@ -622,16 +621,9 @@ const VOICE_TONE_OPTIONS: Array<{ value: VoiceTonePreset; label: string }> = [
   { value: 'sales', label: 'ขายเก่ง' },
 ]
 
-const VOICE_PACE_OPTIONS: Array<{ value: VoicePacePreset; label: string; hint: string }> = [
-  { value: 'slow', label: 'ช้า', hint: 'เว้นจังหวะชัด' },
-  { value: 'balanced', label: 'กลาง', hint: 'ธรรมชาติ' },
-  { value: 'fast', label: 'เร็ว', hint: 'กระชับทันคลิป' },
-]
-
 const normalizeVoiceProfile = (raw: Partial<VoiceProfile> | null | undefined): VoiceProfile => {
   const voiceName = String(raw?.voice_name || '').trim() || DEFAULT_VOICE_PROFILE.voice_name
   const persona = String(raw?.persona || '').trim()
-  const pace = String(raw?.pace || '').trim()
   const tones = Array.isArray(raw?.tones) ? raw?.tones : []
   const uniqueTones = Array.from(new Set(
     tones
@@ -643,14 +635,14 @@ const normalizeVoiceProfile = (raw: Partial<VoiceProfile> | null | undefined): V
     voice_name: voiceName,
     persona: VOICE_PERSONA_OPTIONS.some((option) => option.value === persona) ? persona as VoicePersonaPreset : DEFAULT_VOICE_PROFILE.persona,
     tones: uniqueTones.length > 0 ? uniqueTones : [...DEFAULT_VOICE_PROFILE.tones],
-    pace: VOICE_PACE_OPTIONS.some((option) => option.value === pace) ? pace as VoicePacePreset : DEFAULT_VOICE_PROFILE.pace,
+    custom_style_prompt: String(raw?.custom_style_prompt || '').trim().slice(0, 1200),
   }
 }
 
 const voiceProfilesEqual = (left: VoiceProfile, right: VoiceProfile) =>
   left.voice_name === right.voice_name &&
   left.persona === right.persona &&
-  left.pace === right.pace &&
+  left.custom_style_prompt === right.custom_style_prompt &&
   left.tones.length === right.tones.length &&
   left.tones.every((tone, index) => tone === right.tones[index])
 
@@ -2735,6 +2727,7 @@ function App() {
   const [voiceSettingsLoading, setVoiceSettingsLoading] = useState(false)
   const [voiceSettingsSaving, setVoiceSettingsSaving] = useState(false)
   const [voiceOptions, setVoiceOptions] = useState<GeminiVoiceOption[]>([])
+  const [voiceStylePromptMaxChars, setVoiceStylePromptMaxChars] = useState(1200)
   const [legacyVoicePromptActive, setLegacyVoicePromptActive] = useState(false)
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('')
   const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
@@ -4314,6 +4307,7 @@ function App() {
         updated_at?: string
         legacy_prompt_active?: boolean
         voice_options?: GeminiVoiceOption[]
+        max_style_chars?: number
       }
       const nextProfile = normalizeVoiceProfile(data.profile)
       setVoiceProfile(nextProfile)
@@ -4322,6 +4316,7 @@ function App() {
       setVoiceSettingsUpdatedAt(String(data.updated_at || ''))
       setLegacyVoicePromptActive(!!data.legacy_prompt_active || data.source === 'legacy')
       setVoiceOptions(Array.isArray(data.voice_options) ? data.voice_options : [])
+      if (typeof data.max_style_chars === 'number' && data.max_style_chars > 0) setVoiceStylePromptMaxChars(data.max_style_chars)
       setVoiceSettingsMessage('')
     } catch {
       setVoiceSettingsMessage('โหลดเสียงพากย์ไม่สำเร็จ')
@@ -4527,6 +4522,7 @@ function App() {
         updated_at?: string
         legacy_prompt_active?: boolean
         voice_options?: GeminiVoiceOption[]
+        max_style_chars?: number
       }
       const savedProfile = normalizeVoiceProfile(data.profile)
       setVoiceProfile(savedProfile)
@@ -4535,6 +4531,7 @@ function App() {
       setVoiceSettingsUpdatedAt(String(data.updated_at || new Date().toISOString()))
       setLegacyVoicePromptActive(!!data.legacy_prompt_active || data.source === 'legacy')
       setVoiceOptions(Array.isArray(data.voice_options) ? data.voice_options : [])
+      if (typeof data.max_style_chars === 'number' && data.max_style_chars > 0) setVoiceStylePromptMaxChars(data.max_style_chars)
       setVoiceSettingsMessage(options.reset ? 'รีเซ็ตเสียงพากย์เป็นค่าเริ่มต้นแล้ว' : 'บันทึกเสียงพากย์แล้ว (งานถัดไปจะใช้ทันที)')
     } catch {
       setVoiceSettingsMessage('บันทึกเสียงพากย์ไม่สำเร็จ')
@@ -6593,7 +6590,7 @@ function App() {
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ตั้งค่าเสียงของ workspace นี้ได้เลย งานถัดไปจะใช้ทันที โดยเลือก `voice_name` ของ Gemini จริง พร้อม preset น้ำเสียงของระบบ
+                        ตั้งค่าเสียงของ workspace นี้ได้เลย งานถัดไปจะใช้ทันที โดยเลือก `voice_name` ของ Gemini จริง พร้อม preset น้ำเสียงของระบบ และใส่ prompt เพิ่มเติมได้เองว่าต้องการให้พากย์สไตล์ไหน
                       </p>
                       {voiceSettingsLoading ? (
                         <p className="text-sm text-gray-400 py-3">กำลังโหลดเสียงพากย์...</p>
@@ -6686,31 +6683,31 @@ function App() {
                           </div>
 
                           <div className="space-y-2">
-                            <p className="text-[11px] font-semibold text-gray-600">จังหวะการพูด</p>
-                            <div className="grid grid-cols-3 gap-2">
-                              {VOICE_PACE_OPTIONS.map((option) => {
-                                const active = voiceProfileDraft.pace === option.value
-                                return (
-                                  <button
-                                    key={option.value}
-                                    type="button"
-                                    onClick={() => {
-                                      setVoiceProfileDraft((prev) => ({ ...prev, pace: option.value }))
-                                      if (voiceSettingsMessage) setVoiceSettingsMessage('')
-                                    }}
-                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-700'}`}
-                                  >
-                                    <p className="text-sm font-semibold">{option.label}</p>
-                                    <p className="text-[11px] text-gray-400">{option.hint}</p>
-                                  </button>
-                                )
-                              })}
+                            <div className="flex items-center justify-between">
+                              <p className="text-[11px] font-semibold text-gray-600">Prompt เพิ่มเติมสำหรับการพากย์</p>
+                              <p className={`text-[11px] ${voiceProfileDraft.custom_style_prompt.length > voiceStylePromptMaxChars ? 'text-red-500' : 'text-gray-400'}`}>
+                                {voiceProfileDraft.custom_style_prompt.length}/{voiceStylePromptMaxChars}
+                              </p>
                             </div>
+                            <textarea
+                              value={voiceProfileDraft.custom_style_prompt}
+                              onChange={(e) => {
+                                const nextValue = e.target.value.slice(0, voiceStylePromptMaxChars)
+                                setVoiceProfileDraft((prev) => ({ ...prev, custom_style_prompt: nextValue }))
+                                if (voiceSettingsMessage) setVoiceSettingsMessage('')
+                              }}
+                              rows={4}
+                              placeholder="เช่น พากย์แบบพรีเมียม สุภาพ แต่มีแรงขายเนียน ๆ หรือ พากย์แบบเพื่อนแนะนำของดี น้ำเสียงสดใส ไม่อ่านแข็ง"
+                              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-3 text-sm outline-none focus:border-blue-400 resize-none"
+                            />
+                            <p className="text-[11px] text-gray-400">
+                              ใส่สไตล์เฉพาะที่อยากให้ AI ใช้ตอนเขียนบทและตอนอ่านพากย์ เช่น ความขาย, ความขี้เล่น, ความพรีเมียม, ความเป็นกันเอง หรือคำต้องห้าม
+                            </p>
                           </div>
 
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
                             <p>ใช้ค่าแยกตาม workspace นี้</p>
-                            <p>Google Gemini TTS ใช้ `voice_name` จริง ส่วนเพศเสียง/โทน/จังหวะเป็น preset ที่ระบบเอาไปกำกับสคริปต์และน้ำเสียงให้อัตโนมัติ</p>
+                            <p>Google Gemini TTS ใช้ `voice_name` จริง ส่วนเพศเสียง/โทนเสียงและ prompt เพิ่มเติม จะถูกเอาไปกำกับทั้งการเขียนบทและน้ำเสียงตอนพากย์</p>
                           </div>
 
                           {voiceSettingsUpdatedAt && (

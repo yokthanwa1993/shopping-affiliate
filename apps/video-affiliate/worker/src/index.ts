@@ -30,7 +30,6 @@ import {
     getNamespaceVoiceSettings,
     getSystemGeminiApiKeys,
     normalizeVoiceProfile,
-    type VoicePacePreset,
     type VoicePersonaPreset,
     type VoiceProfile,
     type VoiceTonePreset,
@@ -4954,6 +4953,7 @@ app.get('/api/settings/voice-prompt', async (c) => {
         profile: settings.profile,
         prompt: settings.scriptPrompt,
         tts_prompt_template: settings.ttsPromptTemplate,
+        max_style_chars: settings.maxStyleChars,
         source: settings.source,
         updated_at: settings.updatedAt,
         legacy_prompt_active: settings.legacyPromptActive,
@@ -4972,22 +4972,23 @@ app.put('/api/settings/voice-prompt', async (c) => {
         voice_name?: string
         persona?: VoicePersonaPreset
         tones?: VoiceTonePreset[]
-        pace?: VoicePacePreset
+        custom_style_prompt?: string
     }
     const namespaceId = c.get('botId')
-    const hasStructuredProfile = !!body.profile || !!body.voice_name || !!body.persona || Array.isArray(body.tones) || !!body.pace
+    const hasStructuredProfile = !!body.profile || !!body.voice_name || !!body.persona || Array.isArray(body.tones) || typeof body.custom_style_prompt === 'string'
     if (hasStructuredProfile) {
         const latest = await setNamespaceVoiceSettings(c.env.DB, namespaceId, body.profile || {
             voice_name: body.voice_name,
             persona: body.persona,
             tones: body.tones,
-            pace: body.pace,
+            custom_style_prompt: body.custom_style_prompt,
         })
         return c.json({
             ok: true,
             profile: latest.profile,
             prompt: latest.scriptPrompt,
             tts_prompt_template: latest.ttsPromptTemplate,
+            max_style_chars: latest.maxStyleChars,
             source: latest.source,
             updated_at: latest.updatedAt,
             legacy_prompt_active: latest.legacyPromptActive,
@@ -5008,6 +5009,7 @@ app.put('/api/settings/voice-prompt', async (c) => {
         profile: latest.profile,
         prompt: latest.scriptPrompt,
         tts_prompt_template: latest.ttsPromptTemplate,
+        max_style_chars: latest.maxStyleChars,
         source: latest.source,
         updated_at: latest.updatedAt,
         legacy_prompt_active: latest.legacyPromptActive,
@@ -5027,6 +5029,7 @@ app.delete('/api/settings/voice-prompt', async (c) => {
         profile: latest.profile,
         prompt: latest.scriptPrompt,
         tts_prompt_template: latest.ttsPromptTemplate,
+        max_style_chars: latest.maxStyleChars,
         source: latest.source,
         updated_at: latest.updatedAt,
         legacy_prompt_active: latest.legacyPromptActive,

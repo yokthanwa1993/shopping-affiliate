@@ -343,6 +343,109 @@ fn normalize_srt_blocks(raw_srt: &str, max_duration: f64) -> String {
     out
 }
 
+fn remap_srt_blocks_to_window(
+    raw_srt: &str,
+    target_start: f64,
+    target_end: f64,
+    max_duration: f64,
+) -> String {
+    let blocks = parse_srt_blocks_with_text(raw_srt);
+    if blocks.is_empty() {
+        return String::new();
+    }
+
+    let source_start = blocks.first().map(|(s, _, _)| *s).unwrap_or(0.0);
+    let source_end = blocks.last().map(|(_, e, _)| *e).unwrap_or(0.0);
+    let source_span = (source_end - source_start).max(0.0);
+    let target_span = (target_end - target_start).max(0.0);
+    if source_span < 0.1 || target_span < 0.1 {
+        return normalize_srt_blocks(raw_srt, max_duration);
+    }
+
+    let scale = target_span / source_span;
+    let mut remapped = String::new();
+    for (idx, (start, end, text)) in blocks.into_iter().enumerate() {
+        let mut s = target_start + (start - source_start).max(0.0) * scale;
+        let mut e = target_start + (end - source_start).max(0.0) * scale;
+        if e <= s {
+            e = s + 0.12;
+        }
+        s = s.max(0.0);
+        e = e.max(s + 0.12);
+        remapped.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            idx + 1,
+            format_srt_time(s),
+            format_srt_time(e),
+            text.trim()
+        ));
+    }
+
+    normalize_srt_blocks(&remapped, max_duration)
+}
+
+async fn detect_audio_activity_window(
+    audio_path: &Path,
+    audio_duration: f64,
+) -> Option<(f64, f64)> {
+    let out = Command::new("ffmpeg")
+        .args(&[
+            "-hide_banner",
+            "-i",
+            audio_path.to_str()?,
+            "-af",
+            "silencedetect=noise=-35dB:d=0.05",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut current_silence_start: Option<f64> = None;
+    let mut first_active = 0.0f64;
+    let mut last_active = audio_duration.max(0.0);
+
+    for line in stderr.lines() {
+        if let Some(idx) = line.find("silence_start:") {
+            let raw = line[idx + "silence_start:".len()..].trim();
+            if let Ok(value) = raw.parse::<f64>() {
+                current_silence_start = Some(value);
+            }
+            continue;
+        }
+
+        if let Some(idx) = line.find("silence_end:") {
+            let raw = line[idx + "silence_end:".len()..]
+                .split('|')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if let Ok(end_value) = raw.parse::<f64>() {
+                let start_value = current_silence_start.take().unwrap_or(0.0);
+                if start_value <= 0.02 {
+                    first_active = end_value.min(audio_duration);
+                }
+                if end_value >= audio_duration - 0.05 {
+                    last_active = start_value.max(first_active).min(audio_duration);
+                }
+            }
+        }
+    }
+
+    if last_active <= first_active {
+        last_active = audio_duration.max(first_active);
+    }
+
+    if first_active > 0.02 || last_active < audio_duration - 0.02 {
+        Some((first_active, last_active))
+    } else {
+        None
+    }
+}
+
 async fn gemini_srt_from_audio(
     file_uri: &str,
     subtitle_lines: &[String],
@@ -367,7 +470,7 @@ async fn gemini_srt_from_audio(
          ข้อบังคับ:\n\
          1) ใช้ข้อความซับจากรายการด้านล่างนี้เท่านั้น (ห้ามเปลี่ยนคำ ห้ามเพิ่ม ห้ามลด)\n\
          2) คืนผลลัพธ์เป็น SRT ล้วนๆ เท่านั้น (ไม่ต้องมี markdown)\n\
-         3) เริ่มซับที่ 00:00:00,000\n\
+         3) ถ้ามีช่วงเงียบก่อนเริ่มพูด ให้ timecode แรกเริ่มตามเสียงจริง ไม่ต้องบังคับเริ่มที่ 0 เสมอไป\n\
          4) จบบรรทัดสุดท้ายไม่เกิน {duration:.3} วินาที\n\
          5) timecode ต้องเรียงต่อเนื่อง ไม่ย้อนเวลา\n\n\
          รายการซับที่ต้องใช้:\n\
@@ -978,14 +1081,17 @@ fn build_srt_from_lines_with_timing(
     let (timing_start, timing_end) = extract_speech_srt_time_span(timing_srt)
         .unwrap_or((0.0, fallback_duration));
     let timing_span = (timing_end - timing_start).max(0.0);
-    // Normalize to 0-based timeline so subtitles do not shift right when Whisper misses early words.
+    let start = if timing_span >= 0.2 {
+        timing_start.max(0.0).min(fallback_duration.max(0.1) - 0.1)
+    } else {
+        0.0
+    };
     let total_duration = if timing_span >= 0.2 {
-        timing_span.min(fallback_duration)
+        timing_span.min((fallback_duration - start).max(0.1))
     } else {
         fallback_duration
     };
-    let start = 0.0f64;
-    let end = total_duration.max(0.1);
+    let end = (start + total_duration.max(0.1)).min(fallback_duration.max(0.1));
     let total_chars: usize = chunks.iter().map(|c| c.chars().count().max(1)).sum();
 
     let mut out = String::new();
@@ -1030,6 +1136,23 @@ fn build_srt_from_script_with_timing(
     )
 }
 
+fn build_atempo_filter(mut factor: f64) -> String {
+    let mut filters: Vec<String> = Vec::new();
+
+    while factor > 2.0 {
+        filters.push("atempo=2.0".to_string());
+        factor /= 2.0;
+    }
+
+    while factor < 0.5 {
+        filters.push("atempo=0.5".to_string());
+        factor /= 0.5;
+    }
+
+    filters.push(format!("atempo={:.6}", factor));
+    filters.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1047,13 +1170,13 @@ mod tests {
     fn deterministic_srt_is_zero_based_even_if_whisper_starts_late() {
         let timing_srt = "1\n00:00:01,200 --> 00:00:04,200\nทดสอบ\n\n";
         let lines = vec!["บรรทัดหนึ่ง".to_string(), "บรรทัดสอง".to_string()];
-        let out = build_srt_from_lines_with_timing(&lines, timing_srt, 3.0, 15);
+        let out = build_srt_from_lines_with_timing(&lines, timing_srt, 4.2, 15);
         let times = extract_time_lines(&out);
         assert!(!times.is_empty());
         let (first_start, _) = times[0];
         let (_, last_end) = times[times.len() - 1];
-        assert!(first_start <= 0.001, "first subtitle should start at 0");
-        assert!((last_end - 3.0).abs() < 0.1, "end should match speech span");
+        assert!((first_start - 1.2).abs() < 0.1, "first subtitle should preserve speech offset");
+        assert!((last_end - 4.2).abs() < 0.1, "end should match speech span");
     }
 
     #[test]
@@ -1097,6 +1220,19 @@ mod tests {
         assert!(times[0].1 <= 2.0);
         assert!(times[1].0 >= times[0].1, "second block must not overlap first");
         assert!(times[1].1 <= 2.0);
+    }
+
+    #[test]
+    fn remap_srt_blocks_to_window_preserves_relative_order() {
+        let raw = "\
+1\n00:00:00,000 --> 00:00:01,000\nหนึ่ง\n\n\
+2\n00:00:01,000 --> 00:00:02,000\nสอง\n\n";
+        let out = super::remap_srt_blocks_to_window(raw, 0.25, 1.75, 2.0);
+        let times = extract_time_lines(&out);
+        assert_eq!(times.len(), 2);
+        assert!((times[0].0 - 0.25).abs() < 0.05);
+        assert!((times[1].1 - 1.75).abs() < 0.05);
+        assert!(times[1].0 >= times[0].1);
     }
 }
 
@@ -1400,12 +1536,34 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
     
     let adjusted = tmp_path.join("audio_adj.wav");
     let diff = duration - a_dur;
+    let adjusted_audio_dur = if diff.abs() < 0.5 { a_dur } else { duration };
     if diff.abs() < 0.5 {
          fs::copy(&wav_audio, &adjusted).await?;
     } else if diff > 0.0 {
          Command::new("ffmpeg").args(&["-y", "-i", wav_audio.to_str().unwrap(), "-af", &format!("apad=pad_dur={}", diff), adjusted.to_str().unwrap()]).output().await?;
     } else {
-         Command::new("ffmpeg").args(&["-y", "-i", wav_audio.to_str().unwrap(), "-t", &duration.to_string(), adjusted.to_str().unwrap()]).output().await?;
+         let speed_ratio = (a_dur / duration.max(0.1)).max(0.5);
+         let atempo_filter = build_atempo_filter(speed_ratio);
+         println!(
+            "[PIPELINE] audio longer than video -> tempo fit (audio_dur={:.2}s, video_dur={:.2}s, speed_ratio={:.4}, filter={})",
+            a_dur,
+            duration,
+            speed_ratio,
+            atempo_filter
+         );
+         Command::new("ffmpeg")
+            .args(&[
+                "-y",
+                "-i",
+                wav_audio.to_str().unwrap(),
+                "-af",
+                &atempo_filter,
+                "-t",
+                &duration.to_string(),
+                adjusted.to_str().unwrap(),
+            ])
+            .output()
+            .await?;
     }
 
     // 5. Gemini SRT from generated dub audio (no whisper)
@@ -1426,7 +1584,7 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
             let attempt = async {
                 let audio_uri = gemini_upload_bytes(&adjusted_bytes, "audio/wav", api_key).await?;
                 let audio_uri = gemini_wait(&audio_uri, api_key).await?;
-                gemini_srt_from_audio(&audio_uri, &subtitle_lines, api_key, &model, a_dur).await
+                gemini_srt_from_audio(&audio_uri, &subtitle_lines, api_key, &model, adjusted_audio_dur).await
             }.await;
 
             match attempt {
@@ -1456,6 +1614,33 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
         println!("[PIPELINE] mock mode: skip gemini audio sync");
     }
 
+    let audio_activity_window = detect_audio_activity_window(&adjusted, adjusted_audio_dur).await;
+    if let Some((audio_speech_start_detected, audio_speech_end_detected)) = audio_activity_window {
+        let raw_span_opt = extract_srt_time_span(&raw_srt);
+        let raw_start_detected = raw_span_opt.map(|(s, _)| s).unwrap_or(0.0);
+        let raw_end_detected = raw_span_opt.map(|(_, e)| e).unwrap_or(0.0);
+        let should_remap = !raw_srt.trim().is_empty()
+            && audio_speech_end_detected > audio_speech_start_detected + 0.2
+            && (
+                (audio_speech_start_detected - raw_start_detected).abs() > 0.08
+                || (audio_speech_end_detected - raw_end_detected).abs() > 0.12
+            );
+
+        if should_remap {
+            println!(
+                "[PIPELINE] remap raw SRT to detected audio activity window ({:.3}s -> {:.3}s)",
+                audio_speech_start_detected,
+                audio_speech_end_detected
+            );
+            raw_srt = remap_srt_blocks_to_window(
+                &raw_srt,
+                audio_speech_start_detected,
+                audio_speech_end_detected,
+                adjusted_audio_dur.max(duration),
+            );
+        }
+    }
+
     let raw_srt_blocks = raw_srt.split("\n\n").filter(|s| !s.trim().is_empty()).count();
     let raw_span_opt = extract_srt_time_span(&raw_srt);
     let raw_start = raw_span_opt.map(|(s, _)| s).unwrap_or(0.0);
@@ -1470,13 +1655,18 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
     if speech_span > 0.5 {
         speech_dur = speech_span.min(duration.max(1.0)).max(1.0);
     }
+    let subtitle_max_end = if speech_end > 0.12 {
+        speech_end.min(duration.max(1.0)).max(speech_dur)
+    } else {
+        speech_dur
+    };
     println!(
-        "[PIPELINE] speech_dur={:.2}s (a_dur={:.2}s, video_dur={:.2}s, speech_start={:.2}s, speech_end={:.2}s, speech_span={:.2}s)",
-        speech_dur, a_dur, duration, speech_start, speech_end, speech_span
+        "[PIPELINE] speech_dur={:.2}s max_end={:.2}s (a_dur={:.2}s, video_dur={:.2}s, speech_start={:.2}s, speech_end={:.2}s, speech_span={:.2}s)",
+        speech_dur, subtitle_max_end, a_dur, duration, speech_start, speech_end, speech_span
     );
 
     let t_srt = std::time::Instant::now();
-    let mut final_srt_text = normalize_srt_blocks(&raw_srt, speech_dur);
+    let mut final_srt_text = normalize_srt_blocks(&raw_srt, subtitle_max_end);
     if !final_srt_text.trim().is_empty() && !srt_quality_ok(&script, &final_srt_text, 120) {
         println!("[PIPELINE] Gemini SRT quality check failed -> deterministic fallback");
         final_srt_text.clear();
@@ -1484,15 +1674,15 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
 
     if final_srt_text.trim().is_empty() {
         final_srt_text = if subtitle_lines.is_empty() {
-            build_srt_from_script_with_timing(&script, "", speech_dur, 15)
+            build_srt_from_script_with_timing(&script, &raw_srt, subtitle_max_end, 15)
         } else {
-            build_srt_from_lines_with_timing(&subtitle_lines, "", speech_dur, 15)
+            build_srt_from_lines_with_timing(&subtitle_lines, &raw_srt, subtitle_max_end, 15)
         };
     }
 
     if final_srt_text.trim().is_empty() {
         println!("[PIPELINE] Final SRT empty -> simple script split fallback");
-        final_srt_text = script_to_srt_simple(&script, speech_dur);
+        final_srt_text = script_to_srt_simple(&script, subtitle_max_end);
     }
     println!("[PIPELINE] Build SRT (Gemini-first) → {:.1}s", t_srt.elapsed().as_secs_f64());
     println!(
@@ -1547,7 +1737,13 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
         "speech_end": speech_end,
         "speech_span": speech_span,
         "speech_dur": speech_dur,
+        "subtitle_max_end": subtitle_max_end,
         "audio_dur": a_dur,
+        "adjusted_audio_dur": adjusted_audio_dur,
+        "audio_activity_window": audio_activity_window.map(|(start, end)| json!({
+            "start": start,
+            "end": end,
+        })),
         "video_dur": duration,
         "raw_srt_blocks": raw_srt_blocks,
         "final_srt_blocks": final_srt_text.split("\n\n").filter(|s| !s.trim().is_empty()).count(),

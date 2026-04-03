@@ -14,10 +14,10 @@ const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
 const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_GEMINI_API_KEY_SLOTS = 5
 const MAX_VOICE_PROMPT_CHARS = 12000
+const MAX_VOICE_STYLE_PROMPT_CHARS = 1200
 const MAX_VOICE_TONE_SELECTIONS = 3
 
 export type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
-export type VoicePacePreset = 'slow' | 'balanced' | 'fast'
 export type VoiceTonePreset =
     | 'bright'
     | 'playful'
@@ -33,7 +33,7 @@ export type VoiceProfile = {
     voice_name: string
     persona: VoicePersonaPreset
     tones: VoiceTonePreset[]
-    pace: VoicePacePreset
+    custom_style_prompt: string
 }
 
 export type GeminiTtsVoiceOption = {
@@ -45,6 +45,7 @@ export type NamespaceVoiceSettings = {
     profile: VoiceProfile
     scriptPrompt: string
     ttsPromptTemplate: string
+    maxStyleChars: number
     source: VoiceSettingsSource
     updatedAt: string | null
     legacyPromptActive: boolean
@@ -87,12 +88,11 @@ export const DEFAULT_VOICE_PROFILE: VoiceProfile = {
     voice_name: 'Puck',
     persona: 'female',
     tones: ['bright', 'friendly'],
-    pace: 'balanced',
+    custom_style_prompt: '',
 }
 
 const VOICE_NAME_SET = new Set(GEMINI_TTS_VOICE_OPTIONS.map((option) => option.name))
 const VOICE_PERSONA_SET = new Set<VoicePersonaPreset>(['female', 'male', 'kathoey'])
-const VOICE_PACE_SET = new Set<VoicePacePreset>(['slow', 'balanced', 'fast'])
 const VOICE_TONE_SET = new Set<VoiceTonePreset>(['bright', 'playful', 'warm', 'confident', 'luxury', 'friendly', 'funny', 'sales'])
 
 const VOICE_PERSONA_SCRIPT_GUIDE: Record<VoicePersonaPreset, string> = {
@@ -116,12 +116,6 @@ const VOICE_TONE_SCRIPT_GUIDE: Record<VoiceTonePreset, string> = {
     friendly: 'เป็นกันเอง ไม่แข็ง',
     funny: 'ตลกแบบพอดี มีจังหวะคอมเมนต์',
     sales: 'มีแรงขายแบบเนียน ๆ ชวนคลิก',
-}
-
-const VOICE_PACE_SCRIPT_GUIDE: Record<VoicePacePreset, string> = {
-    slow: 'พูดช้ากว่าปกติเล็กน้อย เว้นจังหวะชัด',
-    balanced: 'พูดจังหวะกลาง ฟังลื่นเป็นธรรมชาติ',
-    fast: 'พูดค่อนข้างเร็ว กระชับ ทันภาพคลิปสั้น',
 }
 
 export const DEFAULT_VOICE_PROMPT_TEMPLATE = `คุณคือคอนเทนต์ครีเอเตอร์และนักพากย์มืออาชีพสำหรับคลิปสั้นแนว Reels
@@ -175,11 +169,14 @@ async function ensureNamespaceSettingsTable(db: D1Database) {
     ).run()
 }
 
+function normalizeVoiceStylePrompt(rawValue: unknown): string {
+    return String(rawValue || '').trim().slice(0, MAX_VOICE_STYLE_PROMPT_CHARS)
+}
+
 export function normalizeVoiceProfile(rawProfile: unknown): VoiceProfile {
     const raw = rawProfile && typeof rawProfile === 'object' ? rawProfile as Record<string, unknown> : {}
     const voiceName = String(raw.voice_name || '').trim()
     const persona = String(raw.persona || '').trim() as VoicePersonaPreset
-    const pace = String(raw.pace || '').trim() as VoicePacePreset
     const tonesRaw = Array.isArray(raw.tones) ? raw.tones : []
     const tones: VoiceTonePreset[] = []
     const seenTones = new Set<VoiceTonePreset>()
@@ -196,7 +193,7 @@ export function normalizeVoiceProfile(rawProfile: unknown): VoiceProfile {
         voice_name: VOICE_NAME_SET.has(voiceName) ? voiceName : DEFAULT_VOICE_PROFILE.voice_name,
         persona: VOICE_PERSONA_SET.has(persona) ? persona : DEFAULT_VOICE_PROFILE.persona,
         tones: tones.length > 0 ? tones : [...DEFAULT_VOICE_PROFILE.tones],
-        pace: VOICE_PACE_SET.has(pace) ? pace : DEFAULT_VOICE_PROFILE.pace,
+        custom_style_prompt: normalizeVoiceStylePrompt(raw.custom_style_prompt),
     }
 }
 
@@ -206,19 +203,23 @@ function stringifyVoiceProfile(profile: VoiceProfile): string {
         voice_name: profile.voice_name,
         persona: profile.persona,
         tones: profile.tones,
-        pace: profile.pace,
+        custom_style_prompt: profile.custom_style_prompt,
     })
 }
 
 function buildStructuredVoicePrompt(profile: VoiceProfile): string {
     const toneGuide = profile.tones.map((tone) => VOICE_TONE_SCRIPT_GUIDE[tone]).join(', ')
+    const customStylePrompt = profile.custom_style_prompt.trim()
+    const customStyleSection = customStylePrompt
+        ? `\n- สไตล์การพากย์เพิ่มเติม: ${customStylePrompt}`
+        : ''
     return `${DEFAULT_VOICE_PROMPT_TEMPLATE}
 
 แนวพากย์ของ workspace นี้:
 - บุคลิกเสียง: ${VOICE_PERSONA_SCRIPT_GUIDE[profile.persona]}
 - โทนเสียง: ${toneGuide}
-- จังหวะการพูด: ${VOICE_PACE_SCRIPT_GUIDE[profile.pace]}
 - Voice ของ Gemini TTS ที่เลือก: ${profile.voice_name}
+${customStyleSection}
 
 ข้อกำชับเพิ่ม:
 - ให้ถ้อยคำและจังหวะประโยคสอดคล้องกับแนวเสียงนี้ แต่ยังต้องอิงภาพจริงเป็นหลัก
@@ -228,12 +229,15 @@ function buildStructuredVoicePrompt(profile: VoiceProfile): string {
 
 export function buildTtsPromptTemplate(profile: VoiceProfile): string {
     const toneGuide = profile.tones.map((tone) => VOICE_TONE_SCRIPT_GUIDE[tone]).join(', ')
+    const customStylePrompt = profile.custom_style_prompt.trim()
+    const customStyleSection = customStylePrompt
+        ? `สไตล์การพากย์เพิ่มเติม: ${customStylePrompt}\n`
+        : ''
     return `หน้าที่ของคุณคืออ่านเฉพาะบทพากย์ภาษาไทยด้านล่างตามต้นฉบับ ห้ามอ่านคำอธิบายหรือหัวข้อออกเสียง
 
 บุคลิกเสียง: ${VOICE_PERSONA_TTS_GUIDE[profile.persona]}
 โทนเสียง: ${toneGuide}
-จังหวะการพูด: ${VOICE_PACE_SCRIPT_GUIDE[profile.pace]}
-ให้เสียงฟังเป็นธรรมชาติ ชัดคำ และตรงจังหวะคลิปสั้น
+${customStyleSection}ให้เสียงฟังเป็นธรรมชาติ ชัดคำ และตรงจังหวะคลิปสั้น
 
 บทพากย์:
 {{script}}`
@@ -451,6 +455,7 @@ export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: str
                 profile,
                 scriptPrompt: buildStructuredVoicePrompt(profile),
                 ttsPromptTemplate: buildTtsPromptTemplate(profile),
+                maxStyleChars: MAX_VOICE_STYLE_PROMPT_CHARS,
                 source: 'structured',
                 updatedAt: profileRow.updated_at || null,
                 legacyPromptActive: false,
@@ -467,6 +472,7 @@ export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: str
             profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
             scriptPrompt: legacyPrompt.slice(0, MAX_VOICE_PROMPT_CHARS),
             ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+            maxStyleChars: MAX_VOICE_STYLE_PROMPT_CHARS,
             source: 'legacy',
             updatedAt: legacyRow?.updated_at || null,
             legacyPromptActive: true,
@@ -477,6 +483,7 @@ export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: str
         profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
         scriptPrompt: buildStructuredVoicePrompt(DEFAULT_VOICE_PROFILE),
         ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+        maxStyleChars: MAX_VOICE_STYLE_PROMPT_CHARS,
         source: 'default',
         updatedAt: null,
         legacyPromptActive: false,
