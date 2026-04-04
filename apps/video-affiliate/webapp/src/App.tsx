@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState, type MouseEvent, type SyntheticEvent } from 'react'
 import { API_BASE_URL } from './apiBaseUrl'
 import { getAppTabPath, getInviteNamespaceFromSearch, getMergedSearchParams, type AppTabRoute } from './app/appRoutes'
 import { useViewerHistory } from './app/hooks/useViewerHistory'
@@ -106,7 +106,7 @@ const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
 const nsInboxCacheKey = (namespaceId: string) => `inbox_cache:${CACHE_VERSION}:${namespaceId}`
-const dashboardCacheKey = (namespaceId: string) => `dashboard_cache:${CACHE_VERSION}:${namespaceId}`
+const dashboardCacheKey = (namespaceId: string, date: string) => `dashboard_cache:${CACHE_VERSION}:${namespaceId}:${date}`
 const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`inbox_system_cache:${CACHE_VERSION}`, botScope)
 const processingCacheKey = (namespaceId: string) => `processing_cache:${CACHE_VERSION}:${namespaceId}`
 const GALLERY_BATCH_SIZE = 24
@@ -501,7 +501,8 @@ interface FacebookPage {
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
-type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'voice' | 'cover' | 'comment' | 'members'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members'
+type PostingOrderOption = 'oldest_first' | 'newest_first' | 'random'
 type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
 type VoiceTonePreset = 'bright' | 'playful' | 'warm' | 'confident' | 'luxury' | 'friendly' | 'funny' | 'sales'
@@ -668,6 +669,12 @@ const summarizeVoiceSettings = (
   return [voiceMeta ? `${voiceMeta.name} ${voiceMeta.descriptor}` : profile.voice_name, persona.label, toneText].filter(Boolean).join(' • ')
 }
 
+const POSTING_ORDER_OPTIONS: Array<{ value: PostingOrderOption; title: string; subtitle: string }> = [
+  { value: 'newest_first', title: 'โพสต์ใหม่สุดก่อน', subtitle: 'หยิบคลิปล่าสุดก่อน' },
+  { value: 'oldest_first', title: 'โพสต์เก่าสุดก่อน', subtitle: 'ไล่จากคลิปเก่าก่อน' },
+  { value: 'random', title: 'โพสต์สุ่ม', subtitle: 'สุ่มจากคลิปที่ยังไม่โพสต์' },
+]
+
 const getSettingsSectionTitle = (section: SettingsSection): string => {
   switch (section) {
     case 'account':
@@ -680,6 +687,8 @@ const getSettingsSectionTitle = (section: SettingsSection): string => {
       return 'Gemini API Key'
     case 'shortlink':
       return 'Shortlink'
+    case 'post':
+      return 'Post'
     case 'comment':
       return 'Comment Template'
     case 'voice':
@@ -1196,7 +1205,9 @@ function VideoCard({
   onUpdate,
   onImport,
   onExpandedChange,
-  keepInPostedOnLinkSave = false
+  keepInPostedOnLinkSave = false,
+  showRepostAction = false,
+  onRepost,
 }: {
   video: Video
   currentNamespaceId?: string
@@ -1207,10 +1218,13 @@ function VideoCard({
   onImport?: (videoId: string, sourceNamespaceId: string) => void
   onExpandedChange?: (expanded: boolean) => void
   keepInPostedOnLinkSave?: boolean
+  showRepostAction?: boolean
+  onRepost?: (id: string, namespaceId?: string) => Promise<void> | void
 }) {
   const [expanded, setExpanded] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [reposting, setReposting] = useState(false)
   const [shopeeInput, setShopeeInput] = useState('')
   const [savingShopee, setSavingShopee] = useState(false)
   const [deletingShopeeLink, setDeletingShopeeLink] = useState(false)
@@ -1468,6 +1482,17 @@ function VideoCard({
       console.error('Delete failed:', e)
     } finally {
       setDeleting(false)
+    }
+  }
+
+  const handleRepost = async (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation()
+    if (!onRepost || reposting) return
+    setReposting(true)
+    try {
+      await onRepost(video.id, videoNamespaceId)
+    } finally {
+      setReposting(false)
     }
   }
 
@@ -1826,6 +1851,28 @@ function VideoCard({
       <div className="absolute bottom-2 right-2 bg-black/60 backdrop-blur-md text-white text-[10px] px-2 py-0.5 rounded-full font-medium">
         {formatDuration(video.duration)}
       </div>
+
+      {showRepostAction && (
+        <button
+          type="button"
+          onClick={handleRepost}
+          disabled={reposting}
+          title="โพสต์ใหม่"
+          aria-label="โพสต์ใหม่"
+          className="absolute left-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-white/92 text-gray-700 shadow-md transition-transform active:scale-95 disabled:opacity-60"
+        >
+          {reposting ? (
+            <div className="h-3.5 w-3.5 rounded-full border-2 border-gray-400 border-t-transparent animate-spin" />
+          ) : (
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+              <path d="M3 12a9 9 0 0 1 15.3-6.3L21 8" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M21 3v5h-5" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M21 12a9 9 0 0 1-15.3 6.3L3 16" strokeLinecap="round" strokeLinejoin="round" />
+              <path d="M8 16H3v5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          )}
+        </button>
+      )}
     </div>
   )
 }
@@ -2787,18 +2834,38 @@ function App({
   const [shortlinkAccountMaxChars, setShortlinkAccountMaxChars] = useState(64)
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [lazadaExpectedMemberIdMaxChars, setLazadaExpectedMemberIdMaxChars] = useState(32)
+  const [postingOrderCurrent, setPostingOrderCurrent] = useState<PostingOrderOption>('oldest_first')
+  const [postingOrderDraft, setPostingOrderDraft] = useState<PostingOrderOption>('oldest_first')
+  const [postingOrderUpdatedAt, setPostingOrderUpdatedAt] = useState('')
+  const [postingOrderMessage, setPostingOrderMessage] = useState('')
+  const [postingOrderLoading, setPostingOrderLoading] = useState(false)
+  const [postingOrderSaving, setPostingOrderSaving] = useState(false)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'voice', 'cover', 'comment', 'members']
+  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'post', 'voice', 'cover', 'comment', 'members']
+  const getPathSegments = (pathname = window.location.pathname) =>
+    String(pathname || '')
+      .replace(/^\/+/, '')
+      .split('/')
+      .filter(Boolean)
   const getSettingsSectionFromLocation = (): SettingsSection => {
-    const pathTab = window.location.pathname.replace('/', '')
+    const pathSegments = getPathSegments()
+    const pathTab = pathSegments[0] || ''
+    const pathSection = pathTab === 'settings' ? String(pathSegments[1] || '').trim() : ''
     const params = new URLSearchParams(window.location.search)
     const sectionParam = String(params.get('section') || '').trim()
     const tabParam = params.get('tab')
+    if (pathSection && validSettingsSections.includes(pathSection as SettingsSection)) return pathSection as SettingsSection
     if (sectionParam && validSettingsSections.includes(sectionParam as SettingsSection)) return sectionParam as SettingsSection
     if (pathTab === 'pages' || tabParam === 'pages') return 'pages'
     return 'menu'
   }
-  const getSelectedPageIdFromLocation = () => String(new URLSearchParams(window.location.search).get('page_id') || '').trim()
+  const getSelectedPageIdFromLocation = () => {
+    const pathSegments = getPathSegments()
+    if (pathSegments[0] === 'settings' && pathSegments[1] === 'pages') {
+      return String(pathSegments[2] || '').trim()
+    }
+    return String(new URLSearchParams(window.location.search).get('page_id') || '').trim()
+  }
   const getInitialSettingsSection = (): SettingsSection => getSelectedPageIdFromLocation() ? 'pages' : getSettingsSectionFromLocation()
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(getInitialSettingsSection)
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
@@ -2900,7 +2967,7 @@ function App({
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(() => {
     const ns = getStoredNamespace(botScope)
-    return ns ? readCache<DashboardData | null>(dashboardCacheKey(ns), null) : null
+    return ns ? readCache<DashboardData | null>(dashboardCacheKey(ns, getTodayString()), null) : null
   })
   const [logDateFilter, setLogDateFilter] = useState<string>(getTodayString())
   const [logNowMs, setLogNowMs] = useState(() => Date.now())
@@ -2974,6 +3041,15 @@ function App({
     const nextSettingsSection = nextTab === 'settings'
       ? (nextPageId ? 'pages' : (options?.settingsSection ?? settingsSection))
       : 'menu'
+    if (nextTab === 'settings') {
+      if (nextPageId) {
+        url.pathname = `/settings/pages/${encodeURIComponent(nextPageId)}`
+      } else if (nextSettingsSection !== 'menu') {
+        url.pathname = `/settings/${nextSettingsSection}`
+      } else {
+        url.pathname = '/settings'
+      }
+    }
     if (nextTab === 'settings' && nextSettingsSection !== 'menu') {
       url.searchParams.set('section', nextSettingsSection)
     } else {
@@ -3135,7 +3211,7 @@ function App({
     const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
     const cachedInbox = readCache<InboxVideo[]>(nsInboxCacheKey(scopedNamespace), [])
-    const cachedDashboard = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace), null)
+    const cachedDashboard = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace, dashboardDateFilter), null)
     setVideos(cachedVideos)
     setUsedVideos(cachedUsedVideos)
     setGalleryReadyTotalCount(cachedVideos.length)
@@ -3202,7 +3278,8 @@ function App({
 
   useEffect(() => {
     if (!namespaceId) return
-    writeCache(dashboardCacheKey(namespaceId), dashboardData)
+    if (!dashboardData?.date) return
+    writeCache(dashboardCacheKey(namespaceId, dashboardData.date), dashboardData)
   }, [namespaceId, dashboardData])
 
   useEffect(() => {
@@ -3376,7 +3453,7 @@ function App({
     const storedNamespace = getStoredNamespace(botScope)
     const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, false)
     const cachedInbox = storedNamespace ? readCache<InboxVideo[]>(nsInboxCacheKey(storedNamespace), []) : []
-    const cachedDashboard = storedNamespace ? readCache<DashboardData | null>(dashboardCacheKey(storedNamespace), null) : null
+    const cachedDashboard = storedNamespace ? readCache<DashboardData | null>(dashboardCacheKey(storedNamespace, getTodayString()), null) : null
     const cachedProcessing = storedNamespace ? readCache<Video[]>(processingCacheKey(storedNamespace), []) : []
     const cachedSystemInbox = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
     const storedShortlinkAccount = getStoredShortlinkAccount(botScope)
@@ -3622,6 +3699,10 @@ function App({
       void loadShortlinkSettings()
       return
     }
+    if (settingsSection === 'post' && isOwner) {
+      void loadPostingOrderSettings()
+      return
+    }
     if (settingsSection === 'voice') {
       void loadVoicePrompt()
       return
@@ -3641,7 +3722,7 @@ function App({
     if (settingsSection === 'members' && isSystemAdmin) {
       void loadSystemMembers()
     }
-  }, [tab, settingsSection, token, authBootstrapping, isSystemAdmin])
+  }, [tab, settingsSection, token, authBootstrapping, isSystemAdmin, isOwner])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3747,6 +3828,9 @@ function App({
   useEffect(() => {
     if (authBootstrapping) return
     if (!isOwner && settingsSection === 'shortlink') {
+      setSettingsSection('menu')
+    }
+    if (!isOwner && settingsSection === 'post') {
       setSettingsSection('menu')
     }
     if (!isSystemAdmin && settingsSection === 'gemini') {
@@ -4322,9 +4406,17 @@ function App({
     const session = getToken()
     if (!session) return
     const requestId = ++dashboardRequestRef.current
+    const scopedNamespace = String(namespaceId || getStoredNamespace(botScope) || '').trim()
+    if (scopedNamespace) {
+      const cachedForDate = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace, dateValue), null)
+      if (cachedForDate && requestId === dashboardRequestRef.current) {
+        setDashboardData((prev) => (prev?.date === cachedForDate.date ? prev : cachedForDate))
+      }
+    }
     if (!options.silent && !dashboardData) setDashboardLoading(true)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/dashboard?date=${encodeURIComponent(dateValue)}`)
+      const cacheBust = options.silent ? '' : `&_ts=${Date.now()}`
+      const resp = await apiFetch(`${WORKER_URL}/api/dashboard?date=${encodeURIComponent(dateValue)}${cacheBust}`)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
@@ -4932,6 +5024,73 @@ function App({
     }
   }
 
+  async function loadPostingOrderSettings() {
+    const session = getToken()
+    if (!session) return
+    setPostingOrderLoading(true)
+    setPostingOrderMessage('')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/posting-order`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setPostingOrderMessage('บัญชีนี้ไม่มีสิทธิ์แก้ลำดับการโพสต์')
+        return
+      }
+      if (!resp.ok) {
+        setPostingOrderMessage('โหลดการตั้งค่า Post ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json().catch(() => ({})) as { posting_order?: PostingOrderOption; updated_at?: string }
+      const nextOrder = String(data.posting_order || 'oldest_first').trim() as PostingOrderOption
+      setPostingOrderCurrent(nextOrder)
+      setPostingOrderDraft(nextOrder)
+      setPostingOrderUpdatedAt(String(data.updated_at || ''))
+    } catch {
+      setPostingOrderMessage('โหลดการตั้งค่า Post ไม่สำเร็จ')
+    } finally {
+      setPostingOrderLoading(false)
+    }
+  }
+
+  async function savePostingOrderSettings(nextOrder: PostingOrderOption) {
+    const session = getToken()
+    if (!session || !isOwner) return
+    setPostingOrderSaving(true)
+    setPostingOrderMessage('')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/posting-order`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ posting_order: nextOrder }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setPostingOrderMessage('บัญชีนี้ไม่มีสิทธิ์แก้ลำดับการโพสต์')
+        return
+      }
+      const data = await resp.json().catch(() => ({})) as { posting_order?: PostingOrderOption; updated_at?: string; error?: string }
+      if (!resp.ok) {
+        setPostingOrderMessage(String(data.error || 'บันทึกการตั้งค่า Post ไม่สำเร็จ'))
+        return
+      }
+      const savedOrder = String(data.posting_order || nextOrder).trim() as PostingOrderOption
+      setPostingOrderCurrent(savedOrder)
+      setPostingOrderDraft(savedOrder)
+      setPostingOrderUpdatedAt(String(data.updated_at || ''))
+      setPostingOrderMessage('บันทึกการตั้งค่า Post แล้ว')
+    } catch {
+      setPostingOrderMessage('บันทึกการตั้งค่า Post ไม่สำเร็จ')
+    } finally {
+      setPostingOrderSaving(false)
+    }
+  }
+
   function formatDuration(seconds: number) {
     const mins = Math.floor(seconds / 60)
     const secs = Math.floor(seconds % 60)
@@ -5134,33 +5293,46 @@ function App({
     const previousPendingVideo = pendingShortlinkVideos.find((video) =>
       matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
     )
-    const nextCandidate = (previousVideo || previousPendingVideo)
-      ? { ...(previousVideo || previousPendingVideo), ...fields } as Video
+    const previousUsedVideo = usedVideos.find((video) =>
+      matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+    )
+    const previousAnyVideo = previousVideo || previousPendingVideo || previousUsedVideo
+    const nextCandidate = previousAnyVideo
+      ? { ...previousAnyVideo, ...fields } as Video
       : null
     const nextCandidateExpectedUtmId = String((nextCandidate as unknown as Record<string, unknown> | null)?.shortlink_expected_utm_id || shortlinkExpectedUtmIdCurrent || '').trim()
     const nextCandidateExpectedLazadaMemberId = String((nextCandidate as unknown as Record<string, unknown> | null)?.lazada_expected_member_id || lazadaExpectedMemberIdCurrent || '').trim()
+  const nextIsPosted = !!String((nextCandidate as unknown as Record<string, unknown> | null)?.postedAt || '').trim()
+  const nextIsAwaitingConversion = nextCandidate
+      ? isVideoAwaitingAffiliateConversion(
+        nextCandidate as unknown as Record<string, unknown>,
+        nextCandidateExpectedUtmId,
+        nextCandidateExpectedLazadaMemberId,
+      )
+      : false
+    const previousWasReady = !!previousVideo
+    const previousWasUsed = !!previousUsedVideo
+    const nextWillBeReady = !!nextCandidate && !nextIsPosted && !nextIsAwaitingConversion
+    const nextWillBeUsed = !!nextCandidate && nextIsPosted
 
     setVideos((prev) => {
       const hasExistingVideo = prev.some((video) =>
         matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
       )
-
-      if (!hasExistingVideo && nextCandidate && !isVideoAwaitingAffiliateConversion(
-        nextCandidate as unknown as Record<string, unknown>,
-        nextCandidateExpectedUtmId,
-        nextCandidateExpectedLazadaMemberId,
-      )) {
-        return dedupeGalleryVideos([nextCandidate, ...prev])
-      }
-
-      return prev.flatMap((video) => {
+      const nextReadyVideos = prev.flatMap((video) => {
         if (!matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)) {
           return [video]
         }
 
-        const nextVideo = { ...video, ...fields }
-        return [nextVideo]
+        if (nextIsPosted || nextIsAwaitingConversion) return []
+        return [{ ...video, ...fields }]
       })
+
+      if (!hasExistingVideo && nextCandidate && !nextIsPosted && !nextIsAwaitingConversion) {
+        return dedupeGalleryVideos([nextCandidate, ...nextReadyVideos])
+      }
+
+      return dedupeGalleryVideos(nextReadyVideos)
     })
 
     setPendingShortlinkVideos((prev) => {
@@ -5176,7 +5348,7 @@ function App({
           nextVideo as unknown as Record<string, unknown>,
           nextVideoExpectedUtmId,
           nextVideoExpectedLazadaMemberId,
-        ) ? [nextVideo] : []
+        ) && !nextIsPosted ? [nextVideo] : []
       })
 
       if (!nextCandidate) return updated
@@ -5185,18 +5357,35 @@ function App({
       )
       if (alreadyTracked) return updated
 
-      return isVideoAwaitingAffiliateConversion(
-        nextCandidate as unknown as Record<string, unknown>,
-        nextCandidateExpectedUtmId,
-        nextCandidateExpectedLazadaMemberId,
-      ) ? dedupeGalleryVideos([nextCandidate, ...updated]) : updated
+      return nextIsAwaitingConversion && !nextIsPosted ? dedupeGalleryVideos([nextCandidate, ...updated]) : updated
     })
 
-    setUsedVideos((prev) => prev.map((video) =>
-      matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
-        ? { ...video, ...fields }
-        : video
-    ))
+    setUsedVideos((prev) => {
+      const hasExistingUsedVideo = prev.some((video) =>
+        matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)
+      )
+      const nextUsedVideos = prev.flatMap((video) => {
+        if (!matchesVideoIdentity(video as unknown as Record<string, unknown>, id, targetNamespaceId)) {
+          return [video]
+        }
+
+        if (!nextIsPosted) return []
+        return [{ ...video, ...fields }]
+      })
+
+      if (!hasExistingUsedVideo && nextCandidate && nextIsPosted) {
+        return dedupeGalleryVideos([nextCandidate, ...nextUsedVideos])
+      }
+
+      return dedupeGalleryVideos(nextUsedVideos)
+    })
+
+    if (previousWasReady !== nextWillBeReady) {
+      setGalleryReadyTotalCount((prev) => Math.max(0, prev + (nextWillBeReady ? 1 : -1)))
+    }
+    if (previousWasUsed !== nextWillBeUsed) {
+      setGalleryUsedTotalCount((prev) => Math.max(0, prev + (nextWillBeUsed ? 1 : -1)))
+    }
 
     if (!systemWideGalleryMode || !previousVideo) return
 
@@ -5233,6 +5422,29 @@ function App({
     } catch {
       alert('นำเข้าไม่สำเร็จ')
     }
+  }
+
+  async function handleRepostGalleryVideo(id: string, targetNamespaceId?: string) {
+    const namespaceForVideo = String(targetNamespaceId || namespaceId || '').trim() || undefined
+    const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(id)}`)
+    if (namespaceForVideo) url.searchParams.set('namespace_id', namespaceForVideo)
+    const resp = await apiFetch(url.toString(), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        namespace_id: namespaceForVideo,
+        resetPostedState: true,
+      }),
+    })
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({})) as { error?: string }
+      throw new Error(String(data.error || 'ย้ายกลับไปยังไม่โพสต์ไม่สำเร็จ'))
+    }
+    updateGalleryVideoState(id, namespaceForVideo, {
+      postedAt: '',
+      keepInPostedTab: false,
+      updatedAt: new Date().toISOString(),
+    })
   }
 
   const { galleryAvailableVideos, galleryShortlinkRequired } = useMemo(() => {
@@ -5756,6 +5968,8 @@ function App({
                       onUpdate={updateGalleryVideoState}
                       onImport={useSystemWideAdminGallery ? handleImportVideo : undefined}
                       onExpandedChange={setVideoViewerOpen}
+                      showRepostAction={categoryFilter === 'used'}
+                      onRepost={handleRepostGalleryVideo}
                     />
                   ))}
                 </div>
@@ -6310,6 +6524,14 @@ function App({
                       onClick={() => openSettingsSection('shortlink')}
                     />
                   )}
+                  {isOwner && (
+                    <SettingsMenuItem
+                      icon="🕒"
+                      title="Post"
+                      subtitle={POSTING_ORDER_OPTIONS.find((option) => option.value === postingOrderCurrent)?.title || 'โพสต์เก่าสุดก่อน'}
+                      onClick={() => openSettingsSection('post')}
+                    />
+                  )}
                   {isSystemAdmin && (
                     <SettingsMenuItem
                       icon="🔑"
@@ -6644,6 +6866,66 @@ function App({
                               ล้างค่า
                             </button>
                           </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {settingsSection === 'post' && isOwner && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <p className="text-xs text-gray-500 leading-relaxed">
+                        ตั้งลำดับการหยิบคลิปจาก Gallery ตอน cron และตอนกดโพสต์ทันที
+                      </p>
+                      {postingOrderLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลดการตั้งค่า Post...</p>
+                      ) : (
+                        <>
+                          <div className="space-y-2">
+                            {POSTING_ORDER_OPTIONS.map((option) => {
+                              const active = postingOrderDraft === option.value
+                              return (
+                                <button
+                                  key={option.value}
+                                  type="button"
+                                  onClick={() => {
+                                    setPostingOrderDraft(option.value)
+                                    if (postingOrderMessage) setPostingOrderMessage('')
+                                  }}
+                                  className={`w-full rounded-2xl border px-4 py-3 text-left transition-all active:scale-[0.99] ${
+                                    active ? 'border-blue-500 bg-blue-50 shadow-sm' : 'border-gray-200 bg-gray-50'
+                                  }`}
+                                >
+                                  <div className="flex items-start gap-3">
+                                    <div className={`mt-0.5 h-4 w-4 rounded-full border ${active ? 'border-blue-500 bg-blue-500 shadow-[inset_0_0_0_3px_white]' : 'border-gray-300 bg-white'}`} />
+                                    <div className="min-w-0">
+                                      <p className={`text-sm font-bold ${active ? 'text-blue-700' : 'text-gray-900'}`}>{option.title}</p>
+                                      <p className="mt-0.5 text-xs text-gray-500">{option.subtitle}</p>
+                                    </div>
+                                  </div>
+                                </button>
+                              )
+                            })}
+                          </div>
+                          {postingOrderUpdatedAt && (
+                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(postingOrderUpdatedAt).toLocaleString()}</p>
+                          )}
+                          {postingOrderMessage && (
+                            <p className={`text-xs ${postingOrderMessage.includes('ไม่สำเร็จ') || postingOrderMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
+                              {postingOrderMessage}
+                            </p>
+                          )}
+                          <button
+                            onClick={() => {
+                              if (postingOrderSaving || postingOrderDraft === postingOrderCurrent) return
+                              void savePostingOrderSettings(postingOrderDraft)
+                            }}
+                            disabled={postingOrderSaving || postingOrderDraft === postingOrderCurrent}
+                            className="w-full rounded-xl bg-gray-900 px-4 py-2.5 text-sm font-bold text-white active:scale-95 transition-all disabled:opacity-40"
+                          >
+                            {postingOrderSaving ? 'กำลังบันทึก...' : 'บันทึกค่า'}
+                          </button>
                         </>
                       )}
                     </div>

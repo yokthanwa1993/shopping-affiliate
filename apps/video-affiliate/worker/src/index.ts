@@ -1536,7 +1536,7 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
            AND ph.status = 'success'
            AND (
                ph.video_id = ?
-               OR (? <> '' AND nvs.source_fingerprint = ?)
+               OR (? <> '' AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) = ?)
            )
          ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
          LIMIT 1`
@@ -1551,6 +1551,168 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
         id: typeof row.id === 'number' ? row.id : null,
         fbPostId: String(row.fb_post_id || '').trim() || null,
         postedAt: String(row.posted_at || '').trim() || null,
+    }
+}
+
+async function ensurePagePostedVideoGuardsTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS page_posted_video_guards (
+            guard_key TEXT PRIMARY KEY,
+            bot_id TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            video_id TEXT NOT NULL DEFAULT '',
+            source_fingerprint TEXT NOT NULL DEFAULT '',
+            history_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`
+    ).run()
+    await db.prepare(
+        'CREATE INDEX IF NOT EXISTS idx_page_posted_video_guards_page ON page_posted_video_guards(bot_id, page_id)'
+    ).run()
+}
+
+async function ensurePagePostedVideoGuardsBackfilled(db: D1Database): Promise<void> {
+    await ensurePostHistoryTraceColumns(db)
+    await ensurePagePostedVideoGuardsTable(db)
+    await db.prepare(
+        `INSERT OR IGNORE INTO page_posted_video_guards (
+            guard_key,
+            bot_id,
+            page_id,
+            video_id,
+            source_fingerprint,
+            history_id,
+            created_at,
+            updated_at
+        )
+        SELECT
+            'video::' || ph.bot_id || '::' || ph.page_id || '::' || ph.video_id,
+            ph.bot_id,
+            ph.page_id,
+            ph.video_id,
+            COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), ''),
+            ph.id,
+            ph.posted_at,
+            ph.posted_at
+        FROM post_history ph
+        WHERE ph.status = 'success'
+          AND TRIM(COALESCE(ph.video_id, '')) <> ''`
+    ).run().catch(() => { })
+    await db.prepare(
+        `INSERT OR IGNORE INTO page_posted_video_guards (
+            guard_key,
+            bot_id,
+            page_id,
+            video_id,
+            source_fingerprint,
+            history_id,
+            created_at,
+            updated_at
+        )
+        SELECT
+            'fingerprint::' || ph.bot_id || '::' || ph.page_id || '::' || COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), TRIM(nvs.source_fingerprint)),
+            ph.bot_id,
+            ph.page_id,
+            ph.video_id,
+            COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), TRIM(nvs.source_fingerprint)),
+            ph.id,
+            ph.posted_at,
+            ph.posted_at
+        FROM post_history ph
+        LEFT JOIN namespace_video_state nvs
+          ON nvs.namespace_id = ph.bot_id
+         AND nvs.video_id = ph.video_id
+        WHERE ph.status = 'success'
+          AND TRIM(COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint, '')) <> ''`
+    ).run().catch(() => { })
+}
+
+function buildPagePostedVideoGuardKeys(params: {
+    namespaceId: string
+    pageId: string
+    videoId: string
+    sourceFingerprint?: string
+}): string[] {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
+    if (!namespaceId || !pageId) return []
+
+    const keys: string[] = []
+    if (videoId) keys.push(`video::${namespaceId}::${pageId}::${videoId}`)
+    if (sourceFingerprint) keys.push(`fingerprint::${namespaceId}::${pageId}::${sourceFingerprint}`)
+    return keys
+}
+
+async function getExistingPagePostedVideoGuard(db: D1Database, params: {
+    namespaceId: string
+    pageId: string
+    videoId: string
+    sourceFingerprint?: string
+}): Promise<{ historyId: number | null; createdAt: string | null } | null> {
+    const keys = buildPagePostedVideoGuardKeys(params)
+    if (keys.length === 0) return null
+    await ensurePagePostedVideoGuardsBackfilled(db)
+    const placeholders = keys.map(() => '?').join(', ')
+    const row = await db.prepare(
+        `SELECT history_id, created_at
+         FROM page_posted_video_guards
+         WHERE guard_key IN (${placeholders})
+         ORDER BY datetime(updated_at) DESC, history_id DESC
+         LIMIT 1`
+    ).bind(...keys).first() as { history_id?: number | null; created_at?: string | null } | null
+    if (!row) return null
+    return {
+        historyId: typeof row.history_id === 'number' ? row.history_id : null,
+        createdAt: String(row.created_at || '').trim() || null,
+    }
+}
+
+async function recordPagePostedVideoGuard(db: D1Database, params: {
+    namespaceId: string
+    pageId: string
+    videoId: string
+    sourceFingerprint?: string
+    historyId?: number | null
+    postedAt?: string | null
+}): Promise<void> {
+    const keys = buildPagePostedVideoGuardKeys(params)
+    if (keys.length === 0) return
+    await ensurePagePostedVideoGuardsBackfilled(db)
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
+    const historyId = typeof params.historyId === 'number' ? params.historyId : null
+    const postedAt = String(params.postedAt || '').trim() || new Date().toISOString()
+
+    for (const guardKey of keys) {
+        await db.prepare(
+            `INSERT INTO page_posted_video_guards (
+                guard_key,
+                bot_id,
+                page_id,
+                video_id,
+                source_fingerprint,
+                history_id,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guard_key) DO UPDATE SET
+                history_id = COALESCE(excluded.history_id, page_posted_video_guards.history_id),
+                updated_at = excluded.updated_at`
+        ).bind(
+            guardKey,
+            namespaceId,
+            pageId,
+            videoId,
+            sourceFingerprint,
+            historyId,
+            postedAt,
+            postedAt,
+        ).run().catch(() => { })
     }
 }
 
@@ -1569,22 +1731,11 @@ async function claimGalleryVideoForPosting(params: {
     for (const video of orderedVideos) {
         const videoId = String(video?.id || '').trim()
         if (!videoId) continue
-        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
-            video?.sourceFingerprint || video?.source_fingerprint,
-        )
-
-        const existingSuccess = await getLatestSuccessfulPostHistoryRow(params.db, {
-            namespaceId,
-            pageId,
-            videoId,
-            sourceFingerprint,
-        })
-        if (existingSuccess) continue
 
         const videoLockKey = await tryAcquirePostingLock(params.db, {
             scope: 'video',
             namespaceId,
-            videoId: sourceFingerprint || videoId,
+            videoId,
         })
         if (!videoLockKey) continue
 
@@ -2446,6 +2597,37 @@ async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: s
 async function isNamespaceAffiliateShortlinkRequired(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return false
+
+    const [
+        explicitRequired,
+        accountEntry,
+        shopeeBaseEntry,
+        lazadaBaseEntry,
+        expectedUtmEntry,
+        expectedLazadaMemberEntry,
+    ] = await Promise.all([
+        getNamespaceShopeeShortlinkRequired(db, normalizedNamespaceId).catch(() => false),
+        getNamespaceAffiliateShortlinkAccountEntry(db, normalizedNamespaceId).catch(() => ({ account: '', updatedAt: null })),
+        getNamespaceShopeeShortlinkBaseUrlEntry(db, normalizedNamespaceId).catch(() => ({ baseUrl: '', updatedAt: null })),
+        getNamespaceLazadaShortlinkBaseUrlEntry(db, normalizedNamespaceId).catch(() => ({ baseUrl: '', updatedAt: null })),
+        getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, normalizedNamespaceId).catch(() => ({ expectedUtmId: '', updatedAt: null })),
+        getNamespaceLazadaExpectedMemberIdEntry(db, normalizedNamespaceId).catch(() => ({ expectedMemberId: '', updatedAt: null })),
+    ])
+
+    if (explicitRequired) return true
+
+    const account = String(accountEntry.account || '').trim()
+    const effectiveShopeeBaseUrl = account ? deriveAffiliateShortlinkBaseUrl('shopee', account) : String(shopeeBaseEntry.baseUrl || '').trim()
+    const effectiveLazadaBaseUrl = account ? deriveAffiliateShortlinkBaseUrl('lazada', account) : String(lazadaBaseEntry.baseUrl || '').trim()
+    const expectedUtmId = String(expectedUtmEntry.expectedUtmId || '').trim()
+    const expectedLazadaMemberId = String(expectedLazadaMemberEntry.expectedMemberId || '').trim()
+    const hasOperationalShortlinkConfig = !!effectiveShopeeBaseUrl
+        && !!effectiveLazadaBaseUrl
+        && !!expectedUtmId
+        && !!expectedLazadaMemberId
+
+    if (hasOperationalShortlinkConfig) return true
+
     const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedNamespaceId).catch(() => '')
     if (!ownerEmail) return false
     return isSystemAdmin(db, ownerEmail)
@@ -2803,6 +2985,18 @@ async function markNamespaceVideoPosted(db: D1Database, namespaceId: string, vid
     const normalizedPostedAt = String(postedAt || '').trim()
     if (!namespaceId || !videoId || !normalizedPostedAt) return
     await upsertNamespaceVideoState(db, namespaceId, videoId, { posted_at: normalizedPostedAt })
+}
+
+async function resetNamespaceVideoPosted(db: D1Database, namespaceId: string, videoId: string): Promise<void> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedNamespaceId || !normalizedVideoId) return
+    await ensureNamespaceVideoStateColumns(db)
+    await db.prepare(
+        `UPDATE namespace_video_state
+         SET posted_at = '', updated_at = datetime('now')
+         WHERE namespace_id = ? AND video_id = ?`
+    ).bind(normalizedNamespaceId, normalizedVideoId).run()
 }
 
 function normalizeNamespaceVideoSourceFingerprint(value: unknown): string {
@@ -12037,6 +12231,7 @@ app.put('/api/gallery/:id', async (c) => {
             title?: string
             manualCaption?: string
             keepInPostedTab?: boolean
+            resetPostedState?: boolean
             namespace_id?: string
             namespaceId?: string
         }
@@ -12163,6 +12358,12 @@ app.put('/api/gallery/:id', async (c) => {
             } else {
                 delete meta.keepInPostedTab
             }
+            changed = true
+        }
+        if (body.resetPostedState === true) {
+            meta.postedAt = ''
+            delete meta.keepInPostedTab
+            await resetNamespaceVideoPosted(c.env.DB, targetNamespaceId, id)
             changed = true
         }
         if (body.category !== undefined) {
@@ -13870,11 +14071,17 @@ async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: 
     const derivedAccount = accountEntry.account || await resolveNamespaceAffiliateShortlinkAccount(db, namespaceId)
     const row = await getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId)
     const lazadaRow = await getNamespaceLazadaShortlinkBaseUrlEntry(db, namespaceId)
-    const required = await getNamespaceShopeeShortlinkRequired(db, namespaceId)
+    const explicitRequired = await getNamespaceShopeeShortlinkRequired(db, namespaceId)
     const expected = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
     const lazadaExpected = await getNamespaceLazadaExpectedMemberIdEntry(db, namespaceId)
     const effectiveShopeeBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('shopee', derivedAccount) : row.baseUrl
     const effectiveLazadaBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('lazada', derivedAccount) : lazadaRow.baseUrl
+    const required = explicitRequired || (
+        !!effectiveShopeeBaseUrl
+        && !!effectiveLazadaBaseUrl
+        && !!expected.expectedUtmId
+        && !!lazadaExpected.expectedMemberId
+    )
     const updatedAt = [accountEntry.updatedAt, row.updatedAt, lazadaRow.updatedAt, expected.updatedAt, lazadaExpected.updatedAt]
         .map((value) => String(value || '').trim())
         .filter(Boolean)
@@ -18193,10 +18400,32 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN lazada_member_match INTEGER',
                 'ALTER TABLE post_history ADD COLUMN comment_delay_seconds INTEGER',
                 'ALTER TABLE post_history ADD COLUMN comment_due_at TEXT',
+                'ALTER TABLE post_history ADD COLUMN source_fingerprint TEXT',
             ]
             for (const sql of statements) {
                 await db.prepare(sql).run().catch(() => { })
             }
+            await db.prepare(
+                `UPDATE post_history
+                 SET source_fingerprint = (
+                     SELECT nvs.source_fingerprint
+                     FROM namespace_video_state nvs
+                     WHERE nvs.namespace_id = post_history.bot_id
+                       AND nvs.video_id = post_history.video_id
+                     LIMIT 1
+                 )
+                 WHERE TRIM(COALESCE(source_fingerprint, '')) = ''
+                   AND EXISTS (
+                     SELECT 1
+                     FROM namespace_video_state nvs
+                     WHERE nvs.namespace_id = post_history.bot_id
+                       AND nvs.video_id = post_history.video_id
+                       AND TRIM(COALESCE(nvs.source_fingerprint, '')) <> ''
+                 )`
+            ).run().catch(() => { })
+            await db.prepare(
+                'CREATE INDEX IF NOT EXISTS idx_post_history_page_fingerprint_success ON post_history(bot_id, page_id, status, source_fingerprint)'
+            ).run().catch(() => { })
         })()
     }
 
@@ -19321,14 +19550,16 @@ app.get('/api/dashboard', async (c) => {
         await ensureLinkSubmissionsTable(c.env.DB)
         await ensureTelegramBotSessionsTable(c.env.DB)
         await ensureLineUsersTable(c.env.DB)
-        await backfillRecentInboxLinkSubmissions({
-            db: c.env.DB,
-            bucket: c.get('bucket'),
-            namespaceId: String(botId || ''),
-        }).catch((e) => {
-            console.error(`[DASHBOARD] Failed to backfill link submissions: ${e instanceof Error ? e.message : String(e)}`)
-            return 0
-        })
+        c.executionCtx.waitUntil(
+            backfillRecentInboxLinkSubmissions({
+                db: c.env.DB,
+                bucket: c.get('bucket'),
+                namespaceId: String(botId || ''),
+            }).catch((e) => {
+                console.error(`[DASHBOARD] Failed to backfill link submissions: ${e instanceof Error ? e.message : String(e)}`)
+                return 0
+            })
+        )
 
         const [postsAllRow, postsOnDateRow, linksAllRow, linksOnDateRow, usersRes, scopedSessionsRes, lineUsersRes, linksByAdminRes] = await Promise.all([
             c.env.DB.prepare(
@@ -19429,6 +19660,7 @@ app.get('/api/dashboard', async (c) => {
             return a.display_name.localeCompare(b.display_name)
         })
 
+        c.header('Cache-Control', 'private, max-age=15, stale-while-revalidate=60')
         return c.json({
             date: targetDate,
             totals: {
@@ -20387,6 +20619,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
     let attemptPostedAtIso = ''
     let normalizedShopeeLink = ''
     let normalizedLazadaLink = ''
+    let selectedSourceFingerprint = ''
     let fbVideoId = ''
     let postingTokenUsed = ''
     let hasCommentToken = false
@@ -20485,6 +20718,22 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             bucket: sourceBucket,
             sourceMeta: meta,
         })
+        selectedSourceFingerprint = sourceFingerprint
+        const existingGuard = await getExistingPagePostedVideoGuard(env.DB, {
+            namespaceId: botId,
+            pageId,
+            videoId: selectedVideoId,
+            sourceFingerprint,
+        })
+        if (existingGuard) {
+            return c.json({
+                error: 'video_already_posted',
+                details: {
+                    history_id: existingGuard.historyId,
+                    posted_at: existingGuard.createdAt,
+                },
+            }, 409)
+        }
         const existingSuccess = await getLatestSuccessfulPostHistoryRow(env.DB, {
             namespaceId: botId,
             pageId,
@@ -20492,6 +20741,14 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             sourceFingerprint,
         })
         if (existingSuccess) {
+            await recordPagePostedVideoGuard(env.DB, {
+                namespaceId: botId,
+                pageId,
+                videoId: selectedVideoId,
+                sourceFingerprint,
+                historyId: existingSuccess.id,
+                postedAt: existingSuccess.postedAt,
+            }).catch(() => { })
             return c.json({
                 error: 'video_already_posted',
                 details: {
@@ -20563,7 +20820,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
         attemptPostedAtIso = new Date().toISOString()
         const inserted = await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             pageId,
             selectedVideoId,
@@ -20586,6 +20843,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             normalizedShopeeError,
             null,
             normalizedShopeeUtmMatch,
+            selectedSourceFingerprint || null,
         ).run() as { meta?: { last_row_id?: number } }
         retryHistoryId = Number(inserted?.meta?.last_row_id || 0) || null
 
@@ -20739,6 +20997,14 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             retryHistoryId,
         ).run()
         await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
+        await recordPagePostedVideoGuard(env.DB, {
+            namespaceId: botId,
+            pageId,
+            videoId: selectedVideoId,
+            sourceFingerprint: selectedSourceFingerprint,
+            historyId: retryHistoryId,
+            postedAt: attemptPostedAtIso,
+        }).catch(() => { })
 
         await clearVideoShopeeLink(sourceBucket, selectedVideoId)
         return c.json({
@@ -20852,6 +21118,14 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                         retryHistoryId,
                     ).run()
                     await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
+                    await recordPagePostedVideoGuard(env.DB, {
+                        namespaceId: botId,
+                        pageId,
+                        videoId: selectedVideoId,
+                        sourceFingerprint: selectedSourceFingerprint,
+                        historyId: retryHistoryId,
+                        postedAt: attemptPostedAtIso,
+                    }).catch(() => { })
 
                     const sourceBucket = selectedVideoNamespaceId === botId
                         ? c.get('bucket')
@@ -21094,6 +21368,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let primaryPostingTokenCandidates: string[] = []
     let fallbackPostTokenCandidates: string[] = []
     let commentTokenCandidates: string[] = []
+    let selectedSourceFingerprint = ''
     let postingTokenUsed = ''
     let hasCommentToken = false
     let initialCommentStatus = 'not_configured'
@@ -21180,6 +21455,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const pickedVideo = pickedVideoEntry.video
         videoPostingLockKey = pickedVideoEntry.videoLockKey
         const unpostedId = String(pickedVideo.id || '').trim()
+        selectedSourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+            pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
+        )
         selectedVideoId = unpostedId
         selectedVideoNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
         const sourceBucket = selectedVideoNamespaceId === botId
@@ -21219,7 +21497,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
         const inserted = await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         ).bind(
             page.id,
             unpostedId,
@@ -21242,6 +21520,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             normalizedShopeeError,
             null,
             normalizedShopeeUtmMatch,
+            selectedSourceFingerprint || null,
         ).run()
         forceHistoryId = Number(inserted.meta?.last_row_id || 0) || null
 
@@ -21410,6 +21689,14 @@ app.post('/api/pages/:id/force-post', async (c) => {
             ).run()
         }
         await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+        await recordPagePostedVideoGuard(env.DB, {
+            namespaceId: botId,
+            pageId: page.id,
+            videoId: unpostedId,
+            sourceFingerprint: selectedSourceFingerprint,
+            historyId: forceHistoryId,
+            postedAt: attemptPostedAtIso,
+        }).catch(() => { })
 
         await clearVideoShopeeLink(c.get('bucket'), unpostedId)
         return c.json({ success: true, page: page.name, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId, fb_reel_url: fbReelUrl })
@@ -21526,6 +21813,14 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         ).run()
                     }
                     await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
+                    await recordPagePostedVideoGuard(env.DB, {
+                        namespaceId: botId,
+                        pageId,
+                        videoId: selectedVideoId,
+                        sourceFingerprint: selectedSourceFingerprint,
+                        historyId: forceHistoryId,
+                        postedAt: attemptPostedAtIso,
+                    }).catch(() => { })
 
                     await clearVideoShopeeLink(new BotBucket(env.BUCKET, selectedVideoNamespaceId || botId) as unknown as R2Bucket, selectedVideoId)
                     return c.json({
@@ -21907,6 +22202,24 @@ async function updateCronRuntimeState(db: D1Database, patch: {
 async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     console.log('[CRON] Starting auto-post check...')
     const dedupCommentTargets = new Set<string>()
+    const scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
+        scope: 'page',
+        namespaceId: '__scheduled__',
+        pageId: 'run',
+        ttlMinutes: 10,
+    })
+    if (!scheduledRunLockKey) {
+        console.log('[CRON] Skip run (scheduled global lock busy)')
+        await updateCronRuntimeState(env.DB, {
+            status: 'busy',
+            heartbeatAt: new Date().toISOString(),
+            currentPageId: null,
+            currentPageName: null,
+            currentNamespaceId: null,
+            lastError: 'scheduled_run_busy',
+        }).catch(() => { })
+        return
+    }
 
     enqueueBackgroundTask(ctx, 'CRON AUTO-IMPORT', async () => {
         await autoImportAndProcessForAdmin(env, ctx)
@@ -22246,6 +22559,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const pickedVideo = pickedVideoEntry.video
         videoPostingLockKey = pickedVideoEntry.videoLockKey
         const unpostedId = String(pickedVideo.id || '').trim()
+        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+            pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
+        )
         const sourceNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
         const recentAttempts = await env.DB.prepare(
             `SELECT status, posted_at
@@ -22337,7 +22653,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const initialCommentError = initialCommentState.error
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         const inserted = await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
         ).bind(
             page.id,
             unpostedId,
@@ -22360,6 +22676,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             normalizedShopeeError,
             null,
             normalizedShopeeUtmMatch,
+            sourceFingerprint || null,
         ).run()
         const cronHistoryId = Number(inserted.meta?.last_row_id || 0) || null
 
@@ -22527,6 +22844,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 ).run()
             }
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+            await recordPagePostedVideoGuard(env.DB, {
+                namespaceId: botId,
+                pageId: page.id,
+                videoId: unpostedId,
+                sourceFingerprint,
+                historyId: cronHistoryId,
+                postedAt: nowISO,
+            }).catch(() => { })
             cronStats.pagesPosted += 1
             await updateCronRuntimeState(env.DB, {
                 runId,
@@ -22655,6 +22980,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         ).run()
                     }
                     await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+                    await recordPagePostedVideoGuard(env.DB, {
+                        namespaceId: botId,
+                        pageId: page.id,
+                        videoId: unpostedId,
+                        sourceFingerprint,
+                        historyId: cronHistoryId,
+                        postedAt: nowISO,
+                    }).catch(() => { })
                     cronStats.pagesPosted += 1
                     await updateCronRuntimeState(env.DB, {
                         runId,
@@ -22733,6 +23066,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             pagesFailed: cronStats.pagesFailed,
             lastError: fatalError ? fatalError.message : null,
         }).catch(() => { })
+        await releasePostingLock(env.DB, scheduledRunLockKey)
     }
 
     console.log('[CRON] Auto-post check complete')
