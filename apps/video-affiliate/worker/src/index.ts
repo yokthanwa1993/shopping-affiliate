@@ -892,16 +892,30 @@ function buildScopedAppPathUrl(baseUrl: string, botScope: string, targetPath: st
     const normalizedTargetPath = String(targetPath || '').trim().replace(/^\/+/, '')
     try {
         const url = new URL(scopedBaseUrl)
-        const preservedBasePath = url.hostname === 'liff.line.me'
+        const isLiffUrl = url.hostname === 'liff.line.me'
+        const preservedBasePath = isLiffUrl
             ? String(url.pathname || '').replace(/\/+$/, '')
             : ''
-        url.pathname = preservedBasePath && preservedBasePath !== '/'
-            ? `${preservedBasePath}/${normalizedTargetPath}`
-            : `/${normalizedTargetPath}`
+        const mergedParams = new URLSearchParams()
+        const scope = String(botScope || '').trim()
+        if (scope) mergedParams.set('bot', scope)
         for (const [key, value] of Object.entries(extraParams || {})) {
             const normalizedValue = String(value || '').trim()
-            if (normalizedValue) url.searchParams.set(key, normalizedValue)
-            else url.searchParams.delete(key)
+            if (normalizedValue) mergedParams.set(key, normalizedValue)
+        }
+        if (isLiffUrl) {
+            url.pathname = preservedBasePath || url.pathname || '/'
+            const liffStatePath = `/${normalizedTargetPath}${mergedParams.toString() ? `?${mergedParams.toString()}` : ''}`
+            url.searchParams.set('liff.state', liffStatePath)
+            if (scope) url.searchParams.set('bot', scope)
+            else url.searchParams.delete('bot')
+        } else {
+            url.pathname = preservedBasePath && preservedBasePath !== '/'
+                ? `${preservedBasePath}/${normalizedTargetPath}`
+                : `/${normalizedTargetPath}`
+            for (const [key, value] of mergedParams.entries()) {
+                url.searchParams.set(key, value)
+            }
         }
         return url.toString()
     } catch {
@@ -5754,19 +5768,19 @@ const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
-        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: `${LIFF_BASE}/dashboard` },
+        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'dashboard') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '🎬 แกลลี่', uri: `${LIFF_BASE}/gallery` },
+        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'gallery') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '📋 ประวัติ', uri: `${LIFF_BASE}/logs` },
+        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'logs') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: `${LIFF_BASE}/settings` },
+        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'settings') },
     },
 ]
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
@@ -22199,15 +22213,64 @@ async function updateCronRuntimeState(db: D1Database, patch: {
     ).run()
 }
 
+async function recoverStaleScheduledRun(db: D1Database, maxStaleMs = 90_000): Promise<boolean> {
+    const runtime = await db.prepare(
+        `SELECT run_id, status, started_at, heartbeat_at
+         FROM cron_runtime_state
+         WHERE id = 'scheduled'
+         LIMIT 1`
+    ).first() as {
+        run_id?: string | null
+        status?: string | null
+        started_at?: string | null
+        heartbeat_at?: string | null
+    } | null
+
+    const status = String(runtime?.status || '').trim().toLowerCase()
+    const heartbeatAt = String(runtime?.heartbeat_at || '').trim()
+    const heartbeatMs = Date.parse(heartbeatAt)
+    if (status !== 'running' || !Number.isFinite(heartbeatMs)) return false
+    if ((Date.now() - heartbeatMs) <= Math.max(30_000, maxStaleMs)) return false
+
+    const staleError = `stale_scheduled_run_recovered:${String(runtime?.run_id || '').trim() || 'unknown'}`
+    await db.prepare(
+        `DELETE FROM posting_locks
+         WHERE lock_key = 'page::__scheduled__::run'`
+    ).run().catch(() => { })
+    await updateCronRuntimeState(db, {
+        status: 'failed',
+        finishedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        currentPageId: null,
+        currentPageName: null,
+        currentNamespaceId: null,
+        lastError: staleError,
+    }).catch(() => { })
+    console.warn(`[CRON] Recovered stale scheduled run: ${staleError}`)
+    return true
+}
+
 async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     console.log('[CRON] Starting auto-post check...')
     const dedupCommentTargets = new Set<string>()
-    const scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
+    await recoverStaleScheduledRun(env.DB).catch(() => { })
+    let scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
         scope: 'page',
         namespaceId: '__scheduled__',
         pageId: 'run',
         ttlMinutes: 10,
     })
+    if (!scheduledRunLockKey) {
+        const recovered = await recoverStaleScheduledRun(env.DB).catch(() => false)
+        if (recovered) {
+            scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
+                scope: 'page',
+                namespaceId: '__scheduled__',
+                pageId: 'run',
+                ttlMinutes: 10,
+            })
+        }
+    }
     if (!scheduledRunLockKey) {
         console.log('[CRON] Skip run (scheduled global lock busy)')
         await updateCronRuntimeState(env.DB, {
