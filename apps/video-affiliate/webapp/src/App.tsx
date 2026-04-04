@@ -3154,6 +3154,8 @@ function App({
   const postHistoryFetchInFlightRef = useRef(false)
   const lastPostHistoryFetchKeyRef = useRef('')
   const lastPostHistoryFetchAtRef = useRef(0)
+  const galleryReadyCountRef = useRef(videos.length)
+  const galleryUsedCountRef = useRef(usedVideos.length)
   const dashboardRequestRef = useRef(0)
   const inboxRequestRef = useRef(0)
   const systemInboxRequestRef = useRef(0)
@@ -3839,6 +3841,14 @@ function App({
   }, [tab, token, authBootstrapping])
 
   useEffect(() => {
+    galleryReadyCountRef.current = videos.length
+  }, [videos.length])
+
+  useEffect(() => {
+    galleryUsedCountRef.current = usedVideos.length
+  }, [usedVideos.length])
+
+  useEffect(() => {
     if (authBootstrapping || !token) return
     if (tab !== 'gallery') return
 
@@ -3848,7 +3858,9 @@ function App({
         if (isOwner) void loadGlobalOriginalVideos({ force: true })
         return
       }
-      const hasCachedGallery = categoryFilter === 'used' ? usedVideos.length > 0 : videos.length > 0
+      const hasCachedGallery = categoryFilter === 'used'
+        ? galleryUsedCountRef.current > 0
+        : galleryReadyCountRef.current > 0
       if (mode === 'reset' || !hasCachedGallery) {
         void loadGallerySnapshotBundle({ reset: true })
         return
@@ -3856,7 +3868,6 @@ function App({
       void loadGallerySnapshotBundle({ refreshTop: true })
     }
 
-    refreshGalleryView('reset')
     const handleVisibilityChange = () => {
       if (document.visibilityState !== 'visible') return
       refreshGalleryView('reset')
@@ -3870,7 +3881,7 @@ function App({
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [tab, token, authBootstrapping, categoryFilter, isOwner, usedVideos.length, videos.length])
+  }, [tab, token, authBootstrapping, categoryFilter, isOwner])
 
   useEffect(() => {
     if (tab !== 'settings' && settingsSection !== 'menu') {
@@ -4475,7 +4486,7 @@ function App({
     const hasCachedGallery = categoryFilter === 'used' ? usedVideos.length > 0 : videos.length > 0
     void loadGallerySnapshotBundle(hasCachedGallery && !gallerySearchQuery ? { refreshTop: true } : { reset: true })
     if (isOwner) void loadGlobalOriginalVideos()
-  }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery, usedVideos.length, videos.length])
+  }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
 
   async function loadDashboard(dateValue = dashboardDateFilter, options: { silent?: boolean } = {}) {
     const session = getToken()
