@@ -3199,7 +3199,7 @@ async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promis
     if (!normalizedNamespaceId) return []
 
     const inventory = await getNamespaceGalleryInventory(env, normalizedNamespaceId)
-    return inventory.videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready)
+    return inventory.videos.filter((video) => isNamespaceGalleryVideoDisplayReady(video as Record<string, unknown>))
 }
 
 function isNamespaceGalleryVideoPosted(video: Record<string, unknown> | null | undefined): boolean {
@@ -5764,7 +5764,7 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
     return namespaceId
 }
 
-const LIFF_BASE = 'https://miniapp.line.me/2009652996-DJtEhoDn'
+const LIFF_BASE = 'https://liff.line.me/2009652996-DJtEhoDn'
 const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
 const LINE_QUICK_REPLY_ITEMS = [
     {
