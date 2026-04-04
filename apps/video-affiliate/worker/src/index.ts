@@ -942,6 +942,34 @@ function buildScopedTabWebAppUrl(baseUrl: string, botScope: string, tab: string,
     return buildScopedAppPathUrl(baseUrl, botScope, String(tab || '').trim(), extraParams)
 }
 
+function buildScopedLiffTabQueryUrl(baseUrl: string, botScope: string, tab: string, extraParams?: Record<string, string>) {
+    const scopedBaseUrl = buildScopedWebAppUrl(baseUrl, botScope)
+    const normalizedTab = String(tab || '').trim()
+    try {
+        const url = new URL(scopedBaseUrl)
+        if (normalizedTab) url.searchParams.set('tab', normalizedTab)
+        else url.searchParams.delete('tab')
+        url.searchParams.delete('liff.state')
+        for (const [key, value] of Object.entries(extraParams || {})) {
+            const normalizedValue = String(value || '').trim()
+            if (normalizedValue) url.searchParams.set(key, normalizedValue)
+            else url.searchParams.delete(key)
+        }
+        return url.toString()
+    } catch {
+        const params = new URLSearchParams()
+        const scope = String(botScope || '').trim()
+        if (scope) params.set('bot', scope)
+        if (normalizedTab) params.set('tab', normalizedTab)
+        for (const [key, value] of Object.entries(extraParams || {})) {
+            const normalizedValue = String(value || '').trim()
+            if (normalizedValue) params.set(key, normalizedValue)
+        }
+        const query = params.toString()
+        return `${baseUrl}${query ? `?${query}` : ''}`
+    }
+}
+
 function getAppWebBaseUrl(env: Env): string {
     return String(env.WEBAPP_URL || 'https://app.oomnn.com').trim() || 'https://app.oomnn.com'
 }
@@ -2913,24 +2941,6 @@ type NamespaceVideoStateRow = {
     posted_at?: string
 }
 
-function pickLatestIsoTimestamp(...values: unknown[]): string {
-    let latestValue = ''
-    let latestMs = Number.NEGATIVE_INFINITY
-
-    for (const value of values) {
-        const normalized = String(value || '').trim()
-        if (!normalized) continue
-        const ms = Date.parse(normalized)
-        if (!Number.isFinite(ms)) continue
-        if (ms > latestMs) {
-            latestMs = ms
-            latestValue = normalized
-        }
-    }
-
-    return latestValue
-}
-
 async function listNamespaceVideoStates(db: D1Database, namespaceId: string): Promise<NamespaceVideoStateRow[]> {
     await ensureNamespaceVideoStateColumns(db)
     const normalizedNamespaceId = String(namespaceId || '').trim()
@@ -3153,28 +3163,6 @@ async function seedNamespaceVideoStateFromLegacy(db: D1Database, namespaceId: st
     }
 }
 
-async function listNamespaceLatestPostedAtByVideoIdFromHistory(db: D1Database, namespaceId: string): Promise<Map<string, string>> {
-    const normalizedNamespaceId = String(namespaceId || '').trim()
-    if (!normalizedNamespaceId) return new Map()
-
-    const res = await db.prepare(
-        `SELECT video_id, MAX(posted_at) AS latest_posted_at
-         FROM post_history
-         WHERE bot_id = ?
-           AND status IN ('success', 'posting')
-           AND TRIM(COALESCE(video_id, '')) <> ''
-         GROUP BY video_id`
-    ).bind(normalizedNamespaceId).all() as {
-        results?: Array<{ video_id?: string; latest_posted_at?: string }>
-    }
-
-    return new Map(
-        (res.results || [])
-            .map((row) => [String(row.video_id || '').trim(), String(row.latest_posted_at || '').trim()] as const)
-            .filter(([videoId, postedAt]) => !!videoId && !!postedAt)
-    )
-}
-
 async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promise<Array<Record<string, unknown>>> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return []
@@ -3218,13 +3206,12 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
 
     await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId)
     const bucket = new BotBucket(env.BUCKET, normalizedNamespaceId) as unknown as R2Bucket
-    const [sourceVideos, stateRows, historyPostedAtByVideoId, expectedUtmId, expectedLazadaMemberId, shortlinkRequired] = await Promise.all([
+    const [sourceVideos, stateRows, expectedUtmId, expectedLazadaMemberId, shortlinkRequired] = await Promise.all([
         listGalleryIndexVideos(env.DB, {
             namespaceId: normalizedNamespaceId,
             requirePublicVideo: true,
         }).catch(() => []),
         listNamespaceVideoStates(env.DB, normalizedNamespaceId),
-        listNamespaceLatestPostedAtByVideoIdFromHistory(env.DB, normalizedNamespaceId),
         resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, normalizedNamespaceId).catch(() => ''),
         resolveNamespaceLazadaExpectedMemberId(env.DB, normalizedNamespaceId).catch(() => ''),
         isNamespaceAffiliateShortlinkRequired(env.DB, normalizedNamespaceId).catch(() => false),
@@ -3247,30 +3234,13 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
         bucket,
     })
 
-    const postedAtByFingerprint = new Map<string, string>()
-    for (const row of stateByVideoId.values()) {
-        const fingerprint = normalizeNamespaceVideoSourceFingerprint(row?.source_fingerprint)
-        const postedAt = String(row?.posted_at || '').trim()
-        if (!fingerprint || !postedAt) continue
-        const previous = String(postedAtByFingerprint.get(fingerprint) || '').trim()
-        if (!previous || Date.parse(postedAt) > Date.parse(previous)) {
-            postedAtByFingerprint.set(fingerprint, postedAt)
-        }
-    }
-
     const inventoryVideos = namespaceSourceVideos
         .map((video) => {
             const source = video as Record<string, unknown>
             const videoId = String(source.id || '').trim()
             const row = stateByVideoId.get(videoId)
             const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(row?.source_fingerprint)
-            const postedAt = pickLatestIsoTimestamp(
-                row?.posted_at,
-                historyPostedAtByVideoId.get(videoId),
-                postedAtByFingerprint.get(sourceFingerprint),
-                source.postedAt,
-                source.posted_at,
-            )
+            const postedAt = String(row?.posted_at || '').trim()
             const merged = {
                 ...source,
                 id: videoId,
@@ -5765,23 +5735,22 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
 
 const LIFF_BASE = 'https://liff.line.me/2009652996-DJtEhoDn'
 const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
-const APP_WEB_BASE = 'https://app.oomnn.com'
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
-        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'dashboard') },
+        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'dashboard') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'gallery') },
+        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'gallery') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'logs') },
+        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'logs') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'settings') },
+        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'settings') },
     },
 ]
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
@@ -20781,46 +20750,6 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             sourceMeta: meta,
         })
         selectedSourceFingerprint = sourceFingerprint
-        const existingGuard = await getExistingPagePostedVideoGuard(env.DB, {
-            namespaceId: botId,
-            pageId,
-            videoId: selectedVideoId,
-            sourceFingerprint,
-        })
-        if (existingGuard) {
-            return c.json({
-                error: 'video_already_posted',
-                details: {
-                    history_id: existingGuard.historyId,
-                    posted_at: existingGuard.createdAt,
-                },
-            }, 409)
-        }
-        const existingSuccess = await getLatestSuccessfulPostHistoryRow(env.DB, {
-            namespaceId: botId,
-            pageId,
-            videoId: selectedVideoId,
-            sourceFingerprint,
-        })
-        if (existingSuccess) {
-            await recordPagePostedVideoGuard(env.DB, {
-                namespaceId: botId,
-                pageId,
-                videoId: selectedVideoId,
-                sourceFingerprint,
-                historyId: existingSuccess.id,
-                postedAt: existingSuccess.postedAt,
-            }).catch(() => { })
-            return c.json({
-                error: 'video_already_posted',
-                details: {
-                    history_id: existingSuccess.id,
-                    fb_post_id: existingSuccess.fbPostId,
-                    posted_at: existingSuccess.postedAt,
-                },
-            }, 409)
-        }
-
         videoPostingLockKey = await tryAcquirePostingLock(env.DB, {
             scope: 'video',
             namespaceId: botId,
@@ -21451,21 +21380,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
         ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
-        const recentPostGuard = await getRecentPagePostGuard({
-            db: env.DB,
-            namespaceId: botId,
-            pageId: page.id,
-        })
-        if (recentPostGuard.blocked) {
-            return c.json({
-                error: 'page_recently_posted_or_posting',
-                details: {
-                    history_id: recentPostGuard.historyId,
-                    status: recentPostGuard.status,
-                    posted_at: recentPostGuard.postedAt,
-                },
-            }, 409)
-        }
         pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
             scope: 'page',
             namespaceId: botId,
@@ -22437,18 +22351,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     continue
                 }
 
-                const recentPostGuard = await getRecentPagePostGuard({
-                    db: env.DB,
-                    namespaceId: botId,
-                    pageId: page.id,
-                })
-                if (recentPostGuard.blocked) {
-                    console.log(
-                        `[CRON] Page ${page.name}: skip (recent ${recentPostGuard.status || 'activity'} history_id=${recentPostGuard.historyId || '-'} posted_at=${recentPostGuard.postedAt || '-'})`
-                    )
-                    continue
-                }
-
                 const pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
                     scope: 'page',
                     namespaceId: botId,
@@ -22623,26 +22525,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
         )
         const sourceNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
-        const recentAttempts = await env.DB.prepare(
-            `SELECT status, posted_at
-             FROM post_history
-             WHERE page_id = ? AND video_id = ? AND bot_id = ?
-             ORDER BY posted_at DESC, id DESC
-             LIMIT 5`
-        ).bind(page.id, unpostedId, botId).all() as {
-            results?: Array<{ status?: string; posted_at?: string }>
-        }
-        const recentFailedAttempts = (recentAttempts.results || []).filter((row) => {
-            if (String(row?.status || '') !== 'failed') return false
-            const postedAtMs = Date.parse(String(row?.posted_at || ''))
-            return Number.isFinite(postedAtMs) && (Date.now() - postedAtMs) <= (60 * 60 * 1000)
-        })
-        if (recentFailedAttempts.length >= 1) {
-            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} after ${recentFailedAttempts.length} failed attempt in the last hour`)
-            console.log(`[CRON] Page ${page.name}: keep dedup key after recent failure, skip retries until next schedule window`)
-            continue
-        }
-
         // Get video metadata
         const sourceBucket = sourceNamespaceId === botId
             ? botBucket
