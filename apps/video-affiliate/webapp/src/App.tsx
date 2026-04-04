@@ -2924,6 +2924,7 @@ function App({
   const [galleryLoading, setGalleryLoading] = useState(() => {
     return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), false).length === 0
   })
+  const [galleryBootstrapPending, setGalleryBootstrapPending] = useState(false)
   const [_systemGalleryStats, setSystemGalleryStats] = useState<SystemGalleryStats>({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
   const [, setGallerySummary] = useState<GallerySummaryStats>({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
   const [, setProcessingSummary] = useState<ProcessingSummaryStats>({
@@ -4372,6 +4373,7 @@ function App({
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
     const shouldShowLoading = (categoryFilter === 'used' ? usedVideos.length === 0 : videos.length === 0)
+    if (reset || refreshTop) setGalleryBootstrapPending(true)
     if (reset && shouldShowLoading) setGalleryLoading(true)
     if (reset) setGalleryLoadingMore(false)
 
@@ -4382,6 +4384,7 @@ function App({
       ])
     } finally {
       if (reset && shouldShowLoading) setGalleryLoading(false)
+      if (reset || refreshTop) setGalleryBootstrapPending(false)
     }
   }
 
@@ -5965,7 +5968,7 @@ function App({
                   ))}
                 </div>
               )
-            ) : galleryLoading ? (
+            ) : (galleryLoading || galleryBootstrapPending) ? (
               <div className="grid grid-cols-3 gap-3">
                 {[1, 2, 3, 4, 5, 6].map(i => (
                   <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />
