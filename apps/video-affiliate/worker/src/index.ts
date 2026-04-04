@@ -5766,22 +5766,26 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
 
 const LIFF_BASE = 'https://liff.line.me/2009652996-DJtEhoDn'
 const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
+const LIFF_DASHBOARD = 'https://liff.line.me/2009652996-2SnLQJeD'
+const LIFF_GALLERY = 'https://liff.line.me/2009652996-OGTCnapx'
+const LIFF_LOGS = 'https://liff.line.me/2009652996-vBsuawCH'
+const LIFF_SETTINGS = 'https://liff.line.me/2009652996-PgxNIX5I'
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
-        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'dashboard') },
+        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: LIFF_DASHBOARD },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'gallery') },
+        action: { type: 'uri', label: '🎬 แกลลี่', uri: LIFF_GALLERY },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'logs') },
+        action: { type: 'uri', label: '📋 ประวัติ', uri: LIFF_LOGS },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'settings') },
+        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: LIFF_SETTINGS },
     },
 ]
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
