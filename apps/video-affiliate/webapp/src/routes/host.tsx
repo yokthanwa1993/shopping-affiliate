@@ -24,6 +24,7 @@ export default function HostRoute() {
   return (
     <App
       controlledTab={tab}
+      controlledLocationKey={`${location.pathname}${location.search}`}
       onControlledTabChange={(nextTab) => {
         const nextPath = getAppTabPath(nextTab)
         const nextSearch = stripLegacyTabSearchParams(location.search)
