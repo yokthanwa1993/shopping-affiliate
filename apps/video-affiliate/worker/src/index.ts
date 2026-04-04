@@ -5764,7 +5764,7 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
     return namespaceId
 }
 
-const LIFF_BASE = 'https://liff.line.me/2009652996-DJtEhoDn'
+const LIFF_BASE = 'https://miniapp.line.me/2009652996-DJtEhoDn'
 const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
 const LINE_QUICK_REPLY_ITEMS = [
     {
