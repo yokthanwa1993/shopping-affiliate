@@ -3045,13 +3045,7 @@ function App({
       ? (nextPageId ? 'pages' : (options?.settingsSection ?? settingsSection))
       : 'menu'
     if (nextTab === 'settings') {
-      if (nextPageId) {
-        url.pathname = `/settings/pages/${encodeURIComponent(nextPageId)}`
-      } else if (nextSettingsSection !== 'menu') {
-        url.pathname = `/settings/${nextSettingsSection}`
-      } else {
-        url.pathname = '/settings'
-      }
+      url.pathname = '/settings'
     }
     if (nextTab === 'settings' && nextSettingsSection !== 'menu') {
       url.searchParams.set('section', nextSettingsSection)
