@@ -3151,6 +3151,9 @@ function App({
   const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const processingFetchInFlightRef = useRef(false)
+  const postHistoryFetchInFlightRef = useRef(false)
+  const lastPostHistoryFetchKeyRef = useRef('')
+  const lastPostHistoryFetchAtRef = useRef(0)
   const dashboardRequestRef = useRef(0)
   const inboxRequestRef = useRef(0)
   const systemInboxRequestRef = useRef(0)
@@ -4425,18 +4428,38 @@ function App({
     }
   }
 
-  async function refreshPostHistorySnapshot() {
+  async function refreshPostHistorySnapshot(options: { force?: boolean } = {}) {
+    const force = !!options.force
+    const fetchKey = `${String(namespaceId || getStoredNamespace(botScope) || '').trim()}::${logDateFilter}`
+    const now = Date.now()
+    if (!force) {
+      if (postHistoryFetchInFlightRef.current) return
+      if (
+        fetchKey === lastPostHistoryFetchKeyRef.current &&
+        now - lastPostHistoryFetchAtRef.current < 1500
+      ) {
+        return
+      }
+    }
+
+    postHistoryFetchInFlightRef.current = true
     const params = new URLSearchParams()
     params.set('date', logDateFilter)
     params.set('limit', '100')
-    const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?${params.toString()}`)
-    if (historyResp.status === 401) {
-      await recoverSessionOrLogout()
-      return
-    }
-    if (historyResp.ok) {
-      const data = await historyResp.json()
-      setPostHistory(data.history || [])
+    try {
+      const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?${params.toString()}`)
+      if (historyResp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (historyResp.ok) {
+        const data = await historyResp.json()
+        setPostHistory(data.history || [])
+        lastPostHistoryFetchKeyRef.current = fetchKey
+        lastPostHistoryFetchAtRef.current = Date.now()
+      }
+    } finally {
+      postHistoryFetchInFlightRef.current = false
     }
   }
 
@@ -6265,7 +6288,7 @@ function App({
                                   if (!resp.ok) {
                                     throw new Error(String(data?.details || data?.error || resp.status))
                                   }
-                                  await refreshPostHistorySnapshot()
+                                  await refreshPostHistorySnapshot({ force: true })
                                   alert(data?.fb_reel_url
                                     ? `โพสต์อีกครั้งสำเร็จ\n${data.fb_reel_url}`
                                     : 'โพสต์อีกครั้งสำเร็จ')
@@ -6299,7 +6322,7 @@ function App({
                                 setDeletingLogId(item.id)
                                 try {
                                   await apiFetch(`${WORKER_URL}/api/post-history/${item.id}`, { method: 'DELETE' })
-                                  await refreshPostHistorySnapshot()
+                                  await refreshPostHistorySnapshot({ force: true })
                                 } finally {
                                   setDeletingLogId(null)
                                 }
