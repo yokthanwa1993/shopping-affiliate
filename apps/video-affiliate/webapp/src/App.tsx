@@ -3178,11 +3178,20 @@ function App({
     setGallerySearchInput('')
   }, [botScope, namespaceId, tab])
   useEffect(() => {
+    if (controlledTab) {
+      const shouldSyncGallerySearch = tab === 'gallery'
+      const shouldSyncSettingsSubpage = tab === 'settings' && (
+        settingsSection !== 'menu'
+        || !!selectedPageHistoryId
+      )
+      if (!shouldSyncGallerySearch && !shouldSyncSettingsSubpage) return
+    }
+
     syncAppUrl(tab, gallerySearchInput, 'replace', {
       settingsSection,
       pageId: selectedPageHistoryId,
     })
-  }, [tab, gallerySearchInput, settingsSection, selectedPageHistoryId])
+  }, [tab, gallerySearchInput, settingsSection, selectedPageHistoryId, controlledTab])
   useEffect(() => {
     if (controlledTab) {
       _setTab(controlledTab)
