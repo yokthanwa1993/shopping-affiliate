@@ -5765,22 +5765,23 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
 
 const LIFF_BASE = 'https://liff.line.me/2009652996-DJtEhoDn'
 const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
+const APP_WEB_BASE = 'https://app.oomnn.com'
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
-        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'dashboard') },
+        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'dashboard') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'gallery') },
+        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'gallery') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'logs') },
+        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'logs') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedTabWebAppUrl(LIFF_BASE, '', 'settings') },
+        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedTabWebAppUrl(APP_WEB_BASE, '', 'settings') },
     },
 ]
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
@@ -18173,6 +18174,62 @@ function buildCommentTargetCandidates(targetIdRaw: string, pageIdRaw?: string): 
     return uniqueTokens(candidates)
 }
 
+function buildCommentTargetDedupKey(targetIdRaw: string, pageIdRaw?: string): string {
+    const candidates = buildCommentTargetCandidates(targetIdRaw, pageIdRaw)
+    return candidates.find((candidate) => candidate.includes('_'))
+        || candidates.find((candidate) => candidate === String(targetIdRaw || '').trim())
+        || String(targetIdRaw || '').trim()
+}
+
+async function findExistingAffiliateComment(params: {
+    env: Env
+    targetId: string
+    pageId?: string
+    accessToken: string
+    logPrefix: string
+}): Promise<{ id: string; targetId: string } | null> {
+    const accessToken = String(params.accessToken || '').trim()
+    const targetId = String(params.targetId || '').trim()
+    if (!accessToken || !targetId) return null
+
+    const shopeeHostPattern = /s\.shopee\.co\.th|shopee\.co\.th/i
+    const candidates = buildCommentTargetCandidates(targetId, params.pageId)
+    try {
+        const resolved = await resolveCommentTargetIdViaGraph({
+            targetId,
+            accessToken,
+            logPrefix: params.logPrefix,
+        })
+        if (resolved) {
+            candidates.unshift(resolved)
+            for (const candidate of buildCommentTargetCandidates(resolved, params.pageId)) {
+                candidates.push(candidate)
+            }
+        }
+    } catch {
+        // ignore graph resolution failure and continue with local candidates
+    }
+
+    for (const candidate of uniqueTokens(candidates)) {
+        try {
+            const existingComments = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string }> }>(
+                `${FB_GRAPH_V19}/${candidate}/comments`,
+                { access_token: accessToken, limit: '25' },
+            )
+            const existingId = (existingComments.data || []).find((comment) =>
+                shopeeHostPattern.test(String(comment.message || ''))
+            )?.id || ''
+            if (existingId) {
+                return { id: existingId, targetId: candidate }
+            }
+        } catch (e) {
+            console.log(`[${params.logPrefix}] comment dedup check failed for ${candidate}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+
+    return null
+}
+
 async function resolveCommentTargetIdViaGraph(params: {
     targetId: string
     accessToken: string
@@ -18329,26 +18386,17 @@ async function postShopeeCommentWithFallback(params: {
         return { ok: false, error: 'access_token_missing', code: 0, subcode: 0, tried: 0, commentToken: '' }
     }
 
-    // Dedup: check if we already commented on this video using any token
     const checkToken = commentTokens[0]
-    try {
-        const existingComments = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string }> }>(
-            `${FB_GRAPH_V19}/${params.fbVideoId}/comments`,
-            { access_token: checkToken, limit: '10' },
-        )
-        const shopeeHostPattern = /s\.shopee\.co\.th|shopee\.co\.th/i
-        const alreadyCommented = (existingComments.data || []).some(c =>
-            shopeeHostPattern.test(String(c.message || ''))
-        )
-        if (alreadyCommented) {
-            const existingId = (existingComments.data || []).find(c =>
-                shopeeHostPattern.test(String(c.message || ''))
-            )?.id || ''
-            console.log(`[${params.logPrefix}] comment SKIPPED (already commented: ${existingId})`)
-            return { ok: true, id: existingId, tried: 0, commentToken: checkToken }
-        }
-    } catch (e) {
-        console.log(`[${params.logPrefix}] comment dedup check failed (proceeding): ${e instanceof Error ? e.message : String(e)}`)
+    const existingComment = await findExistingAffiliateComment({
+        env: params.env,
+        targetId: params.fbVideoId,
+        pageId: params.pageId,
+        accessToken: checkToken,
+        logPrefix: params.logPrefix,
+    })
+    if (existingComment) {
+        console.log(`[${params.logPrefix}] comment SKIPPED (already commented: ${existingComment.id} via ${existingComment.targetId})`)
+        return { ok: true, id: existingComment.id, tried: 0, commentToken: checkToken }
     }
 
     let lastError = 'comment_failed'
@@ -22069,61 +22117,10 @@ function enqueueBackgroundTask(
 }
 
 async function processPendingCommentBacklog(env: Env): Promise<void> {
-    const dedupCommentTargets = new Set<string>()
     const pendingList = await env.BUCKET.list({ prefix: '_pending_comments/' })
-    const nowMs = Date.now()
 
     for (const obj of pendingList.objects) {
-        const ageMs = nowMs - obj.uploaded.getTime()
-        if (ageMs < 60_000) {
-            console.log(`[CRON] Pending comment ${obj.key}: too recent (${Math.round(ageMs / 1000)}s), waiting...`)
-            continue
-        }
-
-        const dataObj = await env.BUCKET.get(obj.key)
-        if (!dataObj) continue
-        const data = await dataObj.json() as {
-            fbVideoId: string
-            commentToken?: string
-            accessToken?: string
-            shopeeLink: string
-            postToken?: string
-            namespaceId?: string
-            botId?: string
-        }
-        const pendingCommentToken = String(data.commentToken || '').trim()
-        const pendingTargetId = String(data.fbVideoId || '').trim()
-        if (!pendingCommentToken) {
-            console.error(`[CRON] Pending comment ${data.fbVideoId}: missing commentToken (legacy accessToken is blocked)`)
-            await env.BUCKET.delete(obj.key)
-            continue
-        }
-        if (pendingTargetId && dedupCommentTargets.has(pendingTargetId)) {
-            console.log(`[CRON] Pending comment ${data.fbVideoId}: skip duplicate in this run`)
-            await env.BUCKET.delete(obj.key)
-            continue
-        }
-
-        try {
-            console.log(`[CRON] Pending comment ${data.fbVideoId}: using comment token ${pendingCommentToken.slice(0, 30)}...`)
-            const result = await postShopeeCommentStrict({
-                env,
-                namespaceId: String(data.namespaceId || data.botId || '').trim(),
-                fbVideoId: data.fbVideoId,
-                shopeeLink: data.shopeeLink,
-                commentToken: pendingCommentToken,
-                logPrefix: 'CRON-PENDING',
-            })
-            if (!result.ok) {
-                console.error(`[CRON] Pending comment ${data.fbVideoId}: FAILED: ${result.error || 'unknown'}`)
-            } else {
-                if (pendingTargetId) dedupCommentTargets.add(pendingTargetId)
-                console.log(`[CRON] Pending comment ${data.fbVideoId}: SUCCESS (id: ${result.id})`)
-            }
-        } catch (error) {
-            console.error(`[CRON] Comment failed for ${data.fbVideoId}: ${error instanceof Error ? error.message : String(error)}`)
-        }
-
+        console.log(`[CRON] Pending comment cleanup: deleting legacy object ${obj.key}`)
         await env.BUCKET.delete(obj.key)
     }
 }
@@ -22366,7 +22363,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     const postingOrderByNamespace = new Map<string, NamespacePostingOrder>()
     const reconciledNamespaces = new Set<string>()
     let fatalError: Error | null = null
-    await updateCronRuntimeState(env.DB, {
+    updateCronRuntimeState(env.DB, {
         runId,
         status: 'running',
         startedAt: nowISO,
@@ -22386,7 +22383,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         for (const page of pages) {
             const botId = page.bot_id || 'default'
             cronStats.pagesVisited += 1
-            await updateCronRuntimeState(env.DB, {
+            updateCronRuntimeState(env.DB, {
                 runId,
                 heartbeatAt: new Date().toISOString(),
                 currentPageId: String(page.id || ''),
@@ -22401,13 +22398,13 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
                 if (!reconciledNamespaces.has(botId)) {
                     const namespaceBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
-                    await reconcilePostingHistoryRows({
-                        env,
-                        bucket: namespaceBucket,
-                        botId,
-                        logPrefix: 'CRON',
-                    }).catch((error) => {
-                        console.error(`[CRON] Reconcile failed for namespace ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+                    enqueueBackgroundTask(ctx, `CRON RECONCILE ${botId}`, async () => {
+                        await reconcilePostingHistoryRows({
+                            env,
+                            bucket: namespaceBucket,
+                            botId,
+                            logPrefix: 'CRON',
+                        })
                     })
                     reconciledNamespaces.add(botId)
                 }
@@ -22831,9 +22828,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             let commentProfileId: string | null = null
             let commentProfileName: string | null = null
             const commentTargetId = fbVideoId || confirmedPostId
+            const commentTargetDedupKey = buildCommentTargetDedupKey(commentTargetId, page.id)
 
             if (normalizedShopeeLink && hasCommentToken) {
-                if (dedupCommentTargets.has(commentTargetId)) {
+                if (dedupCommentTargets.has(commentTargetDedupKey)) {
                     console.log(`[CRON] Page ${page.name}: skip comment for ${commentTargetId} (already commented in this run)`)
                     commentStatus = 'success'
                 } else {
@@ -22876,7 +22874,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             console.error(`[CRON] Page ${page.name}: notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
                         })
                     } else {
-                        dedupCommentTargets.add(commentTargetId)
+                        dedupCommentTargets.add(commentTargetDedupKey)
                         commentStatus = 'success'
                         commentFbId = commentResult.id || null
                         commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
@@ -22916,7 +22914,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 postedAt: nowISO,
             }).catch(() => { })
             cronStats.pagesPosted += 1
-            await updateCronRuntimeState(env.DB, {
+            updateCronRuntimeState(env.DB, {
                 runId,
                 heartbeatAt: new Date().toISOString(),
                 pagesVisited: cronStats.pagesVisited,
@@ -22976,9 +22974,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     let commentProfileId: string | null = null
                     let commentProfileName: string | null = null
                     const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
+                    const commentTargetDedupKey = buildCommentTargetDedupKey(commentTargetId, page.id)
 
                     if (normalizedShopeeLink && hasCommentToken) {
-                        if (dedupCommentTargets.has(commentTargetId)) {
+                        if (dedupCommentTargets.has(commentTargetDedupKey)) {
                             console.log(`[CRON] Page ${page.name}: recovery comment skip for ${commentTargetId} (already commented in this run)`)
                             commentStatus = 'success'
                         } else {
@@ -23012,7 +23011,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                                     console.error(`[CRON] Page ${page.name}: recover notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
                                 })
                             } else {
-                                dedupCommentTargets.add(commentTargetId)
+                                dedupCommentTargets.add(commentTargetDedupKey)
                                 commentStatus = 'success'
                                 commentFbId = commentResult.id || null
                                 commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
@@ -23052,7 +23051,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         postedAt: nowISO,
                     }).catch(() => { })
                     cronStats.pagesPosted += 1
-                    await updateCronRuntimeState(env.DB, {
+                    updateCronRuntimeState(env.DB, {
                         runId,
                         heartbeatAt: new Date().toISOString(),
                         pagesVisited: cronStats.pagesVisited,
@@ -23090,7 +23089,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 cronStats.pagesFailed += 1
                 const message = pageError instanceof Error ? pageError.message : String(pageError)
                 console.error(`[CRON] Page ${page.name}: unexpected fatal page error - ${message}`)
-                await updateCronRuntimeState(env.DB, {
+                updateCronRuntimeState(env.DB, {
                     runId,
                     heartbeatAt: new Date().toISOString(),
                     pagesVisited: cronStats.pagesVisited,
@@ -23100,7 +23099,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 }).catch(() => { })
                 continue
             } finally {
-                await updateCronRuntimeState(env.DB, {
+                updateCronRuntimeState(env.DB, {
                     runId,
                     heartbeatAt: new Date().toISOString(),
                     currentPageId: null,
