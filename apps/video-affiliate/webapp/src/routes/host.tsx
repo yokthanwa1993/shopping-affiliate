@@ -1,7 +1,13 @@
 import { useLocation, useNavigate } from 'react-router'
 
 import App from '../App'
-import { APP_TAB_ROUTES, getAppTabPath, stripLegacyTabSearchParams, type AppTabRoute } from '../app/appRoutes'
+import {
+  APP_TAB_ROUTES,
+  getAppTabPath,
+  getAppTabRouteFromLocation,
+  stripLegacyTabSearchParams,
+  type AppTabRoute,
+} from '../app/appRoutes'
 import { isAppHost } from '../liffConfig'
 
 const APP_TABS = new Set<AppTabRoute>(APP_TAB_ROUTES)
@@ -19,7 +25,7 @@ export default function HostRoute() {
     return <App />
   }
 
-  const tab = getTabFromPathname(location.pathname)
+  const tab = getAppTabRouteFromLocation(location.pathname, location.search)
 
   return (
     <App
