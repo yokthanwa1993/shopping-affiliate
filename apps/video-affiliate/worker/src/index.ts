@@ -294,6 +294,9 @@ app.use('*', async (c, next) => {
 // Cache control middleware — reduce redundant API calls from frontend
 app.use('*', async (c, next) => {
     await next()
+    if (c.res.headers.get('Cache-Control')) {
+        return
+    }
     const path = c.req.path
     if (path === '/api/me') {
         c.header('Cache-Control', 'private, max-age=60')
@@ -476,13 +479,20 @@ async function assignLineUserRole(
     let targetNamespaceId = currentNamespaceId
 
     if (targetRole === 'team') {
-        targetNamespaceId = adminNamespaceId
+        const existingTeam = await db.prepare(
+            'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
+        ).bind(email).first().catch(() => null) as { owner_namespace_id?: string } | null
+        targetNamespaceId = String(existingTeam?.owner_namespace_id || '').trim()
+        if (!targetNamespaceId) {
+            throw new Error('team_role_requires_existing_invite_namespace')
+        }
         await db.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run().catch(() => { })
         await db.prepare('DELETE FROM system_admins WHERE lower(trim(email)) = ?').bind(email).run().catch(() => { })
-        await db.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ?').bind(email).run().catch(() => { })
+        await db.prepare('DELETE FROM team_members WHERE lower(trim(email)) = ? AND owner_namespace_id <> ?')
+            .bind(email, targetNamespaceId).run().catch(() => { })
         await db.prepare(
             'INSERT OR IGNORE INTO team_members (owner_namespace_id, email) VALUES (?, ?)'
-        ).bind(adminNamespaceId, email).run().catch(() => { })
+        ).bind(targetNamespaceId, email).run().catch(() => { })
     } else {
         targetNamespaceId = await resolveManagedWorkspaceForRole(db, email, currentNamespaceId, adminNamespaceId)
         await upsertOwnerNamespaceMapping(db, email, targetNamespaceId)
@@ -1377,10 +1387,10 @@ function dedupeVideosById(videos: any[]): any[] {
 
 function getGalleryVideoSortMs(video: Record<string, unknown> | null | undefined): number {
     const ts = new Date(String(
-        video?.updatedAt
-        || video?.updated_at
-        || video?.createdAt
+        video?.createdAt
         || video?.created_at
+        || video?.updatedAt
+        || video?.updated_at
         || ''
     )).getTime()
     return Number.isFinite(ts) ? ts : 0
@@ -2969,6 +2979,28 @@ function isNamespaceGalleryVideoPosted(video: Record<string, unknown> | null | u
     return !!String(video?.postedAt || video?.posted_at || '').trim()
 }
 
+function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | null | undefined): boolean {
+    if (!video) return false
+    const publicUrl = String(video.publicUrl || video.public_url || '').trim()
+    if (!publicUrl) return false
+
+    const hasShopeeLink = !!String(
+        video.shopeeLink
+        || video.shopee_link
+        || video.shopeeOriginalLink
+        || video.shopee_original_link
+        || ''
+    ).trim()
+    const hasLazadaLink = !!String(
+        video.lazadaLink
+        || video.lazada_link
+        || video.lazadaOriginalLink
+        || video.lazada_original_link
+        || ''
+    ).trim()
+    return hasShopeeLink || hasLazadaLink
+}
+
 async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Promise<{
     sourceTotal: number
     videos: Array<Record<string, unknown>>
@@ -2979,7 +3011,10 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
     await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId)
     const bucket = new BotBucket(env.BUCKET, normalizedNamespaceId) as unknown as R2Bucket
     const [sourceVideos, stateRows, historyPostedAtByVideoId, expectedUtmId, expectedLazadaMemberId, shortlinkRequired] = await Promise.all([
-        getAllSystemGalleryVideos(env),
+        listGalleryIndexVideos(env.DB, {
+            namespaceId: normalizedNamespaceId,
+            requirePublicVideo: true,
+        }).catch(() => []),
         listNamespaceVideoStates(env.DB, normalizedNamespaceId),
         listNamespaceLatestPostedAtByVideoIdFromHistory(env.DB, normalizedNamespaceId),
         resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, normalizedNamespaceId).catch(() => ''),
@@ -3015,7 +3050,7 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
         }
     }
 
-    const inventoryVideos = dedupeSystemGalleryVideos(namespaceSourceVideos)
+    const inventoryVideos = namespaceSourceVideos
         .map((video) => {
             const source = video as Record<string, unknown>
             const videoId = String(source.id || '').trim()
@@ -4181,8 +4216,17 @@ app.post('/admin/api/affiliate-conversion/run', async (c) => {
 
 app.post('/admin/api/scheduled/run', async (c) => {
     try {
-        await watchdogStuckJobs(c.env)
-        await handleScheduled(c.env)
+        c.executionCtx.waitUntil(
+            watchdogStuckJobs(c.env).catch((error) => {
+                console.error(`[ADMIN-SCHEDULED] watchdog failed: ${error instanceof Error ? error.message : String(error)}`)
+            })
+        )
+        c.executionCtx.waitUntil(
+            warmPipelineContainer(c.env).catch((error) => {
+                console.error(`[ADMIN-SCHEDULED] warm-up failed: ${error instanceof Error ? error.message : String(error)}`)
+            })
+        )
+        await handleScheduled(c.env, c.executionCtx)
         return c.json({ ok: true, ran_at: new Date().toISOString() })
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -5458,10 +5502,56 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
     const existing = await db.prepare('SELECT namespace_id FROM line_users WHERE line_user_id = ?')
         .bind(lineUserId).first() as { namespace_id?: string } | null
     if (existing?.namespace_id) return existing.namespace_id
+    const syntheticEmail = `line_${lineUserId}@line.local`
+    const normalizedSyntheticEmail = syntheticEmail.trim().toLowerCase()
+    const existingTeam = await db.prepare(
+        'SELECT owner_namespace_id FROM team_members WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(normalizedSyntheticEmail).first().catch(() => null) as { owner_namespace_id?: string } | null
+    if (existingTeam?.owner_namespace_id) {
+        const namespaceId = String(existingTeam.owner_namespace_id || '').trim()
+        if (namespaceId) {
+            await db.prepare(
+                `INSERT INTO line_users (line_user_id, namespace_id, display_name, email, status)
+                 VALUES (?, ?, ?, ?, 'approved')
+                 ON CONFLICT(line_user_id) DO UPDATE SET
+                    namespace_id = excluded.namespace_id,
+                    display_name = excluded.display_name,
+                    email = excluded.email,
+                    status = 'approved',
+                    updated_at = datetime('now')`
+            ).bind(lineUserId, namespaceId, String(displayName || '').trim().slice(0, 200), syntheticEmail).run().catch(() => { })
+            return namespaceId
+        }
+    }
+    const existingOwnerNamespace = await db.prepare(
+        'SELECT namespace_id FROM email_namespaces WHERE lower(trim(email)) = ? LIMIT 1'
+    ).bind(normalizedSyntheticEmail).first().catch(() => null) as { namespace_id?: string } | null
+    if (existingOwnerNamespace?.namespace_id) {
+        const namespaceId = String(existingOwnerNamespace.namespace_id || '').trim()
+        if (namespaceId) {
+            await db.prepare(
+                `INSERT INTO line_users (line_user_id, namespace_id, display_name, email, status)
+                 VALUES (?, ?, ?, ?, 'approved')
+                 ON CONFLICT(line_user_id) DO UPDATE SET
+                    namespace_id = excluded.namespace_id,
+                    display_name = excluded.display_name,
+                    email = excluded.email,
+                    status = 'approved',
+                    updated_at = datetime('now')`
+            ).bind(lineUserId, namespaceId, String(displayName || '').trim().slice(0, 200), syntheticEmail).run().catch(() => { })
+            return namespaceId
+        }
+    }
     const namespaceId = createOwnerWorkspaceId()
     await db.prepare(
-        'INSERT INTO line_users (line_user_id, namespace_id, display_name) VALUES (?, ?, ?)'
-    ).bind(lineUserId, namespaceId, String(displayName || '').trim().slice(0, 200)).run()
+        `INSERT INTO line_users (line_user_id, namespace_id, display_name, email, status)
+         VALUES (?, ?, ?, ?, 'pending')
+         ON CONFLICT(line_user_id) DO UPDATE SET
+            namespace_id = excluded.namespace_id,
+            display_name = excluded.display_name,
+            email = excluded.email,
+            updated_at = datetime('now')`
+    ).bind(lineUserId, namespaceId, String(displayName || '').trim().slice(0, 200), syntheticEmail).run()
     return namespaceId
 }
 
@@ -6970,6 +7060,11 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         bucket: params.bucket,
         record: inboxRecord,
     }).catch(() => { })
+    await mirrorInboxRecordIntoPrimaryAdminSnapshot({
+        env: params.env,
+        sourceNamespaceId: params.namespaceId,
+        record: inboxRecord,
+    }).catch(() => { })
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
     await promoteSelectedInboxCoverToOriginalThumbnail({
@@ -7215,22 +7310,22 @@ app.post('/api/line/liff-login', async (c) => {
                         `DELETE FROM team_members WHERE owner_namespace_id = ? AND email = ?`
                     ).bind(inviteNs, pending.email).run().catch(() => {})
                 }
+            } else if (existingTeam?.owner_namespace_id) {
+                // Existing team member → use team namespace
+                namespaceId = existingTeam.owner_namespace_id
+                isOwner = false
+                await c.env.DB.prepare(
+                    `DELETE FROM email_namespaces WHERE email = ?`
+                ).bind(email).run().catch(() => { })
             } else if (existingOwnerNamespaceId) {
                 namespaceId = existingOwnerNamespaceId
                 isOwner = true
                 await c.env.DB.prepare(
                     `DELETE FROM team_members WHERE lower(trim(email)) = ?`
                 ).bind(String(email || '').trim().toLowerCase()).run().catch(() => { })
-            } else if (existingTeam?.owner_namespace_id) {
-                // Existing team member → use team namespace
-                namespaceId = existingTeam.owner_namespace_id
-                isOwner = false
             } else {
                 // Regular new user → create own namespace as Member
-                namespaceId = await resolveLineNamespace(c.env.DB, lineUserId, displayName)
-                await c.env.DB.prepare(
-                    `INSERT INTO email_namespaces (email, namespace_id) VALUES (?, ?) ON CONFLICT(email) DO UPDATE SET namespace_id = excluded.namespace_id`
-                ).bind(email, namespaceId).run().catch(() => { })
+                namespaceId = String(linkedRow?.namespace_id || '').trim() || await resolveLineNamespace(c.env.DB, lineUserId, displayName)
                 isOwner = true
             }
             isSysAdmin = false
@@ -9731,16 +9826,18 @@ async function upsertSystemInboxSnapshotVideo(params: {
     adminNamespaceId: string
     bucket: R2Bucket
     record: InboxVideoRecord
+    recordNamespaceId?: string
 }): Promise<void> {
     const adminNamespaceId = String(params.adminNamespaceId || '').trim()
     if (!adminNamespaceId) return
+    const recordNamespaceId = String(params.recordNamespaceId || adminNamespaceId).trim() || adminNamespaceId
 
     const namespaceEmailMap = await getNamespaceOwnerEmailMap(params.env.DB)
     const nextVideo = buildInboxVideoResponseForNamespace(
         params.env,
         params.record,
-        adminNamespaceId,
-        namespaceEmailMap.get(adminNamespaceId) || '',
+        recordNamespaceId,
+        namespaceEmailMap.get(recordNamespaceId) || '',
     )
     const cachedSnapshot = await readSystemInboxSnapshot(params.bucket, adminNamespaceId).catch(() => null)
     const mergedVideos = dedupeSystemInboxVideos([
@@ -9748,6 +9845,62 @@ async function upsertSystemInboxSnapshotVideo(params: {
         ...Array.isArray(cachedSnapshot?.videos) ? cachedSnapshot!.videos : [],
     ], adminNamespaceId)
     await writeSystemInboxSnapshot(params.bucket, adminNamespaceId, mergedVideos)
+}
+
+async function removeSystemInboxSnapshotVideo(params: {
+    adminNamespaceId: string
+    bucket: R2Bucket
+    videoId: string
+    recordNamespaceId?: string
+}): Promise<void> {
+    const adminNamespaceId = String(params.adminNamespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    if (!adminNamespaceId || !videoId) return
+
+    const recordNamespaceId = String(params.recordNamespaceId || adminNamespaceId).trim() || adminNamespaceId
+    const cachedSnapshot = await readSystemInboxSnapshot(params.bucket, adminNamespaceId).catch(() => null)
+    const currentVideos = Array.isArray(cachedSnapshot?.videos) ? cachedSnapshot!.videos : []
+    const nextVideos = currentVideos.filter((video) => (
+        String(video.id || '').trim() !== videoId
+        || String(video.namespace_id || '').trim() !== recordNamespaceId
+    ))
+    await writeSystemInboxSnapshot(params.bucket, adminNamespaceId, nextVideos)
+}
+
+async function mirrorInboxRecordIntoPrimaryAdminSnapshot(params: {
+    env: Env
+    sourceNamespaceId: string
+    record: InboxVideoRecord
+}): Promise<void> {
+    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => '')
+    const sourceNamespaceId = String(params.sourceNamespaceId || '').trim()
+    if (!adminNamespaceId || !sourceNamespaceId) return
+    const adminBucket = new BotBucket(params.env.BUCKET, adminNamespaceId) as unknown as R2Bucket
+    await upsertSystemInboxSnapshotVideo({
+        env: params.env,
+        adminNamespaceId,
+        bucket: adminBucket,
+        record: params.record,
+        recordNamespaceId: sourceNamespaceId,
+    })
+}
+
+async function removeInboxRecordFromPrimaryAdminSnapshot(params: {
+    env: Env
+    sourceNamespaceId: string
+    videoId: string
+}): Promise<void> {
+    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => '')
+    const sourceNamespaceId = String(params.sourceNamespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    if (!adminNamespaceId || !sourceNamespaceId || !videoId) return
+    const adminBucket = new BotBucket(params.env.BUCKET, adminNamespaceId) as unknown as R2Bucket
+    await removeSystemInboxSnapshotVideo({
+        adminNamespaceId,
+        bucket: adminBucket,
+        videoId,
+        recordNamespaceId: sourceNamespaceId,
+    })
 }
 
 async function listNamespaceOriginalArchiveVideos(params: {
@@ -11059,6 +11212,11 @@ app.delete('/api/inbox/:id', async (c) => {
         if (!hasProcessedVideo) {
             await removeFromGalleryCache(bucket, id).catch(() => { })
         }
+        await removeInboxRecordFromPrimaryAdminSnapshot({
+            env: c.env,
+            sourceNamespaceId: targetNamespaceId,
+            videoId: id,
+        }).catch(() => { })
         await syncGalleryIndexEntry(c.env, targetNamespaceId, id).catch((error) => {
             console.log(`[INBOX-DELETE] sync gallery index failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
         })
@@ -11367,7 +11525,7 @@ app.get('/api/gallery', async (c) => {
         const videos = inventory.videos
         const readyVideos = videos.filter((video) => {
             const row = video as Record<string, unknown>
-            return !!row.gallery_ready && !String(row.postedAt || row.posted_at || '').trim()
+            return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
         })
 
         const overallTotal = readyVideos.length
@@ -11460,9 +11618,12 @@ app.get('/api/gallery/system', async (c) => {
         const allVideos = inventory.videos
         const readyVideos = allVideos.filter((video) => {
             const row = video as Record<string, unknown>
-            return !!row.gallery_ready && !String(row.postedAt || row.posted_at || '').trim()
+            return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
         })
-        const usedVideos = allVideos.filter((video) => !!String((video as Record<string, unknown>).postedAt || (video as Record<string, unknown>).posted_at || '').trim())
+        const usedVideos = allVideos.filter((video) => {
+            const row = video as Record<string, unknown>
+            return isNamespaceGalleryVideoDisplayReady(row) && !!String(row.postedAt || row.posted_at || '').trim()
+        })
         const sourceVideos = view === 'used' ? usedVideos : readyVideos
         const searchedVideos = searchQuery
             ? sourceVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
@@ -11738,8 +11899,9 @@ app.get('/api/gallery/used', async (c) => {
         return JSON.parse(s.replace(/https:\/\/pub-[a-f0-9]+\.r2\.dev\/videos\//g, `${r2Url}/${botId}/videos/`))
     }
     try {
-        const readyVideos = await listNamespaceGalleryVideos(c.env, botId)
-        const videos = dedupeVideosById(readyVideos)
+        const inventory = await getNamespaceGalleryInventory(c.env, String(botId || '').trim())
+        const videos = dedupeVideosById(inventory.videos)
+            .filter((video: any) => isNamespaceGalleryVideoDisplayReady(video as Record<string, unknown>))
             .filter((video: any) => !!String(video?.postedAt || video?.posted_at || '').trim())
 
         // Sort by createdAt desc
@@ -18543,15 +18705,18 @@ async function publishReelDirect(params: {
     const formData = new FormData()
     const videoBlob = new Blob([params.videoBuffer], { type: 'video/mp4' })
     formData.append('source', videoBlob, 'video.mp4')
-    if (params.thumbnailBuffer && params.thumbnailBuffer.byteLength > 0) {
-        const thumbnailContentType = String(params.thumbnailContentType || 'image/jpeg').trim() || 'image/jpeg'
+    const thumbnailContentType = String(params.thumbnailContentType || 'image/jpeg').trim().toLowerCase() || 'image/jpeg'
+    const isFacebookDirectThumbSupported = thumbnailContentType.includes('jpeg')
+        || thumbnailContentType.includes('jpg')
+        || thumbnailContentType.includes('png')
+    if (params.thumbnailBuffer && params.thumbnailBuffer.byteLength > 0 && isFacebookDirectThumbSupported) {
         const extension = thumbnailContentType.includes('png')
             ? 'png'
-            : thumbnailContentType.includes('webp')
-                ? 'webp'
-                : 'jpg'
+            : 'jpg'
         const thumbBlob = new Blob([params.thumbnailBuffer], { type: thumbnailContentType })
         formData.append('thumb', thumbBlob, `thumb.${extension}`)
+    } else if (params.thumbnailBuffer && params.thumbnailBuffer.byteLength > 0) {
+        console.warn(`[${params.logPrefix}] skip unsupported direct thumbnail content-type: ${thumbnailContentType || 'unknown'}`)
     }
     formData.append('description', params.description)
     formData.append('published', 'true')
@@ -18582,6 +18747,75 @@ async function publishReelDirect(params: {
     return data
 }
 
+async function applyPreferredVideoThumbnail(params: {
+    videoId: string
+    accessToken: string
+    thumbnailBuffer?: ArrayBuffer | null
+    thumbnailContentType?: string
+    logPrefix: string
+}): Promise<void> {
+    const videoId = String(params.videoId || '').trim()
+    const token = String(params.accessToken || '').trim()
+    const thumbnailBuffer = params.thumbnailBuffer || null
+    if (!videoId || !token || !thumbnailBuffer || thumbnailBuffer.byteLength === 0) return
+
+    const thumbnailContentType = String(params.thumbnailContentType || 'image/jpeg').trim().toLowerCase() || 'image/jpeg'
+    const isSupportedContentType = thumbnailContentType.includes('jpeg')
+        || thumbnailContentType.includes('jpg')
+        || thumbnailContentType.includes('png')
+    if (!isSupportedContentType) {
+        console.warn(`[${params.logPrefix}] skip unsupported preferred thumbnail content-type: ${thumbnailContentType}`)
+        return
+    }
+    const extension = thumbnailContentType.includes('png')
+        ? 'png'
+        : 'jpg'
+
+    let lastError: unknown = null
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+            const formData = new FormData()
+            const thumbBlob = new Blob([thumbnailBuffer], { type: thumbnailContentType })
+            formData.append('source', thumbBlob, `thumb.${extension}`)
+            formData.append('is_preferred', 'true')
+            formData.append('access_token', token)
+
+            const resp = await fetchWithTimeout(
+                `https://graph.facebook.com/v21.0/${videoId}/thumbnails`,
+                {
+                    method: 'POST',
+                    body: formData,
+                },
+                60000,
+                'facebook_apply_thumbnail',
+            )
+            const data = await resp.json().catch(() => ({})) as {
+                success?: boolean
+                error?: { message?: string; code?: number; error_subcode?: number }
+            }
+
+            if (!resp.ok || data?.error) {
+                throw new FacebookRequestFailedError(
+                    String(data?.error?.message || `facebook_apply_thumbnail_http_${resp.status}`),
+                    Number(data?.error?.code || 0),
+                    Number(data?.error?.error_subcode || 0),
+                )
+            }
+
+            console.log(`[${params.logPrefix}] Preferred thumbnail applied for video ${videoId}`)
+            return
+        } catch (error) {
+            lastError = error
+            if (attempt < 3) {
+                await waitMs(1500 * attempt)
+                continue
+            }
+        }
+    }
+
+    throw toFacebookRequestFailedError(lastError, 'facebook_apply_thumbnail_failed')
+}
+
 async function publishReelViaVideosEndpointWithTokenFallback(params: {
     pageId: string
     accessTokens: string[]
@@ -18609,6 +18843,17 @@ async function publishReelViaVideosEndpointWithTokenFallback(params: {
             })
             const fbVideoId = String(publishResult.id || '').trim()
             if (!fbVideoId) throw new Error('facebook_publish_no_video_id')
+
+            await applyPreferredVideoThumbnail({
+                videoId: fbVideoId,
+                accessToken: token,
+                thumbnailBuffer: params.thumbnailBuffer,
+                thumbnailContentType: params.thumbnailContentType,
+                logPrefix: `${params.logPrefix} /videos-thumb`,
+            }).catch((error) => {
+                const message = parseFacebookErrorLike(error)?.message || (error instanceof Error ? error.message : String(error))
+                console.warn(`[${params.logPrefix}] applying preferred thumbnail after /videos publish failed (${message})`)
+            })
 
             const recovered = await pollPublishedReelAfterProcessing({
                 accessToken: token,
@@ -18683,6 +18928,8 @@ async function publishReelDirectWithTokenFallback(params: {
     pageId: string
     postTokens: string[]
     videoBuffer: ArrayBuffer
+    thumbnailBuffer?: ArrayBuffer | null
+    thumbnailContentType?: string
     description: string
     logPrefix: string
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
@@ -18732,6 +18979,18 @@ async function publishReelDirectWithTokenFallback(params: {
                 description: params.description,
                 logPrefix: params.logPrefix,
             })
+
+            await applyPreferredVideoThumbnail({
+                videoId: fbVideoId,
+                accessToken: token,
+                thumbnailBuffer: params.thumbnailBuffer,
+                thumbnailContentType: params.thumbnailContentType,
+                logPrefix: `${params.logPrefix} /video_reels-thumb`,
+            }).catch((error) => {
+                const message = parseFacebookErrorLike(error)?.message || (error instanceof Error ? error.message : String(error))
+                console.warn(`[${params.logPrefix}] applying preferred thumbnail after /video_reels publish failed (${message})`)
+            })
+
             return {
                 id: fbVideoId,
                 postId: String(finishData.post_id || '').trim(),
@@ -18795,6 +19054,8 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
                 pageId: params.pageId,
                 postTokens: resumableCandidates,
                 videoBuffer: params.videoBuffer,
+                thumbnailBuffer: params.thumbnailBuffer,
+                thumbnailContentType: params.thumbnailContentType,
                 description: params.description,
                 logPrefix: `${params.logPrefix} /video_reels`,
             })
@@ -18816,8 +19077,10 @@ async function loadPostingThumbnailAsset(params: {
 
     const bucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
     const candidates: Array<{ key: string; fallbackContentType: string }> = [
-        { key: `_inbox_cover/${videoId}.webp`, fallbackContentType: 'image/webp' },
         { key: `_inbox_cover/${videoId}_preview.jpg`, fallbackContentType: 'image/jpeg' },
+        { key: `_inbox_cover/${videoId}.webp`, fallbackContentType: 'image/webp' },
+        { key: getOriginalThumbnailAssetKey(videoId), fallbackContentType: 'image/webp' },
+        { key: getProcessedThumbnailAssetKey(videoId), fallbackContentType: 'image/webp' },
     ]
 
     for (const candidate of candidates) {
@@ -21476,94 +21739,190 @@ app.post('/api/manual-post-reel', async (c) => {
 
 // ==================== SCHEDULED HANDLER (CRON) ====================
 
+function enqueueBackgroundTask(
+    ctx: ExecutionContext | undefined,
+    label: string,
+    task: () => Promise<unknown>,
+): void {
+    const runner = (async () => {
+        try {
+            await task()
+        } catch (error) {
+            console.error(`[${label}] ${error instanceof Error ? error.message : String(error)}`)
+        }
+    })()
+
+    if (ctx) {
+        ctx.waitUntil(runner)
+    } else {
+        void runner
+    }
+}
+
+async function processPendingCommentBacklog(env: Env): Promise<void> {
+    const dedupCommentTargets = new Set<string>()
+    const pendingList = await env.BUCKET.list({ prefix: '_pending_comments/' })
+    const nowMs = Date.now()
+
+    for (const obj of pendingList.objects) {
+        const ageMs = nowMs - obj.uploaded.getTime()
+        if (ageMs < 60_000) {
+            console.log(`[CRON] Pending comment ${obj.key}: too recent (${Math.round(ageMs / 1000)}s), waiting...`)
+            continue
+        }
+
+        const dataObj = await env.BUCKET.get(obj.key)
+        if (!dataObj) continue
+        const data = await dataObj.json() as {
+            fbVideoId: string
+            commentToken?: string
+            accessToken?: string
+            shopeeLink: string
+            postToken?: string
+            namespaceId?: string
+            botId?: string
+        }
+        const pendingCommentToken = String(data.commentToken || '').trim()
+        const pendingTargetId = String(data.fbVideoId || '').trim()
+        if (!pendingCommentToken) {
+            console.error(`[CRON] Pending comment ${data.fbVideoId}: missing commentToken (legacy accessToken is blocked)`)
+            await env.BUCKET.delete(obj.key)
+            continue
+        }
+        if (pendingTargetId && dedupCommentTargets.has(pendingTargetId)) {
+            console.log(`[CRON] Pending comment ${data.fbVideoId}: skip duplicate in this run`)
+            await env.BUCKET.delete(obj.key)
+            continue
+        }
+
+        try {
+            console.log(`[CRON] Pending comment ${data.fbVideoId}: using comment token ${pendingCommentToken.slice(0, 30)}...`)
+            const result = await postShopeeCommentStrict({
+                env,
+                namespaceId: String(data.namespaceId || data.botId || '').trim(),
+                fbVideoId: data.fbVideoId,
+                shopeeLink: data.shopeeLink,
+                commentToken: pendingCommentToken,
+                logPrefix: 'CRON-PENDING',
+            })
+            if (!result.ok) {
+                console.error(`[CRON] Pending comment ${data.fbVideoId}: FAILED: ${result.error || 'unknown'}`)
+            } else {
+                if (pendingTargetId) dedupCommentTargets.add(pendingTargetId)
+                console.log(`[CRON] Pending comment ${data.fbVideoId}: SUCCESS (id: ${result.id})`)
+            }
+        } catch (error) {
+            console.error(`[CRON] Comment failed for ${data.fbVideoId}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+
+        await env.BUCKET.delete(obj.key)
+    }
+}
+
+async function ensureCronRuntimeStateTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS cron_runtime_state (
+            id TEXT PRIMARY KEY,
+            run_id TEXT,
+            status TEXT NOT NULL DEFAULT 'idle',
+            started_at TEXT,
+            finished_at TEXT,
+            heartbeat_at TEXT,
+            current_page_id TEXT,
+            current_page_name TEXT,
+            current_namespace_id TEXT,
+            pages_total INTEGER NOT NULL DEFAULT 0,
+            pages_visited INTEGER NOT NULL DEFAULT 0,
+            pages_posted INTEGER NOT NULL DEFAULT 0,
+            pages_failed INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        )`
+    ).run()
+}
+
+async function updateCronRuntimeState(db: D1Database, patch: {
+    runId?: string | null
+    status?: string | null
+    startedAt?: string | null
+    finishedAt?: string | null
+    heartbeatAt?: string | null
+    currentPageId?: string | null
+    currentPageName?: string | null
+    currentNamespaceId?: string | null
+    pagesTotal?: number | null
+    pagesVisited?: number | null
+    pagesPosted?: number | null
+    pagesFailed?: number | null
+    lastError?: string | null
+}): Promise<void> {
+    await ensureCronRuntimeStateTable(db)
+    await db.prepare(
+        `INSERT INTO cron_runtime_state (
+            id,
+            run_id,
+            status,
+            started_at,
+            finished_at,
+            heartbeat_at,
+            current_page_id,
+            current_page_name,
+            current_namespace_id,
+            pages_total,
+            pages_visited,
+            pages_posted,
+            pages_failed,
+            last_error
+        ) VALUES ('scheduled', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            run_id = COALESCE(excluded.run_id, cron_runtime_state.run_id),
+            status = COALESCE(excluded.status, cron_runtime_state.status),
+            started_at = COALESCE(excluded.started_at, cron_runtime_state.started_at),
+            finished_at = excluded.finished_at,
+            heartbeat_at = COALESCE(excluded.heartbeat_at, cron_runtime_state.heartbeat_at),
+            current_page_id = excluded.current_page_id,
+            current_page_name = excluded.current_page_name,
+            current_namespace_id = excluded.current_namespace_id,
+            pages_total = COALESCE(excluded.pages_total, cron_runtime_state.pages_total),
+            pages_visited = COALESCE(excluded.pages_visited, cron_runtime_state.pages_visited),
+            pages_posted = COALESCE(excluded.pages_posted, cron_runtime_state.pages_posted),
+            pages_failed = COALESCE(excluded.pages_failed, cron_runtime_state.pages_failed),
+            last_error = excluded.last_error`
+    ).bind(
+        patch.runId ?? null,
+        patch.status ?? null,
+        patch.startedAt ?? null,
+        patch.finishedAt ?? null,
+        patch.heartbeatAt ?? null,
+        patch.currentPageId ?? null,
+        patch.currentPageName ?? null,
+        patch.currentNamespaceId ?? null,
+        typeof patch.pagesTotal === 'number' ? patch.pagesTotal : null,
+        typeof patch.pagesVisited === 'number' ? patch.pagesVisited : null,
+        typeof patch.pagesPosted === 'number' ? patch.pagesPosted : null,
+        typeof patch.pagesFailed === 'number' ? patch.pagesFailed : null,
+        patch.lastError ?? null,
+    ).run()
+}
+
 async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     console.log('[CRON] Starting auto-post check...')
     const dedupCommentTargets = new Set<string>()
 
-    try {
+    enqueueBackgroundTask(ctx, 'CRON AUTO-IMPORT', async () => {
         await autoImportAndProcessForAdmin(env, ctx)
-    } catch (error) {
-        console.error(`[CRON] Auto-import for admin failed: ${error instanceof Error ? error.message : String(error)}`)
-    }
-
-    try {
+    })
+    enqueueBackgroundTask(ctx, 'CRON AFFILIATE', async () => {
         await processPendingAffiliateConversions(env)
-    } catch (error) {
-        console.error(`[CRON] Affiliate conversion failed: ${error instanceof Error ? error.message : String(error)}`)
-    }
-
-    // Keep Container warm — ping /health ทุก 1 นาที ไม่ให้ sleep
-    try {
+    })
+    enqueueBackgroundTask(ctx, 'CRON WARM-UP', async () => {
         const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
         const containerStub = env.MERGE_CONTAINER.get(containerId)
         await containerStub.fetch('http://container/health')
         console.log('[CRON] Container warm-up ping sent')
-    } catch {
-        console.log('[CRON] Container warm-up ping failed (booting...)')
-    }
-
-    // Process pending comments — คอมเมนต์ลิงก์ Shopee ที่ค้างไว้ (รอ ≥1 นาที)
-    try {
-        const pendingList = await env.BUCKET.list({ prefix: '_pending_comments/' })
-        const nowMs = Date.now()
-        for (const obj of pendingList.objects) {
-            // เช็คว่าสร้างมาอย่างน้อย 1 นาทีแล้ว
-            const ageMs = nowMs - obj.uploaded.getTime()
-            if (ageMs < 60_000) {
-                console.log(`[CRON] Pending comment ${obj.key}: too recent (${Math.round(ageMs / 1000)}s), waiting...`)
-                continue
-            }
-
-            const dataObj = await env.BUCKET.get(obj.key)
-            if (!dataObj) continue
-            const data = await dataObj.json() as {
-                fbVideoId: string
-                commentToken?: string
-                accessToken?: string // legacy key
-                shopeeLink: string
-                postToken?: string
-                namespaceId?: string
-                botId?: string
-            }
-            const pendingCommentToken = String(data.commentToken || '').trim()
-            const pendingTargetId = String(data.fbVideoId || '').trim()
-            if (!pendingCommentToken) {
-                console.error(`[CRON] Pending comment ${data.fbVideoId}: missing commentToken (legacy accessToken is blocked)`)
-                await env.BUCKET.delete(obj.key)
-                continue
-            }
-            if (pendingTargetId && dedupCommentTargets.has(pendingTargetId)) {
-                console.log(`[CRON] Pending comment ${data.fbVideoId}: skip duplicate in this run`)
-                await env.BUCKET.delete(obj.key)
-                continue
-            }
-
-            try {
-                console.log(`[CRON] Pending comment ${data.fbVideoId}: using comment token ${pendingCommentToken.slice(0, 30)}...`)
-                const result = await postShopeeCommentStrict({
-                    env,
-                    namespaceId: String(data.namespaceId || data.botId || '').trim(),
-                    fbVideoId: data.fbVideoId,
-                    shopeeLink: data.shopeeLink,
-                    commentToken: pendingCommentToken,
-                    logPrefix: 'CRON-PENDING',
-                })
-                if (!result.ok) {
-                    console.error(`[CRON] Pending comment ${data.fbVideoId}: FAILED: ${result.error || 'unknown'}`)
-                } else {
-                    if (pendingTargetId) dedupCommentTargets.add(pendingTargetId)
-                    console.log(`[CRON] Pending comment ${data.fbVideoId}: SUCCESS (id: ${result.id})`)
-                }
-            } catch (e) {
-                console.error(`[CRON] Comment failed for ${data.fbVideoId}: ${e}`)
-            }
-
-            // ลบ pending ไม่ว่าจะสำเร็จหรือไม่ (ป้องกัน retry ไม่สิ้นสุด)
-            await env.BUCKET.delete(obj.key)
-        }
-    } catch (e) {
-        console.error(`[CRON] Pending comments error: ${e}`)
-    }
+    })
+    enqueueBackgroundTask(ctx, 'CRON PENDING COMMENTS', async () => {
+        await processPendingCommentBacklog(env)
+    })
 
 
     // Get current time in Thailand timezone (UTC+7) using proper Intl
@@ -21621,78 +21980,114 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
 
     console.log(`[CRON] Found ${pages.length} active pages, Thai time: ${thaiHour}:${thaiMinute.toString().padStart(2, '0')} (${nowMinutes}m), date: ${todayStr}`)
 
+    const runId = crypto.randomUUID()
+    const cronStats = {
+        pagesVisited: 0,
+        pagesPosted: 0,
+        pagesFailed: 0,
+    }
     const geminiApiKeysByNamespace = new Map<string, string[]>()
     const postingOrderByNamespace = new Map<string, NamespacePostingOrder>()
     const reconciledNamespaces = new Set<string>()
+    let fatalError: Error | null = null
+    await updateCronRuntimeState(env.DB, {
+        runId,
+        status: 'running',
+        startedAt: nowISO,
+        finishedAt: null,
+        heartbeatAt: nowISO,
+        currentPageId: null,
+        currentPageName: null,
+        currentNamespaceId: null,
+        pagesTotal: pages.length,
+        pagesVisited: 0,
+        pagesPosted: 0,
+        pagesFailed: 0,
+        lastError: null,
+    }).catch(() => { })
 
-    for (const page of pages) {
-        // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
-        const botId = page.bot_id || 'default';
-        if (!reconciledNamespaces.has(botId)) {
-            const namespaceBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
-            await reconcilePostingHistoryRows({
-                env,
-                bucket: namespaceBucket,
-                botId,
-                logPrefix: 'CRON',
-            }).catch((error) => {
-                console.error(`[CRON] Reconcile failed for namespace ${botId}: ${error instanceof Error ? error.message : String(error)}`)
-            })
-            reconciledNamespaces.add(botId)
-        }
-        await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
-        const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
-        if (!shortlinkEnabled) {
-            await env.DB.prepare(
-                `UPDATE post_history
-                 SET status = 'failed',
-                     error_message = 'shortlink_disabled_gallery_empty',
-                     comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
-                     comment_error = CASE WHEN comment_status = 'pending' THEN 'shortlink_disabled_gallery_empty' ELSE comment_error END
-                 WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
-            ).bind(botId, page.id).run().catch(() => { })
-            console.log(`[CRON] Page ${page.name}: skip (shortlink disabled for namespace ${botId})`)
-            continue
-        }
+    try {
+        for (const page of pages) {
+            const botId = page.bot_id || 'default'
+            cronStats.pagesVisited += 1
+            await updateCronRuntimeState(env.DB, {
+                runId,
+                heartbeatAt: new Date().toISOString(),
+                currentPageId: String(page.id || ''),
+                currentPageName: String(page.name || ''),
+                currentNamespaceId: botId,
+                pagesVisited: cronStats.pagesVisited,
+                pagesPosted: cronStats.pagesPosted,
+                pagesFailed: cronStats.pagesFailed,
+            }).catch(() => { })
 
-        const namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
-        if (namespaceGalleryVideos.length === 0) {
-            await env.DB.prepare(
-                `UPDATE post_history
-                 SET status = 'failed',
-                     error_message = 'gallery_empty',
-                     comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
-                     comment_error = CASE WHEN comment_status = 'pending' THEN 'gallery_empty' ELSE comment_error END
-                 WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
-            ).bind(botId, page.id).run().catch(() => { })
-            console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
-            continue
-        }
+            try {
+                // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
+                if (!reconciledNamespaces.has(botId)) {
+                    const namespaceBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+                    await reconcilePostingHistoryRows({
+                        env,
+                        bucket: namespaceBucket,
+                        botId,
+                        logPrefix: 'CRON',
+                    }).catch((error) => {
+                        console.error(`[CRON] Reconcile failed for namespace ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+                    })
+                    reconciledNamespaces.add(botId)
+                }
+                await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
+                const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
+                if (!shortlinkEnabled) {
+                    await env.DB.prepare(
+                        `UPDATE post_history
+                         SET status = 'failed',
+                             error_message = 'shortlink_disabled_gallery_empty',
+                             comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
+                             comment_error = CASE WHEN comment_status = 'pending' THEN 'shortlink_disabled_gallery_empty' ELSE comment_error END
+                         WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
+                    ).bind(botId, page.id).run().catch(() => { })
+                    console.log(`[CRON] Page ${page.name}: skip (shortlink disabled for namespace ${botId})`)
+                    continue
+                }
 
-        const recentPostGuard = await getRecentPagePostGuard({
-            db: env.DB,
-            namespaceId: botId,
-            pageId: page.id,
-        })
-        if (recentPostGuard.blocked) {
-            console.log(
-                `[CRON] Page ${page.name}: skip (recent ${recentPostGuard.status || 'activity'} history_id=${recentPostGuard.historyId || '-'} posted_at=${recentPostGuard.postedAt || '-'})`
-            )
-            continue
-        }
+                const namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
+                if (namespaceGalleryVideos.length === 0) {
+                    await env.DB.prepare(
+                        `UPDATE post_history
+                         SET status = 'failed',
+                             error_message = 'gallery_empty',
+                             comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
+                             comment_error = CASE WHEN comment_status = 'pending' THEN 'gallery_empty' ELSE comment_error END
+                         WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
+                    ).bind(botId, page.id).run().catch(() => { })
+                    console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
+                    continue
+                }
 
-        const pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
-            scope: 'page',
-            namespaceId: botId,
-            pageId: String(page.id || ''),
-        })
-        if (!pagePostingLockKey) {
-            console.log(`[CRON] Page ${page.name}: skip (page lock busy)`)
-            continue
-        }
-        let videoPostingLockKey: string | null = null
+                const recentPostGuard = await getRecentPagePostGuard({
+                    db: env.DB,
+                    namespaceId: botId,
+                    pageId: page.id,
+                })
+                if (recentPostGuard.blocked) {
+                    console.log(
+                        `[CRON] Page ${page.name}: skip (recent ${recentPostGuard.status || 'activity'} history_id=${recentPostGuard.historyId || '-'} posted_at=${recentPostGuard.postedAt || '-'})`
+                    )
+                    continue
+                }
 
-        try {
+                const pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
+                    scope: 'page',
+                    namespaceId: botId,
+                    pageId: String(page.id || ''),
+                })
+                if (!pagePostingLockKey) {
+                    console.log(`[CRON] Page ${page.name}: skip (page lock busy)`)
+                    continue
+                }
+                let videoPostingLockKey: string | null = null
+
+                try {
 
         // สร้าง bucket สำหรับ namespace นี้
         const botBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
@@ -22132,6 +22527,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 ).run()
             }
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+            cronStats.pagesPosted += 1
+            await updateCronRuntimeState(env.DB, {
+                runId,
+                heartbeatAt: new Date().toISOString(),
+                pagesVisited: cronStats.pagesVisited,
+                pagesPosted: cronStats.pagesPosted,
+                pagesFailed: cronStats.pagesFailed,
+            }).catch(() => { })
 
             await clearVideoShopeeLink(botBucket, unpostedId)
             console.log(`[CRON] Page ${page.name}: posted successfully (fb_video_id: ${fbVideoId}, post_id: ${confirmedPostId})`)
@@ -22252,6 +22655,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         ).run()
                     }
                     await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+                    cronStats.pagesPosted += 1
+                    await updateCronRuntimeState(env.DB, {
+                        runId,
+                        heartbeatAt: new Date().toISOString(),
+                        pagesVisited: cronStats.pagesVisited,
+                        pagesPosted: cronStats.pagesPosted,
+                        pagesFailed: cronStats.pagesFailed,
+                    }).catch(() => { })
 
                     await clearVideoShopeeLink(botBucket, unpostedId)
                     console.log(`[CRON] Page ${page.name}: recovered as success (fb_video_id: ${fbVideoId}, post_id: ${recoveredPostId})`)
@@ -22279,6 +22690,49 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             await releasePostingLock(env.DB, videoPostingLockKey)
             await releasePostingLock(env.DB, pagePostingLockKey)
         }
+            } catch (pageError) {
+                cronStats.pagesFailed += 1
+                const message = pageError instanceof Error ? pageError.message : String(pageError)
+                console.error(`[CRON] Page ${page.name}: unexpected fatal page error - ${message}`)
+                await updateCronRuntimeState(env.DB, {
+                    runId,
+                    heartbeatAt: new Date().toISOString(),
+                    pagesVisited: cronStats.pagesVisited,
+                    pagesPosted: cronStats.pagesPosted,
+                    pagesFailed: cronStats.pagesFailed,
+                    lastError: `[${botId}/${String(page.name || page.id)}] ${message}`,
+                }).catch(() => { })
+                continue
+            } finally {
+                await updateCronRuntimeState(env.DB, {
+                    runId,
+                    heartbeatAt: new Date().toISOString(),
+                    currentPageId: null,
+                    currentPageName: null,
+                    currentNamespaceId: null,
+                    pagesVisited: cronStats.pagesVisited,
+                    pagesPosted: cronStats.pagesPosted,
+                    pagesFailed: cronStats.pagesFailed,
+                }).catch(() => { })
+            }
+        }
+    } catch (error) {
+        fatalError = error instanceof Error ? error : new Error(String(error))
+        throw fatalError
+    } finally {
+        await updateCronRuntimeState(env.DB, {
+            runId,
+            status: fatalError ? 'failed' : 'idle',
+            finishedAt: new Date().toISOString(),
+            heartbeatAt: new Date().toISOString(),
+            currentPageId: null,
+            currentPageName: null,
+            currentNamespaceId: null,
+            pagesVisited: cronStats.pagesVisited,
+            pagesPosted: cronStats.pagesPosted,
+            pagesFailed: cronStats.pagesFailed,
+            lastError: fatalError ? fatalError.message : null,
+        }).catch(() => { })
     }
 
     console.log('[CRON] Auto-post check complete')
@@ -22448,10 +22902,12 @@ async function watchdogStuckJobs(env: Env) {
 export default {
     fetch: app.fetch,
     scheduled: async (event: ScheduledEvent, env: Env, _ctx: ExecutionContext) => {
-        // Watchdog ทำงานก่อน → ตรวจจับ job ค้าง + retry
-        await watchdogStuckJobs(env)
-        await warmPipelineContainer(env)
-        // Token sync ถูกย้ายไปทำจาก Telegram mini app (กดซิงค์เอง) เท่านั้น
+        enqueueBackgroundTask(_ctx, 'CRON WATCHDOG', async () => {
+            await watchdogStuckJobs(env)
+        })
+        enqueueBackgroundTask(_ctx, 'CRON CONTAINER-WARMUP', async () => {
+            await warmPipelineContainer(env)
+        })
         await handleScheduled(env, _ctx)
     },
 }

@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState, type SyntheticEvent } from 'react'
 import { API_BASE_URL } from './apiBaseUrl'
-import { getAppTabPath, type AppTabRoute } from './app/appRoutes'
+import { getAppTabPath, getInviteNamespaceFromSearch, getMergedSearchParams, type AppTabRoute } from './app/appRoutes'
 import { useViewerHistory } from './app/hooks/useViewerHistory'
 import { Thumb } from './app/components/Thumb'
 import { getInboxVideoIdentityKey } from './app/inboxUtils'
@@ -101,7 +101,7 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
   return !!(account || shopeeBase || lazadaBase || utmId || memberId)
 }
 
-const CACHE_VERSION = 'v11'
+const CACHE_VERSION = 'v12'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
@@ -971,7 +971,7 @@ const getInitialGallerySearchInput = (): string => {
 }
 
 function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
-  const ts = new Date(String(video.updatedAt || video.createdAt || '')).getTime()
+  const ts = new Date(String(video.createdAt || video.updatedAt || '')).getTime()
   return Number.isFinite(ts) ? ts : 0
 }
 
@@ -2646,13 +2646,13 @@ function App({
       if (!liff || !liff.shareTargetPicker) {
         setInvitingTeam(false)
         // Fallback: copy invite link
-        const url = 'https://liff.line.me/2009652996-DJtEhoDn'
+        const url = `https://liff.line.me/2009652996-DJtEhoDn?invite=${encodeURIComponent(namespaceId)}`
         try { await navigator.clipboard.writeText(url) } catch {}
         alert('คัดลอกลิงก์เชิญแล้ว ส่งให้เพื่อนได้เลย!\n' + url)
         return
       }
 
-      const inviteUrl = `https://liff.line.me/2009652996-DJtEhoDn/dashboard?invite=${namespaceId}`
+      const inviteUrl = `https://liff.line.me/2009652996-DJtEhoDn?invite=${encodeURIComponent(namespaceId)}`
       await liff.shareTargetPicker([{
         type: 'flex',
         altText: 'เชิญเข้าร่วม Affiliate AiBot',
@@ -2955,6 +2955,8 @@ function App({
     },
   ) => {
     const url = new URL(window.location.href)
+    const mergedSearch = getMergedSearchParams(url.search)
+    url.search = mergedSearch.toString() ? `?${mergedSearch.toString()}` : ''
     url.pathname = controlledTab ? getAppTabPath(nextTab) : `/${nextTab}`
     // Clear LIFF legacy routing params once the app owns navigation.
     url.searchParams.delete('tab')
@@ -3040,6 +3042,7 @@ function App({
   const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const processingFetchInFlightRef = useRef(false)
+  const dashboardRequestRef = useRef(0)
   const inboxRequestRef = useRef(0)
   const systemInboxRequestRef = useRef(0)
   const globalOriginalFetchInFlightRef = useRef(false)
@@ -3257,6 +3260,20 @@ function App({
       return null
     }
 
+    const allowsNativeHorizontalGesture = (target: EventTarget | null) => {
+      let current = target instanceof HTMLElement ? target : null
+      while (current) {
+        if (
+          current.matches('input[type="range"], [data-allow-native-drag="true"]')
+          || current.closest('input[type="range"], [data-allow-native-drag="true"]')
+        ) {
+          return true
+        }
+        current = current.parentElement
+      }
+      return false
+    }
+
     const handleTouchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
         lastTouchY = e.touches[0].clientY
@@ -3265,6 +3282,7 @@ function App({
 
     const handleTouchMove = (e: TouchEvent) => {
       if (e.touches.length !== 1) return
+      if (allowsNativeHorizontalGesture(e.target)) return
 
       const currentY = e.touches[0].clientY
       const deltaY = currentY - lastTouchY
@@ -3474,7 +3492,7 @@ function App({
                 display_name: displayName,
                 picture_url: pictureUrl,
                 id_token: idToken,
-                invite_namespace: new URLSearchParams(window.location.search).get('invite') || '',
+                invite_namespace: getInviteNamespaceFromSearch(window.location.search),
               }),
             })
 
@@ -3629,29 +3647,49 @@ function App({
     if (authBootstrapping || !token) return
     if (tab !== 'inbox') return
 
-    const refreshInboxView = () => {
+    const refreshInboxView = (mode: 'reset' | 'top' = 'top') => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
       if (isSystemAdmin) {
-        void loadSystemInbox(systemInboxVideos.length === 0 ? { reset: true } : { refreshTop: true })
+        if (mode === 'reset' || systemInboxVideos.length === 0) {
+          void loadSystemInbox({ reset: true })
+          return
+        }
+        void loadSystemInbox({ refreshTop: true })
         return
       }
-      void loadInboxSnapshot(inboxVideos.length === 0 ? { reset: true } : { refreshTop: true })
+      if (mode === 'reset' || inboxVideos.length === 0) {
+        void loadInboxSnapshot({ reset: true })
+        return
+      }
+      void loadInboxSnapshot({ refreshTop: true })
     }
 
-    refreshInboxView()
+    refreshInboxView('reset')
     const handleVisibilityChange = () => {
       if (document.visibilityState !== 'visible') return
-      refreshInboxView()
+      refreshInboxView('reset')
     }
-    const timer = window.setInterval(refreshInboxView, 12000)
-    window.addEventListener('focus', refreshInboxView)
+    const timer = window.setInterval(() => refreshInboxView('top'), 12000)
+    const handleFocus = () => refreshInboxView('reset')
+    window.addEventListener('focus', handleFocus)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
       window.clearInterval(timer)
-      window.removeEventListener('focus', refreshInboxView)
+      window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [tab, token, authBootstrapping, isSystemAdmin, inboxVideos.length, systemInboxVideos.length])
+
+  useEffect(() => {
+    if (authBootstrapping || !token || !isSystemAdmin) return
+    if (systemInboxVideos.length > 0 || systemInboxLoading || tab === 'inbox') return
+
+    const timer = window.setTimeout(() => {
+      void loadSystemInbox({ reset: true })
+    }, 250)
+
+    return () => window.clearTimeout(timer)
+  }, [tab, token, authBootstrapping, isSystemAdmin, systemInboxVideos.length, systemInboxLoading])
 
   useEffect(() => {
     if (authBootstrapping || !token) return
@@ -3670,29 +3708,35 @@ function App({
     if (authBootstrapping || !token) return
     if (tab !== 'gallery') return
 
-    const refreshGalleryView = () => {
+    const refreshGalleryView = (mode: 'reset' | 'top' = 'top') => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
       if (categoryFilter === 'all-original') {
         if (isOwner) void loadGlobalOriginalVideos({ force: true })
         return
       }
-      void loadGallerySnapshotBundle()
+      const hasCachedGallery = categoryFilter === 'used' ? usedVideos.length > 0 : videos.length > 0
+      if (mode === 'reset' || !hasCachedGallery) {
+        void loadGallerySnapshotBundle({ reset: true })
+        return
+      }
+      void loadGallerySnapshotBundle({ refreshTop: true })
     }
 
-    refreshGalleryView()
+    refreshGalleryView('reset')
     const handleVisibilityChange = () => {
       if (document.visibilityState !== 'visible') return
-      refreshGalleryView()
+      refreshGalleryView('reset')
     }
-    const timer = window.setInterval(refreshGalleryView, 12000)
-    window.addEventListener('focus', refreshGalleryView)
+    const timer = window.setInterval(() => refreshGalleryView('top'), 12000)
+    const handleFocus = () => refreshGalleryView('reset')
+    window.addEventListener('focus', handleFocus)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
       window.clearInterval(timer)
-      window.removeEventListener('focus', refreshGalleryView)
+      window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [tab, token, authBootstrapping, categoryFilter, isOwner, gallerySearchQuery])
+  }, [tab, token, authBootstrapping, categoryFilter, isOwner, usedVideos.length, videos.length])
 
   useEffect(() => {
     if (tab !== 'settings' && settingsSection !== 'menu') {
@@ -3738,6 +3782,12 @@ function App({
     setInboxHasMore(false)
     setInboxLoadingMore(false)
   }, [botScope, namespaceId, systemWideGalleryMode])
+
+  useEffect(() => {
+    if (authBootstrapping || !token) return
+    if (dashboardData?.date === dashboardDateFilter) return
+    void loadDashboard(dashboardDateFilter, { silent: !!dashboardData })
+  }, [token, authBootstrapping, dashboardDateFilter, dashboardData?.date])
 
   useEffect(() => {
     if (authBootstrapping || !token || tab !== 'dashboard') return
@@ -3904,8 +3954,7 @@ function App({
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
-      if (reset && offset === 0) {
-        params.set('fresh', '1')
+      if (offset === 0) {
         params.set('_ts', String(Date.now()))
       }
       const resp = await apiFetch(`${WORKER_URL}/api/inbox/system?${params.toString()}`)
@@ -3923,7 +3972,7 @@ function App({
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
         return merged
       })
-      setSystemInboxHasMore((reset ? false : systemInboxVideos.length > nextVideos.length) || (!!data.has_more && nextVideos.length > 0))
+      setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
     } finally {
@@ -4103,7 +4152,7 @@ function App({
         inventoryTotal: Number(data.inventory_total || 0),
         readyTotal: Number(data.ready_total || data.total || data.overall_total || 0),
       })
-      setSystemGalleryHasMore((refreshTop ? videos.length > nextVideos.length : false) || (!!data.has_more && nextVideos.length > 0))
+      setSystemGalleryHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep current gallery snapshot on transient errors.
     } finally {
@@ -4172,7 +4221,7 @@ function App({
       if (typeof data.ready_total === 'number') {
         setGalleryReadyTotalCount(Number(data.ready_total || 0))
       }
-      setGalleryUsedHasMore((refreshTop ? usedVideos.length > nextVideos.length : false) || (!!data.has_more && nextVideos.length > 0))
+      setGalleryUsedHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep current gallery snapshot on transient errors.
     } finally {
@@ -4272,6 +4321,7 @@ function App({
   async function loadDashboard(dateValue = dashboardDateFilter, options: { silent?: boolean } = {}) {
     const session = getToken()
     if (!session) return
+    const requestId = ++dashboardRequestRef.current
     if (!options.silent && !dashboardData) setDashboardLoading(true)
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/dashboard?date=${encodeURIComponent(dateValue)}`)
@@ -4281,12 +4331,14 @@ function App({
       }
       if (resp.ok) {
         const data = await resp.json() as DashboardData
-        setDashboardData(data)
+        if (requestId === dashboardRequestRef.current) {
+          setDashboardData(data)
+        }
       }
     } catch (e) {
       console.error('Failed to load dashboard:', e)
     } finally {
-      if (!options.silent) setDashboardLoading(false)
+      if (!options.silent && requestId === dashboardRequestRef.current) setDashboardLoading(false)
     }
   }
 
@@ -6939,7 +6991,8 @@ function App({
                                 setCoverTextStyleDraft((prev) => ({ ...prev, background_opacity: Math.round((next / 100) * 100) / 100 }))
                                 if (coverTextStyleMessage) setCoverTextStyleMessage('')
                               }}
-                              className="w-full accent-blue-600"
+                              data-allow-native-drag="true"
+                              className="w-full accent-blue-600 touch-pan-x"
                             />
                           </div>
 
@@ -6959,7 +7012,8 @@ function App({
                                 setCoverTextStyleDraft((prev) => ({ ...prev, size_scale: Math.round((next / 100) * 100) / 100 }))
                                 if (coverTextStyleMessage) setCoverTextStyleMessage('')
                               }}
-                              className="w-full accent-blue-600"
+                              data-allow-native-drag="true"
+                              className="w-full accent-blue-600 touch-pan-x"
                             />
                             <p className="text-[11px] text-gray-400">ระบบจะย่อหรือขยายต่อให้อัตโนมัติตามความยาวข้อความ เพื่อให้ข้อความยาวยังอ่านได้</p>
                           </div>
