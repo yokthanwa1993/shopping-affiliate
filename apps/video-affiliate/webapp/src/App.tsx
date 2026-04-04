@@ -3014,6 +3014,23 @@ function App({
     return 'dashboard'
   }
 
+  const getTabFromCurrentLocation = (): TabName => {
+    const fromPath = matchTab(window.location.pathname)
+    if (fromPath) return fromPath
+
+    const params = new URLSearchParams(window.location.search)
+    const fromParam = matchTab(params.get('tab') || '')
+    if (fromParam) return fromParam
+
+    const liffState = params.get('liff.state') || ''
+    if (liffState) {
+      const fromLiff = matchTab(decodeURIComponent(liffState))
+      if (fromLiff) return fromLiff
+    }
+
+    return 'dashboard'
+  }
+
   const [tab, _setTab] = useState<TabName>(controlledTab ?? getInitialTab())
   const [selectedPageHistoryId, setSelectedPageHistoryId] = useState<string>(getSelectedPageIdFromLocation)
   const buildAppUrl = (
@@ -3161,6 +3178,29 @@ function App({
   const [galleryUsedTotalCount, setGalleryUsedTotalCount] = useState(usedVideos.length)
   const [galleryUsedHasMore, setGalleryUsedHasMore] = useState(false)
 
+  const syncNavigationStateFromLocation = () => {
+    const nextTab = getTabFromCurrentLocation()
+    _setTab(nextTab)
+
+    if (nextTab === 'gallery') {
+      setGallerySearchInput(getInitialGallerySearchInput())
+    } else {
+      setGallerySearchInput('')
+    }
+
+    if (nextTab !== 'settings') {
+      setSettingsSection('menu')
+      setSelectedPageHistoryId('')
+      setSelectedPage(null)
+      return
+    }
+
+    const nextPageId = getSelectedPageIdFromLocation()
+    setSettingsSection(nextPageId ? 'pages' : getSettingsSectionFromLocation())
+    setSelectedPageHistoryId(nextPageId)
+    if (!nextPageId) setSelectedPage(null)
+  }
+
   useEffect(() => {
     const urlSearch = getInitialGallerySearchInput()
     if (tab === 'gallery') {
@@ -3194,25 +3234,7 @@ function App({
   useEffect(() => {
     const handlePopState = () => {
       if (controlledTab) return
-      const nextTab = matchTab(window.location.pathname)
-        || matchTab(new URLSearchParams(window.location.search).get('tab') || '')
-        || 'dashboard'
-      _setTab(nextTab)
-      if (nextTab === 'gallery') {
-        setGallerySearchInput(getInitialGallerySearchInput())
-      } else {
-        setGallerySearchInput('')
-      }
-      if (nextTab !== 'settings') {
-        setSettingsSection('menu')
-        setSelectedPageHistoryId('')
-        setSelectedPage(null)
-        return
-      }
-      const nextPageId = getSelectedPageIdFromLocation()
-      setSettingsSection(nextPageId ? 'pages' : getSettingsSectionFromLocation())
-      setSelectedPageHistoryId(nextPageId)
-      if (!nextPageId) setSelectedPage(null)
+      syncNavigationStateFromLocation()
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
@@ -3542,6 +3564,9 @@ function App({
         try {
           const liff = (window as any).liff
           await liff.init({ liffId: LINE_LIFF_ID })
+          if (!controlledTab) {
+            syncNavigationStateFromLocation()
+          }
 
           // Try multiple ways to get LINE userId
           let lineUserId = ''
