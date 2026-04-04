@@ -31,6 +31,17 @@ export default function HostRoute() {
           navigate({ pathname: nextPath, search: nextSearch })
         }
       }}
+      onControlledUrlChange={(nextUrl, historyMode) => {
+        const parsed = new URL(nextUrl)
+        const nextPath = parsed.pathname
+        const nextSearch = parsed.search
+        if (nextPath !== location.pathname || nextSearch !== location.search) {
+          navigate(
+            { pathname: nextPath, search: nextSearch },
+            { replace: historyMode === 'replace' },
+          )
+        }
+      }}
     />
   )
 }

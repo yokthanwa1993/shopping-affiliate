@@ -980,8 +980,10 @@ const getInitialGallerySearchInput = (): string => {
 }
 
 function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
-  const ts = new Date(String(video.createdAt || video.updatedAt || '')).getTime()
-  return Number.isFinite(ts) ? ts : 0
+  const updatedTs = new Date(String(video.updatedAt || '')).getTime()
+  if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
+  const createdTs = new Date(String(video.createdAt || '')).getTime()
+  return Number.isFinite(createdTs) ? createdTs : 0
 }
 
 function pickPreferredGalleryVideo(
@@ -1859,10 +1861,10 @@ function VideoCard({
           disabled={reposting}
           title="โพสต์ใหม่"
           aria-label="โพสต์ใหม่"
-          className="absolute left-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-white/92 text-gray-700 shadow-md transition-transform active:scale-95 disabled:opacity-60"
+          className="absolute left-2 top-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-amber-50 text-amber-500 shadow-md transition-transform active:scale-95 disabled:opacity-60"
         >
           {reposting ? (
-            <div className="h-3.5 w-3.5 rounded-full border-2 border-gray-400 border-t-transparent animate-spin" />
+            <div className="h-3.5 w-3.5 rounded-full border-2 border-amber-500 border-t-transparent animate-spin" />
           ) : (
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
               <path d="M3 12a9 9 0 0 1 15.3-6.3L21 8" strokeLinecap="round" strokeLinejoin="round" />
@@ -2509,9 +2511,11 @@ export type TabName = AppTabRoute
 function App({
   controlledTab,
   onControlledTabChange,
+  onControlledUrlChange,
 }: {
   controlledTab?: TabName
   onControlledTabChange?: (tab: TabName) => void
+  onControlledUrlChange?: (url: string, historyMode: 'push' | 'replace') => void
 } = {}) {
   const botScope = getBotScopeFromLocation()
 
@@ -2976,7 +2980,7 @@ function App({
   // Read initial tab from URL path or query param
   const validTabs: TabName[] = ['dashboard', 'inbox', 'processing', 'gallery', 'logs', 'settings']
   const matchTab = (val: string): TabName | null => {
-    const t = val.replace(/^\/+/, '').replace(/\?.*/, '').split('/').pop() || ''
+    const t = val.replace(/^\/+/, '').replace(/\?.*/, '').split('/').filter(Boolean)[0] || ''
     if (t === 'pages') return 'settings'
     if (validTabs.includes(t as TabName)) return t as TabName
     return null
@@ -3012,10 +3016,9 @@ function App({
 
   const [tab, _setTab] = useState<TabName>(controlledTab ?? getInitialTab())
   const [selectedPageHistoryId, setSelectedPageHistoryId] = useState<string>(getSelectedPageIdFromLocation)
-  const syncAppUrl = (
+  const buildAppUrl = (
     nextTab: TabName,
     nextSearchInput: string,
-    historyMode: 'push' | 'replace' = 'replace',
     options?: {
       settingsSection?: SettingsSection
       pageId?: string | null
@@ -3060,14 +3063,32 @@ function App({
     } else {
       url.searchParams.delete('page_id')
     }
-    const nextUrl = url.toString()
-    if (nextUrl !== window.location.href) {
-      if (historyMode === 'push') {
-        window.history.pushState(null, '', nextUrl)
-      } else {
-        window.history.replaceState(null, '', nextUrl)
-      }
+    return url.toString()
+  }
+  const syncAppUrl = (
+    nextTab: TabName,
+    nextSearchInput: string,
+    historyMode: 'push' | 'replace' = 'replace',
+    options?: {
+      settingsSection?: SettingsSection
+      pageId?: string | null
+    },
+  ) => {
+    const nextUrl = buildAppUrl(nextTab, nextSearchInput, options)
+    if (nextUrl === window.location.href) return
+
+    if (controlledTab && onControlledUrlChange) {
+      onControlledUrlChange(nextUrl, historyMode)
+      return
     }
+
+    if (historyMode === 'push') {
+      try { localStorage.setItem('_liff_tab', nextTab) } catch {}
+      window.location.assign(nextUrl)
+      return
+    }
+
+    window.history.replaceState(null, '', nextUrl)
   }
   const setTab = (t: TabName) => {
     if (t !== 'settings') {
