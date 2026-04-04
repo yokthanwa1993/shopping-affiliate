@@ -970,6 +970,37 @@ function buildScopedLiffTabQueryUrl(baseUrl: string, botScope: string, tab: stri
     }
 }
 
+function buildScopedLiffPermanentPathUrl(baseUrl: string, botScope: string, targetPath: string, extraParams?: Record<string, string>) {
+    const scopedBaseUrl = buildScopedWebAppUrl(baseUrl, botScope)
+    const normalizedTargetPath = String(targetPath || '').trim().replace(/^\/+/, '')
+    try {
+        const url = new URL(scopedBaseUrl)
+        const basePath = String(url.pathname || '').replace(/\/+$/, '')
+        url.pathname = normalizedTargetPath
+            ? `${basePath}/${normalizedTargetPath}`
+            : (basePath || '/')
+        url.searchParams.delete('tab')
+        url.searchParams.delete('liff.state')
+        for (const [key, value] of Object.entries(extraParams || {})) {
+            const normalizedValue = String(value || '').trim()
+            if (normalizedValue) url.searchParams.set(key, normalizedValue)
+            else url.searchParams.delete(key)
+        }
+        return url.toString()
+    } catch {
+        const params = new URLSearchParams()
+        const scope = String(botScope || '').trim()
+        if (scope) params.set('bot', scope)
+        for (const [key, value] of Object.entries(extraParams || {})) {
+            const normalizedValue = String(value || '').trim()
+            if (normalizedValue) params.set(key, normalizedValue)
+        }
+        const query = params.toString()
+        const suffix = normalizedTargetPath ? `/${normalizedTargetPath}` : ''
+        return `${baseUrl.replace(/\/+$/, '')}${suffix}${query ? `?${query}` : ''}`
+    }
+}
+
 function getAppWebBaseUrl(env: Env): string {
     return String(env.WEBAPP_URL || 'https://app.oomnn.com').trim() || 'https://app.oomnn.com'
 }
@@ -5738,19 +5769,19 @@ const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
-        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'dashboard') },
+        action: { type: 'uri', label: '📊 แดชบอร์ด', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'dashboard') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'gallery') },
+        action: { type: 'uri', label: '🎬 แกลลี่', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'gallery') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'logs') },
+        action: { type: 'uri', label: '📋 ประวัติ', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'logs') },
     },
     {
         type: 'action',
-        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedLiffTabQueryUrl(LIFF_BASE, '', 'settings') },
+        action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: buildScopedLiffPermanentPathUrl(LIFF_BASE, '', 'settings') },
     },
 ]
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
