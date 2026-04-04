@@ -5769,7 +5769,7 @@ const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
 const LIFF_DASHBOARD = 'https://liff.line.me/2009652996-2SnLQJeD'
 const LIFF_GALLERY = 'https://liff.line.me/2009652996-OGTCnapx'
 const LIFF_LOGS = 'https://liff.line.me/2009652996-vBsuawCH'
-const LIFF_SETTINGS = 'https://liff.line.me/2009652996-PgxNIX5I'
+const LIFF_SETTINGS = 'https://liff.line.me/2009652996-PgxNlX5l'
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
@@ -16091,10 +16091,19 @@ type PostingAffiliatePlatformVerification = {
 
 type PostingAffiliateVerificationResult = {
     ok: boolean
+    enforced: boolean
     status: 'skipped' | 'verified' | 'failed'
     error: string | null
     shopee: PostingAffiliatePlatformVerification
     lazada: PostingAffiliatePlatformVerification
+}
+
+async function isNamespaceAffiliateVerificationEnforced(db: D1Database, namespaceId: string): Promise<boolean> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return false
+    const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedNamespaceId).catch(() => '')
+    if (!ownerEmail) return false
+    return isSystemAdmin(db, ownerEmail)
 }
 
 async function verifyAffiliateLinksForPosting(params: {
@@ -16107,6 +16116,7 @@ async function verifyAffiliateLinksForPosting(params: {
     const namespaceId = String(params.namespaceId || '').trim()
     const shopeeInputLink = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
     const lazadaInputLink = pickFirstLazadaUrl(params.lazadaLink || '') || String(params.lazadaLink || '').trim()
+    const enforced = await isNamespaceAffiliateVerificationEnforced(params.env.DB, namespaceId)
 
     const [expectedShopeeId, expectedLazadaMemberId] = await Promise.all([
         resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, namespaceId).catch(() => ''),
@@ -16168,20 +16178,23 @@ async function verifyAffiliateLinksForPosting(params: {
 
     const blockingErrors = [shopee.error, lazada.error].filter((value) => !!String(value || '').trim())
     const verifiedAny = shopee.status === 'verified' || lazada.status === 'verified'
-    const ok = blockingErrors.length === 0
-    const status: 'skipped' | 'verified' | 'failed' = ok
-        ? (verifiedAny ? 'verified' : 'skipped')
-        : 'failed'
+    const ok = enforced ? blockingErrors.length === 0 : true
+    const status: 'skipped' | 'verified' | 'failed' = enforced
+        ? (ok ? (verifiedAny ? 'verified' : 'skipped') : 'failed')
+        : (verifiedAny ? 'verified' : 'skipped')
     const error = blockingErrors.join(' | ') || null
 
-    if (!ok) {
+    if (enforced && !ok) {
         console.log(`[${params.logPrefix}] affiliate verification blocked posting: ${error}`)
     } else if (verifiedAny) {
         console.log(`[${params.logPrefix}] affiliate verification OK shopee=${shopee.actualId || '-'} lazada=${lazada.actualId || '-'}`)
+    } else if (!enforced && error) {
+        console.log(`[${params.logPrefix}] affiliate verification trace only (non-admin namespace): ${error}`)
     }
 
     return {
         ok,
+        enforced,
         status,
         error,
         shopee,
