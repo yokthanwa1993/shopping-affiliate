@@ -474,6 +474,68 @@ interface TeamMember {
 
 type SystemMemberRole = 'admin' | 'member' | 'team'
 
+interface MonitorSummary {
+  active_pages: number
+  active_namespaces: number
+  posting_rows: number
+  pending_comments: number
+  failed_posts_24h: number
+  failed_comments_24h: number
+  latest_cron_success_at?: string
+}
+
+interface MonitorCronRuntime {
+  run_id?: string
+  status?: string
+  started_at?: string
+  finished_at?: string
+  heartbeat_at?: string
+  current_page_id?: string
+  current_page_name?: string
+  current_namespace_id?: string
+  pages_total?: number
+  pages_visited?: number
+  pages_posted?: number
+  pages_failed?: number
+  last_error?: string
+}
+
+interface MonitorCronPage {
+  namespace_id?: string
+  page_id?: string
+  page_name?: string
+  post_hours?: string
+  last_cron_touched?: string
+}
+
+interface MonitorPostIssue {
+  id?: number
+  bot_id?: string
+  page_id?: string
+  video_id?: string
+  status?: string
+  error_message?: string
+  posted_at?: string
+}
+
+interface MonitorCommentIssue {
+  id?: number
+  bot_id?: string
+  page_id?: string
+  video_id?: string
+  comment_status?: string
+  comment_error?: string
+  posted_at?: string
+}
+
+interface MonitorResponse {
+  summary?: MonitorSummary
+  cron_runtime?: MonitorCronRuntime | null
+  stale_cron_pages?: MonitorCronPage[]
+  post_issues?: MonitorPostIssue[]
+  comment_issues?: MonitorCommentIssue[]
+}
+
 interface SystemMember {
   line_user_id: string
   display_name?: string
@@ -501,7 +563,7 @@ interface FacebookPage {
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
-type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members' | 'monitor'
 type PostingOrderOption = 'oldest_first' | 'newest_first' | 'random'
 type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
@@ -697,6 +759,8 @@ const getSettingsSectionTitle = (section: SettingsSection): string => {
       return 'ข้อความบนปก'
     case 'members':
       return 'สมาชิก'
+    case 'monitor':
+      return 'Monitor'
     default:
       return 'ตั้งค่า'
   }
@@ -828,6 +892,54 @@ const extractLazadaTrackingSourceClient = (link: string): string => {
     const parsed = new URL(rawLink)
     for (const key of ['exlaz', 'laz_trackid', 'utm_source']) {
       const hit = matchMarker(String(parsed.searchParams.get(key) || ''))
+      if (hit) return hit
+    }
+  } catch {
+    return ''
+  }
+
+  return ''
+}
+
+const extractShopeeAffiliateIdFromLinkClient = (link: string): string => {
+  const rawLink = extractShopeeLink(link)
+  if (!rawLink) return ''
+
+  try {
+    const parsed = new URL(rawLink)
+    return normalizeShortlinkExpectedUtmIdClient(String(parsed.searchParams.get('utm_source') || ''))
+  } catch {
+    return ''
+  }
+}
+
+const extractLazadaMemberIdFromLinkClient = (link: string): string => {
+  const rawLink = extractLazadaLink(link)
+  if (!rawLink) return ''
+
+  const matchMemberId = (value: string): string => {
+    const decoded = (() => {
+      try {
+        return decodeURIComponent(value)
+      } catch {
+        return value
+      }
+    })()
+
+    const exact = decoded.match(/mm_(\d+)_/i)
+    if (exact) return normalizeLazadaMemberIdClient(String(exact[1] || ''))
+    const direct = decoded.match(/[?&]member_id=(\d+)/i)
+    if (direct) return normalizeLazadaMemberIdClient(String(direct[1] || ''))
+    return ''
+  }
+
+  const direct = matchMemberId(rawLink)
+  if (direct) return direct
+
+  try {
+    const parsed = new URL(rawLink)
+    for (const key of ['exlaz', 'laz_trackid', 'utm_source', 'member_id', 'sub_aff_id', 'aff_trace_key']) {
+      const hit = matchMemberId(String(parsed.searchParams.get(key) || ''))
       if (hit) return hit
     }
   } catch {
@@ -1088,6 +1200,23 @@ const resolveInboxThumbnailDisplayUrl = (video: Partial<InboxVideo> & Record<str
   const proxied = resolveGalleryAssetProxyUrl(video, 'original-thumb')
   if (proxied) return proxied
   return String(video.thumbnailUrl || '').trim()
+}
+
+const buildOriginalFramePreviewUrl = (video: Record<string, unknown>) => {
+  const id = String(video.id || video.video_id || '').trim()
+  const namespaceId = String(video.namespace_id || '').trim()
+  if (!id || !namespaceId) return ''
+  try {
+    const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(id)}/frame`)
+    url.searchParams.set('namespace_id', namespaceId)
+    url.searchParams.set('seed', `${namespaceId}:${id}:original-preview`)
+    url.searchParams.set('format', 'jpg')
+    url.searchParams.set('w', '540')
+    url.searchParams.set('h', '960')
+    return url.toString()
+  } catch {
+    return `${WORKER_URL}/api/gallery/${encodeURIComponent(id)}/frame?namespace_id=${encodeURIComponent(namespaceId)}&seed=${encodeURIComponent(`${namespaceId}:${id}:original-preview`)}&format=jpg&w=540&h=960`
+  }
 }
 
 const resolvePlayableVideoUrl = (video: Partial<Video> & Record<string, unknown>) => {
@@ -1887,8 +2016,7 @@ function GlobalOriginalVideoCard({ video, onExpandedChange }: { video: GlobalOri
     ? '-'
     : createdAt.toLocaleString('th-TH', { hour12: false })
   const originalPlaybackUrl = resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original') || video.original_url
-  const originalPosterUrl = resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'original-thumb')
-    || resolveGalleryAssetProxyUrl(video as unknown as Record<string, unknown>, 'thumb')
+  const originalPosterUrl = buildOriginalFramePreviewUrl(video as unknown as Record<string, unknown>)
 
   useEffect(() => {
     onExpandedChange?.(expanded)
@@ -2845,7 +2973,7 @@ function App({
   const [postingOrderLoading, setPostingOrderLoading] = useState(false)
   const [postingOrderSaving, setPostingOrderSaving] = useState(false)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'post', 'voice', 'cover', 'comment', 'members']
+  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'post', 'voice', 'cover', 'comment', 'members', 'monitor']
   const getPathSegments = (pathname = window.location.pathname) =>
     String(pathname || '')
       .replace(/^\/+/, '')
@@ -2877,6 +3005,9 @@ function App({
   const [pendingApproval, setPendingApproval] = useState(false)
   const [systemMembers, setSystemMembers] = useState<SystemMember[]>([])
   const [systemMembersLoading, setSystemMembersLoading] = useState(false)
+  const [monitorData, setMonitorData] = useState<MonitorResponse | null>(null)
+  const [monitorLoading, setMonitorLoading] = useState(false)
+  const [monitorView, setMonitorView] = useState<'overview' | 'cron' | 'stale' | 'post' | 'comment'>('overview')
   const [approvingUserId, setApprovingUserId] = useState<string | null>(null)
   const [rejectingUserId, setRejectingUserId] = useState<string | null>(null)
   const [savingMemberRoleId, setSavingMemberRoleId] = useState<string | null>(null)
@@ -3119,6 +3250,7 @@ function App({
     setSelectedPage(null)
     setSelectedPageHistoryId('')
     setSettingsSection(section)
+    if (section === 'monitor') setMonitorView('overview')
     syncAppUrl('settings', gallerySearchInput, 'push', { settingsSection: section, pageId: null })
   }
   const openSelectedPage = (page: FacebookPage) => {
@@ -3774,6 +3906,10 @@ function App({
       void loadGeminiApiKey()
       return
     }
+    if (settingsSection === 'monitor' && isSystemAdmin) {
+      void loadMonitor()
+      return
+    }
     if (settingsSection === 'members' && isSystemAdmin) {
       void loadSystemMembers()
     }
@@ -3852,16 +3988,19 @@ function App({
     if (authBootstrapping || !token) return
     if (tab !== 'gallery') return
 
+    const hasCachedGallery = () => (
+      categoryFilter === 'used'
+        ? galleryUsedCountRef.current > 0
+        : galleryReadyCountRef.current > 0
+    )
+
     const refreshGalleryView = (mode: 'reset' | 'top' = 'top') => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
       if (categoryFilter === 'all-original') {
         if (isOwner) void loadGlobalOriginalVideos({ force: true })
         return
       }
-      const hasCachedGallery = categoryFilter === 'used'
-        ? galleryUsedCountRef.current > 0
-        : galleryReadyCountRef.current > 0
-      if (mode === 'reset' || !hasCachedGallery) {
+      if (mode === 'reset' || !hasCachedGallery()) {
         void loadGallerySnapshotBundle({ reset: true })
         return
       }
@@ -3870,10 +4009,10 @@ function App({
 
     const handleVisibilityChange = () => {
       if (document.visibilityState !== 'visible') return
-      refreshGalleryView('reset')
+      refreshGalleryView(hasCachedGallery() ? 'top' : 'reset')
     }
     const timer = window.setInterval(() => refreshGalleryView('top'), 12000)
-    const handleFocus = () => refreshGalleryView('reset')
+    const handleFocus = () => refreshGalleryView(hasCachedGallery() ? 'top' : 'reset')
     window.addEventListener('focus', handleFocus)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
@@ -3901,6 +4040,9 @@ function App({
       setSettingsSection('menu')
     }
     if (!isSystemAdmin && settingsSection === 'members') {
+      setSettingsSection('menu')
+    }
+    if (!isSystemAdmin && settingsSection === 'monitor') {
       setSettingsSection('menu')
     }
   }, [authBootstrapping, isOwner, isSystemAdmin, settingsSection])
@@ -4142,6 +4284,25 @@ function App({
       }
     } catch {}
     finally { setSystemMembersLoading(false) }
+  }
+
+  async function loadMonitor() {
+    if (!token || !isSystemAdmin) return
+    setMonitorLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/admin/monitor`)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (!resp.ok) return
+      const data = await resp.json() as MonitorResponse
+      setMonitorData(data || null)
+    } catch {
+      // keep previous monitor snapshot
+    } finally {
+      setMonitorLoading(false)
+    }
   }
 
   async function approveSystemMember(lineUserId: string) {
@@ -4386,8 +4547,10 @@ function App({
 
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
-    const shouldShowLoading = (categoryFilter === 'used' ? usedVideos.length === 0 : videos.length === 0)
-    if (reset || refreshTop) setGalleryBootstrapPending(true)
+    const visibleGalleryCount = categoryFilter === 'used' ? usedVideos.length : videos.length
+    const shouldShowLoading = visibleGalleryCount === 0
+    const shouldShowBootstrapPending = (reset || refreshTop) && shouldShowLoading
+    if (shouldShowBootstrapPending) setGalleryBootstrapPending(true)
     if (reset && shouldShowLoading) setGalleryLoading(true)
     if (reset) setGalleryLoadingMore(false)
 
@@ -4398,7 +4561,7 @@ function App({
       ])
     } finally {
       if (reset && shouldShowLoading) setGalleryLoading(false)
-      if (reset || refreshTop) setGalleryBootstrapPending(false)
+      if (shouldShowBootstrapPending) setGalleryBootstrapPending(false)
     }
   }
 
@@ -6002,7 +6165,7 @@ function App({
                   ))}
                 </div>
               )
-            ) : (galleryLoading || galleryBootstrapPending) ? (
+            ) : (galleryLoading || (galleryBootstrapPending && galleryCurrentTotal === 0)) ? (
               <div className="grid grid-cols-3 gap-3">
                 {[1, 2, 3, 4, 5, 6].map(i => (
                   <div key={i} className="aspect-[9/16] rounded-2xl bg-gray-100 animate-pulse" />
@@ -6200,13 +6363,19 @@ function App({
                     const actualLazadaAffiliateId = String(item.lazada_member_id || '').trim()
                     const expectedShopeeAffiliateId = String(item.shortlink_expected_utm_id || '').trim()
                     const expectedLazadaAffiliateId = String(item.lazada_expected_member_id || '').trim()
+                    const shopeeAffiliateIdFromUrl = extractShopeeAffiliateIdFromLinkClient(String(item.shopee_link || '')) || actualShopeeAffiliateId
+                    const lazadaMemberIdFromUrl = extractLazadaMemberIdFromLinkClient(String(item.lazada_link || '')) || actualLazadaAffiliateId
+                    const shouldShowAdminAffiliateCheck = isSystemAdmin
+                    const shouldShowMemberAffiliateIds = !isSystemAdmin && !!(item.shopee_link || item.lazada_link || shopeeAffiliateIdFromUrl || lazadaMemberIdFromUrl)
                     const showAffiliateCheck = Boolean(
+                      shouldShowAdminAffiliateCheck && (
                       item.shortlink_status ||
                       item.shortlink_error ||
                       expectedShopeeAffiliateId ||
                       actualShopeeAffiliateId ||
                       expectedLazadaAffiliateId ||
                       actualLazadaAffiliateId
+                      )
                     )
                     const affiliateStatusLabel = item.shortlink_status === 'verified'
                       ? 'ผ่าน'
@@ -6397,6 +6566,15 @@ function App({
                                 <p><span className="font-semibold text-gray-700">Shopee ID:</span> expected {expectedShopeeAffiliateId || '-'} / actual {actualShopeeAffiliateId || '-'} / {shopeeMatchLabel}</p>
                                 <p><span className="font-semibold text-gray-700">Lazada ID:</span> expected {expectedLazadaAffiliateId || '-'} / actual {actualLazadaAffiliateId || '-'} / {lazadaMatchLabel}</p>
                                 {item.shortlink_error && <p className="text-red-500 break-all"><span className="font-semibold text-red-600">Affiliate error:</span> {item.shortlink_error}</p>}
+                              </div>
+                            )}
+                            {shouldShowMemberAffiliateIds && (
+                              <div className="rounded-xl bg-gray-50 px-3 py-2.5 space-y-1.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <p className="font-semibold text-gray-700">Affiliate ID จาก URL</p>
+                                </div>
+                                <p><span className="font-semibold text-gray-700">Shopee ID:</span> {shopeeAffiliateIdFromUrl || '-'}</p>
+                                <p><span className="font-semibold text-gray-700">Lazada ID:</span> {lazadaMemberIdFromUrl || '-'}</p>
                               </div>
                             )}
                             {item.comment_fb_id && <p><span className="font-semibold text-gray-700">Comment ID:</span> {item.comment_fb_id}</p>}
@@ -6650,6 +6828,18 @@ function App({
                     subtitle={commentTemplateSource === 'custom' ? 'กำลังใช้เทมเพลตคอมเมนต์ที่กำหนดเอง' : 'กำลังใช้เทมเพลตคอมเมนต์ค่าเริ่มต้น'}
                     onClick={() => openSettingsSection('comment')}
                   />
+                  {isSystemAdmin && (
+                    <SettingsMenuItem
+                      icon="📊"
+                      title="Monitor"
+                      subtitle={
+                        monitorData?.summary
+                          ? `Cron ${monitorData.summary.active_pages} เพจ • คอมเมนต์ค้าง ${monitorData.summary.pending_comments} • โพสต์ค้าง ${monitorData.summary.posting_rows}`
+                          : 'ดูสถานะ cron, โพสต์ค้าง, คอมเมนต์ค้าง และงานล่าสุด'
+                      }
+                      onClick={() => openSettingsSection('monitor')}
+                    />
+                  )}
                   {isSystemAdmin && (
                     <SettingsMenuItem
                       icon="&#x2705;"
@@ -7565,6 +7755,249 @@ function App({
                           })}
                         </div>
                       )}
+                  </div>
+                )}
+
+                {settingsSection === 'monitor' && isSystemAdmin && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-4 shadow-sm">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-[11px] font-bold tracking-[0.18em] text-blue-500 uppercase">Monitor</p>
+                          <p className="mt-1 text-lg font-black text-gray-900">รายการสถานะระบบ</p>
+                          <p className="mt-1 text-xs text-gray-500 leading-relaxed">
+                            การ์ดสรุปและรายการปัญหาล่าสุดของ cron, post, และ comment
+                          </p>
+                          {monitorData?.summary?.latest_cron_success_at && (
+                            <p className="mt-1 text-[11px] text-gray-400">
+                              cron success ล่าสุด: {new Date(monitorData.summary.latest_cron_success_at).toLocaleString('th-TH')}
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => { void loadMonitor() }}
+                          disabled={monitorLoading}
+                          className="px-3 py-2 rounded-xl text-xs font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
+                        >
+                          {monitorLoading ? 'กำลังโหลด...' : 'รีเฟรช'}
+                        </button>
+                      </div>
+
+                      {monitorLoading && !monitorData ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลด Monitor...</p>
+                      ) : (
+                        <>
+                          <div className="grid grid-cols-2 gap-3">
+                            {[
+                              { label: 'เพจที่เปิด cron', value: String(monitorData?.summary?.active_pages || 0) },
+                              { label: 'namespace ที่ใช้ cron', value: String(monitorData?.summary?.active_namespaces || 0) },
+                              { label: 'โพสต์ค้าง', value: String(monitorData?.summary?.posting_rows || 0) },
+                              { label: 'คอมเมนต์ค้าง', value: String(monitorData?.summary?.pending_comments || 0) },
+                              { label: 'โพสต์ fail 24 ชม.', value: String(monitorData?.summary?.failed_posts_24h || 0) },
+                              { label: 'คอมเมนต์ fail 24 ชม.', value: String(monitorData?.summary?.failed_comments_24h || 0) },
+                            ].map((item) => (
+                              <div key={item.label} className="rounded-2xl border border-gray-100 bg-gray-50 px-4 py-3">
+                                <p className="text-[11px] font-medium text-gray-500">{item.label}</p>
+                                <p className="mt-1 text-xl font-black text-gray-900">{item.value}</p>
+                              </div>
+                            ))}
+                          </div>
+
+                          {monitorView === 'overview' ? (
+                            <div className="grid grid-cols-1 gap-3">
+                              <button
+                                type="button"
+                                onClick={() => setMonitorView('cron')}
+                                className="rounded-2xl border border-gray-100 bg-gray-50 px-4 py-4 text-left active:scale-[0.99] transition-all"
+                              >
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <p className="text-sm font-bold text-gray-900">Cron Runtime</p>
+                                    <p className="mt-1 text-[12px] text-gray-500">ดูสถานะรอบล่าสุดและ heartbeat</p>
+                                  </div>
+                                  <span className={`rounded-full px-2 py-1 text-[11px] font-bold ${
+                                    String(monitorData?.cron_runtime?.status || '').trim() === 'running'
+                                      ? 'bg-blue-50 text-blue-600'
+                                      : String(monitorData?.cron_runtime?.status || '').trim() === 'failed'
+                                        ? 'bg-red-50 text-red-500'
+                                        : 'bg-gray-200 text-gray-600'
+                                  }`}>
+                                    {String(monitorData?.cron_runtime?.status || 'idle')}
+                                  </span>
+                                </div>
+                                <p className="mt-2 text-[12px] text-gray-600">
+                                  visited {Number(monitorData?.cron_runtime?.pages_visited || 0)} / posted {Number(monitorData?.cron_runtime?.pages_posted || 0)} / failed {Number(monitorData?.cron_runtime?.pages_failed || 0)}
+                                </p>
+                              </button>
+
+                              {[
+                                {
+                                  key: 'stale' as const,
+                                  title: 'เพจ cron ที่ stale',
+                                  subtitle: 'เพจที่ cron ไม่ได้แตะนานผิดปกติ',
+                                  count: Array.isArray(monitorData?.stale_cron_pages) ? monitorData.stale_cron_pages.length : 0,
+                                  tone: 'red',
+                                },
+                                {
+                                  key: 'post' as const,
+                                  title: 'โพสต์ที่มีปัญหาล่าสุด',
+                                  subtitle: 'ดูรายการ failed หรือ posting ค้าง',
+                                  count: Array.isArray(monitorData?.post_issues) ? monitorData.post_issues.length : 0,
+                                  tone: 'amber',
+                                },
+                                {
+                                  key: 'comment' as const,
+                                  title: 'คอมเมนต์ที่มีปัญหาล่าสุด',
+                                  subtitle: 'ดูรายการ pending, processing, failed',
+                                  count: Array.isArray(monitorData?.comment_issues) ? monitorData.comment_issues.length : 0,
+                                  tone: 'amber',
+                                },
+                              ].map((item) => (
+                                <button
+                                  key={item.key}
+                                  type="button"
+                                  onClick={() => setMonitorView(item.key)}
+                                  className="rounded-2xl border border-gray-100 bg-white px-4 py-4 text-left active:scale-[0.99] transition-all"
+                                >
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div>
+                                      <p className="text-sm font-bold text-gray-900">{item.title}</p>
+                                      <p className="mt-1 text-[12px] text-gray-500">{item.subtitle}</p>
+                                    </div>
+                                    <span className={`rounded-full px-2 py-1 text-[11px] font-bold ${
+                                      item.tone === 'red' ? 'bg-red-50 text-red-500' : 'bg-amber-50 text-amber-600'
+                                    }`}>
+                                      {item.count}
+                                    </span>
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="space-y-3">
+                              <button
+                                type="button"
+                                onClick={() => setMonitorView('overview')}
+                                className="inline-flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-bold text-gray-700 active:scale-95 transition-all"
+                              >
+                                กลับไปการ์ดสรุป
+                              </button>
+
+                              {monitorView === 'cron' && (
+                                <div className="rounded-2xl border border-gray-100 bg-gray-50 px-4 py-4 space-y-2">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <p className="text-sm font-bold text-gray-900">Cron Runtime</p>
+                                    <span className={`rounded-full px-2 py-1 text-[11px] font-bold ${
+                                      String(monitorData?.cron_runtime?.status || '').trim() === 'running'
+                                        ? 'bg-blue-50 text-blue-600'
+                                        : String(monitorData?.cron_runtime?.status || '').trim() === 'failed'
+                                          ? 'bg-red-50 text-red-500'
+                                          : 'bg-gray-200 text-gray-600'
+                                    }`}>
+                                      {String(monitorData?.cron_runtime?.status || 'idle')}
+                                    </span>
+                                  </div>
+                                  <p className="text-[12px] text-gray-600">
+                                    visited {Number(monitorData?.cron_runtime?.pages_visited || 0)} / posted {Number(monitorData?.cron_runtime?.pages_posted || 0)} / failed {Number(monitorData?.cron_runtime?.pages_failed || 0)}
+                                  </p>
+                                  {monitorData?.cron_runtime?.current_page_name && (
+                                    <p className="text-[12px] text-gray-500">กำลังวิ่งที่: {monitorData.cron_runtime.current_page_name}</p>
+                                  )}
+                                  {monitorData?.cron_runtime?.heartbeat_at && (
+                                    <p className="text-[11px] text-gray-400">heartbeat: {new Date(String(monitorData.cron_runtime.heartbeat_at)).toLocaleString('th-TH')}</p>
+                                  )}
+                                  {monitorData?.cron_runtime?.last_error && (
+                                    <p className="text-[11px] text-red-500 break-all">last error: {String(monitorData.cron_runtime.last_error)}</p>
+                                  )}
+                                </div>
+                              )}
+
+                              {monitorView === 'stale' && (
+                                <div className="rounded-2xl border border-red-100 bg-white px-4 py-4 space-y-2">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <p className="text-sm font-bold text-gray-900">เพจ cron ที่ stale</p>
+                                    <span className="rounded-full bg-red-50 px-2 py-1 text-[11px] font-bold text-red-500">
+                                      {Array.isArray(monitorData?.stale_cron_pages) ? monitorData.stale_cron_pages.length : 0}
+                                    </span>
+                                  </div>
+                                  {Array.isArray(monitorData?.stale_cron_pages) && monitorData.stale_cron_pages.length > 0 ? (
+                                    <div className="space-y-2">
+                                      {monitorData.stale_cron_pages.map((item, index) => (
+                                        <div key={`stale-${item.page_id || index}`} className="rounded-xl border border-red-100 bg-red-50 px-3 py-3">
+                                          <p className="text-sm font-bold text-gray-900">{item.page_name || item.page_id || 'Unknown page'}</p>
+                                          <p className="text-[11px] text-gray-500">namespace {item.namespace_id || '-'} • schedule {item.post_hours || '-'}</p>
+                                          <p className="text-[11px] text-red-500">แตะล่าสุด: {item.last_cron_touched ? new Date(String(item.last_cron_touched)).toLocaleString('th-TH') : 'ยังไม่เคยโดน cron แตะ'}</p>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="text-sm text-green-600">ไม่พบเพจ cron ที่ stale ในตอนนี้</p>
+                                  )}
+                                </div>
+                              )}
+
+                              {monitorView === 'post' && (
+                                <div className="rounded-2xl border border-gray-100 bg-white px-4 py-4 space-y-2">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <p className="text-sm font-bold text-gray-900">โพสต์ที่มีปัญหาล่าสุด</p>
+                                    <span className="rounded-full bg-amber-50 px-2 py-1 text-[11px] font-bold text-amber-600">
+                                      {Array.isArray(monitorData?.post_issues) ? monitorData.post_issues.length : 0}
+                                    </span>
+                                  </div>
+                                  {Array.isArray(monitorData?.post_issues) && monitorData.post_issues.length > 0 ? (
+                                    <div className="space-y-2">
+                                      {monitorData.post_issues.map((item, index) => (
+                                        <div key={`post-issue-${item.id || index}`} className="rounded-xl border border-gray-100 bg-white px-3 py-3">
+                                          <div className="flex items-center justify-between gap-3">
+                                            <p className="text-sm font-bold text-gray-900">video {item.video_id || '-'}</p>
+                                            <span className={`rounded-full px-2 py-1 text-[11px] font-bold ${item.status === 'failed' ? 'bg-red-50 text-red-500' : 'bg-amber-50 text-amber-600'}`}>{item.status || '-'}</span>
+                                          </div>
+                                          <p className="text-[11px] text-gray-500">page {item.page_id || '-'} • namespace {item.bot_id || '-'}</p>
+                                          <p className="text-[11px] text-gray-400">{item.posted_at ? new Date(String(item.posted_at)).toLocaleString('th-TH') : '-'}</p>
+                                          {item.error_message && <p className="text-[11px] text-red-500 break-all">{item.error_message}</p>}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="text-sm text-green-600">ไม่มี post issue ค้างในตอนนี้</p>
+                                  )}
+                                </div>
+                              )}
+
+                              {monitorView === 'comment' && (
+                                <div className="rounded-2xl border border-gray-100 bg-white px-4 py-4 space-y-2">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <p className="text-sm font-bold text-gray-900">คอมเมนต์ที่มีปัญหาล่าสุด</p>
+                                    <span className="rounded-full bg-amber-50 px-2 py-1 text-[11px] font-bold text-amber-600">
+                                      {Array.isArray(monitorData?.comment_issues) ? monitorData.comment_issues.length : 0}
+                                    </span>
+                                  </div>
+                                  {Array.isArray(monitorData?.comment_issues) && monitorData.comment_issues.length > 0 ? (
+                                    <div className="space-y-2">
+                                      {monitorData.comment_issues.map((item, index) => (
+                                        <div key={`comment-issue-${item.id || index}`} className="rounded-xl border border-gray-100 bg-white px-3 py-3">
+                                          <div className="flex items-center justify-between gap-3">
+                                            <p className="text-sm font-bold text-gray-900">video {item.video_id || '-'}</p>
+                                            <span className={`rounded-full px-2 py-1 text-[11px] font-bold ${
+                                              item.comment_status === 'failed' ? 'bg-red-50 text-red-500' : 'bg-amber-50 text-amber-600'
+                                            }`}>{item.comment_status || '-'}</span>
+                                          </div>
+                                          <p className="text-[11px] text-gray-500">page {item.page_id || '-'} • namespace {item.bot_id || '-'}</p>
+                                          <p className="text-[11px] text-gray-400">{item.posted_at ? new Date(String(item.posted_at)).toLocaleString('th-TH') : '-'}</p>
+                                          {item.comment_error && <p className="text-[11px] text-red-500 break-all">{item.comment_error}</p>}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="text-sm text-green-600">ไม่มี comment issue ค้างในตอนนี้</p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
                   </div>
                 )}
               </>
