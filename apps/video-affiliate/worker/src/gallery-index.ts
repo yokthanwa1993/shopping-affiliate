@@ -283,6 +283,27 @@ function normalizeTimestamp(...candidates: unknown[]): string {
     return new Date().toISOString()
 }
 
+function normalizeLatestTimestamp(...candidates: unknown[]): string {
+    let picked = ''
+    let pickedMs = Number.NEGATIVE_INFINITY
+
+    for (const candidate of candidates) {
+        const raw = String(candidate || '').trim()
+        if (!raw) continue
+        const ms = new Date(raw).getTime()
+        if (Number.isFinite(ms)) {
+            if (ms >= pickedMs) {
+                pickedMs = ms
+                picked = new Date(ms).toISOString()
+            }
+            continue
+        }
+        if (!picked) picked = raw
+    }
+
+    return picked || new Date().toISOString()
+}
+
 function mapGalleryIndexRowToVideo(row: GalleryIndexDbRow): GalleryIndexVideo | null {
     const id = normalizeText(row.video_id)
     const namespaceId = normalizeText(row.namespace_id)
@@ -627,7 +648,7 @@ async function buildGalleryIndexUpsertRow(params: {
         knownState.originalUploadedAt,
         originalObj?.uploaded?.toISOString?.(),
     )
-    const updatedAt = normalizeTimestamp(
+    const updatedAt = normalizeLatestTimestamp(
         meta.updatedAt,
         meta.createdAt,
         knownState.metaUploadedAt,
@@ -746,6 +767,7 @@ export async function deleteGalleryIndexEntry(db: D1Database, namespaceId: strin
 }
 
 function buildGalleryWhereClause(options: {
+    namespaceId?: string
     onlyOwnerLinked?: boolean
     linkFilter?: GalleryIndexLinkFilter
     hasThumbnail?: boolean
@@ -755,6 +777,10 @@ function buildGalleryWhereClause(options: {
     const clauses: string[] = []
     const binds: Array<string | number> = []
 
+    if (options.namespaceId) {
+        clauses.push('namespace_id = ?')
+        binds.push(options.namespaceId)
+    }
     if (options.onlyOwnerLinked) clauses.push('is_owner_linked = 1')
     if (options.linkFilter === 'with-link') {
         clauses.push('has_link = 1')
@@ -773,6 +799,7 @@ function buildGalleryWhereClause(options: {
 }
 
 async function queryGalleryIndexCount(db: D1Database, options: {
+    namespaceId?: string
     onlyOwnerLinked?: boolean
     linkFilter?: GalleryIndexLinkFilter
     hasThumbnail?: boolean
@@ -790,6 +817,7 @@ async function queryGalleryIndexCount(db: D1Database, options: {
 }
 
 export async function listGalleryIndexVideos(db: D1Database, options: {
+    namespaceId?: string
     onlyOwnerLinked?: boolean
     linkFilter?: GalleryIndexLinkFilter
     playableOnly?: boolean
@@ -839,6 +867,7 @@ export async function listGalleryIndexVideos(db: D1Database, options: {
 export async function getGalleryIndexPage(db: D1Database, options: {
     offset: number
     limit: number
+    namespaceId?: string
     onlyOwnerLinked?: boolean
     linkFilter?: GalleryIndexLinkFilter
     playableOnly?: boolean
@@ -879,9 +908,9 @@ export async function getGalleryIndexPage(db: D1Database, options: {
              ORDER BY COALESCE(updated_at, created_at) DESC, namespace_id ASC, video_id ASC
              LIMIT ? OFFSET ?`
         ).bind(...binds, limit, offset).all() as Promise<{ results?: GalleryIndexDbRow[] }>,
-        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'all', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
-        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'with-link', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
-        queryGalleryIndexCount(db, { onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'no-link', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
+        queryGalleryIndexCount(db, { namespaceId: options.namespaceId, onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'all', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
+        queryGalleryIndexCount(db, { namespaceId: options.namespaceId, onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'with-link', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
+        queryGalleryIndexCount(db, { namespaceId: options.namespaceId, onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'no-link', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
     ])
 
     const videos: GalleryIndexVideo[] = []

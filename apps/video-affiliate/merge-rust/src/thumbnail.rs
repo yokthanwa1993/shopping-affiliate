@@ -254,7 +254,6 @@ fn build_thumbnail_filter(
     let font_size = font_size.round().max(28.0) as i32;
     let panel_h = ((((font_size as f64) * 1.32 * line_count) + ((font_size as f64) * 0.95)).max(96.0)).round() as i32;
     let line_spacing = ((font_size as f64) * 0.18).round().max(6.0) as i32;
-    let border_w = ((font_size as f64) * 0.08).round().max(2.0) as i32;
     let box_border_w = ((font_size as f64) * 0.34).round().max(12.0) as i32;
     let raw_panel_y = ((target_height as f64) * (y_pct / 100.0)).round() as i32 - (panel_h / 2);
     let max_panel_y = (target_height as i32 - panel_h - 12).max(12);
@@ -265,7 +264,7 @@ fn build_thumbnail_filter(
     let fontfile = resolve_overlay_fontfile(overlay_font_id);
 
     format!(
-        "{base_filter},drawtext=fontfile={fontfile}:textfile={text_path}:fontcolor={text_color}:fontsize={font_size}:line_spacing={line_spacing}:x=(w-text_w)/2:y={panel_y}+({panel_h}-text_h)/2:borderw={border_w}:bordercolor=black@0.22:box=1:boxcolor={bg_color}@{bg_opacity}:boxborderw={box_border_w}",
+        "{base_filter},drawtext=fontfile={fontfile}:textfile={text_path}:fontcolor={text_color}:fontsize={font_size}:line_spacing={line_spacing}:x=(w-text_w)/2:y={panel_y}+({panel_h}-text_h)/2:box=1:boxcolor={bg_color}@{bg_opacity}:boxborderw={box_border_w}",
         base_filter = base_filter,
         fontfile = fontfile,
         panel_y = panel_y,
@@ -276,7 +275,6 @@ fn build_thumbnail_filter(
         bg_opacity = format!("{:.2}", bg_opacity),
         font_size = font_size,
         line_spacing = line_spacing,
-        border_w = border_w,
         box_border_w = box_border_w,
     )
 }

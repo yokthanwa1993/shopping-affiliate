@@ -1,0 +1,2 @@
+[     616ms] [WARNING] [WARN] liff.init() was called with a current URL that is not related to the endpoint URL.
+http://127.0.0.1:4173/dashboard?invite=1775115880383600783 is not under https://app.oomnn.com @ https://static.line-scdn.net/liff/edge/2/sdk.js:0

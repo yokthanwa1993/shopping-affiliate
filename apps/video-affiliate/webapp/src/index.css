@@ -152,6 +152,10 @@
   display: none;
 }
 
+.touch-pan-x {
+  touch-action: pan-x;
+}
+
 .safe-top {
   padding-top: calc(env(safe-area-inset-top, 0px) + 60px);
 }

@@ -2667,9 +2667,19 @@ async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: s
     return !!String(settings?.base_url || '').trim() && !!String(settings?.lazada_base_url || '').trim()
 }
 
+async function isNamespaceShortlinkAdminManaged(db: D1Database, namespaceId: string): Promise<boolean> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return false
+    const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedNamespaceId).catch(() => '')
+    if (!ownerEmail) return false
+    return isSystemAdmin(db, ownerEmail)
+}
+
 async function isNamespaceAffiliateShortlinkRequired(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return false
+    const adminManaged = await isNamespaceShortlinkAdminManaged(db, normalizedNamespaceId)
+    if (!adminManaged) return false
 
     const [
         explicitRequired,
@@ -2701,9 +2711,7 @@ async function isNamespaceAffiliateShortlinkRequired(db: D1Database, namespaceId
 
     if (hasOperationalShortlinkConfig) return true
 
-    const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedNamespaceId).catch(() => '')
-    if (!ownerEmail) return false
-    return isSystemAdmin(db, ownerEmail)
+    return adminManaged
 }
 
 function isUnifiedGalleryEnabled(): boolean {
@@ -3208,6 +3216,8 @@ function isNamespaceGalleryVideoPosted(video: Record<string, unknown> | null | u
 
 function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | null | undefined): boolean {
     if (!video) return false
+    const explicitGalleryReady = getBooleanFlag(video.gallery_ready)
+    if (explicitGalleryReady !== null) return explicitGalleryReady
     const publicUrl = String(video.publicUrl || video.public_url || '').trim()
     if (!publicUrl) return false
 
@@ -4017,51 +4027,6 @@ async function materializeOriginalVideoAsset(params: {
     }
 }
 
-async function promoteSelectedInboxCoverToOriginalThumbnail(params: {
-    env: Env
-    bucket: R2Bucket
-    namespaceId: string
-    videoId: string
-}): Promise<string> {
-    const normalizedNamespaceId = String(params.namespaceId || '').trim()
-    const normalizedVideoId = String(params.videoId || '').trim()
-    if (!normalizedNamespaceId || !normalizedVideoId) return ''
-
-    const selectedCoverObj = await params.bucket.get(`_inbox_cover/${normalizedVideoId}.webp`).catch(() => null)
-    if (!selectedCoverObj) return ''
-
-    const bytes = await selectedCoverObj.arrayBuffer().catch(() => null)
-    if (!bytes || bytes.byteLength === 0) return ''
-
-    const thumbnailKey = getOriginalThumbnailAssetKey(normalizedVideoId)
-    const thumbnailUrl = getVideoOriginalThumbnailUrlForNamespace(params.env.R2_PUBLIC_URL, normalizedNamespaceId, normalizedVideoId)
-    await params.bucket.put(thumbnailKey, bytes, {
-        httpMetadata: {
-            contentType: String(selectedCoverObj.httpMetadata?.contentType || 'image/webp').trim() || 'image/webp',
-        },
-    })
-
-    const metaObj = await params.bucket.get(`videos/${normalizedVideoId}.json`).catch(() => null)
-    if (metaObj) {
-        let meta: Record<string, unknown> = {}
-        try {
-            meta = await metaObj.json() as Record<string, unknown>
-        } catch {
-            meta = {}
-        }
-        const nowIso = new Date().toISOString()
-        meta.originalThumbnailUrl = thumbnailUrl
-        meta.updatedAt = nowIso
-        await params.bucket.put(`videos/${normalizedVideoId}.json`, JSON.stringify(meta, null, 2), {
-            httpMetadata: { contentType: 'application/json' },
-        }).catch(() => { })
-        await updateGalleryCache(params.bucket, normalizedVideoId).catch(() => { })
-    }
-
-    await syncGalleryIndexEntry(params.env, normalizedNamespaceId, normalizedVideoId).catch(() => { })
-    return thumbnailUrl
-}
-
 async function syncOriginalThumbnailToProcessedThumbnail(params: {
     env: Env
     bucket: R2Bucket
@@ -4072,6 +4037,38 @@ async function syncOriginalThumbnailToProcessedThumbnail(params: {
     const normalizedVideoId = String(params.videoId || '').trim()
     if (!normalizedNamespaceId || !normalizedVideoId) {
         return { synced: false, thumbnailUrl: '' }
+    }
+
+    const selectedCoverObj = await params.bucket.get(`_inbox_cover/${normalizedVideoId}.webp`).catch(() => null)
+    if (selectedCoverObj) {
+        const selectedCoverBytes = await selectedCoverObj.arrayBuffer().catch(() => null)
+        if (selectedCoverBytes && selectedCoverBytes.byteLength > 0) {
+            const thumbnailUrl = getVideoThumbnailUrlForNamespace(params.env.R2_PUBLIC_URL, normalizedNamespaceId, normalizedVideoId)
+            const contentType = String(selectedCoverObj.httpMetadata?.contentType || 'image/webp').trim() || 'image/webp'
+            await params.bucket.put(getProcessedThumbnailAssetKey(normalizedVideoId), selectedCoverBytes, {
+                httpMetadata: { contentType },
+            })
+
+            const metaObj = await params.bucket.get(`videos/${normalizedVideoId}.json`).catch(() => null)
+            if (metaObj) {
+                let meta: Record<string, unknown> = {}
+                try {
+                    meta = await metaObj.json() as Record<string, unknown>
+                } catch {
+                    meta = {}
+                }
+                const nowIso = new Date().toISOString()
+                meta.thumbnailUrl = thumbnailUrl
+                meta.updatedAt = nowIso
+                await params.bucket.put(`videos/${normalizedVideoId}.json`, JSON.stringify(meta, null, 2), {
+                    httpMetadata: { contentType: 'application/json' },
+                }).catch(() => { })
+                await updateGalleryCache(params.bucket, normalizedVideoId).catch(() => { })
+            }
+
+            await syncGalleryIndexEntry(params.env, normalizedNamespaceId, normalizedVideoId).catch(() => { })
+            return { synced: true, thumbnailUrl }
+        }
     }
 
     const originalThumbKey = getOriginalThumbnailAssetKey(normalizedVideoId)
@@ -5770,6 +5767,10 @@ const LIFF_DASHBOARD = 'https://liff.line.me/2009652996-2SnLQJeD'
 const LIFF_GALLERY = 'https://liff.line.me/2009652996-OGTCnapx'
 const LIFF_LOGS = 'https://liff.line.me/2009652996-vBsuawCH'
 const LIFF_SETTINGS = 'https://liff.line.me/2009652996-PgxNlX5l'
+const LINE_CANCEL_QUICK_REPLY_ITEM = {
+    type: 'action',
+    action: { type: 'message', label: 'ยกเลิกงาน', text: 'ยกเลิกงาน' },
+}
 const LINE_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
@@ -5787,18 +5788,32 @@ const LINE_QUICK_REPLY_ITEMS = [
         type: 'action',
         action: { type: 'uri', label: '⚙️ ตั้งค่า', uri: LIFF_SETTINGS },
     },
+    LINE_CANCEL_QUICK_REPLY_ITEM,
 ]
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
         action: { type: 'message', label: 'สุ่มอีกครั้ง', text: 'สุ่มอีกครั้ง' },
     },
+    LINE_CANCEL_QUICK_REPLY_ITEM,
 ]
 const LINE_SKIP_ONLY_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
         action: { type: 'message', label: 'ข้าม', text: 'ข้าม' },
     },
+    LINE_CANCEL_QUICK_REPLY_ITEM,
+]
+const LINE_COVER_TEXT_QUICK_REPLY_ITEMS = [
+    {
+        type: 'action',
+        action: { type: 'message', label: 'AI คิดให้', text: 'AI คิดให้' },
+    },
+    {
+        type: 'action',
+        action: { type: 'message', label: 'ไม่ใส่ข้อความ', text: 'ไม่ใส่ข้อความ' },
+    },
+    LINE_CANCEL_QUICK_REPLY_ITEM,
 ]
 const MAX_LINE_MANUAL_CAPTION_CHARS = 1200
 const MAX_LINE_COVER_TEXT_CHARS = 80
@@ -5823,6 +5838,7 @@ type LineWaitingVideoState = {
     lazadaLink?: string
     manualCaption?: string
     awaitingStep?: LineWaitingStep
+    coverCompleted?: boolean
     coverPickerOpened?: boolean
     coverOptions?: LineCoverOption[]
     selectedCoverOption?: LineCoverOption | null
@@ -5908,6 +5924,52 @@ function normalizeLineCoverText(input: unknown): string {
         .trim()
     if (!normalized) return ''
     return normalized.slice(0, MAX_LINE_COVER_TEXT_CHARS)
+}
+
+function extractAiHeadlineFromText(rawText: string): string {
+    const normalized = String(rawText || '').trim()
+    if (!normalized) return ''
+    const quotedHeadlineMatch = normalized.match(/["']headline["']\s*:\s*["']([^"']+)["']/i)
+    if (quotedHeadlineMatch?.[1]) return normalizeLineCoverText(quotedHeadlineMatch[1])
+    const plainHeadlineMatch = normalized.match(/\bheadline\b\s*:\s*([^\n]+)/i)
+    if (plainHeadlineMatch?.[1]) return normalizeLineCoverText(plainHeadlineMatch[1])
+    const cleanedFirstLine = normalized
+        .replace(/```json|```/gi, ' ')
+        .replace(/[{}[\]"]/g, ' ')
+        .replace(/\btextYPercent\b\s*:?\s*\d+/gi, ' ')
+        .split('\n')
+        .map((line) => line.trim())
+        .find(Boolean) || ''
+    return normalizeLineCoverText(cleanedFirstLine)
+}
+
+function isInvalidAiCoverHeadline(input: unknown): boolean {
+    const normalized = normalizeLineCoverText(input)
+    if (!normalized) return true
+
+    const lowered = normalized.toLowerCase()
+    const thaiMatches = normalized.match(/[ก-๙]/g) || []
+    const alphaNumOnly = /^[A-Za-z0-9 _-]+$/.test(normalized)
+    const genericTerms = new Set([
+        'พัดลม',
+        'แก้ว',
+        'กล่อง',
+        'เครื่องครัว',
+        'สินค้า',
+        'ของใช้',
+        'ของเล่น',
+    ])
+
+    if (normalized.length < 4) return true
+    if (thaiMatches.length < 2) return true
+    if (alphaNumOnly) return true
+
+    return lowered === 'headline'
+        || lowered === 'headline:'
+        || lowered === 'ข้อความปก'
+        || lowered === 'ข้อความบนปก'
+        || lowered === 'cover text'
+        || genericTerms.has(normalized)
 }
 
 function buildLineCoverTextPositionOptions(): LineCoverTextPositionOption[] {
@@ -6251,16 +6313,47 @@ function buildLineCoverTextPositionPreviewUrl(params: {
 }): string {
     const coverText = normalizeLineCoverText(params.coverText)
     if (!coverText) return ''
-    return buildWorkerGalleryFrameUrl(params.workerUrl, params.namespaceId, params.videoId, {
-        seed: String(params.option?.seed || '').trim(),
-        format: 'jpg',
-        width: 540,
-        height: 960,
-        coverText,
-        coverTextYPercent: params.coverTextYPercent,
-        coverTemplateId: params.coverTemplateId,
-        coverTextStyle: params.coverTextStyle,
-    })
+    const cacheBust = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const normalizedWorkerUrl = String(params.workerUrl || '').trim().replace(/\/+$/, '')
+    const normalizedNamespaceId = String(params.namespaceId || '').trim()
+    const normalizedVideoId = String(params.videoId || '').trim()
+    const normalizedSeed = String(params.option?.seed || '').trim()
+    const coverTemplateId = normalizeCoverTemplateId(String(params.coverTemplateId || ''))
+    const coverTextStyle = normalizeCoverTextStyle(params.coverTextStyle, coverTemplateId)
+    if (!normalizedWorkerUrl || !normalizedNamespaceId || !normalizedVideoId || !normalizedSeed) return ''
+    try {
+        const url = new URL(`${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame-preview/${encodeURIComponent(cacheBust)}`)
+        url.searchParams.set('namespace_id', normalizedNamespaceId)
+        url.searchParams.set('seed', normalizedSeed)
+        url.searchParams.set('format', 'jpg')
+        url.searchParams.set('w', '540')
+        url.searchParams.set('h', '960')
+        url.searchParams.set('ct', coverText)
+        url.searchParams.set('cy', String(params.coverTextYPercent))
+        url.searchParams.set('tid', coverTemplateId)
+        url.searchParams.set('tf', coverTextStyle.fontId)
+        url.searchParams.set('tc', coverTextStyle.textColor)
+        url.searchParams.set('bc', coverTextStyle.backgroundColor)
+        url.searchParams.set('bo', String(coverTextStyle.backgroundOpacity))
+        url.searchParams.set('ts', String(coverTextStyle.sizeScale))
+        return url.toString()
+    } catch {
+        const paramsObj = new URLSearchParams()
+        paramsObj.set('namespace_id', normalizedNamespaceId)
+        paramsObj.set('seed', normalizedSeed)
+        paramsObj.set('format', 'jpg')
+        paramsObj.set('w', '540')
+        paramsObj.set('h', '960')
+        paramsObj.set('ct', coverText)
+        paramsObj.set('cy', String(params.coverTextYPercent))
+        paramsObj.set('tid', coverTemplateId)
+        paramsObj.set('tf', coverTextStyle.fontId)
+        paramsObj.set('tc', coverTextStyle.textColor)
+        paramsObj.set('bc', coverTextStyle.backgroundColor)
+        paramsObj.set('bo', String(coverTextStyle.backgroundOpacity))
+        paramsObj.set('ts', String(coverTextStyle.sizeScale))
+        return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame-preview/${encodeURIComponent(cacheBust)}?${paramsObj.toString()}`
+    }
 }
 
 function buildLineCoverPickerFlex(params: {
@@ -6521,14 +6614,14 @@ function buildLineCoverChoicePromptFlex(): LineReplyMessage {
         altText: 'เลือกวิธีตั้งหน้าปก',
         pillText: '🖼️ Cover',
         title: 'เลือกปกวิดีโอ',
-        message: 'กดเลือกปกเพื่อให้ระบบสุ่มเฟรมจากวิดีโอมาให้เลือก 10 แบบ หรือกดข้ามเพื่อใช้แบบอัตโนมัติ',
+        message: 'กดเลือกปกเพื่อดูตัวเลือก 10 แบบจากวิดีโอ แล้วเลือกภาพที่ต้องการใช้เป็นหน้าปก',
         primary: '#4F6DF5',
         primaryDark: '#2845C7',
         messageColor: '#EAF0FF',
         primaryActionLabel: 'เลือกปก',
         primaryActionText: 'เลือกปก',
-        secondaryActionLabel: 'ข้ามอัตโนมัติ',
-        secondaryActionText: 'ข้ามเลือกปก',
+        secondaryActionLabel: 'สุ่มใหม่',
+        secondaryActionText: 'สุ่มอีกครั้ง',
         secondarySurface: '#DDE2EC',
         secondaryTextColor: '#111827',
     })
@@ -6537,8 +6630,8 @@ function buildLineCoverChoicePromptFlex(): LineReplyMessage {
 function buildLineCoverTextPromptMessage(): LineReplyMessage {
     return {
         type: 'text',
-        text: 'จะเพิ่มคำในปกไหม\nพิมพ์คำที่ต้องการมาได้เลย หรือกดข้าม',
-        quickReply: { items: LINE_SKIP_ONLY_QUICK_REPLY_ITEMS },
+        text: 'จะเพิ่มข้อความในปกไหม\nพิมพ์ข้อความมาได้เลย หรือกด AI คิดให้',
+        quickReply: { items: LINE_COVER_TEXT_QUICK_REPLY_ITEMS },
     }
 }
 
@@ -6817,11 +6910,90 @@ async function replyLineProcessingResult(params: {
     ])
 }
 
+async function pushLineProcessingResult(params: {
+    channelAccessToken: string
+    lineUserId: string
+    namespaceId: string
+    result: InboxProcessingStartResult
+    previewUrl?: string
+    preferProcessingOnly?: boolean
+}) {
+    const videoId = String(params.result.item.id || '').trim()
+    const processingUrl = buildScopedTabWebAppUrl(LIFF_BASE, params.namespaceId, 'processing')
+    const galleryUrl = buildScopedTabWebAppUrl(LIFF_BASE, params.namespaceId, 'gallery', videoId ? { q: videoId } : undefined)
+    const previewUrl = String(params.previewUrl || '').trim()
+    const preferProcessingOnly = !!params.preferProcessingOnly
+
+    const buildProcessingMessage = (title: string, message: string) => (
+        previewUrl
+            ? buildLineCoverProcessingFlex({
+                previewUrl,
+                title,
+                message,
+                actionLabel: 'เปิดหน้าประมวลผล',
+                actionUrl: processingUrl,
+                videoId,
+            })
+            : buildLineProcessingReadyFlex({
+                title,
+                statusLabel: 'Processing',
+                message,
+                actionLabel: 'เปิดหน้าประมวลผล',
+                actionUrl: processingUrl,
+                videoId,
+                theme: 'processing',
+            })
+    )
+
+    let messages: LineReplyMessage[] = []
+    if (params.result.outcome === 'already_processed' && !preferProcessingOnly) {
+        messages = [
+            buildLineProcessingReadyFlex({
+                title: 'อัปเดตลิงก์เรียบร้อยแล้ว',
+                statusLabel: 'พร้อมใช้',
+                message: 'เปิด Gallery ได้เลย',
+                actionLabel: 'เปิด Gallery',
+                actionUrl: galleryUrl,
+                videoId,
+                theme: 'processed',
+            }),
+        ]
+    } else {
+        const status = params.result.outcome === 'started'
+            ? params.result.job.status
+            : params.result.outcome === 'already_running'
+                ? params.result.status
+                : 'processing'
+        const queued = status === 'queued'
+        const alreadyRunning = params.result.outcome === 'already_running'
+        messages = [
+            buildProcessingMessage(
+                alreadyRunning
+                    ? (queued ? 'เลือกปกแล้ว รอคิวประมวลผล' : 'เลือกปกแล้ว กำลังประมวลผล')
+                    : 'เลือกปกแล้ว กำลังประมวลผล',
+                'เปิดหน้าประมวลผลเพื่อติดตามสถานะได้เลย',
+            ),
+        ]
+    }
+
+    await linePushMessage(params.channelAccessToken, params.lineUserId, messages)
+}
+
 async function lineReply(
     replyToken: string,
     channelAccessToken: string,
     messages: LineReplyMessage[],
 ) {
+    const enrichQuickReplyItems = (items: unknown[]): unknown[] => {
+        const normalizedItems = items.filter((item) => !!item && typeof item === 'object')
+        const hasCancel = normalizedItems.some((item) => {
+            const action = (item as { action?: { text?: unknown; label?: unknown } })?.action
+            return String(action?.text || '').trim() === 'ยกเลิกงาน'
+                || String(action?.label || '').trim() === 'ยกเลิกงาน'
+        })
+        return (hasCancel ? normalizedItems : [...normalizedItems, LINE_CANCEL_QUICK_REPLY_ITEM]).slice(0, 13)
+    }
+
     // Add quick reply to the last message
     const enriched = messages.map((msg, i) => {
         if (i === messages.length - 1) {
@@ -6830,9 +7002,9 @@ async function lineReply(
                 ? existingQuickReply?.items.filter((item) => !!item && typeof item === 'object')
                 : []
             if (existingItems.length > 0) {
-                return { ...msg, quickReply: { items: existingItems.slice(0, 13) } }
+                return { ...msg, quickReply: { items: enrichQuickReplyItems(existingItems) } }
             }
-            return { ...msg, quickReply: { items: LINE_QUICK_REPLY_ITEMS } }
+            return { ...msg, quickReply: { items: enrichQuickReplyItems(LINE_QUICK_REPLY_ITEMS) } }
         }
         return msg
     })
@@ -6933,6 +7105,7 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
         lazadaLink,
         manualCaption: normalizeManualCaption(input?.manualCaption),
         awaitingStep,
+        coverCompleted: Boolean(input?.coverCompleted),
         coverPickerOpened: Boolean(input?.coverPickerOpened),
         coverOptions: normalizeLineCoverOptions(input?.coverOptions),
         selectedCoverOption,
@@ -7018,6 +7191,31 @@ function isLineCoverReshuffleCommand(input: string): boolean {
         || normalized === 'reshuffle'
 }
 
+function isLineAiThinkCommand(input: string): boolean {
+    const normalized = String(input || '').trim().toLowerCase()
+    return normalized === 'ai คิดให้'
+        || normalized === 'ai คิด'
+        || normalized === 'ให้ ai คิดให้'
+        || normalized === 'ให้aiคิดให้'
+        || normalized === 'ai'
+}
+
+function isLineCoverTextSkipCommand(input: string): boolean {
+    const normalized = String(input || '').trim().toLowerCase()
+    return normalized === 'ไม่ใส่ข้อความ'
+        || normalized === 'ข้าม'
+        || normalized === 'skip'
+        || normalized === 'ไม่ต้องใส่ข้อความ'
+}
+
+function isLineCancelCommand(input: string): boolean {
+    const normalized = String(input || '').trim().toLowerCase()
+    return normalized === 'ยกเลิกงาน'
+        || normalized === 'ยกเลิก'
+        || normalized === 'cancel'
+        || normalized === 'abort'
+}
+
 function stripLineAffiliateLinksFromText(input: string): string {
     return String(input || '')
         .replace(/https?:\/\/\S*shopee\S+/gi, ' ')
@@ -7090,6 +7288,7 @@ async function promptLineCoverPicker(params: {
         ...waitingState,
         manualCaption: manualCaption || '',
         awaitingStep: 'cover',
+        coverCompleted: false,
         coverPickerOpened: false,
         coverOptions: normalizeLineCoverOptions(waitingState.coverOptions),
         selectedCoverOption: null,
@@ -7126,6 +7325,7 @@ async function promptLineCoverOptions(params: {
         ...waitingState,
         manualCaption: manualCaption || '',
         awaitingStep: 'cover',
+        coverCompleted: false,
         coverPickerOpened: true,
         coverOptions,
         coverTextPositionOptions: [],
@@ -7156,12 +7356,26 @@ async function promptLineCoverTextPositionOptions(params: {
     if (!waitingState?.selectedCoverOption) throw new Error('line_cover_selected_option_missing')
     const coverText = normalizeLineCoverText(params.coverText)
     if (!coverText) throw new Error('line_cover_text_missing')
+    const coverTemplateSettings = await getNamespaceCoverTemplateSettings(params.env.DB, params.namespaceId).catch(() => ({
+        template_id: waitingState.coverTemplateId || DEFAULT_COVER_TEMPLATE_ID,
+        text_style: waitingState.coverTextStyle || createDefaultCoverTextStyle(waitingState.coverTemplateId || DEFAULT_COVER_TEMPLATE_ID),
+    }))
+    const coverTemplateId = normalizeCoverTemplateId(String(
+        coverTemplateSettings?.template_id
+        || waitingState.coverTemplateId
+        || DEFAULT_COVER_TEMPLATE_ID,
+    ))
+    const resolvedCoverTextStyle = normalizeCoverTextStyle(
+        params.coverTextStyle || coverTemplateSettings?.text_style || waitingState.coverTextStyle,
+        coverTemplateId,
+    )
     const positionOptions = buildLineCoverTextPositionOptions()
     const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
         ...waitingState,
         awaitingStep: 'cover_text_position',
         coverText,
-        coverTextStyle: normalizeCoverTextStyle(params.coverTextStyle || waitingState.coverTextStyle, waitingState.coverTemplateId || DEFAULT_COVER_TEMPLATE_ID),
+        coverTemplateId,
+        coverTextStyle: resolvedCoverTextStyle,
         coverTextPositionOptions: positionOptions,
     })
 
@@ -7172,11 +7386,63 @@ async function promptLineCoverTextPositionOptions(params: {
             workerUrl: String(params.env.WORKER_URL || '').trim(),
             option: waitingState.selectedCoverOption,
             coverText,
-            coverTemplateId: nextWaitingState.coverTemplateId,
-            coverTextStyle: nextWaitingState.coverTextStyle,
+            coverTemplateId,
+            coverTextStyle: resolvedCoverTextStyle,
             positionOptions: nextWaitingState.coverTextPositionOptions || positionOptions,
         }),
     ])
+}
+
+async function continueLineFlowAfterCover(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    channelAccessToken: string
+    replyToken: string
+    lineUserId: string
+    waitingState: LineWaitingVideoState
+    manualCaption?: string
+}) {
+    const waitingState = normalizeLineWaitingVideoState(params.waitingState)
+    if (!waitingState) throw new Error('invalid_line_waiting_state')
+    const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
+
+    if (!String(waitingState.shopeeLink || '').trim() || !String(waitingState.lazadaLink || '').trim()) {
+        const hasShopee = !!String(waitingState.shopeeLink || '').trim()
+        await putLineWaitingVideoState(params.bucket, params.lineUserId, {
+            ...waitingState,
+            manualCaption,
+            awaitingStep: 'links',
+            coverCompleted: true,
+            coverPickerOpened: false,
+            coverTextPositionOptions: [],
+        })
+        await lineReply(params.replyToken, params.channelAccessToken, [
+            buildLineAffiliatePromptFlex({
+                title: hasShopee ? 'รับปกแล้ว รอ Lazada' : 'รับปกแล้ว รอ Shopee',
+                brand: hasShopee ? 'lazada' : 'shopee',
+                message: hasShopee ? 'ส่งลิงก์ Lazada มาเลย' : 'ส่งลิงก์ Shopee มาเลย',
+            }),
+        ])
+        return
+    }
+
+    await promptLineCaptionCollection({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: params.namespaceId,
+        channelAccessToken: params.channelAccessToken,
+        replyToken: params.replyToken,
+        lineUserId: params.lineUserId,
+        waitingState: {
+            ...waitingState,
+            manualCaption,
+            awaitingStep: 'caption',
+            coverCompleted: true,
+            coverPickerOpened: false,
+            coverTextPositionOptions: [],
+        },
+    })
 }
 
 async function materializeSelectedLineCoverOptionAssets(params: {
@@ -7247,9 +7513,11 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
     lineUserId: string
     waitingState: LineWaitingVideoState
     manualCaption?: string
+    pushOnly?: boolean
 }) {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
+    await lineStartLoading(params.channelAccessToken, params.lineUserId, 60).catch(() => { })
     const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
     const nowIso = new Date().toISOString()
     const inboxRecord = await putInboxVideoRecord(params.bucket, {
@@ -7280,12 +7548,6 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
     }).catch(() => { })
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
-    await promoteSelectedInboxCoverToOriginalThumbnail({
-        env: params.env,
-        bucket: params.bucket,
-        namespaceId: params.namespaceId,
-        videoId: waitingState.id,
-    }).catch(() => '')
 
     const processingResult = await ensureInboxVideoProcessingStarted({
         env: params.env,
@@ -7301,6 +7563,18 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         namespaceId: params.namespaceId,
         videoId: waitingState.id,
     })
+
+    if (params.pushOnly) {
+        await pushLineProcessingResult({
+            channelAccessToken: params.channelAccessToken,
+            lineUserId: params.lineUserId,
+            namespaceId: params.namespaceId,
+            result: processingResult,
+            previewUrl,
+            preferProcessingOnly: true,
+        })
+        return
+    }
 
     await replyLineProcessingResult({
         replyToken: params.replyToken,
@@ -7409,7 +7683,7 @@ app.post('/api/line/webhook', async (c) => {
     c.executionCtx.waitUntil((async () => {
         for (const event of events) {
             try {
-                await handleLineEvent(event, c.env, channelAccessToken)
+                await handleLineEvent(event, c.env, channelAccessToken, c.executionCtx)
             } catch (e) {
                 console.error('[LINE] Event handler error:', e instanceof Error ? e.message : String(e))
             }
@@ -7767,11 +8041,135 @@ app.post('/api/admin/members/role', async (c) => {
     }
 })
 
-async function handleLineEvent(event: any, env: Env, channelAccessToken: string) {
+app.get('/api/admin/monitor', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    await ensureCronRuntimeStateTable(c.env.DB)
+    await ensurePostingLocksTable(c.env.DB)
+    await ensurePostHistoryTraceColumns(c.env.DB)
+
+    const activePagesRow = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS total,
+                COUNT(DISTINCT bot_id) AS namespaces
+         FROM pages
+         WHERE is_active = 1
+           AND TRIM(COALESCE(post_hours, '')) <> ''`
+    ).first().catch(() => null) as { total?: number; namespaces?: number } | null
+
+    const postingRowsRow = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS total
+         FROM post_history
+         WHERE status = 'posting'`
+    ).first().catch(() => null) as { total?: number } | null
+
+    const pendingCommentsRow = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS total
+         FROM post_history
+         WHERE comment_status IN ('pending', 'processing')`
+    ).first().catch(() => null) as { total?: number } | null
+
+    const failedPostsRow = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS total
+         FROM post_history
+         WHERE status = 'failed'
+           AND datetime(posted_at) >= datetime('now', '-1 day')`
+    ).first().catch(() => null) as { total?: number } | null
+
+    const failedCommentsRow = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS total
+         FROM post_history
+         WHERE comment_status = 'failed'
+           AND datetime(posted_at) >= datetime('now', '-1 day')`
+    ).first().catch(() => null) as { total?: number } | null
+
+    const latestCronSuccessRow = await c.env.DB.prepare(
+        `SELECT posted_at
+         FROM post_history
+         WHERE trigger_source = 'cron'
+           AND status = 'success'
+         ORDER BY datetime(posted_at) DESC
+         LIMIT 1`
+    ).first().catch(() => null) as { posted_at?: string } | null
+
+    const runtimeRow = await c.env.DB.prepare(
+        `SELECT run_id, status, started_at, finished_at, heartbeat_at,
+                current_page_id, current_page_name, current_namespace_id,
+                pages_total, pages_visited, pages_posted, pages_failed, last_error
+         FROM cron_runtime_state
+         WHERE id = 'scheduled'
+         LIMIT 1`
+    ).first().catch(() => null) as Record<string, unknown> | null
+
+    const staleCronPages = await c.env.DB.prepare(
+        `SELECT
+            p.bot_id AS namespace_id,
+            p.id AS page_id,
+            p.name AS page_name,
+            p.post_hours,
+            MAX(csl.created_at) AS last_cron_touched
+         FROM pages p
+         LEFT JOIN cron_schedule_locks csl
+           ON csl.namespace_id = p.bot_id
+          AND csl.page_id = p.id
+         WHERE p.is_active = 1
+           AND TRIM(COALESCE(p.post_hours, '')) <> ''
+         GROUP BY p.bot_id, p.id, p.name, p.post_hours
+         HAVING last_cron_touched IS NULL
+             OR datetime(last_cron_touched) < datetime('now', '-2 hours')
+         ORDER BY datetime(last_cron_touched) ASC
+         LIMIT 20`
+    ).all().catch(() => ({ results: [] as unknown[] })) as { results?: unknown[] }
+
+    const postIssues = await c.env.DB.prepare(
+        `SELECT id, bot_id, page_id, video_id, status, error_message, posted_at
+         FROM post_history
+         WHERE status = 'failed'
+            OR status = 'posting'
+         ORDER BY
+            CASE WHEN status = 'posting' THEN 0 ELSE 1 END,
+            datetime(posted_at) DESC
+         LIMIT 20`
+    ).all().catch(() => ({ results: [] as unknown[] })) as { results?: unknown[] }
+
+    const commentIssues = await c.env.DB.prepare(
+        `SELECT id, bot_id, page_id, video_id, comment_status, comment_error, posted_at
+         FROM post_history
+         WHERE comment_status IN ('pending', 'processing', 'failed')
+         ORDER BY
+            CASE
+                WHEN comment_status = 'pending' THEN 0
+                WHEN comment_status = 'processing' THEN 1
+                ELSE 2
+            END,
+            datetime(posted_at) DESC
+         LIMIT 20`
+    ).all().catch(() => ({ results: [] as unknown[] })) as { results?: unknown[] }
+
+    return c.json({
+        summary: {
+            active_pages: Number(activePagesRow?.total || 0),
+            active_namespaces: Number(activePagesRow?.namespaces || 0),
+            posting_rows: Number(postingRowsRow?.total || 0),
+            pending_comments: Number(pendingCommentsRow?.total || 0),
+            failed_posts_24h: Number(failedPostsRow?.total || 0),
+            failed_comments_24h: Number(failedCommentsRow?.total || 0),
+            latest_cron_success_at: String(latestCronSuccessRow?.posted_at || ''),
+        },
+        cron_runtime: runtimeRow || null,
+        stale_cron_pages: Array.isArray(staleCronPages.results) ? staleCronPages.results : [],
+        post_issues: Array.isArray(postIssues.results) ? postIssues.results : [],
+        comment_issues: Array.isArray(commentIssues.results) ? commentIssues.results : [],
+    }, 200, {
+        'Cache-Control': 'no-store',
+    })
+})
+
+async function handleLineEvent(event: any, env: Env, channelAccessToken: string, executionCtx?: ExecutionContext) {
     // Handle follow event (user adds bot as friend)
     if (event.type === 'follow') {
         await lineReply(event.replyToken, channelAccessToken, [
-            { type: 'text', text: 'สวัสดี! ยินดีต้อนรับสู่ Affiliate AiBot 🎉\n\nส่งวิดีโอหรือลิงก์ XHS มาได้เลย\nแล้วตามด้วยลิงก์ Shopee/Lazada\nจากนั้นส่งแคปชั่น หรือกดข้ามให้ AI คิดให้\nระบบจะประมวลผลให้อัตโนมัติ!' },
+            { type: 'text', text: 'สวัสดี! ยินดีต้อนรับสู่ Affiliate AiBot 🎉\n\nส่งวิดีโอหรือลิงก์ XHS มาได้เลย\nจากนั้นเลือกปกคลิปก่อน\nแล้วค่อยส่งลิงก์ Shopee/Lazada\nสุดท้ายส่งแคปชั่น หรือกดข้ามให้ AI คิดให้\nระบบจะประมวลผลให้อัตโนมัติ!' },
         ])
         return
     }
@@ -7828,6 +8226,7 @@ async function handleLineEvent(event: any, env: Env, channelAccessToken: string)
         await handleLineTextMessage({
             env,
             bucket,
+            executionCtx,
             namespaceId,
             channelAccessToken,
             replyToken,
@@ -7884,24 +8283,27 @@ async function handleLineVideoMessage(params: {
         })
         await backfillOriginalThumbnail(env, namespaceId, videoId).catch(() => { })
 
-        // Save waiting video state for link collection
         const createdAt = new Date().toISOString()
-        await putLineWaitingVideoState(bucket, lineUserId, {
+        const waitingState = await putLineWaitingVideoState(bucket, lineUserId, {
             id: videoId,
             videoUrl: originalVideoUrl,
             createdAt,
             sourceType: 'line_video',
             sourceLabel: 'LINE video',
-            awaitingStep: 'links',
+            awaitingStep: 'cover',
+            coverCompleted: false,
         })
 
-        await lineReply(replyToken, channelAccessToken, [
-            buildLineAffiliatePromptFlex({
-                title: 'รับวิดีโอแล้ว',
-                brand: 'shopee',
-                message: 'ส่งลิงก์ Shopee มาเลย',
-            }),
-        ])
+        await promptLineCoverOptions({
+            env,
+            bucket,
+            namespaceId,
+            channelAccessToken,
+            replyToken,
+            lineUserId,
+            waitingState,
+            forceRefresh: true,
+        })
     } catch (e) {
         console.error('[LINE] Video handling error:', e instanceof Error ? e.message : String(e))
         await lineReply(replyToken, channelAccessToken, [
@@ -7913,13 +8315,14 @@ async function handleLineVideoMessage(params: {
 async function handleLineTextMessage(params: {
     env: Env
     bucket: R2Bucket
+    executionCtx?: ExecutionContext
     namespaceId: string
     channelAccessToken: string
     replyToken: string
     lineUserId: string
     text: string
 }) {
-    const { env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, text } = params
+    const { env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, text } = params
 
     const extractShopeeLink = (input: string): string => {
         const match = input.match(/https?:\/\/\S*shopee\S+/i) || input.match(/https?:\/\/shope\.ee\S+/i)
@@ -7934,6 +8337,20 @@ async function handleLineTextMessage(params: {
     const lazadaLink = extractLazadaLink(text)
     const lowerText = text.trim().toLowerCase()
     const waitingState = await getLineWaitingVideoState(bucket, lineUserId)
+
+    if (isLineCancelCommand(text)) {
+        if (waitingState) {
+            await clearLineWaitingVideoState(bucket, lineUserId)
+            await lineReply(replyToken, channelAccessToken, [
+                { type: 'text', text: 'ยกเลิกงานที่ค้างไว้แล้ว ส่งวิดีโอหรือลิงก์ใหม่ได้เลย' },
+            ]).catch(() => { })
+            return
+        }
+        await lineReply(replyToken, channelAccessToken, [
+            { type: 'text', text: 'ตอนนี้ไม่มีงานที่ค้างให้ยกเลิก' },
+        ]).catch(() => { })
+        return
+    }
 
     if (waitingState?.awaitingStep === 'cover_text_position') {
         if (!waitingState.selectedCoverOption) {
@@ -7950,7 +8367,7 @@ async function handleLineTextMessage(params: {
             return
         }
 
-        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text)) {
+        if (isLineCoverTextSkipCommand(text)) {
             try {
                 await materializeSelectedLineCoverOptionAssets({
                     env,
@@ -7959,8 +8376,9 @@ async function handleLineTextMessage(params: {
                     videoId: waitingState.id,
                     option: waitingState.selectedCoverOption,
                     coverTemplateId: waitingState.coverTemplateId,
+                    coverTextStyle: waitingState.coverTextStyle,
                 })
-                await finalizeLineWaitingVideoAndStartProcessing({
+                await continueLineFlowAfterCover({
                     env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                     manualCaption: waitingState.manualCaption,
                 })
@@ -8003,6 +8421,7 @@ async function handleLineTextMessage(params: {
                 option: waitingState.selectedCoverOption,
                 coverText: waitingState.coverText || '',
                 coverTemplateId: waitingState.coverTemplateId,
+                coverTextStyle: waitingState.coverTextStyle,
                 positionOptions: waitingState.coverTextPositionOptions && waitingState.coverTextPositionOptions.length > 0
                     ? waitingState.coverTextPositionOptions
                     : buildLineCoverTextPositionOptions(),
@@ -8026,7 +8445,42 @@ async function handleLineTextMessage(params: {
             return
         }
 
-        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text)) {
+        if (isLineAiThinkCommand(text)) {
+            try {
+                const aiSuggestion = await generateAiCoverTextForOption({
+                    env,
+                    bucket,
+                    namespaceId,
+                    videoId: waitingState.id,
+                    option: waitingState.selectedCoverOption,
+                }).catch(() => null)
+                const generatedCoverText = normalizeLineCoverText(aiSuggestion?.coverText || '')
+                if (!generatedCoverText) {
+                    await lineReply(replyToken, channelAccessToken, [
+                        { type: 'text', text: 'AI คิดข้อความบนปกไม่สำเร็จ ลองกดอีกครั้งหรือพิมพ์ข้อความเองได้เลย' },
+                    ]).catch(() => { })
+                    return
+                }
+                await promptLineCoverTextPositionOptions({
+                    env,
+                    bucket,
+                    namespaceId,
+                    channelAccessToken,
+                    replyToken,
+                    lineUserId,
+                    waitingState,
+                    coverText: generatedCoverText,
+                })
+            } catch (e) {
+                console.error('[LINE] Cover text AI prompt error:', e instanceof Error ? e.message : String(e))
+                await lineReply(replyToken, channelAccessToken, [
+                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
+                ]).catch(() => { })
+            }
+            return
+        }
+
+        if (isLineCoverTextSkipCommand(text)) {
             try {
                 await materializeSelectedLineCoverOptionAssets({
                     env,
@@ -8035,8 +8489,9 @@ async function handleLineTextMessage(params: {
                     videoId: waitingState.id,
                     option: waitingState.selectedCoverOption,
                     coverTemplateId: waitingState.coverTemplateId,
+                    coverTextStyle: waitingState.coverTextStyle,
                 })
-                await finalizeLineWaitingVideoAndStartProcessing({
+                await continueLineFlowAfterCover({
                     env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                     manualCaption: waitingState.manualCaption,
                 })
@@ -8128,17 +8583,10 @@ async function handleLineTextMessage(params: {
             return
         }
 
-        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text)) {
-            try {
-                await finalizeLineWaitingVideoAndStartProcessing({
-                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
-                })
-            } catch (e) {
-                console.error('[LINE] Cover → processing error:', e instanceof Error ? e.message : String(e))
-                await lineReply(replyToken, channelAccessToken, [
-                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
-                ]).catch(() => { })
-            }
+        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text) || isLineAiThinkCommand(text)) {
+            await lineReply(replyToken, channelAccessToken, [
+                { type: 'text', text: 'ขั้นตอนนี้ต้องเลือกปกก่อน เลือกจาก 10 รูปได้เลย หรือกดสุ่มอีกครั้ง' },
+            ]).catch(() => { })
             return
         }
 
@@ -8186,9 +8634,15 @@ async function handleLineTextMessage(params: {
 
         if (isLineCaptionSkipCommand(text)) {
             try {
-                await promptLineCoverPicker({
-                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
-                })
+                if (waitingState.coverCompleted) {
+                    await finalizeLineWaitingVideoAndStartProcessing({
+                        env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    })
+                } else {
+                    await promptLineCoverPicker({
+                        env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    })
+                }
             } catch (e) {
                 console.error('[LINE] Skip caption → cover error:', e instanceof Error ? e.message : String(e))
                 await lineReply(replyToken, channelAccessToken, [
@@ -8226,10 +8680,17 @@ async function handleLineTextMessage(params: {
         }
 
         try {
-            await promptLineCoverPicker({
-                env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
-                manualCaption: captionCandidate,
-            })
+            if (waitingState.coverCompleted) {
+                await finalizeLineWaitingVideoAndStartProcessing({
+                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    manualCaption: captionCandidate,
+                })
+            } else {
+                await promptLineCoverPicker({
+                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    manualCaption: captionCandidate,
+                })
+            }
         } catch (e) {
             console.error('[LINE] Caption → cover error:', e instanceof Error ? e.message : String(e))
             await lineReply(replyToken, channelAccessToken, [
@@ -8284,34 +8745,8 @@ async function handleLineTextMessage(params: {
 
         const createdAt = new Date().toISOString()
 
-        if (shopeeLink && lazadaLink) {
-            try {
-                await promptLineCaptionCollection({
-                    env,
-                    bucket,
-                    namespaceId,
-                    channelAccessToken,
-                    replyToken,
-                    lineUserId,
-                    waitingState: {
-                        id: videoId,
-                        videoUrl: r2VideoUrl,
-                        createdAt,
-                        sourceType: 'xhs_url',
-                        sourceLabel: xhsUrl,
-                        shopeeLink,
-                        lazadaLink,
-                        awaitingStep: 'caption',
-                    },
-                })
-            } catch {
-                await lineReply(replyToken, channelAccessToken, [
-                    { type: 'text', text: `รับลิงก์ XHS แล้ว แต่เริ่มประมวลผลไม่ได้ ลองใหม่` },
-                ])
-            }
-        } else {
-            // Save waiting state for follow-up links
-            await putLineWaitingVideoState(bucket, lineUserId, {
+        try {
+            const waitingState = await putLineWaitingVideoState(bucket, lineUserId, {
                 id: videoId,
                 videoUrl: r2VideoUrl,
                 createdAt,
@@ -8319,17 +8754,23 @@ async function handleLineTextMessage(params: {
                 sourceLabel: xhsUrl,
                 shopeeLink: shopeeLink || '',
                 lazadaLink: lazadaLink || '',
-                awaitingStep: 'links',
+                awaitingStep: 'cover',
+                coverCompleted: false,
             })
 
+            await promptLineCoverOptions({
+                env,
+                bucket,
+                namespaceId,
+                channelAccessToken,
+                replyToken,
+                lineUserId,
+                waitingState,
+                forceRefresh: true,
+            })
+        } catch {
             await lineReply(replyToken, channelAccessToken, [
-                buildLineAffiliatePromptFlex({
-                    title: 'รับ XHS แล้ว',
-                    brand: shopeeLink ? 'lazada' : 'shopee',
-                    message: shopeeLink
-                        ? 'ส่งลิงก์ Lazada มาเลย'
-                        : 'ส่งลิงก์ Shopee มาเลย',
-                }),
+                { type: 'text', text: `รับลิงก์ XHS แล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองใหม่` },
             ])
         }
         return
@@ -8339,7 +8780,7 @@ async function handleLineTextMessage(params: {
         // Handle quick reply commands
         if (lowerText === 'วิธีใช้งาน' || lowerText === 'help') {
             await lineReply(replyToken, channelAccessToken, [
-                { type: 'text', text: '📖 วิธีใช้งาน Affiliate AiBot\n\n1️⃣ ส่งวิดีโอ หรือ ลิงก์ XHS มาในแชท\n2️⃣ ส่งลิงก์ Shopee ของสินค้า\n3️⃣ ส่งลิงก์ Lazada ของสินค้า\n4️⃣ ส่งแคปชั่น หรือกดข้ามให้ AI คิดให้\n5️⃣ ระบบจะประมวลผลให้อัตโนมัติ\n\n📱 กดปุ่ม "เปิดแอพ" เพื่อดู Dashboard, Gallery, ตั้งค่า และอื่นๆ' },
+                { type: 'text', text: '📖 วิธีใช้งาน Affiliate AiBot\n\n1️⃣ ส่งวิดีโอ หรือ ลิงก์ XHS มาในแชท\n2️⃣ เลือกปกคลิปจาก 10 รูป\n3️⃣ ถ้าต้องการเพิ่มข้อความบนปก พิมพ์มาได้เลย หรือกด AI คิดให้\n4️⃣ ส่งลิงก์ Shopee ของสินค้า\n5️⃣ ส่งลิงก์ Lazada ของสินค้า\n6️⃣ ส่งแคปชั่น หรือกดข้ามให้ AI คิดให้\n\n📱 กดปุ่ม "เปิดแอพ" เพื่อดู Dashboard, Gallery, ตั้งค่า และอื่นๆ' },
             ])
             return
         }
@@ -8572,7 +9013,7 @@ async function handleLinePostbackEvent(params: {
             coverTemplateId: waitingState.coverTemplateId,
             coverTextStyle: waitingState.coverTextStyle,
         })
-        await finalizeLineWaitingVideoAndStartProcessing({
+        await continueLineFlowAfterCover({
             env: params.env,
             bucket: params.bucket,
             namespaceId: params.namespaceId,
@@ -10125,14 +10566,6 @@ async function listNamespaceOriginalArchiveVideos(params: {
     if (!normalizedNamespaceId) return []
 
     const inboxRecords = await listInboxVideoRecords(params.bucket)
-    for (const record of inboxRecords.slice(0, 8)) {
-        await promoteSelectedInboxCoverToOriginalThumbnail({
-            env: params.env,
-            bucket: params.bucket,
-            namespaceId: normalizedNamespaceId,
-            videoId: record.id,
-        }).catch(() => '')
-    }
 
     const [namespaceStates, originalAssetMap] = await Promise.all([
         listNamespaceVideoStates(params.env.DB, normalizedNamespaceId),
@@ -10553,8 +10986,8 @@ async function prepareInboxVideoForManagedLinks(params: {
     const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false)
     if (!shortlinkRequired) return item
 
-    const sourceShopeeLink = pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || ''
-    const sourceLazadaLink = pickFirstLazadaUrl(String(item.lazadaOriginalLink || item.lazadaLink || '')) || ''
+    const sourceShopeeLink = sanitizeAffiliateTrackingLink(pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || '')
+    const sourceLazadaLink = sanitizeAffiliateTrackingLink(pickFirstLazadaUrl(String(item.lazadaOriginalLink || item.lazadaLink || '')) || '')
     if (!sourceShopeeLink || !sourceLazadaLink) return null
 
     const [expectedUtmId, expectedLazadaMemberId] = await Promise.all([
@@ -10586,8 +11019,17 @@ async function prepareInboxVideoForManagedLinks(params: {
         )
     )
     if (!shopeeReady) {
-        console.log(`[${params.logPrefix}] Admin managed Shopee shortlink not ready for ${item.id}`)
-        return null
+        const resolvedShopeeTrackingLink = await resolveAffiliateTrackingLink(sourceShopeeLink, `${params.logPrefix} SHOPEE_RESOLVE`).catch(() => sourceShopeeLink)
+        const resolvedShopeeUtmSource = normalizeShortlinkExpectedUtmId(extractShopeeUtmSourceFromLink(resolvedShopeeTrackingLink))
+        const inferredShopeeReady = !!resolvedShopeeTrackingLink
+            && !!resolvedShopeeUtmSource
+            && (!normalizedExpectedUtmId || resolvedShopeeUtmSource === normalizedExpectedUtmId)
+        if (inferredShopeeReady) {
+            nextShopeeLink = sourceShopeeLink
+        } else {
+            console.log(`[${params.logPrefix}] Admin managed Shopee shortlink not ready for ${item.id}`)
+            return null
+        }
     }
 
     let lazadaTrace: {
@@ -10603,7 +11045,7 @@ async function prepareInboxVideoForManagedLinks(params: {
         logPrefix: `${params.logPrefix} LAZADA`,
         trace: lazadaTrace,
     })
-    const normalizedMemberId = normalizeLazadaMemberId(String(lazadaTrace.memberId || ''))
+    let normalizedMemberId = normalizeLazadaMemberId(String(lazadaTrace.memberId || ''))
     const lazadaReady = !!nextLazadaLink && (
         nextLazadaLink !== sourceLazadaLink
         && lazadaTrace.status === 'shortened'
@@ -10611,8 +11053,18 @@ async function prepareInboxVideoForManagedLinks(params: {
         && (!expectedLazadaMemberId || normalizedMemberId === expectedLazadaMemberId)
     )
     if (!lazadaReady) {
-        console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}`)
-        return null
+        const resolvedLazadaTrackingLink = await resolveAffiliateTrackingLink(sourceLazadaLink, `${params.logPrefix} LAZADA_RESOLVE`).catch(() => sourceLazadaLink)
+        const resolvedLazadaMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(resolvedLazadaTrackingLink))
+        const inferredLazadaReady = !!resolvedLazadaTrackingLink
+            && !!resolvedLazadaMemberId
+            && (!expectedLazadaMemberId || resolvedLazadaMemberId === expectedLazadaMemberId)
+        if (inferredLazadaReady) {
+            nextLazadaLink = sourceLazadaLink
+            normalizedMemberId = resolvedLazadaMemberId
+        } else {
+            console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}`)
+            return null
+        }
     }
 
     await upsertNamespaceVideoState(params.env.DB, namespaceId, item.id, {
@@ -10710,6 +11162,33 @@ async function startInboxVideoProcessing(params: {
     return { status: 'processing', id: item.id }
 }
 
+async function markInboxProcessingFailed(params: {
+    bucket: R2Bucket
+    item: InboxVideoRecord
+    message: string
+    stepName?: string
+}): Promise<void> {
+    const item = normalizeInboxVideoRecord(params.item)
+    if (!item) return
+    const nowIso = new Date().toISOString()
+    await params.bucket.delete(`_queue/${item.id}.json`).catch(() => { })
+    await params.bucket.put(`_processing/${item.id}.json`, JSON.stringify({
+        id: item.id,
+        videoUrl: item.videoUrl,
+        shopeeLink: String(item.shopeeLink || '').trim(),
+        lazadaLink: String(item.lazadaLink || '').trim(),
+        manualCaption: normalizeManualCaption(item.manualCaption),
+        chatId: item.chatId,
+        createdAt: nowIso,
+        status: 'failed',
+        step: 0,
+        stepName: String(params.stepName || '').trim() || '❌ ย่อลิงก์ไม่สำเร็จ',
+        error: String(params.message || '').trim() || 'shortlink_failed',
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
+
 type InboxProcessingStartResult =
     | { outcome: 'started'; item: InboxVideoRecord; job: { status: 'queued' | 'processing'; id: string } }
     | { outcome: 'already_running'; item: InboxVideoRecord; status: InboxProcessingState; id: string }
@@ -10752,6 +11231,15 @@ async function ensureInboxVideoProcessingStarted(params: {
             return { outcome: 'already_processed', item, id: item.id }
         }
     }
+
+    await ensureInboxAutoCoverSuggestion({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: botId,
+        videoId: item.id,
+    }).catch((error) => {
+        console.log(`[AUTO-COVER] namespace=${botId} video=${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+    })
 
     const started = await startInboxVideoProcessing({
         env: params.env,
@@ -10881,12 +11369,12 @@ app.get('/api/inbox', async (c) => {
             console.log(`[INBOX-BACKFILL] namespace=${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
         }))
         c.executionCtx.waitUntil(Promise.all(
-            page.videos.slice(0, 8).map((record) => promoteSelectedInboxCoverToOriginalThumbnail({
+            page.videos.slice(0, 6).map((record) => ensureInboxAutoCoverSuggestion({
                 env: c.env,
                 bucket: c.get('bucket'),
                 namespaceId,
-                videoId: record.id,
-            }).catch(() => ''))
+                videoId: String(record.id || '').trim(),
+            }).catch(() => false))
         ))
         return c.json({
             videos,
@@ -10950,17 +11438,17 @@ app.get('/api/inbox/system', async (c) => {
         ))
         const page = sliceGalleryPage(visibleVideos, offset, limit)
         c.executionCtx.waitUntil(Promise.all(
-            page.videos.slice(0, 8).map((video) => {
+            page.videos.slice(0, 6).map((video) => {
                 const videoId = String(video.id || '').trim()
                 const namespaceId = String(video.namespace_id || '').trim()
-                if (!videoId || !namespaceId) return Promise.resolve('')
+                if (!videoId || !namespaceId) return Promise.resolve(false)
                 const scopedBucket = new BotBucket(c.env.BUCKET, namespaceId) as unknown as R2Bucket
-                return promoteSelectedInboxCoverToOriginalThumbnail({
+                return ensureInboxAutoCoverSuggestion({
                     env: c.env,
                     bucket: scopedBucket,
                     namespaceId,
                     videoId,
-                }).catch(() => '')
+                }).catch(() => false)
             })
         ))
 
@@ -11306,6 +11794,12 @@ app.post('/api/inbox/:id/process', async (c) => {
                     healthUrl.search = ''
                     const healthResp = await fetchWithTimeout(healthUrl.toString(), {}, 8000, 'shortlink_health')
                     if (!healthResp.ok) {
+                        await markInboxProcessingFailed({
+                            bucket: processBucket,
+                            item,
+                            message: `shortlink_health_http_${healthResp.status}`,
+                            stepName: '❌ ระบบย่อลิงก์ไม่พร้อม',
+                        }).catch(() => { })
                         return c.json({
                             error: 'shortlink_failed',
                             message: 'ระบบย่อลิ้งไม่พร้อม กรุณาลองใหม่',
@@ -11313,6 +11807,12 @@ app.post('/api/inbox/:id/process', async (c) => {
                         }, 400)
                     }
                 } catch (e) {
+                    await markInboxProcessingFailed({
+                        bucket: processBucket,
+                        item,
+                        message: e instanceof Error ? e.message : String(e),
+                        stepName: '❌ เชื่อมต่อระบบย่อลิงก์ไม่ได้',
+                    }).catch(() => { })
                     return c.json({
                         error: 'shortlink_failed',
                         message: 'เชื่อมต่อระบบย่อลิ้งไม่ได้ กรุณาลองใหม่',
@@ -11331,6 +11831,12 @@ app.post('/api/inbox/:id/process', async (c) => {
                 logPrefix: `INBOX-PROCESS ${namespaceId}/${id}`,
             }).catch(() => null)
             if (!prepared) {
+                await markInboxProcessingFailed({
+                    bucket: processBucket,
+                    item,
+                    message: 'managed_shortlink_conversion_failed',
+                    stepName: '❌ ย่อลิงก์ Shopee/Lazada ไม่ผ่าน',
+                }).catch(() => { })
                 return c.json({
                     error: 'shortlink_failed',
                     message: 'ย่อลิ้ง Shopee/Lazada สำหรับ workspace นี้ไม่ผ่าน กรุณาลองใหม่',
@@ -12531,7 +13037,7 @@ app.get('/api/gallery/:id/asset/:variant', async (c) => {
     return response
 })
 
-app.get('/api/gallery/:id/frame', async (c) => {
+async function handleGalleryFrameRequest(c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>) {
     const id = String(c.req.param('id') || '').trim()
     const targetNamespaceId = String(c.req.query('namespace_id') || c.get('botId') || '').trim()
     const timeParam = String(c.req.query('t') || '').trim()
@@ -12595,7 +13101,9 @@ app.get('/api/gallery/:id/frame', async (c) => {
             status: 200,
             headers: {
                 'Content-Type': requestedFormat === 'jpg' ? 'image/jpeg' : 'image/webp',
-                'Cache-Control': 'public, max-age=31536000, immutable',
+                'Cache-Control': coverText
+                    ? 'no-store, max-age=0'
+                    : 'public, max-age=31536000, immutable',
                 'Access-Control-Allow-Origin': '*',
             },
         })
@@ -12604,7 +13112,10 @@ app.get('/api/gallery/:id/frame', async (c) => {
             error: error instanceof Error ? error.message : String(error),
         }, 500)
     }
-})
+}
+
+app.get('/api/gallery/:id/frame', async (c) => handleGalleryFrameRequest(c))
+app.get('/api/gallery/:id/frame-preview/:cacheKey', async (c) => handleGalleryFrameRequest(c))
 
 app.get('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
@@ -13298,6 +13809,67 @@ async function resolveAffiliateTrackingLink(rawLink: string, logPrefix: string):
     return redirected || candidate || current
 }
 
+function removeTrackingParamsFromUrl(input: URL, extraKeepParams: string[] = []): URL {
+    const keep = new Set<string>(extraKeepParams.map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))
+    const next = new URL(input.toString())
+    const keys = Array.from(next.searchParams.keys())
+    for (const key of keys) {
+        const normalizedKey = String(key || '').trim().toLowerCase()
+        if (keep.has(normalizedKey)) continue
+        next.searchParams.delete(key)
+    }
+    next.hash = ''
+    return next
+}
+
+function canonicalizeResolvedShopeeLink(rawLink: string): string {
+    const current = pickFirstShopeeUrl(rawLink) || String(rawLink || '').trim()
+    if (!current) return ''
+    try {
+        const parsed = new URL(current)
+        const host = parsed.hostname.toLowerCase()
+        if (host.startsWith('shopee.') || host.includes('.shopee.')) {
+            return removeTrackingParamsFromUrl(parsed).toString()
+        }
+        return parsed.toString()
+    } catch {
+        return current
+    }
+}
+
+function canonicalizeResolvedLazadaLink(rawLink: string): string {
+    const current = pickFirstLazadaUrl(rawLink) || String(rawLink || '').trim()
+    if (!current) return ''
+    try {
+        const parsed = new URL(current)
+        const host = parsed.hostname.toLowerCase()
+        const pathname = parsed.pathname.toLowerCase()
+        if (host.includes('lazada.') && pathname.endsWith('.html')) {
+            return `${parsed.origin}${parsed.pathname}`
+        }
+        if (host.includes('lazada.')) {
+            return removeTrackingParamsFromUrl(parsed).toString()
+        }
+        return parsed.toString()
+    } catch {
+        return current
+    }
+}
+
+async function resolveCanonicalAffiliateShortlinkInput(
+    kind: 'shopee' | 'lazada',
+    rawLink: string,
+    logPrefix: string,
+): Promise<string> {
+    const current = kind === 'lazada'
+        ? (pickFirstLazadaUrl(rawLink) || String(rawLink || '').trim())
+        : (pickFirstShopeeUrl(rawLink) || String(rawLink || '').trim())
+    if (!current) return ''
+    const resolved = await resolveAffiliateTrackingLink(current, `${logPrefix}_canonical`).catch(() => current)
+    if (kind === 'lazada') return canonicalizeResolvedLazadaLink(resolved || current)
+    return canonicalizeResolvedShopeeLink(resolved || current)
+}
+
 function extractShopeeUtmSourceFromLink(link: string): string {
     try {
         return String(new URL(String(link || '').trim()).searchParams.get('utm_source') || '').trim()
@@ -13408,6 +13980,12 @@ function extractLazadaMemberIdFromLink(link: string): string {
     return ''
 }
 
+function sanitizeAffiliateTrackingLink(rawLink: string): string {
+    const value = String(rawLink || '').trim()
+    if (!value) return ''
+    return value.replace(/[^\w\-._~:/?#[\]@!$&'()*+,;=%]+$/gu, '')
+}
+
 function isLikelyConvertedShopeeLink(link: string, expectedUtmId = ''): boolean {
     const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
     if (!rawLink) return false
@@ -13468,31 +14046,29 @@ function getVideoAffiliateConversionState(
 
     const shopeeSourceLink = getVideoSourceShopeeLink(video)
     const shopeeCurrentLink = normalizeMetaShopeeLink(video) || ''
-    const shopeeCurrentDiffersFromSource = !!shopeeCurrentLink && !!shopeeSourceLink && shopeeCurrentLink !== shopeeSourceLink
     const hasShopeeSource = !!shopeeSourceLink
     const hasShopeeLink = !!(shopeeCurrentLink || shopeeSourceLink)
     const shopeeConvertedAt = String(video.shopeeConvertedAt || video.shopee_converted_at || '').trim()
-    const hasManagedShopeeConversion = shopeeCurrentDiffersFromSource && !!shopeeConvertedAt
+    const hasManagedShopeeConversion = !!shopeeConvertedAt && hasShopeeLink
     const explicitShortlinkRequired = getBooleanFlag(video.shortlink_required)
     const requireManagedLinks = options.requireManagedLinks ?? explicitShortlinkRequired ?? true
     const shopeeReady = requireManagedLinks
-        ? (shopeeCurrentDiffersFromSource && !!shopeeConvertedAt)
+        ? (!!shopeeConvertedAt && hasShopeeLink)
         : hasShopeeLink
 
     const lazadaSourceLink = getVideoSourceLazadaLink(video)
     const lazadaCurrentLink = normalizeMetaLazadaLink(video) || ''
-    const lazadaCurrentDiffersFromSource = !!lazadaCurrentLink && !!lazadaSourceLink && lazadaCurrentLink !== lazadaSourceLink
     const hasLazadaSource = !!lazadaSourceLink
     const hasLazadaLink = !!(lazadaCurrentLink || lazadaSourceLink)
     const lazadaConvertedAt = String(video.lazadaConvertedAt || video.lazada_converted_at || '').trim()
-    const hasManagedLazadaConversion = lazadaCurrentDiffersFromSource && !!lazadaConvertedAt
+    const hasManagedLazadaConversion = !!lazadaConvertedAt && hasLazadaLink
     const lazadaMemberId = normalizeLazadaMemberId(String(video.lazadaMemberId || video.lazada_member_id || ''))
+    const lazadaManagedLinkValid = isLikelyConvertedLazadaLink(lazadaCurrentLink || lazadaSourceLink)
     const lazadaReady = requireManagedLinks
         ? (
-            lazadaCurrentDiffersFromSource
-            && !!lazadaCurrentLink
+            hasLazadaLink
             && !!lazadaConvertedAt
-            && isLikelyConvertedLazadaLink(lazadaCurrentLink)
+            && lazadaManagedLinkValid
             && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId)
         )
         : hasLazadaLink
@@ -13609,7 +14185,7 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
             const conversionState = getVideoAffiliateConversionState(pendingVideo, expectedUtmId, expectedLazadaMemberId)
 
             if (conversionState.hasShopeeSource) {
-                const sourceShopeeLink = conversionState.shopeeSourceLink || getVideoSourceShopeeLink(nextMeta) || ''
+                const sourceShopeeLink = sanitizeAffiliateTrackingLink(conversionState.shopeeSourceLink || getVideoSourceShopeeLink(nextMeta) || '')
                 if (sourceShopeeLink) {
                     nextMeta.shopeeOriginalLink = sourceShopeeLink
                     nextStateFields.shopee_original_link = sourceShopeeLink
@@ -13643,16 +14219,36 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                         delete nextMeta.shopeeConversionError
                         nextStateFields.shopee_converted_at = convertedAt
                     } else {
+                        const resolvedShopeeTrackingLink = await resolveAffiliateTrackingLink(sourceShopeeLink, `AFFILIATE-CONVERT ${namespaceId}/${videoId} SHOPEE_RESOLVE`).catch(() => sourceShopeeLink)
+                        const resolvedShopeeUtmSource = normalizeShortlinkExpectedUtmId(extractShopeeUtmSourceFromLink(resolvedShopeeTrackingLink))
+                        const inferredShopeeReady = !!resolvedShopeeTrackingLink
+                            && !!resolvedShopeeUtmSource
+                            && (!expectedUtmId || resolvedShopeeUtmSource === normalizeShortlinkExpectedUtmId(expectedUtmId))
+                        if (inferredShopeeReady) {
+                            const convertedAt = String(
+                                pendingVideo.shopeeConvertedAt ||
+                                pendingVideo.shopee_converted_at ||
+                                nextMeta.shopeeConvertedAt ||
+                                nextMeta.shopee_converted_at ||
+                                nowIso
+                            ).trim() || nowIso
+                            nextMeta.shopeeLink = sourceShopeeLink
+                            nextMeta.shopeeConvertedAt = convertedAt
+                            delete nextMeta.shopeeConversionError
+                            nextStateFields.shopee_link = sourceShopeeLink
+                            nextStateFields.shopee_converted_at = convertedAt
+                        } else {
                         delete nextMeta.shopeeConvertedAt
                         nextMeta.shopeeConversionError = String(trace.error || '').trim()
                         nextStateFields.shopee_converted_at = ''
+                        }
                     }
                     changed = true
                 }
             }
 
             if (conversionState.hasLazadaSource) {
-                const sourceLazadaLink = conversionState.lazadaSourceLink || getVideoSourceLazadaLink(nextMeta) || ''
+                const sourceLazadaLink = sanitizeAffiliateTrackingLink(conversionState.lazadaSourceLink || getVideoSourceLazadaLink(nextMeta) || '')
                 if (sourceLazadaLink) {
                     nextMeta.lazadaOriginalLink = sourceLazadaLink
                     nextStateFields.lazada_original_link = sourceLazadaLink
@@ -13698,9 +14294,31 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                         delete nextMeta.lazadaConversionError
                         nextStateFields.lazada_converted_at = convertedAt
                     } else {
-                        delete nextMeta.lazadaConvertedAt
-                        nextMeta.lazadaConversionError = String(trace.error || '').trim()
-                        nextStateFields.lazada_converted_at = ''
+                        const resolvedLazadaTrackingLink = await resolveAffiliateTrackingLink(sourceLazadaLink, `AFFILIATE-CONVERT ${namespaceId}/${videoId} LAZADA_RESOLVE`).catch(() => sourceLazadaLink)
+                        const resolvedLazadaMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(resolvedLazadaTrackingLink))
+                        const inferredLazadaReady = !!resolvedLazadaTrackingLink
+                            && !!resolvedLazadaMemberId
+                            && (!expectedLazadaMemberId || resolvedLazadaMemberId === expectedLazadaMemberId)
+                        if (inferredLazadaReady) {
+                            const convertedAt = String(
+                                pendingVideo.lazadaConvertedAt ||
+                                pendingVideo.lazada_converted_at ||
+                                nextMeta.lazadaConvertedAt ||
+                                nextMeta.lazada_converted_at ||
+                                nowIso
+                            ).trim() || nowIso
+                            nextMeta.lazadaLink = sourceLazadaLink
+                            nextMeta.lazadaMemberId = resolvedLazadaMemberId
+                            nextMeta.lazadaConvertedAt = convertedAt
+                            delete nextMeta.lazadaConversionError
+                            nextStateFields.lazada_link = sourceLazadaLink
+                            nextStateFields.lazada_member_id = resolvedLazadaMemberId
+                            nextStateFields.lazada_converted_at = convertedAt
+                        } else {
+                            delete nextMeta.lazadaConvertedAt
+                            nextMeta.lazadaConversionError = String(trace.error || '').trim()
+                            nextStateFields.lazada_converted_at = ''
+                        }
                     }
                     changed = true
                 }
@@ -13845,7 +14463,16 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
             item: nextVideo,
             logPrefix: `AUTO-IMPORT ${adminNamespaceId}/${nextVideo.id}`,
         }).catch(() => null)
-        if (!prepared) continue
+        if (!prepared) {
+            await markInboxProcessingFailed({
+                bucket: adminBucket,
+                item: nextVideo,
+                message: 'managed_shortlink_conversion_failed',
+                stepName: '❌ ย่อลิงก์ Shopee/Lazada ไม่ผ่าน',
+            }).catch(() => { })
+            console.warn(`[AUTO-IMPORT] ${nextVideo.id} blocked: managed shortlink conversion not ready`)
+            continue
+        }
 
         try {
             const result = await ensureInboxVideoProcessingStarted({
@@ -13926,6 +14553,8 @@ async function getNamespaceLazadaExpectedMemberIdEntry(db: D1Database, namespace
 }
 
 async function resolveNamespaceAffiliateShortlinkAccount(db: D1Database, namespaceId: string): Promise<string> {
+    const adminManaged = await isNamespaceShortlinkAdminManaged(db, namespaceId)
+    if (!adminManaged) return ''
     const entry = await getNamespaceAffiliateShortlinkAccountEntry(db, namespaceId)
     if (entry.account) return entry.account
 
@@ -13938,11 +14567,7 @@ async function resolveNamespaceAffiliateShortlinkAccount(db: D1Database, namespa
     if (extracted) return extracted
 
     // Hardcoded fallback: admin namespace uses CHEARB
-    const ownerEmail = await resolveOwnerEmailForNamespace(db, namespaceId).catch(() => '')
-    if (ownerEmail) {
-        const admin = await isSystemAdmin(db, ownerEmail)
-        if (admin) return ADMIN_SHORTLINK_ACCOUNT
-    }
+    if (adminManaged) return ADMIN_SHORTLINK_ACCOUNT
     return ''
 }
 
@@ -15899,15 +16524,22 @@ async function shortenLazadaLinkForNamespace(params: {
         if (payload.error !== undefined) params.trace.error = payload.error
     }
 
-    const originalLink = getVideoSourceLazadaLink({ lazadaLink: params.lazadaLink }) || String(params.lazadaLink || '').trim()
-    if (!originalLink) {
+    const sourceLink = getVideoSourceLazadaLink({ lazadaLink: params.lazadaLink }) || String(params.lazadaLink || '').trim()
+    if (!sourceLink) {
         writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
         return ''
     }
+    const originalLink = await resolveCanonicalAffiliateShortlinkInput('lazada', sourceLink, params.logPrefix)
+    if (!originalLink) {
+        writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: 'empty_canonical_lazada_link' })
+        return ''
+    }
+    const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
 
     const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
     if (!baseUrl) {
         writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
+        if (fallbackDisallowed) throw new Error('admin_lazada_shortlink_disabled')
         return originalLink
     }
 
@@ -15960,6 +16592,7 @@ async function shortenLazadaLinkForNamespace(params: {
     }
 
     writeTrace({ utmSource: null, memberId: null, status: 'fallback', error: lastError })
+    if (fallbackDisallowed) throw new Error(lastError || 'admin_lazada_shortlink_failed')
     return originalLink
 }
 
@@ -15980,15 +16613,22 @@ async function shortenShopeeLinkForNamespace(params: {
         if (payload.status) params.trace.status = payload.status
         if (payload.error !== undefined) params.trace.error = payload.error
     }
-    const originalLink = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
-    if (!originalLink) {
+    const sourceLink = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
+    if (!sourceLink) {
         writeTrace({ utmSource: null, status: 'disabled', error: null })
         return ''
     }
+    const originalLink = await resolveCanonicalAffiliateShortlinkInput('shopee', sourceLink, params.logPrefix)
+    if (!originalLink) {
+        writeTrace({ utmSource: null, status: 'disabled', error: 'empty_canonical_shopee_link' })
+        return ''
+    }
+    const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
 
     const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(params.env.DB, params.namespaceId)
     if (!baseUrl) {
         writeTrace({ utmSource: null, status: 'disabled', error: null })
+        if (fallbackDisallowed) throw new Error('admin_shopee_shortlink_disabled')
         return originalLink
     }
 
@@ -16037,6 +16677,7 @@ async function shortenShopeeLinkForNamespace(params: {
     }
 
     writeTrace({ utmSource: null, status: 'fallback', error: lastError })
+    if (fallbackDisallowed) throw new Error(lastError || 'admin_shopee_shortlink_failed')
     return originalLink
 }
 
@@ -16104,6 +16745,10 @@ async function isNamespaceAffiliateVerificationEnforced(db: D1Database, namespac
     const ownerEmail = await resolveOwnerEmailForNamespace(db, normalizedNamespaceId).catch(() => '')
     if (!ownerEmail) return false
     return isSystemAdmin(db, ownerEmail)
+}
+
+async function isNamespaceShortlinkFallbackDisallowed(db: D1Database, namespaceId: string): Promise<boolean> {
+    return isNamespaceAffiliateVerificationEnforced(db, namespaceId)
 }
 
 async function verifyAffiliateLinksForPosting(params: {
@@ -20968,52 +21613,10 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         let commentTokenUsed = String(pageCommentToken || '').trim()
         let commentProfileId: string | null = null
         let commentProfileName: string | null = null
-        const commentTargetId = fbVideoId || confirmedPostId
 
         if (normalizedShopeeLink && !skipComment && hasCommentToken) {
-            const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
-            console.log(`[RETRY-POST] Waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
-            await waitMs(commentWaitMs)
-            await env.DB.prepare(
-                "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE id = ? AND status = 'posting'"
-            ).bind(
-                deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
-                retryHistoryId,
-            ).run()
-            const commentResult = await postShopeeCommentWithFallback({
-                env,
-                namespaceId: botId,
-                fbVideoId: commentTargetId,
-                shopeeLink: normalizedShopeeLink,
-                lazadaLink: normalizedLazadaLink,
-                commentTokens: commentTokenCandidates,
-                pageId,
-                logPrefix: 'RETRY-POST',
-            })
-            if (!commentResult.ok) {
-                commentStatus = 'failed'
-                commentError = commentResult.error || 'comment_failed'
-                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                commentProfileId = commentProfile.profileId
-                commentProfileName = commentProfile.profileName
-                await notifyCommentTokenIssue(
-                    env,
-                    botId,
-                    pageId,
-                    pageName || pageId,
-                    commentError,
-                ).catch((notifyErr) => {
-                    console.error(`[RETRY-POST] notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
-                })
-            } else {
-                commentStatus = 'success'
-                commentFbId = commentResult.id || null
-                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                commentProfileId = commentProfile.profileId
-                commentProfileName = commentProfile.profileName
-            }
+            commentStatus = 'pending'
+            commentError = null
         } else if (skipComment) {
             commentStatus = 'skipped'
             commentError = null
@@ -21299,6 +21902,381 @@ async function generateCaption(script: string, apiKeys: string[], model: string)
         }
     }
     return script.slice(0, 100)
+}
+
+function extractJsonObjectFromText(rawText: string): Record<string, unknown> | null {
+    const text = String(rawText || '').trim()
+    if (!text) return null
+    const direct = (() => {
+        try {
+            return JSON.parse(text) as Record<string, unknown>
+        } catch {
+            return null
+        }
+    })()
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct
+
+    const match = text.match(/\{[\s\S]*\}/)
+    if (!match) return null
+    try {
+        const parsed = JSON.parse(match[0]) as Record<string, unknown>
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+    } catch {
+        return null
+    }
+}
+
+function normalizeAiCoverTextPosition(rawValue: unknown): number {
+    const allowed = [20, 35, 50, 65, 80]
+    const parsed = Number(rawValue)
+    if (!Number.isFinite(parsed)) return 65
+    let best = allowed[0] || 65
+    let bestDistance = Math.abs(best - parsed)
+    for (const candidate of allowed) {
+        const distance = Math.abs(candidate - parsed)
+        if (distance < bestDistance) {
+            best = candidate
+            bestDistance = distance
+        }
+    }
+    return best
+}
+
+async function writeInboxAutoCoverMeta(params: {
+    bucket: R2Bucket
+    videoId: string
+    mutate: (meta: Record<string, unknown>) => void
+}): Promise<void> {
+    const videoId = String(params.videoId || '').trim()
+    if (!videoId) return
+    const metaObj = await params.bucket.get(`videos/${videoId}.json`).catch(() => null)
+    if (!metaObj) return
+    let meta: Record<string, unknown> = {}
+    try {
+        meta = await metaObj.json() as Record<string, unknown>
+    } catch {
+        meta = {}
+    }
+    params.mutate(meta)
+    meta.updatedAt = new Date().toISOString()
+    await params.bucket.put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
+        httpMetadata: { contentType: 'application/json' },
+    }).catch(() => { })
+}
+
+async function generateAiCoverTextForOption(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    videoId: string
+    option: LineCoverOption
+}): Promise<{ coverText: string; textYPercent: number } | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const option = params.option
+    if (!namespaceId || !videoId || !option?.seed) return null
+
+    const apiKeys = await resolveNamespaceGeminiApiKeys(params.env.DB, namespaceId).catch(() => [])
+    const normalizedKeys = normalizeGeminiApiKeyList(apiKeys)
+    if (normalizedKeys.length === 0) return null
+
+    const originalVideoUrl = buildWorkerGalleryAssetUrl(
+        String(params.env.WORKER_URL || '').trim(),
+        namespaceId,
+        videoId,
+        'original',
+    )
+    if (!originalVideoUrl) return null
+
+    let frameBase64 = ''
+    try {
+        const jpgBytes = await generateThumbnailViaContainer(
+            params.env,
+            originalVideoUrl,
+            option.seed,
+            undefined,
+            'jpg',
+            360,
+            640,
+        )
+        frameBase64 = jpgBytes.toString('base64')
+    } catch {
+        frameBase64 = ''
+    }
+    if (!frameBase64) return null
+
+    const prompt = [
+        'นี่คือหน้าปกวิดีโอรีวิวสินค้า ช่วยคิดข้อความบนปกภาษาไทย 1 บรรทัดให้น่าสนใจ น่าดึงดูด และชวนกดดู',
+        'กติกา:',
+        '- ความยาวไม่เกิน 18 ตัวอักษร',
+        '- ห้ามอีโมจิ',
+        '- ห้ามหลายบรรทัด',
+        '- ห้ามใส่เครื่องหมายคำพูด',
+        '- ห้ามตอบเป็น JSON',
+        '- ห้ามขึ้นต้นด้วยคำว่า headline',
+        '- ห้ามเป็นคำกริยาเดี่ยวหรือคำไม่สมบูรณ์ เช่น ทำไข, ทำครัว, ใช้งาน',
+        '- ห้ามตอบเป็นคำทั่วไปล้วน ๆ เช่น พัดลม, แก้ว, กล่อง, เครื่องครัว',
+        '- ต้องมี hook หรือจุดเด่นอย่างน้อย 1 อย่าง เช่น น่ารัก, พกง่าย, เย็นไว, มินิ, ไฟฟ้า, ตีฟูไว',
+        '- ถ้าเห็นดีไซน์เด่น ให้หยิบดีไซน์มาทำ hook ก่อนประโยชน์',
+        '- ถ้าเห็นประโยชน์การใช้งานชัด ให้หยิบประโยชน์มาทำ hook',
+        '- โทนคำต้องเป็นภาษาหน้าปกคลิปรีวิวสินค้า ไม่ใช่แค่บอกชื่อของ',
+        '- ตัวอย่างคำตอบที่ดี: พัดลมคิตตี้มินิ, น่ารักแต่ลมแรง, เครื่องตีไข่ไฟฟ้า, ตีไข่ฟูไว, ปั่นง่ายในแก้วเดียว',
+        'ตอบเป็นข้อความบรรทัดเดียวเท่านั้น',
+    ].filter(Boolean).join('\n')
+
+    for (const apiKey of normalizedKeys) {
+        try {
+            const model = String(params.env.GEMINI_MODEL || '').trim() || 'gemini-3-flash-preview'
+            const resp = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{
+                            parts: [
+                                { text: prompt },
+                                {
+                                    inlineData: {
+                                        mimeType: 'image/jpeg',
+                                        data: frameBase64,
+                                    },
+                                },
+                            ],
+                        }],
+                        generationConfig: { temperature: 0.4, maxOutputTokens: 64 },
+                    }),
+                },
+            )
+            if (!resp.ok) continue
+            const result = await resp.json().catch(() => ({})) as {
+                candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+            }
+            const responseText = (result.candidates || [])
+                .flatMap((candidate) => candidate.content?.parts || [])
+                .map((part) => String(part.text || '').trim())
+                .filter(Boolean)
+                .join('\n')
+            const fallbackHeadline = extractAiHeadlineFromText(responseText)
+            const coverText = normalizeLineCoverText(fallbackHeadline)
+            if (isInvalidAiCoverHeadline(coverText)) continue
+            return {
+                coverText,
+                textYPercent: 65,
+            }
+        } catch {
+            // try next key
+        }
+    }
+
+    return null
+}
+
+async function generateAiInboxCoverSuggestion(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    videoId: string
+}): Promise<{ option: LineCoverOption; coverText: string; textYPercent: number } | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    if (!namespaceId || !videoId) return null
+
+    const apiKeys = await resolveNamespaceGeminiApiKeys(params.env.DB, namespaceId).catch(() => [])
+    const normalizedKeys = normalizeGeminiApiKeyList(apiKeys)
+    if (normalizedKeys.length === 0) return null
+
+    const originalVideoUrl = buildWorkerGalleryAssetUrl(
+        String(params.env.WORKER_URL || '').trim(),
+        namespaceId,
+        videoId,
+        'original',
+    )
+    if (!originalVideoUrl) return null
+
+    const metaObj = await params.bucket.get(`videos/${videoId}.json`).catch(() => null)
+    const meta = metaObj
+        ? await metaObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        : {}
+    const contextTitle = metaToString(meta, 'title')
+    const contextCategory = metaToString(meta, 'category')
+    const contextManualCaption = normalizeManualCaption(meta.manualCaption || meta.caption || '')
+    const contextScript = metaToString(meta, 'script').slice(0, 800)
+    const contextSourceLabel = metaToString(meta, 'sourceLabel') || metaToString(meta, 'source_label')
+
+    const optionCount = 6
+    const options = buildLineCoverOptions(videoId, optionCount, 'gemini-auto-cover-v1')
+    const frameResults = await Promise.all(options.map(async (option) => {
+        try {
+            const jpgBytes = await generateThumbnailViaContainer(
+                params.env,
+                originalVideoUrl,
+                option.seed,
+                undefined,
+                'jpg',
+                540,
+                960,
+            )
+            return {
+                option,
+                mimeType: 'image/jpeg',
+                data: jpgBytes.toString('base64'),
+            }
+        } catch {
+            return null
+        }
+    }))
+    const usableFrames = frameResults.filter((item): item is { option: LineCoverOption; mimeType: string; data: string } => !!item && !!item.data)
+    if (usableFrames.length === 0) return null
+
+    const prompt = [
+        'คุณคือผู้ช่วยทำปกวิดีโอแนวขายของ/รีวิวสั้นภาษาไทย',
+        'จากภาพตัวเลือกหลายภาพ ให้เลือกเฟรมที่น่าสนใจที่สุดสำหรับทำปก และเขียนข้อความบนปก 1 บรรทัดภาษาไทย',
+        'กติกา:',
+        '- ข้อความต้องสั้น กระชับ น่าเปิดดู ไม่เกิน 12 คำ',
+        '- ห้ามใส่อีโมจิ',
+        '- ห้ามใส่เครื่องหมายคำพูด',
+        '- ห้ามใช้หลายบรรทัด',
+        '- ถ้าเห็นสินค้า/จุดเด่นชัด ให้ใช้คำที่สื่อประโยชน์หรือ hook',
+        '- เลือกตำแหน่งข้อความจาก 20, 35, 50, 65, 80 โดย 80 คือค่อนล่าง',
+        '- ตอบเป็น JSON เท่านั้น',
+        'รูปแบบตอบกลับ:',
+        '{"optionId":"1","headline":"ข้อความปก","textYPercent":65}',
+        '',
+        `ข้อมูลเสริม: title=${contextTitle || '-'} | category=${contextCategory || '-'} | source=${contextSourceLabel || '-'}`,
+        contextManualCaption ? `caption=${contextManualCaption}` : '',
+        contextScript ? `script=${contextScript}` : '',
+    ].filter(Boolean).join('\n')
+
+    for (const apiKey of normalizedKeys) {
+        try {
+            const parts: Array<Record<string, unknown>> = [{ text: prompt }]
+            for (const frame of usableFrames) {
+                parts.push({ text: `ตัวเลือก ${frame.option.optionId}` })
+                parts.push({
+                    inlineData: {
+                        mimeType: frame.mimeType,
+                        data: frame.data,
+                    },
+                })
+            }
+            const model = String(params.env.GEMINI_MODEL || '').trim() || 'gemini-2.5-flash'
+            const resp = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts }],
+                        generationConfig: { temperature: 0.4, maxOutputTokens: 256 },
+                    }),
+                },
+            )
+            if (!resp.ok) continue
+            const result = await resp.json().catch(() => ({})) as {
+                candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>
+            }
+            const responseText = (result.candidates || [])
+                .flatMap((candidate) => candidate.content?.parts || [])
+                .map((part) => String(part.text || '').trim())
+                .filter(Boolean)
+                .join('\n')
+            const parsed = extractJsonObjectFromText(responseText)
+            const optionId = String(parsed?.optionId || '').trim()
+            const selected = usableFrames.find((frame) => String(frame.option.optionId || '').trim() === optionId)
+            const coverText = normalizeLineCoverText(String(parsed?.headline || ''))
+            if (!selected || !coverText) continue
+            return {
+                option: selected.option,
+                coverText,
+                textYPercent: normalizeAiCoverTextPosition(parsed?.textYPercent),
+            }
+        } catch {
+            // try next key
+        }
+    }
+
+    return null
+}
+
+async function ensureInboxAutoCoverSuggestion(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    videoId: string
+}): Promise<boolean> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    if (!namespaceId || !videoId) return false
+
+    const existingCover = await params.bucket.head(`_inbox_cover/${videoId}.webp`).catch(() => null)
+    if (existingCover) return true
+
+    const metaObj = await params.bucket.get(`videos/${videoId}.json`).catch(() => null)
+    let meta: Record<string, unknown> = {}
+    if (metaObj) {
+        try {
+            meta = await metaObj.json() as Record<string, unknown>
+        } catch {
+            meta = {}
+        }
+    }
+    const attemptedAtMs = Date.parse(String(meta.autoCoverAttemptedAt || '').trim())
+    if (Number.isFinite(attemptedAtMs) && Date.now() - attemptedAtMs < 30 * 60 * 1000) {
+        return false
+    }
+
+    await writeInboxAutoCoverMeta({
+        bucket: params.bucket,
+        videoId,
+        mutate(nextMeta) {
+            nextMeta.autoCoverAttemptedAt = new Date().toISOString()
+        },
+    })
+
+    const suggestion = await generateAiInboxCoverSuggestion(params)
+    if (!suggestion) {
+        await writeInboxAutoCoverMeta({
+            bucket: params.bucket,
+            videoId,
+            mutate(nextMeta) {
+                nextMeta.autoCoverError = 'gemini_cover_suggestion_failed'
+            },
+        })
+        return false
+    }
+
+    const coverTemplateSettings = await getNamespaceCoverTemplateSettings(params.env.DB, namespaceId).catch(() => ({
+        template_id: DEFAULT_COVER_TEMPLATE_ID,
+        text_style: createDefaultCoverTextStyle(DEFAULT_COVER_TEMPLATE_ID),
+    }))
+    const coverTemplateId = normalizeCoverTemplateId(String(coverTemplateSettings?.template_id || ''))
+    const coverTextStyle = normalizeCoverTextStyle(coverTemplateSettings?.text_style, coverTemplateId)
+
+    await materializeSelectedLineCoverOptionAssets({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId,
+        videoId,
+        option: suggestion.option,
+        coverText: suggestion.coverText,
+        coverTextYPercent: suggestion.textYPercent,
+        coverTemplateId,
+        coverTextStyle,
+    })
+
+    await writeInboxAutoCoverMeta({
+        bucket: params.bucket,
+        videoId,
+        mutate(nextMeta) {
+            nextMeta.autoCoverText = suggestion.coverText
+            nextMeta.autoCoverSeed = String(suggestion.option.seed || '').trim()
+            nextMeta.autoCoverTextYPercent = suggestion.textYPercent
+            nextMeta.autoCoverGeneratedAt = new Date().toISOString()
+            delete nextMeta.autoCoverError
+        },
+    })
+    return true
 }
 
 // Generate title for ONE video at a time (call repeatedly to process all)
@@ -21631,62 +22609,16 @@ app.post('/api/pages/:id/force-post', async (c) => {
             ).run()
         }
 
-        // Wait 10s for video to be processed before commenting (unless skipped)
         let commentStatus = postReadyCommentState.status
         let commentError: string | null = postReadyCommentState.error
         let commentFbId: string | null = null
         let commentTokenUsed = String(pageCommentToken || '').trim()
         let commentProfileId: string | null = null
         let commentProfileName: string | null = null
-        const commentTargetId = fbVideoId || confirmedPostId
 
         if (normalizedShopeeLink && !skipComment && hasCommentToken) {
-            const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
-            console.log(`[FORCE-POST] Waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
-            await waitMs(commentWaitMs)
-            if (forceHistoryId) {
-                await env.DB.prepare(
-                    "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE id = ? AND status = 'posting'"
-                ).bind(
-                    deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
-                    forceHistoryId,
-                ).run()
-            }
-            const commentResult = await postShopeeCommentWithFallback({
-                env,
-                namespaceId: botId,
-                fbVideoId: commentTargetId,
-                shopeeLink: normalizedShopeeLink,
-                lazadaLink: normalizedLazadaLink,
-                commentTokens: commentTokenCandidates,
-                pageId: page.id,
-                logPrefix: 'FORCE-POST',
-            })
-            if (!commentResult.ok) {
-                commentStatus = 'failed'
-                commentError = commentResult.error || 'comment_failed'
-                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                commentProfileId = commentProfile.profileId
-                commentProfileName = commentProfile.profileName
-                console.error(`[FORCE-POST] Comment failed for ${fbVideoId}: ${commentResult.error}`)
-                await notifyCommentTokenIssue(
-                    env,
-                    botId,
-                    page.id,
-                    page.name,
-                    commentError,
-                ).catch((notifyErr) => {
-                    console.error(`[FORCE-POST] notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
-                })
-            } else {
-                commentStatus = 'success'
-                commentFbId = commentResult.id || null
-                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                commentProfileId = commentProfile.profileId
-                commentProfileName = commentProfile.profileName
-            }
+            commentStatus = 'pending'
+            commentError = null
         } else if (skipComment) {
             commentStatus = 'skipped'
             commentError = null
@@ -22063,13 +22995,13 @@ function enqueueBackgroundTask(
     label: string,
     task: () => Promise<unknown>,
 ): void {
-    const runner = (async () => {
-        try {
+    const runner = Promise.resolve()
+        .then(async () => {
             await task()
-        } catch (error) {
+        })
+        .catch((error) => {
             console.error(`[${label}] ${error instanceof Error ? error.message : String(error)}`)
-        }
-    })()
+        })
 
     if (ctx) {
         ctx.waitUntil(runner)
@@ -22084,6 +23016,190 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
     for (const obj of pendingList.objects) {
         console.log(`[CRON] Pending comment cleanup: deleting legacy object ${obj.key}`)
         await env.BUCKET.delete(obj.key)
+    }
+
+    await ensurePostHistoryTraceColumns(env.DB)
+    const pendingRows = await env.DB.prepare(
+        `SELECT ph.id,
+                ph.bot_id,
+                ph.page_id,
+                ph.video_id,
+                ph.fb_post_id,
+                ph.fb_reel_url,
+                ph.shopee_link,
+                ph.lazada_link,
+                ph.status,
+                p.name AS page_name,
+                p.access_token
+         FROM post_history ph
+         JOIN pages p ON p.id = ph.page_id
+         WHERE ph.comment_status = 'pending'
+           AND TRIM(COALESCE(ph.fb_post_id, '')) <> ''
+           AND (
+                ph.comment_due_at IS NULL
+                OR datetime(ph.comment_due_at) <= datetime('now')
+           )
+         ORDER BY datetime(ph.posted_at) ASC, ph.id ASC
+         LIMIT 20`
+    ).all() as {
+        results?: Array<{
+            id?: number
+            bot_id?: string
+            page_id?: string
+            video_id?: string
+            fb_post_id?: string
+            fb_reel_url?: string
+            shopee_link?: string
+            lazada_link?: string
+            status?: string
+            page_name?: string
+            access_token?: string
+        }>
+    }
+
+    for (const row of pendingRows.results || []) {
+        const historyId = Number(row.id || 0)
+        const botId = String(row.bot_id || '').trim()
+        const pageId = String(row.page_id || '').trim()
+        const pageName = String(row.page_name || '').trim()
+        const targetFromUrl = String(row.fb_reel_url || '').trim()
+            ? extractReelIdFromPermalink(normalizeFacebookPermalink(String(row.fb_reel_url || '').trim()))
+            : ''
+        const targetId = targetFromUrl || String(row.fb_post_id || '').trim()
+        const videoId = String(row.video_id || '').trim()
+        const pageLockKey = buildPostingLockKey({ scope: 'page', namespaceId: botId, pageId })
+        const videoLockKey = buildPostingLockKey({ scope: 'video', namespaceId: botId, videoId })
+        const commentJobLockKey = await tryAcquirePostingLock(env.DB, {
+            scope: 'video',
+            namespaceId: botId,
+            videoId: `comment:${historyId}`,
+            ttlMinutes: 15,
+        })
+
+        if (!commentJobLockKey) {
+            continue
+        }
+
+        const claimResult = await env.DB.prepare(
+            `UPDATE post_history
+             SET comment_status='processing',
+                 comment_error=NULL
+             WHERE id = ?
+               AND comment_status = 'pending'`
+        ).bind(historyId).run().catch(() => null)
+
+        if (Number(claimResult?.meta?.changes || 0) === 0) {
+            await releasePostingLock(env.DB, commentJobLockKey).catch(() => { })
+            continue
+        }
+
+        if (!historyId || !botId || !pageId || !targetId) {
+            await env.DB.prepare(
+                "UPDATE post_history SET status='success', comment_status='failed', comment_error=? WHERE id=?"
+            ).bind('comment_target_missing', historyId).run().catch(() => { })
+            await releasePostingLock(env.DB, pageLockKey).catch(() => { })
+            await releasePostingLock(env.DB, videoLockKey).catch(() => { })
+            await releasePostingLock(env.DB, commentJobLockKey).catch(() => { })
+            continue
+        }
+
+        try {
+            const tokenCandidates = await ensurePageTokenCandidates({
+                env,
+                db: env.DB,
+                namespaceId: botId,
+                pageId,
+                pageName,
+                primaryToken: String(row.access_token || ''),
+                logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+            })
+            const commentToken = String(tokenCandidates.commentTokens[0] || '').trim()
+            const commentTokenHint = deriveCommentTokenHint(commentToken)
+            const commentProfile = await resolvePostHistoryProfileByToken(env, commentToken)
+
+            if (!commentToken) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
+                ).bind('access_token_missing', commentTokenHint, historyId).run().catch(() => { })
+                continue
+            }
+
+            const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+            const shopeeLink = await resolveShopeeLinkForRetry({
+                db: env.DB,
+                bucket,
+                namespaceId: botId,
+                videoId,
+                preferred: String(row.shopee_link || ''),
+            })
+
+            if (!shopeeLink) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                ).bind('shopee_link_missing', commentTokenHint, commentProfile.profileId, commentProfile.profileName, historyId).run().catch(() => { })
+                continue
+            }
+
+            const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
+                env,
+                namespaceId: botId,
+                shopeeLink,
+                logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+            })
+
+            const commentResult = await postShopeeCommentWithFallback({
+                env,
+                namespaceId: botId,
+                fbVideoId: targetId,
+                shopeeLink: shortShopeeLink,
+                lazadaLink: String(row.lazada_link || '').trim(),
+                commentTokens: tokenCandidates.commentTokens,
+                pageId,
+                logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+            })
+
+            if (commentResult.ok) {
+                const usedToken = String(commentResult.commentToken || commentToken || '').trim()
+                const usedTokenHint = deriveCommentTokenHint(usedToken)
+                const usedProfile = await resolvePostHistoryProfileByToken(env, usedToken)
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                ).bind(
+                    commentResult.id || null,
+                    usedTokenHint,
+                    usedProfile.profileId,
+                    usedProfile.profileName,
+                    historyId,
+                ).run().catch(() => { })
+            } else {
+                const usedToken = String(commentResult.commentToken || commentToken || '').trim()
+                const usedTokenHint = deriveCommentTokenHint(usedToken)
+                const usedProfile = await resolvePostHistoryProfileByToken(env, usedToken)
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                ).bind(
+                    commentResult.error || 'comment_failed',
+                    usedTokenHint,
+                    usedProfile.profileId,
+                    usedProfile.profileName,
+                    historyId,
+                ).run().catch(() => { })
+            }
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error)
+            await env.DB.prepare(
+                `UPDATE post_history
+                 SET status='success',
+                     comment_status='pending',
+                     comment_error=?
+                 WHERE id = ?
+                   AND comment_status = 'processing'`
+            ).bind(errorMessage || 'comment_backlog_failed', historyId).run().catch(() => { })
+        } finally {
+            await releasePostingLock(env.DB, pageLockKey).catch(() => { })
+            await releasePostingLock(env.DB, videoLockKey).catch(() => { })
+            await releasePostingLock(env.DB, commentJobLockKey).catch(() => { })
+        }
     }
 }
 
@@ -22174,7 +23290,7 @@ async function updateCronRuntimeState(db: D1Database, patch: {
 
 async function recoverStaleScheduledRun(db: D1Database, maxStaleMs = 90_000): Promise<boolean> {
     const runtime = await db.prepare(
-        `SELECT run_id, status, started_at, heartbeat_at
+        `SELECT run_id, status, started_at, heartbeat_at, pages_visited
          FROM cron_runtime_state
          WHERE id = 'scheduled'
          LIMIT 1`
@@ -22183,13 +23299,19 @@ async function recoverStaleScheduledRun(db: D1Database, maxStaleMs = 90_000): Pr
         status?: string | null
         started_at?: string | null
         heartbeat_at?: string | null
+        pages_visited?: number | null
     } | null
 
     const status = String(runtime?.status || '').trim().toLowerCase()
     const heartbeatAt = String(runtime?.heartbeat_at || '').trim()
     const heartbeatMs = Date.parse(heartbeatAt)
+    const startedAtMs = Date.parse(String(runtime?.started_at || '').trim())
+    const pagesVisited = Number(runtime?.pages_visited || 0)
     if (status !== 'running' || !Number.isFinite(heartbeatMs)) return false
-    if ((Date.now() - heartbeatMs) <= Math.max(30_000, maxStaleMs)) return false
+    const ageMs = Date.now() - heartbeatMs
+    const startupAgeMs = Number.isFinite(startedAtMs) ? (Date.now() - startedAtMs) : ageMs
+    const startupHung = pagesVisited <= 0 && startupAgeMs > 20_000
+    if (!startupHung && ageMs <= Math.max(30_000, maxStaleMs)) return false
 
     const staleError = `stale_scheduled_run_recovered:${String(runtime?.run_id || '').trim() || 'unknown'}`
     await db.prepare(
@@ -22212,6 +23334,21 @@ async function recoverStaleScheduledRun(db: D1Database, maxStaleMs = 90_000): Pr
 async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     console.log('[CRON] Starting auto-post check...')
     const dedupCommentTargets = new Set<string>()
+    await env.DB.prepare(
+        `DELETE FROM posting_locks
+         WHERE lock_key = 'page::__scheduled__::run'
+           AND NOT EXISTS (
+               SELECT 1
+               FROM cron_runtime_state
+               WHERE id = 'scheduled'
+                 AND status = 'running'
+           )`
+    ).run().catch(() => { })
+    await env.DB.prepare(
+        `DELETE FROM posting_locks
+         WHERE lock_key = 'page::__scheduled__::run'
+           AND datetime(created_at) < datetime('now', '-2 minutes')`
+    ).run().catch(() => { })
     await recoverStaleScheduledRun(env.DB).catch(() => { })
     let scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
         scope: 'page',
@@ -22323,9 +23460,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     }
     const geminiApiKeysByNamespace = new Map<string, string[]>()
     const postingOrderByNamespace = new Map<string, NamespacePostingOrder>()
+    const shortlinkEnabledByNamespace = new Map<string, boolean>()
+    const galleryVideosByNamespace = new Map<string, Array<Record<string, unknown>>>()
     const reconciledNamespaces = new Set<string>()
     let fatalError: Error | null = null
-    updateCronRuntimeState(env.DB, {
+    await updateCronRuntimeState(env.DB, {
         runId,
         status: 'running',
         startedAt: nowISO,
@@ -22345,7 +23484,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         for (const page of pages) {
             const botId = page.bot_id || 'default'
             cronStats.pagesVisited += 1
-            updateCronRuntimeState(env.DB, {
+            await updateCronRuntimeState(env.DB, {
                 runId,
                 heartbeatAt: new Date().toISOString(),
                 currentPageId: String(page.id || ''),
@@ -22371,73 +23510,29 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     reconciledNamespaces.add(botId)
                 }
                 await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
-                const shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
-                if (!shortlinkEnabled) {
-                    await env.DB.prepare(
-                        `UPDATE post_history
-                         SET status = 'failed',
-                             error_message = 'shortlink_disabled_gallery_empty',
-                             comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
-                             comment_error = CASE WHEN comment_status = 'pending' THEN 'shortlink_disabled_gallery_empty' ELSE comment_error END
-                         WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
-                    ).bind(botId, page.id).run().catch(() => { })
-                    console.log(`[CRON] Page ${page.name}: skip (shortlink disabled for namespace ${botId})`)
-                    continue
-                }
+                const rawSchedule = (page.post_hours || '').trim()
+                const intervalMatch = rawSchedule.match(/^every:(\d{1,4})$/i)
 
-                const namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
-                if (namespaceGalleryVideos.length === 0) {
-                    await env.DB.prepare(
-                        `UPDATE post_history
-                         SET status = 'failed',
-                             error_message = 'gallery_empty',
-                             comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
-                             comment_error = CASE WHEN comment_status = 'pending' THEN 'gallery_empty' ELSE comment_error END
-                         WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
-                    ).bind(botId, page.id).run().catch(() => { })
-                    console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
-                    continue
-                }
+                // Decide whether this page is due before touching gallery/token work.
+                let dedupKey = ''
+                if (intervalMatch) {
+                    const intervalMinutes = Math.max(5, Math.min(720, parseInt(intervalMatch[1], 10) || 60))
+                    const intervalMs = intervalMinutes * 60_000
+                    const nowMs = now.getTime()
+                    const lastPostedMs = page.last_post_at ? new Date(page.last_post_at).getTime() : 0
+                    const elapsedMs = page.last_post_at ? (nowMs - lastPostedMs) : Number.POSITIVE_INFINITY
 
-                const pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
-                    scope: 'page',
-                    namespaceId: botId,
-                    pageId: String(page.id || ''),
-                })
-                if (!pagePostingLockKey) {
-                    console.log(`[CRON] Page ${page.name}: skip (page lock busy)`)
-                    continue
-                }
-                let videoPostingLockKey: string | null = null
+                    if (page.last_post_at && elapsedMs < intervalMs) {
+                        const remainMin = Math.ceil((intervalMs - elapsedMs) / 60_000)
+                        console.log(`[CRON] Page ${page.name}: skip (interval every ${intervalMinutes}m, remaining ${remainMin}m)`)
+                        continue
+                    }
 
-                try {
-
-        // สร้าง bucket สำหรับ namespace นี้
-        const botBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
-
-        const rawSchedule = (page.post_hours || '').trim()
-        const intervalMatch = rawSchedule.match(/^every:(\d{1,4})$/i)
-
-        // CRITICAL: Atomic dedup using R2 (prevents concurrent cron executions from double-posting)
-        let dedupKey = ''
-        if (intervalMatch) {
-            const intervalMinutes = Math.max(5, Math.min(720, parseInt(intervalMatch[1], 10) || 60))
-            const intervalMs = intervalMinutes * 60_000
-            const nowMs = now.getTime()
-            const lastPostedMs = page.last_post_at ? new Date(page.last_post_at).getTime() : 0
-            const elapsedMs = page.last_post_at ? (nowMs - lastPostedMs) : Number.POSITIVE_INFINITY
-
-            if (page.last_post_at && elapsedMs < intervalMs) {
-                const remainMin = Math.ceil((intervalMs - elapsedMs) / 60_000)
-                console.log(`[CRON] Page ${page.name}: skip (interval every ${intervalMinutes}m, remaining ${remainMin}m)`)
-                continue
-            }
-
-            const intervalBucket = Math.floor(nowMs / intervalMs)
-            dedupKey = `_cron_dedup/${page.id}/interval_${intervalMinutes}_${intervalBucket}`
-            console.log(`[CRON] Page ${page.name}: posting by interval every ${intervalMinutes}m`)
-        } else {
-            const scheduledTimes = rawSchedule
+                    const intervalBucket = Math.floor(nowMs / intervalMs)
+                    dedupKey = `_cron_dedup/${page.id}/interval_${intervalMinutes}_${intervalBucket}`
+                    console.log(`[CRON] Page ${page.name}: posting by interval every ${intervalMinutes}m`)
+                } else {
+                    const scheduledTimes = rawSchedule
                 .split(',')
                 .map(part => part.trim())
                 .filter(Boolean)
@@ -22472,81 +23567,128 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 )
                 .sort((a, b) => a.totalMin - b.totalMin)
 
-            if (scheduledTimes.length === 0) {
-                console.log(`[CRON] Page ${page.name}: skip (invalid slots: ${rawSchedule || 'empty'})`)
-                continue
-            }
+                    if (scheduledTimes.length === 0) {
+                        console.log(`[CRON] Page ${page.name}: skip (invalid slots: ${rawSchedule || 'empty'})`)
+                        continue
+                    }
 
-            // Find a slot that is due now (allow small early trigger and delayed catch-up window).
-            const { results: todayPosts } = await env.DB.prepare(
-                "SELECT posted_at FROM post_history WHERE page_id = ? AND bot_id = ? AND status IN ('success','posting')"
-            ).bind(page.id, botId).all() as { results: Array<{ posted_at: string }> }
+                    const { results: todayPosts } = await env.DB.prepare(
+                        "SELECT posted_at FROM post_history WHERE page_id = ? AND bot_id = ? AND status IN ('success','posting')"
+                    ).bind(page.id, botId).all() as { results: Array<{ posted_at: string }> }
 
-            // Helper to get Thai time parts from ISO date
-            const getThaiTimeParts = (isoDate: string) => {
-                const d = new Date(isoDate)
-                const timeParts = thaiTimeFormatter.formatToParts(d)
-                const dateParts = thaiDateFormatter.formatToParts(d)
-                const hour = parseInt(timeParts.find(p => p.type === 'hour')?.value || '0', 10)
-                const minute = parseInt(timeParts.find(p => p.type === 'minute')?.value || '0', 10)
-                const year = dateParts.find(p => p.type === 'year')?.value
-                const month = dateParts.find(p => p.type === 'month')?.value
-                const day = dateParts.find(p => p.type === 'day')?.value
-                return {
-                    totalMin: hour * 60 + minute,
-                    dateStr: `${year}-${month}-${day}`
+                    const getThaiTimeParts = (isoDate: string) => {
+                        const d = new Date(isoDate)
+                        const timeParts = thaiTimeFormatter.formatToParts(d)
+                        const dateParts = thaiDateFormatter.formatToParts(d)
+                        const hour = parseInt(timeParts.find(p => p.type === 'hour')?.value || '0', 10)
+                        const minute = parseInt(timeParts.find(p => p.type === 'minute')?.value || '0', 10)
+                        const year = dateParts.find(p => p.type === 'year')?.value
+                        const month = dateParts.find(p => p.type === 'month')?.value
+                        const day = dateParts.find(p => p.type === 'day')?.value
+                        return {
+                            totalMin: hour * 60 + minute,
+                            dateStr: `${year}-${month}-${day}`
+                        }
+                    }
+
+                    const postedSlots = new Set(todayPosts.map(p => getThaiTimeParts(p.posted_at))
+                        .filter(pt => pt.dateStr === todayStr)
+                        .map(pt => pt.totalMin))
+
+                    const dueSlots = scheduledTimes.filter(({ totalMin }) => {
+                        if (postedSlots.has(totalMin)) return false
+                        const lagMinutes = nowMinutes - totalMin
+                        return lagMinutes >= -slotEarlyToleranceMinutes && lagMinutes <= slotLateGraceMinutes
+                    })
+                    const matchedSlot = dueSlots.length > 0
+                        ? dueSlots.reduce((latest, slot) => (slot.totalMin > latest.totalMin ? slot : latest), dueSlots[0])
+                        : null
+
+                    if (!matchedSlot) {
+                        const unpostedFutureSlot = scheduledTimes.find((slot) => !postedSlots.has(slot.totalMin) && slot.totalMin >= nowMinutes) || null
+                        const unpostedPastSlot = [...scheduledTimes].reverse().find((slot) => !postedSlots.has(slot.totalMin) && slot.totalMin < nowMinutes) || null
+                        const hintSlot = unpostedFutureSlot || unpostedPastSlot
+                        const hintText = hintSlot ? formatSlot(hintSlot) : 'none'
+                        console.log(
+                            `[CRON] Page ${page.name}: skip (no due slot, now=${nowMinutes}m, grace=${slotLateGraceMinutes}m, next=${hintText}, slots=${rawSchedule})`
+                        )
+                        continue
+                    }
+
+                    const slotLagMinutes = nowMinutes - matchedSlot.totalMin
+                    const slotLagText = slotLagMinutes >= 0 ? `+${slotLagMinutes}` : `${slotLagMinutes}`
+                    console.log(`[CRON] Page ${page.name}: posting for slot ${formatSlot(matchedSlot)} (lag ${slotLagText}m)`)
+                    dedupKey = `_cron_dedup/${page.id}/${todayStr}/${matchedSlot.hour}_${matchedSlot.minute}`
                 }
-            }
 
-            const postedSlots = new Set(todayPosts.map(p => getThaiTimeParts(p.posted_at))
-                .filter(pt => pt.dateStr === todayStr)
-                .map(pt => pt.totalMin))
+                const pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
+                    scope: 'page',
+                    namespaceId: botId,
+                    pageId: String(page.id || ''),
+                })
+                if (!pagePostingLockKey) {
+                    console.log(`[CRON] Page ${page.name}: skip (page lock busy)`)
+                    continue
+                }
+                let videoPostingLockKey: string | null = null
 
-            const dueSlots = scheduledTimes.filter(({ totalMin }) => {
-                if (postedSlots.has(totalMin)) return false
-                const lagMinutes = nowMinutes - totalMin
-                return lagMinutes >= -slotEarlyToleranceMinutes && lagMinutes <= slotLateGraceMinutes
-            })
-            const matchedSlot = dueSlots.length > 0
-                ? dueSlots.reduce((latest, slot) => (slot.totalMin > latest.totalMin ? slot : latest), dueSlots[0])
-                : null
+                try {
+                    const botBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+                    const scheduleLockAcquired = await tryAcquireCronScheduleLock(env.DB, dedupKey, botId, String(page.id || ''))
+                    if (!scheduleLockAcquired) {
+                        console.log(`[CRON] Page ${page.name}: already locked for this schedule window`)
+                        continue
+                    }
+                    const existingDedup = await botBucket.head(dedupKey)
+                    if (existingDedup) {
+                        console.log(`[CRON] Page ${page.name}: already posted for this schedule window (dedup key exists)`)
+                        continue
+                    }
+                    await botBucket.put(dedupKey, nowISO, {
+                        httpMetadata: { contentType: 'text/plain' },
+                        customMetadata: { createdAt: nowISO }
+                    })
 
-            if (!matchedSlot) {
-                const unpostedFutureSlot = scheduledTimes.find((slot) => !postedSlots.has(slot.totalMin) && slot.totalMin >= nowMinutes) || null
-                const unpostedPastSlot = [...scheduledTimes].reverse().find((slot) => !postedSlots.has(slot.totalMin) && slot.totalMin < nowMinutes) || null
-                const hintSlot = unpostedFutureSlot || unpostedPastSlot
-                const hintText = hintSlot ? formatSlot(hintSlot) : 'none'
-                console.log(
-                    `[CRON] Page ${page.name}: skip (no due slot, now=${nowMinutes}m, grace=${slotLateGraceMinutes}m, next=${hintText}, slots=${rawSchedule})`
-                )
-                continue
-            }
+                    let shortlinkEnabled = shortlinkEnabledByNamespace.get(botId)
+                    if (typeof shortlinkEnabled !== 'boolean') {
+                        shortlinkEnabled = await isSystemGalleryEnabledForNamespace(env.DB, botId)
+                        shortlinkEnabledByNamespace.set(botId, shortlinkEnabled)
+                    }
+                    if (!shortlinkEnabled) {
+                        await env.DB.prepare(
+                            `UPDATE post_history
+                             SET status = 'failed',
+                                 error_message = 'shortlink_disabled_gallery_empty',
+                                 comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
+                                 comment_error = CASE WHEN comment_status = 'pending' THEN 'shortlink_disabled_gallery_empty' ELSE comment_error END
+                             WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
+                        ).bind(botId, page.id).run().catch(() => { })
+                        console.log(`[CRON] Page ${page.name}: skip (shortlink disabled for namespace ${botId})`)
+                        await botBucket.delete(dedupKey).catch(() => { })
+                        continue
+                    }
 
-            const slotLagMinutes = nowMinutes - matchedSlot.totalMin
-            const slotLagText = slotLagMinutes >= 0 ? `+${slotLagMinutes}` : `${slotLagMinutes}`
-            console.log(`[CRON] Page ${page.name}: posting for slot ${formatSlot(matchedSlot)} (lag ${slotLagText}m)`)
-            dedupKey = `_cron_dedup/${page.id}/${todayStr}/${matchedSlot.hour}_${matchedSlot.minute}`
-        }
+                    let namespaceGalleryVideos = galleryVideosByNamespace.get(botId)
+                    if (!namespaceGalleryVideos) {
+                        namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
+                        galleryVideosByNamespace.set(botId, namespaceGalleryVideos)
+                    }
+                    if (namespaceGalleryVideos.length === 0) {
+                        await env.DB.prepare(
+                            `UPDATE post_history
+                             SET status = 'failed',
+                                 error_message = 'gallery_empty',
+                                 comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
+                                 comment_error = CASE WHEN comment_status = 'pending' THEN 'gallery_empty' ELSE comment_error END
+                             WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
+                        ).bind(botId, page.id).run().catch(() => { })
+                        console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
+                        await botBucket.delete(dedupKey).catch(() => { })
+                        continue
+                    }
 
-        const scheduleLockAcquired = await tryAcquireCronScheduleLock(env.DB, dedupKey, botId, String(page.id || ''))
-        if (!scheduleLockAcquired) {
-            console.log(`[CRON] Page ${page.name}: already locked for this schedule window`)
-            continue
-        }
-        const existingDedup = await botBucket.head(dedupKey)
-        if (existingDedup) {
-            console.log(`[CRON] Page ${page.name}: already posted for this schedule window (dedup key exists)`)
-            continue
-        }
-        // Set dedup key immediately (before any async operations) - TTL 24 hours
-        await botBucket.put(dedupKey, nowISO, {
-            httpMetadata: { contentType: 'text/plain' },
-            customMetadata: { createdAt: nowISO }
-        })
-
-        // 2. Get a video that hasn't been posted anywhere in this namespace in the last 30 days
-        const unpostedVideos = namespaceGalleryVideos.filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
-        console.log(`[CRON] Page ${page.name}: ready=${namespaceGalleryVideos.length}, unposted=${unpostedVideos.length}, posted=${Math.max(0, namespaceGalleryVideos.length - unpostedVideos.length)}`)
+                    const unpostedVideos = namespaceGalleryVideos.filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
+                    console.log(`[CRON] Page ${page.name}: ready=${namespaceGalleryVideos.length}, unposted=${unpostedVideos.length}, posted=${Math.max(0, namespaceGalleryVideos.length - unpostedVideos.length)}`)
 
         let postingOrder = postingOrderByNamespace.get(botId)
         if (!postingOrder) {
@@ -22750,69 +23892,16 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 ).run()
             }
 
-            // คอมเม้นท์เลยหลังรอ 10 วินาที
             let commentStatus = postReadyCommentState.status
             let commentError: string | null = postReadyCommentState.error
             let commentFbId: string | null = null
             let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
             let commentProfileId: string | null = null
             let commentProfileName: string | null = null
-            const commentTargetId = fbVideoId || confirmedPostId
-            const commentTargetDedupKey = buildCommentTargetDedupKey(commentTargetId, page.id)
 
             if (normalizedShopeeLink && hasCommentToken) {
-                if (dedupCommentTargets.has(commentTargetDedupKey)) {
-                    console.log(`[CRON] Page ${page.name}: skip comment for ${commentTargetId} (already commented in this run)`)
-                    commentStatus = 'success'
-                } else {
-                    const commentWaitMs = (scheduledCommentDelaySeconds || 0) * 1000
-                    console.log(`[CRON] Page ${page.name}: waiting ${Math.ceil(commentWaitMs / 1000)}s before comment...`)
-                    await waitMs(commentWaitMs)
-                    if (cronHistoryId) {
-                        await env.DB.prepare(
-                            "UPDATE post_history SET comment_status = 'pending', comment_token_hint = ?, comment_error = NULL WHERE id = ? AND status = 'posting'"
-                        ).bind(
-                            deriveCommentTokenHint(commentTokenUsed),
-                            cronHistoryId,
-                        ).run()
-                    }
-                    const commentResult = await postShopeeCommentWithFallback({
-                        env,
-                        namespaceId: botId,
-                        fbVideoId: commentTargetId,
-                        shopeeLink: normalizedShopeeLink,
-                        lazadaLink: normalizedLazadaLink,
-                        commentTokens: commentTokenCandidates,
-                        pageId: page.id,
-                        logPrefix: `CRON ${page.name}`,
-                    })
-                    if (!commentResult.ok) {
-                        commentStatus = 'failed'
-                        commentError = commentResult.error || 'comment_failed'
-                        commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                        const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                        commentProfileId = commentProfile.profileId
-                        commentProfileName = commentProfile.profileName
-                        console.error(`[CRON] Page ${page.name}: comment FAILED: ${commentResult.error}`)
-                        await notifyCommentTokenIssue(
-                            env,
-                            botId,
-                            page.id,
-                            page.name,
-                            commentError,
-                        ).catch((notifyErr) => {
-                            console.error(`[CRON] Page ${page.name}: notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
-                        })
-                    } else {
-                        dedupCommentTargets.add(commentTargetDedupKey)
-                        commentStatus = 'success'
-                        commentFbId = commentResult.id || null
-                        commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                        const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                        commentProfileId = commentProfile.profileId
-                        commentProfileName = commentProfile.profileName
-                    }
-                }
+                commentStatus = 'pending'
+                commentError = null
             }
 
             // Update to success
@@ -22844,7 +23933,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 postedAt: nowISO,
             }).catch(() => { })
             cronStats.pagesPosted += 1
-            updateCronRuntimeState(env.DB, {
+            await updateCronRuntimeState(env.DB, {
                 runId,
                 heartbeatAt: new Date().toISOString(),
                 pagesVisited: cronStats.pagesVisited,
@@ -23019,7 +24108,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 cronStats.pagesFailed += 1
                 const message = pageError instanceof Error ? pageError.message : String(pageError)
                 console.error(`[CRON] Page ${page.name}: unexpected fatal page error - ${message}`)
-                updateCronRuntimeState(env.DB, {
+                await updateCronRuntimeState(env.DB, {
                     runId,
                     heartbeatAt: new Date().toISOString(),
                     pagesVisited: cronStats.pagesVisited,
@@ -23029,7 +24118,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 }).catch(() => { })
                 continue
             } finally {
-                updateCronRuntimeState(env.DB, {
+                await updateCronRuntimeState(env.DB, {
                     runId,
                     heartbeatAt: new Date().toISOString(),
                     currentPageId: null,
@@ -23045,6 +24134,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         fatalError = error instanceof Error ? error : new Error(String(error))
         throw fatalError
     } finally {
+        await env.DB.prepare(
+            `DELETE FROM posting_locks
+             WHERE lock_key = 'page::__scheduled__::run'`
+        ).run().catch(() => { })
         await updateCronRuntimeState(env.DB, {
             runId,
             status: fatalError ? 'failed' : 'idle',
@@ -23235,5 +24328,8 @@ export default {
             await warmPipelineContainer(env)
         })
         await handleScheduled(env, _ctx)
+        enqueueBackgroundTask(_ctx, 'CRON PENDING COMMENTS', async () => {
+            await processPendingCommentBacklog(env)
+        })
     },
 }

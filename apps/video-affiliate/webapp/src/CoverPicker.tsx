@@ -1241,15 +1241,12 @@ function drawTemplateOverlay(
   ctx.textAlign = 'center'
   ctx.textBaseline = 'top'
   ctx.lineJoin = 'round'
-  ctx.lineWidth = Math.max(3, Math.round(fontSize * 0.1))
 
-  const drawLines = (fillStyle: string, strokeStyle = 'rgba(0,0,0,0.4)', align: CanvasTextAlign = 'center', x = centerX, startYOverride?: number) => {
+  const drawLines = (fillStyle: string, align: CanvasTextAlign = 'center', x = centerX, startYOverride?: number) => {
     ctx.textAlign = align
     ctx.fillStyle = fillStyle
-    ctx.strokeStyle = strokeStyle
     lines.forEach((line, index) => {
       const y = (startYOverride ?? startY) + index * lineHeight
-      ctx.strokeText(line, x, y)
       ctx.fillText(line, x, y)
     })
   }
@@ -1266,11 +1263,8 @@ function drawTemplateOverlay(
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
     ctx.fillStyle = '#FFFFFF'
-    ctx.strokeStyle = 'rgba(0,0,0,0.2)'
-    ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.08))
     lines.forEach((line, index) => {
       const y = startY + index * lineHeight
-      ctx.strokeText(line, centerX, y)
       ctx.fillText(line, centerX, y)
     })
     return
@@ -1284,14 +1278,12 @@ function drawTemplateOverlay(
     ctx.lineWidth = 2
     roundRect(ctx, panelX, panelY, panelW, panelH, 28)
     ctx.stroke()
-    drawLines('#0F172A', 'rgba(255,255,255,0.18)')
+    drawLines('#0F172A')
     return
   }
 
   if (template.id === 'template-3') {
-    ctx.strokeStyle = 'rgba(0,0,0,0.7)'
-    ctx.lineWidth = Math.max(5, Math.round(fontSize * 0.12))
-    drawLines('#FFFFFF', 'rgba(0,0,0,0.7)', 'center', centerX, containerY)
+    drawLines('#FFFFFF', 'center', centerX, containerY)
     ctx.fillStyle = template.accent
     roundRect(ctx, centerX - 64, containerY + textBlockHeight + 14, 128, 10, 999)
     ctx.fill()
@@ -1323,7 +1315,7 @@ function drawTemplateOverlay(
     ctx.fill()
     ctx.font = buildCanvasFont(fontFamily, fontSize, { weight: 800 })
     startY += 2
-    drawLines('#FFFFFF', 'rgba(0,0,0,0.38)', 'left', panelX + 44)
+    drawLines('#FFFFFF', 'left', panelX + 44)
     return
   }
 
@@ -1339,7 +1331,7 @@ function drawTemplateOverlay(
     ctx.fillStyle = '#FFFFFF'
     roundRect(ctx, panelX, panelY, panelW, panelH, 26)
     ctx.fill()
-    drawLines('#111827', 'rgba(255,255,255,0.1)', 'left', panelX + 22)
+    drawLines('#111827', 'left', panelX + 22)
     return
   }
 
@@ -1350,7 +1342,7 @@ function drawTemplateOverlay(
     ctx.fillStyle = gradient
     roundRect(ctx, panelX, panelY, panelW, panelH, 22)
     ctx.fill()
-    drawLines('#FFFFFF', 'rgba(0,0,0,0.28)')
+    drawLines('#FFFFFF')
     return
   }
 
@@ -1362,7 +1354,7 @@ function drawTemplateOverlay(
     ctx.lineWidth = 4
     roundRect(ctx, panelX, panelY, panelW, panelH, 24)
     ctx.stroke()
-    drawLines('#FFFFFF', 'rgba(0,0,0,0.3)')
+    drawLines('#FFFFFF')
     return
   }
 
@@ -1371,7 +1363,7 @@ function drawTemplateOverlay(
   gradient.addColorStop(1, template.accentAlt)
   ctx.fillStyle = gradient
   ctx.fillRect(0, panelY - 8, width, panelH + 16)
-  drawLines('#FFFFFF', 'rgba(0,0,0,0.28)')
+  drawLines('#FFFFFF')
 }
 
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number) {

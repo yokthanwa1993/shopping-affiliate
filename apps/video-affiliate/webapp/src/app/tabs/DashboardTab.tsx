@@ -13,6 +13,9 @@ export function DashboardTab({
   dashboardLoading: boolean
   dashboardData: DashboardData | null
 }) {
+  const totals = dashboardData?.totals
+  const admins = dashboardData?.admins || []
+
   return (
     <div className="px-4 space-y-4">
       <div className="bg-white border border-gray-200 rounded-2xl p-3 shadow-sm">
@@ -48,64 +51,93 @@ export function DashboardTab({
         </div>
       </div>
 
-      {dashboardLoading && !dashboardData ? (
-        <div className="space-y-3">
-          {[1, 2, 3].map((i) => (
-            <div key={i} className="h-24 rounded-2xl bg-gray-100 animate-pulse" />
-          ))}
+      <div className="grid grid-cols-2 gap-3">
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
+          <p className="text-xs text-gray-400 font-semibold">โพสต์ทั้งหมด</p>
+          {dashboardLoading && !dashboardData ? (
+            <div className="mt-2 h-8 w-16 rounded-lg bg-gray-100 animate-pulse" />
+          ) : (
+            <p className="mt-2 text-2xl font-extrabold text-gray-900">{totals?.posts_all || 0}</p>
+          )}
         </div>
-      ) : (
-        <>
-          <div className="grid grid-cols-2 gap-3">
-            <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-              <p className="text-xs text-gray-400 font-semibold">โพสต์ทั้งหมด</p>
-              <p className="mt-2 text-2xl font-extrabold text-gray-900">{dashboardData?.totals.posts_all || 0}</p>
-            </div>
-            <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-              <p className="text-xs text-gray-400 font-semibold">โพสต์วันนี้</p>
-              <p className="mt-2 text-2xl font-extrabold text-blue-600">{dashboardData?.totals.posts_on_date || 0}</p>
-            </div>
-            <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-              <p className="text-xs text-gray-400 font-semibold">ลิงก์ทั้งหมด</p>
-              <p className="mt-2 text-2xl font-extrabold text-gray-900">{dashboardData?.totals.links_all || 0}</p>
-            </div>
-            <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-              <p className="text-xs text-gray-400 font-semibold">ลิงก์วันนี้</p>
-              <p className="mt-2 text-2xl font-extrabold text-emerald-600">{dashboardData?.totals.links_on_date || 0}</p>
-            </div>
-          </div>
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
+          <p className="text-xs text-gray-400 font-semibold">โพสต์วันนี้</p>
+          {dashboardLoading && !dashboardData ? (
+            <div className="mt-2 h-8 w-16 rounded-lg bg-blue-100 animate-pulse" />
+          ) : (
+            <p className="mt-2 text-2xl font-extrabold text-blue-600">{totals?.posts_on_date || 0}</p>
+          )}
+        </div>
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
+          <p className="text-xs text-gray-400 font-semibold">ลิงก์ทั้งหมด</p>
+          {dashboardLoading && !dashboardData ? (
+            <div className="mt-2 h-8 w-16 rounded-lg bg-gray-100 animate-pulse" />
+          ) : (
+            <p className="mt-2 text-2xl font-extrabold text-gray-900">{totals?.links_all || 0}</p>
+          )}
+        </div>
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
+          <p className="text-xs text-gray-400 font-semibold">ลิงก์วันนี้</p>
+          {dashboardLoading && !dashboardData ? (
+            <div className="mt-2 h-8 w-16 rounded-lg bg-emerald-100 animate-pulse" />
+          ) : (
+            <p className="mt-2 text-2xl font-extrabold text-emerald-600">{totals?.links_on_date || 0}</p>
+          )}
+        </div>
+      </div>
 
-          <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
-            <p className="text-sm font-bold text-gray-900 mb-3">ผู้ส่งลิงก์ต่อวัน</p>
-            {dashboardData?.admins?.length ? (
-              <div className="space-y-2">
-                {dashboardData.admins.map((admin) => (
-                  <div key={`${admin.telegram_id}:${admin.email}`} className="flex items-center justify-between rounded-xl bg-gray-50 px-3 py-2">
-                    <div className="min-w-0 flex items-center gap-3">
-                      {admin.picture_url ? (
-                        <img src={admin.picture_url} className="h-10 w-10 rounded-full object-cover shrink-0" />
-                      ) : (
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-bold text-blue-600">
-                          {(String(admin.display_name || admin.line_user_id || '?').trim().charAt(0) || '?').toUpperCase()}
-                        </div>
-                      )}
-                      <div className="min-w-0">
-                        <p className="text-sm font-semibold text-gray-900 truncate">{admin.display_name || admin.line_user_id || 'LINE User'}</p>
-                        <p className="text-[11px] text-gray-400 truncate">
-                          {admin.line_user_id ? `LINE UID: ${admin.line_user_id}` : `TG ID: ${admin.telegram_id}`}
-                        </p>
-                      </div>
+      <div className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <p className="text-sm font-bold text-gray-900">ผู้ส่งลิงก์ต่อวัน</p>
+          {dashboardLoading && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2.5 py-1 text-[10px] font-bold text-blue-600">
+              <span className="h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+              กำลังอัปเดต
+            </span>
+          )}
+        </div>
+        {admins.length ? (
+          <div className="space-y-2">
+            {admins.map((admin) => (
+              <div key={`${admin.telegram_id}:${admin.email}`} className="flex items-center justify-between rounded-xl bg-gray-50 px-3 py-2">
+                <div className="min-w-0 flex items-center gap-3">
+                  {admin.picture_url ? (
+                    <img src={admin.picture_url} className="h-10 w-10 rounded-full object-cover shrink-0" />
+                  ) : (
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-sm font-bold text-blue-600">
+                      {(String(admin.display_name || admin.line_user_id || '?').trim().charAt(0) || '?').toUpperCase()}
                     </div>
-                    <span className="text-xs font-bold text-white bg-black px-2.5 py-1 rounded-full">{admin.links} ลิงก์</span>
+                  )}
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-gray-900 truncate">{admin.display_name || admin.line_user_id || 'LINE User'}</p>
+                    <p className="text-[11px] text-gray-400 truncate">
+                      {admin.line_user_id ? `LINE UID: ${admin.line_user_id}` : `TG ID: ${admin.telegram_id}`}
+                    </p>
                   </div>
-                ))}
+                </div>
+                <span className="text-xs font-bold text-white bg-black px-2.5 py-1 rounded-full">{admin.links} ลิงก์</span>
               </div>
-            ) : (
-              <p className="text-sm text-gray-400">ยังไม่มีข้อมูลลิงก์ในวันที่เลือก</p>
-            )}
+            ))}
           </div>
-        </>
-      )}
+        ) : dashboardLoading && !dashboardData ? (
+          <div className="space-y-2">
+            {[1, 2, 3].map((item) => (
+              <div key={item} className="flex items-center justify-between rounded-xl bg-gray-50 px-3 py-2">
+                <div className="flex items-center gap-3">
+                  <div className="h-10 w-10 rounded-full bg-gray-200 animate-pulse" />
+                  <div className="space-y-1.5">
+                    <div className="h-3 w-28 rounded bg-gray-200 animate-pulse" />
+                    <div className="h-2.5 w-20 rounded bg-gray-100 animate-pulse" />
+                  </div>
+                </div>
+                <div className="h-6 w-14 rounded-full bg-gray-200 animate-pulse" />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-gray-400">ยังไม่มีข้อมูลลิงก์ในวันที่เลือก</p>
+        )}
+      </div>
     </div>
   )
 }
