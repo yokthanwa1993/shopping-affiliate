@@ -34,19 +34,7 @@ export function getAppTabRouteFromSearch(search = ''): AppTabRoute {
 
   const liffStateUrl = decodeLiffStateUrl(params.get('liff.state'))
   const fromLiffState = normalizeAppTabRoute(liffStateUrl?.pathname || '')
-  if (fromLiffState !== 'dashboard') {
-    try { localStorage.setItem('_liff_tab', fromLiffState) } catch {}
-    return fromLiffState
-  }
-
-  try {
-    const saved = localStorage.getItem('_liff_tab')
-    const fromSaved = normalizeAppTabRoute(saved)
-    if (fromSaved !== 'dashboard') {
-      localStorage.removeItem('_liff_tab')
-      return fromSaved
-    }
-  } catch {}
+  if (fromLiffState !== 'dashboard') return fromLiffState
 
   return 'dashboard'
 }

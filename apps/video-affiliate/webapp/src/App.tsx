@@ -3247,30 +3247,21 @@ function App({
   }
   const getInitialTab = (): TabName => {
     if (!isBrowser) return controlledTab ?? 'dashboard'
-    // 1. URL path
+    // Route modules own navigation; tab comes from path first.
     const fromPath = matchTab(window.location.pathname)
-    if (fromPath) { try { localStorage.setItem('_liff_tab', fromPath) } catch {} return fromPath }
+    if (fromPath) return fromPath
 
-    // 2. ?tab= param
+    // Legacy entry links can still provide ?tab=
     const params = new URLSearchParams(window.location.search)
     const fromParam = matchTab(params.get('tab') || '')
-    if (fromParam) { try { localStorage.setItem('_liff_tab', fromParam) } catch {} return fromParam }
+    if (fromParam) return fromParam
 
-    // 3. ?liff.state= (LIFF encodes the extra path here during redirect)
+    // LIFF redirect fallback.
     const liffState = params.get('liff.state') || ''
     if (liffState) {
       const fromLiff = matchTab(decodeURIComponent(liffState))
-      if (fromLiff) { try { localStorage.setItem('_liff_tab', fromLiff) } catch {} return fromLiff }
+      if (fromLiff) return fromLiff
     }
-
-    // 4. localStorage (survives LIFF multi-redirect)
-    try {
-      const saved = localStorage.getItem('_liff_tab')
-      if (saved && validTabs.includes(saved as TabName)) {
-        localStorage.removeItem('_liff_tab')
-        return saved as TabName
-      }
-    } catch {}
 
     return 'dashboard'
   }
