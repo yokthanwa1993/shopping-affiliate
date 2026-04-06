@@ -1,5 +1,5 @@
 const DEFAULT_APP_LIFF_ID = '2009652996-DJtEhoDn'
-const DEFAULT_WEB_LIFF_ID = '2009652996-SPBvE4F4'
+const DEFAULT_WEB_LIFF_ID = DEFAULT_APP_LIFF_ID
 
 const getCurrentHost = () =>
   typeof window !== 'undefined'

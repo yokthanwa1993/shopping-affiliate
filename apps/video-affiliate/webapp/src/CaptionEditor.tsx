@@ -13,7 +13,7 @@ export default function CaptionEditor() {
   useEffect(() => {
     document.title = 'EDIT CAPTION'
     if (window.liff) {
-      window.liff.init({ liffId: '2009652996-QU4VlviK' }).catch(() => {})
+      window.liff.init({ liffId: '2009652996-DJtEhoDn' }).catch(() => {})
     }
   }, [])
 

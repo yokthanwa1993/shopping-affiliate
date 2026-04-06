@@ -18,7 +18,7 @@ const COVER_FONT_OPTIONS: Array<{ id: CoverFontId; label: string; family: string
   { id: 'noto-sans-thai', label: 'Noto Sans Thai', family: 'Noto Sans Thai' },
 ]
 
-const LINE_COVER_LIFF_ID = '2009652996-u6XRk27e'
+const LINE_COVER_LIFF_ID = '2009652996-DJtEhoDn'
 const COOKIE_SESSION_MARKER = 'cookie'
 type CoverPickerRouteState = {
   videoId: string

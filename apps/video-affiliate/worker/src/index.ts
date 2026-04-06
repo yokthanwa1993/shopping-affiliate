@@ -5801,11 +5801,11 @@ async function resolveLineNamespace(db: D1Database, lineUserId: string, displayN
 }
 
 const LIFF_BASE = 'https://liff.line.me/2009652996-DJtEhoDn'
-const LIFF_COVER_PICKER = 'https://liff.line.me/2009652996-u6XRk27e'
-const LIFF_DASHBOARD = 'https://liff.line.me/2009652996-2SnLQJeD'
-const LIFF_GALLERY = 'https://liff.line.me/2009652996-OGTCnapx'
-const LIFF_LOGS = 'https://liff.line.me/2009652996-vBsuawCH'
-const LIFF_SETTINGS = 'https://liff.line.me/2009652996-PgxNlX5l'
+const LIFF_COVER_PICKER = `${LIFF_BASE}/cover-picker`
+const LIFF_DASHBOARD = `${LIFF_BASE}/dashboard`
+const LIFF_GALLERY = `${LIFF_BASE}/gallery`
+const LIFF_LOGS = `${LIFF_BASE}/logs`
+const LIFF_SETTINGS = `${LIFF_BASE}/settings`
 const LINE_CANCEL_QUICK_REPLY_ITEM = {
     type: 'action',
     action: { type: 'message', label: 'ยกเลิกงาน', text: 'ยกเลิกงาน' },
