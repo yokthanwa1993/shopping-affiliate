@@ -2234,7 +2234,7 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 
 // Page Detail Component
 function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () => void; onSave: (page: FacebookPage) => void }) {
-  // Parse post_hours: supports "2:31,9:47" (new) and "2,9" (legacy) formats
+  // Parse post_hours: supports "0:31,9:47" (new), "24:13" (legacy midnight), and "2,9" (legacy hour-only) formats
   const parsePostHours = (raw: string): Record<number, number> => {
     const result: Record<number, number> = {}
     if (!raw) return result
@@ -2242,10 +2242,16 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     for (const part of raw.split(',')) {
       if (part.includes(':')) {
         const [h, m] = part.split(':').map(Number)
-        if (h >= 1 && h <= 24) result[h] = m
+        const normalizedHour = h === 24 ? 0 : h
+        if (normalizedHour >= 0 && normalizedHour <= 23 && Number.isFinite(m) && m >= 0 && m <= 59) {
+          result[normalizedHour] = m
+        }
       } else {
         const h = Number(part)
-        if (h >= 1 && h <= 24) result[h] = Math.floor(Math.random() * 59) + 1
+        const normalizedHour = h === 24 ? 0 : h
+        if (normalizedHour >= 0 && normalizedHour <= 23) {
+          result[normalizedHour] = Math.floor(Math.random() * 59)
+        }
       }
     }
     return result
@@ -2286,8 +2292,8 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
 
-  // Hours 1-24 for display
-  const hourOptions = Array.from({ length: 24 }, (_, i) => i + 1)
+  // Hours 00-23 for display
+  const hourOptions = Array.from({ length: 24 }, (_, i) => i)
 
   const renderTokenPreview = (value?: string | null) => {
     const token = String(value || '').trim()
@@ -2300,7 +2306,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     if (hour in newMap) {
       delete newMap[hour]
     } else {
-      newMap[hour] = Math.floor(Math.random() * 59) + 1
+      newMap[hour] = Math.floor(Math.random() * 59)
     }
     setHourMinutes(newMap)
   }

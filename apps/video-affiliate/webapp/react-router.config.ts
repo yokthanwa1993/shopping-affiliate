@@ -3,7 +3,7 @@ import type { ReactRouterConfig } from '@react-router/dev/config'
 export default {
   appDirectory: 'src',
   buildDirectory: 'dist',
-  ssr: false,
+  ssr: true,
   routeDiscovery: {
     mode: 'initial',
   },
