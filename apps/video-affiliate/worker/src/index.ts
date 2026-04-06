@@ -108,7 +108,9 @@ const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
-const VOICE_PREVIEW_TTS_MODEL = 'gemini-2.5-flash-preview-tts'
+const VOICE_PREVIEW_TTS_MODELS = ['gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
+const MERGE_CONTAINER_ENGINE_VERSION = '2026-04-05.01'
+const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
 const MAX_VOICE_PREVIEW_TEXT_CHARS = 280
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
 const SESSION_COOKIE_NAME = 'chearb_sess'
@@ -224,34 +226,39 @@ function buildWavFromPcm16le(pcmBytes: Uint8Array, sampleRate = 24000, channels 
 }
 
 async function requestGeminiTtsPreview(apiKey: string, promptText: string, voiceName: string): Promise<Uint8Array> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${VOICE_PREVIEW_TTS_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`
-    const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            contents: [{ parts: [{ text: promptText }] }],
-            generationConfig: {
-                responseModalities: ['AUDIO'],
-                speechConfig: {
-                    voiceConfig: {
-                        prebuiltVoiceConfig: {
-                            voiceName,
-                        },
+    let lastError = 'gemini_tts_preview_failed'
+    const payload = JSON.stringify({
+        contents: [{ parts: [{ text: promptText }] }],
+        generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+                voiceConfig: {
+                    prebuiltVoiceConfig: {
+                        voiceName,
                     },
                 },
             },
-        }),
+        },
     })
-    const data = await resp.json().catch(() => ({})) as any
-    if (!resp.ok) {
-        const message = String(data?.error?.message || data?.message || `gemini_tts_failed_${resp.status}`)
-        throw new Error(message)
+    for (const model of VOICE_PREVIEW_TTS_MODELS) {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payload,
+        })
+        const data = await resp.json().catch(() => ({})) as any
+        if (!resp.ok) {
+            lastError = String(data?.error?.message || data?.message || `${model}_failed_${resp.status}`)
+            continue
+        }
+        const b64 = String(data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || '').trim()
+        if (b64) {
+            return new Uint8Array(NodeBuffer.from(b64, 'base64'))
+        }
+        lastError = `${model}_empty_audio`
     }
-    const b64 = String(data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || '').trim()
-    if (!b64) {
-        throw new Error('gemini_tts_preview_empty')
-    }
-    return new Uint8Array(NodeBuffer.from(b64, 'base64'))
+    throw new Error(lastError)
 }
 
 // CORS
@@ -3274,6 +3281,12 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
         stateByVideoId,
         bucket,
     })
+    await reconcileNamespacePostedStateFromHistory({
+        db: env.DB,
+        namespaceId: normalizedNamespaceId,
+        sourceVideos: namespaceSourceVideos as Array<Record<string, unknown>>,
+        stateByVideoId,
+    })
 
     const inventoryVideos = namespaceSourceVideos
         .map((video) => {
@@ -3357,6 +3370,32 @@ async function getSystemGalleryInventory(env: Env): Promise<{
             const videoId = String(state.video_id || '').trim()
             if (!videoId) continue
             stateByVideoKey.set(`${row.namespaceId}:${videoId}`, state)
+        }
+    }
+
+    for (const namespaceId of namespaceIds) {
+        const namespaceSourceVideos = sourceVideos.filter((video) =>
+            String((video as Record<string, unknown>).namespace_id || '').trim() === namespaceId
+        ) as Array<Record<string, unknown>>
+        if (namespaceSourceVideos.length === 0) continue
+
+        const namespaceStateByVideoId = new Map<string, NamespaceVideoStateRow>()
+        for (const sourceVideo of namespaceSourceVideos) {
+            const videoId = String(sourceVideo?.id || '').trim()
+            if (!videoId) continue
+            const row = stateByVideoKey.get(`${namespaceId}:${videoId}`)
+            if (row) namespaceStateByVideoId.set(videoId, row)
+        }
+
+        await reconcileNamespacePostedStateFromHistory({
+            db: env.DB,
+            namespaceId,
+            sourceVideos: namespaceSourceVideos,
+            stateByVideoId: namespaceStateByVideoId,
+        })
+
+        for (const [videoId, row] of namespaceStateByVideoId.entries()) {
+            stateByVideoKey.set(`${namespaceId}:${videoId}`, row)
         }
     }
 
@@ -3764,7 +3803,7 @@ async function generateThumbnailViaContainer(
         sizeScale?: number
     },
 ): Promise<NodeBuffer> {
-    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker-thumbnail-v2')
+    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
     const containerStub = env.MERGE_CONTAINER.get(containerId)
     const safeTargetWidth = Number.isFinite(targetWidth) ? Math.max(120, Math.min(1440, Math.round(Number(targetWidth)))) : undefined
     const safeTargetHeight = Number.isFinite(targetHeight) ? Math.max(160, Math.min(2560, Math.round(Number(targetHeight)))) : undefined
@@ -3968,7 +4007,7 @@ async function materializeOriginalVideoAsset(params: {
 
     if (params.sourceType === 'xhs_url' && /xhs|xiaohongshu/i.test(normalizedSourceUrl)) {
         try {
-            const containerId = params.env.MERGE_CONTAINER.idFromName('merge-worker')
+            const containerId = params.env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
             const containerStub = params.env.MERGE_CONTAINER.get(containerId)
             const resolveResp = await containerStub.fetch('http://container/xhs/resolve', {
                 method: 'POST',
@@ -5807,10 +5846,6 @@ const LINE_SKIP_ONLY_QUICK_REPLY_ITEMS = [
 const LINE_COVER_TEXT_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
-        action: { type: 'message', label: 'AI คิดให้', text: 'AI คิดให้' },
-    },
-    {
-        type: 'action',
         action: { type: 'message', label: 'ไม่ใส่ข้อความ', text: 'ไม่ใส่ข้อความ' },
     },
     LINE_CANCEL_QUICK_REPLY_ITEM,
@@ -5823,10 +5858,12 @@ type LineWaitingStep = 'links' | 'caption' | 'cover' | 'cover_text' | 'cover_tex
 type LineCoverOption = {
     optionId: string
     seed: string
+    previewUrl?: string
 }
 type LineCoverTextPositionOption = {
     optionId: string
     yPct: number
+    previewUrl?: string
 }
 type LineWaitingVideoState = {
     id: string
@@ -5985,10 +6022,12 @@ function normalizeLineCoverTextPositionOptions(input: unknown): LineCoverTextPos
         .map((item, index) => {
             const optionId = String((item as { optionId?: unknown })?.optionId || index + 1).trim()
             const rawYPct = Number((item as { yPct?: unknown })?.yPct)
+            const previewUrl = String((item as { previewUrl?: unknown })?.previewUrl || '').trim()
             if (!optionId || !Number.isFinite(rawYPct)) return null
             return {
                 optionId: optionId.slice(0, 16),
                 yPct: Math.max(10, Math.min(90, Math.round(rawYPct))),
+                ...(previewUrl ? { previewUrl: previewUrl.slice(0, 1024) } : {}),
             }
         })
         .filter((item): item is LineCoverTextPositionOption => !!item)
@@ -6371,12 +6410,8 @@ function buildLineCoverPickerFlex(params: {
             type: 'carousel',
             contents: coverOptions.map((option) => {
                 const optionId = String(option.optionId || '').trim() || '1'
-                const previewUrl = buildLineCoverOptionPreviewUrl({
-                    workerUrl: params.workerUrl,
-                    namespaceId: params.namespaceId,
-                    videoId: params.videoId,
-                    option,
-                })
+                const previewUrl = String(option.previewUrl || '').trim()
+                    || `${params.workerUrl.replace(/\/+$/, '')}/api/gallery/${encodeURIComponent(params.videoId)}/asset/original-thumb?namespace_id=${encodeURIComponent(params.namespaceId)}`
                 const postbackData = buildLineCoverSelectionPostbackData(params.videoId, optionId)
                 return {
                     type: 'bubble',
@@ -6609,28 +6644,10 @@ function buildLineChoicePromptFlexCard(params: {
     }
 }
 
-function buildLineCoverChoicePromptFlex(): LineReplyMessage {
-    return buildLineChoicePromptFlexCard({
-        altText: 'เลือกวิธีตั้งหน้าปก',
-        pillText: '🖼️ Cover',
-        title: 'เลือกปกวิดีโอ',
-        message: 'กดเลือกปกเพื่อดูตัวเลือก 10 แบบจากวิดีโอ แล้วเลือกภาพที่ต้องการใช้เป็นหน้าปก',
-        primary: '#4F6DF5',
-        primaryDark: '#2845C7',
-        messageColor: '#EAF0FF',
-        primaryActionLabel: 'เลือกปก',
-        primaryActionText: 'เลือกปก',
-        secondaryActionLabel: 'สุ่มใหม่',
-        secondaryActionText: 'สุ่มอีกครั้ง',
-        secondarySurface: '#DDE2EC',
-        secondaryTextColor: '#111827',
-    })
-}
-
 function buildLineCoverTextPromptMessage(): LineReplyMessage {
     return {
         type: 'text',
-        text: 'จะเพิ่มข้อความในปกไหม\nพิมพ์ข้อความมาได้เลย หรือกด AI คิดให้',
+        text: 'จะเพิ่มข้อความในปกไหม\nพิมพ์ข้อความมาได้เลย หรือกดไม่ใส่ข้อความ',
         quickReply: { items: LINE_COVER_TEXT_QUICK_REPLY_ITEMS },
     }
 }
@@ -6655,16 +6672,8 @@ function buildLineCoverTextPositionPickerFlex(params: {
             type: 'carousel',
             contents: positionOptions.map((positionOption) => {
                 const postbackData = buildLineCoverTextPositionPostbackData(params.videoId, positionOption.optionId)
-                const previewUrl = buildLineCoverTextPositionPreviewUrl({
-                    workerUrl: params.workerUrl,
-                    namespaceId: params.namespaceId,
-                    videoId: params.videoId,
-                    option: params.option,
-                    coverText,
-                    coverTextYPercent: positionOption.yPct,
-                    coverTemplateId: params.coverTemplateId,
-                    coverTextStyle: params.coverTextStyle,
-                })
+                const previewUrl = String(positionOption.previewUrl || '').trim()
+                    || `${params.workerUrl.replace(/\/+$/, '')}/api/gallery/${encodeURIComponent(params.videoId)}/asset/original-thumb?namespace_id=${encodeURIComponent(params.namespaceId)}`
                 return {
                     type: 'bubble',
                     body: {
@@ -7022,6 +7031,31 @@ async function lineReply(
     }
 }
 
+async function lineReplyOrPush(params: {
+    replyToken: string
+    channelAccessToken: string
+    lineUserId: string
+    messages: LineReplyMessage[]
+}): Promise<void> {
+    if (!String(params.replyToken || '').trim()) {
+        const pushResult = await linePushMessage(params.channelAccessToken, params.lineUserId, params.messages)
+        if (!pushResult.ok) {
+            throw new Error(`line_push_failed${pushResult.error ? `: ${pushResult.error}` : ''}`)
+        }
+        return
+    }
+    try {
+        await lineReply(params.replyToken, params.channelAccessToken, params.messages)
+        return
+    } catch (error) {
+        console.warn(`[LINE] reply failed, fallback to push: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    const pushResult = await linePushMessage(params.channelAccessToken, params.lineUserId, params.messages)
+    if (!pushResult.ok) {
+        throw new Error(`line_push_failed${pushResult.error ? `: ${pushResult.error}` : ''}`)
+    }
+}
+
 async function lineStartLoading(
     channelAccessToken: string,
     lineUserId: string,
@@ -7070,8 +7104,13 @@ function normalizeLineCoverOptions(input: unknown): LineCoverOption[] {
         .map((item) => {
             const optionId = String((item as { optionId?: unknown })?.optionId || '').trim()
             const seed = String((item as { seed?: unknown })?.seed || '').trim()
+            const previewUrl = String((item as { previewUrl?: unknown })?.previewUrl || '').trim()
             if (!optionId || !seed) return null
-            return { optionId: optionId.slice(0, 32), seed: seed.slice(0, 160) }
+            return {
+                optionId: optionId.slice(0, 32),
+                seed: seed.slice(0, 160),
+                ...(previewUrl ? { previewUrl: previewUrl.slice(0, 1024) } : {}),
+            }
         })
         .filter((item): item is LineCoverOption => !!item)
     return normalized.slice(0, 10)
@@ -7255,13 +7294,18 @@ async function promptLineCaptionCollection(params: {
         console.log(`[LINE-AUTO-IMPORT] ${waitingState.id}: ${error instanceof Error ? error.message : String(error)}`)
     })
 
-    await lineReply(params.replyToken, params.channelAccessToken, [
+    await lineReplyOrPush({
+        replyToken: params.replyToken,
+        channelAccessToken: params.channelAccessToken,
+        lineUserId: params.lineUserId,
+        messages: [
         buildLineCaptionPromptFlex({
             videoId: waitingState.id,
             namespaceId: params.namespaceId,
             manualCaption: waitingState.manualCaption,
         }),
-    ])
+        ],
+    })
 }
 
 async function promptLineCoverPicker(params: {
@@ -7298,9 +7342,17 @@ async function promptLineCoverPicker(params: {
         coverTextPositionOptions: [],
     })
 
-    await lineReply(params.replyToken, params.channelAccessToken, [
-        buildLineCoverChoicePromptFlex(),
-    ])
+        await promptLineCoverOptions({
+            env: params.env,
+            bucket: params.bucket,
+            namespaceId: params.namespaceId,
+            channelAccessToken: params.channelAccessToken,
+            replyToken: params.replyToken,
+            lineUserId: params.lineUserId,
+            waitingState: nextWaitingState,
+            manualCaption,
+            forceRefresh: true,
+        })
 }
 
 async function promptLineCoverOptions(params: {
@@ -7320,6 +7372,15 @@ async function promptLineCoverOptions(params: {
     const coverOptions = !params.forceRefresh && waitingState.coverOptions && waitingState.coverOptions.length > 0
         ? waitingState.coverOptions
         : buildLineCoverOptions(waitingState.id, 10)
+    const coverOptionsWithPreview: LineCoverOption[] = coverOptions.map((option) => {
+        const previewUrl = String(option.previewUrl || '').trim() || buildLineCoverOptionPreviewUrl({
+            workerUrl: String(params.env.WORKER_URL || '').trim(),
+            namespaceId: params.namespaceId,
+            videoId: waitingState.id,
+            option,
+        })
+        return previewUrl ? { ...option, previewUrl } : option
+    })
 
     const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
         ...waitingState,
@@ -7327,18 +7388,23 @@ async function promptLineCoverOptions(params: {
         awaitingStep: 'cover',
         coverCompleted: false,
         coverPickerOpened: true,
-        coverOptions,
+        coverOptions: coverOptionsWithPreview,
         coverTextPositionOptions: [],
     })
 
-    await lineReply(params.replyToken, params.channelAccessToken, [
-        buildLineCoverPickerFlex({
-            videoId: waitingState.id,
-            namespaceId: params.namespaceId,
-            workerUrl: String(params.env.WORKER_URL || '').trim(),
-            coverOptions: nextWaitingState.coverOptions || coverOptions,
-        }),
-    ])
+    await lineReplyOrPush({
+        replyToken: params.replyToken,
+        channelAccessToken: params.channelAccessToken,
+        lineUserId: params.lineUserId,
+        messages: [
+            buildLineCoverPickerFlex({
+                videoId: waitingState.id,
+                namespaceId: params.namespaceId,
+                workerUrl: String(params.env.WORKER_URL || '').trim(),
+                coverOptions: nextWaitingState.coverOptions || coverOptionsWithPreview,
+            }),
+        ],
+    })
 }
 
 async function promptLineCoverTextPositionOptions(params: {
@@ -7370,27 +7436,45 @@ async function promptLineCoverTextPositionOptions(params: {
         coverTemplateId,
     )
     const positionOptions = buildLineCoverTextPositionOptions()
+    const positionOptionsWithPreview: LineCoverTextPositionOption[] = positionOptions.map((positionOption) => {
+        const previewUrl = String(positionOption.previewUrl || '').trim() || buildLineCoverTextPositionPreviewUrl({
+            workerUrl: String(params.env.WORKER_URL || '').trim(),
+            namespaceId: params.namespaceId,
+            videoId: waitingState.id,
+            option: waitingState.selectedCoverOption as LineCoverOption,
+            coverText,
+            coverTextYPercent: positionOption.yPct,
+            coverTemplateId,
+            coverTextStyle: resolvedCoverTextStyle,
+        })
+        return previewUrl ? { ...positionOption, previewUrl } : positionOption
+    })
     const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
         ...waitingState,
         awaitingStep: 'cover_text_position',
         coverText,
         coverTemplateId,
         coverTextStyle: resolvedCoverTextStyle,
-        coverTextPositionOptions: positionOptions,
+        coverTextPositionOptions: positionOptionsWithPreview,
     })
 
-    await lineReply(params.replyToken, params.channelAccessToken, [
-        buildLineCoverTextPositionPickerFlex({
-            videoId: waitingState.id,
-            namespaceId: params.namespaceId,
-            workerUrl: String(params.env.WORKER_URL || '').trim(),
-            option: waitingState.selectedCoverOption,
-            coverText,
-            coverTemplateId,
-            coverTextStyle: resolvedCoverTextStyle,
-            positionOptions: nextWaitingState.coverTextPositionOptions || positionOptions,
-        }),
-    ])
+    await lineReplyOrPush({
+        replyToken: params.replyToken,
+        channelAccessToken: params.channelAccessToken,
+        lineUserId: params.lineUserId,
+        messages: [
+            buildLineCoverTextPositionPickerFlex({
+                videoId: waitingState.id,
+                namespaceId: params.namespaceId,
+                workerUrl: String(params.env.WORKER_URL || '').trim(),
+                option: waitingState.selectedCoverOption,
+                coverText,
+                coverTemplateId,
+                coverTextStyle: resolvedCoverTextStyle,
+                positionOptions: nextWaitingState.coverTextPositionOptions || positionOptionsWithPreview,
+            }),
+        ],
+    })
 }
 
 async function continueLineFlowAfterCover(params: {
@@ -7417,13 +7501,18 @@ async function continueLineFlowAfterCover(params: {
             coverPickerOpened: false,
             coverTextPositionOptions: [],
         })
-        await lineReply(params.replyToken, params.channelAccessToken, [
+        await lineReplyOrPush({
+            replyToken: params.replyToken,
+            channelAccessToken: params.channelAccessToken,
+            lineUserId: params.lineUserId,
+            messages: [
             buildLineAffiliatePromptFlex({
                 title: hasShopee ? 'รับปกแล้ว รอ Lazada' : 'รับปกแล้ว รอ Shopee',
                 brand: hasShopee ? 'lazada' : 'shopee',
                 message: hasShopee ? 'ส่งลิงก์ Lazada มาเลย' : 'ส่งลิงก์ Shopee มาเลย',
             }),
-        ])
+            ],
+        })
         return
     }
 
@@ -7605,10 +7694,12 @@ async function linePushMessage(
         })
         if (!resp.ok) {
             const errText = await resp.text().catch(() => '')
+            console.warn(`[LINE] push failed userId=${userId} status=${resp.status} body=${errText.slice(0, 200)}`)
             return { ok: false, error: `HTTP ${resp.status}: ${errText.slice(0, 200)}` }
         }
         return { ok: true }
     } catch (e) {
+        console.warn(`[LINE] push error userId=${userId}: ${e instanceof Error ? e.message : String(e)}`)
         return { ok: false, error: e instanceof Error ? e.message : String(e) }
     }
 }
@@ -8446,37 +8537,9 @@ async function handleLineTextMessage(params: {
         }
 
         if (isLineAiThinkCommand(text)) {
-            try {
-                const aiSuggestion = await generateAiCoverTextForOption({
-                    env,
-                    bucket,
-                    namespaceId,
-                    videoId: waitingState.id,
-                    option: waitingState.selectedCoverOption,
-                }).catch(() => null)
-                const generatedCoverText = normalizeLineCoverText(aiSuggestion?.coverText || '')
-                if (!generatedCoverText) {
-                    await lineReply(replyToken, channelAccessToken, [
-                        { type: 'text', text: 'AI คิดข้อความบนปกไม่สำเร็จ ลองกดอีกครั้งหรือพิมพ์ข้อความเองได้เลย' },
-                    ]).catch(() => { })
-                    return
-                }
-                await promptLineCoverTextPositionOptions({
-                    env,
-                    bucket,
-                    namespaceId,
-                    channelAccessToken,
-                    replyToken,
-                    lineUserId,
-                    waitingState,
-                    coverText: generatedCoverText,
-                })
-            } catch (e) {
-                console.error('[LINE] Cover text AI prompt error:', e instanceof Error ? e.message : String(e))
-                await lineReply(replyToken, channelAccessToken, [
-                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
-                ]).catch(() => { })
-            }
+            await lineReply(replyToken, channelAccessToken, [
+                { type: 'text', text: 'ระบบปิดตัวเลือก AI คิดข้อความบนปกไว้ชั่วคราว พิมพ์ข้อความเองได้เลย หรือกดไม่ใส่ข้อความ' },
+            ]).catch(() => { })
             return
         }
 
@@ -8557,9 +8620,24 @@ async function handleLineTextMessage(params: {
 
         if (isLineCoverReshuffleCommand(text)) {
             if (!waitingState.coverPickerOpened) {
-                await lineReply(replyToken, channelAccessToken, [
-                    buildLineCoverChoicePromptFlex(),
-                ]).catch(() => { })
+                try {
+                    await promptLineCoverOptions({
+                        env,
+                        bucket,
+                        namespaceId,
+                        channelAccessToken,
+                        replyToken,
+                        lineUserId,
+                        waitingState,
+                        manualCaption: waitingState.manualCaption,
+                        forceRefresh: true,
+                    })
+                } catch (e) {
+                    console.error('[LINE] Cover first-load reshuffle error:', e instanceof Error ? e.message : String(e))
+                    await lineReply(replyToken, channelAccessToken, [
+                        { type: 'text', text: 'เกิดข้อผิดพลาดในการโหลดตัวเลือกหน้าปก กรุณาลองอีกครั้ง' },
+                    ]).catch(() => { })
+                }
                 return
             }
             try {
@@ -8591,9 +8669,24 @@ async function handleLineTextMessage(params: {
         }
 
         if (!waitingState.coverPickerOpened) {
-            await lineReply(replyToken, channelAccessToken, [
-                buildLineCoverChoicePromptFlex(),
-            ])
+            try {
+                await promptLineCoverOptions({
+                    env,
+                    bucket,
+                    namespaceId,
+                    channelAccessToken,
+                    replyToken,
+                    lineUserId,
+                    waitingState,
+                    manualCaption: waitingState.manualCaption,
+                    forceRefresh: true,
+                })
+            } catch (e) {
+                console.error('[LINE] Cover first prompt error:', e instanceof Error ? e.message : String(e))
+                await lineReply(replyToken, channelAccessToken, [
+                    { type: 'text', text: 'เกิดข้อผิดพลาดในการโหลดตัวเลือกหน้าปก กรุณาลองอีกครั้ง' },
+                ]).catch(() => { })
+            }
             return
         }
 
@@ -8706,10 +8799,12 @@ async function handleLineTextMessage(params: {
         const xhsUrl = xhsMatch[0]
         const videoId = crypto.randomUUID().slice(0, 8)
 
+        await lineStartLoading(channelAccessToken, lineUserId, 20).catch(() => { })
+
         // Resolve XHS URL to direct video URL
         let resolvedVideoUrl = xhsUrl
         try {
-            const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+            const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
             const containerStub = env.MERGE_CONTAINER.get(containerId)
             const resolveResp = await containerStub.fetch('http://container/xhs/resolve', {
                 method: 'POST',
@@ -8724,6 +8819,7 @@ async function handleLineTextMessage(params: {
 
         // Download video and store in R2
         let r2VideoUrl = xhsUrl
+        let originalStored = false
         try {
             if (resolvedVideoUrl !== xhsUrl) {
                 const videoResp = await fetch(resolvedVideoUrl, { headers: { 'Referer': 'https://www.xiaohongshu.com/' } })
@@ -8739,9 +8835,22 @@ async function handleLineTextMessage(params: {
                         contentType: 'video/mp4',
                     })
                     await backfillOriginalThumbnail(env, namespaceId, videoId).catch(() => { })
+                    originalStored = true
                 }
             }
         } catch {}
+
+        if (!originalStored) {
+            await lineReplyOrPush({
+                replyToken,
+                channelAccessToken,
+                lineUserId,
+                messages: [
+                    { type: 'text', text: 'รับลิงก์ XHS แล้ว แต่ดึงวิดีโอไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง' },
+                ],
+            }).catch(() => { })
+            return
+        }
 
         const createdAt = new Date().toISOString()
 
@@ -8766,6 +8875,7 @@ async function handleLineTextMessage(params: {
                 replyToken,
                 lineUserId,
                 waitingState,
+                manualCaption: waitingState.manualCaption,
                 forceRefresh: true,
             })
         } catch {
@@ -15646,6 +15756,85 @@ async function getPostedVideoIds(params: {
     return out
 }
 
+async function getLatestPostedAtByVideoIds(params: {
+    db: D1Database
+    namespaceId: string
+    videoIds: string[]
+}): Promise<Map<string, string>> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoIds = Array.from(new Set((params.videoIds || []).map((videoId) => String(videoId || '').trim()).filter(Boolean)))
+    const out = new Map<string, string>()
+    if (!namespaceId || videoIds.length === 0) return out
+
+    // D1/SQLite can reject larger IN lists in some production paths.
+    // Keep this conservative because system gallery reconciliation can span
+    // many videos across many namespaces on a single request.
+    const chunkSize = 25
+    for (let i = 0; i < videoIds.length; i += chunkSize) {
+        const chunk = videoIds.slice(i, i + chunkSize)
+        const placeholders = chunk.map(() => '?').join(', ')
+        const sql = `SELECT video_id, MAX(posted_at) AS posted_at
+            FROM post_history
+            WHERE bot_id = ?
+              AND video_id IN (${placeholders})
+              AND (
+                status IN ('success', 'posting')
+                OR TRIM(COALESCE(fb_post_id, '')) <> ''
+                OR TRIM(COALESCE(fb_reel_url, '')) <> ''
+              )
+            GROUP BY video_id`
+        const result = await params.db.prepare(sql).bind(namespaceId, ...chunk).all() as {
+            results?: Array<{ video_id?: string; posted_at?: string }>
+        }
+        for (const row of result.results || []) {
+            const videoId = String(row?.video_id || '').trim()
+            const postedAt = String(row?.posted_at || '').trim()
+            if (videoId && postedAt) out.set(videoId, postedAt)
+        }
+    }
+
+    return out
+}
+
+async function reconcileNamespacePostedStateFromHistory(params: {
+    db: D1Database
+    namespaceId: string
+    sourceVideos: Array<Record<string, unknown>>
+    stateByVideoId: Map<string, NamespaceVideoStateRow>
+}): Promise<void> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    if (!namespaceId || params.sourceVideos.length === 0) return
+
+    const candidateVideoIds = params.sourceVideos
+        .map((video) => String(video?.id || '').trim())
+        .filter(Boolean)
+        .filter((videoId) => !String(params.stateByVideoId.get(videoId)?.posted_at || '').trim())
+
+    if (candidateVideoIds.length === 0) return
+
+    const postedAtByVideoId = await getLatestPostedAtByVideoIds({
+        db: params.db,
+        namespaceId,
+        videoIds: candidateVideoIds,
+    })
+    if (postedAtByVideoId.size === 0) return
+
+    for (const [videoId, postedAt] of postedAtByVideoId.entries()) {
+        const currentRow = params.stateByVideoId.get(videoId) || {
+            namespace_id: namespaceId,
+            video_id: videoId,
+        }
+        if (String(currentRow.posted_at || '').trim()) continue
+        await upsertNamespaceVideoState(params.db, namespaceId, videoId, { posted_at: postedAt })
+        params.stateByVideoId.set(videoId, {
+            ...currentRow,
+            namespace_id: namespaceId,
+            video_id: videoId,
+            posted_at: postedAt,
+        })
+    }
+}
+
 async function getConfirmedPostedVideoIds(params: {
     db: D1Database
     namespaceId?: string
@@ -20019,6 +20208,97 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     }
 }
 
+type PageOneCardLinkMode = 'shopee' | 'lazada' | 'none'
+type PageOneCardCta = 'SHOP_NOW' | 'LEARN_MORE' | 'NO_BUTTON'
+
+function normalizePageOneCardLinkMode(rawValue: unknown): PageOneCardLinkMode {
+    const value = String(rawValue || '').trim().toLowerCase()
+    if (value === 'lazada') return 'lazada'
+    if (value === 'none') return 'none'
+    return 'shopee'
+}
+
+function normalizePageOneCardCta(rawValue: unknown): PageOneCardCta {
+    const value = String(rawValue || '').trim().toUpperCase()
+    if (value === 'LEARN_MORE') return 'LEARN_MORE'
+    if (value === 'NO_BUTTON') return 'NO_BUTTON'
+    return 'SHOP_NOW'
+}
+
+function pickOneCardWebsiteUrl(params: {
+    linkMode: PageOneCardLinkMode
+    shopeeLink?: string | null
+    lazadaLink?: string | null
+}): string {
+    const shopeeLink = String(params.shopeeLink || '').trim()
+    const lazadaLink = String(params.lazadaLink || '').trim()
+    if (params.linkMode === 'none') return ''
+    if (params.linkMode === 'lazada') return lazadaLink || ''
+    return shopeeLink || lazadaLink || ''
+}
+
+async function ensurePagesOneCardColumns(db: D1Database): Promise<void> {
+    const alterStatements = [
+        `ALTER TABLE pages ADD COLUMN onecard_enabled INTEGER DEFAULT 0`,
+        `ALTER TABLE pages ADD COLUMN onecard_link_mode TEXT DEFAULT 'shopee'`,
+        `ALTER TABLE pages ADD COLUMN onecard_cta TEXT DEFAULT 'SHOP_NOW'`,
+    ]
+    for (const sql of alterStatements) {
+        await db.prepare(sql).run().catch(() => undefined)
+    }
+}
+
+async function publishVideoViaOneCard(params: {
+    env: Env
+    pageId: string
+    videoUrl: string
+    message: string
+    websiteUrl?: string | null
+    cta?: PageOneCardCta
+    logPrefix: string
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
+    const baseUrl = String(params.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.yokthanwa1993-bc9.workers.dev').trim().replace(/\/+$/, '')
+    if (!baseUrl) throw new Error('onecard_worker_url_missing')
+
+    const payload: Record<string, unknown> = {
+        page_id: params.pageId,
+        video_url: params.videoUrl,
+        message: String(params.message || '').trim(),
+    }
+    const websiteUrl = String(params.websiteUrl || '').trim()
+    const cta = normalizePageOneCardCta(params.cta)
+    if (websiteUrl && cta !== 'NO_BUTTON') {
+        payload.website_url = websiteUrl
+        payload.cta = cta
+    }
+
+    const resp = await fetchWithTimeout(`${baseUrl}/post`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }, 180000, 'onecard_post')
+
+    const data = await resp.json().catch(() => ({} as any)) as {
+        ok?: boolean
+        error?: string
+        story_id?: string
+        video_id?: string
+        post_url?: string
+    }
+    if (!resp.ok || !data?.ok) {
+        throw new Error(String(data?.error || `onecard_http_${resp.status}`))
+    }
+
+    const storyId = String(data.story_id || '').trim()
+    const postId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
+    return {
+        id: String(data.video_id || '').trim(),
+        postId,
+        permalinkUrl: String(data.post_url || '').trim() || (postId ? `https://www.facebook.com/${params.pageId}/posts/${postId}` : ''),
+        postingToken: 'onecard',
+    }
+}
+
 async function loadPostingThumbnailAsset(params: {
     env: Env
     namespaceId: string
@@ -20254,8 +20534,9 @@ async function notifyCommentTokenIssue(
 app.get('/api/pages', async (c) => {
     try {
         const botId = c.get('botId')
+        await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
         return c.json({ pages })
     } catch (e) {
@@ -20405,8 +20686,9 @@ app.get('/api/dashboard', async (c) => {
 app.get('/api/pages/:id', async (c) => {
     const id = c.req.param('id')
     try {
+        await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
         if (!page) return c.json({ error: 'Page not found' }, 404)
         return c.json({ page })
@@ -20893,9 +21175,13 @@ app.delete('/api/pages/:id/tag-profiles/:profileId', async (c) => {
 app.post('/api/pages', async (c) => {
     try {
         const body = await c.req.json()
-        const { id, name, image_url, access_token, post_interval_minutes = 60 } = body
+        const { id, name, image_url, access_token, post_interval_minutes = 60, onecard_enabled = false, onecard_link_mode, onecard_cta } = body
         const botId = c.get('botId')
         const postToken = String(access_token || '').trim()
+        const onecardEnabled = onecard_enabled === true || Number(onecard_enabled || 0) === 1 ? 1 : 0
+        const onecardLinkMode = normalizePageOneCardLinkMode(onecard_link_mode)
+        const onecardCta = normalizePageOneCardCta(onecard_cta)
+        await ensurePagesOneCardColumns(c.env.DB)
         const existingInNamespace = await c.env.DB.prepare(
             'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, botId).first()
@@ -20915,8 +21201,8 @@ app.post('/api/pages', async (c) => {
         }
 
         await c.env.DB.prepare(
-            'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, bot_id) VALUES (?, ?, ?, ?, ?, ?)'
-        ).bind(id, name, image_url, postToken, post_interval_minutes, botId).run()
+            'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, bot_id, onecard_enabled, onecard_link_mode, onecard_cta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(id, name, image_url, postToken, post_interval_minutes, botId, onecardEnabled, onecardLinkMode, onecardCta).run()
 
         return c.json({ success: true, id })
     } catch (e) {
@@ -20929,11 +21215,15 @@ app.put('/api/pages/:id', async (c) => {
     const id = c.req.param('id')
     try {
         const body = await c.req.json()
-        const { post_interval_minutes, post_hours, is_active, access_token, comment_token } = body
+        const { post_interval_minutes, post_hours, is_active, access_token, comment_token, onecard_enabled, onecard_link_mode, onecard_cta } = body
         // comment_token is now treated as access_token (unified token model)
         let normalizedPostHours = post_hours as string | undefined
         let normalizedInterval = post_interval_minutes as number | undefined
+        const nextOneCardEnabled = onecard_enabled !== undefined ? ((onecard_enabled === true || Number(onecard_enabled || 0) === 1) ? 1 : 0) : undefined
+        const nextOneCardLinkMode = onecard_link_mode !== undefined ? normalizePageOneCardLinkMode(onecard_link_mode) : undefined
+        const nextOneCardCta = onecard_cta !== undefined ? normalizePageOneCardCta(onecard_cta) : undefined
 
+        await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
             'SELECT id, access_token FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first() as { id: string; access_token?: string | null } | null
@@ -21068,13 +21358,28 @@ app.put('/api/pages/:id', async (c) => {
                 'UPDATE pages SET is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(is_active ? 1 : 0, id, c.get('botId')).run()
         }
+        if (nextOneCardEnabled !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET onecard_enabled = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextOneCardEnabled, id, c.get('botId')).run()
+        }
+        if (nextOneCardLinkMode !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET onecard_link_mode = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextOneCardLinkMode, id, c.get('botId')).run()
+        }
+        if (nextOneCardCta !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET onecard_cta = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextOneCardCta, id, c.get('botId')).run()
+        }
         if (tokenUpdated) {
             const issueKey = `_alerts/comment_token/${c.get('botId')}/${id}.json`
             await c.env.BUCKET.delete(issueKey).catch(() => undefined)
         }
 
         const updatedPage = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
 
         return c.json({ success: true, resolved, resolved_details, page: updatedPage })
@@ -22393,6 +22698,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let forceHistoryId: number | null = null
     let pagePostingLockKey: string | null = null
     let videoPostingLockKey: string | null = null
+    let pageOneCardEnabled = false
+    let pageOneCardLinkMode: PageOneCardLinkMode = 'shopee'
+    let pageOneCardCta: PageOneCardCta = 'SHOP_NOW'
 
     try {
         // Check if skip comment
@@ -22401,9 +22709,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }
         skipComment = body.skipComment === true
         // Get page info
+        await ensurePagesOneCardColumns(env.DB)
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token, post_hours FROM pages WHERE id = ? AND bot_id = ?'
-        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string } | null
+            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
         pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
@@ -22416,6 +22725,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }
         pageName = page.name
         pageAccessToken = String(page.access_token || '').trim()
+        pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
+        pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
+        pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
         pageCommentToken = null
         const tokenCandidates = await ensurePageTokenCandidates({
             env,
@@ -22561,23 +22873,40 @@ app.post('/api/pages/:id/force-post', async (c) => {
         if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
         const videoBuffer = await videoResp.arrayBuffer()
         if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
-        const postingThumbnail = await loadPostingThumbnailAsset({
-            env,
-            namespaceId: selectedVideoNamespaceId,
-            videoId: unpostedId,
-        }).catch(() => null)
+        const postingThumbnail = pageOneCardEnabled
+            ? null
+            : await loadPostingThumbnailAsset({
+                env,
+                namespaceId: selectedVideoNamespaceId,
+                videoId: unpostedId,
+            }).catch(() => null)
 
-        postingTokenUsed = String(primaryPostingTokenCandidates[0] || '').trim()
-        const reelResult = await publishReelWithCommentTokenPrimaryFallback({
-            pageId: page.id,
-            commentTokens: commentTokenCandidates,
-            postTokens: fallbackPostTokenCandidates,
-            videoBuffer,
-            thumbnailBuffer: postingThumbnail?.buffer || null,
-            thumbnailContentType: postingThumbnail?.contentType || '',
-            description: caption,
-            logPrefix: 'FORCE-POST',
+        postingTokenUsed = pageOneCardEnabled ? 'onecard' : String(primaryPostingTokenCandidates[0] || '').trim()
+        const oneCardWebsiteUrl = pickOneCardWebsiteUrl({
+            linkMode: pageOneCardLinkMode,
+            shopeeLink: normalizedShopeeLink,
+            lazadaLink: normalizedLazadaLink,
         })
+        const reelResult = pageOneCardEnabled
+            ? await publishVideoViaOneCard({
+                env,
+                pageId: page.id,
+                videoUrl: realVideoUrl,
+                message: caption,
+                websiteUrl: oneCardWebsiteUrl,
+                cta: pageOneCardCta,
+                logPrefix: 'FORCE-POST ONECARD',
+            })
+            : await publishReelWithCommentTokenPrimaryFallback({
+                pageId: page.id,
+                commentTokens: commentTokenCandidates,
+                postTokens: fallbackPostTokenCandidates,
+                videoBuffer,
+                thumbnailBuffer: postingThumbnail?.buffer || null,
+                thumbnailContentType: postingThumbnail?.contentType || '',
+                description: caption,
+                logPrefix: 'FORCE-POST',
+            })
         postingTokenUsed = reelResult.postingToken
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
@@ -23387,7 +23716,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         await processPendingAffiliateConversions(env)
     })
     enqueueBackgroundTask(ctx, 'CRON WARM-UP', async () => {
-        const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+        const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
         const containerStub = env.MERGE_CONTAINER.get(containerId)
         await containerStub.fetch('http://container/health')
         console.log('[CRON] Container warm-up ping sent')
@@ -23431,9 +23760,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         : 10
     const formatSlot = (slot: { hour: number; minute: number }) => `${slot.hour}:${slot.minute.toString().padStart(2, '0')}`
 
+    await ensurePagesOneCardColumns(env.DB)
     // 1. Get active pages with their post_hours
     const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, post_hours, last_post_at, bot_id
+        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta
         FROM pages
         WHERE is_active = 1 AND post_hours IS NOT NULL AND post_hours != ''
     `).all() as {
@@ -23444,6 +23774,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             post_hours: string
             last_post_at: string | null
             bot_id: string | null
+            onecard_enabled?: number | null
+            onecard_link_mode?: string | null
+            onecard_cta?: string | null
         }>
     }
 
@@ -23839,29 +24172,49 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
 
         let fbVideoId = ''
-        let postingTokenUsed = String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
+        const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
+        const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
+        const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
+        let postingTokenUsed = pageOneCardEnabled ? 'onecard' : String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
         try {
             // Download video and publish via the preferred page-scoped token pool first.
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')
             if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
             const videoBuffer = await videoResp.arrayBuffer()
             if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
-            const postingThumbnail = await loadPostingThumbnailAsset({
-                env,
-                namespaceId: sourceNamespaceId,
-                videoId: unpostedId,
-            }).catch(() => null)
-
-            const reelResult = await publishReelWithCommentTokenPrimaryFallback({
-                pageId: String(page.id || ''),
-                commentTokens: commentTokenCandidates,
-                postTokens: fallbackPostTokenCandidates,
-                videoBuffer,
-                thumbnailBuffer: postingThumbnail?.buffer || null,
-                thumbnailContentType: postingThumbnail?.contentType || '',
-                description: caption,
-                logPrefix: `CRON ${page.name}`,
+            const postingThumbnail = pageOneCardEnabled
+                ? null
+                : await loadPostingThumbnailAsset({
+                    env,
+                    namespaceId: sourceNamespaceId,
+                    videoId: unpostedId,
+                }).catch(() => null)
+            const oneCardWebsiteUrl = pickOneCardWebsiteUrl({
+                linkMode: pageOneCardLinkMode,
+                shopeeLink: normalizedShopeeLink,
+                lazadaLink: normalizedLazadaLink,
             })
+
+            const reelResult = pageOneCardEnabled
+                ? await publishVideoViaOneCard({
+                    env,
+                    pageId: String(page.id || ''),
+                    videoUrl: realVideoUrl,
+                    message: caption,
+                    websiteUrl: oneCardWebsiteUrl,
+                    cta: pageOneCardCta,
+                    logPrefix: `CRON ${page.name} ONECARD`,
+                })
+                : await publishReelWithCommentTokenPrimaryFallback({
+                    pageId: String(page.id || ''),
+                    commentTokens: commentTokenCandidates,
+                    postTokens: fallbackPostTokenCandidates,
+                    videoBuffer,
+                    thumbnailBuffer: postingThumbnail?.buffer || null,
+                    thumbnailContentType: postingThumbnail?.contentType || '',
+                    description: caption,
+                    logPrefix: `CRON ${page.name}`,
+                })
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id

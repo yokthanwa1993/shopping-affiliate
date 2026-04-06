@@ -9,11 +9,11 @@ import { DashboardTab } from './app/tabs/DashboardTab'
 import { InboxTab } from './app/tabs/InboxTab'
 import { ProcessingTab } from './app/tabs/ProcessingTab'
 import { BottomNav } from './app/components/BottomNav'
+import { getMainLiffInitOptionsForHost, getMainLiffUrlForHost, isAppHost, waitForLiffSdk } from './liffConfig'
 
 
 const WORKER_URL = API_BASE_URL
 
-const LINE_LIFF_ID = '2009652996-DJtEhoDn'
 const GALLERY_HEADER_TOP_GAP = 8
 const VERTICAL_VIEWER_FRAME_STYLE = {
   width: '100%',
@@ -105,6 +105,7 @@ const CACHE_VERSION = 'v12'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
+const systemUsedGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_used_cache:${CACHE_VERSION}`, botScope)
 const nsInboxCacheKey = (namespaceId: string) => `inbox_cache:${CACHE_VERSION}:${namespaceId}`
 const dashboardCacheKey = (namespaceId: string, date: string) => `dashboard_cache:${CACHE_VERSION}:${namespaceId}:${date}`
 const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`inbox_system_cache:${CACHE_VERSION}`, botScope)
@@ -125,6 +126,19 @@ const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespac
   }
 
   return dedupeGalleryVideos(readCache<Video[]>(globalCacheKey('gallery'), []))
+}
+
+const readUsedGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
+  if (FORCE_SYSTEM_WIDE_GALLERY || systemWide) {
+    return dedupeGalleryVideos(readCache<Video[]>(systemUsedGalleryCacheKey(botScope), []))
+  }
+
+  const scopedNamespace = String(namespaceId || getStoredNamespace(botScope) || '').trim()
+  if (scopedNamespace) {
+    return dedupeGalleryVideos(readCache<Video[]>(nsCacheKey('used', scopedNamespace), []))
+  }
+
+  return dedupeGalleryVideos(readCache<Video[]>(globalCacheKey('used'), []))
 }
 
 const apiFetch = async (url: string, options: RequestInit = {}) => {
@@ -557,6 +571,9 @@ interface FacebookPage {
   post_interval_minutes: number
   post_hours?: string  // slot: "2:22,9:49" or interval: "every:30"
   is_active: number
+  onecard_enabled?: number
+  onecard_link_mode?: 'shopee' | 'lazada' | 'none'
+  onecard_cta?: 'SHOP_NOW' | 'LEARN_MORE' | 'NO_BUTTON'
   last_post_at?: string
   updated_at?: string
 }
@@ -2251,6 +2268,19 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [scheduleMode, setScheduleMode] = useState<'slots' | 'interval'>(() => detectScheduleMode(page.post_hours))
   const [intervalMinutes, setIntervalMinutes] = useState<number>(() => parseInterval(page.post_hours, page.post_interval_minutes || 60))
   const [isActive, setIsActive] = useState(page.is_active === 1)
+  const [oneCardEnabled, setOneCardEnabled] = useState(page.onecard_enabled === 1)
+  const [oneCardLinkMode, setOneCardLinkMode] = useState<'shopee' | 'lazada' | 'none'>(() => {
+    const value = String(page.onecard_link_mode || '').trim().toLowerCase()
+    if (value === 'lazada') return 'lazada'
+    if (value === 'none') return 'none'
+    return 'shopee'
+  })
+  const [oneCardCta, setOneCardCta] = useState<'SHOP_NOW' | 'LEARN_MORE' | 'NO_BUTTON'>(() => {
+    const value = String(page.onecard_cta || '').trim().toUpperCase()
+    if (value === 'LEARN_MORE') return 'LEARN_MORE'
+    if (value === 'NO_BUTTON') return 'NO_BUTTON'
+    return 'SHOP_NOW'
+  })
   const [accessToken, setAccessToken] = useState(page.access_token || '')
   const [saving, setSaving] = useState(false)
   const [forcingPost, setForcingPost] = useState(false)
@@ -2291,6 +2321,9 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         post_hours: schedulePostHours,
         post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
         is_active: isActive,
+        onecard_enabled: oneCardEnabled,
+        onecard_link_mode: oneCardLinkMode,
+        onecard_cta: oneCardCta,
       }
       if (accessTokenChanged) {
         payload.access_token = nextToken
@@ -2311,6 +2344,9 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         post_hours: schedulePostHours,
         post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : page.post_interval_minutes,
         is_active: isActive ? 1 : 0,
+        onecard_enabled: oneCardEnabled ? 1 : 0,
+        onecard_link_mode: oneCardLinkMode,
+        onecard_cta: oneCardCta,
         access_token: nextToken,
       }
 
@@ -2410,6 +2446,64 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           >
             <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${isActive ? 'right-1' : 'left-1'}`}></div>
           </button>
+        </div>
+
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">Video One Card</p>
+              <p className="text-xs text-gray-400 mt-0.5">เปิดแล้วเพจนี้จะโพสต์ผ่าน flow onecard ส่วนเพจอื่นยังใช้แบบเดิม</p>
+            </div>
+            <button
+              onClick={() => setOneCardEnabled(!oneCardEnabled)}
+              className={`w-12 h-7 rounded-full relative transition-colors ${oneCardEnabled ? 'bg-blue-600' : 'bg-gray-300'}`}
+            >
+              <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${oneCardEnabled ? 'right-1' : 'left-1'}`}></div>
+            </button>
+          </div>
+
+          {oneCardEnabled && (
+            <>
+              <div>
+                <p className="text-xs font-bold text-gray-700 mb-2">ลิงก์ที่ใช้กับปุ่ม</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { value: 'shopee', label: 'Shopee' },
+                    { value: 'lazada', label: 'Lazada' },
+                    { value: 'none', label: 'ไม่ใส่ปุ่ม' },
+                  ].map((option) => (
+                    <button
+                      key={option.value}
+                      onClick={() => setOneCardLinkMode(option.value as 'shopee' | 'lazada' | 'none')}
+                      className={`py-2 rounded-lg text-sm font-medium transition-all ${oneCardLinkMode === option.value ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600'}`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {oneCardLinkMode !== 'none' && (
+                <div>
+                  <p className="text-xs font-bold text-gray-700 mb-2">ข้อความปุ่ม</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { value: 'SHOP_NOW', label: 'Shop Now' },
+                      { value: 'LEARN_MORE', label: 'Learn More' },
+                    ].map((option) => (
+                      <button
+                        key={option.value}
+                        onClick={() => setOneCardCta(option.value as 'SHOP_NOW' | 'LEARN_MORE')}
+                        className={`py-2 rounded-lg text-sm font-medium transition-all ${oneCardCta === option.value ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600'}`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
         </div>
 
         <div className="bg-white border border-blue-100 rounded-2xl p-4 mb-3">
@@ -3023,9 +3117,7 @@ function App({
     return readGalleryCacheForScope(botScope, getStoredNamespace(botScope), false)
   })
   const [usedVideos, setUsedVideos] = useState<Video[]>(() => {
-    const ns = getStoredNamespace(botScope)
-    if (ns) return readCache<Video[]>(nsCacheKey('used', ns), [])
-    return readCache<Video[]>(globalCacheKey('used'), [])
+    return readUsedGalleryCacheForScope(botScope, getStoredNamespace(botScope), false)
   })
   const [globalOriginalVideos, setGlobalOriginalVideos] = useState<GlobalOriginalVideo[]>([])
   const [globalOriginalLoading, setGlobalOriginalLoading] = useState(false)
@@ -3295,6 +3387,8 @@ function App({
   const loadPagesRequestRef = useRef(0)
   const loadTeamRequestRef = useRef(0)
   const lastGlobalOriginalFetchAtRef = useRef(0)
+  // Admin now uses its own namespace gallery only. The old mixed system-wide
+  // gallery/import flow is no longer part of the active product flow.
   const systemWideGalleryMode = FORCE_SYSTEM_WIDE_GALLERY
   const useSystemWideAdminGallery = false
   const mainScrollRef = useRef<HTMLDivElement | null>(null)
@@ -3388,11 +3482,11 @@ function App({
   }, [pages, selectedPageHistoryId])
 
   const tg = window.Telegram?.WebApp
-  const hydrateNamespaceCaches = (ns: string) => {
+  const hydrateNamespaceCaches = (ns: string, systemWide = false) => {
     const scopedNamespace = String(ns || '').trim()
     if (!scopedNamespace) return
-    const cachedVideos = readGalleryCacheForScope(botScope, scopedNamespace, false)
-    const cachedUsedVideos = readCache<Video[]>(nsCacheKey('used', scopedNamespace), [])
+    const cachedVideos = readGalleryCacheForScope(botScope, scopedNamespace, systemWide)
+    const cachedUsedVideos = readUsedGalleryCacheForScope(botScope, scopedNamespace, systemWide)
     const cachedHistory = readCache<PostHistory[]>(nsCacheKey('history', scopedNamespace), [])
     const cachedInbox = readCache<InboxVideo[]>(nsInboxCacheKey(scopedNamespace), [])
     const cachedDashboard = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace, dashboardDateFilter), null)
@@ -3446,9 +3540,13 @@ function App({
   }, [botScope, namespaceId, systemWideGalleryMode, videos])
 
   useEffect(() => {
+    if (systemWideGalleryMode) {
+      writeCache(systemUsedGalleryCacheKey(botScope), usedVideos)
+      return
+    }
     if (!namespaceId) return
     writeCache(nsCacheKey('used', namespaceId), usedVideos)
-  }, [namespaceId, usedVideos])
+  }, [botScope, namespaceId, systemWideGalleryMode, usedVideos])
 
   useEffect(() => {
     if (!namespaceId) return
@@ -3635,22 +3733,26 @@ function App({
   useEffect(() => {
     setTokenState(getToken(botScope))
     const storedNamespace = getStoredNamespace(botScope)
-    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, false)
+    const cachedVideos = readGalleryCacheForScope(botScope, storedNamespace, FORCE_SYSTEM_WIDE_GALLERY)
     const cachedInbox = storedNamespace ? readCache<InboxVideo[]>(nsInboxCacheKey(storedNamespace), []) : []
     const cachedDashboard = storedNamespace ? readCache<DashboardData | null>(dashboardCacheKey(storedNamespace, getTodayString()), null) : null
     const cachedProcessing = storedNamespace ? readCache<Video[]>(processingCacheKey(storedNamespace), []) : []
     const cachedSystemInbox = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
+    const cachedUsedVideos = readUsedGalleryCacheForScope(botScope, storedNamespace, FORCE_SYSTEM_WIDE_GALLERY)
     const storedShortlinkAccount = getStoredShortlinkAccount(botScope)
     const storedShortlinkBaseUrl = getStoredShortlinkBaseUrl(botScope)
     const storedLazadaShortlinkBaseUrl = getStoredLazadaShortlinkBaseUrl(botScope)
     setNamespaceId(storedNamespace)
     setVideos(cachedVideos)
+    setUsedVideos(cachedUsedVideos)
     setInboxVideos(cachedInbox)
     setSystemInboxVideos(cachedSystemInbox)
     setDashboardData(cachedDashboard)
     setProcessingVideos(cachedProcessing)
     setProcessingLoading(cachedProcessing.length === 0)
     setGalleryLoading(cachedVideos.length === 0)
+    setGalleryReadyTotalCount(cachedVideos.length)
+    setGalleryUsedTotalCount(cachedUsedVideos.length)
     const storedShortlinkExpectedUtmId = getStoredShortlinkExpectedUtmId(botScope)
     const storedLazadaExpectedMemberId = getStoredLazadaExpectedMemberId(botScope)
     setShortlinkAccountCurrent(storedShortlinkAccount)
@@ -3697,11 +3799,15 @@ function App({
     let cancelled = false
 
     const bootstrapAuth = async () => {
+      const appHost = typeof window !== 'undefined' && isAppHost(window.location.hostname)
+      const mainLiffUrl = typeof window !== 'undefined' ? getMainLiffUrlForHost(window.location.hostname) : ''
+      const liffInitOptions = typeof window !== 'undefined' ? getMainLiffInitOptionsForHost(window.location.hostname) : null
+
       // LIFF auto-login FIRST (LINE MINI App) — must run before anything else
-      if (typeof window !== 'undefined' && (window as any).liff) {
+      const liff = await waitForLiffSdk(5000)
+      if (typeof window !== 'undefined' && liff && liffInitOptions) {
         try {
-          const liff = (window as any).liff
-          await liff.init({ liffId: LINE_LIFF_ID })
+          await liff.init(liffInitOptions)
           if (!controlledTab) {
             syncNavigationStateFromLocation()
           }
@@ -3787,7 +3893,7 @@ function App({
                 if (liffData?.line_user_id) setMeLineUserId(String(liffData.line_user_id))
                 if (ns) {
                   setNamespaceId(ns)
-                  hydrateNamespaceCaches(ns)
+                  hydrateNamespaceCaches(ns, false)
                 }
                 if (!cancelled) setAuthBootstrapping(false)
                 return
@@ -3797,6 +3903,18 @@ function App({
         } catch (e) {
           console.error('LIFF init error:', e)
         }
+      }
+
+      if (appHost && typeof window !== 'undefined' && mainLiffUrl) {
+        try {
+          const redirectGuardKey = scopedStorageKey('liff_bootstrap_redirecting', botScope)
+          const lastRedirectAt = Number(sessionStorage.getItem(redirectGuardKey) || '0')
+          if (Date.now() - lastRedirectAt > 10_000) {
+            sessionStorage.setItem(redirectGuardKey, String(Date.now()))
+            window.location.replace(mainLiffUrl)
+            return
+          }
+        } catch {}
       }
 
       const tgId = tg?.initDataUnsafe?.user?.id
@@ -3817,7 +3935,7 @@ function App({
             if (me?.line_user_id) setMeLineUserId(String(me.line_user_id))
             if (ns) {
               setNamespaceId(ns)
-              hydrateNamespaceCaches(ns)
+              hydrateNamespaceCaches(ns, false)
             }
             if (!cancelled) setAuthBootstrapping(false)
             return
@@ -3853,7 +3971,7 @@ function App({
                 if (me?.line_picture_url) setMePictureUrl(String(me.line_picture_url))
                 if (ns) {
                   setNamespaceId(ns)
-                  hydrateNamespaceCaches(ns)
+                  hydrateNamespaceCaches(ns, false)
                 }
                 if (!cancelled) setAuthBootstrapping(false)
                 return
@@ -4049,9 +4167,7 @@ function App({
 
   useEffect(() => {
     const cachedVideos = readGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
-    const cachedUsedVideos = namespaceId
-      ? dedupeGalleryVideos(readCache<Video[]>(nsCacheKey('used', namespaceId), []))
-      : []
+    const cachedUsedVideos = readUsedGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
     setVideos(cachedVideos)
     setUsedVideos(cachedUsedVideos)
     const cachedProcessing = namespaceId
@@ -4646,8 +4762,10 @@ function App({
       return
     }
 
-    const hasCachedGallery = categoryFilter === 'used' ? usedVideos.length > 0 : videos.length > 0
-    void loadGallerySnapshotBundle(hasCachedGallery && !gallerySearchQuery ? { refreshTop: true } : { reset: true })
+    // Always reset from page 1 when entering/re-entering gallery.
+    // Using refreshTop with cached data can keep stale cards around after
+    // clips are moved between ready/used or removed from gallery eligibility.
+    void loadGallerySnapshotBundle({ reset: true })
     if (isOwner) void loadGlobalOriginalVideos()
   }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
 
@@ -5992,6 +6110,20 @@ function App({
   }
 
   if (!token) {
+    if (typeof window !== 'undefined' && isAppHost(window.location.hostname)) {
+      return (
+        <div
+          style={appViewportStyle}
+          className="fixed inset-0 bg-white flex items-center justify-center font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden"
+        >
+          <div className="flex flex-col items-center gap-3 text-gray-500 px-8 text-center">
+            <div className="w-7 h-7 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+            <p className="text-sm font-medium">กำลังเชื่อมต่อ LINE...</p>
+          </div>
+        </div>
+      )
+    }
+
     return (
       <div style={appViewportStyle} className="fixed inset-0 flex flex-col bg-white font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden">
         <div className="flex-1 flex flex-col items-center justify-center px-8 gap-6">

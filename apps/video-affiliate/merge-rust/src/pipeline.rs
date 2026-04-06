@@ -721,7 +721,6 @@ async fn gemini_tts(
     voice_name: Option<&str>,
     tts_prompt_template: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={}", api_key);
     let client = Client::new();
     let selected_voice = voice_name
         .map(|value| value.trim())
@@ -736,17 +735,56 @@ async fn gemini_tts(
         }
     });
 
-    for _ in 0..3 {
-        let res = client.post(&url).json(&payload).send().await?;
-        if res.status().is_success() {
-            let json: Value = res.json().await?;
-            if let Some(data) = json.get("candidates").and_then(|c| c.get(0)).and_then(|c| c.get("content")).and_then(|c| c.get("parts")).and_then(|p| p.get(0)).and_then(|p| p.get("inlineData")).and_then(|i| i.get("data")).and_then(|d| d.as_str()) {
-                return Ok(data.to_string());
+    let mut last_err = String::new();
+    let tts_models = [
+        "gemini-2.5-pro-preview-tts",
+        "gemini-2.5-flash-preview-tts",
+    ];
+
+    for model in tts_models {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model,
+            api_key
+        );
+        println!("[PIPELINE] gemini_tts using model={}", model);
+        for attempt in 0..3 {
+            let res = client.post(&url).json(&payload).send().await?;
+            let status = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
+            if status >= 200 && status < 300 {
+                let json: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                if let Some(data) = json
+                    .get("candidates")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("content"))
+                    .and_then(|c| c.get("parts"))
+                    .and_then(|p| p.get(0))
+                    .and_then(|p| p.get("inlineData"))
+                    .and_then(|i| i.get("data"))
+                    .and_then(|d| d.as_str())
+                {
+                    return Ok(data.to_string());
+                }
+                last_err = format!(
+                    "TTS model={} success_without_audio_body: {}",
+                    model,
+                    body.chars().take(300).collect::<String>()
+                );
+                println!("[PIPELINE] gemini_tts attempt {} missing audio: {}", attempt + 1, last_err);
+            } else {
+                last_err = format!(
+                    "TTS model={} http_{}: {}",
+                    model,
+                    status,
+                    body.chars().take(300).collect::<String>()
+                );
+                println!("[PIPELINE] gemini_tts attempt {} failed: {}", attempt + 1, last_err);
             }
+            sleep(Duration::from_secs(5 + (attempt as u64 * 3))).await;
         }
-        sleep(Duration::from_secs(5)).await;
     }
-    Err("TTS failed after retries".into())
+    Err(format!("TTS failed after retries: {}", last_err).into())
 }
 
 // Fallback: Simple script to SRT when Whisper fails

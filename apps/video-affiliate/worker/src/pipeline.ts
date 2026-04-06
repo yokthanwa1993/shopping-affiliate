@@ -5,7 +5,8 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-04-01.02'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-04-05.01'
+const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
 const GEMINI_API_KEY_SETTING_KEY = 'gemini_api_key_v1'
@@ -149,11 +150,13 @@ export type Env = {
     CORS_ORIGIN: string
     WEBAPP_URL?: string
     WEBAPP_DESKTOP_URL?: string
+    VIDEO_ONECARD_WORKER_URL?: string
     BROWSERSAVING_WORKER_URL?: string
     BROWSERSAVING_API_URL?: string
     TAG_SYNC_PUSH_SECRET?: string
     LINE_CHANNEL_SECRET?: string
     LINE_CHANNEL_ACCESS_TOKEN?: string
+    GOOGLE_API_KEY?: string
 }
 
 async function ensureNamespaceSettingsTable(db: D1Database) {
@@ -573,6 +576,10 @@ function normalizeGeminiApiKeys(rawKeys: unknown): string[] {
     return out
 }
 
+function getEnvGeminiApiKeys(env: Pick<Env, 'GOOGLE_API_KEY'>): string[] {
+    return normalizeGeminiApiKeys([String(env.GOOGLE_API_KEY || '').trim()])
+}
+
 async function getLegacySystemGeminiApiKeys(db: D1Database): Promise<string[]> {
     await ensureNamespaceSettingsTable(db)
     const rows = await db.prepare(
@@ -587,6 +594,27 @@ async function getLegacySystemGeminiApiKeys(db: D1Database): Promise<string[]> {
          ORDER BY datetime(ns.updated_at) DESC, datetime(ns.created_at) DESC`
     ).bind(GEMINI_API_KEY_SETTING_KEY).all() as { results?: Array<{ value?: string }> }
     return normalizeGeminiApiKeys((rows.results || []).map((row) => row?.value || ''))
+}
+
+async function getNamespaceGeminiApiKeys(db: D1Database, namespaceId: string): Promise<string[]> {
+    await ensureNamespaceSettingsTable(db)
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return []
+
+    const multiRow = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(normalizedNamespaceId, GEMINI_API_KEYS_SETTING_KEY).first() as { value?: string } | null
+    let parsed: unknown = []
+    try {
+        parsed = JSON.parse(String(multiRow?.value || '[]'))
+    } catch {
+        parsed = []
+    }
+    const multiKeys = normalizeGeminiApiKeys(parsed)
+    if (multiKeys.length > 0) return multiKeys
+
+    const legacyKey = await getNamespaceGeminiApiKey(db, normalizedNamespaceId)
+    return normalizeGeminiApiKeys(legacyKey ? [legacyKey] : [])
 }
 
 export async function getSystemGeminiApiKeys(db: D1Database): Promise<string[]> {
@@ -620,7 +648,7 @@ export async function sendTelegram(token: string, method: string, body: Record<s
 
 async function resolveXhsVideo(url: string, env: Env): Promise<string | null> {
     // เรียก Container เพื่อ resolve XHS URL
-    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
     const containerStub = env.MERGE_CONTAINER.get(containerId)
 
     const resp = await containerStub.fetch('http://container/xhs/resolve', {
@@ -765,10 +793,14 @@ export async function runPipeline(
     } catch (e) {
         console.log(`[PIPELINE] DB lookup failed, using default token: ${e}`)
     }
-    const apiKeys = await getSystemGeminiApiKeys(env.DB).catch(() => [])
+    const namespaceApiKeys = await getNamespaceGeminiApiKeys(env.DB, botId).catch(() => [])
+    const systemApiKeys = await getSystemGeminiApiKeys(env.DB).catch(() => [])
+    const envApiKeys = getEnvGeminiApiKeys(env)
+    const apiKeys = normalizeGeminiApiKeys([...namespaceApiKeys, ...systemApiKeys, ...envApiKeys])
     if (apiKeys.length === 0) {
         throw new Error('ยังไม่ได้ตั้ง Gemini API key กลางของระบบ')
     }
+    console.log(`[PIPELINE] Gemini key pool namespace=${namespaceApiKeys.length} system=${systemApiKeys.length} env=${envApiKeys.length} merged=${apiKeys.length}`)
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
     const voiceSettings = await getNamespaceVoiceSettings(env.DB, botId)
         .catch(() => ({
@@ -793,7 +825,7 @@ export async function runPipeline(
         directVideoUrl = await ensurePipelineSourceUrlAvailable(env, workerUrl, botId, videoId, directVideoUrl)
 
         // ส่งงานทั้งหมดไป Container /pipeline — รัน background ไม่มี time limit
-        const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+        const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
         const containerStub = env.MERGE_CONTAINER.get(containerId)
 
         const payload = JSON.stringify({
@@ -995,7 +1027,7 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
 }
 
 export async function warmPipelineContainer(env: Env): Promise<void> {
-    const containerId = env.MERGE_CONTAINER.idFromName('merge-worker')
+    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
     const containerStub = env.MERGE_CONTAINER.get(containerId)
     try {
         const resp = await fetchWithTimeout(

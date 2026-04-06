@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS pages (
     bot_id TEXT DEFAULT 'default',
     post_hours TEXT DEFAULT '',
     is_active INTEGER DEFAULT 1,
+    onecard_enabled INTEGER DEFAULT 0,
+    onecard_link_mode TEXT DEFAULT 'shopee',
+    onecard_cta TEXT DEFAULT 'SHOP_NOW',
     last_post_at TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
