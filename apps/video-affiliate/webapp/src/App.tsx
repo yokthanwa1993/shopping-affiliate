@@ -1117,6 +1117,8 @@ const getInitialGallerySearchInput = (): string => {
 }
 
 function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
+  const postedTs = new Date(String(video.postedAt || video.posted_at || '')).getTime()
+  if (Number.isFinite(postedTs) && postedTs > 0) return postedTs
   const updatedTs = new Date(String(video.updatedAt || '')).getTime()
   if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
   const createdTs = new Date(String(video.createdAt || '')).getTime()
