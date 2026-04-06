@@ -3226,6 +3226,26 @@ function isNamespaceGalleryVideoVisibleInUsedTab(video: Record<string, unknown> 
     return isNamespaceGalleryVideoPosted(video)
 }
 
+function getGalleryVideoPostedTimeMs(video: Record<string, unknown> | null | undefined): number {
+    if (!video) return 0
+    const postedAt = String(video.postedAt || video.posted_at || '').trim()
+    const postedMs = postedAt ? Date.parse(postedAt) : Number.NaN
+    if (Number.isFinite(postedMs)) return postedMs
+    const createdAt = String(video.createdAt || video.created_at || '').trim()
+    const createdMs = createdAt ? Date.parse(createdAt) : Number.NaN
+    return Number.isFinite(createdMs) ? createdMs : 0
+}
+
+function sortUsedGalleryVideosNewestFirst(videos: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+    return [...videos].sort((a, b) => {
+        const timeDiff = getGalleryVideoPostedTimeMs(b) - getGalleryVideoPostedTimeMs(a)
+        if (timeDiff !== 0) return timeDiff
+        const aId = String(a.id || '').trim()
+        const bId = String(b.id || '').trim()
+        return bId.localeCompare(aId)
+    })
+}
+
 function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | null | undefined): boolean {
     if (!video) return false
     const explicitGalleryReady = getBooleanFlag(video.gallery_ready)
@@ -12458,7 +12478,9 @@ app.get('/api/gallery/system', async (c) => {
             const row = video as Record<string, unknown>
             return isNamespaceGalleryVideoVisibleInUsedTab(row)
         })
-        const sourceVideos = view === 'used' ? usedVideos : readyVideos
+        const sourceVideos = view === 'used'
+            ? sortUsedGalleryVideosNewestFirst(usedVideos as Array<Record<string, unknown>>)
+            : readyVideos
         const searchedVideos = searchQuery
             ? sourceVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
             : sourceVideos
@@ -12734,13 +12756,10 @@ app.get('/api/gallery/used', async (c) => {
     }
     try {
         const inventory = await getNamespaceGalleryInventory(c.env, String(botId || '').trim())
-        const videos = dedupeVideosById(inventory.videos)
+        const videos = sortUsedGalleryVideosNewestFirst(
+            dedupeVideosById(inventory.videos)
             .filter((video: any) => isNamespaceGalleryVideoVisibleInUsedTab(video as Record<string, unknown>))
-
-        // Sort by createdAt desc
-        videos.sort((a: any, b: any) => {
-            return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
-        })
+        )
 
         const searchedVideos = searchQuery
             ? videos.filter((video: any) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
