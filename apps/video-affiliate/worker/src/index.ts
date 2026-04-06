@@ -20209,7 +20209,7 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
 }
 
 type PageOneCardLinkMode = 'shopee' | 'lazada' | 'none'
-type PageOneCardCta = 'SHOP_NOW' | 'LEARN_MORE' | 'NO_BUTTON'
+type PageOneCardCta = 'SHOP_NOW' | 'NO_BUTTON'
 
 function normalizePageOneCardLinkMode(rawValue: unknown): PageOneCardLinkMode {
     const value = String(rawValue || '').trim().toLowerCase()
@@ -20220,7 +20220,6 @@ function normalizePageOneCardLinkMode(rawValue: unknown): PageOneCardLinkMode {
 
 function normalizePageOneCardCta(rawValue: unknown): PageOneCardCta {
     const value = String(rawValue || '').trim().toUpperCase()
-    if (value === 'LEARN_MORE') return 'LEARN_MORE'
     if (value === 'NO_BUTTON') return 'NO_BUTTON'
     return 'SHOP_NOW'
 }
@@ -20257,7 +20256,7 @@ async function publishVideoViaOneCard(params: {
     cta?: PageOneCardCta
     logPrefix: string
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
-    const baseUrl = String(params.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.yokthanwa1993-bc9.workers.dev').trim().replace(/\/+$/, '')
+    const baseUrl = String(params.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
     if (!baseUrl) throw new Error('onecard_worker_url_missing')
 
     const payload: Record<string, unknown> = {

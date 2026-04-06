@@ -573,7 +573,7 @@ interface FacebookPage {
   is_active: number
   onecard_enabled?: number
   onecard_link_mode?: 'shopee' | 'lazada' | 'none'
-  onecard_cta?: 'SHOP_NOW' | 'LEARN_MORE' | 'NO_BUTTON'
+  onecard_cta?: 'SHOP_NOW' | 'NO_BUTTON'
   last_post_at?: string
   updated_at?: string
 }
@@ -2275,9 +2275,8 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
     if (value === 'none') return 'none'
     return 'shopee'
   })
-  const [oneCardCta, setOneCardCta] = useState<'SHOP_NOW' | 'LEARN_MORE' | 'NO_BUTTON'>(() => {
+  const [oneCardCta, setOneCardCta] = useState<'SHOP_NOW' | 'NO_BUTTON'>(() => {
     const value = String(page.onecard_cta || '').trim().toUpperCase()
-    if (value === 'LEARN_MORE') return 'LEARN_MORE'
     if (value === 'NO_BUTTON') return 'NO_BUTTON'
     return 'SHOP_NOW'
   })
@@ -2452,7 +2451,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="font-bold text-gray-900">Video One Card</p>
-              <p className="text-xs text-gray-400 mt-0.5">เปิดแล้วเพจนี้จะโพสต์ผ่าน flow onecard ส่วนเพจอื่นยังใช้แบบเดิม</p>
+              <p className="text-xs text-gray-400 mt-0.5">เปิดแล้วเพจนี้จะโพสต์ผ่าน Video One Card ส่วนเพจอื่นยังใช้แบบเดิม</p>
             </div>
             <button
               onClick={() => setOneCardEnabled(!oneCardEnabled)}
@@ -2487,13 +2486,10 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
                 <div>
                   <p className="text-xs font-bold text-gray-700 mb-2">ข้อความปุ่ม</p>
                   <div className="grid grid-cols-2 gap-2">
-                    {[
-                      { value: 'SHOP_NOW', label: 'Shop Now' },
-                      { value: 'LEARN_MORE', label: 'Learn More' },
-                    ].map((option) => (
+                    {[{ value: 'SHOP_NOW', label: 'Shop Now' }].map((option) => (
                       <button
                         key={option.value}
-                        onClick={() => setOneCardCta(option.value as 'SHOP_NOW' | 'LEARN_MORE')}
+                        onClick={() => setOneCardCta(option.value as 'SHOP_NOW')}
                         className={`py-2 rounded-lg text-sm font-medium transition-all ${oneCardCta === option.value ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600'}`}
                       >
                         {option.label}

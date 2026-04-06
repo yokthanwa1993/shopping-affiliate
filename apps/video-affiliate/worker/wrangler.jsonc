@@ -72,7 +72,7 @@
         "GEMINI_MODEL": "gemini-3-flash-preview",
         "WEBAPP_URL": "https://app.oomnn.com",
         "WEBAPP_DESKTOP_URL": "https://web.oomnn.com",
-        "VIDEO_ONECARD_WORKER_URL": "https://video-onecard.yokthanwa1993-bc9.workers.dev",
+        "VIDEO_ONECARD_WORKER_URL": "https://video-onecard.wwoom.com",
         "BROWSERSAVING_WORKER_URL": "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev",
         "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com"
     },

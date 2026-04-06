@@ -1,0 +1,523 @@
+const {
+  app, BrowserWindow, Tray, Menu, clipboard, nativeImage, Notification, net,
+} = require("electron");
+const path = require("path");
+const fs = require("fs");
+const http = require("http");
+const nodeFetch = require("node-fetch");
+const os = require("os");
+const { spawn } = require("child_process");
+
+const LOCAL_PORT = 3847;
+const TUNNEL_NAME = "onecard-wwoom";
+const TUNNEL_ID = "13056541-56b1-4c65-aec9-8b5112b14c2e";
+const TUNNEL_HOST = "video-onecard.wwoom.com";
+const TUNNEL_URL = `https://${TUNNEL_HOST}`;
+const CLOUDFLARED_BIN = "/opt/homebrew/bin/cloudflared";
+const ADS_MANAGER_URL = "https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=1148837732288721";
+
+const storePath = path.join(app.getPath("userData"), "appdata.json");
+let mainWindow = null, tray = null, accessToken = null, fbDtsg = null, userName = null, isQuitting = false;
+let tunnelProc = null;
+let tunnelReady = false;
+let tunnelError = null;
+
+function loadStore() { try { return JSON.parse(fs.readFileSync(storePath, "utf8")); } catch { return {}; } }
+function saveStore(d) { fs.writeFileSync(storePath, JSON.stringify({ ...loadStore(), ...d }), "utf8"); }
+
+// Electron net.request with session cookies
+function elFetch(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const req = net.request({ url, method: opts.method || "GET", useSessionCookies: true });
+    if (opts.headers) Object.entries(opts.headers).forEach(([k, v]) => req.setHeader(k, v));
+    let body = "";
+    req.on("response", (res) => {
+      res.on("data", (c) => body += c.toString());
+      res.on("end", () => resolve({ status: res.statusCode, text: () => body, json: () => JSON.parse(body) }));
+    });
+    req.on("error", reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({ width: 1400, height: 900, show: false, webPreferences: { nodeIntegration: false, contextIsolation: true } });
+  mainWindow.loadURL(ADS_MANAGER_URL);
+  mainWindow.on("close", (e) => { if (!isQuitting) { e.preventDefault(); mainWindow.hide(); } });
+
+  // Extract __accessToken + fb_dtsg after page loads
+  mainWindow.webContents.on("did-finish-load", extractFromPage);
+  setInterval(extractFromPage, 15000);
+}
+
+async function extractFromPage() {
+  try {
+    const data = await mainWindow.webContents.executeJavaScript(`
+      (function() {
+        var t = window.__accessToken || null;
+        var d = null;
+        try { d = require("DTSGInitData").token; } catch(e) {}
+        if (!d) { try { var m = document.documentElement.innerHTML.match(/"dtsg":\\{"token":"([^"]+)"/); if(m) d = m[1]; } catch(e) {} }
+        var u = null;
+        try { var m2 = document.cookie.match(/c_user=([0-9]+)/); u = m2 ? m2[1] : null; } catch(e) {}
+        return JSON.stringify({token: t, dtsg: d, userId: u});
+      })()
+    `);
+    const p = JSON.parse(data);
+    if (p.token) accessToken = p.token;
+    if (p.dtsg) fbDtsg = p.dtsg;
+    if (p.userId) userName = "User " + p.userId;
+    if (accessToken) { saveStore({ accessToken, fbDtsg, userName }); updateTray(); console.log("Session ready"); }
+  } catch {}
+}
+
+function updateTray() {
+  const s = accessToken ? `✓ ${userName || "Connected"}` : "⏳ Loading...";
+  const tunnelLine = tunnelReady ? `Tunnel: ${TUNNEL_URL}` : `Tunnel: ${tunnelError || "starting..."}`;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "FB Video One Card Post", enabled: false }, { label: s, enabled: false },
+    { label: `API: http://localhost:${LOCAL_PORT}`, enabled: false },
+    { label: tunnelLine, enabled: false },
+    { type: "separator" },
+    { label: "Show Ads Manager", click: () => { mainWindow?.show(); mainWindow?.focus(); } },
+    { type: "separator" },
+    { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
+  ]));
+}
+
+function createTray() {
+  const dir = path.join(__dirname, "assets"), icon = path.join(dir, "trayIconTemplate.png");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(icon)) fs.writeFileSync(icon, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAABYAAAAWCAYAAADEtGw7AAAAhklEQVR4Ae3SMQrCQBCF4X+LFIKFWHgAb+BhPIm38AAewMZKsLCw0CKN4BZb7MImkV3BwvrBwMDM8DFJKKUw/EewgDMe8YSJYwxjHPCEN5xwwBNOOCOhwA1LbLHCGnuckFBijw222GCNE85IKHHFDntscMQZCRWuOOCAI85IqHHDESecccEbfgCoGirZUMzpYwAAAABJRU5ErkJggg==", "base64"));
+  tray = new Tray(icon);
+  tray.on("click", () => mainWindow?.isVisible() ? mainWindow.hide() : mainWindow?.show());
+  updateTray();
+}
+
+function ensureTunnelConfig() {
+  const configPath = path.join(app.getPath("userData"), "cloudflared-onecard.yml");
+  const credentialsFile = path.join(os.homedir(), ".cloudflared", `${TUNNEL_ID}.json`);
+  const config = [
+    `tunnel: ${TUNNEL_ID}`,
+    `credentials-file: ${credentialsFile}`,
+    "ingress:",
+    `  - hostname: ${TUNNEL_HOST}`,
+    `    service: http://localhost:${LOCAL_PORT}`,
+    "  - service: http_status:404",
+    "",
+  ].join("\n");
+  fs.writeFileSync(configPath, config, "utf8");
+  return configPath;
+}
+
+function startTunnel() {
+  if (tunnelProc || !fs.existsSync(CLOUDFLARED_BIN)) {
+    if (!fs.existsSync(CLOUDFLARED_BIN)) {
+      tunnelError = "cloudflared missing";
+      updateTray();
+    }
+    return;
+  }
+  const configPath = ensureTunnelConfig();
+  tunnelReady = false;
+  tunnelError = null;
+  updateTray();
+  tunnelProc = spawn(CLOUDFLARED_BIN, ["tunnel", "--config", configPath, "run", TUNNEL_NAME], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const onOutput = (chunk) => {
+    const text = String(chunk || "");
+    if (!text) return;
+    if (text.includes("Registered tunnel connection") || text.includes("Connection") || text.includes("Starting metrics server")) {
+      tunnelReady = true;
+      tunnelError = null;
+      updateTray();
+    }
+  };
+  tunnelProc.stdout.on("data", onOutput);
+  tunnelProc.stderr.on("data", onOutput);
+  tunnelProc.on("exit", (code) => {
+    tunnelProc = null;
+    tunnelReady = false;
+    tunnelError = `stopped (${code ?? "?"})`;
+    updateTray();
+    if (!isQuitting) {
+      setTimeout(startTunnel, 2000);
+    }
+  });
+}
+
+function stopTunnel() {
+  if (!tunnelProc) return;
+  try { tunnelProc.kill("SIGTERM"); } catch {}
+  tunnelProc = null;
+}
+
+// Local API — ทุก Graph API call ผ่าน Electron net (session cookies)
+function startServer() {
+  http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://localhost:${LOCAL_PORT}`);
+    const p = url.pathname;
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    // Web UI
+    if (p === "/" && req.method === "GET") {
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      return res.end(getWebUI());
+    }
+
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") return res.end();
+
+    // Parse POST JSON body if present
+    let body = {};
+    if (req.method === "POST") {
+      try {
+        const raw = await new Promise((resolve) => {
+          let d = ""; req.on("data", c => d += c); req.on("end", () => resolve(d));
+        });
+        body = JSON.parse(raw);
+      } catch {}
+    }
+
+    // Merge: POST body + query params (query params override)
+    const params = { ...body };
+    url.searchParams.forEach((v, k) => { if (v) params[k] = v; });
+
+    if (p === "/token") return res.end(JSON.stringify({ ok: true, accessToken: !!accessToken, fbDtsg: !!fbDtsg, user: userName }));
+
+    if (p === "/session") {
+      // Return session info
+      const cookies = await mainWindow.webContents.session.cookies.get({ domain: ".facebook.com" });
+      return res.end(JSON.stringify({ ok: true, accessToken, fbDtsg, cookies: cookies.length }));
+    }
+
+    // /pages — ดึงเพจผ่าน Electron session
+    if (p === "/pages") {
+      try {
+        const r = await elFetch("https://www.facebook.com/pages/?category=your_pages", { method: "GET" });
+        // ใช้ Graph API ผ่าน net module
+        const r2 = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id,name&limit=100&access_token=${encodeURIComponent(accessToken)}`);
+        const data = r2.json();
+        if (data.error) {
+          // Fallback: ใช้ user token เดิม
+          const saved = loadStore();
+          if (saved.userToken) {
+            const r3 = await nodeFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id,name&limit=100&access_token=${encodeURIComponent(saved.userToken)}`);
+            return res.end(JSON.stringify(await r3.json()));
+          }
+          return res.end(JSON.stringify(data));
+        }
+        return res.end(JSON.stringify(data));
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /upload-video — อัพวีดีโอ + ดึง thumbnails
+    if (p === "/upload-video") {
+      const adAccount = params.ad_account || "act_1148837732288721";
+      const videoUrl = params.video_url;
+      if (!videoUrl) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: "Missing: video_url" })); }
+      try {
+        const step1 = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: "POST" });
+        const v = step1.json();
+        if (v.error) return res.end(JSON.stringify({ ok: false, error: v.error.message }));
+        let thumbnails = [];
+        for (let i = 0; i < 25; i++) {
+          await new Promise(r => setTimeout(r, 3000));
+          const s = await elFetch(`https://graph.facebook.com/${v.id}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
+          const sd = s.json();
+          if (sd.thumbnails?.data?.length > 1) { thumbnails = sd.thumbnails.data.map(t => ({ id: t.id, url: t.uri })); break; }
+        }
+        return res.end(JSON.stringify({ ok: true, video_id: v.id, thumbnails }));
+      } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /post — One Card post ผ่าน adcreatives (ใช้ accessToken จาก Ads Manager)
+    if (p === "/post") {
+      const adAccount = params.ad_account || "act_1148837732288721";
+      const pageId = params.page_id;
+      const videoUrl = params.video_url;
+      const message = params.message || "";
+      const title = params.title || "";
+      const description = params.description || "";
+      const websiteUrl = params.website_url || "";
+      const cta = params.cta === "NO_BUTTON" ? "NO_BUTTON" : "SHOP_NOW";
+
+      if (!pageId || !videoUrl) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ ok: false, error: "Missing: ad_account, page_id, video_url" }));
+      }
+
+      try {
+        // Step 1: Upload video
+        const step1 = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: "POST" });
+        const v = step1.json();
+        if (v.error) return res.end(JSON.stringify({ ok: false, step: "upload_video", error: v.error.message }));
+        const videoId = v.id;
+
+        // Step 2: Wait for thumbnails
+        let thumbUrl = null;
+        for (let i = 0; i < 25; i++) {
+          await new Promise(r => setTimeout(r, 3000));
+          const s = await elFetch(`https://graph.facebook.com/${videoId}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
+          const sd = s.json();
+          if (sd.thumbnails?.data?.length > 1) { thumbUrl = sd.thumbnails.data[0].uri; break; }
+        }
+        if (!thumbUrl) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout" }));
+
+        // Step 3: Create adcreative
+        const videoData = { video_id: videoId, image_url: thumbUrl, message: message || "" };
+        if (title) videoData.title = title;
+        if (description) videoData.link_description = description;
+        if (cta !== "NO_BUTTON") videoData.call_to_action = { type: cta, value: { link: websiteUrl } };
+        const body = JSON.stringify({ object_story_spec: { page_id: pageId, video_data: videoData } });
+
+        const s3 = await elFetch(`https://graph.facebook.com/v16.0/${adAccount}/adcreatives?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body
+        });
+        const c = s3.json();
+        if (c.error) return res.end(JSON.stringify({ ok: false, step: "adcreative", error: c.error.message }));
+
+        // Step 4: Poll for story ID
+        let storyId = null;
+        for (let i = 0; i < 25; i++) {
+          await new Promise(r => setTimeout(r, 3000));
+          const p4 = await elFetch(`https://graph.facebook.com/${c.id}?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`);
+          const d4 = p4.json();
+          if (d4.effective_object_story_id) { storyId = d4.effective_object_story_id; break; }
+        }
+        if (!storyId) return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout" }));
+
+        // Step 5: Get page token & publish
+        const pagesRes = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id&limit=100&access_token=${encodeURIComponent(accessToken)}`);
+        const pages = pagesRes.json();
+        const page = (pages.data || []).find(pg => pg.id === pageId);
+        const pageToken = page ? page.access_token : accessToken;
+
+        const pub = await elFetch(`https://graph.facebook.com/v16.0/${storyId}?access_token=${encodeURIComponent(pageToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ is_published: true })
+        });
+        const pubR = pub.json();
+        if (pubR.error && pubR.error.code !== 1) return res.end(JSON.stringify({ ok: false, step: "publish", error: pubR.error.message }));
+
+        return res.end(JSON.stringify({ ok: true, story_id: storyId, video_id: videoId, post_url: `https://www.facebook.com/${storyId.replace("_", "/posts/")}` }));
+      } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ ok: false, error: "Use /token, /session, /pages, /post" }));
+  }).listen(LOCAL_PORT, () => console.log(`API: http://localhost:${LOCAL_PORT}`));
+}
+
+function getWebUI() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FB Video One Card Post</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f0f2f5;color:#1c1e21;min-height:100vh;display:flex;justify-content:center;padding:24px}
+  .container{width:100%;max-width:560px}
+  .header{background:#1877f2;color:#fff;padding:20px 24px;border-radius:12px 12px 0 0;display:flex;align-items:center;gap:12px}
+  .header svg{width:32px;height:32px;fill:#fff;flex-shrink:0}
+  .header h1{font-size:20px;font-weight:600}
+  .header .sub{font-size:13px;opacity:.85;margin-top:2px}
+  .card{background:#fff;border-radius:0 0 12px 12px;padding:24px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+  .session-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;margin-bottom:20px;font-size:13px;font-weight:500}
+  .session-bar.ok{background:#e7f3e8;color:#1a7f2b}
+  .session-bar.err{background:#fde8e8;color:#c0392b}
+  .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .session-bar.ok .dot{background:#1a7f2b}
+  .session-bar.err .dot{background:#c0392b}
+  label{display:block;font-size:13px;font-weight:600;color:#606770;margin-bottom:4px;margin-top:14px}
+  label:first-of-type{margin-top:0}
+  input,select,textarea{width:100%;padding:10px 12px;border:1.5px solid #dddfe2;border-radius:8px;font-size:14px;font-family:inherit;transition:border .15s}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:#1877f2;box-shadow:0 0 0 2px rgba(24,119,242,.15)}
+  textarea{resize:vertical;min-height:70px}
+  .btn{display:block;width:100%;padding:12px;margin-top:20px;background:#1877f2;color:#fff;font-size:15px;font-weight:600;border:none;border-radius:8px;cursor:pointer;transition:background .15s}
+  .btn:hover{background:#166fe5}
+  .btn:disabled{background:#a0c4f1;cursor:not-allowed}
+  .progress{margin-top:16px;display:none}
+  .step{display:flex;align-items:center;gap:8px;padding:6px 0;font-size:13px;color:#606770}
+  .step.active{color:#1877f2;font-weight:600}
+  .step.done{color:#1a7f2b}
+  .step.fail{color:#c0392b}
+  .step .icon{width:18px;text-align:center;flex-shrink:0}
+  .result{margin-top:16px;display:none;padding:14px;border-radius:8px;font-size:14px}
+  .result.success{background:#e7f3e8;color:#1a7f2b}
+  .result.error{background:#fde8e8;color:#c0392b}
+  .result a{color:#1877f2;text-decoration:none;font-weight:600;word-break:break-all}
+  .result a:hover{text-decoration:underline}
+  .row{display:flex;gap:12px}
+  .row>div{flex:1}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <svg viewBox="0 0 36 36"><path d="M15 35.8C6.5 34.3 0 26.9 0 18 0 8.1 8.1 0 18 0s18 8.1 18 18c0 8.9-6.5 16.3-15 17.8v-12.6h4.2l.8-4.8H21v-3.1c0-1.3.7-2.6 2.7-2.6h2.1v-4.1s-1.9-.3-3.7-.3c-3.8 0-6.3 2.3-6.3 6.5v3.6h-4.2v4.8H15V35.8z"/></svg>
+    <div><h1>Video One Card Post</h1><div class="sub">Create one-card link posts with video</div></div>
+  </div>
+  <div class="card">
+    <div id="session" class="session-bar err"><div class="dot"></div><span>Checking session...</span></div>
+
+    <label>Page</label>
+    <select id="page"><option value="">Loading pages...</option></select>
+
+    <label>Ad Account</label>
+    <input id="adAccount" value="act_1148837732288721" placeholder="act_XXXXXXX">
+
+    <label>Video URL</label>
+    <input id="videoUrl" placeholder="https://example.com/video.mp4">
+
+    <label>Primary Text</label>
+    <textarea id="message" placeholder="Post caption / primary text"></textarea>
+
+    <div class="row">
+      <div><label>Card Title</label><input id="title" placeholder="Headline on the card"></div>
+      <div><label>Card Description</label><input id="description" placeholder="Description below title"></div>
+    </div>
+
+    <label>Website URL</label>
+    <input id="websiteUrl" placeholder="https://yoursite.com">
+
+    <label>Call to Action</label>
+    <select id="cta">
+      <option value="SHOP_NOW">Shop Now</option>
+      <option value="NO_BUTTON">No Button</option>
+    </select>
+
+    <button class="btn" id="publishBtn" onclick="publish()">Publish</button>
+
+    <div class="progress" id="progress">
+      <div class="step" id="s1"><span class="icon">&#9711;</span> Uploading video</div>
+      <div class="step" id="s2"><span class="icon">&#9711;</span> Waiting for thumbnails</div>
+      <div class="step" id="s3"><span class="icon">&#9711;</span> Creating ad creative</div>
+      <div class="step" id="s4"><span class="icon">&#9711;</span> Publishing post</div>
+    </div>
+
+    <div class="result" id="result"></div>
+  </div>
+</div>
+
+<script>
+const API = "http://localhost:${LOCAL_PORT}";
+let pages = [];
+
+async function init() {
+  // Check session
+  try {
+    const r = await fetch(API + "/token");
+    const d = await r.json();
+    const el = document.getElementById("session");
+    if (d.ok && d.accessToken) {
+      el.className = "session-bar ok";
+      el.innerHTML = '<div class="dot"></div><span>' + (d.user || "Connected") + ' &mdash; session active</span>';
+    } else {
+      el.className = "session-bar err";
+      el.innerHTML = '<div class="dot"></div><span>No session &mdash; open Ads Manager window first</span>';
+    }
+  } catch(e) {
+    document.getElementById("session").innerHTML = '<div class="dot"></div><span>Cannot reach local server</span>';
+  }
+
+  // Load pages
+  try {
+    const r = await fetch(API + "/pages");
+    const d = await r.json();
+    const sel = document.getElementById("page");
+    if (d.data && d.data.length) {
+      pages = d.data;
+      sel.innerHTML = d.data.map(p => '<option value="' + p.id + '">' + p.name + ' (' + p.id + ')</option>').join("");
+    } else if (d.error) {
+      sel.innerHTML = '<option value="">Error: ' + d.error.message + '</option>';
+    } else {
+      sel.innerHTML = '<option value="">No pages found</option>';
+    }
+  } catch(e) {
+    document.getElementById("page").innerHTML = '<option value="">Failed to load pages</option>';
+  }
+}
+
+function setStep(n, state) {
+  for (let i = 1; i <= 4; i++) {
+    const el = document.getElementById("s" + i);
+    if (i < n) { el.className = "step done"; el.querySelector(".icon").textContent = "\\u2713"; }
+    else if (i === n) {
+      el.className = "step " + state;
+      el.querySelector(".icon").textContent = state === "done" ? "\\u2713" : state === "fail" ? "\\u2717" : "\\u25cb";
+    }
+    else { el.className = "step"; el.querySelector(".icon").textContent = "\\u25cb"; }
+  }
+}
+
+async function publish() {
+  const btn = document.getElementById("publishBtn");
+  const prog = document.getElementById("progress");
+  const result = document.getElementById("result");
+  btn.disabled = true;
+  prog.style.display = "block";
+  result.style.display = "none";
+
+  const pageId = document.getElementById("page").value;
+  const adAccount = document.getElementById("adAccount").value.trim();
+  const videoUrl = document.getElementById("videoUrl").value.trim();
+  const message = document.getElementById("message").value;
+  const title = document.getElementById("title").value;
+  const description = document.getElementById("description").value;
+  const websiteUrl = document.getElementById("websiteUrl").value.trim();
+  const cta = document.getElementById("cta").value;
+
+  if (!pageId || !adAccount || !videoUrl) {
+    result.className = "result error"; result.style.display = "block";
+    result.textContent = "Please fill in Page, Ad Account, and Video URL.";
+    btn.disabled = false; return;
+  }
+
+  setStep(1, "active");
+
+  const params = new URLSearchParams({
+    ad_account: adAccount, page_id: pageId, video_url: videoUrl,
+    message, title, description, website_url: websiteUrl, cta
+  });
+
+  try {
+    const r = await fetch(API + "/post?" + params.toString());
+    const d = await r.json();
+
+    if (d.ok) {
+      setStep(4, "done");
+      result.className = "result success"; result.style.display = "block";
+      result.innerHTML = 'Published! <a href="' + d.post_url + '" target="_blank">' + d.post_url + '</a>';
+    } else {
+      const stepMap = { upload_video: 1, thumbnails: 2, adcreative: 3, story_id: 4, publish: 4 };
+      const failAt = stepMap[d.step] || 1;
+      setStep(failAt, "fail");
+      result.className = "result error"; result.style.display = "block";
+      result.textContent = "Failed at " + (d.step || "unknown") + ": " + (d.error || JSON.stringify(d));
+    }
+  } catch(e) {
+    setStep(1, "fail");
+    result.className = "result error"; result.style.display = "block";
+    result.textContent = "Network error: " + e.message;
+  }
+  btn.disabled = false;
+}
+
+init();
+</script>
+</body>
+</html>`;
+}
+
+app.dock.hide();
+app.whenReady().then(() => {
+  createWindow(); createTray(); startServer(); startTunnel();
+});
+app.on("window-all-closed", (e) => e.preventDefault());
+app.on("before-quit", () => { isQuitting = true; stopTunnel(); });
