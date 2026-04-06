@@ -3221,6 +3221,11 @@ function isNamespaceGalleryVideoPosted(video: Record<string, unknown> | null | u
     return !!String(video?.postedAt || video?.posted_at || '').trim()
 }
 
+function isNamespaceGalleryVideoVisibleInUsedTab(video: Record<string, unknown> | null | undefined): boolean {
+    if (!video) return false
+    return isNamespaceGalleryVideoPosted(video)
+}
+
 function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | null | undefined): boolean {
     if (!video) return false
     const explicitGalleryReady = getBooleanFlag(video.gallery_ready)
@@ -12403,7 +12408,7 @@ app.get('/api/gallery', async (c) => {
             total: filteredVideos.length,
             overall_total: overallTotal,
             ready_total: overallTotal,
-            used_total: videos.filter((video) => !!String((video as Record<string, unknown>).postedAt || (video as Record<string, unknown>).posted_at || '').trim()).length,
+            used_total: videos.filter((video) => isNamespaceGalleryVideoVisibleInUsedTab(video as Record<string, unknown>)).length,
             inventory_total: videos.length,
             library_total: inventory.sourceTotal,
             offset,
@@ -12451,7 +12456,7 @@ app.get('/api/gallery/system', async (c) => {
         })
         const usedVideos = allVideos.filter((video) => {
             const row = video as Record<string, unknown>
-            return isNamespaceGalleryVideoDisplayReady(row) && !!String(row.postedAt || row.posted_at || '').trim()
+            return isNamespaceGalleryVideoVisibleInUsedTab(row)
         })
         const sourceVideos = view === 'used' ? usedVideos : readyVideos
         const searchedVideos = searchQuery
@@ -12730,8 +12735,7 @@ app.get('/api/gallery/used', async (c) => {
     try {
         const inventory = await getNamespaceGalleryInventory(c.env, String(botId || '').trim())
         const videos = dedupeVideosById(inventory.videos)
-            .filter((video: any) => isNamespaceGalleryVideoDisplayReady(video as Record<string, unknown>))
-            .filter((video: any) => !!String(video?.postedAt || video?.posted_at || '').trim())
+            .filter((video: any) => isNamespaceGalleryVideoVisibleInUsedTab(video as Record<string, unknown>))
 
         // Sort by createdAt desc
         videos.sort((a: any, b: any) => {
@@ -16672,8 +16676,8 @@ function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string,
         .filter((line) => {
             const trimmed = line.trim()
             if (!trimmed) return true
-            if (!shopee && /shopee/i.test(trimmed) && /[:：]\s*$/.test(trimmed)) return false
-            if (!lazada && /lazada/i.test(trimmed) && /[:：]\s*$/.test(trimmed)) return false
+            if (!shopee && /shopee/i.test(trimmed) && !/https?:\/\//i.test(trimmed)) return false
+            if (!lazada && /lazada/i.test(trimmed) && !/https?:\/\//i.test(trimmed)) return false
             return true
         })
 
@@ -16690,7 +16694,12 @@ async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string,
             updated_at: null,
         }))
         : { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null }
-    return renderAffiliateCommentTemplate(settings.template, shopee, lazadaLink)
+    const lazada = String(lazadaLink || '').trim()
+    let rendered = renderAffiliateCommentTemplate(settings.template, shopee, lazada)
+    if (lazada && !rendered.includes(lazada)) {
+        rendered = `${rendered}\n💙 ${lazada}`.trim()
+    }
+    return rendered
 }
 
 async function shortenLazadaLinkForNamespace(params: {
@@ -20447,6 +20456,31 @@ async function resolveShopeeLinkForRetry(params: {
     return ''
 }
 
+async function resolveLazadaLinkForRetry(params: {
+    bucket: R2Bucket
+    videoId: string
+    preferred?: string | null
+}): Promise<string> {
+    const preferred = pickFirstLazadaUrl(params.preferred || '') || ''
+    if (preferred) return preferred
+
+    const vid = String(params.videoId || '').trim()
+    if (!vid) return ''
+
+    try {
+        const metaObj = await params.bucket.get(`videos/${vid}.json`)
+        if (metaObj) {
+            const meta = await metaObj.json() as Record<string, unknown>
+            const link = normalizeMetaLazadaLink(meta) || ''
+            if (link) return link
+        }
+    } catch {
+        // ignore
+    }
+
+    return ''
+}
+
 async function clearVideoShopeeLink(bucket: R2Bucket, videoId: string): Promise<void> {
     // Requirement: never auto-remove Shopee link from video metadata in any flow.
     void bucket
@@ -21764,7 +21798,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const normalizedShopeeUtmMatch = null
 
         const publicUrl = metaToString(meta, 'publicUrl')
-        normalizedLazadaLink = metaToString(meta, 'lazadaLink')
+        normalizedLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
         const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
         const hasManualCaption = !!normalizeManualCaption(meta.manualCaption || meta.caption || '')
         const title = metaToString(meta, 'title')
@@ -22783,7 +22817,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const normalizedShopeeError = null
         const normalizedShopeeUtmMatch = null
         const publicUrl = metaToString(meta, 'publicUrl')
-        normalizedLazadaLink = metaToString(meta, 'lazadaLink')
+        normalizedLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
 
         // Use title if available, otherwise generate caption from script
         const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
@@ -23474,13 +23508,18 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 shopeeLink,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
             })
+            const lazadaLink = await resolveLazadaLinkForRetry({
+                bucket,
+                videoId,
+                preferred: String(row.lazada_link || '').trim(),
+            })
 
             const commentResult = await postShopeeCommentWithFallback({
                 env,
                 namespaceId: botId,
                 fbVideoId: targetId,
                 shopeeLink: shortShopeeLink,
-                lazadaLink: String(row.lazada_link || '').trim(),
+                lazadaLink,
                 commentTokens: tokenCandidates.commentTokens,
                 pageId,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
@@ -24058,7 +24097,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const normalizedShopeeError = null
         const normalizedShopeeUtmMatch = null
         const publicUrl = metaToString(meta, 'publicUrl')
-        const normalizedLazadaLink = metaToString(meta, 'lazadaLink')
+        const normalizedLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
         const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
 
         // Generate short caption from script (no Shopee link)
