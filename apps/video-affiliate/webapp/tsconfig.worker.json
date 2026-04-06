@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worker.tsbuildinfo",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "types": ["node", "vite/client"],
+    "strict": true,
+    "composite": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "workers/**/*.ts",
+    "workers/**/*.d.ts",
+    "worker-configuration.d.ts"
+  ]
+}

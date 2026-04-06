@@ -1419,7 +1419,10 @@ function VideoCard({
   useEffect(() => {
     if (expanded) {
       setLocalCats(video.category ? video.category.split(',').filter(Boolean) : [])
-      apiFetch(`${WORKER_URL}/api/categories`).then(r => r.json()).then(d => setFetchedCats(d.categories || [])).catch(() => { })
+      apiFetch(`${WORKER_URL}/api/categories`)
+        .then((r) => r.json() as Promise<{ categories?: string[] }>)
+        .then((d) => setFetchedCats(Array.isArray(d.categories) ? d.categories : []))
+        .catch(() => { })
     }
   }, [expanded])
 
@@ -1467,7 +1470,7 @@ function VideoCard({
           updatedAt: nowIso
         })
       } else {
-        const err = await resp.json().catch(() => ({ error: 'Unknown error' }))
+        const err = await resp.json().catch((): { error: string } => ({ error: 'Unknown error' })) as { error?: string }
         alert('บันทึกไม่สำเร็จ: ' + (err.error || resp.status))
       }
     } catch (e) {
@@ -1496,7 +1499,7 @@ function VideoCard({
         setShopeeInput('')
         onUpdate(video.id, videoNamespaceId, { shopeeLink: '', updatedAt: nowIso })
       } else {
-        const err = await resp.json().catch(() => ({ error: 'Unknown error' }))
+        const err = await resp.json().catch((): { error: string } => ({ error: 'Unknown error' })) as { error?: string }
         alert('ลบลิงก์ไม่สำเร็จ: ' + (err.error || resp.status))
       }
     } catch (e) {
@@ -2137,7 +2140,14 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
         })
       })
 
-      const data = await resp.json()
+      const data = await resp.json() as {
+        details?: string
+        error?: string
+        imported?: number
+        updated?: number
+        conflicts?: number
+        conflict_pages?: unknown[]
+      }
 
       if (!resp.ok) {
         setError(data.details || data.error || 'เกิดข้อผิดพลาด')
@@ -2147,7 +2157,18 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
       const imported = Number(data.imported || 0)
       const updated = Number(data.updated || 0)
       const conflicts = Number(data.conflicts || 0)
-      const conflictPages = Array.isArray(data.conflict_pages) ? data.conflict_pages : []
+      const conflictPages = Array.isArray(data.conflict_pages)
+        ? data.conflict_pages.filter(
+            (
+              page,
+            ): page is { id: string; name: string; existing_bot_id: string } =>
+              !!page &&
+              typeof page === 'object' &&
+              typeof (page as { id?: unknown }).id === 'string' &&
+              typeof (page as { name?: unknown }).name === 'string' &&
+              typeof (page as { existing_bot_id?: unknown }).existing_bot_id === 'string',
+          )
+        : []
 
       setResult({ imported, updated, conflicts, conflictPages })
       onSuccess()
@@ -4291,8 +4312,21 @@ function App({
         return
       }
 
-      const procData = processingResp.ok ? await processingResp.json() : { videos: [], pending_shortlink_videos: [] }
-      const queueData = queueResp.ok ? await queueResp.json() : { queue: [] }
+      const procData = processingResp.ok
+        ? await processingResp.json() as {
+            videos?: Video[]
+            pending_shortlink_videos?: Video[]
+            library_total?: number
+            inventory_total?: number
+            ready_total?: number
+            pending_total?: number
+            pending_has_lazada_total?: number
+            pending_missing_lazada_total?: number
+          }
+        : { videos: [], pending_shortlink_videos: [] }
+      const queueData = queueResp.ok
+        ? await queueResp.json() as { queue?: Video[] }
+        : { queue: [] }
       const processingVideos = [...(procData.videos || []), ...(queueData.queue || [])]
       const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
       setProcessingVideos(processingVideos)
@@ -4760,7 +4794,7 @@ function App({
         return
       }
       if (historyResp.ok) {
-        const data = await historyResp.json()
+        const data = await historyResp.json() as { history?: PostHistory[] }
         setPostHistory(data.history || [])
         lastPostHistoryFetchKeyRef.current = fetchKey
         lastPostHistoryFetchAtRef.current = Date.now()
@@ -4831,7 +4865,7 @@ function App({
         return
       }
       if (resp.ok) {
-        const data = await resp.json()
+        const data = await resp.json() as { pages?: FacebookPage[] }
         if (requestId === loadPagesRequestRef.current) {
           setPages(Array.isArray(data.pages) ? data.pages : [])
         }
@@ -6613,7 +6647,11 @@ function App({
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({}),
                                   })
-                                  const data = await resp.json().catch(() => ({}))
+                                  const data = await resp.json().catch(() => ({})) as {
+                                    details?: string
+                                    error?: string
+                                    fb_reel_url?: string
+                                  }
                                   if (!resp.ok) {
                                     throw new Error(String(data?.details || data?.error || resp.status))
                                   }
