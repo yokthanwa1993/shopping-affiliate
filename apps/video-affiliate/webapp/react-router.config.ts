@@ -4,6 +4,9 @@ export default {
   appDirectory: 'src',
   buildDirectory: 'dist',
   ssr: true,
+  future: {
+    v8_viteEnvironmentApi: true,
+  },
   routeDiscovery: {
     mode: 'initial',
   },

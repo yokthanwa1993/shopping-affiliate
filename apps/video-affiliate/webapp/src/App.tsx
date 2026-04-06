@@ -13,6 +13,7 @@ import { getMainLiffInitOptionsForHost, getMainLiffUrlForHost, isAppHost, waitFo
 
 
 const WORKER_URL = API_BASE_URL
+const isBrowser = typeof window !== 'undefined' && typeof document !== 'undefined'
 
 const GALLERY_HEADER_TOP_GAP = 8
 const VERTICAL_VIEWER_FRAME_STYLE = {
@@ -33,6 +34,7 @@ const DEFAULT_COMMENT_TEMPLATE = `📌 พิกัดอยู่ตรงน�
 🛡️ เพจเราเป็น Partner Shopee & Lazada ปลอดภัย ✅💯`
 
 const getBotScopeFromLocation = () => {
+  if (!isBrowser) return ''
   try {
     const url = new URL(window.location.href)
     return String(url.searchParams.get('bot') || '').trim()
@@ -51,8 +53,14 @@ const normalizeSessionToken = (value?: string | null) => {
   return token.startsWith('sess_') ? token : ''
 }
 
-const getToken = (botScope = getBotScopeFromLocation()) =>
-  normalizeSessionToken(localStorage.getItem(scopedStorageKey('auth_token', botScope)));
+const getToken = (botScope = getBotScopeFromLocation()) => {
+  if (!isBrowser) return ''
+  try {
+    return normalizeSessionToken(localStorage.getItem(scopedStorageKey('auth_token', botScope)))
+  } catch {
+    return ''
+  }
+}
 
 const readCache = <T,>(key: string, fallback: T): T => {
   try {
@@ -2734,16 +2742,19 @@ export type TabName = AppTabRoute
 
 function App({
   controlledTab,
+  controlledLocationKey: _controlledLocationKey,
   onControlledTabChange,
   onControlledUrlChange,
 }: {
   controlledTab?: TabName
+  controlledLocationKey?: string
   onControlledTabChange?: (tab: TabName) => void
   onControlledUrlChange?: (url: string, historyMode: 'push' | 'replace') => void
 } = {}) {
   const botScope = getBotScopeFromLocation()
 
   const [token, setTokenState] = useState<string>(() => {
+    if (!isBrowser) return ''
     try {
       const url = new URL(window.location.href)
       const queryToken = (url.searchParams.get('auth_token') || url.searchParams.get('token') || '').trim()
@@ -3070,12 +3081,13 @@ function App({
   const [postingOrderSaving, setPostingOrderSaving] = useState(false)
   const [logoutLoading, setLogoutLoading] = useState(false)
   const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'post', 'voice', 'cover', 'comment', 'members', 'monitor']
-  const getPathSegments = (pathname = window.location.pathname) =>
+  const getPathSegments = (pathname = (isBrowser ? window.location.pathname : '')) =>
     String(pathname || '')
       .replace(/^\/+/, '')
       .split('/')
       .filter(Boolean)
   const getSettingsSectionFromLocation = (): SettingsSection => {
+    if (!isBrowser) return 'menu'
     const pathSegments = getPathSegments()
     const pathTab = pathSegments[0] || ''
     const pathSection = pathTab === 'settings' ? String(pathSegments[1] || '').trim() : ''
@@ -3088,6 +3100,7 @@ function App({
     return 'menu'
   }
   const getSelectedPageIdFromLocation = () => {
+    if (!isBrowser) return ''
     const pathSegments = getPathSegments()
     if (pathSegments[0] === 'settings' && pathSegments[1] === 'pages') {
       return String(pathSegments[2] || '').trim()
@@ -3212,6 +3225,7 @@ function App({
     return null
   }
   const getInitialTab = (): TabName => {
+    if (!isBrowser) return controlledTab ?? 'dashboard'
     // 1. URL path
     const fromPath = matchTab(window.location.pathname)
     if (fromPath) { try { localStorage.setItem('_liff_tab', fromPath) } catch {} return fromPath }
@@ -3241,6 +3255,7 @@ function App({
   }
 
   const getTabFromCurrentLocation = (): TabName => {
+    if (!isBrowser) return controlledTab ?? 'dashboard'
     const fromPath = matchTab(window.location.pathname)
     if (fromPath) return fromPath
 
@@ -3483,7 +3498,7 @@ function App({
     setSelectedPage((prev) => (prev?.id === matchedPage.id ? prev : matchedPage))
   }, [pages, selectedPageHistoryId])
 
-  const tg = window.Telegram?.WebApp
+  const tg = isBrowser ? window.Telegram?.WebApp : undefined
   const hydrateNamespaceCaches = (ns: string, systemWide = false) => {
     const scopedNamespace = String(ns || '').trim()
     if (!scopedNamespace) return
