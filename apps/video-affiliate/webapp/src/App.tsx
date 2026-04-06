@@ -3315,18 +3315,16 @@ function App({
       ? (nextPageId ? 'pages' : (options?.settingsSection ?? settingsSection))
       : 'menu'
     if (nextTab === 'settings') {
-      url.pathname = '/settings'
+      if (nextPageId) {
+        url.pathname = `/settings/pages/${encodeURIComponent(nextPageId)}`
+      } else if (nextSettingsSection !== 'menu') {
+        url.pathname = `/settings/${nextSettingsSection}`
+      } else {
+        url.pathname = '/settings'
+      }
     }
-    if (nextTab === 'settings' && nextSettingsSection !== 'menu') {
-      url.searchParams.set('section', nextSettingsSection)
-    } else {
-      url.searchParams.delete('section')
-    }
-    if (nextTab === 'settings' && nextPageId) {
-      url.searchParams.set('page_id', nextPageId)
-    } else {
-      url.searchParams.delete('page_id')
-    }
+    url.searchParams.delete('section')
+    url.searchParams.delete('page_id')
     return url.toString()
   }
   const syncAppUrl = (

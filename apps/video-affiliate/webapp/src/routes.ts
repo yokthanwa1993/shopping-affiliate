@@ -8,6 +8,8 @@ export default [
   route('gallery', 'routes/gallery.tsx', { id: 'routes/app-gallery' }),
   route('logs', 'routes/logs.tsx', { id: 'routes/app-logs' }),
   route('settings', 'routes/settings.tsx', { id: 'routes/app-settings' }),
+  route('settings/:section', 'routes/settings.tsx', { id: 'routes/app-settings-section' }),
+  route('settings/pages/:pageId', 'routes/settings.tsx', { id: 'routes/app-settings-pages-detail' }),
   route('pages', 'routes/settings.tsx', { id: 'routes/app-pages-legacy' }),
   route('*', 'routes/catchall.tsx', { id: 'routes/app-catchall' }),
 ] satisfies RouteConfig
