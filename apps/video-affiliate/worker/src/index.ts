@@ -1467,10 +1467,14 @@ function dedupeVideosById(videos: any[]): any[] {
 
 function getGalleryVideoSortMs(video: Record<string, unknown> | null | undefined): number {
     const ts = new Date(String(
-        video?.createdAt
-        || video?.created_at
+        video?.processedAt
+        || video?.processed_at
+        || video?.postedAt
+        || video?.posted_at
         || video?.updatedAt
         || video?.updated_at
+        || video?.createdAt
+        || video?.created_at
         || ''
     )).getTime()
     return Number.isFinite(ts) ? ts : 0
@@ -2070,9 +2074,14 @@ function normalizeGallerySearchQuery(value: string | null | undefined): string {
     return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
 }
 
+function normalizeGalleryVideoIdSearchToken(value: string | null | undefined): string {
+    return String(value || '').trim().toLowerCase().replace(/\s+/g, '').replace(/o/g, '0')
+}
+
 function matchesGallerySearchQuery(video: Record<string, unknown>, query: string): boolean {
     const needle = normalizeGallerySearchQuery(query)
     if (!needle) return true
+    const idNeedle = normalizeGalleryVideoIdSearchToken(query)
 
     const haystacks = [
         video.id,
@@ -2084,7 +2093,14 @@ function matchesGallerySearchQuery(video: Record<string, unknown>, query: string
         video.namespace_id,
     ]
 
-    return haystacks.some((value) => normalizeGallerySearchQuery(String(value || '')).includes(needle))
+    if (haystacks.some((value) => normalizeGallerySearchQuery(String(value || '')).includes(needle))) {
+        return true
+    }
+
+    if (!idNeedle) return false
+
+    const idHaystacks = [video.id, video.video_id]
+    return idHaystacks.some((value) => normalizeGalleryVideoIdSearchToken(String(value || '')).includes(idNeedle))
 }
 
 function parseNonNegativeInt(value: string | null | undefined, fallback: number): number {
@@ -3306,13 +3322,6 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
         stateByVideoId,
         bucket,
     })
-    await reconcileNamespacePostedStateFromHistory({
-        db: env.DB,
-        namespaceId: normalizedNamespaceId,
-        sourceVideos: namespaceSourceVideos as Array<Record<string, unknown>>,
-        stateByVideoId,
-    })
-
     const inventoryVideos = namespaceSourceVideos
         .map((video) => {
             const source = video as Record<string, unknown>
@@ -3411,13 +3420,6 @@ async function getSystemGalleryInventory(env: Env): Promise<{
             const row = stateByVideoKey.get(`${namespaceId}:${videoId}`)
             if (row) namespaceStateByVideoId.set(videoId, row)
         }
-
-        await reconcileNamespacePostedStateFromHistory({
-            db: env.DB,
-            namespaceId,
-            sourceVideos: namespaceSourceVideos,
-            stateByVideoId: namespaceStateByVideoId,
-        })
 
         for (const [videoId, row] of namespaceStateByVideoId.entries()) {
             stateByVideoKey.set(`${namespaceId}:${videoId}`, row)
@@ -4474,6 +4476,52 @@ app.post('/admin/api/gallery/index/rebuild', async (c) => {
     await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
     await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
     return c.json({ ok: true, ...result })
+})
+
+// Debug: test cover thumbnail generation
+app.get('/admin/api/test-cover', async (c) => {
+    const videoId = String(c.req.query('video_id') || '').trim()
+    const ns = String(c.req.query('namespace_id') || c.get('botId') || '').trim()
+    if (!videoId || !ns) return c.json({ error: 'video_id and namespace_id required' }, 400)
+
+    const workerUrl = String(c.env.WORKER_URL || '').trim()
+    const assetUrl = buildWorkerGalleryAssetUrl(workerUrl, ns, videoId, 'original')
+
+    try {
+        // Test 1: Can container be reached?
+        const containerId = c.env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
+        const containerStub = c.env.MERGE_CONTAINER.get(containerId)
+        const healthResp = await containerStub.fetch('http://container/health')
+        const healthOk = healthResp.ok
+        const healthBody = await healthResp.text().catch(() => '')
+
+        // Test 2: Can container download the video?
+        const thumbResp = await containerStub.fetch('http://container/thumbnail', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                video_url: assetUrl,
+                frame_seed: `test|${videoId}|1|1`,
+                output_format: 'jpg',
+                target_width: 270,
+                target_height: 480,
+            }),
+        })
+        const thumbOk = thumbResp.ok
+        const thumbStatus = thumbResp.status
+        const thumbSize = thumbOk ? (await thumbResp.arrayBuffer()).byteLength : 0
+        const thumbError = !thumbOk ? await thumbResp.text().catch(() => '') : ''
+
+        return c.json({
+            videoId,
+            namespace: ns,
+            assetUrl,
+            container_health: { ok: healthOk, body: healthBody.substring(0, 200) },
+            thumbnail: { ok: thumbOk, status: thumbStatus, size: thumbSize, error: thumbError.substring(0, 300) },
+        })
+    } catch (e) {
+        return c.json({ error: e instanceof Error ? e.message : String(e), assetUrl }, 500)
+    }
 })
 
 app.post('/admin/api/affiliate-conversion/run', async (c) => {
@@ -7397,15 +7445,19 @@ async function promptLineCoverOptions(params: {
     const coverOptions = !params.forceRefresh && waitingState.coverOptions && waitingState.coverOptions.length > 0
         ? waitingState.coverOptions
         : buildLineCoverOptions(waitingState.id, 10)
-    const coverOptionsWithPreview: LineCoverOption[] = coverOptions.map((option) => {
-        const previewUrl = String(option.previewUrl || '').trim() || buildLineCoverOptionPreviewUrl({
-            workerUrl: String(params.env.WORKER_URL || '').trim(),
-            namespaceId: params.namespaceId,
-            videoId: waitingState.id,
-            option,
-        })
-        return previewUrl ? { ...option, previewUrl } : option
-    })
+    const generatedOptions: LineCoverOption[] = []
+    for (const option of coverOptions) {
+        let previewUrl = String(option.previewUrl || '').trim()
+        if (!previewUrl) {
+            previewUrl = buildLineCoverOptionPreviewUrl({
+                workerUrl: String(params.env.WORKER_URL || '').trim(),
+                namespaceId: params.namespaceId,
+                videoId: waitingState.id,
+                option,
+            })
+        }
+        generatedOptions.push(previewUrl ? { ...option, previewUrl } : option)
+    }
 
     const nextWaitingState = await putLineWaitingVideoState(params.bucket, params.lineUserId, {
         ...waitingState,
@@ -7413,7 +7465,7 @@ async function promptLineCoverOptions(params: {
         awaitingStep: 'cover',
         coverCompleted: false,
         coverPickerOpened: true,
-        coverOptions: coverOptionsWithPreview,
+        coverOptions: generatedOptions,
         coverTextPositionOptions: [],
     })
 
@@ -7426,10 +7478,10 @@ async function promptLineCoverOptions(params: {
                 videoId: waitingState.id,
                 namespaceId: params.namespaceId,
                 workerUrl: String(params.env.WORKER_URL || '').trim(),
-                coverOptions: nextWaitingState.coverOptions || coverOptionsWithPreview,
+                coverOptions: nextWaitingState.coverOptions || generatedOptions,
             }),
         ],
-    })
+    }).catch(() => { })
 }
 
 async function promptLineCoverTextPositionOptions(params: {
@@ -8900,13 +8952,17 @@ async function handleLineTextMessage(params: {
                 replyToken,
                 lineUserId,
                 waitingState,
-                manualCaption: waitingState.manualCaption,
                 forceRefresh: true,
             })
         } catch {
-            await lineReply(replyToken, channelAccessToken, [
-                { type: 'text', text: `รับลิงก์ XHS แล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองใหม่` },
-            ])
+            await lineReplyOrPush({
+                replyToken,
+                channelAccessToken,
+                lineUserId,
+                messages: [
+                    { type: 'text', text: 'รับลิงก์ XHS แล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองใหม่' },
+                ],
+            }).catch(() => { })
         }
         return
     }
@@ -10047,6 +10103,7 @@ type InboxVideoRecord = {
     videoUrl: string
     chatId: number
     createdAt: string
+    processedAt?: string
     updatedAt: string
     status: InboxVideoStatus
     sourceType: InboxVideoSourceType
@@ -10080,6 +10137,7 @@ function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | und
             ? 'LINE video'
             : (sourceLabelInput || 'Xiaohongshu link').slice(0, 500)
     const createdAt = String(input?.createdAt || '').trim() || new Date().toISOString()
+    const processedAt = String(input?.processedAt || '').trim()
     const updatedAt = String(input?.updatedAt || '').trim() || createdAt
     const status: InboxVideoStatus = shopeeLink && lazadaLink ? 'ready' : 'awaiting_links'
 
@@ -10088,6 +10146,7 @@ function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | und
         videoUrl,
         chatId,
         createdAt,
+        ...(processedAt ? { processedAt } : {}),
         updatedAt,
         status,
         sourceType,
@@ -10134,14 +10193,22 @@ async function listInboxVideoRecords(bucket: R2Bucket): Promise<InboxVideoRecord
     return tasks
         .filter((item): item is InboxVideoRecord => !!item)
         .sort((a, b) => {
+            const aProcessedTs = new Date(String(a.processedAt || '')).getTime()
+            const bProcessedTs = new Date(String(b.processedAt || '')).getTime()
+            const aUpdatedTs = new Date(String(a.updatedAt || '')).getTime()
+            const bUpdatedTs = new Date(String(b.updatedAt || '')).getTime()
             const aCreatedTs = new Date(String(a.createdAt || '')).getTime()
             const bCreatedTs = new Date(String(b.createdAt || '')).getTime()
-            const aTs = Number.isFinite(aCreatedTs) && aCreatedTs > 0
-                ? aCreatedTs
-                : new Date(String(a.updatedAt || '')).getTime()
-            const bTs = Number.isFinite(bCreatedTs) && bCreatedTs > 0
-                ? bCreatedTs
-                : new Date(String(b.updatedAt || '')).getTime()
+            const aTs = Number.isFinite(aProcessedTs) && aProcessedTs > 0
+                ? aProcessedTs
+                : Number.isFinite(aUpdatedTs) && aUpdatedTs > 0
+                    ? aUpdatedTs
+                    : aCreatedTs
+            const bTs = Number.isFinite(bProcessedTs) && bProcessedTs > 0
+                ? bProcessedTs
+                : Number.isFinite(bUpdatedTs) && bUpdatedTs > 0
+                    ? bUpdatedTs
+                    : bCreatedTs
             return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
         })
 }
@@ -10330,6 +10397,7 @@ function toInboxVideoResponse(
         thumbnailUrl: String(options?.thumbnailUrl || '').trim(),
         originalUrl: String(options?.originalUrl || '').trim(),
         createdAt: record.createdAt,
+        processedAt: String(record.processedAt || '').trim() || undefined,
         updatedAt: record.updatedAt,
         status: record.status,
         sourceType: record.sourceType,
@@ -10411,6 +10479,8 @@ function dedupeInboxArchiveVideos(videos: Array<Record<string, unknown>>): Array
 }
 
 function getInboxVideoSortMs(video: Record<string, unknown>): number {
+    const processedTs = new Date(String(video.processedAt || video.processed_at || '')).getTime()
+    if (Number.isFinite(processedTs) && processedTs > 0) return processedTs
     const updatedTs = new Date(String(video.updatedAt || '')).getTime()
     if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
     const createdTs = new Date(String(video.createdAt || '')).getTime()
@@ -11343,11 +11413,28 @@ async function ensureInboxVideoProcessingStarted(params: {
     const rawItem = normalizeInboxVideoRecord(params.item)
     if (!rawItem || rawItem.status !== 'ready') throw new Error('inbox_video_not_ready')
 
+    const preparedItem = await prepareInboxVideoForManagedLinks({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: botId,
+        item: rawItem,
+        logPrefix: `INBOX-START ${botId}/${rawItem.id}`,
+    })
+    if (!preparedItem) {
+        await markInboxProcessingFailed({
+            bucket: params.bucket,
+            item: rawItem,
+            message: 'managed_shortlink_conversion_failed',
+            stepName: '❌ ย่อลิงก์ Shopee/Lazada ไม่ผ่าน',
+        }).catch(() => { })
+        throw new Error('managed_shortlink_conversion_failed')
+    }
+
     const item = await recordInboxLinkSubmissionIfNeeded({
         db: params.env.DB,
         bucket: params.bucket,
         namespaceId: botId,
-        item: rawItem,
+        item: preparedItem,
     })
 
     const processingStateMap = await getInboxProcessingStateMap(params.bucket)
@@ -11816,15 +11903,26 @@ app.post('/api/desktop-submit', async (c) => {
         })
 
         const autoStart = body.autoStart !== false
-        const result = autoStart
-            ? await ensureInboxVideoProcessingStarted({
-                env: c.env,
-                bucket,
-                executionCtx: c.executionCtx,
-                botId: namespaceId,
-                item: inboxRecord,
-            })
-            : null
+        let result: InboxProcessingStartResult | null = null
+        if (autoStart) {
+            try {
+                result = await ensureInboxVideoProcessingStarted({
+                    env: c.env,
+                    bucket,
+                    executionCtx: c.executionCtx,
+                    botId: namespaceId,
+                    item: inboxRecord,
+                })
+            } catch (error) {
+                if (error instanceof Error && error.message === 'managed_shortlink_conversion_failed') {
+                    return c.json({
+                        error: 'shortlink_failed',
+                        message: 'ย่อลิ้ง Shopee/Lazada สำหรับ workspace นี้ไม่ผ่าน กรุณาลองใหม่',
+                    }, 400)
+                }
+                throw error
+            }
+        }
 
         return c.json({
             ok: true,
@@ -11917,76 +12015,24 @@ app.post('/api/inbox/:id/process', async (c) => {
         if (!item) return c.json({ error: 'inbox_video_not_found' }, 404)
         if (item.status !== 'ready') return c.json({ error: 'inbox_video_not_ready' }, 400)
 
-        // Pre-check: verify shortlink API is reachable before processing
-        const namespaceId = String(c.get('botId') || '').trim()
-        const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(c.env.DB, namespaceId).catch(() => false)
-        if (shortlinkRequired) {
-            const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId).catch(() => '')
-            if (baseUrl) {
-                try {
-                    const healthUrl = new URL(baseUrl)
-                    healthUrl.pathname = '/health'
-                    healthUrl.search = ''
-                    const healthResp = await fetchWithTimeout(healthUrl.toString(), {}, 8000, 'shortlink_health')
-                    if (!healthResp.ok) {
-                        await markInboxProcessingFailed({
-                            bucket: processBucket,
-                            item,
-                            message: `shortlink_health_http_${healthResp.status}`,
-                            stepName: '❌ ระบบย่อลิงก์ไม่พร้อม',
-                        }).catch(() => { })
-                        return c.json({
-                            error: 'shortlink_failed',
-                            message: 'ระบบย่อลิ้งไม่พร้อม กรุณาลองใหม่',
-                            details: [`HTTP ${healthResp.status}`],
-                        }, 400)
-                    }
-                } catch (e) {
-                    await markInboxProcessingFailed({
-                        bucket: processBucket,
-                        item,
-                        message: e instanceof Error ? e.message : String(e),
-                        stepName: '❌ เชื่อมต่อระบบย่อลิงก์ไม่ได้',
-                    }).catch(() => { })
-                    return c.json({
-                        error: 'shortlink_failed',
-                        message: 'เชื่อมต่อระบบย่อลิ้งไม่ได้ กรุณาลองใหม่',
-                        details: [e instanceof Error ? e.message : String(e)],
-                    }, 400)
-                }
-            }
-        }
-
-        if (shortlinkRequired) {
-            const prepared = await prepareInboxVideoForManagedLinks({
+        let result: InboxProcessingStartResult
+        try {
+            result = await ensureInboxVideoProcessingStarted({
                 env: c.env,
                 bucket: processBucket,
-                namespaceId,
+                executionCtx: c.executionCtx,
+                botId: String(c.get('botId') || '').trim(),
                 item,
-                logPrefix: `INBOX-PROCESS ${namespaceId}/${id}`,
-            }).catch(() => null)
-            if (!prepared) {
-                await markInboxProcessingFailed({
-                    bucket: processBucket,
-                    item,
-                    message: 'managed_shortlink_conversion_failed',
-                    stepName: '❌ ย่อลิงก์ Shopee/Lazada ไม่ผ่าน',
-                }).catch(() => { })
+            })
+        } catch (error) {
+            if (error instanceof Error && error.message === 'managed_shortlink_conversion_failed') {
                 return c.json({
                     error: 'shortlink_failed',
                     message: 'ย่อลิ้ง Shopee/Lazada สำหรับ workspace นี้ไม่ผ่าน กรุณาลองใหม่',
                 }, 400)
             }
-            item = prepared
+            throw error
         }
-
-        const result = await ensureInboxVideoProcessingStarted({
-            env: c.env,
-            bucket: c.get('bucket'),
-            executionCtx: c.executionCtx,
-            botId: String(c.get('botId') || '').trim(),
-            item,
-        })
         if (result.outcome === 'already_running') {
             return c.json({ ok: true, job: { status: result.status, id } })
         }
@@ -12192,6 +12238,8 @@ app.post('/api/gallery/refresh/:id', async (c) => {
             }
             : null
 
+        const refreshCompletedAt = new Date().toISOString()
+
         if (videoId && linkContext) {
             const metaObj = await c.get('bucket').get(`videos/${videoId}.json`)
             if (metaObj) {
@@ -12229,12 +12277,38 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                 if (changed) {
                     meta.id = String(meta.id || videoId).trim() || videoId
                     meta.namespace_id = String(meta.namespace_id || namespaceId).trim() || namespaceId
-                    meta.updatedAt = new Date().toISOString()
+                    meta.processedAt = String(meta.processedAt || refreshCompletedAt).trim() || refreshCompletedAt
+                    meta.updatedAt = refreshCompletedAt
                     await c.get('bucket').put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
                         httpMetadata: { contentType: 'application/json' },
                     })
                     await upsertNamespaceVideoState(c.env.DB, namespaceId, videoId, nextStateFields)
                 }
+            }
+        }
+
+        if (videoId) {
+            const metaObj = await c.get('bucket').get(`videos/${videoId}.json`).catch(() => null)
+            if (metaObj) {
+                const meta = await metaObj.json().catch(() => null) as Record<string, unknown> | null
+                if (meta) {
+                    meta.id = String(meta.id || videoId).trim() || videoId
+                    meta.namespace_id = String(meta.namespace_id || namespaceId).trim() || namespaceId
+                    meta.processedAt = String(meta.processedAt || refreshCompletedAt).trim() || refreshCompletedAt
+                    meta.updatedAt = refreshCompletedAt
+                    await c.get('bucket').put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
+                        httpMetadata: { contentType: 'application/json' },
+                    })
+                }
+            }
+
+            const inboxRecord = await getInboxVideoRecord(c.get('bucket'), videoId).catch(() => null)
+            if (inboxRecord) {
+                await putInboxVideoRecord(c.get('bucket'), {
+                    ...inboxRecord,
+                    processedAt: refreshCompletedAt,
+                    updatedAt: refreshCompletedAt,
+                }).catch(() => { })
             }
         }
 
@@ -14211,7 +14285,9 @@ function getVideoAffiliateConversionState(
     const needsShopeeConversion = requireManagedLinks && hasPlayable && hasShopeeSource && hasManagedShopeeConversion && !shopeeReady
     const needsLazadaConversion = requireManagedLinks && hasPlayable && hasLazadaSource && hasManagedLazadaConversion && !lazadaReady
     const shortlinkReady = hasShopeeSource && hasManagedShopeeConversion && shopeeReady && hasLazadaSource && hasManagedLazadaConversion && lazadaReady
-    const galleryReady = hasPlayable && (!requireManagedLinks || shortlinkReady)
+    const galleryReady = requireManagedLinks
+        ? (hasPlayable && shortlinkReady)
+        : hasPlayable
     const awaitingConversion = requireManagedLinks && hasPlayable && (
         missingShopeeSource
         || missingLazadaSource
@@ -14566,7 +14642,7 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
         console.log(`[AUTO-IMPORT] Added ${importedCount} original videos to admin namespace`)
     }
 
-    // 2. Auto-process ONE admin video at a time (shortlink first, then process)
+    // 2. Auto-process ONE admin video at a time using the same start path as manual/admin UI
     if (!ctx) return
 
     // Check if already processing
@@ -14589,31 +14665,13 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
             continue
         }
 
-        const prepared = await prepareInboxVideoForManagedLinks({
-            env,
-            bucket: adminBucket,
-            namespaceId: adminNamespaceId,
-            item: nextVideo,
-            logPrefix: `AUTO-IMPORT ${adminNamespaceId}/${nextVideo.id}`,
-        }).catch(() => null)
-        if (!prepared) {
-            await markInboxProcessingFailed({
-                bucket: adminBucket,
-                item: nextVideo,
-                message: 'managed_shortlink_conversion_failed',
-                stepName: '❌ ย่อลิงก์ Shopee/Lazada ไม่ผ่าน',
-            }).catch(() => { })
-            console.warn(`[AUTO-IMPORT] ${nextVideo.id} blocked: managed shortlink conversion not ready`)
-            continue
-        }
-
         try {
             const result = await ensureInboxVideoProcessingStarted({
                 env,
                 bucket: adminBucket,
                 executionCtx: ctx,
                 botId: adminNamespaceId,
-                item: prepared,
+                item: nextVideo,
                 skipIfAlreadyProcessed: true,
             })
             if (result.outcome === 'already_running') {
