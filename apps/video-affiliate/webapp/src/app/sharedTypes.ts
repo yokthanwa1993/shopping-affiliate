@@ -30,6 +30,7 @@ export interface InboxVideo {
   thumbnailUrl?: string
   fallbackThumbnailUrl?: string
   createdAt: string
+  processedAt?: string
   updatedAt?: string
   status: string
   sourceType?: string

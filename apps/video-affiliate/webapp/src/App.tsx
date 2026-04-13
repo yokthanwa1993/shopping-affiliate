@@ -227,6 +227,7 @@ interface Video {
   duration: number
   originalUrl: string
   createdAt: string
+  processedAt?: string
   updatedAt?: string
   publicUrl: string
   thumbnailUrl?: string
@@ -419,6 +420,10 @@ interface ProcessingSummaryStats {
 
 function normalizeGallerySearchQuery(value: string | null | undefined): string {
   return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+function normalizeGalleryVideoIdSearchToken(value: string | null | undefined): string {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, '').replace(/o/g, '0')
 }
 
 function buildFacebookLogUrl(item: Pick<PostHistory, 'fb_reel_url' | 'fb_post_id'>): string {
@@ -1119,6 +1124,8 @@ const getInitialGallerySearchInput = (): string => {
 function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
   const postedTs = new Date(String(video.postedAt || video.posted_at || '')).getTime()
   if (Number.isFinite(postedTs) && postedTs > 0) return postedTs
+  const processedTs = new Date(String(video.processedAt || video.processed_at || '')).getTime()
+  if (Number.isFinite(processedTs) && processedTs > 0) return processedTs
   const updatedTs = new Date(String(video.updatedAt || '')).getTime()
   if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
   const createdTs = new Date(String(video.createdAt || '')).getTime()
@@ -1168,6 +1175,8 @@ function dedupeGalleryVideos(rows: Video[]): Video[] {
 }
 
 const getInboxVideoSortMs = (video: Partial<InboxVideo> & Record<string, unknown>) => {
+  const processedTs = new Date(String(video.processedAt || video.processed_at || '')).getTime()
+  if (Number.isFinite(processedTs) && processedTs > 0) return processedTs
   const updatedTs = new Date(String(video.updatedAt || '')).getTime()
   if (Number.isFinite(updatedTs) && updatedTs > 0) return updatedTs
   const createdTs = new Date(String(video.createdAt || '')).getTime()
@@ -4713,10 +4722,13 @@ function App({
     if (reset) setGalleryLoadingMore(false)
 
     try {
-      await Promise.all([
-        loadReadyGalleryPage({ reset, refreshTop, silent: categoryFilter === 'used' }),
-        loadUsedGalleryPage({ reset, refreshTop, silent: categoryFilter !== 'used' }),
-      ])
+      if (categoryFilter === 'used') {
+        await loadUsedGalleryPage({ reset, refreshTop, silent: false })
+        void loadReadyGalleryPage({ reset, refreshTop, silent: true })
+      } else {
+        await loadReadyGalleryPage({ reset, refreshTop, silent: false })
+        void loadUsedGalleryPage({ reset, refreshTop, silent: true })
+      }
     } finally {
       if (reset && shouldShowLoading) setGalleryLoading(false)
       if (shouldShowBootstrapPending) setGalleryBootstrapPending(false)
@@ -5733,11 +5745,11 @@ function App({
           return [video]
         }
 
-        if (nextIsPosted || nextIsAwaitingConversion) return []
+        if (nextIsPosted) return []
         return [{ ...video, ...fields }]
       })
 
-      if (!hasExistingVideo && nextCandidate && !nextIsPosted && !nextIsAwaitingConversion) {
+      if (!hasExistingVideo && nextCandidate && !nextIsPosted) {
         return dedupeGalleryVideos([nextCandidate, ...nextReadyVideos])
       }
 
@@ -5849,10 +5861,36 @@ function App({
       const data = await resp.json().catch(() => ({})) as { error?: string }
       throw new Error(String(data.error || 'ย้ายกลับไปยังไม่โพสต์ไม่สำเร็จ'))
     }
-    updateGalleryVideoState(id, namespaceForVideo, {
+
+    // Move from usedVideos → videos (ยังไม่โพสต์) and put at top
+    const resetFields = {
       postedAt: '',
       keepInPostedTab: false,
       updatedAt: new Date().toISOString(),
+    }
+
+    setUsedVideos((prev) => prev.filter((v) =>
+      !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
+    ))
+
+    setVideos((prev) => {
+      const existing = prev.find((v) =>
+        matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
+      )
+      if (existing) {
+        return dedupeGalleryVideos([
+          { ...existing, ...resetFields } as Video,
+          ...prev.filter((v) => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)),
+        ])
+      }
+      // Find from usedVideos
+      const fromUsed = usedVideos.find((v) =>
+        matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
+      )
+      if (fromUsed) {
+        return dedupeGalleryVideos([{ ...fromUsed, ...resetFields } as Video, ...prev])
+      }
+      return prev
     })
   }
 

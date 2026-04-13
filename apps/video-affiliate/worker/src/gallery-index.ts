@@ -11,6 +11,7 @@ export type GalleryIndexVideo = {
     duration: number
     originalUrl: string
     createdAt: string
+    processedAt?: string
     updatedAt: string
     publicUrl: string
     thumbnailUrl?: string
@@ -45,6 +46,7 @@ type GalleryIndexDbRow = {
     original_url?: string
     thumbnail_url?: string
     created_at?: string
+    processed_at?: string
     updated_at?: string
     is_original_only?: number
     has_public_video?: number
@@ -77,6 +79,7 @@ type GalleryIndexUpsertRow = {
     hasMetadata: number
     isOriginalOnly: number
     createdAt: string
+    processedAt: string
     updatedAt: string
 }
 
@@ -162,9 +165,10 @@ const UPSERT_GALLERY_INDEX_SQL = `INSERT INTO gallery_index (
     has_metadata,
     is_original_only,
     created_at,
+    processed_at,
     updated_at,
     last_synced_at
- ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+ ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
 ON CONFLICT(namespace_id, video_id) DO UPDATE SET
     owner_email = excluded.owner_email,
     is_owner_linked = excluded.is_owner_linked,
@@ -189,6 +193,7 @@ ON CONFLICT(namespace_id, video_id) DO UPDATE SET
     has_metadata = excluded.has_metadata,
     is_original_only = excluded.is_original_only,
     created_at = excluded.created_at,
+    processed_at = excluded.processed_at,
     updated_at = excluded.updated_at,
     last_synced_at = datetime('now')`
 
@@ -317,6 +322,7 @@ function mapGalleryIndexRowToVideo(row: GalleryIndexDbRow): GalleryIndexVideo | 
         duration: parseFiniteNumber(row.duration, 0),
         originalUrl: normalizeText(row.original_url),
         createdAt: normalizeTimestamp(row.created_at),
+        processedAt: normalizeText(row.processed_at) || undefined,
         updatedAt: normalizeTimestamp(row.updated_at, row.created_at),
         publicUrl: normalizeText(row.public_url),
         thumbnailUrl: normalizeText(row.thumbnail_url) || undefined,
@@ -371,12 +377,16 @@ export async function ensureGalleryIndexTable(db: D1Database): Promise<void> {
                 has_metadata INTEGER NOT NULL DEFAULT 0,
                 is_original_only INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT '',
+                processed_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT '',
                 last_synced_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (namespace_id, video_id)
             )`
         ).run()
 
+        await db.prepare(
+            'ALTER TABLE gallery_index ADD COLUMN processed_at TEXT NOT NULL DEFAULT \'\''
+        ).run().catch(() => { })
         await db.prepare(
             'ALTER TABLE gallery_index ADD COLUMN lazada_link TEXT NOT NULL DEFAULT \'\''
         ).run().catch(() => { })
@@ -648,7 +658,9 @@ async function buildGalleryIndexUpsertRow(params: {
         knownState.originalUploadedAt,
         originalObj?.uploaded?.toISOString?.(),
     )
+    const processedAt = normalizeText(meta.processedAt || meta.processed_at || '')
     const updatedAt = normalizeLatestTimestamp(
+        processedAt,
         meta.updatedAt,
         meta.createdAt,
         knownState.metaUploadedAt,
@@ -685,6 +697,7 @@ async function buildGalleryIndexUpsertRow(params: {
         hasMetadata: hasMetadata ? 1 : 0,
         isOriginalOnly: hasMetadata ? 0 : (hasOriginalVideo && !hasPublicVideo ? 1 : 0),
         createdAt,
+        processedAt,
         updatedAt,
     }
 }
@@ -718,6 +731,7 @@ async function upsertGalleryIndexRows(db: D1Database, rows: GalleryIndexUpsertRo
         row.hasMetadata,
         row.isOriginalOnly,
         row.createdAt,
+        row.processedAt,
         row.updatedAt,
     )))
 }
@@ -757,6 +771,7 @@ export async function syncGalleryIndexEntry(env: Env, namespaceId: string, video
         original_url: row.originalUrl,
         thumbnail_url: row.thumbnailUrl,
         created_at: row.createdAt,
+        processed_at: row.processedAt,
         updated_at: row.updatedAt,
         is_original_only: row.isOriginalOnly,
     })
@@ -847,11 +862,12 @@ export async function listGalleryIndexVideos(db: D1Database, options: {
             has_public_video,
             has_original_video,
             created_at,
+            processed_at,
             updated_at,
             is_original_only
          FROM gallery_index
          ${whereSql}
-         ORDER BY COALESCE(updated_at, created_at) DESC, namespace_id ASC, video_id ASC`
+         ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, namespace_id ASC, video_id ASC`
     ).bind(...binds).all() as { results?: GalleryIndexDbRow[] }
 
     const videos: GalleryIndexVideo[] = []
@@ -901,11 +917,12 @@ export async function getGalleryIndexPage(db: D1Database, options: {
                 has_public_video,
                 has_original_video,
                 created_at,
+                processed_at,
                 updated_at,
                 is_original_only
              FROM gallery_index
              ${whereSql}
-             ORDER BY COALESCE(updated_at, created_at) DESC, namespace_id ASC, video_id ASC
+             ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, namespace_id ASC, video_id ASC
              LIMIT ? OFFSET ?`
         ).bind(...binds, limit, offset).all() as Promise<{ results?: GalleryIndexDbRow[] }>,
         queryGalleryIndexCount(db, { namespaceId: options.namespaceId, onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'all', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),
@@ -1010,7 +1027,7 @@ export async function listGalleryIndexVideosMissingThumbnails(db: D1Database, li
          FROM gallery_index
          WHERE has_thumbnail = 0
            AND (has_original_video = 1 OR has_public_video = 1)
-         ORDER BY COALESCE(updated_at, created_at) DESC, namespace_id ASC, video_id ASC
+         ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, namespace_id ASC, video_id ASC
          LIMIT ?`
     ).bind(safeLimit).all() as { results?: Array<{ namespace_id?: string; video_id?: string; thumbnail_url?: string }> }
 

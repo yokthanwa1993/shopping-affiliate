@@ -16,11 +16,25 @@ const TUNNEL_URL = `https://${TUNNEL_HOST}`;
 const CLOUDFLARED_BIN = "/opt/homebrew/bin/cloudflared";
 const ADS_MANAGER_URL = "https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=1148837732288721";
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+  process.exit(0);
+}
+
 const storePath = path.join(app.getPath("userData"), "appdata.json");
 let mainWindow = null, tray = null, accessToken = null, fbDtsg = null, userName = null, isQuitting = false;
 let tunnelProc = null;
 let tunnelReady = false;
 let tunnelError = null;
+let sessionReadyLogged = false;
+
+function safeLog(...args) {
+  try { process.stdout.write(`${args.join(" ")}\n`); } catch (e) { if (e?.code !== "EPIPE") throw e; }
+}
+
+process.stdout.on("error", (e) => { if (e?.code !== "EPIPE") throw e; });
+process.stderr.on("error", (e) => { if (e?.code !== "EPIPE") throw e; });
 
 function loadStore() { try { return JSON.parse(fs.readFileSync(storePath, "utf8")); } catch { return {}; } }
 function saveStore(d) { fs.writeFileSync(storePath, JSON.stringify({ ...loadStore(), ...d }), "utf8"); }
@@ -49,6 +63,12 @@ function createWindow() {
   // Extract __accessToken + fb_dtsg after page loads
   mainWindow.webContents.on("did-finish-load", extractFromPage);
   setInterval(extractFromPage, 15000);
+
+  // Auto-reload Ads Manager ทุก 2 ชั่วโมง เพื่อ refresh token/cookies
+  setInterval(() => {
+    console.log('Auto-reload Ads Manager...');
+    mainWindow.loadURL(ADS_MANAGER_URL);
+  }, 2 * 60 * 60 * 1000);
 }
 
 async function extractFromPage() {
@@ -68,7 +88,14 @@ async function extractFromPage() {
     if (p.token) accessToken = p.token;
     if (p.dtsg) fbDtsg = p.dtsg;
     if (p.userId) userName = "User " + p.userId;
-    if (accessToken) { saveStore({ accessToken, fbDtsg, userName }); updateTray(); console.log("Session ready"); }
+    if (accessToken) {
+      saveStore({ accessToken, fbDtsg, userName });
+      updateTray();
+      if (!sessionReadyLogged) {
+        sessionReadyLogged = true;
+        safeLog("Session ready");
+      }
+    }
   } catch {}
 }
 
@@ -272,7 +299,7 @@ function startServer() {
         const videoData = { video_id: videoId, image_url: thumbUrl, message: message || "" };
         if (title) videoData.title = title;
         if (description) videoData.link_description = description;
-        if (cta !== "NO_BUTTON") videoData.call_to_action = { type: cta, value: { link: websiteUrl } };
+        if (cta !== "NO_BUTTON" && websiteUrl) videoData.call_to_action = { type: cta, value: { link: websiteUrl } };
         const body = JSON.stringify({ object_story_spec: { page_id: pageId, video_data: videoData } });
 
         const s3 = await elFetch(`https://graph.facebook.com/v16.0/${adAccount}/adcreatives?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`, {
@@ -309,7 +336,7 @@ function startServer() {
 
     res.writeHead(404);
     res.end(JSON.stringify({ ok: false, error: "Use /token, /session, /pages, /post" }));
-  }).listen(LOCAL_PORT, () => console.log(`API: http://localhost:${LOCAL_PORT}`));
+  }).listen(LOCAL_PORT, () => safeLog(`API: http://localhost:${LOCAL_PORT}`));
 }
 
 function getWebUI() {
@@ -518,6 +545,12 @@ init();
 app.dock.hide();
 app.whenReady().then(() => {
   createWindow(); createTray(); startServer(); startTunnel();
+});
+app.on("second-instance", () => {
+  if (!mainWindow) return;
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
 });
 app.on("window-all-closed", (e) => e.preventDefault());
 app.on("before-quit", () => { isQuitting = true; stopTunnel(); });

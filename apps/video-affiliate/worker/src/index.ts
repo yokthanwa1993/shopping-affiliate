@@ -1815,6 +1815,27 @@ async function claimGalleryVideoForPosting(params: {
     for (const video of orderedVideos) {
         const videoId = String(video?.id || '').trim()
         if (!videoId) continue
+        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+            video?.sourceFingerprint || video?.source_fingerprint,
+        )
+
+        const existingGuard = await getExistingPagePostedVideoGuard(params.db, {
+            namespaceId,
+            pageId,
+            videoId,
+            sourceFingerprint,
+        })
+        if (existingGuard) {
+            const latestHistory = await getLatestSuccessfulPostHistoryRow(params.db, {
+                namespaceId,
+                pageId,
+                videoId,
+                sourceFingerprint,
+            })
+            const postedAt = latestHistory?.postedAt || existingGuard.createdAt || new Date().toISOString()
+            await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
+            continue
+        }
 
         const videoLockKey = await tryAcquirePostingLock(params.db, {
             scope: 'video',
@@ -1827,6 +1848,26 @@ async function claimGalleryVideoForPosting(params: {
     }
 
     return null
+}
+
+async function ensurePageVideoNeverPosted(params: {
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    videoId: string
+    sourceFingerprint?: string
+}): Promise<{ ok: true } | { ok: false; postedAt: string | null; historyId: number | null }> {
+    const existingGuard = await getExistingPagePostedVideoGuard(params.db, params)
+    if (!existingGuard) return { ok: true }
+
+    const latestHistory = await getLatestSuccessfulPostHistoryRow(params.db, params)
+    const postedAt = latestHistory?.postedAt || existingGuard.createdAt || null
+    await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
+    return {
+        ok: false,
+        postedAt,
+        historyId: latestHistory?.id ?? existingGuard.historyId ?? null,
+    }
 }
 
 function hasGalleryVideoThumbnail(video: Record<string, unknown> | null | undefined): boolean {
@@ -5020,6 +5061,35 @@ app.delete('/admin/api/users/:email', async (c) => {
     })
 })
 
+app.post('/admin/api/namespaces/:namespaceId/clear-videos', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    const namespaceId = String(c.req.param('namespaceId') || '').trim()
+    if (!namespaceId || namespaceId === 'default') {
+        return c.json({ error: 'Invalid namespace' }, 400)
+    }
+
+    const deleted: Record<string, number> = {}
+    deleted.post_queue = toChanges(await c.env.DB.prepare('DELETE FROM post_queue WHERE bot_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.post_history = toChanges(await c.env.DB.prepare('DELETE FROM post_history WHERE bot_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.gallery_index = toChanges(await c.env.DB.prepare('DELETE FROM gallery_index WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.namespace_video_state = toChanges(await c.env.DB.prepare('DELETE FROM namespace_video_state WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.link_submissions = toChanges(await c.env.DB.prepare('DELETE FROM link_submissions WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.imported_videos = toChanges(await c.env.DB.prepare('DELETE FROM imported_videos WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.posting_locks = toChanges(await c.env.DB.prepare('DELETE FROM posting_locks WHERE namespace_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+    deleted.page_posted_video_guards = toChanges(await c.env.DB.prepare('DELETE FROM page_posted_video_guards WHERE bot_id = ?').bind(namespaceId).run().catch(() => ({ meta: { changes: 0 } })))
+
+    const r2Deleted = await deleteNamespaceR2Objects(c.env.BUCKET, namespaceId)
+
+    return c.json({
+        ok: true,
+        namespace_id: namespaceId,
+        deleted,
+        r2_deleted_objects: r2Deleted,
+    })
+})
+
 // ==================== AUTH ====================
 
 app.post('/api/auth/login', async (c) => {
@@ -7279,9 +7349,16 @@ function isLineCaptionSkipCommand(input: string): boolean {
 
 function isLineCaptionEditCommand(input: string): boolean {
     const normalized = String(input || '').trim().toLowerCase()
+    if (!normalized) return false
     return normalized === 'แก้ไขแคปชั่น'
         || normalized === 'กดแก้ไขแคปชั่น'
         || normalized === 'พิมพ์แคปชั่น'
+        || normalized === 'แก้แคปชั่น'
+        || normalized === 'กดแก้แคปชั่น'
+        || normalized === 'แก้แคป'
+        || normalized === 'กดแก้แคป'
+        || normalized === 'พิมพ์แคป'
+        || (normalized.includes('แก้') && normalized.includes('แคป'))
 }
 
 function isLineCoverSkipCommand(input: string): boolean {
@@ -7326,6 +7403,23 @@ function isLineCancelCommand(input: string): boolean {
         || normalized === 'ยกเลิก'
         || normalized === 'cancel'
         || normalized === 'abort'
+}
+
+function buildLineShortErrorMessage(error: unknown): string {
+    const message = String(error instanceof Error ? error.message : error || '').trim()
+    const normalized = message.toLowerCase()
+    if (
+        normalized.includes('managed_shortlink_conversion_failed')
+        || normalized.includes('shortlink')
+        || normalized.includes('fail_sys_session_expired')
+        || normalized.includes('session过期')
+        || normalized.includes('session expired')
+        || normalized.includes('lazada_shortlink')
+        || normalized.includes('shopee_shortlink')
+    ) {
+        return 'Shortlink ไม่สำเร็จ'
+    }
+    return 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง'
 }
 
 function stripLineAffiliateLinksFromText(input: string): string {
@@ -7701,17 +7795,21 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         captionProvidedAt: manualCaption ? nowIso : '',
         updatedAt: nowIso,
     })
-    await upsertSystemInboxSnapshotVideo({
+    upsertSystemInboxSnapshotVideo({
         env: params.env,
         adminNamespaceId: params.namespaceId,
         bucket: params.bucket,
         record: inboxRecord,
-    }).catch(() => { })
-    await mirrorInboxRecordIntoPrimaryAdminSnapshot({
+    }).catch((error) => {
+        console.warn(`[LINE] system inbox snapshot update failed for ${waitingState.id}: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    mirrorInboxRecordIntoPrimaryAdminSnapshot({
         env: params.env,
         sourceNamespaceId: params.namespaceId,
         record: inboxRecord,
-    }).catch(() => { })
+    }).catch((error) => {
+        console.warn(`[LINE] primary admin inbox mirror failed for ${waitingState.id}: ${error instanceof Error ? error.message : String(error)}`)
+    })
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
 
@@ -7742,14 +7840,26 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         return
     }
 
-    await replyLineProcessingResult({
-        replyToken: params.replyToken,
-        channelAccessToken: params.channelAccessToken,
-        namespaceId: params.namespaceId,
-        result: processingResult,
-        previewUrl,
-        preferProcessingOnly: true,
-    })
+    try {
+        await replyLineProcessingResult({
+            replyToken: params.replyToken,
+            channelAccessToken: params.channelAccessToken,
+            namespaceId: params.namespaceId,
+            result: processingResult,
+            previewUrl,
+            preferProcessingOnly: true,
+        })
+    } catch (replyError) {
+        console.warn(`[LINE] finalize reply failed for ${waitingState.id}: ${replyError instanceof Error ? replyError.message : String(replyError)}`)
+        await pushLineProcessingResult({
+            channelAccessToken: params.channelAccessToken,
+            lineUserId: params.lineUserId,
+            namespaceId: params.namespaceId,
+            result: processingResult,
+            previewUrl,
+            preferProcessingOnly: true,
+        })
+    }
 }
 
 async function linePushMessage(
@@ -8789,7 +8899,7 @@ async function handleLineTextMessage(params: {
             } catch (e) {
                 console.error('[LINE] Skip cover during caption error:', e instanceof Error ? e.message : String(e))
                 await lineReply(replyToken, channelAccessToken, [
-                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
+                    { type: 'text', text: buildLineShortErrorMessage(e) },
                 ]).catch(() => { })
             }
             return
@@ -8804,20 +8914,19 @@ async function handleLineTextMessage(params: {
 
         if (isLineCaptionSkipCommand(text)) {
             try {
-                if (waitingState.coverCompleted) {
-                    await finalizeLineWaitingVideoAndStartProcessing({
-                        env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
-                    })
-                } else {
-                    await promptLineCoverPicker({
-                        env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
-                    })
-                }
+                await finalizeLineWaitingVideoAndStartProcessing({
+                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                })
             } catch (e) {
-                console.error('[LINE] Skip caption → cover error:', e instanceof Error ? e.message : String(e))
-                await lineReply(replyToken, channelAccessToken, [
-                    { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
-                ]).catch(() => { })
+                console.error('[LINE] Skip caption error:', e instanceof Error ? `${e.message}\n${e.stack}` : String(e))
+                await lineReplyOrPush({
+                    replyToken,
+                    channelAccessToken,
+                    lineUserId,
+                    messages: [
+                        { type: 'text', text: buildLineShortErrorMessage(e) },
+                    ],
+                }).catch(() => { })
             }
             return
         }
@@ -8850,22 +8959,28 @@ async function handleLineTextMessage(params: {
         }
 
         try {
-            if (waitingState.coverCompleted) {
+            await finalizeLineWaitingVideoAndStartProcessing({
+                env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                manualCaption: captionCandidate,
+            })
+        } catch (e) {
+            console.error('[LINE] Caption → cover error:', e instanceof Error ? e.message : String(e))
+            try {
                 await finalizeLineWaitingVideoAndStartProcessing({
                     env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                     manualCaption: captionCandidate,
                 })
-            } else {
-                await promptLineCoverPicker({
-                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
-                    manualCaption: captionCandidate,
-                })
+            } catch (finalizeErr) {
+                console.error('[LINE] Caption finalize fallback error:', finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr))
+                await lineReplyOrPush({
+                    replyToken,
+                    channelAccessToken,
+                    lineUserId,
+                    messages: [
+                        { type: 'text', text: buildLineShortErrorMessage(finalizeErr) },
+                    ],
+                }).catch(() => { })
             }
-        } catch (e) {
-            console.error('[LINE] Caption → cover error:', e instanceof Error ? e.message : String(e))
-            await lineReply(replyToken, channelAccessToken, [
-                { type: 'text', text: 'เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง' },
-            ]).catch(() => { })
         }
         return
     }
@@ -12513,9 +12628,7 @@ app.get('/api/gallery', async (c) => {
             with_link_total: withLinkVideos.length,
             without_link_total: withoutLinkVideos.length,
         }, 200, {
-            'Cache-Control': forceFresh || offset === 0
-                ? 'private, no-store'
-                : 'private, max-age=15, stale-while-revalidate=60',
+            'Cache-Control': 'private, no-store',
             'Vary': 'x-auth-token',
         })
     } catch (e) {
@@ -12585,9 +12698,7 @@ app.get('/api/gallery/system', async (c) => {
             limit,
             view,
         }, 200, {
-            'Cache-Control': forceFresh || offset === 0
-                ? 'private, no-store'
-                : 'private, max-age=15, stale-while-revalidate=60',
+            'Cache-Control': 'private, no-store',
             'Vary': 'x-auth-token',
         })
     } catch (e) {
@@ -12848,9 +12959,7 @@ app.get('/api/gallery/used', async (c) => {
             limit,
             has_more: page.hasMore,
         }), 200, {
-            'Cache-Control': forceFresh || offset === 0
-                ? 'private, no-store'
-                : 'private, max-age=15, stale-while-revalidate=60',
+            'Cache-Control': 'private, no-store',
             'Vary': 'x-auth-token',
         })
     } catch (e) {
@@ -22884,6 +22993,24 @@ app.post('/api/pages/:id/force-post', async (c) => {
         )
         selectedVideoId = unpostedId
         selectedVideoNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
+        const duplicateCheck = await ensurePageVideoNeverPosted({
+            db: env.DB,
+            namespaceId: botId,
+            pageId: String(page.id || ''),
+            videoId: unpostedId,
+            sourceFingerprint: selectedSourceFingerprint,
+        })
+        if (duplicateCheck.ok === false) {
+            await releasePostingLock(env.DB, videoPostingLockKey)
+            videoPostingLockKey = null
+            return c.json({
+                error: 'video_already_posted',
+                details: {
+                    history_id: duplicateCheck.historyId,
+                    posted_at: duplicateCheck.postedAt,
+                },
+            }, 409)
+        }
         const sourceBucket = selectedVideoNamespaceId === botId
             ? c.get('bucket')
             : new BotBucket(env.BUCKET, selectedVideoNamespaceId) as unknown as R2Bucket
@@ -24163,6 +24290,19 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
         )
         const sourceNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
+        const duplicateCheck = await ensurePageVideoNeverPosted({
+            db: env.DB,
+            namespaceId: botId,
+            pageId: String(page.id || ''),
+            videoId: unpostedId,
+            sourceFingerprint,
+        })
+        if (duplicateCheck.ok === false) {
+            await releasePostingLock(env.DB, videoPostingLockKey)
+            videoPostingLockKey = null
+            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (already posted history=${duplicateCheck.historyId || 'n/a'})`)
+            continue
+        }
         // Get video metadata
         const sourceBucket = sourceNamespaceId === botId
             ? botBucket
