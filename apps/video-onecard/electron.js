@@ -262,6 +262,262 @@ function startServer() {
       } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
     }
 
+    // /create-ad — สร้าง LIKE_PAGE ad จาก video URL
+    if (p === "/create-ad" && req.method === "POST") {
+      try {
+        const pageId = body.page_id;
+        const videoUrl = body.video_url;
+        const existingVideoId = body.video_id || "";
+        const caption = body.caption || "";
+        const adAccount = body.ad_account || "act_1030797047648459";
+        const templateAdset = body.template_adset || "120244070706570263";
+
+        if (!pageId || (!videoUrl && !existingVideoId)) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: "Missing: page_id, video_url or video_id" })); }
+
+        // 1. Upload video (or use existing video_id)
+        let vid;
+        if (existingVideoId) {
+          vid = { id: existingVideoId };
+          console.log(`[CREATE-AD] Using existing video_id: ${existingVideoId}`);
+        } else {
+          const uv = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: "POST" });
+          vid = uv.json();
+          if (vid.error) return res.end(JSON.stringify({ ok: false, step: "upload", error: vid.error.message }));
+        }
+
+        // 2. Wait thumbnails
+        let thumb = null;
+        for (let i = 0; i < 20; i++) {
+          await new Promise(r => setTimeout(r, 3000));
+          const t = await elFetch(`https://graph.facebook.com/${vid.id}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
+          const td = t.json();
+          if (td.thumbnails?.data?.length > 1) { thumb = td.thumbnails.data[0].uri; break; }
+        }
+        if (!thumb) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout" }));
+
+        // 3. Create creative
+        const crBody = {
+          name: caption.substring(0, 50),
+          object_story_spec: {
+            page_id: pageId,
+            video_data: {
+              video_id: vid.id, message: caption, image_url: thumb,
+              call_to_action: { type: "LIKE_PAGE", value: { page: pageId } }
+            }
+          }
+        };
+        const cr = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/adcreatives?access_token=${encodeURIComponent(accessToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(crBody)
+        });
+        const crData = cr.json();
+        if (crData.error) return res.end(JSON.stringify({ ok: false, step: "creative", error: crData.error.message }));
+
+        // 4. Get story ID
+        let storyId = null;
+        for (let i = 0; i < 25; i++) {
+          await new Promise(r => setTimeout(r, 3000));
+          const c = await elFetch(`https://graph.facebook.com/${crData.id}?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`);
+          const cd = c.json();
+          if (cd.effective_object_story_id) { storyId = cd.effective_object_story_id; break; }
+        }
+        if (!storyId) return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout" }));
+
+        // 5. หาแคมเปญ: ใช้ campaign_id ที่ระบุ / สร้างใหม่ด้วย new_campaign_name / หาอัตโนมัติ
+        const maxAdsetsPerCampaign = 10;
+        const maxCampaigns = 10;
+        const campaignPrefix = body.campaign_name || "ADS_PUBLISH_";
+
+        let targetCampaignId = body.campaign_id || null;
+
+        // ถ้าระบุชื่อแคมเปญใหม่ → สร้างเลย
+        if (!targetCampaignId && body.new_campaign_name) {
+          const newCampResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: body.new_campaign_name, objective: "OUTCOME_ENGAGEMENT", status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
+          });
+          const newCamp = newCampResp.json();
+          if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message }));
+          targetCampaignId = newCamp.id;
+          console.log(`[CREATE-AD] Created new campaign "${body.new_campaign_name}": ${targetCampaignId}`);
+        }
+
+        // ถ้ายังไม่มี → หาแคมเปญที่ยังไม่เต็มอัตโนมัติ
+        if (!targetCampaignId) {
+          const campsResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}&fields=id,name,status&limit=50&filtering=[{"field":"name","operator":"CONTAIN","value":"${campaignPrefix}"}]`);
+          const camps = campsResp.json();
+          const activeCamps = (camps.data || []).filter(c => c.status !== "DELETED");
+
+          for (const camp of activeCamps) {
+            const adsetsResp = await elFetch(`https://graph.facebook.com/v21.0/${camp.id}/adsets?access_token=${encodeURIComponent(accessToken)}&fields=id,status&limit=50`);
+            const adsets = adsetsResp.json();
+            const count = (adsets.data || []).filter(a => a.status !== "DELETED").length;
+            if (count < maxAdsetsPerCampaign) {
+              targetCampaignId = camp.id;
+              console.log(`[CREATE-AD] Using campaign ${camp.name} (${count}/${maxAdsetsPerCampaign} adsets)`);
+              break;
+            }
+          }
+
+          if (!targetCampaignId) {
+            if (activeCamps.length >= maxCampaigns) {
+              return res.end(JSON.stringify({ ok: false, step: "campaign", error: "Max " + maxCampaigns + " campaigns reached" }));
+            }
+            const newCampNum = activeCamps.length + 1;
+            const newCampResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name: campaignPrefix + newCampNum, objective: "OUTCOME_ENGAGEMENT", status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
+            });
+            const newCamp = newCampResp.json();
+            if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message }));
+            targetCampaignId = newCamp.id;
+            console.log(`[CREATE-AD] Created new campaign ${campaignPrefix}${newCampNum}: ${targetCampaignId}`);
+          }
+        }
+
+        // Copy adset ไปแคมเปญที่เลือก
+        const copy = await elFetch(`https://graph.facebook.com/v21.0/${templateAdset}/copies?access_token=${encodeURIComponent(accessToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ deep_copy: true, status_option: "PAUSED", campaign_id: targetCampaignId })
+        });
+        const copyData = copy.json();
+        if (copyData.error) return res.end(JSON.stringify({ ok: false, step: "copy", error: copyData.error.message }));
+        const newAdset = copyData.copied_adset_id;
+
+        // 6. สร้าง ad ใหม่ใน adset ที่ copy มา
+        const adResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/ads?access_token=${encodeURIComponent(accessToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: caption.substring(0, 50), adset_id: newAdset, creative: { creative_id: crData.id }, status: "PAUSED" })
+        });
+        const adData = adResp.json();
+        if (adData.error) return res.end(JSON.stringify({ ok: false, step: "ad", error: adData.error.message }));
+        const newAd = adData.id;
+
+        // 7. Rename adset + activate
+        await elFetch(`https://graph.facebook.com/v21.0/${newAdset}?access_token=${encodeURIComponent(accessToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: storyId, status: "ACTIVE" })
+        });
+        await elFetch(`https://graph.facebook.com/v21.0/${newAd}?access_token=${encodeURIComponent(accessToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "ACTIVE" })
+        });
+
+        // Mark video as posted
+        if (body.video_gallery_id && body.bot_id) {
+          try {
+            const markUrl = (body.worker_url || "https://api.oomnn.com") + "/api/mark-video-posted";
+            await nodeFetch(markUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-auth-token": body.auth_token || "", "x-bot-id": body.bot_id },
+              body: JSON.stringify({ video_id: body.video_gallery_id })
+            });
+          } catch {}
+        }
+
+        return res.end(JSON.stringify({ ok: true, story_id: storyId, adset_id: newAdset, ad_id: newAd, video_id: vid.id, creative_id: crData.id }));
+      } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /promote — ลบแอด + ลบปุ่ม CTA + เผยแพร่หน้าเพจ
+    if (p === "/promote" && req.method === "POST") {
+      try {
+        const storyId = body.story_id;
+        const adAccount = body.ad_account || "act_1030797047648459";
+        if (!storyId) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: "Missing: story_id" })); }
+
+        const pageId = storyId.split("_")[0];
+        const postId = storyId.split("_")[1];
+
+        // Get page token
+        const pagesRes = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id&limit=100&access_token=${encodeURIComponent(accessToken)}`);
+        const pages = pagesRes.json();
+        const page = (pages.data || []).find(p => p.id === pageId);
+        const pageToken = page ? page.access_token : accessToken;
+
+        // 1. ลบแอดที่ใช้ story นี้
+        const adsets = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/adsets?access_token=${encodeURIComponent(accessToken)}&fields=id,name&limit=50&filtering=[{"field":"name","operator":"CONTAIN","value":"${postId}"}]`);
+        const adsetsData = adsets.json();
+        for (const a of (adsetsData.data || [])) {
+          const ads = await elFetch(`https://graph.facebook.com/v21.0/${a.id}/ads?access_token=${encodeURIComponent(accessToken)}&fields=id&limit=10`);
+          for (const ad of (ads.json().data || [])) {
+            await elFetch(`https://graph.facebook.com/v21.0/${ad.id}?access_token=${encodeURIComponent(accessToken)}`, {
+              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "DELETED" })
+            });
+          }
+          await elFetch(`https://graph.facebook.com/v21.0/${a.id}?access_token=${encodeURIComponent(accessToken)}`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "DELETED" })
+          });
+        }
+
+        await new Promise(r => setTimeout(r, 3000));
+
+        // 2. ลบปุ่ม CTA
+        const ctaUrl = `https://adsmanager.facebook.com/ads/existing_post/call_to_action/?page_ids[0]=${pageId}&post_ids[0]=${postId}&ad_account_id=${adAccount.replace("act_","")}&source_app_id=119211728144504&call_to_action_type=NO_BUTTON&is_from_cta_upgrade_recommendation=false`;
+        const session = { fbDtsg: fbDtsg };
+        const formBody = "fb_dtsg=" + encodeURIComponent(fbDtsg) + "&jazoest=25357";
+        await elFetch(ctaUrl, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: formBody });
+
+        await new Promise(r => setTimeout(r, 3000));
+
+        // 3. เผยแพร่หน้าเพจ
+        await elFetch(`https://graph.facebook.com/v21.0/${storyId}?access_token=${encodeURIComponent(pageToken)}`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ is_published: true })
+        });
+
+        return res.end(JSON.stringify({ ok: true, story_id: storyId, post_url: "https://www.facebook.com/" + storyId.replace("_", "/posts/") }));
+      } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /proxy — ยิง URL ไหนก็ได้ด้วย session cookies
+    if (p === "/proxy" && req.method === "POST") {
+      try {
+        const targetUrl = body.__url;
+        delete body.__url;
+        const formBody = Object.entries(body).map(([k,v]) => k + '=' + encodeURIComponent(typeof v === 'object' ? JSON.stringify(v) : String(v))).join('&');
+        const r = await elFetch(targetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: formBody
+        });
+        const rawText = r.text();
+        try { return res.end(JSON.stringify(JSON.parse(rawText))); }
+        catch { return res.end(JSON.stringify({ ok: true, raw: rawText })); }
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /fbapi — ยิง www.facebook.com/api/graphql ด้วย session cookies
+    if (p === "/fbapi" && req.method === "POST") {
+      try {
+        const formBody = Object.entries(body).map(([k,v]) => k + '=' + encodeURIComponent(typeof v === 'object' ? JSON.stringify(v) : String(v))).join('&');
+        const r = await elFetch('https://www.facebook.com/api/graphql/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: formBody
+        });
+        return res.end(JSON.stringify(r.json()));
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /graph — Proxy Graph API ผ่าน Electron net (session cookies + token)
+    if (p === "/graph") {
+      const graphPath = params.path;
+      if (!graphPath) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: 'Missing: path' })); }
+      try {
+        const graphUrl = new URL('https://graph.facebook.com/v21.0/' + graphPath);
+        Object.entries(params).forEach(([k,v]) => { if (k !== 'path' && v) graphUrl.searchParams.set(k, v); });
+        if (!graphUrl.searchParams.has('access_token') && accessToken) graphUrl.searchParams.set('access_token', accessToken);
+        const method = req.method === 'POST' ? 'POST' : 'GET';
+        const opts = { method };
+        if (method === 'POST' && Object.keys(body).length > 1) {
+          opts.headers = { 'Content-Type': 'application/json' };
+          const bodyClone = { ...body }; delete bodyClone.path;
+          opts.body = JSON.stringify(bodyClone);
+        }
+        const r = await elFetch(graphUrl.toString(), opts);
+        return res.end(JSON.stringify(r.json()));
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
     // /post — One Card post ผ่าน adcreatives (ใช้ accessToken จาก Ads Manager)
     if (p === "/post") {
       const adAccount = params.ad_account || "act_1148837732288721";
@@ -280,43 +536,60 @@ function startServer() {
 
       try {
         // Step 1: Upload video
+        console.log(`[POST] Step 1: Uploading video for page ${pageId}...`)
         const step1 = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: "POST" });
         const v = step1.json();
+        console.log(`[POST] Step 1 result:`, JSON.stringify(v).substring(0, 200))
         if (v.error) return res.end(JSON.stringify({ ok: false, step: "upload_video", error: v.error.message }));
         const videoId = v.id;
 
         // Step 2: Wait for thumbnails
+        console.log(`[POST] Step 2: Waiting for thumbnails (videoId=${videoId})...`)
         let thumbUrl = null;
-        for (let i = 0; i < 25; i++) {
+        for (let i = 0; i < 60; i++) {
           await new Promise(r => setTimeout(r, 3000));
           const s = await elFetch(`https://graph.facebook.com/${videoId}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
           const sd = s.json();
-          if (sd.thumbnails?.data?.length > 1) { thumbUrl = sd.thumbnails.data[0].uri; break; }
+          if (sd.thumbnails?.data?.length >= 1) { thumbUrl = sd.thumbnails.data[0].uri; console.log(`[POST] Step 2: Got thumbnail after ${i+1} polls`); break; }
+          if (i % 5 === 0) console.log(`[POST] Step 2: Poll ${i+1}/60 - no thumbnail yet`)
         }
-        if (!thumbUrl) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout" }));
+        if (!thumbUrl) { console.log(`[POST] Step 2: TIMEOUT`); return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout" })); }
 
         // Step 3: Create adcreative
+        console.log(`[POST] Step 3: Creating adcreative...`)
         const videoData = { video_id: videoId, image_url: thumbUrl, message: message || "" };
         if (title) videoData.title = title;
         if (description) videoData.link_description = description;
         if (cta !== "NO_BUTTON" && websiteUrl) videoData.call_to_action = { type: cta, value: { link: websiteUrl } };
         const body = JSON.stringify({ object_story_spec: { page_id: pageId, video_data: videoData } });
+        console.log(`[POST] Step 3: body=`, body.substring(0, 200))
 
-        const s3 = await elFetch(`https://graph.facebook.com/v16.0/${adAccount}/adcreatives?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`, {
+        const s3 = await elFetch(`https://graph.facebook.com/v16.0/${adAccount}/adcreatives?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id,object_story_id`, {
           method: "POST", headers: { "Content-Type": "application/json" }, body
         });
         const c = s3.json();
+        console.log(`[POST] Step 3 result:`, JSON.stringify(c).substring(0, 300))
         if (c.error) return res.end(JSON.stringify({ ok: false, step: "adcreative", error: c.error.message }));
 
-        // Step 4: Poll for story ID
-        let storyId = null;
-        for (let i = 0; i < 25; i++) {
+        // Step 4: Poll for story ID (reduced to 20 polls × 3s = 60s max)
+        console.log(`[POST] Step 4: Polling story ID for adcreative ${c.id}...`)
+        let storyId = c.effective_object_story_id || c.object_story_id || null;
+        for (let i = 0; !storyId && i < 20; i++) {
           await new Promise(r => setTimeout(r, 3000));
-          const p4 = await elFetch(`https://graph.facebook.com/${c.id}?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`);
+          const p4 = await elFetch(`https://graph.facebook.com/${c.id}?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id,object_story_id`);
           const d4 = p4.json();
-          if (d4.effective_object_story_id) { storyId = d4.effective_object_story_id; break; }
+          console.log(`[POST] Step 4: Poll ${i+1}/20:`, JSON.stringify(d4).substring(0, 150))
+          if (d4.error) {
+            console.log(`[POST] Step 4: ERROR:`, d4.error.message)
+            return res.end(JSON.stringify({ ok: false, step: "story_id", error: d4.error.message, adcreative_id: c.id }));
+          }
+          if (d4.effective_object_story_id || d4.object_story_id) {
+            storyId = d4.effective_object_story_id || d4.object_story_id;
+            console.log(`[POST] Step 4: Got story ID: ${storyId}`)
+            break;
+          }
         }
-        if (!storyId) return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout" }));
+        if (!storyId) { console.log(`[POST] Step 4: TIMEOUT`); return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout", adcreative_id: c.id, video_id: videoId })); }
 
         // Step 5: Get page token & publish
         const pagesRes = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id&limit=100&access_token=${encodeURIComponent(accessToken)}`);

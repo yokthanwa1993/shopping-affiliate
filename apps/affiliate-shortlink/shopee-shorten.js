@@ -1,23 +1,27 @@
-async function(productUrl) {
+async function(productUrl, subIds) {
   var GQL_ENDPOINT = 'https://affiliate.shopee.co.th/api/v3/gql?q=batchCustomLink';
 
   var csrfMatch = document.cookie.match(/csrftoken=([^;]+)/);
-  if (!csrfMatch) {
-    throw new Error('No csrftoken cookie - not logged in to Shopee Affiliate');
+
+  var headers = {
+    'Content-Type': 'application/json',
+    'affiliate-program-type': '1'
+  };
+  if (csrfMatch) headers['csrf-token'] = csrfMatch[1];
+
+  var linkParam = { originalLink: productUrl };
+  if (subIds && Array.isArray(subIds) && subIds.length > 0) {
+    linkParam.subIds = subIds;
   }
 
   var resp = await fetch(GQL_ENDPOINT, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'affiliate-program-type': '1',
-      'csrf-token': csrfMatch[1]
-    },
+    headers: headers,
     credentials: 'include',
     body: JSON.stringify({
       operationName: 'batchGetCustomLink',
       variables: {
-        linkParams: [{ originalLink: productUrl }],
+        linkParams: [linkParam],
         sourceCaller: 'CUSTOM_LINK_CALLER'
       },
       query: 'query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }'

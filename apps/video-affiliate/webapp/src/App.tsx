@@ -487,6 +487,8 @@ interface PostHistory {
   shortlink_error?: string | null
   shortlink_expected_utm_id?: string | null
   shortlink_utm_match?: number | null
+  shortlink_conversion_status?: string | null
+  shortlink_conversion_error?: string | null
   error_message?: string | null
 }
 
@@ -585,6 +587,7 @@ interface FacebookPage {
   post_hours?: string  // slot: "2:22,9:49" or interval: "every:30"
   is_active: number
   onecard_enabled?: number
+  ads_publish_enabled?: number
   onecard_link_mode?: 'shopee' | 'lazada' | 'none'
   onecard_cta?: 'SHOP_NOW' | 'NO_BUTTON'
   last_post_at?: string
@@ -593,7 +596,7 @@ interface FacebookPage {
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
-type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members' | 'monitor'
+type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members' | 'monitor' | 'ads'
 type PostingOrderOption = 'oldest_first' | 'newest_first' | 'random'
 type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
 type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
@@ -791,6 +794,8 @@ const getSettingsSectionTitle = (section: SettingsSection): string => {
       return 'สมาชิก'
     case 'monitor':
       return 'Monitor'
+    case 'ads':
+      return 'จัดการ ADS'
     default:
       return 'ตั้งค่า'
   }
@@ -2315,6 +2320,12 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
   const [intervalMinutes, setIntervalMinutes] = useState<number>(() => parseInterval(page.post_hours, page.post_interval_minutes || 60))
   const [isActive, setIsActive] = useState(page.is_active === 1)
   const [oneCardEnabled, setOneCardEnabled] = useState(page.onecard_enabled === 1)
+  const [adsPublishEnabled, setAdsPublishEnabled] = useState(page.ads_publish_enabled === 1)
+  const [adsSubId, setAdsSubId] = useState('')
+  const [adsShortlinkUrl, setAdsShortlinkUrl] = useState('https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}')
+  const [adsCommentTemplate, setAdsCommentTemplate] = useState('🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}')
+  const [adsSaveStatus, setAdsSaveStatus] = useState<'saved' | 'error' | null>(null)
+  const handleSaveAdsSettings = async () => { try { setAdsSaveStatus(null); setAdsSaveStatus('saved'); setTimeout(() => setAdsSaveStatus(null), 3000) } catch { setAdsSaveStatus('error') } }
   const [oneCardLinkMode, setOneCardLinkMode] = useState<'shopee' | 'lazada' | 'none'>(() => {
     const value = String(page.onecard_link_mode || '').trim().toLowerCase()
     if (value === 'lazada') return 'lazada'
@@ -2367,6 +2378,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
         is_active: isActive,
         onecard_enabled: oneCardEnabled,
+        ads_publish_enabled: adsPublishEnabled,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
       }
@@ -2390,6 +2402,7 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
         post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : page.post_interval_minutes,
         is_active: isActive ? 1 : 0,
         onecard_enabled: oneCardEnabled ? 1 : 0,
+        ads_publish_enabled: adsPublishEnabled ? 1 : 0,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
         access_token: nextToken,
@@ -3090,6 +3103,12 @@ function App({
   const [shortlinkExpectedUtmIdDraft, setShortlinkExpectedUtmIdDraft] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
   const [shortlinkExpectedUtmIdCurrent, setShortlinkExpectedUtmIdCurrent] = useState(() => getStoredShortlinkExpectedUtmId(botScope))
   const [lazadaExpectedMemberIdDraft, setLazadaExpectedMemberIdDraft] = useState(() => getStoredLazadaExpectedMemberId(botScope))
+  const [shortlinkUrlDraft, setShortlinkUrlDraft] = useState('')
+  const [subId1Draft, setSubId1Draft] = useState('')
+  const [subId2Draft, setSubId2Draft] = useState('')
+  const [subId3Draft, setSubId3Draft] = useState('')
+  const [subId4Draft, setSubId4Draft] = useState('')
+  const [subId5Draft, setSubId5Draft] = useState('')
 
   useEffect(() => {
     return () => {
@@ -3112,7 +3131,7 @@ function App({
   const [postingOrderLoading, setPostingOrderLoading] = useState(false)
   const [postingOrderSaving, setPostingOrderSaving] = useState(false)
   const [logoutLoading, setLogoutLoading] = useState(false)
-  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'post', 'voice', 'cover', 'comment', 'members', 'monitor']
+  const validSettingsSections: SettingsSection[] = ['menu', 'account', 'pages', 'team', 'gemini', 'shortlink', 'post', 'voice', 'cover', 'comment', 'members', 'monitor', 'ads']
   const getPathSegments = (pathname = (isBrowser ? window.location.pathname : '')) =>
     String(pathname || '')
       .replace(/^\/+/, '')
@@ -3140,7 +3159,23 @@ function App({
     return String(new URLSearchParams(window.location.search).get('page_id') || '').trim()
   }
   const getInitialSettingsSection = (): SettingsSection => getSelectedPageIdFromLocation() ? 'pages' : getSettingsSectionFromLocation()
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>(getInitialSettingsSection)
+  const [settingsSection, _setSettingsSection] = useState<SettingsSection>(getInitialSettingsSection)
+  const setSettingsSection = (section: SettingsSection) => {
+    _setSettingsSection(section)
+    if (section !== 'menu') {
+      window.history.pushState({ settingsSection: section }, '')
+    }
+  }
+  // Handle back button for settings subsections
+  useEffect(() => {
+    const handlePopState = (e: PopStateEvent) => {
+      if (settingsSection !== 'menu') {
+        _setSettingsSection('menu')
+      }
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [settingsSection])
   const [namespaceId, setNamespaceId] = useState<string>(() => getStoredNamespace(botScope))
   const [isSystemAdmin, setIsSystemAdmin] = useState(false)
   const [pendingApproval, setPendingApproval] = useState(false)
@@ -4034,6 +4069,7 @@ function App({
       void loadPages()
       return
     }
+
     if (settingsSection === 'team' || settingsSection === 'menu') {
       void loadTeam()
       return
@@ -5359,6 +5395,13 @@ function App({
       if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
       if (typeof data.max_lazada_member_id_chars === 'number' && data.max_lazada_member_id_chars > 0) setLazadaExpectedMemberIdMaxChars(data.max_lazada_member_id_chars)
+      // Load sub IDs + template
+      setShortlinkUrlDraft(String((data as any).shortlink_url_template || ''))
+      setSubId1Draft(String((data as any).sub_id1 || ''))
+      setSubId2Draft(String((data as any).sub_id2 || ''))
+      setSubId3Draft(String((data as any).sub_id3 || ''))
+      setSubId4Draft(String((data as any).sub_id4 || ''))
+      setSubId5Draft(String((data as any).sub_id5 || ''))
       setShortlinkMessage('')
     } catch {
       setShortlinkMessage('โหลด Shortlink URL ไม่สำเร็จ')
@@ -5382,7 +5425,17 @@ function App({
       } : {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account: trimmedAccount, expected_utm_id: expectedTrimmed, lazada_expected_member_id: lazadaExpectedMemberIdTrimmed }),
+        body: JSON.stringify({
+          account: trimmedAccount,
+          expected_utm_id: expectedTrimmed,
+          lazada_expected_member_id: lazadaExpectedMemberIdTrimmed,
+          shortlink_url_template: shortlinkUrlDraft,
+          sub_id1: subId1Draft,
+          sub_id2: subId2Draft,
+          sub_id3: subId3Draft,
+          sub_id4: subId4Draft,
+          sub_id5: subId5Draft,
+        }),
       })
 
       if (resp.status === 401) {
@@ -6741,6 +6794,14 @@ function App({
                             <p><span className="font-semibold text-gray-700">Source:</span> {triggerSourceLabel}</p>
                             <p><span className="font-semibold text-gray-700">โพสต์:</span> {postMeta.label}</p>
                             <p><span className="font-semibold text-gray-700">คอมเม้นต์:</span> {commentMeta.label}</p>
+                            <p><span className="font-semibold text-gray-700">ย่อลิงก์:</span> {' '}
+                              {item.shortlink_conversion_status === 'shortened'
+                                ? <span className="text-green-600 font-semibold">ผ่าน</span>
+                                : item.shortlink_conversion_status === 'fallback' || item.shortlink_conversion_status === 'failed'
+                                  ? <span className="text-red-500 font-semibold">ไม่ผ่าน{item.shortlink_conversion_error ? ` — ${item.shortlink_conversion_error}` : ''}</span>
+                                  : <span className="text-gray-400">{item.shortlink_conversion_status === 'disabled' ? 'ไม่มีลิงก์' : '-'}</span>
+                              }
+                            </p>
                             <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ที่คอมเมนต์:</span> {item.shopee_link || '-'}</p>
                             {item.lazada_link && <p className="break-all"><span className="font-semibold text-gray-700">ลิงก์ Lazada ที่คอมเมนต์:</span> {item.lazada_link}</p>}
                             <div className="rounded-xl bg-blue-50/80 p-2.5 text-[11px] text-blue-900">
@@ -6980,6 +7041,14 @@ function App({
                     subtitle="เพิ่มเพจและตั้งค่า Auto Post"
                     onClick={() => openSettingsSection('pages')}
                   />
+                  {isSystemAdmin && (
+                    <SettingsMenuItem
+                      icon="📢"
+                      title="จัดการ ADS"
+                      subtitle="สร้างแอด LIKE_PAGE, ลบปุ่ม, เผยแพร่หน้าเพจ"
+                      onClick={() => openSettingsSection('ads')}
+                    />
+                  )}
                   <SettingsMenuItem
                     icon="👥"
                     title="Team"
@@ -7250,6 +7319,31 @@ function App({
                   </div>
                 )}
 
+                {settingsSection === 'ads' && isSystemAdmin && (
+                  <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-4">
+                      <p className="text-lg font-bold text-gray-900">จัดการ ADS</p>
+                      <div>
+                        <label className="block text-xs font-bold text-gray-600 mb-1">Sub ID (Shopee)</label>
+                        <input type="text" placeholder="เช่น yok, sub123" value={adsSubId} onChange={(e) => setAdsSubId(e.target.value)} className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                        <p className="text-xs text-gray-400 mt-1">SubID ที่ Shopee กำหนดมา จะถูกแนบไปกับลิงก์</p>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-gray-600 mb-1">Shortlink URL</label>
+                        <input type="text" placeholder="https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}" value={adsShortlinkUrl} onChange={(e) => setAdsShortlinkUrl(e.target.value)} className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                        <p className="text-xs text-gray-400 mt-1">{'{url}'} = ลิงก์ Shopee, {'{sub_id}'} = Sub ID</p>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-gray-600 mb-1">เทมเพลตตอบคอมเมนต์</label>
+                        <textarea placeholder={"🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}"} value={adsCommentTemplate} onChange={(e) => setAdsCommentTemplate(e.target.value)} rows={3} className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none" />
+                        <p className="text-xs text-gray-400 mt-1">{'{shopee_link}'} = ลิงก์ Shopee ที่ย่อแล้ว</p>
+                      </div>
+                      <button onClick={handleSaveAdsSettings} className="w-full py-2.5 bg-blue-600 text-white rounded-xl text-sm font-bold active:scale-95 transition-all">บันทึกตั้งค่า ADS</button>
+                      {adsSaveStatus && (<p className={`text-xs font-medium ${adsSaveStatus === 'saved' ? 'text-green-600' : 'text-red-500'}`}>{adsSaveStatus === 'saved' ? '✓ บันทึกแล้ว' : 'เกิดข้อผิดพลาด'}</p>)}
+                    </div>
+                  </div>
+                )}
+
                 {settingsSection === 'shortlink' && isOwner && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
@@ -7310,6 +7404,43 @@ function App({
                             placeholder="199431090"
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
+                          {isSystemAdmin && (
+                            <>
+                              <div className="space-y-1 pt-2 border-t border-gray-100">
+                                <p className="text-[11px] font-semibold text-gray-600">Shortlink URL</p>
+                                <p className="text-[11px] text-gray-400">ใส่ URL สำหรับย่อลิ้ง ใช้ {'{url}'}, {'{sub_id}'}, {'{sub_id2}'}-{'{sub_id5}'}</p>
+                              </div>
+                              <input
+                                type="text"
+                                value={shortlinkUrlDraft}
+                                onChange={(e) => { setShortlinkUrlDraft(e.target.value); if (shortlinkMessage) setShortlinkMessage('') }}
+                                placeholder="https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}"
+                                className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-xs outline-none focus:border-blue-400"
+                              />
+                              <div className="grid grid-cols-2 gap-2">
+                                <div className="space-y-1">
+                                  <p className="text-[11px] font-semibold text-gray-600">Sub ID 1</p>
+                                  <input type="text" value={subId1Draft} onChange={(e) => setSubId1Draft(e.target.value)} placeholder="yok" className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-[11px] font-semibold text-gray-600">Sub ID 2</p>
+                                  <input type="text" value={subId2Draft} onChange={(e) => setSubId2Draft(e.target.value)} className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-[11px] font-semibold text-gray-600">Sub ID 3</p>
+                                  <input type="text" value={subId3Draft} onChange={(e) => setSubId3Draft(e.target.value)} className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                                </div>
+                                <div className="space-y-1">
+                                  <p className="text-[11px] font-semibold text-gray-600">Sub ID 4</p>
+                                  <input type="text" value={subId4Draft} onChange={(e) => setSubId4Draft(e.target.value)} className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                                </div>
+                                <div className="space-y-1 col-span-2">
+                                  <p className="text-[11px] font-semibold text-gray-600">Sub ID 5</p>
+                                  <input type="text" value={subId5Draft} onChange={(e) => setSubId5Draft(e.target.value)} className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-blue-400" />
+                                </div>
+                              </div>
+                            </>
+                          )}
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
                             {isSystemAdmin && (
                               <p>Account ปัจจุบัน: <span className="font-semibold text-gray-700">{shortlinkAccountCurrent || '-'}</span></p>
@@ -7439,13 +7570,14 @@ function App({
                       ) : (
                         <>
                           <textarea
-                            value={commentTemplateDraft}
+                            key={`ct-${commentTemplateSource}-${commentTemplateUpdatedAt}`}
+                            defaultValue={commentTemplateDraft}
                             onChange={(e) => {
                               setCommentTemplateDraft(e.target.value)
                               if (commentTemplateMessage) setCommentTemplateMessage('')
                             }}
                             rows={9}
-                            placeholder={DEFAULT_COMMENT_TEMPLATE}
+                            placeholder="ใส่เทมเพลตคอมเมนต์ที่นี่... เช่น {{shopee_link}}"
                             className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
                           />
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">

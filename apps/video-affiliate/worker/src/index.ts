@@ -2939,6 +2939,14 @@ async function ensureCronScheduleLocksTable(db: D1Database): Promise<void> {
     ).run()
 }
 
+async function releaseCronScheduleLock(db: D1Database, lockKey: string, namespaceId: string): Promise<void> {
+    const normalizedLockKey = String(lockKey || '').trim()
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedLockKey || !normalizedNamespaceId) return
+    const scopedLockKey = `${normalizedNamespaceId}::${normalizedLockKey}`
+    await db.prepare('DELETE FROM cron_schedule_locks WHERE lock_key = ?').bind(scopedLockKey).run().catch(() => { })
+}
+
 async function tryAcquireCronScheduleLock(db: D1Database, lockKey: string, namespaceId: string, pageId: string): Promise<boolean> {
     const normalizedLockKey = String(lockKey || '').trim()
     const normalizedNamespaceId = String(namespaceId || '').trim()
@@ -3042,6 +3050,580 @@ type NamespaceVideoStateRow = {
     lazada_member_id?: string
     source_fingerprint?: string
     posted_at?: string
+}
+
+type FacebookPageVideoCacheRow = {
+    page_id?: string
+    page_name?: string
+    video_id?: string
+    title?: string
+    description?: string
+    permalink_url?: string
+    picture?: string
+    source_url?: string
+    created_time?: string
+    views?: number | string
+    fetched_at?: string
+    updated_at?: string
+}
+
+type FacebookPageVideoSyncStateRow = {
+    page_id?: string
+    page_name?: string
+    next_after?: string
+    last_attempt_at?: string
+    last_synced_at?: string
+    last_full_scan_at?: string
+    fully_scanned?: number | string
+    last_batch_count?: number | string
+    last_error?: string
+    updated_at?: string
+}
+
+type DashboardSettingRow = {
+    key?: string
+    value?: string
+    updated_at?: string
+}
+
+let facebookPageVideoCacheTablesReady: Promise<void> | null = null
+let dashboardSettingsTableReady: Promise<void> | null = null
+const DASHBOARD_FACEBOOK_GALLERY_PAGE_ID = '1008898512617594'
+const DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME = 'เฉียบ'
+const DASHBOARD_FACEBOOK_GALLERY_BATCH_SIZE = 100
+const DASHBOARD_FACEBOOK_GALLERY_SYNC_COOLDOWN_MS = 30 * 1000
+const DASHBOARD_FACEBOOK_GALLERY_ERROR_COOLDOWN_MS = 60 * 60 * 1000
+const DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN = 'facebook_sync_token'
+
+async function ensureFacebookPageVideoCacheTables(db: D1Database): Promise<void> {
+    if (!facebookPageVideoCacheTablesReady) {
+        facebookPageVideoCacheTablesReady = (async () => {
+            await db.prepare(
+                `CREATE TABLE IF NOT EXISTS facebook_page_video_cache (
+                    page_id TEXT NOT NULL,
+                    page_name TEXT NOT NULL DEFAULT '',
+                    video_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    permalink_url TEXT NOT NULL DEFAULT '',
+                    picture TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL DEFAULT '',
+                    created_time TEXT NOT NULL DEFAULT '',
+                    views INTEGER NOT NULL DEFAULT 0,
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (page_id, video_id)
+                )`
+            ).run()
+            await db.prepare(
+                `CREATE INDEX IF NOT EXISTS idx_fb_page_video_cache_page_views
+                 ON facebook_page_video_cache(page_id, views DESC, created_time DESC)`
+            ).run().catch(() => { })
+            await db.prepare(
+                `CREATE TABLE IF NOT EXISTS facebook_page_video_sync_state (
+                    page_id TEXT NOT NULL PRIMARY KEY,
+                    page_name TEXT NOT NULL DEFAULT '',
+                    next_after TEXT NOT NULL DEFAULT '',
+                    last_attempt_at TEXT NOT NULL DEFAULT '',
+                    last_synced_at TEXT NOT NULL DEFAULT '',
+                    last_full_scan_at TEXT NOT NULL DEFAULT '',
+                    fully_scanned INTEGER NOT NULL DEFAULT 0,
+                    last_batch_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )`
+            ).run()
+            await db.prepare(
+                `ALTER TABLE facebook_page_video_sync_state ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''`
+            ).run().catch(() => { })
+            await db.prepare(
+                `ALTER TABLE facebook_page_video_sync_state ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`
+            ).run().catch(() => { })
+        })()
+    }
+    await facebookPageVideoCacheTablesReady
+}
+
+async function ensureDashboardSettingsTable(db: D1Database): Promise<void> {
+    if (!dashboardSettingsTableReady) {
+        dashboardSettingsTableReady = db.prepare(
+            `CREATE TABLE IF NOT EXISTS dashboard_settings (
+                key TEXT NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )`
+        ).run().then(() => undefined)
+    }
+    await dashboardSettingsTableReady
+}
+
+async function getDashboardSetting(db: D1Database, key: string): Promise<DashboardSettingRow | null> {
+    await ensureDashboardSettingsTable(db)
+    const normalizedKey = String(key || '').trim()
+    if (!normalizedKey) return null
+    return await db.prepare(
+        `SELECT key, value, updated_at FROM dashboard_settings WHERE key = ?`
+    ).bind(normalizedKey).first() as DashboardSettingRow | null
+}
+
+async function setDashboardSetting(db: D1Database, key: string, value: string): Promise<DashboardSettingRow | null> {
+    await ensureDashboardSettingsTable(db)
+    const normalizedKey = String(key || '').trim()
+    if (!normalizedKey) return null
+    await db.prepare(
+        `INSERT INTO dashboard_settings (key, value, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = datetime('now')`
+    ).bind(normalizedKey, String(value || '')).run()
+    return getDashboardSetting(db, normalizedKey)
+}
+
+function normalizeFacebookPageVideoCacheRow(pageId: string, raw: Record<string, unknown>): FacebookPageVideoCacheRow | null {
+    const videoId = String(raw.id || raw.video_id || '').trim()
+    if (!pageId || !videoId) return null
+    const viewsRaw = Number(raw.views || 0)
+    const views = Number.isFinite(viewsRaw) ? Math.max(0, Math.floor(viewsRaw)) : 0
+    return {
+        page_id: pageId,
+        page_name: String(raw.page_name || '').trim(),
+        video_id: videoId,
+        title: String(raw.title || '').trim(),
+        description: String(raw.description || '').trim(),
+        permalink_url: String(raw.permalink_url || '').trim(),
+        picture: String(raw.picture || '').trim(),
+        source_url: String(raw.source || raw.source_url || '').trim(),
+        created_time: String(raw.created_time || '').trim(),
+        views,
+    }
+}
+
+async function upsertFacebookPageVideoCacheRows(db: D1Database, pageId: string, pageName: string, rows: FacebookPageVideoCacheRow[]): Promise<void> {
+    await ensureFacebookPageVideoCacheTables(db)
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId || rows.length === 0) return
+    for (const row of rows) {
+        const postId = String(row.post_id || '').trim()
+        // Lookup shopee_link from post_history via post_id
+        let shopeeLink = ''
+        if (postId) {
+            const phRow = await db.prepare(
+                `SELECT shopee_link FROM post_history WHERE bot_id = '1774858894802785816' AND fb_post_id = ? AND shopee_link != '' AND shopee_link IS NOT NULL LIMIT 1`
+            ).bind(postId).first().catch(() => null) as { shopee_link?: string } | null
+            if (phRow?.shopee_link) shopeeLink = phRow.shopee_link
+        }
+        await db.prepare(
+            `INSERT INTO facebook_page_video_cache (
+                page_id, page_name, video_id, title, description, permalink_url,
+                picture, source_url, created_time, views, post_id, shopee_link, fetched_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(page_id, video_id) DO UPDATE SET
+                page_name = excluded.page_name,
+                title = excluded.title,
+                description = excluded.description,
+                permalink_url = excluded.permalink_url,
+                picture = excluded.picture,
+                source_url = excluded.source_url,
+                created_time = excluded.created_time,
+                views = MAX(facebook_page_video_cache.views, excluded.views),
+                post_id = CASE WHEN excluded.post_id != '' THEN excluded.post_id ELSE facebook_page_video_cache.post_id END,
+                shopee_link = CASE WHEN excluded.shopee_link != '' THEN excluded.shopee_link ELSE facebook_page_video_cache.shopee_link END,
+                fetched_at = datetime('now'),
+                updated_at = datetime('now')`
+        ).bind(
+            normalizedPageId,
+            String(row.page_name || pageName || '').trim(),
+            String(row.video_id || '').trim(),
+            String(row.title || '').trim(),
+            String(row.description || '').trim(),
+            String(row.permalink_url || '').trim(),
+            String(row.picture || '').trim(),
+            String(row.source_url || '').trim(),
+            String(row.created_time || '').trim(),
+            Number(row.views || 0),
+            postId,
+            shopeeLink,
+        ).run()
+    }
+}
+
+async function getFacebookPageVideoSyncState(db: D1Database, pageId: string): Promise<FacebookPageVideoSyncStateRow | null> {
+    await ensureFacebookPageVideoCacheTables(db)
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId) return null
+    return await db.prepare(
+        `SELECT page_id, page_name, next_after, last_attempt_at, last_synced_at, last_full_scan_at,
+                fully_scanned, last_batch_count, last_error, updated_at
+         FROM facebook_page_video_sync_state
+         WHERE page_id = ?`
+    ).bind(normalizedPageId).first() as FacebookPageVideoSyncStateRow | null
+}
+
+async function upsertFacebookPageVideoSyncState(
+    db: D1Database,
+    pageId: string,
+    fields: Partial<FacebookPageVideoSyncStateRow>
+): Promise<FacebookPageVideoSyncStateRow | null> {
+    await ensureFacebookPageVideoCacheTables(db)
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId) return null
+    const current = await getFacebookPageVideoSyncState(db, normalizedPageId)
+    const nextPageName = String(fields.page_name ?? current?.page_name ?? '').trim()
+    const nextAfter = String(fields.next_after ?? current?.next_after ?? '').trim()
+    const lastAttemptAt = String(fields.last_attempt_at ?? current?.last_attempt_at ?? '').trim()
+    const lastSyncedAt = String(fields.last_synced_at ?? current?.last_synced_at ?? '').trim()
+    const lastFullScanAt = String(fields.last_full_scan_at ?? current?.last_full_scan_at ?? '').trim()
+    const fullyScanned = Number(fields.fully_scanned ?? current?.fully_scanned ?? 0) > 0 ? 1 : 0
+    const lastBatchCountRaw = Number(fields.last_batch_count ?? current?.last_batch_count ?? 0)
+    const lastBatchCount = Number.isFinite(lastBatchCountRaw) ? Math.max(0, Math.floor(lastBatchCountRaw)) : 0
+    const lastError = String(fields.last_error ?? current?.last_error ?? '').trim()
+
+    await db.prepare(
+        `INSERT INTO facebook_page_video_sync_state (
+            page_id, page_name, next_after, last_attempt_at, last_synced_at, last_full_scan_at,
+            fully_scanned, last_batch_count, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(page_id) DO UPDATE SET
+            page_name = excluded.page_name,
+            next_after = excluded.next_after,
+            last_attempt_at = excluded.last_attempt_at,
+            last_synced_at = excluded.last_synced_at,
+            last_full_scan_at = excluded.last_full_scan_at,
+            fully_scanned = excluded.fully_scanned,
+            last_batch_count = excluded.last_batch_count,
+            last_error = excluded.last_error,
+            updated_at = datetime('now')`
+    ).bind(
+        normalizedPageId,
+        nextPageName,
+        nextAfter,
+        lastAttemptAt,
+        lastSyncedAt,
+        lastFullScanAt,
+        fullyScanned,
+        lastBatchCount,
+        lastError,
+    ).run()
+
+    return getFacebookPageVideoSyncState(db, normalizedPageId)
+}
+
+async function listFacebookPageVideoCache(db: D1Database, params: {
+    pageId: string
+    minViews?: number
+    limit?: number
+}): Promise<FacebookPageVideoCacheRow[]> {
+    await ensureFacebookPageVideoCacheTables(db)
+    const normalizedPageId = String(params.pageId || '').trim()
+    if (!normalizedPageId) return []
+    const minViewsRaw = Number(params.minViews)
+    const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
+    const limitRaw = Number(params.limit)
+    const limit = Number.isFinite(limitRaw) ? Math.min(1000, Math.max(1, Math.floor(limitRaw))) : 250
+    const result = await db.prepare(
+        `SELECT page_id, page_name, video_id, title, description, permalink_url,
+                picture, source_url, created_time, views, shopee_link, post_id, fetched_at, updated_at
+         FROM facebook_page_video_cache
+         WHERE page_id = ? AND views >= ?
+         ORDER BY created_time DESC, views DESC
+         LIMIT ?`
+    ).bind(normalizedPageId, minViews, limit).all() as { results?: FacebookPageVideoCacheRow[] }
+    return Array.isArray(result.results) ? result.results : []
+}
+
+async function countFacebookPageVideoCache(db: D1Database, params: {
+    pageId: string
+    minViews?: number
+}): Promise<number> {
+    await ensureFacebookPageVideoCacheTables(db)
+    const normalizedPageId = String(params.pageId || '').trim()
+    if (!normalizedPageId) return 0
+    const minViewsRaw = Number(params.minViews)
+    const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
+    const row = await db.prepare(
+        `SELECT COUNT(*) AS total
+         FROM facebook_page_video_cache
+         WHERE page_id = ? AND views >= ?`
+    ).bind(normalizedPageId, minViews).first() as { total?: number } | null
+    return Number(row?.total || 0)
+}
+
+function buildFacebookUrl(value: string): string {
+    const raw = String(value || '').trim()
+    if (!raw) return ''
+    if (raw.startsWith('http://') || raw.startsWith('https://')) return raw
+    return `https://www.facebook.com${raw.startsWith('/') ? raw : `/${raw}`}`
+}
+
+function isSameBangkokDate(a: string, b = new Date().toISOString()): boolean {
+    const first = String(a || '').trim()
+    const second = String(b || '').trim()
+    if (!first || !second) return false
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Bangkok',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    })
+    return formatter.format(new Date(first)) === formatter.format(new Date(second))
+}
+
+async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: string, after = ''): Promise<{
+    items: Array<Record<string, unknown>>
+    nextAfter: string
+}> {
+    // Use /posts endpoint (stable, no 500 errors) instead of /videos
+    const params = new URLSearchParams({
+        fields: 'id,message,permalink_url,created_time,full_picture,attachments{media_type,target{id}}',
+        limit: String(DASHBOARD_FACEBOOK_GALLERY_BATCH_SIZE),
+        access_token: String(token || '').trim(),
+    })
+    if (after) params.set('after', after)
+    const response = await fetch(`https://graph.facebook.com/v21.0/${pageId}/posts?${params.toString()}`)
+    if (!response.ok) {
+        throw new Error(`facebook_graph_http_${response.status}`)
+    }
+    const payload = await response.json().catch(() => ({} as any))
+    if (payload?.error) {
+        const code = Number(payload.error?.code || 0)
+        const message = String(payload.error?.message || 'facebook_graph_failed')
+        if (code === 368) {
+            throw new Error(`facebook_rate_limited:${code}`)
+        }
+        throw new Error(`${message}${code ? `:${code}` : ''}`)
+    }
+    const posts = Array.isArray(payload?.data) ? payload.data : []
+
+    // Filter video posts + batch query views
+    const videoIds: string[] = []
+    const postMap = new Map<string, Record<string, unknown>>()
+    for (const post of posts) {
+        const permalink = String(post.permalink_url || '').trim()
+        if (!permalink.includes('/reel/') && !permalink.includes('/videos/')) continue
+        const atts = (post.attachments?.data || []) as Array<Record<string, unknown>>
+        for (const att of atts) {
+            if (att.media_type === 'video') {
+                const targetId = String((att.target as Record<string, unknown>)?.id || '').trim()
+                if (targetId) {
+                    videoIds.push(targetId)
+                    postMap.set(targetId, post)
+                }
+            }
+        }
+    }
+
+    // Batch fetch views for all video IDs
+    const items: Array<Record<string, unknown>> = []
+    if (videoIds.length > 0) {
+        const idsStr = videoIds.join(',')
+        const viewsResp = await fetch(`https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,title,description,source,picture,length&access_token=${encodeURIComponent(token)}`)
+        const viewsData = viewsResp.ok ? await viewsResp.json().catch(() => ({})) as Record<string, Record<string, unknown>> : {}
+        for (const videoId of videoIds) {
+            const post = postMap.get(videoId) || {}
+            const videoInfo = viewsData[videoId] || {}
+            // Extract post_id from post.id (format: "pageId_postId")
+            const rawPostId = String(post.id || '').trim()
+            const postId = rawPostId.includes('_') ? rawPostId.split('_').pop() || '' : rawPostId
+            items.push({
+                id: videoId,
+                video_id: videoId,
+                post_id: postId,
+                description: String(post.message || videoInfo.description || '').trim(),
+                title: String(videoInfo.title || '').trim(),
+                permalink_url: String(post.permalink_url || '').trim(),
+                created_time: String(post.created_time || '').trim(),
+                picture: String(post.full_picture || videoInfo.picture || '').trim(),
+                source: String(videoInfo.source || '').trim(),
+                views: Number(videoInfo.views || 0),
+                length: Number(videoInfo.length || 0),
+            })
+        }
+    }
+
+    const nextUrl = String(payload?.paging?.next || '').trim()
+    const nextAfter = nextUrl ? (new URL(nextUrl).searchParams.get('after') || '') : ''
+    return { items, nextAfter }
+}
+
+async function syncDashboardFacebookPageVideoCache(env: Env, params?: {
+    pageId?: string
+    pageName?: string
+    force?: boolean
+}): Promise<{
+    ok: boolean
+    skipped?: boolean
+    reason?: string
+    inserted: number
+    totalCached: number
+    totalOverThreshold: number
+    sync: {
+        nextAfter: string
+        lastAttemptAt: string
+        lastSyncedAt: string
+        lastFullScanAt: string
+        fullyScanned: boolean
+        lastBatchCount: number
+        lastError: string
+    }
+}> {
+    const pageId = String(params?.pageId || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
+    const pageName = String(params?.pageName || DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME).trim()
+    const force = !!params?.force
+    const nowIso = new Date().toISOString()
+    const tokenEntry = await getDashboardSetting(env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
+    const graphToken = String(tokenEntry?.value || '').trim()
+    if (!graphToken) {
+        const missingTokenState = await upsertFacebookPageVideoSyncState(env.DB, pageId, {
+            page_name: pageName,
+            last_attempt_at: nowIso,
+            last_error: 'facebook_sync_token_missing',
+        })
+        return {
+            ok: false,
+            reason: 'facebook_sync_token_missing',
+            inserted: 0,
+            totalCached: await countFacebookPageVideoCache(env.DB, { pageId, minViews: 0 }),
+            totalOverThreshold: await countFacebookPageVideoCache(env.DB, { pageId, minViews: 100000 }),
+            sync: {
+                nextAfter: String(missingTokenState?.next_after || '').trim(),
+                lastAttemptAt: String(missingTokenState?.last_attempt_at || '').trim(),
+                lastSyncedAt: String(missingTokenState?.last_synced_at || '').trim(),
+                lastFullScanAt: String(missingTokenState?.last_full_scan_at || '').trim(),
+                fullyScanned: Number(missingTokenState?.fully_scanned || 0) > 0,
+                lastBatchCount: Number(missingTokenState?.last_batch_count || 0),
+                lastError: String(missingTokenState?.last_error || '').trim(),
+            },
+        }
+    }
+    const syncState = await getFacebookPageVideoSyncState(env.DB, pageId)
+    const lastAttemptMs = Date.parse(String(syncState?.last_attempt_at || '').trim())
+    const lastError = String(syncState?.last_error || '').trim()
+
+    if (!force && Number.isFinite(lastAttemptMs)) {
+        const elapsedMs = Date.now() - lastAttemptMs
+        if (lastError && elapsedMs < DASHBOARD_FACEBOOK_GALLERY_ERROR_COOLDOWN_MS) {
+            return {
+                ok: true,
+                skipped: true,
+                reason: 'error_cooldown',
+                inserted: 0,
+                totalCached: await countFacebookPageVideoCache(env.DB, { pageId, minViews: 0 }),
+                totalOverThreshold: await countFacebookPageVideoCache(env.DB, { pageId, minViews: 100000 }),
+                sync: {
+                    nextAfter: String(syncState?.next_after || '').trim(),
+                    lastAttemptAt: String(syncState?.last_attempt_at || '').trim(),
+                    lastSyncedAt: String(syncState?.last_synced_at || '').trim(),
+                    lastFullScanAt: String(syncState?.last_full_scan_at || '').trim(),
+                    fullyScanned: Number(syncState?.fully_scanned || 0) > 0,
+                    lastBatchCount: Number(syncState?.last_batch_count || 0),
+                    lastError,
+                },
+            }
+        }
+        if (elapsedMs < DASHBOARD_FACEBOOK_GALLERY_SYNC_COOLDOWN_MS) {
+            return {
+                ok: true,
+                skipped: true,
+                reason: 'cooldown',
+                inserted: 0,
+                totalCached: await countFacebookPageVideoCache(env.DB, { pageId, minViews: 0 }),
+                totalOverThreshold: await countFacebookPageVideoCache(env.DB, { pageId, minViews: 100000 }),
+                sync: {
+                    nextAfter: String(syncState?.next_after || '').trim(),
+                    lastAttemptAt: String(syncState?.last_attempt_at || '').trim(),
+                    lastSyncedAt: String(syncState?.last_synced_at || '').trim(),
+                    lastFullScanAt: String(syncState?.last_full_scan_at || '').trim(),
+                    fullyScanned: Number(syncState?.fully_scanned || 0) > 0,
+                    lastBatchCount: Number(syncState?.last_batch_count || 0),
+                    lastError,
+                },
+            }
+        }
+    }
+
+    let nextAfter = String(syncState?.next_after || '').trim()
+    let fullyScanned = Number(syncState?.fully_scanned || 0) > 0
+    if (fullyScanned && !isSameBangkokDate(String(syncState?.last_full_scan_at || '').trim(), nowIso)) {
+        nextAfter = ''
+        fullyScanned = false
+    }
+
+    await upsertFacebookPageVideoSyncState(env.DB, pageId, {
+        page_name: pageName,
+        last_attempt_at: nowIso,
+    })
+
+    try {
+        // Sync 1 batch (1 page) per request — like manual pagination, no rate limit
+        const batch = await fetchFacebookPageVideoBatchFromGraphToken(graphToken, pageId, nextAfter)
+        const rows = batch.items
+            .map((item) => normalizeFacebookPageVideoCacheRow(pageId, {
+                ...item,
+                page_name: pageName,
+            }))
+            .filter((item): item is FacebookPageVideoCacheRow => !!item)
+        if (rows.length > 0) {
+            await upsertFacebookPageVideoCacheRows(env.DB, pageId, pageName, rows)
+        }
+        const totalInserted = rows.length
+        const syncedState = await upsertFacebookPageVideoSyncState(env.DB, pageId, {
+            page_name: pageName,
+            next_after: batch.nextAfter,
+            last_attempt_at: nowIso,
+            last_synced_at: nowIso,
+            last_full_scan_at: batch.nextAfter ? undefined : nowIso,
+            fully_scanned: batch.nextAfter ? 0 : 1,
+            last_batch_count: totalInserted,
+            last_error: '',
+        })
+        const [totalCached, totalOverThreshold] = await Promise.all([
+            countFacebookPageVideoCache(env.DB, { pageId, minViews: 0 }),
+            countFacebookPageVideoCache(env.DB, { pageId, minViews: 100000 }),
+        ])
+        return {
+            ok: true,
+            inserted: totalInserted,
+            totalCached,
+            totalOverThreshold,
+            sync: {
+                nextAfter: String(syncedState?.next_after || '').trim(),
+                lastAttemptAt: String(syncedState?.last_attempt_at || '').trim(),
+                lastSyncedAt: String(syncedState?.last_synced_at || '').trim(),
+                lastFullScanAt: String(syncedState?.last_full_scan_at || '').trim(),
+                fullyScanned: Number(syncedState?.fully_scanned || 0) > 0,
+                lastBatchCount: Number(syncedState?.last_batch_count || 0),
+                lastError: String(syncedState?.last_error || '').trim(),
+            },
+        }
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        const failedState = await upsertFacebookPageVideoSyncState(env.DB, pageId, {
+            page_name: pageName,
+            last_attempt_at: nowIso,
+            last_error: errorMessage,
+        })
+        const [totalCached, totalOverThreshold] = await Promise.all([
+            countFacebookPageVideoCache(env.DB, { pageId, minViews: 0 }),
+            countFacebookPageVideoCache(env.DB, { pageId, minViews: 100000 }),
+        ])
+        return {
+            ok: false,
+            reason: errorMessage,
+            inserted: 0,
+            totalCached,
+            totalOverThreshold,
+            sync: {
+                nextAfter: String(failedState?.next_after || '').trim(),
+                lastAttemptAt: String(failedState?.last_attempt_at || '').trim(),
+                lastSyncedAt: String(failedState?.last_synced_at || '').trim(),
+                lastFullScanAt: String(failedState?.last_full_scan_at || '').trim(),
+                fullyScanned: Number(failedState?.fully_scanned || 0) > 0,
+                lastBatchCount: Number(failedState?.last_batch_count || 0),
+                lastError: String(failedState?.last_error || '').trim(),
+            },
+        }
+    }
 }
 
 async function listNamespaceVideoStates(db: D1Database, namespaceId: string): Promise<NamespaceVideoStateRow[]> {
@@ -4512,6 +5094,406 @@ app.get('/admin/api/gallery/index/status', async (c) => {
     return c.json({ ok: true, ...summary })
 })
 
+app.get('/api/dashboard/facebook-page-videos', async (c) => {
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const pageName = String(c.req.query('page_name') || '').trim()
+    const minViewsRaw = Number(c.req.query('min_views') || 0)
+    const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
+    const limitRaw = Number(c.req.query('limit') || 250)
+    const limit = Number.isFinite(limitRaw) ? Math.min(1000, Math.max(1, Math.floor(limitRaw))) : 250
+    if (!pageId) return c.json({ error: 'page_id_required' }, 400)
+
+    if (pageName) {
+        await upsertFacebookPageVideoSyncState(c.env.DB, pageId, { page_name: pageName }).catch(() => { })
+    }
+
+    const [items, total, sync] = await Promise.all([
+        listFacebookPageVideoCache(c.env.DB, { pageId, minViews, limit }),
+        countFacebookPageVideoCache(c.env.DB, { pageId, minViews }),
+        getFacebookPageVideoSyncState(c.env.DB, pageId),
+    ])
+
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        page_name: String(sync?.page_name || pageName || '').trim(),
+        total,
+        items: items.map((item) => ({
+            storyId: String(item.post_id || '').trim() ? `${pageId}_${item.post_id}` : String(item.video_id || '').trim(),
+            pageName: String(item.page_name || '').trim(),
+            createdAt: String(item.created_time || '').trim(),
+            postedAt: String(item.created_time || '').trim(),
+            postUrl: buildFacebookUrl(String(item.permalink_url || '').trim()),
+            facebookThumb: String(item.picture || '').trim(),
+            views: Number(item.views || 0),
+            videoId: String(item.video_id || '').trim(),
+            videoTitle: String(item.description || item.title || 'โพสต์จากเพจ Facebook').trim(),
+            videoUrl: String(item.source_url || '').trim(),
+            videoThumb: String(item.picture || '').trim(),
+            adsetId: '-',
+            shopeeLink: String(item.shopee_link || '').trim(),
+            postId: String(item.post_id || '').trim(),
+        })),
+        sync: {
+            nextAfter: String(sync?.next_after || '').trim(),
+            lastAttemptAt: String(sync?.last_attempt_at || '').trim(),
+            lastSyncedAt: String(sync?.last_synced_at || '').trim(),
+            lastFullScanAt: String(sync?.last_full_scan_at || '').trim(),
+            fullyScanned: Number(sync?.fully_scanned || 0) > 0,
+            lastBatchCount: Number(sync?.last_batch_count || 0),
+            lastError: String(sync?.last_error || '').trim(),
+        },
+    }, 200, {
+        'Cache-Control': 'no-store',
+    })
+})
+
+app.get('/api/dashboard/settings', async (c) => {
+    const keys = ['facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5', 'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset', 'campaign_prefix', 'ads_per_round', 'auto_create_time']
+    const entries = await Promise.all(keys.map(k => getDashboardSetting(c.env.DB, k).catch(() => null)))
+    const result: Record<string, string> = { ok: 'true' }
+    keys.forEach((key, i) => {
+        result[key] = String(entries[i]?.value || '').trim()
+        if (key === 'facebook_sync_token') {
+            result.facebookSyncToken = result[key]
+            result.facebookSyncTokenUpdatedAt = String(entries[i]?.updated_at || '').trim()
+        }
+    })
+    return c.json(result, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.put('/api/dashboard/settings', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, string>
+    const allowedKeys = ['facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5', 'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset', 'campaign_prefix', 'ads_per_round', 'auto_create_time']
+    // Also accept camelCase aliases
+    const aliases: Record<string, string> = { facebookSyncToken: 'facebook_sync_token', subId: 'sub_id', shortlinkUrl: 'shortlink_url', commentTemplate: 'comment_template', defaultPage: 'default_page', adAccount: 'ad_account', templateAdset: 'template_adset', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round', autoCreateTime: 'auto_create_time' }
+    for (const [camel, snake] of Object.entries(aliases)) {
+        if (body[camel] !== undefined && body[snake] === undefined) body[snake] = body[camel]
+    }
+    for (const key of allowedKeys) {
+        if (body[key] !== undefined) {
+            await setDashboardSetting(c.env.DB, key, String(body[key] || '').trim())
+        }
+    }
+    // Return all settings
+    const entries = await Promise.all(allowedKeys.map(k => getDashboardSetting(c.env.DB, k).catch(() => null)))
+    const result: Record<string, string> = { ok: 'true' }
+    allowedKeys.forEach((key, i) => {
+        result[key] = String(entries[i]?.value || '').trim()
+    })
+    result.facebookSyncToken = result.facebook_sync_token || ''
+    result.facebookSyncTokenUpdatedAt = String(entries[0]?.updated_at || '').trim()
+    return c.json(result, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.post('/api/dashboard/facebook-page-videos/sync', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        page_name?: string
+        items?: Array<Record<string, unknown>>
+        next_after?: string
+        fully_scanned?: boolean
+    }
+    const pageId = String(body.page_id || '').trim()
+    const pageName = String(body.page_name || '').trim()
+    const nextAfter = String(body.next_after || '').trim()
+    const fullyScanned = !!body.fully_scanned
+    const rawItems = Array.isArray(body.items) ? body.items : []
+    if (!pageId) return c.json({ error: 'page_id_required' }, 400)
+
+    const rows = rawItems
+        .map((item) => normalizeFacebookPageVideoCacheRow(pageId, {
+            ...item,
+            page_name: pageName,
+        }))
+        .filter((item): item is FacebookPageVideoCacheRow => !!item)
+
+    if (rows.length > 0) {
+        await upsertFacebookPageVideoCacheRows(c.env.DB, pageId, pageName, rows)
+    }
+
+    const syncedAt = new Date().toISOString()
+    const sync = await upsertFacebookPageVideoSyncState(c.env.DB, pageId, {
+        page_name: pageName,
+        next_after: fullyScanned ? '' : nextAfter,
+        last_attempt_at: syncedAt,
+        last_synced_at: syncedAt,
+        last_full_scan_at: fullyScanned ? syncedAt : undefined,
+        fully_scanned: fullyScanned ? 1 : 0,
+        last_batch_count: rows.length,
+        last_error: '',
+    })
+
+    const [total, totalAboveThreshold] = await Promise.all([
+        countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 0 }),
+        countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 100000 }),
+    ])
+
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        inserted: rows.length,
+        total_cached: total,
+        total_over_threshold: totalAboveThreshold,
+        sync: {
+            nextAfter: String(sync?.next_after || '').trim(),
+            lastAttemptAt: String(sync?.last_attempt_at || '').trim(),
+            lastSyncedAt: String(sync?.last_synced_at || '').trim(),
+            lastFullScanAt: String(sync?.last_full_scan_at || '').trim(),
+            fullyScanned: Number(sync?.fully_scanned || 0) > 0,
+            lastBatchCount: Number(sync?.last_batch_count || 0),
+            lastError: String(sync?.last_error || '').trim(),
+        },
+    }, 200, {
+        'Cache-Control': 'no-store',
+    })
+})
+
+app.post('/api/dashboard/facebook-page-videos/auto-sync', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        page_name?: string
+        force?: boolean
+    }
+    const result = await syncDashboardFacebookPageVideoCache(c.env, {
+        pageId: body.page_id,
+        pageName: body.page_name,
+        force: !!body.force,
+    })
+    return c.json(result, result.ok ? 200 : 502, {
+        'Cache-Control': 'no-store',
+    })
+})
+
+app.post('/api/dashboard/create-ad', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        video_url?: string
+        video_id?: string
+        caption?: string
+        shopee_url?: string
+        story_id?: string
+        campaign_id?: string
+        new_campaign_name?: string
+    }
+    const pageId = String(body.page_id || '').trim()
+    const videoUrl = String(body.video_url || '').trim()
+    const videoId = String(body.video_id || '').trim()
+    const caption = String(body.caption || '').trim()
+    const shopeeUrl = String(body.shopee_url || '').trim()
+    const originalStoryId = String(body.story_id || '').trim()
+    const campaignId = String(body.campaign_id || '').trim()
+    const newCampaignName = String(body.new_campaign_name || '').trim()
+    if (!pageId || (!videoUrl && !videoId)) return c.json({ error: 'page_id and video_url or video_id required' }, 400)
+
+    const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+    try {
+        // 1. Get settings + shortlink FIRST (need shortlink for caption)
+        const settingsRow = await getDashboardSetting(c.env.DB, 'shortlink_url').catch(() => null)
+        const commentRow = await getDashboardSetting(c.env.DB, 'comment_template').catch(() => null)
+        const subIdRow = await getDashboardSetting(c.env.DB, 'sub_id').catch(() => null)
+        const shortlinkUrlTemplate = String(settingsRow?.value || 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}').trim()
+        const commentTemplate = String(commentRow?.value || '🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}').trim()
+        const subId = String(subIdRow?.value || 'yok').trim()
+
+        // 2. Find shopee link: first from facebook_page_video_cache, then post_history fallback
+        let shopeeLink = shopeeUrl
+
+        // Direct lookup from cache table
+        if (!shopeeLink && videoId) {
+            const cacheRow = await c.env.DB.prepare(
+                `SELECT shopee_link, post_id FROM facebook_page_video_cache WHERE page_id = ? AND video_id = ? AND shopee_link != '' LIMIT 1`
+            ).bind(pageId, videoId).first().catch(() => null) as { shopee_link?: string; post_id?: string } | null
+            if (cacheRow?.shopee_link) shopeeLink = cacheRow.shopee_link
+            // Also try via post_id → post_history → namespace_video_state for ORIGINAL link
+            if (!shopeeLink && cacheRow?.post_id) {
+                const nvs = await c.env.DB.prepare(
+                    `SELECT nvs.shopee_original_link, nvs.shopee_link FROM post_history ph
+                     JOIN namespace_video_state nvs ON nvs.video_id = ph.video_id AND nvs.namespace_id = ph.bot_id
+                     WHERE ph.bot_id = '1774858894802785816' AND ph.fb_post_id = ?
+                     AND (nvs.shopee_original_link != '' OR nvs.shopee_link != '')
+                     ORDER BY ph.posted_at DESC LIMIT 1`
+                ).bind(cacheRow.post_id).first().catch(() => null) as { shopee_original_link?: string; shopee_link?: string } | null
+                shopeeLink = nvs?.shopee_original_link || nvs?.shopee_link || ''
+            }
+        }
+
+        // Fallback: post_history via fb_reel_url
+        if (!shopeeLink && videoId) {
+            const mapped = await c.env.DB.prepare(
+                `SELECT nvs.shopee_original_link, nvs.shopee_link FROM post_history ph
+                 JOIN namespace_video_state nvs ON nvs.video_id = ph.video_id AND nvs.namespace_id = ph.bot_id
+                 WHERE ph.bot_id = '1774858894802785816' AND ph.fb_reel_url LIKE ?
+                 AND (nvs.shopee_original_link != '' OR nvs.shopee_link != '')
+                 ORDER BY ph.posted_at DESC LIMIT 1`
+            ).bind(`%${videoId}%`).first().catch(() => null) as { shopee_original_link?: string; shopee_link?: string } | null
+            shopeeLink = mapped?.shopee_original_link || mapped?.shopee_link || ''
+        }
+
+        // Fallback: ANY shopee_link from post_history matching same caption
+        if (!shopeeLink && caption) {
+            const byCaption = await c.env.DB.prepare(
+                `SELECT nvs.shopee_original_link, nvs.shopee_link FROM namespace_video_state nvs
+                 JOIN post_history ph ON ph.video_id = nvs.video_id AND ph.bot_id = nvs.namespace_id
+                 WHERE nvs.namespace_id = '1774858894802785816'
+                 AND (nvs.shopee_original_link != '' OR nvs.shopee_link != '')
+                 ORDER BY ph.posted_at DESC LIMIT 1`
+            ).first().catch(() => null) as { shopee_original_link?: string; shopee_link?: string } | null
+            // Don't use random fallback — only use if we're sure
+        }
+
+        // Fallback: from caption text
+        if (!shopeeLink) {
+            const descMatch = caption.match(/https?:\/\/(?:[^\s]+\.)?shopee\.[^\s]+/i)
+            if (descMatch) shopeeLink = descMatch[0]
+        }
+
+        // ALWAYS shorten with current sub_ids from settings (even if already shortened)
+        // Get original product URL from the shopee link
+        const subId2Row = await getDashboardSetting(c.env.DB, 'sub_id2').catch(() => null)
+        const subId3Row = await getDashboardSetting(c.env.DB, 'sub_id3').catch(() => null)
+        const subId4Row = await getDashboardSetting(c.env.DB, 'sub_id4').catch(() => null)
+        const subId5Row = await getDashboardSetting(c.env.DB, 'sub_id5').catch(() => null)
+        const sub2 = String(subId2Row?.value || '').trim()
+        const sub3 = String(subId3Row?.value || '').trim()
+        const sub4 = String(subId4Row?.value || '').trim()
+        const sub5 = String(subId5Row?.value || '').trim()
+
+        let shortLink = ''
+        if (shopeeLink) {
+            // Replace all placeholders in template
+            let shortlinkUrl = shortlinkUrlTemplate
+                .replace('{url}', encodeURIComponent(shopeeLink))
+                .replace('{sub_id}', encodeURIComponent(subId))
+                .replace('{sub_id2}', encodeURIComponent(sub2))
+                .replace('{sub_id3}', encodeURIComponent(sub3))
+                .replace('{sub_id4}', encodeURIComponent(sub4))
+                .replace('{sub_id5}', encodeURIComponent(sub5))
+            try {
+                const slResp = await fetch(shortlinkUrl, { method: 'GET' })
+                if (slResp.ok) {
+                    const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+                    shortLink = String(slData.shortLink || slData.short_link || '').trim()
+                }
+            } catch {}
+        }
+
+        // 3. Stop if no shopee link found
+        if (!shopeeLink) {
+            return c.json({ ok: false, error: 'ไม่พบลิ้ง Shopee สำหรับวีดีโอนี้', step: 'shopee_link_not_found', video_id: videoId }, 400)
+        }
+        if (!shortLink) {
+            return c.json({ ok: false, error: 'ย่อลิ้ง Shopee ไม่สำเร็จ', step: 'shortlink_failed', video_id: videoId, shopeeLink }, 400)
+        }
+
+        // 4. Build caption with shortlink on top
+        // Clean shortlink: remove ?lp=aff that Shopee appends
+        const cleanShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
+        const finalCaption = `📌 พิกัด : ${cleanShortLink}\n${caption}`
+
+        // 4. Create ad with final caption
+        const resp = await fetch(`${baseUrl}/create-ad`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page_id: pageId,
+                video_url: videoUrl,
+                video_id: videoId,
+                caption: finalCaption,
+                ...(campaignId ? { campaign_id: campaignId } : {}),
+                ...(newCampaignName ? { new_campaign_name: newCampaignName } : {}),
+            }),
+        })
+        const data = await resp.json().catch(() => ({ ok: false, error: 'invalid_response' })) as Record<string, unknown>
+        if (!data.ok || !data.story_id) {
+            return c.json(data, resp.ok ? 200 : 502)
+        }
+
+        // 5. Comment on the post with shortlink (using PAGE token, not user token)
+        let commentId = ''
+        if (cleanShortLink) {
+            const commentText = commentTemplate.replace('{shopee_link}', cleanShortLink)
+            const storyId = String(data.story_id || '').trim()
+            try {
+                // Get page access token first
+                const pagesResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent('me/accounts')}&fields=id,access_token&limit=100`)
+                const pagesData = await pagesResp.json().catch(() => ({})) as { data?: Array<{ id: string; access_token: string }> }
+                const pageEntry = (pagesData.data || []).find((p) => p.id === pageId)
+                const pageToken = pageEntry?.access_token || ''
+
+                if (pageToken && storyId) {
+                    // Comment via onecard /graph proxy with page token
+                    const commentResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(storyId)}/comments`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: commentText, access_token: pageToken }),
+                    })
+                    const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
+                    if (commentData.error) {
+                        console.error(`[CREATE-AD] Comment error: ${JSON.stringify(commentData.error).substring(0, 200)}`)
+                    }
+                    commentId = String(commentData.id || '').trim()
+                }
+            } catch {}
+        }
+
+        return c.json({
+            ...data,
+            shortLink,
+            commentId,
+            commentPosted: !!commentId,
+        })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 502)
+    }
+})
+
+app.get('/api/dashboard/campaigns', async (c) => {
+    const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
+    const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+    try {
+        // Get campaigns
+        const campResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=10`)
+        const campData = await campResp.json().catch(() => ({})) as Record<string, unknown>
+        const campaigns = Array.isArray((campData as any)?.data) ? (campData as any).data : []
+
+        const result: Array<Record<string, unknown>> = []
+        for (const camp of campaigns) {
+            // Get adsets for each campaign
+            const adsetResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/adsets&fields=id,name,effective_status,daily_budget&limit=50`)
+            const adsetData = await adsetResp.json().catch(() => ({})) as Record<string, unknown>
+            const adsets = Array.isArray((adsetData as any)?.data) ? (adsetData as any).data : []
+
+            // Get campaign insights
+            const insResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/insights&fields=reach,impressions,spend,cost_per_thruplay,actions&date_preset=lifetime`)
+            const insData = await insResp.json().catch(() => ({})) as Record<string, unknown>
+            const insights = Array.isArray((insData as any)?.data) ? (insData as any).data[0] || {} : {}
+
+            result.push({
+                id: camp.id,
+                name: camp.name,
+                status: camp.effective_status,
+                dailyBudget: camp.daily_budget,
+                startTime: camp.start_time,
+                adsets: adsets.map((a: any) => ({
+                    id: a.id,
+                    name: a.name,
+                    status: a.effective_status,
+                })),
+                adsetCount: adsets.length,
+                activeAdsetCount: adsets.filter((a: any) => a.effective_status === 'ACTIVE').length,
+                reach: String(insights.reach || '0'),
+                impressions: String(insights.impressions || '0'),
+                spend: String(insights.spend || '0'),
+                costPerResult: String(insights.cost_per_thruplay || '0'),
+            })
+        }
+        return c.json({ ok: true, campaigns: result })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 502)
+    }
+})
+
 app.post('/admin/api/gallery/index/rebuild', async (c) => {
     const result = await rebuildGalleryIndexFromR2(c.env)
     await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
@@ -5708,8 +6690,22 @@ app.delete('/api/settings/gemini-key', async (c) => {
 app.get('/api/settings/shopee-shortlink', async (c) => {
     const namespaceId = c.get('botId')
     const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    // Load sub IDs + template
+    await ensureNamespaceSettingsTable(c.env.DB)
+    const extraKeys = ['shortlink_url_template_v1', 'shortlink_sub_id1_v1', 'shortlink_sub_id2_v1', 'shortlink_sub_id3_v1', 'shortlink_sub_id4_v1', 'shortlink_sub_id5_v1']
+    const extras: Record<string, string> = {}
+    for (const key of extraKeys) {
+        const row = await c.env.DB.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, key).first().catch(() => null) as { value?: string } | null
+        extras[key] = String(row?.value || '').trim()
+    }
     return c.json({
         ...settings,
+        shortlink_url_template: extras.shortlink_url_template_v1,
+        sub_id1: extras.shortlink_sub_id1_v1,
+        sub_id2: extras.shortlink_sub_id2_v1,
+        sub_id3: extras.shortlink_sub_id3_v1,
+        sub_id4: extras.shortlink_sub_id4_v1,
+        sub_id5: extras.shortlink_sub_id5_v1,
         max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
         max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
         max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
@@ -5732,6 +6728,12 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
         expectedUtmId?: string
         lazada_expected_member_id?: string
         lazadaExpectedMemberId?: string
+        shortlink_url_template?: string
+        sub_id1?: string
+        sub_id2?: string
+        sub_id3?: string
+        sub_id4?: string
+        sub_id5?: string
     }
     const hasAccount = Object.prototype.hasOwnProperty.call(body, 'account') || Object.prototype.hasOwnProperty.call(body, 'accountName')
     const hasBaseUrl = Object.prototype.hasOwnProperty.call(body, 'base_url') || Object.prototype.hasOwnProperty.call(body, 'baseUrl')
@@ -5804,6 +6806,19 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
     }
     if (hasLazadaExpectedMemberId) {
         await setNamespaceLazadaExpectedMemberId(c.env.DB, namespaceId, normalizedLazadaExpectedMemberId)
+    }
+    // Save shortlink URL template + sub IDs
+    if (body.shortlink_url_template !== undefined) {
+        await ensureNamespaceSettingsTable(c.env.DB)
+        await c.env.DB.prepare('INSERT INTO namespace_settings (namespace_id, key, value) VALUES (?, ?, ?) ON CONFLICT(namespace_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')')
+            .bind(namespaceId, 'shortlink_url_template_v1', String(body.shortlink_url_template || '').trim()).run()
+    }
+    for (const [field, key] of [['sub_id1', 'shortlink_sub_id1_v1'], ['sub_id2', 'shortlink_sub_id2_v1'], ['sub_id3', 'shortlink_sub_id3_v1'], ['sub_id4', 'shortlink_sub_id4_v1'], ['sub_id5', 'shortlink_sub_id5_v1']] as const) {
+        if ((body as Record<string, unknown>)[field] !== undefined) {
+            await ensureNamespaceSettingsTable(c.env.DB)
+            await c.env.DB.prepare('INSERT INTO namespace_settings (namespace_id, key, value) VALUES (?, ?, ?) ON CONFLICT(namespace_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')')
+                .bind(namespaceId, key, String((body as Record<string, unknown>)[field] || '').trim()).run()
+        }
     }
     const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
     return c.json({
@@ -11370,19 +12385,17 @@ async function prepareInboxVideoForManagedLinks(params: {
         nextLazadaLink !== sourceLazadaLink
         && lazadaTrace.status === 'shortened'
         && isLikelyConvertedLazadaLink(nextLazadaLink)
-        && (!expectedLazadaMemberId || normalizedMemberId === expectedLazadaMemberId)
     )
     if (!lazadaReady) {
         const resolvedLazadaTrackingLink = await resolveAffiliateTrackingLink(sourceLazadaLink, `${params.logPrefix} LAZADA_RESOLVE`).catch(() => sourceLazadaLink)
         const resolvedLazadaMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(resolvedLazadaTrackingLink))
         const inferredLazadaReady = !!resolvedLazadaTrackingLink
-            && !!resolvedLazadaMemberId
-            && (!expectedLazadaMemberId || resolvedLazadaMemberId === expectedLazadaMemberId)
+            && isLikelyConvertedLazadaLink(resolvedLazadaTrackingLink)
         if (inferredLazadaReady) {
             nextLazadaLink = sourceLazadaLink
             normalizedMemberId = resolvedLazadaMemberId
         } else {
-            console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}`)
+            console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}; source=${sourceLazadaLink} short=${nextLazadaLink || '-'} status=${lazadaTrace.status || '-'} error=${String(lazadaTrace.error || '').trim() || '-'} member_id=${normalizedMemberId || '-'} expected_member_id=${expectedLazadaMemberId || '-'}`)
             return null
         }
     }
@@ -14385,7 +15398,6 @@ function getVideoAffiliateConversionState(
             hasLazadaLink
             && !!lazadaConvertedAt
             && lazadaManagedLinkValid
-            && (!expectedLazadaMemberId || lazadaMemberId === expectedLazadaMemberId)
         )
         : hasLazadaLink
 
@@ -14597,7 +15609,6 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                         && effectiveLazadaLink !== sourceLazadaLink
                         && trace.status === 'shortened'
                         && isLikelyConvertedLazadaLink(effectiveLazadaLink)
-                        && (!expectedLazadaMemberId || nextMemberId === expectedLazadaMemberId)
                     if (
                         lazadaConvertedReady
                     ) {
@@ -14615,8 +15626,7 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                         const resolvedLazadaTrackingLink = await resolveAffiliateTrackingLink(sourceLazadaLink, `AFFILIATE-CONVERT ${namespaceId}/${videoId} LAZADA_RESOLVE`).catch(() => sourceLazadaLink)
                         const resolvedLazadaMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(resolvedLazadaTrackingLink))
                         const inferredLazadaReady = !!resolvedLazadaTrackingLink
-                            && !!resolvedLazadaMemberId
-                            && (!expectedLazadaMemberId || resolvedLazadaMemberId === expectedLazadaMemberId)
+                            && isLikelyConvertedLazadaLink(resolvedLazadaTrackingLink)
                         if (inferredLazadaReady) {
                             const convertedAt = String(
                                 pendingVideo.lazadaConvertedAt ||
@@ -14633,6 +15643,7 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                             nextStateFields.lazada_member_id = resolvedLazadaMemberId
                             nextStateFields.lazada_converted_at = convertedAt
                         } else {
+                            console.log(`[AFFILIATE-CONVERT ${namespaceId}/${videoId} LAZADA] shortlink not ready; source=${sourceLazadaLink} short=${effectiveLazadaLink || '-'} status=${trace.status || '-'} error=${String(trace.error || '').trim() || '-'} member_id=${nextMemberId || '-'} expected_member_id=${expectedLazadaMemberId || '-'}`)
                             delete nextMeta.lazadaConvertedAt
                             nextMeta.lazadaConversionError = String(trace.error || '').trim()
                             nextStateFields.lazada_converted_at = ''
@@ -15051,6 +16062,38 @@ function deriveShortlinkSub1(namespaceId: string): string {
     // Keep sub1 strictly alphanumeric so workspace emails like "mr.adisorn..." remain valid.
     const safe = fromEmail.replace(/[^a-z0-9]+/g, '').slice(0, 32)
     return safe || 'workspace'
+}
+
+async function resolveNamespaceShortlinkSubIds(db: D1Database, namespaceId: string): Promise<{ sub1: string; sub2: string; sub3: string; sub4: string; sub5: string }> {
+    const keys = ['shortlink_sub_id1_v1', 'shortlink_sub_id2_v1', 'shortlink_sub_id3_v1', 'shortlink_sub_id4_v1', 'shortlink_sub_id5_v1'] as const
+    const result: Record<string, string> = {}
+    for (const key of keys) {
+        const row = await db.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, key).first().catch(() => null) as { value?: string } | null
+        result[key] = String(row?.value || '').trim()
+    }
+    return {
+        sub1: result['shortlink_sub_id1_v1'] || '',
+        sub2: result['shortlink_sub_id2_v1'] || '',
+        sub3: result['shortlink_sub_id3_v1'] || '',
+        sub4: result['shortlink_sub_id4_v1'] || '',
+        sub5: result['shortlink_sub_id5_v1'] || '',
+    }
+}
+
+async function resolveNamespaceShortlinkUrlTemplate(db: D1Database, namespaceId: string): Promise<string> {
+    const row = await db.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, 'shortlink_url_template_v1').first().catch(() => null) as { value?: string } | null
+    return String(row?.value || '').trim()
+}
+
+function buildShortlinkRequestUrlFromTemplate(template: string, productUrl: string, subIds: { sub1: string; sub2: string; sub3: string; sub4: string; sub5: string }, account?: string): string {
+    return template
+        .replace(/\{account\}/g, encodeURIComponent(account || ''))
+        .replace(/\{url\}/g, encodeURIComponent(productUrl))
+        .replace(/\{sub_id\}/g, encodeURIComponent(subIds.sub1))
+        .replace(/\{sub_id2\}/g, encodeURIComponent(subIds.sub2))
+        .replace(/\{sub_id3\}/g, encodeURIComponent(subIds.sub3))
+        .replace(/\{sub_id4\}/g, encodeURIComponent(subIds.sub4))
+        .replace(/\{sub_id5\}/g, encodeURIComponent(subIds.sub5))
 }
 
 async function getNamespacePagesLastSyncAtMs(db: D1Database, namespaceId: string): Promise<number> {
@@ -16849,7 +17892,7 @@ function normalizeCommentTemplate(rawTemplate: string): string {
 
 function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string, lazadaLink = ''): string {
     const template = normalizeCommentTemplate(rawTemplate) || DEFAULT_COMMENT_TEMPLATE
-    const shopee = String(shopeeLink || '').trim()
+    const shopee = String(shopeeLink || '').trim().replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
     const lazada = String(lazadaLink || '').trim()
 
     const renderedLines = template
@@ -16881,10 +17924,8 @@ async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string,
         }))
         : { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null }
     const lazada = String(lazadaLink || '').trim()
-    let rendered = renderAffiliateCommentTemplate(settings.template, shopee, lazada)
-    if (lazada && !rendered.includes(lazada)) {
-        rendered = `${rendered}\n💙 ${lazada}`.trim()
-    }
+    const rendered = renderAffiliateCommentTemplate(settings.template, shopee, lazada)
+    // DO NOT auto-append lazada link. Respect user's template exactly — if {{lazada_link}} is not in template, user does not want lazada link in comment.
     return rendered
 }
 
@@ -16920,26 +17961,44 @@ async function shortenLazadaLinkForNamespace(params: {
     }
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
 
-    const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
-    if (!baseUrl) {
-        writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
-        if (fallbackDisallowed) throw new Error('admin_lazada_shortlink_disabled')
-        return originalLink
+    // Load sub IDs + URL template from namespace settings
+    const lazadaSubIds = await resolveNamespaceShortlinkSubIds(params.env.DB, params.namespaceId).catch(() => ({ sub1: '', sub2: '', sub3: '', sub4: '', sub5: '' }))
+    const effectiveLazadaSub1 = lazadaSubIds.sub1 || deriveShortlinkSub1(params.namespaceId)
+    const effectiveLazadaSubIds = { ...lazadaSubIds, sub1: effectiveLazadaSub1 }
+    const lazadaUrlTemplate = await resolveNamespaceShortlinkUrlTemplate(params.env.DB, params.namespaceId).catch(() => '')
+
+    // Priority: 1) URL template from settings  2) baseUrl derived from account
+    const lazadaAccount = await resolveNamespaceAffiliateShortlinkAccount(params.env.DB, params.namespaceId).catch(() => '')
+    let finalLazadaRequestUrl: string
+    if (lazadaUrlTemplate && lazadaUrlTemplate.includes('{url}')) {
+        finalLazadaRequestUrl = buildShortlinkRequestUrlFromTemplate(lazadaUrlTemplate, originalLink, effectiveLazadaSubIds, lazadaAccount)
+        console.log(`[${params.logPrefix}] Using URL template from settings`)
+    } else {
+        const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
+        if (!baseUrl) {
+            writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
+            if (fallbackDisallowed) throw new Error('admin_lazada_shortlink_disabled')
+            return originalLink
+        }
+        const requestUrl = new URL(baseUrl)
+        requestUrl.searchParams.set('url', originalLink)
+        requestUrl.searchParams.set('sub1', effectiveLazadaSub1)
+        if (lazadaSubIds.sub2) requestUrl.searchParams.set('sub2', lazadaSubIds.sub2)
+        if (lazadaSubIds.sub3) requestUrl.searchParams.set('sub3', lazadaSubIds.sub3)
+        if (lazadaSubIds.sub4) requestUrl.searchParams.set('sub4', lazadaSubIds.sub4)
+        if (lazadaSubIds.sub5) requestUrl.searchParams.set('sub5', lazadaSubIds.sub5)
+        finalLazadaRequestUrl = requestUrl.toString()
     }
 
-    const requestUrl = new URL(baseUrl)
-    requestUrl.searchParams.set('url', originalLink)
-    requestUrl.searchParams.set('sub1', deriveShortlinkSub1(params.namespaceId))
-
     let lastError: string | null = null
-    const maxAttempts = 5
+    const maxAttempts = 2
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
             if (attempt > 1) {
-                const backoffMs = Math.min(2500, 250 * Math.pow(2, attempt - 2))
+                const backoffMs = Math.min(1000, 250 * Math.pow(2, attempt - 2))
                 await waitMs(backoffMs)
             }
-            const resp = await fetchWithTimeout(requestUrl.toString(), {}, 15000, 'lazada_shortlink')
+            const resp = await fetchWithTimeout(finalLazadaRequestUrl, {}, 8000, 'lazada_shortlink')
             if (!resp.ok) {
                 const errText = await resp.text().catch(() => '')
                 throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
@@ -17009,26 +18068,44 @@ async function shortenShopeeLinkForNamespace(params: {
     }
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
 
-    const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(params.env.DB, params.namespaceId)
-    if (!baseUrl) {
-        writeTrace({ utmSource: null, status: 'disabled', error: null })
-        if (fallbackDisallowed) throw new Error('admin_shopee_shortlink_disabled')
-        return originalLink
+    // Load sub IDs + URL template from namespace settings
+    const subIds = await resolveNamespaceShortlinkSubIds(params.env.DB, params.namespaceId).catch(() => ({ sub1: '', sub2: '', sub3: '', sub4: '', sub5: '' }))
+    const effectiveSub1 = subIds.sub1 || deriveShortlinkSub1(params.namespaceId)
+    const effectiveSubIds = { ...subIds, sub1: effectiveSub1 }
+    const urlTemplate = await resolveNamespaceShortlinkUrlTemplate(params.env.DB, params.namespaceId).catch(() => '')
+
+    // Priority: 1) URL template from settings  2) baseUrl derived from account
+    const shopeeAccount = await resolveNamespaceAffiliateShortlinkAccount(params.env.DB, params.namespaceId).catch(() => '')
+    let finalRequestUrl: string
+    if (urlTemplate && urlTemplate.includes('{url}')) {
+        finalRequestUrl = buildShortlinkRequestUrlFromTemplate(urlTemplate, originalLink, effectiveSubIds, shopeeAccount)
+        console.log(`[${params.logPrefix}] Using URL template from settings`)
+    } else {
+        const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(params.env.DB, params.namespaceId)
+        if (!baseUrl) {
+            writeTrace({ utmSource: null, status: 'disabled', error: null })
+            if (fallbackDisallowed) throw new Error('admin_shopee_shortlink_disabled')
+            return originalLink
+        }
+        const requestUrl = new URL(baseUrl)
+        requestUrl.searchParams.set('url', originalLink)
+        requestUrl.searchParams.set('sub1', effectiveSub1)
+        if (subIds.sub2) requestUrl.searchParams.set('sub2', subIds.sub2)
+        if (subIds.sub3) requestUrl.searchParams.set('sub3', subIds.sub3)
+        if (subIds.sub4) requestUrl.searchParams.set('sub4', subIds.sub4)
+        if (subIds.sub5) requestUrl.searchParams.set('sub5', subIds.sub5)
+        finalRequestUrl = requestUrl.toString()
     }
 
-    const requestUrl = new URL(baseUrl)
-    requestUrl.searchParams.set('url', originalLink)
-    requestUrl.searchParams.set('sub1', deriveShortlinkSub1(params.namespaceId))
-
     let lastError: string | null = null
-    const maxAttempts = 5
+    const maxAttempts = 2
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
             if (attempt > 1) {
-                const backoffMs = Math.min(2500, 250 * Math.pow(2, attempt - 2))
+                const backoffMs = Math.min(1000, 250 * Math.pow(2, attempt - 2))
                 await waitMs(backoffMs)
             }
-            const resp = await fetchWithTimeout(requestUrl.toString(), {}, 15000, 'shortlink')
+            const resp = await fetchWithTimeout(finalRequestUrl, {}, 8000, 'shortlink')
             if (!resp.ok) {
                 const errText = await resp.text().catch(() => '')
                 throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
@@ -17048,8 +18125,10 @@ async function shortenShopeeLinkForNamespace(params: {
             const affiliateId = String(data.id || data.affiliate_id || data.affiliateId || '').trim()
             const utmSource = String(data.utm_source || data.utmSource || '').trim() || (affiliateId ? `an_${affiliateId}` : '') || null
             if (shortLink) {
+                // Strip ?lp=aff that Shopee appends on redirect (not our code)
+                const cleanedShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
                 writeTrace({ utmSource, status: 'shortened', error: null })
-                return shortLink
+                return cleanedShortLink
             }
             throw new Error('missing_short_link_in_response')
         } catch (e) {
@@ -17184,24 +18263,22 @@ async function verifyAffiliateLinksForPosting(params: {
         resolvedLink: '',
         expectedId: expectedLazadaMemberId,
         actualId: '',
-        status: !lazadaInputLink ? 'missing_link' : !expectedLazadaMemberId ? 'skipped' : 'error',
+        status: !lazadaInputLink ? 'missing_link' : 'skipped',
         match: computeLazadaMemberMatchValue(expectedLazadaMemberId, null),
         error: null,
     }
 
-    if (lazadaInputLink && expectedLazadaMemberId) {
+    if (lazadaInputLink) {
         try {
             lazada.resolvedLink = await resolveAffiliateTrackingLink(lazadaInputLink, `${params.logPrefix}_lazada`)
             lazada.actualId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(lazada.resolvedLink))
             lazada.match = computeLazadaMemberMatchValue(expectedLazadaMemberId, lazada.actualId)
-            lazada.status = lazada.match === 1 ? 'verified' : 'mismatch'
-            if (lazada.status !== 'verified') {
-                lazada.error = `Lazada affiliate id ไม่ตรง (expected ${expectedLazadaMemberId}, actual ${lazada.actualId || '-'})`
-            }
+            lazada.status = lazada.actualId ? 'verified' : 'skipped'
         } catch (e) {
-            lazada.status = 'error'
-            lazada.match = 0
-            lazada.error = `Lazada verify failed: ${e instanceof Error ? e.message : String(e)}`
+            lazada.status = 'skipped'
+            lazada.match = computeLazadaMemberMatchValue(expectedLazadaMemberId, null)
+            lazada.error = null
+            console.log(`[${params.logPrefix}] Lazada member_id verify skipped: ${e instanceof Error ? e.message : String(e)}`)
         }
     }
 
@@ -19509,6 +20586,8 @@ async function ensurePostHistoryTraceColumns(db: D1Database): Promise<void> {
                 'ALTER TABLE post_history ADD COLUMN comment_delay_seconds INTEGER',
                 'ALTER TABLE post_history ADD COLUMN comment_due_at TEXT',
                 'ALTER TABLE post_history ADD COLUMN source_fingerprint TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_conversion_status TEXT',
+                'ALTER TABLE post_history ADD COLUMN shortlink_conversion_error TEXT',
             ]
             for (const sql of statements) {
                 await db.prepare(sql).run().catch(() => { })
@@ -20436,6 +21515,7 @@ async function ensurePagesOneCardColumns(db: D1Database): Promise<void> {
         `ALTER TABLE pages ADD COLUMN onecard_enabled INTEGER DEFAULT 0`,
         `ALTER TABLE pages ADD COLUMN onecard_link_mode TEXT DEFAULT 'shopee'`,
         `ALTER TABLE pages ADD COLUMN onecard_cta TEXT DEFAULT 'SHOP_NOW'`,
+        `ALTER TABLE pages ADD COLUMN ads_publish_enabled INTEGER DEFAULT 0`,
     ]
     for (const sql of alterStatements) {
         await db.prepare(sql).run().catch(() => undefined)
@@ -20755,7 +21835,7 @@ app.get('/api/pages', async (c) => {
         const botId = c.get('botId')
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
         return c.json({ pages })
     } catch (e) {
@@ -20907,7 +21987,7 @@ app.get('/api/pages/:id', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
         if (!page) return c.json({ error: 'Page not found' }, 404)
         return c.json({ page })
@@ -21434,7 +22514,7 @@ app.put('/api/pages/:id', async (c) => {
     const id = c.req.param('id')
     try {
         const body = await c.req.json()
-        const { post_interval_minutes, post_hours, is_active, access_token, comment_token, onecard_enabled, onecard_link_mode, onecard_cta } = body
+        const { post_interval_minutes, post_hours, is_active, access_token, comment_token, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled } = body
         // comment_token is now treated as access_token (unified token model)
         let normalizedPostHours = post_hours as string | undefined
         let normalizedInterval = post_interval_minutes as number | undefined
@@ -21598,7 +22678,7 @@ app.put('/api/pages/:id', async (c) => {
         }
 
         const updatedPage = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
 
         return c.json({ success: true, resolved, resolved_details, page: updatedPage })
@@ -22930,7 +24010,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Get page info
         await ensurePagesOneCardColumns(env.DB)
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
@@ -23118,12 +24198,36 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 videoId: unpostedId,
             }).catch(() => null)
 
-        postingTokenUsed = pageOneCardEnabled ? 'onecard' : String(primaryPostingTokenCandidates[0] || '').trim()
+        const pageAdsPublishEnabled_fp = Number((page as any).ads_publish_enabled || 0) === 1
+        postingTokenUsed = pageOneCardEnabled ? 'onecard' : pageAdsPublishEnabled_fp ? 'ads_publish' : String(primaryPostingTokenCandidates[0] || '').trim()
         const oneCardWebsiteUrl = pickOneCardWebsiteUrl({
             linkMode: pageOneCardLinkMode,
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
         })
+
+        // ADS PUBLISH MODE (force-post)
+        if (pageAdsPublishEnabled_fp) {
+            const adsBaseUrl = String(env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+            const adsResp = await fetchWithTimeout(adsBaseUrl + '/create-ad', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ page_id: page.id, video_url: realVideoUrl, caption }),
+            }, 300000, 'force_ads_publish')
+            const adsData = await adsResp.json().catch(() => ({} as any)) as { ok?: boolean; error?: string; story_id?: string; video_id?: string }
+            if (!adsResp.ok || !adsData?.ok) throw new Error(String(adsData?.error || 'ads_publish_failed'))
+            fbVideoId = String(adsData.video_id || '')
+            const storyId_fp = String(adsData.story_id || '')
+            const confirmedPostId_fp = storyId_fp.includes('_') ? storyId_fp.split('_').slice(1).join('_') : storyId_fp
+            postingTokenUsed = 'ads_publish'
+            if (forceHistoryId) {
+                await env.DB.prepare("UPDATE post_history SET status = 'success', fb_post_id = ?, fb_reel_url = ?, post_token_hint = 'ads_publish', comment_status = 'not_configured' WHERE id = ?")
+                    .bind(confirmedPostId_fp, 'https://www.facebook.com/' + storyId_fp.replace('_', '/posts/'), forceHistoryId).run()
+            }
+            await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+            return c.json({ success: true, page: pageName, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId_fp, fb_reel_url: 'https://www.facebook.com/' + storyId_fp.replace('_', '/posts/') })
+        }
+
         const reelResult = pageOneCardEnabled
             ? await publishVideoViaOneCard({
                 env,
@@ -23383,6 +24487,45 @@ app.post('/api/pages/:id/force-post', async (c) => {
 })
 
 // ==================== MANUAL REEL POST (ใส่ Page ID + Token เอง) ====================
+
+
+
+app.post('/api/mark-video-posted', async (c) => {
+    const botId = c.get('botId')
+    try {
+        const body = await c.req.json().catch(() => ({})) as { video_id?: string }
+        const videoId = String(body.video_id || '').trim()
+        if (!videoId) return c.json({ error: 'Missing video_id' }, 400)
+        await markNamespaceVideoPosted(c.env.DB, botId, videoId, new Date().toISOString())
+        return c.json({ success: true, video_id: videoId })
+    } catch (e) {
+        return c.json({ error: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
+
+app.post('/api/pages/:id/promote-ad', async (c) => {
+    const pageId = c.req.param('id')
+    const botId = c.get('botId')
+    try {
+        const body = await c.req.json().catch(() => ({})) as { story_id?: string }
+        const storyId = String(body.story_id || '').trim()
+        if (!storyId) return c.json({ error: 'Missing story_id' }, 400)
+
+        const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+        const resp = await fetchWithTimeout(baseUrl + '/promote', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ story_id: storyId }),
+        }, 60000, 'promote_ad')
+        const data = await resp.json().catch(() => ({} as any)) as { ok?: boolean; error?: string; post_url?: string }
+        if (!resp.ok || !data?.ok) {
+            return c.json({ error: String(data?.error || 'promote_failed') }, 500)
+        }
+        return c.json({ success: true, story_id: storyId, post_url: data.post_url })
+    } catch (e) {
+        return c.json({ error: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
 
 app.post('/api/manual-post-reel', async (c) => {
     const t0 = Date.now()
@@ -23966,6 +25109,15 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     enqueueBackgroundTask(ctx, 'CRON PENDING COMMENTS', async () => {
         await processPendingCommentBacklog(env)
     })
+    enqueueBackgroundTask(ctx, 'CRON DASHBOARD FB GALLERY', async () => {
+        const result = await syncDashboardFacebookPageVideoCache(env, {
+            pageId: DASHBOARD_FACEBOOK_GALLERY_PAGE_ID,
+            pageName: DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME,
+        })
+        if (!result.skipped) {
+            console.log(`[CRON] dashboard gallery sync ok=${result.ok} inserted=${result.inserted} total=${result.totalOverThreshold} reason=${result.reason || ''}`)
+        }
+    })
 
 
     // Get current time in Thailand timezone (UTC+7) using proper Intl
@@ -24240,6 +25392,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         ).bind(botId, page.id).run().catch(() => { })
                         console.log(`[CRON] Page ${page.name}: skip (shortlink disabled for namespace ${botId})`)
                         await botBucket.delete(dedupKey).catch(() => { })
+                        await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
                         continue
                     }
 
@@ -24259,6 +25412,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         ).bind(botId, page.id).run().catch(() => { })
                         console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
                         await botBucket.delete(dedupKey).catch(() => { })
+                        await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
                         continue
                     }
 
@@ -24281,6 +25435,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         if (!pickedVideoEntry) {
             console.log(`[CRON] Page ${page.name}: no unposted gallery video left`)
             await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
+            await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
             continue
         }
         const pickedVideo = pickedVideoEntry.video
@@ -24308,14 +25463,97 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             ? botBucket
             : new BotBucket(env.BUCKET, sourceNamespaceId) as unknown as R2Bucket
         const meta = await loadLatestVideoMetaForPosting(sourceBucket, unpostedId, pickedVideo)
-        const normalizedShopeeLink = normalizeMetaShopeeLink(meta) || ''
-        const normalizedShopeeUtmSource = null
-        const normalizedShopeeStatus = null
-        const normalizedShopeeError = null
+        // === SHORTLINK BEFORE POSTING: ONLY for admin namespace. Members use raw links from gallery as-is ===
+        const isAdminNamespace = await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
+        const rawShopeeLink = normalizeMetaShopeeLink(meta) || ''
+        const shopeeShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
+        let normalizedShopeeLink = rawShopeeLink
+        if (isAdminNamespace && rawShopeeLink) {
+            try {
+                normalizedShopeeLink = await shortenShopeeLinkForNamespace({
+                    env,
+                    namespaceId: botId,
+                    shopeeLink: rawShopeeLink,
+                    logPrefix: `CRON ${page.name} SHORTLINK`,
+                    trace: shopeeShortlinkTrace,
+                })
+                console.log(`[CRON] Page ${page.name}: shopee shortlink ${shopeeShortlinkTrace.status} — ${rawShopeeLink.slice(0, 80)} → ${normalizedShopeeLink.slice(0, 80)}`)
+            } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e)
+                shopeeShortlinkTrace.status = 'fallback'
+                shopeeShortlinkTrace.error = errMsg
+                console.error(`[CRON] Page ${page.name}: shopee shortlink failed — ${errMsg}`)
+            }
+        } else if (rawShopeeLink) {
+            // Member namespace: use raw link as-is, mark as disabled (no conversion needed)
+            shopeeShortlinkTrace.status = 'disabled'
+            console.log(`[CRON] Page ${page.name}: member namespace — using raw shopee link as-is`)
+        }
+        const normalizedShopeeUtmSource = shopeeShortlinkTrace.utmSource ?? null
+        const normalizedShopeeStatus = shopeeShortlinkTrace.status ?? null
+        const normalizedShopeeError = shopeeShortlinkTrace.error ?? null
         const normalizedShopeeUtmMatch = null
         const publicUrl = metaToString(meta, 'publicUrl')
-        const normalizedLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
-        const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
+        const rawLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
+        const lazadaShortlinkTrace: { utmSource?: string | null; memberId?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
+        let normalizedLazadaLink = rawLazadaLink
+        if (isAdminNamespace && rawLazadaLink) {
+            try {
+                normalizedLazadaLink = await shortenLazadaLinkForNamespace({
+                    env,
+                    namespaceId: botId,
+                    lazadaLink: rawLazadaLink,
+                    logPrefix: `CRON ${page.name} SHORTLINK`,
+                    trace: lazadaShortlinkTrace,
+                })
+                console.log(`[CRON] Page ${page.name}: lazada shortlink ${lazadaShortlinkTrace.status} — ${rawLazadaLink.slice(0, 80)} → ${normalizedLazadaLink.slice(0, 80)}`)
+            } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e)
+                lazadaShortlinkTrace.status = 'fallback'
+                lazadaShortlinkTrace.error = errMsg
+                console.error(`[CRON] Page ${page.name}: lazada shortlink failed — ${errMsg}`)
+            }
+        } else if (rawLazadaLink) {
+            // Member namespace: use raw link as-is, mark as disabled (no conversion needed)
+            lazadaShortlinkTrace.status = 'disabled'
+            console.log(`[CRON] Page ${page.name}: member namespace — using raw lazada link as-is`)
+        }
+        const normalizedLazadaMemberId = String(lazadaShortlinkTrace.memberId || metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
+
+        // === BLOCK POSTING if shortlink failed ===
+        const combinedConversionStatus = (shopeeShortlinkTrace.status === 'fallback' || lazadaShortlinkTrace.status === 'fallback')
+            ? 'fallback'
+            : (shopeeShortlinkTrace.status === 'shortened' || lazadaShortlinkTrace.status === 'shortened')
+                ? 'shortened'
+                : (shopeeShortlinkTrace.status === 'disabled' || lazadaShortlinkTrace.status === 'disabled')
+                    ? 'disabled'
+                    : null
+        const combinedConversionError = shopeeShortlinkTrace.error || lazadaShortlinkTrace.error || null
+        const shopeeShortlinkFailed = rawShopeeLink && shopeeShortlinkTrace.status !== 'shortened' && shopeeShortlinkTrace.status !== 'disabled'
+        const lazadaShortlinkFailed = rawLazadaLink && lazadaShortlinkTrace.status !== 'shortened' && lazadaShortlinkTrace.status !== 'disabled'
+        if (shopeeShortlinkFailed || lazadaShortlinkFailed) {
+            const failedPlatforms = [shopeeShortlinkFailed ? 'shopee' : '', lazadaShortlinkFailed ? 'lazada' : ''].filter(Boolean).join('+')
+            const shortlinkErrorMsg = `shortlink_failed:${failedPlatforms} — ${combinedConversionError || 'unknown'}`
+            console.error(`[CRON] Page ${page.name}: BLOCKED — ${shortlinkErrorMsg}`)
+            // Record failed attempt in post_history
+            await ensurePostHistoryTraceColumns(env.DB)
+            await env.DB.prepare(
+                "INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, error_message, shopee_link, lazada_link, shortlink_conversion_status, shortlink_conversion_error, comment_status, source_fingerprint) VALUES (?, ?, ?, 'failed', 'cron', ?, ?, ?, ?, 'failed', ?, 'not_attempted', ?)"
+            ).bind(
+                page.id, unpostedId, nowISO, botId,
+                shortlinkErrorMsg,
+                rawShopeeLink || null, rawLazadaLink || null,
+                combinedConversionError || 'shortlink_failed',
+                'not_attempted',
+                sourceFingerprint || null,
+            ).run().catch(() => { })
+            await releasePostingLock(env.DB, videoPostingLockKey).catch(() => { })
+            videoPostingLockKey = null
+            await botBucket.delete(dedupKey).catch(() => { })
+            await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
+            cronStats.pagesFailed++
+            continue
+        }
 
         // Generate short caption from script (no Shopee link)
         let apiKeys = geminiApiKeysByNamespace.get(botId)
@@ -24329,6 +25567,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         if (!hasManualCaption && !title && script && apiKeys.length === 0) {
             console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (Gemini API key กลางของระบบยังไม่ได้ตั้งค่า)`)
             await botBucket.delete(dedupKey).catch(() => { })
+            await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
             continue
         }
         const geminiModel = env.GEMINI_MODEL || 'gemini-3-flash-preview'
@@ -24373,7 +25612,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const initialCommentError = initialCommentState.error
         // 3. Record attempt BEFORE posting (prevents duplicate posts if FB succeeds but D1 fails after)
         const inserted = await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, shortlink_conversion_status, shortlink_conversion_error, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
@@ -24396,6 +25635,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             normalizedShopeeError,
             null,
             normalizedShopeeUtmMatch,
+            combinedConversionStatus,
+            combinedConversionError,
             sourceFingerprint || null,
         ).run()
         const cronHistoryId = Number(inserted.meta?.last_row_id || 0) || null
@@ -24421,6 +25662,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             }
             console.error(`[CRON] Page ${page.name}: affiliate verification failed - ${affiliateVerification.error || 'unknown'}`)
             await botBucket.delete(dedupKey).catch(() => { })
+            await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
             continue
         }
 
@@ -24430,7 +25672,39 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
         const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
         const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
-        let postingTokenUsed = pageOneCardEnabled ? 'onecard' : String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
+        const pageAdsPublishEnabled = Number((page as any).ads_publish_enabled || 0) === 1
+        let postingTokenUsed = pageOneCardEnabled ? 'onecard' : pageAdsPublishEnabled ? 'ads_publish' : String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
+
+        // ADS PUBLISH MODE
+        if (pageAdsPublishEnabled) {
+            try {
+                const adsBaseUrl = String(env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+                const adsResp = await fetchWithTimeout(adsBaseUrl + '/create-ad', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ page_id: String(page.id || ''), video_url: realVideoUrl, caption }),
+                }, 300000, 'ads_publish_create_ad')
+                const adsData = await adsResp.json().catch(() => ({} as any)) as { ok?: boolean; error?: string; story_id?: string; video_id?: string }
+                if (!adsResp.ok || !adsData?.ok) throw new Error(String(adsData?.error || 'ads_publish_failed'))
+                const storyId_ads = String(adsData.story_id || '')
+                const confirmedPostId_ads = storyId_ads.includes('_') ? storyId_ads.split('_').slice(1).join('_') : storyId_ads
+                if (cronHistoryId) {
+                    await env.DB.prepare("UPDATE post_history SET status = 'success', fb_post_id = ?, fb_reel_url = ?, post_token_hint = 'ads_publish', comment_status = 'not_configured', posted_at = ? WHERE id = ? AND status = 'posting'")
+                        .bind(confirmedPostId_ads, 'https://www.facebook.com/' + storyId_ads.replace('_', '/posts/'), nowISO, cronHistoryId).run()
+                }
+                await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
+                cronStats.pagesPosted++
+                console.log(`[CRON] Page ${page.name}: ADS PUBLISH OK - ${storyId_ads}`)
+                continue
+            } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e)
+                if (cronHistoryId) { await env.DB.prepare("UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'").bind(errMsg, cronHistoryId).run().catch(() => {}) }
+                cronStats.pagesFailed++
+                console.error(`[CRON] Page ${page.name}: ADS PUBLISH FAILED - ${errMsg}`)
+                continue
+            }
+        }
+
         try {
             // Download video and publish via the preferred page-scoped token pool first.
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')

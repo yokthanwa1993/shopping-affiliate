@@ -153,6 +153,20 @@ function buildShopeeShortlinkPayload(params) {
     const longLink = String(params.longLink || '').trim() || link;
     const originalLink = normalizeShopeeOriginalLink(longLink) || longLink || link;
     const id = normalizeAffiliateId(params.id || params.utmSource || '');
+
+    // Extract sub_ids from utm_content in longLink (format: sub1-sub2-sub3-sub4-sub5)
+    let utmContent = '';
+    try {
+        const url = new URL(longLink.includes('://') ? longLink : `https://${longLink}`);
+        utmContent = url.searchParams.get('utm_content') || '';
+    } catch {}
+    const subParts = utmContent.split('-');
+    const sub1 = String(subParts[0] || '').trim() || '';
+    const sub2 = String(subParts[1] || '').trim() || '';
+    const sub3 = String(subParts[2] || '').trim() || '';
+    const sub4 = String(subParts[3] || '').trim() || '';
+    const sub5 = String(subParts[4] || '').trim() || '';
+
     return {
         link,
         longLink,
@@ -160,8 +174,13 @@ function buildShopeeShortlinkPayload(params) {
         shortLink: String(params.shortLink || '').trim(),
         id,
         utm_source: String(params.utmSource || '').trim(),
+        utm_content: utmContent,
         account: String(params.account || '').trim(),
-        sub1: String(params.sub1 || '').trim(),
+        sub1,
+        sub2,
+        sub3,
+        sub4,
+        sub5,
     };
 }
 
@@ -250,7 +269,12 @@ async function executeInWindow(win, js, timeoutMs = 20000) {
     });
 }
 
-async function shortenShopee(productUrl) {
+async function shortenShopee(productUrl, subIds) {
+    const sub1 = String((subIds && subIds[0]) || '').trim()
+    const sub2 = String((subIds && subIds[1]) || '').trim()
+    const sub3 = String((subIds && subIds[2]) || '').trim()
+    const sub4 = String((subIds && subIds[3]) || '').trim()
+    const sub5 = String((subIds && subIds[4]) || '').trim()
     const win = createShopeeWindow();
     const currentUrl = win.webContents.getURL();
     if (!currentUrl.includes('affiliate.shopee.co.th')) {
@@ -259,31 +283,30 @@ async function shortenShopee(productUrl) {
     }
 
     const safeUrl = productUrl.replace(/'/g, "\\'");
-    const js = `(async function(productUrl) {
-        // Try multiple ways to find csrf token
+    const safeSub1 = String(sub1 || '').replace(/'/g, "\\'");
+    const safeSub2 = String(sub2 || '').replace(/'/g, "\\'");
+    const safeSub3 = String(sub3 || '').replace(/'/g, "\\'");
+    const safeSub4 = String(sub4 || '').replace(/'/g, "\\'");
+    const safeSub5 = String(sub5 || '').replace(/'/g, "\\'");
+    const js = `(async function(productUrl, sub1, sub2, sub3, sub4, sub5) {
         var csrfToken = null;
-
-        // 1. document.cookie
         var m = document.cookie.match(/csrftoken=([^;]+)/);
         if (m) csrfToken = m[1];
-
-        // 2. meta tag
         if (!csrfToken) {
             var meta = document.querySelector('meta[name="csrf-token"]') || document.querySelector('meta[name="csrftoken"]');
             if (meta) csrfToken = meta.getAttribute('content');
         }
 
-        // 3. window.__INITIAL_STATE__ or similar
-        if (!csrfToken && window.__INITIAL_STATE__ && window.__INITIAL_STATE__.csrfToken) {
-            csrfToken = window.__INITIAL_STATE__.csrfToken;
-        }
-
-        // Build headers
         var headers = {
             'Content-Type': 'application/json',
             'affiliate-program-type': '1'
         };
         if (csrfToken) headers['csrf-token'] = csrfToken;
+
+        var linkParam = { originalLink: productUrl };
+        if (sub1 || sub2 || sub3 || sub4 || sub5) {
+            linkParam.advancedLinkParams = { subId1: sub1 || '', subId2: sub2 || '', subId3: sub3 || '', subId4: sub4 || '', subId5: sub5 || '' };
+        }
 
         var resp = await fetch('https://affiliate.shopee.co.th/api/v3/gql?q=batchCustomLink', {
             method: 'POST',
@@ -292,7 +315,7 @@ async function shortenShopee(productUrl) {
             body: JSON.stringify({
                 operationName: 'batchGetCustomLink',
                 variables: {
-                    linkParams: [{ originalLink: productUrl }],
+                    linkParams: [linkParam],
                     sourceCaller: 'CUSTOM_LINK_CALLER'
                 },
                 query: 'query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }'
@@ -304,7 +327,7 @@ async function shortenShopee(productUrl) {
         var r = results[0];
         if (r.failCode && r.failCode !== 0) throw new Error('failCode: ' + r.failCode);
         return { shortLink: r.shortLink || '', longLink: r.longLink || '', originalLink: productUrl };
-    })('${safeUrl}')`;
+    })('${safeUrl}', '${safeSub1}', '${safeSub2}', '${safeSub3}', '${safeSub4}', '${safeSub5}')`;
 
     const result = await executeInWindow(win, js);
 
@@ -422,7 +445,7 @@ function startApiServer() {
 
             // Shopee: GET /shopee or GET / with shopee URL
             if (pathname === '/shopee' || pathname === '/shopee/shorten' || ((pathname === '/' || pathname === '/shorten') && query.url && query.url.includes('shopee'))) {
-                const d = await shortenShopee(query.url);
+                const d = await shortenShopee(query.url, [query.sub1, query.sub2, query.sub3, query.sub4, query.sub5]);
                 const resolvedShortLink = await resolveTrackingLink(d.shortLink);
                 res.end(JSON.stringify(buildShopeeShortlinkPayload({
                     link: query.url,
@@ -439,7 +462,7 @@ function startApiServer() {
             if ((pathname === '/' || pathname === '/shorten') && query.url) {
                 const resolvedOriginalLink = await resolveOriginalLink(query.url);
                 if (query.url.includes('shopee')) {
-                    const d = await shortenShopee(query.url);
+                    const d = await shortenShopee(query.url, [query.sub1, query.sub2, query.sub3, query.sub4, query.sub5]);
                     const resolvedShortLink = await resolveTrackingLink(d.shortLink);
                     res.end(JSON.stringify(buildShopeeShortlinkPayload({
                         link: query.url,
