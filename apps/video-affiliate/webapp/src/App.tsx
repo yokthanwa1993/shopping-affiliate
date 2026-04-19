@@ -3318,6 +3318,7 @@ function App({
 
   const [categoryFilter, setCategoryFilter] = useState<GalleryFilter>('ready')
   const [gallerySearchInput, setGallerySearchInput] = useState(getInitialGallerySearchInput)
+  const [bulkResetPostedLoading, setBulkResetPostedLoading] = useState(false)
   const [dashboardDateFilter, setDashboardDateFilter] = useState<string>(getTodayString())
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(() => {
@@ -5965,6 +5966,46 @@ function App({
     }
   }
 
+  async function handleBulkResetPostedForCurrentNamespace() {
+    const ns = String(namespaceId || '').trim()
+    if (!ns) {
+      alert('ไม่พบ namespace_id ปัจจุบัน — ลองเข้าจาก LINE/LIFF อีกครั้ง')
+      return
+    }
+    const ok = window.confirm(
+      `ย้ายคลิปที่ "โพสต์แล้ว" ทั้งหมดของ namespace นี้กลับไปแท็บ "ยังไม่โพสต์" ใช่ไหม?\n\n` +
+      `namespace_id: ${ns}\n\n` +
+      `จะมีผลเฉพาะ namespace นี้เท่านั้น ไม่กระทบ namespace อื่น`
+    )
+    if (!ok) return
+    setBulkResetPostedLoading(true)
+    try {
+      const url = new URL(`${WORKER_URL}/api/gallery/reset-posted-bulk`)
+      url.searchParams.set('namespace_id', ns)
+      const resp = await apiFetch(url.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ namespace_id: ns }),
+      })
+      const data = await resp.json().catch(() => ({})) as {
+        success?: boolean
+        reset_count?: number
+        posted_total?: number
+        error?: string
+      }
+      if (!resp.ok || !data.success) {
+        alert(`ย้ายคลิปไม่สำเร็จ: ${data.error || resp.statusText || 'unknown error'}`)
+        return
+      }
+      alert(`ย้ายคลิป ${data.reset_count ?? 0} คลิป กลับไป "ยังไม่โพสต์" สำเร็จ`)
+      void loadGallerySnapshotBundle({ reset: true })
+    } catch (e) {
+      alert(`เกิดข้อผิดพลาด: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setBulkResetPostedLoading(false)
+    }
+  }
+
   async function handleRepostGalleryVideo(id: string, targetNamespaceId?: string) {
     const namespaceForVideo = String(targetNamespaceId || namespaceId || '').trim() || undefined
     const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(id)}`)
@@ -6370,31 +6411,52 @@ function App({
         >
           {tab === 'gallery' && !isAllOriginalMode && (
             <div className="pb-3">
-              <div className="relative">
-                <input
-                  type="text"
-                  value={gallerySearchInput}
-                  onChange={(e) => setGallerySearchInput(e.target.value)}
-                  placeholder="ค้นหา video id หรือชื่อคลิป"
-                  className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 pr-11 text-sm font-medium text-gray-900 outline-none transition-all placeholder:text-gray-400 focus:border-blue-400 focus:bg-white"
-                />
-                {gallerySearchInput.trim() ? (
-                  <button
-                    onClick={() => setGallerySearchInput('')}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-gray-200 p-1.5 active:scale-95"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2.5" strokeLinecap="round">
-                      <path d="M18 6L6 18M6 6l12 12" />
+              <div className="flex gap-2 items-center">
+                <div className="relative flex-1">
+                  <input
+                    type="text"
+                    value={gallerySearchInput}
+                    onChange={(e) => setGallerySearchInput(e.target.value)}
+                    placeholder="ค้นหา video id หรือชื่อคลิป"
+                    className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 pr-11 text-sm font-medium text-gray-900 outline-none transition-all placeholder:text-gray-400 focus:border-blue-400 focus:bg-white"
+                  />
+                  {gallerySearchInput.trim() ? (
+                    <button
+                      onClick={() => setGallerySearchInput('')}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 rounded-full bg-gray-200 p-1.5 active:scale-95"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6b7280" strokeWidth="2.5" strokeLinecap="round">
+                        <path d="M18 6L6 18M6 6l12 12" />
+                      </svg>
+                    </button>
+                  ) : (
+                    <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="11" cy="11" r="8" />
+                        <path d="M21 21l-4.35-4.35" />
+                      </svg>
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleBulkResetPostedForCurrentNamespace}
+                  disabled={bulkResetPostedLoading}
+                  title="ย้ายคลิปที่โพสต์แล้วทั้งหมดของ namespace นี้กลับไป 'ยังไม่โพสต์'"
+                  aria-label="ย้ายคลิปที่โพสต์แล้วทั้งหมดกลับไปยังไม่โพสต์"
+                  className="shrink-0 rounded-2xl border border-orange-200 bg-orange-50 hover:bg-orange-100 active:scale-95 px-3 py-3 text-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {bulkResetPostedLoading ? (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
+                      <path d="M21 12a9 9 0 1 1-6.219-8.56" />
                     </svg>
-                  </button>
-                ) : (
-                  <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="11" cy="11" r="8" />
-                      <path d="M21 21l-4.35-4.35" />
+                  ) : (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+                      <path d="M3 3v5h5" />
                     </svg>
-                  </div>
-                )}
+                  )}
+                </button>
               </div>
             </div>
           )}
@@ -8026,7 +8088,11 @@ function App({
                                   style={{
                                     fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
                                     fontSize: `${Math.round(32 * coverTextStyleDraft.size_scale)}px`,
-                                    WebkitTextStroke: `${Math.max(1, Math.round(coverTextStyleDraft.outline_width / 2))}px ${coverTextStyleDraft.outline_color}`,
+                                    // Match the proportional stroke ratio of the final 1080-wide cover:
+                                    // final font_size ≈ 1080 × 0.18 = 194px, final visible stroke = outline_width / 2 (PIL halves).
+                                    // preview font_size base = 32 → preview stroke = outline_width × 32 / (2 × 194) ≈ outline_width × 0.082
+                                    // (size_scale cancels because preview font and final font both scale with it)
+                                    WebkitTextStroke: `${coverTextStyleDraft.outline_width > 0 ? Math.max(1, Math.round(coverTextStyleDraft.outline_width * 32 / (1080 * 0.36))) : 0}px ${coverTextStyleDraft.outline_color}`,
                                     paintOrder: 'stroke fill',
                                   }}
                                 >

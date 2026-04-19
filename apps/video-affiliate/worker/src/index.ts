@@ -7892,13 +7892,23 @@ function buildLineCoverTextPositionPreviewUrl(params: {
     const coverTemplateId = normalizeCoverTemplateId(String(params.coverTemplateId || ''))
     const coverTextStyle = normalizeCoverTextStyle(params.coverTextStyle, coverTemplateId)
     if (!normalizedWorkerUrl || !normalizedNamespaceId || !normalizedVideoId || !normalizedSeed) return ''
+    // Outline width is calibrated for the final 1080-wide cover. Scale it
+    // proportionally for this smaller preview thumbnail so the visible stroke
+    // ratio matches the final render (otherwise stroke looks ~2x too thick).
+    const PREVIEW_WIDTH = 540
+    const PREVIEW_HEIGHT = 960
+    const FINAL_COVER_WIDTH = 1080
+    const scaledOutlineWidth = Math.max(
+        coverTextStyle.outlineWidth > 0 ? 1 : 0,
+        Math.round(coverTextStyle.outlineWidth * PREVIEW_WIDTH / FINAL_COVER_WIDTH),
+    )
     try {
         const url = new URL(`${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame-preview/${encodeURIComponent(cacheBust)}`)
         url.searchParams.set('namespace_id', normalizedNamespaceId)
         url.searchParams.set('seed', normalizedSeed)
         url.searchParams.set('format', 'jpg')
-        url.searchParams.set('w', '540')
-        url.searchParams.set('h', '960')
+        url.searchParams.set('w', String(PREVIEW_WIDTH))
+        url.searchParams.set('h', String(PREVIEW_HEIGHT))
         url.searchParams.set('ct', coverText)
         url.searchParams.set('cy', String(params.coverTextYPercent))
         url.searchParams.set('tid', coverTemplateId)
@@ -7910,15 +7920,15 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         url.searchParams.set('ts', String(coverTextStyle.sizeScale))
         url.searchParams.set('om', coverTextStyle.mode)
         url.searchParams.set('oc', coverTextStyle.outlineColor)
-        url.searchParams.set('ow', String(coverTextStyle.outlineWidth))
+        url.searchParams.set('ow', String(scaledOutlineWidth))
         return url.toString()
     } catch {
         const paramsObj = new URLSearchParams()
         paramsObj.set('namespace_id', normalizedNamespaceId)
         paramsObj.set('seed', normalizedSeed)
         paramsObj.set('format', 'jpg')
-        paramsObj.set('w', '540')
-        paramsObj.set('h', '960')
+        paramsObj.set('w', String(PREVIEW_WIDTH))
+        paramsObj.set('h', String(PREVIEW_HEIGHT))
         paramsObj.set('ct', coverText)
         paramsObj.set('cy', String(params.coverTextYPercent))
         paramsObj.set('tid', coverTemplateId)
@@ -7930,7 +7940,7 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         paramsObj.set('ts', String(coverTextStyle.sizeScale))
         paramsObj.set('om', coverTextStyle.mode)
         paramsObj.set('oc', coverTextStyle.outlineColor)
-        paramsObj.set('ow', String(coverTextStyle.outlineWidth))
+        paramsObj.set('ow', String(scaledOutlineWidth))
         return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame-preview/${encodeURIComponent(cacheBust)}?${paramsObj.toString()}`
     }
 }
@@ -14755,6 +14765,77 @@ app.put('/api/gallery/:id', async (c) => {
         })
     } catch {
         return c.json({ error: 'Failed to update video' }, 500)
+    }
+})
+
+// Bulk reset all posted videos in the CURRENT namespace back to "ยังไม่โพสต์".
+// Strictly scoped to the caller's namespace_id — refuses cross-namespace requests.
+// This avoids accidentally moving member clips when admin only wants to reset their own.
+app.post('/api/gallery/reset-posted-bulk', async (c) => {
+    try {
+        const currentNamespaceId = String(c.get('botId') || '').trim()
+        const body = await c.req.json().catch(() => ({} as { namespace_id?: string; namespaceId?: string })) as { namespace_id?: string; namespaceId?: string }
+        const requestedNamespaceId = String(
+            body.namespace_id ?? body.namespaceId ?? c.req.query('namespace_id') ?? ''
+        ).trim()
+        const targetNamespaceId = requestedNamespaceId || currentNamespaceId
+        if (!targetNamespaceId) {
+            return c.json({ error: 'namespace_id_required' }, 400)
+        }
+        if (targetNamespaceId !== currentNamespaceId) {
+            return c.json({ error: 'cross_namespace_gallery_write_forbidden' }, 403)
+        }
+
+        // Find all posted videos in this namespace
+        const inventory = await getNamespaceGalleryInventory(c.env, targetNamespaceId)
+        const postedVideos = inventory.videos.filter((v) =>
+            isNamespaceGalleryVideoVisibleInUsedTab(v as Record<string, unknown>)
+        )
+
+        // Bulk reset D1 — only this namespace's rows
+        await ensureNamespaceVideoStateColumns(c.env.DB)
+        await c.env.DB.prepare(
+            `UPDATE namespace_video_state
+             SET posted_at = '', updated_at = datetime('now')
+             WHERE namespace_id = ? AND posted_at <> ''`
+        ).bind(targetNamespaceId).run()
+
+        // Reset R2 metadata for each posted video (clears postedAt + keepInPostedTab)
+        const bucket = c.get('bucket')
+        const nowIso = new Date().toISOString()
+        let resetCount = 0
+        for (const video of postedVideos) {
+            const id = String((video as Record<string, unknown>).id || '').trim()
+            if (!id) continue
+            try {
+                const metaObj = await bucket.get(`videos/${id}.json`)
+                if (!metaObj) continue
+                const meta = await metaObj.json() as Record<string, unknown>
+                meta.postedAt = ''
+                delete meta.keepInPostedTab
+                meta.updatedAt = nowIso
+                await bucket.put(`videos/${id}.json`, JSON.stringify(meta, null, 2), {
+                    httpMetadata: { contentType: 'application/json' },
+                })
+                await updateGalleryCache(bucket, id).catch(() => { })
+                resetCount++
+            } catch (e) {
+                console.log(`[GALLERY-RESET-BULK] reset failed ns=${targetNamespaceId} video=${id}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+
+        // Invalidate admin caches so the change is reflected everywhere
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+
+        return c.json({
+            success: true,
+            namespace_id: targetNamespaceId,
+            reset_count: resetCount,
+            posted_total: postedVideos.length,
+        })
+    } catch (e) {
+        return c.json({ error: e instanceof Error ? e.message : String(e) }, 500)
     }
 })
 
