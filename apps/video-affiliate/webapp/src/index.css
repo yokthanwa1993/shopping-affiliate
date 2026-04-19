@@ -163,4 +163,20 @@
 .safe-bottom {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+
+/* Allow native text selection (long-press → Select All) inside inputs/textareas on iOS.
+   Parent <html> sets touch-action: pan-x pan-y which blocks the long-press gesture. */
+textarea,
+input[type="text"],
+input[type="search"],
+input[type="url"],
+input[type="email"],
+input[type="tel"],
+input[type="password"],
+input:not([type]) {
+  touch-action: auto;
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
 /* deployed Fri Feb  6 17:03:00 +07 2026 */

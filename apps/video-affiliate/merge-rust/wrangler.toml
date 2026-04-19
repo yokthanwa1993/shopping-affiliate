@@ -4,5 +4,5 @@ main = "src/main.rs"
 compatibility_date = "2026-02-24"
 
 [[containers]]
-image = "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-04-05.104500"
+image = "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-04-19.xxl"
 class_name = "MergeContainer"

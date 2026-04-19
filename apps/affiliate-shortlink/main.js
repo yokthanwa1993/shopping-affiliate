@@ -269,7 +269,80 @@ async function executeInWindow(win, js, timeoutMs = 20000) {
     });
 }
 
-async function shortenShopee(productUrl, subIds) {
+// ==================== SESSION RESILIENCE ====================
+// Track active requests so periodic refresh skips busy windows.
+const activeRequests = { shopee: 0, lazada: 0 };
+// Serialise reloads so concurrent session failures don't thrash the window.
+const reloadLocks = { shopee: null, lazada: null };
+
+// Last-resort app restart when in-wrapper reloads can't recover.
+// pm2 autorestart brings the process back up on exit(0).
+const consecutiveFailures = { shopee: 0, lazada: 0 };
+const FAILURES_BEFORE_RESTART = 3;                // 3 full-wrapper failures in a row → relaunch
+const MIN_RESTART_INTERVAL_MS = 10 * 60 * 1000;   // rate-limit: at most 1 restart per 10 min
+let lastAppRestartAt = 0;
+let restartScheduled = false;
+
+function triggerAppRestartIfStuck(platform) {
+    if (restartScheduled) return;
+    const now = Date.now();
+    if (now - lastAppRestartAt < MIN_RESTART_INTERVAL_MS) {
+        const leftSec = Math.ceil((MIN_RESTART_INTERVAL_MS - (now - lastAppRestartAt)) / 1000);
+        console.warn(`[restart] skip — cooldown ${leftSec}s left since last restart`);
+        return;
+    }
+    restartScheduled = true;
+    lastAppRestartAt = now;
+    console.error(`[restart] ${platform} hit ${consecutiveFailures[platform]} consecutive failures — relaunching app (pm2 will restart)`);
+    // Short delay so the current failing response flushes back to caller before we exit.
+    setTimeout(() => {
+        try { app.relaunch(); } catch (e) { console.warn('[restart] app.relaunch failed:', e && e.message); }
+        try { app.exit(0); } catch (e) { console.warn('[restart] app.exit failed:', e && e.message); process.exit(0); }
+    }, 1500);
+}
+
+function isSessionLikelyExpired(err) {
+    const msg = String((err && err.message) || err || '').toUpperCase();
+    // Session/auth errors (cookie expired, login required) — reload window to restore login state.
+    if (/SESSION|TOKEN_EMPTY|TOKEN_EXPIRED|ILLEGAL_ACCESS|UNAUTHORIZED|LOGIN|CSRF|FAIL_SYS|401|403/.test(msg)) return true;
+    // Transient browser/network errors from webContents.executeJavaScript's inner fetch —
+    // reloading the window gives the renderer a fresh network context and usually succeeds on retry.
+    if (/FAILED TO FETCH|NETWORKERROR|NETWORK ERROR|ERR_NETWORK|ERR_INTERNET|ERR_CONNECTION|ERR_NAME_NOT_RESOLVED|ERR_TIMED_OUT|ETIMEDOUT|ECONNRESET|EAI_AGAIN|LOAD FAILED|ABORTED/.test(msg)) return true;
+    return false;
+}
+
+async function reloadAndWait(win, loadUrl) {
+    if (!win || win.isDestroyed()) return;
+    await new Promise((resolve) => {
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            try { win.webContents.removeListener('did-finish-load', done); } catch {}
+            resolve();
+        };
+        try { win.webContents.once('did-finish-load', done); } catch {}
+        try {
+            win.webContents.reloadIgnoringCache();
+        } catch {
+            try { win.loadURL(loadUrl); } catch {}
+        }
+        // Safety net: resolve after 10s even if did-finish-load never fires
+        setTimeout(done, 10000);
+    });
+    // Let client JS settle (cookies, tokens)
+    await new Promise(r => setTimeout(r, 1500));
+}
+
+async function reloadWindowSerialized(platform, win, loadUrl) {
+    if (reloadLocks[platform]) return reloadLocks[platform];
+    const p = reloadAndWait(win, loadUrl);
+    reloadLocks[platform] = p;
+    try { await p; } finally { reloadLocks[platform] = null; }
+    return p;
+}
+
+async function shortenShopeeOnce(productUrl, subIds) {
     const sub1 = String((subIds && subIds[0]) || '').trim()
     const sub2 = String((subIds && subIds[1]) || '').trim()
     const sub3 = String((subIds && subIds[2]) || '').trim()
@@ -321,7 +394,18 @@ async function shortenShopee(productUrl, subIds) {
                 query: 'query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }'
             })
         });
-        var json = await resp.json();
+        if (resp.status === 401 || resp.status === 403) {
+            throw new Error('HTTP ' + resp.status + ' UNAUTHORIZED (likely SESSION_EXPIRED)');
+        }
+        var text = await resp.text();
+        var json;
+        try { json = JSON.parse(text); }
+        catch (e) {
+            // HTML login page instead of JSON means the session is gone
+            var snippet = text.substring(0, 200);
+            if (/login|sign[- ]?in|csrf/i.test(snippet)) throw new Error('SESSION_EXPIRED (login page returned)');
+            throw new Error('Invalid JSON: ' + snippet);
+        }
         var results = json && json.data && json.data.batchCustomLink;
         if (!results || !results.length) throw new Error('No results: ' + JSON.stringify(json).substring(0, 200));
         var r = results[0];
@@ -337,7 +421,7 @@ async function shortenShopee(productUrl, subIds) {
     return result;
 }
 
-async function shortenLazada(productUrl) {
+async function shortenLazadaOnce(productUrl) {
     const win = createLazadaWindow();
     const currentUrl = win.webContents.getURL();
     if (!currentUrl.includes('lazada.co.th')) {
@@ -350,16 +434,110 @@ async function shortenLazada(productUrl) {
 
     if (!result) throw new Error('No result from Lazada');
 
+    // Surface explicit session errors before the "No promotionLink" fallback
+    const retText = Array.isArray(result.ret) ? result.ret.join(', ') : '';
+    if (retText && /SESSION|TOKEN_EMPTY|TOKEN_EXPIRED|ILLEGAL_ACCESS|FAIL_SYS/i.test(retText)) {
+        throw new Error(retText);
+    }
+
     // Extract from nested structure
     let d = result;
     if (result.data && typeof result.data === 'object') {
         d = result.data.data || result.data;
     }
     if (!d || !d.promotionLink) {
-        const ret = (result.ret || []).join(', ');
-        throw new Error(ret || 'No promotionLink: ' + JSON.stringify(result).substring(0, 200));
+        throw new Error(retText || 'No promotionLink: ' + JSON.stringify(result).substring(0, 200));
     }
     return d;
+}
+
+// Public wrappers with multi-attempt reactive reload on session/network errors.
+// Up to 3 attempts per request; between attempts we reload the browser window
+// and wait briefly so the renderer has a fresh network/cookie context.
+const MAX_SHORTEN_ATTEMPTS = 3;
+const BETWEEN_ATTEMPT_DELAY_MS = [0, 1500, 3500];
+
+async function shortenShopee(productUrl, subIds) {
+    activeRequests.shopee++;
+    let lastErr = null;
+    try {
+        for (let attempt = 1; attempt <= MAX_SHORTEN_ATTEMPTS; attempt++) {
+            try {
+                const result = await shortenShopeeOnce(productUrl, subIds);
+                consecutiveFailures.shopee = 0;
+                return result;
+            } catch (err) {
+                lastErr = err;
+                const recoverable = isSessionLikelyExpired(err);
+                console.warn(`[Shopee] attempt ${attempt}/${MAX_SHORTEN_ATTEMPTS} failed (${recoverable ? 'recoverable' : 'non-recoverable'}): ${err.message}`);
+                if (!recoverable || attempt === MAX_SHORTEN_ATTEMPTS) break;
+                await new Promise(r => setTimeout(r, BETWEEN_ATTEMPT_DELAY_MS[attempt] || 3500));
+                await reloadWindowSerialized('shopee', createShopeeWindow(), SHOPEE_URL);
+            }
+        }
+        consecutiveFailures.shopee++;
+        if (consecutiveFailures.shopee >= FAILURES_BEFORE_RESTART) {
+            triggerAppRestartIfStuck('shopee');
+        }
+        throw lastErr;
+    } finally {
+        activeRequests.shopee = Math.max(0, activeRequests.shopee - 1);
+    }
+}
+
+async function shortenLazada(productUrl) {
+    activeRequests.lazada++;
+    let lastErr = null;
+    try {
+        for (let attempt = 1; attempt <= MAX_SHORTEN_ATTEMPTS; attempt++) {
+            try {
+                const result = await shortenLazadaOnce(productUrl);
+                consecutiveFailures.lazada = 0;
+                return result;
+            } catch (err) {
+                lastErr = err;
+                const recoverable = isSessionLikelyExpired(err);
+                console.warn(`[Lazada] attempt ${attempt}/${MAX_SHORTEN_ATTEMPTS} failed (${recoverable ? 'recoverable' : 'non-recoverable'}): ${err.message}`);
+                if (!recoverable || attempt === MAX_SHORTEN_ATTEMPTS) break;
+                await new Promise(r => setTimeout(r, BETWEEN_ATTEMPT_DELAY_MS[attempt] || 3500));
+                await reloadWindowSerialized('lazada', createLazadaWindow(), LAZADA_URL);
+            }
+        }
+        consecutiveFailures.lazada++;
+        if (consecutiveFailures.lazada >= FAILURES_BEFORE_RESTART) {
+            triggerAppRestartIfStuck('lazada');
+        }
+        throw lastErr;
+    } finally {
+        activeRequests.lazada = Math.max(0, activeRequests.lazada - 1);
+    }
+}
+
+// Periodic refresh — keep cookies warm so CRON shortlinks never hit a cold session.
+// Lowered from 20m to 10m because 20m was occasionally long enough for the renderer
+// to enter a bad network state (manifests as "Failed to fetch" in the inner fetch()).
+const REFRESH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+function schedulePeriodicRefresh(platform, getWin, loadUrl, offsetMs = 0) {
+    setTimeout(() => {
+        setInterval(async () => {
+            const win = getWin();
+            if (!win || win.isDestroyed()) return;
+            if (activeRequests[platform] > 0) {
+                console.log(`[${platform}] periodic refresh skipped (active=${activeRequests[platform]})`);
+                return;
+            }
+            if (reloadLocks[platform]) {
+                console.log(`[${platform}] periodic refresh skipped (reload already in progress)`);
+                return;
+            }
+            console.log(`[${platform}] periodic refresh (every ${REFRESH_INTERVAL_MS / 60000}m)`);
+            try {
+                await reloadWindowSerialized(platform, win, loadUrl);
+            } catch (e) {
+                console.warn(`[${platform}] periodic refresh failed:`, e.message || e);
+            }
+        }, REFRESH_INTERVAL_MS);
+    }, offsetMs);
 }
 
 function extractMemberId(data) {
@@ -581,6 +759,11 @@ app.on('ready', () => {
 
     // Update tray status periodically
     setInterval(updateTrayMenu, 10000);
+
+    // Periodic refresh keeps session cookies warm for CRON shortlinks.
+    // Offset Lazada by 10 min so both windows never reload simultaneously.
+    schedulePeriodicRefresh('shopee', () => shopeeWindow, SHOPEE_URL, 0);
+    schedulePeriodicRefresh('lazada', () => lazadaWindow, LAZADA_URL, REFRESH_INTERVAL_MS / 2);
 
     console.log('Ready! Shopee + Lazada browsers open, API on port ' + API_PORT);
 });

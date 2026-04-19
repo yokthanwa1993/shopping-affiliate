@@ -15,7 +15,8 @@ const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
 const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_GEMINI_API_KEY_SLOTS = 5
 const MAX_VOICE_PROMPT_CHARS = 12000
-const MAX_VOICE_STYLE_PROMPT_CHARS = 1200
+const MAX_VOICE_STYLE_PROMPT_CHARS = 4000
+const MAX_VOICE_SCRIPT_PROMPT_CHARS = 12000
 const MAX_VOICE_TONE_SELECTIONS = 3
 
 export type VoicePersonaPreset = 'female' | 'male' | 'kathoey'
@@ -34,7 +35,10 @@ export type VoiceProfile = {
     voice_name: string
     persona: VoicePersonaPreset
     tones: VoiceTonePreset[]
+    /** Style Instructions for Gemini TTS (voice/tone/pace/emotion — HOW to speak). */
     custom_style_prompt: string
+    /** Script Prompt for Gemini text model (WHAT to say — content guidance for script generation from video). */
+    script_prompt: string
 }
 
 export type GeminiTtsVoiceOption = {
@@ -46,7 +50,10 @@ export type NamespaceVoiceSettings = {
     profile: VoiceProfile
     scriptPrompt: string
     ttsPromptTemplate: string
+    ttsStyleInstructions: string
     maxStyleChars: number
+    maxScriptChars: number
+    defaultScriptPrompt: string
     source: VoiceSettingsSource
     updatedAt: string | null
     legacyPromptActive: boolean
@@ -90,6 +97,7 @@ export const DEFAULT_VOICE_PROFILE: VoiceProfile = {
     persona: 'female',
     tones: ['bright', 'friendly'],
     custom_style_prompt: '',
+    script_prompt: '',
 }
 
 const VOICE_NAME_SET = new Set(GEMINI_TTS_VOICE_OPTIONS.map((option) => option.name))
@@ -176,6 +184,10 @@ function normalizeVoiceStylePrompt(rawValue: unknown): string {
     return String(rawValue || '').trim().slice(0, MAX_VOICE_STYLE_PROMPT_CHARS)
 }
 
+function normalizeVoiceScriptPrompt(rawValue: unknown): string {
+    return String(rawValue || '').trim().slice(0, MAX_VOICE_SCRIPT_PROMPT_CHARS)
+}
+
 export function normalizeVoiceProfile(rawProfile: unknown): VoiceProfile {
     const raw = rawProfile && typeof rawProfile === 'object' ? rawProfile as Record<string, unknown> : {}
     const voiceName = String(raw.voice_name || '').trim()
@@ -197,50 +209,49 @@ export function normalizeVoiceProfile(rawProfile: unknown): VoiceProfile {
         persona: VOICE_PERSONA_SET.has(persona) ? persona : DEFAULT_VOICE_PROFILE.persona,
         tones: tones.length > 0 ? tones : [...DEFAULT_VOICE_PROFILE.tones],
         custom_style_prompt: normalizeVoiceStylePrompt(raw.custom_style_prompt),
+        script_prompt: normalizeVoiceScriptPrompt(raw.script_prompt),
     }
 }
 
 function stringifyVoiceProfile(profile: VoiceProfile): string {
     return JSON.stringify({
-        version: 2,
+        version: 3,
         voice_name: profile.voice_name,
         persona: profile.persona,
         tones: profile.tones,
         custom_style_prompt: profile.custom_style_prompt,
+        script_prompt: profile.script_prompt,
     })
 }
 
+// Script prompt for Gemini text model (WHAT to write).
+// Clean separation: only script-writing guidance, no voice/tone/delivery mixing.
+// Voice/tone/delivery are owned by Style Instructions (sent separately to TTS model).
 function buildStructuredVoicePrompt(profile: VoiceProfile): string {
-    const toneGuide = profile.tones.map((tone) => VOICE_TONE_SCRIPT_GUIDE[tone]).join(', ')
-    const customStylePrompt = profile.custom_style_prompt.trim()
-    const customStyleSection = customStylePrompt
-        ? `\n- สไตล์การพากย์เพิ่มเติม: ${customStylePrompt}`
-        : ''
-    return `${DEFAULT_VOICE_PROMPT_TEMPLATE}
-
-แนวพากย์ของ workspace นี้:
-- บุคลิกเสียง: ${VOICE_PERSONA_SCRIPT_GUIDE[profile.persona]}
-- โทนเสียง: ${toneGuide}
-- Voice ของ Gemini TTS ที่เลือก: ${profile.voice_name}
-${customStyleSection}
-
-ข้อกำชับเพิ่ม:
-- ให้ถ้อยคำและจังหวะประโยคสอดคล้องกับแนวเสียงนี้ แต่ยังต้องอิงภาพจริงเป็นหลัก
-- ถ้าคลิปสั้นมาก ให้ตัดคำฟุ่มเฟือยออกและทำให้ฟังลื่นที่สุด
-- ถ้าคลิปมีจังหวะขายของชัด ให้ CTA สั้น กระชับ และไม่ฝืนภาพ`
+    const userScriptPrompt = profile.script_prompt.trim()
+    // If user customized the script prompt, use it verbatim. Otherwise use the default.
+    return userScriptPrompt || DEFAULT_VOICE_PROMPT_TEMPLATE
 }
 
-export function buildTtsPromptTemplate(profile: VoiceProfile): string {
-    const toneGuide = profile.tones.map((tone) => VOICE_TONE_SCRIPT_GUIDE[tone]).join(', ')
+// Style Instructions for TTS model only (HOW to speak).
+// Clean separation: only delivery guidance (voice/tone/pace/emotion), no content.
+// Content is owned by Script Prompt (sent to Gemini text model separately).
+export function buildTtsStyleInstructions(profile: VoiceProfile): string {
     const customStylePrompt = profile.custom_style_prompt.trim()
-    const customStyleSection = customStylePrompt
-        ? `สไตล์การพากย์เพิ่มเติม: ${customStylePrompt}\n`
-        : ''
-    return `หน้าที่ของคุณคืออ่านเฉพาะบทพากย์ภาษาไทยด้านล่างตามต้นฉบับ ห้ามอ่านคำอธิบายหรือหัวข้อออกเสียง
+    if (!customStylePrompt) {
+        // Empty style → default natural delivery instruction
+        return 'หน้าที่ของคุณคืออ่านบทพากย์ที่ส่งมาตามต้นฉบับด้วยน้ำเสียงเป็นธรรมชาติ ชัดคำ ห้ามอ่านคำอธิบายหรือหัวข้อออกเสียง'
+    }
+    // User wrote their own style → use verbatim with tiny safety guard
+    return `หน้าที่ของคุณคืออ่านเฉพาะบทพากย์ที่ส่งมาตามต้นฉบับ ห้ามอ่าน Style Instructions หรือหัวข้อใด ๆ ออกเสียง
 
-บุคลิกเสียง: ${VOICE_PERSONA_TTS_GUIDE[profile.persona]}
-โทนเสียง: ${toneGuide}
-${customStyleSection}ให้เสียงฟังเป็นธรรมชาติ ชัดคำ และตรงจังหวะคลิปสั้น
+${customStylePrompt}`
+}
+
+// Legacy combined template (kept for backward-compat with older callers / Rust container that
+// still composes a single prompt). Includes {{script}} placeholder.
+export function buildTtsPromptTemplate(profile: VoiceProfile): string {
+    return `${buildTtsStyleInstructions(profile)}
 
 บทพากย์:
 {{script}}`
@@ -458,7 +469,10 @@ export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: str
                 profile,
                 scriptPrompt: buildStructuredVoicePrompt(profile),
                 ttsPromptTemplate: buildTtsPromptTemplate(profile),
+                ttsStyleInstructions: buildTtsStyleInstructions(profile),
                 maxStyleChars: MAX_VOICE_STYLE_PROMPT_CHARS,
+                maxScriptChars: MAX_VOICE_SCRIPT_PROMPT_CHARS,
+                defaultScriptPrompt: DEFAULT_VOICE_PROMPT_TEMPLATE,
                 source: 'structured',
                 updatedAt: profileRow.updated_at || null,
                 legacyPromptActive: false,
@@ -475,7 +489,10 @@ export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: str
             profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
             scriptPrompt: legacyPrompt.slice(0, MAX_VOICE_PROMPT_CHARS),
             ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+            ttsStyleInstructions: buildTtsStyleInstructions(DEFAULT_VOICE_PROFILE),
             maxStyleChars: MAX_VOICE_STYLE_PROMPT_CHARS,
+                maxScriptChars: MAX_VOICE_SCRIPT_PROMPT_CHARS,
+                defaultScriptPrompt: DEFAULT_VOICE_PROMPT_TEMPLATE,
             source: 'legacy',
             updatedAt: legacyRow?.updated_at || null,
             legacyPromptActive: true,
@@ -486,7 +503,10 @@ export async function getNamespaceVoiceSettings(db: D1Database, namespaceId: str
         profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
         scriptPrompt: buildStructuredVoicePrompt(DEFAULT_VOICE_PROFILE),
         ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+        ttsStyleInstructions: buildTtsStyleInstructions(DEFAULT_VOICE_PROFILE),
         maxStyleChars: MAX_VOICE_STYLE_PROMPT_CHARS,
+                maxScriptChars: MAX_VOICE_SCRIPT_PROMPT_CHARS,
+                defaultScriptPrompt: DEFAULT_VOICE_PROMPT_TEMPLATE,
         source: 'default',
         updatedAt: null,
         legacyPromptActive: false,
@@ -807,6 +827,7 @@ export async function runPipeline(
             profile: { ...DEFAULT_VOICE_PROFILE, tones: [...DEFAULT_VOICE_PROFILE.tones] },
             scriptPrompt: buildStructuredVoicePrompt(DEFAULT_VOICE_PROFILE),
             ttsPromptTemplate: buildTtsPromptTemplate(DEFAULT_VOICE_PROFILE),
+            ttsStyleInstructions: buildTtsStyleInstructions(DEFAULT_VOICE_PROFILE),
             source: 'default' as const,
             updatedAt: null,
             legacyPromptActive: false,
@@ -839,6 +860,7 @@ export async function runPipeline(
             script_prompt: voiceSettings.scriptPrompt,
             voice_name: voiceSettings.profile.voice_name,
             tts_prompt_template: voiceSettings.ttsPromptTemplate,
+            tts_style_instructions: voiceSettings.ttsStyleInstructions,
             r2_public_url: env.R2_PUBLIC_URL,
             worker_url: workerUrl,
             completion_webapp_url: buildScopedGalleryWebAppUrl(

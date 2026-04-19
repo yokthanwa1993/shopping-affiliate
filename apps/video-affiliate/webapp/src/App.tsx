@@ -610,20 +610,30 @@ type CoverTextFontId =
   | 'krub-bold'
   | 'chakra-petch-bold'
   | 'ibm-plex-sans-thai-bold'
+  | 'psl-x-omyim-bold'
+
+type CoverTextStyleMode = 'box' | 'outline'
 
 type VoiceProfile = {
   voice_name: string
   persona: VoicePersonaPreset
   tones: VoiceTonePreset[]
+  /** Style Instructions for TTS (HOW to speak). */
   custom_style_prompt: string
+  /** Script Prompt for text model (WHAT to write from video). */
+  script_prompt: string
 }
 
 type CoverTextStyleSettings = {
   font_id: CoverTextFontId
   text_color: string
+  secondary_text_color: string
   background_color: string
   background_opacity: number
   size_scale: number
+  mode: CoverTextStyleMode
+  outline_color: string
+  outline_width: number
 }
 
 type GeminiVoiceOption = {
@@ -636,14 +646,19 @@ const DEFAULT_VOICE_PROFILE: VoiceProfile = {
   persona: 'female',
   tones: ['bright', 'friendly'],
   custom_style_prompt: '',
+  script_prompt: '',
 }
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
 const DEFAULT_COVER_TEXT_STYLE: CoverTextStyleSettings = {
   font_id: 'kanit-bold',
   text_color: '#FFFFFF',
+  secondary_text_color: '#FFFFFF',
   background_color: '#E53935',
   background_opacity: 0.94,
   size_scale: 1,
+  mode: 'box',
+  outline_color: '#000000',
+  outline_width: 8,
 }
 
 const COVER_TEXT_FONT_OPTIONS: Array<{ value: CoverTextFontId; label: string; hint: string; family: string }> = [
@@ -655,6 +670,12 @@ const COVER_TEXT_FONT_OPTIONS: Array<{ value: CoverTextFontId; label: string; hi
   { value: 'krub-bold', label: 'Krub Bold', hint: 'มินิมอล อ่านง่าย ดูสะอาด', family: 'Krub' },
   { value: 'chakra-petch-bold', label: 'Chakra Petch Bold', hint: 'เหลี่ยมเท่ มีคาแรกเตอร์', family: 'Chakra Petch' },
   { value: 'ibm-plex-sans-thai-bold', label: 'IBM Plex Sans Thai Bold', hint: 'คม เนี้ยบ สไตล์มืออาชีพ', family: 'IBM Plex Sans Thai' },
+  { value: 'psl-x-omyim-bold', label: 'PSL x Omyim Bold', hint: 'กลมป๋อง สไตล์ TikTok/Reel ยอดนิยม', family: 'PSL x Omyim' },
+]
+
+const COVER_TEXT_STYLE_MODE_OPTIONS: Array<{ value: CoverTextStyleMode; label: string; hint: string }> = [
+  { value: 'box', label: 'กล่องพื้นหลัง', hint: 'ตัวอักษรในกรอบสี (สไตล์เดิม)' },
+  { value: 'outline', label: 'ขอบตัดดำ (ไม่มีกรอบ)', hint: 'ตัวอักษรมีขอบหนาล้อม ไม่มีพื้นหลัง — สไตล์ไวรัล TikTok' },
 ]
 
 const createDefaultVoiceProfile = (): VoiceProfile => ({
@@ -677,24 +698,44 @@ const normalizeCoverTextFontId = (value: unknown): CoverTextFontId =>
 const getCoverTextFontFamily = (fontId: CoverTextFontId) =>
   COVER_TEXT_FONT_OPTIONS.find((option) => option.value === fontId)?.family || 'Kanit'
 
-const normalizeCoverTextStyle = (raw: Partial<CoverTextStyleSettings> | null | undefined): CoverTextStyleSettings => ({
-  font_id: normalizeCoverTextFontId(raw?.font_id),
-  text_color: normalizeCoverHexColor(raw?.text_color, DEFAULT_COVER_TEXT_STYLE.text_color),
-  background_color: normalizeCoverHexColor(raw?.background_color, DEFAULT_COVER_TEXT_STYLE.background_color),
-  background_opacity: Number.isFinite(raw?.background_opacity)
-    ? Math.max(0, Math.min(1, Math.round(Number(raw?.background_opacity) * 100) / 100))
-    : DEFAULT_COVER_TEXT_STYLE.background_opacity,
-  size_scale: Number.isFinite(raw?.size_scale)
-    ? Math.max(0.8, Math.min(1.35, Math.round(Number(raw?.size_scale) * 100) / 100))
-    : DEFAULT_COVER_TEXT_STYLE.size_scale,
-})
+const normalizeCoverTextStyleMode = (value: unknown): CoverTextStyleMode =>
+  value === 'outline' ? 'outline' : 'box'
+
+const normalizeCoverTextStyleOutlineWidth = (value: unknown): number => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return DEFAULT_COVER_TEXT_STYLE.outline_width
+  return Math.max(0, Math.min(40, Math.round(parsed)))
+}
+
+const normalizeCoverTextStyle = (raw: Partial<CoverTextStyleSettings> | null | undefined): CoverTextStyleSettings => {
+  const primary = normalizeCoverHexColor(raw?.text_color, DEFAULT_COVER_TEXT_STYLE.text_color)
+  return {
+    font_id: normalizeCoverTextFontId(raw?.font_id),
+    text_color: primary,
+    secondary_text_color: normalizeCoverHexColor(raw?.secondary_text_color, primary),
+    background_color: normalizeCoverHexColor(raw?.background_color, DEFAULT_COVER_TEXT_STYLE.background_color),
+    background_opacity: Number.isFinite(raw?.background_opacity)
+      ? Math.max(0, Math.min(1, Math.round(Number(raw?.background_opacity) * 100) / 100))
+      : DEFAULT_COVER_TEXT_STYLE.background_opacity,
+    size_scale: Number.isFinite(raw?.size_scale)
+      ? Math.max(0.8, Math.min(1.35, Math.round(Number(raw?.size_scale) * 100) / 100))
+      : DEFAULT_COVER_TEXT_STYLE.size_scale,
+    mode: normalizeCoverTextStyleMode(raw?.mode),
+    outline_color: normalizeCoverHexColor(raw?.outline_color, DEFAULT_COVER_TEXT_STYLE.outline_color),
+    outline_width: normalizeCoverTextStyleOutlineWidth(raw?.outline_width),
+  }
+}
 
 const coverTextStylesEqual = (left: CoverTextStyleSettings, right: CoverTextStyleSettings) =>
   left.font_id === right.font_id &&
   left.text_color === right.text_color &&
+  left.secondary_text_color === right.secondary_text_color &&
   left.background_color === right.background_color &&
   left.background_opacity === right.background_opacity &&
-  left.size_scale === right.size_scale
+  left.size_scale === right.size_scale &&
+  left.mode === right.mode &&
+  left.outline_color === right.outline_color &&
+  left.outline_width === right.outline_width
 
 const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
   const fontLabel = COVER_TEXT_FONT_OPTIONS.find((option) => option.value === style.font_id)?.label || style.font_id
@@ -732,7 +773,8 @@ const normalizeVoiceProfile = (raw: Partial<VoiceProfile> | null | undefined): V
     voice_name: voiceName,
     persona: VOICE_PERSONA_OPTIONS.some((option) => option.value === persona) ? persona as VoicePersonaPreset : DEFAULT_VOICE_PROFILE.persona,
     tones: uniqueTones.length > 0 ? uniqueTones : [...DEFAULT_VOICE_PROFILE.tones],
-    custom_style_prompt: String(raw?.custom_style_prompt || '').trim().slice(0, 1200),
+    custom_style_prompt: String(raw?.custom_style_prompt || '').trim().slice(0, 4000),
+    script_prompt: String(raw?.script_prompt || '').trim().slice(0, 12000),
   }
 }
 
@@ -3067,7 +3109,9 @@ function App({
   const [voiceSettingsLoading, setVoiceSettingsLoading] = useState(false)
   const [voiceSettingsSaving, setVoiceSettingsSaving] = useState(false)
   const [voiceOptions, setVoiceOptions] = useState<GeminiVoiceOption[]>([])
-  const [voiceStylePromptMaxChars, setVoiceStylePromptMaxChars] = useState(1200)
+  const [voiceStylePromptMaxChars, setVoiceStylePromptMaxChars] = useState(4000)
+  const [voiceScriptPromptMaxChars, setVoiceScriptPromptMaxChars] = useState(12000)
+  const [voiceScriptPromptDefault, setVoiceScriptPromptDefault] = useState('')
   const [legacyVoicePromptActive, setLegacyVoicePromptActive] = useState(false)
   const [voicePreviewUrl, setVoicePreviewUrl] = useState('')
   const [voicePreviewLoading, setVoicePreviewLoading] = useState(false)
@@ -3087,6 +3131,7 @@ function App({
   const [commentTemplateSaving, setCommentTemplateSaving] = useState(false)
   const [commentTemplateMaxChars, setCommentTemplateMaxChars] = useState(4000)
   const copiedIdentityTimerRef = useRef<number | null>(null)
+  const voiceStyleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [geminiApiKeyDrafts, setGeminiApiKeyDrafts] = useState<string[]>(() => createEmptyGeminiKeySlots())
   const [geminiApiKeyMaskedList, setGeminiApiKeyMaskedList] = useState<string[]>(() => createEmptyGeminiKeySlots())
   const [geminiApiKeySource, setGeminiApiKeySource] = useState<GeminiKeySource>('none')
@@ -3706,6 +3751,15 @@ function App({
       return false
     }
 
+    const isEditableTarget = (target: EventTarget | null) => {
+      const el = target instanceof HTMLElement ? target : null
+      if (!el) return false
+      const tag = el.tagName
+      if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') return true
+      if (el.isContentEditable) return true
+      return !!el.closest('textarea, input, select, [contenteditable="true"], [contenteditable=""]')
+    }
+
     const handleTouchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
         lastTouchY = e.touches[0].clientY
@@ -3715,6 +3769,9 @@ function App({
     const handleTouchMove = (e: TouchEvent) => {
       if (e.touches.length !== 1) return
       if (allowsNativeHorizontalGesture(e.target)) return
+      // Let native iOS/Android handle text selection, caret drag, magnifier
+      // inside inputs/textareas/contenteditable.
+      if (isEditableTarget(e.target)) return
 
       const currentY = e.touches[0].clientY
       const deltaY = currentY - lastTouchY
@@ -4826,8 +4883,14 @@ function App({
     const params = new URLSearchParams()
     params.set('date', logDateFilter)
     params.set('limit', '100')
+    // Cache-bust on forced refresh (e.g. after delete/retry) so the worker's
+    // Cache-Control: max-age=15 header doesn't keep serving the stale row.
+    if (force) params.set('_t', String(Date.now()))
     try {
-      const historyResp = await apiFetch(`${WORKER_URL}/api/post-history?${params.toString()}`)
+      const historyResp = await apiFetch(
+        `${WORKER_URL}/api/post-history?${params.toString()}`,
+        force ? { cache: 'no-store' } : {},
+      )
       if (historyResp.status === 401) {
         await recoverSessionOrLogout()
         return
@@ -4968,6 +5031,8 @@ function App({
         legacy_prompt_active?: boolean
         voice_options?: GeminiVoiceOption[]
         max_style_chars?: number
+        max_script_chars?: number
+        default_script_prompt?: string
       }
       const nextProfile = normalizeVoiceProfile(data.profile)
       setVoiceProfile(nextProfile)
@@ -4977,6 +5042,8 @@ function App({
       setLegacyVoicePromptActive(!!data.legacy_prompt_active || data.source === 'legacy')
       setVoiceOptions(Array.isArray(data.voice_options) ? data.voice_options : [])
       if (typeof data.max_style_chars === 'number' && data.max_style_chars > 0) setVoiceStylePromptMaxChars(data.max_style_chars)
+      if (typeof data.max_script_chars === 'number' && data.max_script_chars > 0) setVoiceScriptPromptMaxChars(data.max_script_chars)
+      if (typeof data.default_script_prompt === 'string') setVoiceScriptPromptDefault(data.default_script_prompt)
       setVoiceSettingsMessage('')
     } catch {
       setVoiceSettingsMessage('โหลดเสียงพากย์ไม่สำเร็จ')
@@ -6769,9 +6836,26 @@ function App({
                               onClick={async (e) => {
                                 e.stopPropagation()
                                 setDeletingLogId(item.id)
+                                // Optimistic removal — hide the row immediately so the user
+                                // sees feedback even before the server refresh lands.
+                                const snapshot = postHistory
+                                setPostHistory((prev) => prev.filter((row) => row.id !== item.id))
                                 try {
-                                  await apiFetch(`${WORKER_URL}/api/post-history/${item.id}`, { method: 'DELETE' })
+                                  const resp = await apiFetch(
+                                    `${WORKER_URL}/api/post-history/${item.id}`,
+                                    { method: 'DELETE' },
+                                  )
+                                  if (!resp.ok) {
+                                    // Roll back optimistic removal and surface the error
+                                    setPostHistory(snapshot)
+                                    const text = await resp.text().catch(() => '')
+                                    alert(`ลบไม่สำเร็จ (${resp.status})${text ? `\n${text.slice(0, 160)}` : ''}`)
+                                    return
+                                  }
                                   await refreshPostHistorySnapshot({ force: true })
+                                } catch (err) {
+                                  setPostHistory(snapshot)
+                                  alert(err instanceof Error ? err.message : 'ลบไม่สำเร็จ')
                                 } finally {
                                   setDeletingLogId(null)
                                 }
@@ -7631,10 +7715,7 @@ function App({
 
                 {settingsSection === 'voice' && (
                   <div className="space-y-3">
-                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
-                      <p className="text-xs text-gray-500 leading-relaxed">
-                        ตั้งค่าเสียงของ workspace นี้ได้เลย งานถัดไปจะใช้ทันที โดยเลือก `voice_name` ของ Gemini จริง พร้อม preset น้ำเสียงของระบบ และใส่ prompt เพิ่มเติมได้เองว่าต้องการให้พากย์สไตล์ไหน
-                      </p>
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-4">
                       {voiceSettingsLoading ? (
                         <p className="text-sm text-gray-400 py-3">กำลังโหลดเสียงพากย์...</p>
                       ) : (
@@ -7645,117 +7726,38 @@ function App({
                             </div>
                           )}
 
-                          <div className="space-y-1">
-                            <p className="text-[11px] font-semibold text-gray-600">Gemini voice</p>
-                            <select
-                              value={voiceProfileDraft.voice_name}
-                              onChange={(e) => {
-                                setVoiceProfileDraft((prev) => ({ ...prev, voice_name: e.target.value }))
-                                if (voiceSettingsMessage) setVoiceSettingsMessage('')
-                              }}
-                              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                            >
-                              {(voiceOptions.length > 0 ? voiceOptions : [{ name: 'Puck', descriptor: 'Upbeat' }]).map((option) => (
-                                <option key={option.name} value={option.name}>
-                                  {option.name} • {option.descriptor}
-                                </option>
-                              ))}
-                            </select>
-                            <p className="text-[11px] text-gray-400">
-                              เสียงจริงจาก Gemini: {getVoiceOptionMeta(voiceProfileDraft.voice_name, voiceOptions)?.descriptor || 'Upbeat'}
-                            </p>
-                          </div>
-
-                          <div className="space-y-2">
-                            <p className="text-[11px] font-semibold text-gray-600">เพศเสียง</p>
-                            <div className="grid grid-cols-3 gap-2">
-                              {VOICE_PERSONA_OPTIONS.map((option) => {
-                                const active = voiceProfileDraft.persona === option.value
-                                return (
-                                  <button
-                                    key={option.value}
-                                    type="button"
-                                    onClick={() => {
-                                      setVoiceProfileDraft((prev) => ({ ...prev, persona: option.value }))
-                                      if (voiceSettingsMessage) setVoiceSettingsMessage('')
-                                    }}
-                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-700'}`}
-                                  >
-                                    <p className="text-sm font-semibold">{option.label}</p>
-                                    <p className="text-[11px] text-gray-400">{option.hint}</p>
-                                  </button>
-                                )
-                              })}
-                            </div>
-                            <p className="text-[11px] text-gray-400">ตัวเลือกนี้เป็น preset ของระบบเพื่อกำกับคาแรกเตอร์ ไม่ใช่ field gender ตรงของ Google</p>
-                          </div>
-
+                          {/* Style Instructions — ช่องเดียว สำหรับ TTS */}
                           <div className="space-y-2">
                             <div className="flex items-center justify-between">
-                              <p className="text-[11px] font-semibold text-gray-600">โทนเสียง</p>
-                              <p className="text-[11px] text-gray-400">เลือกได้สูงสุด 3</p>
-                            </div>
-                            <div className="flex flex-wrap gap-2">
-                              {VOICE_TONE_OPTIONS.map((option) => {
-                                const active = voiceProfileDraft.tones.includes(option.value)
-                                const limitReached = !active && voiceProfileDraft.tones.length >= 3
-                                return (
-                                  <button
-                                    key={option.value}
-                                    type="button"
-                                    onClick={() => {
-                                      setVoiceProfileDraft((prev) => {
-                                        const exists = prev.tones.includes(option.value)
-                                        if (exists) {
-                                          if (prev.tones.length === 1) return prev
-                                          return { ...prev, tones: prev.tones.filter((tone) => tone !== option.value) }
-                                        }
-                                        if (prev.tones.length >= 3) return prev
-                                        return { ...prev, tones: [...prev.tones, option.value] }
-                                      })
-                                      if (voiceSettingsMessage) setVoiceSettingsMessage('')
-                                    }}
-                                    disabled={limitReached}
-                                    className={`rounded-full border px-3 py-1.5 text-[12px] font-semibold transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-600'} ${limitReached ? 'opacity-40' : ''}`}
-                                  >
-                                    {active ? '✓ ' : ''}{option.label}
-                                  </button>
-                                )
-                              })}
-                            </div>
-                          </div>
-
-                          <div className="space-y-2">
-                            <div className="flex items-center justify-between">
-                              <p className="text-[11px] font-semibold text-gray-600">Prompt เพิ่มเติมสำหรับการพากย์</p>
+                              <p className="text-[11px] font-semibold text-gray-600">Style Instructions</p>
                               <p className={`text-[11px] ${voiceProfileDraft.custom_style_prompt.length > voiceStylePromptMaxChars ? 'text-red-500' : 'text-gray-400'}`}>
                                 {voiceProfileDraft.custom_style_prompt.length}/{voiceStylePromptMaxChars}
                               </p>
                             </div>
                             <textarea
-                              value={voiceProfileDraft.custom_style_prompt}
-                              onChange={(e) => {
-                                const nextValue = e.target.value.slice(0, voiceStylePromptMaxChars)
-                                setVoiceProfileDraft((prev) => ({ ...prev, custom_style_prompt: nextValue }))
+                              ref={voiceStyleTextareaRef}
+                              key={`voice-style-${voiceSettingsUpdatedAt || 'init'}`}
+                              defaultValue={voiceProfileDraft.custom_style_prompt}
+                              onInput={(e) => {
+                                const target = e.currentTarget
+                                let nextValue = target.value
+                                if (nextValue.length > voiceStylePromptMaxChars) {
+                                  nextValue = nextValue.slice(0, voiceStylePromptMaxChars)
+                                  target.value = nextValue
+                                }
+                                setVoiceProfileDraft((prev) => prev.custom_style_prompt === nextValue ? prev : { ...prev, custom_style_prompt: nextValue })
                                 if (voiceSettingsMessage) setVoiceSettingsMessage('')
                               }}
-                              rows={4}
-                              placeholder="เช่น พากย์แบบพรีเมียม สุภาพ แต่มีแรงขายเนียน ๆ หรือ พากย์แบบเพื่อนแนะนำของดี น้ำเสียงสดใส ไม่อ่านแข็ง"
-                              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-3 text-sm outline-none focus:border-blue-400 resize-none"
+                              rows={24}
+                              placeholder="เขียนสไตล์ที่นี่..."
+                              autoComplete="off"
+                              autoCorrect="off"
+                              spellCheck={false}
+                              style={{ WebkitUserSelect: 'text', userSelect: 'text', WebkitTouchCallout: 'default', touchAction: 'auto' }}
+                              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-3 text-sm outline-none focus:border-blue-400 resize-none leading-relaxed min-h-[460px]"
                             />
-                            <p className="text-[11px] text-gray-400">
-                              ใส่สไตล์เฉพาะที่อยากให้ AI ใช้ตอนเขียนบทและตอนอ่านพากย์ เช่น ความขาย, ความขี้เล่น, ความพรีเมียม, ความเป็นกันเอง หรือคำต้องห้าม
-                            </p>
                           </div>
 
-                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
-                            <p>ใช้ค่าแยกตาม workspace นี้</p>
-                            <p>Google Gemini TTS ใช้ `voice_name` จริง ส่วนเพศเสียง/โทนเสียงและ prompt เพิ่มเติม จะถูกเอาไปกำกับทั้งการเขียนบทและน้ำเสียงตอนพากย์</p>
-                          </div>
-
-                          {voiceSettingsUpdatedAt && (
-                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(voiceSettingsUpdatedAt).toLocaleString()}</p>
-                          )}
                           {voicePreviewUrl && (
                             <audio
                               id="voice-preview-audio"
@@ -7848,6 +7850,29 @@ function App({
                             </div>
                           </div>
 
+                          <div className="space-y-2">
+                            <p className="text-[11px] font-semibold text-gray-600">สไตล์ปก</p>
+                            <div className="grid grid-cols-2 gap-2">
+                              {COVER_TEXT_STYLE_MODE_OPTIONS.map((opt) => {
+                                const active = coverTextStyleDraft.mode === opt.value
+                                return (
+                                  <button
+                                    key={opt.value}
+                                    type="button"
+                                    onClick={() => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, mode: opt.value }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className={`rounded-xl border px-3 py-2.5 text-left transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-gray-50 text-gray-700'}`}
+                                  >
+                                    <p className="text-xs font-bold">{opt.label}</p>
+                                    <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{opt.hint}</p>
+                                  </button>
+                                )
+                              })}
+                            </div>
+                          </div>
+
                           <div className="grid grid-cols-2 gap-3">
                             <label className="space-y-1">
                               <span className="text-[11px] font-semibold text-gray-600">สีตัวหนังสือ</span>
@@ -7864,43 +7889,111 @@ function App({
                                 <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.text_color}</span>
                               </div>
                             </label>
-                            <label className="space-y-1">
-                              <span className="text-[11px] font-semibold text-gray-600">พื้นหลังข้อความ</span>
-                              <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
-                                <input
-                                  type="color"
-                                  value={coverTextStyleDraft.background_color}
-                                  onChange={(e) => {
-                                    setCoverTextStyleDraft((prev) => ({ ...prev, background_color: normalizeCoverHexColor(e.target.value, prev.background_color) }))
-                                    if (coverTextStyleMessage) setCoverTextStyleMessage('')
-                                  }}
-                                  className="h-8 w-10 rounded border-0 bg-transparent p-0"
-                                />
-                                <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.background_color}</span>
-                              </div>
-                            </label>
+                            {coverTextStyleDraft.mode === 'outline' ? (
+                              <label className="space-y-1">
+                                <span className="text-[11px] font-semibold text-gray-600">สีขอบตัวอักษร</span>
+                                <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                                  <input
+                                    type="color"
+                                    value={coverTextStyleDraft.outline_color}
+                                    onChange={(e) => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, outline_color: normalizeCoverHexColor(e.target.value, prev.outline_color) }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className="h-8 w-10 rounded border-0 bg-transparent p-0"
+                                  />
+                                  <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.outline_color}</span>
+                                </div>
+                              </label>
+                            ) : (
+                              <label className="space-y-1">
+                                <span className="text-[11px] font-semibold text-gray-600">พื้นหลังข้อความ</span>
+                                <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                                  <input
+                                    type="color"
+                                    value={coverTextStyleDraft.background_color}
+                                    onChange={(e) => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, background_color: normalizeCoverHexColor(e.target.value, prev.background_color) }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className="h-8 w-10 rounded border-0 bg-transparent p-0"
+                                  />
+                                  <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.background_color}</span>
+                                </div>
+                              </label>
+                            )}
                           </div>
 
-                          <div className="space-y-2">
-                            <div className="flex items-center justify-between">
-                              <p className="text-[11px] font-semibold text-gray-600">ความโปร่งใสพื้นหลัง</p>
-                              <p className="text-[11px] text-gray-400">{Math.round(coverTextStyleDraft.background_opacity * 100)}%</p>
+                          {coverTextStyleDraft.mode === 'outline' ? (
+                            <div className="space-y-3">
+                              <label className="space-y-1 block">
+                                <span className="text-[11px] font-semibold text-gray-600">สีบรรทัดที่ 2+ (ถ้าอยากให้ต่างจากบรรทัดแรก)</span>
+                                <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                                  <input
+                                    type="color"
+                                    value={coverTextStyleDraft.secondary_text_color}
+                                    onChange={(e) => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, secondary_text_color: normalizeCoverHexColor(e.target.value, prev.secondary_text_color) }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className="h-8 w-10 rounded border-0 bg-transparent p-0"
+                                  />
+                                  <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.secondary_text_color}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, secondary_text_color: prev.text_color }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className="ml-auto text-[10px] font-semibold text-gray-500 bg-white border border-gray-200 rounded-md px-2 py-1 active:scale-95"
+                                  >
+                                    ใช้สีเดียวกัน
+                                  </button>
+                                </div>
+                              </label>
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <p className="text-[11px] font-semibold text-gray-600">ความหนาของขอบ</p>
+                                  <p className="text-[11px] text-gray-400">{coverTextStyleDraft.outline_width}px</p>
+                                </div>
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={40}
+                                  step={1}
+                                  value={coverTextStyleDraft.outline_width}
+                                  onChange={(e) => {
+                                    const next = Math.max(0, Math.min(40, Number(e.target.value || 0)))
+                                    setCoverTextStyleDraft((prev) => ({ ...prev, outline_width: Math.round(next) }))
+                                    if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                  }}
+                                  data-allow-native-drag="true"
+                                  className="w-full accent-blue-600 touch-pan-x"
+                                />
+                              </div>
                             </div>
-                            <input
-                              type="range"
-                              min={0}
-                              max={100}
-                              step={1}
-                              value={Math.round(coverTextStyleDraft.background_opacity * 100)}
-                              onChange={(e) => {
-                                const next = Math.max(0, Math.min(100, Number(e.target.value || 0)))
-                                setCoverTextStyleDraft((prev) => ({ ...prev, background_opacity: Math.round((next / 100) * 100) / 100 }))
-                                if (coverTextStyleMessage) setCoverTextStyleMessage('')
-                              }}
-                              data-allow-native-drag="true"
-                              className="w-full accent-blue-600 touch-pan-x"
-                            />
-                          </div>
+                          ) : (
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between">
+                                <p className="text-[11px] font-semibold text-gray-600">ความโปร่งใสพื้นหลัง</p>
+                                <p className="text-[11px] text-gray-400">{Math.round(coverTextStyleDraft.background_opacity * 100)}%</p>
+                              </div>
+                              <input
+                                type="range"
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={Math.round(coverTextStyleDraft.background_opacity * 100)}
+                                onChange={(e) => {
+                                  const next = Math.max(0, Math.min(100, Number(e.target.value || 0)))
+                                  setCoverTextStyleDraft((prev) => ({ ...prev, background_opacity: Math.round((next / 100) * 100) / 100 }))
+                                  if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                }}
+                                data-allow-native-drag="true"
+                                className="w-full accent-blue-600 touch-pan-x"
+                              />
+                            </div>
+                          )}
 
                           <div className="space-y-2">
                             <div className="flex items-center justify-between">
@@ -7927,19 +8020,38 @@ function App({
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-2">
                             <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างสไตล์</p>
                             <div className="rounded-2xl bg-slate-900/90 px-4 py-6 flex items-center justify-center">
-                              <span
-                                className="inline-flex items-center justify-center rounded-lg px-4 py-2 text-center font-bold"
-                                style={{
-                                  fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
-                                  color: coverTextStyleDraft.text_color,
-                                  backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
-                                  fontSize: `${Math.round(26 * coverTextStyleDraft.size_scale)}px`,
-                                }}
-                              >
-                                ข้อความบนปกตัวอย่าง
-                              </span>
+                              {coverTextStyleDraft.mode === 'outline' ? (
+                                <div
+                                  className="flex flex-col items-center justify-center text-center font-bold leading-tight"
+                                  style={{
+                                    fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
+                                    fontSize: `${Math.round(32 * coverTextStyleDraft.size_scale)}px`,
+                                    WebkitTextStroke: `${Math.max(1, Math.round(coverTextStyleDraft.outline_width / 2))}px ${coverTextStyleDraft.outline_color}`,
+                                    paintOrder: 'stroke fill',
+                                  }}
+                                >
+                                  <span style={{ color: coverTextStyleDraft.text_color }}>ข้อความบนปก</span>
+                                  <span style={{ color: coverTextStyleDraft.secondary_text_color }}>ตัวอย่าง</span>
+                                </div>
+                              ) : (
+                                <span
+                                  className="inline-flex items-center justify-center rounded-lg px-4 py-2 text-center font-bold"
+                                  style={{
+                                    fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
+                                    color: coverTextStyleDraft.text_color,
+                                    backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
+                                    fontSize: `${Math.round(26 * coverTextStyleDraft.size_scale)}px`,
+                                  }}
+                                >
+                                  ข้อความบนปกตัวอย่าง
+                                </span>
+                              )}
                             </div>
-                            <p className="text-[11px] text-gray-400">พื้นหลังของข้อความจริงจะพอดีกับความกว้างข้อความอัตโนมัติ</p>
+                            <p className="text-[11px] text-gray-400">
+                              {coverTextStyleDraft.mode === 'outline'
+                                ? 'บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2 — ปกจริงที่ render จะคมกว่านี้'
+                                : 'พื้นหลังของข้อความจริงจะพอดีกับความกว้างข้อความอัตโนมัติ'}
+                            </p>
                           </div>
 
                           {coverTextStyleUpdatedAt && (

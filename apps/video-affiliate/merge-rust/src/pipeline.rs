@@ -33,6 +33,10 @@ pub struct PipelineRequest {
     pub script_prompt: Option<String>,
     pub voice_name: Option<String>,
     pub tts_prompt_template: Option<String>,
+    /// Style instructions for gemini-3.1-flash-tts-preview `systemInstruction` field.
+    /// Sent separately from the script body so the model can apply voice direction without
+    /// reading the style guide aloud. Falls back to `tts_prompt_template` when missing.
+    pub tts_style_instructions: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -715,20 +719,64 @@ fn build_tts_input(script: &str, template: Option<&str>) -> String {
     format!("{}\n\nบทพากย์:\n{}", trimmed_template, trimmed_script)
 }
 
+/// Given a legacy combined template like "...style guide...\n\nบทพากย์:\n{{script}}",
+/// extract just the style guide portion (everything before "บทพากย์:" or "{{script}}").
+/// Returns None if the template is empty or has no separable style portion.
+fn extract_style_from_legacy_template(template: Option<&str>) -> Option<String> {
+    let trimmed = template.unwrap_or("").trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Try the script header first ("บทพากย์:") which the worker template emits.
+    let cut = trimmed
+        .find("บทพากย์:")
+        .or_else(|| trimmed.find("{{script}}"));
+    let style_portion = match cut {
+        Some(idx) => trimmed[..idx].trim().to_string(),
+        None => trimmed.to_string(),
+    };
+    if style_portion.is_empty() {
+        None
+    } else {
+        Some(style_portion)
+    }
+}
+
 async fn gemini_tts(
     script: &str,
     api_key: &str,
     voice_name: Option<&str>,
     tts_prompt_template: Option<&str>,
+    tts_style_instructions: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
     let selected_voice = voice_name
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .unwrap_or("Puck");
-    let prompt_text = build_tts_input(script, tts_prompt_template);
+
+    // gemini-3.1-flash-tts-preview pattern: Script in `contents.parts.text`,
+    // Style Instructions in `systemInstruction.parts.text`.
+    // For older models the systemInstruction field is harmlessly ignored.
+    let style_text: String = tts_style_instructions
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| extract_style_from_legacy_template(tts_prompt_template))
+        .unwrap_or_default();
+
+    // gemini-3.1-flash-tts-preview rejects `systemInstruction`. Both 3.1 and 2.5 still need
+    // voiceConfig. Style Instructions are inlined as a prefix to the script text so the model
+    // follows the delivery direction without reading the prefix aloud (matches Vertex Studio UX).
+    let script_only = script.trim().to_string();
+    let final_text = if style_text.is_empty() {
+        // Legacy path: use combined template if no style provided.
+        build_tts_input(script, tts_prompt_template)
+    } else {
+        format!("[Voice direction: {}]\n\n{}", style_text, script_only)
+    };
+
     let payload = json!({
-        "contents": [{"parts": [{"text": prompt_text}]}],
+        "contents": [{"parts": [{"text": final_text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": selected_voice}}}
@@ -737,6 +785,7 @@ async fn gemini_tts(
 
     let mut last_err = String::new();
     let tts_models = [
+        "gemini-3.1-flash-tts-preview",
         "gemini-2.5-pro-preview-tts",
         "gemini-2.5-flash-preview-tts",
     ];
@@ -1533,6 +1582,7 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
                     api_key,
                     req.voice_name.as_deref(),
                     req.tts_prompt_template.as_deref(),
+                    req.tts_style_instructions.as_deref(),
                 ).await?;
                 let raw_audio = tmp_path.join("audio.raw");
                 fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;

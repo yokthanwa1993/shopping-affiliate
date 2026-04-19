@@ -3,6 +3,7 @@ import {
   BarChart3,
   ChevronRight,
   ExternalLink,
+  Facebook,
   LayoutDashboard,
   Layers,
   Megaphone,
@@ -16,9 +17,9 @@ import {
 import type { ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 
-type DashboardTab = 'dashboard' | 'gallery' | 'create' | 'running' | 'history' | 'settings'
+type DashboardTab = 'dashboard' | 'gallery' | 'page-posts' | 'create' | 'running' | 'history' | 'settings'
 
-const DASHBOARD_TABS: DashboardTab[] = ['dashboard', 'gallery', 'create', 'running', 'history', 'settings']
+const DASHBOARD_TABS: DashboardTab[] = ['dashboard', 'gallery', 'page-posts', 'create', 'running', 'history', 'settings']
 
 type VideoCandidate = {
   id: string
@@ -27,17 +28,6 @@ type VideoCandidate = {
   thumbnail: string
   shopeeLink: string
   status: 'ready' | 'queued' | 'creating'
-}
-
-type RunningAd = {
-  storyId: string
-  campaign: string
-  adsetId: string
-  status: 'ACTIVE' | 'PUBLISHED'
-  createdAt: string
-  reach: string
-  impressions: string
-  costPerResult: string
 }
 
 type HistoryItem = {
@@ -60,6 +50,8 @@ type GalleryLinkedItem = {
   videoUrl: string
   videoThumb: string
   adsetId: string
+  shopeeLink?: string
+  postId?: string
 }
 
 type GallerySyncState = {
@@ -137,29 +129,6 @@ const videoCandidates: VideoCandidate[] = [
   },
 ]
 
-const runningAds: RunningAd[] = [
-  {
-    storyId: '1008898512617594_1251765270461502',
-    campaign: 'ADS_PUBLISH_2',
-    adsetId: '120244088050920263',
-    status: 'ACTIVE',
-    createdAt: '14 เม.ย. 2026 22:34',
-    reach: '4,281',
-    impressions: '6,490',
-    costPerResult: '฿2.84',
-  },
-  {
-    storyId: '1008898512617594_1251721693799193',
-    campaign: 'ADS_PUBLISH_2',
-    adsetId: '120244085585210263',
-    status: 'PUBLISHED',
-    createdAt: '14 เม.ย. 2026 21:19',
-    reach: '7,902',
-    impressions: '11,118',
-    costPerResult: '฿2.11',
-  },
-]
-
 const historyItems: HistoryItem[] = [
   {
     storyId: '1008898512617594_1251721693799193',
@@ -183,8 +152,39 @@ const statusClass = {
 
 const CHIEB_PAGE_ID = '1008898512617594'
 const CHIEB_PAGE_NAME = 'เฉียบ'
+const CHIEB_NAMESPACE_ID = '1774858894802785816'
 const GALLERY_MIN_VIEWS = 100000
 const GALLERY_READ_LIMIT = 300
+const SYSTEM_GALLERY_BATCH_SIZE = 30
+
+type SystemGalleryView = 'ready' | 'used'
+
+type SystemGalleryVideo = {
+  id: string
+  script?: string
+  manualCaption?: string
+  caption?: string
+  duration?: number
+  thumbnailUrl?: string
+  publicUrl?: string
+  originalUrl?: string
+  createdAt?: string
+  postedAt?: string
+  shopeeLink?: string
+  lazadaLink?: string
+  title?: string
+  [key: string]: unknown
+}
+
+type SystemGalleryResponse = {
+  ok?: boolean
+  videos?: SystemGalleryVideo[]
+  total?: number
+  ready_total?: number
+  used_total?: number
+  has_more?: boolean
+  view?: SystemGalleryView
+}
 const DEFAULT_SETTINGS: DashboardSettings = {
   subId: 'yok',
   subId2: '',
@@ -222,23 +222,52 @@ function formatCompactViews(value: number) {
   return value.toLocaleString()
 }
 
-function isSameBangkokDay(value: string) {
-  if (!value) return false
-  const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Bangkok',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  })
-  return formatter.format(new Date(value)) === formatter.format(new Date())
-}
-
 function isDashboardTab(value: string | null): value is DashboardTab {
   return value !== null && DASHBOARD_TABS.includes(value as DashboardTab)
 }
 
 function getTabPath(tab: DashboardTab) {
   return tab === 'dashboard' ? '/' : `/${tab}`
+}
+
+function formatVideoDuration(seconds: number | undefined) {
+  const s = Number(seconds || 0)
+  if (!Number.isFinite(s) || s <= 0) return ''
+  const total = Math.floor(s)
+  const mm = Math.floor(total / 60)
+  const ss = total % 60
+  return `${mm}:${ss.toString().padStart(2, '0')}`
+}
+
+function pickVideoTitle(video: SystemGalleryVideo): string {
+  const manual = String(video.manualCaption || '').trim()
+  if (manual) return manual
+  const caption = String(video.caption || '').trim()
+  if (caption) return caption
+  const script = String(video.script || '').trim()
+  if (script) return script.length > 120 ? `${script.slice(0, 120)}…` : script
+  const title = String(video.title || '').trim()
+  if (title) return title
+  return video.id || ''
+}
+
+function hasAffiliateLink(video: SystemGalleryVideo): boolean {
+  return !!String(video.shopeeLink || '').trim() || !!String(video.lazadaLink || '').trim()
+}
+
+// Asset variants:
+//   - public / thumb         = ประมวลผลแล้ว (after AI processing — what dashboard/app shows)
+//   - original / original-thumb = คลังต้นฉบับ (raw uploaded source)
+// We want the PROCESSED version, so use 'public' (video) + 'thumb' (poster).
+// Proxy via /worker-api to stay on dashboard.oomnn.com.
+function buildVideoThumbnailUrl(videoId: string, namespaceId: string): string {
+  if (!videoId || !namespaceId) return ''
+  return `/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/thumb?namespace_id=${encodeURIComponent(namespaceId)}`
+}
+
+function buildVideoPlaybackUrl(videoId: string, namespaceId: string): string {
+  if (!videoId || !namespaceId) return ''
+  return `/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/public?namespace_id=${encodeURIComponent(namespaceId)}`
 }
 
 function getInitialTab(): DashboardTab {
@@ -268,6 +297,18 @@ export default function App() {
   const [gallerySyncing, setGallerySyncing] = useState(false)
   const [gallerySyncState, setGallerySyncState] = useState<GallerySyncState | null>(null)
   const [galleryBootstrapped, setGalleryBootstrapped] = useState(false)
+
+  // System gallery (new /gallery tab — เหมือน mobile app)
+  const [systemGalleryView, setSystemGalleryView] = useState<SystemGalleryView>('ready')
+  const [systemGalleryReadyItems, setSystemGalleryReadyItems] = useState<SystemGalleryVideo[]>([])
+  const [systemGalleryUsedItems, setSystemGalleryUsedItems] = useState<SystemGalleryVideo[]>([])
+  const [systemGalleryReadyTotal, setSystemGalleryReadyTotal] = useState(0)
+  const [systemGalleryUsedTotal, setSystemGalleryUsedTotal] = useState(0)
+  const [systemGalleryHasMore, setSystemGalleryHasMore] = useState(true)
+  const [systemGalleryLoading, setSystemGalleryLoading] = useState(false)
+  const [systemGalleryError, setSystemGalleryError] = useState<string | null>(null)
+  const [systemGallerySearch, setSystemGallerySearch] = useState('')
+  const [videoPreview, setVideoPreview] = useState<SystemGalleryVideo | null>(null)
   const [settings, setSettings] = useState<DashboardSettings>(DEFAULT_SETTINGS)
   const [settingsLoading, setSettingsLoading] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -535,7 +576,7 @@ export default function App() {
 
   // Auto-sync: keep syncing until fully scanned
   useEffect(() => {
-    if (tab !== 'gallery' || galleryLoading || gallerySyncing) return
+    if (tab !== 'page-posts' || galleryLoading || gallerySyncing) return
     if (!galleryBootstrapped) {
       setGalleryBootstrapped(true)
       void syncNextGalleryBatch()
@@ -548,8 +589,167 @@ export default function App() {
     }
   }, [tab, galleryLoading, gallerySyncing, galleryBootstrapped, gallerySyncState?.fullyScanned, gallerySyncState?.nextAfter])
 
+  // ==================== SYSTEM GALLERY (new /gallery tab) ====================
+  async function loadSystemGalleryPage(view: SystemGalleryView, options: { reset?: boolean; search?: string } = {}) {
+    const reset = !!options.reset
+    const searchQuery = options.search ?? systemGallerySearch
+    const currentList = view === 'ready' ? systemGalleryReadyItems : systemGalleryUsedItems
+    const offset = reset ? 0 : currentList.length
+
+    setSystemGalleryLoading(true)
+    setSystemGalleryError(null)
+    try {
+      const params = new URLSearchParams({
+        namespace_id: CHIEB_NAMESPACE_ID,
+        view,
+        offset: String(offset),
+        limit: String(SYSTEM_GALLERY_BATCH_SIZE),
+      })
+      if (searchQuery.trim()) params.set('q', searchQuery.trim())
+
+      const response = await fetch(`/worker-api/api/dashboard/gallery?${params.toString()}`)
+      if (!response.ok) throw new Error(`โหลดวิดีโอไม่สำเร็จ (${response.status})`)
+      const payload = await response.json() as SystemGalleryResponse
+      const incoming = Array.isArray(payload.videos) ? payload.videos : []
+
+      if (view === 'ready') {
+        setSystemGalleryReadyItems(reset ? incoming : [...systemGalleryReadyItems, ...incoming])
+      } else {
+        setSystemGalleryUsedItems(reset ? incoming : [...systemGalleryUsedItems, ...incoming])
+      }
+      setSystemGalleryReadyTotal(Number(payload.ready_total || 0))
+      setSystemGalleryUsedTotal(Number(payload.used_total || 0))
+      setSystemGalleryHasMore(!!payload.has_more)
+    } catch (error) {
+      setSystemGalleryError(error instanceof Error ? error.message : 'โหลดวิดีโอไม่สำเร็จ')
+    } finally {
+      setSystemGalleryLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (tab !== 'gallery') return
+    // Reset and load whenever switching tab or view
+    void loadSystemGalleryPage(systemGalleryView, { reset: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, systemGalleryView])
+
+  // Debounce search
+  useEffect(() => {
+    if (tab !== 'gallery') return
+    const timer = setTimeout(() => {
+      void loadSystemGalleryPage(systemGalleryView, { reset: true, search: systemGallerySearch })
+    }, 350)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [systemGallerySearch])
+
   return (
     <div className="h-screen overflow-hidden bg-[#f6f8fb] text-slate-900">
+      {/* Video Preview Popup */}
+      {videoPreview && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          onClick={() => setVideoPreview(null)}
+        >
+          <div
+            className="relative flex w-full max-w-4xl flex-col gap-4 md:flex-row md:items-stretch"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              aria-label="close"
+              onClick={() => setVideoPreview(null)}
+              className="absolute -top-12 right-0 inline-flex h-10 w-10 items-center justify-center rounded-full bg-white/20 text-white text-xl font-light backdrop-blur hover:bg-white/30"
+            >
+              ×
+            </button>
+
+            {/* Video — 9:16 on mobile (full-width), fixed width on desktop */}
+            <div className="mx-auto w-full max-w-sm shrink-0 overflow-hidden rounded-2xl bg-black md:mx-0 md:w-[360px]">
+              <div className="aspect-[9/16] w-full">
+                <video
+                  key={String(videoPreview.id)}
+                  src={buildVideoPlaybackUrl(String(videoPreview.id), CHIEB_NAMESPACE_ID)}
+                  poster={buildVideoThumbnailUrl(String(videoPreview.id), CHIEB_NAMESPACE_ID) || undefined}
+                  className="h-full w-full object-cover"
+                  controls
+                  autoPlay
+                  playsInline
+                  preload="metadata"
+                />
+              </div>
+            </div>
+
+            {/* Details — stacks below on mobile, sits on right (flex-1) on desktop */}
+            <div className="flex min-w-0 flex-1 flex-col gap-3 rounded-2xl bg-white/10 p-4 text-white backdrop-blur md:max-w-md">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-white/50">คำบรรยาย</p>
+                <p className="mt-1.5 whitespace-pre-wrap text-sm leading-relaxed text-white">
+                  {pickVideoTitle(videoPreview)}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 rounded-xl bg-black/30 p-3 text-xs">
+                <div>
+                  <p className="text-white/50">Video ID</p>
+                  <p className="mt-0.5 font-mono text-white">{String(videoPreview.id)}</p>
+                </div>
+                {videoPreview.duration ? (
+                  <div>
+                    <p className="text-white/50">ความยาว</p>
+                    <p className="mt-0.5 text-white">{formatVideoDuration(videoPreview.duration)}</p>
+                  </div>
+                ) : null}
+                {videoPreview.createdAt ? (
+                  <div className="col-span-2">
+                    <p className="text-white/50">สร้างเมื่อ</p>
+                    <p className="mt-0.5 text-white">{formatThaiDate(String(videoPreview.createdAt))}</p>
+                  </div>
+                ) : null}
+                {videoPreview.postedAt ? (
+                  <div className="col-span-2">
+                    <p className="text-white/50">โพสต์เมื่อ</p>
+                    <p className="mt-0.5 text-white">{formatThaiDate(String(videoPreview.postedAt))}</p>
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="mt-auto flex flex-wrap gap-2 pt-1">
+                {String(videoPreview.shopeeLink || '').trim() && (
+                  <a
+                    href={String(videoPreview.shopeeLink)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded-lg bg-orange-500 px-3 py-2 text-xs font-semibold text-white hover:bg-orange-600"
+                  >
+                    <ExternalLink size={12} /> Shopee
+                  </a>
+                )}
+                {String(videoPreview.lazadaLink || '').trim() && (
+                  <a
+                    href={String(videoPreview.lazadaLink)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 rounded-lg bg-pink-500 px-3 py-2 text-xs font-semibold text-white hover:bg-pink-600"
+                  >
+                    <ExternalLink size={12} /> Lazada
+                  </a>
+                )}
+                <a
+                  href={buildVideoPlaybackUrl(String(videoPreview.id), CHIEB_NAMESPACE_ID)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded-lg bg-white/20 px-3 py-2 text-xs font-semibold text-white hover:bg-white/30"
+                >
+                  เปิดวิดีโอเต็ม
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Create Ad Popup */}
       {createAdPopup && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => !createAdCreating && setCreateAdPopup(null)}>
@@ -665,6 +865,7 @@ export default function App() {
               {([
                 { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
                 { id: 'gallery', label: 'แกลลี่', icon: Layers },
+                { id: 'page-posts', label: 'โพสต์เพจ', icon: Facebook },
                 { id: 'running', label: 'Campaigns', icon: Megaphone },
                 { id: 'create', label: 'Create Ads', icon: Users },
                 { id: 'history', label: 'History', icon: MessageCircle },
@@ -713,7 +914,8 @@ export default function App() {
                     <div className="flex items-center gap-2">
                       <p className="text-sm font-semibold">
                         {tab === 'dashboard' && 'Campaigns'}
-                        {tab === 'gallery' && 'แกลลี่โพสต์เพจเฉียบ'}
+                        {tab === 'gallery' && 'แกลลี่วิดีโอในระบบ'}
+                        {tab === 'page-posts' && 'โพสต์เพจเฉียบ'}
                         {tab === 'create' && 'Create Ads'}
                         {tab === 'running' && 'Campaigns'}
                         {tab === 'history' && 'History'}
@@ -721,14 +923,21 @@ export default function App() {
                     </p>
                     {tab === 'gallery' && (
                       <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600">
+                        {systemGalleryView === 'ready' ? systemGalleryReadyTotal : systemGalleryUsedTotal} videos
+                      </span>
+                    )}
+                    {tab === 'page-posts' && (
+                      <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600">
                         {galleryLinkedItems.length} videos
                       </span>
                     )}
                     </div>
                     <p className="text-xs text-slate-500">
-                      {tab === 'gallery' && gallerySyncState?.lastSyncedAt
+                      {tab === 'page-posts' && gallerySyncState?.lastSyncedAt
                         ? `sync ล่าสุด ${formatThaiDate(gallerySyncState.lastSyncedAt)}`
-                        : 'Ads manager workspace'}
+                        : tab === 'gallery'
+                          ? 'คลิปที่ import เข้าระบบแล้ว'
+                          : 'Ads manager workspace'}
                     </p>
                   </div>
                 </div>
@@ -918,6 +1127,120 @@ export default function App() {
               )}
 
               {tab === 'gallery' && (
+                <div className="space-y-4">
+                  <div className="flex flex-col gap-3 rounded-3xl border border-slate-200 bg-white p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex items-center gap-2 rounded-full bg-slate-100 p-1">
+                      <button
+                        onClick={() => setSystemGalleryView('ready')}
+                        className={`rounded-full px-4 py-1.5 text-sm font-semibold transition ${systemGalleryView === 'ready' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                      >
+                        ยังไม่โพสต์ ({systemGalleryReadyTotal})
+                      </button>
+                      <button
+                        onClick={() => setSystemGalleryView('used')}
+                        className={`rounded-full px-4 py-1.5 text-sm font-semibold transition ${systemGalleryView === 'used' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}
+                      >
+                        โพสต์แล้ว ({systemGalleryUsedTotal})
+                      </button>
+                    </div>
+                    <div className="relative flex-1 sm:max-w-sm">
+                      <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                      <input
+                        value={systemGallerySearch}
+                        onChange={(e) => setSystemGallerySearch(e.target.value)}
+                        placeholder="ค้นหา video id หรือชื่อคลิป"
+                        className="w-full rounded-xl border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm outline-none focus:border-slate-400"
+                      />
+                    </div>
+                  </div>
+                  {systemGalleryError ? (
+                    <EmptyState title="โหลดวิดีโอไม่สำเร็จ" description={systemGalleryError} />
+                  ) : null}
+                  {(() => {
+                    const items = systemGalleryView === 'ready' ? systemGalleryReadyItems : systemGalleryUsedItems
+                    if (systemGalleryLoading && items.length === 0) {
+                      return <EmptyState title="กำลังโหลดวิดีโอ" description="ดึงคลิปจากฐานข้อมูลระบบ" />
+                    }
+                    if (items.length === 0 && !systemGalleryError) {
+                      return (
+                        <EmptyState
+                          title={systemGalleryView === 'ready' ? 'ยังไม่มีคลิปที่รอโพสต์' : 'ยังไม่มีคลิปที่โพสต์แล้ว'}
+                          description={systemGalleryView === 'ready'
+                            ? 'กด import วิดีโอเข้าระบบจาก mobile app เพื่อเริ่ม'
+                            : 'เมื่อ cron โพสต์คลิปใดแล้ว จะย้ายมาแท็บนี้อัตโนมัติ'}
+                        />
+                      )
+                    }
+                    return (
+                      <>
+                        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
+                          {items.map((video) => {
+                            const vid = String(video.id || '')
+                            const title = pickVideoTitle(video)
+                            const durationText = formatVideoDuration(video.duration)
+                            const thumb = buildVideoThumbnailUrl(vid, CHIEB_NAMESPACE_ID)
+                            const linked = hasAffiliateLink(video)
+                            return (
+                              <article key={vid} className="group overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_4px_16px_rgba(15,23,42,0.04)] transition hover:shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
+                                <button
+                                  type="button"
+                                  onClick={() => setVideoPreview(video)}
+                                  className="relative block aspect-[9/16] w-full overflow-hidden bg-slate-100 text-left active:scale-[0.98] transition-transform"
+                                >
+                                  {thumb ? (
+                                    <img src={thumb} alt={vid} loading="lazy" className="h-full w-full object-cover" />
+                                  ) : (
+                                    <div className="flex h-full w-full items-center justify-center text-xs text-slate-400">
+                                      <PlaySquare size={28} />
+                                    </div>
+                                  )}
+                                  <div className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity group-hover:opacity-100">
+                                    <span className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-white/90 text-slate-900 shadow-lg backdrop-blur">
+                                      <PlaySquare size={22} />
+                                    </span>
+                                  </div>
+                                  {linked && (
+                                    <span className="absolute left-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#1877f2] text-white shadow-sm">
+                                      <ExternalLink size={13} />
+                                    </span>
+                                  )}
+                                  {durationText && (
+                                    <span className="absolute bottom-2 right-2 rounded-md bg-black/70 px-2 py-0.5 text-[11px] font-semibold text-white">
+                                      {durationText}
+                                    </span>
+                                  )}
+                                </button>
+                                <div className="space-y-2 p-3">
+                                  <p className="line-clamp-2 text-sm font-medium text-slate-900">{title || vid}</p>
+                                  <div className="flex items-center justify-between text-[11px] text-slate-400">
+                                    <span className="truncate font-mono">{vid}</span>
+                                    {systemGalleryView === 'used' && video.postedAt
+                                      ? <span>{formatThaiDate(String(video.postedAt))}</span>
+                                      : null}
+                                  </div>
+                                </div>
+                              </article>
+                            )
+                          })}
+                        </div>
+                        {systemGalleryHasMore && (
+                          <div className="flex justify-center pt-2">
+                            <button
+                              onClick={() => void loadSystemGalleryPage(systemGalleryView, { reset: false })}
+                              disabled={systemGalleryLoading}
+                              className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {systemGalleryLoading ? 'กำลังโหลด…' : 'โหลดเพิ่ม'}
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )
+                  })()}
+                </div>
+              )}
+
+              {tab === 'page-posts' && (
                 <div className="space-y-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="text-xs text-slate-500">

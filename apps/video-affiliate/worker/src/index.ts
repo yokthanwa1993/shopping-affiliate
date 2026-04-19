@@ -18,6 +18,7 @@ import { getBotId } from './utils/botAuth'
 import {
     type Env,
     buildTtsPromptTemplate,
+    buildTtsStyleInstructions,
     GEMINI_TTS_VOICE_OPTIONS,
     rebuildGalleryCache,
     updateGalleryCache,
@@ -108,7 +109,7 @@ const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
-const VOICE_PREVIEW_TTS_MODELS = ['gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
+const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
 const MERGE_CONTAINER_ENGINE_VERSION = '2026-04-05.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
 const MAX_VOICE_PREVIEW_TEXT_CHARS = 280
@@ -225,17 +226,23 @@ function buildWavFromPcm16le(pcmBytes: Uint8Array, sampleRate = 24000, channels 
     return bytes
 }
 
-async function requestGeminiTtsPreview(apiKey: string, promptText: string, voiceName: string): Promise<Uint8Array> {
+async function requestGeminiTtsPreview(apiKey: string, promptText: string, voiceName: string, styleInstructions?: string): Promise<Uint8Array> {
     let lastError = 'gemini_tts_preview_failed'
+    const trimmedStyle = String(styleInstructions || '').trim()
+    // gemini-3.1-flash-tts-preview rejects `systemInstruction` ("Developer instruction is not
+    // enabled for this model"). Both 3.1 and 2.5 require voiceConfig.prebuiltVoiceConfig.voiceName.
+    // Style Instructions are inlined as a prefix to the script text — model follows them as
+    // delivery direction without reading the prefix aloud (Vertex Studio uses the same approach).
+    const combinedText = trimmedStyle
+        ? `[Voice direction: ${trimmedStyle}]\n\n${promptText}`
+        : promptText
     const payload = JSON.stringify({
-        contents: [{ parts: [{ text: promptText }] }],
+        contents: [{ parts: [{ text: combinedText }] }],
         generationConfig: {
             responseModalities: ['AUDIO'],
             speechConfig: {
                 voiceConfig: {
-                    prebuiltVoiceConfig: {
-                        voiceName,
-                    },
+                    prebuiltVoiceConfig: { voiceName: voiceName || 'Puck' },
                 },
             },
         },
@@ -3199,20 +3206,85 @@ function normalizeFacebookPageVideoCacheRow(pageId: string, raw: Record<string, 
     }
 }
 
+async function resolveShopeeLinkForCacheRow(
+    db: D1Database,
+    args: { postId: string; videoId: string; description: string }
+): Promise<string> {
+    const postId = String(args.postId || '').trim()
+    const videoId = String(args.videoId || '').trim()
+    const description = String(args.description || '')
+
+    // Level 1: post_history.fb_post_id (any bot_id)
+    if (postId) {
+        const row = await db.prepare(
+            `SELECT shopee_link FROM post_history
+             WHERE fb_post_id = ? AND shopee_link != '' AND shopee_link IS NOT NULL
+             ORDER BY datetime(posted_at) DESC LIMIT 1`
+        ).bind(postId).first().catch(() => null) as { shopee_link?: string } | null
+        if (row?.shopee_link) return String(row.shopee_link).trim()
+    }
+
+    // Level 2: post_history → namespace_video_state via fb_post_id (original link preferred)
+    if (postId) {
+        const row = await db.prepare(
+            `SELECT nvs.shopee_original_link, nvs.shopee_link
+             FROM post_history ph
+             JOIN namespace_video_state nvs
+               ON nvs.video_id = ph.video_id AND nvs.namespace_id = ph.bot_id
+             WHERE ph.fb_post_id = ?
+               AND (nvs.shopee_original_link != '' OR nvs.shopee_link != '')
+             ORDER BY datetime(ph.posted_at) DESC LIMIT 1`
+        ).bind(postId).first().catch(() => null) as {
+            shopee_original_link?: string; shopee_link?: string
+        } | null
+        const link = String(row?.shopee_original_link || row?.shopee_link || '').trim()
+        if (link) return link
+    }
+
+    // Level 3: namespace_video_state via video_id directly
+    if (videoId) {
+        const row = await db.prepare(
+            `SELECT shopee_original_link, shopee_link
+             FROM namespace_video_state
+             WHERE video_id = ?
+               AND (shopee_original_link != '' OR shopee_link != '')
+             ORDER BY datetime(updated_at) DESC LIMIT 1`
+        ).bind(videoId).first().catch(() => null) as {
+            shopee_original_link?: string; shopee_link?: string
+        } | null
+        const link = String(row?.shopee_original_link || row?.shopee_link || '').trim()
+        if (link) return link
+    }
+
+    // Level 4: post_history.fb_reel_url contains videoId
+    if (videoId) {
+        const row = await db.prepare(
+            `SELECT shopee_link FROM post_history
+             WHERE fb_reel_url LIKE ?
+               AND shopee_link != '' AND shopee_link IS NOT NULL
+             ORDER BY datetime(posted_at) DESC LIMIT 1`
+        ).bind(`%${videoId}%`).first().catch(() => null) as { shopee_link?: string } | null
+        if (row?.shopee_link) return String(row.shopee_link).trim()
+    }
+
+    // Level 5: regex from description text
+    if (description) {
+        const m = description.match(/https?:\/\/(?:[^\s]+\.)?shopee\.[^\s]+/i)
+        if (m) return m[0]
+    }
+
+    return ''
+}
+
 async function upsertFacebookPageVideoCacheRows(db: D1Database, pageId: string, pageName: string, rows: FacebookPageVideoCacheRow[]): Promise<void> {
     await ensureFacebookPageVideoCacheTables(db)
     const normalizedPageId = String(pageId || '').trim()
     if (!normalizedPageId || rows.length === 0) return
     for (const row of rows) {
         const postId = String(row.post_id || '').trim()
-        // Lookup shopee_link from post_history via post_id
-        let shopeeLink = ''
-        if (postId) {
-            const phRow = await db.prepare(
-                `SELECT shopee_link FROM post_history WHERE bot_id = '1774858894802785816' AND fb_post_id = ? AND shopee_link != '' AND shopee_link IS NOT NULL LIMIT 1`
-            ).bind(postId).first().catch(() => null) as { shopee_link?: string } | null
-            if (phRow?.shopee_link) shopeeLink = phRow.shopee_link
-        }
+        const videoId = String(row.video_id || '').trim()
+        const description = String(row.description || row.title || '')
+        const shopeeLink = await resolveShopeeLinkForCacheRow(db, { postId, videoId, description })
         await db.prepare(
             `INSERT INTO facebook_page_video_cache (
                 page_id, page_name, video_id, title, description, permalink_url,
@@ -4448,9 +4520,13 @@ async function generateThumbnailViaContainer(
         yPercent?: number
         fontId?: CoverTextStyleFontId
         textColor?: string
+        secondaryTextColor?: string
         backgroundColor?: string
         backgroundOpacity?: number
         sizeScale?: number
+        mode?: CoverTextStyleMode
+        outlineColor?: string
+        outlineWidth?: number
     },
 ): Promise<NodeBuffer> {
     const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
@@ -4463,9 +4539,13 @@ async function generateThumbnailViaContainer(
         : undefined
     const overlayFontId = normalizeCoverTextStyleFontId(overlay?.fontId)
     const overlayTextColor = normalizeHexColor(String(overlay?.textColor || '').trim())
+    const overlaySecondaryTextColor = normalizeHexColor(String(overlay?.secondaryTextColor || '').trim())
     const overlayBackgroundColor = normalizeHexColor(String(overlay?.backgroundColor || '').trim())
     const overlayBackgroundOpacity = normalizeCoverTextStyleBackgroundOpacity(overlay?.backgroundOpacity)
     const overlaySizeScale = normalizeCoverTextStyleSizeScale(overlay?.sizeScale)
+    const overlayMode = normalizeCoverTextStyleMode(overlay?.mode)
+    const overlayOutlineColor = normalizeHexColor(String(overlay?.outlineColor || '').trim())
+    const overlayOutlineWidth = normalizeCoverTextStyleOutlineWidth(overlay?.outlineWidth)
     const resp = await containerStub.fetch('http://container/thumbnail', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4480,9 +4560,13 @@ async function generateThumbnailViaContainer(
             ...(overlayText && Number.isFinite(overlayYPercent) ? { overlay_y_pct: overlayYPercent } : {}),
             ...(overlayText ? { overlay_font_id: overlayFontId } : {}),
             ...(overlayText && overlayTextColor ? { overlay_text_color: overlayTextColor } : {}),
+            ...(overlayText && overlaySecondaryTextColor ? { overlay_secondary_text_color: overlaySecondaryTextColor } : {}),
             ...(overlayText && overlayBackgroundColor ? { overlay_bg_color: overlayBackgroundColor } : {}),
             ...(overlayText ? { overlay_bg_opacity: overlayBackgroundOpacity } : {}),
             ...(overlayText ? { overlay_size_scale: overlaySizeScale } : {}),
+            ...(overlayText ? { overlay_mode: overlayMode } : {}),
+            ...(overlayText && overlayOutlineColor ? { overlay_outline_color: overlayOutlineColor } : {}),
+            ...(overlayText ? { overlay_outline_width: overlayOutlineWidth } : {}),
         }),
     })
 
@@ -5148,6 +5232,61 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
     })
 })
 
+// Namespace-scoped gallery for dashboard.oomnn.com.
+// Trusted like other /api/dashboard/* endpoints — no session auth required,
+// but namespace_id is required so we never fall back to a surprise default.
+app.get('/api/dashboard/gallery', async (c) => {
+    const namespaceId = String(c.req.query('namespace_id') || c.req.query('bot_id') || '').trim()
+    if (!namespaceId) return c.json({ error: 'namespace_id_required' }, 400)
+
+    const offset = parseNonNegativeInt(c.req.query('offset'), 0)
+    const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
+    const limit = Math.min(Math.max(requestedLimit, 1), 120)
+    const viewRaw = String(c.req.query('view') || '').trim().toLowerCase()
+    const view = viewRaw === 'used' ? 'used' : 'ready'
+    const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
+
+    try {
+        const inventory = await getNamespaceGalleryInventory(c.env, namespaceId)
+        const allVideos = inventory.videos
+        const readyVideos = allVideos.filter((video) => {
+            const row = video as Record<string, unknown>
+            return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
+        })
+        const usedVideos = allVideos.filter((video) => {
+            const row = video as Record<string, unknown>
+            return isNamespaceGalleryVideoVisibleInUsedTab(row)
+        })
+        const sourceVideos = view === 'used'
+            ? sortUsedGalleryVideosNewestFirst(usedVideos as Array<Record<string, unknown>>)
+            : readyVideos
+        const searchedVideos = searchQuery
+            ? sourceVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
+            : sourceVideos
+        const page = sliceGalleryPage(searchedVideos, offset, limit)
+
+        return c.json({
+            ok: true,
+            namespace_id: namespaceId,
+            videos: page.videos,
+            total: searchedVideos.length,
+            overall_total: sourceVideos.length,
+            ready_total: readyVideos.length,
+            used_total: usedVideos.length,
+            inventory_total: allVideos.length,
+            library_total: inventory.sourceTotal,
+            has_more: page.hasMore,
+            offset,
+            limit,
+            view,
+        }, 200, {
+            'Cache-Control': 'private, no-store',
+        })
+    } catch (e) {
+        return c.json({ videos: [], error: String(e) }, 500)
+    }
+})
+
 app.get('/api/dashboard/settings', async (c) => {
     const keys = ['facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5', 'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset', 'campaign_prefix', 'ads_per_round', 'auto_create_time']
     const entries = await Promise.all(keys.map(k => getDashboardSetting(c.env.DB, k).catch(() => null)))
@@ -5261,6 +5400,176 @@ app.post('/api/dashboard/facebook-page-videos/auto-sync', async (c) => {
         force: !!body.force,
     })
     return c.json(result, result.ok ? 200 : 502, {
+        'Cache-Control': 'no-store',
+    })
+})
+
+// Deep backfill — calls Facebook Graph API to fill missing post_id + scan
+// post description + first page-authored comment for shopee links.
+// Use this when DB-side fallback chain cannot find the link.
+app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        limit?: number
+        include_with_post_id?: boolean
+    }
+    const pageId = String(body.page_id || '').trim()
+    const limitRaw = Number(body.limit || 100)
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 100
+    const includeWithPostId = !!body.include_with_post_id
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+
+    const tokenEntry = await getDashboardSetting(c.env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
+    const token = String(tokenEntry?.value || '').trim()
+    if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
+
+    const whereExtra = includeWithPostId ? '' : "AND (post_id = '' OR post_id IS NULL)"
+    const rowsQuery = await c.env.DB.prepare(
+        `SELECT video_id, post_id, description
+         FROM facebook_page_video_cache
+         WHERE page_id = ? AND (shopee_link = '' OR shopee_link IS NULL) ${whereExtra}
+         LIMIT ?`
+    ).bind(pageId, limit).all().catch(() => null) as {
+        results?: Array<{ video_id: string; post_id: string; description: string }>
+    } | null
+    const rows = Array.isArray(rowsQuery?.results) ? rowsQuery!.results : []
+
+    const shopeeRe = /https?:\/\/(?:[^\s<>"']+\.)?shopee\.[^\s<>"']+/i
+
+    let scanned = 0
+    let updated = 0
+    const errors: Array<{ video_id: string; error: string }> = []
+
+    for (const row of rows) {
+        scanned++
+        const videoId = String(row.video_id || '').trim()
+        if (!videoId) continue
+
+        try {
+            // 1. Fetch video metadata (description + from)
+            const vidResp = await fetch(
+                `https://graph.facebook.com/v21.0/${videoId}?fields=description,title,permalink_url&access_token=${encodeURIComponent(token)}`
+            )
+            const vid = vidResp.ok ? await vidResp.json().catch(() => ({})) as Record<string, unknown> : {}
+            const vidDesc = String(vid.description || vid.title || '')
+            let foundLink = ''
+            const m1 = vidDesc.match(shopeeRe)
+            if (m1) foundLink = m1[0]
+
+            // 2. Try permalink → find post_id → fetch first page-authored comment
+            let foundPostId = String(row.post_id || '').trim()
+            if (!foundLink) {
+                const permalink = String(vid.permalink_url || '').trim()
+                // permalink for reels: /reel/{videoId}/  — doesn't help; try /posts lookup
+                // For /videos/ posts: /{pageId}/videos/{videoId}/ — we can query {pageId}_{videoId}? NO, post_id != video_id.
+                // Best shot: look up via edge /{videoId}/sharedposts or via ?fields=post_id (undocumented)
+                const metaResp = await fetch(
+                    `https://graph.facebook.com/v21.0/${videoId}?fields=post_id,from&access_token=${encodeURIComponent(token)}`
+                )
+                const metaJson = metaResp.ok ? await metaResp.json().catch(() => ({})) as Record<string, unknown> : {}
+                const rawPostId = String(metaJson.post_id || '').trim()
+                if (rawPostId) foundPostId = rawPostId.includes('_') ? (rawPostId.split('_').pop() || '') : rawPostId
+
+                // If we now have a full post id, fetch comments from the page
+                if (foundPostId) {
+                    const fullPostId = `${pageId}_${foundPostId}`
+                    const commentsResp = await fetch(
+                        `https://graph.facebook.com/v21.0/${fullPostId}/comments?fields=from,message&limit=10&access_token=${encodeURIComponent(token)}`
+                    )
+                    const commentsJson = commentsResp.ok ? await commentsResp.json().catch(() => ({})) as Record<string, unknown> : {}
+                    const commentArr = Array.isArray((commentsJson as { data?: unknown[] }).data)
+                        ? ((commentsJson as { data: Array<Record<string, unknown>> }).data)
+                        : []
+                    for (const cmt of commentArr) {
+                        const from = cmt.from as Record<string, unknown> | undefined
+                        const fromId = String(from?.id || '').trim()
+                        if (fromId && fromId !== pageId) continue // prefer page-authored
+                        const msg = String(cmt.message || '')
+                        const m2 = msg.match(shopeeRe)
+                        if (m2) { foundLink = m2[0]; break }
+                    }
+                    // If no match from page, try any comment
+                    if (!foundLink) {
+                        for (const cmt of commentArr) {
+                            const msg = String(cmt.message || '')
+                            const m2 = msg.match(shopeeRe)
+                            if (m2) { foundLink = m2[0]; break }
+                        }
+                    }
+                }
+            }
+
+            if (foundPostId || foundLink) {
+                await c.env.DB.prepare(
+                    `UPDATE facebook_page_video_cache
+                     SET post_id = CASE WHEN ? != '' THEN ? ELSE post_id END,
+                         shopee_link = CASE WHEN ? != '' THEN ? ELSE shopee_link END,
+                         updated_at = datetime('now')
+                     WHERE page_id = ? AND video_id = ?`
+                ).bind(foundPostId, foundPostId, foundLink, foundLink, pageId, videoId).run().catch(() => { })
+                if (foundLink) updated++
+            }
+        } catch (err) {
+            errors.push({ video_id: videoId, error: String(err).slice(0, 200) })
+        }
+    }
+
+    return c.json({ ok: true, scanned, updated, errors_count: errors.length, errors: errors.slice(0, 5) }, 200, {
+        'Cache-Control': 'no-store',
+    })
+})
+
+// Backfill shopee_link for facebook_page_video_cache rows that currently have empty shopee_link.
+// Runs the same fallback chain used on sync, but over existing rows.
+app.post('/api/dashboard/facebook-page-videos/backfill-shopee-links', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        limit?: number
+    }
+    const pageId = String(body.page_id || '').trim()
+    const limitRaw = Number(body.limit || 500)
+    const limit = Number.isFinite(limitRaw) ? Math.min(5000, Math.max(1, Math.floor(limitRaw))) : 500
+
+    const query = pageId
+        ? c.env.DB.prepare(
+            `SELECT page_id, video_id, post_id, description, title
+             FROM facebook_page_video_cache
+             WHERE (shopee_link = '' OR shopee_link IS NULL) AND page_id = ?
+             LIMIT ?`
+        ).bind(pageId, limit)
+        : c.env.DB.prepare(
+            `SELECT page_id, video_id, post_id, description, title
+             FROM facebook_page_video_cache
+             WHERE shopee_link = '' OR shopee_link IS NULL
+             LIMIT ?`
+        ).bind(limit)
+
+    const result = await query.all().catch(() => null) as {
+        results?: Array<{ page_id: string; video_id: string; post_id: string; description: string; title: string }>
+    } | null
+    const rows = Array.isArray(result?.results) ? result!.results : []
+
+    let scanned = 0
+    let updated = 0
+    const examples: Array<{ video_id: string; shopee_link: string }> = []
+    for (const row of rows) {
+        scanned++
+        const link = await resolveShopeeLinkForCacheRow(c.env.DB, {
+            postId: String(row.post_id || ''),
+            videoId: String(row.video_id || ''),
+            description: String(row.description || row.title || ''),
+        })
+        if (!link) continue
+        await c.env.DB.prepare(
+            `UPDATE facebook_page_video_cache
+             SET shopee_link = ?, updated_at = datetime('now')
+             WHERE page_id = ? AND video_id = ?`
+        ).bind(link, row.page_id, row.video_id).run().catch(() => { })
+        updated++
+        if (examples.length < 5) examples.push({ video_id: row.video_id, shopee_link: link })
+    }
+
+    return c.json({ ok: true, scanned, updated, examples }, 200, {
         'Cache-Control': 'no-store',
     })
 })
@@ -6368,6 +6677,12 @@ app.get('/api/settings/voice-prompt', async (c) => {
         prompt: settings.scriptPrompt,
         tts_prompt_template: settings.ttsPromptTemplate,
         max_style_chars: settings.maxStyleChars,
+
+        max_script_chars: settings.maxScriptChars,
+
+        default_script_prompt: settings.defaultScriptPrompt,
+
+        script_prompt: settings.profile.script_prompt,
         source: settings.source,
         updated_at: settings.updatedAt,
         legacy_prompt_active: settings.legacyPromptActive,
@@ -6387,15 +6702,17 @@ app.put('/api/settings/voice-prompt', async (c) => {
         persona?: VoicePersonaPreset
         tones?: VoiceTonePreset[]
         custom_style_prompt?: string
+        script_prompt?: string
     }
     const namespaceId = c.get('botId')
-    const hasStructuredProfile = !!body.profile || !!body.voice_name || !!body.persona || Array.isArray(body.tones) || typeof body.custom_style_prompt === 'string'
+    const hasStructuredProfile = !!body.profile || !!body.voice_name || !!body.persona || Array.isArray(body.tones) || typeof body.custom_style_prompt === 'string' || typeof body.script_prompt === 'string'
     if (hasStructuredProfile) {
         const latest = await setNamespaceVoiceSettings(c.env.DB, namespaceId, body.profile || {
             voice_name: body.voice_name,
             persona: body.persona,
             tones: body.tones,
             custom_style_prompt: body.custom_style_prompt,
+            script_prompt: body.script_prompt,
         })
         return c.json({
             ok: true,
@@ -6403,6 +6720,12 @@ app.put('/api/settings/voice-prompt', async (c) => {
             prompt: latest.scriptPrompt,
             tts_prompt_template: latest.ttsPromptTemplate,
             max_style_chars: latest.maxStyleChars,
+
+            max_script_chars: latest.maxScriptChars,
+
+            default_script_prompt: latest.defaultScriptPrompt,
+
+            script_prompt: latest.profile.script_prompt,
             source: latest.source,
             updated_at: latest.updatedAt,
             legacy_prompt_active: latest.legacyPromptActive,
@@ -6424,6 +6747,12 @@ app.put('/api/settings/voice-prompt', async (c) => {
         prompt: latest.scriptPrompt,
         tts_prompt_template: latest.ttsPromptTemplate,
         max_style_chars: latest.maxStyleChars,
+
+        max_script_chars: latest.maxScriptChars,
+
+        default_script_prompt: latest.defaultScriptPrompt,
+
+        script_prompt: latest.profile.script_prompt,
         source: latest.source,
         updated_at: latest.updatedAt,
         legacy_prompt_active: latest.legacyPromptActive,
@@ -6444,6 +6773,12 @@ app.delete('/api/settings/voice-prompt', async (c) => {
         prompt: latest.scriptPrompt,
         tts_prompt_template: latest.ttsPromptTemplate,
         max_style_chars: latest.maxStyleChars,
+
+        max_script_chars: latest.maxScriptChars,
+
+        default_script_prompt: latest.defaultScriptPrompt,
+
+        script_prompt: latest.profile.script_prompt,
         source: latest.source,
         updated_at: latest.updatedAt,
         legacy_prompt_active: latest.legacyPromptActive,
@@ -6464,7 +6799,8 @@ app.post('/api/settings/voice-preview', async (c) => {
     const stored = await getNamespaceVoiceSettings(c.env.DB, namespaceId)
     const profile = normalizeVoiceProfile(body.profile || stored.profile)
     const previewText = String(body.text || '').trim().slice(0, MAX_VOICE_PREVIEW_TEXT_CHARS) || DEFAULT_VOICE_PREVIEW_TEXT
-    const promptText = buildTtsPromptTemplate(profile).replace('{{script}}', previewText)
+    // gemini-3.1-flash-tts-preview pattern: Script in `contents`, Style Instructions in `systemInstruction`.
+    const styleInstructions = buildTtsStyleInstructions(profile)
     const apiKeys = await getSystemGeminiApiKeys(c.env.DB).catch(() => [])
     if (!apiKeys.length) {
         return c.json({ error: 'ยังไม่ได้ตั้ง Gemini API key กลางของระบบ' }, 400)
@@ -6473,7 +6809,7 @@ app.post('/api/settings/voice-preview', async (c) => {
     let lastError = 'voice_preview_failed'
     for (const apiKey of apiKeys) {
         try {
-            const pcm = await requestGeminiTtsPreview(apiKey, promptText, profile.voice_name)
+            const pcm = await requestGeminiTtsPreview(apiKey, previewText, profile.voice_name, styleInstructions)
             const wav = buildWavFromPcm16le(pcm)
             return new Response(wav, {
                 status: 200,
@@ -6990,6 +7326,10 @@ const LINE_QUICK_REPLY_ITEMS = [
 const LINE_COVER_PICKER_QUICK_REPLY_ITEMS = [
     {
         type: 'action',
+        action: { type: 'message', label: '✨ ให้ AI คิดให้', text: 'ให้ ai คิดให้' },
+    },
+    {
+        type: 'action',
         action: { type: 'message', label: 'สุ่มอีกครั้ง', text: 'สุ่มอีกครั้ง' },
     },
     LINE_CANCEL_QUICK_REPLY_ITEM,
@@ -7038,6 +7378,7 @@ type LineWaitingVideoState = {
     coverOptions?: LineCoverOption[]
     selectedCoverOption?: LineCoverOption | null
     coverText?: string
+    coverTextYPercent?: number
     coverTemplateId?: string
     coverTextStyle?: CoverTextStyleSettings
     coverTextPositionOptions?: LineCoverTextPositionOption[]
@@ -7084,6 +7425,7 @@ function normalizeCoverTextStyleFontId(rawValue: unknown): CoverTextStyleFontId 
         case 'krub-bold':
         case 'chakra-petch-bold':
         case 'ibm-plex-sans-thai-bold':
+        case 'psl-x-omyim-bold':
             return normalized
         case 'fc-iconic-bold':
             return 'kanit-bold'
@@ -7094,6 +7436,17 @@ function normalizeCoverTextStyleFontId(rawValue: unknown): CoverTextStyleFontId 
         default:
             return DEFAULT_COVER_TEXT_STYLE_FONT_ID
     }
+}
+
+function normalizeCoverTextStyleMode(rawValue: unknown): CoverTextStyleMode {
+    const normalized = String(rawValue || '').trim().toLowerCase()
+    return normalized === 'outline' ? 'outline' : 'box'
+}
+
+function normalizeCoverTextStyleOutlineWidth(rawValue: unknown): number {
+    const parsed = Number(rawValue)
+    if (!Number.isFinite(parsed)) return 8
+    return Math.max(0, Math.min(40, Math.round(parsed)))
 }
 
 function normalizeCoverTextStyleBackgroundOpacity(rawValue: unknown): number {
@@ -7112,10 +7465,22 @@ function normalizeCoverTextStyleSizeScale(rawValue: unknown): number {
 }
 
 function normalizeLineCoverText(input: unknown): string {
-    const normalized = String(input || '')
+    let normalized = String(input || '')
         .replace(/\r\n/g, '\n')
         .replace(/\u00a0/g, ' ')
-        .replace(/[ \t]+/g, ' ')
+    // Allow users to force a line break via any of these delimiters:
+    //   |  (pipe)         — "ของเล่นใหม่|เอาไว้เกลงแมว"
+    //   \n (literal)      — "ของเล่นใหม่\nเอาไว้เกลงแมว"  (typed 2 chars, not a real newline)
+    //   // (double slash) — "ของเล่นใหม่//เอาไว้เกลงแมว"
+    normalized = normalized
+        .replace(/\\n/g, '\n')
+        .replace(/\s*\|\s*/g, '\n')
+        .replace(/\s*\/\/\s*/g, '\n')
+        // collapse runs of plain spaces/tabs within each line (not newlines)
+        .split('\n')
+        .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+        .filter((line, idx, arr) => line.length > 0 || (idx < arr.length - 1))
+        .join('\n')
         .trim()
     if (!normalized) return ''
     return normalized.slice(0, MAX_LINE_COVER_TEXT_CHARS)
@@ -7214,9 +7579,13 @@ function createDefaultCoverTextStyle(templateId: string): CoverTextStyleSettings
     return {
         fontId: DEFAULT_COVER_TEXT_STYLE_FONT_ID,
         textColor: '#FFFFFF',
+        secondaryTextColor: '#FFFFFF',
         backgroundColor: getLineCoverTemplateAccentColor(normalizedTemplateId),
         backgroundOpacity: DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY,
         sizeScale: DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE,
+        mode: 'box',
+        outlineColor: '#000000',
+        outlineWidth: 8,
     }
 }
 
@@ -7236,20 +7605,25 @@ function normalizeCoverTextStyle(
         ?? '',
     ))
 
+    const record = (input as Record<string, unknown> | null | undefined) || {}
+    const outlineColorRaw = String(record.outlineColor ?? record.outline_color ?? '')
+    const normalizedOutlineColor = normalizeHexColor(outlineColorRaw)
+    const secondaryTextColorRaw = String(record.secondaryTextColor ?? record.secondary_text_color ?? '')
+    const normalizedSecondaryTextColor = normalizeHexColor(secondaryTextColorRaw)
+    const baseTextColor = normalizedTextColor || defaults.textColor
     return {
-        fontId: normalizeCoverTextStyleFontId(
-            (input as Record<string, unknown> | null | undefined)?.fontId
-            ?? (input as Record<string, unknown> | null | undefined)?.font_id,
-        ),
-        textColor: normalizedTextColor || defaults.textColor,
+        fontId: normalizeCoverTextStyleFontId(record.fontId ?? record.font_id),
+        textColor: baseTextColor,
+        secondaryTextColor: normalizedSecondaryTextColor || baseTextColor,
         backgroundColor: normalizedBackgroundColor || defaults.backgroundColor,
         backgroundOpacity: normalizeCoverTextStyleBackgroundOpacity(
-            (input as Record<string, unknown> | null | undefined)?.backgroundOpacity
-            ?? (input as Record<string, unknown> | null | undefined)?.background_opacity,
+            record.backgroundOpacity ?? record.background_opacity,
         ),
-        sizeScale: normalizeCoverTextStyleSizeScale(
-            (input as Record<string, unknown> | null | undefined)?.sizeScale
-            ?? (input as Record<string, unknown> | null | undefined)?.size_scale,
+        sizeScale: normalizeCoverTextStyleSizeScale(record.sizeScale ?? record.size_scale),
+        mode: normalizeCoverTextStyleMode(record.mode ?? record.textMode ?? record.text_mode),
+        outlineColor: normalizedOutlineColor || defaults.outlineColor,
+        outlineWidth: normalizeCoverTextStyleOutlineWidth(
+            record.outlineWidth ?? record.outline_width,
         ),
     }
 }
@@ -7530,9 +7904,13 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         url.searchParams.set('tid', coverTemplateId)
         url.searchParams.set('tf', coverTextStyle.fontId)
         url.searchParams.set('tc', coverTextStyle.textColor)
+        url.searchParams.set('tc2', coverTextStyle.secondaryTextColor)
         url.searchParams.set('bc', coverTextStyle.backgroundColor)
         url.searchParams.set('bo', String(coverTextStyle.backgroundOpacity))
         url.searchParams.set('ts', String(coverTextStyle.sizeScale))
+        url.searchParams.set('om', coverTextStyle.mode)
+        url.searchParams.set('oc', coverTextStyle.outlineColor)
+        url.searchParams.set('ow', String(coverTextStyle.outlineWidth))
         return url.toString()
     } catch {
         const paramsObj = new URLSearchParams()
@@ -7546,9 +7924,13 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         paramsObj.set('tid', coverTemplateId)
         paramsObj.set('tf', coverTextStyle.fontId)
         paramsObj.set('tc', coverTextStyle.textColor)
+        paramsObj.set('tc2', coverTextStyle.secondaryTextColor)
         paramsObj.set('bc', coverTextStyle.backgroundColor)
         paramsObj.set('bo', String(coverTextStyle.backgroundOpacity))
         paramsObj.set('ts', String(coverTextStyle.sizeScale))
+        paramsObj.set('om', coverTextStyle.mode)
+        paramsObj.set('oc', coverTextStyle.outlineColor)
+        paramsObj.set('ow', String(coverTextStyle.outlineWidth))
         return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame-preview/${encodeURIComponent(cacheBust)}?${paramsObj.toString()}`
     }
 }
@@ -7805,7 +8187,7 @@ function buildLineChoicePromptFlexCard(params: {
 function buildLineCoverTextPromptMessage(): LineReplyMessage {
     return {
         type: 'text',
-        text: 'จะเพิ่มข้อความในปกไหม\nพิมพ์ข้อความมาได้เลย หรือกดไม่ใส่ข้อความ',
+        text: 'จะเพิ่มข้อความในปกไหม\nพิมพ์ข้อความมาได้เลย หรือกดไม่ใส่ข้อความ\n\nเคล็ดลับ: ขึ้นบรรทัดใหม่ใช้ | คั่น เช่น "ของเล่นใหม่|เอาไว้เกลงแมว"',
         quickReply: { items: LINE_COVER_TEXT_QUICK_REPLY_ITEMS },
     }
 }
@@ -8720,6 +9102,86 @@ async function continueLineFlowAfterCover(params: {
     })
 }
 
+/**
+ * AI-Auto "Pick Everything" for cover:
+ *   - Gemini chooses the best frame out of 6 candidates.
+ *   - Generates a 2-line Thai cover text.
+ *   - Picks the best y-position (20/35/50/65/80).
+ * Then materializes the cover assets and proceeds to the caption step.
+ * Called when user taps "ให้ AI คิดให้" at the cover-picker stage.
+ */
+async function handleLineAiFullCoverAutoPick(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    channelAccessToken: string
+    lineUserId: string
+    waitingState: LineWaitingVideoState
+}): Promise<void> {
+    const waitingState = normalizeLineWaitingVideoState(params.waitingState)
+    if (!waitingState || !waitingState.id) throw new Error('invalid_line_waiting_state')
+
+    const suggestion = await generateAiInboxCoverSuggestion({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: params.namespaceId,
+        videoId: waitingState.id,
+    })
+    if (!suggestion) {
+        throw new Error('gemini_cover_suggestion_failed')
+    }
+
+    // Pull the user's saved cover template + text style so the AI-generated text
+    // inherits the same font/color/outline settings as manual picks.
+    const coverTemplateSettings = await getNamespaceCoverTemplateSettings(params.env.DB, params.namespaceId).catch(() => ({
+        template_id: DEFAULT_COVER_TEMPLATE_ID,
+        text_style: createDefaultCoverTextStyle(DEFAULT_COVER_TEMPLATE_ID),
+    }))
+    const coverTemplateId = normalizeCoverTemplateId(String(coverTemplateSettings?.template_id || ''))
+    const coverTextStyle = normalizeCoverTextStyle(coverTemplateSettings?.text_style, coverTemplateId)
+
+    await materializeSelectedLineCoverOptionAssets({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: params.namespaceId,
+        videoId: waitingState.id,
+        option: suggestion.option,
+        coverText: suggestion.coverText,
+        coverTextYPercent: suggestion.textYPercent,
+        coverTemplateId,
+        coverTextStyle,
+    })
+
+    const nextWaitingState: LineWaitingVideoState = {
+        ...waitingState,
+        selectedCoverOption: suggestion.option,
+        coverText: suggestion.coverText,
+        coverTextYPercent: suggestion.textYPercent,
+        coverTemplateId,
+        coverTextStyle,
+        awaitingStep: 'caption',
+        coverCompleted: true,
+    }
+
+    // Short summary so the user sees what AI chose (push because we already replied earlier).
+    const previewLine = suggestion.coverText.replace(/\n/g, ' / ')
+    await linePushMessage(params.channelAccessToken, params.lineUserId, [
+        { type: 'text', text: `✅ AI เลือกปกและข้อความให้แล้ว\n"${previewLine}"\nตำแหน่ง ${suggestion.textYPercent}%` },
+    ]).catch(() => { })
+
+    // Route into the normal post-cover flow — will ask for caption or finalize.
+    await continueLineFlowAfterCover({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: params.namespaceId,
+        channelAccessToken: params.channelAccessToken,
+        replyToken: '',
+        lineUserId: params.lineUserId,
+        waitingState: nextWaitingState,
+        manualCaption: waitingState.manualCaption,
+    })
+}
+
 async function materializeSelectedLineCoverOptionAssets(params: {
     env: Env
     bucket: R2Bucket
@@ -8755,9 +9217,13 @@ async function materializeSelectedLineCoverOptionAssets(params: {
             yPercent: coverTextYPercent,
             fontId: coverTextStyle.fontId,
             textColor: coverTextStyle.textColor,
+            secondaryTextColor: coverTextStyle.secondaryTextColor,
             backgroundColor: coverTextStyle.backgroundColor,
             backgroundOpacity: coverTextStyle.backgroundOpacity,
             sizeScale: coverTextStyle.sizeScale,
+            mode: coverTextStyle.mode,
+            outlineColor: coverTextStyle.outlineColor,
+            outlineWidth: coverTextStyle.outlineWidth,
         }
         : undefined
 
@@ -9863,9 +10329,27 @@ async function handleLineTextMessage(params: {
             return
         }
 
-        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text) || isLineAiThinkCommand(text)) {
+        if (isLineAiThinkCommand(text)) {
+            // AI picks: best frame + 2-line cover text + y-position (all via Gemini)
+            try {
+                await lineReply(replyToken, channelAccessToken, [
+                    { type: 'text', text: '✨ AI กำลังเลือกปก+คิดข้อความ+ตำแหน่งให้... สักครู่นะ' },
+                ]).catch(() => { })
+                await handleLineAiFullCoverAutoPick({
+                    env, bucket, namespaceId, channelAccessToken, lineUserId, waitingState,
+                })
+            } catch (e) {
+                console.error('[LINE] AI full cover auto-pick error:', e instanceof Error ? e.message : String(e))
+                await linePushMessage(channelAccessToken, lineUserId, [
+                    { type: 'text', text: 'ขออภัย AI ทำปกไม่สำเร็จ ลองเลือกปกเองจาก 10 รูป หรือกดสุ่มอีกครั้ง' },
+                ]).catch(() => { })
+            }
+            return
+        }
+
+        if (isLineCoverSkipCommand(text) || isLineCaptionSkipCommand(text)) {
             await lineReply(replyToken, channelAccessToken, [
-                { type: 'text', text: 'ขั้นตอนนี้ต้องเลือกปกก่อน เลือกจาก 10 รูปได้เลย หรือกดสุ่มอีกครั้ง' },
+                { type: 'text', text: 'ขั้นตอนนี้ต้องเลือกปกก่อน เลือกจาก 10 รูปได้เลย หรือกด "ให้ AI คิดให้" / "สุ่มอีกครั้ง"' },
             ]).catch(() => { })
             return
         }
@@ -14390,9 +14874,13 @@ async function handleGalleryFrameRequest(c: Context<{ Bindings: Env, Variables: 
     const coverTextStyle = normalizeCoverTextStyle({
         font_id: c.req.query('tf') || c.req.query('font_id') || '',
         text_color: c.req.query('tc') || c.req.query('text_color') || '',
+        secondary_text_color: c.req.query('tc2') || c.req.query('secondary_text_color') || '',
         background_color: c.req.query('bc') || c.req.query('bg_color') || '',
         background_opacity: c.req.query('bo') || c.req.query('bg_opacity') || '',
         size_scale: c.req.query('ts') || c.req.query('text_scale') || '',
+        mode: c.req.query('om') || c.req.query('overlay_mode') || '',
+        outline_color: c.req.query('oc') || c.req.query('outline_color') || '',
+        outline_width: c.req.query('ow') || c.req.query('outline_width') || '',
     }, coverTemplateId)
     if (!id || !targetNamespaceId) return c.text('Not found', 404)
 
@@ -14419,9 +14907,13 @@ async function handleGalleryFrameRequest(c: Context<{ Bindings: Env, Variables: 
                     yPercent: coverTextYPercent,
                     fontId: coverTextStyle.fontId,
                     textColor: coverTextStyle.textColor,
+                    secondaryTextColor: coverTextStyle.secondaryTextColor,
                     backgroundColor: coverTextStyle.backgroundColor,
                     backgroundOpacity: coverTextStyle.backgroundOpacity,
                     sizeScale: coverTextStyle.sizeScale,
+                    mode: coverTextStyle.mode,
+                    outlineColor: coverTextStyle.outlineColor,
+                    outlineWidth: coverTextStyle.outlineWidth,
                 }
                 : undefined,
         )
@@ -14535,13 +15027,20 @@ type CoverTextStyleFontId =
     | 'krub-bold'
     | 'chakra-petch-bold'
     | 'ibm-plex-sans-thai-bold'
+    | 'psl-x-omyim-bold'
+
+type CoverTextStyleMode = 'box' | 'outline'
 
 type CoverTextStyleSettings = {
     fontId: CoverTextStyleFontId
     textColor: string
+    secondaryTextColor: string
     backgroundColor: string
     backgroundOpacity: number
     sizeScale: number
+    mode: CoverTextStyleMode
+    outlineColor: string
+    outlineWidth: number
 }
 
 type FacebookErrorLike = {
@@ -14919,9 +15418,13 @@ async function setNamespaceCoverTextStyle(
     ).bind(namespaceId, NS_SETTING_COVER_TEXT_STYLE, JSON.stringify({
         font_id: style.fontId,
         text_color: style.textColor,
+        secondary_text_color: style.secondaryTextColor,
         background_color: style.backgroundColor,
         background_opacity: style.backgroundOpacity,
         size_scale: style.sizeScale,
+        mode: style.mode,
+        outline_color: style.outlineColor,
+        outline_width: style.outlineWidth,
     })).run()
 }
 
@@ -14935,9 +15438,13 @@ async function getNamespaceCoverTemplateSettings(db: D1Database, namespaceId: st
         text_style: {
             font_id: textStyleEntry.style.fontId,
             text_color: textStyleEntry.style.textColor,
+            secondary_text_color: textStyleEntry.style.secondaryTextColor,
             background_color: textStyleEntry.style.backgroundColor,
             background_opacity: textStyleEntry.style.backgroundOpacity,
             size_scale: textStyleEntry.style.sizeScale,
+            mode: textStyleEntry.style.mode,
+            outline_color: textStyleEntry.style.outlineColor,
+            outline_width: textStyleEntry.style.outlineWidth,
         },
         source: workspace.updatedAt || textStyleEntry.updatedAt ? 'custom' : 'default',
         updated_at: updatedAt,
@@ -16275,7 +16782,11 @@ function generateRandomPostHours(): string {
 }
 
 function normalizePostTokenPool(tokens: string[]): string[] {
-    return uniqueTokens((tokens || []).filter((token) => isPostRoleToken(token)))
+    // Accept any valid (non-empty) token. Previously filtered EAAD6 prefix as "user token",
+    // but that's unreliable — EAAD6 encodes the Facebook app id (e.g. Facebook Lite), not
+    // the token type. We now trust whatever the operator pastes in the page-token field
+    // and use the same token for both post + comment.
+    return uniqueTokens((tokens || []).filter((token) => isTokenValid(token)))
 }
 
 function isCommentRoleToken(token: string): boolean {
@@ -16310,9 +16821,11 @@ function isRoleTokenForMode(token: string, mode: BrowserSavingTokenMode): boolea
 }
 
 function normalizeCommentTokenPool(tokens: string[]): string[] {
-    // Runtime now only accepts page-scoped tokens (EAACh/other non-EAAD6).
-    // Keep legacy EAAD6 out of both posting and comment flows entirely.
-    return uniqueTokens(tokens.filter((token) => isPostRoleToken(token)))
+    // Accept any valid (non-empty) token. The operator-pasted page-token is the single
+    // source of truth for both post + comment, regardless of the EAAD6/EAACh prefix
+    // (those prefixes just encode the Facebook app id — Lite, Marketing etc —
+    // not the token's scope).
+    return uniqueTokens(tokens.filter((token) => isTokenValid(token)))
 }
 
 function normalizeDirectVideoTokenPool(tokens: string[]): string[] {
@@ -16777,37 +17290,19 @@ async function ensurePageTokenCandidates(params: {
     primaryToken?: string | null
     logPrefix: string
 }): Promise<{ tokens: string[]; postTokens: string[]; commentTokens: string[] }> {
-    let candidates = await getPageTokenCandidates(params)
-    const needsCommentRecover = normalizeDirectVideoTokenPool(candidates.commentTokens).length === 0
-    const needsPostRecover = candidates.postTokens.length === 0
-    if (!needsCommentRecover && !needsPostRecover) {
-        return candidates
+    // Single-token model: whatever the operator pastes in the page "Access Token (โพสต์)"
+    // field is used for BOTH posting and commenting. No fallback to BrowserSaving
+    // profiles, no postcron/EAACh rotation, no namespace token-pool auto-rebuild.
+    // If the token goes bad, update it manually in the UI.
+    const primary = String(params.primaryToken || '').trim()
+    if (!primary) {
+        return { tokens: [], postTokens: [], commentTokens: [] }
     }
-
-    try {
-        const rebuilt = await rebuildTaggedPageProfileTokens(
-            params.env,
-            params.namespaceId,
-            params.pageId,
-            params.pageName,
-        )
-        const fallbackPostTokens = normalizePostTokenPool([String(params.primaryToken || '').trim()])
-        const postTokens = rebuilt.postTokens.length > 0 ? rebuilt.postTokens : fallbackPostTokens
-        const commentTokens = buildPreferredCommentTokenPool({
-            primaryToken: params.primaryToken,
-            postTokens,
-            commentTokens: rebuilt.commentTokens,
-        })
-        candidates = {
-            tokens: uniqueTokens([...postTokens, ...commentTokens]),
-            postTokens,
-            commentTokens,
-        }
-    } catch (e) {
-        console.log(`[${params.logPrefix}] token auto-rebuild failed for page ${params.pageId}: ${e instanceof Error ? e.message : String(e)}`)
+    return {
+        tokens: [primary],
+        postTokens: [primary],
+        commentTokens: [primary],
     }
-
-    return candidates
 }
 
 function getFacebookErrorMessage(rawError: unknown): string {
@@ -17991,13 +18486,15 @@ async function shortenLazadaLinkForNamespace(params: {
     }
 
     let lastError: string | null = null
-    const maxAttempts = 2
+    // Extended retry schedule — short.wwoom.com (Electron bridge) returns transient HTTP 500
+    // when its puppeteer session refreshes. 2 attempts @ 250ms was insufficient and caused
+    // posting to be BLOCKED for minutes at a time. Now: 5 attempts over ~11s total.
+    const lazadaRetryDelaysMs = [0, 500, 2000, 4000, 8000]
+    const maxAttempts = lazadaRetryDelaysMs.length
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
-            if (attempt > 1) {
-                const backoffMs = Math.min(1000, 250 * Math.pow(2, attempt - 2))
-                await waitMs(backoffMs)
-            }
+            const delayMs = lazadaRetryDelaysMs[attempt - 1]
+            if (delayMs > 0) await waitMs(delayMs)
             const resp = await fetchWithTimeout(finalLazadaRequestUrl, {}, 8000, 'lazada_shortlink')
             if (!resp.ok) {
                 const errText = await resp.text().catch(() => '')
@@ -18023,6 +18520,7 @@ async function shortenLazadaLinkForNamespace(params: {
             const memberId = String(data.member_id || data.memberId || affiliateId || '').trim() || null
             if (shortLink) {
                 writeTrace({ utmSource, memberId, status: 'shortened', error: null })
+                if (attempt > 1) console.log(`[${params.logPrefix}] Lazada shortlink succeeded on attempt ${attempt}/${maxAttempts}`)
                 return shortLink
             }
             throw new Error('missing_short_link_in_response')
@@ -18098,13 +18596,14 @@ async function shortenShopeeLinkForNamespace(params: {
     }
 
     let lastError: string | null = null
-    const maxAttempts = 2
+    // Same extended retry schedule as Lazada — Electron bridge returns transient HTTP 500
+    // during puppeteer session refresh. Was 2 attempts @ 250ms, now 5 attempts over ~11s.
+    const shopeeRetryDelaysMs = [0, 500, 2000, 4000, 8000]
+    const maxAttempts = shopeeRetryDelaysMs.length
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
-            if (attempt > 1) {
-                const backoffMs = Math.min(1000, 250 * Math.pow(2, attempt - 2))
-                await waitMs(backoffMs)
-            }
+            const delayMs = shopeeRetryDelaysMs[attempt - 1]
+            if (delayMs > 0) await waitMs(delayMs)
             const resp = await fetchWithTimeout(finalRequestUrl, {}, 8000, 'shortlink')
             if (!resp.ok) {
                 const errText = await resp.text().catch(() => '')
@@ -18128,6 +18627,7 @@ async function shortenShopeeLinkForNamespace(params: {
                 // Strip ?lp=aff that Shopee appends on redirect (not our code)
                 const cleanedShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
                 writeTrace({ utmSource, status: 'shortened', error: null })
+                if (attempt > 1) console.log(`[${params.logPrefix}] Shopee shortlink succeeded on attempt ${attempt}/${maxAttempts}`)
                 return cleanedShortLink
             }
             throw new Error('missing_short_link_in_response')
@@ -19281,8 +19781,11 @@ async function resolvePageScopedToken(
     const token = tokenInput.token
     if (!token) return { token: '', source: 'provided_as_is', reason: 'empty_token' }
 
+    const normalizedPageId = String(pageId || '').trim()
+    const browsersavingSource = tokenInput.source === 'browsersaving_profile_id' ? 'browsersaving_profile_id' : 'provided_as_is'
+
     const resolveFromMeAccountsData = (items: Array<{ id?: string; access_token?: string }>): { token: string; source: 'resolved_from_me_accounts' | 'provided_as_is' | 'browsersaving_profile_id'; reason?: string } => {
-        const matched = items.find((p) => String(p.id || '') === String(pageId))
+        const matched = items.find((p) => String(p.id || '') === normalizedPageId)
         const pageToken = String(matched?.access_token || '').trim()
         if (isResolvedRoleTokenForMode(pageToken, mode)) {
             return {
@@ -19293,13 +19796,40 @@ async function resolvePageScopedToken(
         }
         return {
             token: '',
-            source: tokenInput.source === 'browsersaving_profile_id' ? 'browsersaving_profile_id' : 'provided_as_is',
+            source: browsersavingSource,
             reason: tokenInput.source === 'browsersaving_profile_id'
                 ? `page_not_found_in_me_accounts (${tokenInput.reason || 'browsersaving_profile_id'})`
                 : 'page_not_found_in_me_accounts',
         }
     }
 
+    // STEP 1: Identify the token via /me first.
+    // - Page token  → /me returns the page's own id → if matches pageId, accept the token as-is.
+    // - User token  → /me returns a user id → fall through to /me/accounts to find page token.
+    // /me works for BOTH token types, so we can detect the kind without failing on
+    // "(#100) Tried accessing nonexisting field (accounts)" which happens if we hit
+    // /me/accounts first with a page-scoped token.
+    //
+    // IMPORTANT: do NOT gate this behind isResolvedRoleTokenForMode. The EAAD6* prefix
+    // is just the Facebook App ID (e.g. Facebook Lite) encoded in the token; it does
+    // NOT tell us whether the token is user-scoped or page-scoped. Only /me can.
+    let meIdentityFailed: unknown = null
+    try {
+        const me = await fetchMeIdentityViaHttp(token)
+        const meId = String(me?.id || '').trim()
+        if (meId && normalizedPageId && meId === normalizedPageId) {
+            return {
+                token,
+                source: browsersavingSource,
+                reason: tokenInput.reason || 'already_page_scoped_token',
+            }
+        }
+    } catch (e) {
+        meIdentityFailed = e
+        console.log(`[PAGES] resolvePageScopedToken /me probe failed: ${String(e)}`)
+    }
+
+    // STEP 2: Assume user token — enumerate pages via /me/accounts and pull the target page's token.
     try {
         const data = await facebookGraphGet<{ data?: Array<{ id?: string; access_token?: string }> }>(
             token,
@@ -19312,30 +19842,21 @@ async function resolvePageScopedToken(
         return resolveFromMeAccountsData(data.data || [])
     } catch (e) {
         console.log(`[PAGES] resolvePageScopedToken sdk fallback: ${String(e)}`)
-        if (isResolvedRoleTokenForMode(token, mode)) {
-            try {
-                const me = await fetchMeIdentityViaHttp(token)
-                const meId = String(me?.id || '').trim()
-                if (meId && String(pageId || '').trim() === meId) {
-                    return {
-                        token,
-                        source: tokenInput.source === 'browsersaving_profile_id' ? 'browsersaving_profile_id' : 'provided_as_is',
-                        reason: tokenInput.reason || 'already_page_scoped_token',
-                    }
-                }
-            } catch {
-                // continue to /me/accounts fallback below
-            }
-        }
+        // Last-ditch: direct HTTP (some SDK paths normalize errors differently).
         try {
             const pages = await fetchMeAccountsViaHttp(token)
             return resolveFromMeAccountsData(pages)
         } catch (fallbackErr) {
-            const err = parseFacebookErrorLike(fallbackErr) || parseFacebookErrorLike(e)
-            const reason = err?.message || String(fallbackErr instanceof Error ? fallbackErr.message : fallbackErr)
+            const err = parseFacebookErrorLike(fallbackErr) || parseFacebookErrorLike(e) || parseFacebookErrorLike(meIdentityFailed)
+            const rawReason = err?.message || String(fallbackErr instanceof Error ? fallbackErr.message : fallbackErr)
+            // Rewrite the cryptic "(#100) accounts" error into a user-friendly hint
+            // pointing out the likely cause (user pasted a page token for the wrong page).
+            const reason = /nonexisting field.*accounts/i.test(rawReason)
+                ? `token_not_for_this_page (page=${normalizedPageId})`
+                : rawReason
             return {
                 token: '',
-                source: tokenInput.source === 'browsersaving_profile_id' ? 'browsersaving_profile_id' : 'provided_as_is',
+                source: browsersavingSource,
                 reason: tokenInput.source === 'browsersaving_profile_id'
                     ? `${reason} (${tokenInput.reason || 'browsersaving_profile_id'})`
                     : reason,
@@ -20783,11 +21304,134 @@ async function reconcilePostingHistoryRows(params: {
     }
 }
 
+/**
+ * Recovers rows that were marked status='failed' with no fb_post_id — but the video
+ * actually reached Facebook (e.g. our publish call threw a transient error after FB
+ * had already accepted the upload). Scans the page feed for a matching post around
+ * the failed row's posted_at window and, when found, upgrades the row to success +
+ * queues the comment so the existing pending-comment worker posts the shopee link.
+ */
+async function recoverFailedHistoryRowsFromFeed(params: {
+    env: Env
+    botId: string
+    logPrefix: string
+}): Promise<void> {
+    const { env, botId, logPrefix } = params
+    const recoveryWindowMinutes = 45
+    try {
+        const { results } = await env.DB.prepare(
+            `SELECT ph.id, ph.page_id, ph.video_id, ph.posted_at, ph.shopee_link, ph.lazada_link,
+                    p.name AS page_name, p.access_token
+             FROM post_history ph
+             JOIN pages p ON p.id = ph.page_id
+             WHERE ph.status = 'failed'
+               AND (ph.fb_post_id IS NULL OR TRIM(ph.fb_post_id) = '')
+               AND ph.comment_status = 'not_attempted'
+               AND ph.bot_id = ?
+               AND p.bot_id = ?
+               AND datetime(ph.posted_at) >= datetime('now', ?)
+             ORDER BY ph.posted_at DESC
+             LIMIT 10`
+        ).bind(botId, botId, `-${recoveryWindowMinutes} minutes`).all() as {
+            results: Array<{
+                id: number
+                page_id: string
+                video_id: string
+                posted_at: string
+                shopee_link?: string | null
+                lazada_link?: string | null
+                page_name?: string
+                access_token?: string
+            }>
+        }
+
+        for (const row of results || []) {
+            try {
+                const pageAccessToken = String(row.access_token || '').trim()
+                if (!pageAccessToken) continue
+
+                const postedAtMs = Date.parse(String(row.posted_at || ''))
+                // skip fresh failures — FB feed needs time to index
+                if (!Number.isFinite(postedAtMs) || Date.now() - postedAtMs < 60000) continue
+
+                const feedRecovered = await recoverPublishedReelFromRecentFeed({
+                    accessToken: pageAccessToken,
+                    pageId: String(row.page_id || ''),
+                    expectedCaption: '', // no caption stored in DB; fall back to time-window match only
+                    notBeforeIso: row.posted_at,
+                    logPrefix: `${logPrefix} RECOVER-FAILED ${row.page_name || row.page_id}`,
+                }).catch(() => ({ published: false } as { published: boolean; post_id?: string; permalink_url?: string }))
+
+                if (!feedRecovered.published || !feedRecovered.post_id) continue
+
+                const recoveredPostId = String(feedRecovered.post_id || '').trim()
+                const recoveredReelUrl = String(feedRecovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
+
+                // Guard: make sure this fb_post_id is not already claimed by another history row for the same page.
+                const claimedByOther = await env.DB.prepare(
+                    `SELECT id FROM post_history
+                     WHERE fb_post_id = ? AND page_id = ? AND id <> ?
+                     LIMIT 1`
+                ).bind(recoveredPostId, String(row.page_id || ''), row.id).first<{ id?: number }>().catch(() => null)
+                if (claimedByOther?.id) {
+                    console.log(`[${logPrefix}] RECOVER-FAILED skip row ${row.id}: fb_post_id ${recoveredPostId} already claimed by row ${claimedByOther.id}`)
+                    continue
+                }
+
+                const hasShopee = !!String(row.shopee_link || '').trim()
+                const nextCommentStatus = hasShopee ? 'pending' : 'not_configured'
+
+                const update = await env.DB.prepare(
+                    `UPDATE post_history
+                     SET status = 'success',
+                         fb_post_id = ?,
+                         fb_reel_url = ?,
+                         error_message = NULL,
+                         comment_status = CASE WHEN comment_status = 'not_attempted' THEN ? ELSE comment_status END,
+                         comment_error = NULL,
+                         comment_due_at = NULL
+                     WHERE id = ?
+                       AND status = 'failed'
+                       AND (fb_post_id IS NULL OR TRIM(fb_post_id) = '')`
+                ).bind(recoveredPostId, recoveredReelUrl, nextCommentStatus, row.id).run().catch(() => null)
+
+                if (Number(update?.meta?.changes || 0) > 0) {
+                    console.log(`[${logPrefix}] RECOVER-FAILED row ${row.id} recovered: fb_post_id=${recoveredPostId}, comment=${nextCommentStatus}`)
+                    await markNamespaceVideoPosted(env.DB, botId, String(row.video_id || ''), new Date().toISOString()).catch(() => { })
+                }
+            } catch (rowErr) {
+                console.error(`[${logPrefix}] RECOVER-FAILED row ${row.id} failed: ${rowErr instanceof Error ? rowErr.message : String(rowErr)}`)
+            }
+        }
+    } catch (outerErr) {
+        console.error(`[${logPrefix}] RECOVER-FAILED scan failed: ${outerErr instanceof Error ? outerErr.message : String(outerErr)}`)
+    }
+}
+
 function isVideoProcessingErrorMessage(message: string): boolean {
     const normalized = String(message || '').toLowerCase()
     return normalized.includes('video is processing') ||
         normalized.includes('get-the-upload-status') ||
         normalized.includes('upload status')
+}
+
+/**
+ * Detects transient Facebook publish errors that warrant a retry.
+ * FB returns misleading generic messages (e.g. "Please reduce the amount of data you're asking for")
+ * for internal backend hiccups — the same request usually succeeds minutes later.
+ * Evidence: same video+token combo has history of FAIL→SUCCESS on retry (see post_history).
+ */
+function isTransientFacebookPublishError(message: string): boolean {
+    const normalized = String(message || '').toLowerCase()
+    return normalized.includes('please reduce the amount of data') ||
+        normalized.includes('please try again') ||
+        normalized.includes('service temporarily unavailable') ||
+        normalized.includes('an unknown error occurred') ||
+        normalized.includes('temporarily unavailable') ||
+        normalized.includes('timeout') ||
+        normalized.includes('socket hang up') ||
+        normalized.includes('econnreset') ||
+        normalized.includes('network error')
 }
 
 function waitMs(ms: number): Promise<void> {
@@ -21246,17 +21890,38 @@ async function publishReelViaVideosEndpointWithTokenFallback(params: {
     const errors: string[] = []
     const notBeforeIso = new Date().toISOString()
 
+    // Transient-error retry schedule for publishReelDirect (FB /videos occasionally returns
+    // misleading "Please reduce the amount of data" or similar on backend hiccups).
+    const TRANSIENT_RETRY_DELAYS_MS = [0, 5000, 20000]
+
     for (const token of candidates) {
         try {
-            const publishResult = await publishReelDirect({
-                pageId: params.pageId,
-                accessToken: token,
-                videoBuffer: params.videoBuffer,
-                thumbnailBuffer: params.thumbnailBuffer,
-                thumbnailContentType: params.thumbnailContentType,
-                description: params.description,
-                logPrefix: params.logPrefix,
-            })
+            let publishResult: Awaited<ReturnType<typeof publishReelDirect>> | null = null
+            let lastTransientError: unknown = null
+            for (let attempt = 0; attempt < TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
+                const delay = TRANSIENT_RETRY_DELAYS_MS[attempt]
+                if (delay > 0) await waitMs(delay)
+                try {
+                    publishResult = await publishReelDirect({
+                        pageId: params.pageId,
+                        accessToken: token,
+                        videoBuffer: params.videoBuffer,
+                        thumbnailBuffer: params.thumbnailBuffer,
+                        thumbnailContentType: params.thumbnailContentType,
+                        description: params.description,
+                        logPrefix: attempt === 0 ? params.logPrefix : `${params.logPrefix} retry#${attempt}`,
+                    })
+                    break
+                } catch (innerErr) {
+                    const innerMsg = parseFacebookErrorLike(innerErr)?.message || (innerErr instanceof Error ? innerErr.message : String(innerErr))
+                    if (!isTransientFacebookPublishError(innerMsg) || attempt === TRANSIENT_RETRY_DELAYS_MS.length - 1) {
+                        throw innerErr
+                    }
+                    lastTransientError = innerErr
+                    console.warn(`[${params.logPrefix}] transient FB publish error (attempt ${attempt + 1}/${TRANSIENT_RETRY_DELAYS_MS.length}), will retry: ${innerMsg}`)
+                }
+            }
+            if (!publishResult) throw lastTransientError ?? new Error('facebook_publish_no_result')
             const fbVideoId = String(publishResult.id || '').trim()
             if (!fbVideoId) throw new Error('facebook_publish_no_video_id')
 
@@ -22721,10 +23386,55 @@ app.post('/api/pages/import', async (c) => {
             fbPages = await fetchMeAccountsViaHttp(postImportToken)
         } catch (e) {
             const parsed = parseFacebookErrorLike(e)
-            return c.json({
-                error: 'Facebook API error',
-                details: parsed?.message || (e instanceof Error ? e.message : 'Unknown error')
-            }, 400)
+            const msg = String(parsed?.message || (e instanceof Error ? e.message : '')).toLowerCase()
+            // When the user pastes a PAGE token (not a USER token), /me/accounts fails with
+            //   (#100) Tried accessing nonexisting field (accounts)
+            // because only USER tokens can enumerate accounts. Fall back to /me — a page
+            // token lets /me return that single page's id/name, and the pasted token IS
+            // the access_token for that page.
+            const isPageTokenLike = /nonexisting field.*accounts/i.test(msg)
+                || (/\(#100\)/.test(msg) && /accounts/i.test(msg))
+            if (isPageTokenLike) {
+                try {
+                    const meUrl = buildFacebookGraphUrl(`${FB_GRAPH_V19}/me`, {
+                        fields: 'id,name,picture.type(large)',
+                        access_token: postImportToken,
+                    })
+                    const meResp = await fetch(meUrl, { method: 'GET' })
+                    const meData = await meResp.json().catch(() => ({})) as {
+                        id?: string
+                        name?: string
+                        picture?: { data?: { url?: string } }
+                        error?: { message?: string } | string
+                    }
+                    if (!meResp.ok) {
+                        const errPayload = typeof meData?.error === 'string'
+                            ? { message: meData.error }
+                            : (meData?.error || {})
+                        throw new Error(String(errPayload?.message || `HTTP ${meResp.status}`))
+                    }
+                    const fallbackPageId = String(meData?.id || '').trim()
+                    if (!fallbackPageId) {
+                        throw new Error('Page token /me returned no id')
+                    }
+                    fbPages = [{
+                        id: fallbackPageId,
+                        name: String(meData?.name || '').trim() || fallbackPageId,
+                        picture: meData?.picture,
+                        access_token: postImportToken,
+                    }]
+                } catch (fallbackErr) {
+                    return c.json({
+                        error: 'Facebook API error',
+                        details: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+                    }, 400)
+                }
+            } else {
+                return c.json({
+                    error: 'Facebook API error',
+                    details: parsed?.message || (e instanceof Error ? e.message : 'Unknown error')
+                }, 400)
+            }
         }
 
         if (fbPages.length === 0) {
@@ -22738,7 +23448,13 @@ app.post('/api/pages/import', async (c) => {
         const commentPageTokenById = new Map<string, string>()
         const tokenPool = await getNamespacePagesTokenPool(c.env.DB, botId)
 
-        if (String(commentImportToken || '').trim()) {
+        // Only run a SEPARATE /me/accounts pass for comment tokens when the operator
+        // actually pasted a distinct comment token. In the single-token model (same
+        // token used for post + comment) and when a Page token was pasted, this extra
+        // call is unnecessary and will fail with "#100 accounts" for page tokens.
+        const hasDistinctCommentToken = !!String(commentImportToken || '').trim()
+            && String(commentImportToken || '').trim() !== String(postImportToken || '').trim()
+        if (hasDistinctCommentToken) {
             try {
                 const commentPages = await fetchMeAccountsViaHttp(commentImportToken)
                 for (const item of commentPages) {
@@ -22749,10 +23465,44 @@ app.post('/api/pages/import', async (c) => {
                 }
             } catch (e) {
                 const parsed = parseFacebookErrorLike(e)
-                return c.json({
-                    error: 'Failed to resolve comment page tokens via /me/accounts',
-                    details: parsed?.message || (e instanceof Error ? e.message : String(e)),
-                }, 400)
+                const msg = String(parsed?.message || (e instanceof Error ? e.message : '')).toLowerCase()
+                // Comment token is a page token too — fall back to /me and treat it as
+                // the comment token for that single page.
+                const isPageTokenLike = /nonexisting field.*accounts/i.test(msg)
+                    || (/\(#100\)/.test(msg) && /accounts/i.test(msg))
+                if (isPageTokenLike) {
+                    try {
+                        const meUrl = buildFacebookGraphUrl(`${FB_GRAPH_V19}/me`, {
+                            fields: 'id,name',
+                            access_token: commentImportToken,
+                        })
+                        const meResp = await fetch(meUrl, { method: 'GET' })
+                        const meData = await meResp.json().catch(() => ({})) as {
+                            id?: string
+                            error?: { message?: string } | string
+                        }
+                        if (!meResp.ok) {
+                            const errPayload = typeof meData?.error === 'string'
+                                ? { message: meData.error }
+                                : (meData?.error || {})
+                            throw new Error(String(errPayload?.message || `HTTP ${meResp.status}`))
+                        }
+                        const fallbackPageId = String(meData?.id || '').trim()
+                        if (fallbackPageId && isResolvedCommentToken(commentImportToken)) {
+                            commentPageTokenById.set(fallbackPageId, commentImportToken)
+                        }
+                    } catch (fallbackErr) {
+                        return c.json({
+                            error: 'Failed to resolve comment page tokens via /me/accounts',
+                            details: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+                        }, 400)
+                    }
+                } else {
+                    return c.json({
+                        error: 'Failed to resolve comment page tokens via /me/accounts',
+                        details: parsed?.message || (e instanceof Error ? e.message : String(e)),
+                    }, 400)
+                }
             }
         }
 
@@ -22764,11 +23514,14 @@ app.post('/api/pages/import', async (c) => {
                 ? `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`
                 : (fbPage.picture?.data?.url || '')
             const pageAccessToken = String(fbPage.access_token || '').trim()
-            if (!isPostRoleToken(pageAccessToken)) {
+            // Accept any non-empty token — the EAAD6/EAACh prefix encodes the Facebook
+            // app id, not the token's scope. Matches the single-token model where
+            // whatever the operator pasted is used for both posting and commenting.
+            if (!isTokenValid(pageAccessToken)) {
                 invalidPostTokenPages.push({
                     id: pageId,
                     name: pageName,
-                    reason: 'post_token_prefix_invalid_from_me_accounts',
+                    reason: 'missing_page_access_token_from_me_accounts',
                 })
                 continue
             }
@@ -22804,18 +23557,32 @@ app.post('/api/pages/import', async (c) => {
                 continue
             }
 
-            // Important: pages.id is globally unique in current schema.
-            // If this page exists in another workspace, do not overwrite cross-tenant data.
+            // pages.id is globally unique in current schema. If the page is currently
+            // registered under a different namespace and the operator is re-adding it
+            // here with a fresh token, treat that as an explicit "move" — reassign
+            // ownership to the current workspace and purge the token pool from the
+            // previous namespace. Confirmed user intent: "ถ้าไม่ว่ายูสใส่ โทเค้นที่
+            // namespace id ไหน ให้ลบเพจออกจากที่เก่า แล้วเพิ่มเพจ namespace id ใหม่"
             const existingInOtherNamespace = await c.env.DB.prepare(
                 'SELECT bot_id FROM pages WHERE id = ?'
-            ).bind(pageId).first() as any
+            ).bind(pageId).first() as { bot_id?: string } | null
             if (existingInOtherNamespace?.bot_id) {
-                conflicts.push({
-                    id: pageId,
-                    name: pageName,
-                    reason: 'already_connected_to_other_workspace',
-                    existing_bot_id: String(existingInOtherNamespace.bot_id),
-                })
+                const oldBotId = String(existingInOtherNamespace.bot_id || '').trim()
+                // Best-effort: remove the page entry from the OLD namespace's token pool
+                // so stale tokens don't linger in a workspace that no longer owns the page.
+                if (oldBotId && oldBotId !== botId) {
+                    try {
+                        const oldPool = await getNamespacePagesTokenPool(c.env.DB, oldBotId)
+                        if (oldPool[pageId]) {
+                            delete oldPool[pageId]
+                            await setNamespacePagesTokenPool(c.env.DB, oldBotId, oldPool)
+                        }
+                    } catch { /* best-effort cleanup */ }
+                }
+                await c.env.DB.prepare(
+                    'UPDATE pages SET bot_id = ?, access_token = ?, image_url = ?, name = ?, updated_at = datetime("now") WHERE id = ?'
+                ).bind(botId, primaryToken, pageImageUrl, pageName, pageId).run()
+                imported.push({ id: pageId, name: pageName })
             } else {
                 await c.env.DB.prepare(
                     'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, is_active, bot_id) VALUES (?, ?, ?, ?, 60, 1, ?)'
@@ -23734,18 +24501,25 @@ async function generateAiInboxCoverSuggestion(params: {
     if (usableFrames.length === 0) return null
 
     const prompt = [
-        'คุณคือผู้ช่วยทำปกวิดีโอแนวขายของ/รีวิวสั้นภาษาไทย',
-        'จากภาพตัวเลือกหลายภาพ ให้เลือกเฟรมที่น่าสนใจที่สุดสำหรับทำปก และเขียนข้อความบนปก 1 บรรทัดภาษาไทย',
-        'กติกา:',
-        '- ข้อความต้องสั้น กระชับ น่าเปิดดู ไม่เกิน 12 คำ',
-        '- ห้ามใส่อีโมจิ',
-        '- ห้ามใส่เครื่องหมายคำพูด',
-        '- ห้ามใช้หลายบรรทัด',
-        '- ถ้าเห็นสินค้า/จุดเด่นชัด ให้ใช้คำที่สื่อประโยชน์หรือ hook',
-        '- เลือกตำแหน่งข้อความจาก 20, 35, 50, 65, 80 โดย 80 คือค่อนล่าง',
-        '- ตอบเป็น JSON เท่านั้น',
+        'คุณคือผู้ช่วยทำปกวิดีโอสั้นแนวไวรัลขายของภาษาไทย สไตล์ TikTok/Reel',
+        'จากภาพตัวเลือกหลายภาพ ให้ทำ 3 อย่าง:',
+        '1) เลือกเฟรมที่น่าสนใจที่สุด (เห็นสินค้าหรือจุดเด่นชัด มุมดี แสงโอเค) สำหรับทำปก',
+        '2) เขียนข้อความบนปก 2 บรรทัดภาษาไทย (ใช้ \\n คั่น)',
+        '3) เลือกตำแหน่งที่ข้อความจะแสดงบนปก ไม่บังสินค้า/ใบหน้า',
+        'กติกาข้อความ:',
+        '- บรรทัด 1 = hook สั้น สะดุด ดึงความสนใจ 3-6 คำ',
+        '- บรรทัด 2 = ประโยชน์/เรียกให้ดู 3-6 คำ',
+        '- ห้ามใส่อีโมจิ เครื่องหมายคำพูด แฮชแทก ลิงก์',
+        '- ห้ามเขียนว่า "ดูเลย" "คลิกเลย" หรือคำเชิญทั่วไป ให้สื่อเฉพาะของชิ้นนี้',
+        '- ถ้าเห็นสินค้าชัด ให้ระบุประโยชน์/ปัญหาที่แก้',
+        'กติกาตำแหน่ง (textYPercent):',
+        '- เลือกจาก 20 (บนสุด), 35, 50 (กลาง), 65, 80 (ล่างสุด)',
+        '- ถ้าสินค้า/คนอยู่กลาง → 20 หรือ 80',
+        '- ถ้าสินค้าอยู่ล่าง → 20',
+        '- ถ้าสินค้าอยู่บน → 65 หรือ 80',
+        'ตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่นหน้า/หลัง',
         'รูปแบบตอบกลับ:',
-        '{"optionId":"1","headline":"ข้อความปก","textYPercent":65}',
+        '{"optionId":"1","headline":"ของเล่นใหม่\\nเอาไว้แกล้งแมว","textYPercent":20}',
         '',
         `ข้อมูลเสริม: title=${contextTitle || '-'} | category=${contextCategory || '-'} | source=${contextSourceLabel || '-'}`,
         contextManualCaption ? `caption=${contextManualCaption}` : '',
@@ -25234,6 +26008,13 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             logPrefix: 'CRON',
                         })
                     })
+                    enqueueBackgroundTask(ctx, `CRON RECOVER-FAILED ${botId}`, async () => {
+                        await recoverFailedHistoryRowsFromFeed({
+                            env,
+                            botId,
+                            logPrefix: 'CRON',
+                        })
+                    })
                     reconciledNamespaces.add(botId)
                 }
                 await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
@@ -25544,9 +26325,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 shortlinkErrorMsg,
                 rawShopeeLink || null, rawLazadaLink || null,
                 combinedConversionError || 'shortlink_failed',
-                'not_attempted',
                 sourceFingerprint || null,
-            ).run().catch(() => { })
+            ).run().catch((err) => {
+                console.error(`[CRON] Page ${page.name}: failed to insert shortlink-failure history row: ${err instanceof Error ? err.message : String(err)}`)
+            })
             await releasePostingLock(env.DB, videoPostingLockKey).catch(() => { })
             videoPostingLockKey = null
             await botBucket.delete(dedupKey).catch(() => { })

@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::process::Stdio;
 use tempfile::tempdir;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -35,6 +37,14 @@ pub struct ThumbnailRequest {
     pub overlay_bg_opacity: Option<f64>,
     #[serde(default)]
     pub overlay_size_scale: Option<f64>,
+    #[serde(default)]
+    pub overlay_mode: String,
+    #[serde(default)]
+    pub overlay_outline_color: String,
+    #[serde(default)]
+    pub overlay_outline_width: Option<i32>,
+    #[serde(default)]
+    pub overlay_secondary_text_color: String,
 }
 
 #[derive(Serialize)]
@@ -202,6 +212,7 @@ fn resolve_overlay_fontfile(font_id: &str) -> &'static str {
         "krub-bold" => "/usr/local/share/fonts/Krub-Bold.ttf",
         "chakra-petch-bold" => "/usr/local/share/fonts/ChakraPetch-Bold.ttf",
         "ibm-plex-sans-thai-bold" => "/usr/local/share/fonts/IBMPlexSansThai-Bold.ttf",
+        "psl-x-omyim-bold" => "/usr/local/share/fonts/PSLxOmyim-Bold.ttf",
         "fc-iconic-bold" | "kanit-bold" => "/usr/local/share/fonts/Kanit-Bold.ttf",
         "sukhumvit-bold" => "/usr/local/share/fonts/Prompt-Bold.ttf",
         "sukhumvit-semibold" => "/usr/local/share/fonts/Sarabun-Bold.ttf",
@@ -209,25 +220,94 @@ fn resolve_overlay_fontfile(font_id: &str) -> &'static str {
     }
 }
 
-fn build_thumbnail_filter(
+/// Font family name for libass/fontconfig lookup (match .ttf metadata's family field).
+/// libass uses family+bold style, not file paths — cross-reference Dockerfile's fc-cache.
+fn resolve_overlay_font_family(font_id: &str) -> &'static str {
+    match font_id.trim().to_ascii_lowercase().as_str() {
+        "prompt-bold" => "Prompt",
+        "sarabun-bold" => "Sarabun",
+        "bai-jamjuree-bold" => "Bai Jamjuree",
+        "mitr-bold" => "Mitr",
+        "krub-bold" => "Krub",
+        "chakra-petch-bold" => "Chakra Petch",
+        "ibm-plex-sans-thai-bold" => "IBM Plex Sans Thai",
+        "fc-iconic-bold" | "kanit-bold" => "Kanit",
+        "sukhumvit-bold" => "Prompt",
+        "sukhumvit-semibold" => "Sarabun",
+        _ => "Kanit",
+    }
+}
+
+/// Convert "#RRGGBB" + alpha hex to ASS BGR color "&HAABBGGRR".
+/// ASS alpha is INVERTED: 00=opaque, FF=transparent.
+fn hex_to_ass_bgr(hex: &str, alpha_hex: &str) -> String {
+    let h = hex.trim_start_matches('#').to_ascii_uppercase();
+    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return format!("&H{}FFFFFF", alpha_hex.to_ascii_uppercase());
+    }
+    format!("&H{}{}{}{}", alpha_hex.to_ascii_uppercase(), &h[4..6], &h[2..4], &h[0..2])
+}
+
+fn opacity_to_ass_alpha_hex(opacity: f64) -> String {
+    let transparency = (1.0 - opacity.clamp(0.0, 1.0)) * 255.0;
+    format!("{:02X}", transparency.round() as u8)
+}
+
+fn escape_ass_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\n', "\\N")
+        .replace('{', "\\{")
+        .replace('}', "\\}")
+}
+
+/// Overlay plan — either a base-only filter (no overlay needed) or a Python-rendered
+/// PNG to composite on top of the scaled frame.
+///
+/// We render the overlay with Pillow (python3-pil) because Debian's ffmpeg ships
+/// WITHOUT `--enable-libharfbuzz`, so `drawtext text_shaping=1` cannot shape Thai.
+/// libass also works for shaping but its BorderStyle=3 box clips diacritics
+/// (ไม้โท above the cap height ends up outside the box). Pillow measures the
+/// real inked bbox including combining marks → box contains all diacritics.
+struct OverlayPlan {
+    /// FFmpeg filter graph. Empty overlay → plain `-vf base_filter`.
+    /// With overlay → uses `-filter_complex` form (base_filter is applied to [0:v]).
+    uses_filter_complex: bool,
+    filter: String,
+    /// JSON params to pass to generate_overlay.py on stdin. None → no overlay.
+    overlay_params_json: Option<String>,
+}
+
+fn build_thumbnail_plan(
     base_filter: &str,
     overlay_text: &str,
-    overlay_text_path: Option<&str>,
+    overlay_png_path: Option<&str>,
     overlay_y_pct: Option<f64>,
     overlay_font_id: &str,
     overlay_text_color: &str,
+    overlay_secondary_text_color: &str,
     overlay_bg_color: &str,
     overlay_bg_opacity: Option<f64>,
     overlay_size_scale: Option<f64>,
+    overlay_mode: &str,
+    overlay_outline_color: &str,
+    overlay_outline_width: Option<i32>,
     target_width: u32,
     target_height: u32,
-) -> String {
+) -> OverlayPlan {
     if overlay_text.trim().is_empty() {
-        return base_filter.to_string();
+        return OverlayPlan {
+            uses_filter_complex: false,
+            filter: base_filter.to_string(),
+            overlay_params_json: None,
+        };
     }
 
-    let Some(text_path) = overlay_text_path else {
-        return base_filter.to_string();
+    let Some(png_path) = overlay_png_path else {
+        return OverlayPlan {
+            uses_filter_complex: false,
+            filter: base_filter.to_string(),
+            overlay_params_json: None,
+        };
     };
 
     let y_pct = overlay_y_pct.unwrap_or(72.0).clamp(10.0, 90.0);
@@ -239,8 +319,11 @@ fn build_thumbnail_filter(
         .max()
         .unwrap_or(0)
         .max(1) as f64;
-    let mut font_size = (((target_width as f64) * 0.075) * size_scale).round().max(34.0);
-    let max_text_width = (target_width as f64) * 0.82;
+    // Base font size at 100% scale: 18% of frame width (≈194px on 1080px wide = viral-huge).
+    // Size-scale slider still multiplies: 100%=194px, 120%=233px, 135%=262px.
+    let mut font_size = (((target_width as f64) * 0.18) * size_scale).round().max(72.0);
+    // Max text width 92% of frame — allow long text without excessive shrink.
+    let max_text_width = (target_width as f64) * 0.92;
     let estimated_char_width = font_size * 0.62;
     let estimated_text_width = longest_line_chars * estimated_char_width;
     if estimated_text_width > max_text_width {
@@ -253,30 +336,73 @@ fn build_thumbnail_filter(
     }
     let font_size = font_size.round().max(28.0) as i32;
     let panel_h = ((((font_size as f64) * 1.32 * line_count) + ((font_size as f64) * 0.95)).max(96.0)).round() as i32;
-    let line_spacing = ((font_size as f64) * 0.18).round().max(6.0) as i32;
+    let line_spacing_px = ((font_size as f64) * 0.18).round().max(6.0) as i32;
     let box_border_w = ((font_size as f64) * 0.34).round().max(12.0) as i32;
     let raw_panel_y = ((target_height as f64) * (y_pct / 100.0)).round() as i32 - (panel_h / 2);
     let max_panel_y = (target_height as i32 - panel_h - 12).max(12);
     let panel_y = raw_panel_y.clamp(12, max_panel_y);
+    let center_y = panel_y + (panel_h / 2);
     let text_color = normalize_overlay_color(overlay_text_color, "#FFFFFF");
     let bg_color = normalize_overlay_color(overlay_bg_color, "#E53935");
     let bg_opacity = normalize_overlay_bg_opacity(overlay_bg_opacity);
-    let fontfile = resolve_overlay_fontfile(overlay_font_id);
+    let font_path = resolve_overlay_fontfile(overlay_font_id);
 
-    format!(
-        "{base_filter},drawtext=fontfile={fontfile}:textfile={text_path}:fontcolor={text_color}:fontsize={font_size}:line_spacing={line_spacing}:x=(w-text_w)/2:y={panel_y}+({panel_h}-text_h)/2:box=1:boxcolor={bg_color}@{bg_opacity}:boxborderw={box_border_w}",
-        base_filter = base_filter,
-        fontfile = fontfile,
-        panel_y = panel_y,
-        panel_h = panel_h,
-        text_path = text_path,
-        text_color = text_color,
-        bg_color = bg_color,
-        bg_opacity = format!("{:.2}", bg_opacity),
-        font_size = font_size,
-        line_spacing = line_spacing,
-        box_border_w = box_border_w,
-    )
+    // Padding inside the coloured box, tuned to leave generous room above the text
+    // so Thai marks (ไม้โท / ไม้เอก / สระอี) always fit inside the box.
+    let pad_x = (box_border_w as f64).round().max(16.0) as i32;
+    let pad_y = ((font_size as f64) * 0.22).round().max(14.0) as i32;
+
+    // mode=outline → draw text with thick outline, no box. mode=box (default) → filled box behind text.
+    let is_outline_mode = overlay_mode.eq_ignore_ascii_case("outline");
+    let (effective_bg_color, effective_bg_opacity, effective_outline_color, effective_outline_width) =
+        if is_outline_mode {
+            let normalized_outline = normalize_overlay_color(overlay_outline_color, "#000000");
+            let width = overlay_outline_width.unwrap_or(8).clamp(0, 40);
+            (String::new(), 0.0, normalized_outline, width)
+        } else {
+            (bg_color, bg_opacity, String::new(), 0)
+        };
+
+    // Secondary fill: used for line 2+ when in outline mode and a distinct secondary
+    // color is provided (matches reference project's line1=orange line2=white pattern).
+    let secondary_trimmed = overlay_secondary_text_color.trim();
+    let secondary_effective = if !secondary_trimmed.is_empty() && !secondary_trimmed.eq_ignore_ascii_case(&text_color) {
+        normalize_overlay_color(overlay_secondary_text_color, &text_color)
+    } else {
+        String::new()
+    };
+
+    let params = json!({
+        "text": overlay_text,
+        "width": target_width,
+        "height": target_height,
+        "font_path": font_path,
+        "font_size": font_size,
+        "fill_color": text_color,
+        "secondary_fill_color": secondary_effective,
+        "bg_color": effective_bg_color,
+        "bg_opacity": effective_bg_opacity,
+        "outline_color": effective_outline_color,
+        "outline_width": effective_outline_width,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+        "line_spacing_px": line_spacing_px,
+        "center_y": center_y,
+        "output_path": png_path,
+    });
+
+    // filter_complex: apply base scale/crop to [0:v], then overlay the PNG at 0:0
+    // (the PNG is rendered at exact target dimensions, so top-left alignment matches).
+    let filter = format!(
+        "[0:v]{base}[bg];[bg][1:v]overlay=0:0:format=auto[out]",
+        base = base_filter,
+    );
+
+    OverlayPlan {
+        uses_filter_complex: true,
+        filter,
+        overlay_params_json: Some(params.to_string()),
+    }
 }
 
 pub async fn handle_thumbnail(
@@ -303,15 +429,11 @@ pub async fn handle_thumbnail(
         if payload.target_width.unwrap_or(270) >= 720 { 16 } else { 12 },
         3,
     );
-    let overlay_text_path = if overlay_text.is_empty() {
+    // Overlay PNG is rendered by the Python Pillow helper at the canvas size.
+    let overlay_png_path = if overlay_text.is_empty() {
         None
     } else {
-        let path = tmp_path.join("overlay.txt");
-        fs::write(&path, overlay_text.as_bytes()).await.map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("write_overlay_text_failed: {}", e) })),
-        ))?;
-        Some(path)
+        Some(tmp_path.join("overlay.png"))
     };
 
     let video_resp = reqwest::get(&video_url).await.map_err(|e| (
@@ -366,31 +488,78 @@ pub async fn handle_thumbnail(
         target_width,
         target_height,
     );
-    let filter_chain = build_thumbnail_filter(
+    let plan = build_thumbnail_plan(
         &scale_filter,
         &overlay_text,
-        overlay_text_path.as_ref().and_then(|path| path.to_str()),
+        overlay_png_path.as_ref().and_then(|path| path.to_str()),
         payload.overlay_y_pct,
         &payload.overlay_font_id,
         &payload.overlay_text_color,
+        &payload.overlay_secondary_text_color,
         &payload.overlay_bg_color,
         payload.overlay_bg_opacity,
         payload.overlay_size_scale,
+        &payload.overlay_mode,
+        &payload.overlay_outline_color,
+        payload.overlay_outline_width,
         target_width,
         target_height,
     );
 
-    let mut ffmpeg_args = vec![
+    // Render the overlay PNG via Pillow before invoking ffmpeg.
+    if let Some(params_json) = plan.overlay_params_json.as_ref() {
+        let mut child = Command::new("python3")
+            .arg("/app/scripts/generate_overlay.py")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("spawn_overlay_python_failed: {}", e) })),
+            ))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(params_json.as_bytes()).await.map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("write_overlay_params_failed: {}", e) })),
+            ))?;
+            stdin.shutdown().await.ok();
+        }
+        let py_out = child.wait_with_output().await.map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("overlay_python_wait_failed: {}", e) })),
+        ))?;
+        if !py_out.status.success() {
+            let stderr = String::from_utf8_lossy(&py_out.stderr).trim().to_string();
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "error": format!("overlay_python_failed: {}", stderr)
+            }))));
+        }
+    }
+
+    let mut ffmpeg_args: Vec<String> = vec![
         "-y".to_string(),
-        "-i".to_string(),
-        video_path.to_str().unwrap().to_string(),
-        "-vframes".to_string(),
-        "1".to_string(),
         "-ss".to_string(),
         seek_arg.clone(),
-        "-vf".to_string(),
-        filter_chain,
+        "-i".to_string(),
+        video_path.to_str().unwrap().to_string(),
     ];
+    if plan.uses_filter_complex {
+        // Second input is the overlay PNG.
+        if let Some(png_path) = overlay_png_path.as_ref().and_then(|p| p.to_str()) {
+            ffmpeg_args.push("-i".to_string());
+            ffmpeg_args.push(png_path.to_string());
+        }
+        ffmpeg_args.push("-filter_complex".to_string());
+        ffmpeg_args.push(plan.filter.clone());
+        ffmpeg_args.push("-map".to_string());
+        ffmpeg_args.push("[out]".to_string());
+    } else {
+        ffmpeg_args.push("-vf".to_string());
+        ffmpeg_args.push(plan.filter.clone());
+    }
+    ffmpeg_args.push("-frames:v".to_string());
+    ffmpeg_args.push("1".to_string());
     if output_format == "jpg" {
         ffmpeg_args.extend(["-q:v".to_string(), "1".to_string()]);
     } else {
