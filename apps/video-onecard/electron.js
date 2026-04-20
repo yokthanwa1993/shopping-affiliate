@@ -270,9 +270,35 @@ function startServer() {
         const existingVideoId = body.video_id || "";
         const caption = body.caption || "";
         const adAccount = body.ad_account || "act_1030797047648459";
-        const templateAdset = body.template_adset || "120244070706570263";
+        const templateAdset = body.template_adset || "120244361318490263";
+        const shortlink = String(body.shortlink || "").trim();
+        const shopeeUrl = String(body.shopee_url || "").trim();
+        // CTA destination MUST be the wwoom shortlink — it's the only URL that
+        // carries our sub_id tracking params (configured in dashboard /settings, e.g.
+        // sub_id=20APR26FBSPCAD). The shortlink redirects to Shopee with full attribution.
+        // shopee_url is kept around only as a last-resort fallback if shortening failed.
+        const ctaLink = shortlink || shopeeUrl;
 
         if (!pageId || (!videoUrl && !existingVideoId)) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: "Missing: page_id, video_url or video_id" })); }
+
+        // Read CTA type from the template adset's existing ad creative — so whatever
+        // CTA the user sets in their template (SHOP_NOW / LEARN_MORE / LIKE_PAGE / etc.)
+        // gets mirrored to every new ad we create. Falls back to SHOP_NOW (matches
+        // current "การมีส่วนร่วม" template) if lookup fails.
+        let ctaType = "SHOP_NOW";
+        try {
+          const tplAdsResp = await elFetch(`https://graph.facebook.com/v21.0/${templateAdset}/ads?fields=creative{id}&limit=1&access_token=${encodeURIComponent(accessToken)}`);
+          const tplAdsData = tplAdsResp.json();
+          const tplCreativeId = tplAdsData?.data?.[0]?.creative?.id;
+          if (tplCreativeId) {
+            const tplCrResp = await elFetch(`https://graph.facebook.com/v21.0/${tplCreativeId}?fields=call_to_action_type&access_token=${encodeURIComponent(accessToken)}`);
+            const tplCrData = tplCrResp.json();
+            if (tplCrData?.call_to_action_type) ctaType = String(tplCrData.call_to_action_type).trim();
+          }
+        } catch (e) {
+          console.log(`[CREATE-AD] Could not read template CTA, using fallback ${ctaType}: ${e.message}`);
+        }
+        console.log(`[CREATE-AD] Template adset=${templateAdset} → CTA type=${ctaType} link=${ctaLink || '(none)'} (shopee=${shopeeUrl ? 'y' : 'n'}, short=${shortlink ? 'y' : 'n'})`);
 
         // 1. Upload video (or use existing video_id)
         let vid;
@@ -282,7 +308,7 @@ function startServer() {
         } else {
           const uv = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: "POST" });
           vid = uv.json();
-          if (vid.error) return res.end(JSON.stringify({ ok: false, step: "upload", error: vid.error.message }));
+          if (vid.error) return res.end(JSON.stringify({ ok: false, step: "upload", error: vid.error.message, fb_error_code: vid.error.code, fb_error_subcode: vid.error.error_subcode, fb_trace_id: vid.error.fbtrace_id }));
         }
 
         // 2. Wait thumbnails
@@ -296,13 +322,22 @@ function startServer() {
         if (!thumb) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout" }));
 
         // 3. Create creative
+        // CTA value shape depends on type:
+        //   - LIKE_PAGE → { page: pageId } (no link)
+        //   - SHOP_NOW / LEARN_MORE / BUY_NOW / etc. → { link: ctaLink }
+        // ctaLink prefers shopee_url over shortlink so the FB button shows real shopee.co.th
+        // domain (matches user's template). If no link at all, fall back to LIKE_PAGE.
+        const isLikePageCta = ctaType === "LIKE_PAGE" || !ctaLink;
+        const ctaSpec = isLikePageCta
+          ? { type: "LIKE_PAGE", value: { page: pageId } }
+          : { type: ctaType, value: { link: ctaLink, link_format: "VIDEO_LPP" } };
         const crBody = {
           name: caption.substring(0, 50),
           object_story_spec: {
             page_id: pageId,
             video_data: {
               video_id: vid.id, message: caption, image_url: thumb,
-              call_to_action: { type: "LIKE_PAGE", value: { page: pageId } }
+              call_to_action: ctaSpec
             }
           }
         };
@@ -310,7 +345,7 @@ function startServer() {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(crBody)
         });
         const crData = cr.json();
-        if (crData.error) return res.end(JSON.stringify({ ok: false, step: "creative", error: crData.error.message }));
+        if (crData.error) return res.end(JSON.stringify({ ok: false, step: "creative", error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: ctaLink || null, used_existing_video: !!existingVideoId }));
 
         // 4. Get story ID
         let storyId = null;
@@ -329,23 +364,44 @@ function startServer() {
 
         let targetCampaignId = body.campaign_id || null;
 
-        // ถ้าระบุชื่อแคมเปญใหม่ → สร้างเลย
+        // Read template's campaign objective to reuse when creating NEW campaigns.
+        // FB subcode 1815149 = "objective mismatch" — when template adset has
+        // LINK_CLICKS optimization but new campaign is OUTCOME_ENGAGEMENT, the copy
+        // adset step fails because adsets must match their campaign's objective.
+        // So: fetch the template adset → get its campaign → get that campaign's objective
+        // → use same objective for any new campaign we create.
+        let templateObjective = "OUTCOME_ENGAGEMENT"; // safe fallback matching old template
+        try {
+          const tplAdsetResp = await elFetch(`https://graph.facebook.com/v21.0/${templateAdset}?fields=campaign{objective}&access_token=${encodeURIComponent(accessToken)}`);
+          const tplAdsetData = tplAdsetResp.json();
+          const obj = tplAdsetData?.campaign?.objective;
+          if (obj && typeof obj === "string") {
+            templateObjective = obj;
+            console.log(`[CREATE-AD] Template ${templateAdset} objective=${templateObjective}`);
+          }
+        } catch (e) {
+          console.log(`[CREATE-AD] Could not read template objective, using fallback ${templateObjective}: ${e.message}`);
+        }
+
+        // ถ้าระบุชื่อแคมเปญใหม่ → สร้างเลย (use template's objective!)
         if (!targetCampaignId && body.new_campaign_name) {
           const newCampResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: body.new_campaign_name, objective: "OUTCOME_ENGAGEMENT", status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
+            body: JSON.stringify({ name: body.new_campaign_name, objective: templateObjective, status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
           });
           const newCamp = newCampResp.json();
-          if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message }));
+          if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message, fb_error_code: newCamp.error.code, fb_error_subcode: newCamp.error.error_subcode, fb_trace_id: newCamp.error.fbtrace_id, attempted_objective: templateObjective }));
           targetCampaignId = newCamp.id;
-          console.log(`[CREATE-AD] Created new campaign "${body.new_campaign_name}": ${targetCampaignId}`);
+          console.log(`[CREATE-AD] Created new campaign "${body.new_campaign_name}" objective=${templateObjective}: ${targetCampaignId}`);
         }
 
         // ถ้ายังไม่มี → หาแคมเปญที่ยังไม่เต็มอัตโนมัติ
+        // Filter by BOTH name prefix AND matching template objective (otherwise we could
+        // pick an old-objective campaign and hit the same 1815149 mismatch error)
         if (!targetCampaignId) {
-          const campsResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}&fields=id,name,status&limit=50&filtering=[{"field":"name","operator":"CONTAIN","value":"${campaignPrefix}"}]`);
+          const campsResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}&fields=id,name,status,objective&limit=50&filtering=[{"field":"name","operator":"CONTAIN","value":"${campaignPrefix}"}]`);
           const camps = campsResp.json();
-          const activeCamps = (camps.data || []).filter(c => c.status !== "DELETED");
+          const activeCamps = (camps.data || []).filter(c => c.status !== "DELETED" && c.objective === templateObjective);
 
           for (const camp of activeCamps) {
             const adsetsResp = await elFetch(`https://graph.facebook.com/v21.0/${camp.id}/adsets?access_token=${encodeURIComponent(accessToken)}&fields=id,status&limit=50`);
@@ -353,24 +409,24 @@ function startServer() {
             const count = (adsets.data || []).filter(a => a.status !== "DELETED").length;
             if (count < maxAdsetsPerCampaign) {
               targetCampaignId = camp.id;
-              console.log(`[CREATE-AD] Using campaign ${camp.name} (${count}/${maxAdsetsPerCampaign} adsets)`);
+              console.log(`[CREATE-AD] Using campaign ${camp.name} objective=${camp.objective} (${count}/${maxAdsetsPerCampaign} adsets)`);
               break;
             }
           }
 
           if (!targetCampaignId) {
             if (activeCamps.length >= maxCampaigns) {
-              return res.end(JSON.stringify({ ok: false, step: "campaign", error: "Max " + maxCampaigns + " campaigns reached" }));
+              return res.end(JSON.stringify({ ok: false, step: "campaign", error: "Max " + maxCampaigns + " campaigns reached for objective " + templateObjective }));
             }
             const newCampNum = activeCamps.length + 1;
             const newCampResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`, {
               method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ name: campaignPrefix + newCampNum, objective: "OUTCOME_ENGAGEMENT", status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
+              body: JSON.stringify({ name: campaignPrefix + newCampNum, objective: templateObjective, status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
             });
             const newCamp = newCampResp.json();
-            if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message }));
+            if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message, fb_error_code: newCamp.error.code, fb_error_subcode: newCamp.error.error_subcode, fb_trace_id: newCamp.error.fbtrace_id, attempted_objective: templateObjective }));
             targetCampaignId = newCamp.id;
-            console.log(`[CREATE-AD] Created new campaign ${campaignPrefix}${newCampNum}: ${targetCampaignId}`);
+            console.log(`[CREATE-AD] Created new campaign ${campaignPrefix}${newCampNum} objective=${templateObjective}: ${targetCampaignId}`);
           }
         }
 
@@ -380,7 +436,7 @@ function startServer() {
           body: JSON.stringify({ deep_copy: true, status_option: "PAUSED", campaign_id: targetCampaignId })
         });
         const copyData = copy.json();
-        if (copyData.error) return res.end(JSON.stringify({ ok: false, step: "copy", error: copyData.error.message }));
+        if (copyData.error) return res.end(JSON.stringify({ ok: false, step: "copy", error: copyData.error.message, fb_error_code: copyData.error.code, fb_error_subcode: copyData.error.error_subcode, fb_trace_id: copyData.error.fbtrace_id, template_adset: templateAdset, target_campaign: targetCampaignId }));
         const newAdset = copyData.copied_adset_id;
 
         // 6. สร้าง ad ใหม่ใน adset ที่ copy มา
@@ -389,7 +445,7 @@ function startServer() {
           body: JSON.stringify({ name: caption.substring(0, 50), adset_id: newAdset, creative: { creative_id: crData.id }, status: "PAUSED" })
         });
         const adData = adResp.json();
-        if (adData.error) return res.end(JSON.stringify({ ok: false, step: "ad", error: adData.error.message }));
+        if (adData.error) return res.end(JSON.stringify({ ok: false, step: "ad", error: adData.error.message, fb_error_code: adData.error.code, fb_error_subcode: adData.error.error_subcode, fb_trace_id: adData.error.fbtrace_id, adset_id: newAdset, creative_id: crData.id }));
         const newAd = adData.id;
 
         // 7. Rename adset + activate
@@ -401,6 +457,41 @@ function startServer() {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ status: "ACTIVE" })
         });
+
+        // 7.5. Also publish the (dark) post to the page feed.
+        // The ad creates a "dark post" by default — only visible as an ad. Setting
+        // is_published=true makes it appear on the page wall too, so people can find
+        // and engage with it organically. CTA button stays intact.
+        // For OUTCOME_ENGAGEMENT campaigns this boosts organic reach + algorithm signal.
+        let publishedToPage = false;
+        let publishError = "";
+        try {
+          // Need a PAGE access token to publish (user token can't toggle is_published on a page post)
+          const pagesRes = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id&limit=100&access_token=${encodeURIComponent(accessToken)}`);
+          const pages = pagesRes.json();
+          const page = (pages.data || []).find(p => p.id === pageId);
+          const pageToken = page ? page.access_token : "";
+          if (pageToken) {
+            const pubResp = await elFetch(`https://graph.facebook.com/v21.0/${storyId}?access_token=${encodeURIComponent(pageToken)}`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ is_published: true })
+            });
+            const pubData = pubResp.json();
+            if (pubData?.error) {
+              publishError = String(pubData.error.message || "").substring(0, 200);
+              console.log(`[CREATE-AD] Publish to page failed: ${publishError}`);
+            } else {
+              publishedToPage = true;
+              console.log(`[CREATE-AD] Published to page feed: ${storyId}`);
+            }
+          } else {
+            publishError = "page_token_not_found";
+            console.log(`[CREATE-AD] No page token for ${pageId} — cannot publish to feed`);
+          }
+        } catch (e) {
+          publishError = e.message || String(e);
+          console.log(`[CREATE-AD] Publish to page exception: ${publishError}`);
+        }
 
         // Mark video as posted
         if (body.video_gallery_id && body.bot_id) {
@@ -414,7 +505,7 @@ function startServer() {
           } catch {}
         }
 
-        return res.end(JSON.stringify({ ok: true, story_id: storyId, adset_id: newAdset, ad_id: newAd, video_id: vid.id, creative_id: crData.id }));
+        return res.end(JSON.stringify({ ok: true, story_id: storyId, adset_id: newAdset, ad_id: newAd, video_id: vid.id, creative_id: crData.id, published_to_page: publishedToPage, publish_error: publishError || undefined }));
       } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
     }
 

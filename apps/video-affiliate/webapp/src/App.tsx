@@ -2320,7 +2320,7 @@ function AddPagePopup({ onClose, onSuccess }: { onClose: () => void; onSuccess: 
 }
 
 // Page Detail Component
-function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () => void; onSave: (page: FacebookPage) => void }) {
+function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPage; onBack: () => void; onSave: (page: FacebookPage) => void; isSystemAdmin: boolean }) {
   // Parse post_hours: supports "0:31,9:47" (new), "24:13" (legacy midnight), and "2,9" (legacy hour-only) formats
   const parsePostHours = (raw: string): Record<number, number> => {
     const result: Record<number, number> = {}
@@ -2602,6 +2602,36 @@ function PageDetail({ page, onBack, onSave }: { page: FacebookPage; onBack: () =
             </>
           )}
         </div>
+
+        {/*
+         * Auto-Ads toggle — admin namespace only.
+         * Uses SAME toggle styling as Auto Post (green pill) so users see a consistent
+         * switch UI. Tailwind sometimes misses color classes that only appear in one
+         * place; sticking to colors already proven to render (green-500, gray-300) avoids
+         * that class of rendering bug.
+         */}
+        {isSystemAdmin && (
+          <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="font-bold text-gray-900">ยิงแอดอัตโนมัติทุกโพสต์</p>
+                <p className="text-xs text-gray-400 mt-0.5">เปิดแล้วทุกครั้งที่ cron โพสต์เพจนี้ ระบบจะสร้างแอด + เผยแพร่ไปหน้าเพจ (แทนการโพสต์ Reel ปกติ) ตามเวลาที่ตั้งไว้ด้านบน</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAdsPublishEnabled(!adsPublishEnabled)}
+                className={`shrink-0 w-12 h-7 rounded-full relative transition-colors ${adsPublishEnabled ? 'bg-green-500' : 'bg-gray-300'}`}
+              >
+                <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${adsPublishEnabled ? 'right-1' : 'left-1'}`}></div>
+              </button>
+            </div>
+            {adsPublishEnabled && oneCardEnabled && (
+              <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-700">
+                ⚠️ เปิดพร้อม Video One Card จะยิงแอดแทน (Video One Card ถูกข้าม)
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="bg-white border border-blue-100 rounded-2xl p-4 mb-3">
           <div className="flex items-center justify-between gap-3">
@@ -3130,6 +3160,13 @@ function App({
   const [commentTemplateLoading, setCommentTemplateLoading] = useState(false)
   const [commentTemplateSaving, setCommentTemplateSaving] = useState(false)
   const [commentTemplateMaxChars, setCommentTemplateMaxChars] = useState(4000)
+  const [commentTokenDraft, setCommentTokenDraft] = useState('')
+  const [commentTokenHint, setCommentTokenHint] = useState('')
+  const [commentTokenHasToken, setCommentTokenHasToken] = useState(false)
+  const [commentTokenUpdatedAt, setCommentTokenUpdatedAt] = useState('')
+  const [commentTokenLoading, setCommentTokenLoading] = useState(false)
+  const [commentTokenSaving, setCommentTokenSaving] = useState(false)
+  const [commentTokenMessage, setCommentTokenMessage] = useState('')
   const copiedIdentityTimerRef = useRef<number | null>(null)
   const voiceStyleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [geminiApiKeyDrafts, setGeminiApiKeyDrafts] = useState<string[]>(() => createEmptyGeminiKeySlots())
@@ -4150,6 +4187,7 @@ function App({
     }
     if (settingsSection === 'comment') {
       void loadCommentTemplate()
+      void loadCommentToken()
       return
     }
     if (settingsSection === 'gemini' && isSystemAdmin) {
@@ -5215,6 +5253,64 @@ function App({
       setCommentTemplateMessage('บันทึกเทมเพลตคอมเมนต์ไม่สำเร็จ')
     } finally {
       setCommentTemplateSaving(false)
+    }
+  }
+
+  async function loadCommentToken() {
+    const session = getToken()
+    if (!session) return
+    setCommentTokenMessage('')
+    setCommentTokenLoading(true)
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-token`)
+      if (resp.status === 401) { await recoverSessionOrLogout(); return }
+      if (resp.status === 403) { setCommentTokenMessage('บัญชีนี้ไม่มีสิทธิ์ดู comment token'); return }
+      if (!resp.ok) { setCommentTokenMessage('โหลด comment token ไม่สำเร็จ'); return }
+      const data = await resp.json() as { token?: string; token_hint?: string; has_token?: boolean; updated_at?: string }
+      setCommentTokenDraft(String(data.token || ''))
+      setCommentTokenHint(String(data.token_hint || ''))
+      setCommentTokenHasToken(!!data.has_token)
+      setCommentTokenUpdatedAt(String(data.updated_at || ''))
+    } catch {
+      setCommentTokenMessage('โหลด comment token ไม่สำเร็จ')
+    } finally {
+      setCommentTokenLoading(false)
+    }
+  }
+
+  async function saveCommentToken(nextToken: string) {
+    const session = getToken()
+    if (!session) return
+    setCommentTokenSaving(true)
+    setCommentTokenMessage('')
+    try {
+      const trimmed = String(nextToken || '').trim()
+      const isReset = !trimmed
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-token`, isReset ? {
+        method: 'DELETE',
+      } : {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: trimmed }),
+      })
+      if (resp.status === 401) { await recoverSessionOrLogout(); return }
+      if (resp.status === 403) { setCommentTokenMessage('บัญชีนี้ไม่มีสิทธิ์แก้ comment token'); return }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setCommentTokenMessage(data.error || 'บันทึก comment token ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json() as { token?: string; token_hint?: string; has_token?: boolean }
+      setCommentTokenDraft(String(data.token || ''))
+      setCommentTokenHint(String(data.token_hint || ''))
+      setCommentTokenHasToken(!!data.has_token)
+      setCommentTokenMessage(isReset
+        ? 'ลบ comment token แล้ว — ระบบจะใช้ post token ของแต่ละเพจในการคอมเม้นต์ (legacy)'
+        : 'บันทึก comment token แล้ว — cron / force-post / dashboard ad ทุกการคอมเม้นต์จะใช้ token นี้')
+    } catch {
+      setCommentTokenMessage('บันทึก comment token ไม่สำเร็จ')
+    } finally {
+      setCommentTokenSaving(false)
     }
   }
 
@@ -6317,6 +6413,7 @@ function App({
             page={selectedPage}
             onBack={closeSelectedPage}
             onSave={handleSavePage}
+            isSystemAdmin={isSystemAdmin}
           />
         </div>
       </div>
@@ -7703,6 +7800,72 @@ function App({
 
                 {settingsSection === 'comment' && (
                   <div className="space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className="text-sm font-bold text-gray-900">Access Token (คอมเม้น)</p>
+                          <p className="text-[11px] text-gray-500 mt-0.5">
+                            Token นี้จะใช้สำหรับ <b>คอมเม้นต์</b> ทุกที่ — cron auto-post, โฟกัสโพสต์, สร้างแอดในแดชบอร์ด — ทุกเพจในเวิร์คสเปซนี้
+                          </p>
+                          <p className="text-[11px] text-gray-400 mt-0.5">
+                            ปล่อยว่าง = fallback ไปใช้ post token ของแต่ละเพจ (เหมือนเดิม)
+                          </p>
+                        </div>
+                        {commentTokenHasToken && (
+                          <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700 border border-emerald-200">
+                            กำลังใช้: {commentTokenHint}
+                          </span>
+                        )}
+                      </div>
+                      {commentTokenLoading ? (
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลด comment token...</p>
+                      ) : (
+                        <>
+                          <textarea
+                            key={`commenttoken-${commentTokenUpdatedAt}`}
+                            defaultValue={commentTokenDraft}
+                            onChange={(e) => {
+                              setCommentTokenDraft(e.target.value)
+                              if (commentTokenMessage) setCommentTokenMessage('')
+                            }}
+                            rows={5}
+                            placeholder="วาง Page Access Token (EAA...) ที่จะใช้คอมเม้นต์ — สามารถเป็น token ของเพจอื่น/บัญชีอื่นได้"
+                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-xs font-mono outline-none focus:border-blue-400"
+                          />
+                          {commentTokenUpdatedAt && (
+                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(commentTokenUpdatedAt).toLocaleString()}</p>
+                          )}
+                          {commentTokenMessage && (
+                            <p className={`text-xs ${commentTokenMessage.includes('ไม่สำเร็จ') || commentTokenMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
+                              {commentTokenMessage}
+                            </p>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => {
+                                if (commentTokenSaving) return
+                                void saveCommentToken(commentTokenDraft)
+                              }}
+                              disabled={commentTokenSaving || !commentTokenDraft.trim()}
+                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              {commentTokenSaving ? 'กำลังบันทึก...' : 'บันทึก token'}
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (commentTokenSaving) return
+                                if (!window.confirm('ลบ comment token? ระบบจะกลับไปใช้ post token ของแต่ละเพจในการคอมเม้นต์')) return
+                                void saveCommentToken('')
+                              }}
+                              disabled={commentTokenSaving || !commentTokenHasToken}
+                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              ลบ
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
                         ตั้งค่าข้อความคอมเมนต์ที่ระบบใช้ตอนโพสต์ลิงก์อัตโนมัติ เทมเพลตนี้จะมีผลกับงานถัดไปทันที

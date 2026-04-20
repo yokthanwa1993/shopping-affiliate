@@ -2,6 +2,7 @@ import {
   Activity,
   BarChart3,
   ChevronRight,
+  Clock,
   ExternalLink,
   Facebook,
   LayoutDashboard,
@@ -17,9 +18,37 @@ import {
 import type { ReactNode } from 'react'
 import { useEffect, useMemo, useState } from 'react'
 
-type DashboardTab = 'dashboard' | 'gallery' | 'page-posts' | 'create' | 'running' | 'history' | 'settings'
+type DashboardTab = 'dashboard' | 'gallery' | 'page-posts' | 'create' | 'running' | 'queue' | 'history' | 'settings'
 
-const DASHBOARD_TABS: DashboardTab[] = ['dashboard', 'gallery', 'page-posts', 'create', 'running', 'history', 'settings']
+const DASHBOARD_TABS: DashboardTab[] = ['dashboard', 'gallery', 'page-posts', 'create', 'running', 'queue', 'history', 'settings']
+
+type AdQueueItem = {
+  id: number
+  created_at: string
+  page_id: string
+  video_id: string
+  caption: string
+  shopee_url: string
+  story_id: string
+  campaign_id: string
+  new_campaign_name: string
+  status: 'queued' | 'processing' | 'done' | 'failed' | 'cancelled'
+  attempted_at: string
+  completed_at: string
+  error_message: string
+  result_story_id: string
+  result_ad_id: string
+  result_adset_id: string
+}
+
+type AdQueueListResponse = {
+  ok?: boolean
+  items?: AdQueueItem[]
+  counts?: Record<string, number>
+  last_run_at?: string
+  next_run_at?: string
+  interval_minutes?: number
+}
 
 type VideoCandidate = {
   id: string
@@ -210,6 +239,21 @@ function formatThaiDate(value: string) {
   }).format(new Date(value))
 }
 
+// Robustly parse a timestamp string and format in Thai locale.
+// SQLite `datetime('now')` returns "YYYY-MM-DD HH:MM:SS" (UTC, NO Z) — JS Date()
+// would treat it as LOCAL time, causing a 7-hour drift in Bangkok. Append 'Z' to
+// force UTC interpretation. ISO strings (with Z or +offset) parse correctly as-is.
+function formatThaiDateTime(value: string): string {
+  if (!value) return ''
+  const trimmed = String(value).trim()
+  if (!trimmed) return ''
+  const hasTimezone = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(trimmed)
+  const parseable = hasTimezone ? trimmed : trimmed.replace(' ', 'T') + 'Z'
+  const d = new Date(parseable)
+  if (isNaN(d.getTime())) return trimmed
+  return d.toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })
+}
+
 function buildFacebookUrl(permalinkUrl: string) {
   if (!permalinkUrl) return '#'
   if (permalinkUrl.startsWith('http://') || permalinkUrl.startsWith('https://')) return permalinkUrl
@@ -282,11 +326,18 @@ export default function App() {
   const [tab, setTab] = useState<DashboardTab>(() => getInitialTab())
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   const [createAdPopup, setCreateAdPopup] = useState<{ videoId: string; caption: string; storyId: string; shopeeLink: string } | null>(null)
+  const [adQueueItems, setAdQueueItems] = useState<AdQueueItem[]>([])
+  const [adQueueCounts, setAdQueueCounts] = useState<Record<string, number>>({})
+  const [adQueueLastRun, setAdQueueLastRun] = useState<string>('')
+  const [adQueueNextRun, setAdQueueNextRun] = useState<string>('')
+  const [adQueueLoading, setAdQueueLoading] = useState(false)
+  const [adQueueIntervalMinutes, setAdQueueIntervalMinutes] = useState(20)
   const [createAdShopeeLink, setCreateAdShopeeLink] = useState('')
   const [createAdCampaigns, setCreateAdCampaigns] = useState<Array<{ id: string; name: string; status: string; adsetCount: number }>>([])
   const [createAdLoading, setCreateAdLoading] = useState(false)
   const [createAdCreating, setCreateAdCreating] = useState(false)
   const [createAdStep, setCreateAdStep] = useState('')
+  const [createAdResultBanner, setCreateAdResultBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [createAdProgress, setCreateAdProgress] = useState(0)
   const [createAdSelectedCampaign, setCreateAdSelectedCampaign] = useState('')
   const [createAdNewCampaignName, setCreateAdNewCampaignName] = useState('')
@@ -344,24 +395,31 @@ export default function App() {
     finally { setCreateAdLoading(false) }
   }
 
-  async function submitCreateAd() {
+  async function submitCreateAdImmediate() {
     if (!createAdPopup) return
+    setCreateAdResultBanner(null)
     setCreateAdCreating(true)
-    setCreateAdStep('🔗 กำลังย่อลิ้ง Shopee...')
+    setCreateAdStep('⚡ กำลังสร้างแอดทันที...')
     setCreateAdProgress(10)
 
-    // Simulate progress while waiting for API
+    // Progress simulation while waiting for FB API (upload + thumbnail wait + adset copy)
     const steps = [
-      { delay: 3000, step: '📤 กำลังสร้างแอด...', progress: 30 },
-      { delay: 8000, step: '🖼️ รอ Facebook สร้าง thumbnail...', progress: 50 },
-      { delay: 15000, step: '⚙️ กำลังสร้างชุดโฆษณา...', progress: 70 },
-      { delay: 25000, step: '💬 กำลังคอมเม้นต์ลิ้ง...', progress: 85 },
+      { delay: 3000, step: '📤 กำลังอัปโหลดวิดีโอไปยัง Ad Account...', progress: 25 },
+      { delay: 8000, step: '🖼️ รอ Facebook สร้าง thumbnail...', progress: 45 },
+      { delay: 18000, step: '⚙️ กำลังคัดลอก adset จาก template...', progress: 65 },
+      { delay: 30000, step: '🌐 กำลังเผยแพร่ไปหน้าเพจ...', progress: 80 },
+      { delay: 45000, step: '💬 กำลังคอมเมนต์ลิงก์...', progress: 90 },
     ]
     const timers = steps.map(({ delay, step, progress }) =>
       setTimeout(() => { setCreateAdStep(step); setCreateAdProgress(progress) }, delay)
     )
 
+    let finalStatus: 'success' | 'error' = 'error'
+    let finalMessage = ''
+
     try {
+      // IMMEDIATE — call create-ad directly, bypass queue entirely.
+      // Runs full pipeline synchronously (60-120s typical). User waits for real result.
       const resp = await fetch('/worker-api/api/dashboard/create-ad', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -376,22 +434,178 @@ export default function App() {
         }),
       })
       timers.forEach(clearTimeout)
-      const data = await resp.json() as { ok?: boolean; error?: string; story_id?: string; adset_id?: string; shortLink?: string; commentPosted?: boolean }
-      if (data.ok) {
-        setCreateAdStep('✅ สำเร็จ!')
+      const rawText = await resp.text()
+      let data: {
+        ok?: boolean
+        error?: string
+        step?: string
+        fb_error_code?: number
+        fb_error_subcode?: number
+        fb_trace_id?: string
+        story_id?: string
+        ad_id?: string
+        adset_id?: string
+        commentPosted?: boolean
+      } = {}
+      try { data = rawText ? JSON.parse(rawText) : {} } catch { data = { error: `invalid_json_response: ${rawText.substring(0, 200)}` } }
+
+      if (resp.ok && data.ok) {
+        finalStatus = 'success'
+        finalMessage = `✅ สำเร็จ!\n\nstory_id: ${data.story_id || '-'}\nad_id: ${data.ad_id || '-'}\nadset_id: ${data.adset_id || '-'}\nคอมเมนต์: ${data.commentPosted ? 'โพสต์แล้ว' : 'ข้าม'}`
         setCreateAdProgress(100)
-        await new Promise(r => setTimeout(r, 1500))
-        setCreateAdPopup(null)
+        setCreateAdStep(`✅ สำเร็จ! story=${data.story_id || '-'} ${data.commentPosted ? '(คอมเมนต์แล้ว)' : ''}`)
+        setCreateAdResultBanner({ type: 'success', text: `✅ story=${data.story_id || '-'} ${data.commentPosted ? '· คอมเมนต์แล้ว' : ''}` })
       } else {
-        setCreateAdStep(`❌ ${data.error || 'ไม่สำเร็จ'}`)
+        finalStatus = 'error'
+        const stepLabel = data.step ? `[${data.step}] ` : ''
+        const fbCode = data.fb_error_code ? ` (FB code=${data.fb_error_code}${data.fb_error_subcode ? `/subcode=${data.fb_error_subcode}` : ''})` : ''
+        const traceId = data.fb_trace_id ? `\ntrace_id: ${data.fb_trace_id}` : ''
+        const shortSummary = `${stepLabel}${data.error || `HTTP ${resp.status}`}${fbCode}`
+        finalMessage = `❌ สร้างแอดไม่สำเร็จ — HTTP ${resp.status}\n\n${shortSummary}${traceId}\n\n(Invalid parameter บ่อยครั้งเป็น transient — ลองกดซ้ำอีกครั้ง)`
+        setCreateAdStep(`❌ ${shortSummary}`)
         setCreateAdProgress(0)
+        setCreateAdResultBanner({ type: 'error', text: `❌ ${shortSummary}${traceId ? `\ntrace=${data.fb_trace_id}` : ''}` })
       }
     } catch (e) {
-      setCreateAdStep(`❌ ${e instanceof Error ? e.message : String(e)}`)
+      timers.forEach(clearTimeout)
+      const msg = e instanceof Error ? e.message : String(e)
+      finalStatus = 'error'
+      finalMessage = `❌ Exception: ${msg}`
+      setCreateAdStep(`❌ ${msg}`)
       setCreateAdProgress(0)
+      setCreateAdResultBanner({ type: 'error', text: `❌ Exception — ${msg}` })
     } finally {
       timers.forEach(clearTimeout)
       setCreateAdCreating(false)
+      // Always show alert with final result — user sees unambiguous outcome even if
+      // popup timing was tight or they looked away during the 60-120s wait.
+      if (finalMessage) {
+        alert(finalMessage)
+      }
+      if (finalStatus === 'success') {
+        setCreateAdPopup(null)
+        setCreateAdResultBanner(null)
+      }
+      // On error: leave popup open AND banner visible so user can see message + retry
+    }
+  }
+
+  async function submitCreateAd() {
+    if (!createAdPopup) return
+    setCreateAdResultBanner(null)
+    setCreateAdCreating(true)
+    setCreateAdStep('📥 กำลังเพิ่มเข้าคิว...')
+    setCreateAdProgress(40)
+
+    try {
+      // ENQUEUE — don't run create-ad now, let cron pick it up every 20 minutes.
+      const resp = await fetch('/worker-api/api/dashboard/ad-queue/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          page_id: CHIEB_PAGE_ID,
+          video_id: createAdPopup.videoId,
+          caption: createAdPopup.caption,
+          story_id: createAdPopup.storyId || '',
+          shopee_url: createAdShopeeLink || '',
+          campaign_id: createAdSelectedCampaign || undefined,
+          new_campaign_name: createAdNewCampaignName || undefined,
+        }),
+      })
+      const rawText = await resp.text()
+      let data: { ok?: boolean; error?: string; queue_id?: number; queued_count?: number; next_run_at?: string } = {}
+      try { data = rawText ? JSON.parse(rawText) : {} } catch { data = { error: `invalid_json: ${rawText.substring(0, 200)}` } }
+
+      if (resp.ok && data.ok) {
+        setCreateAdProgress(100)
+        const nextRun = data.next_run_at ? new Date(data.next_run_at).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) : '~20 นาที'
+        const successText = `✅ เพิ่มเข้าคิวแล้ว #${data.queue_id} · ${data.queued_count || 0} งานในคิว · รันถัดไป ${nextRun}`
+        setCreateAdStep(successText)
+        setCreateAdResultBanner({ type: 'success', text: successText })
+        await new Promise(r => setTimeout(r, 1800))
+        setCreateAdPopup(null)
+        setCreateAdResultBanner(null)
+        // Refresh queue page if user is on it
+        void loadAdQueue()
+      } else {
+        const errText = `❌ HTTP ${resp.status} — ${data.error || 'เพิ่มเข้าคิวไม่สำเร็จ'}`
+        setCreateAdStep(errText)
+        setCreateAdResultBanner({ type: 'error', text: errText })
+        setCreateAdProgress(0)
+        alert(errText)
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setCreateAdStep(`❌ ${msg}`)
+      setCreateAdResultBanner({ type: 'error', text: `❌ Exception — ${msg}` })
+      setCreateAdProgress(0)
+      alert(`❌ Exception: ${msg}`)
+    } finally {
+      setCreateAdCreating(false)
+    }
+  }
+
+  async function loadAdQueue() {
+    setAdQueueLoading(true)
+    try {
+      const resp = await fetch('/worker-api/api/dashboard/ad-queue/list?limit=100')
+      const data = await resp.json() as AdQueueListResponse
+      if (data.ok) {
+        setAdQueueItems(data.items || [])
+        setAdQueueCounts(data.counts || {})
+        setAdQueueLastRun(data.last_run_at || '')
+        setAdQueueNextRun(data.next_run_at || '')
+        if (data.interval_minutes) setAdQueueIntervalMinutes(data.interval_minutes)
+      }
+    } catch {
+      // keep previous state
+    } finally {
+      setAdQueueLoading(false)
+    }
+  }
+
+  async function cancelQueueItem(id: number) {
+    if (!window.confirm(`ยกเลิกงานคิว #${id}?`)) return
+    try {
+      const resp = await fetch(`/worker-api/api/dashboard/ad-queue/${id}`, { method: 'DELETE' })
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      await loadAdQueue()
+    } catch (e) {
+      alert(`ยกเลิกไม่สำเร็จ: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  async function runQueueNow() {
+    if (!window.confirm('รันงานคิวถัดไปเดี๋ยวนี้?\n\n(ระบบจะหยิบงาน queued ตัวเก่าสุดมาทำทันที ไม่ต้องรอ cron 20 นาที)\n\n⚠ ใช้เวลา ~30-60 วินาที เพราะต้องรอ Facebook สร้าง thumbnail + adset')) return
+    setAdQueueLoading(true)
+    try {
+      const resp = await fetch('/worker-api/api/dashboard/ad-queue/run-next', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json' },
+      })
+      // Read as text first so we can show raw content on JSON parse failure (debug aid)
+      const rawText = await resp.text()
+      let data: { ok?: boolean; queue_id?: number; skipped?: boolean; reason?: string; error?: string } = {}
+      try {
+        data = rawText ? JSON.parse(rawText) : {}
+      } catch (parseErr) {
+        const preview = rawText.length > 300 ? rawText.substring(0, 300) + '...' : rawText
+        alert(`รันไม่สำเร็จ: response ไม่ใช่ JSON (status ${resp.status})\n\nResponse:\n${preview}`)
+        await loadAdQueue()
+        return
+      }
+      if (data.skipped) {
+        alert(`คิวว่างเปล่า (${data.reason || 'no_items'})`)
+      } else if (data.ok) {
+        alert(`รันคิว #${data.queue_id} สำเร็จ`)
+      } else {
+        alert(`รันคิว #${data.queue_id || '?'} ล้มเหลว: ${data.error || `HTTP ${resp.status}`}`)
+      }
+      await loadAdQueue()
+    } catch (e) {
+      alert(`รันไม่สำเร็จ: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setAdQueueLoading(false)
     }
   }
 
@@ -570,9 +784,54 @@ export default function App() {
     }
   }
 
+  async function refreshAllGalleryViews() {
+    if (gallerySyncing) return
+    setGallerySyncing(true)
+    setGalleryError(null)
+    try {
+      const resp = await fetch(`/worker-api/api/dashboard/facebook-page-videos/refresh-all-views`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_id: CHIEB_PAGE_ID }),
+      })
+      const data = await resp.json().catch(() => ({})) as {
+        ok?: boolean
+        total?: number
+        refreshed?: number
+        raised?: number
+        errors?: number
+        total_over_100k?: number
+        error?: string
+      }
+      if (!resp.ok || data.ok === false) {
+        throw new Error(data.error || `refresh ไม่สำเร็จ (${resp.status})`)
+      }
+      await loadGalleryFromWorker(false)
+      setGalleryError(
+        `รีเฟรชเสร็จ: เช็ค ${data.total ?? 0} คลิป, ` +
+        `อัปเดตยอดวิว ${data.raised ?? 0} คลิป, ` +
+        `คลิปที่มียอด ≥ 1 แสน: ${data.total_over_100k ?? 0}` +
+        (data.errors ? ` (errors: ${data.errors})` : '')
+      )
+    } catch (error) {
+      setGalleryError(error instanceof Error ? error.message : 'รีเฟรชไม่สำเร็จ')
+    } finally {
+      setGallerySyncing(false)
+      setGalleryLoading(false)
+    }
+  }
+
   useEffect(() => {
     void loadGalleryFromWorker(true)
   }, [])
+
+  // Auto-load queue when user opens the queue tab + auto-refresh every 30s while there
+  useEffect(() => {
+    if (tab !== 'queue') return
+    void loadAdQueue()
+    const id = setInterval(() => void loadAdQueue(), 30000)
+    return () => clearInterval(id)
+  }, [tab])
 
   // Auto-sync: keep syncing until fully scanned
   useEffect(() => {
@@ -752,7 +1011,7 @@ export default function App() {
 
       {/* Create Ad Popup */}
       {createAdPopup && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => !createAdCreating && setCreateAdPopup(null)}>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => { if (!createAdCreating) { setCreateAdPopup(null); setCreateAdResultBanner(null) } }}>
           <div className="mx-4 w-full max-w-lg rounded-3xl bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-lg font-bold text-slate-900">สร้างแอด LikePage</h2>
             <p className="mt-1 text-sm text-slate-500">Video ID: {createAdPopup.videoId}</p>
@@ -809,6 +1068,18 @@ export default function App() {
               </div>
             </div>
 
+            {/* Persistent result banner — shown AFTER request finishes, stays until user
+                 retries or cancels. Critical so user doesn't miss success/error message. */}
+            {!createAdCreating && createAdResultBanner && (
+              <div className={`mt-6 rounded-xl p-4 text-sm font-semibold ${
+                createAdResultBanner.type === 'success'
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                  : 'bg-red-50 text-red-700 border border-red-200'
+              }`}>
+                <p className="whitespace-pre-wrap break-words">{createAdResultBanner.text}</p>
+              </div>
+            )}
+
             {createAdCreating ? (
               <div className="mt-6 space-y-3">
                 <div className="rounded-xl bg-slate-50 p-4">
@@ -823,19 +1094,29 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="mt-6 flex gap-3">
+              <div className="mt-6 space-y-2">
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => { setCreateAdPopup(null); setCreateAdResultBanner(null) }}
+                    className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700"
+                  >
+                    ยกเลิก
+                  </button>
+                  <button
+                    onClick={() => void submitCreateAd()}
+                    disabled={!createAdSelectedCampaign && !createAdNewCampaignName}
+                    className="flex-1 rounded-xl bg-[#1877f2] py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+                  >
+                    เพิ่มเข้าคิว
+                  </button>
+                </div>
                 <button
-                  onClick={() => setCreateAdPopup(null)}
-                  className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700"
-                >
-                  ยกเลิก
-                </button>
-                <button
-                  onClick={() => void submitCreateAd()}
+                  onClick={() => void submitCreateAdImmediate()}
                   disabled={!createAdSelectedCampaign && !createAdNewCampaignName}
-                  className="flex-1 rounded-xl bg-[#1877f2] py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+                  title="รันเลยโดยไม่รอคิว 20 นาที (ใช้เวลา ~60-120 วินาที)"
+                  className="w-full rounded-xl bg-orange-500 hover:bg-orange-600 py-2.5 text-sm font-semibold text-white disabled:opacity-50 transition-colors"
                 >
-                  สร้างแอด
+                  ⚡ โพสต์เลย (ข้ามคิว)
                 </button>
               </div>
             )}
@@ -868,6 +1149,7 @@ export default function App() {
                 { id: 'page-posts', label: 'โพสต์เพจ', icon: Facebook },
                 { id: 'running', label: 'Campaigns', icon: Megaphone },
                 { id: 'create', label: 'Create Ads', icon: Users },
+                { id: 'queue', label: 'คิวสร้างแอด', icon: Clock },
                 { id: 'history', label: 'History', icon: MessageCircle },
               ] as const).map(({ id, label, icon: Icon }) => {
                 const active = tab === id
@@ -918,6 +1200,7 @@ export default function App() {
                         {tab === 'page-posts' && 'โพสต์เพจเฉียบ'}
                         {tab === 'create' && 'Create Ads'}
                         {tab === 'running' && 'Campaigns'}
+                        {tab === 'queue' && 'คิวสร้างแอด'}
                         {tab === 'history' && 'History'}
                       {tab === 'settings' && 'Settings'}
                     </p>
@@ -1250,13 +1533,23 @@ export default function App() {
                           ? 'มีโพสต์เก่ารอโหลดเพิ่ม'
                           : 'พร้อมดึงโพสต์ชุดแรกจาก Facebook'}
                     </div>
-                    <button
-                      onClick={() => void syncNextGalleryBatch()}
-                      disabled={gallerySyncing}
-                      className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {gallerySyncing ? 'กำลังโหลด…' : galleryLinkedItems.length > 0 ? 'โหลดโพสต์เพิ่ม' : 'ดึงโพสต์จาก Facebook'}
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        onClick={() => void refreshAllGalleryViews()}
+                        disabled={gallerySyncing}
+                        title="ยิง Facebook API ทุกคลิปในแคชแล้วอัปเดตยอดวิวล่าสุด (ใช้ตอนยอดวิวค้าง/ไม่ตรง)"
+                        className="rounded-xl bg-orange-500 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60 hover:bg-orange-600 transition-colors"
+                      >
+                        {gallerySyncing ? 'กำลังรีเฟรช…' : '🔄 รีเฟรชยอดวิวทั้งหมด'}
+                      </button>
+                      <button
+                        onClick={() => void syncNextGalleryBatch()}
+                        disabled={gallerySyncing}
+                        className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {gallerySyncing ? 'กำลังโหลด…' : galleryLinkedItems.length > 0 ? 'โหลดโพสต์เพิ่ม' : 'ดึงโพสต์จาก Facebook'}
+                      </button>
+                    </div>
                   </div>
                   {galleryLoading ? (
                     <EmptyState title="กำลังโหลดโพสต์จากฐานข้อมูล" description="อ่านโพสต์ที่เคย sync ไว้ใน worker ก่อน แล้วค่อยโหลดเพิ่มเฉพาะของใหม่" />
@@ -1355,6 +1648,115 @@ export default function App() {
                     ))}
                   </div>
                   )}
+                </Card>
+              )}
+
+              {tab === 'queue' && (
+                <Card
+                  title="คิวสร้างแอด"
+                  subtitle={`ระบบจะหยิบงาน "queued" ตัวเก่าสุดมารันทุก ${adQueueIntervalMinutes} นาที — รวมการสร้างแอดและโพสต์ไปเพจในขั้นตอนเดียว`}
+                  action={
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => void loadAdQueue()}
+                        disabled={adQueueLoading}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
+                      >
+                        {adQueueLoading ? 'กำลังโหลด...' : '↻ รีเฟรช'}
+                      </button>
+                      <button
+                        onClick={() => void runQueueNow()}
+                        disabled={adQueueLoading || !(adQueueCounts.queued && adQueueCounts.queued > 0)}
+                        className="rounded-xl bg-orange-500 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50 hover:bg-orange-600"
+                      >
+                        ⚡ รันตอนนี้เลย (ข้าม cron)
+                      </button>
+                    </div>
+                  }
+                >
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+                    {[
+                      { key: 'queued', label: 'รอคิว', color: 'bg-blue-50 text-blue-700' },
+                      { key: 'processing', label: 'กำลังรัน', color: 'bg-amber-50 text-amber-700' },
+                      { key: 'done', label: 'สำเร็จ', color: 'bg-emerald-50 text-emerald-700' },
+                      { key: 'failed', label: 'ล้มเหลว', color: 'bg-red-50 text-red-700' },
+                      { key: 'cancelled', label: 'ยกเลิก', color: 'bg-slate-100 text-slate-500' },
+                    ].map(({ key, label, color }) => (
+                      <div key={key} className={`rounded-2xl ${color} px-3 py-3 text-center`}>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] opacity-75">{label}</p>
+                        <p className="mt-1 text-xl font-bold">{adQueueCounts[key] || 0}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
+                    <p>
+                      <span className="font-semibold">รันล่าสุด:</span>{' '}
+                      {adQueueLastRun ? formatThaiDateTime(adQueueLastRun) : 'ยังไม่เคยรัน'}
+                    </p>
+                    <p className="mt-1">
+                      <span className="font-semibold">รันถัดไป (โดยประมาณ):</span>{' '}
+                      {adQueueNextRun ? formatThaiDateTime(adQueueNextRun) : '-'}
+                    </p>
+                  </div>
+                  <div className="mt-5 space-y-2">
+                    {adQueueItems.length === 0 ? (
+                      <EmptyState title="ยังไม่มีงานในคิว" description='กดสร้างแอดในแท็บ "โพสต์เพจ" จะถูกเพิ่มเข้าคิวที่นี่' />
+                    ) : (
+                      adQueueItems.map((item) => {
+                        const statusColor =
+                          item.status === 'done' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                          item.status === 'failed' ? 'bg-red-50 text-red-700 border-red-200' :
+                          item.status === 'processing' ? 'bg-amber-50 text-amber-700 border-amber-200' :
+                          item.status === 'cancelled' ? 'bg-slate-100 text-slate-500 border-slate-200' :
+                          'bg-blue-50 text-blue-700 border-blue-200'
+                        return (
+                          <div key={item.id} className="rounded-2xl border border-slate-200 bg-white p-3">
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className={`rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase ${statusColor}`}>
+                                    {item.status}
+                                  </span>
+                                  <span className="text-xs text-slate-400">#{item.id}</span>
+                                  <span className="text-xs text-slate-500">{formatThaiDateTime(item.created_at)}</span>
+                                </div>
+                                <p className="mt-1.5 truncate text-sm font-medium text-slate-900">
+                                  {item.caption || `Video ${item.video_id}`}
+                                </p>
+                                <p className="mt-0.5 truncate text-[11px] text-slate-400">
+                                  video_id: {item.video_id} • campaign: {item.campaign_id || item.new_campaign_name || '-'}
+                                </p>
+                                {item.shopee_url && (
+                                  <p className="mt-0.5 truncate text-[11px] text-slate-400">shopee: {item.shopee_url}</p>
+                                )}
+                                {item.error_message && (
+                                  <p className="mt-1 text-xs text-red-600">⚠ {item.error_message}</p>
+                                )}
+                                {item.result_story_id && (
+                                  <a
+                                    href={`https://www.facebook.com/${item.result_story_id.replace('_', '/posts/')}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-[#1877f2]"
+                                  >
+                                    <ExternalLink size={12} /> ดูโพสต์
+                                  </a>
+                                )}
+                              </div>
+                              {item.status === 'queued' && (
+                                <button
+                                  onClick={() => void cancelQueueItem(item.id)}
+                                  className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-semibold text-slate-600 hover:border-red-300 hover:bg-red-50 hover:text-red-600"
+                                >
+                                  ยกเลิก
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
                 </Card>
               )}
 

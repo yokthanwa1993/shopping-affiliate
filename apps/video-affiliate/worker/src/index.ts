@@ -3485,11 +3485,15 @@ async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: 
         }
     }
 
-    // Batch fetch views for all video IDs
+    // Batch fetch views for all video IDs.
+    // Note: the `views` field on /video is unreliable for Reels — it returns a snapshot
+    // that often lags or caps. The lifetime-accurate metric is `total_video_views` from
+    // /{video_id}/video_insights, so we request both and pick the larger value.
+    // Requires `read_insights` permission on the Facebook sync token.
     const items: Array<Record<string, unknown>> = []
     if (videoIds.length > 0) {
         const idsStr = videoIds.join(',')
-        const viewsResp = await fetch(`https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,title,description,source,picture,length&access_token=${encodeURIComponent(token)}`)
+        const viewsResp = await fetch(`https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,title,description,source,picture,length,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`)
         const viewsData = viewsResp.ok ? await viewsResp.json().catch(() => ({})) as Record<string, Record<string, unknown>> : {}
         for (const videoId of videoIds) {
             const post = postMap.get(videoId) || {}
@@ -3497,6 +3501,24 @@ async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: 
             // Extract post_id from post.id (format: "pageId_postId")
             const rawPostId = String(post.id || '').trim()
             const postId = rawPostId.includes('_') ? rawPostId.split('_').pop() || '' : rawPostId
+            // Pull total_video_views from insights — lifetime accurate count.
+            const insightsContainer = (videoInfo.video_insights as Record<string, unknown> | undefined)
+            const insightsData = Array.isArray(insightsContainer?.data)
+                ? insightsContainer.data as Array<Record<string, unknown>>
+                : []
+            let insightsViews = 0
+            for (const metric of insightsData) {
+                if (String((metric as Record<string, unknown>).name || '') !== 'total_video_views') continue
+                const values = (metric as Record<string, unknown>).values
+                if (!Array.isArray(values) || values.length === 0) continue
+                const v = Number((values[0] as Record<string, unknown>).value || 0)
+                if (Number.isFinite(v) && v > insightsViews) insightsViews = v
+            }
+            const fieldViews = Number(videoInfo.views || 0)
+            const finalViews = Math.max(
+                Number.isFinite(fieldViews) ? Math.max(0, Math.floor(fieldViews)) : 0,
+                Math.max(0, Math.floor(insightsViews)),
+            )
             items.push({
                 id: videoId,
                 video_id: videoId,
@@ -3507,7 +3529,7 @@ async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: 
                 created_time: String(post.created_time || '').trim(),
                 picture: String(post.full_picture || videoInfo.picture || '').trim(),
                 source: String(videoInfo.source || '').trim(),
-                views: Number(videoInfo.views || 0),
+                views: finalViews,
                 length: Number(videoInfo.length || 0),
             })
         }
@@ -5404,6 +5426,197 @@ app.post('/api/dashboard/facebook-page-videos/auto-sync', async (c) => {
     })
 })
 
+// Full resync — loops through ALL FB page posts in one request, discovering NEW videos
+// AND refreshing views for existing ones. Use when cron is too slow or after threshold drift.
+// Bypasses the 100-videos-per-minute cron pacing entirely.
+app.post('/api/dashboard/facebook-page-videos/full-resync', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        page_name?: string
+        max_pages?: number
+    }
+    const pageId = String(body.page_id || c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
+    const pageName = String(body.page_name || c.req.query('page_name') || DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME).trim()
+    const maxPagesRaw = Number(body.max_pages || 30)
+    const maxPages = Number.isFinite(maxPagesRaw) ? Math.min(50, Math.max(1, Math.floor(maxPagesRaw))) : 30
+
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+
+    const tokenEntry = await getDashboardSetting(c.env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
+    const token = String(tokenEntry?.value || '').trim()
+    if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
+
+    const beforeOver100k = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 100000 })
+    const beforeTotal = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 0 })
+
+    let nextAfter = ''
+    let totalDiscovered = 0
+    let pagesScanned = 0
+    let firstError = ''
+    let firstSampleResponse: unknown = null
+    const fbErrors: string[] = []
+
+    for (let i = 0; i < maxPages; i++) {
+        try {
+            const batch = await fetchFacebookPageVideoBatchFromGraphToken(token, pageId, nextAfter)
+            pagesScanned++
+
+            // Capture first batch's first item for debugging (so user can verify insights field is working)
+            if (i === 0 && batch.items.length > 0) {
+                firstSampleResponse = {
+                    sample_video_id: batch.items[0].video_id,
+                    sample_views: batch.items[0].views,
+                    fields_present: Object.keys(batch.items[0] || {}),
+                }
+            }
+
+            const rows = batch.items
+                .map((item) => normalizeFacebookPageVideoCacheRow(pageId, {
+                    ...item,
+                    page_name: pageName,
+                }))
+                .filter((item): item is FacebookPageVideoCacheRow => !!item)
+            if (rows.length > 0) {
+                await upsertFacebookPageVideoCacheRows(c.env.DB, pageId, pageName, rows)
+                totalDiscovered += rows.length
+            }
+            nextAfter = batch.nextAfter || ''
+            if (!nextAfter) break  // Reached end of page posts
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            if (!firstError) firstError = msg
+            fbErrors.push(`page_${i}: ${msg}`)
+            // Don't stop — try next page (FB might rate-limit one page)
+            if (msg.includes('rate_limited') || msg.includes('facebook_graph_http_4')) break
+        }
+    }
+
+    // Update sync state to reflect this full re-scan
+    const nowIso = new Date().toISOString()
+    await upsertFacebookPageVideoSyncState(c.env.DB, pageId, {
+        page_name: pageName,
+        next_after: nextAfter,
+        last_attempt_at: nowIso,
+        last_synced_at: nowIso,
+        last_full_scan_at: nextAfter ? undefined : nowIso,
+        fully_scanned: nextAfter ? 0 : 1,
+        last_batch_count: totalDiscovered,
+        last_error: firstError || '',
+    })
+
+    const afterOver100k = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 100000 })
+    const afterTotal = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 0 })
+
+    return c.json({
+        ok: !firstError,
+        page_id: pageId,
+        pages_scanned: pagesScanned,
+        max_pages: maxPages,
+        rows_upserted: totalDiscovered,
+        fully_scanned: !nextAfter,
+        next_after: nextAfter,
+        before: { total: beforeTotal, over_100k: beforeOver100k },
+        after: { total: afterTotal, over_100k: afterOver100k },
+        delta_over_100k: afterOver100k - beforeOver100k,
+        first_error: firstError || null,
+        fb_errors: fbErrors.slice(0, 5),
+        debug_sample: firstSampleResponse,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Refresh view counts for ALL cached videos in one shot.
+// Useful when cron is too slow to cycle through every page (one batch per minute).
+// Hits Facebook Graph API in batches of 50 (FB API limit for ?ids=) and updates
+// any video whose view count has increased — never decreases values.
+app.post('/api/dashboard/facebook-page-videos/refresh-all-views', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+    }
+    const pageId = String(body.page_id || c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+
+    const tokenEntry = await getDashboardSetting(c.env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
+    const token = String(tokenEntry?.value || '').trim()
+    if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
+
+    await ensureFacebookPageVideoCacheTables(c.env.DB)
+    const cachedRows = await c.env.DB.prepare(
+        `SELECT video_id, views FROM facebook_page_video_cache WHERE page_id = ? AND video_id <> ''`
+    ).bind(pageId).all() as { results?: Array<{ video_id: string; views: number }> }
+    const cachedVideos = Array.isArray(cachedRows.results) ? cachedRows.results : []
+    if (cachedVideos.length === 0) {
+        return c.json({ ok: true, page_id: pageId, total: 0, refreshed: 0, raised: 0, errors: 0 })
+    }
+
+    const BATCH = 50
+    let refreshed = 0
+    let raised = 0
+    let errors = 0
+    let totalViewsDelta = 0
+
+    for (let i = 0; i < cachedVideos.length; i += BATCH) {
+        const batch = cachedVideos.slice(i, i + BATCH)
+        const idsStr = batch.map(v => String(v.video_id || '').trim()).filter(Boolean).join(',')
+        if (!idsStr) continue
+        try {
+            const resp = await fetch(`https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`)
+            if (!resp.ok) { errors++; continue }
+            const data = await resp.json().catch(() => ({})) as Record<string, Record<string, unknown>>
+
+            for (const cached of batch) {
+                const videoInfo = data[cached.video_id] || {}
+                const fieldViews = Number(videoInfo.views || 0)
+
+                const insightsContainer = (videoInfo.video_insights as Record<string, unknown> | undefined)
+                const insightsData = Array.isArray(insightsContainer?.data)
+                    ? insightsContainer.data as Array<Record<string, unknown>>
+                    : []
+                let insightsViews = 0
+                for (const metric of insightsData) {
+                    if (String((metric as Record<string, unknown>).name || '') !== 'total_video_views') continue
+                    const values = (metric as Record<string, unknown>).values
+                    if (!Array.isArray(values) || values.length === 0) continue
+                    const v = Number((values[0] as Record<string, unknown>).value || 0)
+                    if (Number.isFinite(v) && v > insightsViews) insightsViews = v
+                }
+
+                const newViews = Math.max(
+                    Number.isFinite(fieldViews) ? Math.max(0, Math.floor(fieldViews)) : 0,
+                    Math.max(0, Math.floor(insightsViews)),
+                )
+                const oldViews = Math.max(0, Math.floor(Number(cached.views) || 0))
+
+                if (newViews > oldViews) {
+                    await c.env.DB.prepare(
+                        `UPDATE facebook_page_video_cache
+                         SET views = ?, fetched_at = datetime('now'), updated_at = datetime('now')
+                         WHERE page_id = ? AND video_id = ?`
+                    ).bind(newViews, pageId, cached.video_id).run()
+                    raised++
+                    totalViewsDelta += (newViews - oldViews)
+                }
+                refreshed++
+            }
+        } catch (_e) {
+            errors++
+        }
+    }
+
+    // Recount videos crossing the 100K threshold so the dashboard sees the new count immediately
+    const totalOver100k = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 100000 })
+
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        total: cachedVideos.length,
+        refreshed,
+        raised,
+        errors,
+        total_views_delta: totalViewsDelta,
+        total_over_100k: totalOver100k,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
 // Deep backfill — calls Facebook Graph API to fill missing post_id + scan
 // post description + first page-authored comment for shopee links.
 // Use this when DB-side fallback chain cannot find the link.
@@ -5574,6 +5787,263 @@ app.post('/api/dashboard/facebook-page-videos/backfill-shopee-links', async (c) 
     })
 })
 
+// =====================================================================
+// Ad Queue — store create-ad requests for cron to process every 20 min.
+// User clicks "เพิ่มเข้าคิว" in dashboard → row inserted with status=queued.
+// Cron picks oldest queued row every 20 min → calls create-ad logic →
+// updates status to done/failed.
+// =====================================================================
+const AD_QUEUE_INTERVAL_MS = 20 * 60 * 1000  // 20 minutes
+const AD_QUEUE_LAST_RUN_KEY = 'ad_queue_last_run_at'
+
+async function ensureAdQueueTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS dashboard_ad_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            page_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            caption TEXT NOT NULL DEFAULT '',
+            shopee_url TEXT NOT NULL DEFAULT '',
+            story_id TEXT NOT NULL DEFAULT '',
+            campaign_id TEXT NOT NULL DEFAULT '',
+            new_campaign_name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'queued',
+            attempted_at TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            result_story_id TEXT NOT NULL DEFAULT '',
+            result_ad_id TEXT NOT NULL DEFAULT '',
+            result_adset_id TEXT NOT NULL DEFAULT ''
+        )`
+    ).run()
+    await db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_dashboard_ad_queue_status ON dashboard_ad_queue(status, created_at)`
+    ).run()
+}
+
+app.post('/api/dashboard/ad-queue/enqueue', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        video_id?: string
+        caption?: string
+        shopee_url?: string
+        story_id?: string
+        campaign_id?: string
+        new_campaign_name?: string
+    }
+    const pageId = String(body.page_id || '').trim()
+    const videoId = String(body.video_id || '').trim()
+    if (!pageId || !videoId) return c.json({ ok: false, error: 'page_id and video_id required' }, 400)
+    if (!body.campaign_id && !body.new_campaign_name) {
+        return c.json({ ok: false, error: 'campaign_id or new_campaign_name required' }, 400)
+    }
+    await ensureAdQueueTable(c.env.DB)
+    const insert = await c.env.DB.prepare(
+        `INSERT INTO dashboard_ad_queue (page_id, video_id, caption, shopee_url, story_id, campaign_id, new_campaign_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+        pageId,
+        videoId,
+        String(body.caption || '').trim(),
+        String(body.shopee_url || '').trim(),
+        String(body.story_id || '').trim(),
+        String(body.campaign_id || '').trim(),
+        String(body.new_campaign_name || '').trim(),
+    ).run()
+    const queueId = (insert as unknown as { meta?: { last_row_id?: number } }).meta?.last_row_id || 0
+    const queuedCount = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM dashboard_ad_queue WHERE status = 'queued'`
+    ).first() as { n?: number } | null
+    const lastRun = await getDashboardSetting(c.env.DB, AD_QUEUE_LAST_RUN_KEY).catch(() => null)
+    const lastRunMs = Date.parse(String(lastRun?.value || '').trim())
+    const nextRunMs = Number.isFinite(lastRunMs) ? lastRunMs + AD_QUEUE_INTERVAL_MS : Date.now() + AD_QUEUE_INTERVAL_MS
+    return c.json({
+        ok: true,
+        queue_id: queueId,
+        queued_count: Number(queuedCount?.n || 0),
+        next_run_at: new Date(nextRunMs).toISOString(),
+    })
+})
+
+app.get('/api/dashboard/ad-queue/list', async (c) => {
+    await ensureAdQueueTable(c.env.DB)
+    const limitRaw = Number(c.req.query('limit') || 100)
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 100
+    const status = String(c.req.query('status') || '').trim()
+    const where = status ? `WHERE status = ?` : ''
+    const stmt = status
+        ? c.env.DB.prepare(`SELECT * FROM dashboard_ad_queue ${where} ORDER BY id DESC LIMIT ?`).bind(status, limit)
+        : c.env.DB.prepare(`SELECT * FROM dashboard_ad_queue ORDER BY id DESC LIMIT ?`).bind(limit)
+    const rows = await stmt.all() as { results?: Array<Record<string, unknown>> }
+    const counts = await c.env.DB.prepare(
+        `SELECT status, COUNT(*) AS n FROM dashboard_ad_queue GROUP BY status`
+    ).all() as { results?: Array<{ status: string; n: number }> }
+    const countsByStatus: Record<string, number> = {}
+    for (const r of (counts.results || [])) countsByStatus[String(r.status)] = Number(r.n)
+    const lastRun = await getDashboardSetting(c.env.DB, AD_QUEUE_LAST_RUN_KEY).catch(() => null)
+    const lastRunMs = Date.parse(String(lastRun?.value || '').trim())
+    const nextRunMs = Number.isFinite(lastRunMs) ? lastRunMs + AD_QUEUE_INTERVAL_MS : Date.now()
+    return c.json({
+        ok: true,
+        items: rows.results || [],
+        counts: countsByStatus,
+        last_run_at: lastRun?.value || '',
+        next_run_at: new Date(nextRunMs).toISOString(),
+        interval_minutes: AD_QUEUE_INTERVAL_MS / 60000,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.delete('/api/dashboard/ad-queue/:id', async (c) => {
+    await ensureAdQueueTable(c.env.DB)
+    const id = Number(c.req.param('id') || 0)
+    if (!id) return c.json({ ok: false, error: 'id required' }, 400)
+    await c.env.DB.prepare(
+        `UPDATE dashboard_ad_queue SET status = 'cancelled', completed_at = datetime('now')
+         WHERE id = ? AND status = 'queued'`
+    ).bind(id).run()
+    return c.json({ ok: true, id })
+})
+
+// Process the oldest queued item — runs from cron and from manual "run now" button.
+async function processNextAdQueueItem(env: Env): Promise<{
+    ok: boolean
+    skipped?: boolean
+    reason?: string
+    queue_id?: number
+    result?: unknown
+    error?: string
+}> {
+    await ensureAdQueueTable(env.DB)
+    const row = await env.DB.prepare(
+        `SELECT * FROM dashboard_ad_queue WHERE status = 'queued' ORDER BY id ASC LIMIT 1`
+    ).first() as Record<string, unknown> | null
+    if (!row) return { ok: true, skipped: true, reason: 'queue_empty' }
+
+    const queueId = Number(row.id)
+    const nowIso = new Date().toISOString()
+    // Mark processing (atomic-ish: only if still queued)
+    const claim = await env.DB.prepare(
+        `UPDATE dashboard_ad_queue SET status = 'processing', attempted_at = ? WHERE id = ? AND status = 'queued'`
+    ).bind(nowIso, queueId).run()
+    const claimed = (claim as unknown as { meta?: { changes?: number } }).meta?.changes || 0
+    if (!claimed) return { ok: true, skipped: true, reason: 'claim_lost', queue_id: queueId }
+
+    try {
+        // Call our own create-ad endpoint via internal fetch
+        const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
+        const resp = await fetch(`${workerUrl}/api/dashboard/create-ad`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page_id: row.page_id,
+                video_id: row.video_id,
+                caption: row.caption,
+                story_id: row.story_id,
+                shopee_url: row.shopee_url,
+                campaign_id: row.campaign_id || undefined,
+                new_campaign_name: row.new_campaign_name || undefined,
+            }),
+        })
+        const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+        if (!resp.ok || !data.ok) {
+            // Preserve the FULL failure context for debugging:
+            //   [step] error_message — electron step name tells operator WHICH phase failed
+            //   (upload / thumbnails / creative / campaign / copy / ad / story_id)
+            //   Without step, "Invalid parameter" is unhelpful — FB returns the same vague
+            //   string from 10+ different validation failures.
+            const stepLabel = String(data.step || '').trim()
+            const errorMsg = String(data.error || `http_${resp.status}`).trim()
+            const combined = stepLabel ? `[${stepLabel}] ${errorMsg}` : errorMsg
+            await env.DB.prepare(
+                `UPDATE dashboard_ad_queue SET status = 'failed', completed_at = datetime('now'), error_message = ? WHERE id = ?`
+            ).bind(combined.substring(0, 500), queueId).run()
+            return { ok: false, queue_id: queueId, error: combined }
+        }
+        await env.DB.prepare(
+            `UPDATE dashboard_ad_queue
+             SET status = 'done', completed_at = datetime('now'),
+                 result_story_id = ?, result_ad_id = ?, result_adset_id = ?, error_message = ''
+             WHERE id = ?`
+        ).bind(
+            String(data.story_id || ''),
+            String(data.ad_id || ''),
+            String(data.adset_id || ''),
+            queueId,
+        ).run()
+        return { ok: true, queue_id: queueId, result: data }
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        await env.DB.prepare(
+            `UPDATE dashboard_ad_queue SET status = 'failed', completed_at = datetime('now'), error_message = ? WHERE id = ?`
+        ).bind(msg.substring(0, 500), queueId).run()
+        return { ok: false, queue_id: queueId, error: msg }
+    }
+}
+
+// Process the oldest queued item immediately, bypassing the 20-min cron interval.
+// Doesn't take an id — always picks oldest queued. To prioritize a specific item,
+// cancel newer items first.
+app.post('/api/dashboard/ad-queue/run-next', async (c) => {
+    await ensureAdQueueTable(c.env.DB)
+    const result = await processNextAdQueueItem(c.env)
+    return c.json(result, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Recover a stuck "processing" item — used when create-ad on FB succeeded but the
+// worker died before writing result back to DB. Caller looks up story_id by matching
+// caption against recent FB posts then calls this with story_id + ad_id (optional).
+// Marks status=done and saves result; optionally posts the comment if comment_text given.
+app.post('/api/dashboard/ad-queue/:id/recover', async (c) => {
+    await ensureAdQueueTable(c.env.DB)
+    const id = Number(c.req.param('id') || 0)
+    if (!id) return c.json({ ok: false, error: 'id required' }, 400)
+    const body = await c.req.json().catch(() => ({} as { story_id?: string; ad_id?: string; adset_id?: string; status?: string })) as {
+        story_id?: string; ad_id?: string; adset_id?: string; status?: 'done' | 'failed' | 'queued'
+    }
+    const status = body.status === 'failed' || body.status === 'queued' ? body.status : 'done'
+    await c.env.DB.prepare(
+        `UPDATE dashboard_ad_queue
+         SET status = ?, completed_at = datetime('now'),
+             result_story_id = COALESCE(NULLIF(?, ''), result_story_id),
+             result_ad_id = COALESCE(NULLIF(?, ''), result_ad_id),
+             result_adset_id = COALESCE(NULLIF(?, ''), result_adset_id),
+             error_message = CASE WHEN ? = 'done' THEN '' ELSE error_message END
+         WHERE id = ?`
+    ).bind(
+        status,
+        String(body.story_id || '').trim(),
+        String(body.ad_id || '').trim(),
+        String(body.adset_id || '').trim(),
+        status,
+        id,
+    ).run()
+    return c.json({ ok: true, id, status })
+})
+
+// Watchdog — reset items stuck in 'processing' for too long.
+// Called from cron (and on-demand). 5-min timeout (typical create-ad flow takes 60-120s).
+async function recoverStuckAdQueueProcessing(env: Env): Promise<{ recovered: number }> {
+    await ensureAdQueueTable(env.DB)
+    const STUCK_THRESHOLD_MS = 5 * 60 * 1000
+    const cutoffIso = new Date(Date.now() - STUCK_THRESHOLD_MS).toISOString()
+    const stuck = await env.DB.prepare(
+        `SELECT id FROM dashboard_ad_queue WHERE status = 'processing' AND attempted_at < ?`
+    ).bind(cutoffIso).all() as { results?: Array<{ id: number }> }
+    const ids = (stuck.results || []).map((r) => Number(r.id)).filter(Boolean)
+    if (ids.length === 0) return { recovered: 0 }
+    for (const id of ids) {
+        await env.DB.prepare(
+            `UPDATE dashboard_ad_queue
+             SET status = 'failed', completed_at = datetime('now'),
+                 error_message = COALESCE(NULLIF(error_message, ''), 'stuck_processing_timeout — verify on FB then call /recover')
+             WHERE id = ? AND status = 'processing'`
+        ).bind(id).run()
+    }
+    console.log(`[AD QUEUE WATCHDOG] reset ${ids.length} stuck processing items: ${ids.join(',')}`)
+    return { recovered: ids.length }
+}
+
 app.post('/api/dashboard/create-ad', async (c) => {
     const body = await c.req.json().catch(() => ({})) as {
         page_id?: string
@@ -5700,7 +6170,24 @@ app.post('/api/dashboard/create-ad', async (c) => {
         const cleanShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
         const finalCaption = `📌 พิกัด : ${cleanShortLink}\n${caption}`
 
-        // 4. Create ad with final caption
+        // 4. Create ad with final caption.
+        // CTA button (SHOP_NOW) → shopee_url (real Shopee link, like the template)
+        // Caption + comment text → cleanShortLink (wwoom for affiliate tracking)
+        // Both are passed; video-onecard prefers shopee_url for the button destination.
+        //
+        // IMPORTANT: forward template_adset + ad_account FROM DASHBOARD SETTINGS so the
+        // operator's configured template (read from dashboard_settings.template_adset) is
+        // actually used. Before this fix, electron.js fell back to its hardcoded default
+        // (120244361318490263) whenever these weren't in the body — meaning changing the
+        // template in Settings UI had NO effect on real ad creation. electron.js also
+        // reads call_to_action_type dynamically from the template adset's first ad, so
+        // whatever CTA the operator set in their new template (SHOP_NOW, LEARN_MORE,
+        // LIKE_PAGE, etc.) automatically flows through.
+        const templateAdsetRow = await getDashboardSetting(c.env.DB, 'template_adset').catch(() => null)
+        const adAccountRow = await getDashboardSetting(c.env.DB, 'ad_account').catch(() => null)
+        const templateAdsetFromSettings = String(templateAdsetRow?.value || '').trim()
+        const adAccountFromSettings = String(adAccountRow?.value || '').trim()
+
         const resp = await fetch(`${baseUrl}/create-ad`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -5709,6 +6196,10 @@ app.post('/api/dashboard/create-ad', async (c) => {
                 video_url: videoUrl,
                 video_id: videoId,
                 caption: finalCaption,
+                shortlink: cleanShortLink,
+                shopee_url: shopeeLink,
+                ...(templateAdsetFromSettings ? { template_adset: templateAdsetFromSettings } : {}),
+                ...(adAccountFromSettings ? { ad_account: adAccountFromSettings } : {}),
                 ...(campaignId ? { campaign_id: campaignId } : {}),
                 ...(newCampaignName ? { new_campaign_name: newCampaignName } : {}),
             }),
@@ -5718,24 +6209,46 @@ app.post('/api/dashboard/create-ad', async (c) => {
             return c.json(data, resp.ok ? 200 : 502)
         }
 
-        // 5. Comment on the post with shortlink (using PAGE token, not user token)
+        // 5. Comment on the post with shortlink.
+        // Token priority for COMMENTING:
+        //   1) Per-namespace dedicated comment token (LIFF settings → ตั้งค่า → คอมเม้น)
+        //      — single source of truth across cron, force-post, and dashboard ads.
+        //   2) Fallback: PAGE access_token from /me/accounts via electron user token
+        //      (legacy behavior).
+        // namespaceId derived from pages.bot_id since this dashboard endpoint accepts
+        // page_id as the only routing input.
         let commentId = ''
         if (cleanShortLink) {
             const commentText = commentTemplate.replace('{shopee_link}', cleanShortLink)
             const storyId = String(data.story_id || '').trim()
             try {
-                // Get page access token first
-                const pagesResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent('me/accounts')}&fields=id,access_token&limit=100`)
-                const pagesData = await pagesResp.json().catch(() => ({})) as { data?: Array<{ id: string; access_token: string }> }
-                const pageEntry = (pagesData.data || []).find((p) => p.id === pageId)
-                const pageToken = pageEntry?.access_token || ''
+                let commentToken = ''
+                // Look up the namespace this page belongs to → load dedicated comment token
+                const pageRow = await c.env.DB.prepare(
+                    'SELECT bot_id FROM pages WHERE id = ? LIMIT 1'
+                ).bind(pageId).first().catch(() => null) as { bot_id?: string } | null
+                const pageNamespaceId = String(pageRow?.bot_id || '').trim()
+                if (pageNamespaceId) {
+                    commentToken = await resolveNamespaceDedicatedCommentToken(c.env.DB, pageNamespaceId).catch(() => '')
+                    if (commentToken) {
+                        console.log(`[CREATE-AD] Using namespace dedicated comment token for ns=${pageNamespaceId}`)
+                    }
+                }
 
-                if (pageToken && storyId) {
-                    // Comment via onecard /graph proxy with page token
+                // Fallback: page access_token from /me/accounts (legacy behavior)
+                if (!commentToken) {
+                    const pagesResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent('me/accounts')}&fields=id,access_token&limit=100`)
+                    const pagesData = await pagesResp.json().catch(() => ({})) as { data?: Array<{ id: string; access_token: string }> }
+                    const pageEntry = (pagesData.data || []).find((p) => p.id === pageId)
+                    commentToken = pageEntry?.access_token || ''
+                }
+
+                if (commentToken && storyId) {
+                    // Comment via onecard /graph proxy with the resolved comment token
                     const commentResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(storyId)}/comments`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message: commentText, access_token: pageToken }),
+                        body: JSON.stringify({ message: commentText, access_token: commentToken }),
                     })
                     const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
                     if (commentData.error) {
@@ -6869,6 +7382,78 @@ app.put('/api/settings/comment-template', async (c) => {
         },
     })
 })
+
+// Dedicated comment token (per-namespace, applies to ALL pages in this workspace).
+// When set, takes priority over each page's access_token for COMMENT posting only.
+// Posting (create video/reel) still uses page's own access_token. Empty = fall back
+// to per-page access_token (legacy single-token behavior).
+app.get('/api/settings/comment-token', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+    const namespaceId = c.get('botId')
+    await ensureNamespaceSettingsTable(c.env.DB)
+    const row = await c.env.DB.prepare(
+        'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_DEDICATED_COMMENT_TOKEN).first().catch(() => null) as { value?: string; updated_at?: string } | null
+    const token = String(row?.value || '').trim()
+    return c.json({
+        token,
+        token_hint: token ? deriveCommentTokenHint(token) : '',
+        has_token: !!token,
+        updated_at: String(row?.updated_at || '').trim(),
+    })
+})
+
+app.put('/api/settings/comment-token', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+    const body = await c.req.json().catch(() => ({})) as { token?: string }
+    const token = String(body.token || '').trim()
+    if (token && token.length > 1024) {
+        return c.json({ error: 'Token too long (max 1024 chars)' }, 400)
+    }
+    const namespaceId = c.get('botId')
+    await ensureNamespaceSettingsTable(c.env.DB)
+    await c.env.DB.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value)
+         VALUES (?, ?, ?)
+         ON CONFLICT(namespace_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_DEDICATED_COMMENT_TOKEN, token).run()
+    return c.json({
+        ok: true,
+        token,
+        token_hint: token ? deriveCommentTokenHint(token) : '',
+        has_token: !!token,
+    })
+})
+
+app.delete('/api/settings/comment-token', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+    const namespaceId = c.get('botId')
+    await ensureNamespaceSettingsTable(c.env.DB)
+    await c.env.DB.prepare(
+        'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_DEDICATED_COMMENT_TOKEN).run()
+    return c.json({ ok: true, token: '', has_token: false })
+})
+
+// Helper used by ensurePageTokenCandidates and dashboard /create-ad to look up the
+// per-namespace dedicated comment token. Returns empty string if not set (caller
+// then falls back to each page's own access_token for backward compat).
+async function resolveNamespaceDedicatedCommentToken(db: D1Database, namespaceId: string): Promise<string> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return ''
+    try {
+        await ensureNamespaceSettingsTable(db)
+    } catch {
+        return ''
+    }
+    const row = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(normalizedNamespaceId, NS_SETTING_DEDICATED_COMMENT_TOKEN).first().catch(() => null) as { value?: string } | null
+    return String(row?.value || '').trim()
+}
 
 app.delete('/api/settings/comment-template', async (c) => {
     const ownerCheck = await requireAuthSession(c)
@@ -13035,28 +13620,34 @@ async function ensureInboxVideoProcessingStarted(params: {
     const rawItem = normalizeInboxVideoRecord(params.item)
     if (!rawItem || rawItem.status !== 'ready') throw new Error('inbox_video_not_ready')
 
-    const preparedItem = await prepareInboxVideoForManagedLinks({
-        env: params.env,
-        bucket: params.bucket,
-        namespaceId: botId,
-        item: rawItem,
-        logPrefix: `INBOX-START ${botId}/${rawItem.id}`,
-    })
-    if (!preparedItem) {
-        await markInboxProcessingFailed({
-            bucket: params.bucket,
-            item: rawItem,
-            message: 'managed_shortlink_conversion_failed',
-            stepName: '❌ ย่อลิงก์ Shopee/Lazada ไม่ผ่าน',
-        }).catch(() => { })
-        throw new Error('managed_shortlink_conversion_failed')
-    }
+    // 2026-04-20: REMOVED submit-time shortlink check.
+    // Previously called prepareInboxVideoForManagedLinks here, which shortened
+    // Shopee+Lazada links AT SUBMIT TIME and BLOCKED processing if shortening failed
+    // ("ย่อลิงก์ Shopee/Lazada ไม่ผ่าน"). Per user 2026-04-20: the check should only
+    // run at POSTING time, not submission.
+    //
+    // Posting-time shortening is handled by:
+    //   - processPendingAffiliateConversions cron (runs every minute, shortens any
+    //     gallery video still missing shortened links)
+    //   - resolvePostingShopeeLinkForNamespace (called right before comment posting,
+    //     re-shortens with current namespace sub_ids)
+    //   - SACRED-RULES-READ-FIRST: both of these gate by isNamespaceShortlinkAdminManaged,
+    //     so only admin namespace ever re-shortens. Member namespace links pass through
+    //     unchanged. See drawer shopping-affiliate/SACRED-RULES-READ-FIRST.
+    //
+    // Kick off the conversion in the background so admin namespace videos still get
+    // their gallery_ready flag flipped eventually, without blocking processing start.
+    params.executionCtx.waitUntil(
+        processPendingAffiliateConversions(params.env).catch((error) => {
+            console.log(`[INBOX-START] background affiliate conversion kickoff failed for ${botId}/${rawItem.id}: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    )
 
     const item = await recordInboxLinkSubmissionIfNeeded({
         db: params.env.DB,
         bucket: params.bucket,
         namespaceId: botId,
-        item: preparedItem,
+        item: rawItem,
     })
 
     const processingStateMap = await getInboxProcessingStateMap(params.bucket)
@@ -15063,6 +15654,7 @@ const NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1 = 'pages_linked_tagged_profiles
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
 const NS_SETTING_GEMINI_API_KEYS = 'gemini_api_keys_v2'
 const NS_SETTING_COMMENT_TEMPLATE = 'comment_template_v1'
+const NS_SETTING_DEDICATED_COMMENT_TOKEN = 'dedicated_comment_token_v1'
 const NS_SETTING_COVER_TEMPLATE = 'cover_template_v1'
 const NS_SETTING_COVER_TEXT_STYLE = 'cover_text_style_v1'
 const NS_SETTING_POSTING_ORDER = 'posting_order_v1'
@@ -17371,18 +17963,22 @@ async function ensurePageTokenCandidates(params: {
     primaryToken?: string | null
     logPrefix: string
 }): Promise<{ tokens: string[]; postTokens: string[]; commentTokens: string[] }> {
-    // Single-token model: whatever the operator pastes in the page "Access Token (โพสต์)"
-    // field is used for BOTH posting and commenting. No fallback to BrowserSaving
-    // profiles, no postcron/EAACh rotation, no namespace token-pool auto-rebuild.
-    // If the token goes bad, update it manually in the UI.
+    // Posting tokens: whatever the operator pastes in the page "Access Token (โพสต์)"
+    // field is used for posting only.
+    // Comment tokens: prefer the per-namespace dedicated comment token (LIFF settings →
+    // ตั้งค่า → คอมเม้น → "Access Token (คอมเม้น)"); falls back to primary post token
+    // if not set (legacy single-token behavior). If neither is set → empty pool.
     const primary = String(params.primaryToken || '').trim()
-    if (!primary) {
+    const dedicatedComment = await resolveNamespaceDedicatedCommentToken(params.db, params.namespaceId).catch(() => '')
+    const commentTokens = dedicatedComment ? [dedicatedComment] : (primary ? [primary] : [])
+    const postTokens = primary ? [primary] : []
+    if (postTokens.length === 0 && commentTokens.length === 0) {
         return { tokens: [], postTokens: [], commentTokens: [] }
     }
     return {
-        tokens: [primary],
-        postTokens: [primary],
-        commentTokens: [primary],
+        tokens: postTokens.length > 0 ? postTokens : commentTokens,
+        postTokens,
+        commentTokens,
     }
 }
 
@@ -18749,18 +19345,38 @@ async function resolvePostingShopeeLinkForNamespace(params: {
         return ''
     }
 
-    const expectedUtmId = await resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, params.namespaceId).catch(() => '')
-    const extractedUtmSource = extractShopeeUtmSourceFromLink(link) || null
-    const normalizedExpectedUtmId = normalizeShortlinkExpectedUtmId(expectedUtmId)
-    const inferredUtmSource = normalizedExpectedUtmId ? `an_${normalizedExpectedUtmId}` : null
+    // ADMIN-ONLY re-shortening:
+    // Only the system-admin namespace owns shortlink credentials (wwoom account +
+    // sub_ids). For other workspaces (members), re-shortening would:
+    //   1) unwrap their existing short link → product URL
+    //   2) fail to re-shorten (they have no account/sub_ids configured)
+    //   3) fall back to the BARE product URL → BREAKS their affiliate tracking
+    // So: admin namespace → re-shorten with current admin sub_ids.
+    //     member namespaces → return the submitted link AS-IS.
+    const isAdminNamespace = await isNamespaceShortlinkAdminManaged(params.env.DB, params.namespaceId).catch(() => false)
 
-    if (isLikelyConvertedShopeeLink(link, expectedUtmId)) {
-        writeTrace({ utmSource: extractedUtmSource || inferredUtmSource, status: 'shortened', error: null })
+    if (!isAdminNamespace) {
+        console.log(`[${params.logPrefix}] Non-admin namespace ${params.namespaceId} — using submitted Shopee link as-is (no re-shorten)`)
+        writeTrace({ utmSource: extractShopeeUtmSourceFromLink(link) || null, status: 'shortened', error: null })
         return link
     }
 
-    console.log(`[${params.logPrefix}] Using gallery Shopee link directly (no live shortlink conversion during posting)`)
-    writeTrace({ utmSource: extractedUtmSource, status: 'fallback', error: null })
+    // Admin namespace: re-shorten with CURRENT namespace sub_ids (set in LIFF settings
+    // → Shortlink). This lets admin change sub_id and have it apply to every future
+    // post without re-importing videos.
+    try {
+        const shortened = await shortenShopeeLinkForNamespace({
+            env: params.env,
+            namespaceId: params.namespaceId,
+            shopeeLink: link,
+            logPrefix: params.logPrefix,
+            trace: params.trace,
+        })
+        if (shortened) return shortened
+    } catch (e) {
+        console.log(`[${params.logPrefix}] shortenShopeeLinkForNamespace failed, falling back to submitted link: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    writeTrace({ utmSource: extractShopeeUtmSourceFromLink(link) || null, status: 'fallback', error: null })
     return link
 }
 
@@ -23418,6 +24034,27 @@ app.put('/api/pages/:id', async (c) => {
                 'UPDATE pages SET onecard_cta = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(nextOneCardCta, id, c.get('botId')).run()
         }
+        // ads_publish_enabled — admin-namespace ONLY.
+        // This feature routes cron/force-post through /api/dashboard/create-ad which uses
+        // admin's ad account (act_1030797047648459) and admin's template adset. Allowing
+        // member namespaces to enable this would spend admin's ad budget on member videos.
+        // (Shortlink integrity handled elsewhere by isNamespaceShortlinkAdminManaged — see
+        //  SACRED-RULES-READ-FIRST drawer.)
+        if (ads_publish_enabled !== undefined) {
+            const wantsEnabled = ads_publish_enabled === true || Number(ads_publish_enabled || 0) === 1
+            if (wantsEnabled) {
+                const namespaceIsAdminManaged = await isNamespaceShortlinkAdminManaged(c.env.DB, c.get('botId')).catch(() => false)
+                if (!namespaceIsAdminManaged) {
+                    return c.json({
+                        error: 'ads_publish_admin_only',
+                        details: 'auto-ads feature is restricted to the admin namespace (uses admin ad account)',
+                    }, 403)
+                }
+            }
+            await c.env.DB.prepare(
+                'UPDATE pages SET ads_publish_enabled = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(wantsEnabled ? 1 : 0, id, c.get('botId')).run()
+        }
         if (tokenUpdated) {
             const issueKey = `_alerts/comment_token/${c.get('botId')}/${id}.json`
             await c.env.BUCKET.delete(issueKey).catch(() => undefined)
@@ -25040,6 +25677,77 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Handle legacy publicUrl without namespace path
         const realVideoUrl = resolvePostingVideoDownloadUrl(env, selectedVideoNamespaceId, unpostedId, publicUrl)
 
+        // AUTO-ADS MODE (per-page toggle, admin-only).
+        // Mirrors the cron branch: skip normal Reel post entirely, route through
+        // /api/dashboard/create-ad (upload → creative → adset → ad → publish-to-page → comment).
+        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        if (pageAdsPublishEnabled) {
+            const namespaceIsAdminManaged = await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
+            if (!namespaceIsAdminManaged) {
+                throw new Error('ads_publish_admin_only_runtime_check_failed')
+            }
+            const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
+            const adsResp = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    page_id: String(page.id || ''),
+                    video_id: unpostedId,
+                    caption,
+                    shopee_url: normalizedShopeeLink,
+                }),
+            }, 300000, 'force_ads_publish')
+            const adsData = await adsResp.json().catch(() => ({})) as {
+                ok?: boolean
+                error?: string
+                story_id?: string
+                ad_id?: string
+                adset_id?: string
+                commentPosted?: boolean
+                commentId?: string
+            }
+            if (!adsResp.ok || !adsData?.ok) {
+                throw new Error(String(adsData?.error || `ads_publish_http_${adsResp.status}`))
+            }
+            const storyId = String(adsData.story_id || '')
+            const confirmedPostId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
+            const fbReelUrl = storyId ? `https://www.facebook.com/${storyId.replace('_', '/posts/')}` : ''
+            fbVideoId = String(adsData.ad_id || storyId || unpostedId)
+            postingTokenUsed = 'ads_publish'
+            if (forceHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, error_message=NULL WHERE id=? AND status='posting'"
+                ).bind(
+                    confirmedPostId || storyId,
+                    fbReelUrl,
+                    adsData.commentPosted ? 'success' : 'not_configured',
+                    adsData.commentId || null,
+                    forceHistoryId,
+                ).run().catch(() => { })
+            }
+            await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+            await recordPagePostedVideoGuard(env.DB, {
+                namespaceId: botId,
+                pageId: page.id,
+                videoId: unpostedId,
+                sourceFingerprint: selectedSourceFingerprint,
+                historyId: forceHistoryId,
+                postedAt: attemptPostedAtIso,
+            }).catch(() => { })
+            await clearVideoShopeeLink(c.get('bucket'), unpostedId)
+            console.log(`[FORCE-POST] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${adsData.commentPosted ? 'yes' : 'no'}`)
+            return c.json({
+                success: true,
+                page: page.name,
+                video_id: unpostedId,
+                fb_video_id: fbVideoId,
+                fb_post_id: confirmedPostId || storyId,
+                fb_reel_url: fbReelUrl,
+                ads_publish: true,
+                comment_posted: !!adsData.commentPosted,
+            })
+        }
+
         // Prefer the stored page-scoped token pool, then fall back to legacy tokens if needed.
         const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'force_download_video')
         if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
@@ -25053,35 +25761,15 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 videoId: unpostedId,
             }).catch(() => null)
 
-        const pageAdsPublishEnabled_fp = Number((page as any).ads_publish_enabled || 0) === 1
-        postingTokenUsed = pageOneCardEnabled ? 'onecard' : pageAdsPublishEnabled_fp ? 'ads_publish' : String(primaryPostingTokenCandidates[0] || '').trim()
+        // Normal post path always uses the page's post tokens from settings (organic Reel).
+        // The legacy `ads_publish_enabled` flag is intentionally NOT consulted here — ads
+        // creation is now a fully separate flow via the dashboard ad queue.
+        postingTokenUsed = pageOneCardEnabled ? 'onecard' : String(primaryPostingTokenCandidates[0] || '').trim()
         const oneCardWebsiteUrl = pickOneCardWebsiteUrl({
             linkMode: pageOneCardLinkMode,
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
         })
-
-        // ADS PUBLISH MODE (force-post)
-        if (pageAdsPublishEnabled_fp) {
-            const adsBaseUrl = String(env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
-            const adsResp = await fetchWithTimeout(adsBaseUrl + '/create-ad', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ page_id: page.id, video_url: realVideoUrl, caption }),
-            }, 300000, 'force_ads_publish')
-            const adsData = await adsResp.json().catch(() => ({} as any)) as { ok?: boolean; error?: string; story_id?: string; video_id?: string }
-            if (!adsResp.ok || !adsData?.ok) throw new Error(String(adsData?.error || 'ads_publish_failed'))
-            fbVideoId = String(adsData.video_id || '')
-            const storyId_fp = String(adsData.story_id || '')
-            const confirmedPostId_fp = storyId_fp.includes('_') ? storyId_fp.split('_').slice(1).join('_') : storyId_fp
-            postingTokenUsed = 'ads_publish'
-            if (forceHistoryId) {
-                await env.DB.prepare("UPDATE post_history SET status = 'success', fb_post_id = ?, fb_reel_url = ?, post_token_hint = 'ads_publish', comment_status = 'not_configured' WHERE id = ?")
-                    .bind(confirmedPostId_fp, 'https://www.facebook.com/' + storyId_fp.replace('_', '/posts/'), forceHistoryId).run()
-            }
-            await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
-            return c.json({ success: true, page: pageName, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId_fp, fb_reel_url: 'https://www.facebook.com/' + storyId_fp.replace('_', '/posts/') })
-        }
 
         const reelResult = pageOneCardEnabled
             ? await publishVideoViaOneCard({
@@ -25973,6 +26661,49 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             console.log(`[CRON] dashboard gallery sync ok=${result.ok} inserted=${result.inserted} total=${result.totalOverThreshold} reason=${result.reason || ''}`)
         }
     })
+    enqueueBackgroundTask(ctx, 'CRON AD QUEUE', async () => {
+        // Watchdog: every cron tick, reset items stuck in 'processing' > 5 min.
+        // (Worker dying mid-flight can leave create-ad result orphaned without DB update.)
+        await recoverStuckAdQueueProcessing(env).catch((e) => {
+            console.error(`[AD QUEUE WATCHDOG] failed: ${e instanceof Error ? e.message : String(e)}`)
+        })
+        // Process one queued ad-creation job per 20-min interval.
+        // Tracked via dashboard_settings.ad_queue_last_run_at.
+        //
+        // RACE CONDITION FIX (2026-04-20): previously we set last_run AFTER
+        // processNextAdQueueItem (which takes 60-120s). That allowed every cron tick
+        // during that window (once per minute) to pass the elapsed check and start
+        // ANOTHER item in parallel — collapsing the 20-min spacing to ~1-min spacing.
+        // Observed: items #13 done 11:53:58, #14 done 11:54:55 (gap 55s, not 20min).
+        //
+        // Fix: STAMP last_run BEFORE processing, but only if there's actually a queued
+        // item (so empty ticks don't reset the timer). Subsequent ticks within the
+        // 20-min window see the stamped timestamp and skip.
+        const lastRunEntry = await getDashboardSetting(env.DB, AD_QUEUE_LAST_RUN_KEY).catch(() => null)
+        const lastRunMs = Date.parse(String(lastRunEntry?.value || '').trim())
+        const elapsed = Number.isFinite(lastRunMs) ? (Date.now() - lastRunMs) : Infinity
+        if (elapsed < AD_QUEUE_INTERVAL_MS) {
+            // Not yet time
+            return
+        }
+        // Cheap peek to see if there's work — don't advance timer on empty queue
+        await ensureAdQueueTable(env.DB)
+        const pending = await env.DB.prepare(
+            `SELECT id FROM dashboard_ad_queue WHERE status = 'queued' ORDER BY id ASC LIMIT 1`
+        ).first().catch(() => null) as { id?: number } | null
+        if (!pending) {
+            return
+        }
+        // Stamp last_run FIRST — concurrent ticks within the 20-min window will now
+        // see this timestamp and skip, preventing double-processing.
+        await setDashboardSetting(env.DB, AD_QUEUE_LAST_RUN_KEY, new Date().toISOString())
+        // Now actually process (may take 60-120s). processNextAdQueueItem uses an
+        // atomic claim (UPDATE...WHERE status='queued') so even if another tick
+        // somehow sneaks through, it can't grab the same item — worst case a second
+        // item gets processed early; the 20-min timer then prevents a third.
+        const result = await processNextAdQueueItem(env)
+        console.log(`[CRON AD QUEUE] processed queue_id=${result.queue_id} ok=${result.ok} error=${result.error || ''}`)
+    })
 
 
     // Get current time in Thailand timezone (UTC+7) using proper Intl
@@ -26535,35 +27266,99 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
         const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
         const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
-        const pageAdsPublishEnabled = Number((page as any).ads_publish_enabled || 0) === 1
-        let postingTokenUsed = pageOneCardEnabled ? 'onecard' : pageAdsPublishEnabled ? 'ads_publish' : String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
+        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        // Cron normal-post path always uses page post tokens from settings (organic Reel).
+        let postingTokenUsed = pageAdsPublishEnabled
+            ? 'ads_publish'
+            : pageOneCardEnabled
+                ? 'onecard'
+                : String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
 
-        // ADS PUBLISH MODE
+        // AUTO-ADS MODE (per-page toggle, admin-only enforced at PUT).
+        // When enabled, skip the normal Reel post entirely and route through
+        // /api/dashboard/create-ad which handles: re-shorten (admin-namespace already
+        // verified by PUT gate) → electron /create-ad (upload + creative + adset copy
+        // + ad create + publish-to-page) → comment with shortlink using dedicated
+        // comment token. Produces an ad post visible on the page feed + paid ad.
         if (pageAdsPublishEnabled) {
             try {
-                const adsBaseUrl = String(env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
-                const adsResp = await fetchWithTimeout(adsBaseUrl + '/create-ad', {
+                // Paranoid runtime re-check: toggle could have been persisted before the
+                // admin-only gate landed, or namespace could have been downgraded.
+                const namespaceIsAdminManaged = await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
+                if (!namespaceIsAdminManaged) {
+                    throw new Error('ads_publish_admin_only_runtime_check_failed')
+                }
+                const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
+                const adsResp = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ page_id: String(page.id || ''), video_url: realVideoUrl, caption }),
-                }, 300000, 'ads_publish_create_ad')
-                const adsData = await adsResp.json().catch(() => ({} as any)) as { ok?: boolean; error?: string; story_id?: string; video_id?: string }
-                if (!adsResp.ok || !adsData?.ok) throw new Error(String(adsData?.error || 'ads_publish_failed'))
-                const storyId_ads = String(adsData.story_id || '')
-                const confirmedPostId_ads = storyId_ads.includes('_') ? storyId_ads.split('_').slice(1).join('_') : storyId_ads
+                    body: JSON.stringify({
+                        page_id: String(page.id || ''),
+                        video_id: unpostedId,
+                        caption,
+                        shopee_url: normalizedShopeeLink,
+                    }),
+                }, 300000, 'cron_ads_publish')
+                const adsData = await adsResp.json().catch(() => ({})) as {
+                    ok?: boolean
+                    error?: string
+                    story_id?: string
+                    ad_id?: string
+                    adset_id?: string
+                    commentPosted?: boolean
+                    commentId?: string
+                }
+                if (!adsResp.ok || !adsData?.ok) {
+                    throw new Error(String(adsData?.error || `ads_publish_http_${adsResp.status}`))
+                }
+                const storyId = String(adsData.story_id || '')
+                const confirmedPostId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
+                const fbReelUrl = storyId ? `https://www.facebook.com/${storyId.replace('_', '/posts/')}` : ''
                 if (cronHistoryId) {
-                    await env.DB.prepare("UPDATE post_history SET status = 'success', fb_post_id = ?, fb_reel_url = ?, post_token_hint = 'ads_publish', comment_status = 'not_configured', posted_at = ? WHERE id = ? AND status = 'posting'")
-                        .bind(confirmedPostId_ads, 'https://www.facebook.com/' + storyId_ads.replace('_', '/posts/'), nowISO, cronHistoryId).run()
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
+                    ).bind(
+                        confirmedPostId || storyId,
+                        fbReelUrl,
+                        adsData.commentPosted ? 'success' : 'not_configured',
+                        adsData.commentId || null,
+                        nowISO,
+                        cronHistoryId,
+                    ).run().catch(() => { })
                 }
                 await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
+                await recordPagePostedVideoGuard(env.DB, {
+                    namespaceId: botId,
+                    pageId: page.id,
+                    videoId: unpostedId,
+                    sourceFingerprint,
+                    historyId: cronHistoryId,
+                    postedAt: nowISO,
+                }).catch(() => { })
                 cronStats.pagesPosted++
-                console.log(`[CRON] Page ${page.name}: ADS PUBLISH OK - ${storyId_ads}`)
+                console.log(`[CRON] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${adsData.commentPosted ? 'yes' : 'no'}`)
+                await clearVideoShopeeLink(botBucket, unpostedId)
+                await updateCronRuntimeState(env.DB, {
+                    runId,
+                    heartbeatAt: new Date().toISOString(),
+                    pagesVisited: cronStats.pagesVisited,
+                    pagesPosted: cronStats.pagesPosted,
+                    pagesFailed: cronStats.pagesFailed,
+                }).catch(() => { })
                 continue
             } catch (e) {
                 const errMsg = e instanceof Error ? e.message : String(e)
-                if (cronHistoryId) { await env.DB.prepare("UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'").bind(errMsg, cronHistoryId).run().catch(() => {}) }
+                if (cronHistoryId) {
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status='failed', error_message=?, comment_status='not_attempted' WHERE id=? AND status='posting'"
+                    ).bind(`ads_publish_failed: ${errMsg}`, cronHistoryId).run().catch(() => { })
+                }
                 cronStats.pagesFailed++
-                console.error(`[CRON] Page ${page.name}: ADS PUBLISH FAILED - ${errMsg}`)
+                console.error(`[CRON] Page ${page.name}: ADS PUBLISH FAILED — ${errMsg}`)
+                await releasePostingLock(env.DB, videoPostingLockKey).catch(() => { })
+                videoPostingLockKey = null
+                await botBucket.delete(dedupKey).catch(() => { })
+                await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
                 continue
             }
         }
