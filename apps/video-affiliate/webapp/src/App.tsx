@@ -275,6 +275,8 @@ interface GalleryPageResponse {
 interface InboxPageResponse {
   videos?: InboxVideo[]
   total?: number
+  processed_total?: number
+  unprocessed_total?: number
   offset?: number
   limit?: number
   has_more?: boolean
@@ -595,6 +597,7 @@ interface FacebookPage {
 }
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
+type InboxFilterView = 'unprocessed' | 'processed'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
 type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members' | 'monitor' | 'ads'
 type PostingOrderOption = 'oldest_first' | 'newest_first' | 'random'
@@ -631,6 +634,7 @@ type CoverTextStyleSettings = {
   background_color: string
   background_opacity: number
   size_scale: number
+  auto_fit: boolean
   mode: CoverTextStyleMode
   outline_color: string
   outline_width: number
@@ -656,6 +660,7 @@ const DEFAULT_COVER_TEXT_STYLE: CoverTextStyleSettings = {
   background_color: '#E53935',
   background_opacity: 0.94,
   size_scale: 1,
+  auto_fit: true,
   mode: 'box',
   outline_color: '#000000',
   outline_width: 8,
@@ -707,7 +712,13 @@ const normalizeCoverTextStyleOutlineWidth = (value: unknown): number => {
   return Math.max(0, Math.min(40, Math.round(parsed)))
 }
 
-const normalizeCoverTextStyle = (raw: Partial<CoverTextStyleSettings> | null | undefined): CoverTextStyleSettings => {
+const normalizeCoverTextStyleAutoFit = (value: unknown): boolean => {
+  if (value === false || value === 0) return false
+  if (typeof value === 'string' && ['false', '0', 'off', 'no'].includes(value.trim().toLowerCase())) return false
+  return DEFAULT_COVER_TEXT_STYLE.auto_fit
+}
+
+const normalizeCoverTextStyle = (raw: (Partial<CoverTextStyleSettings> & { autoFit?: unknown }) | null | undefined): CoverTextStyleSettings => {
   const primary = normalizeCoverHexColor(raw?.text_color, DEFAULT_COVER_TEXT_STYLE.text_color)
   return {
     font_id: normalizeCoverTextFontId(raw?.font_id),
@@ -718,8 +729,9 @@ const normalizeCoverTextStyle = (raw: Partial<CoverTextStyleSettings> | null | u
       ? Math.max(0, Math.min(1, Math.round(Number(raw?.background_opacity) * 100) / 100))
       : DEFAULT_COVER_TEXT_STYLE.background_opacity,
     size_scale: Number.isFinite(raw?.size_scale)
-      ? Math.max(0.8, Math.min(1.35, Math.round(Number(raw?.size_scale) * 100) / 100))
+      ? Math.max(0.5, Math.min(1.35, Math.round(Number(raw?.size_scale) * 100) / 100))
       : DEFAULT_COVER_TEXT_STYLE.size_scale,
+    auto_fit: normalizeCoverTextStyleAutoFit(raw?.auto_fit ?? raw?.autoFit),
     mode: normalizeCoverTextStyleMode(raw?.mode),
     outline_color: normalizeCoverHexColor(raw?.outline_color, DEFAULT_COVER_TEXT_STYLE.outline_color),
     outline_width: normalizeCoverTextStyleOutlineWidth(raw?.outline_width),
@@ -733,13 +745,14 @@ const coverTextStylesEqual = (left: CoverTextStyleSettings, right: CoverTextStyl
   left.background_color === right.background_color &&
   left.background_opacity === right.background_opacity &&
   left.size_scale === right.size_scale &&
+  left.auto_fit === right.auto_fit &&
   left.mode === right.mode &&
   left.outline_color === right.outline_color &&
   left.outline_width === right.outline_width
 
 const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
   const fontLabel = COVER_TEXT_FONT_OPTIONS.find((option) => option.value === style.font_id)?.label || style.font_id
-  return `${fontLabel} • พื้นหลัง ${Math.round(style.background_opacity * 100)}% • ขนาด ${Math.round(style.size_scale * 100)}%`
+  return `${fontLabel} • พื้นหลัง ${Math.round(style.background_opacity * 100)}% • ขนาด ${Math.round(style.size_scale * 100)}% • ${style.auto_fit ? 'ย่ออัตโนมัติ' : 'ขนาดคงที่'}`
 }
 
 const VOICE_PERSONA_OPTIONS: Array<{ value: VoicePersonaPreset; label: string; hint: string }> = [
@@ -3160,13 +3173,6 @@ function App({
   const [commentTemplateLoading, setCommentTemplateLoading] = useState(false)
   const [commentTemplateSaving, setCommentTemplateSaving] = useState(false)
   const [commentTemplateMaxChars, setCommentTemplateMaxChars] = useState(4000)
-  const [commentTokenDraft, setCommentTokenDraft] = useState('')
-  const [commentTokenHint, setCommentTokenHint] = useState('')
-  const [commentTokenHasToken, setCommentTokenHasToken] = useState(false)
-  const [commentTokenUpdatedAt, setCommentTokenUpdatedAt] = useState('')
-  const [commentTokenLoading, setCommentTokenLoading] = useState(false)
-  const [commentTokenSaving, setCommentTokenSaving] = useState(false)
-  const [commentTokenMessage, setCommentTokenMessage] = useState('')
   const copiedIdentityTimerRef = useRef<number | null>(null)
   const voiceStyleTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const [geminiApiKeyDrafts, setGeminiApiKeyDrafts] = useState<string[]>(() => createEmptyGeminiKeySlots())
@@ -3198,7 +3204,7 @@ function App({
     }
   }, [voicePreviewUrl])
   const [lazadaExpectedMemberIdCurrent, setLazadaExpectedMemberIdCurrent] = useState(() => getStoredLazadaExpectedMemberId(botScope))
-  const [shortlinkEnabled, setShortlinkEnabled] = useState(() => hasStoredAffiliateShortlinkConfig(botScope))
+  const [shortlinkEnabled, setShortlinkEnabled] = useState(false)
   const [shortlinkUpdatedAt, setShortlinkUpdatedAt] = useState('')
   const [shortlinkMessage, setShortlinkMessage] = useState('')
   const [shortlinkLoading, setShortlinkLoading] = useState(false)
@@ -3518,7 +3524,22 @@ function App({
     return ns ? readCache<InboxVideo[]>(nsInboxCacheKey(ns), []) : []
   })
   const [systemInboxVideos, setSystemInboxVideos] = useState<InboxVideo[]>(() => readCache<InboxVideo[]>(systemInboxCacheKey(botScope), []))
+  const [inboxTotalCount, setInboxTotalCount] = useState(() => {
+    const ns = getStoredNamespace(botScope)
+    return ns ? readCache<InboxVideo[]>(nsInboxCacheKey(ns), []).length : 0
+  })
+  const [systemInboxTotalCount, setSystemInboxTotalCount] = useState(() => readCache<InboxVideo[]>(systemInboxCacheKey(botScope), []).length)
+  const [inboxProcessedTotalCount, setInboxProcessedTotalCount] = useState(() => {
+    const ns = getStoredNamespace(botScope)
+    const cached = ns ? readCache<InboxVideo[]>(nsInboxCacheKey(ns), []) : []
+    return cached.filter((video) => !!String(video.processedAt || '').trim()).length
+  })
+  const [systemInboxProcessedTotalCount, setSystemInboxProcessedTotalCount] = useState(() => {
+    const cached = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
+    return cached.filter((video) => !!String(video.processedAt || '').trim()).length
+  })
   const [systemInboxLoading, setSystemInboxLoading] = useState(false)
+  const [inboxView, setInboxView] = useState<InboxFilterView>('unprocessed')
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
   const [showAddPagePopup, setShowAddPagePopup] = useState(false)
   const [inboxLoading, setInboxLoading] = useState(false)
@@ -3565,6 +3586,7 @@ function App({
   const [galleryReadyTotalCount, setGalleryReadyTotalCount] = useState(videos.length)
   const [galleryUsedTotalCount, setGalleryUsedTotalCount] = useState(usedVideos.length)
   const [galleryUsedHasMore, setGalleryUsedHasMore] = useState(false)
+  const galleryCurrentTotal = categoryFilter === 'used' ? galleryUsedTotalCount : galleryReadyTotalCount
 
   const syncNavigationStateFromLocation = () => {
     const nextTab = getTabFromCurrentLocation()
@@ -3652,6 +3674,8 @@ function App({
     setGalleryUsedTotalCount(cachedUsedVideos.length)
     setPostHistory(cachedHistory)
     setInboxVideos(cachedInbox)
+    setInboxTotalCount(cachedInbox.length)
+    setInboxProcessedTotalCount(cachedInbox.filter((video) => !!String(video.processedAt || '').trim()).length)
     setDashboardData(cachedDashboard)
     setGalleryLoading(cachedVideos.length === 0)
     setInboxLoading(cachedInbox.length === 0)
@@ -3915,6 +3939,10 @@ function App({
     setUsedVideos(cachedUsedVideos)
     setInboxVideos(cachedInbox)
     setSystemInboxVideos(cachedSystemInbox)
+    setInboxTotalCount(cachedInbox.length)
+    setSystemInboxTotalCount(cachedSystemInbox.length)
+    setInboxProcessedTotalCount(cachedInbox.filter((video) => !!String(video.processedAt || '').trim()).length)
+    setSystemInboxProcessedTotalCount(cachedSystemInbox.filter((video) => !!String(video.processedAt || '').trim()).length)
     setDashboardData(cachedDashboard)
     setProcessingVideos(cachedProcessing)
     setProcessingLoading(cachedProcessing.length === 0)
@@ -3931,7 +3959,7 @@ function App({
     setShortlinkExpectedUtmIdDraft(storedShortlinkExpectedUtmId)
     setLazadaExpectedMemberIdCurrent(storedLazadaExpectedMemberId)
     setLazadaExpectedMemberIdDraft(storedLazadaExpectedMemberId)
-    setShortlinkEnabled(!!String(storedShortlinkAccount || storedShortlinkBaseUrl || storedLazadaShortlinkBaseUrl || '').trim())
+    setShortlinkEnabled(false)
     setInboxLoading(cachedInbox.length === 0)
     setProcessingVideos([])
     setPendingShortlinkVideos([])
@@ -4173,7 +4201,7 @@ function App({
       void loadShortlinkSettings()
       return
     }
-    if (settingsSection === 'post' && isOwner) {
+    if (settingsSection === 'post') {
       void loadPostingOrderSettings()
       return
     }
@@ -4187,7 +4215,6 @@ function App({
     }
     if (settingsSection === 'comment') {
       void loadCommentTemplate()
-      void loadCommentToken()
       return
     }
     if (settingsSection === 'gemini' && isSystemAdmin) {
@@ -4238,7 +4265,7 @@ function App({
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [tab, token, authBootstrapping, isSystemAdmin, inboxVideos.length, systemInboxVideos.length])
+  }, [tab, token, authBootstrapping, isSystemAdmin, inboxVideos.length, systemInboxVideos.length, inboxView])
 
   useEffect(() => {
     if (authBootstrapping || !token || !isSystemAdmin) return
@@ -4318,12 +4345,6 @@ function App({
 
   useEffect(() => {
     if (authBootstrapping) return
-    if (!isOwner && settingsSection === 'shortlink') {
-      setSettingsSection('menu')
-    }
-    if (!isOwner && settingsSection === 'post') {
-      setSettingsSection('menu')
-    }
     if (!isSystemAdmin && settingsSection === 'gemini') {
       setSettingsSection('menu')
     }
@@ -4333,7 +4354,7 @@ function App({
     if (!isSystemAdmin && settingsSection === 'monitor') {
       setSettingsSection('menu')
     }
-  }, [authBootstrapping, isOwner, isSystemAdmin, settingsSection])
+  }, [authBootstrapping, isSystemAdmin, settingsSection])
 
   useEffect(() => {
     const cachedVideos = readGalleryCacheForScope(botScope, namespaceId, systemWideGalleryMode)
@@ -4355,6 +4376,10 @@ function App({
     setGalleryLoadingMore(false)
     setSystemInboxHasMore(false)
     setSystemInboxLoadingMore(false)
+    setInboxTotalCount(0)
+    setSystemInboxTotalCount(0)
+    setInboxProcessedTotalCount(0)
+    setSystemInboxProcessedTotalCount(0)
     setInboxHasMore(false)
     setInboxLoadingMore(false)
   }, [botScope, namespaceId, systemWideGalleryMode])
@@ -4406,19 +4431,24 @@ function App({
   useEffect(() => {
     const titles: Record<string, string> = {
       dashboard: 'แดชบอร์ด',
-      inbox: 'คลังต้นฉบับ',
       processing: 'ประมวลผล',
-      gallery: 'Gallery',
       logs: 'ประวัติ',
       settings: 'ตั้งค่า',
     }
+    const inboxCurrentTotal = isSystemAdmin ? systemInboxTotalCount : inboxTotalCount
+    const inboxTitle = inboxCurrentTotal > 0 ? `คลังต้นฉบับ (${inboxCurrentTotal})` : 'คลังต้นฉบับ'
+    const galleryTitle = galleryCurrentTotal > 0 ? `Gallery (${galleryCurrentTotal})` : 'Gallery'
     const settingsTitle = settingsSection === 'shortlink'
       ? (isSystemAdmin ? 'Shortlink' : 'Affiliate ID')
       : getSettingsSectionTitle(settingsSection)
     document.title = tab === 'settings'
       ? settingsTitle
-      : (titles[tab] || 'เฉียบ AI')
-  }, [tab, settingsSection, isSystemAdmin])
+      : tab === 'inbox'
+        ? inboxTitle
+        : tab === 'gallery'
+          ? galleryTitle
+          : (titles[tab] || 'เฉียบ AI')
+  }, [tab, settingsSection, isSystemAdmin, inboxTotalCount, systemInboxTotalCount, galleryCurrentTotal])
 
   async function recoverSessionOrLogout() {
     clearSession()
@@ -4489,8 +4519,13 @@ function App({
     if (!reset && !refreshTop && (inboxLoadingMore || !inboxHasMore)) return
     if (refreshTop && inboxLoadingMore) return
 
-    const offset = reset || refreshTop ? 0 : inboxVideos.length
-    const shouldShowLoading = reset && inboxVideos.length === 0
+    const currentInboxViewLength = inboxVideos.filter((video) => (
+      inboxView === 'processed'
+        ? !!String(video.processedAt || '').trim()
+        : !String(video.processedAt || '').trim()
+    )).length
+    const offset = reset || refreshTop ? 0 : currentInboxViewLength
+    const shouldShowLoading = reset && currentInboxViewLength === 0
     if (shouldShowLoading) setInboxLoading(true)
     if (!reset && !refreshTop) setInboxLoadingMore(true)
 
@@ -4498,6 +4533,7 @@ function App({
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
+      params.set('view', inboxView)
       if (offset === 0) params.set('_ts', String(Date.now()))
       const resp = await apiFetch(`${WORKER_URL}/api/inbox?${params.toString()}`)
       if (resp.status === 401) {
@@ -4514,6 +4550,8 @@ function App({
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
         return merged
       })
+      setInboxTotalCount(Number(data.total || 0))
+      setInboxProcessedTotalCount(Number(data.processed_total || 0))
       setInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
@@ -4534,8 +4572,13 @@ function App({
     if (!reset && !refreshTop && (systemInboxLoadingMore || !systemInboxHasMore)) return
     if (refreshTop && systemInboxLoadingMore) return
 
-    const offset = reset || refreshTop ? 0 : systemInboxVideos.length
-    const shouldShowLoading = reset && systemInboxVideos.length === 0
+    const currentSystemInboxViewLength = systemInboxVideos.filter((video) => (
+      inboxView === 'processed'
+        ? !!String(video.processedAt || '').trim()
+        : !String(video.processedAt || '').trim()
+    )).length
+    const offset = reset || refreshTop ? 0 : currentSystemInboxViewLength
+    const shouldShowLoading = reset && currentSystemInboxViewLength === 0
     if (shouldShowLoading) setSystemInboxLoading(true)
     if (!reset && !refreshTop) setSystemInboxLoadingMore(true)
 
@@ -4543,6 +4586,7 @@ function App({
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
+      params.set('view', inboxView)
       if (offset === 0) {
         params.set('_ts', String(Date.now()))
       }
@@ -4561,6 +4605,8 @@ function App({
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
         return merged
       })
+      setSystemInboxTotalCount(Number(data.total || 0))
+      setSystemInboxProcessedTotalCount(Number(data.processed_total || 0))
       setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
@@ -5256,64 +5302,6 @@ function App({
     }
   }
 
-  async function loadCommentToken() {
-    const session = getToken()
-    if (!session) return
-    setCommentTokenMessage('')
-    setCommentTokenLoading(true)
-    try {
-      const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-token`)
-      if (resp.status === 401) { await recoverSessionOrLogout(); return }
-      if (resp.status === 403) { setCommentTokenMessage('บัญชีนี้ไม่มีสิทธิ์ดู comment token'); return }
-      if (!resp.ok) { setCommentTokenMessage('โหลด comment token ไม่สำเร็จ'); return }
-      const data = await resp.json() as { token?: string; token_hint?: string; has_token?: boolean; updated_at?: string }
-      setCommentTokenDraft(String(data.token || ''))
-      setCommentTokenHint(String(data.token_hint || ''))
-      setCommentTokenHasToken(!!data.has_token)
-      setCommentTokenUpdatedAt(String(data.updated_at || ''))
-    } catch {
-      setCommentTokenMessage('โหลด comment token ไม่สำเร็จ')
-    } finally {
-      setCommentTokenLoading(false)
-    }
-  }
-
-  async function saveCommentToken(nextToken: string) {
-    const session = getToken()
-    if (!session) return
-    setCommentTokenSaving(true)
-    setCommentTokenMessage('')
-    try {
-      const trimmed = String(nextToken || '').trim()
-      const isReset = !trimmed
-      const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-token`, isReset ? {
-        method: 'DELETE',
-      } : {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: trimmed }),
-      })
-      if (resp.status === 401) { await recoverSessionOrLogout(); return }
-      if (resp.status === 403) { setCommentTokenMessage('บัญชีนี้ไม่มีสิทธิ์แก้ comment token'); return }
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({})) as { error?: string }
-        setCommentTokenMessage(data.error || 'บันทึก comment token ไม่สำเร็จ')
-        return
-      }
-      const data = await resp.json() as { token?: string; token_hint?: string; has_token?: boolean }
-      setCommentTokenDraft(String(data.token || ''))
-      setCommentTokenHint(String(data.token_hint || ''))
-      setCommentTokenHasToken(!!data.has_token)
-      setCommentTokenMessage(isReset
-        ? 'ลบ comment token แล้ว — ระบบจะใช้ post token ของแต่ละเพจในการคอมเม้นต์ (legacy)'
-        : 'บันทึก comment token แล้ว — cron / force-post / dashboard ad ทุกการคอมเม้นต์จะใช้ token นี้')
-    } catch {
-      setCommentTokenMessage('บันทึก comment token ไม่สำเร็จ')
-    } finally {
-      setCommentTokenSaving(false)
-    }
-  }
-
   async function saveVoicePrompt(nextProfile?: VoiceProfile | null, options: { reset?: boolean } = {}) {
     const session = getToken()
     if (!session) return
@@ -5535,6 +5523,12 @@ function App({
         required?: boolean
         expected_utm_id?: string
         lazada_expected_member_id?: string
+        shortlink_url_template?: string
+        sub_id1?: string
+        sub_id2?: string
+        sub_id3?: string
+        sub_id4?: string
+        sub_id5?: string
         updated_at?: string
         max_account_chars?: number
         max_chars?: number
@@ -5554,18 +5548,18 @@ function App({
       setShortlinkExpectedUtmIdDraft(expectedUtmId)
       setLazadaExpectedMemberIdCurrent(lazadaExpectedMemberId)
       setLazadaExpectedMemberIdDraft(lazadaExpectedMemberId)
-      setShortlinkEnabled((!!data.enabled && !!baseUrl) || (!!data.lazada_enabled && !!lazadaBaseUrl))
+      setShortlinkEnabled(data.required === true)
       setShortlinkUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
       if (typeof data.max_lazada_member_id_chars === 'number' && data.max_lazada_member_id_chars > 0) setLazadaExpectedMemberIdMaxChars(data.max_lazada_member_id_chars)
       // Load sub IDs + template
-      setShortlinkUrlDraft(String((data as any).shortlink_url_template || ''))
-      setSubId1Draft(String((data as any).sub_id1 || ''))
-      setSubId2Draft(String((data as any).sub_id2 || ''))
-      setSubId3Draft(String((data as any).sub_id3 || ''))
-      setSubId4Draft(String((data as any).sub_id4 || ''))
-      setSubId5Draft(String((data as any).sub_id5 || ''))
+      setShortlinkUrlDraft(String(data.shortlink_url_template || ''))
+      setSubId1Draft(String(data.sub_id1 || ''))
+      setSubId2Draft(String(data.sub_id2 || ''))
+      setSubId3Draft(String(data.sub_id3 || ''))
+      setSubId4Draft(String(data.sub_id4 || ''))
+      setSubId5Draft(String(data.sub_id5 || ''))
       setShortlinkMessage('')
     } catch {
       setShortlinkMessage('โหลด Shortlink URL ไม่สำเร็จ')
@@ -5576,7 +5570,7 @@ function App({
 
   async function saveShortlinkSettings(nextAccount: string) {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     const trimmedAccount = String(nextAccount || '').trim().toUpperCase()
     const expectedTrimmed = String(shortlinkExpectedUtmIdDraft || '').trim()
     const lazadaExpectedMemberIdTrimmed = String(lazadaExpectedMemberIdDraft || '').trim()
@@ -5644,7 +5638,7 @@ function App({
       setShortlinkExpectedUtmIdDraft(expectedUtmId)
       setLazadaExpectedMemberIdCurrent(lazadaExpectedMemberId)
       setLazadaExpectedMemberIdDraft(lazadaExpectedMemberId)
-      setShortlinkEnabled((!!data.enabled && !!baseUrl) || (!!data.lazada_enabled && !!lazadaBaseUrl))
+      setShortlinkEnabled(data.required === true)
       setShortlinkUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
@@ -5657,6 +5651,41 @@ function App({
       void loadProcessingSnapshot()
     } catch {
       setShortlinkMessage('บันทึกค่า Shortlink ไม่สำเร็จ')
+    } finally {
+      setShortlinkSaving(false)
+    }
+  }
+
+  async function saveShortlinkRequirement(required: boolean) {
+    const session = getToken()
+    if (!session) return
+    setShortlinkSaving(true)
+    setShortlinkMessage('')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink/requirement`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ required }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setShortlinkMessage('บัญชีนี้ไม่มีสิทธิ์แก้การย่อลิงก์')
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setShortlinkMessage(data.error || 'บันทึกการย่อลิงก์ไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json().catch(() => ({})) as { required?: boolean; updated_at?: string }
+      setShortlinkEnabled(data.required === true)
+      setShortlinkUpdatedAt(String(data.updated_at || ''))
+      setShortlinkMessage(required ? 'เปิดย่อลิงก์ตอนโพสต์แล้ว' : 'ปิดย่อลิงก์ตอนโพสต์แล้ว')
+    } catch {
+      setShortlinkMessage('บันทึกการย่อลิงก์ไม่สำเร็จ')
     } finally {
       setShortlinkSaving(false)
     }
@@ -5695,7 +5724,7 @@ function App({
 
   async function savePostingOrderSettings(nextOrder: PostingOrderOption) {
     const session = getToken()
-    if (!session || !isOwner) return
+    if (!session) return
     setPostingOrderSaving(true)
     setPostingOrderMessage('')
     try {
@@ -5912,11 +5941,29 @@ function App({
         const sameNamespace = !namespaceId || String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
         return !(sameId && sameNamespace)
       }))
+      setInboxTotalCount((prev) => Math.max(0, prev - 1))
+      setInboxProcessedTotalCount((prev) => {
+        const matched = inboxVideos.find((video) => {
+          const sameId = String(video.id || '').trim() === String(id || '').trim()
+          const sameNamespace = !namespaceId || String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
+          return sameId && sameNamespace
+        })
+        return matched && String(matched.processedAt || '').trim() ? Math.max(0, prev - 1) : prev
+      })
       setSystemInboxVideos((prev) => prev.filter((video) => {
         const sameId = String(video.id || '').trim() === String(id || '').trim()
         const sameNamespace = !namespaceId || String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
         return !(sameId && sameNamespace)
       }))
+      setSystemInboxTotalCount((prev) => Math.max(0, prev - 1))
+      setSystemInboxProcessedTotalCount((prev) => {
+        const matched = systemInboxVideos.find((video) => {
+          const sameId = String(video.id || '').trim() === String(id || '').trim()
+          const sameNamespace = !namespaceId || String(video.namespace_id || '').trim() === String(namespaceId || '').trim()
+          return sameId && sameNamespace
+        })
+        return matched && String(matched.processedAt || '').trim() ? Math.max(0, prev - 1) : prev
+      })
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e))
     } finally {
@@ -6151,7 +6198,7 @@ function App({
     })
   }
 
-  const { galleryAvailableVideos, galleryShortlinkRequired } = useMemo(() => {
+  const { galleryAvailableVideos } = useMemo(() => {
     const readyVideos = dedupeGalleryVideos(
       filterDeletedGalleryVideos(videos, deletedGalleryKeysRef.current).filter((video) =>
         getBooleanFlag((video as Video & Record<string, unknown>).original_only) !== true
@@ -6160,16 +6207,12 @@ function App({
     const postedVideos = dedupeGalleryVideos(
       filterDeletedGalleryVideos(usedVideos, deletedGalleryKeysRef.current)
     )
-    const galleryShortlinkRequired = readyVideos.some((video) =>
-      isVideoShortlinkRequired(video as Video & Record<string, unknown>, isSystemAdmin)
-    )
     const availableVideos = categoryFilter === 'used' ? postedVideos : readyVideos
 
     return {
       galleryAvailableVideos: availableVideos,
-      galleryShortlinkRequired,
     }
-  }, [videos, usedVideos, categoryFilter, isSystemAdmin])
+  }, [videos, usedVideos, categoryFilter])
   const showGalleryFilterBar = tab === 'gallery' && (
     galleryLoading ||
     galleryReadyTotalCount > 0 ||
@@ -6180,7 +6223,6 @@ function App({
   const galleryHeaderOffset = shouldShowGalleryHeader ? galleryHeaderHeight : 0
   const galleryVisibleVideos = galleryAvailableVideos
   const galleryHasMore = categoryFilter === 'used' ? galleryUsedHasMore : systemGalleryHasMore
-  const galleryCurrentTotal = categoryFilter === 'used' ? galleryUsedTotalCount : galleryReadyTotalCount
   const appViewportStyle = {
     height: 'var(--tg-viewport-stable-height, 100dvh)',
     minHeight: 'var(--tg-viewport-stable-height, 100dvh)',
@@ -6594,10 +6636,16 @@ function App({
             isSystemAdmin={isSystemAdmin}
             systemInboxLoading={systemInboxLoading}
             systemInboxVideos={systemInboxVideos}
+            systemInboxProcessedTotalCount={systemInboxProcessedTotalCount}
+            systemInboxUnprocessedTotalCount={Math.max(0, systemInboxTotalCount - systemInboxProcessedTotalCount)}
             systemInboxLoadingMore={systemInboxLoadingMore}
             systemInboxHasMore={systemInboxHasMore}
             inboxLoading={inboxLoading}
             inboxVideos={inboxVideos}
+            inboxProcessedTotalCount={inboxProcessedTotalCount}
+            inboxUnprocessedTotalCount={Math.max(0, inboxTotalCount - inboxProcessedTotalCount)}
+            inboxView={inboxView}
+            onInboxViewChange={setInboxView}
             inboxLoadingMore={inboxLoadingMore}
             inboxHasMore={inboxHasMore}
             loadMoreRef={inboxLoadMoreRef}
@@ -6683,9 +6731,7 @@ function App({
                     ? 'คลิปทุก workspace จะแสดงรวมกันที่นี่'
                     : categoryFilter === 'used'
                       ? 'คลิปที่โพสต์สำเร็จจะแสดงที่นี่'
-                      : galleryShortlinkRequired
-                        ? 'คลิปที่ย่อลิ้งครบแล้วและพร้อมโพสต์จะแสดงที่นี่'
-                        : 'คลิปที่ประมวลผลเสร็จและลิงก์ครบแล้วจะพร้อมโพสต์ทันที'}
+                      : 'คลิปที่ประมวลผลเสร็จและลิงก์ครบแล้วจะพร้อมโพสต์ทันที'}
                 </p>
               </div>
             ) : (
@@ -7298,32 +7344,28 @@ function App({
                     subtitle={`${teamMembers.length} สมาชิก`}
                     onClick={() => openSettingsSection('team')}
                   />
-                  {isOwner && (
-                    <SettingsMenuItem
-                      icon="🔗"
-                      title={isSystemAdmin ? 'Shortlink' : 'Affiliate ID'}
-                      subtitle={isSystemAdmin
-                        ? (
-                          shortlinkAccountCurrent
-                            ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
-                            : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'
-                        )
-                        : (
-                          shortlinkExpectedUtmIdCurrent || lazadaExpectedMemberIdCurrent
-                            ? `Shopee ID ${shortlinkExpectedUtmIdCurrent || '-'} • Lazada ID ${lazadaExpectedMemberIdCurrent || '-'}`
-                            : 'ตั้งค่า Shopee ID และ Lazada ID'
-                        )}
-                      onClick={() => openSettingsSection('shortlink')}
-                    />
-                  )}
-                  {isOwner && (
-                    <SettingsMenuItem
-                      icon="🕒"
-                      title="Post"
-                      subtitle={POSTING_ORDER_OPTIONS.find((option) => option.value === postingOrderCurrent)?.title || 'โพสต์เก่าสุดก่อน'}
-                      onClick={() => openSettingsSection('post')}
-                    />
-                  )}
+                  <SettingsMenuItem
+                    icon="🔗"
+                    title={isSystemAdmin ? 'Shortlink' : 'Affiliate ID'}
+                    subtitle={isSystemAdmin
+                      ? (
+                        shortlinkAccountCurrent
+                          ? `Account ${shortlinkAccountCurrent} • UTM ${shortlinkExpectedUtmIdCurrent || '-'} • member_id ${lazadaExpectedMemberIdCurrent || '-'}`
+                          : 'ตั้งค่า account, Shopee UTM และ Lazada member_id'
+                      )
+                      : (
+                        shortlinkExpectedUtmIdCurrent || lazadaExpectedMemberIdCurrent
+                          ? `Shopee ID ${shortlinkExpectedUtmIdCurrent || '-'} • Lazada ID ${lazadaExpectedMemberIdCurrent || '-'}`
+                          : 'ตั้งค่า Shopee ID และ Lazada ID'
+                      )}
+                    onClick={() => openSettingsSection('shortlink')}
+                  />
+                  <SettingsMenuItem
+                    icon="🕒"
+                    title="Post"
+                    subtitle={POSTING_ORDER_OPTIONS.find((option) => option.value === postingOrderCurrent)?.title || 'โพสต์เก่าสุดก่อน'}
+                    onClick={() => openSettingsSection('post')}
+                  />
                   {isSystemAdmin && (
                     <SettingsMenuItem
                       icon="🔑"
@@ -7342,14 +7384,12 @@ function App({
                     subtitle={summarizeVoiceSettings(voiceProfile, voiceSettingsSource, voiceOptions)}
                     onClick={() => openSettingsSection('voice')}
                   />
-                  {isOwner && (
-                    <SettingsMenuItem
-                      icon="🖍️"
-                      title="ข้อความบนปก"
-                      subtitle={summarizeCoverTextStyle(coverTextStyle)}
-                      onClick={() => openSettingsSection('cover')}
-                    />
-                  )}
+                  <SettingsMenuItem
+                    icon="🖍️"
+                    title="ข้อความบนปก"
+                    subtitle={summarizeCoverTextStyle(coverTextStyle)}
+                    onClick={() => openSettingsSection('cover')}
+                  />
                   <SettingsMenuItem
                     icon="💬"
                     title="Comment Template"
@@ -7587,13 +7627,36 @@ function App({
                   </div>
                 )}
 
-                {settingsSection === 'shortlink' && isOwner && (
+                {settingsSection === 'shortlink' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-start justify-between gap-3 rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3">
+                        <div className="space-y-1">
+                          <p className="text-sm font-bold text-gray-800">ย่อลิงก์ตอนโพสต์</p>
+                          <p className="text-[11px] leading-relaxed text-gray-500">
+                            เปิดไว้เฉพาะ namespace ที่ต้องการให้ระบบย่อลิงก์ตอนโพสต์เท่านั้น การประมวลผลและแท็บยังไม่โพสต์จะไม่รอย่อลิงก์แล้ว
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (shortlinkSaving) return
+                            void saveShortlinkRequirement(!shortlinkEnabled)
+                          }}
+                          disabled={shortlinkSaving}
+                          className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors ${shortlinkEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${shortlinkSaving ? 'opacity-60' : ''}`}
+                          aria-pressed={shortlinkEnabled}
+                          title={shortlinkEnabled ? 'ปิดย่อลิงก์ตอนโพสต์' : 'เปิดย่อลิงก์ตอนโพสต์'}
+                        >
+                          <span
+                            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${shortlinkEnabled ? 'translate-x-6' : 'translate-x-1'}`}
+                          />
+                        </button>
+                      </div>
                       <p className="text-xs text-gray-500 leading-relaxed">
                         {isSystemAdmin
-                          ? 'ใส่ค่า affiliate ของ workspace นี้เพื่อให้ระบบเช็กก่อนโพสต์ทุกครั้ง ส่วน account ใช้เฉพาะ workspace ที่ต้องย่อลิงก์'
-                          : 'ใส่ Shopee ID กับ Lazada ID ของ workspace นี้ เพื่อให้ระบบเช็กก่อนโพสต์ทุกครั้ง โดย member จะไม่มีการย่อลิงก์'}
+                          ? 'ใส่ค่า affiliate ของ workspace นี้สำหรับย่อลิงก์ตอนโพสต์เท่านั้น ถ้าปิดสวิตช์ด้านบน ระบบจะไม่ย่อลิงก์'
+                          : 'ใส่ Shopee ID กับ Lazada ID ของ workspace นี้เพื่อใช้ตรวจตอนโพสต์ โดย member จะไม่มีการย่อลิงก์'}
                       </p>
                       {shortlinkLoading ? (
                         <p className="text-sm text-gray-400 py-3">{isSystemAdmin ? 'กำลังโหลด Shortlink...' : 'กำลังโหลด Affiliate ID...'}</p>
@@ -7738,7 +7801,7 @@ function App({
                   </div>
                 )}
 
-                {settingsSection === 'post' && isOwner && (
+                {settingsSection === 'post' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
@@ -7801,75 +7864,12 @@ function App({
                 {settingsSection === 'comment' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <p className="text-sm font-bold text-gray-900">Access Token (คอมเม้น)</p>
-                          <p className="text-[11px] text-gray-500 mt-0.5">
-                            Token นี้จะใช้สำหรับ <b>คอมเม้นต์</b> ทุกที่ — cron auto-post, โฟกัสโพสต์, สร้างแอดในแดชบอร์ด — ทุกเพจในเวิร์คสเปซนี้
-                          </p>
-                          <p className="text-[11px] text-gray-400 mt-0.5">
-                            ปล่อยว่าง = fallback ไปใช้ post token ของแต่ละเพจ (เหมือนเดิม)
-                          </p>
-                        </div>
-                        {commentTokenHasToken && (
-                          <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700 border border-emerald-200">
-                            กำลังใช้: {commentTokenHint}
-                          </span>
-                        )}
-                      </div>
-                      {commentTokenLoading ? (
-                        <p className="text-sm text-gray-400 py-3">กำลังโหลด comment token...</p>
-                      ) : (
-                        <>
-                          <textarea
-                            key={`commenttoken-${commentTokenUpdatedAt}`}
-                            defaultValue={commentTokenDraft}
-                            onChange={(e) => {
-                              setCommentTokenDraft(e.target.value)
-                              if (commentTokenMessage) setCommentTokenMessage('')
-                            }}
-                            rows={5}
-                            placeholder="วาง Page Access Token (EAA...) ที่จะใช้คอมเม้นต์ — สามารถเป็น token ของเพจอื่น/บัญชีอื่นได้"
-                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-xs font-mono outline-none focus:border-blue-400"
-                          />
-                          {commentTokenUpdatedAt && (
-                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(commentTokenUpdatedAt).toLocaleString()}</p>
-                          )}
-                          {commentTokenMessage && (
-                            <p className={`text-xs ${commentTokenMessage.includes('ไม่สำเร็จ') || commentTokenMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
-                              {commentTokenMessage}
-                            </p>
-                          )}
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => {
-                                if (commentTokenSaving) return
-                                void saveCommentToken(commentTokenDraft)
-                              }}
-                              disabled={commentTokenSaving || !commentTokenDraft.trim()}
-                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
-                            >
-                              {commentTokenSaving ? 'กำลังบันทึก...' : 'บันทึก token'}
-                            </button>
-                            <button
-                              onClick={() => {
-                                if (commentTokenSaving) return
-                                if (!window.confirm('ลบ comment token? ระบบจะกลับไปใช้ post token ของแต่ละเพจในการคอมเม้นต์')) return
-                                void saveCommentToken('')
-                              }}
-                              disabled={commentTokenSaving || !commentTokenHasToken}
-                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
-                            >
-                              ลบ
-                            </button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
                         ตั้งค่าข้อความคอมเมนต์ที่ระบบใช้ตอนโพสต์ลิงก์อัตโนมัติ เทมเพลตนี้จะมีผลกับงานถัดไปทันที
                       </p>
+                      <div className="rounded-xl border border-blue-100 bg-blue-50 px-3 py-3 text-[11px] text-blue-700">
+                        Token คอมเมนต์ให้จัดการที่หน้าเพจแต่ละเพจ ไม่ได้ตั้งจากหน้านี้
+                      </div>
                       <div className="flex flex-wrap gap-2">
                         <span className="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] font-semibold text-gray-700">{COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER} จำเป็น</span>
                         <span className="rounded-full bg-gray-100 px-2.5 py-1 text-[11px] font-semibold text-gray-700">{COMMENT_TEMPLATE_LAZADA_PLACEHOLDER} ถ้ามีลิงก์</span>
@@ -8039,7 +8039,7 @@ function App({
                   </div>
                 )}
 
-                {settingsSection === 'cover' && isOwner && (
+                {settingsSection === 'cover' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
@@ -8149,53 +8149,52 @@ function App({
                             )}
                           </div>
 
+                          <label className="space-y-1 block">
+                            <span className="text-[11px] font-semibold text-gray-600">สีบรรทัดที่ 2+ (ถ้าอยากให้ต่างจากบรรทัดแรก)</span>
+                            <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
+                              <input
+                                type="color"
+                                value={coverTextStyleDraft.secondary_text_color}
+                                onChange={(e) => {
+                                  setCoverTextStyleDraft((prev) => ({ ...prev, secondary_text_color: normalizeCoverHexColor(e.target.value, prev.secondary_text_color) }))
+                                  if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                }}
+                                className="h-8 w-10 rounded border-0 bg-transparent p-0"
+                              />
+                              <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.secondary_text_color}</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setCoverTextStyleDraft((prev) => ({ ...prev, secondary_text_color: prev.text_color }))
+                                  if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                }}
+                                className="ml-auto text-[10px] font-semibold text-gray-500 bg-white border border-gray-200 rounded-md px-2 py-1 active:scale-95"
+                              >
+                                ใช้สีเดียวกัน
+                              </button>
+                            </div>
+                          </label>
+
                           {coverTextStyleDraft.mode === 'outline' ? (
-                            <div className="space-y-3">
-                              <label className="space-y-1 block">
-                                <span className="text-[11px] font-semibold text-gray-600">สีบรรทัดที่ 2+ (ถ้าอยากให้ต่างจากบรรทัดแรก)</span>
-                                <div className="flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5">
-                                  <input
-                                    type="color"
-                                    value={coverTextStyleDraft.secondary_text_color}
-                                    onChange={(e) => {
-                                      setCoverTextStyleDraft((prev) => ({ ...prev, secondary_text_color: normalizeCoverHexColor(e.target.value, prev.secondary_text_color) }))
-                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
-                                    }}
-                                    className="h-8 w-10 rounded border-0 bg-transparent p-0"
-                                  />
-                                  <span className="text-sm font-semibold text-gray-700">{coverTextStyleDraft.secondary_text_color}</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setCoverTextStyleDraft((prev) => ({ ...prev, secondary_text_color: prev.text_color }))
-                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
-                                    }}
-                                    className="ml-auto text-[10px] font-semibold text-gray-500 bg-white border border-gray-200 rounded-md px-2 py-1 active:scale-95"
-                                  >
-                                    ใช้สีเดียวกัน
-                                  </button>
-                                </div>
-                              </label>
-                              <div className="space-y-2">
-                                <div className="flex items-center justify-between">
-                                  <p className="text-[11px] font-semibold text-gray-600">ความหนาของขอบ</p>
-                                  <p className="text-[11px] text-gray-400">{coverTextStyleDraft.outline_width}px</p>
-                                </div>
-                                <input
-                                  type="range"
-                                  min={0}
-                                  max={40}
-                                  step={1}
-                                  value={coverTextStyleDraft.outline_width}
-                                  onChange={(e) => {
-                                    const next = Math.max(0, Math.min(40, Number(e.target.value || 0)))
-                                    setCoverTextStyleDraft((prev) => ({ ...prev, outline_width: Math.round(next) }))
-                                    if (coverTextStyleMessage) setCoverTextStyleMessage('')
-                                  }}
-                                  data-allow-native-drag="true"
-                                  className="w-full accent-blue-600 touch-pan-x"
-                                />
+                            <div className="space-y-2">
+                              <div className="flex items-center justify-between">
+                                <p className="text-[11px] font-semibold text-gray-600">ความหนาของขอบ</p>
+                                <p className="text-[11px] text-gray-400">{coverTextStyleDraft.outline_width}px</p>
                               </div>
+                              <input
+                                type="range"
+                                min={0}
+                                max={40}
+                                step={1}
+                                value={coverTextStyleDraft.outline_width}
+                                onChange={(e) => {
+                                  const next = Math.max(0, Math.min(40, Number(e.target.value || 0)))
+                                  setCoverTextStyleDraft((prev) => ({ ...prev, outline_width: Math.round(next) }))
+                                  if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                }}
+                                data-allow-native-drag="true"
+                                className="w-full accent-blue-600 touch-pan-x"
+                              />
                             </div>
                           ) : (
                             <div className="space-y-2">
@@ -8227,19 +8226,72 @@ function App({
                             </div>
                             <input
                               type="range"
-                              min={80}
+                              min={50}
                               max={135}
                               step={1}
                               value={Math.round(coverTextStyleDraft.size_scale * 100)}
                               onChange={(e) => {
-                                const next = Math.max(80, Math.min(135, Number(e.target.value || 100)))
+                                const next = Math.max(50, Math.min(135, Number(e.target.value || 100)))
                                 setCoverTextStyleDraft((prev) => ({ ...prev, size_scale: Math.round((next / 100) * 100) / 100 }))
                                 if (coverTextStyleMessage) setCoverTextStyleMessage('')
                               }}
                               data-allow-native-drag="true"
                               className="w-full accent-blue-600 touch-pan-x"
                             />
-                            <p className="text-[11px] text-gray-400">ระบบจะย่อหรือขยายต่อให้อัตโนมัติตามความยาวข้อความ เพื่อให้ข้อความยาวยังอ่านได้</p>
+                            <p className="text-[11px] text-gray-400">ใช้เป็นขนาดเริ่มต้นก่อนระบบปรับตามความยาวข้อความ</p>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCoverTextStyleDraft((prev) => ({ ...prev, auto_fit: !prev.auto_fit }))
+                              if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                            }}
+                            className={`w-full rounded-xl border px-3 py-3 text-left transition-all ${coverTextStyleDraft.auto_fit ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <p className={`text-xs font-bold ${coverTextStyleDraft.auto_fit ? 'text-blue-700' : 'text-gray-700'}`}>
+                                  ปรับขนาดอัตโนมัติ
+                                </p>
+                                <p className="text-[11px] text-gray-500 leading-snug mt-0.5">
+                                  ย่อข้อความยาวให้พอดีกับปก ไม่ให้ล้นขอบภาพ
+                                </p>
+                              </div>
+                              <span className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${coverTextStyleDraft.auto_fit ? 'bg-blue-600' : 'bg-gray-300'}`}>
+                                <span className={`absolute top-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${coverTextStyleDraft.auto_fit ? 'translate-x-6' : 'translate-x-1'}`} />
+                              </span>
+                            </div>
+                          </button>
+
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างข้อความยาว</p>
+                              <p className="text-[11px] text-gray-400">{coverTextStyleDraft.auto_fit ? 'เปิดอัตโนมัติ' : 'ปิดอัตโนมัติ'}</p>
+                            </div>
+                            <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3">
+                              <div
+                                className="mx-auto rounded-lg px-3 py-2 text-center font-bold leading-tight"
+                                style={{
+                                  maxWidth: '100%',
+                                  fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
+                                  backgroundColor: coverTextStyleDraft.mode === 'box'
+                                    ? `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`
+                                    : 'transparent',
+                                  color: coverTextStyleDraft.text_color,
+                                  fontSize: `${Math.round((coverTextStyleDraft.auto_fit ? 16 : 24) * coverTextStyleDraft.size_scale)}px`,
+                                  WebkitTextStroke: coverTextStyleDraft.mode === 'outline'
+                                    ? `${coverTextStyleDraft.outline_width > 0 ? 1 : 0}px ${coverTextStyleDraft.outline_color}`
+                                    : undefined,
+                                  paintOrder: coverTextStyleDraft.mode === 'outline' ? 'stroke fill' : undefined,
+                                  overflow: 'hidden',
+                                  textOverflow: coverTextStyleDraft.auto_fit ? 'clip' : 'ellipsis',
+                                  whiteSpace: 'nowrap',
+                                }}
+                              >
+                                ของในบ้านไม่ต้องยกให้เมื่อย
+                              </div>
+                            </div>
                           </div>
 
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-2">
@@ -8263,23 +8315,24 @@ function App({
                                   <span style={{ color: coverTextStyleDraft.secondary_text_color }}>ตัวอย่าง</span>
                                 </div>
                               ) : (
-                                <span
-                                  className="inline-flex items-center justify-center rounded-lg px-4 py-2 text-center font-bold"
+                                <div
+                                  className="inline-flex flex-col items-center justify-center rounded-lg px-4 py-2 text-center font-bold leading-tight"
                                   style={{
                                     fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
-                                    color: coverTextStyleDraft.text_color,
                                     backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
                                     fontSize: `${Math.round(26 * coverTextStyleDraft.size_scale)}px`,
                                   }}
                                 >
-                                  ข้อความบนปกตัวอย่าง
-                                </span>
+                                  <span style={{ color: coverTextStyleDraft.text_color }}>ข้อความบนปก</span>
+                                  <span style={{ color: coverTextStyleDraft.secondary_text_color }}>ตัวอย่าง</span>
+                                </div>
                               )}
                             </div>
                             <p className="text-[11px] text-gray-400">
+                              บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2
                               {coverTextStyleDraft.mode === 'outline'
-                                ? 'บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2 — ปกจริงที่ render จะคมกว่านี้'
-                                : 'พื้นหลังของข้อความจริงจะพอดีกับความกว้างข้อความอัตโนมัติ'}
+                                ? ' — ปกจริงที่ render จะคมกว่านี้'
+                                : ' — พื้นหลังของข้อความจริงจะพอดีกับความกว้างข้อความอัตโนมัติ'}
                             </p>
                           </div>
 

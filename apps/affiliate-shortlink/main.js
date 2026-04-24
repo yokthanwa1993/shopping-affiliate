@@ -216,6 +216,7 @@ function createShopeeWindow(show = false) {
         width: 1200, height: 800,
         title: 'Shopee Affiliate',
         show: show,
+        skipTaskbar: true,
         webPreferences: {
             partition: shopeeSession,
             contextIsolation: false,
@@ -224,8 +225,18 @@ function createShopeeWindow(show = false) {
     });
 
     shopeeWindow.loadURL(SHOPEE_URL, { userAgent: CHROME_UA });
+    shopeeWindow.once('ready-to-show', () => {
+        if (process.platform === 'darwin') {
+            try { app.dock.hide(); } catch { }
+        }
+    });
     shopeeWindow.on('close', (e) => {
         if (!app.isQuitting) { e.preventDefault(); shopeeWindow.hide(); }
+    });
+    shopeeWindow.on('show', () => {
+        if (process.platform === 'darwin') {
+            try { app.dock.hide(); } catch { }
+        }
     });
 
     return shopeeWindow;
@@ -244,6 +255,7 @@ function createLazadaWindow(show = false) {
         width: 1200, height: 800,
         title: 'Lazada Affiliate',
         show: show,
+        skipTaskbar: true,
         webPreferences: {
             partition: lazadaSession,
             contextIsolation: false,
@@ -252,8 +264,18 @@ function createLazadaWindow(show = false) {
     });
 
     lazadaWindow.loadURL(LAZADA_URL, { userAgent: CHROME_UA });
+    lazadaWindow.once('ready-to-show', () => {
+        if (process.platform === 'darwin') {
+            try { app.dock.hide(); } catch { }
+        }
+    });
     lazadaWindow.on('close', (e) => {
         if (!app.isQuitting) { e.preventDefault(); lazadaWindow.hide(); }
+    });
+    lazadaWindow.on('show', () => {
+        if (process.platform === 'darwin') {
+            try { app.dock.hide(); } catch { }
+        }
     });
 
     return lazadaWindow;
@@ -741,13 +763,15 @@ function updateTrayMenu() {
 }
 
 // ==================== APP LIFECYCLE ====================
-app.dock.hide(); // Hide from dock, show only in menu bar
 
 // Auto-start on login
 app.setLoginItemSettings({ openAtLogin: true, path: app.getPath('exe') });
 
 app.on('ready', () => {
     console.log('Affiliate Shortlink starting...');
+    if (process.platform === 'darwin') {
+        try { app.dock.hide(); } catch { }
+    }
     createTray();
 
     // Open both browsers in background
@@ -766,6 +790,18 @@ app.on('ready', () => {
     schedulePeriodicRefresh('lazada', () => lazadaWindow, LAZADA_URL, REFRESH_INTERVAL_MS / 2);
 
     console.log('Ready! Shopee + Lazada browsers open, API on port ' + API_PORT);
+});
+
+app.on('browser-window-created', () => {
+    if (process.platform === 'darwin') {
+        try { app.dock.hide(); } catch { }
+    }
+});
+
+app.on('activate', () => {
+    if (process.platform === 'darwin') {
+        try { app.dock.hide(); } catch { }
+    }
 });
 
 app.on('before-quit', () => {

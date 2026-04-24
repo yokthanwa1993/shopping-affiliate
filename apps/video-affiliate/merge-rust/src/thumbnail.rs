@@ -38,6 +38,8 @@ pub struct ThumbnailRequest {
     #[serde(default)]
     pub overlay_size_scale: Option<f64>,
     #[serde(default)]
+    pub overlay_auto_fit: Option<bool>,
+    #[serde(default)]
     pub overlay_mode: String,
     #[serde(default)]
     pub overlay_outline_color: String,
@@ -111,7 +113,7 @@ fn normalize_overlay_text(input: &str) -> String {
         .collect::<String>()
 }
 
-fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize) -> String {
+fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize, split_long_words: bool) -> String {
     let normalized = normalize_overlay_text(input);
     if normalized.is_empty() {
         return String::new();
@@ -126,6 +128,31 @@ fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize) -
         if !words.is_empty() {
             let mut current = String::new();
             for word in words {
+                if split_long_words && word.chars().count() > max_chars {
+                    if !current.trim().is_empty() {
+                        lines.push(current.trim().to_string());
+                        current.clear();
+                        if lines.len() >= max_lines {
+                            break;
+                        }
+                    }
+                    let mut chunk = String::new();
+                    for ch in word.chars() {
+                        chunk.push(ch);
+                        if chunk.chars().count() >= max_chars {
+                            lines.push(chunk.trim().to_string());
+                            chunk.clear();
+                            if lines.len() >= max_lines {
+                                break;
+                            }
+                        }
+                    }
+                    if lines.len() >= max_lines {
+                        break;
+                    }
+                    current = chunk;
+                    continue;
+                }
                 let candidate = if current.is_empty() {
                     word.to_string()
                 } else {
@@ -200,7 +227,11 @@ fn normalize_overlay_bg_opacity(input: Option<f64>) -> f64 {
 }
 
 fn normalize_overlay_size_scale(input: Option<f64>) -> f64 {
-    input.unwrap_or(1.0).clamp(0.8, 1.35)
+    input.unwrap_or(1.0).clamp(0.5, 1.35)
+}
+
+fn normalize_overlay_auto_fit(input: Option<bool>) -> bool {
+    input.unwrap_or(true)
 }
 
 fn resolve_overlay_fontfile(font_id: &str) -> &'static str {
@@ -288,6 +319,7 @@ fn build_thumbnail_plan(
     overlay_bg_color: &str,
     overlay_bg_opacity: Option<f64>,
     overlay_size_scale: Option<f64>,
+    overlay_auto_fit: Option<bool>,
     overlay_mode: &str,
     overlay_outline_color: &str,
     overlay_outline_width: Option<i32>,
@@ -312,6 +344,7 @@ fn build_thumbnail_plan(
 
     let y_pct = overlay_y_pct.unwrap_or(72.0).clamp(10.0, 90.0);
     let size_scale = normalize_overlay_size_scale(overlay_size_scale);
+    let auto_fit = normalize_overlay_auto_fit(overlay_auto_fit);
     let line_count = overlay_text.lines().count().max(1) as f64;
     let longest_line_chars = overlay_text
         .lines()
@@ -326,12 +359,12 @@ fn build_thumbnail_plan(
     let max_text_width = (target_width as f64) * 0.92;
     let estimated_char_width = font_size * 0.62;
     let estimated_text_width = longest_line_chars * estimated_char_width;
-    if estimated_text_width > max_text_width {
+    if auto_fit && estimated_text_width > max_text_width {
         font_size *= (max_text_width / estimated_text_width).clamp(0.72, 1.0);
     }
     let estimated_text_height = line_count * font_size * 1.18;
     let max_text_height = (target_height as f64) * 0.22;
-    if estimated_text_height > max_text_height {
+    if auto_fit && estimated_text_height > max_text_height {
         font_size *= (max_text_height / estimated_text_height).clamp(0.72, 1.0);
     }
     let font_size = font_size.round().max(28.0) as i32;
@@ -388,6 +421,10 @@ fn build_thumbnail_plan(
         "pad_y": pad_y,
         "line_spacing_px": line_spacing_px,
         "center_y": center_y,
+        "auto_fit": auto_fit,
+        "max_box_width": ((target_width as f64) * 0.96).round() as i32,
+        "max_box_height": ((target_height as f64) * 0.26).round() as i32,
+        "min_font_size": if target_width >= 720 { 42 } else { 24 },
         "output_path": png_path,
     });
 
@@ -428,6 +465,7 @@ pub async fn handle_thumbnail(
         &payload.overlay_text,
         if payload.target_width.unwrap_or(270) >= 720 { 16 } else { 12 },
         3,
+        normalize_overlay_auto_fit(payload.overlay_auto_fit),
     );
     // Overlay PNG is rendered by the Python Pillow helper at the canvas size.
     let overlay_png_path = if overlay_text.is_empty() {
@@ -499,6 +537,7 @@ pub async fn handle_thumbnail(
         &payload.overlay_bg_color,
         payload.overlay_bg_opacity,
         payload.overlay_size_scale,
+        payload.overlay_auto_fit,
         &payload.overlay_mode,
         &payload.overlay_outline_color,
         payload.overlay_outline_width,

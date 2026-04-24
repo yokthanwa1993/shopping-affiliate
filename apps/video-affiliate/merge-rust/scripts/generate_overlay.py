@@ -79,6 +79,16 @@ def draw_text_with_outline(
         draw.text(position, text, font=font, fill=fill_rgba)
 
 
+def bool_param(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in {"0", "false", "off", "no"}
+
+
 def main() -> None:
     params = json.loads(sys.stdin.read())
 
@@ -105,6 +115,10 @@ def main() -> None:
     line_spacing_px = int(params.get("line_spacing_px", 12))
     center_y = int(params.get("center_y", img_h // 2))
     output_path: str = params["output_path"]
+    auto_fit = bool_param(params.get("auto_fit"), default=True)
+    max_box_width = int(params.get("max_box_width", int(img_w * 0.96)))
+    max_box_height = int(params.get("max_box_height", int(img_h * 0.26)))
+    min_font_size = max(12, int(params.get("min_font_size", 24)))
 
     img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -113,17 +127,42 @@ def main() -> None:
         img.save(output_path, "PNG")
         return
 
+    def measure_layout(size: int, spacing_px: int):
+        measured_font = load_font(font_path, size)
+        measured_metrics = []
+        for ln in lines:
+            bbox, lw, lh = measure_line(draw, ln, measured_font, stroke_width=outline_width)
+            measured_metrics.append((ln, bbox, lw, lh))
+        measured_total_h = sum(m[3] for m in measured_metrics) + spacing_px * max(0, len(measured_metrics) - 1)
+        measured_max_w = max(m[2] for m in measured_metrics)
+        return measured_font, measured_metrics, measured_total_h, measured_max_w
+
     font = load_font(font_path, font_size)
-
-    # Measure all lines (bbox includes Thai marks above/below base glyph AND the
-    # stroke expansion when outline is active — so the box/canvas accounts for it).
     metrics = []
-    for ln in lines:
-        bbox, lw, lh = measure_line(draw, ln, font, stroke_width=outline_width)
-        metrics.append((ln, bbox, lw, lh))
+    total_text_h = 0
+    max_line_w = 0
 
-    total_text_h = sum(m[3] for m in metrics) + line_spacing_px * max(0, len(metrics) - 1)
-    max_line_w = max(m[2] for m in metrics)
+    if auto_fit:
+        # Fit against measured inked glyph bounds, including Thai diacritics and
+        # outline stroke. This catches long Thai text with no spaces accurately.
+        while True:
+            scaled_line_spacing = max(4, int(round(line_spacing_px * (font_size / max(1, int(params.get("font_size", font_size)))))))
+            scaled_pad_x = max(8, int(round(pad_x * (font_size / max(1, int(params.get("font_size", font_size)))))))
+            scaled_pad_y = max(8, int(round(pad_y * (font_size / max(1, int(params.get("font_size", font_size)))))))
+            font, metrics, total_text_h, max_line_w = measure_layout(font_size, scaled_line_spacing)
+            box_w = max_line_w + scaled_pad_x * 2
+            box_h = total_text_h + scaled_pad_y * 2
+            if (box_w <= max_box_width and box_h <= max_box_height) or font_size <= min_font_size:
+                line_spacing_px = scaled_line_spacing
+                pad_x = scaled_pad_x
+                pad_y = scaled_pad_y
+                break
+            width_ratio = max_box_width / max(1, box_w)
+            height_ratio = max_box_height / max(1, box_h)
+            next_size = int(font_size * min(width_ratio, height_ratio) * 0.98)
+            font_size = max(min_font_size, min(font_size - 1, next_size))
+    else:
+        font, metrics, total_text_h, max_line_w = measure_layout(font_size, line_spacing_px)
 
     # Box covers the real inked bounds + padding on all sides.
     box_w = max_line_w + pad_x * 2

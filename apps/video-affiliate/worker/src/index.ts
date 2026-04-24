@@ -2613,9 +2613,14 @@ function buildWorkerGalleryFrameUrl(
             url.searchParams.set('tid', coverTemplateId)
             url.searchParams.set('tf', coverTextStyle.fontId)
             url.searchParams.set('tc', coverTextStyle.textColor)
+            url.searchParams.set('tc2', coverTextStyle.secondaryTextColor)
             url.searchParams.set('bc', coverTextStyle.backgroundColor)
             url.searchParams.set('bo', String(coverTextStyle.backgroundOpacity))
             url.searchParams.set('ts', String(coverTextStyle.sizeScale))
+            url.searchParams.set('af', coverTextStyle.autoFit ? '1' : '0')
+            url.searchParams.set('om', coverTextStyle.mode)
+            url.searchParams.set('oc', coverTextStyle.outlineColor)
+            url.searchParams.set('ow', String(coverTextStyle.outlineWidth))
         }
         return url.toString()
     } catch {
@@ -2632,9 +2637,14 @@ function buildWorkerGalleryFrameUrl(
             params.set('tid', coverTemplateId)
             params.set('tf', coverTextStyle.fontId)
             params.set('tc', coverTextStyle.textColor)
+            params.set('tc2', coverTextStyle.secondaryTextColor)
             params.set('bc', coverTextStyle.backgroundColor)
             params.set('bo', String(coverTextStyle.backgroundOpacity))
             params.set('ts', String(coverTextStyle.sizeScale))
+            params.set('af', coverTextStyle.autoFit ? '1' : '0')
+            params.set('om', coverTextStyle.mode)
+            params.set('oc', coverTextStyle.outlineColor)
+            params.set('ow', String(coverTextStyle.outlineWidth))
         }
         return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/frame?${params.toString()}`
     }
@@ -2732,10 +2742,7 @@ async function buildGalleryAssetResponse(
 async function isSystemGalleryEnabledForNamespace(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return false
-    const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(db, normalizedNamespaceId)
-    if (!shortlinkRequired) return true
-    const settings = await getNamespaceShopeeShortlinkSettings(db, normalizedNamespaceId).catch(() => null)
-    return !!String(settings?.base_url || '').trim() && !!String(settings?.lazada_base_url || '').trim()
+    return true
 }
 
 async function isNamespaceShortlinkAdminManaged(db: D1Database, namespaceId: string): Promise<boolean> {
@@ -2751,38 +2758,7 @@ async function isNamespaceAffiliateShortlinkRequired(db: D1Database, namespaceId
     if (!normalizedNamespaceId) return false
     const adminManaged = await isNamespaceShortlinkAdminManaged(db, normalizedNamespaceId)
     if (!adminManaged) return false
-
-    const [
-        explicitRequired,
-        accountEntry,
-        shopeeBaseEntry,
-        lazadaBaseEntry,
-        expectedUtmEntry,
-        expectedLazadaMemberEntry,
-    ] = await Promise.all([
-        getNamespaceShopeeShortlinkRequired(db, normalizedNamespaceId).catch(() => false),
-        getNamespaceAffiliateShortlinkAccountEntry(db, normalizedNamespaceId).catch(() => ({ account: '', updatedAt: null })),
-        getNamespaceShopeeShortlinkBaseUrlEntry(db, normalizedNamespaceId).catch(() => ({ baseUrl: '', updatedAt: null })),
-        getNamespaceLazadaShortlinkBaseUrlEntry(db, normalizedNamespaceId).catch(() => ({ baseUrl: '', updatedAt: null })),
-        getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, normalizedNamespaceId).catch(() => ({ expectedUtmId: '', updatedAt: null })),
-        getNamespaceLazadaExpectedMemberIdEntry(db, normalizedNamespaceId).catch(() => ({ expectedMemberId: '', updatedAt: null })),
-    ])
-
-    if (explicitRequired) return true
-
-    const account = String(accountEntry.account || '').trim()
-    const effectiveShopeeBaseUrl = account ? deriveAffiliateShortlinkBaseUrl('shopee', account) : String(shopeeBaseEntry.baseUrl || '').trim()
-    const effectiveLazadaBaseUrl = account ? deriveAffiliateShortlinkBaseUrl('lazada', account) : String(lazadaBaseEntry.baseUrl || '').trim()
-    const expectedUtmId = String(expectedUtmEntry.expectedUtmId || '').trim()
-    const expectedLazadaMemberId = String(expectedLazadaMemberEntry.expectedMemberId || '').trim()
-    const hasOperationalShortlinkConfig = !!effectiveShopeeBaseUrl
-        && !!effectiveLazadaBaseUrl
-        && !!expectedUtmId
-        && !!expectedLazadaMemberId
-
-    if (hasOperationalShortlinkConfig) return true
-
-    return adminManaged
+    return await getNamespaceShopeeShortlinkRequired(db, normalizedNamespaceId).catch(() => false)
 }
 
 function isUnifiedGalleryEnabled(): boolean {
@@ -3956,7 +3932,7 @@ function isNamespaceGalleryVideoPosted(video: Record<string, unknown> | null | u
 
 function isNamespaceGalleryVideoVisibleInUsedTab(video: Record<string, unknown> | null | undefined): boolean {
     if (!video) return false
-    return isNamespaceGalleryVideoPosted(video)
+    return isNamespaceGalleryVideoPosted(video) && isNamespaceGalleryVideoDisplayReady(video)
 }
 
 function getGalleryVideoPostedTimeMs(video: Record<string, unknown> | null | undefined): number {
@@ -3982,7 +3958,6 @@ function sortUsedGalleryVideosNewestFirst(videos: Array<Record<string, unknown>>
 function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | null | undefined): boolean {
     if (!video) return false
     const explicitGalleryReady = getBooleanFlag(video.gallery_ready)
-    if (explicitGalleryReady !== null) return explicitGalleryReady
     const publicUrl = String(video.publicUrl || video.public_url || '').trim()
     if (!publicUrl) return false
 
@@ -4000,7 +3975,8 @@ function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | nu
         || video.lazada_original_link
         || ''
     ).trim()
-    return hasShopeeLink || hasLazadaLink
+    if (explicitGalleryReady !== null) return explicitGalleryReady && hasShopeeLink && hasLazadaLink
+    return hasShopeeLink && hasLazadaLink
 }
 
 async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Promise<{
@@ -4065,7 +4041,7 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
                 shortlink_required: shortlinkRequired,
             }
             const conversionState = getVideoAffiliateConversionState(merged, expectedUtmId, expectedLazadaMemberId, {
-                requireManagedLinks: shortlinkRequired,
+                requireManagedLinks: false,
             })
             return {
                 ...merged,
@@ -4169,7 +4145,7 @@ async function getSystemGalleryInventory(env: Env): Promise<{
             shortlink_required: shortlinkRequired,
         }
         const conversionState = getVideoAffiliateConversionState(merged, expectedUtmId, expectedLazadaMemberId, {
-            requireManagedLinks: shortlinkRequired,
+            requireManagedLinks: false,
         })
         return {
             ...merged,
@@ -4546,6 +4522,7 @@ async function generateThumbnailViaContainer(
         backgroundColor?: string
         backgroundOpacity?: number
         sizeScale?: number
+        autoFit?: boolean
         mode?: CoverTextStyleMode
         outlineColor?: string
         outlineWidth?: number
@@ -4565,6 +4542,7 @@ async function generateThumbnailViaContainer(
     const overlayBackgroundColor = normalizeHexColor(String(overlay?.backgroundColor || '').trim())
     const overlayBackgroundOpacity = normalizeCoverTextStyleBackgroundOpacity(overlay?.backgroundOpacity)
     const overlaySizeScale = normalizeCoverTextStyleSizeScale(overlay?.sizeScale)
+    const overlayAutoFit = normalizeCoverTextStyleAutoFit(overlay?.autoFit)
     const overlayMode = normalizeCoverTextStyleMode(overlay?.mode)
     const overlayOutlineColor = normalizeHexColor(String(overlay?.outlineColor || '').trim())
     const overlayOutlineWidth = normalizeCoverTextStyleOutlineWidth(overlay?.outlineWidth)
@@ -4586,6 +4564,7 @@ async function generateThumbnailViaContainer(
             ...(overlayText && overlayBackgroundColor ? { overlay_bg_color: overlayBackgroundColor } : {}),
             ...(overlayText ? { overlay_bg_opacity: overlayBackgroundOpacity } : {}),
             ...(overlayText ? { overlay_size_scale: overlaySizeScale } : {}),
+            ...(overlayText ? { overlay_auto_fit: overlayAutoFit } : {}),
             ...(overlayText ? { overlay_mode: overlayMode } : {}),
             ...(overlayText && overlayOutlineColor ? { overlay_outline_color: overlayOutlineColor } : {}),
             ...(overlayText ? { overlay_outline_width: overlayOutlineWidth } : {}),
@@ -6370,11 +6349,10 @@ app.get('/admin/api/test-cover', async (c) => {
 })
 
 app.post('/admin/api/affiliate-conversion/run', async (c) => {
-    await processPendingAffiliateConversions(c.env)
     const result = await rebuildGalleryIndexFromR2(c.env)
     await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
     await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
-    return c.json({ ok: true, ...result })
+    return c.json({ ok: true, skipped: true, reason: 'shortlink_only_at_posting', ...result })
 })
 
 app.post('/admin/api/scheduled/run', async (c) => {
@@ -7509,7 +7487,7 @@ app.put('/api/settings/cover-template', async (c) => {
 })
 
 app.get('/api/settings/posting-order', async (c) => {
-    const ownerCheck = await requireOwnerSession(c)
+    const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
     const namespaceId = c.get('botId')
@@ -7518,7 +7496,7 @@ app.get('/api/settings/posting-order', async (c) => {
 })
 
 app.put('/api/settings/posting-order', async (c) => {
-    const ownerCheck = await requireOwnerSession(c)
+    const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
     const body = await c.req.json().catch(() => ({})) as { posting_order?: string; postingOrder?: string; order?: string }
@@ -7635,7 +7613,7 @@ app.get('/api/settings/shopee-shortlink', async (c) => {
 })
 
 app.put('/api/settings/shopee-shortlink', async (c) => {
-    const ownerCheck = await requireOwnerSession(c)
+    const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
     const body = await c.req.json().catch(() => ({})) as {
@@ -7753,7 +7731,7 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
 })
 
 app.put('/api/settings/shopee-shortlink/requirement', async (c) => {
-    const ownerCheck = await requireOwnerSession(c)
+    const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
     const body = await c.req.json().catch(() => ({})) as { required?: boolean }
@@ -7772,7 +7750,7 @@ app.put('/api/settings/shopee-shortlink/requirement', async (c) => {
 })
 
 app.delete('/api/settings/shopee-shortlink', async (c) => {
-    const ownerCheck = await requireOwnerSession(c)
+    const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
     const namespaceId = c.get('botId')
@@ -7964,6 +7942,7 @@ type LineWaitingVideoState = {
     selectedCoverOption?: LineCoverOption | null
     coverText?: string
     coverTextYPercent?: number
+    selectedCoverPreviewUrl?: string
     coverTemplateId?: string
     coverTextStyle?: CoverTextStyleSettings
     coverTextPositionOptions?: LineCoverTextPositionOption[]
@@ -8047,6 +8026,12 @@ function normalizeCoverTextStyleSizeScale(rawValue: unknown): number {
         COVER_TEXT_STYLE_SIZE_SCALE_MIN,
         Math.min(COVER_TEXT_STYLE_SIZE_SCALE_MAX, Math.round(parsed * 100) / 100),
     )
+}
+
+function normalizeCoverTextStyleAutoFit(rawValue: unknown): boolean {
+    if (rawValue === false || rawValue === 0) return false
+    if (typeof rawValue === 'string' && ['false', '0', 'off', 'no'].includes(rawValue.trim().toLowerCase())) return false
+    return true
 }
 
 function normalizeLineCoverText(input: unknown): string {
@@ -8168,6 +8153,7 @@ function createDefaultCoverTextStyle(templateId: string): CoverTextStyleSettings
         backgroundColor: getLineCoverTemplateAccentColor(normalizedTemplateId),
         backgroundOpacity: DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY,
         sizeScale: DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE,
+        autoFit: true,
         mode: 'box',
         outlineColor: '#000000',
         outlineWidth: 8,
@@ -8205,6 +8191,7 @@ function normalizeCoverTextStyle(
             record.backgroundOpacity ?? record.background_opacity,
         ),
         sizeScale: normalizeCoverTextStyleSizeScale(record.sizeScale ?? record.size_scale),
+        autoFit: normalizeCoverTextStyleAutoFit(record.autoFit ?? record.auto_fit),
         mode: normalizeCoverTextStyleMode(record.mode ?? record.textMode ?? record.text_mode),
         outlineColor: normalizedOutlineColor || defaults.outlineColor,
         outlineWidth: normalizeCoverTextStyleOutlineWidth(
@@ -8503,6 +8490,7 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         url.searchParams.set('bc', coverTextStyle.backgroundColor)
         url.searchParams.set('bo', String(coverTextStyle.backgroundOpacity))
         url.searchParams.set('ts', String(coverTextStyle.sizeScale))
+        url.searchParams.set('af', coverTextStyle.autoFit ? '1' : '0')
         url.searchParams.set('om', coverTextStyle.mode)
         url.searchParams.set('oc', coverTextStyle.outlineColor)
         url.searchParams.set('ow', String(scaledOutlineWidth))
@@ -8523,6 +8511,7 @@ function buildLineCoverTextPositionPreviewUrl(params: {
         paramsObj.set('bc', coverTextStyle.backgroundColor)
         paramsObj.set('bo', String(coverTextStyle.backgroundOpacity))
         paramsObj.set('ts', String(coverTextStyle.sizeScale))
+        paramsObj.set('af', coverTextStyle.autoFit ? '1' : '0')
         paramsObj.set('om', coverTextStyle.mode)
         paramsObj.set('oc', coverTextStyle.outlineColor)
         paramsObj.set('ow', String(scaledOutlineWidth))
@@ -9284,6 +9273,10 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
         coverOptions: normalizeLineCoverOptions(input?.coverOptions),
         selectedCoverOption,
         coverText: normalizeLineCoverText(input?.coverText),
+        coverTextYPercent: Number.isFinite(Number(input?.coverTextYPercent))
+            ? Math.max(10, Math.min(90, Math.round(Number(input?.coverTextYPercent))))
+            : undefined,
+        selectedCoverPreviewUrl: String(input?.selectedCoverPreviewUrl || '').trim().slice(0, 2048),
         coverTemplateId,
         coverTextStyle: normalizeCoverTextStyle(input?.coverTextStyle, coverTemplateId),
         coverTextPositionOptions: normalizeLineCoverTextPositionOptions(input?.coverTextPositionOptions),
@@ -9496,6 +9489,8 @@ async function promptLineCoverPicker(params: {
         coverOptions: normalizeLineCoverOptions(waitingState.coverOptions),
         selectedCoverOption: null,
         coverText: '',
+        coverTextYPercent: undefined,
+        selectedCoverPreviewUrl: '',
         coverTemplateId,
         coverTextStyle,
         coverTextPositionOptions: [],
@@ -9816,6 +9811,7 @@ async function materializeSelectedLineCoverOptionAssets(params: {
             backgroundColor: coverTextStyle.backgroundColor,
             backgroundOpacity: coverTextStyle.backgroundOpacity,
             sizeScale: coverTextStyle.sizeScale,
+            autoFit: coverTextStyle.autoFit,
             mode: coverTextStyle.mode,
             outlineColor: coverTextStyle.outlineColor,
             outlineWidth: coverTextStyle.outlineWidth,
@@ -9897,12 +9893,13 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         item: inboxRecord,
         skipIfAlreadyProcessed: true,
     })
-    const previewUrl = await resolveLineCoverPreviewUrl({
-        env: params.env,
-        bucket: params.bucket,
-        namespaceId: params.namespaceId,
-        videoId: waitingState.id,
-    })
+    const previewUrl = String(waitingState.selectedCoverPreviewUrl || '').trim()
+        || await resolveLineCoverPreviewUrl({
+            env: params.env,
+            bucket: params.bucket,
+            namespaceId: params.namespaceId,
+            videoId: waitingState.id,
+        })
 
     if (params.pushOnly) {
         await pushLineProcessingResult({
@@ -11352,13 +11349,15 @@ async function handleLinePostbackEvent(params: {
         }
 
         try {
-            await putLineWaitingVideoState(params.bucket, params.lineUserId, {
-                ...waitingState,
-                awaitingStep: 'cover_text',
-                selectedCoverOption: selectedOption,
-                coverText: '',
-                coverTextPositionOptions: [],
-            })
+        await putLineWaitingVideoState(params.bucket, params.lineUserId, {
+            ...waitingState,
+            awaitingStep: 'cover_text',
+            selectedCoverOption: selectedOption,
+            coverText: '',
+            coverTextYPercent: undefined,
+            selectedCoverPreviewUrl: '',
+            coverTextPositionOptions: [],
+        })
             await lineReply(params.replyToken, params.channelAccessToken, [
                 buildLineCoverTextPromptMessage(),
             ])
@@ -11420,7 +11419,11 @@ async function handleLinePostbackEvent(params: {
             channelAccessToken: params.channelAccessToken,
             replyToken: params.replyToken,
             lineUserId: params.lineUserId,
-            waitingState,
+            waitingState: {
+                ...waitingState,
+                coverTextYPercent: selectedTextPosition.yPct,
+                selectedCoverPreviewUrl: String(selectedTextPosition.previewUrl || '').trim(),
+            },
             manualCaption: waitingState.manualCaption,
         })
     } catch (e) {
@@ -12804,7 +12807,52 @@ function buildInboxVideoResponseForNamespace(
     }
 }
 
+const NAMESPACE_INBOX_CACHE_TTL_MS = 15 * 1000
 const SYSTEM_INBOX_CACHE_TTL_MS = 15 * 1000
+
+function getNamespaceInboxCacheKey(namespaceId: string): string {
+    const normalizedNamespaceId = String(namespaceId || '').trim() || 'default'
+    return `_cache/inbox_${normalizedNamespaceId}.json`
+}
+
+async function buildNamespaceInboxSnapshot(
+    env: Env,
+    namespaceId: string,
+): Promise<Array<Record<string, unknown>>> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return []
+    const bucket = new BotBucket(env.BUCKET, normalizedNamespaceId) as unknown as R2Bucket
+    const records = await listInboxVideoRecords(bucket)
+    return records.map((record) => buildInboxVideoResponseForNamespace(env, record, normalizedNamespaceId))
+}
+
+async function readNamespaceInboxSnapshot(
+    bucket: R2Bucket,
+    namespaceId: string,
+): Promise<{ videos: Array<Record<string, unknown>>; builtAtMs: number } | null> {
+    const cacheObj = await bucket.get(getNamespaceInboxCacheKey(namespaceId)).catch(() => null)
+    if (!cacheObj) return null
+    const payload = await cacheObj.json().catch(() => null) as { builtAt?: string; videos?: Array<Record<string, unknown>> } | null
+    const videos = Array.isArray(payload?.videos) ? payload!.videos : []
+    const builtAtMs = Date.parse(String(payload?.builtAt || ''))
+    return {
+        videos,
+        builtAtMs: Number.isFinite(builtAtMs) ? builtAtMs : 0,
+    }
+}
+
+async function writeNamespaceInboxSnapshot(
+    bucket: R2Bucket,
+    namespaceId: string,
+    videos: Array<Record<string, unknown>>,
+): Promise<void> {
+    await bucket.put(getNamespaceInboxCacheKey(namespaceId), JSON.stringify({
+        builtAt: new Date().toISOString(),
+        videos,
+    }), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
 
 function getSystemInboxCacheKey(namespaceId: string): string {
     const normalizedNamespaceId = String(namespaceId || '').trim() || 'default'
@@ -13620,28 +13668,8 @@ async function ensureInboxVideoProcessingStarted(params: {
     const rawItem = normalizeInboxVideoRecord(params.item)
     if (!rawItem || rawItem.status !== 'ready') throw new Error('inbox_video_not_ready')
 
-    // 2026-04-20: REMOVED submit-time shortlink check.
-    // Previously called prepareInboxVideoForManagedLinks here, which shortened
-    // Shopee+Lazada links AT SUBMIT TIME and BLOCKED processing if shortening failed
-    // ("ย่อลิงก์ Shopee/Lazada ไม่ผ่าน"). Per user 2026-04-20: the check should only
-    // run at POSTING time, not submission.
-    //
-    // Posting-time shortening is handled by:
-    //   - processPendingAffiliateConversions cron (runs every minute, shortens any
-    //     gallery video still missing shortened links)
-    //   - resolvePostingShopeeLinkForNamespace (called right before comment posting,
-    //     re-shortens with current namespace sub_ids)
-    //   - SACRED-RULES-READ-FIRST: both of these gate by isNamespaceShortlinkAdminManaged,
-    //     so only admin namespace ever re-shortens. Member namespace links pass through
-    //     unchanged. See drawer shopping-affiliate/SACRED-RULES-READ-FIRST.
-    //
-    // Kick off the conversion in the background so admin namespace videos still get
-    // their gallery_ready flag flipped eventually, without blocking processing start.
-    params.executionCtx.waitUntil(
-        processPendingAffiliateConversions(params.env).catch((error) => {
-            console.log(`[INBOX-START] background affiliate conversion kickoff failed for ${botId}/${rawItem.id}: ${error instanceof Error ? error.message : String(error)}`)
-        })
-    )
+    // 2026-04-20: shortlink runs ONLY at posting time.
+    // No submit-time or background conversion should run from inbox start.
 
     const item = await recordInboxLinkSubmissionIfNeeded({
         db: params.env.DB,
@@ -13793,30 +13821,62 @@ app.get('/api/inbox', async (c) => {
         const offset = parseNonNegativeInt(c.req.query('offset'), 0)
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
-        const records = await listInboxVideoRecords(c.get('bucket'))
-        const page = sliceGalleryPage(records, offset, limit)
-        const videos = page.videos.map((record) => buildInboxVideoResponseForNamespace(c.env, record, namespaceId))
+        const view = String(c.req.query('view') || 'unprocessed').trim().toLowerCase() === 'processed' ? 'processed' : 'unprocessed'
+        const bucket = c.get('bucket')
+        const cachedSnapshot = await readNamespaceInboxSnapshot(bucket, namespaceId).catch(() => null)
+        const cacheAgeMs = cachedSnapshot ? Math.max(0, Date.now() - cachedSnapshot.builtAtMs) : Number.POSITIVE_INFINITY
+        const shouldRefreshCache = !cachedSnapshot || cacheAgeMs > NAMESPACE_INBOX_CACHE_TTL_MS
+
+        if (shouldRefreshCache) {
+            c.executionCtx.waitUntil((async () => {
+                try {
+                    const freshVideos = await buildNamespaceInboxSnapshot(c.env, namespaceId)
+                    await writeNamespaceInboxSnapshot(bucket, namespaceId, freshVideos)
+                } catch (error) {
+                    console.log(`[INBOX-CACHE] refresh failed ns=${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                }
+            })())
+        }
+
+        const visibleVideos: Array<Record<string, unknown>> = Array.isArray(cachedSnapshot?.videos) && cachedSnapshot!.videos.length > 0
+            ? cachedSnapshot!.videos
+            : await buildNamespaceInboxSnapshot(c.env, namespaceId)
+        if (!cachedSnapshot?.videos?.length) {
+            await writeNamespaceInboxSnapshot(bucket, namespaceId, visibleVideos).catch(() => { })
+        }
+
+        const processedTotal = visibleVideos.filter((video) => !!String(video.processedAt || '').trim()).length
+        const unprocessedTotal = Math.max(0, visibleVideos.length - processedTotal)
+        const filteredVideos = visibleVideos.filter((video) => (
+            view === 'processed'
+                ? !!String(video.processedAt || '').trim()
+                : !String(video.processedAt || '').trim()
+        ))
+        const page = sliceGalleryPage(filteredVideos, offset, limit)
         c.executionCtx.waitUntil(backfillNamespaceInboxOriginalAssets({
             env: c.env,
-            bucket: c.get('bucket'),
+            bucket,
             namespaceId,
         }).catch((error) => {
             console.log(`[INBOX-BACKFILL] namespace=${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
         }))
         c.executionCtx.waitUntil(Promise.all(
-            page.videos.slice(0, 6).map((record) => ensureInboxAutoCoverSuggestion({
+            page.videos.slice(0, 6).map((video) => ensureInboxAutoCoverSuggestion({
                 env: c.env,
-                bucket: c.get('bucket'),
+                bucket,
                 namespaceId,
-                videoId: String(record.id || '').trim(),
+                videoId: String(video.id || '').trim(),
             }).catch(() => false))
         ))
         return c.json({
-            videos,
-            total: records.length,
+            videos: page.videos,
+            total: visibleVideos.length,
+            processed_total: processedTotal,
+            unprocessed_total: unprocessedTotal,
             offset,
             limit,
             has_more: page.hasMore,
+            view,
         }, 200, {
             'Cache-Control': offset === 0
                 ? 'private, no-store'
@@ -13833,6 +13893,7 @@ app.get('/api/inbox/system', async (c) => {
         const offset = parseNonNegativeInt(c.req.query('offset'), 0)
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
+        const view = String(c.req.query('view') || 'unprocessed').trim().toLowerCase() === 'processed' ? 'processed' : 'unprocessed'
         const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
@@ -13871,7 +13932,14 @@ app.get('/api/inbox/system', async (c) => {
             !!String(video.thumbnailUrl || '').trim()
             || !!String((video as Record<string, unknown>).fallbackThumbnailUrl || '').trim()
         ))
-        const page = sliceGalleryPage(visibleVideos, offset, limit)
+        const processedTotal = visibleVideos.filter((video) => !!String(video.processedAt || '').trim()).length
+        const unprocessedTotal = Math.max(0, visibleVideos.length - processedTotal)
+        const filteredVideos = visibleVideos.filter((video) => (
+            view === 'processed'
+                ? !!String(video.processedAt || '').trim()
+                : !String(video.processedAt || '').trim()
+        ))
+        const page = sliceGalleryPage(filteredVideos, offset, limit)
         c.executionCtx.waitUntil(Promise.all(
             page.videos.slice(0, 6).map((video) => {
                 const videoId = String(video.id || '').trim()
@@ -13890,9 +13958,12 @@ app.get('/api/inbox/system', async (c) => {
         return c.json({
             videos: page.videos,
             total: visibleVideos.length,
+            processed_total: processedTotal,
+            unprocessed_total: unprocessedTotal,
             offset,
             limit,
             has_more: page.hasMore,
+            view,
         }, 200, {
             'Cache-Control': forceFresh || offset === 0
                 ? 'private, no-store'
@@ -13901,6 +13972,60 @@ app.get('/api/inbox/system', async (c) => {
         })
     } catch (e) {
         return c.json({ error: String(e), videos: [] }, 500)
+    }
+})
+
+app.post('/api/inbox/reset-processed', async (c) => {
+    const authCheck = await requireSystemAdminSession(c)
+    if (!authCheck.ok) return authCheck.response
+
+    try {
+        const body = await c.req.json().catch(() => ({})) as { namespace_id?: string }
+        const targetNamespaceId = String(body.namespace_id || authCheck.namespaceId || '').trim()
+        if (!targetNamespaceId) return c.json({ error: 'missing_namespace_id' }, 400)
+
+        const bucket = new BotBucket(c.env.BUCKET, targetNamespaceId) as unknown as R2Bucket
+        const records = await listInboxVideoRecords(bucket)
+
+        let processedBefore = 0
+        let resetCount = 0
+        const nextRecords: InboxVideoRecord[] = []
+        for (const record of records) {
+            if (!String(record.processedAt || '').trim()) {
+                nextRecords.push(record)
+                continue
+            }
+            processedBefore += 1
+            const nextRecord = await putInboxVideoRecord(bucket, {
+                ...record,
+                processedAt: '',
+                updatedAt: new Date().toISOString(),
+            })
+            nextRecords.push(nextRecord)
+            resetCount += 1
+        }
+
+        await writeNamespaceInboxSnapshot(
+            bucket,
+            targetNamespaceId,
+            nextRecords.map((record) => buildInboxVideoResponseForNamespace(c.env, record, targetNamespaceId)),
+        ).catch(() => { })
+
+        if (authCheck.namespaceId === targetNamespaceId) {
+            await writeSystemInboxSnapshot(bucket, targetNamespaceId, []).catch(() => { })
+        }
+
+        return c.json({
+            ok: true,
+            namespace_id: targetNamespaceId,
+            total: records.length,
+            processed_before: processedBefore,
+            processed_reset: resetCount,
+            unprocessed_after: records.length,
+            processed_after: 0,
+        })
+    } catch (e) {
+        return c.json({ error: String(e) }, 500)
     }
 })
 
@@ -14566,12 +14691,6 @@ app.post('/api/gallery/refresh/:id', async (c) => {
             }).catch(() => null)
         }
         await c.get('bucket').delete(`_link_context/${videoId}.json`).catch(() => { })
-
-        if (videoId) {
-            c.executionCtx.waitUntil(processPendingAffiliateConversions(c.env).catch((error) => {
-                console.log(`[GALLERY-REFRESH] affiliate conversion failed video=${videoId}: ${error instanceof Error ? error.message : String(error)}`)
-            }))
-        }
 
         await c.get('bucket').delete(`_processing/${videoId}.json`).catch(() => { })
 
@@ -15336,9 +15455,6 @@ app.put('/api/gallery/:id', async (c) => {
         })
         if (touchedAffiliateFields) {
             await upsertNamespaceVideoState(c.env.DB, targetNamespaceId, id, nextStateFields)
-            c.executionCtx.waitUntil(processPendingAffiliateConversions(c.env).catch((error) => {
-                console.log(`[GALLERY-PUT] affiliate conversion failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
-            }))
         }
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
@@ -15550,6 +15666,7 @@ async function handleGalleryFrameRequest(c: Context<{ Bindings: Env, Variables: 
         background_color: c.req.query('bc') || c.req.query('bg_color') || '',
         background_opacity: c.req.query('bo') || c.req.query('bg_opacity') || '',
         size_scale: c.req.query('ts') || c.req.query('text_scale') || '',
+        auto_fit: c.req.query('af') || c.req.query('auto_fit') || '',
         mode: c.req.query('om') || c.req.query('overlay_mode') || '',
         outline_color: c.req.query('oc') || c.req.query('outline_color') || '',
         outline_width: c.req.query('ow') || c.req.query('outline_width') || '',
@@ -15583,6 +15700,7 @@ async function handleGalleryFrameRequest(c: Context<{ Bindings: Env, Variables: 
                     backgroundColor: coverTextStyle.backgroundColor,
                     backgroundOpacity: coverTextStyle.backgroundOpacity,
                     sizeScale: coverTextStyle.sizeScale,
+                    autoFit: coverTextStyle.autoFit,
                     mode: coverTextStyle.mode,
                     outlineColor: coverTextStyle.outlineColor,
                     outlineWidth: coverTextStyle.outlineWidth,
@@ -15672,7 +15790,7 @@ const DEFAULT_COVER_TEMPLATE_ID = 'template-1'
 const DEFAULT_COVER_TEXT_STYLE_FONT_ID = 'kanit-bold'
 const DEFAULT_COVER_TEXT_STYLE_BACKGROUND_OPACITY = 0.94
 const DEFAULT_COVER_TEXT_STYLE_SIZE_SCALE = 1
-const COVER_TEXT_STYLE_SIZE_SCALE_MIN = 0.8
+const COVER_TEXT_STYLE_SIZE_SCALE_MIN = 0.5
 const COVER_TEXT_STYLE_SIZE_SCALE_MAX = 1.35
 const DEFAULT_POSTING_ORDER: NamespacePostingOrder = 'oldest_first'
 const COVER_TEMPLATE_IDS = new Set([
@@ -15711,6 +15829,7 @@ type CoverTextStyleSettings = {
     backgroundColor: string
     backgroundOpacity: number
     sizeScale: number
+    autoFit: boolean
     mode: CoverTextStyleMode
     outlineColor: string
     outlineWidth: number
@@ -16095,6 +16214,7 @@ async function setNamespaceCoverTextStyle(
         background_color: style.backgroundColor,
         background_opacity: style.backgroundOpacity,
         size_scale: style.sizeScale,
+        auto_fit: style.autoFit,
         mode: style.mode,
         outline_color: style.outlineColor,
         outline_width: style.outlineWidth,
@@ -16115,6 +16235,7 @@ async function getNamespaceCoverTemplateSettings(db: D1Database, namespaceId: st
             background_color: textStyleEntry.style.backgroundColor,
             background_opacity: textStyleEntry.style.backgroundOpacity,
             size_scale: textStyleEntry.style.sizeScale,
+            auto_fit: textStyleEntry.style.autoFit,
             mode: textStyleEntry.style.mode,
             outline_color: textStyleEntry.style.outlineColor,
             outline_width: textStyleEntry.style.outlineWidth,
@@ -16658,6 +16779,11 @@ async function persistAffiliateVideoMeta(env: Env, namespaceId: string, videoId:
 }
 
 async function processPendingAffiliateConversions(env: Env): Promise<void> {
+    void env
+    // 2026-04-20: disabled by design.
+    // Shortlink must run only at posting time, behind the explicit namespace toggle.
+    return
+
     const videos = await getAllSystemGalleryVideos(env)
     const namespaceIds = Array.from(new Set(
         videos
@@ -17211,12 +17337,7 @@ async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: 
     const lazadaExpected = await getNamespaceLazadaExpectedMemberIdEntry(db, namespaceId)
     const effectiveShopeeBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('shopee', derivedAccount) : row.baseUrl
     const effectiveLazadaBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('lazada', derivedAccount) : lazadaRow.baseUrl
-    const required = explicitRequired || (
-        !!effectiveShopeeBaseUrl
-        && !!effectiveLazadaBaseUrl
-        && !!expected.expectedUtmId
-        && !!lazadaExpected.expectedMemberId
-    )
+    const required = explicitRequired
     const updatedAt = [accountEntry.updatedAt, row.updatedAt, lazadaRow.updatedAt, expected.updatedAt, lazadaExpected.updatedAt]
         .map((value) => String(value || '').trim())
         .filter(Boolean)
@@ -19088,13 +19209,27 @@ function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string,
 async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string, shopeeLink: string, lazadaLink = ''): Promise<string> {
     const shopee = String(shopeeLink || '').trim()
     if (!shopee) return ''
-    const settings = namespaceId
-        ? await getNamespaceCommentTemplateSettings(db, namespaceId).catch(() => ({
-            template: DEFAULT_COMMENT_TEMPLATE,
-            source: 'default' as const,
-            updated_at: null,
-        }))
-        : { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null }
+    const ns = String(namespaceId || '').trim()
+    let settings: { template: string; source: 'default' | 'custom'; updated_at: string | null }
+    let lookupError: string | null = null
+    if (ns) {
+        try {
+            settings = await getNamespaceCommentTemplateSettings(db, ns)
+        } catch (e) {
+            lookupError = e instanceof Error ? e.message : String(e)
+            settings = {
+                template: DEFAULT_COMMENT_TEMPLATE,
+                source: 'default' as const,
+                updated_at: null,
+            }
+        }
+    } else {
+        settings = { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null }
+    }
+    // DEBUG: log namespace + which template source was picked. Helps diagnose when
+    // custom template isn't being used despite user saving one (e.g., empty namespaceId
+    // passed by caller, DB read error, wrong namespace_id column value in post_history).
+    console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} source=${settings.source} template_len=${settings.template.length} has_lazada_placeholder=${settings.template.includes(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER)} lookup_error=${lookupError || 'none'}`)
     const lazada = String(lazadaLink || '').trim()
     const rendered = renderAffiliateCommentTemplate(settings.template, shopee, lazada)
     // DO NOT auto-append lazada link. Respect user's template exactly — if {{lazada_link}} is not in template, user does not want lazada link in comment.
@@ -19353,11 +19488,15 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     //   3) fall back to the BARE product URL → BREAKS their affiliate tracking
     // So: admin namespace → re-shorten with current admin sub_ids.
     //     member namespaces → return the submitted link AS-IS.
-    const isAdminNamespace = await isNamespaceShortlinkAdminManaged(params.env.DB, params.namespaceId).catch(() => false)
+    const [isAdminManaged, shortlinkRequired] = await Promise.all([
+        isNamespaceShortlinkAdminManaged(params.env.DB, params.namespaceId).catch(() => false),
+        isNamespaceAffiliateShortlinkRequired(params.env.DB, params.namespaceId).catch(() => false),
+    ])
+    const isAdminNamespace = isAdminManaged && shortlinkRequired
 
     if (!isAdminNamespace) {
-        console.log(`[${params.logPrefix}] Non-admin namespace ${params.namespaceId} — using submitted Shopee link as-is (no re-shorten)`)
-        writeTrace({ utmSource: extractShopeeUtmSourceFromLink(link) || null, status: 'shortened', error: null })
+        console.log(`[${params.logPrefix}] Shortlink disabled for namespace ${params.namespaceId} — using submitted Shopee link as-is`)
+        writeTrace({ utmSource: extractShopeeUtmSourceFromLink(link) || null, status: 'disabled', error: null })
         return link
     }
 
@@ -26640,9 +26779,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     enqueueBackgroundTask(ctx, 'CRON AUTO-IMPORT', async () => {
         await autoImportAndProcessForAdmin(env, ctx)
     })
-    enqueueBackgroundTask(ctx, 'CRON AFFILIATE', async () => {
-        await processPendingAffiliateConversions(env)
-    })
     enqueueBackgroundTask(ctx, 'CRON WARM-UP', async () => {
         const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
         const containerStub = env.MERGE_CONTAINER.get(containerId)
@@ -27057,7 +27193,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             : new BotBucket(env.BUCKET, sourceNamespaceId) as unknown as R2Bucket
         const meta = await loadLatestVideoMetaForPosting(sourceBucket, unpostedId, pickedVideo)
         // === SHORTLINK BEFORE POSTING: ONLY for admin namespace. Members use raw links from gallery as-is ===
-        const isAdminNamespace = await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
+        const [isAdminManaged, shortlinkRequired] = await Promise.all([
+            isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false),
+            isNamespaceAffiliateShortlinkRequired(env.DB, botId).catch(() => false),
+        ])
+        const isAdminNamespace = isAdminManaged && shortlinkRequired
         const rawShopeeLink = normalizeMetaShopeeLink(meta) || ''
         const shopeeShortlinkTrace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         let normalizedShopeeLink = rawShopeeLink
