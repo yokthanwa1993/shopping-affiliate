@@ -755,6 +755,15 @@ const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
   return `${fontLabel} • พื้นหลัง ${Math.round(style.background_opacity * 100)}% • ขนาด ${Math.round(style.size_scale * 100)}% • ${style.auto_fit ? 'ย่ออัตโนมัติ' : 'ขนาดคงที่'}`
 }
 
+const estimateCoverPreviewFontSize = (lines: string[], baseFontSize: number, autoFit: boolean) => {
+  if (!autoFit) return baseFontSize
+  const longestLineChars = lines.reduce((max, line) => Math.max(max, Array.from(line).length), 1)
+  const maxTextWidth = 188
+  const estimatedWidth = longestLineChars * baseFontSize * 0.62
+  if (estimatedWidth <= maxTextWidth) return baseFontSize
+  return Math.max(14, Math.round(baseFontSize * Math.min(1, maxTextWidth / estimatedWidth)))
+}
+
 const VOICE_PERSONA_OPTIONS: Array<{ value: VoicePersonaPreset; label: string; hint: string }> = [
   { value: 'female', label: 'ผู้หญิง', hint: 'นุ่มลื่น ชัดถ้อย' },
   { value: 'male', label: 'ผู้ชาย', hint: 'มั่นใจ กระชับ' },
@@ -8264,70 +8273,66 @@ function App({
                             </div>
                           </button>
 
-                          <div className="space-y-2">
+                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-2">
                             <div className="flex items-center justify-between">
-                              <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างข้อความยาว</p>
+                              <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างปก 9:16</p>
                               <p className="text-[11px] text-gray-400">{coverTextStyleDraft.auto_fit ? 'เปิดอัตโนมัติ' : 'ปิดอัตโนมัติ'}</p>
                             </div>
-                            <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3">
-                              <div
-                                className="mx-auto rounded-lg px-3 py-2 text-center font-bold leading-tight"
-                                style={{
-                                  maxWidth: '100%',
-                                  fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
-                                  backgroundColor: coverTextStyleDraft.mode === 'box'
-                                    ? `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`
-                                    : 'transparent',
-                                  color: coverTextStyleDraft.text_color,
-                                  fontSize: `${Math.round((coverTextStyleDraft.auto_fit ? 16 : 24) * coverTextStyleDraft.size_scale)}px`,
-                                  WebkitTextStroke: coverTextStyleDraft.mode === 'outline'
-                                    ? `${coverTextStyleDraft.outline_width > 0 ? 1 : 0}px ${coverTextStyleDraft.outline_color}`
-                                    : undefined,
-                                  paintOrder: coverTextStyleDraft.mode === 'outline' ? 'stroke fill' : undefined,
-                                  overflow: 'hidden',
-                                  textOverflow: coverTextStyleDraft.auto_fit ? 'clip' : 'ellipsis',
-                                  whiteSpace: 'nowrap',
-                                }}
-                              >
-                                ของในบ้านไม่ต้องยกให้เมื่อย
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-2">
-                            <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างสไตล์</p>
-                            <div className="rounded-2xl bg-slate-900/90 px-4 py-6 flex items-center justify-center">
-                              {coverTextStyleDraft.mode === 'outline' ? (
-                                <div
-                                  className="flex flex-col items-center justify-center text-center font-bold leading-tight"
-                                  style={{
-                                    fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
-                                    fontSize: `${Math.round(32 * coverTextStyleDraft.size_scale)}px`,
-                                    // Match the proportional stroke ratio of the final 1080-wide cover:
-                                    // final font_size ≈ 1080 × 0.18 = 194px, final visible stroke = outline_width / 2 (PIL halves).
-                                    // preview font_size base = 32 → preview stroke = outline_width × 32 / (2 × 194) ≈ outline_width × 0.082
-                                    // (size_scale cancels because preview font and final font both scale with it)
-                                    WebkitTextStroke: `${coverTextStyleDraft.outline_width > 0 ? Math.max(1, Math.round(coverTextStyleDraft.outline_width * 32 / (1080 * 0.36))) : 0}px ${coverTextStyleDraft.outline_color}`,
-                                    paintOrder: 'stroke fill',
-                                  }}
-                                >
-                                  <span style={{ color: coverTextStyleDraft.text_color }}>ข้อความบนปก</span>
-                                  <span style={{ color: coverTextStyleDraft.secondary_text_color }}>ตัวอย่าง</span>
+                            {(() => {
+                              const previewLines = ['ของในบ้านไม่ต้องยกให้เมื่อย', 'ตัวอย่าง']
+                              const previewFontSize = estimateCoverPreviewFontSize(
+                                previewLines,
+                                Math.round(40 * coverTextStyleDraft.size_scale),
+                                coverTextStyleDraft.auto_fit,
+                              )
+                              const previewStrokeWidth = coverTextStyleDraft.outline_width > 0
+                                ? Math.max(1, Math.round(coverTextStyleDraft.outline_width * previewFontSize / (1080 * 0.36)))
+                                : 0
+                              return (
+                                <div className="flex justify-center">
+                                  <div
+                                    className="relative w-full max-w-[230px] overflow-hidden rounded-2xl bg-slate-900 shadow-sm"
+                                    style={{ aspectRatio: '9 / 16' }}
+                                  >
+                                    <div className="absolute inset-0 bg-slate-800" />
+                                    <div className="absolute left-[14%] top-[8%] h-[18%] w-[44%] rounded-md bg-slate-700/70" />
+                                    <div className="absolute right-[10%] top-[12%] h-[30%] w-[24%] rounded-md bg-slate-600/70" />
+                                    <div className="absolute bottom-0 left-0 right-0 h-[38%] bg-slate-700" />
+                                    <div className="absolute bottom-[20%] left-[18%] h-[13%] w-[64%] rounded-xl bg-slate-200/80" />
+                                    <div className="absolute bottom-[17%] left-[16%] h-[8%] w-[14%] rounded-full bg-slate-100/90" />
+                                    <div className="absolute bottom-[17%] right-[16%] h-[8%] w-[14%] rounded-full bg-slate-100/90" />
+                                    <div className="absolute left-0 right-0 top-[34%] flex justify-center px-2">
+                                      {coverTextStyleDraft.mode === 'outline' ? (
+                                        <div
+                                          className="flex max-w-[92%] flex-col items-center justify-center text-center font-bold leading-tight"
+                                          style={{
+                                            fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
+                                            fontSize: `${previewFontSize}px`,
+                                            WebkitTextStroke: `${previewStrokeWidth}px ${coverTextStyleDraft.outline_color}`,
+                                            paintOrder: 'stroke fill',
+                                          }}
+                                        >
+                                          <span style={{ color: coverTextStyleDraft.text_color }}>{previewLines[0]}</span>
+                                          <span style={{ color: coverTextStyleDraft.secondary_text_color }}>{previewLines[1]}</span>
+                                        </div>
+                                      ) : (
+                                        <div
+                                          className="flex max-w-[96%] flex-col items-center justify-center px-3 py-1.5 text-center font-bold leading-tight"
+                                          style={{
+                                            fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
+                                            backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
+                                            fontSize: `${previewFontSize}px`,
+                                          }}
+                                        >
+                                          <span className="whitespace-nowrap" style={{ color: coverTextStyleDraft.text_color }}>{previewLines[0]}</span>
+                                          <span className="whitespace-nowrap" style={{ color: coverTextStyleDraft.secondary_text_color }}>{previewLines[1]}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
                                 </div>
-                              ) : (
-                                <div
-                                  className="inline-flex flex-col items-center justify-center rounded-lg px-4 py-2 text-center font-bold leading-tight"
-                                  style={{
-                                    fontFamily: `'${getCoverTextFontFamily(coverTextStyleDraft.font_id)}', 'Kanit', sans-serif`,
-                                    backgroundColor: `${coverTextStyleDraft.background_color}${Math.round(coverTextStyleDraft.background_opacity * 255).toString(16).padStart(2, '0')}`,
-                                    fontSize: `${Math.round(26 * coverTextStyleDraft.size_scale)}px`,
-                                  }}
-                                >
-                                  <span style={{ color: coverTextStyleDraft.text_color }}>ข้อความบนปก</span>
-                                  <span style={{ color: coverTextStyleDraft.secondary_text_color }}>ตัวอย่าง</span>
-                                </div>
-                              )}
-                            </div>
+                              )
+                            })()}
                             <p className="text-[11px] text-gray-400">
                               บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2
                               {coverTextStyleDraft.mode === 'outline'
