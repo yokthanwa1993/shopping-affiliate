@@ -8246,8 +8246,30 @@ function App({
 
                           <div className="space-y-2">
                             <div className="flex items-center justify-between">
-                              <p className="text-[11px] font-semibold text-gray-600">ขนาดข้อความพื้นฐาน</p>
+                              <p className="text-[11px] font-semibold text-gray-600">ขนาดเริ่มต้นก่อน Auto</p>
                               <p className="text-[11px] text-gray-400">{Math.round(coverTextStyleDraft.size_scale * 100)}%</p>
+                            </div>
+                            <div className="grid grid-cols-3 gap-2">
+                              {[
+                                { label: 'เล็ก', value: 0.8 },
+                                { label: 'กลาง', value: 1 },
+                                { label: 'ใหญ่', value: 1.2 },
+                              ].map((option) => {
+                                const active = Math.abs(coverTextStyleDraft.size_scale - option.value) < 0.01
+                                return (
+                                  <button
+                                    key={option.label}
+                                    type="button"
+                                    onClick={() => {
+                                      setCoverTextStyleDraft((prev) => ({ ...prev, size_scale: option.value }))
+                                      if (coverTextStyleMessage) setCoverTextStyleMessage('')
+                                    }}
+                                    className={`rounded-lg border px-2 py-2 text-xs font-bold transition-all ${active ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-600'}`}
+                                  >
+                                    {option.label}
+                                  </button>
+                                )
+                              })}
                             </div>
                             <input
                               type="range"
@@ -8263,7 +8285,7 @@ function App({
                               data-allow-native-drag="true"
                               className="w-full accent-blue-600 touch-pan-x"
                             />
-                            <p className="text-[11px] text-gray-400">ใช้เป็นขนาดเริ่มต้นก่อนระบบปรับตามความยาวข้อความ</p>
+                            <p className="text-[11px] text-gray-400">ปรับได้แม้เปิด Auto อยู่: ระบบจะเริ่มจากขนาดนี้ แล้วค่อยย่อตอนข้อความยาว</p>
                           </div>
 
                           <button
