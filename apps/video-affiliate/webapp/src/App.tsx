@@ -756,6 +756,7 @@ const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
 }
 
 const COVER_TEXT_PREVIEW_IMAGE_URL = '/demo/cover-preview-cart.jpg'
+const DEFAULT_COVER_TEXT_PREVIEW_TEXT = 'ของในบ้านไม่ต้องยกให้เมื่อย\nตัวอย่าง'
 
 const estimateCoverPreviewFontSize = (lines: string[], baseFontSize: number, autoFit: boolean) => {
   if (!autoFit) return baseFontSize
@@ -3176,6 +3177,7 @@ function App({
   const [coverTextStyleMessage, setCoverTextStyleMessage] = useState('')
   const [coverTextStyleLoading, setCoverTextStyleLoading] = useState(false)
   const [coverTextStyleSaving, setCoverTextStyleSaving] = useState(false)
+  const [coverTextPreviewText, setCoverTextPreviewText] = useState(DEFAULT_COVER_TEXT_PREVIEW_TEXT)
   const [commentTemplate, setCommentTemplate] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateDraft, setCommentTemplateDraft] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateSource, setCommentTemplateSource] = useState<'default' | 'custom'>('default')
@@ -8281,7 +8283,12 @@ function App({
                               <p className="text-[11px] text-gray-400">{coverTextStyleDraft.auto_fit ? 'เปิดอัตโนมัติ' : 'ปิดอัตโนมัติ'}</p>
                             </div>
                             {(() => {
-                              const previewLines = ['ของในบ้านไม่ต้องยกให้เมื่อย', 'ตัวอย่าง']
+                              const previewLines = normalizeLineCoverText(coverTextPreviewText)
+                                .split('\n')
+                                .map((line) => line.trim())
+                                .filter(Boolean)
+                                .slice(0, 3)
+                              if (previewLines.length === 0) previewLines.push('ข้อความบนปก')
                               const previewFontSize = estimateCoverPreviewFontSize(
                                 previewLines,
                                 Math.round(40 * coverTextStyleDraft.size_scale),
@@ -8335,6 +8342,16 @@ function App({
                                 </div>
                               )
                             })()}
+                            <label className="block space-y-1">
+                              <span className="text-[11px] font-semibold text-gray-600">ลองพิมพ์ข้อความบนปก</span>
+                              <textarea
+                                value={coverTextPreviewText}
+                                onChange={(e) => setCoverTextPreviewText(e.target.value.slice(0, 80))}
+                                rows={3}
+                                placeholder="พิมพ์ข้อความตัวอย่าง หรือใช้ | เพื่อขึ้นบรรทัดใหม่"
+                                className="w-full resize-none rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-800 outline-none focus:border-blue-400"
+                              />
+                            </label>
                             <p className="text-[11px] text-gray-400">
                               บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2
                               {coverTextStyleDraft.mode === 'outline'
