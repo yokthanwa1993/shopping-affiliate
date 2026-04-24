@@ -758,6 +758,18 @@ const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
 const COVER_TEXT_PREVIEW_IMAGE_URL = '/demo/cover-preview-cart.jpg'
 const DEFAULT_COVER_TEXT_PREVIEW_TEXT = 'ของในบ้านไม่ต้องยกให้เมื่อย\nตัวอย่าง'
 
+const normalizeCoverTextPreviewText = (input: string) =>
+  String(input || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\\n/g, '\n')
+    .replace(/\s*\|\s*/g, '\n')
+    .replace(/\s*\/\/\s*/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .slice(0, 3)
+
 const estimateCoverPreviewFontSize = (lines: string[], baseFontSize: number, autoFit: boolean) => {
   if (!autoFit) return baseFontSize
   const longestLineChars = lines.reduce((max, line) => Math.max(max, Array.from(line).length), 1)
@@ -8283,11 +8295,7 @@ function App({
                               <p className="text-[11px] text-gray-400">{coverTextStyleDraft.auto_fit ? 'เปิดอัตโนมัติ' : 'ปิดอัตโนมัติ'}</p>
                             </div>
                             {(() => {
-                              const previewLines = normalizeLineCoverText(coverTextPreviewText)
-                                .split('\n')
-                                .map((line) => line.trim())
-                                .filter(Boolean)
-                                .slice(0, 3)
+                              const previewLines = normalizeCoverTextPreviewText(coverTextPreviewText)
                               if (previewLines.length === 0) previewLines.push('ข้อความบนปก')
                               const previewFontSize = estimateCoverPreviewFontSize(
                                 previewLines,
