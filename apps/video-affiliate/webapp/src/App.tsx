@@ -8068,7 +8068,7 @@ function App({
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ตั้งค่าสไตล์ข้อความบนปกของ workspace นี้ได้เลย เวลาผู้ใช้พิมพ์คำบนปก ระบบจะใช้ฟอนต์ สีตัวหนังสือ สีพื้นหลัง และความโปร่งใสจากค่านี้ทันที โดยกล่องพื้นหลังจะพอดีกับความยาวข้อความอัตโนมัติ
+                        ตั้งค่าสไตล์ข้อความบนปกของ workspace นี้ได้เลย เวลาผู้ใช้พิมพ์คำบนปก ระบบจะใช้ฟอนต์ สีตัวหนังสือ สีพื้นหลัง และความโปร่งใสจากค่านี้กับการ render ปกจริงทันที
                       </p>
                       {coverTextStyleLoading ? (
                         <p className="text-sm text-gray-400 py-3">กำลังโหลดการตั้งค่าข้อความบนปก...</p>
@@ -8291,7 +8291,7 @@ function App({
 
                           <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 space-y-2">
                             <div className="flex items-center justify-between">
-                              <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างปก 9:16</p>
+                              <p className="text-[11px] font-semibold text-gray-600">ตัวอย่างปกจริง 9:16</p>
                               <p className="text-[11px] text-gray-400">{coverTextStyleDraft.auto_fit ? 'เปิดอัตโนมัติ' : 'ปิดอัตโนมัติ'}</p>
                             </div>
                             {(() => {
@@ -8361,7 +8361,8 @@ function App({
                               />
                             </label>
                             <p className="text-[11px] text-gray-400">
-                              บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2
+                              ตัวอย่างนี้ใช้ frame จากวิดีโอจริง และใช้สัดส่วน 9:16 เหมือนปกที่ระบบสร้าง
+                              {' '}บรรทัด 1 = สีตัวหนังสือ, บรรทัด 2+ = สีบรรทัดที่ 2
                               {coverTextStyleDraft.mode === 'outline'
                                 ? ' — ปกจริงที่ render จะคมกว่านี้'
                                 : ' — พื้นหลังของข้อความจริงจะพอดีกับความกว้างข้อความอัตโนมัติ'}
