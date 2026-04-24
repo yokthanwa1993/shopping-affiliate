@@ -755,6 +755,8 @@ const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
   return `${fontLabel} • พื้นหลัง ${Math.round(style.background_opacity * 100)}% • ขนาด ${Math.round(style.size_scale * 100)}% • ${style.auto_fit ? 'ย่ออัตโนมัติ' : 'ขนาดคงที่'}`
 }
 
+const COVER_TEXT_PREVIEW_IMAGE_URL = '/demo/cover-preview-cart.jpg'
+
 const estimateCoverPreviewFontSize = (lines: string[], baseFontSize: number, autoFit: boolean) => {
   if (!autoFit) return baseFontSize
   const longestLineChars = lines.reduce((max, line) => Math.max(max, Array.from(line).length), 1)
@@ -8294,13 +8296,13 @@ function App({
                                     className="relative w-full max-w-[230px] overflow-hidden rounded-2xl bg-slate-900 shadow-sm"
                                     style={{ aspectRatio: '9 / 16' }}
                                   >
-                                    <div className="absolute inset-0 bg-slate-800" />
-                                    <div className="absolute left-[14%] top-[8%] h-[18%] w-[44%] rounded-md bg-slate-700/70" />
-                                    <div className="absolute right-[10%] top-[12%] h-[30%] w-[24%] rounded-md bg-slate-600/70" />
-                                    <div className="absolute bottom-0 left-0 right-0 h-[38%] bg-slate-700" />
-                                    <div className="absolute bottom-[20%] left-[18%] h-[13%] w-[64%] rounded-xl bg-slate-200/80" />
-                                    <div className="absolute bottom-[17%] left-[16%] h-[8%] w-[14%] rounded-full bg-slate-100/90" />
-                                    <div className="absolute bottom-[17%] right-[16%] h-[8%] w-[14%] rounded-full bg-slate-100/90" />
+                                    <img
+                                      src={COVER_TEXT_PREVIEW_IMAGE_URL}
+                                      alt=""
+                                      className="absolute inset-0 h-full w-full object-cover"
+                                      loading="lazy"
+                                    />
+                                    <div className="absolute inset-0 bg-black/5" />
                                     <div className="absolute left-0 right-0 top-[34%] flex justify-center px-2">
                                       {coverTextStyleDraft.mode === 'outline' ? (
                                         <div
