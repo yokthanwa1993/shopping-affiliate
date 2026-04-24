@@ -367,9 +367,9 @@ fn build_thumbnail_plan(
         .max()
         .unwrap_or(0)
         .max(1) as f64;
-    // Base font size at 100% scale: 18% of frame width (≈194px on 1080px wide = viral-huge).
-    // Size-scale slider still multiplies: 100%=194px, 120%=233px, 135%=262px.
-    let mut font_size = (((target_width as f64) * 0.18) * size_scale).round().max(72.0);
+    // Base font size at 100% scale: 13% of frame width (≈140px on 1080px wide).
+    // Auto-fit still shrinks long text, but short headlines no longer dominate the cover.
+    let mut font_size = (((target_width as f64) * 0.13) * size_scale).round().max(56.0);
     // Max text width 92% of frame — allow long text without excessive shrink.
     let max_text_width = (target_width as f64) * 0.92;
     let estimated_char_width = font_size * 0.62;

@@ -8299,7 +8299,7 @@ function App({
                               if (previewLines.length === 0) previewLines.push('ข้อความบนปก')
                               const previewFontSize = estimateCoverPreviewFontSize(
                                 previewLines,
-                                Math.round(40 * coverTextStyleDraft.size_scale),
+                                Math.round(30 * coverTextStyleDraft.size_scale),
                                 coverTextStyleDraft.auto_fit,
                               )
                               const previewStrokeWidth = coverTextStyleDraft.outline_width > 0
