@@ -103,6 +103,8 @@ fn normalize_overlay_text(input: &str) -> String {
     input
         .replace("\r\n", "\n")
         .replace('\u{00A0}', " ")
+        .replace("\\n", "\n")
+        .replace('|', "\n")
         .split('\n')
         .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
@@ -119,8 +121,21 @@ fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize, s
         return String::new();
     }
 
-    let max_chars = max_chars_per_line.max(8);
     let max_lines = max_lines.max(1);
+    let manual_lines: Vec<String> = normalized
+        .split('\n')
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if manual_lines.len() > 1 {
+        return manual_lines
+            .into_iter()
+            .take(max_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    let max_chars = max_chars_per_line.max(8);
     let mut lines: Vec<String> = Vec::new();
 
     for paragraph in normalized.split('\n') {
