@@ -1021,17 +1021,18 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
         return false
     }
 
-    // เอาตัวที่เก่าที่สุด (sorted by key/timestamp)
-    const sorted = queueList.objects.sort((a, b) => a.uploaded.getTime() - b.uploaded.getTime())
-    const oldest = sorted[0]
+    // Process the latest explicit submission first. Background admin ingestion does
+    // not need a deep FIFO queue; newer user-provided links should get the next slot.
+    const sorted = queueList.objects.sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
+    const next = sorted[0]
 
-    const jobData = await botBucket.get(oldest.key)
+    const jobData = await botBucket.get(next.key)
     if (!jobData) return false
 
     const job = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string }
 
     // ย้ายจาก _queue → _processing
-    await botBucket.delete(oldest.key)
+    await botBucket.delete(next.key)
     await botBucket.put(`_processing/${job.id}.json`, JSON.stringify({
         ...job,
         status: 'processing',

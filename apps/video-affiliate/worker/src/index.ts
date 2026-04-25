@@ -13540,7 +13540,14 @@ async function prepareInboxVideoForManagedLinks(params: {
     const item = normalizeInboxVideoRecord(params.item)
     if (!namespaceId || !item || item.status !== 'ready') return null
 
-    const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false)
+    const [adminManaged, shortlinkRequired] = await Promise.all([
+        isNamespaceShortlinkAdminManaged(params.env.DB, namespaceId).catch(() => false),
+        isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false),
+    ])
+    if (adminManaged && !shortlinkRequired) {
+        console.log(`[${params.logPrefix}] Admin managed shortlink is not enabled for ${namespaceId}`)
+        return null
+    }
     if (!shortlinkRequired) return item
 
     const sourceShopeeLink = sanitizeAffiliateTrackingLink(pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || '')
@@ -13763,20 +13770,35 @@ async function ensureInboxVideoProcessingStarted(params: {
     const rawItem = normalizeInboxVideoRecord(params.item)
     if (!rawItem || rawItem.status !== 'ready') throw new Error('inbox_video_not_ready')
 
-    // 2026-04-20: shortlink runs ONLY at posting time.
-    // No submit-time or background conversion should run from inbox start.
+    // Admin originals must pass the configured managed shortlink flow before
+    // entering the processing pipeline. Member namespaces keep their raw links.
 
-    const item = await recordInboxLinkSubmissionIfNeeded({
+    let item = await recordInboxLinkSubmissionIfNeeded({
         db: params.env.DB,
         bucket: params.bucket,
         namespaceId: botId,
         item: rawItem,
     })
 
+    const preparedItem = await prepareInboxVideoForManagedLinks({
+        env: params.env,
+        bucket: params.bucket,
+        namespaceId: botId,
+        item,
+        logPrefix: `INBOX-PROCESS ${botId}/${item.id}`,
+    })
+    if (!preparedItem) {
+        throw new Error('managed_shortlink_conversion_failed')
+    }
+    item = preparedItem
+
     const processingStateMap = await getInboxProcessingStateMap(params.bucket)
     const currentProcessingState = processingStateMap.get(item.id) || 'idle'
     if (currentProcessingState !== 'idle') {
         return { outcome: 'already_running', item, status: currentProcessingState, id: item.id }
+    }
+    if (await hasActiveProcessingJob(params.bucket)) {
+        return { outcome: 'already_running', item, status: 'processing', id: item.id }
     }
 
     if (params.skipIfAlreadyProcessed) {
