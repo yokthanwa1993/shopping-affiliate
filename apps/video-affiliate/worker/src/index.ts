@@ -12835,6 +12835,53 @@ function buildInboxVideoResponseForNamespace(
     }
 }
 
+function buildInboxVideoResponseFromGalleryIndex(
+    env: Env,
+    video: Record<string, unknown>,
+    ownerEmail = '',
+): Record<string, unknown> | null {
+    const namespaceId = String(video.namespace_id || '').trim()
+    const videoId = String(video.id || video.video_id || '').trim()
+    const originalUrl = String(video.originalUrl || video.original_url || '').trim()
+    if (!namespaceId || !videoId || !originalUrl) return null
+    const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
+        String(env.WORKER_URL || '').trim(),
+        namespaceId,
+        videoId,
+        {
+            seed: `${namespaceId}:${videoId}:original`,
+            format: 'jpg',
+            width: 540,
+            height: 960,
+        },
+    )
+    return {
+        id: videoId,
+        videoUrl: originalUrl,
+        previewUrl: originalUrl,
+        thumbnailUrl: String(video.thumbnailUrl || video.thumbnail_url || '').trim()
+            || getVideoOriginalThumbnailUrlForNamespace(env.R2_PUBLIC_URL, namespaceId, videoId),
+        originalUrl,
+        fallbackThumbnailUrl,
+        createdAt: String(video.createdAt || video.created_at || video.updatedAt || video.updated_at || '').trim() || new Date().toISOString(),
+        updatedAt: String(video.updatedAt || video.updated_at || video.createdAt || video.created_at || '').trim() || new Date().toISOString(),
+        status: (String(video.shopeeLink || video.shopee_link || '').trim() && String(video.lazadaLink || video.lazada_link || '').trim())
+            ? 'ready'
+            : 'awaiting_links',
+        sourceType: 'line_video',
+        sourceLabel: 'Admin original',
+        shopeeLink: String(video.shopeeLink || video.shopee_link || '').trim(),
+        lazadaLink: String(video.lazadaLink || video.lazada_link || '').trim(),
+        hasShopeeLink: !!String(video.shopeeLink || video.shopee_link || '').trim(),
+        hasLazadaLink: !!String(video.lazadaLink || video.lazada_link || '').trim(),
+        readyToProcess: !!String(video.shopeeLink || video.shopee_link || '').trim() && !!String(video.lazadaLink || video.lazada_link || '').trim(),
+        canStartProcessing: true,
+        canDelete: true,
+        namespace_id: namespaceId,
+        ...(ownerEmail ? { owner_email: ownerEmail } : {}),
+    }
+}
+
 const NAMESPACE_INBOX_CACHE_TTL_MS = 15 * 1000
 const SYSTEM_INBOX_CACHE_TTL_MS = 15 * 1000
 
@@ -12891,6 +12938,22 @@ async function buildSystemInboxSnapshot(
     env: Env,
     currentNamespaceId: string,
 ): Promise<Array<Record<string, unknown>>> {
+    const namespaceEmailMap = await getNamespaceOwnerEmailMap(env.DB)
+    const currentNamespaceGalleryVideos = await listGalleryIndexVideos(env.DB, {
+        namespaceId: currentNamespaceId,
+        playableOnly: true,
+    }).catch(() => [])
+    const currentNamespaceOriginalVideos = currentNamespaceGalleryVideos
+        .map((video) => buildInboxVideoResponseFromGalleryIndex(
+            env,
+            video as unknown as Record<string, unknown>,
+            namespaceEmailMap.get(currentNamespaceId) || '',
+        ))
+        .filter((video): video is Record<string, unknown> => !!video)
+    if (currentNamespaceOriginalVideos.length > 0) {
+        return dedupeSystemInboxVideos(currentNamespaceOriginalVideos, currentNamespaceId)
+    }
+
     const namespaceIds = new Set<string>()
     try {
         const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
@@ -12901,7 +12964,6 @@ async function buildSystemInboxSnapshot(
     } catch { /* email_namespaces table may not exist */ }
     if (currentNamespaceId) namespaceIds.add(currentNamespaceId)
 
-    const namespaceEmailMap = await getNamespaceOwnerEmailMap(env.DB)
     const hiddenImportedSourceKeys = new Set<string>()
     if (currentNamespaceId) {
         await ensureImportedVideosTable(env.DB)
