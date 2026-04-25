@@ -12844,6 +12844,10 @@ function buildInboxVideoResponseFromGalleryIndex(
     const videoId = String(video.id || video.video_id || '').trim()
     const originalUrl = String(video.originalUrl || video.original_url || '').trim()
     if (!namespaceId || !videoId || !originalUrl) return null
+    const processedAt = String(video.processedAt || video.processed_at || '').trim()
+    const shopeeLink = String(video.shopeeLink || video.shopee_link || '').trim()
+    const lazadaLink = String(video.lazadaLink || video.lazada_link || '').trim()
+    const readyToProcess = !processedAt && !!shopeeLink && !!lazadaLink
     const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
         String(env.WORKER_URL || '').trim(),
         namespaceId,
@@ -12865,17 +12869,18 @@ function buildInboxVideoResponseFromGalleryIndex(
         fallbackThumbnailUrl,
         createdAt: String(video.createdAt || video.created_at || video.updatedAt || video.updated_at || '').trim() || new Date().toISOString(),
         updatedAt: String(video.updatedAt || video.updated_at || video.createdAt || video.created_at || '').trim() || new Date().toISOString(),
-        status: (String(video.shopeeLink || video.shopee_link || '').trim() && String(video.lazadaLink || video.lazada_link || '').trim())
+        ...(processedAt ? { processedAt } : {}),
+        status: (shopeeLink && lazadaLink)
             ? 'ready'
             : 'awaiting_links',
         sourceType: 'line_video',
         sourceLabel: 'Admin original',
-        shopeeLink: String(video.shopeeLink || video.shopee_link || '').trim(),
-        lazadaLink: String(video.lazadaLink || video.lazada_link || '').trim(),
-        hasShopeeLink: !!String(video.shopeeLink || video.shopee_link || '').trim(),
-        hasLazadaLink: !!String(video.lazadaLink || video.lazada_link || '').trim(),
-        readyToProcess: !!String(video.shopeeLink || video.shopee_link || '').trim() && !!String(video.lazadaLink || video.lazada_link || '').trim(),
-        canStartProcessing: true,
+        shopeeLink,
+        lazadaLink,
+        hasShopeeLink: !!shopeeLink,
+        hasLazadaLink: !!lazadaLink,
+        readyToProcess,
+        canStartProcessing: !processedAt,
         canDelete: true,
         namespace_id: namespaceId,
         ...(ownerEmail ? { owner_email: ownerEmail } : {}),
