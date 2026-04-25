@@ -12887,6 +12887,84 @@ function buildInboxVideoResponseFromGalleryIndex(
     }
 }
 
+async function getNamespaceInboxGalleryIndexPage(params: {
+    env: Env
+    namespaceId: string
+    ownerEmail?: string
+    view: 'unprocessed' | 'processed'
+    offset: number
+    limit: number
+}): Promise<{
+    videos: Array<Record<string, unknown>>
+    total: number
+    processedTotal: number
+    unprocessedTotal: number
+    hasMore: boolean
+}> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    if (!namespaceId) {
+        return { videos: [], total: 0, processedTotal: 0, unprocessedTotal: 0, hasMore: false }
+    }
+    await ensureGalleryIndexTable(params.env.DB).catch(() => { })
+    const offset = Math.max(0, Number(params.offset || 0))
+    const limit = Math.min(Math.max(1, Number(params.limit || 24)), 120)
+    const processedClause = params.view === 'processed'
+        ? "AND TRIM(COALESCE(processed_at,'')) <> ''"
+        : "AND TRIM(COALESCE(processed_at,'')) = ''"
+    const [pageRows, totals] = await Promise.all([
+        params.env.DB.prepare(
+            `SELECT
+                namespace_id,
+                video_id,
+                owner_email,
+                script,
+                title,
+                category,
+                duration,
+                shopee_link,
+                lazada_link,
+                shopee_original_link,
+                lazada_original_link,
+                public_url,
+                original_url,
+                thumbnail_url,
+                created_at,
+                processed_at,
+                updated_at
+             FROM gallery_index
+             WHERE namespace_id = ?
+               AND TRIM(COALESCE(original_url,'')) <> ''
+               ${processedClause}
+             ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, video_id ASC
+             LIMIT ? OFFSET ?`
+        ).bind(namespaceId, limit, offset).all() as Promise<{ results?: Array<Record<string, unknown>> }>,
+        params.env.DB.prepare(
+            `SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) <> '' THEN 1 ELSE 0 END) AS processed_total,
+                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' THEN 1 ELSE 0 END) AS unprocessed_total
+             FROM gallery_index
+             WHERE namespace_id = ?
+               AND TRIM(COALESCE(original_url,'')) <> ''`
+        ).bind(namespaceId).first() as Promise<{ total?: number; processed_total?: number; unprocessed_total?: number } | null>,
+    ])
+    const ownerEmail = String(params.ownerEmail || '').trim()
+    const videos = (pageRows.results || [])
+        .map((row) => buildInboxVideoResponseFromGalleryIndex(params.env, row, ownerEmail || String(row.owner_email || '').trim()))
+        .filter((video): video is Record<string, unknown> => !!video)
+    const processedTotal = Number(totals?.processed_total || 0)
+    const unprocessedTotal = Number(totals?.unprocessed_total || 0)
+    const total = Number(totals?.total || 0)
+    const viewTotal = params.view === 'processed' ? processedTotal : unprocessedTotal
+    return {
+        videos,
+        total,
+        processedTotal,
+        unprocessedTotal,
+        hasMore: offset + videos.length < viewTotal,
+    }
+}
+
 const NAMESPACE_INBOX_CACHE_TTL_MS = 15 * 1000
 const SYSTEM_INBOX_CACHE_TTL_MS = 15 * 1000
 
@@ -13955,6 +14033,32 @@ app.get('/api/inbox', async (c) => {
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
         const view = String(c.req.query('view') || 'unprocessed').trim().toLowerCase() === 'processed' ? 'processed' : 'unprocessed'
         const bucket = c.get('bucket')
+        const ownerEmail = await resolveOwnerEmailForNamespace(c.env.DB, namespaceId).catch(() => '')
+        const galleryIndexPage = await getNamespaceInboxGalleryIndexPage({
+            env: c.env,
+            namespaceId,
+            ownerEmail,
+            view,
+            offset,
+            limit,
+        }).catch(() => null)
+        if (galleryIndexPage && galleryIndexPage.total > 0) {
+            return c.json({
+                videos: galleryIndexPage.videos,
+                total: galleryIndexPage.total,
+                processed_total: galleryIndexPage.processedTotal,
+                unprocessed_total: galleryIndexPage.unprocessedTotal,
+                offset,
+                limit,
+                has_more: galleryIndexPage.hasMore,
+                view,
+            }, 200, {
+                'Cache-Control': offset === 0
+                    ? 'private, no-store'
+                    : 'private, max-age=15, stale-while-revalidate=60',
+                'Vary': 'x-auth-token',
+            })
+        }
         const cachedSnapshot = await readNamespaceInboxSnapshot(bucket, namespaceId).catch(() => null)
         const cacheAgeMs = cachedSnapshot ? Math.max(0, Date.now() - cachedSnapshot.builtAtMs) : Number.POSITIVE_INFINITY
         const shouldRefreshCache = !cachedSnapshot || cacheAgeMs > NAMESPACE_INBOX_CACHE_TTL_MS
@@ -14036,6 +14140,31 @@ app.get('/api/inbox/system', async (c) => {
         const currentNamespaceId = String(me.namespace_id || c.get('botId') || '').trim()
 
         const bucket = c.get('bucket')
+        const galleryIndexPage = await getNamespaceInboxGalleryIndexPage({
+            env: c.env,
+            namespaceId: currentNamespaceId,
+            ownerEmail: String(me.email || '').trim().toLowerCase(),
+            view,
+            offset,
+            limit,
+        }).catch(() => null)
+        if (galleryIndexPage && galleryIndexPage.total > 0) {
+            return c.json({
+                videos: galleryIndexPage.videos,
+                total: galleryIndexPage.total,
+                processed_total: galleryIndexPage.processedTotal,
+                unprocessed_total: galleryIndexPage.unprocessedTotal,
+                offset,
+                limit,
+                has_more: galleryIndexPage.hasMore,
+                view,
+            }, 200, {
+                'Cache-Control': forceFresh || offset === 0
+                    ? 'private, no-store'
+                    : 'private, max-age=15, stale-while-revalidate=60',
+                'Vary': 'x-auth-token',
+            })
+        }
         const cachedSnapshot = forceFresh
             ? null
             : await readSystemInboxSnapshot(bucket, currentNamespaceId).catch(() => null)
