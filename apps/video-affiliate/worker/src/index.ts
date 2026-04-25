@@ -1748,10 +1748,17 @@ async function getExistingPagePostedVideoGuard(db: D1Database, params: {
     await ensurePagePostedVideoGuardsBackfilled(db)
     const placeholders = keys.map(() => '?').join(', ')
     const row = await db.prepare(
-        `SELECT history_id, created_at
-         FROM page_posted_video_guards
-         WHERE guard_key IN (${placeholders})
-         ORDER BY datetime(updated_at) DESC, history_id DESC
+        `SELECT p.history_id, p.created_at
+         FROM page_posted_video_guards p
+         LEFT JOIN namespace_video_state nvs
+           ON nvs.namespace_id = p.bot_id
+          AND nvs.video_id = p.video_id
+         WHERE p.guard_key IN (${placeholders})
+           AND (
+               TRIM(COALESCE(nvs.manual_unposted_at, '')) = ''
+               OR datetime(COALESCE(p.updated_at, p.created_at)) > datetime(nvs.manual_unposted_at)
+           )
+         ORDER BY datetime(p.updated_at) DESC, p.history_id DESC
          LIMIT 1`
     ).bind(...keys).first() as { history_id?: number | null; created_at?: string | null } | null
     if (!row) return null
@@ -2875,6 +2882,7 @@ async function ensureNamespaceVideoStateTable(db: D1Database): Promise<void> {
             lazada_member_id TEXT NOT NULL DEFAULT '',
             source_fingerprint TEXT NOT NULL DEFAULT '',
             posted_at TEXT NOT NULL DEFAULT '',
+            manual_unposted_at TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (namespace_id, video_id)
@@ -2890,6 +2898,7 @@ async function ensureNamespaceVideoStateColumns(db: D1Database): Promise<void> {
             await ensureNamespaceVideoStateTable(db)
             const statements = [
                 "ALTER TABLE namespace_video_state ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE namespace_video_state ADD COLUMN manual_unposted_at TEXT NOT NULL DEFAULT ''",
             ]
             for (const sql of statements) {
                 await db.prepare(sql).run().catch(() => { })
@@ -3033,6 +3042,7 @@ type NamespaceVideoStateRow = {
     lazada_member_id?: string
     source_fingerprint?: string
     posted_at?: string
+    manual_unposted_at?: string
 }
 
 type FacebookPageVideoCacheRow = {
@@ -3702,7 +3712,7 @@ async function listNamespaceVideoStates(db: D1Database, namespaceId: string): Pr
     if (!normalizedNamespaceId) return []
     const res = await db.prepare(
         `SELECT namespace_id, video_id, shopee_link, lazada_link, shopee_original_link, lazada_original_link,
-                shopee_converted_at, lazada_converted_at, lazada_member_id, source_fingerprint, posted_at
+                shopee_converted_at, lazada_converted_at, lazada_member_id, source_fingerprint, posted_at, manual_unposted_at
          FROM namespace_video_state
          WHERE namespace_id = ?`
     ).bind(normalizedNamespaceId).all() as { results?: NamespaceVideoStateRow[] }
@@ -3713,7 +3723,7 @@ async function upsertNamespaceVideoState(db: D1Database, namespaceId: string, vi
     await ensureNamespaceVideoStateColumns(db)
     const current = await db.prepare(
         `SELECT shopee_link, lazada_link, shopee_original_link, lazada_original_link,
-                shopee_converted_at, lazada_converted_at, lazada_member_id, source_fingerprint, posted_at
+                shopee_converted_at, lazada_converted_at, lazada_member_id, source_fingerprint, posted_at, manual_unposted_at
          FROM namespace_video_state WHERE namespace_id = ? AND video_id = ?`
     ).bind(namespaceId, videoId).first() as NamespaceVideoStateRow | null
 
@@ -3727,13 +3737,14 @@ async function upsertNamespaceVideoState(db: D1Database, namespaceId: string, vi
         lazada_member_id: String(fields.lazada_member_id ?? current?.lazada_member_id ?? '').trim(),
         source_fingerprint: String(fields.source_fingerprint ?? current?.source_fingerprint ?? '').trim(),
         posted_at: String(fields.posted_at ?? current?.posted_at ?? '').trim(),
+        manual_unposted_at: String(fields.manual_unposted_at ?? (fields.posted_at ? '' : current?.manual_unposted_at) ?? '').trim(),
     }
 
     await db.prepare(
         `INSERT INTO namespace_video_state (
             namespace_id, video_id, shopee_link, lazada_link, shopee_original_link, lazada_original_link,
-            shopee_converted_at, lazada_converted_at, lazada_member_id, source_fingerprint, posted_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            shopee_converted_at, lazada_converted_at, lazada_member_id, source_fingerprint, posted_at, manual_unposted_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
         ON CONFLICT(namespace_id, video_id) DO UPDATE SET
             shopee_link = excluded.shopee_link,
             lazada_link = excluded.lazada_link,
@@ -3744,6 +3755,7 @@ async function upsertNamespaceVideoState(db: D1Database, namespaceId: string, vi
             lazada_member_id = excluded.lazada_member_id,
             source_fingerprint = CASE WHEN excluded.source_fingerprint <> '' THEN excluded.source_fingerprint ELSE namespace_video_state.source_fingerprint END,
             posted_at = CASE WHEN excluded.posted_at <> '' THEN excluded.posted_at ELSE namespace_video_state.posted_at END,
+            manual_unposted_at = excluded.manual_unposted_at,
             updated_at = datetime('now')`
     ).bind(
         namespaceId,
@@ -3757,6 +3769,7 @@ async function upsertNamespaceVideoState(db: D1Database, namespaceId: string, vi
         next.lazada_member_id,
         next.source_fingerprint,
         next.posted_at,
+        next.manual_unposted_at,
     ).run()
 }
 
@@ -3773,9 +3786,13 @@ async function resetNamespaceVideoPosted(db: D1Database, namespaceId: string, vi
     await ensureNamespaceVideoStateColumns(db)
     await db.prepare(
         `UPDATE namespace_video_state
-         SET posted_at = '', updated_at = datetime('now')
+         SET posted_at = '', manual_unposted_at = datetime('now'), updated_at = datetime('now')
          WHERE namespace_id = ? AND video_id = ?`
     ).bind(normalizedNamespaceId, normalizedVideoId).run()
+    await db.prepare(
+        `DELETE FROM page_posted_video_guards
+         WHERE bot_id = ? AND video_id = ?`
+    ).bind(normalizedNamespaceId, normalizedVideoId).run().catch(() => { })
 }
 
 function normalizeNamespaceVideoSourceFingerprint(value: unknown): string {
@@ -15503,9 +15520,14 @@ app.post('/api/gallery/reset-posted-bulk', async (c) => {
         await ensureNamespaceVideoStateColumns(c.env.DB)
         await c.env.DB.prepare(
             `UPDATE namespace_video_state
-             SET posted_at = '', updated_at = datetime('now')
+             SET posted_at = '', manual_unposted_at = datetime('now'), updated_at = datetime('now')
              WHERE namespace_id = ? AND posted_at <> ''`
         ).bind(targetNamespaceId).run()
+        await ensurePagePostedVideoGuardsTable(c.env.DB)
+        await c.env.DB.prepare(
+            `DELETE FROM page_posted_video_guards
+             WHERE bot_id = ?`
+        ).bind(targetNamespaceId).run().catch(() => { })
 
         // Reset R2 metadata for each posted video (clears postedAt + keepInPostedTab)
         const bucket = c.get('bucket')
