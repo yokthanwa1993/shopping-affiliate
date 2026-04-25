@@ -867,7 +867,7 @@ export async function listGalleryIndexVideos(db: D1Database, options: {
             is_original_only
          FROM gallery_index
          ${whereSql}
-         ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, namespace_id ASC, video_id ASC`
+         ORDER BY COALESCE(NULLIF(TRIM(processed_at), ''), NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, namespace_id ASC, video_id ASC`
     ).bind(...binds).all() as { results?: GalleryIndexDbRow[] }
 
     const videos: GalleryIndexVideo[] = []
@@ -922,7 +922,7 @@ export async function getGalleryIndexPage(db: D1Database, options: {
                 is_original_only
              FROM gallery_index
              ${whereSql}
-             ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, namespace_id ASC, video_id ASC
+             ORDER BY COALESCE(NULLIF(TRIM(processed_at), ''), NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, namespace_id ASC, video_id ASC
              LIMIT ? OFFSET ?`
         ).bind(...binds, limit, offset).all() as Promise<{ results?: GalleryIndexDbRow[] }>,
         queryGalleryIndexCount(db, { namespaceId: options.namespaceId, onlyOwnerLinked: options.onlyOwnerLinked, linkFilter: 'all', playableOnly: options.playableOnly, requirePublicVideo: options.requirePublicVideo }),

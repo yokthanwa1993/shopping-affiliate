@@ -9870,7 +9870,6 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
 }) {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
-    await lineStartLoading(params.channelAccessToken, params.lineUserId, 60).catch(() => { })
     const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
     const nowIso = new Date().toISOString()
     const inboxRecord = await putInboxVideoRecord(params.bucket, {
@@ -9906,53 +9905,28 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
 
-    const processingResult = await ensureInboxVideoProcessingStarted({
-        env: params.env,
-        bucket: params.bucket,
-        executionCtx: { waitUntil: (_p: Promise<any>) => { } } as ExecutionContext,
-        botId: params.namespaceId,
-        item: inboxRecord,
-        skipIfAlreadyProcessed: true,
-    })
-    const previewUrl = String(waitingState.selectedCoverPreviewUrl || '').trim()
-        || await resolveLineCoverPreviewUrl({
-            env: params.env,
-            bucket: params.bucket,
-            namespaceId: params.namespaceId,
-            videoId: waitingState.id,
-        })
+    const messages: LineReplyMessage[] = [
+        {
+            type: 'text',
+            text: '✅ รับลิงก์ครบแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ระบบ cron จะทยอยประมวลผลทีละคลิป',
+        },
+    ]
 
     if (params.pushOnly) {
-        await pushLineProcessingResult({
-            channelAccessToken: params.channelAccessToken,
-            lineUserId: params.lineUserId,
-            namespaceId: params.namespaceId,
-            result: processingResult,
-            previewUrl,
-            preferProcessingOnly: true,
-        })
+        await linePushMessage(params.channelAccessToken, params.lineUserId, messages)
         return
     }
 
     try {
-        await replyLineProcessingResult({
+        await lineReplyOrPush({
             replyToken: params.replyToken,
             channelAccessToken: params.channelAccessToken,
-            namespaceId: params.namespaceId,
-            result: processingResult,
-            previewUrl,
-            preferProcessingOnly: true,
+            lineUserId: params.lineUserId,
+            messages,
         })
     } catch (replyError) {
         console.warn(`[LINE] finalize reply failed for ${waitingState.id}: ${replyError instanceof Error ? replyError.message : String(replyError)}`)
-        await pushLineProcessingResult({
-            channelAccessToken: params.channelAccessToken,
-            lineUserId: params.lineUserId,
-            namespaceId: params.namespaceId,
-            result: processingResult,
-            previewUrl,
-            preferProcessingOnly: true,
-        })
+        await linePushMessage(params.channelAccessToken, params.lineUserId, messages)
     }
 }
 
@@ -12013,6 +11987,21 @@ app.post('/api/telegram/:token?', async (c) => {
                 },
             })
         }
+        const sendQueuedInboxMessage = async (item: InboxVideoRecord) => {
+            const inboxUrl = buildScopedTabWebAppUrl(
+                getAppWebBaseUrl(c.env),
+                String(c.get('botId') || ''),
+                'inbox',
+            )
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: '✅ รับลิงก์ครบแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ระบบ cron จะทยอยประมวลผลทีละคลิป',
+                reply_markup: {
+                    inline_keyboard: [[{ text: '📥 เปิดคลังต้นฉบับ', web_app: { url: inboxUrl } }]],
+                },
+            })
+            void item
+        }
 
         const CATEGORIES = await getCategories(c.get('bucket'))
 
@@ -12104,15 +12093,7 @@ app.post('/api/telegram/:token?', async (c) => {
                     } else {
                         const inboxItem = await upsertInboxFromWaitingState(mergedWaitingState)
                         await clearWaitingVideoState()
-                        const processingResult = await ensureInboxVideoProcessingStarted({
-                            env: c.env,
-                            bucket: c.get('bucket'),
-                            executionCtx: c.executionCtx,
-                            botId: String(c.get('botId') || ''),
-                            item: inboxItem,
-                            skipIfAlreadyProcessed: true,
-                        })
-                        await sendReadyInboxMessage(processingResult)
+                        await sendQueuedInboxMessage(inboxItem)
                     }
                 }
                 await c.get('bucket').put(dedupKey, 'processing')
@@ -12126,15 +12107,7 @@ app.post('/api/telegram/:token?', async (c) => {
                     updatedAt: new Date().toISOString(),
                 })
                 if (mergedRecord.status === 'ready') {
-                    const processingResult = await ensureInboxVideoProcessingStarted({
-                        env: c.env,
-                        bucket: c.get('bucket'),
-                        executionCtx: c.executionCtx,
-                        botId: String(c.get('botId') || ''),
-                        item: mergedRecord,
-                        skipIfAlreadyProcessed: true,
-                    })
-                    await sendReadyInboxMessage(processingResult)
+                    await sendQueuedInboxMessage(mergedRecord)
                 } else {
                     await sendTelegram(token, 'sendMessage', {
                         chat_id: chatId,
@@ -12159,15 +12132,7 @@ app.post('/api/telegram/:token?', async (c) => {
 
             if (inboxItem.status === 'ready') {
                 await clearWaitingVideoState()
-                const processingResult = await ensureInboxVideoProcessingStarted({
-                    env: c.env,
-                    bucket: c.get('bucket'),
-                    executionCtx: c.executionCtx,
-                    botId: String(c.get('botId') || ''),
-                    item: inboxItem,
-                    skipIfAlreadyProcessed: true,
-                })
-                await sendReadyInboxMessage(processingResult)
+                await sendQueuedInboxMessage(inboxItem)
                 await c.get('bucket').put(dedupKey, 'processing')
                 return
             }
@@ -12223,15 +12188,7 @@ app.post('/api/telegram/:token?', async (c) => {
                 const inboxItem = await upsertInboxFromWaitingState(nextState)
                 if (inboxItem.status === 'ready') {
                     await clearWaitingVideoState()
-                    const processingResult = await ensureInboxVideoProcessingStarted({
-                        env: c.env,
-                        bucket: c.get('bucket'),
-                        executionCtx: c.executionCtx,
-                        botId: String(c.get('botId') || ''),
-                        item: inboxItem,
-                        skipIfAlreadyProcessed: true,
-                    })
-                    await sendReadyInboxMessage(processingResult)
+                    await sendQueuedInboxMessage(inboxItem)
                     await c.get('bucket').put(dedupKey, 'processing')
                     return c.text('ok')
                 }
@@ -12935,7 +12892,7 @@ async function getNamespaceInboxGalleryIndexPage(params: {
              WHERE namespace_id = ?
                AND TRIM(COALESCE(original_url,'')) <> ''
                ${processedClause}
-             ORDER BY COALESCE(processed_at, updated_at, created_at) DESC, video_id ASC
+             ORDER BY COALESCE(NULLIF(TRIM(processed_at), ''), NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, video_id ASC
              LIMIT ? OFFSET ?`
         ).bind(namespaceId, limit, offset).all() as Promise<{ results?: Array<Record<string, unknown>> }>,
         params.env.DB.prepare(
@@ -14501,7 +14458,7 @@ app.post('/api/desktop-submit', async (c) => {
             captionProvidedAt: manualCaption ? createdAt : '',
         })
 
-        const autoStart = body.autoStart !== false
+        const autoStart = body.autoStart === true
         let result: InboxProcessingStartResult | null = null
         if (autoStart) {
             try {
@@ -17240,7 +17197,61 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
     if (!adminNamespaceId) return
 
     const adminBucket = new BotBucket(env.BUCKET, adminNamespaceId) as unknown as R2Bucket
+    const tryStartNextAdminVideo = async (): Promise<boolean> => {
+        if (!ctx) return false
+
+        const isProcessing = await hasActiveProcessingJob(adminBucket)
+        if (isProcessing) {
+            console.log('[AUTO-IMPORT] Admin already has active processing job, skipping')
+            return false
+        }
+
+        const inboxVideos = await listInboxVideoRecords(adminBucket)
+        for (const nextVideo of inboxVideos) {
+            if (nextVideo.status !== 'ready') continue
+            const existingProcessingStatus = await getProcessingJobStatus(adminBucket, nextVideo.id).catch(() => '')
+            const processedAt = await getGalleryIndexProcessedAt(env.DB, adminNamespaceId, nextVideo.id).catch(() => '')
+            if (processedAt) continue
+            if (existingProcessingStatus && existingProcessingStatus !== 'failed') {
+                console.log(`[AUTO-IMPORT] Skip ${nextVideo.id}: existing processing record present`)
+                continue
+            }
+
+            try {
+                const result = await ensureInboxVideoProcessingStarted({
+                    env,
+                    bucket: adminBucket,
+                    executionCtx: ctx,
+                    botId: adminNamespaceId,
+                    item: nextVideo,
+                    skipIfAlreadyProcessed: true,
+                })
+                if (result.outcome === 'already_running') {
+                    console.log(`[AUTO-IMPORT] ${nextVideo.id} already ${result.status}`)
+                    return false
+                }
+                if (result.outcome === 'already_processed') {
+                    console.log(`[AUTO-IMPORT] ${nextVideo.id} already processed`)
+                    continue
+                }
+
+                console.log(`[AUTO-IMPORT] Started processing ${nextVideo.id}: ${result.job.status}`)
+                return true
+            } catch (e) {
+                console.error(`[AUTO-IMPORT] Failed to start processing ${nextVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+
+        return false
+    }
+
+    // Start one waiting admin original before doing any cross-namespace import.
+    // The import scan can be expensive; it must not consume the whole cron tick
+    // before the next processing job is kicked off.
+    await tryStartNextAdminVideo()
+
     let importedCount = 0
+    const maxImportsPerTick = 25
     const namespaceIds = new Set<string>()
     try {
         const { results } = await env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
@@ -17327,54 +17338,13 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
 
             importedCount++
             console.log(`[AUTO-IMPORT] Copied original ${videoId} from ${sourceNamespaceId} -> ${adminNamespaceId}`)
+            if (importedCount >= maxImportsPerTick) break
         }
+        if (importedCount >= maxImportsPerTick) break
     }
 
     if (importedCount > 0) {
         console.log(`[AUTO-IMPORT] Added ${importedCount} original videos to admin namespace`)
-    }
-
-    // 2. Auto-process ONE admin video at a time using the same start path as manual/admin UI
-    if (!ctx) return
-
-    // Check if already processing
-    const isProcessing = await hasActiveProcessingJob(adminBucket)
-    if (isProcessing) {
-        console.log('[AUTO-IMPORT] Admin already has active processing job, skipping')
-        return
-    }
-
-    const inboxVideos = await listInboxVideoRecords(adminBucket)
-    for (const nextVideo of inboxVideos) {
-        if (nextVideo.status !== 'ready') continue
-        const existingProcessingStatus = await getProcessingJobStatus(adminBucket, nextVideo.id).catch(() => '')
-        const processedAt = await getGalleryIndexProcessedAt(env.DB, adminNamespaceId, nextVideo.id).catch(() => '')
-        if (processedAt) continue
-        if (existingProcessingStatus && existingProcessingStatus !== 'failed') {
-            console.log(`[AUTO-IMPORT] Skip ${nextVideo.id}: existing processing record present`)
-            continue
-        }
-
-        try {
-            const result = await ensureInboxVideoProcessingStarted({
-                env,
-                bucket: adminBucket,
-                executionCtx: ctx,
-                botId: adminNamespaceId,
-                item: nextVideo,
-                skipIfAlreadyProcessed: true,
-            })
-            if (result.outcome === 'already_running') {
-                console.log(`[AUTO-IMPORT] ${nextVideo.id} already ${result.status}`)
-            } else if (result.outcome === 'already_processed') {
-                console.log(`[AUTO-IMPORT] ${nextVideo.id} already processed`)
-            } else {
-                console.log(`[AUTO-IMPORT] Started processing ${nextVideo.id}: ${result.job.status}`)
-            }
-            break
-        } catch (e) {
-            console.error(`[AUTO-IMPORT] Failed to start processing ${nextVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
-        }
     }
 }
 
@@ -27010,6 +26980,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
            AND datetime(created_at) < datetime('now', '-2 minutes')`
     ).run().catch(() => { })
     await recoverStaleScheduledRun(env.DB).catch(() => { })
+    enqueueBackgroundTask(ctx, 'CRON AUTO-IMPORT', async () => {
+        await autoImportAndProcessForAdmin(env, ctx)
+    })
     let scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
         scope: 'page',
         namespaceId: '__scheduled__',
@@ -27040,9 +27013,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         return
     }
 
-    enqueueBackgroundTask(ctx, 'CRON AUTO-IMPORT', async () => {
-        await autoImportAndProcessForAdmin(env, ctx)
-    })
     enqueueBackgroundTask(ctx, 'CRON WARM-UP', async () => {
         const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
         const containerStub = env.MERGE_CONTAINER.get(containerId)
