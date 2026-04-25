@@ -134,6 +134,9 @@ fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize, s
             .collect::<Vec<_>>()
             .join("\n");
     }
+    if manual_lines.len() == 1 {
+        return manual_lines[0].clone();
+    }
 
     let max_chars = max_chars_per_line.max(8);
     let mut lines: Vec<String> = Vec::new();
