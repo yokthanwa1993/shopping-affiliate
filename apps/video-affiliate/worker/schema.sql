@@ -185,6 +185,7 @@ CREATE TABLE IF NOT EXISTS namespace_video_state (
   lazada_member_id TEXT NOT NULL DEFAULT '',
   source_fingerprint TEXT NOT NULL DEFAULT '',
   posted_at TEXT NOT NULL DEFAULT '',
+  manual_unposted_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (namespace_id, video_id)
