@@ -3784,11 +3784,15 @@ async function resetNamespaceVideoPosted(db: D1Database, namespaceId: string, vi
     const normalizedVideoId = String(videoId || '').trim()
     if (!normalizedNamespaceId || !normalizedVideoId) return
     await ensureNamespaceVideoStateColumns(db)
+    const manualUnpostedAt = new Date().toISOString()
+    await upsertNamespaceVideoState(db, normalizedNamespaceId, normalizedVideoId, {
+        manual_unposted_at: manualUnpostedAt,
+    })
     await db.prepare(
         `UPDATE namespace_video_state
-         SET posted_at = '', manual_unposted_at = datetime('now'), updated_at = datetime('now')
+         SET posted_at = '', manual_unposted_at = ?, updated_at = datetime('now')
          WHERE namespace_id = ? AND video_id = ?`
-    ).bind(normalizedNamespaceId, normalizedVideoId).run()
+    ).bind(manualUnpostedAt, normalizedNamespaceId, normalizedVideoId).run()
     await db.prepare(
         `DELETE FROM page_posted_video_guards
          WHERE bot_id = ? AND video_id = ?`
