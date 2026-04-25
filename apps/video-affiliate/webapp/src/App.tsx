@@ -109,7 +109,7 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
   return !!(account || shopeeBase || lazadaBase || utmId || memberId)
 }
 
-const CACHE_VERSION = 'v12'
+const CACHE_VERSION = 'v13'
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
@@ -1298,6 +1298,12 @@ function pickPreferredGalleryVideo(
   current: Partial<Video> & Record<string, unknown>,
   next: Partial<Video> & Record<string, unknown>,
 ) {
+  const currentTs = getGalleryVideoSortMs(current)
+  const nextTs = getGalleryVideoSortMs(next)
+  if (currentTs !== nextTs) {
+    return nextTs >= currentTs ? next : current
+  }
+
   const currentLinkRank = getVideoLazadaLink(current) ? 2 : getVideoShopeeLink(current) ? 1 : 0
   const nextLinkRank = getVideoLazadaLink(next) ? 2 : getVideoShopeeLink(next) ? 1 : 0
   if (currentLinkRank !== nextLinkRank) {
@@ -1308,12 +1314,6 @@ function pickPreferredGalleryVideo(
   const nextHasThumbnail = !!String(next.thumbnailUrl || '').trim()
   if (currentHasThumbnail !== nextHasThumbnail) {
     return nextHasThumbnail ? next : current
-  }
-
-  const currentTs = getGalleryVideoSortMs(current)
-  const nextTs = getGalleryVideoSortMs(next)
-  if (currentTs !== nextTs) {
-    return nextTs >= currentTs ? next : current
   }
 
   const currentNamespaceId = String(current.namespace_id || '').trim()
