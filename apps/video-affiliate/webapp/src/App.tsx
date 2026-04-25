@@ -757,6 +757,10 @@ const summarizeCoverTextStyle = (style: CoverTextStyleSettings) => {
 
 const COVER_TEXT_PREVIEW_IMAGE_URL = '/demo/cover-preview-cart.jpg'
 const DEFAULT_COVER_TEXT_PREVIEW_TEXT = 'ของในบ้านไม่ต้องยกให้เมื่อย\nตัวอย่าง'
+const COVER_TEXT_RENDER_PREVIEW_WIDTH = 540
+const COVER_TEXT_RENDER_PREVIEW_HEIGHT = 960
+const COVER_TEXT_RENDER_FINAL_WIDTH = 1080
+const COVER_TEXT_RENDER_PREVIEW_Y_PERCENT = 34
 
 const normalizeCoverTextPreviewText = (input: string) =>
   String(input || '')
@@ -769,6 +773,80 @@ const normalizeCoverTextPreviewText = (input: string) =>
     .map((line) => line.replace(/[ \t]+/g, ' ').trim())
     .filter(Boolean)
     .slice(0, 3)
+
+const hashCoverTextPreviewKey = (input: string) => {
+  let hash = 2166136261
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
+
+const buildRenderedCoverTextPreviewUrl = (
+  video: Partial<Video> & Record<string, unknown> | null | undefined,
+  lines: string[],
+  style: CoverTextStyleSettings,
+) => {
+  const id = String(video?.id || video?.video_id || '').trim()
+  const namespaceId = String(video?.namespace_id || '').trim()
+  const coverText = lines.map((line) => line.trim()).filter(Boolean).slice(0, 3).join('\n')
+  if (!id || !namespaceId || !coverText) return ''
+  const scaledOutlineWidth = Math.max(
+    style.outline_width > 0 ? 1 : 0,
+    Math.round(style.outline_width * COVER_TEXT_RENDER_PREVIEW_WIDTH / COVER_TEXT_RENDER_FINAL_WIDTH),
+  )
+  const cacheKey = hashCoverTextPreviewKey(JSON.stringify({
+    id,
+    namespaceId,
+    coverText,
+    style,
+    y: COVER_TEXT_RENDER_PREVIEW_Y_PERCENT,
+  }))
+  try {
+    const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(id)}/frame-preview/settings-${cacheKey}`)
+    url.searchParams.set('namespace_id', namespaceId)
+    url.searchParams.set('seed', `${namespaceId}:${id}:settings-cover-preview`)
+    url.searchParams.set('format', 'jpg')
+    url.searchParams.set('w', String(COVER_TEXT_RENDER_PREVIEW_WIDTH))
+    url.searchParams.set('h', String(COVER_TEXT_RENDER_PREVIEW_HEIGHT))
+    url.searchParams.set('ct', coverText)
+    url.searchParams.set('cy', String(COVER_TEXT_RENDER_PREVIEW_Y_PERCENT))
+    url.searchParams.set('tid', 'template-1')
+    url.searchParams.set('tf', style.font_id)
+    url.searchParams.set('tc', style.text_color)
+    url.searchParams.set('tc2', style.secondary_text_color)
+    url.searchParams.set('bc', style.background_color)
+    url.searchParams.set('bo', String(style.background_opacity))
+    url.searchParams.set('ts', String(style.size_scale))
+    url.searchParams.set('af', style.auto_fit ? '1' : '0')
+    url.searchParams.set('om', style.mode)
+    url.searchParams.set('oc', style.outline_color)
+    url.searchParams.set('ow', String(scaledOutlineWidth))
+    return url.toString()
+  } catch {
+    const params = new URLSearchParams()
+    params.set('namespace_id', namespaceId)
+    params.set('seed', `${namespaceId}:${id}:settings-cover-preview`)
+    params.set('format', 'jpg')
+    params.set('w', String(COVER_TEXT_RENDER_PREVIEW_WIDTH))
+    params.set('h', String(COVER_TEXT_RENDER_PREVIEW_HEIGHT))
+    params.set('ct', coverText)
+    params.set('cy', String(COVER_TEXT_RENDER_PREVIEW_Y_PERCENT))
+    params.set('tid', 'template-1')
+    params.set('tf', style.font_id)
+    params.set('tc', style.text_color)
+    params.set('tc2', style.secondary_text_color)
+    params.set('bc', style.background_color)
+    params.set('bo', String(style.background_opacity))
+    params.set('ts', String(style.size_scale))
+    params.set('af', style.auto_fit ? '1' : '0')
+    params.set('om', style.mode)
+    params.set('oc', style.outline_color)
+    params.set('ow', String(scaledOutlineWidth))
+    return `${WORKER_URL}/api/gallery/${encodeURIComponent(id)}/frame-preview/settings-${cacheKey}?${params.toString()}`
+  }
+}
 
 const estimateCoverPreviewFontSize = (lines: string[], baseFontSize: number, autoFit: boolean) => {
   if (!autoFit) return baseFontSize
@@ -3190,6 +3268,7 @@ function App({
   const [coverTextStyleLoading, setCoverTextStyleLoading] = useState(false)
   const [coverTextStyleSaving, setCoverTextStyleSaving] = useState(false)
   const [coverTextPreviewText, setCoverTextPreviewText] = useState(DEFAULT_COVER_TEXT_PREVIEW_TEXT)
+  const [coverTextPreviewVideo, setCoverTextPreviewVideo] = useState<Video | null>(null)
   const [commentTemplate, setCommentTemplate] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateDraft, setCommentTemplateDraft] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateSource, setCommentTemplateSource] = useState<'default' | 'custom'>('default')
@@ -4236,6 +4315,7 @@ function App({
     }
     if (settingsSection === 'cover') {
       void loadCoverTextStyle()
+      void loadCoverTextPreviewVideo()
       return
     }
     if (settingsSection === 'comment') {
@@ -5195,6 +5275,50 @@ function App({
       setCoverTextStyleMessage('โหลดการตั้งค่าข้อความบนปกไม่สำเร็จ')
     } finally {
       setCoverTextStyleLoading(false)
+    }
+  }
+
+  async function loadCoverTextPreviewVideo() {
+    const session = getToken()
+    if (!session) return
+    const pickUsableVideo = (items: Video[]) =>
+      items.find((video) => String(video.id || '').trim() && String(video.namespace_id || namespaceId || '').trim()) || null
+
+    const localPreview = pickUsableVideo([
+      ...videos,
+      ...usedVideos,
+      ...processingVideos,
+    ])
+    if (localPreview) {
+      setCoverTextPreviewVideo({
+        ...localPreview,
+        namespace_id: String(localPreview.namespace_id || namespaceId || '').trim(),
+      })
+    }
+
+    const fetchFirstVideo = async (path: string) => {
+      const resp = await apiFetch(path)
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return null
+      }
+      if (!resp.ok) return null
+      const data = await resp.json().catch(() => ({})) as GalleryPageResponse
+      return pickUsableVideo(Array.isArray(data.videos) ? data.videos : [])
+    }
+
+    try {
+      const readyUrl = `${WORKER_URL}/api/gallery?offset=0&limit=1&link_filter=all&fresh=1`
+      const usedUrl = `${WORKER_URL}/api/gallery/used?offset=0&limit=1&fresh=1`
+      const remotePreview = await fetchFirstVideo(readyUrl) || await fetchFirstVideo(usedUrl)
+      if (remotePreview) {
+        setCoverTextPreviewVideo({
+          ...remotePreview,
+          namespace_id: String(remotePreview.namespace_id || namespaceId || '').trim(),
+        })
+      }
+    } catch {
+      // Keep the local cached preview or static fallback.
     }
   }
 
@@ -8319,6 +8443,11 @@ function App({
                             {(() => {
                               const previewLines = normalizeCoverTextPreviewText(coverTextPreviewText)
                               if (previewLines.length === 0) previewLines.push('ข้อความบนปก')
+                              const renderedPreviewUrl = buildRenderedCoverTextPreviewUrl(
+                                coverTextPreviewVideo,
+                                previewLines,
+                                coverTextStyleDraft,
+                              )
                               const previewFontSize = estimateCoverPreviewFontSize(
                                 previewLines,
                                 Math.round(30 * coverTextStyleDraft.size_scale),
@@ -8351,8 +8480,11 @@ function App({
                                             paintOrder: 'stroke fill',
                                           }}
                                         >
-                                          <span style={{ color: coverTextStyleDraft.text_color }}>{previewLines[0]}</span>
-                                          <span style={{ color: coverTextStyleDraft.secondary_text_color }}>{previewLines[1]}</span>
+                                          {previewLines.map((line, index) => (
+                                            <span key={`${index}-${line}`} style={{ color: index === 0 ? coverTextStyleDraft.text_color : coverTextStyleDraft.secondary_text_color }}>
+                                              {line}
+                                            </span>
+                                          ))}
                                         </div>
                                       ) : (
                                         <div
@@ -8363,11 +8495,25 @@ function App({
                                             fontSize: `${previewFontSize}px`,
                                           }}
                                         >
-                                          <span className="whitespace-nowrap" style={{ color: coverTextStyleDraft.text_color }}>{previewLines[0]}</span>
-                                          <span className="whitespace-nowrap" style={{ color: coverTextStyleDraft.secondary_text_color }}>{previewLines[1]}</span>
+                                          {previewLines.map((line, index) => (
+                                            <span key={`${index}-${line}`} className="whitespace-nowrap" style={{ color: index === 0 ? coverTextStyleDraft.text_color : coverTextStyleDraft.secondary_text_color }}>
+                                              {line}
+                                            </span>
+                                          ))}
                                         </div>
                                       )}
                                     </div>
+                                    {renderedPreviewUrl ? (
+                                      <img
+                                        src={renderedPreviewUrl}
+                                        alt=""
+                                        className="absolute inset-0 h-full w-full object-cover"
+                                        loading="eager"
+                                        onError={(event) => {
+                                          event.currentTarget.style.display = 'none'
+                                        }}
+                                      />
+                                    ) : null}
                                   </div>
                                 </div>
                               )
