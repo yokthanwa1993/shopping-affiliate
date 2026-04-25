@@ -13300,6 +13300,20 @@ async function getProcessingJobStatus(bucket: R2Bucket, id: string): Promise<str
     return String(data.status || '').trim().toLowerCase()
 }
 
+async function getGalleryIndexProcessedAt(db: D1Database, namespaceId: string, videoId: string): Promise<string> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!normalizedNamespaceId || !normalizedVideoId) return ''
+    await ensureGalleryIndexTable(db).catch(() => { })
+    const row = await db.prepare(
+        `SELECT processed_at
+         FROM gallery_index
+         WHERE namespace_id = ? AND video_id = ?
+         LIMIT 1`
+    ).bind(normalizedNamespaceId, normalizedVideoId).first().catch(() => null) as { processed_at?: string } | null
+    return String(row?.processed_at || '').trim()
+}
+
 async function recordInboxLinkSubmissionIfNeeded(params: {
     db: D1Database
     bucket: R2Bucket
@@ -13802,10 +13816,11 @@ async function ensureInboxVideoProcessingStarted(params: {
     }
 
     if (params.skipIfAlreadyProcessed) {
-        const assetMap = await listNamespaceOriginalAssetMap(params.env, params.bucket, botId).catch(() => new Map<string, NamespaceOriginalAsset>())
-        if (assetMap.get(item.id)?.hasProcessedVideo) {
+        const processedAt = await getGalleryIndexProcessedAt(params.env.DB, botId, item.id).catch(() => '')
+        if (processedAt) {
             await putInboxVideoRecord(params.bucket, {
                 ...item,
+                processedAt,
                 updatedAt: new Date().toISOString(),
             }).catch(() => { })
             return { outcome: 'already_processed', item, id: item.id }
@@ -17203,11 +17218,9 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
     const inboxVideos = await listInboxVideoRecords(adminBucket)
     for (const nextVideo of inboxVideos) {
         if (nextVideo.status !== 'ready') continue
-        const [hasProcessed, existingProcessingStatus] = await Promise.all([
-            adminBucket.head(`videos/${nextVideo.id}.mp4`).catch(() => null),
-            getProcessingJobStatus(adminBucket, nextVideo.id).catch(() => ''),
-        ])
-        if (hasProcessed) continue
+        const existingProcessingStatus = await getProcessingJobStatus(adminBucket, nextVideo.id).catch(() => '')
+        const processedAt = await getGalleryIndexProcessedAt(env.DB, adminNamespaceId, nextVideo.id).catch(() => '')
+        if (processedAt) continue
         if (existingProcessingStatus && existingProcessingStatus !== 'failed') {
             console.log(`[AUTO-IMPORT] Skip ${nextVideo.id}: existing processing record present`)
             continue
