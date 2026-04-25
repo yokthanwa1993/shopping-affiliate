@@ -12418,12 +12418,19 @@ async function putInboxVideoRecord(bucket: R2Bucket, input: Partial<InboxVideoRe
 }
 
 async function listInboxVideoRecords(bucket: R2Bucket): Promise<InboxVideoRecord[]> {
-    const list = await bucket.list({ prefix: '_inbox/' })
-    const tasks = await Promise.all(list.objects.map(async (obj) => {
-        const record = await getInboxVideoRecord(bucket, obj.key.replace(/^_inbox\//, '').replace(/\.json$/i, ''))
-        return record
-    }))
-    return tasks
+    const records: InboxVideoRecord[] = []
+    let cursor: string | undefined = undefined
+    do {
+        const list = await bucket.list({ prefix: '_inbox/', cursor })
+        const tasks = await Promise.all(list.objects.map(async (obj) => {
+            const record = await getInboxVideoRecord(bucket, obj.key.replace(/^_inbox\//, '').replace(/\.json$/i, ''))
+            return record
+        }))
+        records.push(...tasks.filter((item): item is InboxVideoRecord => !!item))
+        cursor = list.truncated ? list.cursor : undefined
+    } while (cursor)
+
+    return records
         .filter((item): item is InboxVideoRecord => !!item)
         .sort((a, b) => {
             const aProcessedTs = new Date(String(a.processedAt || '')).getTime()
