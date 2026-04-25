@@ -4,6 +4,11 @@ const fs = require('fs');
 const http = require('http');
 const url = require('url');
 
+if (process.platform === 'darwin') {
+    try { app.setActivationPolicy('accessory'); } catch { }
+    try { app.dock?.hide(); } catch { }
+}
+
 // Single instance — prevent duplicate
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) { app.quit(); process.exit(0); }

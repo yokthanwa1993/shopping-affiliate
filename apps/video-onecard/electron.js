@@ -8,6 +8,11 @@ const nodeFetch = require("node-fetch");
 const os = require("os");
 const { spawn } = require("child_process");
 
+if (process.platform === "darwin") {
+  try { app.setActivationPolicy("accessory"); } catch {}
+  try { app.dock?.hide(); } catch {}
+}
+
 const LOCAL_PORT = 3847;
 const TUNNEL_NAME = "onecard-wwoom";
 const TUNNEL_ID = "13056541-56b1-4c65-aec9-8b5112b14c2e";
