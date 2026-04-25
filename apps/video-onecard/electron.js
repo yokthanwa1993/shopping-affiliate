@@ -6,12 +6,24 @@ const fs = require("fs");
 const http = require("http");
 const nodeFetch = require("node-fetch");
 const os = require("os");
-const { spawn } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 
-if (process.platform === "darwin") {
+function ensureMacBackgroundOnly() {
+  if (process.platform !== "darwin") return;
   try { app.setActivationPolicy("accessory"); } catch {}
   try { app.dock?.hide(); } catch {}
+  try {
+    const plistPath = path.resolve(path.dirname(process.execPath), "..", "Info.plist");
+    if (!fs.existsSync(plistPath)) return;
+    try {
+      execFileSync("/usr/libexec/PlistBuddy", ["-c", "Set :LSUIElement true", plistPath], { stdio: "ignore" });
+    } catch {
+      execFileSync("/usr/libexec/PlistBuddy", ["-c", "Add :LSUIElement bool true", plistPath], { stdio: "ignore" });
+    }
+  } catch {}
 }
+
+ensureMacBackgroundOnly();
 
 const LOCAL_PORT = 3847;
 const TUNNEL_NAME = "onecard-wwoom";

@@ -3,11 +3,24 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const url = require('url');
+const { execFileSync } = require('child_process');
 
-if (process.platform === 'darwin') {
+function ensureMacBackgroundOnly() {
+    if (process.platform !== 'darwin') return;
     try { app.setActivationPolicy('accessory'); } catch { }
     try { app.dock?.hide(); } catch { }
+    try {
+        const plistPath = path.resolve(path.dirname(process.execPath), '..', 'Info.plist');
+        if (!fs.existsSync(plistPath)) return;
+        try {
+            execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Set :LSUIElement true', plistPath], { stdio: 'ignore' });
+        } catch {
+            execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Add :LSUIElement bool true', plistPath], { stdio: 'ignore' });
+        }
+    } catch { }
 }
+
+ensureMacBackgroundOnly();
 
 // Single instance — prevent duplicate
 const gotLock = app.requestSingleInstanceLock();
