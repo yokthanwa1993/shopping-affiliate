@@ -9681,7 +9681,7 @@ async function continueLineFlowAfterCover(params: {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
     const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
-    const affiliateLinksRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, params.namespaceId).catch(() => false)
+    const affiliateLinksRequired = true
 
     if (affiliateLinksRequired && (!String(waitingState.shopeeLink || '').trim() || !String(waitingState.lazadaLink || '').trim())) {
         const hasShopee = !!String(waitingState.shopeeLink || '').trim()
@@ -9885,6 +9885,31 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
     const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
+    const hasShopeeLink = !!String(waitingState.shopeeLink || '').trim()
+    const hasLazadaLink = !!String(waitingState.lazadaLink || '').trim()
+    if (!hasShopeeLink || !hasLazadaLink) {
+        await putLineWaitingVideoState(params.bucket, params.lineUserId, {
+            ...waitingState,
+            manualCaption,
+            awaitingStep: 'links',
+            coverCompleted: true,
+            coverPickerOpened: false,
+            coverTextPositionOptions: [],
+        })
+        await lineReplyOrPush({
+            replyToken: params.replyToken,
+            channelAccessToken: params.channelAccessToken,
+            lineUserId: params.lineUserId,
+            messages: [
+                buildLineAffiliatePromptFlex({
+                    title: hasShopeeLink ? 'รอ Lazada' : 'รอ Shopee',
+                    brand: hasShopeeLink ? 'lazada' : 'shopee',
+                    message: hasShopeeLink ? 'ส่งลิงก์ Lazada มาเลย' : 'ส่งลิงก์ Shopee มาเลย',
+                }),
+            ],
+        })
+        return
+    }
     const nowIso = new Date().toISOString()
     const inboxRecord = await putInboxVideoRecord(params.bucket, {
         id: waitingState.id,
@@ -12372,8 +12397,7 @@ function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | und
     const createdAt = String(input?.createdAt || '').trim() || new Date().toISOString()
     const processedAt = String(input?.processedAt || '').trim()
     const updatedAt = String(input?.updatedAt || '').trim() || createdAt
-    const canProcessRawSource = (sourceType === 'line_video' || sourceType === 'xhs_url') && !shopeeLink && !lazadaLink
-    const status: InboxVideoStatus = (shopeeLink && lazadaLink) || canProcessRawSource ? 'ready' : 'awaiting_links'
+    const status: InboxVideoStatus = shopeeLink && lazadaLink ? 'ready' : 'awaiting_links'
 
     return {
         id,
