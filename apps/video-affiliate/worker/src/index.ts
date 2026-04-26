@@ -9669,8 +9669,9 @@ async function continueLineFlowAfterCover(params: {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
     const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
+    const affiliateLinksRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, params.namespaceId).catch(() => false)
 
-    if (!String(waitingState.shopeeLink || '').trim() || !String(waitingState.lazadaLink || '').trim()) {
+    if (affiliateLinksRequired && (!String(waitingState.shopeeLink || '').trim() || !String(waitingState.lazadaLink || '').trim())) {
         const hasShopee = !!String(waitingState.shopeeLink || '').trim()
         await putLineWaitingVideoState(params.bucket, params.lineUserId, {
             ...waitingState,
@@ -9860,6 +9861,7 @@ async function materializeSelectedLineCoverOptionAssets(params: {
 async function finalizeLineWaitingVideoAndStartProcessing(params: {
     env: Env
     bucket: R2Bucket
+    executionCtx?: ExecutionContext
     namespaceId: string
     channelAccessToken: string
     replyToken: string
@@ -9903,12 +9905,41 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         console.warn(`[LINE] primary admin inbox mirror failed for ${waitingState.id}: ${error instanceof Error ? error.message : String(error)}`)
     })
 
+    const executionCtx = params.executionCtx || {
+        waitUntil(promise: Promise<unknown>) {
+            promise.catch((error) => {
+                console.error(`[LINE] background processing failed for ${waitingState.id}: ${error instanceof Error ? error.message : String(error)}`)
+            })
+        },
+    } as ExecutionContext
+    const startResult = await ensureInboxVideoProcessingStarted({
+        env: params.env,
+        bucket: params.bucket,
+        executionCtx,
+        botId: params.namespaceId,
+        item: inboxRecord,
+        skipIfAlreadyProcessed: true,
+    })
+
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
 
+    const hasLinks = !!String(inboxRecord.shopeeLink || '').trim() || !!String(inboxRecord.lazadaLink || '').trim()
+    const jobStatus = startResult.outcome === 'started'
+        ? startResult.job.status
+        : startResult.outcome === 'already_running'
+            ? startResult.status
+            : 'processed'
+    const statusText = jobStatus === 'queued'
+        ? 'ระบบใส่คิวไว้แล้ว จะทยอยประมวลผลต่ออัตโนมัติ'
+        : jobStatus === 'processing'
+            ? 'ระบบเริ่มประมวลผลให้อัตโนมัติแล้ว'
+            : 'คลิปนี้มีไฟล์ประมวลผลแล้ว'
     const messages: LineReplyMessage[] = [
         {
             type: 'text',
-            text: '✅ รับลิงก์ครบแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ระบบ cron จะทยอยประมวลผลทีละคลิป',
+            text: hasLinks
+                ? `✅ รับลิงก์ครบแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ${statusText}`
+                : `✅ รับวิดีโอแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ${statusText}`,
         },
     ]
 
@@ -10980,7 +11011,7 @@ async function handleLineTextMessage(params: {
         if (isLineCoverSkipCommand(text)) {
             try {
                 await finalizeLineWaitingVideoAndStartProcessing({
-                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                 })
             } catch (e) {
                 console.error('[LINE] Skip cover during caption error:', e instanceof Error ? e.message : String(e))
@@ -11001,7 +11032,7 @@ async function handleLineTextMessage(params: {
         if (isLineCaptionSkipCommand(text)) {
             try {
                 await finalizeLineWaitingVideoAndStartProcessing({
-                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                 })
             } catch (e) {
                 console.error('[LINE] Skip caption error:', e instanceof Error ? `${e.message}\n${e.stack}` : String(e))
@@ -11046,14 +11077,14 @@ async function handleLineTextMessage(params: {
 
         try {
             await finalizeLineWaitingVideoAndStartProcessing({
-                env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                 manualCaption: captionCandidate,
             })
         } catch (e) {
             console.error('[LINE] Caption → cover error:', e instanceof Error ? e.message : String(e))
             try {
                 await finalizeLineWaitingVideoAndStartProcessing({
-                    env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
+                    env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                     manualCaption: captionCandidate,
                 })
             } catch (finalizeErr) {
@@ -12329,7 +12360,8 @@ function normalizeInboxVideoRecord(input: Partial<InboxVideoRecord> | null | und
     const createdAt = String(input?.createdAt || '').trim() || new Date().toISOString()
     const processedAt = String(input?.processedAt || '').trim()
     const updatedAt = String(input?.updatedAt || '').trim() || createdAt
-    const status: InboxVideoStatus = shopeeLink && lazadaLink ? 'ready' : 'awaiting_links'
+    const canProcessRawSource = (sourceType === 'line_video' || sourceType === 'xhs_url') && !shopeeLink && !lazadaLink
+    const status: InboxVideoStatus = (shopeeLink && lazadaLink) || canProcessRawSource ? 'ready' : 'awaiting_links'
 
     return {
         id,
@@ -13924,9 +13956,6 @@ async function ensureInboxVideoProcessingStarted(params: {
     const currentProcessingState = processingStateMap.get(item.id) || 'idle'
     if (currentProcessingState !== 'idle') {
         return { outcome: 'already_running', item, status: currentProcessingState, id: item.id }
-    }
-    if (await hasActiveProcessingJob(params.bucket)) {
-        return { outcome: 'already_running', item, status: 'processing', id: item.id }
     }
 
     if (params.skipIfAlreadyProcessed) {
@@ -17457,6 +17486,84 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
 
     if (importedCount > 0) {
         console.log(`[AUTO-IMPORT] Added ${importedCount} original videos to admin namespace`)
+    }
+}
+
+async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<void> {
+    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+    const namespaceIds = new Set<string>()
+    const addRows = (rows: unknown[] | undefined, key = 'namespace_id') => {
+        for (const row of rows || []) {
+            const namespaceId = String((row as Record<string, unknown>)?.[key] || '').trim()
+            if (namespaceId) namespaceIds.add(namespaceId)
+        }
+    }
+
+    await Promise.all([
+        env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        env.DB.prepare('SELECT DISTINCT namespace_id FROM users').all()
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        env.DB.prepare('SELECT DISTINCT namespace_id FROM line_users').all()
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        ensureTelegramBotSessionsTable(env.DB)
+            .then(() => env.DB.prepare('SELECT DISTINCT namespace_id FROM telegram_bot_sessions').all())
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        env.DB.prepare('SELECT DISTINCT bot_id FROM channels').all()
+            .then((res) => addRows(res.results as unknown[], 'bot_id'))
+            .catch(() => { }),
+    ])
+
+    for (const namespaceId of namespaceIds) {
+        if (!namespaceId || namespaceId === adminNamespaceId) continue
+        const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
+        if (await hasActiveProcessingJob(bucket).catch(() => true)) continue
+
+        const records = await listInboxVideoRecords(bucket).catch(() => [])
+        for (const record of records) {
+            const item = normalizeInboxVideoRecord(record)
+            if (!item || item.status !== 'ready') continue
+
+            const processedAt = await getGalleryIndexProcessedAt(env.DB, namespaceId, item.id).catch(() => '')
+            if (processedAt || String(item.processedAt || '').trim()) {
+                if (!String(item.processedAt || '').trim()) {
+                    await putInboxVideoRecord(bucket, {
+                        ...item,
+                        processedAt,
+                        updatedAt: new Date().toISOString(),
+                    }).catch(() => { })
+                }
+                continue
+            }
+
+            const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
+            if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+
+            try {
+                const result = await ensureInboxVideoProcessingStarted({
+                    env,
+                    bucket,
+                    executionCtx: ctx,
+                    botId: namespaceId,
+                    item,
+                    skipIfAlreadyProcessed: true,
+                })
+                if (result.outcome === 'started') {
+                    console.log(`[AUTO-INBOX] Started ${namespaceId}/${item.id}: ${result.job.status}`)
+                    break
+                }
+                if (result.outcome === 'already_running') {
+                    console.log(`[AUTO-INBOX] ${namespaceId}/${item.id} already ${result.status}`)
+                    break
+                }
+            } catch (error) {
+                console.error(`[AUTO-INBOX] Failed ${namespaceId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+            }
+        }
     }
 }
 
@@ -28352,6 +28459,9 @@ export default {
         })
         enqueueBackgroundTask(_ctx, 'CRON CONTAINER-WARMUP', async () => {
             await warmPipelineContainer(env)
+        })
+        enqueueBackgroundTask(_ctx, 'CRON READY INBOX', async () => {
+            await autoProcessReadyInboxForNamespaces(env, _ctx)
         })
         await handleScheduled(env, _ctx)
         enqueueBackgroundTask(_ctx, 'CRON PENDING COMMENTS', async () => {
