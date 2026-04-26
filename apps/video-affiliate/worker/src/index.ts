@@ -12828,6 +12828,7 @@ function buildInboxVideoResponseFromGalleryIndex(
     env: Env,
     video: Record<string, unknown>,
     ownerEmail = '',
+    options?: { shortlinkRequired?: boolean },
 ): Record<string, unknown> | null {
     const namespaceId = String(video.namespace_id || '').trim()
     const videoId = String(video.id || video.video_id || '').trim()
@@ -12836,7 +12837,8 @@ function buildInboxVideoResponseFromGalleryIndex(
     const processedAt = String(video.processedAt || video.processed_at || '').trim()
     const shopeeLink = String(video.shopeeLink || video.shopee_link || '').trim()
     const lazadaLink = String(video.lazadaLink || video.lazada_link || '').trim()
-    const readyToProcess = !processedAt && !!shopeeLink && !!lazadaLink
+    const shortlinkRequired = options?.shortlinkRequired === true
+    const readyToProcess = !processedAt && ((!!shopeeLink && !!lazadaLink) || !shortlinkRequired)
     const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
         String(env.WORKER_URL || '').trim(),
         namespaceId,
@@ -12859,7 +12861,7 @@ function buildInboxVideoResponseFromGalleryIndex(
         createdAt: String(video.createdAt || video.created_at || video.updatedAt || video.updated_at || '').trim() || new Date().toISOString(),
         updatedAt: String(video.updatedAt || video.updated_at || video.createdAt || video.created_at || '').trim() || new Date().toISOString(),
         ...(processedAt ? { processedAt } : {}),
-        status: (shopeeLink && lazadaLink)
+        status: readyToProcess
             ? 'ready'
             : 'awaiting_links',
         sourceType: 'line_video',
@@ -12967,6 +12969,7 @@ async function getNamespaceInboxGalleryIndexPage(params: {
     await ensureGalleryIndexTable(params.env.DB).catch(() => { })
     const offset = Math.max(0, Number(params.offset || 0))
     const limit = Math.min(Math.max(1, Number(params.limit || 24)), 120)
+    const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false)
     const processedClause = params.view === 'processed'
         ? "AND TRIM(COALESCE(processed_at,'')) <> ''"
         : "AND TRIM(COALESCE(processed_at,'')) = ''"
@@ -13009,7 +13012,7 @@ async function getNamespaceInboxGalleryIndexPage(params: {
     ])
     const ownerEmail = String(params.ownerEmail || '').trim()
     const videos = (pageRows.results || [])
-        .map((row) => buildInboxVideoResponseFromGalleryIndex(params.env, row, ownerEmail || String(row.owner_email || '').trim()))
+        .map((row) => buildInboxVideoResponseFromGalleryIndex(params.env, row, ownerEmail || String(row.owner_email || '').trim(), { shortlinkRequired }))
         .filter((video): video is Record<string, unknown> => !!video)
     const processedTotal = Number(totals?.processed_total || 0)
     const unprocessedTotal = Number(totals?.unprocessed_total || 0)
@@ -17491,32 +17494,7 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
 
 async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<void> {
     const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
-    const namespaceIds = new Set<string>()
-    const addRows = (rows: unknown[] | undefined, key = 'namespace_id') => {
-        for (const row of rows || []) {
-            const namespaceId = String((row as Record<string, unknown>)?.[key] || '').trim()
-            if (namespaceId) namespaceIds.add(namespaceId)
-        }
-    }
-
-    await Promise.all([
-        env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
-            .then((res) => addRows(res.results as unknown[]))
-            .catch(() => { }),
-        env.DB.prepare('SELECT DISTINCT namespace_id FROM users').all()
-            .then((res) => addRows(res.results as unknown[]))
-            .catch(() => { }),
-        env.DB.prepare('SELECT DISTINCT namespace_id FROM line_users').all()
-            .then((res) => addRows(res.results as unknown[]))
-            .catch(() => { }),
-        ensureTelegramBotSessionsTable(env.DB)
-            .then(() => env.DB.prepare('SELECT DISTINCT namespace_id FROM telegram_bot_sessions').all())
-            .then((res) => addRows(res.results as unknown[]))
-            .catch(() => { }),
-        env.DB.prepare('SELECT DISTINCT bot_id FROM channels').all()
-            .then((res) => addRows(res.results as unknown[], 'bot_id'))
-            .catch(() => { }),
-    ])
+    const namespaceIds = await collectKnownNamespaceIds(env)
 
     for (const namespaceId of namespaceIds) {
         if (!namespaceId || namespaceId === adminNamespaceId) continue
@@ -17565,6 +17543,36 @@ async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContex
             }
         }
     }
+}
+
+async function collectKnownNamespaceIds(env: Env): Promise<Set<string>> {
+    const namespaceIds = new Set<string>()
+    const addRows = (rows: unknown[] | undefined, key = 'namespace_id') => {
+        for (const row of rows || []) {
+            const namespaceId = String((row as Record<string, unknown>)?.[key] || '').trim()
+            if (namespaceId) namespaceIds.add(namespaceId)
+        }
+    }
+
+    await Promise.all([
+        env.DB.prepare('SELECT DISTINCT namespace_id FROM email_namespaces').all()
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        env.DB.prepare('SELECT DISTINCT namespace_id FROM users').all()
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        env.DB.prepare('SELECT DISTINCT namespace_id FROM line_users').all()
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        ensureTelegramBotSessionsTable(env.DB)
+            .then(() => env.DB.prepare('SELECT DISTINCT namespace_id FROM telegram_bot_sessions').all())
+            .then((res) => addRows(res.results as unknown[]))
+            .catch(() => { }),
+        env.DB.prepare('SELECT DISTINCT bot_id FROM channels').all()
+            .then((res) => addRows(res.results as unknown[], 'bot_id'))
+            .catch(() => { }),
+    ])
+    return namespaceIds
 }
 
 async function getNamespaceShopeeShortlinkBaseUrlEntry(db: D1Database, namespaceId: string): Promise<{ baseUrl: string; updatedAt: string | null }> {
