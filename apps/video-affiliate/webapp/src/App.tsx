@@ -53,6 +53,32 @@ const normalizeSessionToken = (value?: string | null) => {
   return token.startsWith('sess_') ? token : ''
 }
 
+const buildMainLiffRedirectUrl = (baseUrl: string) => {
+  if (!isBrowser || !baseUrl) return baseUrl
+  try {
+    const current = new URL(window.location.href)
+    const base = baseUrl.replace(/\/+$/, '')
+    const path = current.pathname === '/' ? '' : current.pathname
+    return `${base}${path}${current.search}`
+  } catch {
+    return baseUrl
+  }
+}
+
+const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 const getToken = (botScope = getBotScopeFromLocation()) => {
   if (!isBrowser) return ''
   try {
@@ -3004,6 +3030,7 @@ function App({
     } catch { return getToken(botScope) }
   });
   const [authBootstrapping, setAuthBootstrapping] = useState(true)
+  const [authError, setAuthError] = useState('')
 
   const bindTelegramSession = async (sessionToken: string, telegramId: string | number | undefined, botId: string) => {
     const normalizedSessionToken = normalizeSessionToken(sessionToken)
@@ -4092,6 +4119,7 @@ function App({
     setCommentTemplateLoading(false)
     setCommentTemplateSaving(false)
     setCommentTemplateMaxChars(4000)
+    setAuthError('')
     setAuthBootstrapping(true)
   }, [botScope])
 
@@ -4107,7 +4135,7 @@ function App({
       const liff = await waitForLiffSdk(5000)
       if (typeof window !== 'undefined' && liff && liffInitOptions) {
         try {
-          await liff.init(liffInitOptions)
+          await withTimeout(Promise.resolve(liff.init(liffInitOptions)), 8000, 'LIFF init')
           if (!controlledTab) {
             syncNavigationStateFromLocation()
           }
@@ -4150,21 +4178,29 @@ function App({
           // If still no userId and in client, try login with redirect back
           if (!lineUserId && liff.isInClient() && !liff.isLoggedIn()) {
             liff.login({ redirectUri: window.location.href })
+            if (!cancelled) {
+              setAuthError('LINE ยังไม่ส่งข้อมูลผู้ใช้กลับมา กดลองใหม่หรือเปิดผ่าน LINE อีกครั้ง')
+              setAuthBootstrapping(false)
+            }
             return
           }
 
           if (lineUserId) {
-            const liffResp = await fetch(`${WORKER_URL}/api/line/liff-login`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                line_user_id: lineUserId,
-                display_name: displayName,
-                picture_url: pictureUrl,
-                id_token: idToken,
-                invite_namespace: getInviteNamespaceFromSearch(window.location.search),
+            const liffResp = await withTimeout(
+              fetch(`${WORKER_URL}/api/line/liff-login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  line_user_id: lineUserId,
+                  display_name: displayName,
+                  picture_url: pictureUrl,
+                  id_token: idToken,
+                  invite_namespace: getInviteNamespaceFromSearch(window.location.search),
+                }),
               }),
-            })
+              10_000,
+              'LIFF login',
+            )
 
             if (liffResp.ok) {
               const liffData = await liffResp.json().catch(() => ({})) as any
@@ -4199,10 +4235,20 @@ function App({
                 return
               }
             }
+            if (!cancelled) {
+              setAuthError(`LINE login API ไม่สำเร็จ (${liffResp.status})`)
+            }
+          } else if (!cancelled) {
+            setAuthError('LINE ไม่ส่ง user id กลับมา')
           }
         } catch (e) {
           console.error('LIFF init error:', e)
+          if (!cancelled) {
+            setAuthError(e instanceof Error ? e.message : 'เชื่อมต่อ LINE ไม่สำเร็จ')
+          }
         }
+      } else if (appHost && !liff && !cancelled) {
+        setAuthError('โหลด LINE SDK ไม่สำเร็จ')
       }
 
       if (appHost && typeof window !== 'undefined' && mainLiffUrl) {
@@ -4211,7 +4257,7 @@ function App({
           const lastRedirectAt = Number(sessionStorage.getItem(redirectGuardKey) || '0')
           if (Date.now() - lastRedirectAt > 10_000) {
             sessionStorage.setItem(redirectGuardKey, String(Date.now()))
-            window.location.replace(mainLiffUrl)
+            window.location.replace(buildMainLiffRedirectUrl(mainLiffUrl))
             return
           }
         } catch {}
@@ -6592,6 +6638,19 @@ function App({
     return () => window.clearTimeout(timer)
   }, [tab, systemInboxLoading, systemInboxLoadingMore, systemInboxHasMore, isSystemAdmin, systemInboxVideos.length])
 
+  const openMainLiff = () => {
+    if (typeof window === 'undefined') return
+    const mainLiffUrl = getMainLiffUrlForHost(window.location.hostname)
+    if (!mainLiffUrl) {
+      window.location.reload()
+      return
+    }
+    try {
+      sessionStorage.removeItem(scopedStorageKey('liff_bootstrap_redirecting', botScope))
+    } catch {}
+    window.location.href = buildMainLiffRedirectUrl(mainLiffUrl)
+  }
+
   // If viewing a specific page detail
   if (selectedPage) {
     return (
@@ -6645,9 +6704,28 @@ function App({
           style={appViewportStyle}
           className="fixed inset-0 bg-white flex items-center justify-center font-['Sukhumvit_Set','Kanit',sans-serif] overflow-hidden"
         >
-          <div className="flex flex-col items-center gap-3 text-gray-500 px-8 text-center">
-            <div className="w-7 h-7 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-            <p className="text-sm font-medium">กำลังเชื่อมต่อ LINE...</p>
+          <div className="flex w-full max-w-sm flex-col items-center gap-4 px-8 text-center">
+            <div className="w-10 h-10 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+            <div>
+              <p className="text-base font-bold text-gray-900">กำลังเชื่อมต่อ LINE...</p>
+              <p className="mt-1 text-sm text-gray-500">
+                {authError || 'ถ้าหน้านี้ค้าง ให้กดเปิดผ่าน LINE อีกครั้ง'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={openMainLiff}
+              className="mt-2 w-full rounded-2xl bg-[#06C755] px-5 py-3 text-sm font-bold text-white active:scale-95 transition-transform"
+            >
+              เปิดผ่าน LINE อีกครั้ง
+            </button>
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="w-full rounded-2xl bg-gray-100 px-5 py-3 text-sm font-bold text-gray-700 active:scale-95 transition-transform"
+            >
+              โหลดใหม่
+            </button>
           </div>
         </div>
       )
