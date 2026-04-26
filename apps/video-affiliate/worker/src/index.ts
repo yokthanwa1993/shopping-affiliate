@@ -12844,6 +12844,76 @@ function buildInboxVideoResponseFromGalleryIndex(
     }
 }
 
+async function getNextReadyGalleryIndexInboxRecord(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+}): Promise<InboxVideoRecord | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    if (!namespaceId) return null
+    await ensureGalleryIndexTable(params.env.DB).catch(() => { })
+
+    const page = await params.env.DB.prepare(
+        `SELECT
+            namespace_id,
+            video_id,
+            title,
+            shopee_link,
+            lazada_link,
+            shopee_original_link,
+            lazada_original_link,
+            original_url,
+            created_at,
+            updated_at
+         FROM gallery_index
+         WHERE namespace_id = ?
+           AND TRIM(COALESCE(original_url,'')) <> ''
+           AND TRIM(COALESCE(processed_at,'')) = ''
+           AND TRIM(COALESCE(shopee_link,'')) <> ''
+           AND TRIM(COALESCE(lazada_link,'')) <> ''
+         ORDER BY COALESCE(NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, video_id ASC
+         LIMIT 12`
+    ).bind(namespaceId).all().catch(() => ({ results: [] })) as { results?: Array<Record<string, unknown>> }
+
+    for (const row of page.results || []) {
+        const id = String(row.video_id || '').trim()
+        if (!id) continue
+
+        const existingProcessingStatus = await getProcessingJobStatus(params.bucket, id).catch(() => '')
+        if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+
+        const processedAt = await getGalleryIndexProcessedAt(params.env.DB, namespaceId, id).catch(() => '')
+        if (processedAt) continue
+
+        const originalUrl = String(row.original_url || '').trim()
+        const shopeeLink = String(row.shopee_link || '').trim()
+        const lazadaLink = String(row.lazada_link || '').trim()
+        if (!originalUrl || !shopeeLink || !lazadaLink) continue
+
+        const existing = await getInboxVideoRecord(params.bucket, id).catch(() => null)
+        const timestamp = String(row.updated_at || row.created_at || '').trim() || new Date().toISOString()
+        return putInboxVideoRecord(params.bucket, {
+            ...existing,
+            id,
+            videoUrl: originalUrl,
+            chatId: Number(existing?.chatId || 0),
+            createdAt: String(existing?.createdAt || row.created_at || timestamp).trim() || timestamp,
+            updatedAt: new Date().toISOString(),
+            sourceType: existing?.sourceType || 'line_video',
+            sourceLabel: String(existing?.sourceLabel || row.title || 'Admin original').trim().slice(0, 500) || 'Admin original',
+            shopeeLink,
+            lazadaLink,
+            shopeeOriginalLink: String(row.shopee_original_link || shopeeLink).trim(),
+            lazadaOriginalLink: String(row.lazada_original_link || lazadaLink).trim(),
+            linkRecordedAt: String(existing?.linkRecordedAt || timestamp).trim() || timestamp,
+            manualCaption: normalizeManualCaption(existing?.manualCaption || ''),
+            captionProvidedAt: String(existing?.captionProvidedAt || '').trim(),
+        })
+    }
+
+    return null
+}
+
 async function getNamespaceInboxGalleryIndexPage(params: {
     env: Env
     namespaceId: string
@@ -13758,18 +13828,27 @@ async function startInboxVideoProcessing(params: {
     }), {
         httpMetadata: { contentType: 'application/json' },
     })
-    params.executionCtx.waitUntil(
-        runPipeline(
-            params.env,
-            item.videoUrl,
-            item.chatId,
-            0,
-            item.id,
-            params.botId,
-            String(item.shopeeLink || '').trim(),
-            String(item.lazadaLink || '').trim(),
-        )
-    )
+    params.executionCtx.waitUntil((async () => {
+        try {
+            await runPipeline(
+                params.env,
+                item.videoUrl,
+                item.chatId,
+                0,
+                item.id,
+                params.botId,
+                String(item.shopeeLink || '').trim(),
+                String(item.lazadaLink || '').trim(),
+            )
+        } finally {
+            const adminNamespaceId = await resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => '')
+            if (adminNamespaceId && adminNamespaceId === params.botId) {
+                await autoImportAndProcessForAdmin(params.env, params.executionCtx).catch((error) => {
+                    console.error(`[INBOX-PROCESS] failed to start next admin original after ${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+                })
+            }
+        }
+    })())
     return { status: 'processing', id: item.id }
 }
 
@@ -17239,6 +17318,39 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
                 return true
             } catch (e) {
                 console.error(`[AUTO-IMPORT] Failed to start processing ${nextVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+
+        const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
+            env,
+            bucket: adminBucket,
+            namespaceId: adminNamespaceId,
+        }).catch((error) => {
+            console.error(`[AUTO-IMPORT] Failed to read gallery_index fallback: ${error instanceof Error ? error.message : String(error)}`)
+            return null
+        })
+        if (galleryIndexVideo) {
+            try {
+                const result = await ensureInboxVideoProcessingStarted({
+                    env,
+                    bucket: adminBucket,
+                    executionCtx: ctx,
+                    botId: adminNamespaceId,
+                    item: galleryIndexVideo,
+                    skipIfAlreadyProcessed: true,
+                })
+                if (result.outcome === 'already_running') {
+                    console.log(`[AUTO-IMPORT] gallery_index ${galleryIndexVideo.id} already ${result.status}`)
+                    return false
+                }
+                if (result.outcome === 'already_processed') {
+                    console.log(`[AUTO-IMPORT] gallery_index ${galleryIndexVideo.id} already processed`)
+                    return false
+                }
+                console.log(`[AUTO-IMPORT] Started gallery_index processing ${galleryIndexVideo.id}: ${result.job.status}`)
+                return true
+            } catch (e) {
+                console.error(`[AUTO-IMPORT] Failed to start gallery_index processing ${galleryIndexVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
             }
         }
 
