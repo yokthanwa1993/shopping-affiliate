@@ -98,8 +98,63 @@ const readCache = <T,>(key: string, fallback: T): T => {
   }
 }
 
-const writeCache = (key: string, value: unknown) => {
-  try { localStorage.setItem(key, JSON.stringify(value)) } catch { }
+const isQuotaExceededError = (error: unknown) => {
+  const name = error instanceof DOMException ? error.name : ''
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /quota/i.test(name) || /quota/i.test(message)
+}
+
+const trimCacheValue = <T,>(value: T, maxItems?: number): T => {
+  if (!maxItems || !Array.isArray(value)) return value
+  return value.slice(0, Math.max(0, maxItems)) as T
+}
+
+const clearLargeLocalCaches = () => {
+  if (!isBrowser) return
+  const prefixes = [
+    'gallery_cache',
+    'used_cache',
+    'history_cache',
+    'inbox_cache',
+    'inbox_system_cache',
+    'gallery_system_cache',
+    'gallery_system_used_cache',
+    'dashboard_cache',
+    'processing_cache',
+    'categories_cache',
+  ]
+  try {
+    const keys: string[] = []
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i) || ''
+      if (prefixes.some((prefix) => key.startsWith(prefix))) keys.push(key)
+    }
+    keys.forEach((key) => localStorage.removeItem(key))
+  } catch {}
+}
+
+const clearLocalAppDataAndReload = () => {
+  if (!isBrowser) return
+  try { localStorage.clear() } catch {}
+  try { sessionStorage.clear() } catch {}
+  try {
+    if ('caches' in window) {
+      void caches.keys().then((keys) => Promise.all(keys.map((key) => caches.delete(key))))
+    }
+  } catch {}
+  window.setTimeout(() => window.location.reload(), 120)
+}
+
+const writeCache = (key: string, value: unknown, maxItems?: number) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(trimCacheValue(value, maxItems)))
+  } catch (error) {
+    if (!isQuotaExceededError(error)) return
+    clearLargeLocalCaches()
+    try {
+      localStorage.setItem(key, JSON.stringify(trimCacheValue(value, Math.min(maxItems || 24, 24))))
+    } catch {}
+  }
 }
 
 const getStoredNamespace = (botScope = getBotScopeFromLocation()) => {
@@ -136,6 +191,11 @@ const hasStoredAffiliateShortlinkConfig = (botScope = getBotScopeFromLocation())
 }
 
 const CACHE_VERSION = 'v13'
+const GALLERY_CACHE_ITEMS = 72
+const USED_GALLERY_CACHE_ITEMS = 72
+const INBOX_CACHE_ITEMS = 72
+const HISTORY_CACHE_ITEMS = 80
+const PROCESSING_CACHE_ITEMS = 32
 const globalCacheKey = (kind: 'gallery' | 'used' | 'history') => `${kind}_cache:${CACHE_VERSION}`
 const nsCacheKey = (kind: 'gallery' | 'used' | 'history', namespaceId: string) => `${kind}_cache:${CACHE_VERSION}:${namespaceId}`
 const systemGalleryCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`gallery_system_cache:${CACHE_VERSION}`, botScope)
@@ -3843,30 +3903,30 @@ function App({
 
   useEffect(() => {
     if (systemWideGalleryMode) {
-      writeCache(systemGalleryCacheKey(botScope), videos)
+      writeCache(systemGalleryCacheKey(botScope), videos, GALLERY_CACHE_ITEMS)
       return
     }
     if (!namespaceId) return
-    writeCache(nsCacheKey('gallery', namespaceId), videos)
+    writeCache(nsCacheKey('gallery', namespaceId), videos, GALLERY_CACHE_ITEMS)
   }, [botScope, namespaceId, systemWideGalleryMode, videos])
 
   useEffect(() => {
     if (systemWideGalleryMode) {
-      writeCache(systemUsedGalleryCacheKey(botScope), usedVideos)
+      writeCache(systemUsedGalleryCacheKey(botScope), usedVideos, USED_GALLERY_CACHE_ITEMS)
       return
     }
     if (!namespaceId) return
-    writeCache(nsCacheKey('used', namespaceId), usedVideos)
+    writeCache(nsCacheKey('used', namespaceId), usedVideos, USED_GALLERY_CACHE_ITEMS)
   }, [botScope, namespaceId, systemWideGalleryMode, usedVideos])
 
   useEffect(() => {
     if (!namespaceId) return
-    writeCache(nsCacheKey('history', namespaceId), postHistory)
+    writeCache(nsCacheKey('history', namespaceId), postHistory, HISTORY_CACHE_ITEMS)
   }, [namespaceId, postHistory])
 
   useEffect(() => {
     if (!namespaceId) return
-    writeCache(nsInboxCacheKey(namespaceId), inboxVideos)
+    writeCache(nsInboxCacheKey(namespaceId), inboxVideos, INBOX_CACHE_ITEMS)
   }, [namespaceId, inboxVideos])
 
   useEffect(() => {
@@ -3877,11 +3937,11 @@ function App({
 
   useEffect(() => {
     if (!namespaceId) return
-    writeCache(processingCacheKey(namespaceId), processingVideos)
+    writeCache(processingCacheKey(namespaceId), processingVideos, PROCESSING_CACHE_ITEMS)
   }, [namespaceId, processingVideos])
 
   useEffect(() => {
-    writeCache(systemInboxCacheKey(botScope), systemInboxVideos)
+    writeCache(systemInboxCacheKey(botScope), systemInboxVideos, INBOX_CACHE_ITEMS)
   }, [botScope, systemInboxVideos])
 
   useEffect(() => {
@@ -4244,7 +4304,9 @@ function App({
         } catch (e) {
           console.error('LIFF init error:', e)
           if (!cancelled) {
-            setAuthError(e instanceof Error ? e.message : 'เชื่อมต่อ LINE ไม่สำเร็จ')
+            setAuthError(isQuotaExceededError(e)
+              ? 'พื้นที่เก็บข้อมูลของ LINE ในเครื่องนี้เต็ม ให้ล้างข้อมูลเครื่องนี้แล้วเข้าใหม่'
+              : e instanceof Error ? e.message : 'เชื่อมต่อ LINE ไม่สำเร็จ')
           }
         }
       } else if (appHost && !liff && !cancelled) {
@@ -6725,6 +6787,13 @@ function App({
               className="w-full rounded-2xl bg-gray-100 px-5 py-3 text-sm font-bold text-gray-700 active:scale-95 transition-transform"
             >
               โหลดใหม่
+            </button>
+            <button
+              type="button"
+              onClick={clearLocalAppDataAndReload}
+              className="w-full rounded-2xl border border-red-100 bg-red-50 px-5 py-3 text-sm font-bold text-red-600 active:scale-95 transition-transform"
+            >
+              ล้างข้อมูลเครื่องนี้
             </button>
           </div>
         </div>

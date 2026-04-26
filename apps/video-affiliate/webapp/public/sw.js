@@ -1,5 +1,5 @@
 // Minimal SW - just handles cache cleanup and stays out of the way
-const CACHE_NAME = 'chearb-v4'
+const CACHE_NAME = 'chearb-v5'
 
 self.addEventListener('install', () => {
   self.skipWaiting()
