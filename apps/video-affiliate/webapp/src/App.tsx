@@ -89,24 +89,15 @@ const getToken = (botScope = getBotScopeFromLocation()) => {
 }
 
 const readCache = <T,>(key: string, fallback: T): T => {
-  try {
-    const raw = localStorage.getItem(key)
-    if (!raw) return fallback
-    return JSON.parse(raw) as T
-  } catch {
-    return fallback
-  }
+  // Bulk data is Cloudflare-backed; LINE WebViews can exhaust localStorage quota quickly.
+  void key
+  return fallback
 }
 
 const isQuotaExceededError = (error: unknown) => {
   const name = error instanceof DOMException ? error.name : ''
   const message = error instanceof Error ? error.message : String(error || '')
   return /quota/i.test(name) || /quota/i.test(message)
-}
-
-const trimCacheValue = <T,>(value: T, maxItems?: number): T => {
-  if (!maxItems || !Array.isArray(value)) return value
-  return value.slice(0, Math.max(0, maxItems)) as T
 }
 
 const clearLargeLocalCaches = () => {
@@ -146,15 +137,10 @@ const clearLocalAppDataAndReload = () => {
 }
 
 const writeCache = (key: string, value: unknown, maxItems?: number) => {
-  try {
-    localStorage.setItem(key, JSON.stringify(trimCacheValue(value, maxItems)))
-  } catch (error) {
-    if (!isQuotaExceededError(error)) return
-    clearLargeLocalCaches()
-    try {
-      localStorage.setItem(key, JSON.stringify(trimCacheValue(value, Math.min(maxItems || 24, 24))))
-    } catch {}
-  }
+  // Keep only small auth/settings values in localStorage. Lists stay server-backed.
+  void key
+  void value
+  void maxItems
 }
 
 const getStoredNamespace = (botScope = getBotScopeFromLocation()) => {
@@ -3071,6 +3057,10 @@ function App({
 } = {}) {
   const botScope = getBotScopeFromLocation()
 
+  useEffect(() => {
+    clearLargeLocalCaches()
+  }, [])
+
   const [token, setTokenState] = useState<string>(() => {
     if (!isBrowser) return ''
     try {
@@ -5224,13 +5214,6 @@ function App({
     const session = getToken()
     if (!session) return
     const requestId = ++dashboardRequestRef.current
-    const scopedNamespace = String(namespaceId || getStoredNamespace(botScope) || '').trim()
-    if (scopedNamespace) {
-      const cachedForDate = readCache<DashboardData | null>(dashboardCacheKey(scopedNamespace, dateValue), null)
-      if (cachedForDate && requestId === dashboardRequestRef.current) {
-        setDashboardData((prev) => (prev?.date === cachedForDate.date ? prev : cachedForDate))
-      }
-    }
     if (!options.silent && !dashboardData) setDashboardLoading(true)
     try {
       const cacheBust = options.silent ? '' : `&_ts=${Date.now()}`
