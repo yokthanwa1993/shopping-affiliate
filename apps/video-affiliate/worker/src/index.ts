@@ -1614,7 +1614,7 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
     const pageId = String(params.pageId || '').trim()
     const videoId = String(params.videoId || '').trim()
     const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
-    if (!namespaceId || !pageId || !videoId) return null
+    if (!namespaceId || !pageId || (!videoId && !sourceFingerprint)) return null
 
     const row = await db.prepare(
         `SELECT ph.id, ph.fb_post_id, ph.posted_at
@@ -1626,12 +1626,12 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
            AND ph.page_id = ?
            AND ph.status = 'success'
            AND (
-               ph.video_id = ?
+               (? <> '' AND ph.video_id = ?)
                OR (? <> '' AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) = ?)
            )
          ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
          LIMIT 1`
-    ).bind(namespaceId, pageId, videoId, sourceFingerprint, sourceFingerprint).first() as {
+    ).bind(namespaceId, pageId, videoId, videoId, sourceFingerprint, sourceFingerprint).first() as {
         id?: number
         fb_post_id?: string | null
         posted_at?: string | null
@@ -1750,14 +1750,7 @@ async function getExistingPagePostedVideoGuard(db: D1Database, params: {
     const row = await db.prepare(
         `SELECT p.history_id, p.created_at
          FROM page_posted_video_guards p
-         LEFT JOIN namespace_video_state nvs
-           ON nvs.namespace_id = p.bot_id
-          AND nvs.video_id = p.video_id
          WHERE p.guard_key IN (${placeholders})
-           AND (
-               TRIM(COALESCE(nvs.manual_unposted_at, '')) = ''
-               OR datetime(COALESCE(p.updated_at, p.created_at)) > datetime(nvs.manual_unposted_at)
-           )
          ORDER BY datetime(p.updated_at) DESC, p.history_id DESC
          LIMIT 1`
     ).bind(...keys).first() as { history_id?: number | null; created_at?: string | null } | null
@@ -1833,21 +1826,14 @@ async function claimGalleryVideoForPosting(params: {
             video?.sourceFingerprint || video?.source_fingerprint,
         )
 
-        const existingGuard = await getExistingPagePostedVideoGuard(params.db, {
+        const duplicateCheck = await ensurePageVideoNeverPosted({
+            db: params.db,
             namespaceId,
             pageId,
             videoId,
             sourceFingerprint,
         })
-        if (existingGuard) {
-            const latestHistory = await getLatestSuccessfulPostHistoryRow(params.db, {
-                namespaceId,
-                pageId,
-                videoId,
-                sourceFingerprint,
-            })
-            const postedAt = latestHistory?.postedAt || existingGuard.createdAt || new Date().toISOString()
-            await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
+        if (duplicateCheck.ok === false) {
             continue
         }
 
@@ -1871,16 +1857,33 @@ async function ensurePageVideoNeverPosted(params: {
     videoId: string
     sourceFingerprint?: string
 }): Promise<{ ok: true } | { ok: false; postedAt: string | null; historyId: number | null }> {
+    const latestHistory = await getLatestSuccessfulPostHistoryRow(params.db, params)
+    if (latestHistory) {
+        await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, latestHistory.postedAt || new Date().toISOString()).catch(() => { })
+        await recordPagePostedVideoGuard(params.db, {
+            namespaceId: params.namespaceId,
+            pageId: params.pageId,
+            videoId: params.videoId,
+            sourceFingerprint: params.sourceFingerprint,
+            historyId: latestHistory.id,
+            postedAt: latestHistory.postedAt,
+        }).catch(() => { })
+        return {
+            ok: false,
+            postedAt: latestHistory.postedAt,
+            historyId: latestHistory.id,
+        }
+    }
+
     const existingGuard = await getExistingPagePostedVideoGuard(params.db, params)
     if (!existingGuard) return { ok: true }
 
-    const latestHistory = await getLatestSuccessfulPostHistoryRow(params.db, params)
-    const postedAt = latestHistory?.postedAt || existingGuard.createdAt || null
+    const postedAt = existingGuard.createdAt || null
     await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
     return {
         ok: false,
         postedAt,
-        historyId: latestHistory?.id ?? existingGuard.historyId ?? null,
+        historyId: existingGuard.historyId ?? null,
     }
 }
 
