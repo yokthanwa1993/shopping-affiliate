@@ -12873,8 +12873,7 @@ function buildInboxVideoResponseFromGalleryIndex(
     const processedAt = String(video.processedAt || video.processed_at || '').trim()
     const shopeeLink = String(video.shopeeLink || video.shopee_link || '').trim()
     const lazadaLink = String(video.lazadaLink || video.lazada_link || '').trim()
-    const shortlinkRequired = options?.shortlinkRequired === true
-    const readyToProcess = !processedAt && ((!!shopeeLink && !!lazadaLink) || !shortlinkRequired)
+    const readyToProcess = !processedAt && !!shopeeLink && !!lazadaLink
     const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
         String(env.WORKER_URL || '').trim(),
         namespaceId,
@@ -13047,8 +13046,19 @@ async function getNamespaceInboxGalleryIndexPage(params: {
         ).bind(namespaceId).first() as Promise<{ total?: number; processed_total?: number; unprocessed_total?: number } | null>,
     ])
     const ownerEmail = String(params.ownerEmail || '').trim()
-    const videos = (pageRows.results || [])
-        .map((row) => buildInboxVideoResponseFromGalleryIndex(params.env, row, ownerEmail || String(row.owner_email || '').trim(), { shortlinkRequired }))
+    const bucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
+    const videos = (await Promise.all((pageRows.results || []).map(async (row) => {
+        const videoId = String(row.video_id || row.id || '').trim()
+        const existingInboxRecord = videoId ? await getInboxVideoRecord(bucket, videoId).catch(() => null) : null
+        const existingLineRecordNeedsLinks = !!(
+            existingInboxRecord
+            && (existingInboxRecord.sourceType === 'line_video' || existingInboxRecord.sourceType === 'xhs_url')
+            && (!String(existingInboxRecord.shopeeLink || '').trim() || !String(existingInboxRecord.lazadaLink || '').trim())
+        )
+        return buildInboxVideoResponseFromGalleryIndex(params.env, row, ownerEmail || String(row.owner_email || '').trim(), {
+            shortlinkRequired: shortlinkRequired || existingLineRecordNeedsLinks,
+        })
+    })))
         .filter((video): video is Record<string, unknown> => !!video)
     const processedTotal = Number(totals?.processed_total || 0)
     const unprocessedTotal = Number(totals?.unprocessed_total || 0)
