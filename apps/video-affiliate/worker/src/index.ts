@@ -13880,18 +13880,6 @@ async function startInboxVideoProcessing(params: {
     })
 
     if (await hasActiveProcessingJob(params.bucket)) {
-        await params.bucket.put(`_queue/${item.id}.json`, JSON.stringify({
-            id: item.id,
-            videoUrl: item.videoUrl,
-            shopeeLink: String(item.shopeeLink || '').trim(),
-            lazadaLink: String(item.lazadaLink || '').trim(),
-            manualCaption: normalizeManualCaption(item.manualCaption),
-            chatId: item.chatId,
-            createdAt: nowIso,
-            status: 'queued',
-        }), {
-            httpMetadata: { contentType: 'application/json' },
-        })
         return { status: 'queued', id: item.id }
     }
 
@@ -14097,6 +14085,7 @@ app.get('/api/processing', async (c) => {
             })
         )
         const videos = (tasks.filter(Boolean) as Array<Record<string, unknown>>)
+            .filter((video) => String(video.status || '').trim().toLowerCase() === 'processing')
         videos.sort((a, b) => {
             const at = new Date(String(a.createdAt || '')).getTime()
             const bt = new Date(String(b.createdAt || '')).getTime()

@@ -4667,12 +4667,9 @@ function App({
     const shouldShowLoading = processingVideos.length === 0
     if (shouldShowLoading) setProcessingLoading(true)
     try {
-      const [processingResp, queueResp] = await Promise.all([
-        apiFetch(`${WORKER_URL}/api/processing?summary=0`),
-        apiFetch(`${WORKER_URL}/api/queue`)
-      ])
+      const processingResp = await apiFetch(`${WORKER_URL}/api/processing?summary=0`)
 
-      if (processingResp.status === 401 || queueResp.status === 401) {
+      if (processingResp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
@@ -4687,12 +4684,9 @@ function App({
             pending_total?: number
             pending_has_lazada_total?: number
             pending_missing_lazada_total?: number
-          }
+        }
         : { videos: [], pending_shortlink_videos: [] }
-      const queueData = queueResp.ok
-        ? await queueResp.json() as { queue?: Video[] }
-        : { queue: [] }
-      const processingVideos = [...(procData.videos || []), ...(queueData.queue || [])]
+      const processingVideos = procData.videos || []
       const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
       setProcessingVideos(processingVideos)
       setPendingShortlinkVideos(pendingVideos)
