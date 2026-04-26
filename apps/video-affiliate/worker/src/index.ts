@@ -4036,6 +4036,12 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
         stateByVideoId,
         bucket,
     })
+    await reconcileNamespacePostedStateFromHistory({
+        db: env.DB,
+        namespaceId: normalizedNamespaceId,
+        sourceVideos: namespaceSourceVideos as Array<Record<string, unknown>>,
+        stateByVideoId,
+    })
     const inventoryVideos = namespaceSourceVideos
         .map((video) => {
             const source = video as Record<string, unknown>
@@ -4134,6 +4140,12 @@ async function getSystemGalleryInventory(env: Env): Promise<{
             const row = stateByVideoKey.get(`${namespaceId}:${videoId}`)
             if (row) namespaceStateByVideoId.set(videoId, row)
         }
+        await reconcileNamespacePostedStateFromHistory({
+            db: env.DB,
+            namespaceId,
+            sourceVideos: namespaceSourceVideos,
+            stateByVideoId: namespaceStateByVideoId,
+        })
 
         for (const [videoId, row] of namespaceStateByVideoId.entries()) {
             stateByVideoKey.set(`${namespaceId}:${videoId}`, row)
@@ -15809,6 +15821,9 @@ app.put('/api/gallery/:id', async (c) => {
 // This avoids accidentally moving member clips when admin only wants to reset their own.
 app.post('/api/gallery/reset-posted-bulk', async (c) => {
     try {
+        const adminCheck = await requireSystemAdminSession(c)
+        if (!adminCheck.ok) return adminCheck.response
+
         const currentNamespaceId = String(c.get('botId') || '').trim()
         const body = await c.req.json().catch(() => ({} as { namespace_id?: string; namespaceId?: string })) as { namespace_id?: string; namespaceId?: string }
         const requestedNamespaceId = String(
@@ -18812,6 +18827,12 @@ async function reconcileNamespacePostedStateFromHistory(params: {
             video_id: videoId,
         }
         if (String(currentRow.posted_at || '').trim()) continue
+        const manualUnpostedAt = String(currentRow.manual_unposted_at || '').trim()
+        if (manualUnpostedAt) {
+            const postedTime = Date.parse(postedAt)
+            const manualTime = Date.parse(manualUnpostedAt)
+            if (Number.isFinite(postedTime) && Number.isFinite(manualTime) && postedTime <= manualTime) continue
+        }
         await upsertNamespaceVideoState(params.db, namespaceId, videoId, { posted_at: postedAt })
         params.stateByVideoId.set(videoId, {
             ...currentRow,
