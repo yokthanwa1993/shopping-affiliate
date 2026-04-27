@@ -28401,7 +28401,6 @@ async function watchdogStuckJobs(env: Env) {
         const botBucket = new BotBucket(env.BUCKET, botId)
         try {
             const list = await botBucket.list({ prefix: '_processing/' })
-            if (list.objects.length === 0) continue
 
             for (const obj of list.objects) {
                 const data = await botBucket.get(obj.key)
