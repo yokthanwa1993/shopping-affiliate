@@ -13715,10 +13715,23 @@ async function syncImportedOriginalIntoNamespace(params: {
         shopee_original_link?: string
         lazada_original_link?: string
     } | null
+    const sourceGallery = await params.env.DB.prepare(
+        `SELECT shopee_link, lazada_link, shopee_original_link, lazada_original_link
+         FROM gallery_index
+         WHERE namespace_id = ? AND video_id = ?
+         LIMIT 1`
+    ).bind(sourceNamespaceId, videoId).first().catch(() => null) as {
+        shopee_link?: string
+        lazada_link?: string
+        shopee_original_link?: string
+        lazada_original_link?: string
+    } | null
     const shopeeLink = getVideoSourceShopeeLink(params.sourceVideo)
         || String(sourceState?.shopee_link || sourceState?.shopee_original_link || '').trim()
+        || String(sourceGallery?.shopee_link || sourceGallery?.shopee_original_link || '').trim()
     const lazadaLink = getVideoSourceLazadaLink(params.sourceVideo)
         || String(sourceState?.lazada_link || sourceState?.lazada_original_link || '').trim()
+        || String(sourceGallery?.lazada_link || sourceGallery?.lazada_original_link || '').trim()
     const sourceShopeeOriginalLink = pickFirstShopeeUrl(String(
         params.sourceVideo.shopeeOriginalLink ||
         params.sourceVideo.shopee_original_link ||
@@ -13736,12 +13749,14 @@ async function syncImportedOriginalIntoNamespace(params: {
     const shopeeOriginalLink = String(
         sourceShopeeOriginalLink
         || sourceState?.shopee_original_link
+        || sourceGallery?.shopee_original_link
         || shopeeLink
         || ''
     ).trim()
     const lazadaOriginalLink = String(
         sourceLazadaOriginalLink
         || sourceState?.lazada_original_link
+        || sourceGallery?.lazada_original_link
         || lazadaLink
         || ''
     ).trim()
