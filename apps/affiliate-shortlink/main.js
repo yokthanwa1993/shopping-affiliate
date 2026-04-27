@@ -815,8 +815,11 @@ function updateTrayMenu() {
 
 // ==================== APP LIFECYCLE ====================
 
-// Auto-start on login
-app.setLoginItemSettings({ openAtLogin: true, path: app.getPath('exe') });
+// macOS autostart is owned by LaunchAgent. Electron's Login Item can start a
+// second unsupervised instance and race the managed one, so keep it disabled.
+if (process.platform === 'darwin') {
+    try { app.setLoginItemSettings({ openAtLogin: false, path: app.getPath('exe') }); } catch { }
+}
 
 app.on('ready', () => {
     console.log('Affiliate Shortlink starting...');

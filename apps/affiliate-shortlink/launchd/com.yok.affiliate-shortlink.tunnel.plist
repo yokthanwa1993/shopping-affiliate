@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yok.affiliate-shortlink.tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloudflared</string>
+    <string>tunnel</string>
+    <string>--config</string>
+    <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/affiliate-shortlink/cloudflared/config.yml</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/affiliate-shortlink</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/yok-macmini</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/yok-macmini/Library/Logs/affiliate-shortlink-tunnel.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yok-macmini/Library/Logs/affiliate-shortlink-tunnel.launchd.err.log</string>
+</dict>
+</plist>

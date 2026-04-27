@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yok.affiliate-shortlink</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/affiliate-shortlink/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron</string>
+    <string>.</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/affiliate-shortlink</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/yok-macmini</string>
+    <key>PATH</key>
+    <string>/Users/yok-macmini/.local/opt/node-v24.14.1-darwin-arm64/bin:/Users/yok-macmini/.local/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AFFILIATE_SHORTLINK_SUPERVISED</key>
+    <string>launchd</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>StandardOutPath</key>
+  <string>/Users/yok-macmini/Library/Logs/affiliate-shortlink.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yok-macmini/Library/Logs/affiliate-shortlink.launchd.err.log</string>
+</dict>
+</plist>
