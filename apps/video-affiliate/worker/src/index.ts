@@ -14143,56 +14143,129 @@ async function ensureInboxVideoProcessingStarted(params: {
     return { outcome: 'started', item, job: started }
 }
 
+async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Record<string, unknown>>> {
+    const list = await bucket.list({ prefix: '_processing/' })
+    const prefix = '_processing/'
+    const tasks = await Promise.all(
+        list.objects.map(async obj => {
+            const data = await bucket.get(obj.key)
+            if (!data) return null
+
+            let json: Record<string, unknown> = {}
+            try {
+                json = await data.json() as Record<string, unknown>
+            } catch {
+                json = {}
+            }
+
+            const keyId = obj.key.startsWith(prefix)
+                ? obj.key.slice(prefix.length).replace(/\.json$/i, '').trim()
+                : obj.key.trim()
+            const id = String(json.id || keyId || '').trim()
+            if (!id) {
+                await bucket.delete(obj.key).catch(() => { })
+                return null
+            }
+
+            const createdAt = String(json.createdAt || '').trim() || obj.uploaded.toISOString()
+            const status = String(json.status || '').trim() || 'processing'
+            const error = sanitizeProcessingError(json.error || json.error_message)
+
+            return {
+                ...json,
+                id,
+                createdAt,
+                status,
+                error,
+                stepName: normalizeProcessingStepName(json.stepName),
+            }
+        })
+    )
+    const videos = (tasks.filter(Boolean) as Array<Record<string, unknown>>)
+        .filter((video) => String(video.status || '').trim().toLowerCase() === 'processing')
+    videos.sort((a, b) => {
+        const at = new Date(String(a.createdAt || '')).getTime()
+        const bt = new Date(String(b.createdAt || '')).getTime()
+        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
+    })
+    return videos
+}
+
+async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, namespaceId: string): Promise<boolean> {
+    const botId = String(namespaceId || '').trim()
+    if (!botId) return false
+
+    const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+    if (await hasActiveProcessingJob(bucket).catch(() => true)) return false
+
+    const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
+        env,
+        bucket,
+        namespaceId: botId,
+    }).catch((error) => {
+        console.error(`[PROCESSING-AUTOSTART] Failed to read gallery_index next ready video for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+        return null
+    })
+
+    const candidates = galleryIndexVideo
+        ? [galleryIndexVideo]
+        : await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
+
+    for (const candidate of candidates) {
+        const item = normalizeInboxVideoRecord(candidate)
+        if (!item || item.status !== 'ready') continue
+
+        const processedAt = await getGalleryIndexProcessedAt(env.DB, botId, item.id).catch(() => '')
+        if (processedAt || String(item.processedAt || '').trim()) {
+            if (!String(item.processedAt || '').trim()) {
+                await putInboxVideoRecord(bucket, {
+                    ...item,
+                    processedAt,
+                    updatedAt: new Date().toISOString(),
+                }).catch(() => { })
+            }
+            continue
+        }
+
+        const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
+        if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+
+        try {
+            const result = await ensureInboxVideoProcessingStarted({
+                env,
+                bucket,
+                executionCtx: ctx,
+                botId,
+                item,
+                skipIfAlreadyProcessed: true,
+            })
+            if (result.outcome === 'started') {
+                console.log(`[PROCESSING-AUTOSTART] Started ${botId}/${item.id}: ${result.job.status}`)
+                return true
+            }
+            if (result.outcome === 'already_running') return true
+        } catch (error) {
+            console.error(`[PROCESSING-AUTOSTART] Failed ${botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+        }
+    }
+
+    return false
+}
+
 app.get('/api/processing', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
         const includeSummary = String(c.req.query('summary') || '').trim() === '1'
-        const list = await c.get('bucket').list({ prefix: '_processing/' })
-        const prefix = '_processing/'
-        const tasks = await Promise.all(
-            list.objects.map(async obj => {
-                const data = await c.get('bucket').get(obj.key)
-                if (!data) return null
-
-                let json: Record<string, unknown> = {}
-                try {
-                    json = await data.json() as Record<string, unknown>
-                } catch {
-                    json = {}
-                }
-
-                const keyId = obj.key.startsWith(prefix)
-                    ? obj.key.slice(prefix.length).replace(/\.json$/i, '').trim()
-                    : obj.key.trim()
-                const id = String(json.id || keyId || '').trim()
-
-                // orphan/corrupted entry without usable id: auto-clean to prevent UI zombie rows
-                if (!id) {
-                    await c.get('bucket').delete(obj.key).catch(() => { })
-                    return null
-                }
-
-                const createdAt = String(json.createdAt || '').trim() || obj.uploaded.toISOString()
-                const status = String(json.status || '').trim() || 'processing'
-                const error = sanitizeProcessingError(json.error || json.error_message)
-
-                return {
-                    ...json,
-                    id,
-                    createdAt,
-                    status,
-                    error,
-                    stepName: normalizeProcessingStepName(json.stepName),
-                }
+        let videos = await listActiveProcessingVideos(c.get('bucket'))
+        if (videos.length === 0 && namespaceId) {
+            const started = await startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceId).catch((error) => {
+                console.error(`[PROCESSING-AUTOSTART] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                return false
             })
-        )
-        const videos = (tasks.filter(Boolean) as Array<Record<string, unknown>>)
-            .filter((video) => String(video.status || '').trim().toLowerCase() === 'processing')
-        videos.sort((a, b) => {
-            const at = new Date(String(a.createdAt || '')).getTime()
-            const bt = new Date(String(b.createdAt || '')).getTime()
-            return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
-        })
+            if (started) {
+                videos = await listActiveProcessingVideos(c.get('bucket')).catch(() => videos)
+            }
+        }
         let pendingShortlinkVideos: Array<Record<string, unknown>> = []
         let pendingHasLazadaTotal = 0
         let readyTotal = 0
