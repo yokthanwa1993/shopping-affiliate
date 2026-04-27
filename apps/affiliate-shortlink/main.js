@@ -31,6 +31,8 @@ const SHOPEE_URL = 'https://affiliate.shopee.co.th/offer/custom_link';
 const LAZADA_URL = 'https://www.lazada.co.th';
 const API_PORT = 8800;
 const CHROME_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+const HEALTHCHECK_INTERVAL_MS = 30 * 1000;
+const HEALTHCHECK_TIMEOUT_MS = 3000;
 
 // Separate sessions for each platform
 const shopeeSession = 'persist:shopee-affiliate';
@@ -333,11 +335,11 @@ function triggerAppRestartIfStuck(platform) {
     }
     restartScheduled = true;
     lastAppRestartAt = now;
-    console.error(`[restart] ${platform} hit ${consecutiveFailures[platform]} consecutive failures — relaunching app (pm2 will restart)`);
+    const failureCount = consecutiveFailures[platform] || 0;
+    console.error(`[restart] ${platform} hit ${failureCount} consecutive failures — exiting app (pm2 will restart)`);
     // Short delay so the current failing response flushes back to caller before we exit.
     setTimeout(() => {
-        try { app.relaunch(); } catch (e) { console.warn('[restart] app.relaunch failed:', e && e.message); }
-        try { app.exit(0); } catch (e) { console.warn('[restart] app.exit failed:', e && e.message); process.exit(0); }
+        try { app.exit(1); } catch (e) { console.warn('[restart] app.exit failed:', e && e.message); process.exit(1); }
     }, 1500);
 }
 
@@ -722,9 +724,40 @@ function startApiServer() {
         }
     });
 
+    apiServer.on('error', (err) => {
+        console.error('[API] server error:', err && err.message ? err.message : err);
+        triggerAppRestartIfStuck('api');
+    });
+    apiServer.on('close', () => {
+        if (app.isQuitting) return;
+        console.error('[API] server closed unexpectedly');
+        triggerAppRestartIfStuck('api');
+    });
+
     apiServer.listen(API_PORT, () => {
         console.log(`[API] Shortlink API running on http://localhost:${API_PORT}`);
     });
+}
+
+function startApiHealthWatchdog() {
+    setInterval(async () => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), HEALTHCHECK_TIMEOUT_MS);
+        try {
+            const resp = await fetch(`http://127.0.0.1:${API_PORT}/health`, {
+                method: 'GET',
+                signal: controller.signal,
+            });
+            if (!resp.ok) throw new Error(`health_http_${resp.status}`);
+            const data = await resp.json().catch(() => null);
+            if (!data || data.status !== 'ok') throw new Error('health_bad_payload');
+        } catch (err) {
+            console.error('[watchdog] API health failed:', err && err.message ? err.message : err);
+            triggerAppRestartIfStuck('api');
+        } finally {
+            clearTimeout(timer);
+        }
+    }, HEALTHCHECK_INTERVAL_MS);
 }
 
 // ==================== TRAY MENU ====================
@@ -798,6 +831,7 @@ app.on('ready', () => {
 
     // Start API server
     startApiServer();
+    startApiHealthWatchdog();
 
     // Update tray status periodically
     setInterval(updateTrayMenu, 10000);
