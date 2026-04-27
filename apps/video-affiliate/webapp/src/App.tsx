@@ -349,6 +349,7 @@ interface InboxPageResponse {
   total?: number
   processed_total?: number
   unprocessed_total?: number
+  missing_link_total?: number
   offset?: number
   limit?: number
   has_more?: boolean
@@ -669,7 +670,7 @@ interface FacebookPage {
 }
 
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
-type InboxFilterView = 'unprocessed' | 'processed'
+type InboxFilterView = 'unprocessed' | 'missing_links' | 'processed'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
 type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members' | 'monitor' | 'ads'
 type PostingOrderOption = 'oldest_first' | 'newest_first' | 'random'
@@ -3719,6 +3720,8 @@ function App({
     const cached = readCache<InboxVideo[]>(systemInboxCacheKey(botScope), [])
     return cached.filter((video) => !!String(video.processedAt || '').trim()).length
   })
+  const [inboxMissingLinkTotalCount, setInboxMissingLinkTotalCount] = useState(0)
+  const [systemInboxMissingLinkTotalCount, setSystemInboxMissingLinkTotalCount] = useState(0)
   const [systemInboxLoading, setSystemInboxLoading] = useState(false)
   const [inboxView, setInboxView] = useState<InboxFilterView>('unprocessed')
   const [selectedPage, setSelectedPage] = useState<FacebookPage | null>(null)
@@ -4583,6 +4586,8 @@ function App({
     setSystemInboxTotalCount(0)
     setInboxProcessedTotalCount(0)
     setSystemInboxProcessedTotalCount(0)
+    setInboxMissingLinkTotalCount(0)
+    setSystemInboxMissingLinkTotalCount(0)
     setInboxHasMore(false)
     setInboxLoadingMore(false)
   }, [botScope, namespaceId, systemWideGalleryMode])
@@ -4719,7 +4724,9 @@ function App({
     const currentInboxViewLength = inboxVideos.filter((video) => (
       inboxView === 'processed'
         ? !!String(video.processedAt || '').trim()
-        : !String(video.processedAt || '').trim()
+        : inboxView === 'missing_links'
+          ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
+          : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
     )).length
     const offset = reset || refreshTop ? 0 : currentInboxViewLength
     const shouldShowLoading = reset && currentInboxViewLength === 0
@@ -4749,6 +4756,7 @@ function App({
       })
       setInboxTotalCount(Number(data.total || 0))
       setInboxProcessedTotalCount(Number(data.processed_total || 0))
+      setInboxMissingLinkTotalCount(Number(data.missing_link_total || 0))
       setInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
@@ -4772,7 +4780,9 @@ function App({
     const currentSystemInboxViewLength = systemInboxVideos.filter((video) => (
       inboxView === 'processed'
         ? !!String(video.processedAt || '').trim()
-        : !String(video.processedAt || '').trim()
+        : inboxView === 'missing_links'
+          ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
+          : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
     )).length
     const offset = reset || refreshTop ? 0 : currentSystemInboxViewLength
     const shouldShowLoading = reset && currentSystemInboxViewLength === 0
@@ -4804,6 +4814,7 @@ function App({
       })
       setSystemInboxTotalCount(Number(data.total || 0))
       setSystemInboxProcessedTotalCount(Number(data.processed_total || 0))
+      setSystemInboxMissingLinkTotalCount(Number(data.missing_link_total || 0))
       setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
       // Keep previous inbox snapshot on transient errors.
@@ -6912,13 +6923,15 @@ function App({
             systemInboxLoading={systemInboxLoading}
             systemInboxVideos={systemInboxVideos}
             systemInboxProcessedTotalCount={systemInboxProcessedTotalCount}
-            systemInboxUnprocessedTotalCount={Math.max(0, systemInboxTotalCount - systemInboxProcessedTotalCount)}
+            systemInboxUnprocessedTotalCount={Math.max(0, systemInboxTotalCount - systemInboxProcessedTotalCount - systemInboxMissingLinkTotalCount)}
+            systemInboxMissingLinkTotalCount={systemInboxMissingLinkTotalCount}
             systemInboxLoadingMore={systemInboxLoadingMore}
             systemInboxHasMore={systemInboxHasMore}
             inboxLoading={inboxLoading}
             inboxVideos={inboxVideos}
             inboxProcessedTotalCount={inboxProcessedTotalCount}
-            inboxUnprocessedTotalCount={Math.max(0, inboxTotalCount - inboxProcessedTotalCount)}
+            inboxUnprocessedTotalCount={Math.max(0, inboxTotalCount - inboxProcessedTotalCount - inboxMissingLinkTotalCount)}
+            inboxMissingLinkTotalCount={inboxMissingLinkTotalCount}
             inboxView={inboxView}
             onInboxViewChange={setInboxView}
             inboxLoadingMore={inboxLoadingMore}

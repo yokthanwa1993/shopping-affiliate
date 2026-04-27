@@ -9,12 +9,14 @@ export function InboxTab({
   systemInboxVideos,
   systemInboxProcessedTotalCount,
   systemInboxUnprocessedTotalCount,
+  systemInboxMissingLinkTotalCount,
   systemInboxLoadingMore,
   systemInboxHasMore,
   inboxLoading,
   inboxVideos,
   inboxProcessedTotalCount,
   inboxUnprocessedTotalCount,
+  inboxMissingLinkTotalCount,
   inboxView,
   onInboxViewChange,
   inboxLoadingMore,
@@ -34,14 +36,16 @@ export function InboxTab({
   systemInboxVideos: InboxVideo[]
   systemInboxProcessedTotalCount: number
   systemInboxUnprocessedTotalCount: number
+  systemInboxMissingLinkTotalCount: number
   systemInboxLoadingMore: boolean
   systemInboxHasMore: boolean
   inboxLoading: boolean
   inboxVideos: InboxVideo[]
   inboxProcessedTotalCount: number
   inboxUnprocessedTotalCount: number
-  inboxView: 'unprocessed' | 'processed'
-  onInboxViewChange: (view: 'unprocessed' | 'processed') => void
+  inboxMissingLinkTotalCount: number
+  inboxView: 'unprocessed' | 'missing_links' | 'processed'
+  onInboxViewChange: (view: 'unprocessed' | 'missing_links' | 'processed') => void
   inboxLoadingMore: boolean
   inboxHasMore: boolean
   loadMoreRef: RefObject<HTMLDivElement | null>
@@ -61,16 +65,24 @@ export function InboxTab({
   const visibleSystemInboxVideos = useMemo(() => filteredSystemInboxVideos.filter((video) => (
     inboxView === 'processed'
       ? !!String(video.processedAt || '').trim()
-      : !String(video.processedAt || '').trim()
+      : inboxView === 'missing_links'
+        ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
+        : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
   )), [filteredSystemInboxVideos, inboxView])
   const visibleInboxVideos = useMemo(() => inboxVideos.filter((video) => (
     inboxView === 'processed'
       ? !!String(video.processedAt || '').trim()
-      : !String(video.processedAt || '').trim()
+      : inboxView === 'missing_links'
+        ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
+        : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
   )), [inboxVideos, inboxView])
 
   if (isSystemAdmin) {
-    const currentTotal = inboxView === 'processed' ? systemInboxProcessedTotalCount : systemInboxUnprocessedTotalCount
+    const currentTotal = inboxView === 'processed'
+      ? systemInboxProcessedTotalCount
+      : inboxView === 'missing_links'
+        ? systemInboxMissingLinkTotalCount
+        : systemInboxUnprocessedTotalCount
 
     return (
       <div className="px-4">
@@ -79,7 +91,13 @@ export function InboxTab({
             onClick={() => onInboxViewChange('unprocessed')}
             className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${inboxView === 'unprocessed' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
           >
-            ยังไม่ประมวลผล ({systemInboxUnprocessedTotalCount})
+            พร้อมทำ ({systemInboxUnprocessedTotalCount})
+          </button>
+          <button
+            onClick={() => onInboxViewChange('missing_links')}
+            className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${inboxView === 'missing_links' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+          >
+            ไม่มีลิงก์ ({systemInboxMissingLinkTotalCount})
           </button>
           <button
             onClick={() => onInboxViewChange('processed')}
@@ -97,11 +115,13 @@ export function InboxTab({
             <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
               <span className="text-4xl grayscale opacity-50">📥</span>
             </div>
-            <p className="text-gray-900 font-bold text-lg">{inboxView === 'processed' ? 'ยังไม่มีคลิปที่ประมวลผลแล้ว' : 'ยังไม่มีวิดีโอต้นฉบับ'}</p>
+            <p className="text-gray-900 font-bold text-lg">{inboxView === 'processed' ? 'ยังไม่มีคลิปที่ประมวลผลแล้ว' : inboxView === 'missing_links' ? 'ยังไม่มีคลิปที่ขาดลิงก์' : 'ยังไม่มีวิดีโอพร้อมประมวลผล'}</p>
             <p className="text-gray-400 text-sm mt-1 text-center">
               {inboxView === 'processed'
                 ? 'คลิปที่ประมวลผลเสร็จแล้วจะย้ายมาแสดงที่นี่'
-                : 'ส่งวิดีโอหรือลิงก์ XHS มาทาง LINE แล้วจะแสดงที่นี่'}
+                : inboxView === 'missing_links'
+                  ? 'คลิปที่ไม่มี Shopee หรือ Lazada จะถูกแยกมาให้ทีมเติมลิงก์'
+                  : 'คลิปที่มีลิงก์ครบและรอ cron ประมวลผลจะแสดงที่นี่'}
             </p>
           </div>
         ) : (
@@ -142,7 +162,11 @@ export function InboxTab({
       </div>
     )
   }
-  const currentTotal = inboxView === 'processed' ? inboxProcessedTotalCount : inboxUnprocessedTotalCount
+  const currentTotal = inboxView === 'processed'
+    ? inboxProcessedTotalCount
+    : inboxView === 'missing_links'
+      ? inboxMissingLinkTotalCount
+      : inboxUnprocessedTotalCount
 
   return (
     <div className="px-4">
@@ -151,7 +175,13 @@ export function InboxTab({
           onClick={() => onInboxViewChange('unprocessed')}
           className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${inboxView === 'unprocessed' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
         >
-          ยังไม่ประมวลผล ({inboxUnprocessedTotalCount})
+          พร้อมทำ ({inboxUnprocessedTotalCount})
+        </button>
+        <button
+          onClick={() => onInboxViewChange('missing_links')}
+          className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${inboxView === 'missing_links' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+        >
+          ไม่มีลิงก์ ({inboxMissingLinkTotalCount})
         </button>
         <button
           onClick={() => onInboxViewChange('processed')}
@@ -171,11 +201,13 @@ export function InboxTab({
           <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
             <span className="text-4xl grayscale opacity-50">📥</span>
           </div>
-          <p className="text-gray-900 font-bold text-lg">{inboxView === 'processed' ? 'ยังไม่มีคลิปที่ประมวลผลแล้ว' : 'ยังไม่มีวิดีโอต้นฉบับ'}</p>
+          <p className="text-gray-900 font-bold text-lg">{inboxView === 'processed' ? 'ยังไม่มีคลิปที่ประมวลผลแล้ว' : inboxView === 'missing_links' ? 'ยังไม่มีคลิปที่ขาดลิงก์' : 'ยังไม่มีวิดีโอพร้อมประมวลผล'}</p>
           <p className="text-gray-400 text-sm mt-1 text-center">
             {inboxView === 'processed'
               ? 'คลิปที่ประมวลผลเสร็จแล้วจะย้ายมาแสดงที่นี่'
-              : 'ส่งวิดีโอหรือ XHS link มาทาง Telegram แล้วระบบจะเก็บไว้ที่นี่ถาวร แยกจากหน้า Processing'}
+              : inboxView === 'missing_links'
+                ? 'คลิปที่ไม่มี Shopee หรือ Lazada จะถูกแยกมาให้ทีมเติมลิงก์'
+                : 'คลิปที่มีลิงก์ครบและรอ cron ประมวลผลจะแสดงที่นี่'}
           </p>
         </div>
       ) : (

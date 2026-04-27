@@ -13000,11 +13000,40 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
     return null
 }
 
+type InboxListView = 'unprocessed' | 'missing_links' | 'processed'
+
+function parseInboxListView(input: unknown): InboxListView {
+    const value = String(input || '').trim().toLowerCase()
+    if (value === 'processed') return 'processed'
+    if (value === 'missing_links' || value === 'missing-links' || value === 'no_links' || value === 'no-links') return 'missing_links'
+    return 'unprocessed'
+}
+
+function isInboxResponseProcessed(video: Record<string, unknown>): boolean {
+    return !!String(video.processedAt || video.processed_at || '').trim()
+}
+
+function isInboxResponseMissingLinks(video: Record<string, unknown>): boolean {
+    if (isInboxResponseProcessed(video)) return false
+    const hasShopee = video.hasShopeeLink === true || !!String(video.shopeeLink || video.shopee_link || '').trim()
+    const hasLazada = video.hasLazadaLink === true || !!String(video.lazadaLink || video.lazada_link || '').trim()
+    return !hasShopee || !hasLazada
+}
+
+function filterInboxVideosByView<T extends Record<string, unknown>>(videos: T[], view: InboxListView): T[] {
+    return videos.filter((video) => {
+        const processed = isInboxResponseProcessed(video)
+        if (view === 'processed') return processed
+        if (view === 'missing_links') return isInboxResponseMissingLinks(video)
+        return !processed && !isInboxResponseMissingLinks(video)
+    })
+}
+
 async function getNamespaceInboxGalleryIndexPage(params: {
     env: Env
     namespaceId: string
     ownerEmail?: string
-    view: 'unprocessed' | 'processed'
+    view: InboxListView
     offset: number
     limit: number
 }): Promise<{
@@ -13012,11 +13041,12 @@ async function getNamespaceInboxGalleryIndexPage(params: {
     total: number
     processedTotal: number
     unprocessedTotal: number
+    missingLinkTotal: number
     hasMore: boolean
 }> {
     const namespaceId = String(params.namespaceId || '').trim()
     if (!namespaceId) {
-        return { videos: [], total: 0, processedTotal: 0, unprocessedTotal: 0, hasMore: false }
+        return { videos: [], total: 0, processedTotal: 0, unprocessedTotal: 0, missingLinkTotal: 0, hasMore: false }
     }
     await ensureGalleryIndexTable(params.env.DB).catch(() => { })
     const offset = Math.max(0, Number(params.offset || 0))
@@ -13024,7 +13054,9 @@ async function getNamespaceInboxGalleryIndexPage(params: {
     const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false)
     const processedClause = params.view === 'processed'
         ? "AND TRIM(COALESCE(processed_at,'')) <> ''"
-        : "AND TRIM(COALESCE(processed_at,'')) = ''"
+        : params.view === 'missing_links'
+            ? "AND TRIM(COALESCE(processed_at,'')) = '' AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')"
+            : "AND TRIM(COALESCE(processed_at,'')) = '' AND TRIM(COALESCE(shopee_link,'')) <> '' AND TRIM(COALESCE(lazada_link,'')) <> ''"
     const [pageRows, totals] = await Promise.all([
         params.env.DB.prepare(
             `SELECT
@@ -13056,7 +13088,8 @@ async function getNamespaceInboxGalleryIndexPage(params: {
             `SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) <> '' THEN 1 ELSE 0 END) AS processed_total,
-                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' THEN 1 ELSE 0 END) AS unprocessed_total
+                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' AND TRIM(COALESCE(shopee_link,'')) <> '' AND TRIM(COALESCE(lazada_link,'')) <> '' THEN 1 ELSE 0 END) AS unprocessed_total,
+                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '') THEN 1 ELSE 0 END) AS missing_link_total
              FROM gallery_index
              WHERE namespace_id = ?
                AND TRIM(COALESCE(original_url,'')) <> ''`
@@ -13079,13 +13112,19 @@ async function getNamespaceInboxGalleryIndexPage(params: {
         .filter((video): video is Record<string, unknown> => !!video)
     const processedTotal = Number(totals?.processed_total || 0)
     const unprocessedTotal = Number(totals?.unprocessed_total || 0)
+    const missingLinkTotal = Number((totals as Record<string, unknown> | null)?.missing_link_total || 0)
     const total = Number(totals?.total || 0)
-    const viewTotal = params.view === 'processed' ? processedTotal : unprocessedTotal
+    const viewTotal = params.view === 'processed'
+        ? processedTotal
+        : params.view === 'missing_links'
+            ? missingLinkTotal
+            : unprocessedTotal
     return {
         videos,
         total,
         processedTotal,
         unprocessedTotal,
+        missingLinkTotal,
         hasMore: offset + videos.length < viewTotal,
     }
 }
@@ -14151,7 +14190,7 @@ app.get('/api/inbox', async (c) => {
         const offset = parseNonNegativeInt(c.req.query('offset'), 0)
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
-        const view = String(c.req.query('view') || 'unprocessed').trim().toLowerCase() === 'processed' ? 'processed' : 'unprocessed'
+        const view = parseInboxListView(c.req.query('view'))
         const bucket = c.get('bucket')
         const ownerEmail = await resolveOwnerEmailForNamespace(c.env.DB, namespaceId).catch(() => '')
         const galleryIndexPage = await getNamespaceInboxGalleryIndexPage({
@@ -14168,6 +14207,7 @@ app.get('/api/inbox', async (c) => {
                 total: galleryIndexPage.total,
                 processed_total: galleryIndexPage.processedTotal,
                 unprocessed_total: galleryIndexPage.unprocessedTotal,
+                missing_link_total: galleryIndexPage.missingLinkTotal,
                 offset,
                 limit,
                 has_more: galleryIndexPage.hasMore,
@@ -14201,13 +14241,10 @@ app.get('/api/inbox', async (c) => {
             await writeNamespaceInboxSnapshot(bucket, namespaceId, visibleVideos).catch(() => { })
         }
 
-        const processedTotal = visibleVideos.filter((video) => !!String(video.processedAt || '').trim()).length
-        const unprocessedTotal = Math.max(0, visibleVideos.length - processedTotal)
-        const filteredVideos = visibleVideos.filter((video) => (
-            view === 'processed'
-                ? !!String(video.processedAt || '').trim()
-                : !String(video.processedAt || '').trim()
-        ))
+        const processedTotal = visibleVideos.filter((video) => isInboxResponseProcessed(video)).length
+        const missingLinkTotal = visibleVideos.filter((video) => isInboxResponseMissingLinks(video)).length
+        const unprocessedTotal = Math.max(0, visibleVideos.length - processedTotal - missingLinkTotal)
+        const filteredVideos = filterInboxVideosByView(visibleVideos, view)
         const page = sliceGalleryPage(filteredVideos, offset, limit)
         c.executionCtx.waitUntil(backfillNamespaceInboxOriginalAssets({
             env: c.env,
@@ -14229,6 +14266,7 @@ app.get('/api/inbox', async (c) => {
             total: visibleVideos.length,
             processed_total: processedTotal,
             unprocessed_total: unprocessedTotal,
+            missing_link_total: missingLinkTotal,
             offset,
             limit,
             has_more: page.hasMore,
@@ -14249,7 +14287,7 @@ app.get('/api/inbox/system', async (c) => {
         const offset = parseNonNegativeInt(c.req.query('offset'), 0)
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
-        const view = String(c.req.query('view') || 'unprocessed').trim().toLowerCase() === 'processed' ? 'processed' : 'unprocessed'
+        const view = parseInboxListView(c.req.query('view'))
         const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
@@ -14274,6 +14312,7 @@ app.get('/api/inbox/system', async (c) => {
                 total: galleryIndexPage.total,
                 processed_total: galleryIndexPage.processedTotal,
                 unprocessed_total: galleryIndexPage.unprocessedTotal,
+                missing_link_total: galleryIndexPage.missingLinkTotal,
                 offset,
                 limit,
                 has_more: galleryIndexPage.hasMore,
@@ -14313,13 +14352,10 @@ app.get('/api/inbox/system', async (c) => {
             !!String(video.thumbnailUrl || '').trim()
             || !!String((video as Record<string, unknown>).fallbackThumbnailUrl || '').trim()
         ))
-        const processedTotal = visibleVideos.filter((video) => !!String(video.processedAt || '').trim()).length
-        const unprocessedTotal = Math.max(0, visibleVideos.length - processedTotal)
-        const filteredVideos = visibleVideos.filter((video) => (
-            view === 'processed'
-                ? !!String(video.processedAt || '').trim()
-                : !String(video.processedAt || '').trim()
-        ))
+        const processedTotal = visibleVideos.filter((video) => isInboxResponseProcessed(video)).length
+        const missingLinkTotal = visibleVideos.filter((video) => isInboxResponseMissingLinks(video)).length
+        const unprocessedTotal = Math.max(0, visibleVideos.length - processedTotal - missingLinkTotal)
+        const filteredVideos = filterInboxVideosByView(visibleVideos, view)
         const page = sliceGalleryPage(filteredVideos, offset, limit)
         c.executionCtx.waitUntil(Promise.all(
             page.videos.slice(0, 6).map((video) => {
@@ -14341,6 +14377,7 @@ app.get('/api/inbox/system', async (c) => {
             total: visibleVideos.length,
             processed_total: processedTotal,
             unprocessed_total: unprocessedTotal,
+            missing_link_total: missingLinkTotal,
             offset,
             limit,
             has_more: page.hasMore,
