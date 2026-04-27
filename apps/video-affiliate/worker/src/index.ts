@@ -12481,6 +12481,20 @@ async function listInboxVideoRecords(bucket: R2Bucket): Promise<InboxVideoRecord
         })
 }
 
+async function listRecentInboxVideoRecords(bucket: R2Bucket, limit = 50): Promise<InboxVideoRecord[]> {
+    const normalizedLimit = Math.min(Math.max(Math.floor(Number(limit) || 50), 1), 100)
+    const list = await bucket.list({ prefix: '_inbox/', limit: normalizedLimit })
+    const records = await Promise.all(list.objects.map(async (obj) => {
+        const id = obj.key.replace(/^_inbox\//, '').replace(/\.json$/i, '')
+        const record = await getInboxVideoRecord(bucket, id).catch(() => null)
+        return record ? { record, uploadedAt: obj.uploaded.getTime() } : null
+    }))
+    return records
+        .filter((item): item is { record: InboxVideoRecord; uploadedAt: number } => !!item)
+        .sort((a, b) => b.uploadedAt - a.uploadedAt)
+        .map((item) => item.record)
+}
+
 type NamespaceOriginalAsset = {
     id: string
     originalUrl: string
@@ -17358,7 +17372,40 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
             return false
         }
 
-        const inboxVideos = await listInboxVideoRecords(adminBucket)
+        const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
+            env,
+            bucket: adminBucket,
+            namespaceId: adminNamespaceId,
+        }).catch((error) => {
+            console.error(`[AUTO-IMPORT] Failed to read gallery_index next ready video: ${error instanceof Error ? error.message : String(error)}`)
+            return null
+        })
+        if (galleryIndexVideo) {
+            try {
+                const result = await ensureInboxVideoProcessingStarted({
+                    env,
+                    bucket: adminBucket,
+                    executionCtx: ctx,
+                    botId: adminNamespaceId,
+                    item: galleryIndexVideo,
+                    skipIfAlreadyProcessed: true,
+                })
+                if (result.outcome === 'already_running') {
+                    console.log(`[AUTO-IMPORT] gallery_index ${galleryIndexVideo.id} already ${result.status}`)
+                    return false
+                }
+                if (result.outcome === 'already_processed') {
+                    console.log(`[AUTO-IMPORT] gallery_index ${galleryIndexVideo.id} already processed`)
+                    return false
+                }
+                console.log(`[AUTO-IMPORT] Started gallery_index processing ${galleryIndexVideo.id}: ${result.job.status}`)
+                return true
+            } catch (e) {
+                console.error(`[AUTO-IMPORT] Failed to start gallery_index processing ${galleryIndexVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+
+        const inboxVideos = await listRecentInboxVideoRecords(adminBucket, 75)
         for (const nextVideo of inboxVideos) {
             if (nextVideo.status !== 'ready') continue
             const existingProcessingStatus = await getProcessingJobStatus(adminBucket, nextVideo.id).catch(() => '')
@@ -17391,39 +17438,6 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
                 return true
             } catch (e) {
                 console.error(`[AUTO-IMPORT] Failed to start processing ${nextVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
-            }
-        }
-
-        const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
-            env,
-            bucket: adminBucket,
-            namespaceId: adminNamespaceId,
-        }).catch((error) => {
-            console.error(`[AUTO-IMPORT] Failed to read gallery_index fallback: ${error instanceof Error ? error.message : String(error)}`)
-            return null
-        })
-        if (galleryIndexVideo) {
-            try {
-                const result = await ensureInboxVideoProcessingStarted({
-                    env,
-                    bucket: adminBucket,
-                    executionCtx: ctx,
-                    botId: adminNamespaceId,
-                    item: galleryIndexVideo,
-                    skipIfAlreadyProcessed: true,
-                })
-                if (result.outcome === 'already_running') {
-                    console.log(`[AUTO-IMPORT] gallery_index ${galleryIndexVideo.id} already ${result.status}`)
-                    return false
-                }
-                if (result.outcome === 'already_processed') {
-                    console.log(`[AUTO-IMPORT] gallery_index ${galleryIndexVideo.id} already processed`)
-                    return false
-                }
-                console.log(`[AUTO-IMPORT] Started gallery_index processing ${galleryIndexVideo.id}: ${result.job.status}`)
-                return true
-            } catch (e) {
-                console.error(`[AUTO-IMPORT] Failed to start gallery_index processing ${galleryIndexVideo.id}: ${e instanceof Error ? e.message : String(e)}`)
             }
         }
 
@@ -17535,14 +17549,47 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
 
 async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<void> {
     const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
-    const namespaceIds = await collectKnownNamespaceIds(env)
+    const namespaceIds = Array.from(await collectKnownNamespaceIds(env))
+    const MAX_NAMESPACES_PER_TICK = 6
+    let scannedNamespaces = 0
 
     for (const namespaceId of namespaceIds) {
         if (!namespaceId || namespaceId === adminNamespaceId) continue
+        if (scannedNamespaces >= MAX_NAMESPACES_PER_TICK) break
+        scannedNamespaces++
+
         const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
         if (await hasActiveProcessingJob(bucket).catch(() => true)) continue
 
-        const records = await listInboxVideoRecords(bucket).catch(() => [])
+        const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
+            env,
+            bucket,
+            namespaceId,
+        }).catch(() => null)
+        if (galleryIndexVideo) {
+            try {
+                const result = await ensureInboxVideoProcessingStarted({
+                    env,
+                    bucket,
+                    executionCtx: ctx,
+                    botId: namespaceId,
+                    item: galleryIndexVideo,
+                    skipIfAlreadyProcessed: true,
+                })
+                if (result.outcome === 'started') {
+                    console.log(`[AUTO-INBOX] Started ${namespaceId}/${galleryIndexVideo.id}: ${result.job.status}`)
+                    continue
+                }
+                if (result.outcome === 'already_running') {
+                    console.log(`[AUTO-INBOX] ${namespaceId}/${galleryIndexVideo.id} already ${result.status}`)
+                    continue
+                }
+            } catch (error) {
+                console.error(`[AUTO-INBOX] Failed ${namespaceId}/${galleryIndexVideo.id}: ${error instanceof Error ? error.message : String(error)}`)
+            }
+        }
+
+        const records = await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
         for (const record of records) {
             const item = normalizeInboxVideoRecord(record)
             if (!item || item.status !== 'ready') continue
@@ -28397,10 +28444,20 @@ async function watchdogStuckJobs(env: Env) {
         }
     } catch { /* DB might not have telegram_bot_sessions yet */ }
 
-    for (const botId of botIds) {
+    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+    const orderedBotIds = Array.from(botIds)
+    if (adminNamespaceId && orderedBotIds.includes(adminNamespaceId)) {
+        orderedBotIds.splice(orderedBotIds.indexOf(adminNamespaceId), 1)
+        orderedBotIds.unshift(adminNamespaceId)
+    }
+    const MAX_QUEUE_DRAIN_CHECKS = 8
+    let queueDrainChecks = 0
+
+    for (const botId of orderedBotIds) {
         const botBucket = new BotBucket(env.BUCKET, botId)
         try {
             const list = await botBucket.list({ prefix: '_processing/' })
+            const hadProcessingEntries = list.objects.length > 0
 
             for (const obj of list.objects) {
                 const data = await botBucket.get(obj.key)
@@ -28498,7 +28555,10 @@ async function watchdogStuckJobs(env: Env) {
             }
 
             // ลองเริ่มอันถัดไปในคิวของ bot นี้
-            await processNextInQueue(env, botId)
+            if (hadProcessingEntries || queueDrainChecks < MAX_QUEUE_DRAIN_CHECKS) {
+                queueDrainChecks++
+                await processNextInQueue(env, botId)
+            }
         } catch (e) {
             console.error(`[WATCHDOG] Error for bot ${botId}:`, e instanceof Error ? e.message : String(e))
         }
