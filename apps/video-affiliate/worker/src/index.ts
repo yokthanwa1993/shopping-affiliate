@@ -9929,6 +9929,14 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         captionProvidedAt: manualCaption ? nowIso : '',
         updatedAt: nowIso,
     })
+    await syncInboxRecordLinksToNamespaceIndex({
+        env: params.env,
+        namespaceId: params.namespaceId,
+        item: inboxRecord,
+    }).catch((error) => {
+        console.warn(`[LINE] inbox link sync failed for ${waitingState.id}: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+    })
     upsertSystemInboxSnapshotVideo({
         env: params.env,
         adminNamespaceId: params.namespaceId,
@@ -13076,6 +13084,60 @@ async function syncReadyInboxLinksToNamespaceIndex(params: {
     return synced
 }
 
+async function syncInboxRecordLinksToNamespaceIndex(params: {
+    env: Env
+    namespaceId: string
+    item: InboxVideoRecord
+}): Promise<boolean> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const item = normalizeInboxVideoRecord(params.item)
+    if (!namespaceId || !item || item.status !== 'ready') return false
+
+    const videoId = String(item.id || '').trim()
+    const shopeeLink = String(item.shopeeLink || '').trim()
+    const lazadaLink = String(item.lazadaLink || '').trim()
+    if (!videoId || !shopeeLink || !lazadaLink) return false
+
+    await ensureGalleryIndexTable(params.env.DB).catch(() => { })
+
+    const shopeeOriginalLink = String(item.shopeeOriginalLink || shopeeLink).trim()
+    const lazadaOriginalLink = String(item.lazadaOriginalLink || lazadaLink).trim()
+    await upsertNamespaceVideoState(params.env.DB, namespaceId, videoId, {
+        shopee_link: shopeeLink,
+        lazada_link: lazadaLink,
+        shopee_original_link: shopeeOriginalLink,
+        lazada_original_link: lazadaOriginalLink,
+    }).catch(() => { })
+
+    const updateExisting = async () => params.env.DB.prepare(
+        `UPDATE gallery_index
+         SET shopee_link = ?,
+             lazada_link = ?,
+             shopee_original_link = ?,
+             lazada_original_link = ?,
+             updated_at = ?
+         WHERE namespace_id = ?
+           AND video_id = ?
+           AND TRIM(COALESCE(processed_at,'')) = ''`
+    ).bind(
+        shopeeLink,
+        lazadaLink,
+        shopeeOriginalLink,
+        lazadaOriginalLink,
+        new Date().toISOString(),
+        namespaceId,
+        videoId,
+    ).run().catch(() => null) as Promise<{ meta?: { changes?: number } } | null>
+
+    let result = await updateExisting()
+    if (Number(result?.meta?.changes || 0) <= 0) {
+        await syncGalleryIndexEntry(params.env, namespaceId, videoId).catch(() => null)
+        result = await updateExisting()
+    }
+
+    return Number(result?.meta?.changes || 0) > 0
+}
+
 type InboxListView = 'unprocessed' | 'missing_links' | 'processed'
 
 function parseInboxListView(input: unknown): InboxListView {
@@ -14169,6 +14231,14 @@ async function ensureInboxVideoProcessingStarted(params: {
         namespaceId: botId,
         item: rawItem,
     })
+    await syncInboxRecordLinksToNamespaceIndex({
+        env: params.env,
+        namespaceId: botId,
+        item,
+    }).catch((error) => {
+        console.warn(`[INBOX-PROCESS] link sync failed for ${botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+    })
 
     const preparedItem = await prepareInboxVideoForManagedLinks({
         env: params.env,
@@ -14181,6 +14251,14 @@ async function ensureInboxVideoProcessingStarted(params: {
         throw new Error('managed_shortlink_conversion_failed')
     }
     item = preparedItem
+    await syncInboxRecordLinksToNamespaceIndex({
+        env: params.env,
+        namespaceId: botId,
+        item,
+    }).catch((error) => {
+        console.warn(`[INBOX-PROCESS] prepared link sync failed for ${botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+    })
 
     const processingStateMap = await getInboxProcessingStateMap(params.bucket)
     const currentProcessingState = processingStateMap.get(item.id) || 'idle'
