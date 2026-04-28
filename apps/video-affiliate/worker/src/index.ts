@@ -6472,6 +6472,60 @@ app.post('/admin/api/gallery/index/rebuild', async (c) => {
     return c.json({ ok: true, ...result })
 })
 
+// Targeted backfill: re-sync only the gallery_index rows that are inbox-stage
+// (no processed_at) AND missing shopee or lazada links. Uses syncGalleryIndexEntry
+// per-video so the new buildGalleryIndexUpsertRow inbox JSON fallback kicks in.
+// Stays well under the 1000 subrequest limit by capping batch size.
+//
+// Pagination: pass `offset=N` to skip the first N stale videos (they likely have
+// no inbox record either). Without offset, the same unhealable rows return every
+// call. To run a full sweep, walk offset 0, 30, 60, ... until scanned=0.
+app.post('/admin/api/gallery/index/backfill-missing-links', async (c) => {
+    const limit = Math.max(1, Math.min(40, parseInt(String(c.req.query('limit') || '20'), 10) || 20))
+    const offset = Math.max(0, parseInt(String(c.req.query('offset') || '0'), 10) || 0)
+    const namespaceFilter = String(c.req.query('namespace_id') || '').trim()
+    const whereNamespace = namespaceFilter ? 'AND namespace_id = ?' : ''
+    const sql = `SELECT namespace_id, video_id
+                 FROM gallery_index
+                 WHERE TRIM(COALESCE(processed_at,'')) = ''
+                   AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')
+                   AND TRIM(COALESCE(original_url,'')) <> ''
+                   ${whereNamespace}
+                 ORDER BY namespace_id ASC, video_id ASC
+                 LIMIT ? OFFSET ?`
+    const stmt = namespaceFilter
+        ? c.env.DB.prepare(sql).bind(namespaceFilter, limit, offset)
+        : c.env.DB.prepare(sql).bind(limit, offset)
+    const rows = await stmt.all() as { results?: Array<{ namespace_id?: string; video_id?: string }> }
+    const candidates = (rows.results || [])
+        .map((row) => ({ namespaceId: String(row.namespace_id || '').trim(), videoId: String(row.video_id || '').trim() }))
+        .filter((row) => row.namespaceId && row.videoId)
+    let healed = 0
+    let stillMissing = 0
+    const failures: Array<{ namespaceId: string; videoId: string; error: string }> = []
+    for (const row of candidates) {
+        try {
+            const result = await syncGalleryIndexEntry(c.env, row.namespaceId, row.videoId)
+            if (result?.shopeeLink && result?.lazadaLink) healed += 1
+            else stillMissing += 1
+        } catch (error) {
+            failures.push({
+                ...row,
+                error: error instanceof Error ? error.message : String(error),
+            })
+        }
+    }
+    return c.json({
+        ok: true,
+        scanned: candidates.length,
+        healed,
+        still_missing: stillMissing,
+        offset,
+        next_offset: offset + Math.max(0, stillMissing),
+        failures,
+    })
+})
+
 // Debug: test cover thumbnail generation
 app.get('/admin/api/test-cover', async (c) => {
     const videoId = String(c.req.query('video_id') || '').trim()
