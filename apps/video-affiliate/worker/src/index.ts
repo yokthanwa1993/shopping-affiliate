@@ -17390,6 +17390,7 @@ function isLikelyConvertedLazadaLink(link: string): boolean {
         const parsed = new URL(rawLink)
         const host = parsed.hostname.toLowerCase()
         if (host === 'lzd.co' || host.endsWith('.lzd.co')) return true
+        if (host.startsWith('c.lazada.') && parsed.pathname.toLowerCase().startsWith('/t/c')) return true
         if (host.startsWith('s.lazada.')) {
             return parsed.searchParams.has('cc')
                 || parsed.searchParams.has('t')
@@ -20201,6 +20202,23 @@ async function shortenLazadaLinkForNamespace(params: {
         return ''
     }
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
+    const expectedMemberId = normalizeLazadaMemberId(await resolveNamespaceLazadaExpectedMemberId(params.env.DB, params.namespaceId).catch(() => ''))
+    const sourceMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(sourceLink))
+    const originalMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(originalLink))
+    const alreadyConvertedLink = isLikelyConvertedLazadaLink(sourceLink)
+        ? sourceLink
+        : (isLikelyConvertedLazadaLink(originalLink) ? originalLink : '')
+    const alreadyConvertedMemberId = sourceMemberId || originalMemberId
+    if (alreadyConvertedLink && (!expectedMemberId || !alreadyConvertedMemberId || alreadyConvertedMemberId === expectedMemberId)) {
+        writeTrace({
+            utmSource: extractLazadaTrackingSourceFromLink(alreadyConvertedLink) || null,
+            memberId: alreadyConvertedMemberId || null,
+            status: 'shortened',
+            error: null,
+        })
+        console.log(`[${params.logPrefix}] Lazada link is already converted; using it without bridge call`)
+        return alreadyConvertedLink
+    }
 
     // Load sub IDs + URL template from namespace settings
     const lazadaSubIds = await resolveNamespaceShortlinkSubIds(params.env.DB, params.namespaceId).catch(() => ({ sub1: '', sub2: '', sub3: '', sub4: '', sub5: '' }))
@@ -20233,15 +20251,15 @@ async function shortenLazadaLinkForNamespace(params: {
 
     let lastError: string | null = null
     // Extended retry schedule — short.wwoom.com (Electron bridge) returns transient HTTP 500
-    // when its puppeteer session refreshes. 2 attempts @ 250ms was insufficient and caused
-    // posting to be BLOCKED for minutes at a time. Now: 5 attempts over ~11s total.
+    // when its puppeteer session refreshes. Use a longer per-attempt timeout because Lazada
+    // login/session refresh can take longer than the old 8s window.
     const lazadaRetryDelaysMs = [0, 500, 2000, 4000, 8000]
     const maxAttempts = lazadaRetryDelaysMs.length
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
             const delayMs = lazadaRetryDelaysMs[attempt - 1]
             if (delayMs > 0) await waitMs(delayMs)
-            const resp = await fetchWithTimeout(finalLazadaRequestUrl, {}, 8000, 'lazada_shortlink')
+            const resp = await fetchWithTimeout(finalLazadaRequestUrl, {}, 30000, 'lazada_shortlink')
             if (!resp.ok) {
                 const errText = await resp.text().catch(() => '')
                 throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
