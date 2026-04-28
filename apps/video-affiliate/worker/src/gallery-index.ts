@@ -623,6 +623,22 @@ async function buildGalleryIndexUpsertRow(params: {
             meta = {}
         }
     }
+    const state = await params.env.DB.prepare(
+        `SELECT shopee_link, lazada_link, shopee_original_link, lazada_original_link,
+                shopee_converted_at, lazada_converted_at, lazada_member_id, posted_at
+         FROM namespace_video_state
+         WHERE namespace_id = ? AND video_id = ?
+         LIMIT 1`
+    ).bind(namespaceId, videoId).first().catch(() => null) as {
+        shopee_link?: string
+        lazada_link?: string
+        shopee_original_link?: string
+        lazada_original_link?: string
+        shopee_converted_at?: string
+        lazada_converted_at?: string
+        lazada_member_id?: string
+        posted_at?: string
+    } | null
 
     const ownerEmail = await resolveOwnerEmailForNamespace(params.env.DB, namespaceId, params.ownerEmailCache)
     const derivedOriginalUrl = hasOriginalVideo
@@ -642,13 +658,17 @@ async function buildGalleryIndexUpsertRow(params: {
         ? (normalizeText(meta.publicUrl) || derivedPublicUrl)
         : ''
     const thumbnailUrl = normalizeText(meta.thumbnailUrl) || derivedThumbnailUrl
-    const shopeeLink = normalizeMetaShopeeLink(meta)
-    const lazadaLink = normalizeMetaLazadaLink(meta)
-    const shopeeOriginalLink = pickFirstShopeeUrl(meta.shopeeOriginalLink || meta.shopee_original_link || '') || ''
-    const lazadaOriginalLink = pickFirstLazadaUrl(meta.lazadaOriginalLink || meta.lazada_original_link || '') || ''
-    const shopeeConvertedAt = normalizeText(meta.shopeeConvertedAt || meta.shopee_converted_at || '')
-    const lazadaConvertedAt = normalizeText(meta.lazadaConvertedAt || meta.lazada_converted_at || '')
-    const lazadaMemberId = normalizeText(meta.lazadaMemberId || meta.lazada_member_id || '')
+    const shopeeLink = normalizeMetaShopeeLink(meta) || normalizeText(state?.shopee_link || '')
+    const lazadaLink = normalizeMetaLazadaLink(meta) || normalizeText(state?.lazada_link || '')
+    const shopeeOriginalLink = pickFirstShopeeUrl(meta.shopeeOriginalLink || meta.shopee_original_link || '')
+        || pickFirstShopeeUrl(state?.shopee_original_link || state?.shopee_link || '')
+        || ''
+    const lazadaOriginalLink = pickFirstLazadaUrl(meta.lazadaOriginalLink || meta.lazada_original_link || '')
+        || pickFirstLazadaUrl(state?.lazada_original_link || state?.lazada_link || '')
+        || ''
+    const shopeeConvertedAt = normalizeText(meta.shopeeConvertedAt || meta.shopee_converted_at || state?.shopee_converted_at || '')
+    const lazadaConvertedAt = normalizeText(meta.lazadaConvertedAt || meta.lazada_converted_at || state?.lazada_converted_at || '')
+    const lazadaMemberId = normalizeText(meta.lazadaMemberId || meta.lazada_member_id || state?.lazada_member_id || '')
     const createdAt = normalizeTimestamp(
         meta.createdAt,
         knownState.metaUploadedAt,

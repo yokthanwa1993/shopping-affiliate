@@ -13000,6 +13000,82 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
     return null
 }
 
+async function syncReadyInboxLinksToNamespaceIndex(params: {
+    env: Env
+    bucket: R2Bucket
+    namespaceId: string
+    limit?: number
+}): Promise<number> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    if (!namespaceId) return 0
+
+    await ensureGalleryIndexTable(params.env.DB).catch(() => { })
+    const limit = Math.min(Math.max(Math.floor(Number(params.limit || 300)), 1), 1000)
+    const rows = await params.env.DB.prepare(
+        `SELECT video_id
+         FROM gallery_index
+         WHERE namespace_id = ?
+           AND TRIM(COALESCE(original_url,'')) <> ''
+           AND TRIM(COALESCE(processed_at,'')) = ''
+           AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')
+         ORDER BY COALESCE(NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, video_id ASC
+         LIMIT ?`
+    ).bind(namespaceId, limit).all().catch(() => ({ results: [] })) as { results?: Array<{ video_id?: string }> }
+    let synced = 0
+    const nowIso = new Date().toISOString()
+
+    for (const row of rows.results || []) {
+        const rowVideoId = String(row.video_id || '').trim()
+        if (!rowVideoId) continue
+        const record = await getInboxVideoRecord(params.bucket, rowVideoId).catch(() => null)
+        const item = normalizeInboxVideoRecord(record)
+        if (!item || item.status !== 'ready') continue
+
+        const videoId = String(item.id || '').trim()
+        const shopeeLink = String(item.shopeeLink || '').trim()
+        const lazadaLink = String(item.lazadaLink || '').trim()
+        if (!videoId || !shopeeLink || !lazadaLink) continue
+
+        const shopeeOriginalLink = String(item.shopeeOriginalLink || shopeeLink).trim()
+        const lazadaOriginalLink = String(item.lazadaOriginalLink || lazadaLink).trim()
+
+        await upsertNamespaceVideoState(params.env.DB, namespaceId, videoId, {
+            shopee_link: shopeeLink,
+            lazada_link: lazadaLink,
+            shopee_original_link: shopeeOriginalLink,
+            lazada_original_link: lazadaOriginalLink,
+        }).catch(() => { })
+
+        const result = await params.env.DB.prepare(
+            `UPDATE gallery_index
+             SET shopee_link = CASE WHEN TRIM(COALESCE(shopee_link,'')) = '' THEN ? ELSE shopee_link END,
+                 lazada_link = CASE WHEN TRIM(COALESCE(lazada_link,'')) = '' THEN ? ELSE lazada_link END,
+                 shopee_original_link = CASE WHEN TRIM(COALESCE(shopee_original_link,'')) = '' THEN ? ELSE shopee_original_link END,
+                 lazada_original_link = CASE WHEN TRIM(COALESCE(lazada_original_link,'')) = '' THEN ? ELSE lazada_original_link END,
+                 updated_at = ?
+             WHERE namespace_id = ?
+               AND video_id = ?
+               AND TRIM(COALESCE(processed_at,'')) = ''
+               AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')`
+        ).bind(
+            shopeeLink,
+            lazadaLink,
+            shopeeOriginalLink,
+            lazadaOriginalLink,
+            nowIso,
+            namespaceId,
+            videoId,
+        ).run().catch(() => null) as { meta?: { changes?: number } } | null
+
+        if (Number(result?.meta?.changes || 0) > 0) synced++
+    }
+
+    if (synced > 0) {
+        console.log(`[INBOX-LINK-SYNC] namespace=${namespaceId} synced=${synced}`)
+    }
+    return synced
+}
+
 type InboxListView = 'unprocessed' | 'missing_links' | 'processed'
 
 function parseInboxListView(input: unknown): InboxListView {
@@ -14212,6 +14288,15 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
 
     const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
     if (await hasActiveProcessingJob(bucket).catch(() => true)) return false
+    await syncReadyInboxLinksToNamespaceIndex({
+        env,
+        bucket,
+        namespaceId: botId,
+        limit: 40,
+    }).catch((error) => {
+        console.error(`[PROCESSING-AUTOSTART] Failed to sync ready inbox links for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+        return 0
+    })
 
     const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
         env,
@@ -14327,6 +14412,17 @@ app.get('/api/inbox', async (c) => {
         const view = parseInboxListView(c.req.query('view'))
         const bucket = c.get('bucket')
         const ownerEmail = await resolveOwnerEmailForNamespace(c.env.DB, namespaceId).catch(() => '')
+        if (namespaceId && offset === 0 && (view === 'unprocessed' || view === 'missing_links')) {
+            c.executionCtx.waitUntil(syncReadyInboxLinksToNamespaceIndex({
+                env: c.env,
+                bucket,
+                namespaceId,
+                limit: 120,
+            }).catch((error) => {
+                console.error(`[INBOX-LINK-SYNC] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                return 0
+            }))
+        }
         const galleryIndexPage = await getNamespaceInboxGalleryIndexPage({
             env: c.env,
             namespaceId,
@@ -15189,6 +15285,20 @@ app.post('/api/gallery/refresh/:id', async (c) => {
                     await c.get('bucket').put(`videos/${videoId}.json`, JSON.stringify(meta, null, 2), {
                         httpMetadata: { contentType: 'application/json' },
                     })
+                    const metaShopeeLink = getVideoSourceShopeeLink(meta)
+                    const metaLazadaLink = getVideoSourceLazadaLink(meta)
+                    const nextStateFields: Partial<NamespaceVideoStateRow> = {}
+                    if (metaShopeeLink) {
+                        nextStateFields.shopee_link = metaShopeeLink
+                        nextStateFields.shopee_original_link = String(meta.shopeeOriginalLink || meta.shopee_original_link || metaShopeeLink).trim()
+                    }
+                    if (metaLazadaLink) {
+                        nextStateFields.lazada_link = metaLazadaLink
+                        nextStateFields.lazada_original_link = String(meta.lazadaOriginalLink || meta.lazada_original_link || metaLazadaLink).trim()
+                    }
+                    if (Object.keys(nextStateFields).length > 0) {
+                        await upsertNamespaceVideoState(c.env.DB, namespaceId, videoId, nextStateFields).catch(() => { })
+                    }
                 }
             }
 
@@ -17543,6 +17653,16 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
             return false
         }
 
+        await syncReadyInboxLinksToNamespaceIndex({
+            env,
+            bucket: adminBucket,
+            namespaceId: adminNamespaceId,
+            limit: 200,
+        }).catch((error) => {
+            console.error(`[AUTO-IMPORT] Failed to sync ready inbox links: ${error instanceof Error ? error.message : String(error)}`)
+            return 0
+        })
+
         const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
             env,
             bucket: adminBucket,
@@ -17731,6 +17851,16 @@ async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContex
 
         const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
         if (await hasActiveProcessingJob(bucket).catch(() => true)) continue
+
+        await syncReadyInboxLinksToNamespaceIndex({
+            env,
+            bucket,
+            namespaceId,
+            limit: 200,
+        }).catch((error) => {
+            console.error(`[AUTO-INBOX] Failed to sync ready inbox links for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+            return 0
+        })
 
         const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
             env,
