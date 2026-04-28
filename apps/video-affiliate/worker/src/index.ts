@@ -19251,6 +19251,50 @@ async function getLatestPostedAtByVideoIds(params: {
     return out
 }
 
+async function getLatestPostedAtBySourceFingerprints(params: {
+    db: D1Database
+    namespaceId: string
+    sourceFingerprints: string[]
+}): Promise<Map<string, string>> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const sourceFingerprints = Array.from(new Set((params.sourceFingerprints || [])
+        .map((value) => normalizeNamespaceVideoSourceFingerprint(value))
+        .filter(Boolean)))
+    const out = new Map<string, string>()
+    if (!namespaceId || sourceFingerprints.length === 0) return out
+
+    const chunkSize = 25
+    for (let i = 0; i < sourceFingerprints.length; i += chunkSize) {
+        const chunk = sourceFingerprints.slice(i, i + chunkSize)
+        const placeholders = chunk.map(() => '?').join(', ')
+        const sql = `SELECT
+                COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) AS source_fingerprint,
+                MAX(ph.posted_at) AS posted_at
+            FROM post_history ph
+            LEFT JOIN namespace_video_state nvs
+              ON nvs.namespace_id = ph.bot_id
+             AND nvs.video_id = ph.video_id
+            WHERE ph.bot_id = ?
+              AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) IN (${placeholders})
+              AND (
+                ph.status IN ('success', 'posting')
+                OR TRIM(COALESCE(ph.fb_post_id, '')) <> ''
+                OR TRIM(COALESCE(ph.fb_reel_url, '')) <> ''
+              )
+            GROUP BY COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint)`
+        const result = await params.db.prepare(sql).bind(namespaceId, ...chunk).all() as {
+            results?: Array<{ source_fingerprint?: string; posted_at?: string }>
+        }
+        for (const row of result.results || []) {
+            const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(row?.source_fingerprint)
+            const postedAt = String(row?.posted_at || '').trim()
+            if (sourceFingerprint && postedAt) out.set(sourceFingerprint, postedAt)
+        }
+    }
+
+    return out
+}
+
 async function reconcileNamespacePostedStateFromHistory(params: {
     db: D1Database
     namespaceId: string
@@ -19272,14 +19316,35 @@ async function reconcileNamespacePostedStateFromHistory(params: {
         namespaceId,
         videoIds: candidateVideoIds,
     })
-    if (postedAtByVideoId.size === 0) return
+    const candidateSourceFingerprints = params.sourceVideos
+        .filter((video) => candidateVideoIds.includes(String(video?.id || '').trim()))
+        .map((video) => {
+            const videoId = String(video?.id || '').trim()
+            return normalizeNamespaceVideoSourceFingerprint(
+                params.stateByVideoId.get(videoId)?.source_fingerprint
+                || video?.sourceFingerprint
+                || video?.source_fingerprint,
+            )
+        })
+        .filter(Boolean)
+    const postedAtBySourceFingerprint = await getLatestPostedAtBySourceFingerprints({
+        db: params.db,
+        namespaceId,
+        sourceFingerprints: candidateSourceFingerprints,
+    })
+    if (postedAtByVideoId.size === 0 && postedAtBySourceFingerprint.size === 0) return
 
-    for (const [videoId, postedAt] of postedAtByVideoId.entries()) {
+    for (const videoId of candidateVideoIds) {
         const currentRow = params.stateByVideoId.get(videoId) || {
             namespace_id: namespaceId,
             video_id: videoId,
         }
         if (String(currentRow.posted_at || '').trim()) continue
+        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(currentRow.source_fingerprint)
+        const postedAt = postedAtByVideoId.get(videoId)
+            || (sourceFingerprint ? postedAtBySourceFingerprint.get(sourceFingerprint) : '')
+            || ''
+        if (!postedAt) continue
         const manualUnpostedAt = String(currentRow.manual_unposted_at || '').trim()
         if (manualUnpostedAt) {
             const postedTime = Date.parse(postedAt)
