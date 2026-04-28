@@ -1645,6 +1645,44 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
     }
 }
 
+async function getLatestSuccessfulNamespacePostHistoryRow(db: D1Database, params: {
+    namespaceId: string
+    videoId: string
+    sourceFingerprint?: string
+}): Promise<{ id: number | null; pageId: string | null; postedAt: string | null } | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
+    if (!namespaceId || (!videoId && !sourceFingerprint)) return null
+
+    const row = await db.prepare(
+        `SELECT ph.id, ph.page_id, ph.posted_at
+         FROM post_history ph
+         LEFT JOIN namespace_video_state nvs
+           ON nvs.namespace_id = ph.bot_id
+          AND nvs.video_id = ph.video_id
+         WHERE ph.bot_id = ?
+           AND ph.status = 'success'
+           AND (
+               (? <> '' AND ph.video_id = ?)
+               OR (? <> '' AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) = ?)
+           )
+         ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
+         LIMIT 1`
+    ).bind(namespaceId, videoId, videoId, sourceFingerprint, sourceFingerprint).first() as {
+        id?: number
+        page_id?: string | null
+        posted_at?: string | null
+    } | null
+
+    if (!row) return null
+    return {
+        id: typeof row.id === 'number' ? row.id : null,
+        pageId: String(row.page_id || '').trim() || null,
+        postedAt: String(row.posted_at || '').trim() || null,
+    }
+}
+
 async function ensurePagePostedVideoGuardsTable(db: D1Database): Promise<void> {
     await db.prepare(
         `CREATE TABLE IF NOT EXISTS page_posted_video_guards (
@@ -1822,9 +1860,69 @@ async function claimGalleryVideoForPosting(params: {
     for (const video of orderedVideos) {
         const videoId = String(video?.id || '').trim()
         if (!videoId) continue
+
+        // Cached-state guard: if the in-memory video object already has postedAt set
+        // (e.g., from markCachedNamespaceVideoPosted in the same cron tick), skip.
+        // This guards against stale `videos[]` arrays leaking already-posted entries.
+        if (isNamespaceGalleryVideoPosted(video)) {
+            continue
+        }
+
         const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
             video?.sourceFingerprint || video?.source_fingerprint,
         )
+
+        // SAFETY NET (bulletproof): strict video_id-only namespace dedup directly
+        // against post_history. Catches any bypass of ensure*VideoNeverPosted —
+        // e.g., if state.posted_at was reset, fingerprint mismatch, race condition,
+        // or stale guard table. The rule is simple: if this exact video_id was ever
+        // successfully posted (or is currently being posted) anywhere in the same
+        // namespace, it is NEVER eligible for re-posting.
+        const existingNamespacePost = await params.db.prepare(
+            `SELECT id, page_id, posted_at FROM post_history
+             WHERE bot_id = ?
+               AND video_id = ?
+               AND status IN ('success', 'posting')
+             ORDER BY datetime(posted_at) DESC, id DESC
+             LIMIT 1`
+        ).bind(namespaceId, videoId).first().catch(() => null) as { id?: number; page_id?: string; posted_at?: string } | null
+        if (existingNamespacePost) {
+            const postedAt = String(existingNamespacePost.posted_at || '').trim() || new Date().toISOString()
+            const seenPageId = String(existingNamespacePost.page_id || '').trim()
+            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
+            // Heal: backfill state + guard so subsequent cron ticks fail fast.
+            await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
+            if (seenPageId) {
+                await recordPagePostedVideoGuard(params.db, {
+                    namespaceId,
+                    pageId: seenPageId,
+                    videoId,
+                    sourceFingerprint,
+                    historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
+                    postedAt,
+                }).catch(() => { })
+            }
+            // Also seed a guard for the CURRENT page so the next race can't re-post here either.
+            await recordPagePostedVideoGuard(params.db, {
+                namespaceId,
+                pageId,
+                videoId,
+                sourceFingerprint,
+                historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
+                postedAt,
+            }).catch(() => { })
+            continue
+        }
+
+        const namespaceDuplicateCheck = await ensureNamespaceVideoNeverPosted({
+            db: params.db,
+            namespaceId,
+            videoId,
+            sourceFingerprint,
+        })
+        if (namespaceDuplicateCheck.ok === false) {
+            continue
+        }
 
         const duplicateCheck = await ensurePageVideoNeverPosted({
             db: params.db,
@@ -1848,6 +1946,24 @@ async function claimGalleryVideoForPosting(params: {
     }
 
     return null
+}
+
+async function ensureNamespaceVideoNeverPosted(params: {
+    db: D1Database
+    namespaceId: string
+    videoId: string
+    sourceFingerprint?: string
+}): Promise<{ ok: true } | { ok: false; postedAt: string | null; historyId: number | null }> {
+    const latestHistory = await getLatestSuccessfulNamespacePostHistoryRow(params.db, params)
+    if (!latestHistory) return { ok: true }
+
+    const postedAt = String(latestHistory.postedAt || '').trim()
+    await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
+    return {
+        ok: false,
+        postedAt: postedAt || null,
+        historyId: latestHistory.id ?? null,
+    }
 }
 
 async function ensurePageVideoNeverPosted(params: {
@@ -3782,6 +3898,28 @@ async function markNamespaceVideoPosted(db: D1Database, namespaceId: string, vid
     await upsertNamespaceVideoState(db, namespaceId, videoId, { posted_at: normalizedPostedAt })
 }
 
+function markCachedNamespaceVideoPosted(
+    cache: Map<string, Array<Record<string, unknown>>>,
+    namespaceId: string,
+    videoId: string,
+    postedAt: string,
+): void {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    const normalizedPostedAt = String(postedAt || '').trim()
+    if (!normalizedNamespaceId || !normalizedVideoId || !normalizedPostedAt) return
+
+    const videos = cache.get(normalizedNamespaceId)
+    if (!videos) return
+
+    for (const video of videos) {
+        if (String(video?.id || '').trim() !== normalizedVideoId) continue
+        video.postedAt = normalizedPostedAt
+        video.posted_at = normalizedPostedAt
+        break
+    }
+}
+
 async function resetNamespaceVideoPosted(db: D1Database, namespaceId: string, videoId: string): Promise<void> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     const normalizedVideoId = String(videoId || '').trim()
@@ -3796,10 +3934,6 @@ async function resetNamespaceVideoPosted(db: D1Database, namespaceId: string, vi
          SET posted_at = '', manual_unposted_at = ?, updated_at = datetime('now')
          WHERE namespace_id = ? AND video_id = ?`
     ).bind(manualUnpostedAt, normalizedNamespaceId, normalizedVideoId).run()
-    await db.prepare(
-        `DELETE FROM page_posted_video_guards
-         WHERE bot_id = ? AND video_id = ?`
-    ).bind(normalizedNamespaceId, normalizedVideoId).run().catch(() => { })
 }
 
 function normalizeNamespaceVideoSourceFingerprint(value: unknown): string {
@@ -16250,10 +16384,6 @@ app.post('/api/gallery/reset-posted-bulk', async (c) => {
              WHERE namespace_id = ? AND posted_at <> ''`
         ).bind(targetNamespaceId).run()
         await ensurePagePostedVideoGuardsTable(c.env.DB)
-        await c.env.DB.prepare(
-            `DELETE FROM page_posted_video_guards
-             WHERE bot_id = ?`
-        ).bind(targetNamespaceId).run().catch(() => { })
 
         // Reset R2 metadata for each posted video (clears postedAt + keepInPostedTab)
         const bucket = c.get('bucket')
@@ -19345,12 +19475,6 @@ async function reconcileNamespacePostedStateFromHistory(params: {
             || (sourceFingerprint ? postedAtBySourceFingerprint.get(sourceFingerprint) : '')
             || ''
         if (!postedAt) continue
-        const manualUnpostedAt = String(currentRow.manual_unposted_at || '').trim()
-        if (manualUnpostedAt) {
-            const postedTime = Date.parse(postedAt)
-            const manualTime = Date.parse(manualUnpostedAt)
-            if (Number.isFinite(postedTime) && Number.isFinite(manualTime) && postedTime <= manualTime) continue
-        }
         await upsertNamespaceVideoState(params.db, namespaceId, videoId, { posted_at: postedAt })
         params.stateByVideoId.set(videoId, {
             ...currentRow,
@@ -22569,31 +22693,26 @@ async function autoSyncPagesForNamespace(
         imported += 1
     }
 
-    let deleted = 0
-    const canPrune = desiredPageIds.size > 0 && postFetchErrors.length === 0 && commentFetchErrors.length === 0
-    if (canPrune) {
-        const existingRows = await env.DB.prepare(
-            'SELECT id FROM pages WHERE bot_id = ?'
-        ).bind(ns).all() as { results?: Array<{ id?: string }> }
+    const existingRows = await env.DB.prepare(
+        'SELECT id FROM pages WHERE bot_id = ?'
+    ).bind(ns).all() as { results?: Array<{ id?: string }> }
 
-        const staleIds = (existingRows.results || [])
-            .map((row) => String(row?.id || '').trim())
-            .filter((id) => id && !desiredPageIds.has(id))
+    const skippedPrune = (existingRows.results || [])
+        .map((row) => String(row?.id || '').trim())
+        .filter((id) => id && !desiredPageIds.has(id))
+        .length
 
-        for (const staleId of staleIds) {
-            await env.DB.prepare(
-                'DELETE FROM pages WHERE id = ? AND bot_id = ?'
-            ).bind(staleId, ns).run()
-            delete nextPool[staleId]
-            deleted += 1
-        }
+    if (skippedPrune > 0) {
+        console.log(
+            `[PAGES-AUTO-SYNC] namespace=${ns} skipped_prune=${skippedPrune}: auto-sync never deletes pages; use explicit page delete only`
+        )
     }
 
     await setNamespacePagesTokenPool(env.DB, ns, nextPool)
 
-    if (imported > 0 || updated > 0 || conflicts > 0 || deleted > 0 || commentFetchErrors.length > 0 || postFetchErrors.length > 0) {
+    if (imported > 0 || updated > 0 || conflicts > 0 || skippedPrune > 0 || commentFetchErrors.length > 0 || postFetchErrors.length > 0) {
         console.log(
-            `[PAGES-AUTO-SYNC] namespace=${ns} imported=${imported} updated=${updated} deleted=${deleted} conflicts=${conflicts} post_selectors=${cfg.postSelectors.join(',')} comment_selectors=${cfg.commentSelectors.join(',')} post_fetch_errors=${postFetchErrors.length} comment_fetch_errors=${commentFetchErrors.length}`
+            `[PAGES-AUTO-SYNC] namespace=${ns} imported=${imported} updated=${updated} skipped_prune=${skippedPrune} conflicts=${conflicts} post_selectors=${cfg.postSelectors.join(',')} comment_selectors=${cfg.commentSelectors.join(',')} post_fetch_errors=${postFetchErrors.length} comment_fetch_errors=${commentFetchErrors.length}`
         )
     }
 }
@@ -28484,6 +28603,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     ).run().catch(() => { })
                 }
                 await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
+                markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, nowISO)
                 await recordPagePostedVideoGuard(env.DB, {
                     namespaceId: botId,
                     pageId: page.id,
@@ -28620,7 +28740,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     cronHistoryId,
                 ).run()
             }
-            await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+            const postedAtIso = new Date().toISOString()
+            await markNamespaceVideoPosted(env.DB, botId, unpostedId, postedAtIso)
+            markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, postedAtIso)
             await recordPagePostedVideoGuard(env.DB, {
                 namespaceId: botId,
                 pageId: page.id,
@@ -28757,7 +28879,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             cronHistoryId,
                         ).run()
                     }
-                    await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+                    const recoveredPostedAtIso = new Date().toISOString()
+                    await markNamespaceVideoPosted(env.DB, botId, unpostedId, recoveredPostedAtIso)
+                    markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, recoveredPostedAtIso)
                     await recordPagePostedVideoGuard(env.DB, {
                         namespaceId: botId,
                         pageId: page.id,
