@@ -16478,6 +16478,69 @@ app.post('/api/gallery/reset-posted-bulk', async (c) => {
     }
 })
 
+// Mirror of /api/gallery/reset-posted-bulk but in the OPPOSITE direction:
+// move every "ยังไม่โพสต์" (unposted) video into "โพสต์แล้ว" (posted) by stamping
+// state.posted_at = now. Use this to clear the to-do list when a member wants
+// to re-upload a fresh batch of clips and abandon the old queue.
+//
+// Does NOT post to Facebook — only marks state. Subsequent cron ticks will
+// skip these videos because the unposted filter excludes posted_at != ''.
+app.post('/api/gallery/mark-posted-bulk', async (c) => {
+    try {
+        const adminCheck = await requireSystemAdminSession(c)
+        if (!adminCheck.ok) return adminCheck.response
+
+        const currentNamespaceId = String(c.get('botId') || '').trim()
+        const body = await c.req.json().catch(() => ({} as { namespace_id?: string; namespaceId?: string })) as { namespace_id?: string; namespaceId?: string }
+        const requestedNamespaceId = String(
+            body.namespace_id ?? body.namespaceId ?? c.req.query('namespace_id') ?? ''
+        ).trim()
+        const targetNamespaceId = requestedNamespaceId || currentNamespaceId
+        if (!targetNamespaceId) {
+            return c.json({ error: 'namespace_id_required' }, 400)
+        }
+        if (targetNamespaceId !== currentNamespaceId) {
+            return c.json({ error: 'cross_namespace_gallery_write_forbidden' }, 403)
+        }
+
+        await ensureNamespaceVideoStateColumns(c.env.DB)
+        // Single SQL: upsert state.posted_at=now for every gallery_index row in
+        // this namespace that is processed + has both shopee/lazada links and is
+        // currently unposted. Handles both new state rows and existing rows.
+        const nowIso = new Date().toISOString()
+        const result = await c.env.DB.prepare(
+            `INSERT INTO namespace_video_state (namespace_id, video_id, posted_at, created_at, updated_at)
+             SELECT g.namespace_id, g.video_id, ?, datetime('now'), datetime('now')
+             FROM gallery_index g
+             LEFT JOIN namespace_video_state s
+               ON s.namespace_id = g.namespace_id AND s.video_id = g.video_id
+             WHERE g.namespace_id = ?
+               AND g.has_public_video = 1
+               AND TRIM(COALESCE(g.processed_at,'')) <> ''
+               AND TRIM(COALESCE(g.shopee_link,'')) <> ''
+               AND TRIM(COALESCE(g.lazada_link,'')) <> ''
+               AND TRIM(COALESCE(s.posted_at,'')) = ''
+             ON CONFLICT(namespace_id, video_id) DO UPDATE SET
+                 posted_at = excluded.posted_at,
+                 manual_unposted_at = '',
+                 updated_at = excluded.updated_at`
+        ).bind(nowIso, targetNamespaceId).run()
+
+        // Invalidate admin caches so the change is reflected everywhere
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
+        await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+
+        return c.json({
+            success: true,
+            namespace_id: targetNamespaceId,
+            marked_count: Number(result.meta?.changes || 0),
+            posted_at: nowIso,
+        })
+    } catch (e) {
+        return c.json({ error: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
+
 app.delete('/api/gallery/:id', async (c) => {
     const id = c.req.param('id')
     try {

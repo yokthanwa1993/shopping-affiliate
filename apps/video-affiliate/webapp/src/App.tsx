@@ -3394,7 +3394,7 @@ function App({
   const [shortlinkAccountMaxChars, setShortlinkAccountMaxChars] = useState(64)
   const [shortlinkExpectedUtmIdMaxChars, setShortlinkExpectedUtmIdMaxChars] = useState(32)
   const [lazadaExpectedMemberIdMaxChars, setLazadaExpectedMemberIdMaxChars] = useState(32)
-  const [postingOrderCurrent, setPostingOrderCurrent] = useState<PostingOrderOption>('oldest_first')
+  const [postingOrderCurrent, setPostingOrderCurrent] = useState<PostingOrderOption | null>(null)
   const [postingOrderDraft, setPostingOrderDraft] = useState<PostingOrderOption>('oldest_first')
   const [postingOrderUpdatedAt, setPostingOrderUpdatedAt] = useState('')
   const [postingOrderMessage, setPostingOrderMessage] = useState('')
@@ -4398,8 +4398,13 @@ function App({
       return
     }
 
-    if (settingsSection === 'team' || settingsSection === 'menu') {
+    if (settingsSection === 'team') {
       void loadTeam()
+      return
+    }
+    if (settingsSection === 'menu') {
+      void loadTeam()
+      void loadPostingOrderSettings()
       return
     }
     if (settingsSection === 'shortlink') {
@@ -5956,7 +5961,10 @@ function App({
         return
       }
       const data = await resp.json().catch(() => ({})) as { posting_order?: PostingOrderOption; updated_at?: string }
-      const nextOrder = String(data.posting_order || 'oldest_first').trim() as PostingOrderOption
+      const rawOrder = String(data.posting_order || '').trim()
+      const nextOrder = POSTING_ORDER_OPTIONS.some((option) => option.value === rawOrder)
+        ? rawOrder as PostingOrderOption
+        : 'oldest_first'
       setPostingOrderCurrent(nextOrder)
       setPostingOrderDraft(nextOrder)
       setPostingOrderUpdatedAt(String(data.updated_at || ''))
@@ -5991,7 +5999,10 @@ function App({
         setPostingOrderMessage(String(data.error || 'บันทึกการตั้งค่า Post ไม่สำเร็จ'))
         return
       }
-      const savedOrder = String(data.posting_order || nextOrder).trim() as PostingOrderOption
+      const rawSavedOrder = String(data.posting_order || nextOrder).trim()
+      const savedOrder = POSTING_ORDER_OPTIONS.some((option) => option.value === rawSavedOrder)
+        ? rawSavedOrder as PostingOrderOption
+        : nextOrder
       setPostingOrderCurrent(savedOrder)
       setPostingOrderDraft(savedOrder)
       setPostingOrderUpdatedAt(String(data.updated_at || ''))
@@ -6386,6 +6397,47 @@ function App({
         return
       }
       alert(`ย้ายคลิป ${data.reset_count ?? 0} คลิป กลับไป "ยังไม่โพสต์" สำเร็จ`)
+      void loadGallerySnapshotBundle({ reset: true })
+    } catch (e) {
+      alert(`เกิดข้อผิดพลาด: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setBulkResetPostedLoading(false)
+    }
+  }
+
+  async function handleBulkMarkPostedForCurrentNamespace() {
+    const ns = String(namespaceId || '').trim()
+    if (!ns) {
+      alert('ไม่พบ namespace_id ปัจจุบัน — ลองเข้าจาก LINE/LIFF อีกครั้ง')
+      return
+    }
+    const ok = window.confirm(
+      `ย้ายคลิปที่ "ยังไม่โพสต์" ทั้งหมดของ namespace นี้ไปแท็บ "โพสต์แล้ว" ใช่ไหม?\n\n` +
+      `namespace_id: ${ns}\n\n` +
+      `ระบบจะ "ทำเครื่องหมายว่าโพสต์แล้ว" เท่านั้น (ไม่ได้โพสต์จริงไป Facebook)\n` +
+      `cron จะข้ามคลิปเหล่านี้และไม่ post ซ้ำ\n\n` +
+      `จะมีผลเฉพาะ namespace นี้เท่านั้น ไม่กระทบ namespace อื่น`
+    )
+    if (!ok) return
+    setBulkResetPostedLoading(true)
+    try {
+      const url = new URL(`${WORKER_URL}/api/gallery/mark-posted-bulk`)
+      url.searchParams.set('namespace_id', ns)
+      const resp = await apiFetch(url.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ namespace_id: ns }),
+      })
+      const data = await resp.json().catch(() => ({})) as {
+        success?: boolean
+        marked_count?: number
+        error?: string
+      }
+      if (!resp.ok || !data.success) {
+        alert(`ทำเครื่องหมายไม่สำเร็จ: ${data.error || resp.statusText || 'unknown error'}`)
+        return
+      }
+      alert(`ทำเครื่องหมาย ${data.marked_count ?? 0} คลิป เป็น "โพสต์แล้ว" สำเร็จ`)
       void loadGallerySnapshotBundle({ reset: true })
     } catch (e) {
       alert(`เกิดข้อผิดพลาด: ${e instanceof Error ? e.message : String(e)}`)
@@ -6862,25 +6914,46 @@ function App({
                   )}
                 </div>
                 {isSystemAdmin && (
-                  <button
-                    type="button"
-                    onClick={handleBulkResetPostedForCurrentNamespace}
-                    disabled={bulkResetPostedLoading}
-                    title="ย้ายคลิปที่โพสต์แล้วทั้งหมดของ namespace นี้กลับไป 'ยังไม่โพสต์'"
-                    aria-label="ย้ายคลิปที่โพสต์แล้วทั้งหมดกลับไปยังไม่โพสต์"
-                    className="shrink-0 rounded-2xl border border-orange-200 bg-orange-50 hover:bg-orange-100 active:scale-95 px-3 py-3 text-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                  >
-                    {bulkResetPostedLoading ? (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
-                        <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                      </svg>
-                    ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
-                        <path d="M3 3v5h5" />
-                      </svg>
-                    )}
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={handleBulkResetPostedForCurrentNamespace}
+                      disabled={bulkResetPostedLoading}
+                      title="ย้ายคลิปที่โพสต์แล้วทั้งหมดของ namespace นี้กลับไป 'ยังไม่โพสต์'"
+                      aria-label="ย้ายคลิปที่โพสต์แล้วทั้งหมดกลับไปยังไม่โพสต์"
+                      className="shrink-0 rounded-2xl border border-orange-200 bg-orange-50 hover:bg-orange-100 active:scale-95 px-3 py-3 text-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {bulkResetPostedLoading ? (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
+                          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                        </svg>
+                      ) : (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+                          <path d="M3 3v5h5" />
+                        </svg>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleBulkMarkPostedForCurrentNamespace}
+                      disabled={bulkResetPostedLoading}
+                      title="ทำเครื่องหมายคลิปที่ยังไม่โพสต์ทั้งหมดของ namespace นี้เป็น 'โพสต์แล้ว' (ไม่ได้โพสต์จริง)"
+                      aria-label="ทำเครื่องหมายคลิปที่ยังไม่โพสต์ทั้งหมดเป็นโพสต์แล้ว"
+                      className="shrink-0 rounded-2xl border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 active:scale-95 px-3 py-3 text-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {bulkResetPostedLoading ? (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
+                          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                        </svg>
+                      ) : (
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20 6L9 17l-5-5" />
+                          <path d="M9 17l-5-5" />
+                        </svg>
+                      )}
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -7651,7 +7724,9 @@ function App({
                   <SettingsMenuItem
                     icon="🕒"
                     title="Post"
-                    subtitle={POSTING_ORDER_OPTIONS.find((option) => option.value === postingOrderCurrent)?.title || 'โพสต์เก่าสุดก่อน'}
+                    subtitle={postingOrderCurrent
+                      ? POSTING_ORDER_OPTIONS.find((option) => option.value === postingOrderCurrent)?.title || 'โพสต์เก่าสุดก่อน'
+                      : 'กำลังโหลดค่า Post...'}
                     onClick={() => openSettingsSection('post')}
                   />
                   {isSystemAdmin && (
