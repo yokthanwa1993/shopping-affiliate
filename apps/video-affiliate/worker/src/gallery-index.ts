@@ -640,6 +640,24 @@ async function buildGalleryIndexUpsertRow(params: {
         posted_at?: string
     } | null
 
+    // Inbox-stage fallback: when meta file is missing (video uploaded but not yet
+    // processed), the affiliate links live in `_inbox/{videoId}.json`. Without this
+    // fallback, freshly uploaded videos with valid links get classified as "ไม่มีลิงก์"
+    // (no link) in the คลังต้นฉบับ tab, even though the inbox record has them.
+    let inbox: Record<string, unknown> | null = null
+    const needsInboxFallback = !hasMetadata && (
+        !normalizeText(meta.shopeeLink || meta.shopee_link || '')
+        || !normalizeText(meta.lazadaLink || meta.lazada_link || '')
+        || !normalizeText(state?.shopee_link || '')
+        || !normalizeText(state?.lazada_link || '')
+    )
+    if (needsInboxFallback) {
+        const inboxObj = await bucket.get(`_inbox/${videoId}.json`).catch(() => null)
+        if (inboxObj) {
+            inbox = await inboxObj.json().catch(() => null) as Record<string, unknown> | null
+        }
+    }
+
     const ownerEmail = await resolveOwnerEmailForNamespace(params.env.DB, namespaceId, params.ownerEmailCache)
     const derivedOriginalUrl = hasOriginalVideo
         ? getVideoOriginalUrlForNamespace(params.env.R2_PUBLIC_URL, namespaceId, videoId)
@@ -658,13 +676,19 @@ async function buildGalleryIndexUpsertRow(params: {
         ? (normalizeText(meta.publicUrl) || derivedPublicUrl)
         : ''
     const thumbnailUrl = normalizeText(meta.thumbnailUrl) || derivedThumbnailUrl
-    const shopeeLink = normalizeMetaShopeeLink(meta) || normalizeText(state?.shopee_link || '')
-    const lazadaLink = normalizeMetaLazadaLink(meta) || normalizeText(state?.lazada_link || '')
+    const shopeeLink = normalizeMetaShopeeLink(meta)
+        || normalizeText(state?.shopee_link || '')
+        || (inbox ? (pickFirstShopeeUrl(inbox.shopeeLink || inbox.shopee_link || '') || '') : '')
+    const lazadaLink = normalizeMetaLazadaLink(meta)
+        || normalizeText(state?.lazada_link || '')
+        || (inbox ? (pickFirstLazadaUrl(inbox.lazadaLink || inbox.lazada_link || '') || '') : '')
     const shopeeOriginalLink = pickFirstShopeeUrl(meta.shopeeOriginalLink || meta.shopee_original_link || '')
         || pickFirstShopeeUrl(state?.shopee_original_link || state?.shopee_link || '')
+        || (inbox ? (pickFirstShopeeUrl(inbox.shopeeOriginalLink || inbox.shopee_original_link || inbox.shopeeLink || inbox.shopee_link || '') || '') : '')
         || ''
     const lazadaOriginalLink = pickFirstLazadaUrl(meta.lazadaOriginalLink || meta.lazada_original_link || '')
         || pickFirstLazadaUrl(state?.lazada_original_link || state?.lazada_link || '')
+        || (inbox ? (pickFirstLazadaUrl(inbox.lazadaOriginalLink || inbox.lazada_original_link || inbox.lazadaLink || inbox.lazada_link || '') || '') : '')
         || ''
     const shopeeConvertedAt = normalizeText(meta.shopeeConvertedAt || meta.shopee_converted_at || state?.shopee_converted_at || '')
     const lazadaConvertedAt = normalizeText(meta.lazadaConvertedAt || meta.lazada_converted_at || state?.lazada_converted_at || '')
