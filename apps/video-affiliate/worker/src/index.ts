@@ -1557,6 +1557,10 @@ function pickRandomGalleryVideoForPostingOrder(videos: Array<Record<string, unkn
 
 type NamespacePostingOrder = 'oldest_first' | 'newest_first' | 'random'
 
+function isNamespacePostingOrder(value: string): value is NamespacePostingOrder {
+    return value === 'oldest_first' || value === 'newest_first' || value === 'random'
+}
+
 function pickGalleryVideoForPostingByOrder(
     videos: Array<Record<string, unknown>>,
     postingOrder: NamespacePostingOrder,
@@ -1845,6 +1849,40 @@ async function recordPagePostedVideoGuard(db: D1Database, params: {
     }
 }
 
+async function getFreshNamespacePostedState(db: D1Database, params: {
+    namespaceId: string
+    videoId: string
+    sourceFingerprint?: string
+}): Promise<{ videoId: string; postedAt: string } | null> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
+    if (!namespaceId || (!videoId && !sourceFingerprint)) return null
+
+    const row = await db.prepare(
+        `SELECT video_id, posted_at
+         FROM namespace_video_state
+         WHERE namespace_id = ?
+           AND TRIM(COALESCE(posted_at, '')) <> ''
+           AND (
+               (? <> '' AND video_id = ?)
+               OR (? <> '' AND TRIM(COALESCE(source_fingerprint, '')) = ?)
+           )
+         ORDER BY datetime(updated_at) DESC, datetime(posted_at) DESC
+         LIMIT 1`
+    ).bind(namespaceId, videoId, videoId, sourceFingerprint, sourceFingerprint).first().catch(() => null) as {
+        video_id?: string | null
+        posted_at?: string | null
+    } | null
+
+    const postedAt = String(row?.posted_at || '').trim()
+    if (!postedAt) return null
+    return {
+        videoId: String(row?.video_id || '').trim(),
+        postedAt,
+    }
+}
+
 async function claimGalleryVideoForPosting(params: {
     db: D1Database
     namespaceId: string
@@ -1861,6 +1899,10 @@ async function claimGalleryVideoForPosting(params: {
         const videoId = String(video?.id || '').trim()
         if (!videoId) continue
 
+        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+            video?.sourceFingerprint || video?.source_fingerprint,
+        )
+
         // Cached-state guard: if the in-memory video object already has postedAt set
         // (e.g., from markCachedNamespaceVideoPosted in the same cron tick), skip.
         // This guards against stale `videos[]` arrays leaking already-posted entries.
@@ -1868,9 +1910,19 @@ async function claimGalleryVideoForPosting(params: {
             continue
         }
 
-        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
-            video?.sourceFingerprint || video?.source_fingerprint,
-        )
+        // Fresh DB-state guard: the cron tick can hold a stale gallery array while
+        // an admin bulk-marks/reconciles videos as posted. Re-read state per candidate
+        // at claim time so videos manually moved to "posted" (even with no FB history
+        // row) can never be picked again.
+        const freshPostedState = await getFreshNamespacePostedState(params.db, {
+            namespaceId,
+            videoId,
+            sourceFingerprint,
+        })
+        if (freshPostedState) {
+            console.log(`[CLAIM-STATE-DEDUP] Skip ${videoId} ns=${namespaceId} — state already posted at ${freshPostedState.postedAt} (state_video=${freshPostedState.videoId || videoId})`)
+            continue
+        }
 
         // SAFETY NET (bulletproof): strict video_id-only namespace dedup directly
         // against post_history. Catches any bypass of ensure*VideoNeverPosted —
@@ -7724,7 +7776,15 @@ app.put('/api/settings/posting-order', async (c) => {
     if (!ownerCheck.ok) return ownerCheck.response
 
     const body = await c.req.json().catch(() => ({})) as { posting_order?: string; postingOrder?: string; order?: string }
-    const postingOrder = normalizeNamespacePostingOrder(String(body.posting_order || body.postingOrder || body.order || ''))
+    const rawPostingOrder = String(body.posting_order || body.postingOrder || body.order || '').trim().toLowerCase()
+    if (!isNamespacePostingOrder(rawPostingOrder)) {
+        return c.json({
+            ok: false,
+            error: 'invalid_posting_order',
+            allowed: ['newest_first', 'oldest_first', 'random'],
+        }, 400)
+    }
+    const postingOrder = rawPostingOrder
     const namespaceId = c.get('botId')
     await setNamespacePostingOrder(c.env.DB, namespaceId, postingOrder)
     const settings = await getNamespacePostingOrderSettings(c.env.DB, namespaceId)
@@ -14183,10 +14243,12 @@ async function prepareInboxVideoForManagedLinks(params: {
     const item = normalizeInboxVideoRecord(params.item)
     if (!namespaceId || !item || item.status !== 'ready') return null
 
-    const [adminManaged, shortlinkRequired] = await Promise.all([
+    const [adminManaged, shortlinkRequired, primaryAdminNamespaceId] = await Promise.all([
         isNamespaceShortlinkAdminManaged(params.env.DB, namespaceId).catch(() => false),
         isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false),
+        resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => ''),
     ])
+    const forceManagedShortlink = !!primaryAdminNamespaceId && primaryAdminNamespaceId === namespaceId
     if (adminManaged && !shortlinkRequired) {
         console.log(`[${params.logPrefix}] Admin managed shortlink is not enabled for ${namespaceId}`)
         return null
@@ -14250,13 +14312,14 @@ async function prepareInboxVideoForManagedLinks(params: {
         namespaceId,
         lazadaLink: sourceLazadaLink,
         logPrefix: `${params.logPrefix} LAZADA`,
+        forceShortlink: forceManagedShortlink,
         trace: lazadaTrace,
     })
     let normalizedMemberId = normalizeLazadaMemberId(String(lazadaTrace.memberId || ''))
     const lazadaReady = !!nextLazadaLink && (
-        nextLazadaLink !== sourceLazadaLink
-        && lazadaTrace.status === 'shortened'
+        lazadaTrace.status === 'shortened'
         && isLikelyConvertedLazadaLink(nextLazadaLink)
+        && (!forceManagedShortlink || nextLazadaLink !== sourceLazadaLink)
     )
     if (!lazadaReady) {
         const resolvedLazadaTrackingLink = await resolveAffiliateTrackingLink(sourceLazadaLink, `${params.logPrefix} LAZADA_RESOLVE`).catch(() => sourceLazadaLink)
@@ -16491,7 +16554,7 @@ app.post('/api/gallery/mark-posted-bulk', async (c) => {
         if (!adminCheck.ok) return adminCheck.response
 
         const currentNamespaceId = String(c.get('botId') || '').trim()
-        const body = await c.req.json().catch(() => ({} as { namespace_id?: string; namespaceId?: string })) as { namespace_id?: string; namespaceId?: string }
+        const body = await c.req.json().catch(() => ({} as { namespace_id?: string; namespaceId?: string; confirm?: string })) as { namespace_id?: string; namespaceId?: string; confirm?: string }
         const requestedNamespaceId = String(
             body.namespace_id ?? body.namespaceId ?? c.req.query('namespace_id') ?? ''
         ).trim()
@@ -16501,6 +16564,10 @@ app.post('/api/gallery/mark-posted-bulk', async (c) => {
         }
         if (targetNamespaceId !== currentNamespaceId) {
             return c.json({ error: 'cross_namespace_gallery_write_forbidden' }, 403)
+        }
+        const expectedConfirm = `MARK_POSTED_${targetNamespaceId}`
+        if (String(body.confirm || '').trim() !== expectedConfirm) {
+            return c.json({ error: 'explicit_confirmation_required', expected_confirm: expectedConfirm }, 400)
         }
 
         await ensureNamespaceVideoStateColumns(c.env.DB)
@@ -17639,9 +17706,10 @@ function isLikelyConvertedLazadaLink(link: string): boolean {
         if (host === 'lzd.co' || host.endsWith('.lzd.co')) return true
         if (host.startsWith('c.lazada.') && parsed.pathname.toLowerCase().startsWith('/t/c')) return true
         if (host.startsWith('s.lazada.')) {
-            return parsed.searchParams.has('cc')
-                || parsed.searchParams.has('t')
-                || !!extractLazadaTrackingSourceFromLink(rawLink)
+            // Lazada's official short domain is already a usable converted/short link.
+            // Do not send it back through the shortlink bridge, otherwise the Worker can
+            // get stuck re-shortening an already-shortened URL before creating a job.
+            return true
         }
         if (host.includes('lazada.')) return !!extractLazadaTrackingSourceFromLink(rawLink)
     } catch {
@@ -18164,10 +18232,33 @@ async function autoImportAndProcessForAdmin(env: Env, ctx?: ExecutionContext): P
     }
 }
 
+async function collectNamespacesWithReadyGalleryIndexInbox(env: Env): Promise<string[]> {
+    await ensureGalleryIndexTable(env.DB).catch(() => { })
+    const rows = await env.DB.prepare(
+        `SELECT namespace_id, MAX(datetime(COALESCE(NULLIF(updated_at, ''), NULLIF(created_at, '')))) AS last_ready_at
+         FROM gallery_index
+         WHERE TRIM(COALESCE(namespace_id, '')) <> ''
+           AND TRIM(COALESCE(original_url,'')) <> ''
+           AND TRIM(COALESCE(processed_at,'')) = ''
+           AND TRIM(COALESCE(shopee_link,'')) <> ''
+           AND TRIM(COALESCE(lazada_link,'')) <> ''
+         GROUP BY namespace_id
+         ORDER BY datetime(last_ready_at) DESC`
+    ).all().catch(() => ({ results: [] })) as { results?: Array<{ namespace_id?: string }> }
+    return (rows.results || [])
+        .map((row) => String(row.namespace_id || '').trim())
+        .filter(Boolean)
+}
+
 async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<void> {
     const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
-    const namespaceIds = Array.from(await collectKnownNamespaceIds(env))
-    const MAX_NAMESPACES_PER_TICK = 6
+    const knownNamespaceIds = Array.from(await collectKnownNamespaceIds(env))
+    const readyNamespaceIds = await collectNamespacesWithReadyGalleryIndexInbox(env).catch(() => [])
+    const namespaceIds = Array.from(new Set([...readyNamespaceIds, ...knownNamespaceIds]))
+    // Do not let early namespace IDs starve later tenants. Production already has more than
+    // 6 namespaces; limiting to 6 meant namespaces after the first batch (including
+    // 1775115880383600783) were never scanned by the cron auto-inbox processor.
+    const MAX_NAMESPACES_PER_TICK = 50
     let scannedNamespaces = 0
 
     for (const namespaceId of namespaceIds) {
@@ -19307,6 +19398,11 @@ async function refreshPagePostTokensFromBrowserSaving(params: {
     currentPostTokens: string[]
     logPrefix: string
 }): Promise<{ postTokens: string[]; profileCount: number; errors: string[] }> {
+    void params
+    // BrowserSaving token refresh DISABLED 2026-04-29 by user request:
+    // page tokens come exclusively from operator-pasted values via Settings page.
+    // Returning current pool unchanged (no refresh, no fetch from BrowserSaving).
+    return { postTokens: params.currentPostTokens || [], profileCount: 0, errors: [] }
     const namespaceId = String(params.namespaceId || '').trim()
     const pageId = String(params.pageId || '').trim()
     const pageName = String(params.pageName || '').trim()
@@ -19592,6 +19688,20 @@ async function reconcileNamespacePostedStateFromHistory(params: {
             || (sourceFingerprint ? postedAtBySourceFingerprint.get(sourceFingerprint) : '')
             || ''
         if (!postedAt) continue
+
+        const manualUnpostedAt = String(currentRow.manual_unposted_at || '').trim()
+        if (manualUnpostedAt) {
+            const postedAtMs = Date.parse(postedAt)
+            const manualUnpostedMs = Date.parse(manualUnpostedAt)
+            if (
+                Number.isFinite(postedAtMs)
+                && Number.isFinite(manualUnpostedMs)
+                && postedAtMs <= manualUnpostedMs
+            ) {
+                continue
+            }
+        }
+
         await upsertNamespaceVideoState(params.db, namespaceId, videoId, { posted_at: postedAt })
         params.stateByVideoId.set(videoId, {
             ...currentRow,
@@ -20339,11 +20449,13 @@ async function fetchBrowserSavingProfiles(
 }
 
 async function fetchBrowserSavingProfilesForNamespace(env: Env, db: D1Database, namespaceId: string): Promise<BrowserSavingProfileRecord[]> {
-    const ownerEmails = await getNamespaceBrowserSavingOwnerEmails(db, namespaceId)
-    if (ownerEmails.length === 0) {
-        throw new Error(`browsersaving_owner_emails_not_found:${namespaceId}`)
-    }
-    return fetchBrowserSavingProfiles(env, { ownerEmails })
+    void env
+    void db
+    void namespaceId
+    // BrowserSaving profile fetch DISABLED 2026-04-29 by user request:
+    // returns empty so callers downstream produce empty token pools and never
+    // overwrite operator-pasted page.access_token values.
+    return []
 }
 
 function collectProfilesBySelectors(
@@ -20482,6 +20594,7 @@ async function shortenLazadaLinkForNamespace(params: {
     namespaceId: string
     lazadaLink: string
     logPrefix: string
+    forceShortlink?: boolean
     trace?: {
         utmSource?: string | null
         memberId?: string | null
@@ -20511,11 +20624,12 @@ async function shortenLazadaLinkForNamespace(params: {
     const expectedMemberId = normalizeLazadaMemberId(await resolveNamespaceLazadaExpectedMemberId(params.env.DB, params.namespaceId).catch(() => ''))
     const sourceMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(sourceLink))
     const originalMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(originalLink))
+    const bridgeInputLink = params.forceShortlink ? sourceLink : originalLink
     const alreadyConvertedLink = isLikelyConvertedLazadaLink(sourceLink)
         ? sourceLink
         : (isLikelyConvertedLazadaLink(originalLink) ? originalLink : '')
     const alreadyConvertedMemberId = sourceMemberId || originalMemberId
-    if (alreadyConvertedLink && (!expectedMemberId || !alreadyConvertedMemberId || alreadyConvertedMemberId === expectedMemberId)) {
+    if (!params.forceShortlink && alreadyConvertedLink && (!expectedMemberId || !alreadyConvertedMemberId || alreadyConvertedMemberId === expectedMemberId)) {
         writeTrace({
             utmSource: extractLazadaTrackingSourceFromLink(alreadyConvertedLink) || null,
             memberId: alreadyConvertedMemberId || null,
@@ -20536,7 +20650,7 @@ async function shortenLazadaLinkForNamespace(params: {
     const lazadaAccount = await resolveNamespaceAffiliateShortlinkAccount(params.env.DB, params.namespaceId).catch(() => '')
     let finalLazadaRequestUrl: string
     if (lazadaUrlTemplate && lazadaUrlTemplate.includes('{url}')) {
-        finalLazadaRequestUrl = buildShortlinkRequestUrlFromTemplate(lazadaUrlTemplate, originalLink, effectiveLazadaSubIds, lazadaAccount)
+        finalLazadaRequestUrl = buildShortlinkRequestUrlFromTemplate(lazadaUrlTemplate, bridgeInputLink, effectiveLazadaSubIds, lazadaAccount)
         console.log(`[${params.logPrefix}] Using URL template from settings`)
     } else {
         const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
@@ -20546,7 +20660,7 @@ async function shortenLazadaLinkForNamespace(params: {
             return originalLink
         }
         const requestUrl = new URL(baseUrl)
-        requestUrl.searchParams.set('url', originalLink)
+        requestUrl.searchParams.set('url', bridgeInputLink)
         requestUrl.searchParams.set('sub1', effectiveLazadaSub1)
         if (lazadaSubIds.sub2) requestUrl.searchParams.set('sub2', lazadaSubIds.sub2)
         if (lazadaSubIds.sub3) requestUrl.searchParams.set('sub3', lazadaSubIds.sub3)
@@ -22064,6 +22178,12 @@ async function maybeMigrateNamespaceStoredPageTokens(
     namespaceId: string,
     options: { force?: boolean } = {},
 ): Promise<{ skipped: boolean; scanned: number; updatedRows: number; updatedAccess: number; updatedPoolPages: number; errors: string[] }> {
+    void env
+    void namespaceId
+    void options
+    // Token migration from BrowserSaving DISABLED 2026-04-29 by user request:
+    // page tokens are now controlled solely by operator pasting via Settings page.
+    return { skipped: true, scanned: 0, updatedRows: 0, updatedAccess: 0, updatedPoolPages: 0, errors: [] }
     const ns = String(namespaceId || '').trim()
     if (!ns || ns === 'default') {
         return { skipped: true, scanned: 0, updatedRows: 0, updatedAccess: 0, updatedPoolPages: 0, errors: [] }
@@ -22208,6 +22328,16 @@ async function autoSyncPagesForNamespace(
     namespaceId: string,
     options: { force?: boolean } = {},
 ): Promise<void> {
+    void env
+    void namespaceId
+    void options
+    // BrowserSaving auto-sync DISABLED 2026-04-29 by user request:
+    // operators now paste page access tokens manually via the Settings page
+    // (PUT /api/pages/:id with `access_token`), and BrowserSaving is no longer
+    // a source of truth for page tokens. This prevents stale "postcron"-era
+    // tokens from being silently re-imported into pages_token_pool_v1 and
+    // overwriting what the operator pasted.
+    return
     const ns = String(namespaceId || '').trim()
     if (!ns || ns === 'default') return
 
@@ -28161,7 +28291,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         pagesFailed: 0,
     }
     const geminiApiKeysByNamespace = new Map<string, string[]>()
-    const postingOrderByNamespace = new Map<string, NamespacePostingOrder>()
     const shortlinkEnabledByNamespace = new Map<string, boolean>()
     const galleryVideosByNamespace = new Map<string, Array<Record<string, unknown>>>()
     const reconciledNamespaces = new Set<string>()
@@ -28401,11 +28530,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     const unpostedVideos = namespaceGalleryVideos.filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
                     console.log(`[CRON] Page ${page.name}: ready=${namespaceGalleryVideos.length}, unposted=${unpostedVideos.length}, posted=${Math.max(0, namespaceGalleryVideos.length - unpostedVideos.length)}`)
 
-        let postingOrder = postingOrderByNamespace.get(botId)
-        if (!postingOrder) {
-            postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
-            postingOrderByNamespace.set(botId, postingOrder)
-        }
+        // Read posting order fresh for every page selection. This is intentionally
+        // not cached: when a member changes Settings > Post, the next cron/force
+        // selection must obey the live namespace setting exactly.
+        const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
         console.log(`[CRON] Page ${page.name}: posting_order=${postingOrder}`)
         const pickedVideoEntry = await claimGalleryVideoForPosting({
             db: env.DB,
