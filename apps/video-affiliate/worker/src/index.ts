@@ -14700,15 +14700,19 @@ app.get('/api/processing', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
         const includeSummary = String(c.req.query('summary') || '').trim() === '1'
-        let videos = await listActiveProcessingVideos(c.get('bucket'))
+        const videos = await listActiveProcessingVideos(c.get('bucket'))
+        // Auto-start next video moved to background (waitUntil) so the user's
+        // processing tab loads fast even when no jobs are in flight. Previously
+        // this synchronous call could take 10-30s for admin namespaces because
+        // managed-shortlink conversion (Shopee + Lazada) runs inside
+        // ensureInboxVideoProcessingStarted with retry timeouts.
         if (videos.length === 0 && namespaceId) {
-            const started = await startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceId).catch((error) => {
-                console.error(`[PROCESSING-AUTOSTART] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
-                return false
-            })
-            if (started) {
-                videos = await listActiveProcessingVideos(c.get('bucket')).catch(() => videos)
-            }
+            c.executionCtx.waitUntil(
+                startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceId).catch((error) => {
+                    console.error(`[PROCESSING-AUTOSTART] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                    return false
+                })
+            )
         }
         let pendingShortlinkVideos: Array<Record<string, unknown>> = []
         let pendingHasLazadaTotal = 0
