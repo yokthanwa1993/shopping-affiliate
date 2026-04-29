@@ -1924,24 +1924,39 @@ async function claimGalleryVideoForPosting(params: {
             continue
         }
 
-        // SAFETY NET (bulletproof): strict video_id-only namespace dedup directly
-        // against post_history. Catches any bypass of ensure*VideoNeverPosted —
-        // e.g., if state.posted_at was reset, fingerprint mismatch, race condition,
-        // or stale guard table. The rule is simple: if this exact video_id was ever
-        // successfully posted (or is currently being posted) anywhere in the same
-        // namespace, it is NEVER eligible for re-posting.
+        // SAFETY NET (bulletproof): namespace-level dedup directly against
+        // post_history. Matches by EXACT video_id OR by source_fingerprint so a
+        // freshly-uploaded duplicate of previously-posted content (different
+        // video_id, same etag) is also blocked. Catches any bypass of
+        // ensure*VideoNeverPosted — e.g., if state.posted_at was reset,
+        // race condition, or stale guard table. Rule: if this exact video_id OR
+        // its source_fingerprint was ever successfully posted (or is currently
+        // being posted) anywhere in the same namespace, it is NEVER eligible
+        // for re-posting.
         const existingNamespacePost = await params.db.prepare(
-            `SELECT id, page_id, posted_at FROM post_history
-             WHERE bot_id = ?
-               AND video_id = ?
-               AND status IN ('success', 'posting')
-             ORDER BY datetime(posted_at) DESC, id DESC
+            `SELECT ph.id, ph.page_id, ph.video_id AS matched_video_id, ph.posted_at
+             FROM post_history ph
+             LEFT JOIN namespace_video_state nvs
+               ON nvs.namespace_id = ph.bot_id
+              AND nvs.video_id = ph.video_id
+             WHERE ph.bot_id = ?
+               AND ph.status IN ('success', 'posting')
+               AND (
+                   ph.video_id = ?
+                   OR (
+                       ? <> ''
+                       AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) = ?
+                   )
+               )
+             ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
              LIMIT 1`
-        ).bind(namespaceId, videoId).first().catch(() => null) as { id?: number; page_id?: string; posted_at?: string } | null
+        ).bind(namespaceId, videoId, sourceFingerprint, sourceFingerprint).first().catch(() => null) as { id?: number; page_id?: string; matched_video_id?: string; posted_at?: string } | null
         if (existingNamespacePost) {
             const postedAt = String(existingNamespacePost.posted_at || '').trim() || new Date().toISOString()
             const seenPageId = String(existingNamespacePost.page_id || '').trim()
-            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
+            const matchedVideoId = String(existingNamespacePost.matched_video_id || '').trim()
+            const matchKind = matchedVideoId && matchedVideoId !== videoId ? 'fingerprint' : 'video_id'
+            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
             // Heal: backfill state + guard so subsequent cron ticks fail fast.
             await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
             if (seenPageId) {
@@ -19654,28 +19669,20 @@ async function reconcileNamespacePostedStateFromHistory(params: {
 
     if (candidateVideoIds.length === 0) return
 
+    // 2026-04-29: Reconciler now matches by EXACT video_id only — no longer
+    // back-fills posted_at from sibling videos that share the same
+    // source_fingerprint. Cross-video fingerprint dedup is enforced at cron
+    // post-time inside claimGalleryVideoForPosting (safety net checks
+    // post_history for both video_id AND source_fingerprint), so freshly
+    // uploaded videos with the same content as a previously-posted video
+    // still appear in the "ยังไม่โพสต์" gallery tab. The cron then refuses to
+    // re-post duplicate content, but the user can see the upload landed.
     const postedAtByVideoId = await getLatestPostedAtByVideoIds({
         db: params.db,
         namespaceId,
         videoIds: candidateVideoIds,
     })
-    const candidateSourceFingerprints = params.sourceVideos
-        .filter((video) => candidateVideoIds.includes(String(video?.id || '').trim()))
-        .map((video) => {
-            const videoId = String(video?.id || '').trim()
-            return normalizeNamespaceVideoSourceFingerprint(
-                params.stateByVideoId.get(videoId)?.source_fingerprint
-                || video?.sourceFingerprint
-                || video?.source_fingerprint,
-            )
-        })
-        .filter(Boolean)
-    const postedAtBySourceFingerprint = await getLatestPostedAtBySourceFingerprints({
-        db: params.db,
-        namespaceId,
-        sourceFingerprints: candidateSourceFingerprints,
-    })
-    if (postedAtByVideoId.size === 0 && postedAtBySourceFingerprint.size === 0) return
+    if (postedAtByVideoId.size === 0) return
 
     for (const videoId of candidateVideoIds) {
         const currentRow = params.stateByVideoId.get(videoId) || {
@@ -19683,10 +19690,7 @@ async function reconcileNamespacePostedStateFromHistory(params: {
             video_id: videoId,
         }
         if (String(currentRow.posted_at || '').trim()) continue
-        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(currentRow.source_fingerprint)
-        const postedAt = postedAtByVideoId.get(videoId)
-            || (sourceFingerprint ? postedAtBySourceFingerprint.get(sourceFingerprint) : '')
-            || ''
+        const postedAt = postedAtByVideoId.get(videoId) || ''
         if (!postedAt) continue
 
         const manualUnpostedAt = String(currentRow.manual_unposted_at || '').trim()
