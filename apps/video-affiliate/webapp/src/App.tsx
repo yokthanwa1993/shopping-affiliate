@@ -3451,6 +3451,12 @@ function App({
   const [pendingApproval, setPendingApproval] = useState(false)
   const [systemMembers, setSystemMembers] = useState<SystemMember[]>([])
   const [systemMembersLoading, setSystemMembersLoading] = useState(false)
+  const [memberPagesViewer, setMemberPagesViewer] = useState<{
+    member: SystemMember
+    pages: FacebookPage[]
+    loading: boolean
+    error?: string
+  } | null>(null)
   const [monitorData, setMonitorData] = useState<MonitorResponse | null>(null)
   const [monitorLoading, setMonitorLoading] = useState(false)
   const [monitorView, setMonitorView] = useState<'overview' | 'cron' | 'stale' | 'post' | 'comment'>('overview')
@@ -4828,6 +4834,30 @@ function App({
         if (shouldShowLoading) setSystemInboxLoading(false)
         if (!reset && !refreshTop) setSystemInboxLoadingMore(false)
       }
+    }
+  }
+
+  async function openMemberPagesViewer(member: SystemMember) {
+    if (!isSystemAdmin) return
+    const ns = String(member.namespace_id || '').trim()
+    if (!ns) {
+      alert('สมาชิกนี้ยังไม่มี namespace_id')
+      return
+    }
+    setMemberPagesViewer({ member, pages: [], loading: true })
+    try {
+      const url = new URL(`${WORKER_URL}/api/admin/pages`)
+      url.searchParams.set('namespace_id', ns)
+      const resp = await apiFetch(url.toString())
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setMemberPagesViewer({ member, pages: [], loading: false, error: data.error || `HTTP ${resp.status}` })
+        return
+      }
+      const data = await resp.json() as { pages?: FacebookPage[] }
+      setMemberPagesViewer({ member, pages: Array.isArray(data.pages) ? data.pages : [], loading: false })
+    } catch (e) {
+      setMemberPagesViewer({ member, pages: [], loading: false, error: e instanceof Error ? e.message : String(e) })
     }
   }
 
@@ -6419,6 +6449,10 @@ function App({
       `จะมีผลเฉพาะ namespace นี้เท่านั้น ไม่กระทบ namespace อื่น`
     )
     if (!ok) return
+    const confirmText = window.prompt(
+      `ต้องการทำเครื่องหมาย "ยังไม่โพสต์" ทั้งหมดเป็น "โพสต์แล้ว" จริง ๆ ให้พิมพ์:\nMARK_POSTED_${ns}`
+    )
+    if (String(confirmText || '').trim() !== `MARK_POSTED_${ns}`) return
     setBulkResetPostedLoading(true)
     try {
       const url = new URL(`${WORKER_URL}/api/gallery/mark-posted-bulk`)
@@ -6426,7 +6460,7 @@ function App({
       const resp = await apiFetch(url.toString(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ namespace_id: ns }),
+        body: JSON.stringify({ namespace_id: ns, confirm: `MARK_POSTED_${ns}` }),
       })
       const data = await resp.json().catch(() => ({})) as {
         success?: boolean
@@ -6876,6 +6910,102 @@ function App({
           onClose={() => setShowAddPagePopup(false)}
           onSuccess={loadPages}
         />
+      )}
+
+      {/* Member Pages Viewer (admin-only, read-only popover) */}
+      {memberPagesViewer && (
+        <div className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-6" onClick={() => setMemberPagesViewer(null)}>
+          <div
+            className="bg-white w-full sm:max-w-lg sm:rounded-3xl rounded-t-3xl max-h-[90vh] overflow-hidden flex flex-col shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="px-5 pt-5 pb-3 border-b border-gray-100">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
+                  {memberPagesViewer.member.picture_url ? (
+                    <img src={memberPagesViewer.member.picture_url} className="w-11 h-11 rounded-full object-cover flex-shrink-0" />
+                  ) : (
+                    <div className="w-11 h-11 rounded-full bg-gray-200 flex items-center justify-center text-gray-500 font-bold text-sm flex-shrink-0">
+                      {(memberPagesViewer.member.display_name || '?').charAt(0).toUpperCase()}
+                    </div>
+                  )}
+                  <div className="min-w-0">
+                    <p className="text-sm font-bold text-gray-900 truncate">{memberPagesViewer.member.display_name || 'ไม่มีชื่อ'}</p>
+                    <p className="text-[11px] text-gray-400 break-all">ns: {memberPagesViewer.member.namespace_id || '-'}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setMemberPagesViewer(null)}
+                  className="shrink-0 w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center text-gray-500 active:scale-95"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6L6 18M6 6l12 12" /></svg>
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-gray-500">เพจของสมาชิกในระบบนี้ — ดูเวลาโพสต์ + สถานะ Auto Post (read-only)</p>
+            </div>
+
+            {/* Body */}
+            <div className="flex-1 overflow-y-auto px-5 py-4">
+              {memberPagesViewer.loading ? (
+                <div className="grid grid-cols-3 gap-4">
+                  {[1, 2, 3, 4, 5, 6].map(i => <div key={i} className="aspect-square rounded-2xl bg-gray-100 animate-pulse" />)}
+                </div>
+              ) : memberPagesViewer.error ? (
+                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-5 text-center">
+                  <p className="text-sm font-semibold text-red-700">โหลดเพจไม่สำเร็จ</p>
+                  <p className="text-xs text-red-500 mt-1 break-all">{memberPagesViewer.error}</p>
+                </div>
+              ) : memberPagesViewer.pages.length === 0 ? (
+                <div className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-5 text-center">
+                  <p className="text-sm font-semibold text-gray-700">สมาชิกนี้ยังไม่มีเพจ</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 gap-4">
+                  {memberPagesViewer.pages.map((page) => {
+                    const isAutoPostOn = page.is_active === 1
+                    const scheduleRaw = String(page.post_hours || '').trim()
+                    const intervalMatch = scheduleRaw.match(/^every:(\d{1,4})$/i)
+                    const intervalMinutes = Math.max(5, Math.min(720, parseInt(intervalMatch?.[1] || '', 10) || page.post_interval_minutes || 60))
+                    const slotCount = scheduleRaw
+                      ? scheduleRaw.split(',').map(s => s.trim()).filter(Boolean).length
+                      : 0
+                    const hasSchedule = !!intervalMatch || slotCount > 0
+                    const postsPerDay = intervalMatch
+                      ? Math.max(1, Math.floor((24 * 60) / intervalMinutes))
+                      : slotCount
+                    const postsPerDayLabel = hasSchedule ? `${postsPerDay} เวลา/วัน` : 'ยังไม่ตั้งเวลา'
+                    const scheduleModeHint = intervalMatch ? `ทุก ${intervalMinutes} นาที` : ''
+                    const borderClass = isAutoPostOn
+                      ? 'border-green-400 shadow-[0_0_0_2px_rgba(74,222,128,0.4),0_0_16px_rgba(34,197,94,0.6)]'
+                      : 'border-red-400 shadow-[0_0_0_2px_rgba(248,113,113,0.35),0_0_12px_rgba(239,68,68,0.42)]'
+                    const dotClass = isAutoPostOn ? 'bg-green-500' : 'bg-gray-300'
+                    return (
+                      <div key={page.id} className="flex flex-col items-center">
+                        <div className="relative w-full">
+                          <div className="absolute z-20 top-2 left-2 px-2.5 py-1 rounded-full text-[10px] font-bold bg-black/85 text-white shadow-md">
+                            {postsPerDayLabel}
+                          </div>
+                          <img
+                            src={page.image_url || getGraphPageImageUrl(page.id)}
+                            alt={page.name}
+                            onError={(e) => onPageImageError(e, page.id)}
+                            className={`w-full aspect-square rounded-2xl object-cover border-2 ${borderClass}`}
+                          />
+                          <div className={`absolute bottom-2 right-2 w-3 h-3 rounded-full ${dotClass} border-2 border-white shadow`} />
+                        </div>
+                        <p className="mt-2 text-[11px] font-semibold text-gray-700 text-center truncate w-full" title={page.name}>{page.name}</p>
+                        {scheduleModeHint && (
+                          <p className="text-[10px] text-gray-400 text-center">{scheduleModeHint}</p>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {shouldShowGalleryHeader && (
@@ -8817,10 +8947,18 @@ function App({
                               { value: 'team', label: 'Team' },
                             ]
 
+                            const canViewPages = isSystemAdmin && !isPending && !!String(member.namespace_id || '').trim()
                             return (
                               <div
                                 key={member.line_user_id}
-                                className={`bg-white px-4 py-3 ${index === 0 ? '' : 'border-t border-gray-100'}`}
+                                onClick={(e) => {
+                                  if (!canViewPages) return
+                                  // Don't trigger when clicking the role pill column on the right
+                                  const target = e.target as HTMLElement
+                                  if (target.closest('button')) return
+                                  void openMemberPagesViewer(member)
+                                }}
+                                className={`bg-white px-4 py-3 ${index === 0 ? '' : 'border-t border-gray-100'} ${canViewPages ? 'cursor-pointer hover:bg-gray-50 active:bg-gray-100' : ''} transition-colors`}
                               >
                                 <div className="flex items-start gap-3">
                                   {member.picture_url ? (
@@ -8840,6 +8978,12 @@ function App({
                                       <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold ${isPending ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'}`}>
                                         {isPending ? 'Pending' : 'Approved'}
                                       </span>
+                                      {canViewPages && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-600">
+                                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 18l6-6-6-6"/></svg>
+                                          ดูเพจ
+                                        </span>
+                                      )}
                                     </div>
 
                                     <div className="space-y-1">

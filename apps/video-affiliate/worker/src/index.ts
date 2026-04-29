@@ -24727,6 +24727,31 @@ app.get('/api/pages', async (c) => {
     }
 })
 
+// Admin-only: read pages for ANY namespace_id (without switching the admin's
+// own session bot_id). Used by the "view member pages" feature where an admin
+// clicks a member row in the system members list and sees that member's pages
+// in a read-only popover. Returns same fields as /api/pages so the existing
+// page-card UI can render directly.
+app.get('/api/admin/pages', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    const requestedNamespaceId = String(c.req.query('namespace_id') || '').trim()
+    if (!requestedNamespaceId) {
+        return c.json({ error: 'namespace_id_required' }, 400)
+    }
+
+    try {
+        await ensurePagesOneCardColumns(c.env.DB)
+        const pages = (((await c.env.DB.prepare(
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+        ).bind(requestedNamespaceId).all()).results || []) as any[])
+        return c.json({ pages, namespace_id: requestedNamespaceId })
+    } catch (e) {
+        return c.json({ error: 'Failed to fetch pages', details: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
+
 app.get('/api/dashboard', async (c) => {
     try {
         const botId = c.get('botId')
