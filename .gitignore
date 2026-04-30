@@ -16,13 +16,12 @@ apps/video-affiliate/worker/deploy.tar
 apps/video-affiliate/worker/_processing/
 apps/video-affiliate/worker/_waiting_video/
 apps/video-affiliate/worker/videos/
-apps/video-affiliate/worker/8328894625/
+apps/video-affiliate/worker/[0-9]*/
 apps/video-affiliate/worker/_config/categories.json
 apps/video-affiliate/worker/tail.json
 apps/video-affiliate/worker/*.orig
 apps/video-affiliate/webapp/deploy.tar
 apps/video-affiliate/webapp/dist/
-apps/video-affiliate/AGENTS.md
 
 # browsersaving build/runtime artifacts
 apps/browsersaving/node_modules/
@@ -45,3 +44,7 @@ package-lock.json
 pnpm-lock.yaml
 yarn.lock
 bun.lockb
+
+# Claude Code session-local state (per-machine, must never be committed)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

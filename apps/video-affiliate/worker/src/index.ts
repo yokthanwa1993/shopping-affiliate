@@ -2040,26 +2040,58 @@ async function ensurePageVideoNeverPosted(params: {
     videoId: string
     sourceFingerprint?: string
 }): Promise<{ ok: true } | { ok: false; postedAt: string | null; historyId: number | null }> {
+    // Read the user's manual-unpost timestamp. If the user clicked the amber refresh
+    // button on this video AFTER the last successful post / guard creation, treat it
+    // as a fresh post candidate and DO NOT block. Without this check, cron would see
+    // the historical post_history row and re-mark the video as posted, undoing the
+    // user's intent silently.
+    let manualUnpostedAtMs = 0
+    try {
+        const row = await params.db.prepare(
+            `SELECT manual_unposted_at FROM namespace_video_state
+             WHERE namespace_id = ? AND video_id = ?`
+        ).bind(params.namespaceId, params.videoId).first() as { manual_unposted_at?: string | null } | null
+        const raw = String(row?.manual_unposted_at || '').trim()
+        if (raw) {
+            const ts = Date.parse(raw)
+            if (Number.isFinite(ts)) manualUnpostedAtMs = ts
+        }
+    } catch {
+        // best-effort: fall through to default behavior
+    }
+
     const latestHistory = await getLatestSuccessfulPostHistoryRow(params.db, params)
     if (latestHistory) {
-        await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, latestHistory.postedAt || new Date().toISOString()).catch(() => { })
-        await recordPagePostedVideoGuard(params.db, {
-            namespaceId: params.namespaceId,
-            pageId: params.pageId,
-            videoId: params.videoId,
-            sourceFingerprint: params.sourceFingerprint,
-            historyId: latestHistory.id,
-            postedAt: latestHistory.postedAt,
-        }).catch(() => { })
-        return {
-            ok: false,
-            postedAt: latestHistory.postedAt,
-            historyId: latestHistory.id,
+        const postedAtMs = latestHistory.postedAt ? Date.parse(latestHistory.postedAt) : NaN
+        const historyIsStale = manualUnpostedAtMs > 0
+            && Number.isFinite(postedAtMs)
+            && postedAtMs <= manualUnpostedAtMs
+        if (!historyIsStale) {
+            await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, latestHistory.postedAt || new Date().toISOString()).catch(() => { })
+            await recordPagePostedVideoGuard(params.db, {
+                namespaceId: params.namespaceId,
+                pageId: params.pageId,
+                videoId: params.videoId,
+                sourceFingerprint: params.sourceFingerprint,
+                historyId: latestHistory.id,
+                postedAt: latestHistory.postedAt,
+            }).catch(() => { })
+            return {
+                ok: false,
+                postedAt: latestHistory.postedAt,
+                historyId: latestHistory.id,
+            }
         }
     }
 
     const existingGuard = await getExistingPagePostedVideoGuard(params.db, params)
     if (!existingGuard) return { ok: true }
+
+    const guardCreatedAtMs = existingGuard.createdAt ? Date.parse(existingGuard.createdAt) : NaN
+    const guardIsStale = manualUnpostedAtMs > 0
+        && Number.isFinite(guardCreatedAtMs)
+        && guardCreatedAtMs <= manualUnpostedAtMs
+    if (guardIsStale) return { ok: true }
 
     const postedAt = existingGuard.createdAt || null
     await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
@@ -3274,6 +3306,30 @@ const DASHBOARD_FACEBOOK_GALLERY_SYNC_COOLDOWN_MS = 30 * 1000
 const DASHBOARD_FACEBOOK_GALLERY_ERROR_COOLDOWN_MS = 60 * 60 * 1000
 const DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN = 'facebook_sync_token'
 
+// Resolve the Graph API token used by the dashboard's FB-page-videos sync flow.
+// Order:
+//   1. dashboard_settings.facebook_sync_token (operator-pasted, full user token, preferred)
+//   2. pages.access_token of the gallery page itself (page-scoped fallback so the
+//      "โหลดโพสต์ไม่สำเร็จ — facebook_sync_token_missing" error never bricks the
+//      dashboard just because the operator hasn't pasted a dedicated sync token)
+// Returning '' tells the caller "still no token, surface the missing-token error".
+async function resolveFacebookSyncToken(db: D1Database, pageId: string): Promise<string> {
+    const settingEntry = await getDashboardSetting(db, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN).catch(() => null)
+    const settingValue = String(settingEntry?.value || '').trim()
+    if (settingValue) return settingValue
+
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId) return ''
+    try {
+        const row = await db.prepare(
+            'SELECT access_token FROM pages WHERE id = ? AND access_token IS NOT NULL AND access_token != "" LIMIT 1'
+        ).bind(normalizedPageId).first() as { access_token?: string | null } | null
+        return String(row?.access_token || '').trim()
+    } catch {
+        return ''
+    }
+}
+
 async function ensureFacebookPageVideoCacheTables(db: D1Database): Promise<void> {
     if (!facebookPageVideoCacheTablesReady) {
         facebookPageVideoCacheTablesReady = (async () => {
@@ -3737,8 +3793,7 @@ async function syncDashboardFacebookPageVideoCache(env: Env, params?: {
     const pageName = String(params?.pageName || DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME).trim()
     const force = !!params?.force
     const nowIso = new Date().toISOString()
-    const tokenEntry = await getDashboardSetting(env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
-    const graphToken = String(tokenEntry?.value || '').trim()
+    const graphToken = await resolveFacebookSyncToken(env.DB, pageId)
     if (!graphToken) {
         const missingTokenState = await upsertFacebookPageVideoSyncState(env.DB, pageId, {
             page_name: pageName,
@@ -4204,6 +4259,22 @@ function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | nu
     return hasShopeeLink && hasLazadaLink
 }
 
+// Per-isolate in-memory cache for namespace inventory.
+// Workers reuse isolates across requests, so consecutive paginated loads (scroll → loadMore)
+// hit this cache instead of re-running the full D1 + hydration pipeline every time.
+// Short TTL keeps moves/repost actions visible quickly.
+const NAMESPACE_INVENTORY_CACHE_TTL_MS = 30_000
+const namespaceInventoryCache = new Map<string, {
+    expiresAt: number
+    pending?: Promise<{ sourceTotal: number; videos: Array<Record<string, unknown>> }>
+    value?: { sourceTotal: number; videos: Array<Record<string, unknown>> }
+}>()
+
+function invalidateNamespaceInventoryCache(namespaceId: string) {
+    const key = String(namespaceId || '').trim()
+    if (key) namespaceInventoryCache.delete(key)
+}
+
 async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Promise<{
     sourceTotal: number
     videos: Array<Record<string, unknown>>
@@ -4211,6 +4282,43 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return { sourceTotal: 0, videos: [] }
 
+    const cached = namespaceInventoryCache.get(normalizedNamespaceId)
+    const nowMs = Date.now()
+    if (cached?.value && cached.expiresAt > nowMs) {
+        return cached.value
+    }
+    if (cached?.pending) {
+        // Coalesce concurrent loads into a single in-flight promise.
+        return cached.pending
+    }
+
+    const inflight = (async () => {
+        const result = await loadNamespaceGalleryInventoryFresh(env, normalizedNamespaceId)
+        namespaceInventoryCache.set(normalizedNamespaceId, {
+            expiresAt: Date.now() + NAMESPACE_INVENTORY_CACHE_TTL_MS,
+            value: result,
+        })
+        return result
+    })()
+
+    namespaceInventoryCache.set(normalizedNamespaceId, {
+        expiresAt: nowMs,
+        pending: inflight,
+    })
+
+    try {
+        return await inflight
+    } catch (err) {
+        // On failure, drop the cache so the next request retries fresh instead of being stuck.
+        namespaceInventoryCache.delete(normalizedNamespaceId)
+        throw err
+    }
+}
+
+async function loadNamespaceGalleryInventoryFresh(env: Env, normalizedNamespaceId: string): Promise<{
+    sourceTotal: number
+    videos: Array<Record<string, unknown>>
+}> {
     await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId)
     const bucket = new BotBucket(env.BUCKET, normalizedNamespaceId) as unknown as R2Bucket
     const [sourceVideos, stateRows, expectedUtmId, expectedLazadaMemberId, shortlinkRequired] = await Promise.all([
@@ -4253,6 +4361,7 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
             const row = stateByVideoId.get(videoId)
             const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(row?.source_fingerprint)
             const postedAt = String(row?.posted_at || '').trim()
+            const manualUnpostedAt = String((row as Record<string, unknown> | undefined)?.manual_unposted_at || '').trim()
             const merged = {
                 ...source,
                 id: videoId,
@@ -4267,6 +4376,8 @@ async function getNamespaceGalleryInventory(env: Env, namespaceId: string): Prom
                 lazadaMemberId: String(row?.lazada_member_id || source.lazadaMemberId || source.lazada_member_id || '').trim(),
                 sourceFingerprint,
                 postedAt,
+                manualUnpostedAt,
+                manual_unposted_at: manualUnpostedAt,
                 shortlink_expected_utm_id: expectedUtmId,
                 lazada_expected_member_id: expectedLazadaMemberId,
                 shortlink_required: shortlinkRequired,
@@ -5658,8 +5769,7 @@ app.post('/api/dashboard/facebook-page-videos/full-resync', async (c) => {
 
     if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
 
-    const tokenEntry = await getDashboardSetting(c.env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
-    const token = String(tokenEntry?.value || '').trim()
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId)
     if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
 
     const beforeOver100k = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 100000 })
@@ -5751,8 +5861,7 @@ app.post('/api/dashboard/facebook-page-videos/refresh-all-views', async (c) => {
     const pageId = String(body.page_id || c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
     if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
 
-    const tokenEntry = await getDashboardSetting(c.env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
-    const token = String(tokenEntry?.value || '').trim()
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId)
     if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
 
     await ensureFacebookPageVideoCacheTables(c.env.DB)
@@ -5848,8 +5957,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     const includeWithPostId = !!body.include_with_post_id
     if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
 
-    const tokenEntry = await getDashboardSetting(c.env.DB, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN)
-    const token = String(tokenEntry?.value || '').trim()
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId)
     if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
 
     const whereExtra = includeWithPostId ? '' : "AND (post_id = '' OR post_id IS NULL)"
@@ -13201,6 +13309,11 @@ function buildInboxVideoResponseFromGalleryIndex(
     }
 }
 
+// Failed-processing cooldown: skip videos whose last failure is fresher than this.
+// Prevents one broken video (e.g., Lazada link with t=p-i0-s0 placeholder that
+// repeatedly returns HTTP 500) from blocking the entire admin queue every cron tick.
+const PROCESSING_FAILURE_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
 async function getNextReadyGalleryIndexInboxRecord(params: {
     env: Env
     bucket: R2Bucket
@@ -13236,8 +13349,15 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
         const id = String(row.video_id || '').trim()
         if (!id) continue
 
-        const existingProcessingStatus = await getProcessingJobStatus(params.bucket, id).catch(() => '')
+        const processingRecord = await getProcessingJobRecord(params.bucket, id).catch(() => null)
+        const existingProcessingStatus = String(processingRecord?.status || '').trim().toLowerCase()
         if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+        if (existingProcessingStatus === 'failed') {
+            const failedAtMs = Date.parse(String(processingRecord?.failedAt || processingRecord?.updatedAt || ''))
+            if (Number.isFinite(failedAtMs) && (Date.now() - failedAtMs) < PROCESSING_FAILURE_COOLDOWN_MS) {
+                continue
+            }
+        }
 
         const processedAt = await getGalleryIndexProcessedAt(params.env.DB, namespaceId, id).catch(() => '')
         if (processedAt) continue
@@ -13943,6 +14063,56 @@ async function getProcessingJobStatus(bucket: R2Bucket, id: string): Promise<str
     return String(data.status || '').trim().toLowerCase()
 }
 
+// Returns the full _processing/{id}.json record so callers can inspect the
+// failure timestamp + error message for cooldown / "ประมวลผลไม่ผ่าน" UI.
+async function getProcessingJobRecord(bucket: R2Bucket, id: string): Promise<Record<string, unknown> | null> {
+    const normalizedId = String(id || '').trim()
+    if (!normalizedId) return null
+    const obj = await bucket.get(`_processing/${normalizedId}.json`).catch(() => null)
+    if (!obj) return null
+    return await obj.json().catch(() => null) as Record<string, unknown> | null
+}
+
+async function writeProcessingJobFailure(bucket: R2Bucket, params: {
+    id: string
+    chatId?: number
+    videoUrl?: string
+    shopeeLink?: string
+    lazadaLink?: string
+    manualCaption?: string
+    error: string
+    errorCategory: string
+    errorDetails?: Record<string, unknown> | string
+}): Promise<void> {
+    const id = String(params.id || '').trim()
+    if (!id) return
+    const nowIso = new Date().toISOString()
+    const existing = await getProcessingJobRecord(bucket, id).catch(() => null) || {}
+    const payload = {
+        ...existing,
+        id,
+        chatId: typeof params.chatId === 'number' ? params.chatId : Number(existing.chatId || 0),
+        videoUrl: String(params.videoUrl || existing.videoUrl || '').trim(),
+        shopeeLink: String(params.shopeeLink || existing.shopeeLink || '').trim(),
+        lazadaLink: String(params.lazadaLink || existing.lazadaLink || '').trim(),
+        manualCaption: String(params.manualCaption || existing.manualCaption || ''),
+        status: 'failed',
+        error: String(params.error || '').trim().slice(0, 500),
+        errorCategory: String(params.errorCategory || '').trim().slice(0, 60),
+        errorDetails: params.errorDetails && typeof params.errorDetails === 'object'
+            ? params.errorDetails
+            : params.errorDetails
+                ? String(params.errorDetails).slice(0, 500)
+                : undefined,
+        failedAt: nowIso,
+        updatedAt: nowIso,
+        createdAt: String(existing.createdAt || nowIso),
+    }
+    await bucket.put(`_processing/${id}.json`, JSON.stringify(payload), {
+        httpMetadata: { contentType: 'application/json' },
+    }).catch(() => { })
+}
+
 async function getGalleryIndexProcessedAt(db: D1Database, namespaceId: string, videoId: string): Promise<string> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     const normalizedVideoId = String(videoId || '').trim()
@@ -14247,16 +14417,33 @@ async function syncWaitingVideoIntoPrimaryAdminNamespace(params: {
     }).catch(() => null)
 }
 
+type ManagedLinkFailureTrace = {
+    reason?: string
+    category?: string
+    details?: Record<string, unknown>
+}
+
 async function prepareInboxVideoForManagedLinks(params: {
     env: Env
     bucket: R2Bucket
     namespaceId: string
     item: InboxVideoRecord
     logPrefix: string
+    failureTrace?: ManagedLinkFailureTrace
 }): Promise<InboxVideoRecord | null> {
+    const recordFailure = (reason: string, category: string, details?: Record<string, unknown>) => {
+        if (params.failureTrace) {
+            params.failureTrace.reason = reason
+            params.failureTrace.category = category
+            if (details) params.failureTrace.details = details
+        }
+    }
     const namespaceId = String(params.namespaceId || '').trim()
     const item = normalizeInboxVideoRecord(params.item)
-    if (!namespaceId || !item || item.status !== 'ready') return null
+    if (!namespaceId || !item || item.status !== 'ready') {
+        recordFailure('inbox record invalid or not ready', 'invalid_inbox_record')
+        return null
+    }
 
     const [adminManaged, shortlinkRequired, primaryAdminNamespaceId] = await Promise.all([
         isNamespaceShortlinkAdminManaged(params.env.DB, namespaceId).catch(() => false),
@@ -14266,13 +14453,25 @@ async function prepareInboxVideoForManagedLinks(params: {
     const forceManagedShortlink = !!primaryAdminNamespaceId && primaryAdminNamespaceId === namespaceId
     if (adminManaged && !shortlinkRequired) {
         console.log(`[${params.logPrefix}] Admin managed shortlink is not enabled for ${namespaceId}`)
+        recordFailure('Admin managed shortlink not enabled for this namespace', 'shortlink_disabled')
         return null
     }
     if (!shortlinkRequired) return item
 
     const sourceShopeeLink = sanitizeAffiliateTrackingLink(pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || '')
     const sourceLazadaLink = sanitizeAffiliateTrackingLink(pickFirstLazadaUrl(String(item.lazadaOriginalLink || item.lazadaLink || '')) || '')
-    if (!sourceShopeeLink || !sourceLazadaLink) return null
+    if (!sourceShopeeLink || !sourceLazadaLink) {
+        recordFailure(
+            !sourceShopeeLink && !sourceLazadaLink
+                ? 'Missing both Shopee and Lazada source links'
+                : !sourceShopeeLink
+                    ? 'Missing Shopee source link'
+                    : 'Missing Lazada source link',
+            'missing_source_link',
+            { shopee: !!sourceShopeeLink, lazada: !!sourceLazadaLink }
+        )
+        return null
+    }
 
     const [expectedUtmId, expectedLazadaMemberId] = await Promise.all([
         resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, namespaceId).catch(() => ''),
@@ -15798,6 +15997,28 @@ app.get('/api/gallery', async (c) => {
             return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
         })
 
+        // Sort unposted videos so that videos manually moved back from "posted" tab
+        // (via the amber refresh button) appear at the very top — newest first.
+        // Falls back to processed_at / created_at when manualUnpostedAt is empty.
+        const getReadySortMs = (video: Record<string, unknown>): number => {
+            const candidates = [
+                video.manualUnpostedAt,
+                video.manual_unposted_at,
+                video.processedAt,
+                video.processed_at,
+                video.updatedAt,
+                video.updated_at,
+                video.createdAt,
+                video.created_at,
+            ]
+            for (const candidate of candidates) {
+                const ts = new Date(String(candidate || '')).getTime()
+                if (Number.isFinite(ts) && ts > 0) return ts
+            }
+            return 0
+        }
+        readyVideos.sort((a, b) => getReadySortMs(b as Record<string, unknown>) - getReadySortMs(a as Record<string, unknown>))
+
         const overallTotal = readyVideos.length
         const shopeeVideos = readyVideos.filter((video) => !hasLazadaLinkInMeta(video as Record<string, unknown>))
         const lazadaVideos = readyVideos.filter((video) => hasLazadaLinkInMeta(video as Record<string, unknown>))
@@ -16468,6 +16689,10 @@ app.put('/api/gallery/:id', async (c) => {
         }
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+        // Inventory state changed (link/posted/etc.) — drop the cache so the next
+        // gallery list request reflects the move immediately.
+        invalidateNamespaceInventoryCache(targetNamespaceId)
+
         return c.json({
             success: true,
             video: {
@@ -16548,6 +16773,7 @@ app.post('/api/gallery/reset-posted-bulk', async (c) => {
         // Invalidate admin caches so the change is reflected everywhere
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+        invalidateNamespaceInventoryCache(targetNamespaceId)
 
         return c.json({
             success: true,
@@ -16651,6 +16877,7 @@ app.delete('/api/gallery/:id', async (c) => {
         })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
+        invalidateNamespaceInventoryCache(targetNamespaceId)
         return c.json({ success: true })
     } catch {
         return c.json({ error: 'Failed to delete video' }, 500)
@@ -25465,6 +25692,75 @@ app.put('/api/pages/:id', async (c) => {
             normalizedInterval = Math.max(5, Math.min(720, Number.isFinite(parsed) ? Math.floor(parsed) : 60))
         }
 
+        // === Drift guard ===
+        // post_hours is the cron's source of truth (every:N or H:MM slot list).
+        // post_interval_minutes is a UI-display field. They MUST stay in sync, otherwise
+        // toggling the UI from "ติ๊กเวลา" to "ทุกๆ X นาที" leaves a stale slot string in
+        // post_hours and the cron silently keeps posting on the old slots.
+        //
+        // Rule: when the request implies interval mode (interval is set AND post_hours
+        // is either absent or already an every:N string), force post_hours = every:N
+        // so the cron immediately honors the user's intent. We don't touch explicit
+        // slot strings because those signal the user is in slot mode.
+        if (normalizedInterval !== undefined) {
+            const phStr = String(normalizedPostHours ?? '').trim()
+            const isAlreadyInterval = /^every:\d+$/i.test(phStr)
+            const isExplicitSlot = phStr.length > 0 && phStr.includes(':') && !isAlreadyInterval
+            if (!isExplicitSlot) {
+                normalizedPostHours = `every:${normalizedInterval}`
+            }
+        }
+
+        // === Persist schedule + flags BEFORE touching the token ===
+        // The token resolution block below can early-return 400 (invalid_access_token,
+        // page_not_found_in_me_accounts, etc.). If we left the schedule UPDATE after
+        // it, a stale or expired token would silently swallow the user's schedule
+        // change — they tap "60 นาที", hit Save, see a token error, dismiss it, and
+        // the schedule never persists. Token health and schedule are independent
+        // settings; one failing must not silently veto the other.
+        if (normalizedPostHours !== undefined) {
+            if (is_active !== undefined) {
+                await c.env.DB.prepare(
+                    'UPDATE pages SET post_hours = ?, is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+                ).bind(normalizedPostHours, is_active ? 1 : 0, id, c.get('botId')).run()
+            } else {
+                await c.env.DB.prepare(
+                    'UPDATE pages SET post_hours = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+                ).bind(normalizedPostHours, id, c.get('botId')).run()
+            }
+        }
+        if (normalizedInterval !== undefined) {
+            if (is_active !== undefined) {
+                await c.env.DB.prepare(
+                    'UPDATE pages SET post_interval_minutes = ?, is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+                ).bind(normalizedInterval, is_active ? 1 : 0, id, c.get('botId')).run()
+            } else {
+                await c.env.DB.prepare(
+                    'UPDATE pages SET post_interval_minutes = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+                ).bind(normalizedInterval, id, c.get('botId')).run()
+            }
+        }
+        if (is_active !== undefined && normalizedPostHours === undefined && normalizedInterval === undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(is_active ? 1 : 0, id, c.get('botId')).run()
+        }
+        if (nextOneCardEnabled !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET onecard_enabled = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextOneCardEnabled, id, c.get('botId')).run()
+        }
+        if (nextOneCardLinkMode !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET onecard_link_mode = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextOneCardLinkMode, id, c.get('botId')).run()
+        }
+        if (nextOneCardCta !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET onecard_cta = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextOneCardCta, id, c.get('botId')).run()
+        }
+
         const tokenUpdated = access_token !== undefined || comment_token !== undefined
         const resolved: { access_token?: string; comment_token?: string } = {}
         const resolved_details: { access_token?: string; comment_token?: string } = {}
@@ -25546,49 +25842,8 @@ app.put('/api/pages/:id', async (c) => {
             await setNamespacePagesTokenPool(c.env.DB, c.get('botId'), tokenPool)
         }
 
-        // Support both old interval and new hours-based scheduling
-        if (normalizedPostHours !== undefined) {
-            if (is_active !== undefined) {
-                await c.env.DB.prepare(
-                    'UPDATE pages SET post_hours = ?, is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-                ).bind(normalizedPostHours, is_active ? 1 : 0, id, c.get('botId')).run()
-            } else {
-                await c.env.DB.prepare(
-                    'UPDATE pages SET post_hours = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-                ).bind(normalizedPostHours, id, c.get('botId')).run()
-            }
-        }
-        if (normalizedInterval !== undefined) {
-            if (is_active !== undefined) {
-                await c.env.DB.prepare(
-                    'UPDATE pages SET post_interval_minutes = ?, is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-                ).bind(normalizedInterval, is_active ? 1 : 0, id, c.get('botId')).run()
-            } else {
-                await c.env.DB.prepare(
-                    'UPDATE pages SET post_interval_minutes = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-                ).bind(normalizedInterval, id, c.get('botId')).run()
-            }
-        }
-        if (is_active !== undefined && normalizedPostHours === undefined && normalizedInterval === undefined) {
-            await c.env.DB.prepare(
-                'UPDATE pages SET is_active = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-            ).bind(is_active ? 1 : 0, id, c.get('botId')).run()
-        }
-        if (nextOneCardEnabled !== undefined) {
-            await c.env.DB.prepare(
-                'UPDATE pages SET onecard_enabled = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-            ).bind(nextOneCardEnabled, id, c.get('botId')).run()
-        }
-        if (nextOneCardLinkMode !== undefined) {
-            await c.env.DB.prepare(
-                'UPDATE pages SET onecard_link_mode = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-            ).bind(nextOneCardLinkMode, id, c.get('botId')).run()
-        }
-        if (nextOneCardCta !== undefined) {
-            await c.env.DB.prepare(
-                'UPDATE pages SET onecard_cta = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
-            ).bind(nextOneCardCta, id, c.get('botId')).run()
-        }
+        // Schedule + is_active + onecard_* are already persisted above (before token
+        // resolution) so they never get vetoed by a stale-token early-return.
         // ads_publish_enabled — admin-namespace ONLY.
         // This feature routes cron/force-post through /api/dashboard/create-ad which uses
         // admin's ad account (act_1030797047648459) and admin's template adset. Allowing
@@ -28293,17 +28548,27 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     const formatSlot = (slot: { hour: number; minute: number }) => `${slot.hour}:${slot.minute.toString().padStart(2, '0')}`
 
     await ensurePagesOneCardColumns(env.DB)
-    // 1. Get active pages with their post_hours
-    const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta
+    // 1. Get active pages with their schedule columns.
+    //    The cron historically only used post_hours, but post_interval_minutes is the
+    //    field the UI exposes for "ทุกๆ X นาที" mode. We pull both so we can fall back
+    //    to interval mode when post_hours is missing/invalid but post_interval_minutes
+    //    is set — guarantees the user's setting is honored even if a stale slot string
+    //    leaked into post_hours.
+    const { results: rawPages } = await env.DB.prepare(`
+        SELECT id, name, access_token, post_hours, post_interval_minutes, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta
         FROM pages
-        WHERE is_active = 1 AND post_hours IS NOT NULL AND post_hours != ''
+        WHERE is_active = 1
+          AND (
+              (post_hours IS NOT NULL AND post_hours != '')
+              OR (post_interval_minutes IS NOT NULL AND post_interval_minutes >= 5)
+          )
     `).all() as {
         results: Array<{
             id: string
             name: string
             access_token: string
-            post_hours: string
+            post_hours: string | null
+            post_interval_minutes: number | null
             last_post_at: string | null
             bot_id: string | null
             onecard_enabled?: number | null
@@ -28311,6 +28576,28 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             onecard_cta?: string | null
         }>
     }
+
+    // Compute the effective post_hours per page:
+    //   - "every:N" stays as-is
+    //   - valid "H:MM,..." slot strings stay as-is
+    //   - empty/invalid strings fall back to "every:${post_interval_minutes}" if available
+    const pages = rawPages.map((row) => {
+        const rawSchedule = String(row.post_hours || '').trim()
+        const intervalCol = Number(row.post_interval_minutes)
+        const hasValidIntervalCol = Number.isFinite(intervalCol) && intervalCol >= 5 && intervalCol <= 720
+        const matchesIntervalString = /^every:\d+$/i.test(rawSchedule)
+        const matchesSlotString = rawSchedule.length > 0 && /^[\d,:\s]+$/.test(rawSchedule) && !matchesIntervalString
+
+        let effectiveSchedule = rawSchedule
+        if (!matchesIntervalString && !matchesSlotString && hasValidIntervalCol) {
+            effectiveSchedule = `every:${Math.floor(intervalCol)}`
+        }
+
+        return {
+            ...row,
+            post_hours: effectiveSchedule,
+        }
+    }).filter((row) => row.post_hours !== '')
 
     // Current time in minutes since midnight (Thailand)
     const nowMinutes = thaiHour * 60 + thaiMinute
@@ -28381,6 +28668,24 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     reconciledNamespaces.add(botId)
                 }
                 await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
+
+                // Universal min-gap guard — prevents back-to-back posts regardless of schedule mode.
+                // Catches bucket-boundary races (every:N) and stale last_post_at across cron ticks.
+                // 5-minute hard floor: if the page posted anything within the last 5 minutes, skip.
+                const MIN_GAP_SECONDS = 5 * 60
+                const recentRow = await env.DB.prepare(
+                    `SELECT MAX(posted_at) AS last_at FROM post_history
+                     WHERE page_id = ? AND bot_id = ? AND status IN ('success','posting')
+                     AND posted_at > datetime('now', '-2 hours')`
+                ).bind(page.id, botId).first<{ last_at: string | null }>().catch(() => null)
+                if (recentRow?.last_at) {
+                    const elapsedSeconds = (Date.now() - Date.parse(String(recentRow.last_at))) / 1000
+                    if (Number.isFinite(elapsedSeconds) && elapsedSeconds >= 0 && elapsedSeconds < MIN_GAP_SECONDS) {
+                        console.log(`[CRON] Page ${page.name}: skip (min-gap guard, last post ${Math.round(elapsedSeconds)}s ago < ${MIN_GAP_SECONDS}s)`)
+                        continue
+                    }
+                }
+
                 const rawSchedule = (page.post_hours || '').trim()
                 const intervalMatch = rawSchedule.match(/^every:(\d{1,4})$/i)
 
@@ -28462,12 +28767,23 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         }
                     }
 
-                    const postedSlots = new Set(todayPosts.map(p => getThaiTimeParts(p.posted_at))
+                    // Use a windowed check: a slot is "already posted" if ANY post landed within
+                    // [slot - earlyTolerance, slot + lateGrace] today. Previously used exact-minute
+                    // match against postedSlots which broke when posts landed late (e.g. slot 19:02
+                    // but post landed 19:08, so 19:02 stayed "due" and could fire again).
+                    const todayPostMinutes = todayPosts.map(p => getThaiTimeParts(p.posted_at))
                         .filter(pt => pt.dateStr === todayStr)
-                        .map(pt => pt.totalMin))
+                        .map(pt => pt.totalMin)
+                        .sort((a, b) => a - b)
+
+                    const isSlotAlreadyPosted = (slotTotalMin: number) => {
+                        const windowStart = slotTotalMin - slotEarlyToleranceMinutes
+                        const windowEnd = slotTotalMin + slotLateGraceMinutes
+                        return todayPostMinutes.some(m => m >= windowStart && m <= windowEnd)
+                    }
 
                     const dueSlots = scheduledTimes.filter(({ totalMin }) => {
-                        if (postedSlots.has(totalMin)) return false
+                        if (isSlotAlreadyPosted(totalMin)) return false
                         const lagMinutes = nowMinutes - totalMin
                         return lagMinutes >= -slotEarlyToleranceMinutes && lagMinutes <= slotLateGraceMinutes
                     })
@@ -28476,8 +28792,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         : null
 
                     if (!matchedSlot) {
-                        const unpostedFutureSlot = scheduledTimes.find((slot) => !postedSlots.has(slot.totalMin) && slot.totalMin >= nowMinutes) || null
-                        const unpostedPastSlot = [...scheduledTimes].reverse().find((slot) => !postedSlots.has(slot.totalMin) && slot.totalMin < nowMinutes) || null
+                        const unpostedFutureSlot = scheduledTimes.find((slot) => !isSlotAlreadyPosted(slot.totalMin) && slot.totalMin >= nowMinutes) || null
+                        const unpostedPastSlot = [...scheduledTimes].reverse().find((slot) => !isSlotAlreadyPosted(slot.totalMin) && slot.totalMin < nowMinutes) || null
                         const hintSlot = unpostedFutureSlot || unpostedPastSlot
                         const hintText = hintSlot ? formatSlot(hintSlot) : 'none'
                         console.log(

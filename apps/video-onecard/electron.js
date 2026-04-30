@@ -328,15 +328,23 @@ function startServer() {
           if (vid.error) return res.end(JSON.stringify({ ok: false, step: "upload", error: vid.error.message, fb_error_code: vid.error.code, fb_error_subcode: vid.error.error_subcode, fb_trace_id: vid.error.fbtrace_id }));
         }
 
-        // 2. Wait thumbnails
+        // 2. Wait thumbnails — poll up to 60 × 3s = 180s.
+        // FB processing latency is variable: short videos finish in 5–10s, long videos
+        // can take 90s+. Previous limit of 20 × 3s (60s) failed on routine 60–120s waits
+        // — exactly the symptom the dashboard reported as "[thumbnails] Timeout HTTP 200".
+        // Also relax the gate to data.length >= 1: FB always returns at least one auto
+        // thumbnail once the encode is ready, and we only use data[0].uri anyway. The old
+        // > 1 check waited for an extra optional frame that often never arrives, padding
+        // failures by minutes. Matches the /post endpoint below (line ~657).
         let thumb = null;
-        for (let i = 0; i < 20; i++) {
+        for (let i = 0; i < 60; i++) {
           await new Promise(r => setTimeout(r, 3000));
           const t = await elFetch(`https://graph.facebook.com/${vid.id}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
           const td = t.json();
-          if (td.thumbnails?.data?.length > 1) { thumb = td.thumbnails.data[0].uri; break; }
+          if (td.thumbnails?.data?.length >= 1) { thumb = td.thumbnails.data[0].uri; console.log(`[CREATE-AD] thumbnail ready after ${i+1} polls`); break; }
+          if (i % 5 === 0) console.log(`[CREATE-AD] poll ${i+1}/60 — no thumbnail yet`);
         }
-        if (!thumb) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout" }));
+        if (!thumb) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout (180s, FB still processing)" }));
 
         // 3. Create creative
         // CTA value shape depends on type:

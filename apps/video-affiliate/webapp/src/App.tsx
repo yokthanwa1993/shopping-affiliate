@@ -1359,6 +1359,10 @@ const getInitialGallerySearchInput = (): string => {
 function getGalleryVideoSortMs(video: Partial<Video> & Record<string, unknown>) {
   const postedTs = new Date(String(video.postedAt || video.posted_at || '')).getTime()
   if (Number.isFinite(postedTs) && postedTs > 0) return postedTs
+  // For unposted videos: if it was manually moved back from "posted" tab,
+  // bump it to the top using the manual-unposted timestamp.
+  const manualUnpostedTs = new Date(String(video.manualUnpostedAt || video.manual_unposted_at || '')).getTime()
+  if (Number.isFinite(manualUnpostedTs) && manualUnpostedTs > 0) return manualUnpostedTs
   const processedTs = new Date(String(video.processedAt || video.processed_at || '')).getTime()
   if (Number.isFinite(processedTs) && processedTs > 0) return processedTs
   const updatedTs = new Date(String(video.updatedAt || '')).getTime()
@@ -6497,12 +6501,28 @@ function App({
       throw new Error(String(data.error || 'ย้ายกลับไปยังไม่โพสต์ไม่สำเร็จ'))
     }
 
-    // Move from usedVideos → videos (ยังไม่โพสต์) and put at top
+    // Move from usedVideos → videos (ยังไม่โพสต์) and put at top.
+    // manualUnpostedAt is the highest-priority sort field for unposted videos
+    // — bumping it to "now" guarantees the card lands at the very top of the list,
+    // even after dedupe/re-sort and silent server refreshes (the worker also reads
+    // namespace_video_state.manual_unposted_at and sorts by it server-side).
+    const nowIso = new Date().toISOString()
     const resetFields = {
       postedAt: '',
       keepInPostedTab: false,
-      updatedAt: new Date().toISOString(),
+      updatedAt: nowIso,
+      manualUnpostedAt: nowIso,
+      manual_unposted_at: nowIso,
     }
+
+    // Snapshot the row from usedVideos BEFORE we remove it (so we have data to push to top)
+    const fromUsed = usedVideos.find((v) =>
+      matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
+    )
+    const wasInUsed = Boolean(fromUsed)
+    const wasInReady = videos.some((v) =>
+      matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
+    )
 
     setUsedVideos((prev) => prev.filter((v) =>
       !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
@@ -6518,15 +6538,19 @@ function App({
           ...prev.filter((v) => !matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)),
         ])
       }
-      // Find from usedVideos
-      const fromUsed = usedVideos.find((v) =>
-        matchesVideoIdentity(v as unknown as Record<string, unknown>, id, namespaceForVideo)
-      )
       if (fromUsed) {
         return dedupeGalleryVideos([{ ...fromUsed, ...resetFields } as Video, ...prev])
       }
       return prev
     })
+
+    // Update tab counters immediately so "ยังไม่โพสต์ (N)" / "โพสต์แล้ว (N)" reflect the move.
+    if (wasInUsed) {
+      setGalleryUsedTotalCount((prev) => Math.max(0, prev - 1))
+    }
+    if (!wasInReady) {
+      setGalleryReadyTotalCount((prev) => prev + 1)
+    }
   }
 
   const { galleryAvailableVideos } = useMemo(() => {

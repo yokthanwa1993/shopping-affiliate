@@ -264,7 +264,11 @@ function createShopeeWindow(show = false) {
 
 function createLazadaWindow(show = false) {
     if (lazadaWindow && !lazadaWindow.isDestroyed()) {
-        if (show) { lazadaWindow.show(); lazadaWindow.focus(); }
+        if (show) {
+            markManualLogin('lazada', 'open');
+            lazadaWindow.show();
+            lazadaWindow.focus();
+        }
         return lazadaWindow;
     }
 
@@ -283,6 +287,7 @@ function createLazadaWindow(show = false) {
         },
     });
 
+    if (show) markManualLogin('lazada', 'create');
     lazadaWindow.loadURL(LAZADA_URL, { userAgent: CHROME_UA });
     lazadaWindow.once('ready-to-show', () => {
         if (process.platform === 'darwin') {
@@ -293,9 +298,18 @@ function createLazadaWindow(show = false) {
         if (!app.isQuitting) { e.preventDefault(); lazadaWindow.hide(); }
     });
     lazadaWindow.on('show', () => {
+        markManualLogin('lazada', 'show');
         if (process.platform === 'darwin') {
             try { app.dock.hide(); } catch { }
         }
+    });
+    lazadaWindow.on('focus', () => markManualLogin('lazada', 'focus'));
+    lazadaWindow.webContents.on('before-input-event', () => markManualLogin('lazada', 'typing'));
+    lazadaWindow.webContents.on('did-navigate', (_event, navUrl) => {
+        if (isLoginRelatedUrl(navUrl)) markManualLogin('lazada', 'login-url');
+    });
+    lazadaWindow.webContents.on('did-navigate-in-page', (_event, navUrl) => {
+        if (isLoginRelatedUrl(navUrl)) markManualLogin('lazada', 'login-url');
     });
 
     return lazadaWindow;
@@ -322,11 +336,39 @@ const reloadLocks = { shopee: null, lazada: null };
 const consecutiveFailures = { shopee: 0, lazada: 0 };
 const FAILURES_BEFORE_RESTART = 3;                // 3 full-wrapper failures in a row → relaunch
 const MIN_RESTART_INTERVAL_MS = 10 * 60 * 1000;   // rate-limit: at most 1 restart per 10 min
+const MANUAL_LOGIN_GRACE_MS = 15 * 60 * 1000;     // keep login pages stable while a human signs in
+const manualLoginUntil = { shopee: 0, lazada: 0 };
 let lastAppRestartAt = 0;
 let restartScheduled = false;
 
+function markManualLogin(platform, reason = '') {
+    if (platform !== 'lazada') return;
+    const until = Date.now() + MANUAL_LOGIN_GRACE_MS;
+    if (until > (manualLoginUntil[platform] || 0)) {
+        manualLoginUntil[platform] = until;
+    }
+    const suffix = reason ? ` (${reason})` : '';
+    console.log(`[${platform}] manual login guard active for ${Math.ceil(MANUAL_LOGIN_GRACE_MS / 60000)}m${suffix}`);
+}
+
+function isManualLoginProtected(platform, win) {
+    if (platform !== 'lazada') return false;
+    if (Date.now() < (manualLoginUntil[platform] || 0)) return true;
+    return !!(win && !win.isDestroyed() && win.isVisible());
+}
+
+function isLoginRelatedUrl(rawUrl) {
+    const value = String(rawUrl || '').toLowerCase();
+    return /login|member|account|passport|user/.test(value);
+}
+
 function triggerAppRestartIfStuck(platform) {
     if (restartScheduled) return;
+    const win = platform === 'lazada' ? lazadaWindow : platform === 'shopee' ? shopeeWindow : null;
+    if (isManualLoginProtected(platform, win)) {
+        console.warn(`[restart] skip ${platform} restart — manual login guard is active`);
+        return;
+    }
     const now = Date.now();
     if (now - lastAppRestartAt < MIN_RESTART_INTERVAL_MS) {
         const leftSec = Math.ceil((MIN_RESTART_INTERVAL_MS - (now - lastAppRestartAt)) / 1000);
@@ -377,6 +419,10 @@ async function reloadAndWait(win, loadUrl) {
 }
 
 async function reloadWindowSerialized(platform, win, loadUrl) {
+    if (isManualLoginProtected(platform, win)) {
+        console.log(`[${platform}] reload skipped — manual login guard is active`);
+        return null;
+    }
     if (reloadLocks[platform]) return reloadLocks[platform];
     const p = reloadAndWait(win, loadUrl);
     reloadLocks[platform] = p;
@@ -540,6 +586,15 @@ async function shortenLazada(productUrl) {
                 lastErr = err;
                 const recoverable = isSessionLikelyExpired(err);
                 console.warn(`[Lazada] attempt ${attempt}/${MAX_SHORTEN_ATTEMPTS} failed (${recoverable ? 'recoverable' : 'non-recoverable'}): ${err.message}`);
+                if (recoverable && isManualLoginProtected('lazada', lazadaWindow)) {
+                    console.warn('[Lazada] manual login guard active — not reloading while user signs in');
+                    break;
+                }
+                if (recoverable && /SESSION|TOKEN_EMPTY|TOKEN_EXPIRED|ILLEGAL_ACCESS|UNAUTHORIZED|LOGIN|CSRF|FAIL_SYS|401|403/i.test(String(err.message || err))) {
+                    markManualLogin('lazada', 'session-expired');
+                    createLazadaWindow(true);
+                    break;
+                }
                 if (!recoverable || attempt === MAX_SHORTEN_ATTEMPTS) break;
                 await new Promise(r => setTimeout(r, BETWEEN_ATTEMPT_DELAY_MS[attempt] || 3500));
                 await reloadWindowSerialized('lazada', createLazadaWindow(), LAZADA_URL);
@@ -570,6 +625,10 @@ function schedulePeriodicRefresh(platform, getWin, loadUrl, offsetMs = 0) {
             }
             if (reloadLocks[platform]) {
                 console.log(`[${platform}] periodic refresh skipped (reload already in progress)`);
+                return;
+            }
+            if (isManualLoginProtected(platform, win)) {
+                console.log(`[${platform}] periodic refresh skipped (manual login guard active)`);
                 return;
             }
             console.log(`[${platform}] periodic refresh (every ${REFRESH_INTERVAL_MS / 60000}m)`);
