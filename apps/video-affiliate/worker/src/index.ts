@@ -3669,6 +3669,117 @@ function isSameBangkokDate(a: string, b = new Date().toISOString()): boolean {
     return formatter.format(new Date(first)) === formatter.format(new Date(second))
 }
 
+// Extract a normalized views count from a /{video} or /?ids= record.
+// Tries the lifetime-accurate insights metric first, falls back to the snapshot
+// `views` field. Both can be missing (page tokens don't always grant insights),
+// in which case we return 0.
+function extractViewsFromVideoInfo(videoInfo: Record<string, unknown>): number {
+    const fieldViews = Number(videoInfo?.views || 0)
+    const insightsContainer = videoInfo?.video_insights as Record<string, unknown> | undefined
+    const insightsData = Array.isArray(insightsContainer?.data)
+        ? insightsContainer.data as Array<Record<string, unknown>>
+        : []
+    let insightsViews = 0
+    for (const metric of insightsData) {
+        if (String((metric as Record<string, unknown>).name || '') !== 'total_video_views') continue
+        const values = (metric as Record<string, unknown>).values
+        if (!Array.isArray(values) || values.length === 0) continue
+        const v = Number((values[0] as Record<string, unknown>).value || 0)
+        if (Number.isFinite(v) && v > insightsViews) insightsViews = v
+    }
+    return Math.max(
+        Number.isFinite(fieldViews) ? Math.max(0, Math.floor(fieldViews)) : 0,
+        Math.max(0, Math.floor(insightsViews)),
+    )
+}
+
+// Fetch views for a list of video IDs using a Facebook Graph token.
+// Tries the cheap `/?ids=v1,v2,...` batch first; on `(#100) does not support
+// multiple ID read requests` (which is what page-scoped tokens return — they
+// can read individual videos but not multi-id batches), falls back to a
+// per-video parallel fetch with bounded concurrency.
+//
+// Returns a map { video_id -> { views, raw } } including videos where views
+// could not be resolved (they are simply absent from the map). Errors per
+// individual video are swallowed — the caller reports the count.
+async function fetchVideoViewsResilient(
+    token: string,
+    videoIds: string[],
+): Promise<{ viewsByVideoId: Map<string, number>; rawByVideoId: Map<string, Record<string, unknown>>; mode: 'batch' | 'per_video' | 'mixed'; errorSample?: string }> {
+    const viewsByVideoId = new Map<string, number>()
+    const rawByVideoId = new Map<string, Record<string, unknown>>()
+    if (videoIds.length === 0) return { viewsByVideoId, rawByVideoId, mode: 'batch' }
+
+    const idsStr = videoIds.map((v) => String(v).trim()).filter(Boolean).join(',')
+    let mode: 'batch' | 'per_video' | 'mixed' = 'batch'
+    let errorSample: string | undefined
+
+    // Fast path: /?ids= batch
+    try {
+        const resp = await fetch(
+            `https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,title,description,source,picture,length,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`,
+        )
+        if (resp.ok) {
+            const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+            const errorObj = data?.error as Record<string, unknown> | undefined
+            const errorCode = Number(errorObj?.code || 0)
+            if (!errorObj) {
+                for (const id of videoIds) {
+                    const info = (data as Record<string, Record<string, unknown>>)[id]
+                    if (info && typeof info === 'object') {
+                        rawByVideoId.set(id, info)
+                        viewsByVideoId.set(id, extractViewsFromVideoInfo(info))
+                    }
+                }
+                if (viewsByVideoId.size === videoIds.length) {
+                    return { viewsByVideoId, rawByVideoId, mode }
+                }
+                // Partial — fall through to per-video for missing ones
+            } else if (errorCode === 100) {
+                errorSample = String(errorObj.message || `(#${errorCode}) batch ID read not supported`)
+            } else {
+                errorSample = String(errorObj.message || `fb_error_${errorCode}`)
+            }
+        } else {
+            errorSample = `http_${resp.status}`
+        }
+    } catch (e) {
+        errorSample = e instanceof Error ? e.message : String(e)
+    }
+
+    // Slow path: per-video parallel fetch with bounded concurrency.
+    // Page tokens reject /?ids= but accept /{video_id}, so this works regardless
+    // of whether the operator pasted a user token or we fell back to pages.access_token.
+    const CONCURRENCY = 10
+    const remaining = videoIds.filter((id) => !viewsByVideoId.has(id))
+    if (remaining.length > 0) {
+        mode = viewsByVideoId.size > 0 ? 'mixed' : 'per_video'
+        let cursor = 0
+        const worker = async (): Promise<void> => {
+            while (true) {
+                const i = cursor++
+                if (i >= remaining.length) return
+                const id = remaining[i]
+                try {
+                    const resp = await fetch(
+                        `https://graph.facebook.com/v21.0/${encodeURIComponent(id)}?fields=views,title,description,source,picture,length,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`,
+                    )
+                    if (!resp.ok) continue
+                    const info = await resp.json().catch(() => ({})) as Record<string, unknown>
+                    if (info?.error) continue
+                    rawByVideoId.set(id, info)
+                    viewsByVideoId.set(id, extractViewsFromVideoInfo(info))
+                } catch {
+                    // swallow — caller computes errors from missing entries
+                }
+            }
+        }
+        await Promise.all(Array.from({ length: Math.min(CONCURRENCY, remaining.length) }, () => worker()))
+    }
+
+    return { viewsByVideoId, rawByVideoId, mode, errorSample }
+}
+
 async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: string, after = ''): Promise<{
     items: Array<Record<string, unknown>>
     nextAfter: string
@@ -3718,35 +3829,21 @@ async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: 
     // that often lags or caps. The lifetime-accurate metric is `total_video_views` from
     // /{video_id}/video_insights, so we request both and pick the larger value.
     // Requires `read_insights` permission on the Facebook sync token.
+    //
+    // Uses fetchVideoViewsResilient which transparently falls back to per-video
+    // parallel fetch when the token doesn't support /?ids= batch reads (page-scoped
+    // tokens return error code 100 there). Without this, view counts silently never
+    // updated and the dashboard's over-100K count stayed frozen at whatever it was
+    // when a user-scoped token was last in use.
     const items: Array<Record<string, unknown>> = []
     if (videoIds.length > 0) {
-        const idsStr = videoIds.join(',')
-        const viewsResp = await fetch(`https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,title,description,source,picture,length,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`)
-        const viewsData = viewsResp.ok ? await viewsResp.json().catch(() => ({})) as Record<string, Record<string, unknown>> : {}
+        const { viewsByVideoId, rawByVideoId } = await fetchVideoViewsResilient(token, videoIds)
         for (const videoId of videoIds) {
             const post = postMap.get(videoId) || {}
-            const videoInfo = viewsData[videoId] || {}
-            // Extract post_id from post.id (format: "pageId_postId")
+            const videoInfo = rawByVideoId.get(videoId) || {}
             const rawPostId = String(post.id || '').trim()
             const postId = rawPostId.includes('_') ? rawPostId.split('_').pop() || '' : rawPostId
-            // Pull total_video_views from insights — lifetime accurate count.
-            const insightsContainer = (videoInfo.video_insights as Record<string, unknown> | undefined)
-            const insightsData = Array.isArray(insightsContainer?.data)
-                ? insightsContainer.data as Array<Record<string, unknown>>
-                : []
-            let insightsViews = 0
-            for (const metric of insightsData) {
-                if (String((metric as Record<string, unknown>).name || '') !== 'total_video_views') continue
-                const values = (metric as Record<string, unknown>).values
-                if (!Array.isArray(values) || values.length === 0) continue
-                const v = Number((values[0] as Record<string, unknown>).value || 0)
-                if (Number.isFinite(v) && v > insightsViews) insightsViews = v
-            }
-            const fieldViews = Number(videoInfo.views || 0)
-            const finalViews = Math.max(
-                Number.isFinite(fieldViews) ? Math.max(0, Math.floor(fieldViews)) : 0,
-                Math.max(0, Math.floor(insightsViews)),
-            )
+            const finalViews = viewsByVideoId.get(videoId) ?? 0
             items.push({
                 id: videoId,
                 video_id: videoId,
@@ -5864,66 +5961,92 @@ app.post('/api/dashboard/facebook-page-videos/refresh-all-views', async (c) => {
     const token = await resolveFacebookSyncToken(c.env.DB, pageId)
     if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
 
+    // Cloudflare Workers cap outbound subrequests per invocation (1,000 on Standard,
+    // 50 on Bundled). Per-video fallback at full vault size (≈3,000 videos) blows past
+    // that ceiling, so we always work in size-bounded chunks ordered by staleness.
+    // Body params: { limit?: number = 800, max_age_minutes?: number = 0 = always include }
+    const limitRaw = Number((body as Record<string, unknown>)?.limit ?? 800)
+    const limit = Number.isFinite(limitRaw) ? Math.max(50, Math.min(900, Math.floor(limitRaw))) : 800
+    const maxAgeMinutesRaw = Number((body as Record<string, unknown>)?.max_age_minutes ?? 0)
+    const maxAgeMinutes = Number.isFinite(maxAgeMinutesRaw) && maxAgeMinutesRaw > 0
+        ? Math.floor(maxAgeMinutesRaw)
+        : 0
+
     await ensureFacebookPageVideoCacheTables(c.env.DB)
+    const totalCachedRow = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS c FROM facebook_page_video_cache WHERE page_id = ? AND video_id <> ''`,
+    ).bind(pageId).first<{ c: number }>().catch(() => null)
+    const totalCachedRows = Number(totalCachedRow?.c || 0)
+
+    // Take the chunk most in need: oldest fetched_at first, NULLs treated as oldest.
+    // Optional max_age filter so callers can ask "only rows older than N minutes".
+    const ageWhere = maxAgeMinutes > 0
+        ? `AND (fetched_at IS NULL OR fetched_at < datetime('now', ?))`
+        : ''
+    const ageBindings: unknown[] = maxAgeMinutes > 0 ? [`-${maxAgeMinutes} minutes`] : []
     const cachedRows = await c.env.DB.prepare(
-        `SELECT video_id, views FROM facebook_page_video_cache WHERE page_id = ? AND video_id <> ''`
-    ).bind(pageId).all() as { results?: Array<{ video_id: string; views: number }> }
+        `SELECT video_id, views, fetched_at FROM facebook_page_video_cache
+         WHERE page_id = ? AND video_id <> '' ${ageWhere}
+         ORDER BY (fetched_at IS NULL) DESC, fetched_at ASC
+         LIMIT ?`,
+    ).bind(pageId, ...ageBindings, limit).all() as { results?: Array<{ video_id: string; views: number; fetched_at: string | null }> }
     const cachedVideos = Array.isArray(cachedRows.results) ? cachedRows.results : []
     if (cachedVideos.length === 0) {
-        return c.json({ ok: true, page_id: pageId, total: 0, refreshed: 0, raised: 0, errors: 0 })
+        const totalOver100k = await countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 100000 })
+        return c.json({
+            ok: true,
+            page_id: pageId,
+            total: 0,
+            total_in_cache: totalCachedRows,
+            refreshed: 0,
+            raised: 0,
+            errors: 0,
+            total_views_delta: 0,
+            total_over_100k: totalOver100k,
+            pending_more: false,
+        })
     }
 
-    const BATCH = 50
+    // Larger batch since fetchVideoViewsResilient handles fallback internally — and
+    // because per-video fallback runs 10-way concurrent, oversize batches stay fast.
+    const BATCH = 200
     let refreshed = 0
     let raised = 0
     let errors = 0
     let totalViewsDelta = 0
+    let lastErrorSample = ''
+    const modesCount: Record<string, number> = { batch: 0, mixed: 0, per_video: 0 }
 
     for (let i = 0; i < cachedVideos.length; i += BATCH) {
         const batch = cachedVideos.slice(i, i + BATCH)
-        const idsStr = batch.map(v => String(v.video_id || '').trim()).filter(Boolean).join(',')
-        if (!idsStr) continue
+        const ids = batch.map((v) => String(v.video_id || '').trim()).filter(Boolean)
+        if (ids.length === 0) continue
         try {
-            const resp = await fetch(`https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(idsStr)}&fields=views,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`)
-            if (!resp.ok) { errors++; continue }
-            const data = await resp.json().catch(() => ({})) as Record<string, Record<string, unknown>>
+            const { viewsByVideoId, mode, errorSample } = await fetchVideoViewsResilient(token, ids)
+            modesCount[mode] = (modesCount[mode] || 0) + 1
+            if (errorSample) lastErrorSample = errorSample
 
             for (const cached of batch) {
-                const videoInfo = data[cached.video_id] || {}
-                const fieldViews = Number(videoInfo.views || 0)
-
-                const insightsContainer = (videoInfo.video_insights as Record<string, unknown> | undefined)
-                const insightsData = Array.isArray(insightsContainer?.data)
-                    ? insightsContainer.data as Array<Record<string, unknown>>
-                    : []
-                let insightsViews = 0
-                for (const metric of insightsData) {
-                    if (String((metric as Record<string, unknown>).name || '') !== 'total_video_views') continue
-                    const values = (metric as Record<string, unknown>).values
-                    if (!Array.isArray(values) || values.length === 0) continue
-                    const v = Number((values[0] as Record<string, unknown>).value || 0)
-                    if (Number.isFinite(v) && v > insightsViews) insightsViews = v
+                const newViews = viewsByVideoId.get(String(cached.video_id || '').trim())
+                if (newViews === undefined) {
+                    errors++
+                    continue
                 }
-
-                const newViews = Math.max(
-                    Number.isFinite(fieldViews) ? Math.max(0, Math.floor(fieldViews)) : 0,
-                    Math.max(0, Math.floor(insightsViews)),
-                )
                 const oldViews = Math.max(0, Math.floor(Number(cached.views) || 0))
-
                 if (newViews > oldViews) {
                     await c.env.DB.prepare(
                         `UPDATE facebook_page_video_cache
                          SET views = ?, fetched_at = datetime('now'), updated_at = datetime('now')
-                         WHERE page_id = ? AND video_id = ?`
+                         WHERE page_id = ? AND video_id = ?`,
                     ).bind(newViews, pageId, cached.video_id).run()
                     raised++
                     totalViewsDelta += (newViews - oldViews)
                 }
                 refreshed++
             }
-        } catch (_e) {
-            errors++
+        } catch (e) {
+            errors += batch.length
+            if (!lastErrorSample) lastErrorSample = e instanceof Error ? e.message : String(e)
         }
     }
 
@@ -5934,11 +6057,21 @@ app.post('/api/dashboard/facebook-page-videos/refresh-all-views', async (c) => {
         ok: true,
         page_id: pageId,
         total: cachedVideos.length,
+        total_in_cache: totalCachedRows,
         refreshed,
         raised,
         errors,
         total_views_delta: totalViewsDelta,
         total_over_100k: totalOver100k,
+        // Caller (dashboard / cron / curl loop) should re-call until pending_more=false
+        // to fully refresh the vault. Each call processes the staleest `limit` rows.
+        pending_more: cachedVideos.length >= limit && (totalCachedRows > limit),
+        // Diagnostic: which fetch path each batch used. If `per_video` dominates,
+        // the operator's token doesn't support /?ids= batch reads (page-scoped
+        // tokens behave that way). Pasting a user token in Settings will move
+        // batches to the faster `batch` path. `mixed` = batch returned partial.
+        modes: modesCount,
+        last_error_sample: lastErrorSample || null,
     }, 200, { 'Cache-Control': 'no-store' })
 })
 
@@ -6141,6 +6274,12 @@ async function ensureAdQueueTable(db: D1Database): Promise<void> {
             result_adset_id TEXT NOT NULL DEFAULT ''
         )`
     ).run()
+    // Schema migration: video_url column added 2026-05-01 to support gallery
+    // (unposted) videos. SQLite has no `ADD COLUMN IF NOT EXISTS`, so swallow
+    // the duplicate-column error on re-run.
+    await db.prepare(
+        `ALTER TABLE dashboard_ad_queue ADD COLUMN video_url TEXT NOT NULL DEFAULT ''`
+    ).run().catch(() => undefined)
     await db.prepare(
         `CREATE INDEX IF NOT EXISTS idx_dashboard_ad_queue_status ON dashboard_ad_queue(status, created_at)`
     ).run()
@@ -6150,6 +6289,7 @@ app.post('/api/dashboard/ad-queue/enqueue', async (c) => {
     const body = await c.req.json().catch(() => ({})) as {
         page_id?: string
         video_id?: string
+        video_url?: string
         caption?: string
         shopee_url?: string
         story_id?: string
@@ -6158,17 +6298,23 @@ app.post('/api/dashboard/ad-queue/enqueue', async (c) => {
     }
     const pageId = String(body.page_id || '').trim()
     const videoId = String(body.video_id || '').trim()
-    if (!pageId || !videoId) return c.json({ ok: false, error: 'page_id and video_id required' }, 400)
+    const videoUrl = String(body.video_url || '').trim()
+    // Accept either video_id (for already-on-FB videos) or video_url (for unposted
+    // gallery videos that the electron pipeline will upload to FB Ads first).
+    if (!pageId || (!videoId && !videoUrl)) {
+        return c.json({ ok: false, error: 'page_id and (video_id or video_url) required' }, 400)
+    }
     if (!body.campaign_id && !body.new_campaign_name) {
         return c.json({ ok: false, error: 'campaign_id or new_campaign_name required' }, 400)
     }
     await ensureAdQueueTable(c.env.DB)
     const insert = await c.env.DB.prepare(
-        `INSERT INTO dashboard_ad_queue (page_id, video_id, caption, shopee_url, story_id, campaign_id, new_campaign_name)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO dashboard_ad_queue (page_id, video_id, video_url, caption, shopee_url, story_id, campaign_id, new_campaign_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
         pageId,
         videoId,
+        videoUrl,
         String(body.caption || '').trim(),
         String(body.shopee_url || '').trim(),
         String(body.story_id || '').trim(),
@@ -6254,7 +6400,10 @@ async function processNextAdQueueItem(env: Env): Promise<{
     if (!claimed) return { ok: true, skipped: true, reason: 'claim_lost', queue_id: queueId }
 
     try {
-        // Call our own create-ad endpoint via internal fetch
+        // Call our own create-ad endpoint via internal fetch.
+        // Forward video_url too — if the queued row was enqueued from the
+        // gallery tab (no FB video_id yet), this is what tells the electron
+        // pipeline to upload the file to FB Ads first.
         const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
         const resp = await fetch(`${workerUrl}/api/dashboard/create-ad`, {
             method: 'POST',
@@ -6262,6 +6411,7 @@ async function processNextAdQueueItem(env: Env): Promise<{
             body: JSON.stringify({
                 page_id: row.page_id,
                 video_id: row.video_id,
+                video_url: row.video_url || '',
                 caption: row.caption,
                 story_id: row.story_id,
                 shopee_url: row.shopee_url,

@@ -325,7 +325,11 @@ function getInitialTab(): DashboardTab {
 export default function App() {
   const [tab, setTab] = useState<DashboardTab>(() => getInitialTab())
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
-  const [createAdPopup, setCreateAdPopup] = useState<{ videoId: string; caption: string; storyId: string; shopeeLink: string } | null>(null)
+  // videoUrl is set when the popup is opened for an UNPOSTED gallery video
+  // (no FB video_id yet). The submit handler routes between two paths:
+  //   - videoUrl set  → send `video_url` so electron uploads to FB Ads first
+  //   - videoUrl empty → send `video_id` so electron reuses existing FB video
+  const [createAdPopup, setCreateAdPopup] = useState<{ videoId: string; caption: string; storyId: string; shopeeLink: string; videoUrl: string } | null>(null)
   const [adQueueItems, setAdQueueItems] = useState<AdQueueItem[]>([])
   const [adQueueCounts, setAdQueueCounts] = useState<Record<string, number>>({})
   const [adQueueLastRun, setAdQueueLastRun] = useState<string>('')
@@ -379,8 +383,8 @@ export default function App() {
   const [liveCampaigns, setLiveCampaigns] = useState<LiveCampaign[]>([])
   const [campaignsLoading, setCampaignsLoading] = useState(false)
 
-  async function openCreateAdPopup(videoId: string, caption: string, storyId = '', shopeeLink = '') {
-    setCreateAdPopup({ videoId, caption, storyId, shopeeLink })
+  async function openCreateAdPopup(videoId: string, caption: string, storyId = '', shopeeLink = '', videoUrl = '') {
+    setCreateAdPopup({ videoId, caption, storyId, shopeeLink, videoUrl })
     setCreateAdShopeeLink(shopeeLink)
     setCreateAdSelectedCampaign('')
     setCreateAdNewCampaignName('')
@@ -420,12 +424,17 @@ export default function App() {
     try {
       // IMMEDIATE — call create-ad directly, bypass queue entirely.
       // Runs full pipeline synchronously (60-120s typical). User waits for real result.
+      // For gallery (unposted) videos we send video_url instead of video_id so the
+      // electron pipeline uploads the file to FB Ads first; for posted videos we
+      // send video_id to reuse the existing FB asset and skip the upload step.
       const resp = await fetch('/worker-api/api/dashboard/create-ad', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           page_id: CHIEB_PAGE_ID,
-          video_id: createAdPopup.videoId,
+          ...(createAdPopup.videoUrl
+            ? { video_url: createAdPopup.videoUrl }
+            : { video_id: createAdPopup.videoId }),
           caption: createAdPopup.caption,
           story_id: createAdPopup.storyId || '',
           shopee_url: createAdShopeeLink || '',
@@ -499,12 +508,16 @@ export default function App() {
 
     try {
       // ENQUEUE — don't run create-ad now, let cron pick it up every 20 minutes.
+      // Same video_url-vs-video_id branching as the immediate path so cron can
+      // process gallery (unposted) videos identically.
       const resp = await fetch('/worker-api/api/dashboard/ad-queue/enqueue', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           page_id: CHIEB_PAGE_ID,
-          video_id: createAdPopup.videoId,
+          ...(createAdPopup.videoUrl
+            ? { video_url: createAdPopup.videoUrl }
+            : { video_id: createAdPopup.videoId }),
           caption: createAdPopup.caption,
           story_id: createAdPopup.storyId || '',
           shopee_url: createAdShopeeLink || '',
@@ -1501,6 +1514,25 @@ export default function App() {
                                       ? <span>{formatThaiDate(String(video.postedAt))}</span>
                                       : null}
                                   </div>
+                                  {/* Same flow as page-posts → openCreateAdPopup, but the
+                                      gallery video has no FB video_id yet. We pass an
+                                      absolute video URL so the worker → electron pipeline
+                                      uploads to FB Ads first instead of reusing an
+                                      existing video. shopeeLink/lazadaLink come straight
+                                      from the gallery row so the popup pre-fills. */}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const fileUrl = `${window.location.origin}${buildVideoPlaybackUrl(vid, CHIEB_NAMESPACE_ID)}`
+                                      const link = String(video.shopeeLink || video.lazadaLink || '').trim()
+                                      void openCreateAdPopup('', title || vid, '', link, fileUrl)
+                                    }}
+                                    disabled={!linked}
+                                    title={linked ? 'สร้างแอด LikePage จากคลิปนี้' : 'ต้องมี Shopee/Lazada link ใน metadata ก่อน'}
+                                    className="w-full rounded-xl bg-[#1877f2] px-3 py-2 text-sm font-semibold text-white transition active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                                  >
+                                    สร้างแอด
+                                  </button>
                                 </div>
                               </article>
                             )
