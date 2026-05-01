@@ -5779,12 +5779,19 @@ const DASHBOARD_SETTING_KEYS = [
     'facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5',
     'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset',
     'campaign_prefix', 'ads_per_round', 'auto_create_time',
+    // Per-page choice for how the create-ad pipeline shortens Shopee URLs:
+    //   'api'        → call short.wwoom.com (default; same as the Electron flow)
+    //   'extension'  → call affiliate.shopee.co.th GraphQL via the Feed Ad
+    //                  Creator extension's logged-in Shopee tab. Only meaningful
+    //                  for ฟีด — เฉียบ goes through worker → Electron, which
+    //                  always uses the URL template above.
+    'shortlink_provider',
 ] as const
 const DASHBOARD_SETTING_ALIASES: Record<string, string> = {
     facebookSyncToken: 'facebook_sync_token', subId: 'sub_id', shortlinkUrl: 'shortlink_url',
     commentTemplate: 'comment_template', defaultPage: 'default_page', adAccount: 'ad_account',
     templateAdset: 'template_adset', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round',
-    autoCreateTime: 'auto_create_time',
+    autoCreateTime: 'auto_create_time', shortlinkProvider: 'shortlink_provider',
 }
 
 app.get('/api/dashboard/settings', async (c) => {

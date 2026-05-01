@@ -93,6 +93,7 @@ type GallerySyncState = {
   lastError: string
 }
 
+type ShortlinkProvider = 'api' | 'extension'
 type DashboardSettings = {
   subId: string
   subId2: string
@@ -100,6 +101,7 @@ type DashboardSettings = {
   subId4: string
   subId5: string
   shortlinkUrl: string
+  shortlinkProvider: ShortlinkProvider
   commentTemplate: string
   defaultPage: string
   adAccount: string
@@ -240,6 +242,7 @@ const DEFAULT_SETTINGS: DashboardSettings = {
   subId4: '',
   subId5: '',
   shortlinkUrl: 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}',
+  shortlinkProvider: 'api',
   commentTemplate: '🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}',
   defaultPage: DEFAULT_PAGE.id,
   adAccount: 'act_1030797047648459',
@@ -881,6 +884,7 @@ export default function App() {
         subId4: String(p.sub_id4 || current.subId4 || ''),
         subId5: String(p.sub_id5 || current.subId5 || ''),
         shortlinkUrl: String(p.shortlink_url || current.shortlinkUrl || ''),
+        shortlinkProvider: (String(p.shortlink_provider || '').toLowerCase() === 'extension' ? 'extension' : 'api') as ShortlinkProvider,
         commentTemplate: String(p.comment_template || current.commentTemplate || ''),
         defaultPage: String(p.default_page || current.defaultPage || ''),
         adAccount: String(p.ad_account || current.adAccount || ''),
@@ -915,6 +919,7 @@ export default function App() {
           sub_id4: settings.subId4,
           sub_id5: settings.subId5,
           shortlink_url: settings.shortlinkUrl,
+          shortlink_provider: settings.shortlinkProvider,
           comment_template: settings.commentTemplate,
           default_page: settings.defaultPage,
           ad_account: settings.adAccount,
@@ -2164,6 +2169,43 @@ export default function App() {
                           rows={3}
                           className="field-input resize-none"
                         />
+                      </Field>
+                      <Field
+                        label="ย่อลิงก์ผ่าน"
+                        help={
+                          selectedPage.slug === 'feed'
+                            ? 'API = call short.wwoom.com (commission ไป CHEARB account). Extension = ย่อผ่าน tab affiliate.shopee.co.th ของพี่ตรงๆ (commission ไปบัญชี Shopee Affiliate ของพี่เอง — ต้องเปิด tab ค้างไว้)'
+                            : 'เพจนี้ใช้ Electron — เลือก API เท่านั้น. Extension ใช้ได้แค่ฟีด'
+                        }
+                      >
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setSettings((c) => ({ ...c, shortlinkProvider: 'api' }))}
+                            className={`rounded-xl border px-3 py-2.5 text-sm font-semibold transition ${
+                              settings.shortlinkProvider === 'api'
+                                ? 'border-slate-900 bg-slate-900 text-white'
+                                : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+                            }`}
+                          >
+                            <span className="block">API</span>
+                            <span className="block text-[10px] font-normal opacity-70">short.wwoom.com</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSettings((c) => ({ ...c, shortlinkProvider: 'extension' }))}
+                            disabled={selectedPage.slug !== 'feed'}
+                            title={selectedPage.slug !== 'feed' ? 'Extension ใช้ได้แค่ฟีด' : ''}
+                            className={`rounded-xl border px-3 py-2.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                              settings.shortlinkProvider === 'extension'
+                                ? 'border-blue-600 bg-blue-600 text-white'
+                                : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+                            }`}
+                          >
+                            <span className="block">Extension</span>
+                            <span className="block text-[10px] font-normal opacity-70">Shopee Affiliate tab</span>
+                          </button>
+                        </div>
                       </Field>
                       <Field label="เทมเพลตตอบคอมเมนต์" help="ใช้ {shopee_link} เป็น placeholder">
                         <textarea

@@ -53,6 +53,11 @@ async function loadFeedSettings() {
     const r = await fetch(url, { method: 'GET' })
     if (!r.ok) throw new Error(`โหลด settings ของฟีดจาก worker ไม่สำเร็จ (HTTP ${r.status})`)
     const d = await r.json()
+    // shortlink_provider toggles between two strict modes:
+    //   'api'        → only short.wwoom.com (no fallback)
+    //   'extension'  → only affiliate.shopee.co.th tab (no fallback)
+    // Anything unrecognized → 'api' (matches the historical behaviour).
+    const provider = String(d.shortlink_provider || '').trim().toLowerCase() === 'extension' ? 'extension' : 'api'
     return {
         sub_id: String(d.sub_id || ''),
         sub_id2: String(d.sub_id2 || ''),
@@ -60,6 +65,7 @@ async function loadFeedSettings() {
         sub_id4: String(d.sub_id4 || ''),
         sub_id5: String(d.sub_id5 || ''),
         shortlink_url: String(d.shortlink_url || `${SHORTLINK_BASE}/?account=CHEARB&url={url}&sub1={sub_id}`),
+        shortlink_provider: provider,
         ad_account: String(d.ad_account || DEFAULT_AD_ACCOUNT),
         template_adset: String(d.template_adset || DEFAULT_TEMPLATE_ADSET),
     }
@@ -67,20 +73,51 @@ async function loadFeedSettings() {
 
 // ────────────────────── Shopee shortening ──────────────────────
 //
-// Two paths supported:
-//   1. via short.wwoom.com (default — matches existing dashboard /create-ad
-//      flow exactly, sub_ids forwarded into wwoom-tracked s.shopee.co.th URL)
-//   2. via affiliate.shopee.co.th tab (fallback — only if wwoom returns
-//      empty / fails AND a Shopee tab is open)
+// `provider` is set per-page in dashboard /feed Settings → "ย่อลิงก์ผ่าน":
+//   'api'       → call short.wwoom.com (commission to CHEARB account)
+//   'extension' → call affiliate.shopee.co.th GraphQL via the user's logged-in
+//                 Shopee tab (commission to user's own Shopee Affiliate account)
 //
-// We keep wwoom as primary so the extension produces identical short links to
-// the Electron pipeline (same account=CHEARB, same sub_id encoding).
+// Each mode is strict: no silent fallback to the other provider. If wwoom
+// fails in 'api' mode we surface the error so the operator knows wwoom is
+// down rather than getting an unexpected commission split. Same for extension
+// mode if the Shopee tab isn't logged in.
 
-async function shortenShopee({ shopeeUrl, subId, subId2, subId3, subId4, subId5, shortlinkUrlTemplate }) {
+async function shortenShopee({ provider, shopeeUrl, subId, subId2, subId3, subId4, subId5, shortlinkUrlTemplate }) {
     const url = String(shopeeUrl || '').trim()
     if (!url) throw new Error('ไม่มี shopee URL')
+    const mode = provider === 'extension' ? 'extension' : 'api'
 
-    // Path 1: wwoom shortener
+    // ── extension mode: direct GraphQL via Shopee Affiliate tab ──
+    if (mode === 'extension') {
+        const shopeeTab = await findTabByPattern(SHOPEE_TAB_PATTERN)
+        if (!shopeeTab) {
+            throw new Error('โหมด Extension: ต้องเปิด tab https://affiliate.shopee.co.th/ ค้างไว้ + login บัญชี Shopee Affiliate ของพี่')
+        }
+        const advancedLinkParams = {}
+        if (subId) advancedLinkParams.subId1 = String(subId)
+        if (subId2) advancedLinkParams.subId2 = String(subId2)
+        if (subId3) advancedLinkParams.subId3 = String(subId3)
+        if (subId4) advancedLinkParams.subId4 = String(subId4)
+        if (subId5) advancedLinkParams.subId5 = String(subId5)
+        const gqlBody = {
+            operationName: 'batchGetCustomLink',
+            query: 'query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }',
+            variables: { linkParams: [{ originalLink: url, advancedLinkParams }], sourceCaller: 'CUSTOM_LINK_CALLER' },
+        }
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: shopeeTab.id },
+            world: 'MAIN',
+            func: shopeePageXhr,
+            args: ['https://affiliate.shopee.co.th/api/v3/gql?q=batchCustomLink', gqlBody],
+        })
+        const result = results?.[0]?.result
+        if (!result) throw new Error('โหมด Extension: Shopee tab ไม่ตอบกลับ — ลอง refresh tab affiliate.shopee.co.th')
+        if (!result.ok) throw new Error(`โหมด Extension: ${result.error || 'Shopee shortening ไม่สำเร็จ'}`)
+        return { source: 'shopee_tab', shortLink: cleanShortLink(result.shortLink) }
+    }
+
+    // ── api mode (default): short.wwoom.com ──
     const tpl = String(shortlinkUrlTemplate || '').trim()
         || `${SHORTLINK_BASE}/?account=CHEARB&url={url}&sub1={sub_id}&sub2={sub_id2}&sub3={sub_id3}&sub4={sub_id4}&sub5={sub_id5}`
     const built = tpl
@@ -91,42 +128,21 @@ async function shortenShopee({ shopeeUrl, subId, subId2, subId3, subId4, subId5,
         .replace('{sub_id4}', encodeURIComponent(String(subId4 || '')))
         .replace('{sub_id5}', encodeURIComponent(String(subId5 || '')))
 
+    let lastError = ''
     try {
         const r = await fetch(built, { method: 'GET' })
         if (r.ok) {
             const j = await r.json().catch(() => ({}))
             const sl = String(j.shortLink || j.short_link || '').trim()
             if (sl) return { source: 'wwoom', shortLink: cleanShortLink(sl) }
+            lastError = `wwoom ตอบ HTTP 200 แต่ไม่มี shortLink ใน response`
+        } else {
+            lastError = `wwoom ตอบ HTTP ${r.status}`
         }
-    } catch { /* fall through to Shopee tab */ }
-
-    // Path 2: Shopee Affiliate tab (fallback) — direct GraphQL via the user's
-    // logged-in tab. Borrowed from shortlink-v2 reference extension.
-    const shopeeTab = await findTabByPattern(SHOPEE_TAB_PATTERN)
-    if (!shopeeTab) {
-        throw new Error('ย่อลิงก์ wwoom ไม่สำเร็จ และไม่มี tab Shopee Affiliate เปิดอยู่ — เปิด affiliate.shopee.co.th แล้วลองใหม่')
+    } catch (e) {
+        lastError = `เชื่อมต่อ wwoom ไม่ได้: ${e?.message || e}`
     }
-    const advancedLinkParams = {}
-    if (subId) advancedLinkParams.subId1 = String(subId)
-    if (subId2) advancedLinkParams.subId2 = String(subId2)
-    if (subId3) advancedLinkParams.subId3 = String(subId3)
-    if (subId4) advancedLinkParams.subId4 = String(subId4)
-    if (subId5) advancedLinkParams.subId5 = String(subId5)
-    const gqlBody = {
-        operationName: 'batchGetCustomLink',
-        query: 'query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }',
-        variables: { linkParams: [{ originalLink: url, advancedLinkParams }], sourceCaller: 'CUSTOM_LINK_CALLER' },
-    }
-    const results = await chrome.scripting.executeScript({
-        target: { tabId: shopeeTab.id },
-        world: 'MAIN',
-        func: shopeePageXhr,
-        args: ['https://affiliate.shopee.co.th/api/v3/gql?q=batchCustomLink', gqlBody],
-    })
-    const result = results?.[0]?.result
-    if (!result) throw new Error('Shopee tab ไม่ตอบกลับ')
-    if (!result.ok) throw new Error(result.error || 'Shopee shortening ไม่สำเร็จ')
-    return { source: 'shopee_tab', shortLink: cleanShortLink(result.shortLink) }
+    throw new Error(`โหมด API: ${lastError} — สลับเป็น "Extension" ใน Settings ถ้า wwoom พังต่อเนื่อง`)
 }
 
 function cleanShortLink(s) {
@@ -196,6 +212,7 @@ async function runCreateAdPipeline(payload) {
     if (shopeeLink) {
         try {
             const sl = await shortenShopee({
+                provider: settings.shortlink_provider,    // 'api' | 'extension', strict per mode
                 shopeeUrl: shopeeLink,
                 subId: settings.sub_id, subId2: settings.sub_id2, subId3: settings.sub_id3,
                 subId4: settings.sub_id4, subId5: settings.sub_id5,
@@ -203,10 +220,10 @@ async function runCreateAdPipeline(payload) {
             })
             shortLink = sl.shortLink
         } catch (e) {
-            return { ok: false, step: 'shortlink', error: e.message || String(e) }
+            return { ok: false, step: 'shortlink', error: e.message || String(e), provider: settings.shortlink_provider }
         }
     }
-    if (!shortLink) return { ok: false, step: 'shortlink', error: 'ย่อลิงก์ Shopee ไม่สำเร็จ — เช็คว่า shopee URL ถูก + lookup table ของ wwoom มีสินค้านี้' }
+    if (!shortLink) return { ok: false, step: 'shortlink', error: 'ย่อลิงก์ Shopee ไม่สำเร็จ — เช็คว่า shopee URL ถูก + เช็คโหมด API/Extension ใน Settings' }
 
     // 3. Build final caption (matches video-onecard electron format)
     const finalCaption = `📌 พิกัด : ${shortLink}\n${caption}`
