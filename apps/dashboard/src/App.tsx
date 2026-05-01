@@ -564,6 +564,14 @@ export default function App() {
   const [adQueueLoading, setAdQueueLoading] = useState(false)
   const [adQueueIntervalMinutes, setAdQueueIntervalMinutes] = useState(20)
   const [createAdShopeeLink, setCreateAdShopeeLink] = useState('')
+  // Per-ad Sub ID overrides — when blank, the worker/extension falls back to
+  // settings.subId2-5 (the page-level defaults). Lets the operator stamp an
+  // ad with extra utm_content sub-ids (campaign-specific tracking) without
+  // changing the page-wide defaults.
+  const [createAdSubId2, setCreateAdSubId2] = useState('')
+  const [createAdSubId3, setCreateAdSubId3] = useState('')
+  const [createAdSubId4, setCreateAdSubId4] = useState('')
+  const [createAdSubId5, setCreateAdSubId5] = useState('')
   const [createAdCampaigns, setCreateAdCampaigns] = useState<Array<{ id: string; name: string; status: string; adsetCount: number }>>([])
   const [createAdCampaignsError, setCreateAdCampaignsError] = useState<string>('')
   const [feedExtensionStatus, setFeedExtensionStatus] = useState<ExtensionStatus | null>(null)
@@ -617,6 +625,10 @@ export default function App() {
     setCreateAdShopeeLink(shopeeLink)
     setCreateAdSelectedCampaign('')
     setCreateAdNewCampaignName('')
+    setCreateAdSubId2('')
+    setCreateAdSubId3('')
+    setCreateAdSubId4('')
+    setCreateAdSubId5('')
     setCreateAdCampaignsError('')
     setFeedExtensionStatus(null)
     setCreateAdLoading(true)
@@ -727,6 +739,10 @@ export default function App() {
           shopeeUrl: createAdShopeeLink || '',
           campaignId: createAdSelectedCampaign || '',
           newCampaignName: createAdNewCampaignName || '',
+          subId2: createAdSubId2 || '',
+          subId3: createAdSubId3 || '',
+          subId4: createAdSubId4 || '',
+          subId5: createAdSubId5 || '',
         })
         timers.forEach(clearTimeout)
         // Translate extension response into the same shape the existing UI expects.
@@ -765,6 +781,11 @@ export default function App() {
             shopee_url: createAdShopeeLink || '',
             campaign_id: createAdSelectedCampaign || undefined,
             new_campaign_name: createAdNewCampaignName || undefined,
+            // Per-ad Sub ID overrides — empty = worker uses settings defaults.
+            sub_id2: createAdSubId2 || undefined,
+            sub_id3: createAdSubId3 || undefined,
+            sub_id4: createAdSubId4 || undefined,
+            sub_id5: createAdSubId5 || undefined,
           }),
         })
         timers.forEach(clearTimeout)
@@ -1401,6 +1422,58 @@ export default function App() {
               />
               {!createAdShopeeLink && <p className="mt-1 text-xs text-red-500">⚠️ ต้องมี Shopee link ถึงสร้างแอดได้</p>}
             </div>
+
+            {/* Per-ad Sub ID 2-5 overrides — collapsed by default. Sub ID 1
+                stays at the page-level default (settings.subId) since that's
+                the affiliate account identifier; 2-5 are usually used for
+                campaign / placement / variant tracking on a per-ad basis. */}
+            <details className="mt-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+              <summary className="cursor-pointer px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100">
+                Sub IDs 2-5 (เพิ่มเติม) — เว้นว่างคือใช้ค่า default ของเพจ
+              </summary>
+              <div className="grid grid-cols-2 gap-2 border-t border-slate-200 bg-white p-3">
+                <label className="block">
+                  <span className="text-[11px] font-semibold text-slate-500">Sub ID 2</span>
+                  <input
+                    type="text"
+                    value={createAdSubId2}
+                    onChange={(e) => setCreateAdSubId2(e.target.value)}
+                    placeholder={settings.subId2 || '(default ว่าง)'}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs focus:border-blue-500 focus:outline-none"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-[11px] font-semibold text-slate-500">Sub ID 3</span>
+                  <input
+                    type="text"
+                    value={createAdSubId3}
+                    onChange={(e) => setCreateAdSubId3(e.target.value)}
+                    placeholder={settings.subId3 || '(default ว่าง)'}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs focus:border-blue-500 focus:outline-none"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-[11px] font-semibold text-slate-500">Sub ID 4</span>
+                  <input
+                    type="text"
+                    value={createAdSubId4}
+                    onChange={(e) => setCreateAdSubId4(e.target.value)}
+                    placeholder={settings.subId4 || '(default ว่าง)'}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs focus:border-blue-500 focus:outline-none"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-[11px] font-semibold text-slate-500">Sub ID 5</span>
+                  <input
+                    type="text"
+                    value={createAdSubId5}
+                    onChange={(e) => setCreateAdSubId5(e.target.value)}
+                    placeholder={settings.subId5 || '(default ว่าง)'}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-2 py-1.5 text-xs focus:border-blue-500 focus:outline-none"
+                  />
+                </label>
+              </div>
+            </details>
 
             {/* Extension status panel — only ฟีด, only when extension is
                 installed. Mirrors what video-onecard's /token /session /pages

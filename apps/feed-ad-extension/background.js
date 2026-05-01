@@ -471,6 +471,8 @@ async function runCreateAdPipeline(payload) {
         campaignId, newCampaignName,
         adAccount, templateAdset,
         thumbnailUrl,
+        subId2: overrideSub2, subId3: overrideSub3,
+        subId4: overrideSub4, subId5: overrideSub5,
     } = payload || {}
 
     if (!caption) return { ok: false, step: 'validate', error: 'ไม่มี caption' }
@@ -489,11 +491,16 @@ async function runCreateAdPipeline(payload) {
     const shopeeLink = String(shopeeUrl || '').trim()
     if (shopeeLink) {
         try {
+            // Per-ad override (passed in from popup) wins over per-page settings.
+            // Empty override = fall back to settings.sub_id2-5 default.
             const sl = await shortenShopee({
                 provider: settings.shortlink_provider,    // 'api' | 'extension', strict per mode
                 shopeeUrl: shopeeLink,
-                subId: settings.sub_id, subId2: settings.sub_id2, subId3: settings.sub_id3,
-                subId4: settings.sub_id4, subId5: settings.sub_id5,
+                subId: settings.sub_id,
+                subId2: String(overrideSub2 || '').trim() || settings.sub_id2,
+                subId3: String(overrideSub3 || '').trim() || settings.sub_id3,
+                subId4: String(overrideSub4 || '').trim() || settings.sub_id4,
+                subId5: String(overrideSub5 || '').trim() || settings.sub_id5,
                 shortlinkUrlTemplate: settings.shortlink_url,
             })
             shortLink = sl.shortLink

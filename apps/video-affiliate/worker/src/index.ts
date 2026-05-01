@@ -6603,6 +6603,10 @@ app.post('/api/dashboard/create-ad', async (c) => {
         story_id?: string
         campaign_id?: string
         new_campaign_name?: string
+        sub_id2?: string
+        sub_id3?: string
+        sub_id4?: string
+        sub_id5?: string
     }
     const pageId = String(body.page_id || '').trim()
     const videoUrl = String(body.video_url || '').trim()
@@ -6612,6 +6616,11 @@ app.post('/api/dashboard/create-ad', async (c) => {
     const originalStoryId = String(body.story_id || '').trim()
     const campaignId = String(body.campaign_id || '').trim()
     const newCampaignName = String(body.new_campaign_name || '').trim()
+    // Per-ad Sub ID overrides — when blank, fall back to settings defaults below.
+    const overrideSub2 = String(body.sub_id2 || '').trim()
+    const overrideSub3 = String(body.sub_id3 || '').trim()
+    const overrideSub4 = String(body.sub_id4 || '').trim()
+    const overrideSub5 = String(body.sub_id5 || '').trim()
     if (!pageId || (!videoUrl && !videoId)) return c.json({ error: 'page_id and video_url or video_id required' }, 400)
 
     const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
@@ -6685,16 +6694,17 @@ app.post('/api/dashboard/create-ad', async (c) => {
             if (descMatch) shopeeLink = descMatch[0]
         }
 
-        // ALWAYS shorten with current sub_ids from settings (per-page so /chearb
-        // and /feed can have different attribution sub_ids).
-        const subId2Row = await getPageSetting(c.env.DB, pageId, 'sub_id2').catch(() => null)
-        const subId3Row = await getPageSetting(c.env.DB, pageId, 'sub_id3').catch(() => null)
-        const subId4Row = await getPageSetting(c.env.DB, pageId, 'sub_id4').catch(() => null)
-        const subId5Row = await getPageSetting(c.env.DB, pageId, 'sub_id5').catch(() => null)
-        const sub2 = String(subId2Row?.value || '').trim()
-        const sub3 = String(subId3Row?.value || '').trim()
-        const sub4 = String(subId4Row?.value || '').trim()
-        const sub5 = String(subId5Row?.value || '').trim()
+        // ALWAYS shorten with current sub_ids — per-ad override (from popup
+        // input) wins over per-page settings. Empty override = fall back to
+        // settings.subId2-5 (the page-level default).
+        const subId2Row = overrideSub2 ? null : await getPageSetting(c.env.DB, pageId, 'sub_id2').catch(() => null)
+        const subId3Row = overrideSub3 ? null : await getPageSetting(c.env.DB, pageId, 'sub_id3').catch(() => null)
+        const subId4Row = overrideSub4 ? null : await getPageSetting(c.env.DB, pageId, 'sub_id4').catch(() => null)
+        const subId5Row = overrideSub5 ? null : await getPageSetting(c.env.DB, pageId, 'sub_id5').catch(() => null)
+        const sub2 = overrideSub2 || String(subId2Row?.value || '').trim()
+        const sub3 = overrideSub3 || String(subId3Row?.value || '').trim()
+        const sub4 = overrideSub4 || String(subId4Row?.value || '').trim()
+        const sub5 = overrideSub5 || String(subId5Row?.value || '').trim()
 
         let shortLink = ''
         if (shopeeLink) {
