@@ -179,9 +179,17 @@ const statusClass = {
   creating: 'bg-sky-50 text-sky-700',
 } as const
 
-const CHIEB_PAGE_ID = '1008898512617594'
-const CHIEB_PAGE_NAME = 'เฉียบ'
+// Both pages share namespace 1774858894802785816 (gallery + create-ad backend
+// query by namespace, so switching pages doesn't change the video pool — only
+// where ads/sync target on Facebook).
 const CHIEB_NAMESPACE_ID = '1774858894802785816'
+const PAGES = [
+    { id: '1008898512617594', name: 'เฉียบ' },
+    { id: '116759241338040', name: 'ฟีด' },
+] as const
+type PageOption = typeof PAGES[number]
+const DEFAULT_PAGE_ID: string = PAGES[0].id
+const PAGE_ID_STORAGE_KEY = 'dashboard.selectedPageId'
 const GALLERY_MIN_VIEWS = 100000
 const GALLERY_READ_LIMIT = 300
 const SYSTEM_GALLERY_BATCH_SIZE = 30
@@ -222,7 +230,7 @@ const DEFAULT_SETTINGS: DashboardSettings = {
   subId5: '',
   shortlinkUrl: 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}',
   commentTemplate: '🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}',
-  defaultPage: '1008898512617594',
+  defaultPage: DEFAULT_PAGE_ID,
   adAccount: 'act_1030797047648459',
   templateAdset: '120244070706570263',
   campaignPrefix: 'ADS_PUBLISH_',
@@ -324,6 +332,21 @@ function getInitialTab(): DashboardTab {
 
 export default function App() {
   const [tab, setTab] = useState<DashboardTab>(() => getInitialTab())
+  // Selected FB page — switches between เฉียบ + ฟีด. Persisted in localStorage so
+  // refresh/reload keeps the same view. Both pages share the same namespace, so
+  // gallery videos pool is identical — only the FB target (sync source, ad post,
+  // comment) changes when switching.
+  const [selectedPageId, setSelectedPageId] = useState<string>(() => {
+    try {
+      const saved = typeof window !== 'undefined' ? window.localStorage.getItem(PAGE_ID_STORAGE_KEY) : null
+      if (saved && PAGES.some(p => p.id === saved)) return saved
+    } catch { /* localStorage may be unavailable (SSR / privacy mode) */ }
+    return DEFAULT_PAGE_ID
+  })
+  const selectedPage: PageOption = PAGES.find(p => p.id === selectedPageId) ?? PAGES[0]
+  useEffect(() => {
+    try { window.localStorage.setItem(PAGE_ID_STORAGE_KEY, selectedPageId) } catch { /* ignore */ }
+  }, [selectedPageId])
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   // videoUrl is set when the popup is opened for an UNPOSTED gallery video
   // (no FB video_id yet). The submit handler routes between two paths:
@@ -431,7 +454,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          page_id: CHIEB_PAGE_ID,
+          page_id: selectedPage.id,
           ...(createAdPopup.videoUrl
             ? { video_url: createAdPopup.videoUrl }
             : { video_id: createAdPopup.videoId }),
@@ -514,7 +537,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          page_id: CHIEB_PAGE_ID,
+          page_id: selectedPage.id,
           ...(createAdPopup.videoUrl
             ? { video_url: createAdPopup.videoUrl }
             : { video_id: createAdPopup.videoId }),
@@ -729,8 +752,8 @@ export default function App() {
     setGalleryError(null)
     try {
       const search = new URLSearchParams({
-        page_id: CHIEB_PAGE_ID,
-        page_name: CHIEB_PAGE_NAME,
+        page_id: selectedPage.id,
+        page_name: selectedPage.name,
         min_views: String(GALLERY_MIN_VIEWS),
         limit: String(GALLERY_READ_LIMIT),
       })
@@ -773,8 +796,8 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          page_id: CHIEB_PAGE_ID,
-          page_name: CHIEB_PAGE_NAME,
+          page_id: selectedPage.id,
+          page_name: selectedPage.name,
           force: true,
         }),
       })
@@ -805,7 +828,7 @@ export default function App() {
       const resp = await fetch(`/worker-api/api/dashboard/facebook-page-videos/refresh-all-views`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page_id: CHIEB_PAGE_ID }),
+        body: JSON.stringify({ page_id: selectedPage.id }),
       })
       const data = await resp.json().catch(() => ({})) as {
         ok?: boolean
@@ -835,8 +858,15 @@ export default function App() {
   }
 
   useEffect(() => {
+    // Reload page-posts cache whenever the page changes (or first mount). Clear
+    // any existing items + sync state first so the UI doesn't show เฉียบ posts
+    // for a moment while ฟีด is fetching.
+    setGalleryLinkedItems([])
+    setGallerySyncState(null)
+    setGalleryBootstrapped(false)
     void loadGalleryFromWorker(true)
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPageId])
 
   // Auto-load queue when user opens the queue tab + auto-refresh every 30s while there
   useEffect(() => {
@@ -846,7 +876,8 @@ export default function App() {
     return () => clearInterval(id)
   }, [tab])
 
-  // Auto-sync: keep syncing until fully scanned
+  // Auto-sync: keep syncing until fully scanned. Re-bootstraps when the user
+  // switches FB page (via galleryBootstrapped reset above).
   useEffect(() => {
     if (tab !== 'page-posts' || galleryLoading || gallerySyncing) return
     if (!galleryBootstrapped) {
@@ -1140,19 +1171,28 @@ export default function App() {
       <div className="flex h-full min-h-0 flex-col lg:flex-row">
         <aside className="w-full shrink-0 border-b border-slate-200 bg-white lg:h-screen lg:w-72 lg:border-b-0 lg:border-r">
           <div className="flex h-full flex-col overflow-hidden p-3">
-            <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
+            {/* Page picker — switch between เฉียบ + ฟีด. Single namespace, so
+                video pool stays the same; only FB target changes (sync source,
+                ad post, comment). selectedPageId is persisted to localStorage. */}
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
               <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#1877f2] text-white">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#1877f2] text-white">
                   <Megaphone size={18} />
                 </div>
-                <div>
-                  <p className="text-sm font-semibold">Ads Manager</p>
-                  <p className="text-xs text-slate-500">LIKE_PAGE dashboard</p>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Ads Manager</p>
+                  <select
+                    value={selectedPageId}
+                    onChange={(e) => setSelectedPageId(e.target.value)}
+                    className="-ml-0.5 mt-0.5 w-full cursor-pointer truncate bg-transparent pr-2 text-sm font-semibold text-slate-900 outline-none focus:outline-none"
+                    title="เลือกเพจ"
+                  >
+                    {PAGES.map(p => (
+                      <option key={p.id} value={p.id}>เพจ {p.name}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
-              <button className="rounded-xl border border-slate-200 bg-white p-2 text-slate-500">
-                <Search size={16} />
-              </button>
             </div>
 
             <nav className="mt-4 space-y-1.5">
@@ -1210,7 +1250,7 @@ export default function App() {
                       <p className="text-sm font-semibold">
                         {tab === 'dashboard' && 'Campaigns'}
                         {tab === 'gallery' && 'แกลลี่วิดีโอในระบบ'}
-                        {tab === 'page-posts' && 'โพสต์เพจเฉียบ'}
+                        {tab === 'page-posts' && `โพสต์เพจ${selectedPage.name}`}
                         {tab === 'create' && 'Create Ads'}
                         {tab === 'running' && 'Campaigns'}
                         {tab === 'queue' && 'คิวสร้างแอด'}
@@ -1602,7 +1642,7 @@ export default function App() {
                             <img src={item.facebookThumb} alt={item.storyId} className="h-full w-full object-cover" />
                             <div className="absolute inset-x-0 top-0 flex items-start justify-between p-3">
                               <span className="rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-white backdrop-blur">
-                                {CHIEB_PAGE_NAME}
+                                {selectedPage.name}
                               </span>
                               <span className="rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-white backdrop-blur">
                                 {formatCompactViews(item.views)} views

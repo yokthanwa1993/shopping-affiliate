@@ -3314,20 +3314,28 @@ const DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN = 'facebook_sync_token'
 //      dashboard just because the operator hasn't pasted a dedicated sync token)
 // Returning '' tells the caller "still no token, surface the missing-token error".
 async function resolveFacebookSyncToken(db: D1Database, pageId: string): Promise<string> {
-    const settingEntry = await getDashboardSetting(db, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN).catch(() => null)
-    const settingValue = String(settingEntry?.value || '').trim()
-    if (settingValue) return settingValue
-
+    // Resolution order: per-page token → dashboard_settings fallback.
+    //
+    // History note (2026-05-01): Originally dashboard_settings was queried FIRST
+    // so dashboard sync would always use a single global token. That broke when
+    // we added support for multiple FB pages (เฉียบ + ฟีด): page tokens are
+    // page-scoped, so reusing เฉียบ's token to sync ฟีด returns FB code 100.
+    // Switched the order so each page gets its own valid token, while
+    // dashboard_settings remains as a manual override (e.g. paste a User Access
+    // Token that has access to multiple pages).
     const normalizedPageId = String(pageId || '').trim()
-    if (!normalizedPageId) return ''
-    try {
-        const row = await db.prepare(
-            'SELECT access_token FROM pages WHERE id = ? AND access_token IS NOT NULL AND access_token != "" LIMIT 1'
-        ).bind(normalizedPageId).first() as { access_token?: string | null } | null
-        return String(row?.access_token || '').trim()
-    } catch {
-        return ''
+    if (normalizedPageId) {
+        try {
+            const row = await db.prepare(
+                'SELECT access_token FROM pages WHERE id = ? AND access_token IS NOT NULL AND access_token != "" LIMIT 1'
+            ).bind(normalizedPageId).first() as { access_token?: string | null } | null
+            const pageToken = String(row?.access_token || '').trim()
+            if (pageToken) return pageToken
+        } catch { /* fall through to dashboard_settings */ }
     }
+
+    const settingEntry = await getDashboardSetting(db, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN).catch(() => null)
+    return String(settingEntry?.value || '').trim()
 }
 
 async function ensureFacebookPageVideoCacheTables(db: D1Database): Promise<void> {
@@ -6543,21 +6551,28 @@ app.post('/api/dashboard/create-ad', async (c) => {
     try {
         // 1. Get settings + shortlink FIRST (need shortlink for caption)
         const settingsRow = await getDashboardSetting(c.env.DB, 'shortlink_url').catch(() => null)
-        const commentRow = await getDashboardSetting(c.env.DB, 'comment_template').catch(() => null)
         const subIdRow = await getDashboardSetting(c.env.DB, 'sub_id').catch(() => null)
         const shortlinkUrlTemplate = String(settingsRow?.value || 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}').trim()
-        const commentTemplate = String(commentRow?.value || '🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}').trim()
         const subId = String(subIdRow?.value || 'yok').trim()
 
         // 2. Find shopee link: first from facebook_page_video_cache, then post_history fallback
         let shopeeLink = shopeeUrl
+        let thumbnailUrl = ''
+
+        // Direct lookup from cache table. Keep the cached `picture` too: for already
+        // posted page videos it is a valid FB thumbnail URL, and lets video-onecard
+        // avoid calling `/{video_id}?fields=thumbnails` during temporary FB blocks.
+        let cacheRow: { shopee_link?: string; post_id?: string; picture?: string } | null = null
+        if (videoId) {
+            cacheRow = await c.env.DB.prepare(
+                `SELECT shopee_link, post_id, picture FROM facebook_page_video_cache WHERE page_id = ? AND video_id = ? LIMIT 1`
+            ).bind(pageId, videoId).first().catch(() => null) as { shopee_link?: string; post_id?: string; picture?: string } | null
+            if (cacheRow?.picture && /^https?:\/\//i.test(cacheRow.picture)) thumbnailUrl = cacheRow.picture
+            if (cacheRow?.shopee_link) shopeeLink = cacheRow.shopee_link
+        }
 
         // Direct lookup from cache table
         if (!shopeeLink && videoId) {
-            const cacheRow = await c.env.DB.prepare(
-                `SELECT shopee_link, post_id FROM facebook_page_video_cache WHERE page_id = ? AND video_id = ? AND shopee_link != '' LIMIT 1`
-            ).bind(pageId, videoId).first().catch(() => null) as { shopee_link?: string; post_id?: string } | null
-            if (cacheRow?.shopee_link) shopeeLink = cacheRow.shopee_link
             // Also try via post_id → post_history → namespace_video_state for ORIGINAL link
             if (!shopeeLink && cacheRow?.post_id) {
                 const nvs = await c.env.DB.prepare(
@@ -6672,13 +6687,27 @@ app.post('/api/dashboard/create-ad', async (c) => {
                 caption: finalCaption,
                 shortlink: cleanShortLink,
                 shopee_url: shopeeLink,
+                ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
                 ...(templateAdsetFromSettings ? { template_adset: templateAdsetFromSettings } : {}),
                 ...(adAccountFromSettings ? { ad_account: adAccountFromSettings } : {}),
                 ...(campaignId ? { campaign_id: campaignId } : {}),
                 ...(newCampaignName ? { new_campaign_name: newCampaignName } : {}),
             }),
         })
-        const data = await resp.json().catch(() => ({ ok: false, error: 'invalid_response' })) as Record<string, unknown>
+        const upstreamText = await resp.text()
+        let data: Record<string, unknown>
+        try {
+            data = upstreamText ? JSON.parse(upstreamText) as Record<string, unknown> : { ok: false, error: 'empty_response' }
+        } catch {
+            data = {
+                ok: false,
+                error: 'invalid_response',
+                step: 'video_onecard_response',
+                upstream_status: resp.status,
+                upstream_content_type: resp.headers.get('content-type') || '',
+                upstream_preview: upstreamText.substring(0, 300),
+            }
+        }
         if (!data.ok || !data.story_id) {
             return c.json(data, resp.ok ? 200 : 502)
         }
@@ -6693,7 +6722,6 @@ app.post('/api/dashboard/create-ad', async (c) => {
         // page_id as the only routing input.
         let commentId = ''
         if (cleanShortLink) {
-            const commentText = commentTemplate.replace('{shopee_link}', cleanShortLink)
             const storyId = String(data.story_id || '').trim()
             try {
                 let commentToken = ''
@@ -6702,6 +6730,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     'SELECT bot_id FROM pages WHERE id = ? LIMIT 1'
                 ).bind(pageId).first().catch(() => null) as { bot_id?: string } | null
                 const pageNamespaceId = String(pageRow?.bot_id || '').trim()
+                const commentText = await buildAffiliateCommentMessage(c.env.DB, pageNamespaceId, cleanShortLink)
                 if (pageNamespaceId) {
                     commentToken = await resolveNamespaceDedicatedCommentToken(c.env.DB, pageNamespaceId).catch(() => '')
                     if (commentToken) {
@@ -6717,7 +6746,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     commentToken = pageEntry?.access_token || ''
                 }
 
-                if (commentToken && storyId) {
+                if (commentToken && storyId && commentText) {
                     // Comment via onecard /graph proxy with the resolved comment token
                     const commentResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(storyId)}/comments`, {
                         method: 'POST',
@@ -25921,7 +25950,20 @@ app.put('/api/pages/:id', async (c) => {
     const id = c.req.param('id')
     try {
         const body = await c.req.json()
-        const { post_interval_minutes, post_hours, is_active, access_token, comment_token, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled } = body
+        const {
+            post_interval_minutes,
+            post_hours,
+            is_active,
+            access_token,
+            comment_token,
+            onecard_enabled,
+            onecard_link_mode,
+            onecard_cta,
+            ads_publish_enabled,
+            base_post_hours,
+            base_post_interval_minutes,
+            base_is_active,
+        } = body
         // DIAGNOSTIC: log every save attempt so we can trace stale-state overwrites.
         // The big 2026-05-01 incident was a webapp tab with cached `every:30` re-saving
         // over a server-cleared post_hours='' — visible only by knowing PUT was hit and
@@ -25937,10 +25979,59 @@ app.put('/api/pages/:id', async (c) => {
 
         await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
-            'SELECT id, access_token FROM pages WHERE id = ? AND bot_id = ?'
-        ).bind(id, c.get('botId')).first() as { id: string; access_token?: string | null } | null
+            'SELECT id, access_token, post_hours, post_interval_minutes, is_active FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(id, c.get('botId')).first() as {
+            id: string
+            access_token?: string | null
+            post_hours?: string | null
+            post_interval_minutes?: number | null
+            is_active?: number | null
+        } | null
         if (!page) return c.json({ error: 'Page not found' }, 404)
         let effectivePostToken = String(page.access_token || '').trim()
+        const touchesSchedule = post_hours !== undefined || post_interval_minutes !== undefined || is_active !== undefined
+        if (touchesSchedule) {
+            const hasScheduleBase = base_post_hours !== undefined
+                && base_post_interval_minutes !== undefined
+                && base_is_active !== undefined
+            if (!hasScheduleBase) {
+                return c.json({
+                    error: 'schedule_version_required',
+                    details: 'กรุณารีเฟรชหน้าเพจนี้ก่อนบันทึก เพื่อกันค่า schedule เก่าทับค่าล่าสุด',
+                }, 409)
+            }
+
+            const currentSchedule = {
+                post_hours: String(page.post_hours || '').trim(),
+                post_interval_minutes: page.post_interval_minutes === null || page.post_interval_minutes === undefined
+                    ? null
+                    : Number(page.post_interval_minutes),
+                is_active: Number(page.is_active || 0) ? 1 : 0,
+            }
+            const clientBaseSchedule = {
+                post_hours: String(base_post_hours || '').trim(),
+                post_interval_minutes: base_post_interval_minutes === null || base_post_interval_minutes === undefined || base_post_interval_minutes === ''
+                    ? null
+                    : Number(base_post_interval_minutes),
+                is_active: Number(base_is_active || 0) ? 1 : 0,
+            }
+            const scheduleMatches = currentSchedule.post_hours === clientBaseSchedule.post_hours
+                && currentSchedule.post_interval_minutes === clientBaseSchedule.post_interval_minutes
+                && currentSchedule.is_active === clientBaseSchedule.is_active
+            if (!scheduleMatches) {
+                console.warn(
+                    `[PAGES-PUT] stale schedule rejected page=${id} ns=${c.get('botId')} base=${JSON.stringify(clientBaseSchedule)} current=${JSON.stringify(currentSchedule)}`
+                )
+                return c.json({
+                    error: 'stale_schedule_state',
+                    details: 'ค่า schedule บนเซิร์ฟเวอร์เปลี่ยนไปแล้ว กรุณารีเฟรชก่อนบันทึก',
+                    page: {
+                        id,
+                        ...currentSchedule,
+                    },
+                }, 409)
+            }
+        }
 
         // Normalize schedule payload:
         // - Slot mode: "2:10,9:35,16:42"
