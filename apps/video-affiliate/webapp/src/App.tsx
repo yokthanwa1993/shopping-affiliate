@@ -2577,6 +2577,39 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
 
+  useEffect(() => {
+    setHourMinutes(parsePostHours(page.post_hours || ''))
+    setScheduleMode(detectScheduleMode(page.post_hours))
+    setIntervalMinutes(parseInterval(page.post_hours, page.post_interval_minutes || 60))
+    setIsActive(page.is_active === 1)
+    setOneCardEnabled(page.onecard_enabled === 1)
+    setAdsPublishEnabled(page.ads_publish_enabled === 1)
+    setOneCardLinkMode(() => {
+      const value = String(page.onecard_link_mode || '').trim().toLowerCase()
+      if (value === 'lazada') return 'lazada'
+      if (value === 'none') return 'none'
+      return 'shopee'
+    })
+    setOneCardCta(() => {
+      const value = String(page.onecard_cta || '').trim().toUpperCase()
+      if (value === 'NO_BUTTON') return 'NO_BUTTON'
+      return 'SHOP_NOW'
+    })
+    setAccessToken(page.access_token || '')
+    setEditingToken(null)
+    setEditingTokenValue('')
+  }, [
+    page.id,
+    page.post_hours,
+    page.post_interval_minutes,
+    page.is_active,
+    page.onecard_enabled,
+    page.ads_publish_enabled,
+    page.onecard_link_mode,
+    page.onecard_cta,
+    page.access_token,
+  ])
+
   // Hours 00-23 for display
   const hourOptions = Array.from({ length: 24 }, (_, i) => i)
 
@@ -2611,6 +2644,9 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         post_hours: schedulePostHours,
         post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
         is_active: isActive,
+        base_post_hours: page.post_hours || '',
+        base_post_interval_minutes: page.post_interval_minutes ?? null,
+        base_is_active: page.is_active === 1 ? 1 : 0,
         onecard_enabled: oneCardEnabled,
         ads_publish_enabled: adsPublishEnabled,
         onecard_link_mode: oneCardLinkMode,
@@ -3850,7 +3886,7 @@ function App({
     }
     const matchedPage = pages.find((page) => page.id === selectedPageHistoryId) || null
     if (!matchedPage) return
-    setSelectedPage((prev) => (prev?.id === matchedPage.id ? prev : matchedPage))
+    setSelectedPage(matchedPage)
   }, [pages, selectedPageHistoryId])
 
   const tg = isBrowser ? window.Telegram?.WebApp : undefined
@@ -5286,7 +5322,7 @@ function App({
     const shouldShowSkeleton = pages.length === 0
     if (shouldShowSkeleton) setPagesLoading(true)
     try {
-      const resp = await apiFetch(`${WORKER_URL}/api/pages`)
+      const resp = await apiFetch(`${WORKER_URL}/api/pages?_ts=${Date.now()}`, { cache: 'no-store' })
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
@@ -7068,46 +7104,25 @@ function App({
                   )}
                 </div>
                 {isSystemAdmin && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={handleBulkResetPostedForCurrentNamespace}
-                      disabled={bulkResetPostedLoading}
-                      title="ย้ายคลิปที่โพสต์แล้วทั้งหมดของ namespace นี้กลับไป 'ยังไม่โพสต์'"
-                      aria-label="ย้ายคลิปที่โพสต์แล้วทั้งหมดกลับไปยังไม่โพสต์"
-                      className="shrink-0 rounded-2xl border border-orange-200 bg-orange-50 hover:bg-orange-100 active:scale-95 px-3 py-3 text-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {bulkResetPostedLoading ? (
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
-                          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                        </svg>
-                      ) : (
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
-                          <path d="M3 3v5h5" />
-                        </svg>
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleBulkMarkPostedForCurrentNamespace}
-                      disabled={bulkResetPostedLoading}
-                      title="ทำเครื่องหมายคลิปที่ยังไม่โพสต์ทั้งหมดของ namespace นี้เป็น 'โพสต์แล้ว' (ไม่ได้โพสต์จริง)"
-                      aria-label="ทำเครื่องหมายคลิปที่ยังไม่โพสต์ทั้งหมดเป็นโพสต์แล้ว"
-                      className="shrink-0 rounded-2xl border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 active:scale-95 px-3 py-3 text-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {bulkResetPostedLoading ? (
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
-                          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                        </svg>
-                      ) : (
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M20 6L9 17l-5-5" />
-                          <path d="M9 17l-5-5" />
-                        </svg>
-                      )}
-                    </button>
-                  </>
+                  <button
+                    type="button"
+                    onClick={handleBulkResetPostedForCurrentNamespace}
+                    disabled={bulkResetPostedLoading}
+                    title="ย้ายคลิปที่โพสต์แล้วทั้งหมดของ namespace นี้กลับไป 'ยังไม่โพสต์'"
+                    aria-label="ย้ายคลิปที่โพสต์แล้วทั้งหมดกลับไปยังไม่โพสต์"
+                    className="shrink-0 rounded-2xl border border-orange-200 bg-orange-50 hover:bg-orange-100 active:scale-95 px-3 py-3 text-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {bulkResetPostedLoading ? (
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="animate-spin">
+                        <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                      </svg>
+                    ) : (
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+                        <path d="M3 3v5h5" />
+                      </svg>
+                    )}
+                  </button>
                 )}
               </div>
             </div>
