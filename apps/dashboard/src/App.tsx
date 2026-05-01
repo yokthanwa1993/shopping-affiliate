@@ -182,14 +182,25 @@ const statusClass = {
 // Both pages share namespace 1774858894802785816 (gallery + create-ad backend
 // query by namespace, so switching pages doesn't change the video pool — only
 // where ads/sync target on Facebook).
+//
+// Workspace separation is URL-driven:
+//   /chearb/...  → เฉียบ (default redirect target if no slug)
+//   /feed/...    → ฟีด
+// Each URL is its own workspace with isolated settings, page-posts cache, etc.
+// No client-side picker — switching is just navigating to the other URL.
+//
+// iconUrl points at static files committed under apps/dashboard/public/page-icons/
+// (downloaded once from FB Graph picture API). They get bundled into dist/ at
+// build time so the browser never re-fetches FB CDN — fast + no token needed.
 const CHIEB_NAMESPACE_ID = '1774858894802785816'
 const PAGES = [
-    { id: '1008898512617594', name: 'เฉียบ' },
-    { id: '116759241338040', name: 'ฟีด' },
+    { id: '1008898512617594', name: 'เฉียบ', slug: 'chearb', iconUrl: '/page-icons/chieb.jpg' },
+    { id: '116759241338040', name: 'ฟีด', slug: 'feed', iconUrl: '/page-icons/feed.jpg' },
 ] as const
 type PageOption = typeof PAGES[number]
-const DEFAULT_PAGE_ID: string = PAGES[0].id
-const PAGE_ID_STORAGE_KEY = 'dashboard.selectedPageId'
+const DEFAULT_PAGE: PageOption = PAGES[0]
+const PAGE_BY_SLUG: Record<string, PageOption> = Object.fromEntries(PAGES.map(p => [p.slug, p]))
+const PAGE_BY_ID: Record<string, PageOption> = Object.fromEntries(PAGES.map(p => [p.id, p]))
 const GALLERY_MIN_VIEWS = 100000
 const GALLERY_READ_LIMIT = 300
 const SYSTEM_GALLERY_BATCH_SIZE = 30
@@ -230,7 +241,7 @@ const DEFAULT_SETTINGS: DashboardSettings = {
   subId5: '',
   shortlinkUrl: 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}',
   commentTemplate: '🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}',
-  defaultPage: DEFAULT_PAGE_ID,
+  defaultPage: DEFAULT_PAGE.id,
   adAccount: 'act_1030797047648459',
   templateAdset: '120244070706570263',
   campaignPrefix: 'ADS_PUBLISH_',
@@ -278,10 +289,6 @@ function isDashboardTab(value: string | null): value is DashboardTab {
   return value !== null && DASHBOARD_TABS.includes(value as DashboardTab)
 }
 
-function getTabPath(tab: DashboardTab) {
-  return tab === 'dashboard' ? '/' : `/${tab}`
-}
-
 function formatVideoDuration(seconds: number | undefined) {
   const s = Number(seconds || 0)
   if (!Number.isFinite(s) || s <= 0) return ''
@@ -322,31 +329,71 @@ function buildVideoPlaybackUrl(videoId: string, namespaceId: string): string {
   return `/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/public?namespace_id=${encodeURIComponent(namespaceId)}`
 }
 
-function getInitialTab(): DashboardTab {
-  const pathTab = window.location.pathname.replace(/^\/+|\/+$/g, '')
-  if (isDashboardTab(pathTab)) return pathTab
-  const params = new URLSearchParams(window.location.search)
-  const tab = params.get('tab')
-  return isDashboardTab(tab) ? tab : 'dashboard'
+// Parse `/<slug>/<tab>` (or `/<slug>` or `/<tab>` legacy) into routing state.
+// If no slug present and no legacy tab match, defaults to (chearb, dashboard).
+function parseUrlState(): { page: PageOption; tab: DashboardTab } {
+  if (typeof window === 'undefined') return { page: DEFAULT_PAGE, tab: 'dashboard' }
+  const segments = window.location.pathname.split('/').filter(Boolean)
+  const first = segments[0] || ''
+  const slugMatch = PAGE_BY_SLUG[first]
+  if (slugMatch) {
+    const tabCandidate = segments[1] || ''
+    const tab = isDashboardTab(tabCandidate) ? tabCandidate : 'dashboard'
+    return { page: slugMatch, tab }
+  }
+  // Legacy: bare /gallery, /queue etc. — keep the old behaviour but with default page.
+  if (isDashboardTab(first)) return { page: DEFAULT_PAGE, tab: first }
+  const tabParam = new URLSearchParams(window.location.search).get('tab')
+  if (isDashboardTab(tabParam)) return { page: DEFAULT_PAGE, tab: tabParam }
+  return { page: DEFAULT_PAGE, tab: 'dashboard' }
+}
+
+function buildPageUrl(page: PageOption, tab: DashboardTab): string {
+  // dashboard tab is the default → just /<slug>; other tabs get the suffix.
+  return tab === 'dashboard' ? `/${page.slug}` : `/${page.slug}/${tab}`
 }
 
 export default function App() {
-  const [tab, setTab] = useState<DashboardTab>(() => getInitialTab())
-  // Selected FB page — switches between เฉียบ + ฟีด. Persisted in localStorage so
-  // refresh/reload keeps the same view. Both pages share the same namespace, so
-  // gallery videos pool is identical — only the FB target (sync source, ad post,
-  // comment) changes when switching.
-  const [selectedPageId, setSelectedPageId] = useState<string>(() => {
-    try {
-      const saved = typeof window !== 'undefined' ? window.localStorage.getItem(PAGE_ID_STORAGE_KEY) : null
-      if (saved && PAGES.some(p => p.id === saved)) return saved
-    } catch { /* localStorage may be unavailable (SSR / privacy mode) */ }
-    return DEFAULT_PAGE_ID
-  })
-  const selectedPage: PageOption = PAGES.find(p => p.id === selectedPageId) ?? PAGES[0]
+  const initialUrl = useMemo(parseUrlState, [])
+  const [tab, setTab] = useState<DashboardTab>(initialUrl.tab)
+  // Selected FB page is fully URL-driven: /chearb vs /feed. Each URL is its own
+  // workspace with isolated settings, page-posts cache, etc. No localStorage,
+  // no UI picker — to switch, the user navigates to the other URL.
+  const [selectedPageId, setSelectedPageId] = useState<string>(initialUrl.page.id)
+  const selectedPage: PageOption = PAGE_BY_ID[selectedPageId] ?? DEFAULT_PAGE
+  // On initial mount: if the URL was missing a slug (e.g. plain `/` or
+  // `/gallery`), normalize it to the canonical /<slug>/<tab> form so refresh +
+  // share-link both stay consistent. Use replaceState so it doesn't add to history.
   useEffect(() => {
-    try { window.localStorage.setItem(PAGE_ID_STORAGE_KEY, selectedPageId) } catch { /* ignore */ }
-  }, [selectedPageId])
+    if (typeof window === 'undefined') return
+    const canonical = buildPageUrl(selectedPage, tab)
+    if (window.location.pathname !== canonical) {
+      window.history.replaceState({}, '', canonical)
+    }
+    // We only want to canonicalize once at mount; pushPageTab handles subsequent
+    // navigations explicitly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  // Whenever the user clicks a tab in the nav we push the new URL so back/forward
+  // and refresh both work. selectedPage doesn't change here — only tab.
+  function pushPageTab(nextTab: DashboardTab) {
+    if (typeof window === 'undefined') { setTab(nextTab); return }
+    const url = buildPageUrl(selectedPage, nextTab)
+    if (window.location.pathname !== url) {
+      window.history.pushState({}, '', url)
+    }
+    setTab(nextTab)
+  }
+  // Listen for browser back/forward so the UI follows the URL.
+  useEffect(() => {
+    function handlePop() {
+      const { page, tab: t } = parseUrlState()
+      setSelectedPageId(page.id)
+      setTab(t)
+    }
+    window.addEventListener('popstate', handlePop)
+    return () => window.removeEventListener('popstate', handlePop)
+  }, [])
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   // videoUrl is set when the popup is opened for an UNPOSTED gallery video
   // (no FB video_id yet). The submit handler routes between two paths:
@@ -661,32 +708,22 @@ export default function App() {
     if (tab === 'running') void loadCampaigns()
   }, [tab])
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    params.delete('tab')
-    const search = params.toString()
-    const next = `${getTabPath(tab)}${search ? `?${search}` : ''}`
-    window.history.replaceState({}, '', next)
-  }, [tab])
+  // (URL syncing happens in pushPageTab + popstate listener defined above —
+  // legacy `getTabPath(tab)` URL writer was removed because it stripped the
+  // page slug from /chearb/<tab> and /feed/<tab>.)
 
   useEffect(() => {
-    const handlePopState = () => {
-      setTab(getInitialTab())
-    }
-
-    window.addEventListener('popstate', handlePopState)
-    return () => window.removeEventListener('popstate', handlePopState)
-  }, [])
-
-  useEffect(() => {
+    // Reload settings when the workspace (selectedPageId) changes — /chearb and
+    // /feed are stored as separate page-scoped keys server-side.
     void loadDashboardSettings()
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPageId])
 
   async function loadDashboardSettings() {
     setSettingsLoading(true)
     setSettingsMessage(null)
     try {
-      const response = await fetch('/worker-api/api/dashboard/settings')
+      const response = await fetch(`/worker-api/api/dashboard/settings?page_id=${encodeURIComponent(selectedPage.id)}`)
       if (!response.ok) throw new Error(`โหลด settings ไม่สำเร็จ (${response.status})`)
       const p = await response.json() as Record<string, string>
       setSettings((current) => ({
@@ -718,10 +755,13 @@ export default function App() {
     setSettingsSaving(true)
     setSettingsMessage(null)
     try {
-      const response = await fetch('/worker-api/api/dashboard/settings', {
+      // page_id is sent both as query (so server can early-route) AND in body
+      // (so legacy POST-only middleware-stripped query params still resolve).
+      const response = await fetch(`/worker-api/api/dashboard/settings?page_id=${encodeURIComponent(selectedPage.id)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          page_id: selectedPage.id,
           sub_id: settings.subId,
           sub_id2: settings.subId2,
           sub_id3: settings.subId3,
@@ -1171,28 +1211,36 @@ export default function App() {
       <div className="flex h-full min-h-0 flex-col lg:flex-row">
         <aside className="w-full shrink-0 border-b border-slate-200 bg-white lg:h-screen lg:w-72 lg:border-b-0 lg:border-r">
           <div className="flex h-full flex-col overflow-hidden p-3">
-            {/* Page picker — switch between เฉียบ + ฟีด. Single namespace, so
-                video pool stays the same; only FB target changes (sync source,
-                ad post, comment). selectedPageId is persisted to localStorage. */}
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
-              <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#1877f2] text-white">
-                  <Megaphone size={18} />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Ads Manager</p>
-                  <select
-                    value={selectedPageId}
-                    onChange={(e) => setSelectedPageId(e.target.value)}
-                    className="-ml-0.5 mt-0.5 w-full cursor-pointer truncate bg-transparent pr-2 text-sm font-semibold text-slate-900 outline-none focus:outline-none"
-                    title="เลือกเพจ"
-                  >
-                    {PAGES.map(p => (
-                      <option key={p.id} value={p.id}>เพจ {p.name}</option>
-                    ))}
-                  </select>
-                </div>
+            {/* Workspace identifier — pure display, no picker. Switching pages
+                is done by visiting the other URL (/chearb ↔ /feed). The other
+                page is shown as a sibling link below so the operator can hop
+                across without typing. iconUrl is a static asset bundled at
+                build time (no FB CDN refetch). */}
+            <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
+              <img
+                src={selectedPage.iconUrl}
+                alt={selectedPage.name}
+                className="h-10 w-10 shrink-0 rounded-xl object-cover ring-1 ring-slate-200"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Ads Manager</p>
+                <p className="truncate text-sm font-semibold text-slate-900">เพจ {selectedPage.name}</p>
               </div>
+            </div>
+            {/* Sibling-page links so the operator can flip workspaces with one
+                click — full page reload is intentional so each workspace boots
+                from a clean slate (no leaked state across pages). */}
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {PAGES.filter(p => p.id !== selectedPage.id).map((p) => (
+                <a
+                  key={p.id}
+                  href={buildPageUrl(p, 'dashboard')}
+                  className="flex flex-1 items-center gap-2 rounded-xl border border-dashed border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-500 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-700"
+                >
+                  <img src={p.iconUrl} alt={p.name} className="h-5 w-5 rounded-lg object-cover" />
+                  <span className="truncate">ไป เพจ {p.name}</span>
+                </a>
+              ))}
             </div>
 
             <nav className="mt-4 space-y-1.5">
@@ -1209,7 +1257,7 @@ export default function App() {
                 return (
                   <button
                     key={id}
-                    onClick={() => setTab(id)}
+                    onClick={() => pushPageTab(id)}
                     className={`flex w-full items-center justify-between rounded-2xl px-3 py-2.5 text-left transition ${
                       active ? 'bg-slate-900 text-white' : 'bg-transparent text-slate-600 hover:bg-slate-100'
                     }`}
@@ -1226,7 +1274,7 @@ export default function App() {
 
             <div className="mt-auto hidden space-y-1.5 lg:block">
               <button
-                onClick={() => setTab('settings')}
+                onClick={() => pushPageTab('settings')}
                 className={`flex w-full items-center gap-3 rounded-2xl px-3 py-2 text-left text-sm transition ${
                   tab === 'settings' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
                 }`}
@@ -1857,7 +1905,24 @@ export default function App() {
               )}
 
               {tab === 'settings' && (
-                <div className="grid gap-4 xl:grid-cols-[0.95fr,1.05fr]">
+                <div className="space-y-4">
+                  {/* Make it visually obvious which page these settings belong
+                      to — operator should never accidentally edit the wrong
+                      workspace. The icon + name + URL slug cluster matches the
+                      sidebar header exactly so the connection is unambiguous. */}
+                  <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3">
+                    <img
+                      src={selectedPage.iconUrl}
+                      alt={selectedPage.name}
+                      className="h-10 w-10 shrink-0 rounded-xl object-cover ring-1 ring-slate-200"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">การตั้งค่าของเพจ</p>
+                      <p className="truncate text-sm font-semibold text-slate-900">เพจ {selectedPage.name} <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 font-mono text-[11px] font-medium text-slate-500">/{selectedPage.slug}</span></p>
+                    </div>
+                    <p className="text-[11px] text-slate-400">การตั้งค่านี้ใช้กับเพจนี้เท่านั้น</p>
+                  </div>
+                  <div className="grid gap-4 xl:grid-cols-[0.95fr,1.05fr]">
                   <Card title="Shortlink / Comment" subtitle="ค่าหลักที่ระบบสร้างแอดจะใช้">
                     <div className="grid gap-4">
                       <Field label="Sub ID 1" help="utm_content ตัวที่ 1">
@@ -1961,9 +2026,10 @@ export default function App() {
                       disabled={settingsSaving}
                       className="mt-5 w-full rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      {settingsSaving ? 'กำลังบันทึก...' : 'บันทึกตั้งค่า'}
+                      {settingsSaving ? 'กำลังบันทึก...' : `บันทึกตั้งค่าของเพจ ${selectedPage.name}`}
                     </button>
                   </Card>
+                  </div>
                 </div>
               )}
             </main>

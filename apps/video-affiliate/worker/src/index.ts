@@ -3423,6 +3423,35 @@ async function setDashboardSetting(db: D1Database, key: string, value: string): 
     return getDashboardSetting(db, normalizedKey)
 }
 
+// Per-page settings layer — keys stored as `page:{pageId}:{key}` in the same
+// flat dashboard_settings table. When pageId is empty/unknown we transparently
+// fall back to the legacy global key, so old code paths keep working.
+//
+// Usage: read with getPageSetting(db, pageId, key) — tries per-page first,
+// falls back to global. Write with setPageSetting(db, pageId, key, value).
+//
+// Why a key prefix instead of a new column: we keep schema migration zero
+// (no ALTER TABLE / cache invalidation), and the legacy global rows continue
+// to act as defaults for any setting the operator hasn't customized per-page.
+function pageScopedSettingKey(pageId: string, key: string): string {
+    return `page:${pageId}:${key}`
+}
+
+async function getPageSetting(db: D1Database, pageId: string, key: string): Promise<DashboardSettingRow | null> {
+    const normalizedPageId = String(pageId || '').trim()
+    if (normalizedPageId) {
+        const scoped = await getDashboardSetting(db, pageScopedSettingKey(normalizedPageId, key)).catch(() => null)
+        if (scoped && String(scoped.value || '').length > 0) return scoped
+    }
+    return getDashboardSetting(db, key)
+}
+
+async function setPageSetting(db: D1Database, pageId: string, key: string, value: string): Promise<DashboardSettingRow | null> {
+    const normalizedPageId = String(pageId || '').trim()
+    const targetKey = normalizedPageId ? pageScopedSettingKey(normalizedPageId, key) : key
+    return setDashboardSetting(db, targetKey, value)
+}
+
 function normalizeFacebookPageVideoCacheRow(pageId: string, raw: Record<string, unknown>): FacebookPageVideoCacheRow | null {
     const videoId = String(raw.id || raw.video_id || '').trim()
     if (!pageId || !videoId) return null
@@ -5741,11 +5770,30 @@ app.get('/api/dashboard/gallery', async (c) => {
     }
 })
 
+// Settings are page-scoped when `?page_id=...` is provided (or `page_id` in
+// PUT body) — each FB page has its own sub_id, comment_template, ad_account,
+// etc. so the dashboards at /chearb and /feed don't share state. Without the
+// param, we read/write the legacy global keys (kept for backward compat and
+// as the fallback default for any setting the operator hasn't customized).
+const DASHBOARD_SETTING_KEYS = [
+    'facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5',
+    'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset',
+    'campaign_prefix', 'ads_per_round', 'auto_create_time',
+] as const
+const DASHBOARD_SETTING_ALIASES: Record<string, string> = {
+    facebookSyncToken: 'facebook_sync_token', subId: 'sub_id', shortlinkUrl: 'shortlink_url',
+    commentTemplate: 'comment_template', defaultPage: 'default_page', adAccount: 'ad_account',
+    templateAdset: 'template_adset', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round',
+    autoCreateTime: 'auto_create_time',
+}
+
 app.get('/api/dashboard/settings', async (c) => {
-    const keys = ['facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5', 'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset', 'campaign_prefix', 'ads_per_round', 'auto_create_time']
-    const entries = await Promise.all(keys.map(k => getDashboardSetting(c.env.DB, k).catch(() => null)))
-    const result: Record<string, string> = { ok: 'true' }
-    keys.forEach((key, i) => {
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const entries = await Promise.all(
+        DASHBOARD_SETTING_KEYS.map(k => getPageSetting(c.env.DB, pageId, k).catch(() => null))
+    )
+    const result: Record<string, string> = { ok: 'true', page_id: pageId }
+    DASHBOARD_SETTING_KEYS.forEach((key, i) => {
         result[key] = String(entries[i]?.value || '').trim()
         if (key === 'facebook_sync_token') {
             result.facebookSyncToken = result[key]
@@ -5756,22 +5804,22 @@ app.get('/api/dashboard/settings', async (c) => {
 })
 
 app.put('/api/dashboard/settings', async (c) => {
+    const queryPageId = String(c.req.query('page_id') || '').trim()
     const body = await c.req.json().catch(() => ({})) as Record<string, string>
-    const allowedKeys = ['facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5', 'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset', 'campaign_prefix', 'ads_per_round', 'auto_create_time']
-    // Also accept camelCase aliases
-    const aliases: Record<string, string> = { facebookSyncToken: 'facebook_sync_token', subId: 'sub_id', shortlinkUrl: 'shortlink_url', commentTemplate: 'comment_template', defaultPage: 'default_page', adAccount: 'ad_account', templateAdset: 'template_adset', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round', autoCreateTime: 'auto_create_time' }
-    for (const [camel, snake] of Object.entries(aliases)) {
+    const pageId = String(body.page_id || queryPageId || '').trim()
+    for (const [camel, snake] of Object.entries(DASHBOARD_SETTING_ALIASES)) {
         if (body[camel] !== undefined && body[snake] === undefined) body[snake] = body[camel]
     }
-    for (const key of allowedKeys) {
+    for (const key of DASHBOARD_SETTING_KEYS) {
         if (body[key] !== undefined) {
-            await setDashboardSetting(c.env.DB, key, String(body[key] || '').trim())
+            await setPageSetting(c.env.DB, pageId, key, String(body[key] || '').trim())
         }
     }
-    // Return all settings
-    const entries = await Promise.all(allowedKeys.map(k => getDashboardSetting(c.env.DB, k).catch(() => null)))
-    const result: Record<string, string> = { ok: 'true' }
-    allowedKeys.forEach((key, i) => {
+    const entries = await Promise.all(
+        DASHBOARD_SETTING_KEYS.map(k => getPageSetting(c.env.DB, pageId, k).catch(() => null))
+    )
+    const result: Record<string, string> = { ok: 'true', page_id: pageId }
+    DASHBOARD_SETTING_KEYS.forEach((key, i) => {
         result[key] = String(entries[i]?.value || '').trim()
     })
     result.facebookSyncToken = result.facebook_sync_token || ''
@@ -6549,9 +6597,11 @@ app.post('/api/dashboard/create-ad', async (c) => {
 
     const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
     try {
-        // 1. Get settings + shortlink FIRST (need shortlink for caption)
-        const settingsRow = await getDashboardSetting(c.env.DB, 'shortlink_url').catch(() => null)
-        const subIdRow = await getDashboardSetting(c.env.DB, 'sub_id').catch(() => null)
+        // 1. Get settings + shortlink FIRST (need shortlink for caption). Read
+        //    per-page so /chearb and /feed dashboards can hold different
+        //    sub_ids / shortlink templates without leaking into each other.
+        const settingsRow = await getPageSetting(c.env.DB, pageId, 'shortlink_url').catch(() => null)
+        const subIdRow = await getPageSetting(c.env.DB, pageId, 'sub_id').catch(() => null)
         const shortlinkUrlTemplate = String(settingsRow?.value || 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}').trim()
         const subId = String(subIdRow?.value || 'yok').trim()
 
@@ -6616,12 +6666,12 @@ app.post('/api/dashboard/create-ad', async (c) => {
             if (descMatch) shopeeLink = descMatch[0]
         }
 
-        // ALWAYS shorten with current sub_ids from settings (even if already shortened)
-        // Get original product URL from the shopee link
-        const subId2Row = await getDashboardSetting(c.env.DB, 'sub_id2').catch(() => null)
-        const subId3Row = await getDashboardSetting(c.env.DB, 'sub_id3').catch(() => null)
-        const subId4Row = await getDashboardSetting(c.env.DB, 'sub_id4').catch(() => null)
-        const subId5Row = await getDashboardSetting(c.env.DB, 'sub_id5').catch(() => null)
+        // ALWAYS shorten with current sub_ids from settings (per-page so /chearb
+        // and /feed can have different attribution sub_ids).
+        const subId2Row = await getPageSetting(c.env.DB, pageId, 'sub_id2').catch(() => null)
+        const subId3Row = await getPageSetting(c.env.DB, pageId, 'sub_id3').catch(() => null)
+        const subId4Row = await getPageSetting(c.env.DB, pageId, 'sub_id4').catch(() => null)
+        const subId5Row = await getPageSetting(c.env.DB, pageId, 'sub_id5').catch(() => null)
         const sub2 = String(subId2Row?.value || '').trim()
         const sub3 = String(subId3Row?.value || '').trim()
         const sub4 = String(subId4Row?.value || '').trim()
@@ -6672,8 +6722,8 @@ app.post('/api/dashboard/create-ad', async (c) => {
         // reads call_to_action_type dynamically from the template adset's first ad, so
         // whatever CTA the operator set in their new template (SHOP_NOW, LEARN_MORE,
         // LIKE_PAGE, etc.) automatically flows through.
-        const templateAdsetRow = await getDashboardSetting(c.env.DB, 'template_adset').catch(() => null)
-        const adAccountRow = await getDashboardSetting(c.env.DB, 'ad_account').catch(() => null)
+        const templateAdsetRow = await getPageSetting(c.env.DB, pageId, 'template_adset').catch(() => null)
+        const adAccountRow = await getPageSetting(c.env.DB, pageId, 'ad_account').catch(() => null)
         const templateAdsetFromSettings = String(templateAdsetRow?.value || '').trim()
         const adAccountFromSettings = String(adAccountRow?.value || '').trim()
 
