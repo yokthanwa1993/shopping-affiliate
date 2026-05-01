@@ -28698,27 +28698,29 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     const formatSlot = (slot: { hour: number; minute: number }) => `${slot.hour}:${slot.minute.toString().padStart(2, '0')}`
 
     await ensurePagesOneCardColumns(env.DB)
-    // 1. Get active pages with their schedule columns.
-    //    The cron historically only used post_hours, but post_interval_minutes is the
-    //    field the UI exposes for "ทุกๆ X นาที" mode. We pull both so we can fall back
-    //    to interval mode when post_hours is missing/invalid but post_interval_minutes
-    //    is set — guarantees the user's setting is honored even if a stale slot string
-    //    leaked into post_hours.
-    const { results: rawPages } = await env.DB.prepare(`
-        SELECT id, name, access_token, post_hours, post_interval_minutes, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta
+    // 1. Get active pages whose schedule field tells the cron WHEN to post.
+    //
+    // post_hours is the single source of truth. Empty post_hours = explicit
+    // "no schedule" = do not post — even if post_interval_minutes still has a
+    // stale value from a previous interval-mode save. The earlier version of
+    // this query OR'd in post_interval_minutes >= 5 as a fallback, which
+    // caused pages to keep posting after the operator switched the UI to
+    // "ติ๊กเวลา" with zero slots ticked (the user-facing intent of "off").
+    //
+    // The API-side drift guard already ensures post_hours stays in sync with
+    // interval-mode saves, so a NULL/empty post_hours genuinely means "off".
+    const { results: pages } = await env.DB.prepare(`
+        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta
         FROM pages
         WHERE is_active = 1
-          AND (
-              (post_hours IS NOT NULL AND post_hours != '')
-              OR (post_interval_minutes IS NOT NULL AND post_interval_minutes >= 5)
-          )
+          AND post_hours IS NOT NULL
+          AND post_hours != ''
     `).all() as {
         results: Array<{
             id: string
             name: string
             access_token: string
-            post_hours: string | null
-            post_interval_minutes: number | null
+            post_hours: string
             last_post_at: string | null
             bot_id: string | null
             onecard_enabled?: number | null
@@ -28726,28 +28728,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             onecard_cta?: string | null
         }>
     }
-
-    // Compute the effective post_hours per page:
-    //   - "every:N" stays as-is
-    //   - valid "H:MM,..." slot strings stay as-is
-    //   - empty/invalid strings fall back to "every:${post_interval_minutes}" if available
-    const pages = rawPages.map((row) => {
-        const rawSchedule = String(row.post_hours || '').trim()
-        const intervalCol = Number(row.post_interval_minutes)
-        const hasValidIntervalCol = Number.isFinite(intervalCol) && intervalCol >= 5 && intervalCol <= 720
-        const matchesIntervalString = /^every:\d+$/i.test(rawSchedule)
-        const matchesSlotString = rawSchedule.length > 0 && /^[\d,:\s]+$/.test(rawSchedule) && !matchesIntervalString
-
-        let effectiveSchedule = rawSchedule
-        if (!matchesIntervalString && !matchesSlotString && hasValidIntervalCol) {
-            effectiveSchedule = `every:${Math.floor(intervalCol)}`
-        }
-
-        return {
-            ...row,
-            post_hours: effectiveSchedule,
-        }
-    }).filter((row) => row.post_hours !== '')
 
     // Current time in minutes since midnight (Thailand)
     const nowMinutes = thaiHour * 60 + thaiMinute
