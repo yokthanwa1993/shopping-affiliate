@@ -2162,14 +2162,11 @@ export default function App() {
                       <Field label="Sub ID 5" help="utm_content ตัวที่ 5">
                         <input value={settings.subId5} onChange={(e) => setSettings((c) => ({ ...c, subId5: e.target.value }))} className="field-input" />
                       </Field>
-                      <Field label="Shortlink URL" help="รูปแบบ https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}">
-                        <textarea
-                          value={settings.shortlinkUrl}
-                          onChange={(event) => setSettings((current) => ({ ...current, shortlinkUrl: event.target.value }))}
-                          rows={3}
-                          className="field-input resize-none"
-                        />
-                      </Field>
+                      {/* Show provider toggle FIRST so it's clear which mode the
+                          URL template below applies to. The URL field is only
+                          shown when API mode is picked — Extension mode shortens
+                          via affiliate.shopee.co.th GraphQL inside Chrome and
+                          ignores the wwoom template entirely. */}
                       <Field
                         label="ย่อลิงก์ผ่าน"
                         help={
@@ -2207,6 +2204,20 @@ export default function App() {
                           </button>
                         </div>
                       </Field>
+                      {settings.shortlinkProvider === 'api' ? (
+                        <Field label="Shortlink URL" help="รูปแบบ https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}">
+                          <textarea
+                            value={settings.shortlinkUrl}
+                            onChange={(event) => setSettings((current) => ({ ...current, shortlinkUrl: event.target.value }))}
+                            rows={3}
+                            className="field-input resize-none"
+                          />
+                        </Field>
+                      ) : (
+                        <div className="rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-[11px] text-blue-700">
+                          🟦 โหมด Extension — ใช้ <code className="rounded bg-white px-1">affiliate.shopee.co.th</code> ตรงๆ ไม่ต้องตั้ง URL template
+                        </div>
+                      )}
                       <Field label="เทมเพลตตอบคอมเมนต์" help="ใช้ {shopee_link} เป็น placeholder">
                         <textarea
                           value={settings.commentTemplate}
