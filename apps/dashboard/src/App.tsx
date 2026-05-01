@@ -714,6 +714,7 @@ export default function App() {
         ad_id?: string
         adset_id?: string
         commentPosted?: boolean
+        commentError?: string
       } = {}
       let httpStatus = 200
 
@@ -742,7 +743,11 @@ export default function App() {
           // Extension v1.9.0+ posts the first comment with the shortlink
           // using the same page_token it uses to publish to page. Mirrors the
           // worker comment step that runs after Electron returns for เฉียบ.
+          // Forward comment_error so the success alert can show *why* a
+          // comment was skipped (no template / FB error / etc.) instead of
+          // a silent 'ข้าม'.
           commentPosted: !!r.comment_posted,
+          commentError: typeof r.comment_error === 'string' ? r.comment_error : undefined,
         }
         httpStatus = data.ok ? 200 : 502
       } else {
@@ -771,7 +776,13 @@ export default function App() {
 
       if (httpStatus < 400 && data.ok) {
         finalStatus = 'success'
-        finalMessage = `✅ สำเร็จ!\n\nstory_id: ${data.story_id || '-'}\nad_id: ${data.ad_id || '-'}\nadset_id: ${data.adset_id || '-'}\nคอมเมนต์: ${data.commentPosted ? 'โพสต์แล้ว' : 'ข้าม'}`
+        // Make the comment status actionable: show the reason when it was
+        // skipped so operator can fix it (empty template, FB token, etc.)
+        // without having to open DevTools console.
+        const commentLine = data.commentPosted
+          ? 'โพสต์แล้ว'
+          : `ข้าม${data.commentError ? ` (${data.commentError})` : ''}`
+        finalMessage = `✅ สำเร็จ!\n\nstory_id: ${data.story_id || '-'}\nad_id: ${data.ad_id || '-'}\nadset_id: ${data.adset_id || '-'}\nคอมเมนต์: ${commentLine}`
         setCreateAdProgress(100)
         setCreateAdStep(`✅ สำเร็จ! story=${data.story_id || '-'} ${data.commentPosted ? '(คอมเมนต์แล้ว)' : ''}`)
         setCreateAdResultBanner({ type: 'success', text: `✅ story=${data.story_id || '-'} ${data.commentPosted ? '· คอมเมนต์แล้ว' : ''}` })
