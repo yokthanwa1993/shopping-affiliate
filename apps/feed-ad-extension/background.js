@@ -342,6 +342,10 @@ async function loadFeedSettings() {
         shortlink_provider: provider,
         ad_account: String(d.ad_account || DEFAULT_AD_ACCOUNT),
         template_adset: String(d.template_adset || DEFAULT_TEMPLATE_ADSET),
+        // Comment template — used by Step 8 ของ pipeline (post first comment with
+        // shortlink). Earlier versions forgot to forward this field, so even
+        // when DB had a value the pipeline saw 'empty' and skipped the comment.
+        comment_template: String(d.comment_template || ''),
     }
 }
 
