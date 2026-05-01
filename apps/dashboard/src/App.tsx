@@ -474,6 +474,31 @@ export default function App() {
       window.postMessage({ type: 'feedExt.createAd.request', requestId, payload }, '*')
     })
   }
+  // List campaigns via extension. Used for ฟีด only — extension reads from the
+  // operator's logged-in Ads Manager tab so the campaigns shown match whatever
+  // ad_account is set in /feed/settings (which can differ from the Electron
+  // user's primary account).
+  function listCampaignsViaExtension(payload: Record<string, unknown>, timeoutMs = 30000): Promise<{ ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }>; error?: string }> {
+    return new Promise((resolve) => {
+      const requestId = `camp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      function onMessage(e: MessageEvent) {
+        if (e.source !== window) return
+        const data = e.data as { source?: string; type?: string; requestId?: string; ok?: boolean } | null
+        if (!data || data.source !== 'feed-ad-extension') return
+        if (data.type !== 'feedExt.listCampaigns.result') return
+        if (data.requestId !== requestId) return
+        window.removeEventListener('message', onMessage)
+        clearTimeout(timer)
+        resolve(data as { ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }>; error?: string })
+      }
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', onMessage)
+        resolve({ ok: false, error: 'extension_timeout' })
+      }, timeoutMs)
+      window.addEventListener('message', onMessage)
+      window.postMessage({ type: 'feedExt.listCampaigns.request', requestId, payload }, '*')
+    })
+  }
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   // videoUrl is set when the popup is opened for an UNPOSTED gallery video
   // (no FB video_id yet). The submit handler routes between two paths:
@@ -540,10 +565,25 @@ export default function App() {
     setCreateAdNewCampaignName('')
     setCreateAdLoading(true)
     try {
-      const resp = await fetch(`/worker-api/api/dashboard/campaigns?ad_account=${encodeURIComponent(settings.adAccount || 'act_1030797047648459')}`)
-      if (resp.ok) {
-        const data = await resp.json() as { campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }> }
-        setCreateAdCampaigns(data.campaigns || [])
+      // ฟีด → list campaigns via extension (reads from operator's Ads Manager
+      // tab, so campaigns shown match the per-page ad_account in /feed/settings).
+      // เฉียบ + อื่นๆ → list via worker proxy that hits Electron's /graph (the
+      // existing path; nothing changed for those workspaces).
+      const adAccount = settings.adAccount || 'act_1030797047648459'
+      if (selectedPage.slug === 'feed' && feedExtension.available) {
+        const r = await listCampaignsViaExtension({ adAccount })
+        if (r.ok && r.campaigns) {
+          setCreateAdCampaigns(r.campaigns)
+        } else {
+          console.warn('[campaigns] extension load failed:', r.error)
+          setCreateAdCampaigns([])
+        }
+      } else {
+        const resp = await fetch(`/worker-api/api/dashboard/campaigns?ad_account=${encodeURIComponent(adAccount)}`)
+        if (resp.ok) {
+          const data = await resp.json() as { campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }> }
+          setCreateAdCampaigns(data.campaigns || [])
+        }
       }
     } catch {}
     finally { setCreateAdLoading(false) }

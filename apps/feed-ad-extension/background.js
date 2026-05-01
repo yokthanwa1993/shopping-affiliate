@@ -39,12 +39,79 @@ const SHOPEE_TAB_PATTERN = 'https://affiliate.shopee.co.th/*'
 // the dashboard side stays a single round-trip.
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg?.type !== 'feedExt.createAd') return false
-    runCreateAdPipeline(msg.payload || {})
-        .then((r) => sendResponse(r))
-        .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }))
-    return true // async response
+    if (msg?.type === 'feedExt.createAd') {
+        runCreateAdPipeline(msg.payload || {})
+            .then((r) => sendResponse(r))
+            .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }))
+        return true
+    }
+    if (msg?.type === 'feedExt.listCampaigns') {
+        runListCampaigns(msg.payload || {})
+            .then((r) => sendResponse(r))
+            .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }))
+        return true
+    }
+    return false
 })
+
+// ────────────────────── Campaign list ──────────────────────
+//
+// Replaces the worker's /api/dashboard/campaigns proxy for ฟีด — that proxy
+// hits Electron's /graph endpoint, which uses the Electron user's session.
+// For ฟีด the operator may have a different ad_account whose campaigns the
+// Electron session can't see. Instead we read campaigns from inside the user's
+// own Ads Manager tab (same place the create-ad pipeline reads tokens).
+
+async function runListCampaigns({ adAccount }) {
+    const settings = await loadFeedSettings().catch(() => null)
+    const effAdAccount = String(adAccount || settings?.ad_account || DEFAULT_AD_ACCOUNT).trim()
+
+    const adsTabs = await findTabsByPatterns(ADS_MANAGER_TAB_PATTERNS)
+    if (!adsTabs.length) {
+        return { ok: false, error: 'ไม่มี tab Ads Manager เปิดอยู่ — เปิด adsmanager.facebook.com ก่อน' }
+    }
+
+    const exec = await chrome.scripting.executeScript({
+        target: { tabId: adsTabs[0].id },
+        world: 'MAIN',
+        func: fbListCampaignsMainWorld,
+        args: [{ adAccount: effAdAccount }],
+    })
+
+    const result = exec?.[0]?.result
+    if (!result) return { ok: false, error: 'pipeline ไม่ตอบกลับ' }
+    return result
+}
+
+async function fbListCampaignsMainWorld({ adAccount }) {
+    const accessToken = window.__accessToken
+    if (!accessToken) return { ok: false, error: 'ไม่พบ window.__accessToken — refresh tab Ads Manager' }
+
+    const fbFetch = async (url) => {
+        const r = await fetch(url, { credentials: 'include' })
+        const t = await r.text()
+        try { return JSON.parse(t) } catch { return { __raw: t } }
+    }
+
+    const camp = await fbFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?fields=id,name,effective_status,daily_budget,start_time&limit=10&access_token=${encodeURIComponent(accessToken)}`)
+    if (camp?.error) return { ok: false, error: `[campaigns] ${camp.error.message}`, fb_error_code: camp.error.code }
+    const campaigns = Array.isArray(camp?.data) ? camp.data : []
+
+    const result = []
+    for (const c of campaigns) {
+        const adsets = await fbFetch(`https://graph.facebook.com/v21.0/${c.id}/adsets?fields=id,effective_status&limit=50&access_token=${encodeURIComponent(accessToken)}`)
+        const aArr = Array.isArray(adsets?.data) ? adsets.data : []
+        const liveAdsets = aArr.filter((a) => a.effective_status !== 'DELETED' && a.effective_status !== 'ARCHIVED')
+        result.push({
+            id: c.id,
+            name: c.name || c.id,
+            status: c.effective_status || 'UNKNOWN',
+            adsetCount: liveAdsets.length,
+        })
+    }
+
+    return { ok: true, campaigns: result, ad_account: adAccount }
+}
 
 // ────────────────────── Worker settings (per-page) ──────────────────────
 
