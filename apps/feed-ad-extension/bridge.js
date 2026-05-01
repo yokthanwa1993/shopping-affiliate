@@ -104,5 +104,29 @@
             }
             return
         }
+
+        // Status request → forward to background (cookies + token + tabs check)
+        if (msg.type === 'feedExt.status.request') {
+            const requestId = msg.requestId
+            if (!requestId) return
+            try {
+                const resp = await chrome.runtime.sendMessage({ type: 'feedExt.status', payload: msg.payload || {} })
+                window.postMessage({
+                    source: SOURCE,
+                    type: 'feedExt.status.result',
+                    requestId,
+                    ...(resp || { ok: false, error: 'no_response_from_background' }),
+                }, '*')
+            } catch (err) {
+                window.postMessage({
+                    source: SOURCE,
+                    type: 'feedExt.status.result',
+                    requestId,
+                    ok: false,
+                    error: err?.message || String(err),
+                }, '*')
+            }
+            return
+        }
     })
 })()

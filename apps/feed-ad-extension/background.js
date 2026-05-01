@@ -51,8 +51,130 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }))
         return true
     }
+    if (msg?.type === 'feedExt.status') {
+        runStatusCheck(msg.payload || {})
+            .then((r) => sendResponse(r))
+            .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }))
+        return true
+    }
     return false
 })
+
+// ────────────────────── Status / readiness check ──────────────────────
+//
+// Mirrors what the Electron app exposes via /token /session /pages, but for
+// our Chrome flow:
+//   - Is there an Ads Manager tab open?
+//   - Does that tab have window.__accessToken + DTSGInitData + c_user?
+//   - Can we hit graph.facebook.com/{adAccount} with that token? (catches the
+//     "ad account not in this user's permissions" case before the user clicks
+//     สร้างแอด and waits 80s for the pipeline to fail at /campaigns)
+//   - Is there a Shopee Affiliate tab open? (only matters for shortlink_provider='extension')
+
+async function runStatusCheck({ adAccount }) {
+    const settings = await loadFeedSettings().catch(() => null)
+    const effAdAccount = String(adAccount || settings?.ad_account || DEFAULT_AD_ACCOUNT).trim()
+
+    const adsTabs = await findTabsByPatterns(ADS_MANAGER_TAB_PATTERNS)
+    const shopeeTab = await findTabByPattern(SHOPEE_TAB_PATTERN)
+
+    let inspect = null
+    if (adsTabs[0]) {
+        try {
+            const exec = await chrome.scripting.executeScript({
+                target: { tabId: adsTabs[0].id },
+                world: 'MAIN',
+                func: fbInspectMainWorld,
+                args: [{ adAccount: effAdAccount }],
+            })
+            inspect = exec?.[0]?.result || { error: 'pipeline_no_result' }
+        } catch (e) {
+            inspect = { error: e?.message || String(e) }
+        }
+    }
+
+    return {
+        ok: true,
+        version: chrome.runtime.getManifest().version,
+        page_id: FEED_PAGE_ID,
+        page_name: FEED_PAGE_NAME,
+        ads_manager_tab: adsTabs[0]
+            ? { url: adsTabs[0].url, title: adsTabs[0].title || '', status: adsTabs[0].status }
+            : null,
+        shopee_tab: shopeeTab
+            ? { url: shopeeTab.url, title: shopeeTab.title || '', status: shopeeTab.status }
+            : null,
+        inspect,
+        ad_account: effAdAccount,
+        settings_loaded: !!settings,
+        shortlink_provider: settings?.shortlink_provider || 'api',
+    }
+}
+
+// Runs INSIDE Ads Manager tab (MAIN world). Reads creds + does a cheap
+// graph.facebook.com smoke test to verify the ad_account is reachable from
+// this user's session. Reports presence + truncated tail (no full token).
+async function fbInspectMainWorld({ adAccount }) {
+    const accessToken = window.__accessToken || ''
+    let fbDtsg = ''
+    try {
+        if (window.DTSGInitData?.token) {
+            fbDtsg = String(window.DTSGInitData.token)
+        } else {
+            const m = (document.documentElement.outerHTML || '').match(/"dtsg":\{"token":"([^"]+)"/)
+            if (m) fbDtsg = m[1]
+        }
+    } catch { /* ignore */ }
+    const cuserMatch = (document.cookie || '').match(/c_user=(\d+)/)
+    const cuser = cuserMatch ? cuserMatch[1] : ''
+    const cookieCount = (document.cookie || '').split(';').filter(Boolean).length
+
+    let adAccountStatus = { tested: false }
+    let pageAccessOk = { tested: false }
+    if (accessToken && adAccount) {
+        try {
+            const r = await fetch(
+                `https://graph.facebook.com/v21.0/${adAccount}?fields=id,name,account_status,currency&access_token=${encodeURIComponent(accessToken)}`,
+                { credentials: 'include' }
+            )
+            const j = await r.json().catch(() => ({}))
+            if (j?.error) {
+                adAccountStatus = { tested: true, ok: false, error: String(j.error.message || ''), code: j.error.code, fb_trace_id: j.error.fbtrace_id }
+            } else {
+                adAccountStatus = { tested: true, ok: true, id: j.id, name: j.name, account_status: j.account_status, currency: j.currency }
+            }
+        } catch (e) {
+            adAccountStatus = { tested: true, ok: false, error: e?.message || String(e) }
+        }
+        try {
+            const r = await fetch(
+                `https://graph.facebook.com/v21.0/116759241338040?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
+                { credentials: 'include' }
+            )
+            const j = await r.json().catch(() => ({}))
+            if (j?.error) {
+                pageAccessOk = { tested: true, ok: false, error: String(j.error.message || ''), code: j.error.code }
+            } else {
+                pageAccessOk = { tested: true, ok: true, id: j.id, name: j.name }
+            }
+        } catch (e) {
+            pageAccessOk = { tested: true, ok: false, error: e?.message || String(e) }
+        }
+    }
+
+    return {
+        access_token_present: !!accessToken,
+        access_token_len: accessToken.length,
+        access_token_tail: accessToken ? accessToken.slice(-6) : '',
+        fb_dtsg_present: !!fbDtsg,
+        fb_dtsg_len: fbDtsg.length,
+        c_user: cuser,
+        cookie_count: cookieCount,
+        page_url: window.location.href,
+        ad_account_status: adAccountStatus,
+        page_access_ok: pageAccessOk,
+    }
+}
 
 // ────────────────────── Campaign list ──────────────────────
 //

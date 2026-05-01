@@ -499,6 +499,55 @@ export default function App() {
       window.postMessage({ type: 'feedExt.listCampaigns.request', requestId, payload }, '*')
     })
   }
+  // Ask the extension for a full readiness report. Used to debug "why no
+  // campaigns?" issues — surfaces missing tab, expired token, ad_account
+  // permission, etc., right inside the create-ad popup.
+  type ExtensionStatus = {
+    ok: boolean
+    error?: string
+    version?: string
+    page_id?: string
+    page_name?: string
+    ads_manager_tab?: { url: string; title: string; status?: string } | null
+    shopee_tab?: { url: string; title: string; status?: string } | null
+    inspect?: {
+      access_token_present?: boolean
+      access_token_len?: number
+      access_token_tail?: string
+      fb_dtsg_present?: boolean
+      fb_dtsg_len?: number
+      c_user?: string
+      cookie_count?: number
+      page_url?: string
+      ad_account_status?: { tested: boolean; ok?: boolean; error?: string; code?: number; id?: string; name?: string; account_status?: number; currency?: string }
+      page_access_ok?: { tested: boolean; ok?: boolean; error?: string; code?: number; id?: string; name?: string }
+      error?: string
+    } | null
+    ad_account?: string
+    settings_loaded?: boolean
+    shortlink_provider?: string
+  }
+  function statusViaExtension(payload: Record<string, unknown> = {}, timeoutMs = 15000): Promise<ExtensionStatus> {
+    return new Promise((resolve) => {
+      const requestId = `status-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      function onMessage(e: MessageEvent) {
+        if (e.source !== window) return
+        const data = e.data as ExtensionStatus & { source?: string; type?: string; requestId?: string } | null
+        if (!data || data.source !== 'feed-ad-extension') return
+        if (data.type !== 'feedExt.status.result') return
+        if (data.requestId !== requestId) return
+        window.removeEventListener('message', onMessage)
+        clearTimeout(timer)
+        resolve(data as ExtensionStatus)
+      }
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', onMessage)
+        resolve({ ok: false, error: 'extension_timeout' })
+      }, timeoutMs)
+      window.addEventListener('message', onMessage)
+      window.postMessage({ type: 'feedExt.status.request', requestId, payload }, '*')
+    })
+  }
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   // videoUrl is set when the popup is opened for an UNPOSTED gallery video
   // (no FB video_id yet). The submit handler routes between two paths:
@@ -513,6 +562,8 @@ export default function App() {
   const [adQueueIntervalMinutes, setAdQueueIntervalMinutes] = useState(20)
   const [createAdShopeeLink, setCreateAdShopeeLink] = useState('')
   const [createAdCampaigns, setCreateAdCampaigns] = useState<Array<{ id: string; name: string; status: string; adsetCount: number }>>([])
+  const [createAdCampaignsError, setCreateAdCampaignsError] = useState<string>('')
+  const [feedExtensionStatus, setFeedExtensionStatus] = useState<ExtensionStatus | null>(null)
   const [createAdLoading, setCreateAdLoading] = useState(false)
   const [createAdCreating, setCreateAdCreating] = useState(false)
   const [createAdStep, setCreateAdStep] = useState('')
@@ -563,29 +614,39 @@ export default function App() {
     setCreateAdShopeeLink(shopeeLink)
     setCreateAdSelectedCampaign('')
     setCreateAdNewCampaignName('')
+    setCreateAdCampaignsError('')
+    setFeedExtensionStatus(null)
     setCreateAdLoading(true)
+    const adAccount = settings.adAccount || 'act_1030797047648459'
     try {
-      // ฟีด → list campaigns via extension (reads from operator's Ads Manager
-      // tab, so campaigns shown match the per-page ad_account in /feed/settings).
-      // เฉียบ + อื่นๆ → list via worker proxy that hits Electron's /graph (the
-      // existing path; nothing changed for those workspaces).
-      const adAccount = settings.adAccount || 'act_1030797047648459'
       if (selectedPage.slug === 'feed' && feedExtension.available) {
-        const r = await listCampaignsViaExtension({ adAccount })
-        if (r.ok && r.campaigns) {
-          setCreateAdCampaigns(r.campaigns)
+        // ฟีด — request status + campaigns concurrently. Status panel shows
+        // up immediately so even when campaigns fail the operator can see why.
+        const [status, campaigns] = await Promise.all([
+          statusViaExtension({ adAccount }),
+          listCampaignsViaExtension({ adAccount }),
+        ])
+        setFeedExtensionStatus(status)
+        if (campaigns.ok && campaigns.campaigns) {
+          setCreateAdCampaigns(campaigns.campaigns)
         } else {
-          console.warn('[campaigns] extension load failed:', r.error)
           setCreateAdCampaigns([])
+          setCreateAdCampaignsError(campaigns.error || 'unknown_error_loading_campaigns')
         }
       } else {
+        // เฉียบ + อื่นๆ → list via worker proxy that hits Electron's /graph.
         const resp = await fetch(`/worker-api/api/dashboard/campaigns?ad_account=${encodeURIComponent(adAccount)}`)
         if (resp.ok) {
           const data = await resp.json() as { campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }> }
           setCreateAdCampaigns(data.campaigns || [])
+          if (!data.campaigns?.length) setCreateAdCampaignsError(`worker คืน 0 campaigns (ad_account=${adAccount})`)
+        } else {
+          setCreateAdCampaignsError(`worker proxy HTTP ${resp.status}`)
         }
       }
-    } catch {}
+    } catch (e) {
+      setCreateAdCampaignsError(e instanceof Error ? e.message : String(e))
+    }
     finally { setCreateAdLoading(false) }
   }
 
@@ -1327,10 +1388,73 @@ export default function App() {
               {!createAdShopeeLink && <p className="mt-1 text-xs text-red-500">⚠️ ต้องมี Shopee link ถึงสร้างแอดได้</p>}
             </div>
 
+            {/* Extension status panel — only ฟีด, only when extension is
+                installed. Mirrors what video-onecard's /token /session /pages
+                expose for Electron, so the operator can tell at a glance:
+                  - Ads Manager tab open?
+                  - access_token + fb_dtsg + c_user grabbed?
+                  - cookies count
+                  - ad_account reachable? (catches "wrong ad_account" before
+                    they wait 2 min for the pipeline to fail)
+                  - Shopee Affiliate tab open? (only matters in extension
+                    shortlink mode)
+                Collapsible <details> so it doesn't clutter the popup once the
+                operator has confirmed everything is green. */}
+            {selectedPage.slug === 'feed' && feedExtension.available && feedExtensionStatus && (() => {
+              const s = feedExtensionStatus
+              const inspect = s.inspect || null
+              const adsOk = !!s.ads_manager_tab
+              const tokenOk = !!inspect?.access_token_present
+              const dtsgOk = !!inspect?.fb_dtsg_present
+              const cuserOk = !!inspect?.c_user
+              const adAccountOk = inspect?.ad_account_status?.tested && inspect?.ad_account_status?.ok
+              const pageOk = inspect?.page_access_ok?.tested && inspect?.page_access_ok?.ok
+              const shopeeOk = !!s.shopee_tab
+              const allReady = adsOk && tokenOk && dtsgOk && cuserOk && adAccountOk && pageOk
+              const Row = ({ label, ok, detail }: { label: string; ok: boolean; detail?: string }) => (
+                <div className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs odd:bg-slate-50">
+                  <span className="flex items-center gap-2">
+                    <span className={`inline-block h-2 w-2 rounded-full ${ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                    <span className="font-medium text-slate-700">{label}</span>
+                  </span>
+                  <span className={`text-right font-mono ${ok ? 'text-slate-500' : 'text-red-600'}`}>{detail || (ok ? '✓' : '✗')}</span>
+                </div>
+              )
+              return (
+                <details className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-white" open={!allReady}>
+                  <summary className={`flex cursor-pointer items-center justify-between px-3 py-2 text-xs font-semibold ${allReady ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'}`}>
+                    <span className="flex items-center gap-2">
+                      <span className={`inline-block h-2 w-2 rounded-full ${allReady ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+                      สถานะ Feed Ad Creator extension v{s.version || '?'} {allReady ? '— พร้อมสร้างแอด' : '— ยังไม่พร้อม'}
+                    </span>
+                    <span className="text-[10px] font-normal opacity-70">คลิกขยาย</span>
+                  </summary>
+                  <div className="border-t border-slate-200">
+                    <Row label="Ads Manager tab" ok={adsOk} detail={adsOk ? 'open' : 'ไม่มี — เปิด adsmanager.facebook.com'} />
+                    <Row label="access_token (window.__accessToken)" ok={tokenOk} detail={tokenOk ? `${inspect?.access_token_len} chars · tail=${inspect?.access_token_tail}` : 'ไม่พบ — refresh tab Ads Manager'} />
+                    <Row label="fb_dtsg (CSRF)" ok={dtsgOk} detail={dtsgOk ? `${inspect?.fb_dtsg_len} chars` : 'ไม่พบ'} />
+                    <Row label="c_user cookie" ok={cuserOk} detail={cuserOk ? inspect?.c_user || '—' : 'ไม่พบ — login FB ก่อน'} />
+                    <Row label={`ad_account (${s.ad_account || ''})`} ok={!!adAccountOk} detail={inspect?.ad_account_status?.tested ? (inspect?.ad_account_status?.ok ? `${inspect.ad_account_status.name || inspect.ad_account_status.id} · ${inspect.ad_account_status.currency || ''}` : `${inspect.ad_account_status.error || ''} (code=${inspect.ad_account_status.code ?? '-'})`) : 'รอตรวจ'} />
+                    <Row label={`Page access (${s.page_id || ''})`} ok={!!pageOk} detail={inspect?.page_access_ok?.tested ? (inspect?.page_access_ok?.ok ? `${inspect.page_access_ok.name || ''}` : `${inspect.page_access_ok.error || ''} (code=${inspect.page_access_ok.code ?? '-'})`) : 'รอตรวจ'} />
+                    <Row label={`Shopee Affiliate tab (${s.shortlink_provider || 'api'} mode)`} ok={shopeeOk || s.shortlink_provider !== 'extension'} detail={shopeeOk ? 'open' : (s.shortlink_provider === 'extension' ? 'ต้องเปิด affiliate.shopee.co.th' : '— (โหมด api ไม่ต้องใช้)')} />
+                    <Row label="Cookies (.facebook.com)" ok={!!(inspect?.cookie_count && inspect.cookie_count > 0)} detail={inspect?.cookie_count ? `${inspect.cookie_count} cookies` : '0'} />
+                  </div>
+                </details>
+              )
+            })()}
+
             <div className="mt-4 space-y-3">
               <p className="text-sm font-semibold text-slate-700">เลือกแคมเปญ</p>
               {createAdLoading ? (
                 <div className="h-12 rounded-xl bg-slate-100 animate-pulse" />
+              ) : createAdCampaigns.length === 0 ? (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-800">
+                  <p className="font-semibold">ไม่มี campaigns ขึ้นมา</p>
+                  {createAdCampaignsError && (
+                    <p className="mt-1 break-words font-mono text-[11px] text-amber-700">{createAdCampaignsError}</p>
+                  )}
+                  <p className="mt-1 text-[11px] text-amber-700">ดูสถานะ extension ด้านบน เลือกสร้างแคมเปญใหม่ด้านล่างก็ได้</p>
+                </div>
               ) : (
                 <div className="space-y-2 max-h-48 overflow-y-auto">
                   {createAdCampaigns.map((camp) => (
