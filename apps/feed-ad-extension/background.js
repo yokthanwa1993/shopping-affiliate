@@ -658,20 +658,34 @@ async function fbAdPipelineMainWorld(args) {
     if (!storyId) return { ok: false, step: 'story_id', error: 'Timeout (150s) — FB ยังสร้าง story ไม่เสร็จ', creative_id: creativeId, video_id: vidId }
 
     // ── Step 5: resolve campaign (existing or new) ──
+    //
+    // Campaign create payload mirrors apps/video-onecard/electron.js:438-447 exactly.
+    // Earlier extension code drifted from Electron in 3 ways that all break /copies:
+    //   1. special_ad_categories: '[]' (STRING)  →  must be []  (ARRAY)
+    //   2. status: 'PAUSED'                      →  Electron uses ACTIVE before /copies
+    //   3. missing daily_budget + bid_strategy   →  /copies needs the parent campaign
+    //      to have budget settings before deep-copying an adset (which itself has
+    //      lifetime/daily budget that must align with the parent campaign's CBO state)
+    // FB rejected /copies with code=100 'Invalid parameter' because of #1 + #3.
     let targetCampaignId = String(campaignId || '').trim()
     if (!targetCampaignId && newCampaignName) {
-        // Read template adset's campaign objective so new campaigns match it (otherwise FB error 1815149).
         const tpl = await fbFetch(`https://graph.facebook.com/v21.0/${templateAdset}?fields=campaign{objective,buying_type}&access_token=${encodeURIComponent(accessToken)}`)
         const objective = tpl.json?.campaign?.objective || 'OUTCOME_ENGAGEMENT'
-        const buyingType = tpl.json?.campaign?.buying_type || 'AUCTION'
         const newCamp = await fbFetch(
             `https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`,
             {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name: newCampaignName, objective, buying_type: buyingType, status: 'PAUSED', special_ad_categories: '[]' }),
+                body: JSON.stringify({
+                    name: newCampaignName,
+                    objective,
+                    status: 'ACTIVE',
+                    special_ad_categories: [],
+                    daily_budget: '100000',
+                    bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+                }),
             }
         )
-        if (newCamp.json?.error) return { ok: false, step: 'new_campaign', error: newCamp.json.error.message, fb_error_code: newCamp.json.error.code, fb_trace_id: newCamp.json.error.fbtrace_id, creative_id: creativeId, story_id: storyId }
+        if (newCamp.json?.error) return { ok: false, step: 'new_campaign', error: newCamp.json.error.message, fb_error_code: newCamp.json.error.code, fb_trace_id: newCamp.json.error.fbtrace_id, creative_id: creativeId, story_id: storyId, attempted_objective: objective }
         targetCampaignId = newCamp.json?.id
     }
     if (!targetCampaignId) return { ok: false, step: 'campaign', error: 'ต้องระบุ campaign_id หรือ new_campaign_name', creative_id: creativeId, story_id: storyId }
