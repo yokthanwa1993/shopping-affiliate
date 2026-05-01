@@ -521,6 +521,7 @@ export default function App() {
       page_url?: string
       ad_account_status?: { tested: boolean; ok?: boolean; error?: string; code?: number; id?: string; name?: string; account_status?: number; currency?: string }
       page_access_ok?: { tested: boolean; ok?: boolean; error?: string; code?: number; id?: string; name?: string }
+      promotable_linkage?: { tested: boolean; ok?: boolean; error?: string; code?: number; total_pages?: number; feed_in_promotable?: boolean; sample?: Array<{ id?: string; name?: string }> }
       error?: string
     } | null
     ad_account?: string
@@ -1409,17 +1410,25 @@ export default function App() {
               const cuserOk = !!inspect?.c_user
               const adAccountOk = inspect?.ad_account_status?.tested && inspect?.ad_account_status?.ok
               const pageOk = inspect?.page_access_ok?.tested && inspect?.page_access_ok?.ok
+              const linkageTested = inspect?.promotable_linkage?.tested
+              const linkageOk = linkageTested && inspect?.promotable_linkage?.ok
               const shopeeOk = !!s.shopee_tab
-              const allReady = adsOk && tokenOk && dtsgOk && cuserOk && adAccountOk && pageOk
-              const Row = ({ label, ok, detail }: { label: string; ok: boolean; detail?: string }) => (
-                <div className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs odd:bg-slate-50">
-                  <span className="flex items-center gap-2">
-                    <span className={`inline-block h-2 w-2 rounded-full ${ok ? 'bg-emerald-500' : 'bg-red-500'}`} />
-                    <span className="font-medium text-slate-700">{label}</span>
-                  </span>
-                  <span className={`text-right font-mono ${ok ? 'text-slate-500' : 'text-red-600'}`}>{detail || (ok ? '✓' : '✗')}</span>
-                </div>
-              )
+              // Critical = blocks pipeline. fb_dtsg is informational (not used by our pipeline).
+              const allReady = adsOk && tokenOk && cuserOk && adAccountOk && pageOk && linkageOk
+              const Row = ({ label, ok, severity = 'critical', detail }: { label: string; ok: boolean; severity?: 'critical' | 'info'; detail?: string }) => {
+                const dotClass = ok ? 'bg-emerald-500' : (severity === 'info' ? 'bg-amber-400' : 'bg-red-500')
+                const detailClass = ok ? 'text-slate-500' : (severity === 'info' ? 'text-amber-700' : 'text-red-600')
+                return (
+                  <div className="flex items-center justify-between gap-3 px-3 py-1.5 text-xs odd:bg-slate-50">
+                    <span className="flex items-center gap-2">
+                      <span className={`inline-block h-2 w-2 rounded-full ${dotClass}`} />
+                      <span className="font-medium text-slate-700">{label}</span>
+                    </span>
+                    <span className={`text-right font-mono ${detailClass}`}>{detail || (ok ? '✓' : '✗')}</span>
+                  </div>
+                )
+              }
+              const linkagePagesPreview = (inspect?.promotable_linkage?.sample || []).map((p) => p?.name || p?.id).filter(Boolean).join(', ')
               return (
                 <details className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-white" open={!allReady}>
                   <summary className={`flex cursor-pointer items-center justify-between px-3 py-2 text-xs font-semibold ${allReady ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'}`}>
@@ -1432,13 +1441,33 @@ export default function App() {
                   <div className="border-t border-slate-200">
                     <Row label="Ads Manager tab" ok={adsOk} detail={adsOk ? 'open' : 'ไม่มี — เปิด adsmanager.facebook.com'} />
                     <Row label="access_token (window.__accessToken)" ok={tokenOk} detail={tokenOk ? `${inspect?.access_token_len} chars · tail=${inspect?.access_token_tail}` : 'ไม่พบ — refresh tab Ads Manager'} />
-                    <Row label="fb_dtsg (CSRF)" ok={dtsgOk} detail={dtsgOk ? `${inspect?.fb_dtsg_len} chars` : 'ไม่พบ'} />
+                    <Row label="fb_dtsg (CSRF)" ok={dtsgOk} severity="info" detail={dtsgOk ? `${inspect?.fb_dtsg_len} chars` : 'ไม่พบ — ไม่ critical (pipeline ไม่ใช้)'} />
                     <Row label="c_user cookie" ok={cuserOk} detail={cuserOk ? inspect?.c_user || '—' : 'ไม่พบ — login FB ก่อน'} />
                     <Row label={`ad_account (${s.ad_account || ''})`} ok={!!adAccountOk} detail={inspect?.ad_account_status?.tested ? (inspect?.ad_account_status?.ok ? `${inspect.ad_account_status.name || inspect.ad_account_status.id} · ${inspect.ad_account_status.currency || ''}` : `${inspect.ad_account_status.error || ''} (code=${inspect.ad_account_status.code ?? '-'})`) : 'รอตรวจ'} />
                     <Row label={`Page access (${s.page_id || ''})`} ok={!!pageOk} detail={inspect?.page_access_ok?.tested ? (inspect?.page_access_ok?.ok ? `${inspect.page_access_ok.name || ''}` : `${inspect.page_access_ok.error || ''} (code=${inspect.page_access_ok.code ?? '-'})`) : 'รอตรวจ'} />
+                    <Row
+                      label="ad_account ↔ page linkage (Business Manager)"
+                      ok={!!linkageOk}
+                      detail={linkageTested
+                        ? (linkageOk
+                          ? `✓ ฟีดอยู่ใน promote_pages (${inspect?.promotable_linkage?.total_pages} pages)`
+                          : (inspect?.promotable_linkage?.error
+                            ? `${inspect.promotable_linkage.error} (code=${inspect.promotable_linkage.code ?? '-'})`
+                            : `ไม่มีฟีดใน promote_pages — มี ${inspect?.promotable_linkage?.total_pages ?? 0} pages: ${linkagePagesPreview || '(empty)'}`))
+                        : 'รอตรวจ'}
+                    />
                     <Row label={`Shopee Affiliate tab (${s.shortlink_provider || 'api'} mode)`} ok={shopeeOk || s.shortlink_provider !== 'extension'} detail={shopeeOk ? 'open' : (s.shortlink_provider === 'extension' ? 'ต้องเปิด affiliate.shopee.co.th' : '— (โหมด api ไม่ต้องใช้)')} />
-                    <Row label="Cookies (.facebook.com)" ok={!!(inspect?.cookie_count && inspect.cookie_count > 0)} detail={inspect?.cookie_count ? `${inspect.cookie_count} cookies` : '0'} />
+                    <Row label="Cookies (.facebook.com)" ok={!!(inspect?.cookie_count && inspect.cookie_count > 0)} severity="info" detail={inspect?.cookie_count ? `${inspect.cookie_count} cookies (HttpOnly ไม่นับ — ปกติ 3-5)` : '0'} />
                   </div>
+                  {linkageTested && !linkageOk && !inspect?.promotable_linkage?.error && (
+                    <div className="border-t border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                      <p className="font-semibold">⚠️ ที่น่าจะเป็นสาเหตุของ FB code=10:</p>
+                      <p className="mt-0.5">เพจฟีดไม่อยู่ใน promotable pages ของ ad_account นี้ — ต้อง link ใน Business Manager</p>
+                      <p className="mt-1 break-words font-mono text-[10px] text-amber-700">
+                        แก้: business.facebook.com → Business Settings → Pages → ฟีด → Add Asset → Ad Accounts → เลือก {s.ad_account}
+                      </p>
+                    </div>
+                  )}
                 </details>
               )
             })()}

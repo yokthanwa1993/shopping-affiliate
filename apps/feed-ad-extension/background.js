@@ -116,13 +116,29 @@ async function runStatusCheck({ adAccount }) {
 // this user's session. Reports presence + truncated tail (no full token).
 async function fbInspectMainWorld({ adAccount }) {
     const accessToken = window.__accessToken || ''
+    // fb_dtsg detection across multiple FB UI versions. Not strictly required
+    // by our pipeline (we use access_token in the URL) — informational only.
     let fbDtsg = ''
     try {
-        if (window.DTSGInitData?.token) {
-            fbDtsg = String(window.DTSGInitData.token)
-        } else {
-            const m = (document.documentElement.outerHTML || '').match(/"dtsg":\{"token":"([^"]+)"/)
-            if (m) fbDtsg = m[1]
+        const candidates = [
+            window.DTSGInitData?.token,
+            window.DTSGInitialData?.token,
+            window.__DTSGInitData?.token,
+            window.__bbox?.define?.['DTSGInitData']?.token,
+        ].filter(Boolean)
+        if (candidates.length > 0) fbDtsg = String(candidates[0])
+        if (!fbDtsg) {
+            const html = document.documentElement.outerHTML || ''
+            const patterns = [
+                /"dtsg":\{"token":"([^"]+)"/,
+                /"DTSGInitData",\[\],\{"token":"([^"]+)"/,
+                /"asyncSignal":"[^"]*","dtsg":\{"token":"([^"]+)"/,
+                /name="fb_dtsg" value="([^"]+)"/,
+            ]
+            for (const p of patterns) {
+                const m = html.match(p)
+                if (m) { fbDtsg = m[1]; break }
+            }
         }
     } catch { /* ignore */ }
     const cuserMatch = (document.cookie || '').match(/c_user=(\d+)/)
@@ -131,6 +147,7 @@ async function fbInspectMainWorld({ adAccount }) {
 
     let adAccountStatus = { tested: false }
     let pageAccessOk = { tested: false }
+    let promotableLinkage = { tested: false }
     if (accessToken && adAccount) {
         try {
             const r = await fetch(
@@ -160,6 +177,33 @@ async function fbInspectMainWorld({ adAccount }) {
         } catch (e) {
             pageAccessOk = { tested: true, ok: false, error: e?.message || String(e) }
         }
+        // ── promotable_pages — the test that actually catches FB code=10 at
+        // /adcreatives. Even when both ad_account + page can be READ, FB
+        // refuses to create a creative referencing both unless they're linked
+        // in Business Manager. promotable_pages returns exactly the set that
+        // a creative on this ad_account is allowed to reference.
+        try {
+            const r = await fetch(
+                `https://graph.facebook.com/v21.0/${adAccount}/promote_pages?fields=id,name&limit=200&access_token=${encodeURIComponent(accessToken)}`,
+                { credentials: 'include' }
+            )
+            const j = await r.json().catch(() => ({}))
+            if (j?.error) {
+                promotableLinkage = { tested: true, ok: false, error: String(j.error.message || ''), code: j.error.code }
+            } else {
+                const pages = Array.isArray(j?.data) ? j.data : []
+                const feedInList = pages.find((p) => String(p?.id || '') === '116759241338040')
+                promotableLinkage = {
+                    tested: true,
+                    ok: !!feedInList,
+                    total_pages: pages.length,
+                    feed_in_promotable: !!feedInList,
+                    sample: pages.slice(0, 5).map((p) => ({ id: p.id, name: p.name })),
+                }
+            }
+        } catch (e) {
+            promotableLinkage = { tested: true, ok: false, error: e?.message || String(e) }
+        }
     }
 
     return {
@@ -173,6 +217,7 @@ async function fbInspectMainWorld({ adAccount }) {
         page_url: window.location.href,
         ad_account_status: adAccountStatus,
         page_access_ok: pageAccessOk,
+        promotable_linkage: promotableLinkage,
     }
 }
 

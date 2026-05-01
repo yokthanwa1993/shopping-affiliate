@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Feed Ad Creator",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "description": "เบื้องหลังของ dashboard /feed — shortlink + ดึงโทเค้น/cookies จาก Ads Manager tab + รัน FB pipeline. ไม่มี UI (ทำงานเงียบๆ ผ่าน dashboard.oomnn.com/feed เท่านั้น). ฟีดเท่านั้น เฉียบไม่แตะ",
     "permissions": [
         "tabs",
