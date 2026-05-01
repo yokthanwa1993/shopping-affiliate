@@ -24785,9 +24785,15 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
     }
 
-    // Snapshot the start-of-attempt time so the cross-endpoint fallback below can
-    // ask FB "did any earlier attempt actually publish?" before re-publishing.
-    const overallNotBeforeIso = new Date().toISOString()
+    // Look back 30 minutes when checking FB feed for "did we already publish this?".
+    // The narrow window we used before only caught duplicates from THIS cron tick.
+    // The real-world bug saw `/video_reels` fallback uploads finishing on FB's side
+    // up to several minutes after the next cron tick had already started — so the
+    // OLDER /video_reels attempt's post was already visible in FB feed by the time
+    // the newer cron tick reached its fallback step, but the narrow window missed it.
+    // 30 minutes safely covers a delayed `/video_reels` upload + processing window
+    // without producing false-positive matches (we still match by caption + after time).
+    const overallNotBeforeIso = new Date(Date.now() - 30 * 60 * 1000).toISOString()
 
     try {
         return await publishReelViaVideosEndpointWithTokenFallback({
