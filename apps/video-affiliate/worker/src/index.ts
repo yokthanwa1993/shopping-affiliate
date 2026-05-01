@@ -24539,13 +24539,45 @@ async function publishReelViaVideosEndpointWithTokenFallback(params: {
     // misleading "Please reduce the amount of data" or similar on backend hiccups).
     const TRANSIENT_RETRY_DELAYS_MS = [0, 5000, 20000]
 
-    for (const token of candidates) {
+    for (const tokenIndex in candidates) {
+        const token = candidates[tokenIndex]
         try {
             let publishResult: Awaited<ReturnType<typeof publishReelDirect>> | null = null
             let lastTransientError: unknown = null
             for (let attempt = 0; attempt < TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
                 const delay = TRANSIENT_RETRY_DELAYS_MS[attempt]
                 if (delay > 0) await waitMs(delay)
+
+                // IDEMPOTENCY GUARD (added 2026-05-01 to fix duplicate-post bug):
+                // Before any retry/token-fallback attempt, ask FB whether the PREVIOUS
+                // attempt already created the post — even if our worker saw a timeout or
+                // transient error. Without this, every retry / token fallback that runs
+                // after a "silent success" on the FB side double-publishes (the operator
+                // saw 6 duplicate posts in 24 hours that matched this exact pattern).
+                if (attempt > 0 || Number(tokenIndex) > 0) {
+                    try {
+                        const recovery = await recoverPublishedReelFromRecentFeed({
+                            accessToken: token,
+                            pageId: params.pageId,
+                            expectedCaption: params.description,
+                            notBeforeIso,
+                            logPrefix: `${params.logPrefix} pre-retry-recover`,
+                        })
+                        if (recovery.published && recovery.post_id) {
+                            const recoveredPostId = String(recovery.post_id || '').trim()
+                            console.log(`[${params.logPrefix}] previous attempt already published as ${recoveredPostId} — skipping this retry to prevent duplicate`)
+                            return {
+                                id: recoveredPostId,
+                                postId: recoveredPostId,
+                                permalinkUrl: String(recovery.permalink_url || '').trim(),
+                                postingToken: token,
+                            }
+                        }
+                    } catch {
+                        // ignore — best-effort guard, fall through to actual retry
+                    }
+                }
+
                 try {
                     publishResult = await publishReelDirect({
                         pageId: params.pageId,
@@ -24753,6 +24785,10 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
     }
 
+    // Snapshot the start-of-attempt time so the cross-endpoint fallback below can
+    // ask FB "did any earlier attempt actually publish?" before re-publishing.
+    const overallNotBeforeIso = new Date().toISOString()
+
     try {
         return await publishReelViaVideosEndpointWithTokenFallback({
             pageId: params.pageId,
@@ -24771,6 +24807,36 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         ])
         if (resumableCandidates.length === 0) {
             throw directErr
+        }
+
+        // CROSS-ENDPOINT IDEMPOTENCY GUARD (added 2026-05-01 for duplicate-post fix):
+        // /videos exhausted all retries × all tokens. Before kicking off the entirely
+        // separate 3-step /video_reels flow (which would create a brand-new post),
+        // ask FB once more whether any of the /videos attempts actually published —
+        // FB sometimes accepts the post but returns a transient error code, leading
+        // both /videos retries AND /video_reels to publish the same video twice.
+        for (const token of resumableCandidates) {
+            try {
+                const recovery = await recoverPublishedReelFromRecentFeed({
+                    accessToken: token,
+                    pageId: params.pageId,
+                    expectedCaption: params.description,
+                    notBeforeIso: overallNotBeforeIso,
+                    logPrefix: `${params.logPrefix} fallback-recover`,
+                })
+                if (recovery.published && recovery.post_id) {
+                    const recoveredPostId = String(recovery.post_id || '').trim()
+                    console.log(`[${params.logPrefix}] /videos attempts already published as ${recoveredPostId} — skipping /video_reels fallback to prevent duplicate (token_tail=${deriveCommentTokenHint(token) || token.slice(-8)})`)
+                    return {
+                        id: recoveredPostId,
+                        postId: recoveredPostId,
+                        permalinkUrl: String(recovery.permalink_url || '').trim(),
+                        postingToken: token,
+                    }
+                }
+            } catch {
+                // best-effort guard — fall through to /video_reels if recovery fails
+            }
         }
 
         console.warn(`[${params.logPrefix}] direct /videos publish failed, falling back to 3-step /video_reels (${directMessage})`)
