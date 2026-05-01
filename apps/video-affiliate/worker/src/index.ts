@@ -28251,7 +28251,109 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
 // ==================== MANUAL REEL POST (ใส่ Page ID + Token เอง) ====================
 
+function inferManualPostHistoryVideoId(videoUrl: string, fallback = 'manual-reel'): string {
+    const raw = String(videoUrl || '').trim()
+    if (!raw) return fallback
 
+    try {
+        const url = new URL(raw)
+        const path = decodeURIComponent(url.pathname || '')
+        const candidates = [
+            path.match(/\/videos\/([^/?#]+?)(?:_line)?_original\.mp4$/i)?.[1],
+            path.match(/\/videos\/([^/?#]+?)\.mp4$/i)?.[1],
+        ]
+        for (const candidate of candidates) {
+            const normalized = String(candidate || '').trim()
+            if (normalized) return normalized
+        }
+    } catch {
+        // fall through to regex parsing
+    }
+
+    const fallbackMatch = raw.match(/\/videos\/([^/?#]+?)(?:_line)?_original\.mp4(?:[?#]|$)/i)
+        || raw.match(/\/videos\/([^/?#]+?)\.mp4(?:[?#]|$)/i)
+    return String(fallbackMatch?.[1] || '').trim() || fallback
+}
+
+
+
+// Extension-side ad creation log (เพจ ฟีด only)
+//
+// The feed-ad-extension does the entire ad-creation pipeline inside the user's
+// logged-in Chrome tab (Ads Manager) — bypassing the Electron app — and posts
+// here once successful so the result lands in post_history alongside everything
+// else (gallery "used" filter, dashboard history, etc.).
+//
+// Locked to ฟีด page id 116759241338040 because:
+//   - This is the page we agreed to migrate to extension; เฉียบ keeps Electron.
+//   - Other pages have their own Electron flow that already writes post_history.
+// Anything else is rejected up-front so a misconfigured extension build can't
+// log against the wrong workspace.
+const FEED_EXTENSION_PAGE_ID = '116759241338040'
+
+app.post('/api/dashboard/extension-ad-log', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as {
+        page_id?: string
+        video_id?: string
+        story_id?: string
+        ad_id?: string
+        adset_id?: string
+        creative_id?: string
+        shopee_link?: string
+        short_link?: string
+        comment_id?: string
+    }
+    const pageId = String(body.page_id || '').trim()
+    if (pageId !== FEED_EXTENSION_PAGE_ID) {
+        return c.json({ ok: false, error: 'extension_log_only_for_feed_page', expected_page_id: FEED_EXTENSION_PAGE_ID }, 403)
+    }
+    const videoId = String(body.video_id || '').trim()
+    const storyId = String(body.story_id || '').trim()
+    if (!videoId || !storyId) {
+        return c.json({ ok: false, error: 'video_id_and_story_id_required' }, 400)
+    }
+
+    const pageRow = await c.env.DB.prepare(
+        'SELECT bot_id FROM pages WHERE id = ? LIMIT 1'
+    ).bind(pageId).first().catch(() => null) as { bot_id?: string } | null
+    const namespaceId = String(pageRow?.bot_id || '').trim()
+
+    await ensurePostHistoryTraceColumns(c.env.DB).catch(() => { })
+    const nowIso = new Date().toISOString()
+    const shopeeLink = String(body.shopee_link || '').trim()
+    const commentId = String(body.comment_id || '').trim()
+    const commentStatus = commentId ? 'success' : 'not_attempted'
+
+    try {
+        await c.env.DB.prepare(
+            `INSERT INTO post_history (
+                page_id, video_id, fb_post_id, posted_at, status, trigger_source, bot_id,
+                shopee_link, comment_status, comment_fb_id
+            ) VALUES (?, ?, ?, ?, 'success', 'feed_extension', ?, ?, ?, ?)`
+        ).bind(
+            pageId, videoId, storyId, nowIso, namespaceId,
+            shopeeLink, commentStatus, commentId || null,
+        ).run()
+    } catch (e) {
+        return c.json({ ok: false, error: 'post_history_insert_failed', detail: String(e instanceof Error ? e.message : e) }, 500)
+    }
+
+    if (namespaceId) {
+        await markNamespaceVideoPosted(c.env.DB, namespaceId, videoId, nowIso).catch(() => { })
+    }
+
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        video_id: videoId,
+        story_id: storyId,
+        ad_id: String(body.ad_id || '').trim(),
+        adset_id: String(body.adset_id || '').trim(),
+        creative_id: String(body.creative_id || '').trim(),
+        short_link: String(body.short_link || '').trim(),
+        logged_at: nowIso,
+    })
+})
 
 app.post('/api/mark-video-posted', async (c) => {
     const botId = c.get('botId')
@@ -28292,12 +28394,15 @@ app.post('/api/pages/:id/promote-ad', async (c) => {
 
 app.post('/api/manual-post-reel', async (c) => {
     const t0 = Date.now()
+    let manualHistoryId: number | null = null
 
     try {
         const body = await c.req.json() as {
             pageId: string
             accessToken: string
             videoUrl: string
+            videoId?: string
+            video_id?: string
             caption?: string
             commentToken?: string
             shopeeLink?: string
@@ -28312,12 +28417,30 @@ app.post('/api/manual-post-reel', async (c) => {
 
         console.log(`[MANUAL-REEL] Starting for page ${pageId}`)
         console.log(`[MANUAL-REEL] Video: ${videoUrl}`)
-        const namespaceId = String(c.get('botId') || '').trim()
+        const incomingNamespaceId = String(c.get('botId') || '').trim()
+        const pageRow = await c.env.DB.prepare(
+            `SELECT id, name, bot_id, is_active
+             FROM pages
+             WHERE id = ?
+             ORDER BY CASE WHEN bot_id = ? THEN 0 ELSE 1 END
+             LIMIT 1`
+        ).bind(pageId, incomingNamespaceId).first() as { id?: string; name?: string; bot_id?: string; is_active?: number } | null
+        if (!pageRow?.id) {
+            return c.json({ error: 'page_not_registered_for_manual_post', pageId }, 404)
+        }
+        if (Number(pageRow.is_active || 0) !== 1) {
+            return c.json({ error: 'page_posting_disabled', pageId, page: String(pageRow.name || pageId) }, 409)
+        }
+        const namespaceId = String(pageRow.bot_id || incomingNamespaceId || '').trim()
+        const pageName = String(pageRow.name || pageId).trim()
+        const historyVideoId = String(body.videoId || body.video_id || '').trim()
+            || inferManualPostHistoryVideoId(videoUrl)
+        const effectiveLazadaLink = String(lazadaLink || '').trim()
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env: c.env,
             namespaceId,
             shopeeLink: shopeeLink || '',
-            lazadaLink: lazadaLink || '',
+            lazadaLink: effectiveLazadaLink,
             logPrefix: 'MANUAL-REEL VERIFY',
         })
         if (!affiliateVerification.ok) {
@@ -28339,6 +28462,35 @@ app.post('/api/manual-post-reel', async (c) => {
             })
             : ''
 
+        await ensurePostHistoryTraceColumns(c.env.DB)
+        const nowIso = new Date().toISOString()
+        const initialPostProfile = await resolvePostHistoryProfileByToken(c.env, accessToken)
+        const inserted = await c.env.DB.prepare(
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(
+            pageId,
+            historyVideoId,
+            nowIso,
+            'posting',
+            'manual_post_reel',
+            namespaceId,
+            deriveCommentTokenHint(accessToken),
+            initialPostProfile.profileId,
+            initialPostProfile.profileName,
+            shopeeLink ? 'pending' : 'not_configured',
+            deriveCommentTokenHint(commentToken || ''),
+            shopeeLink ? null : 'shopee_link_missing',
+            null,
+            effectiveShopeeLink || shopeeLink || null,
+            effectiveLazadaLink || null,
+        ).run() as { meta?: { last_row_id?: number } }
+        manualHistoryId = Number(inserted?.meta?.last_row_id || 0) || null
+        await c.env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?')
+            .bind(nowIso, pageId, namespaceId)
+            .run()
+            .catch(() => { })
+        console.log(`[MANUAL-REEL] history row=${manualHistoryId || 'n/a'} ns=${namespaceId} page=${pageName} video=${historyVideoId}`)
+
         // Step 1: Init upload
         let initData: { video_id?: string; upload_url?: string }
         try {
@@ -28349,19 +28501,19 @@ app.post('/api/manual-post-reel', async (c) => {
             )
         } catch (e) {
             const parsed = parseFacebookErrorLike(e)
-            return c.json({ error: `Init failed: ${parsed?.message || (e instanceof Error ? e.message : 'unknown')}`, stage: 'init' }, 400)
+            throw new Error(`init_failed: ${parsed?.message || (e instanceof Error ? e.message : 'unknown')}`)
         }
 
         const { video_id: fbVideoId, upload_url } = initData
         if (!upload_url || !fbVideoId) {
-            return c.json({ error: 'No upload URL or video ID returned', stage: 'init' }, 400)
+            throw new Error('init_failed: No upload URL or video ID returned')
         }
         console.log(`[MANUAL-REEL] Init OK: video_id=${fbVideoId}`)
 
         // Step 2: Upload video
         const videoResp = await fetch(videoUrl)
         if (!videoResp.ok) {
-            return c.json({ error: `Cannot fetch video: HTTP ${videoResp.status}`, stage: 'fetch-video' }, 400)
+            throw new Error(`fetch_video_failed: HTTP ${videoResp.status}`)
         }
         const videoBuffer = await videoResp.arrayBuffer()
         console.log(`[MANUAL-REEL] Video size: ${(videoBuffer.byteLength / 1024 / 1024).toFixed(1)}MB`)
@@ -28377,7 +28529,7 @@ app.post('/api/manual-post-reel', async (c) => {
         })
         const uploadData = await uploadResp.json() as { success?: boolean; error?: { message: string } }
         if (uploadData.error) {
-            return c.json({ error: `Upload failed: ${uploadData.error.message}`, stage: 'upload' }, 400)
+            throw new Error(`upload_failed: ${uploadData.error.message}`)
         }
         console.log(`[MANUAL-REEL] Upload OK`)
 
@@ -28393,25 +28545,59 @@ app.post('/api/manual-post-reel', async (c) => {
             })
         } catch (e) {
             const parsed = parseFacebookErrorLike(e)
-            return c.json({ error: `Publish failed: ${parsed?.message || (e instanceof Error ? e.message : 'unknown')}`, stage: 'finish' }, 400)
+            throw new Error(`publish_failed: ${parsed?.message || (e instanceof Error ? e.message : 'unknown')}`)
         }
 
         const dur = ((Date.now() - t0) / 1000).toFixed(1)
         console.log(`[MANUAL-REEL] ✅ Published: ${fbVideoId} in ${dur}s`)
         const confirmedPostId = String(finishData.post_id || '').trim() || fbVideoId
         const fbReelUrl = String(finishData.permalink_url || '').trim() || `https://www.facebook.com/watch/?v=${fbVideoId}`
+        if (historyVideoId && historyVideoId !== 'manual-reel') {
+            await markNamespaceVideoPosted(c.env.DB, namespaceId, historyVideoId, new Date().toISOString()).catch(() => { })
+        }
+        if (manualHistoryId) {
+            await c.env.DB.prepare(
+                `UPDATE post_history
+                 SET fb_post_id = ?,
+                     fb_reel_url = ?,
+                     status = 'success',
+                     error_message = NULL,
+                     post_token_hint = ?,
+                     post_profile_id = ?,
+                     post_profile_name = ?,
+                     comment_status = ?,
+                     comment_token_hint = ?,
+                     comment_error = ?
+                 WHERE id = ? AND status = 'posting'`
+            ).bind(
+                confirmedPostId,
+                fbReelUrl,
+                deriveCommentTokenHint(accessToken),
+                initialPostProfile.profileId,
+                initialPostProfile.profileName,
+                shopeeLink ? 'pending' : 'not_configured',
+                deriveCommentTokenHint(commentToken || ''),
+                shopeeLink ? null : 'shopee_link_missing',
+                manualHistoryId,
+            ).run().catch(() => { })
+        }
 
         // Step 4: Auto comment (if shopeeLink provided)
         let commentResult: string | null = null
+        let commentStatus = shopeeLink ? 'pending' : 'not_configured'
+        let commentError: string | null = shopeeLink ? null : 'shopee_link_missing'
+        let commentFbId: string | null = null
+        let commentTokenUsed = String(commentToken || '').trim()
+        let commentProfileId: string | null = null
+        let commentProfileName: string | null = null
         if (shopeeLink) {
-            const effectiveLazadaLink = String(lazadaLink || '').trim()
             const commentWaitMs = getRandomCommentDelayMs()
             console.log(`[MANUAL-REEL] Waiting ${Math.ceil(commentWaitMs / 1000)}s before commenting...`)
             await waitMs(commentWaitMs)
             try {
                 const res = await postShopeeCommentWithFallback({
                     env: c.env,
-                    namespaceId: c.get('botId'),
+                    namespaceId,
                     fbVideoId: fbVideoId || confirmedPostId,
                     shopeeLink: effectiveShopeeLink,
                     lazadaLink: effectiveLazadaLink,
@@ -28421,26 +28607,56 @@ app.post('/api/manual-post-reel', async (c) => {
                 })
                 if (res.ok) {
                     commentResult = res.id || 'ok'
+                    commentStatus = 'success'
+                    commentError = null
+                    commentFbId = res.id || null
+                    commentTokenUsed = String(res.commentToken || commentTokenUsed || '').trim()
+                    const commentProfile = await resolvePostHistoryProfileByToken(c.env, commentTokenUsed)
+                    commentProfileId = commentProfile.profileId
+                    commentProfileName = commentProfile.profileName
                 } else {
                     commentResult = `failed: ${res.error || 'unknown'}`
-                    const page = await c.env.DB.prepare(
-                        'SELECT id, name, bot_id FROM pages WHERE id = ? LIMIT 1'
-                    ).bind(pageId).first() as { id?: string; name?: string; bot_id?: string } | null
-                    if (page?.id && page?.bot_id) {
-                        await notifyCommentTokenIssue(
-                            c.env,
-                            String(page.bot_id),
-                            String(page.id),
-                            String(page.name || page.id),
-                            res.error || 'comment_failed',
-                        ).catch((notifyErr) => {
-                            console.error(`[MANUAL-REEL] notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
-                        })
-                    }
+                    commentStatus = 'failed'
+                    commentError = res.error || 'comment_failed'
+                    commentTokenUsed = String(res.commentToken || commentTokenUsed || '').trim()
+                    const commentProfile = await resolvePostHistoryProfileByToken(c.env, commentTokenUsed)
+                    commentProfileId = commentProfile.profileId
+                    commentProfileName = commentProfile.profileName
+                    await notifyCommentTokenIssue(
+                        c.env,
+                        namespaceId,
+                        pageId,
+                        pageName || pageId,
+                        res.error || 'comment_failed',
+                    ).catch((notifyErr) => {
+                        console.error(`[MANUAL-REEL] notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+                    })
                 }
             } catch (e) {
-                commentResult = `exception: ${e instanceof Error ? e.message : String(e)}`
+                commentError = e instanceof Error ? e.message : String(e)
+                commentStatus = 'failed'
+                commentResult = `exception: ${commentError}`
             }
+        }
+        if (manualHistoryId) {
+            await c.env.DB.prepare(
+                `UPDATE post_history
+                 SET comment_status = ?,
+                     comment_error = ?,
+                     comment_fb_id = ?,
+                     comment_token_hint = ?,
+                     comment_profile_id = ?,
+                     comment_profile_name = ?
+                 WHERE id = ?`
+            ).bind(
+                commentStatus,
+                commentError,
+                commentFbId,
+                deriveCommentTokenHint(commentTokenUsed),
+                commentProfileId,
+                commentProfileName,
+                manualHistoryId,
+            ).run().catch(() => { })
         }
 
         return c.json({
@@ -28449,6 +28665,8 @@ app.post('/api/manual-post-reel', async (c) => {
             postId: confirmedPostId,
             reelUrl: fbReelUrl,
             pageId,
+            namespaceId,
+            historyId: manualHistoryId,
             caption: caption || '',
             duration: dur + 's',
             comment: commentResult,
@@ -28456,6 +28674,11 @@ app.post('/api/manual-post-reel', async (c) => {
     } catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e)
         console.error(`[MANUAL-REEL] ❌ Error:`, errorMsg)
+        if (manualHistoryId) {
+            await c.env.DB.prepare(
+                "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+            ).bind(errorMsg, manualHistoryId).run().catch(() => { })
+        }
         return c.json({ error: errorMsg, stage: 'exception' }, 500)
     }
 })

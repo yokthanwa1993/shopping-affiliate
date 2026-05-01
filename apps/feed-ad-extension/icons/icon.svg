@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" shape-rendering="geometricPrecision">
+  <rect width="128" height="128" rx="28" fill="#1877f2"/>
+  <text x="64" y="92" font-family="-apple-system, system-ui, 'Segoe UI', sans-serif"
+        font-size="86" font-weight="800" text-anchor="middle"
+        fill="white" letter-spacing="-2">F</text>
+</svg>

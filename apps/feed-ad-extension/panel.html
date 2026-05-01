@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="th">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Feed Ad Creator</title>
+    <link rel="stylesheet" href="panel.css">
+</head>
+
+<body>
+    <main class="panel">
+        <header class="header">
+            <div class="brand">
+                <div class="brand-icon">F</div>
+                <div>
+                    <p class="brand-eyebrow">Ad Creator — เพจ <span id="page-name">ฟีด</span></p>
+                    <p class="brand-id" id="page-id">page_id 116759241338040</p>
+                </div>
+            </div>
+            <div class="status-row" id="status-row">
+                <span class="dot dot-grey" id="dot-ads"></span><span id="status-ads">Ads Manager: ตรวจ...</span>
+                <span class="dot dot-grey" id="dot-shopee"></span><span id="status-shopee">Shopee: ตรวจ...</span>
+            </div>
+        </header>
+
+        <section class="card">
+            <form id="form" novalidate>
+                <label class="field">
+                    <span>วิดีโอ — กรอกอย่างใดอย่างหนึ่ง</span>
+                    <input id="video-id" type="text" placeholder="Video ID (เช่น 1609140340142561) — ใช้กับวิดีโอที่อัปขึ้น FB แล้ว"
+                        autocomplete="off">
+                    <input id="video-url" type="text" placeholder="หรือ Video URL (https://...) — ระบบจะ upload ใหม่"
+                        autocomplete="off" style="margin-top:6px">
+                </label>
+
+                <label class="field">
+                    <span>Caption</span>
+                    <textarea id="caption" rows="3" spellcheck="false"
+                        placeholder="แคปชั่นจริงของแอด — ระบบจะใส่ '📌 พิกัด : <shortlink>' เพิ่มให้บรรทัดบนสุด"></textarea>
+                </label>
+
+                <label class="field">
+                    <span>Shopee URL</span>
+                    <input id="shopee-url" type="text" placeholder="https://shopee.co.th/... หรือ https://s.shopee.co.th/..."
+                        autocomplete="off">
+                </label>
+
+                <fieldset class="campaign-block">
+                    <legend>Campaign</legend>
+                    <label class="field compact">
+                        <span>Existing Campaign ID (ใช้ได้เลย)</span>
+                        <input id="campaign-id" type="text" placeholder="เช่น 120245064878470263" autocomplete="off">
+                    </label>
+                    <p class="or">— หรือ —</p>
+                    <label class="field compact">
+                        <span>สร้างแคมเปญใหม่ (กรอกชื่อใหม่)</span>
+                        <input id="new-campaign-name" type="text" placeholder="เช่น ADS_PUBLISH_FEED_01" autocomplete="off">
+                    </label>
+                </fieldset>
+
+                <details class="advanced">
+                    <summary>ตั้งค่าขั้นสูง (override settings ของฟีด)</summary>
+                    <label class="field compact">
+                        <span>Ad Account</span>
+                        <input id="ad-account" type="text" autocomplete="off" placeholder="โหลดอัตโนมัติจาก worker">
+                    </label>
+                    <label class="field compact">
+                        <span>Template Adset ID</span>
+                        <input id="template-adset" type="text" autocomplete="off" placeholder="โหลดอัตโนมัติจาก worker">
+                    </label>
+                    <label class="field compact">
+                        <span>Thumbnail URL (optional — ข้าม poll thumbnails)</span>
+                        <input id="thumbnail-url" type="text" autocomplete="off"
+                            placeholder="ใส่ thumbnail URL ที่ valid ถ้ามี เพื่อ skip 60×3s polling">
+                    </label>
+                </details>
+
+                <div class="actions">
+                    <button id="btn-create" class="primary" type="submit">สร้างแอด ฟีด</button>
+                    <button id="btn-clear" class="ghost" type="button">เคลียร์</button>
+                </div>
+            </form>
+
+            <p id="status" class="status hide" role="status"></p>
+
+            <div id="progress" class="progress hide">
+                <div class="progress-bar"><span id="progress-fill"></span></div>
+                <p id="progress-text" class="progress-text"></p>
+            </div>
+
+            <div id="result" class="result-container hide">
+                <h4>สำเร็จ ✅</h4>
+                <dl id="result-list"></dl>
+            </div>
+        </section>
+    </main>
+
+    <script src="panel.js"></script>
+</body>
+
+</html>
