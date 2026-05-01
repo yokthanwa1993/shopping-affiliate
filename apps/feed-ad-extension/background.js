@@ -509,6 +509,14 @@ async function runCreateAdPipeline(payload) {
         return { ok: false, step: 'ads_manager_tab', error: 'ไม่มี tab Ads Manager เปิดอยู่ — เปิด adsmanager.facebook.com แล้วลองใหม่ (ต้อง login บัญชีที่มี admin บนเพจฟีด)' }
     }
 
+    // Build comment text (matches Electron's worker comment step). Reads
+    // settings.comment_template (per-page) and replaces {shopee_link} with
+    // the wwoom shortLink. Empty template = silent skip.
+    const commentTemplate = String(settings.comment_template || '').trim()
+    const commentText = commentTemplate && shortLink
+        ? commentTemplate.replace(/\{shopee_link\}/g, shortLink)
+        : ''
+
     // 5. Run pipeline IN-PLACE in Ads Manager tab (MAIN world)
     const pipelineArgs = {
         pageId: FEED_PAGE_ID,
@@ -521,6 +529,7 @@ async function runCreateAdPipeline(payload) {
         campaignId: String(campaignId || ''),
         newCampaignName: String(newCampaignName || ''),
         thumbnailUrl: String(thumbnailUrl || ''),
+        commentText,
     }
 
     const exec = await chrome.scripting.executeScript({
@@ -549,6 +558,7 @@ async function runCreateAdPipeline(payload) {
                 creative_id: result.creative_id,
                 shopee_link: shopeeLink,
                 short_link: shortLink,
+                comment_id: result.comment_id || '',
             }),
         })
         logged = await logResp.json().catch(() => null)
@@ -578,7 +588,7 @@ async function runCreateAdPipeline(payload) {
 // All arguments are serialized — must pass primitives only.
 
 async function fbAdPipelineMainWorld(args) {
-    const { pageId, videoId, videoUrl, caption, ctaLink, adAccount, templateAdset, campaignId, newCampaignName, thumbnailUrl } = args
+    const { pageId, videoId, videoUrl, caption, ctaLink, adAccount, templateAdset, campaignId, newCampaignName, thumbnailUrl, commentText } = args
 
     const accessToken = window.__accessToken
     if (!accessToken) {
@@ -733,11 +743,12 @@ async function fbAdPipelineMainWorld(args) {
     // ── Step 7.5: publish to page feed (so post is visible organically too) ──
     let publishedToPage = false
     let publishError = ''
+    let pageToken = ''
     try {
         const pagesRes = await fbFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id&limit=100&access_token=${encodeURIComponent(accessToken)}`)
         const pages = (pagesRes.json?.data || [])
         const page = pages.find((p) => p.id === pageId)
-        const pageToken = page ? page.access_token : ''
+        pageToken = page ? page.access_token : ''
         if (pageToken) {
             const pubResp = await fbFetch(
                 `https://graph.facebook.com/v21.0/${storyId}?access_token=${encodeURIComponent(pageToken)}`,
@@ -753,6 +764,41 @@ async function fbAdPipelineMainWorld(args) {
         }
     } catch (e) { publishError = e.message || String(e) }
 
+    // ── Step 8: post first comment with shortlink (matches Electron's worker
+    // comment step). Uses page access_token (same one used to publish), since
+    // page tokens can comment on their own page's posts. Skip silently if
+    // commentText is empty (operator left comment_template blank in /feed/settings)
+    // or if we couldn't get the page token in step 7.5.
+    let commentPosted = false
+    let commentId = ''
+    let commentError = ''
+    if (commentText && pageToken) {
+        try {
+            const cm = await fbFetch(
+                `https://graph.facebook.com/v21.0/${storyId}/comments?access_token=${encodeURIComponent(pageToken)}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: commentText }),
+                }
+            )
+            if (cm.json?.error) {
+                commentError = String(cm.json.error.message || '').substring(0, 200)
+            } else if (cm.json?.id) {
+                commentPosted = true
+                commentId = String(cm.json.id)
+            } else {
+                commentError = 'no_comment_id_returned'
+            }
+        } catch (e) {
+            commentError = e?.message || String(e)
+        }
+    } else if (!commentText) {
+        commentError = 'no_comment_template (settings.comment_template empty)'
+    } else if (!pageToken) {
+        commentError = 'no_page_token (publish-to-page skipped)'
+    }
+
     return {
         ok: true,
         story_id: storyId,
@@ -762,6 +808,9 @@ async function fbAdPipelineMainWorld(args) {
         video_id: vidId,
         published_to_page: publishedToPage,
         publish_error: publishError || undefined,
+        comment_posted: commentPosted,
+        comment_id: commentId || undefined,
+        comment_error: commentError || undefined,
     }
 }
 

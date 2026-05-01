@@ -739,10 +739,10 @@ export default function App() {
           story_id: typeof r.story_id === 'string' ? r.story_id : undefined,
           ad_id: typeof r.ad_id === 'string' ? r.ad_id : undefined,
           adset_id: typeof r.adset_id === 'string' ? r.adset_id : undefined,
-          // Extension publishes to page (is_published=true) and worker logs
-          // post_history. There's no auto-comment in the ext path right now —
-          // surface that explicitly so the operator knows.
-          commentPosted: false,
+          // Extension v1.9.0+ posts the first comment with the shortlink
+          // using the same page_token it uses to publish to page. Mirrors the
+          // worker comment step that runs after Electron returns for เฉียบ.
+          commentPosted: !!r.comment_posted,
         }
         httpStatus = data.ok ? 200 : 502
       } else {
