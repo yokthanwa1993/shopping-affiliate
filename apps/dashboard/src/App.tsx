@@ -522,9 +522,11 @@ export default function App() {
       ad_account_status?: { tested: boolean; ok?: boolean; error?: string; code?: number; id?: string; name?: string; account_status?: number; currency?: string }
       page_access_ok?: { tested: boolean; ok?: boolean; error?: string; code?: number; id?: string; name?: string }
       promotable_linkage?: { tested: boolean; ok?: boolean; error?: string; code?: number; total_pages?: number; feed_in_promotable?: boolean; sample?: Array<{ id?: string; name?: string }> }
+      template_adset_check?: { tested: boolean; ok?: boolean; error?: string; code?: number; template_id?: string; template_name?: string; template_account_id?: string; expected_account_id?: string; status?: string; objective?: string; buying_type?: string; parent_campaign_name?: string }
       error?: string
     } | null
     ad_account?: string
+    template_adset?: string
     settings_loaded?: boolean
     shortlink_provider?: string
   }
@@ -1412,9 +1414,11 @@ export default function App() {
               const pageOk = inspect?.page_access_ok?.tested && inspect?.page_access_ok?.ok
               const linkageTested = inspect?.promotable_linkage?.tested
               const linkageOk = linkageTested && inspect?.promotable_linkage?.ok
+              const tplTested = inspect?.template_adset_check?.tested
+              const tplOk = tplTested && inspect?.template_adset_check?.ok
               const shopeeOk = !!s.shopee_tab
               // Critical = blocks pipeline. fb_dtsg is informational (not used by our pipeline).
-              const allReady = adsOk && tokenOk && cuserOk && adAccountOk && pageOk && linkageOk
+              const allReady = adsOk && tokenOk && cuserOk && adAccountOk && pageOk && linkageOk && tplOk
               const Row = ({ label, ok, severity = 'critical', detail }: { label: string; ok: boolean; severity?: 'critical' | 'info'; detail?: string }) => {
                 const dotClass = ok ? 'bg-emerald-500' : (severity === 'info' ? 'bg-amber-400' : 'bg-red-500')
                 const detailClass = ok ? 'text-slate-500' : (severity === 'info' ? 'text-amber-700' : 'text-red-600')
@@ -1456,6 +1460,17 @@ export default function App() {
                             : `ไม่มีฟีดใน promote_pages — มี ${inspect?.promotable_linkage?.total_pages ?? 0} pages: ${linkagePagesPreview || '(empty)'}`))
                         : 'รอตรวจ'}
                     />
+                    <Row
+                      label={`Template Adset (${s.template_adset || ''})`}
+                      ok={!!tplOk}
+                      detail={tplTested
+                        ? (tplOk
+                          ? `✓ "${inspect?.template_adset_check?.template_name || ''}" · ${inspect?.template_adset_check?.objective || ''}`
+                          : (inspect?.template_adset_check?.error
+                            ? `${inspect.template_adset_check.error} (code=${inspect.template_adset_check.code ?? '-'})`
+                            : `อยู่คนละ ad_account: ${inspect?.template_adset_check?.template_account_id || '?'} ≠ ${inspect?.template_adset_check?.expected_account_id || '?'}`))
+                        : 'รอตรวจ'}
+                    />
                     <Row label={`Shopee Affiliate tab (${s.shortlink_provider || 'api'} mode)`} ok={shopeeOk || s.shortlink_provider !== 'extension'} detail={shopeeOk ? 'open' : (s.shortlink_provider === 'extension' ? 'ต้องเปิด affiliate.shopee.co.th' : '— (โหมด api ไม่ต้องใช้)')} />
                     <Row label="Cookies (.facebook.com)" ok={!!(inspect?.cookie_count && inspect.cookie_count > 0)} severity="info" detail={inspect?.cookie_count ? `${inspect.cookie_count} cookies (HttpOnly ไม่นับ — ปกติ 3-5)` : '0'} />
                   </div>
@@ -1465,6 +1480,24 @@ export default function App() {
                       <p className="mt-0.5">เพจฟีดไม่อยู่ใน promotable pages ของ ad_account นี้ — ต้อง link ใน Business Manager</p>
                       <p className="mt-1 break-words font-mono text-[10px] text-amber-700">
                         แก้: business.facebook.com → Business Settings → Pages → ฟีด → Add Asset → Ad Accounts → เลือก {s.ad_account}
+                      </p>
+                    </div>
+                  )}
+                  {tplTested && !tplOk && !inspect?.template_adset_check?.error && (
+                    <div className="border-t border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                      <p className="font-semibold">⚠️ ที่น่าจะเป็นสาเหตุของ FB code=100 ที่ step [copy]:</p>
+                      <p className="mt-0.5">
+                        Template Adset อยู่ใน ad_account
+                        <code className="mx-1 rounded bg-white px-1">act_{inspect?.template_adset_check?.template_account_id}</code>
+                        แต่กำลังสร้างแอดให้ ad_account
+                        <code className="mx-1 rounded bg-white px-1">act_{inspect?.template_adset_check?.expected_account_id}</code>
+                        — FB ห้าม copy adset ข้าม account
+                      </p>
+                      <p className="mt-1 text-amber-700">
+                        แก้ทาง 1: สร้าง adset ตัวอย่างใหม่ใน <code className="rounded bg-white px-1">act_{inspect?.template_adset_check?.expected_account_id}</code> (Ads Manager → Create → Adset → set audience/budget/placement → save) แล้วเอา id มาใส่ใน /feed/settings → Template Adset
+                      </p>
+                      <p className="mt-1 text-amber-700">
+                        แก้ทาง 2: ใน /feed/settings → Ad Account → เปลี่ยนเป็น <code className="rounded bg-white px-1">act_{inspect?.template_adset_check?.template_account_id}</code> ที่ template adset อยู่ (ถ้า ad_account นั้น link กับฟีดด้วย)
                       </p>
                     </div>
                   )}

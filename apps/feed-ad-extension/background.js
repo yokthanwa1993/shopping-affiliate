@@ -74,6 +74,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function runStatusCheck({ adAccount }) {
     const settings = await loadFeedSettings().catch(() => null)
     const effAdAccount = String(adAccount || settings?.ad_account || DEFAULT_AD_ACCOUNT).trim()
+    const effTemplateAdset = String(settings?.template_adset || DEFAULT_TEMPLATE_ADSET).trim()
 
     const adsTabs = await findTabsByPatterns(ADS_MANAGER_TAB_PATTERNS)
     const shopeeTab = await findTabByPattern(SHOPEE_TAB_PATTERN)
@@ -85,7 +86,7 @@ async function runStatusCheck({ adAccount }) {
                 target: { tabId: adsTabs[0].id },
                 world: 'MAIN',
                 func: fbInspectMainWorld,
-                args: [{ adAccount: effAdAccount }],
+                args: [{ adAccount: effAdAccount, templateAdset: effTemplateAdset }],
             })
             inspect = exec?.[0]?.result || { error: 'pipeline_no_result' }
         } catch (e) {
@@ -106,6 +107,7 @@ async function runStatusCheck({ adAccount }) {
             : null,
         inspect,
         ad_account: effAdAccount,
+        template_adset: effTemplateAdset,
         settings_loaded: !!settings,
         shortlink_provider: settings?.shortlink_provider || 'api',
     }
@@ -114,7 +116,7 @@ async function runStatusCheck({ adAccount }) {
 // Runs INSIDE Ads Manager tab (MAIN world). Reads creds + does a cheap
 // graph.facebook.com smoke test to verify the ad_account is reachable from
 // this user's session. Reports presence + truncated tail (no full token).
-async function fbInspectMainWorld({ adAccount }) {
+async function fbInspectMainWorld({ adAccount, templateAdset }) {
     const accessToken = window.__accessToken || ''
     // fb_dtsg detection across multiple FB UI versions. Not strictly required
     // by our pipeline (we use access_token in the URL) — informational only.
@@ -206,6 +208,43 @@ async function fbInspectMainWorld({ adAccount }) {
         }
     }
 
+    // Template adset must live in the SAME ad_account we're creating ads for —
+    // FB's /copies endpoint refuses cross-account adset copies with code=100
+    // "Invalid parameter". This is the most common cause for ฟีด failing at
+    // step 'copy' when the operator's template_adset was originally created
+    // for the เฉียบ ad account.
+    let templateAdsetCheck = { tested: false }
+    if (accessToken && templateAdset) {
+        try {
+            const r = await fetch(
+                `https://graph.facebook.com/v21.0/${templateAdset}?fields=id,name,account_id,status,campaign{id,name,objective,buying_type}&access_token=${encodeURIComponent(accessToken)}`,
+                { credentials: 'include' }
+            )
+            const j = await r.json().catch(() => ({}))
+            if (j?.error) {
+                templateAdsetCheck = { tested: true, ok: false, error: String(j.error.message || ''), code: j.error.code }
+            } else {
+                const tplAccount = String(j.account_id || '').trim()
+                const cleanAdAccount = String(adAccount || '').replace(/^act_/, '').trim()
+                const matches = tplAccount === cleanAdAccount
+                templateAdsetCheck = {
+                    tested: true,
+                    ok: matches,
+                    template_id: j.id,
+                    template_name: j.name || '',
+                    template_account_id: tplAccount,
+                    expected_account_id: cleanAdAccount,
+                    status: j.status,
+                    objective: j?.campaign?.objective || '',
+                    buying_type: j?.campaign?.buying_type || '',
+                    parent_campaign_name: j?.campaign?.name || '',
+                }
+            }
+        } catch (e) {
+            templateAdsetCheck = { tested: true, ok: false, error: e?.message || String(e) }
+        }
+    }
+
     return {
         access_token_present: !!accessToken,
         access_token_len: accessToken.length,
@@ -218,6 +257,7 @@ async function fbInspectMainWorld({ adAccount }) {
         ad_account_status: adAccountStatus,
         page_access_ok: pageAccessOk,
         promotable_linkage: promotableLinkage,
+        template_adset_check: templateAdsetCheck,
     }
 }
 
