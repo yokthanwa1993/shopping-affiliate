@@ -3433,6 +3433,18 @@ async function setDashboardSetting(db: D1Database, key: string, value: string): 
 // Why a key prefix instead of a new column: we keep schema migration zero
 // (no ALTER TABLE / cache invalidation), and the legacy global rows continue
 // to act as defaults for any setting the operator hasn't customized per-page.
+//
+// Bootstrap policy (run once when adding a new page workspace):
+// Each page must have its OWN row for every setting key, otherwise switching
+// pages in the dashboard will appear "linked" — chearb editing inherits feed's
+// values via the global fallback. Workaround on 2026-05-01:
+//
+//   INSERT OR IGNORE INTO dashboard_settings (key, value, updated_at)
+//   SELECT 'page:{NEW_PAGE_ID}:' || key, value, datetime('now')
+//   FROM dashboard_settings
+//   WHERE key IN ('sub_id', 'sub_id2', ..., 'shortlink_provider');
+//
+// After bootstrap, dashboard saves on one page never bleed into another.
 function pageScopedSettingKey(pageId: string, key: string): string {
     return `page:${pageId}:${key}`
 }
