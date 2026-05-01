@@ -20506,6 +20506,21 @@ async function facebookGraphRawPost<T>(
         if (value === undefined || value === null || value === '') continue
         form.set(key, String(value))
     }
+    // UNIVERSAL POST LOG: every outbound write to graph.facebook.com goes through here
+    // (or facebookGraphPost). Logging path + body-keys + token-tail + a stack trace
+    // captures WHICH code path made the call — so a future "comment came from somewhere
+    // I don't know about" bug can be traced from `wrangler tail` alone, no source review.
+    try {
+        const tokenStr = String(body.access_token ?? '')
+        const tokenTail = tokenStr ? tokenStr.trim().slice(-8) : '(none)'
+        const bodyKeys = Object.keys(body).filter((k) => k !== 'access_token').join(',')
+        const messagePreview = body.message ? JSON.stringify(String(body.message)).slice(0, 220) : ''
+        const stack = (new Error('graph_post_trace').stack || '').split('\n').slice(2, 6).join(' | ').slice(0, 400)
+        console.log(`[GRAPH-POST] path=${path} keys=${bodyKeys} token_tail=${tokenTail} message_preview=${messagePreview}`)
+        console.log(`[GRAPH-POST] stack: ${stack}`)
+    } catch {
+        // never fail a post because of a logging bug
+    }
     const resp = await fetchWithTimeout(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -20549,6 +20564,19 @@ async function facebookGraphPost<T>(
 ): Promise<T> {
     const token = String(accessToken || '').trim()
     if (!token) throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
+    // Same universal logging as facebookGraphRawPost — see comment there.
+    try {
+        const tokenTail = token.slice(-8)
+        const bodyKeys = Object.keys(body).join(',')
+        const messagePreview = (body as Record<string, unknown>).message
+            ? JSON.stringify(String((body as Record<string, unknown>).message)).slice(0, 220)
+            : ''
+        const stack = (new Error('graph_post_trace').stack || '').split('\n').slice(2, 6).join(' | ').slice(0, 400)
+        console.log(`[GRAPH-POST] path=${path} keys=${bodyKeys} token_tail=${tokenTail} message_preview=${messagePreview}`)
+        console.log(`[GRAPH-POST] stack: ${stack}`)
+    } catch {
+        // never fail a post because of a logging bug
+    }
     const fbApi = await getFacebookAdsApi()
     const api = fbApi.init(token)
     try {
@@ -20970,6 +20998,13 @@ async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string,
     console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} source=${settings.source} template_len=${settings.template.length} has_lazada_placeholder=${settings.template.includes(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER)} lookup_error=${lookupError || 'none'}`)
     const lazada = String(lazadaLink || '').trim()
     const rendered = renderAffiliateCommentTemplate(settings.template, shopee, lazada)
+    // Heavy diagnostic: log the EXACT template + rendered text + input links. Lets us
+    // verify in `wrangler tail` whether a "weird" comment in production really came
+    // from this code path or from somewhere else entirely. Length-prefixed so the
+    // first/last bytes are visible even if a renderer truncates the line.
+    console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} shopee_link=${shopee} lazada_link=${lazada || '(none)'}`)
+    console.log(`[COMMENT-BUILD] template_updated_at=${settings.updated_at || '(default)'} template_text=${JSON.stringify(settings.template)}`)
+    console.log(`[COMMENT-BUILD] rendered_len=${rendered.length} rendered_text=${JSON.stringify(rendered)}`)
     // DO NOT auto-append lazada link. Respect user's template exactly — if {{lazada_link}} is not in template, user does not want lazada link in comment.
     return rendered
 }
@@ -23560,6 +23595,12 @@ async function postShopeeCommentStrict(params: {
         const tid = String(targetId || '').trim()
         if (!tid || tried.has(tid)) return { ok: false as const, error: 'empty_target', code: 0, subcode: 0 }
         tried.add(tid)
+        // DIAGNOSTIC: log the EXACT outbound payload to FB so a future "comment doesn't
+        // match my template" report can be answered by tailing `wrangler tail` without
+        // guesswork. JSON-stringify the message so multi-line/Unicode survives the line.
+        const tokenHint = String(commentToken || '').trim().slice(-8)
+        console.log(`[${params.logPrefix}] comment OUTBOUND target=${tid} token_tail=${tokenHint} ns=${params.namespaceId} page=${params.pageId} message_len=${commentMessage.length}`)
+        console.log(`[${params.logPrefix}] comment OUTBOUND message=${JSON.stringify(commentMessage)}`)
         const result = await facebookGraphRawPost<{ id?: string }>(
             `${FB_GRAPH_V19}/${tid}/comments`,
             {
@@ -25809,6 +25850,12 @@ app.put('/api/pages/:id', async (c) => {
     try {
         const body = await c.req.json()
         const { post_interval_minutes, post_hours, is_active, access_token, comment_token, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled } = body
+        // DIAGNOSTIC: log every save attempt so we can trace stale-state overwrites.
+        // The big 2026-05-01 incident was a webapp tab with cached `every:30` re-saving
+        // over a server-cleared post_hours='' — visible only by knowing PUT was hit and
+        // with which payload. token redacted to a short tail to avoid leaking secrets.
+        const tokenTail = access_token !== undefined ? String(access_token || '').trim().slice(-6) : '(unset)'
+        console.log(`[PAGES-PUT] page=${id} ns=${c.get('botId')} post_hours=${JSON.stringify(post_hours ?? null)} post_interval_minutes=${JSON.stringify(post_interval_minutes ?? null)} is_active=${JSON.stringify(is_active ?? null)} access_token_tail=${tokenTail} onecard_enabled=${JSON.stringify(onecard_enabled ?? null)} ads_publish_enabled=${JSON.stringify(ads_publish_enabled ?? null)}`)
         // comment_token is now treated as access_token (unified token model)
         let normalizedPostHours = post_hours as string | undefined
         let normalizedInterval = post_interval_minutes as number | undefined
@@ -28549,7 +28596,8 @@ async function recoverStaleScheduledRun(db: D1Database, maxStaleMs = 90_000): Pr
 }
 
 async function handleScheduled(env: Env, ctx?: ExecutionContext) {
-    console.log('[CRON] Starting auto-post check...')
+    const cronTickIso = new Date().toISOString()
+    console.log(`[CRON] tick=${cronTickIso} starting auto-post check...`)
     const dedupCommentTargets = new Set<string>()
     await env.DB.prepare(
         `DELETE FROM posting_locks
@@ -28727,6 +28775,13 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             onecard_link_mode?: string | null
             onecard_cta?: string | null
         }>
+    }
+    // Visibility: dump every page the cron picked up plus its schedule so a future
+    // "why is this page posting" report has a starting point. Pages that aren't here
+    // are either is_active=0 or have empty post_hours (correctly skipped).
+    console.log(`[CRON] tick=${cronTickIso} candidate_pages=${pages.length}`)
+    for (const p of pages) {
+        console.log(`[CRON]   page=${p.id} ns=${p.bot_id} name=${JSON.stringify(p.name)} post_hours=${JSON.stringify(p.post_hours)} last_post_at=${p.last_post_at || 'never'}`)
     }
 
     // Current time in minutes since midnight (Thailand)
