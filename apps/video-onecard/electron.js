@@ -290,6 +290,7 @@ function startServer() {
         const templateAdset = body.template_adset || "120244361318490263";
         const shortlink = String(body.shortlink || "").trim();
         const shopeeUrl = String(body.shopee_url || "").trim();
+        const thumbnailUrl = String(body.thumbnail_url || body.image_url || "").trim();
         // CTA destination MUST be the wwoom shortlink — it's the only URL that
         // carries our sub_id tracking params (configured in dashboard /settings, e.g.
         // sub_id=20APR26FBSPCAD). The shortlink redirects to Shopee with full attribution.
@@ -336,13 +337,29 @@ function startServer() {
         // thumbnail once the encode is ready, and we only use data[0].uri anyway. The old
         // > 1 check waited for an extra optional frame that often never arrives, padding
         // failures by minutes. Matches the /post endpoint below (line ~657).
-        let thumb = null;
-        for (let i = 0; i < 60; i++) {
-          await new Promise(r => setTimeout(r, 3000));
-          const t = await elFetch(`https://graph.facebook.com/${vid.id}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
-          const td = t.json();
-          if (td.thumbnails?.data?.length >= 1) { thumb = td.thumbnails.data[0].uri; console.log(`[CREATE-AD] thumbnail ready after ${i+1} polls`); break; }
-          if (i % 5 === 0) console.log(`[CREATE-AD] poll ${i+1}/60 — no thumbnail yet`);
+        let thumb = /^https?:\/\//i.test(thumbnailUrl) ? thumbnailUrl : null;
+        if (thumb) {
+          console.log(`[CREATE-AD] using cached thumbnail_url for video_id=${vid.id}`);
+        } else {
+          for (let i = 0; i < 60; i++) {
+            await new Promise(r => setTimeout(r, 3000));
+            const t = await elFetch(`https://graph.facebook.com/${vid.id}?access_token=${encodeURIComponent(accessToken)}&fields=thumbnails`);
+            const td = t.json();
+            if (td.error) {
+              console.log(`[CREATE-AD] thumbnail graph error code=${td.error.code || ""} subcode=${td.error.error_subcode || ""}: ${td.error.message || ""}`);
+              return res.end(JSON.stringify({
+                ok: false,
+                step: "thumbnails",
+                error: td.error.message || "Graph thumbnails error",
+                fb_error_code: td.error.code,
+                fb_error_subcode: td.error.error_subcode,
+                fb_trace_id: td.error.fbtrace_id || td.__www_request_id,
+                used_existing_video: !!existingVideoId
+              }));
+            }
+            if (td.thumbnails?.data?.length >= 1) { thumb = td.thumbnails.data[0].uri; console.log(`[CREATE-AD] thumbnail ready after ${i+1} polls`); break; }
+            if (i % 5 === 0) console.log(`[CREATE-AD] poll ${i+1}/60 — no thumbnail yet`);
+          }
         }
         if (!thumb) return res.end(JSON.stringify({ ok: false, step: "thumbnails", error: "Timeout (180s, FB still processing)" }));
 
@@ -372,15 +389,25 @@ function startServer() {
         const crData = cr.json();
         if (crData.error) return res.end(JSON.stringify({ ok: false, step: "creative", error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: ctaLink || null, used_existing_video: !!existingVideoId }));
 
-        // 4. Get story ID
+        // 4. Get story ID — poll up to 50 × 3s = 150s.
+        // FB story-resolution latency is variable (often 30-80s, occasionally
+        // 80-120s). Previous limit of 25 × 3s (75s) cut off right at the edge:
+        // smoke test on 2026-05-01 hit 83s success on retry of the same 75s
+        // timeout. Matches the thumbnails widening from yesterday (also from
+        // a poll-too-narrow symptom on transient FB slowness).
         let storyId = null;
-        for (let i = 0; i < 25; i++) {
+        for (let i = 0; i < 50; i++) {
           await new Promise(r => setTimeout(r, 3000));
           const c = await elFetch(`https://graph.facebook.com/${crData.id}?access_token=${encodeURIComponent(accessToken)}&fields=effective_object_story_id`);
           const cd = c.json();
-          if (cd.effective_object_story_id) { storyId = cd.effective_object_story_id; break; }
+          if (cd.effective_object_story_id) {
+            storyId = cd.effective_object_story_id;
+            console.log(`[CREATE-AD] story_id ready after ${i+1} polls (${(i+1)*3}s)`);
+            break;
+          }
+          if (i % 5 === 0) console.log(`[CREATE-AD] story_id poll ${i+1}/50 — not ready yet`);
         }
-        if (!storyId) return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout" }));
+        if (!storyId) return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout (150s, FB still creating story)", creative_id: crData.id }));
 
         // 5. หาแคมเปญ: ใช้ campaign_id ที่ระบุ / สร้างใหม่ด้วย new_campaign_name / หาอัตโนมัติ
         const maxAdsetsPerCampaign = 10;
