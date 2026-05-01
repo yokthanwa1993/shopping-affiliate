@@ -16,7 +16,7 @@ import {
   Wallet,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 type DashboardTab = 'dashboard' | 'gallery' | 'page-posts' | 'create' | 'running' | 'queue' | 'history' | 'settings'
 
@@ -394,6 +394,27 @@ export default function App() {
     window.addEventListener('popstate', handlePop)
     return () => window.removeEventListener('popstate', handlePop)
   }, [])
+  // Workspace dropdown — opens from the sidebar header. Picking another page
+  // does a real navigation (window.location.href) so each workspace boots from
+  // a clean slate and we don't have to track which page each cache belongs to.
+  const [pagePickerOpen, setPagePickerOpen] = useState(false)
+  const pagePickerRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!pagePickerOpen) return
+    function handlePointer(e: PointerEvent) {
+      if (!pagePickerRef.current) return
+      if (!pagePickerRef.current.contains(e.target as Node)) setPagePickerOpen(false)
+    }
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setPagePickerOpen(false)
+    }
+    document.addEventListener('pointerdown', handlePointer)
+    document.addEventListener('keydown', handleKey)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointer)
+      document.removeEventListener('keydown', handleKey)
+    }
+  }, [pagePickerOpen])
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   // videoUrl is set when the popup is opened for an UNPOSTED gallery video
   // (no FB video_id yet). The submit handler routes between two paths:
@@ -1211,36 +1232,76 @@ export default function App() {
       <div className="flex h-full min-h-0 flex-col lg:flex-row">
         <aside className="w-full shrink-0 border-b border-slate-200 bg-white lg:h-screen lg:w-72 lg:border-b-0 lg:border-r">
           <div className="flex h-full flex-col overflow-hidden p-3">
-            {/* Workspace identifier — pure display, no picker. Switching pages
-                is done by visiting the other URL (/chearb ↔ /feed). The other
-                page is shown as a sibling link below so the operator can hop
-                across without typing. iconUrl is a static asset bundled at
-                build time (no FB CDN refetch). */}
-            <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3">
-              <img
-                src={selectedPage.iconUrl}
-                alt={selectedPage.name}
-                className="h-10 w-10 shrink-0 rounded-xl object-cover ring-1 ring-slate-200"
-              />
-              <div className="min-w-0 flex-1">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Ads Manager</p>
-                <p className="truncate text-sm font-semibold text-slate-900">เพจ {selectedPage.name}</p>
-              </div>
-            </div>
-            {/* Sibling-page links so the operator can flip workspaces with one
-                click — full page reload is intentional so each workspace boots
-                from a clean slate (no leaked state across pages). */}
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {PAGES.filter(p => p.id !== selectedPage.id).map((p) => (
-                <a
-                  key={p.id}
-                  href={buildPageUrl(p, 'dashboard')}
-                  className="flex flex-1 items-center gap-2 rounded-xl border border-dashed border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-500 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-700"
+            {/* Workspace dropdown. Click the card → menu opens with both pages.
+                Picking the OTHER page does a full navigation to /<slug> (real
+                href, not pushState) so each workspace boots from a clean slate.
+                Picking the current page just closes the menu. iconUrl is a
+                static bundled asset — no FB CDN refetch. */}
+            <div ref={pagePickerRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setPagePickerOpen((o) => !o)}
+                aria-haspopup="listbox"
+                aria-expanded={pagePickerOpen}
+                className="flex w-full items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 text-left transition hover:bg-slate-100 active:scale-[0.99]"
+              >
+                <img
+                  src={selectedPage.iconUrl}
+                  alt={selectedPage.name}
+                  className="h-10 w-10 shrink-0 rounded-xl object-cover ring-1 ring-slate-200"
+                />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Ads Manager</p>
+                  <p className="truncate text-sm font-semibold text-slate-900">เพจ {selectedPage.name}</p>
+                </div>
+                <ChevronRight
+                  size={16}
+                  className={`shrink-0 text-slate-400 transition-transform ${pagePickerOpen ? 'rotate-90' : ''}`}
+                />
+              </button>
+              {pagePickerOpen && (
+                <ul
+                  role="listbox"
+                  className="absolute left-0 right-0 top-full z-40 mt-1.5 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-lg"
                 >
-                  <img src={p.iconUrl} alt={p.name} className="h-5 w-5 rounded-lg object-cover" />
-                  <span className="truncate">ไป เพจ {p.name}</span>
-                </a>
-              ))}
+                  {PAGES.map((p) => {
+                    const active = p.id === selectedPage.id
+                    return (
+                      <li key={p.id}>
+                        <a
+                          role="option"
+                          aria-selected={active}
+                          // Active page → just close. Other page → real
+                          // navigation so caches don't leak across workspaces.
+                          href={active ? '#' : buildPageUrl(p, 'dashboard')}
+                          onClick={(e) => {
+                            if (active) {
+                              e.preventDefault()
+                              setPagePickerOpen(false)
+                            }
+                            // For the non-active case we let the browser handle
+                            // the navigation — full reload is intentional.
+                          }}
+                          className={`flex w-full items-center gap-3 px-3 py-2.5 text-left transition ${
+                            active ? 'bg-slate-100 cursor-default' : 'bg-white hover:bg-slate-50'
+                          }`}
+                        >
+                          <img
+                            src={p.iconUrl}
+                            alt={p.name}
+                            className="h-9 w-9 shrink-0 rounded-xl object-cover ring-1 ring-slate-200"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <span className="block truncate text-sm font-semibold text-slate-900">เพจ {p.name}</span>
+                            <span className="block truncate font-mono text-[11px] text-slate-400">/{p.slug}</span>
+                          </div>
+                          {active && <span className="h-2 w-2 shrink-0 rounded-full bg-[#1877f2]" />}
+                        </a>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
             </div>
 
             <nav className="mt-4 space-y-1.5">
