@@ -500,7 +500,11 @@ async function runCreateAdPipeline(payload) {
     if (!shortLink) return { ok: false, step: 'shortlink', error: 'ย่อลิงก์ Shopee ไม่สำเร็จ — เช็คว่า shopee URL ถูก + เช็คโหมด API/Extension ใน Settings' }
 
     // 3. Build final caption (matches video-onecard electron format)
-    const finalCaption = `📌 พิกัด : ${shortLink}\n${caption}`
+    // Caption matches cron post format — operator's caption verbatim, no
+    // shortlink prefix. The shortlink lives in the first comment (step 8) +
+    // the ad CTA button only, so the page feed post reads identical to
+    // every other cron-driven post on the page.
+    const finalCaption = caption
 
     // 4. Find Ads Manager tab — required because window.__accessToken + session
     //    cookies live there. No tab → no token → can't call graph.

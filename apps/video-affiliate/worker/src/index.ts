@@ -6723,10 +6723,14 @@ app.post('/api/dashboard/create-ad', async (c) => {
             return c.json({ ok: false, error: 'ย่อลิ้ง Shopee ไม่สำเร็จ', step: 'shortlink_failed', video_id: videoId, shopeeLink }, 400)
         }
 
-        // 4. Build caption with shortlink on top
-        // Clean shortlink: remove ?lp=aff that Shopee appends
+        // 4. Caption stays exactly what the operator typed/pulled — matches the
+        // cron post format (caption + hashtags only, NO shortlink prefix). The
+        // shortlink lives in the first comment + the ad's CTA button only, so
+        // the page-feed post reads naturally and matches every other cron post.
+        // Earlier we prepended "📌 พิกัด : <shortlink>\n" here, but operator
+        // wants page-post captions identical to cron's.
         const cleanShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
-        const finalCaption = `📌 พิกัด : ${cleanShortLink}\n${caption}`
+        const finalCaption = caption
 
         // 4. Create ad with final caption.
         // CTA button (SHOP_NOW) → shopee_url (real Shopee link, like the template)
@@ -25317,6 +25321,7 @@ app.get('/api/pages', async (c) => {
         const pages = (((await c.env.DB.prepare(
             'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
+        c.header('Cache-Control', 'private, no-store')
         return c.json({ pages })
     } catch (e) {
         return c.json({ error: 'Failed to fetch pages' }, 500)
@@ -25495,6 +25500,7 @@ app.get('/api/pages/:id', async (c) => {
             'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
         if (!page) return c.json({ error: 'Page not found' }, 404)
+        c.header('Cache-Control', 'private, no-store')
         return c.json({ page })
     } catch (e) {
         return c.json({ error: 'Failed to fetch page' }, 500)
@@ -26064,41 +26070,38 @@ app.put('/api/pages/:id', async (c) => {
                 && base_post_interval_minutes !== undefined
                 && base_is_active !== undefined
             if (!hasScheduleBase) {
-                return c.json({
-                    error: 'schedule_version_required',
-                    details: 'กรุณารีเฟรชหน้าเพจนี้ก่อนบันทึก เพื่อกันค่า schedule เก่าทับค่าล่าสุด',
-                }, 409)
-            }
-
-            const currentSchedule = {
-                post_hours: String(page.post_hours || '').trim(),
-                post_interval_minutes: page.post_interval_minutes === null || page.post_interval_minutes === undefined
-                    ? null
-                    : Number(page.post_interval_minutes),
-                is_active: Number(page.is_active || 0) ? 1 : 0,
-            }
-            const clientBaseSchedule = {
-                post_hours: String(base_post_hours || '').trim(),
-                post_interval_minutes: base_post_interval_minutes === null || base_post_interval_minutes === undefined || base_post_interval_minutes === ''
-                    ? null
-                    : Number(base_post_interval_minutes),
-                is_active: Number(base_is_active || 0) ? 1 : 0,
-            }
-            const scheduleMatches = currentSchedule.post_hours === clientBaseSchedule.post_hours
-                && currentSchedule.post_interval_minutes === clientBaseSchedule.post_interval_minutes
-                && currentSchedule.is_active === clientBaseSchedule.is_active
-            if (!scheduleMatches) {
-                console.warn(
-                    `[PAGES-PUT] stale schedule rejected page=${id} ns=${c.get('botId')} base=${JSON.stringify(clientBaseSchedule)} current=${JSON.stringify(currentSchedule)}`
-                )
-                return c.json({
-                    error: 'stale_schedule_state',
-                    details: 'ค่า schedule บนเซิร์ฟเวอร์เปลี่ยนไปแล้ว กรุณารีเฟรชก่อนบันทึก',
-                    page: {
-                        id,
-                        ...currentSchedule,
-                    },
-                }, 409)
+                console.warn(`[PAGES-PUT] legacy schedule save without base accepted page=${id} ns=${c.get('botId')}`)
+            } else {
+                const currentSchedule = {
+                    post_hours: String(page.post_hours || '').trim(),
+                    post_interval_minutes: page.post_interval_minutes === null || page.post_interval_minutes === undefined
+                        ? null
+                        : Number(page.post_interval_minutes),
+                    is_active: Number(page.is_active || 0) ? 1 : 0,
+                }
+                const clientBaseSchedule = {
+                    post_hours: String(base_post_hours || '').trim(),
+                    post_interval_minutes: base_post_interval_minutes === null || base_post_interval_minutes === undefined || base_post_interval_minutes === ''
+                        ? null
+                        : Number(base_post_interval_minutes),
+                    is_active: Number(base_is_active || 0) ? 1 : 0,
+                }
+                const scheduleMatches = currentSchedule.post_hours === clientBaseSchedule.post_hours
+                    && currentSchedule.post_interval_minutes === clientBaseSchedule.post_interval_minutes
+                    && currentSchedule.is_active === clientBaseSchedule.is_active
+                if (!scheduleMatches) {
+                    console.warn(
+                        `[PAGES-PUT] stale schedule rejected page=${id} ns=${c.get('botId')} base=${JSON.stringify(clientBaseSchedule)} current=${JSON.stringify(currentSchedule)}`
+                    )
+                    return c.json({
+                        error: 'stale_schedule_state',
+                        details: 'ค่า schedule บนเซิร์ฟเวอร์เปลี่ยนไปแล้ว กรุณารีเฟรชก่อนบันทึก',
+                        page: {
+                            id,
+                            ...currentSchedule,
+                        },
+                    }, 409)
+                }
             }
         }
 
