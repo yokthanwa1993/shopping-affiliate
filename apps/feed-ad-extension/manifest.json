@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Feed Ad Creator",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "สร้างแอด LikePage ให้เพจ ฟีด (page id 116759241338040) ผ่าน Ads Manager session ใน Chrome — ทดแทน Electron flow ของฟีดเท่านั้น (เฉียบยังใช้ Electron เหมือนเดิม)",
     "permissions": [
         "tabs",
@@ -21,6 +21,18 @@
         "service_worker": "background.js",
         "type": "module"
     },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://dashboard.oomnn.com/*",
+                "https://ads-manager-dashboard.yokthanwa1993-bc9.workers.dev/*"
+            ],
+            "js": [
+                "bridge.js"
+            ],
+            "run_at": "document_idle"
+        }
+    ],
     "side_panel": {
         "default_path": "panel.html"
     },

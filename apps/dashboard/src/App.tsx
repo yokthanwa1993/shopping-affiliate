@@ -415,6 +415,62 @@ export default function App() {
       document.removeEventListener('keydown', handleKey)
     }
   }, [pagePickerOpen])
+  // Feed Ad Creator extension presence — detected via window.postMessage
+  // handshake from feed-ad-extension/bridge.js. Only meaningful when
+  // selectedPage.slug === 'feed': เฉียบ creates ads via worker → Electron
+  // (unchanged), ฟีด creates them via the extension running on a real Ads
+  // Manager tab. If a feed user clicks สร้างแอด without the extension
+  // installed, we surface a clear "ติดตั้ง extension ก่อน" error instead of
+  // silently falling back through a broken path.
+  const [feedExtension, setFeedExtension] = useState<{ available: boolean; version: string }>(
+    () => ({ available: false, version: '' }),
+  )
+  useEffect(() => {
+    function onMessage(e: MessageEvent) {
+      if (e.source !== window) return
+      const data = e.data as { source?: string; type?: string; version?: string } | null
+      if (!data || data.source !== 'feed-ad-extension') return
+      if (data.type === 'feedExt.handshake') {
+        setFeedExtension({ available: true, version: String(data.version || '') })
+      }
+    }
+    window.addEventListener('message', onMessage)
+    // Ping in case the bridge content script loaded before this listener mounted.
+    window.postMessage({ type: 'feedExt.ping.request', requestId: `boot-${Date.now()}` }, '*')
+    // Re-ping a few times (bridge.js handshake may race with React hydration).
+    const t1 = setTimeout(() => window.postMessage({ type: 'feedExt.ping.request', requestId: `t1-${Date.now()}` }, '*'), 500)
+    const t2 = setTimeout(() => window.postMessage({ type: 'feedExt.ping.request', requestId: `t2-${Date.now()}` }, '*'), 1500)
+    return () => {
+      window.removeEventListener('message', onMessage)
+      clearTimeout(t1)
+      clearTimeout(t2)
+    }
+  }, [])
+  // Send a create-ad job to the extension and await the result. Uses a unique
+  // requestId so multiple in-flight jobs (unlikely but cheap to support)
+  // don't get crossed. Times out the wait at 240s — pipeline tends to run
+  // 80-200s end-to-end (upload + thumbnails up to 180s + story_id up to 150s).
+  function createAdViaExtension(payload: Record<string, unknown>, timeoutMs = 240000): Promise<Record<string, unknown>> {
+    return new Promise((resolve) => {
+      const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      function onMessage(e: MessageEvent) {
+        if (e.source !== window) return
+        const data = e.data as { source?: string; type?: string; requestId?: string } | null
+        if (!data || data.source !== 'feed-ad-extension') return
+        if (data.type !== 'feedExt.createAd.result') return
+        if (data.requestId !== requestId) return
+        window.removeEventListener('message', onMessage)
+        clearTimeout(timer)
+        resolve(data as unknown as Record<string, unknown>)
+      }
+      const timer = setTimeout(() => {
+        window.removeEventListener('message', onMessage)
+        resolve({ ok: false, error: 'extension_timeout', step: 'extension_response' })
+      }, timeoutMs)
+      window.addEventListener('message', onMessage)
+      window.postMessage({ type: 'feedExt.createAd.request', requestId, payload }, '*')
+    })
+  }
   const [selectedVideos, setSelectedVideos] = useState<string[]>(['6b784d9a'])
   // videoUrl is set when the popup is opened for an UNPOSTED gallery video
   // (no FB video_id yet). The submit handler routes between two paths:
@@ -513,28 +569,33 @@ export default function App() {
     let finalMessage = ''
 
     try {
-      // IMMEDIATE — call create-ad directly, bypass queue entirely.
-      // Runs full pipeline synchronously (60-120s typical). User waits for real result.
-      // For gallery (unposted) videos we send video_url instead of video_id so the
-      // electron pipeline uploads the file to FB Ads first; for posted videos we
-      // send video_id to reuse the existing FB asset and skip the upload step.
-      const resp = await fetch('/worker-api/api/dashboard/create-ad', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          page_id: selectedPage.id,
-          ...(createAdPopup.videoUrl
-            ? { video_url: createAdPopup.videoUrl }
-            : { video_id: createAdPopup.videoId }),
-          caption: createAdPopup.caption,
-          story_id: createAdPopup.storyId || '',
-          shopee_url: createAdShopeeLink || '',
-          campaign_id: createAdSelectedCampaign || undefined,
-          new_campaign_name: createAdNewCampaignName || undefined,
-        }),
-      })
-      timers.forEach(clearTimeout)
-      const rawText = await resp.text()
+      // ฟีด vs เฉียบ split:
+      //   - เฉียบ → POST /api/dashboard/create-ad → worker calls Electron video-onecard
+      //     (the pipeline that's been running fine; nothing changed here).
+      //   - ฟีด  → bypass worker entirely; the pipeline runs INSIDE the operator's
+      //     Chrome via the Feed Ad Creator extension. The extension has its own
+      //     graph.facebook.com session (real Ads Manager tab) and writes back to
+      //     post_history via /api/dashboard/extension-ad-log.
+      //
+      // The dashboard detects the extension via a window.postMessage handshake
+      // (see feedExtension state above). If a feed user reaches this point
+      // without the extension installed, we abort with a clear message — silently
+      // falling through to the worker path would create the ad via Electron and
+      // bypass the per-page workflow the user explicitly chose.
+      const isFeed = selectedPage.slug === 'feed'
+
+      if (isFeed && !feedExtension.available) {
+        timers.forEach(clearTimeout)
+        finalStatus = 'error'
+        finalMessage = `❌ ติดตั้ง Feed Ad Creator extension ก่อน\n\nเพจฟีดสร้างแอดผ่าน extension เท่านั้น — โหลด apps/feed-ad-extension/ ใน chrome://extensions แล้วรีโหลดหน้านี้\n\nถ้าติดตั้งแล้วยังเห็นข้อความนี้ ให้รีเฟรชหน้าหรือ disable+enable extension ใหม่`
+        setCreateAdStep('❌ ไม่พบ extension')
+        setCreateAdProgress(0)
+        setCreateAdResultBanner({ type: 'error', text: '❌ ติดตั้ง Feed Ad Creator extension ก่อน' })
+        alert(finalMessage)
+        setCreateAdCreating(false)
+        return
+      }
+
       let data: {
         ok?: boolean
         error?: string
@@ -547,9 +608,61 @@ export default function App() {
         adset_id?: string
         commentPosted?: boolean
       } = {}
-      try { data = rawText ? JSON.parse(rawText) : {} } catch { data = { error: `invalid_json_response: ${rawText.substring(0, 200)}` } }
+      let httpStatus = 200
 
-      if (resp.ok && data.ok) {
+      if (isFeed) {
+        // Extension path. Pipeline runs ~80-200s in MAIN world of Ads Manager tab.
+        const extResp = await createAdViaExtension({
+          videoId: createAdPopup.videoUrl ? '' : createAdPopup.videoId,
+          videoUrl: createAdPopup.videoUrl || '',
+          caption: createAdPopup.caption,
+          shopeeUrl: createAdShopeeLink || '',
+          campaignId: createAdSelectedCampaign || '',
+          newCampaignName: createAdNewCampaignName || '',
+        })
+        timers.forEach(clearTimeout)
+        // Translate extension response into the same shape the existing UI expects.
+        const r = extResp as Record<string, unknown>
+        data = {
+          ok: !!r.ok,
+          error: typeof r.error === 'string' ? r.error : undefined,
+          step: typeof r.step === 'string' ? r.step : undefined,
+          fb_error_code: typeof r.fb_error_code === 'number' ? r.fb_error_code : undefined,
+          fb_trace_id: typeof r.fb_trace_id === 'string' ? r.fb_trace_id : undefined,
+          story_id: typeof r.story_id === 'string' ? r.story_id : undefined,
+          ad_id: typeof r.ad_id === 'string' ? r.ad_id : undefined,
+          adset_id: typeof r.adset_id === 'string' ? r.adset_id : undefined,
+          // Extension publishes to page (is_published=true) and worker logs
+          // post_history. There's no auto-comment in the ext path right now —
+          // surface that explicitly so the operator knows.
+          commentPosted: false,
+        }
+        httpStatus = data.ok ? 200 : 502
+      } else {
+        // เฉียบ + อื่นๆ — original Electron-backed path.
+        const resp = await fetch('/worker-api/api/dashboard/create-ad', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page_id: selectedPage.id,
+            ...(createAdPopup.videoUrl
+              ? { video_url: createAdPopup.videoUrl }
+              : { video_id: createAdPopup.videoId }),
+            caption: createAdPopup.caption,
+            story_id: createAdPopup.storyId || '',
+            shopee_url: createAdShopeeLink || '',
+            campaign_id: createAdSelectedCampaign || undefined,
+            new_campaign_name: createAdNewCampaignName || undefined,
+          }),
+        })
+        timers.forEach(clearTimeout)
+        httpStatus = resp.status
+        const rawText = await resp.text()
+        try { data = rawText ? JSON.parse(rawText) : {} } catch { data = { error: `invalid_json_response: ${rawText.substring(0, 200)}` } }
+        if (!resp.ok) data = { ...data, ok: false }
+      }
+
+      if (httpStatus < 400 && data.ok) {
         finalStatus = 'success'
         finalMessage = `✅ สำเร็จ!\n\nstory_id: ${data.story_id || '-'}\nad_id: ${data.ad_id || '-'}\nadset_id: ${data.adset_id || '-'}\nคอมเมนต์: ${data.commentPosted ? 'โพสต์แล้ว' : 'ข้าม'}`
         setCreateAdProgress(100)
@@ -560,8 +673,8 @@ export default function App() {
         const stepLabel = data.step ? `[${data.step}] ` : ''
         const fbCode = data.fb_error_code ? ` (FB code=${data.fb_error_code}${data.fb_error_subcode ? `/subcode=${data.fb_error_subcode}` : ''})` : ''
         const traceId = data.fb_trace_id ? `\ntrace_id: ${data.fb_trace_id}` : ''
-        const shortSummary = `${stepLabel}${data.error || `HTTP ${resp.status}`}${fbCode}`
-        finalMessage = `❌ สร้างแอดไม่สำเร็จ — HTTP ${resp.status}\n\n${shortSummary}${traceId}\n\n(Invalid parameter บ่อยครั้งเป็น transient — ลองกดซ้ำอีกครั้ง)`
+        const shortSummary = `${stepLabel}${data.error || `HTTP ${httpStatus}`}${fbCode}`
+        finalMessage = `❌ สร้างแอดไม่สำเร็จ — HTTP ${httpStatus}\n\n${shortSummary}${traceId}\n\n(Invalid parameter บ่อยครั้งเป็น transient — ลองกดซ้ำอีกครั้ง)`
         setCreateAdStep(`❌ ${shortSummary}`)
         setCreateAdProgress(0)
         setCreateAdResultBanner({ type: 'error', text: `❌ ${shortSummary}${traceId ? `\ntrace=${data.fb_trace_id}` : ''}` })
@@ -592,6 +705,19 @@ export default function App() {
 
   async function submitCreateAd() {
     if (!createAdPopup) return
+
+    // Queue mode = "เพิ่มเข้าคิว" — relies on the worker-side cron picking up
+    // the job every ~20 minutes and processing it via Electron. ฟีด's pipeline
+    // runs inside the operator's Chrome extension, not on the worker, so a
+    // cron-triggered queue can't drive it. We block queue mode for ฟีด and
+    // funnel them to immediate ("โพสต์เลย") instead, which calls the extension.
+    if (selectedPage.slug === 'feed') {
+      const msg = '❌ คิวสร้างแอดไม่รองรับสำหรับเพจฟีด\n\nคิวนี้รันโดย worker cron ที่เรียก Electron — เพจฟีดสร้างแอดผ่าน extension ใน Chrome ของพี่เท่านั้น (worker ไม่มี session ของ Ads Manager)\n\nกด "⚡ โพสต์เลย" แทนเพื่อให้ extension สร้างแอดทันที'
+      setCreateAdResultBanner({ type: 'error', text: '❌ ฟีดใช้ "โพสต์เลย" เท่านั้น — queue ไม่รองรับ' })
+      alert(msg)
+      return
+    }
+
     setCreateAdResultBanner(null)
     setCreateAdCreating(true)
     setCreateAdStep('📥 กำลังเพิ่มเข้าคิว...')
@@ -1122,6 +1248,28 @@ export default function App() {
             <p className="mt-1 text-sm text-slate-500">Video ID: {createAdPopup.videoId}</p>
             <p className="mt-1 truncate text-xs text-slate-400">{createAdPopup.caption}</p>
 
+            {/* Provider badge — makes it obvious whether the click will go through
+                Electron (เฉียบ) or the Chrome extension (ฟีด). For ฟีด we also
+                surface the install state so missing extension is visible up-front
+                rather than hitting an error after the user clicks. */}
+            {selectedPage.slug === 'feed' ? (
+              <div className={`mt-3 flex items-center gap-2 rounded-xl border px-3 py-2 text-xs ${
+                feedExtension.available
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                  : 'border-red-200 bg-red-50 text-red-700'
+              }`}>
+                <span className={`inline-block h-2 w-2 rounded-full ${feedExtension.available ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                {feedExtension.available
+                  ? <span>สร้างผ่าน Feed Ad Creator extension v{feedExtension.version} (Ads Manager tab)</span>
+                  : <span>⚠️ ไม่พบ extension — ติดตั้ง <code className="rounded bg-white px-1">apps/feed-ad-extension/</code> ใน chrome://extensions ก่อน</span>}
+              </div>
+            ) : (
+              <div className="mt-3 flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                <span className="inline-block h-2 w-2 rounded-full bg-slate-400" />
+                <span>สร้างผ่าน Electron (video-onecard) — ปกติของ {selectedPage.name}</span>
+              </div>
+            )}
+
             <div className="mt-3">
               <p className="text-sm font-semibold text-slate-700">Shopee Link</p>
               <input
@@ -1209,7 +1357,8 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => void submitCreateAd()}
-                    disabled={!createAdSelectedCampaign && !createAdNewCampaignName}
+                    disabled={(!createAdSelectedCampaign && !createAdNewCampaignName) || selectedPage.slug === 'feed'}
+                    title={selectedPage.slug === 'feed' ? 'ฟีดใช้ extension — queue ไม่รองรับ กด "โพสต์เลย" แทน' : ''}
                     className="flex-1 rounded-xl bg-[#1877f2] py-2.5 text-sm font-semibold text-white disabled:opacity-50"
                   >
                     เพิ่มเข้าคิว
@@ -1217,11 +1366,18 @@ export default function App() {
                 </div>
                 <button
                   onClick={() => void submitCreateAdImmediate()}
-                  disabled={!createAdSelectedCampaign && !createAdNewCampaignName}
-                  title="รันเลยโดยไม่รอคิว 20 นาที (ใช้เวลา ~60-120 วินาที)"
+                  disabled={
+                    (!createAdSelectedCampaign && !createAdNewCampaignName)
+                    || (selectedPage.slug === 'feed' && !feedExtension.available)
+                  }
+                  title={
+                    selectedPage.slug === 'feed' && !feedExtension.available
+                      ? 'ติดตั้ง Feed Ad Creator extension ก่อน'
+                      : 'รันเลยโดยไม่รอคิว 20 นาที (extension ใช้ ~80-200 วินาที, electron ~60-120 วินาที)'
+                  }
                   className="w-full rounded-xl bg-orange-500 hover:bg-orange-600 py-2.5 text-sm font-semibold text-white disabled:opacity-50 transition-colors"
                 >
-                  ⚡ โพสต์เลย (ข้ามคิว)
+                  ⚡ โพสต์เลย {selectedPage.slug === 'feed' ? '(ผ่าน extension)' : '(ข้ามคิว)'}
                 </button>
               </div>
             )}
