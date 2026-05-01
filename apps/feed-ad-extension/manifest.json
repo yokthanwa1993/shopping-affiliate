@@ -1,12 +1,11 @@
 {
     "manifest_version": 3,
     "name": "Feed Ad Creator",
-    "version": "1.1.0",
-    "description": "สร้างแอด LikePage ให้เพจ ฟีด (page id 116759241338040) ผ่าน Ads Manager session ใน Chrome — ทดแทน Electron flow ของฟีดเท่านั้น (เฉียบยังใช้ Electron เหมือนเดิม)",
+    "version": "1.2.0",
+    "description": "เบื้องหลังของ dashboard /feed — shortlink + ดึงโทเค้น/cookies จาก Ads Manager tab + รัน FB pipeline. ไม่มี UI (ทำงานเงียบๆ ผ่าน dashboard.oomnn.com/feed เท่านั้น). ฟีดเท่านั้น เฉียบไม่แตะ",
     "permissions": [
         "tabs",
         "scripting",
-        "sidePanel",
         "storage"
     ],
     "host_permissions": [
@@ -33,12 +32,8 @@
             "run_at": "document_idle"
         }
     ],
-    "side_panel": {
-        "default_path": "panel.html"
-    },
     "action": {
-        "default_title": "Feed Ad Creator",
-        "default_popup": "panel.html",
+        "default_title": "Feed Ad Creator (เบื้องหลังของ dashboard /feed)",
         "default_icon": {
             "16": "icons/icon-16.png",
             "48": "icons/icon-48.png",

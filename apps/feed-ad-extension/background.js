@@ -1,23 +1,17 @@
-// Feed Ad Creator — service worker
+// Feed Ad Creator — service worker (headless).
 //
-// Hard-locked to เพจ ฟีด (page id 116759241338040). The whole ad creation
-// pipeline runs inside the user's logged-in Ads Manager tab (MAIN world)
-// because that's where window.__accessToken + session cookies live, exactly
-// like the Electron app's BrowserWindow trick — just shifted into a real
-// Chrome tab so we don't have to keep an Electron BrowserWindow alive.
-//
-// Why MAIN world (not service worker fetch)?
-//   - The fetches that work against graph.facebook.com without an explicit
-//     long-lived token are the ones originating from facebook.com pages
-//     with their cookies + tokens attached. Service-worker fetches don't
-//     get those for free.
-//   - Same reason Shopee shortening goes through the affiliate tab: the
-//     anti-bot SDK auto-injects security headers when called from the
-//     real page context.
-//
-// Service worker keep-alive: long-running pipeline awaits live INSIDE the
-// Ads Manager tab via a single executeScript call, so the SW doesn't need
-// to stay awake for 100+ seconds. SW only handles message bus + worker log.
+// No UI: extension runs entirely behind dashboard.oomnn.com/feed. The dashboard
+// page is the only thing the operator interacts with. This worker just:
+//   1. Receives 'feedExt.createAd' messages forwarded by content_script bridge.js
+//   2. Reads the operator's settings (sub_id, ad_account, template_adset) from
+//      api.oomnn.com so dashboard /feed/settings stays the source of truth
+//   3. Shortens the Shopee URL via short.wwoom.com (with affiliate-tab fallback)
+//   4. Pulls window.__accessToken + cookies out of the operator's logged-in
+//      Ads Manager tab via chrome.scripting.executeScript({ world: 'MAIN' })
+//      — same trick the Electron BrowserWindow used, just inside Chrome
+//   5. Runs the full FB Graph pipeline in that page's context (cookies attach
+//      automatically, anti-bot validators see calls coming from facebook.com)
+//   6. Logs the result to api.oomnn.com so post_history matches what cron sees
 
 // ────────────────────── Constants ──────────────────────
 
@@ -38,54 +32,21 @@ const ADS_MANAGER_TAB_PATTERNS = [
 
 const SHOPEE_TAB_PATTERN = 'https://affiliate.shopee.co.th/*'
 
-// ────────────────────── Side panel setup ──────────────────────
-
-chrome.runtime.onInstalled.addListener(() => {
-    chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => { })
-})
-
 // ────────────────────── Message bus ──────────────────────
+//
+// Only one entry point: 'feedExt.createAd'. Everything the extension does
+// (settings load, shortlink, pipeline, log) is folded into this one handler so
+// the dashboard side stays a single round-trip.
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg?.type === 'feedExt.status') {
-        getStatus().then(sendResponse).catch((e) => sendResponse({ ok: false, error: e.message }))
-        return true
-    }
-    if (msg?.type === 'feedExt.loadSettings') {
-        loadFeedSettings().then(sendResponse).catch((e) => sendResponse({ ok: false, error: e.message }))
-        return true
-    }
-    if (msg?.type === 'feedExt.shortenShopee') {
-        shortenShopee(msg.payload || {})
-            .then((r) => sendResponse({ ok: true, ...r }))
-            .catch((e) => sendResponse({ ok: false, error: e.message }))
-        return true
-    }
-    if (msg?.type === 'feedExt.createAd') {
-        runCreateAdPipeline(msg.payload || {})
-            .then((r) => sendResponse(r))
-            .catch((e) => sendResponse({ ok: false, error: e.message }))
-        return true
-    }
-    return false
+    if (msg?.type !== 'feedExt.createAd') return false
+    runCreateAdPipeline(msg.payload || {})
+        .then((r) => sendResponse(r))
+        .catch((e) => sendResponse({ ok: false, error: e?.message || String(e) }))
+    return true // async response
 })
 
-// ────────────────────── Status check ──────────────────────
-
-async function getStatus() {
-    const adsTabs = await findTabsByPatterns(ADS_MANAGER_TAB_PATTERNS)
-    const shopeeTab = await findTabByPattern(SHOPEE_TAB_PATTERN)
-    return {
-        ok: true,
-        page_id: FEED_PAGE_ID,
-        page_name: FEED_PAGE_NAME,
-        ads_manager_tab: adsTabs[0] ? { id: adsTabs[0].id, url: adsTabs[0].url } : null,
-        shopee_tab: shopeeTab ? { id: shopeeTab.id, url: shopeeTab.url } : null,
-        worker_base: WORKER_BASE,
-    }
-}
-
-// ────────────────────── Worker settings (sub_id, ad_account, etc.) ──────────────────────
+// ────────────────────── Worker settings (per-page) ──────────────────────
 
 async function loadFeedSettings() {
     const url = `${WORKER_BASE}/api/dashboard/settings?page_id=${encodeURIComponent(FEED_PAGE_ID)}`
@@ -93,7 +54,6 @@ async function loadFeedSettings() {
     if (!r.ok) throw new Error(`โหลด settings ของฟีดจาก worker ไม่สำเร็จ (HTTP ${r.status})`)
     const d = await r.json()
     return {
-        ok: true,
         sub_id: String(d.sub_id || ''),
         sub_id2: String(d.sub_id2 || ''),
         sub_id3: String(d.sub_id3 || ''),
@@ -102,7 +62,6 @@ async function loadFeedSettings() {
         shortlink_url: String(d.shortlink_url || `${SHORTLINK_BASE}/?account=CHEARB&url={url}&sub1={sub_id}`),
         ad_account: String(d.ad_account || DEFAULT_AD_ACCOUNT),
         template_adset: String(d.template_adset || DEFAULT_TEMPLATE_ADSET),
-        comment_template: String(d.comment_template || ''),
     }
 }
 
@@ -111,11 +70,11 @@ async function loadFeedSettings() {
 // Two paths supported:
 //   1. via short.wwoom.com (default — matches existing dashboard /create-ad
 //      flow exactly, sub_ids forwarded into wwoom-tracked s.shopee.co.th URL)
-//   2. via affiliate.shopee.co.th tab (fallback — only used if wwoom returns
-//      empty / fails AND a Shopee tab is available in Chrome)
+//   2. via affiliate.shopee.co.th tab (fallback — only if wwoom returns
+//      empty / fails AND a Shopee tab is open)
 //
 // We keep wwoom as primary so the extension produces identical short links to
-// the Electron pipeline (same account, same sub_id encoding).
+// the Electron pipeline (same account=CHEARB, same sub_id encoding).
 
 async function shortenShopee({ shopeeUrl, subId, subId2, subId3, subId4, subId5, shortlinkUrlTemplate }) {
     const url = String(shopeeUrl || '').trim()
@@ -137,14 +96,12 @@ async function shortenShopee({ shopeeUrl, subId, subId2, subId3, subId4, subId5,
         if (r.ok) {
             const j = await r.json().catch(() => ({}))
             const sl = String(j.shortLink || j.short_link || '').trim()
-            if (sl) return { source: 'wwoom', shortLink: cleanShortLink(sl), longLink: String(j.longLink || '') }
+            if (sl) return { source: 'wwoom', shortLink: cleanShortLink(sl) }
         }
-    } catch (e) {
-        // Fall through to Shopee tab
-    }
+    } catch { /* fall through to Shopee tab */ }
 
-    // Path 2: Shopee tab (fallback) — direct GraphQL via the user's logged-in
-    // affiliate tab. Borrowed from shortlink-v2 reference extension.
+    // Path 2: Shopee Affiliate tab (fallback) — direct GraphQL via the user's
+    // logged-in tab. Borrowed from shortlink-v2 reference extension.
     const shopeeTab = await findTabByPattern(SHOPEE_TAB_PATTERN)
     if (!shopeeTab) {
         throw new Error('ย่อลิงก์ wwoom ไม่สำเร็จ และไม่มี tab Shopee Affiliate เปิดอยู่ — เปิด affiliate.shopee.co.th แล้วลองใหม่')
@@ -169,15 +126,15 @@ async function shortenShopee({ shopeeUrl, subId, subId2, subId3, subId4, subId5,
     const result = results?.[0]?.result
     if (!result) throw new Error('Shopee tab ไม่ตอบกลับ')
     if (!result.ok) throw new Error(result.error || 'Shopee shortening ไม่สำเร็จ')
-    return { source: 'shopee_tab', shortLink: cleanShortLink(result.shortLink), longLink: '' }
+    return { source: 'shopee_tab', shortLink: cleanShortLink(result.shortLink) }
 }
 
 function cleanShortLink(s) {
     return String(s || '').trim().replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
 }
 
-// Runs INSIDE Shopee Affiliate page (MAIN world). Same pattern as shortlink-v2:
-// XHR so Shopee's anti-bot SDK interceptors auto-attach x-sap-sec headers.
+// Runs INSIDE Shopee Affiliate page (MAIN world). XHR (not fetch) so the
+// anti-bot SDK interceptors auto-attach x-sap-sec, af-ac-enc-dat, etc.
 function shopeePageXhr(endpoint, body) {
     return new Promise((resolve) => {
         try {
@@ -222,19 +179,20 @@ async function runCreateAdPipeline(payload) {
         thumbnailUrl,
     } = payload || {}
 
-    if (!caption) return { ok: false, error: 'ไม่มี caption' }
-    if (!videoUrl && !videoId) return { ok: false, error: 'ต้องใส่ video_url หรือ video_id' }
+    if (!caption) return { ok: false, step: 'validate', error: 'ไม่มี caption' }
+    if (!videoUrl && !videoId) return { ok: false, step: 'validate', error: 'ต้องใส่ video_url หรือ video_id' }
+    if (!campaignId && !newCampaignName) return { ok: false, step: 'validate', error: 'ต้องเลือก campaign_id หรือ new_campaign_name' }
 
-    // 1. Settings
-    const settings = await loadFeedSettings().catch(() => null)
-    if (!settings?.ok) return { ok: false, error: 'โหลด settings ฟีดจาก worker ไม่สำเร็จ' }
+    // 1. Settings (always re-read so dashboard /feed/settings stays source of truth)
+    const settings = await loadFeedSettings().catch((e) => ({ __err: e?.message || String(e) }))
+    if (settings?.__err) return { ok: false, step: 'settings', error: settings.__err }
 
     const effAdAccount = String(adAccount || settings.ad_account || DEFAULT_AD_ACCOUNT).trim()
     const effTemplateAdset = String(templateAdset || settings.template_adset || DEFAULT_TEMPLATE_ADSET).trim()
 
-    // 2. Shorten shopee link → wwoom (this is the link that goes into caption + comment)
+    // 2. Shorten shopee → goes into caption + CTA + comment (matches Electron format)
     let shortLink = ''
-    let shopeeLink = String(shopeeUrl || '').trim()
+    const shopeeLink = String(shopeeUrl || '').trim()
     if (shopeeLink) {
         try {
             const sl = await shortenShopee({
@@ -245,27 +203,28 @@ async function runCreateAdPipeline(payload) {
             })
             shortLink = sl.shortLink
         } catch (e) {
-            return { ok: false, step: 'shortlink', error: e.message }
+            return { ok: false, step: 'shortlink', error: e.message || String(e) }
         }
     }
-    if (!shortLink) return { ok: false, step: 'shortlink', error: 'ไม่ได้ short link — ใส่ shopee URL ที่ valid + ลอง refresh tab affiliate.shopee.co.th' }
+    if (!shortLink) return { ok: false, step: 'shortlink', error: 'ย่อลิงก์ Shopee ไม่สำเร็จ — เช็คว่า shopee URL ถูก + lookup table ของ wwoom มีสินค้านี้' }
 
     // 3. Build final caption (matches video-onecard electron format)
     const finalCaption = `📌 พิกัด : ${shortLink}\n${caption}`
 
-    // 4. Find Ads Manager tab
+    // 4. Find Ads Manager tab — required because window.__accessToken + session
+    //    cookies live there. No tab → no token → can't call graph.
     const adsTabs = await findTabsByPatterns(ADS_MANAGER_TAB_PATTERNS)
     if (!adsTabs.length) {
-        return { ok: false, step: 'ads_manager_tab', error: 'ไม่มี tab Ads Manager เปิดอยู่ — เปิด adsmanager.facebook.com แล้วลองใหม่' }
+        return { ok: false, step: 'ads_manager_tab', error: 'ไม่มี tab Ads Manager เปิดอยู่ — เปิด adsmanager.facebook.com แล้วลองใหม่ (ต้อง login บัญชีที่มี admin บนเพจฟีด)' }
     }
 
-    // 5. Pipeline (in MAIN world of Ads Manager tab — needs cookies + window.__accessToken)
+    // 5. Run pipeline IN-PLACE in Ads Manager tab (MAIN world)
     const pipelineArgs = {
         pageId: FEED_PAGE_ID,
         videoId: String(videoId || ''),
         videoUrl: String(videoUrl || ''),
         caption: finalCaption,
-        ctaLink: shortLink,            // CTA goes to wwoom → tracking
+        ctaLink: shortLink,
         adAccount: effAdAccount,
         templateAdset: effTemplateAdset,
         campaignId: String(campaignId || ''),
@@ -282,9 +241,9 @@ async function runCreateAdPipeline(payload) {
 
     const result = exec?.[0]?.result
     if (!result) return { ok: false, step: 'pipeline', error: 'pipeline ไม่ตอบกลับ — Ads Manager tab อาจถูกปิด' }
-    if (!result.ok) return { ...result, short_link: shortLink, shopee_link: shopeeLink }
+    if (!result.ok) return { ...result, short_link: shortLink, shopee_link: shopeeLink, page_name: FEED_PAGE_NAME }
 
-    // 6. Log to worker (post_history insert + mark video as posted)
+    // 6. Log to worker (post_history insert + mark video as posted in namespace_video_state)
     let logged = null
     try {
         const logResp = await fetch(`${WORKER_BASE}/api/dashboard/extension-ad-log`, {
@@ -303,12 +262,14 @@ async function runCreateAdPipeline(payload) {
         })
         logged = await logResp.json().catch(() => null)
     } catch (e) {
-        logged = { ok: false, error: e.message }
+        logged = { ok: false, error: e?.message || String(e) }
     }
 
     return {
         ok: true,
         ...result,
+        page_id: FEED_PAGE_ID,
+        page_name: FEED_PAGE_NAME,
         short_link: shortLink,
         shopee_link: shopeeLink,
         final_caption: finalCaption,
@@ -328,7 +289,6 @@ async function runCreateAdPipeline(payload) {
 async function fbAdPipelineMainWorld(args) {
     const { pageId, videoId, videoUrl, caption, ctaLink, adAccount, templateAdset, campaignId, newCampaignName, thumbnailUrl } = args
 
-    function tokenTail(t) { return String(t || '').slice(-6) }
     const accessToken = window.__accessToken
     if (!accessToken) {
         return { ok: false, step: 'token', error: 'ไม่พบ window.__accessToken — refresh หน้า Ads Manager แล้วลองใหม่ (login ยังอยู่ไหม?)' }
@@ -360,7 +320,7 @@ async function fbAdPipelineMainWorld(args) {
             `https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`,
             { method: 'POST' }
         )
-        if (r.json?.error) return { ok: false, step: 'upload', error: r.json.error.message, fb_error_code: r.json.error.code, fb_trace_id: r.json.error.fbtrace_id, token_tail: tokenTail(accessToken) }
+        if (r.json?.error) return { ok: false, step: 'upload', error: r.json.error.message, fb_error_code: r.json.error.code, fb_trace_id: r.json.error.fbtrace_id }
         vidId = r.json?.id
         if (!vidId) return { ok: false, step: 'upload', error: 'no_video_id_returned', preview: r.text.substring(0, 300) }
     }
@@ -397,7 +357,7 @@ async function fbAdPipelineMainWorld(args) {
     const creativeId = cr.json?.id
     if (!creativeId) return { ok: false, step: 'creative', error: 'no_creative_id', preview: cr.text.substring(0, 300) }
 
-    // ── Step 4: poll story_id (50×3s = 150s) — matches the recent Electron widening ──
+    // ── Step 4: poll story_id (50×3s = 150s) — matches Electron's recent widening ──
     let storyId = null
     for (let i = 0; i < 50; i++) {
         await new Promise(r => setTimeout(r, 3000))
@@ -515,7 +475,6 @@ async function findTabsByPatterns(patterns) {
         const tabs = await chrome.tabs.query({ url: p }).catch(() => [])
         for (const t of tabs) if (t.id) all.push(t)
     }
-    // Prefer fully loaded tabs first
     all.sort((a, b) => (a.status === 'complete' ? -1 : 1) - (b.status === 'complete' ? -1 : 1))
     return all
 }
