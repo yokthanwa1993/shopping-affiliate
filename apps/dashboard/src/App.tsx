@@ -187,7 +187,7 @@ const statusClass = {
 //
 // Workspace separation is URL-driven:
 //   /chearb/...  → เฉียบ (default redirect target if no slug)
-//   /feed/...    → ฟีด
+//   /cham/...    → ฉ่ำ
 // Each URL is its own workspace with isolated settings, page-posts cache, etc.
 // No client-side picker — switching is just navigating to the other URL.
 //
@@ -197,7 +197,7 @@ const statusClass = {
 const CHIEB_NAMESPACE_ID = '1774858894802785816'
 const PAGES = [
     { id: '1008898512617594', name: 'เฉียบ', slug: 'chearb', iconUrl: '/page-icons/chieb.jpg' },
-    { id: '116759241338040', name: 'ฟีด', slug: 'feed', iconUrl: '/page-icons/feed.jpg' },
+    { id: '114142457961643', name: 'ฉ่ำ', slug: 'cham', iconUrl: '/page-icons/cham.jpg' },
 ] as const
 type PageOption = typeof PAGES[number]
 const DEFAULT_PAGE: PageOption = PAGES[0]
@@ -420,8 +420,8 @@ export default function App() {
   }, [pagePickerOpen])
   // Feed Ad Creator extension presence — detected via window.postMessage
   // handshake from feed-ad-extension/bridge.js. Only meaningful when
-  // selectedPage.slug === 'feed': เฉียบ creates ads via worker → Electron
-  // (unchanged), ฟีด creates them via the extension running on a real Ads
+  // selectedPage.slug === 'cham': เฉียบ creates ads via worker → Electron
+  // (unchanged), ฉ่ำ creates them via the extension running on a real Ads
   // Manager tab. If a feed user clicks สร้างแอด without the extension
   // installed, we surface a clear "ติดตั้ง extension ก่อน" error instead of
   // silently falling back through a broken path.
@@ -474,9 +474,9 @@ export default function App() {
       window.postMessage({ type: 'feedExt.createAd.request', requestId, payload }, '*')
     })
   }
-  // List campaigns via extension. Used for ฟีด only — extension reads from the
+  // List campaigns via extension. Used for ฉ่ำ only — extension reads from the
   // operator's logged-in Ads Manager tab so the campaigns shown match whatever
-  // ad_account is set in /feed/settings (which can differ from the Electron
+  // ad_account is set in /cham/settings (which can differ from the Electron
   // user's primary account).
   function listCampaignsViaExtension(payload: Record<string, unknown>, timeoutMs = 30000): Promise<{ ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number; costPerLinkClick?: string }>; error?: string }> {
     return new Promise((resolve) => {
@@ -593,7 +593,7 @@ export default function App() {
   // (selectedPage) but the operator can switch on the page-posts tab to view
   // ANOTHER page's video archive and pick a clip to run as an ad on the
   // current workspace. The clip's source vs the ad's destination are decoupled
-  // here on purpose: e.g. /chearb workspace can browse ฟีด's high-view clips
+  // here on purpose: e.g. /chearb workspace can browse ฉ่ำ's high-view clips
   // and create an ad that posts to เฉียบ.
   const [pagePostsSourcePageId, setPagePostsSourcePageId] = useState<string>(initialUrl.page.id)
   const pagePostsSource = PAGE_BY_ID[pagePostsSourcePageId] ?? selectedPage
@@ -642,8 +642,8 @@ export default function App() {
     setCreateAdLoading(true)
     const adAccount = settings.adAccount || 'act_1030797047648459'
     try {
-      if (selectedPage.slug === 'feed' && feedExtension.available) {
-        // ฟีด — request status + campaigns concurrently. Status panel shows
+      if (selectedPage.slug === 'cham' && feedExtension.available) {
+        // ฉ่ำ — request status + campaigns concurrently. Status panel shows
         // up immediately so even when campaigns fail the operator can see why.
         const [status, campaigns] = await Promise.all([
           statusViaExtension({ adAccount }),
@@ -696,10 +696,10 @@ export default function App() {
     let finalMessage = ''
 
     try {
-      // ฟีด vs เฉียบ split:
+      // ฉ่ำ vs เฉียบ split:
       //   - เฉียบ → POST /api/dashboard/create-ad → worker calls Electron video-onecard
       //     (the pipeline that's been running fine; nothing changed here).
-      //   - ฟีด  → bypass worker entirely; the pipeline runs INSIDE the operator's
+      //   - ฉ่ำ  → bypass worker entirely; the pipeline runs INSIDE the operator's
       //     Chrome via the Feed Ad Creator extension. The extension has its own
       //     graph.facebook.com session (real Ads Manager tab) and writes back to
       //     post_history via /api/dashboard/extension-ad-log.
@@ -709,12 +709,12 @@ export default function App() {
       // without the extension installed, we abort with a clear message — silently
       // falling through to the worker path would create the ad via Electron and
       // bypass the per-page workflow the user explicitly chose.
-      const isFeed = selectedPage.slug === 'feed'
+      const isFeed = selectedPage.slug === 'cham'
 
       if (isFeed && !feedExtension.available) {
         timers.forEach(clearTimeout)
         finalStatus = 'error'
-        finalMessage = `❌ ติดตั้ง Feed Ad Creator extension ก่อน\n\nเพจฟีดสร้างแอดผ่าน extension เท่านั้น — โหลด apps/feed-ad-extension/ ใน chrome://extensions แล้วรีโหลดหน้านี้\n\nถ้าติดตั้งแล้วยังเห็นข้อความนี้ ให้รีเฟรชหน้าหรือ disable+enable extension ใหม่`
+        finalMessage = `❌ ติดตั้ง Feed Ad Creator extension ก่อน\n\nเพจฉ่ำสร้างแอดผ่าน extension เท่านั้น — โหลด apps/feed-ad-extension/ ใน chrome://extensions แล้วรีโหลดหน้านี้\n\nถ้าติดตั้งแล้วยังเห็นข้อความนี้ ให้รีเฟรชหน้าหรือ disable+enable extension ใหม่`
         setCreateAdStep('❌ ไม่พบ extension')
         setCreateAdProgress(0)
         setCreateAdResultBanner({ type: 'error', text: '❌ ติดตั้ง Feed Ad Creator extension ก่อน' })
@@ -854,13 +854,13 @@ export default function App() {
     if (!createAdPopup) return
 
     // Queue mode = "เพิ่มเข้าคิว" — relies on the worker-side cron picking up
-    // the job every ~20 minutes and processing it via Electron. ฟีด's pipeline
+    // the job every ~20 minutes and processing it via Electron. ฉ่ำ's pipeline
     // runs inside the operator's Chrome extension, not on the worker, so a
-    // cron-triggered queue can't drive it. We block queue mode for ฟีด and
+    // cron-triggered queue can't drive it. We block queue mode for ฉ่ำ and
     // funnel them to immediate ("โพสต์เลย") instead, which calls the extension.
-    if (selectedPage.slug === 'feed') {
-      const msg = '❌ คิวสร้างแอดไม่รองรับสำหรับเพจฟีด\n\nคิวนี้รันโดย worker cron ที่เรียก Electron — เพจฟีดสร้างแอดผ่าน extension ใน Chrome ของพี่เท่านั้น (worker ไม่มี session ของ Ads Manager)\n\nกด "⚡ โพสต์เลย" แทนเพื่อให้ extension สร้างแอดทันที'
-      setCreateAdResultBanner({ type: 'error', text: '❌ ฟีดใช้ "โพสต์เลย" เท่านั้น — queue ไม่รองรับ' })
+    if (selectedPage.slug === 'cham') {
+      const msg = '❌ คิวสร้างแอดไม่รองรับสำหรับเพจฉ่ำ\n\nคิวนี้รันโดย worker cron ที่เรียก Electron — เพจฉ่ำสร้างแอดผ่าน extension ใน Chrome ของพี่เท่านั้น (worker ไม่มี session ของ Ads Manager)\n\nกด "⚡ โพสต์เลย" แทนเพื่อให้ extension สร้างแอดทันที'
+      setCreateAdResultBanner({ type: 'error', text: '❌ ฉ่ำใช้ "โพสต์เลย" เท่านั้น — queue ไม่รองรับ' })
       alert(msg)
       return
     }
@@ -1004,7 +1004,7 @@ export default function App() {
 
   // (URL syncing happens in pushPageTab + popstate listener defined above —
   // legacy `getTabPath(tab)` URL writer was removed because it stripped the
-  // page slug from /chearb/<tab> and /feed/<tab>.)
+  // page slug from /chearb/<tab> and /cham/<tab>.)
 
   useEffect(() => {
     // Reload settings when the workspace (selectedPageId) changes — /chearb and
@@ -1204,7 +1204,7 @@ export default function App() {
   useEffect(() => {
     // Reload page-posts cache whenever the SOURCE page changes — could be
     // because the workspace changed (effect above) or the operator clicked
-    // the source picker on /chearb/page-posts to view ฟีด's archive. Clear
+    // the source picker on /chearb/page-posts to view ฉ่ำ's archive. Clear
     // existing items first so we don't flash the previous page's videos
     // while the new fetch is in flight.
     setGalleryLinkedItems([])
@@ -1408,10 +1408,10 @@ export default function App() {
             <p className="mt-1 truncate text-xs text-slate-400">{createAdPopup.caption}</p>
 
             {/* Provider badge — makes it obvious whether the click will go through
-                Electron (เฉียบ) or the Chrome extension (ฟีด). For ฟีด we also
+                Electron (เฉียบ) or the Chrome extension (ฉ่ำ). For ฉ่ำ we also
                 surface the install state so missing extension is visible up-front
                 rather than hitting an error after the user clicks. */}
-            {selectedPage.slug === 'feed' ? (
+            {selectedPage.slug === 'cham' ? (
               <div className={`mt-3 flex items-center gap-2 rounded-xl border px-3 py-2 text-xs ${
                 feedExtension.available
                   ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
@@ -1493,7 +1493,7 @@ export default function App() {
               </div>
             </details>
 
-            {/* Extension status panel — only ฟีด, only when extension is
+            {/* Extension status panel — only ฉ่ำ, only when extension is
                 installed. Mirrors what video-onecard's /token /session /pages
                 expose for Electron, so the operator can tell at a glance:
                   - Ads Manager tab open?
@@ -1505,7 +1505,7 @@ export default function App() {
                     shortlink mode)
                 Collapsible <details> so it doesn't clutter the popup once the
                 operator has confirmed everything is green. */}
-            {selectedPage.slug === 'feed' && feedExtension.available && feedExtensionStatus && (() => {
+            {selectedPage.slug === 'cham' && feedExtension.available && feedExtensionStatus && (() => {
               const s = feedExtensionStatus
               const inspect = s.inspect || null
               const adsOk = !!s.ads_manager_tab
@@ -1556,10 +1556,10 @@ export default function App() {
                       ok={!!linkageOk}
                       detail={linkageTested
                         ? (linkageOk
-                          ? `✓ ฟีดอยู่ใน promote_pages (${inspect?.promotable_linkage?.total_pages} pages)`
+                          ? `✓ ฉ่ำอยู่ใน promote_pages (${inspect?.promotable_linkage?.total_pages} pages)`
                           : (inspect?.promotable_linkage?.error
                             ? `${inspect.promotable_linkage.error} (code=${inspect.promotable_linkage.code ?? '-'})`
-                            : `ไม่มีฟีดใน promote_pages — มี ${inspect?.promotable_linkage?.total_pages ?? 0} pages: ${linkagePagesPreview || '(empty)'}`))
+                            : `ไม่มีฉ่ำใน promote_pages — มี ${inspect?.promotable_linkage?.total_pages ?? 0} pages: ${linkagePagesPreview || '(empty)'}`))
                         : 'รอตรวจ'}
                     />
                     <Row
@@ -1579,9 +1579,9 @@ export default function App() {
                   {linkageTested && !linkageOk && !inspect?.promotable_linkage?.error && (
                     <div className="border-t border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
                       <p className="font-semibold">⚠️ ที่น่าจะเป็นสาเหตุของ FB code=10:</p>
-                      <p className="mt-0.5">เพจฟีดไม่อยู่ใน promotable pages ของ ad_account นี้ — ต้อง link ใน Business Manager</p>
+                      <p className="mt-0.5">เพจฉ่ำไม่อยู่ใน promotable pages ของ ad_account นี้ — ต้อง link ใน Business Manager</p>
                       <p className="mt-1 break-words font-mono text-[10px] text-amber-700">
-                        แก้: business.facebook.com → Business Settings → Pages → ฟีด → Add Asset → Ad Accounts → เลือก {s.ad_account}
+                        แก้: business.facebook.com → Business Settings → Pages → ฉ่ำ → Add Asset → Ad Accounts → เลือก {s.ad_account}
                       </p>
                     </div>
                   )}
@@ -1596,10 +1596,10 @@ export default function App() {
                         — FB ห้าม copy adset ข้าม account
                       </p>
                       <p className="mt-1 text-amber-700">
-                        แก้ทาง 1: สร้าง adset ตัวอย่างใหม่ใน <code className="rounded bg-white px-1">act_{inspect?.template_adset_check?.expected_account_id}</code> (Ads Manager → Create → Adset → set audience/budget/placement → save) แล้วเอา id มาใส่ใน /feed/settings → Template Adset
+                        แก้ทาง 1: สร้าง adset ตัวอย่างใหม่ใน <code className="rounded bg-white px-1">act_{inspect?.template_adset_check?.expected_account_id}</code> (Ads Manager → Create → Adset → set audience/budget/placement → save) แล้วเอา id มาใส่ใน /cham/settings → Template Adset
                       </p>
                       <p className="mt-1 text-amber-700">
-                        แก้ทาง 2: ใน /feed/settings → Ad Account → เปลี่ยนเป็น <code className="rounded bg-white px-1">act_{inspect?.template_adset_check?.template_account_id}</code> ที่ template adset อยู่ (ถ้า ad_account นั้น link กับฟีดด้วย)
+                        แก้ทาง 2: ใน /cham/settings → Ad Account → เปลี่ยนเป็น <code className="rounded bg-white px-1">act_{inspect?.template_adset_check?.template_account_id}</code> ที่ template adset อยู่ (ถ้า ad_account นั้น link กับฉ่ำด้วย)
                       </p>
                     </div>
                   )}
@@ -1705,8 +1705,8 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => void submitCreateAd()}
-                    disabled={(!createAdSelectedCampaign && !createAdNewCampaignName) || selectedPage.slug === 'feed'}
-                    title={selectedPage.slug === 'feed' ? 'ฟีดใช้ extension — queue ไม่รองรับ กด "โพสต์เลย" แทน' : ''}
+                    disabled={(!createAdSelectedCampaign && !createAdNewCampaignName) || selectedPage.slug === 'cham'}
+                    title={selectedPage.slug === 'cham' ? 'ฉ่ำใช้ extension — queue ไม่รองรับ กด "โพสต์เลย" แทน' : ''}
                     className="flex-1 rounded-xl bg-[#1877f2] py-2.5 text-sm font-semibold text-white disabled:opacity-50"
                   >
                     เพิ่มเข้าคิว
@@ -1716,16 +1716,16 @@ export default function App() {
                   onClick={() => void submitCreateAdImmediate()}
                   disabled={
                     (!createAdSelectedCampaign && !createAdNewCampaignName)
-                    || (selectedPage.slug === 'feed' && !feedExtension.available)
+                    || (selectedPage.slug === 'cham' && !feedExtension.available)
                   }
                   title={
-                    selectedPage.slug === 'feed' && !feedExtension.available
+                    selectedPage.slug === 'cham' && !feedExtension.available
                       ? 'ติดตั้ง Feed Ad Creator extension ก่อน'
                       : 'รันเลยโดยไม่รอคิว 20 นาที (extension ใช้ ~80-200 วินาที, electron ~60-120 วินาที)'
                   }
                   className="w-full rounded-xl bg-orange-500 hover:bg-orange-600 py-2.5 text-sm font-semibold text-white disabled:opacity-50 transition-colors"
                 >
-                  ⚡ โพสต์เลย {selectedPage.slug === 'feed' ? '(ผ่าน extension)' : '(ข้ามคิว)'}
+                  ⚡ โพสต์เลย {selectedPage.slug === 'cham' ? '(ผ่าน extension)' : '(ข้ามคิว)'}
                 </button>
               </div>
             )}
@@ -2554,9 +2554,9 @@ export default function App() {
                       <Field
                         label="ย่อลิงก์ผ่าน"
                         help={
-                          selectedPage.slug === 'feed'
+                          selectedPage.slug === 'cham'
                             ? 'API = call short.wwoom.com (commission ไป CHEARB account). Extension = ย่อผ่าน tab affiliate.shopee.co.th ของพี่ตรงๆ (commission ไปบัญชี Shopee Affiliate ของพี่เอง — ต้องเปิด tab ค้างไว้)'
-                            : 'เพจนี้ใช้ Electron — เลือก API เท่านั้น. Extension ใช้ได้แค่ฟีด'
+                            : 'เพจนี้ใช้ Electron — เลือก API เท่านั้น. Extension ใช้ได้แค่ฉ่ำ'
                         }
                       >
                         <div className="grid grid-cols-2 gap-2">
@@ -2575,8 +2575,8 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => setSettings((c) => ({ ...c, shortlinkProvider: 'extension' }))}
-                            disabled={selectedPage.slug !== 'feed'}
-                            title={selectedPage.slug !== 'feed' ? 'Extension ใช้ได้แค่ฟีด' : ''}
+                            disabled={selectedPage.slug !== 'cham'}
+                            title={selectedPage.slug !== 'cham' ? 'Extension ใช้ได้แค่ฉ่ำ' : ''}
                             className={`rounded-xl border px-3 py-2.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 ${
                               settings.shortlinkProvider === 'extension'
                                 ? 'border-blue-600 bg-blue-600 text-white'

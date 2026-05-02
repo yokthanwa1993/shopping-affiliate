@@ -28329,12 +28329,16 @@ function inferManualPostHistoryVideoId(videoUrl: string, fallback = 'manual-reel
 // here once successful so the result lands in post_history alongside everything
 // else (gallery "used" filter, dashboard history, etc.).
 //
-// Locked to ฟีด page id 116759241338040 because:
+// Locked to ฉ่ำ page id 114142457961643 because:
 //   - This is the page we agreed to migrate to extension; เฉียบ keeps Electron.
 //   - Other pages have their own Electron flow that already writes post_history.
 // Anything else is rejected up-front so a misconfigured extension build can't
 // log against the wrong workspace.
-const FEED_EXTENSION_PAGE_ID = '116759241338040'
+//
+// History note (2026-05-02): originally locked to ฟีด (116759241338040). User
+// switched the extension target to ฉ่ำ (114142457961643). Behaviour identical
+// — only the page id literal changed.
+const EXTENSION_PAGE_ID = '114142457961643'
 
 app.post('/api/dashboard/extension-ad-log', async (c) => {
     const body = await c.req.json().catch(() => ({})) as {
@@ -28349,8 +28353,8 @@ app.post('/api/dashboard/extension-ad-log', async (c) => {
         comment_id?: string
     }
     const pageId = String(body.page_id || '').trim()
-    if (pageId !== FEED_EXTENSION_PAGE_ID) {
-        return c.json({ ok: false, error: 'extension_log_only_for_feed_page', expected_page_id: FEED_EXTENSION_PAGE_ID }, 403)
+    if (pageId !== EXTENSION_PAGE_ID) {
+        return c.json({ ok: false, error: 'extension_log_only_for_extension_page', expected_page_id: EXTENSION_PAGE_ID }, 403)
     }
     const videoId = String(body.video_id || '').trim()
     const storyId = String(body.story_id || '').trim()

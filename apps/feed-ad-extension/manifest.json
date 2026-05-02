@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
-    "name": "Feed Ad Creator",
-    "version": "1.12.0",
-    "description": "เบื้องหลังของ dashboard /feed — shortlink + ดึงโทเค้น/cookies จาก Ads Manager tab + รัน FB pipeline. ไม่มี UI (ทำงานเงียบๆ ผ่าน dashboard.oomnn.com/feed เท่านั้น). ฟีดเท่านั้น เฉียบไม่แตะ",
+    "name": "Cham Ad Creator",
+    "version": "1.13.0",
+    "description": "เบื้องหลังของ dashboard /cham — shortlink + ดึงโทเค้น/cookies จาก Ads Manager tab + รัน FB pipeline. ไม่มี UI (ทำงานเงียบๆ ผ่าน dashboard.oomnn.com/cham เท่านั้น). ฉ่ำเท่านั้น เฉียบไม่แตะ",
     "permissions": [
         "tabs",
         "scripting",
@@ -33,7 +33,7 @@
         }
     ],
     "action": {
-        "default_title": "Feed Ad Creator (เบื้องหลังของ dashboard /feed)",
+        "default_title": "Cham Ad Creator (เบื้องหลังของ dashboard /cham)",
         "default_icon": {
             "16": "icons/icon-16.png",
             "48": "icons/icon-48.png",

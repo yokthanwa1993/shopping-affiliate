@@ -15,8 +15,11 @@
 
 // ────────────────────── Constants ──────────────────────
 
-const FEED_PAGE_ID = '116759241338040'           // เพจ ฟีด
-const FEED_PAGE_NAME = 'ฟีด'
+// History: this constant used to point at ฉ่ำ (page id 116759241338040).
+// User switched the extension target to ฉ่ำ on 2026-05-02. Behaviour is
+// identical — only the page id literal changed.
+const FEED_PAGE_ID = '114142457961643'           // เพจ ฉ่ำ
+const FEED_PAGE_NAME = 'ฉ่ำ'
 
 const WORKER_BASE = 'https://api.oomnn.com'
 const SHORTLINK_BASE = 'https://short.wwoom.com'
@@ -167,7 +170,7 @@ async function fbInspectMainWorld({ adAccount, templateAdset }) {
         }
         try {
             const r = await fetch(
-                `https://graph.facebook.com/v21.0/116759241338040?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
+                `https://graph.facebook.com/v21.0/114142457961643?fields=id,name&access_token=${encodeURIComponent(accessToken)}`,
                 { credentials: 'include' }
             )
             const j = await r.json().catch(() => ({}))
@@ -194,7 +197,7 @@ async function fbInspectMainWorld({ adAccount, templateAdset }) {
                 promotableLinkage = { tested: true, ok: false, error: String(j.error.message || ''), code: j.error.code }
             } else {
                 const pages = Array.isArray(j?.data) ? j.data : []
-                const feedInList = pages.find((p) => String(p?.id || '') === '116759241338040')
+                const feedInList = pages.find((p) => String(p?.id || '') === '114142457961643')
                 promotableLinkage = {
                     tested: true,
                     ok: !!feedInList,
@@ -210,7 +213,7 @@ async function fbInspectMainWorld({ adAccount, templateAdset }) {
 
     // Template adset must live in the SAME ad_account we're creating ads for —
     // FB's /copies endpoint refuses cross-account adset copies with code=100
-    // "Invalid parameter". This is the most common cause for ฟีด failing at
+    // "Invalid parameter". This is the most common cause for ฉ่ำ failing at
     // step 'copy' when the operator's template_adset was originally created
     // for the เฉียบ ad account.
     let templateAdsetCheck = { tested: false }
@@ -263,9 +266,9 @@ async function fbInspectMainWorld({ adAccount, templateAdset }) {
 
 // ────────────────────── Campaign list ──────────────────────
 //
-// Replaces the worker's /api/dashboard/campaigns proxy for ฟีด — that proxy
+// Replaces the worker's /api/dashboard/campaigns proxy for ฉ่ำ — that proxy
 // hits Electron's /graph endpoint, which uses the Electron user's session.
-// For ฟีด the operator may have a different ad_account whose campaigns the
+// For ฉ่ำ the operator may have a different ad_account whose campaigns the
 // Electron session can't see. Instead we read campaigns from inside the user's
 // own Ads Manager tab (same place the create-ad pipeline reads tokens).
 
@@ -340,7 +343,7 @@ async function fbListCampaignsMainWorld({ adAccount }) {
 async function loadFeedSettings() {
     const url = `${WORKER_BASE}/api/dashboard/settings?page_id=${encodeURIComponent(FEED_PAGE_ID)}`
     const r = await fetch(url, { method: 'GET' })
-    if (!r.ok) throw new Error(`โหลด settings ของฟีดจาก worker ไม่สำเร็จ (HTTP ${r.status})`)
+    if (!r.ok) throw new Error(`โหลด settings ของฉ่ำจาก worker ไม่สำเร็จ (HTTP ${r.status})`)
     const d = await r.json()
     // shortlink_provider toggles between two strict modes:
     //   'api'        → only short.wwoom.com (no fallback)
@@ -536,7 +539,7 @@ async function runCreateAdPipeline(payload) {
     //    cookies live there. No tab → no token → can't call graph.
     const adsTabs = await findTabsByPatterns(ADS_MANAGER_TAB_PATTERNS)
     if (!adsTabs.length) {
-        return { ok: false, step: 'ads_manager_tab', error: 'ไม่มี tab Ads Manager เปิดอยู่ — เปิด adsmanager.facebook.com แล้วลองใหม่ (ต้อง login บัญชีที่มี admin บนเพจฟีด)' }
+        return { ok: false, step: 'ads_manager_tab', error: 'ไม่มี tab Ads Manager เปิดอยู่ — เปิด adsmanager.facebook.com แล้วลองใหม่ (ต้อง login บัญชีที่มี admin บนเพจฉ่ำ)' }
     }
 
     // Build comment text (matches Electron's worker comment step). Reads
