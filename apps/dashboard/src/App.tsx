@@ -478,7 +478,7 @@ export default function App() {
   // operator's logged-in Ads Manager tab so the campaigns shown match whatever
   // ad_account is set in /feed/settings (which can differ from the Electron
   // user's primary account).
-  function listCampaignsViaExtension(payload: Record<string, unknown>, timeoutMs = 30000): Promise<{ ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }>; error?: string }> {
+  function listCampaignsViaExtension(payload: Record<string, unknown>, timeoutMs = 30000): Promise<{ ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number; costPerLinkClick?: string }>; error?: string }> {
     return new Promise((resolve) => {
       const requestId = `camp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
       function onMessage(e: MessageEvent) {
@@ -489,7 +489,7 @@ export default function App() {
         if (data.requestId !== requestId) return
         window.removeEventListener('message', onMessage)
         clearTimeout(timer)
-        resolve(data as { ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }>; error?: string })
+        resolve(data as { ok: boolean; campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number; costPerLinkClick?: string }>; error?: string })
       }
       const timer = setTimeout(() => {
         window.removeEventListener('message', onMessage)
@@ -572,7 +572,7 @@ export default function App() {
   const [createAdSubId3, setCreateAdSubId3] = useState('')
   const [createAdSubId4, setCreateAdSubId4] = useState('')
   const [createAdSubId5, setCreateAdSubId5] = useState('')
-  const [createAdCampaigns, setCreateAdCampaigns] = useState<Array<{ id: string; name: string; status: string; adsetCount: number }>>([])
+  const [createAdCampaigns, setCreateAdCampaigns] = useState<Array<{ id: string; name: string; status: string; adsetCount: number; costPerLinkClick?: string }>>([])
   const [createAdCampaignsError, setCreateAdCampaignsError] = useState<string>('')
   const [feedExtensionStatus, setFeedExtensionStatus] = useState<ExtensionStatus | null>(null)
   const [createAdLoading, setCreateAdLoading] = useState(false)
@@ -652,7 +652,7 @@ export default function App() {
         // เฉียบ + อื่นๆ → list via worker proxy that hits Electron's /graph.
         const resp = await fetch(`/worker-api/api/dashboard/campaigns?ad_account=${encodeURIComponent(adAccount)}`)
         if (resp.ok) {
-          const data = await resp.json() as { campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number }> }
+          const data = await resp.json() as { campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number; costPerLinkClick?: string }> }
           setCreateAdCampaigns(data.campaigns || [])
           if (!data.campaigns?.length) setCreateAdCampaignsError(`worker คืน 0 campaigns (ad_account=${adAccount})`)
         } else {
@@ -1603,19 +1603,34 @@ export default function App() {
                 </div>
               ) : (
                 <div className="space-y-2 max-h-48 overflow-y-auto">
-                  {createAdCampaigns.map((camp) => (
-                    <button
-                      key={camp.id}
-                      onClick={() => { setCreateAdSelectedCampaign(camp.id); setCreateAdNewCampaignName('') }}
-                      className={`w-full rounded-xl border p-3 text-left transition ${createAdSelectedCampaign === camp.id ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm font-semibold text-slate-900">{camp.name} ({camp.adsetCount} adsets)</span>
-                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${camp.status === 'ACTIVE' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{camp.status}</span>
-                      </div>
-                      <p className="mt-0.5 text-[11px] text-slate-400">{camp.id}</p>
-                    </button>
-                  ))}
+                  {createAdCampaigns.map((camp) => {
+                    // FB cost_per_action_type returns the value pre-formatted
+                    // in the ad_account currency (THB). Show 2 decimals to
+                    // match Ads Manager UI (฿0.16, ฿0.25, ...). If FB has no
+                    // data yet (brand-new campaign with no spend) skip the row.
+                    const cpcRaw = camp.costPerLinkClick ? Number(camp.costPerLinkClick) : NaN
+                    const cpcDisplay = Number.isFinite(cpcRaw) && cpcRaw > 0
+                      ? `฿${cpcRaw.toFixed(2)}/คลิก`
+                      : ''
+                    return (
+                      <button
+                        key={camp.id}
+                        onClick={() => { setCreateAdSelectedCampaign(camp.id); setCreateAdNewCampaignName('') }}
+                        className={`w-full rounded-xl border p-3 text-left transition ${createAdSelectedCampaign === camp.id ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-semibold text-slate-900">{camp.name} ({camp.adsetCount} adsets)</span>
+                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${camp.status === 'ACTIVE' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{camp.status}</span>
+                        </div>
+                        <div className="mt-0.5 flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">{camp.id}</span>
+                          {cpcDisplay && (
+                            <span className="font-semibold text-emerald-700">{cpcDisplay}</span>
+                          )}
+                        </div>
+                      </button>
+                    )
+                  })}
                 </div>
               )}
 

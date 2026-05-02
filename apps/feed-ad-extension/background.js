@@ -300,6 +300,15 @@ async function fbListCampaignsMainWorld({ adAccount }) {
         try { return JSON.parse(t) } catch { return { __raw: t } }
     }
 
+    // Pull `value` for action_type='link_click' out of the FB insights
+    // cost_per_action_type array. That's the same number Ads Manager UI
+    // shows as 'ต้นทุนต่อการคลิกลิงก์'.
+    const pickCostPerAction = (insights, actionType) => {
+        const arr = Array.isArray(insights?.cost_per_action_type) ? insights.cost_per_action_type : []
+        const hit = arr.find((entry) => String(entry?.action_type || '').trim() === actionType)
+        return hit ? String(hit.value || '') : ''
+    }
+
     const camp = await fbFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?fields=id,name,effective_status,daily_budget,start_time&limit=10&access_token=${encodeURIComponent(accessToken)}`)
     if (camp?.error) return { ok: false, error: `[campaigns] ${camp.error.message}`, fb_error_code: camp.error.code }
     const campaigns = Array.isArray(camp?.data) ? camp.data : []
@@ -309,11 +318,17 @@ async function fbListCampaignsMainWorld({ adAccount }) {
         const adsets = await fbFetch(`https://graph.facebook.com/v21.0/${c.id}/adsets?fields=id,effective_status&limit=50&access_token=${encodeURIComponent(accessToken)}`)
         const aArr = Array.isArray(adsets?.data) ? adsets.data : []
         const liveAdsets = aArr.filter((a) => a.effective_status !== 'DELETED' && a.effective_status !== 'ARCHIVED')
+
+        // Insights — same shape as worker /api/dashboard/campaigns.
+        const ins = await fbFetch(`https://graph.facebook.com/v21.0/${c.id}/insights?fields=spend,cost_per_action_type,actions&date_preset=lifetime&access_token=${encodeURIComponent(accessToken)}`)
+        const insRow = Array.isArray(ins?.data) ? (ins.data[0] || {}) : {}
+
         result.push({
             id: c.id,
             name: c.name || c.id,
             status: c.effective_status || 'UNKNOWN',
             adsetCount: liveAdsets.length,
+            costPerLinkClick: pickCostPerAction(insRow, 'link_click'),
         })
     }
 

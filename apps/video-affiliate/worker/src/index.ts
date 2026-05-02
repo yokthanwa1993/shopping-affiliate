@@ -6865,6 +6865,17 @@ app.get('/api/dashboard/campaigns', async (c) => {
         const campData = await campResp.json().catch(() => ({})) as Record<string, unknown>
         const campaigns = Array.isArray((campData as any)?.data) ? (campData as any).data : []
 
+        // Helper: pull the per-action numeric cost out of the FB insights array
+        // shape. cost_per_action_type returns:
+        //   [{action_type:'link_click', value:'0.16'}, {action_type:'post_engagement',...}, ...]
+        // We surface link_click specifically because that's what the operator
+        // sees as 'ต้นทุนต่อการคลิกลิงก์' in Ads Manager UI.
+        const pickCostPerAction = (insights: any, actionType: string): string => {
+            const arr = Array.isArray(insights?.cost_per_action_type) ? insights.cost_per_action_type : []
+            const hit = arr.find((entry: any) => String(entry?.action_type || '').trim() === actionType)
+            return hit ? String(hit.value || '0') : ''
+        }
+
         const result: Array<Record<string, unknown>> = []
         for (const camp of campaigns) {
             // Get adsets for each campaign
@@ -6872,8 +6883,9 @@ app.get('/api/dashboard/campaigns', async (c) => {
             const adsetData = await adsetResp.json().catch(() => ({})) as Record<string, unknown>
             const adsets = Array.isArray((adsetData as any)?.data) ? (adsetData as any).data : []
 
-            // Get campaign insights
-            const insResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/insights&fields=reach,impressions,spend,cost_per_thruplay,actions&date_preset=lifetime`)
+            // Get campaign insights — request cost_per_action_type so we can surface
+            // 'cost per link click' per campaign in the create-ad popup.
+            const insResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/insights&fields=reach,impressions,spend,cost_per_thruplay,cost_per_action_type,actions&date_preset=lifetime`)
             const insData = await insResp.json().catch(() => ({})) as Record<string, unknown>
             const insights = Array.isArray((insData as any)?.data) ? (insData as any).data[0] || {} : {}
 
@@ -6894,6 +6906,7 @@ app.get('/api/dashboard/campaigns', async (c) => {
                 impressions: String(insights.impressions || '0'),
                 spend: String(insights.spend || '0'),
                 costPerResult: String(insights.cost_per_thruplay || '0'),
+                costPerLinkClick: pickCostPerAction(insights, 'link_click'),
             })
         }
         return c.json({ ok: true, campaigns: result })
