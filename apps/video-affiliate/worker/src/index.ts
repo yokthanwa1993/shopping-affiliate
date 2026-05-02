@@ -1933,6 +1933,27 @@ async function claimGalleryVideoForPosting(params: {
         // its source_fingerprint was ever successfully posted (or is currently
         // being posted) anywhere in the same namespace, it is NEVER eligible
         // for re-posting.
+        //
+        // EXCEPTION (manual unpost): if the user clicked the refresh button on
+        // this video AFTER the last successful post, treat it as a fresh
+        // candidate. Without this exception, the user's intent ("post this
+        // again") is silently undone — cron sees the historical post_history
+        // row, skips, and heals state back to "posted". Mirrors the same
+        // manual_unposted_at gate inside ensurePageVideoNeverPosted (the page-
+        // level dedup that runs after this safety net).
+        let manualUnpostedAtMs = 0
+        try {
+            const row = await params.db.prepare(
+                `SELECT manual_unposted_at FROM namespace_video_state
+                 WHERE namespace_id = ? AND video_id = ?`
+            ).bind(namespaceId, videoId).first() as { manual_unposted_at?: string | null } | null
+            const raw = String(row?.manual_unposted_at || '').trim()
+            if (raw) {
+                const t = Date.parse(raw)
+                if (Number.isFinite(t)) manualUnpostedAtMs = t
+            }
+        } catch { /* fall through */ }
+
         const existingNamespacePost = await params.db.prepare(
             `SELECT ph.id, ph.page_id, ph.video_id AS matched_video_id, ph.posted_at
              FROM post_history ph
@@ -1956,29 +1977,44 @@ async function claimGalleryVideoForPosting(params: {
             const seenPageId = String(existingNamespacePost.page_id || '').trim()
             const matchedVideoId = String(existingNamespacePost.matched_video_id || '').trim()
             const matchKind = matchedVideoId && matchedVideoId !== videoId ? 'fingerprint' : 'video_id'
-            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
-            // Heal: backfill state + guard so subsequent cron ticks fail fast.
-            await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
-            if (seenPageId) {
+
+            // Manual-unpost bypass: if user reset state AFTER the last successful
+            // post, this video is intentionally up for re-post. Skip the safety
+            // net (don't `continue`), and let the downstream page-level dedup
+            // (ensurePageVideoNeverPosted) make the final call — it has its own
+            // manual_unposted_at gate that allows the post.
+            const postedAtMs = Date.parse(postedAt)
+            if (
+                manualUnpostedAtMs > 0
+                && Number.isFinite(postedAtMs)
+                && postedAtMs <= manualUnpostedAtMs
+            ) {
+                console.log(`[CLAIM-DEDUP] BYPASS ${videoId} ns=${namespaceId} — manual_unposted_at(${new Date(manualUnpostedAtMs).toISOString()}) >= post_history.posted_at(${postedAt}). Allowing re-post.`)
+            } else {
+                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
+                // Heal: backfill state + guard so subsequent cron ticks fail fast.
+                await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
+                if (seenPageId) {
+                    await recordPagePostedVideoGuard(params.db, {
+                        namespaceId,
+                        pageId: seenPageId,
+                        videoId,
+                        sourceFingerprint,
+                        historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
+                        postedAt,
+                    }).catch(() => { })
+                }
+                // Also seed a guard for the CURRENT page so the next race can't re-post here either.
                 await recordPagePostedVideoGuard(params.db, {
                     namespaceId,
-                    pageId: seenPageId,
+                    pageId,
                     videoId,
                     sourceFingerprint,
                     historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
                     postedAt,
                 }).catch(() => { })
+                continue
             }
-            // Also seed a guard for the CURRENT page so the next race can't re-post here either.
-            await recordPagePostedVideoGuard(params.db, {
-                namespaceId,
-                pageId,
-                videoId,
-                sourceFingerprint,
-                historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
-                postedAt,
-            }).catch(() => { })
-            continue
         }
 
         const namespaceDuplicateCheck = await ensureNamespaceVideoNeverPosted({
@@ -2024,7 +2060,33 @@ async function ensureNamespaceVideoNeverPosted(params: {
     const latestHistory = await getLatestSuccessfulNamespacePostHistoryRow(params.db, params)
     if (!latestHistory) return { ok: true }
 
+    // Manual-unpost bypass — same gate as ensurePageVideoNeverPosted (line ~2099).
+    // Without this, the user's "ย้ายกลับไปยังไม่โพสต์" click is silently undone:
+    // cron sees the historical post_history row, marks the video as posted, and
+    // the video flips back to "โพสต์แล้ว" without an actual re-post hitting FB.
+    let manualUnpostedAtMs = 0
+    try {
+        const row = await params.db.prepare(
+            `SELECT manual_unposted_at FROM namespace_video_state
+             WHERE namespace_id = ? AND video_id = ?`
+        ).bind(params.namespaceId, params.videoId).first() as { manual_unposted_at?: string | null } | null
+        const raw = String(row?.manual_unposted_at || '').trim()
+        if (raw) {
+            const ts = Date.parse(raw)
+            if (Number.isFinite(ts)) manualUnpostedAtMs = ts
+        }
+    } catch { /* best-effort */ }
+
     const postedAt = String(latestHistory.postedAt || '').trim()
+    const postedAtMs = postedAt ? Date.parse(postedAt) : NaN
+    const historyIsStale = manualUnpostedAtMs > 0
+        && Number.isFinite(postedAtMs)
+        && postedAtMs <= manualUnpostedAtMs
+    if (historyIsStale) {
+        console.log(`[NAMESPACE-DEDUP] BYPASS ${params.videoId} ns=${params.namespaceId} — manual_unposted_at(${new Date(manualUnpostedAtMs).toISOString()}) >= post_history.posted_at(${postedAt}). Allowing re-post.`)
+        return { ok: true }
+    }
+
     await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
     return {
         ok: false,
