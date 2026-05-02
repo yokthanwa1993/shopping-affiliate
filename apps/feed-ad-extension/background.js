@@ -778,6 +778,23 @@ async function fbAdPipelineMainWorld(args) {
         }
     )
 
+    // ── Step 7.25: cleanup ads ที่ติดมาจาก deep_copy ของ template adset ──
+    // /copies?deep_copy=true ก๊อป adset settings + ALL existing ads in the
+    // template (PAUSED). Operator sees these stale ads ติดอยู่ในทุก adset
+    // ใหม่ → confusing. Delete every ad in newAdset whose id !== newAd.
+    try {
+        const adsListResp = await fbFetch(
+            `https://graph.facebook.com/v21.0/${newAdset}/ads?fields=id&limit=50&access_token=${encodeURIComponent(accessToken)}`
+        )
+        const stragglers = (adsListResp.json?.data || []).filter((a) => String(a.id) !== String(newAd))
+        for (const a of stragglers) {
+            await fbFetch(
+                `https://graph.facebook.com/v21.0/${a.id}?access_token=${encodeURIComponent(accessToken)}`,
+                { method: 'DELETE' }
+            )
+        }
+    } catch { /* non-fatal */ }
+
     // ── Step 7.5: publish to page feed (so post is visible organically too) ──
     let publishedToPage = false
     let publishError = ''

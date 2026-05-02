@@ -510,6 +510,23 @@ function startServer() {
           body: JSON.stringify({ status: "ACTIVE" })
         });
 
+        // 7.25. Cleanup ads ที่ติดมาจาก deep_copy ของ template adset.
+        // /copies?deep_copy=true ก๊อป adset settings + ALL existing ads in the
+        // template. Operator sees these as "PAUSED ad with old name like
+        // 1MAY26FBSPCAD/3IN1FUCKINGMOTOR" stuck inside every new adset → ดู
+        // รก. Delete every ad in newAdset whose id !== newAd.
+        try {
+          const adsListResp = await elFetch(`https://graph.facebook.com/v21.0/${newAdset}/ads?fields=id&limit=50&access_token=${encodeURIComponent(accessToken)}`);
+          const adsList = adsListResp.json();
+          const stragglers = (adsList?.data || []).filter(a => String(a.id) !== String(newAd));
+          for (const a of stragglers) {
+            await elFetch(`https://graph.facebook.com/v21.0/${a.id}?access_token=${encodeURIComponent(accessToken)}`, { method: "DELETE" });
+            console.log(`[CREATE-AD] Cleanup deep_copy straggler ad ${a.id}`);
+          }
+        } catch (e) {
+          console.log(`[CREATE-AD] Cleanup deep_copy stragglers failed (non-fatal): ${e.message || e}`);
+        }
+
         // 7.5. Also publish the (dark) post to the page feed.
         // The ad creates a "dark post" by default — only visible as an ad. Setting
         // is_published=true makes it appear on the page wall too, so people can find
