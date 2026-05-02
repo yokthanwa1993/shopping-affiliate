@@ -589,6 +589,14 @@ export default function App() {
   const [gallerySyncing, setGallerySyncing] = useState(false)
   const [gallerySyncState, setGallerySyncState] = useState<GallerySyncState | null>(null)
   const [galleryBootstrapped, setGalleryBootstrapped] = useState(false)
+  // Source page for the page-posts gallery — defaults to the current workspace
+  // (selectedPage) but the operator can switch on the page-posts tab to view
+  // ANOTHER page's video archive and pick a clip to run as an ad on the
+  // current workspace. The clip's source vs the ad's destination are decoupled
+  // here on purpose: e.g. /chearb workspace can browse ฟีด's high-view clips
+  // and create an ad that posts to เฉียบ.
+  const [pagePostsSourcePageId, setPagePostsSourcePageId] = useState<string>(initialUrl.page.id)
+  const pagePostsSource = PAGE_BY_ID[pagePostsSourcePageId] ?? selectedPage
 
   // System gallery (new /gallery tab — เหมือน mobile app)
   const [systemGalleryView, setSystemGalleryView] = useState<SystemGalleryView>('ready')
@@ -1080,8 +1088,8 @@ export default function App() {
     setGalleryError(null)
     try {
       const search = new URLSearchParams({
-        page_id: selectedPage.id,
-        page_name: selectedPage.name,
+        page_id: pagePostsSource.id,
+        page_name: pagePostsSource.name,
         min_views: String(GALLERY_MIN_VIEWS),
         limit: String(GALLERY_READ_LIMIT),
       })
@@ -1124,8 +1132,8 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          page_id: selectedPage.id,
-          page_name: selectedPage.name,
+          page_id: pagePostsSource.id,
+          page_name: pagePostsSource.name,
           force: true,
         }),
       })
@@ -1156,7 +1164,7 @@ export default function App() {
       const resp = await fetch(`/worker-api/api/dashboard/facebook-page-videos/refresh-all-views`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page_id: selectedPage.id }),
+        body: JSON.stringify({ page_id: pagePostsSource.id }),
       })
       const data = await resp.json().catch(() => ({})) as {
         ok?: boolean
@@ -1186,15 +1194,25 @@ export default function App() {
   }
 
   useEffect(() => {
-    // Reload page-posts cache whenever the page changes (or first mount). Clear
-    // any existing items + sync state first so the UI doesn't show เฉียบ posts
-    // for a moment while ฟีด is fetching.
+    // Workspace change → reset source picker back to current workspace + clear
+    // gallery so the picker doesn't appear stuck on the previous workspace's
+    // page when the operator hops to /chearb ↔ /feed.
+    setPagePostsSourcePageId(selectedPageId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPageId])
+
+  useEffect(() => {
+    // Reload page-posts cache whenever the SOURCE page changes — could be
+    // because the workspace changed (effect above) or the operator clicked
+    // the source picker on /chearb/page-posts to view ฟีด's archive. Clear
+    // existing items first so we don't flash the previous page's videos
+    // while the new fetch is in flight.
     setGalleryLinkedItems([])
     setGallerySyncState(null)
     setGalleryBootstrapped(false)
     void loadGalleryFromWorker(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPageId])
+  }, [pagePostsSourcePageId])
 
   // Auto-load queue when user opens the queue tab + auto-refresh every 30s while there
   useEffect(() => {
@@ -1845,7 +1863,7 @@ export default function App() {
                       <p className="text-sm font-semibold">
                         {tab === 'dashboard' && 'Campaigns'}
                         {tab === 'gallery' && 'แกลลี่วิดีโอในระบบ'}
-                        {tab === 'page-posts' && `โพสต์เพจ${selectedPage.name}`}
+                        {tab === 'page-posts' && `โพสต์เพจ${pagePostsSource.name}`}
                         {tab === 'create' && 'Create Ads'}
                         {tab === 'running' && 'Campaigns'}
                         {tab === 'queue' && 'คิวสร้างแอด'}
@@ -2192,6 +2210,47 @@ export default function App() {
 
               {tab === 'page-posts' && (
                 <div className="space-y-4">
+                  {/* Source page picker — choose which page's video archive to
+                      browse. Independent of the workspace's ad target: the
+                      "สร้างแอด" button on each card always posts to selectedPage
+                      (the workspace), but the operator can pull videos from
+                      any page they have access to. */}
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">ดูโพสต์จากเพจ</p>
+                        <p className="mt-0.5 text-xs text-slate-600">
+                          เพจปลายทางของแอด: <span className="font-semibold text-slate-900">{selectedPage.name}</span>
+                          {pagePostsSource.id !== selectedPage.id && (
+                            <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-800">
+                              ดูข้ามเพจ — กดสร้างแอดจะลงที่ {selectedPage.name}
+                            </span>
+                          )}
+                        </p>
+                      </div>
+                      <div className="flex gap-1.5">
+                        {PAGES.map((p) => {
+                          const active = p.id === pagePostsSource.id
+                          return (
+                            <button
+                              key={p.id}
+                              type="button"
+                              onClick={() => setPagePostsSourcePageId(p.id)}
+                              className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold transition ${
+                                active
+                                  ? 'border-slate-900 bg-slate-900 text-white'
+                                  : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
+                              }`}
+                            >
+                              <img src={p.iconUrl} alt={p.name} className="h-5 w-5 rounded-md object-cover" />
+                              <span>{p.name}</span>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="text-xs text-slate-500">
                       {gallerySyncState?.fullyScanned
@@ -2237,7 +2296,7 @@ export default function App() {
                             <img src={item.facebookThumb} alt={item.storyId} className="h-full w-full object-cover" />
                             <div className="absolute inset-x-0 top-0 flex items-start justify-between p-3">
                               <span className="rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-white backdrop-blur">
-                                {selectedPage.name}
+                                {pagePostsSource.name}
                               </span>
                               <span className="rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-white backdrop-blur">
                                 {formatCompactViews(item.views)} views
