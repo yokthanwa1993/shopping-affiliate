@@ -6860,10 +6860,14 @@ app.get('/api/dashboard/campaigns', async (c) => {
     const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
     const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
     try {
-        // Get campaigns
-        const campResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=10`)
+        // Pull more than the visible limit (30) so after we filter out paused
+        // /archived/etc. we still have enough ACTIVE campaigns to show. Operator
+        // wants only ACTIVE in the create-ad picker — paused ones just clutter
+        // the list (same FB UX as Ads Manager's 'Active' filter).
+        const campResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=30`)
         const campData = await campResp.json().catch(() => ({})) as Record<string, unknown>
-        const campaigns = Array.isArray((campData as any)?.data) ? (campData as any).data : []
+        const allCampaigns = Array.isArray((campData as any)?.data) ? (campData as any).data : []
+        const campaigns = allCampaigns.filter((c: any) => String(c?.effective_status || '').trim() === 'ACTIVE').slice(0, 10)
 
         // Helper: pull the per-action numeric cost out of the FB insights array
         // shape. cost_per_action_type returns:

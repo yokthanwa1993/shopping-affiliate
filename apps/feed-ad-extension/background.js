@@ -312,9 +312,14 @@ async function fbListCampaignsMainWorld({ adAccount }) {
         return hit ? String(hit.value || '') : ''
     }
 
-    const camp = await fbFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?fields=id,name,effective_status,daily_budget,start_time&limit=10&access_token=${encodeURIComponent(accessToken)}`)
+    // Pull more than the visible limit (10) so after we filter out paused
+    // /archived/etc. we still have enough ACTIVE campaigns to show. Operator
+    // wants only ACTIVE in the create-ad picker — paused ones just clutter
+    // the list (same FB UX as Ads Manager's 'Active' filter).
+    const camp = await fbFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?fields=id,name,effective_status,daily_budget,start_time&limit=30&access_token=${encodeURIComponent(accessToken)}`)
     if (camp?.error) return { ok: false, error: `[campaigns] ${camp.error.message}`, fb_error_code: camp.error.code }
-    const campaigns = Array.isArray(camp?.data) ? camp.data : []
+    const allCampaigns = Array.isArray(camp?.data) ? camp.data : []
+    const campaigns = allCampaigns.filter((c) => String(c?.effective_status || '').trim() === 'ACTIVE').slice(0, 10)
 
     const result = []
     for (const c of campaigns) {
