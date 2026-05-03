@@ -363,26 +363,22 @@ function isLoginRelatedUrl(rawUrl) {
 }
 
 function triggerAppRestartIfStuck(platform) {
-    if (restartScheduled) return;
-    const win = platform === 'lazada' ? lazadaWindow : platform === 'shopee' ? shopeeWindow : null;
-    if (isManualLoginProtected(platform, win)) {
-        console.warn(`[restart] skip ${platform} restart — manual login guard is active`);
-        return;
-    }
-    const now = Date.now();
-    if (now - lastAppRestartAt < MIN_RESTART_INTERVAL_MS) {
-        const leftSec = Math.ceil((MIN_RESTART_INTERVAL_MS - (now - lastAppRestartAt)) / 1000);
-        console.warn(`[restart] skip — cooldown ${leftSec}s left since last restart`);
-        return;
-    }
-    restartScheduled = true;
-    lastAppRestartAt = now;
+    // DISABLED 2026-05-03: Lazada API ฝั่ง server เองมี outage แบบ
+    // HTTP 500 + body "SUCCESS::调用成功" (Lazada server bug, not ours).
+    // Auto-exit ทำให้เกิด crashloop: launchd KeepAlive restart → ติด session
+    // เก่าหรือเจอ outage อีก → fail 3 ครั้ง → exit อีก → loop ไม่หยุด.
+    //
+    // ผลข้างเคียง: Shopee shorten พังตามไปด้วย เพราะ port 8800 ไม่เปิดเลย
+    // (Electron crashloop ตลอดเวลา)
+    //
+    // Solution: log only. ปล่อย Electron รันต่อ. ถ้า Lazada session expire
+    // จริงๆ reloadWindowSerialized ใน per-attempt handler จัดการอยู่แล้ว
+    // (line ~600). API outage ของ Lazada เป็นเรื่อง upstream ไม่ใช่อะไรที่
+    // restart Electron จะแก้ได้
     const failureCount = consecutiveFailures[platform] || 0;
-    console.error(`[restart] ${platform} hit ${failureCount} consecutive failures — exiting app (pm2 will restart)`);
-    // Short delay so the current failing response flushes back to caller before we exit.
-    setTimeout(() => {
-        try { app.exit(1); } catch (e) { console.warn('[restart] app.exit failed:', e && e.message); process.exit(1); }
-    }, 1500);
+    console.warn(`[restart-disabled] ${platform} hit ${failureCount} consecutive failures — staying alive (auto-exit disabled to break crashloop). Manually restart if Shopee also breaks.`);
+    // Reset counter so we don't keep flagging — prevents log spam.
+    consecutiveFailures[platform] = 0;
 }
 
 function isSessionLikelyExpired(err) {
