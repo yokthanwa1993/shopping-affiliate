@@ -10632,12 +10632,18 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
         : jobStatus === 'processing'
             ? 'ระบบเริ่มประมวลผลให้อัตโนมัติแล้ว'
             : 'คลิปนี้มีไฟล์ประมวลผลแล้ว'
+    // Surface the video id in the headline so the operator can correlate the
+    // LINE confirmation with the matching row on the processing/gallery page
+    // at app.oomnn.com (same id appears under each clip card). Previously this
+    // said "✅ รับลิงก์ครบแล้ว" without identifying which clip — the operator
+    // had no way to tell two consecutive uploads apart from chat history.
+    const videoIdShort = String(inboxRecord.id || '').trim()
     const messages: LineReplyMessage[] = [
         {
             type: 'text',
             text: hasLinks
-                ? `✅ รับลิงก์ครบแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ${statusText}`
-                : `✅ รับวิดีโอแล้ว\nผมเพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ${statusText}`,
+                ? `✅ ID: ${videoIdShort}\nรับลิงก์ครบแล้ว — เพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ${statusText}`
+                : `✅ ID: ${videoIdShort}\nรับวิดีโอแล้ว — เพิ่มคลิปไว้บนสุดของคลังต้นฉบับแล้ว ${statusText}`,
         },
     ]
 
