@@ -1956,9 +1956,47 @@ async function claimGalleryVideoForPosting(params: {
             const seenPageId = String(existingNamespacePost.page_id || '').trim()
             const matchedVideoId = String(existingNamespacePost.matched_video_id || '').trim()
             const matchKind = matchedVideoId && matchedVideoId !== videoId ? 'fingerprint' : 'video_id'
-            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
-            // Heal: backfill state + guard so subsequent cron ticks fail fast.
-            await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
+
+            // 2026-05-04: Suppress the heal-back-to-posted step when the operator
+            // has manually unposted this video AFTER the last successful post.
+            // Previous behaviour: cron tick re-marked state.posted_at = postedAt
+            // (from post_history) → UI flipped video back from "ยังไม่โพสต์" to
+            // "โพสต์แล้ว" within minutes WITHOUT actually posting to FB.
+            // Operator complaint: "โพสต์ ต้องถูกโพสต์จริงๆสิ ถึงจะย้ายไป โพสต์แล้ว"
+            //
+            // Critically we DO NOT bypass the dedup `continue` — the page guard
+            // is still seeded so the cron will not re-post this video to a page
+            // that already has it (would cause duplicates). Net effect: video
+            // stays in "ยังไม่โพสต์" tab and is not picked up for posting again.
+            // Operator can delete the post_history row(s) manually if they want
+            // a true repost, OR move to a fresh page.
+            let manualUnpostedAtMs = 0
+            try {
+                const muRow = await params.db.prepare(
+                    `SELECT manual_unposted_at FROM namespace_video_state
+                     WHERE namespace_id = ? AND video_id = ?`
+                ).bind(namespaceId, videoId).first() as { manual_unposted_at?: string | null } | null
+                const raw = String(muRow?.manual_unposted_at || '').trim()
+                if (raw) {
+                    const ms = Date.parse(raw)
+                    if (Number.isFinite(ms)) manualUnpostedAtMs = ms
+                }
+            } catch { /* fall through */ }
+            const postedAtMs = Date.parse(postedAt)
+            const operatorReverted = manualUnpostedAtMs > 0
+                && Number.isFinite(postedAtMs)
+                && postedAtMs <= manualUnpostedAtMs
+
+            if (operatorReverted) {
+                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} BUT manual_unposted_at=${new Date(manualUnpostedAtMs).toISOString()} → leave state empty, do NOT heal posted_at back (respect operator). Still skip to prevent dup repost.`)
+                // Skip without writing back state.posted_at. Page guard still gets
+                // seeded below so cron won't pick this page again.
+            } else {
+                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
+                // Heal: backfill state + guard so subsequent cron ticks fail fast.
+                await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
+            }
+
             if (seenPageId) {
                 await recordPagePostedVideoGuard(params.db, {
                     namespaceId,
@@ -2025,7 +2063,34 @@ async function ensureNamespaceVideoNeverPosted(params: {
     if (!latestHistory) return { ok: true }
 
     const postedAt = String(latestHistory.postedAt || '').trim()
-    await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
+
+    // 2026-05-04: Same heal-suppression as claimGalleryVideoForPosting (above).
+    // If operator manually unposted via the orange refresh button after the last
+    // successful post, do NOT write state.posted_at back. The dedup `ok: false`
+    // return is preserved so we never repost — UI stays "ยังไม่โพสต์" until
+    // manually intervened with (e.g. delete post_history row, or repost via UI).
+    let manualUnpostedAtMs = 0
+    try {
+        const muRow = await params.db.prepare(
+            `SELECT manual_unposted_at FROM namespace_video_state
+             WHERE namespace_id = ? AND video_id = ?`
+        ).bind(params.namespaceId, params.videoId).first() as { manual_unposted_at?: string | null } | null
+        const raw = String(muRow?.manual_unposted_at || '').trim()
+        if (raw) {
+            const ms = Date.parse(raw)
+            if (Number.isFinite(ms)) manualUnpostedAtMs = ms
+        }
+    } catch { /* fall through to default heal */ }
+    const postedAtMs = postedAt ? Date.parse(postedAt) : NaN
+    const operatorReverted = manualUnpostedAtMs > 0
+        && Number.isFinite(postedAtMs)
+        && postedAtMs <= manualUnpostedAtMs
+
+    if (!operatorReverted) {
+        await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
+    } else {
+        console.log(`[NS-NEVER-POSTED] Skip heal ${params.videoId} ns=${params.namespaceId} — manual_unposted_at(${new Date(manualUnpostedAtMs).toISOString()}) >= post_history.posted_at(${postedAt}). State stays unposted; dedup still blocks repost.`)
+    }
     return {
         ok: false,
         postedAt: postedAt || null,
