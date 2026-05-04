@@ -1987,15 +1987,25 @@ async function claimGalleryVideoForPosting(params: {
                 && Number.isFinite(postedAtMs)
                 && postedAtMs <= manualUnpostedAtMs
 
-            if (operatorReverted) {
-                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} BUT manual_unposted_at=${new Date(manualUnpostedAtMs).toISOString()} → leave state empty, do NOT heal posted_at back (respect operator). Still skip to prevent dup repost.`)
-                // Skip without writing back state.posted_at. Page guard still gets
-                // seeded below so cron won't pick this page again.
-            } else {
-                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'})`)
-                // Heal: backfill state + guard so subsequent cron ticks fail fast.
-                await markNamespaceVideoPosted(params.db, namespaceId, videoId, postedAt).catch(() => { })
-            }
+            // 2026-05-04 (v3 fix): NEVER write posted_at back on dedup match.
+            // Earlier behaviour was to "heal" state by calling markNamespaceVideoPosted
+            // with the matched post_history's posted_at. This caused user-facing
+            // confusion: a freshly-uploaded video with the same source_fingerprint
+            // as an old post would suddenly appear in "โพสต์แล้ว" with a stale
+            // April timestamp, even though no FB post was ever made for THIS
+            // video. The dedup `continue` below is enough to prevent re-posting
+            // — and recordPagePostedVideoGuard (seeded right after) gives the
+            // next cron tick a fast O(1) skip without re-running the expensive
+            // post_history query, so we don't pay perf for keeping state honest.
+            //
+            // Tradeoff: the duplicate-content video will sit in "ยังไม่โพสต์"
+            // tab forever. Operator can delete it manually if they don't want
+            // it lingering. This is the trade-off they explicitly asked for —
+            // "โพสต์ ต้องถูกโพสต์จริงๆ ถึงจะย้ายไป โพสต์แล้ว".
+            const matchAction = operatorReverted
+                ? 'manual_unposted_at protects (skip heal)'
+                : 'fingerprint/video_id match (skip heal — state stays honest)'
+            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'}) — ${matchAction}`)
 
             if (seenPageId) {
                 await recordPagePostedVideoGuard(params.db, {
@@ -2086,11 +2096,17 @@ async function ensureNamespaceVideoNeverPosted(params: {
         && Number.isFinite(postedAtMs)
         && postedAtMs <= manualUnpostedAtMs
 
-    if (!operatorReverted) {
-        await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
-    } else {
-        console.log(`[NS-NEVER-POSTED] Skip heal ${params.videoId} ns=${params.namespaceId} — manual_unposted_at(${new Date(manualUnpostedAtMs).toISOString()}) >= post_history.posted_at(${postedAt}). State stays unposted; dedup still blocks repost.`)
-    }
+    // 2026-05-04 (v3): Same as claimGalleryVideoForPosting — NEVER write
+    // state.posted_at back on dedup match (whether operator-reverted or not).
+    // Just block re-posting via ok:false. Operator wants UI to reflect actual
+    // FB state; auto-healing posted_at from a sibling post_history row was
+    // surfacing fake "posted at 2026-04-25" timestamps for videos uploaded
+    // today that share a source_fingerprint with an old post.
+    const matchAction = operatorReverted
+        ? 'manual_unposted_at protects'
+        : 'sibling history match (skip heal — state stays honest)'
+    console.log(`[NS-NEVER-POSTED] Skip ${params.videoId} ns=${params.namespaceId} — ${matchAction}. post_history.posted_at=${postedAt} manual_unposted_at=${manualUnpostedAtMs ? new Date(manualUnpostedAtMs).toISOString() : '-'}.`)
+    void operatorReverted
     return {
         ok: false,
         postedAt: postedAt || null,
@@ -2132,7 +2148,9 @@ async function ensurePageVideoNeverPosted(params: {
             && Number.isFinite(postedAtMs)
             && postedAtMs <= manualUnpostedAtMs
         if (!historyIsStale) {
-            await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, latestHistory.postedAt || new Date().toISOString()).catch(() => { })
+            // 2026-05-04 (v3): NO heal of state.posted_at. Just seed the page
+            // guard for fast next-tick skip + return ok:false to block repost.
+            // Was: markNamespaceVideoPosted(...) which surfaced stale timestamps.
             await recordPagePostedVideoGuard(params.db, {
                 namespaceId: params.namespaceId,
                 pageId: params.pageId,
@@ -2159,7 +2177,7 @@ async function ensurePageVideoNeverPosted(params: {
     if (guardIsStale) return { ok: true }
 
     const postedAt = existingGuard.createdAt || null
-    await markNamespaceVideoPosted(params.db, params.namespaceId, params.videoId, postedAt || new Date().toISOString()).catch(() => { })
+    // 2026-05-04 (v3): No heal. Page guard already exists; ok:false blocks repost.
     return {
         ok: false,
         postedAt,
