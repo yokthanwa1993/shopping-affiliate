@@ -1,7 +1,7 @@
 # Stage 1: Rust (native cross-compile — avoids QEMU emulation flakiness for rust linker)
 # $BUILDPLATFORM = the host arch (e.g. arm64 Mac), $TARGETARCH = what we're producing (amd64).
 # By forcing Stage 1 to $BUILDPLATFORM we compile rust NATIVELY then cross-link for x86_64.
-FROM --platform=$BUILDPLATFORM rust:1.85-bookworm AS rust-builder
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS rust-builder
 ARG TARGETARCH
 RUN dpkg --add-architecture amd64 \
     && apt-get update && apt-get install -y --no-install-recommends \
