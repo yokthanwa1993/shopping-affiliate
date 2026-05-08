@@ -70,6 +70,10 @@
         "WORKER_URL": "https://api.oomnn.com",
         "R2_PUBLIC_URL": "https://pub-14b6c1dd39f14ed7a219a84afc93c182.r2.dev",
         "GEMINI_MODEL": "gemini-3-flash-preview",
+        "VERTEX_TTS_ENDPOINT": "https://aiplatform.googleapis.com",
+        "VERTEX_TTS_PROJECT_ID": "healthy-keyword-495705-h0",
+        "VERTEX_TTS_LOCATION": "global",
+        "VERTEX_TTS_MODEL": "gemini-2.5-flash-preview-tts",
         "WEBAPP_URL": "https://app.oomnn.com",
         "WEBAPP_DESKTOP_URL": "https://web.oomnn.com",
         "VIDEO_ONECARD_WORKER_URL": "https://video-onecard.wwoom.com",
@@ -85,8 +89,11 @@
             "* * * * *"
         ]
     },
-    // Secrets (set via `wrangler secret put`):
+    // Secrets (set via `wrangler secret put` or the equivalent secure Container secret path; never commit values):
     // TELEGRAM_BOT_TOKEN
+    // GOOGLE_API_KEY (legacy Gemini analyze/script fallback)
+    // VERTEX_TTS_SERVICE_ACCOUNT_JSON (preferred production TTS Service Account JSON, if supported by the deployment target)
+    // GOOGLE_APPLICATION_CREDENTIALS (local/container file path only; do not commit the file)
     // TAG_SYNC_PUSH_SECRET
     // LINE_CHANNEL_SECRET
     // LINE_CHANNEL_ACCESS_TOKEN

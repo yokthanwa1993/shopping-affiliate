@@ -30,6 +30,9 @@ import {
     clearNamespaceVoiceSettings,
     getNamespaceVoiceSettings,
     getSystemGeminiApiKeys,
+    getGeminiApiKeyHealthSummary,
+    recordGeminiApiKeyHealth,
+    classifyGeminiApiKeyFailure,
     normalizeVoiceProfile,
     type VoicePersonaPreset,
     type VoiceProfile,
@@ -3350,11 +3353,13 @@ type FacebookPageVideoCacheRow = {
     page_id?: string
     page_name?: string
     video_id?: string
+    post_id?: string
     title?: string
     description?: string
     permalink_url?: string
     picture?: string
     source_url?: string
+    shopee_link?: string
     created_time?: string
     views?: number | string
     fetched_at?: string
@@ -3873,7 +3878,8 @@ async function fetchVideoViewsResilient(
                 errorSample = String(errorObj.message || `fb_error_${errorCode}`)
             }
         } else {
-            errorSample = `http_${resp.status}`
+            const errorBody = await resp.text().catch(() => '')
+            errorSample = `http_${resp.status}${errorBody ? `:${errorBody.slice(0, 120)}` : ''}`
         }
     } catch (e) {
         errorSample = e instanceof Error ? e.message : String(e)
@@ -3896,7 +3902,10 @@ async function fetchVideoViewsResilient(
                     const resp = await fetch(
                         `https://graph.facebook.com/v21.0/${encodeURIComponent(id)}?fields=views,title,description,source,picture,length,video_insights.metric(total_video_views)%7Bvalues%7D&access_token=${encodeURIComponent(token)}`,
                     )
-                    if (!resp.ok) continue
+                    if (!resp.ok) {
+                        await resp.text().catch(() => '')
+                        continue
+                    }
                     const info = await resp.json().catch(() => ({})) as Record<string, unknown>
                     if (info?.error) continue
                     rawByVideoId.set(id, info)
@@ -3925,9 +3934,14 @@ async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: 
     if (after) params.set('after', after)
     const response = await fetch(`https://graph.facebook.com/v21.0/${pageId}/posts?${params.toString()}`)
     if (!response.ok) {
-        throw new Error(`facebook_graph_http_${response.status}`)
+        const errorBody = await response.text().catch(() => '')
+        throw new Error(`facebook_graph_http_${response.status}${errorBody ? `:${errorBody.slice(0, 120)}` : ''}`)
     }
-    const payload = await response.json().catch(() => ({} as any))
+    const payload = await response.json().catch(() => ({})) as {
+        error?: { code?: number | string; message?: string }
+        data?: Array<Record<string, unknown>>
+        paging?: { next?: string }
+    }
     if (payload?.error) {
         const code = Number(payload.error?.code || 0)
         const message = String(payload.error?.message || 'facebook_graph_failed')
@@ -3944,7 +3958,8 @@ async function fetchFacebookPageVideoBatchFromGraphToken(token: string, pageId: 
     for (const post of posts) {
         const permalink = String(post.permalink_url || '').trim()
         if (!permalink.includes('/reel/') && !permalink.includes('/videos/')) continue
-        const atts = (post.attachments?.data || []) as Array<Record<string, unknown>>
+        const attachments = post.attachments as { data?: Array<Record<string, unknown>> } | undefined
+        const atts = Array.isArray(attachments?.data) ? attachments.data : []
         for (const att of atts) {
             if (att.media_type === 'video') {
                 const targetId = String((att.target as Record<string, unknown>)?.id || '').trim()
@@ -4436,7 +4451,23 @@ async function listNamespaceGalleryVideos(env: Env, namespaceId: string): Promis
 }
 
 function isNamespaceGalleryVideoPosted(video: Record<string, unknown> | null | undefined): boolean {
-    return !!String(video?.postedAt || video?.posted_at || '').trim()
+    if (!video) return false
+    const postedAt = String(video.postedAt || video.posted_at || '').trim()
+    if (!postedAt) return false
+
+    // A bulk/archive action can leave namespace_video_state.posted_at on an
+    // original/inbox row before that video is actually processed. Once the
+    // processed asset is created later, that stale posted_at must not hide the
+    // freshly processed video from the "ยังไม่โพสต์" gallery or the auto-post
+    // queue. Real Facebook posts are always recorded after processedAt.
+    const processedAt = String(video.processedAt || video.processed_at || '').trim()
+    const postedMs = Date.parse(postedAt)
+    const processedMs = processedAt ? Date.parse(processedAt) : Number.NaN
+    if (Number.isFinite(postedMs) && Number.isFinite(processedMs) && postedMs < processedMs) {
+        return false
+    }
+
+    return true
 }
 
 function isNamespaceGalleryVideoVisibleInUsedTab(video: Record<string, unknown> | null | undefined): boolean {
@@ -5638,6 +5669,17 @@ app.get('/admin/api/ping', async (c) => {
     return c.json({ ok: true, now: new Date().toISOString() })
 })
 
+app.post('/admin/api/processing/guardian/run', async (c) => {
+    try {
+        const report = await autoProcessReadyInboxForNamespaces(c.env, c.executionCtx)
+        return c.json({ ok: true, ...report })
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[PROCESSING-GUARDIAN] failed: ${message}`)
+        return c.json({ ok: false, error: message }, 500)
+    }
+})
+
 // One-time migration: unify namespace IDs to timestamp+random format
 app.post('/admin/api/migrate-namespaces', async (c) => {
     const db = c.env.DB
@@ -5829,7 +5871,7 @@ app.get('/api/dashboard/gallery', async (c) => {
         const allVideos = inventory.videos
         const readyVideos = allVideos.filter((video) => {
             const row = video as Record<string, unknown>
-            return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
+            return isNamespaceGalleryVideoDisplayReady(row) && !isNamespaceGalleryVideoPosted(row)
         })
         const usedVideos = allVideos.filter((video) => {
             const row = video as Record<string, unknown>
@@ -7129,7 +7171,12 @@ app.post('/admin/api/scheduled/run', async (c) => {
             })
         )
         await handleScheduled(c.env, c.executionCtx)
-        return c.json({ ok: true, ran_at: new Date().toISOString() })
+        c.executionCtx.waitUntil(autoProcessReadyInboxForNamespaces(c.env, c.executionCtx).then((report) => {
+            console.log(`[ADMIN-SCHEDULED-AUTO-INBOX] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total}`)
+        }).catch((error) => {
+            console.error(`[ADMIN-SCHEDULED-AUTO-INBOX] failed: ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        return c.json({ ok: true, ran_at: new Date().toISOString(), auto_inbox_scheduled: true })
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         console.error(`[ADMIN-SCHEDULED] failed: ${message}`)
@@ -8059,9 +8106,11 @@ app.post('/api/settings/voice-preview', async (c) => {
     }
 
     let lastError = 'voice_preview_failed'
-    for (const apiKey of apiKeys) {
+    for (let index = 0; index < apiKeys.length; index += 1) {
+        const apiKey = apiKeys[index]
         try {
             const pcm = await requestGeminiTtsPreview(apiKey, previewText, profile.voice_name, styleInstructions)
+            await recordGeminiApiKeyHealth(c.env.DB, { apiKey, status: 'ok', slot: index + 1 }).catch(() => null)
             const wav = buildWavFromPcm16le(pcm)
             return new Response(wav, {
                 status: 200,
@@ -8073,6 +8122,16 @@ app.post('/api/settings/voice-preview', async (c) => {
             })
         } catch (error) {
             lastError = error instanceof Error ? error.message : String(error)
+            const healthStatus = classifyGeminiApiKeyFailure(0, lastError)
+            if (healthStatus) {
+                await recordGeminiApiKeyHealth(c.env.DB, {
+                    apiKey,
+                    status: healthStatus,
+                    slot: index + 1,
+                    error: lastError,
+                    model: VOICE_PREVIEW_TTS_MODELS.join(','),
+                }).catch(() => null)
+            }
         }
     }
 
@@ -8285,11 +8344,82 @@ app.get('/api/settings/gemini-key', async (c) => {
 
     const namespaceId = c.get('botId')
     const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
+    const health = await getGeminiApiKeyHealthSummary(c.env.DB).catch(() => ({ keys: [], active_count: settings.keys_count || 0, disabled_count: 0 }))
     return c.json({
         ...settings,
+        health,
         max_chars: MAX_GEMINI_API_KEY_CHARS,
         max_slots: MAX_GEMINI_API_KEY_SLOTS,
     })
+})
+
+app.get('/api/settings/gemini-key-health', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    const health = await getGeminiApiKeyHealthSummary(c.env.DB)
+    return c.json({ ok: true, ...health }, 200, { 'Cache-Control': 'private, no-store' })
+})
+
+app.post('/api/settings/gemini-key/check', async (c) => {
+    const adminCheck = await requireSystemAdminSession(c)
+    if (!adminCheck.ok) return adminCheck.response
+
+    const keys = await getSystemGeminiApiKeys(c.env.DB).catch(() => [])
+    const results: Array<Record<string, unknown>> = []
+    for (let index = 0; index < keys.length; index += 1) {
+        const apiKey = keys[index]
+        const masked_key = maskApiKeyForDisplay(apiKey)
+        try {
+            await requestGeminiTtsPreview(apiKey, 'ทดสอบ Gemini key health', 'Puck')
+            const record = await recordGeminiApiKeyHealth(c.env.DB, { apiKey, status: 'ok', slot: index + 1, model: VOICE_PREVIEW_TTS_MODELS.join(',') })
+            results.push({ slot: index + 1, masked_key, status: 'ok', active: true, disabled_until: record?.disabled_until || null })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            const healthStatus = classifyGeminiApiKeyFailure(0, message) || 'error'
+            const record = await recordGeminiApiKeyHealth(c.env.DB, {
+                apiKey,
+                status: healthStatus,
+                slot: index + 1,
+                error: message,
+                model: VOICE_PREVIEW_TTS_MODELS.join(','),
+            })
+            console.warn(`[GEMINI-KEY-HEALTH] slot=${index + 1} key=${masked_key} status=${healthStatus} disabled_until=${record?.disabled_until || ''}`)
+            results.push({
+                slot: index + 1,
+                masked_key,
+                status: healthStatus,
+                active: healthStatus === 'ok',
+                disabled_until: record?.disabled_until || null,
+                error: message.slice(0, 220),
+            })
+        }
+    }
+    const health = await getGeminiApiKeyHealthSummary(c.env.DB)
+    return c.json({ ok: true, checked_count: keys.length, results, health }, 200, { 'Cache-Control': 'private, no-store' })
+})
+
+app.post('/api/internal/gemini-key-health/report', async (c) => {
+    const rawToken = String(c.req.header('x-auth-token') || '').trim()
+    if (!rawToken || rawToken !== String(c.env.TELEGRAM_BOT_TOKEN || '').trim()) {
+        return c.json({ ok: false, error: 'unauthorized' }, 401)
+    }
+    const body = await c.req.json().catch(() => ({})) as { api_key?: string; status?: string; http_status?: number; error?: string; model?: string; slot?: number }
+    const apiKey = String(body.api_key || '').trim()
+    if (!apiKey) return c.json({ ok: false, error: 'missing_api_key' }, 400)
+    const message = String(body.error || '').trim()
+    const status = (String(body.status || '').trim() as 'ok' | 'quota_limited' | 'invalid' | 'error')
+        || classifyGeminiApiKeyFailure(Number(body.http_status || 0), message)
+        || 'error'
+    const record = await recordGeminiApiKeyHealth(c.env.DB, {
+        apiKey,
+        status,
+        error: message,
+        model: String(body.model || '').trim(),
+        slot: Number(body.slot || 0) || undefined,
+    })
+    console.warn(`[GEMINI-KEY-HEALTH] reported key=${record?.masked_key || 'unknown'} status=${status} disabled_until=${record?.disabled_until || ''}`)
+    return c.json({ ok: true, key: record ? { ...record, hash: undefined } : null })
 })
 
 app.put('/api/settings/gemini-key', async (c) => {
@@ -14967,7 +15097,23 @@ async function startInboxVideoProcessing(params: {
         httpMetadata: { contentType: 'application/json' },
     })
 
+    const queuedJobPayload = {
+        id: item.id,
+        videoUrl: item.videoUrl,
+        shopeeLink: String(item.shopeeLink || '').trim(),
+        lazadaLink: String(item.lazadaLink || '').trim(),
+        manualCaption: normalizeManualCaption(item.manualCaption),
+        chatId: item.chatId,
+        createdAt: nowIso,
+    }
+
     if (await hasActiveProcessingJob(params.bucket)) {
+        await params.bucket.put(`_queue/${item.id}.json`, JSON.stringify({
+            ...queuedJobPayload,
+            status: 'queued',
+        }), {
+            httpMetadata: { contentType: 'application/json' },
+        })
         return { status: 'queued', id: item.id }
     }
 
@@ -15218,9 +15364,13 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
         return null
     })
 
+    const recentCandidates = await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
     const candidates = galleryIndexVideo
-        ? [galleryIndexVideo]
-        : await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
+        ? [
+            galleryIndexVideo,
+            ...recentCandidates.filter((record) => String(record.id || '').trim() !== String(galleryIndexVideo.id || '').trim()),
+        ]
+        : recentCandidates
 
     for (const candidate of candidates) {
         const item = normalizeInboxVideoRecord(candidate)
@@ -16362,7 +16512,7 @@ app.get('/api/gallery', async (c) => {
         const videos = inventory.videos
         const readyVideos = videos.filter((video) => {
             const row = video as Record<string, unknown>
-            return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
+            return isNamespaceGalleryVideoDisplayReady(row) && !isNamespaceGalleryVideoPosted(row)
         })
 
         // Sort unposted videos so that videos manually moved back from "posted" tab
@@ -16475,7 +16625,7 @@ app.get('/api/gallery/system', async (c) => {
         const allVideos = inventory.videos
         const readyVideos = allVideos.filter((video) => {
             const row = video as Record<string, unknown>
-            return isNamespaceGalleryVideoDisplayReady(row) && !String(row.postedAt || row.posted_at || '').trim()
+            return isNamespaceGalleryVideoDisplayReady(row) && !isNamespaceGalleryVideoPosted(row)
         })
         const usedVideos = allVideos.filter((video) => {
             const row = video as Record<string, unknown>
@@ -17099,19 +17249,42 @@ app.post('/api/gallery/reset-posted-bulk', async (c) => {
             return c.json({ error: 'cross_namespace_gallery_write_forbidden' }, 403)
         }
 
-        // Find all posted videos in this namespace
+        // Find only videos that are really eligible for repost: they must be
+        // visible as posted AND have a confirmed post_history row. Videos moved
+        // to "โพสต์แล้ว" only by state/guard/manual-marking are not a repost
+        // source and must not be reset by this button.
         const inventory = await getNamespaceGalleryInventory(c.env, targetNamespaceId)
-        const postedVideos = inventory.videos.filter((v) =>
+        const confirmedPostedVideoIds = await getConfirmedPostedVideoIds({
+            db: c.env.DB,
+            namespaceId: targetNamespaceId,
+        })
+        const visiblePostedVideos = inventory.videos.filter((v) =>
             isNamespaceGalleryVideoVisibleInUsedTab(v as Record<string, unknown>)
         )
+        const postedVideos = visiblePostedVideos.filter((v) => {
+            const id = String((v as Record<string, unknown>).id || '').trim()
+            return id && confirmedPostedVideoIds.has(id)
+        })
 
-        // Bulk reset D1 — only this namespace's rows
+        // Bulk reset D1 — only confirmed real-posted rows in this namespace.
         await ensureNamespaceVideoStateColumns(c.env.DB)
-        await c.env.DB.prepare(
-            `UPDATE namespace_video_state
-             SET posted_at = '', manual_unposted_at = datetime('now'), updated_at = datetime('now')
-             WHERE namespace_id = ? AND posted_at <> ''`
-        ).bind(targetNamespaceId).run()
+        const postedVideoIds = postedVideos
+            .map((video) => String((video as Record<string, unknown>).id || '').trim())
+            .filter(Boolean)
+        if (postedVideoIds.length > 0) {
+            const chunkSize = 25
+            for (let i = 0; i < postedVideoIds.length; i += chunkSize) {
+                const chunk = postedVideoIds.slice(i, i + chunkSize)
+                const placeholders = chunk.map(() => '?').join(', ')
+                await c.env.DB.prepare(
+                    `UPDATE namespace_video_state
+                     SET posted_at = '', manual_unposted_at = datetime('now'), updated_at = datetime('now')
+                     WHERE namespace_id = ?
+                       AND video_id IN (${placeholders})
+                       AND posted_at <> ''`
+                ).bind(targetNamespaceId, ...chunk).run()
+            }
+        }
         await ensurePagePostedVideoGuardsTable(c.env.DB)
 
         // Reset R2 metadata for each posted video (clears postedAt + keepInPostedTab)
@@ -17148,6 +17321,8 @@ app.post('/api/gallery/reset-posted-bulk', async (c) => {
             namespace_id: targetNamespaceId,
             reset_count: resetCount,
             posted_total: postedVideos.length,
+            visible_posted_total: visiblePostedVideos.length,
+            skipped_without_history: Math.max(0, visiblePostedVideos.length - postedVideos.length),
         })
     } catch (e) {
         return c.json({ error: e instanceof Error ? e.message : String(e) }, 500)
@@ -18864,105 +19039,138 @@ async function collectNamespacesWithReadyGalleryIndexInbox(env: Env): Promise<st
         .filter(Boolean)
 }
 
-async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<void> {
-    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+type AutoInboxGuardianNamespaceResult = {
+    namespace_id: string
+    outcome: 'started' | 'active' | 'idle' | 'error'
+    video_id?: string
+    detail?: string
+}
+
+type AutoInboxGuardianReport = {
+    ran_at: string
+    total_namespaces: number
+    scanned_namespaces: number
+    started_total: number
+    active_total: number
+    idle_total: number
+    error_total: number
+    namespace_results: AutoInboxGuardianNamespaceResult[]
+}
+
+async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<AutoInboxGuardianReport> {
     const knownNamespaceIds = Array.from(await collectKnownNamespaceIds(env))
     const readyNamespaceIds = await collectNamespacesWithReadyGalleryIndexInbox(env).catch(() => [])
-    const namespaceIds = Array.from(new Set([...readyNamespaceIds, ...knownNamespaceIds]))
-    // Do not let early namespace IDs starve later tenants. Production already has more than
-    // 6 namespaces; limiting to 6 meant namespaces after the first batch (including
-    // 1775115880383600783) were never scanned by the cron auto-inbox processor.
-    const MAX_NAMESPACES_PER_TICK = 50
-    let scannedNamespaces = 0
+    const namespaceIds = Array.from(new Set([...readyNamespaceIds, ...knownNamespaceIds])).filter(Boolean)
+    const report: AutoInboxGuardianReport = {
+        ran_at: new Date().toISOString(),
+        total_namespaces: namespaceIds.length,
+        scanned_namespaces: 0,
+        started_total: 0,
+        active_total: 0,
+        idle_total: 0,
+        error_total: 0,
+        namespace_results: [],
+    }
+
+    const mark = (result: AutoInboxGuardianNamespaceResult) => {
+        report.namespace_results.push(result)
+        if (result.outcome === 'started') report.started_total++
+        else if (result.outcome === 'active') report.active_total++
+        else if (result.outcome === 'error') report.error_total++
+        else report.idle_total++
+    }
 
     for (const namespaceId of namespaceIds) {
-        if (!namespaceId || namespaceId === adminNamespaceId) continue
-        if (scannedNamespaces >= MAX_NAMESPACES_PER_TICK) break
-        scannedNamespaces++
-
-        const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
-        if (await hasActiveProcessingJob(bucket).catch(() => true)) continue
-
-        await syncReadyInboxLinksToNamespaceIndex({
-            env,
-            bucket,
-            namespaceId,
-            limit: 200,
-        }).catch((error) => {
-            console.error(`[AUTO-INBOX] Failed to sync ready inbox links for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
-            return 0
-        })
-
-        const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
-            env,
-            bucket,
-            namespaceId,
-        }).catch(() => null)
-        if (galleryIndexVideo) {
-            try {
-                const result = await ensureInboxVideoProcessingStarted({
-                    env,
-                    bucket,
-                    executionCtx: ctx,
-                    botId: namespaceId,
-                    item: galleryIndexVideo,
-                    skipIfAlreadyProcessed: true,
-                })
-                if (result.outcome === 'started') {
-                    console.log(`[AUTO-INBOX] Started ${namespaceId}/${galleryIndexVideo.id}: ${result.job.status}`)
-                    continue
-                }
-                if (result.outcome === 'already_running') {
-                    console.log(`[AUTO-INBOX] ${namespaceId}/${galleryIndexVideo.id} already ${result.status}`)
-                    continue
-                }
-            } catch (error) {
-                console.error(`[AUTO-INBOX] Failed ${namespaceId}/${galleryIndexVideo.id}: ${error instanceof Error ? error.message : String(error)}`)
-            }
-        }
-
-        const records = await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
-        for (const record of records) {
-            const item = normalizeInboxVideoRecord(record)
-            if (!item || item.status !== 'ready') continue
-
-            const processedAt = await getGalleryIndexProcessedAt(env.DB, namespaceId, item.id).catch(() => '')
-            if (processedAt || String(item.processedAt || '').trim()) {
-                if (!String(item.processedAt || '').trim()) {
-                    await putInboxVideoRecord(bucket, {
-                        ...item,
-                        processedAt,
-                        updatedAt: new Date().toISOString(),
-                    }).catch(() => { })
-                }
+        report.scanned_namespaces++
+        try {
+            const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
+            if (await hasActiveProcessingJob(bucket).catch(() => true)) {
+                mark({ namespace_id: namespaceId, outcome: 'active' })
                 continue
             }
 
-            const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
-            if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+            await syncReadyInboxLinksToNamespaceIndex({
+                env,
+                bucket,
+                namespaceId,
+                limit: 200,
+            }).catch((error) => {
+                console.error(`[AUTO-INBOX] Failed to sync ready inbox links for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                return 0
+            })
 
-            try {
-                const result = await ensureInboxVideoProcessingStarted({
-                    env,
-                    bucket,
-                    executionCtx: ctx,
-                    botId: namespaceId,
-                    item,
-                    skipIfAlreadyProcessed: true,
-                })
-                if (result.outcome === 'started') {
-                    console.log(`[AUTO-INBOX] Started ${namespaceId}/${item.id}: ${result.job.status}`)
-                    break
-                }
-                if (result.outcome === 'already_running') {
-                    console.log(`[AUTO-INBOX] ${namespaceId}/${item.id} already ${result.status}`)
-                    break
-                }
-            } catch (error) {
-                console.error(`[AUTO-INBOX] Failed ${namespaceId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+            const candidates: InboxVideoRecord[] = []
+            const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
+                env,
+                bucket,
+                namespaceId,
+            }).catch(() => null)
+            if (galleryIndexVideo) candidates.push(galleryIndexVideo)
+            const records = await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
+            const seenCandidateIds = new Set(candidates.map((item) => String(item.id || '').trim()).filter(Boolean))
+            for (const record of records) {
+                const id = String(record.id || '').trim()
+                if (!id || seenCandidateIds.has(id)) continue
+                seenCandidateIds.add(id)
+                candidates.push(record)
             }
+
+            let startedOrActive = false
+            for (const candidate of candidates) {
+                const item = normalizeInboxVideoRecord(candidate)
+                if (!item || item.status !== 'ready') continue
+
+                const processedAt = await getGalleryIndexProcessedAt(env.DB, namespaceId, item.id).catch(() => '')
+                if (processedAt || String(item.processedAt || '').trim()) {
+                    if (!String(item.processedAt || '').trim()) {
+                        await putInboxVideoRecord(bucket, {
+                            ...item,
+                            processedAt,
+                            updatedAt: new Date().toISOString(),
+                        }).catch(() => { })
+                    }
+                    continue
+                }
+
+                const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
+                if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+
+                try {
+                    const result = await ensureInboxVideoProcessingStarted({
+                        env,
+                        bucket,
+                        executionCtx: ctx,
+                        botId: namespaceId,
+                        item,
+                        skipIfAlreadyProcessed: true,
+                    })
+                    if (result.outcome === 'started') {
+                        console.log(`[AUTO-INBOX] Started ${namespaceId}/${item.id}: ${result.job.status}`)
+                        mark({ namespace_id: namespaceId, outcome: 'started', video_id: item.id, detail: result.job.status })
+                        startedOrActive = true
+                        break
+                    }
+                    if (result.outcome === 'already_running') {
+                        console.log(`[AUTO-INBOX] ${namespaceId}/${item.id} already ${result.status}`)
+                        mark({ namespace_id: namespaceId, outcome: 'active', video_id: item.id, detail: result.status })
+                        startedOrActive = true
+                        break
+                    }
+                } catch (error) {
+                    console.error(`[AUTO-INBOX] Failed ${namespaceId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+                }
+            }
+
+            if (!startedOrActive) mark({ namespace_id: namespaceId, outcome: 'idle', detail: candidates.length ? 'no_startable_ready_candidate' : 'no_ready_candidate' })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.error(`[AUTO-INBOX] Namespace ${namespaceId} failed: ${message}`)
+            mark({ namespace_id: namespaceId, outcome: 'error', detail: message.slice(0, 240) })
         }
     }
+
+    console.log(`[AUTO-INBOX-GUARDIAN] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total} errors=${report.error_total}`)
+    return report
 }
 
 async function collectKnownNamespaceIds(env: Env): Promise<Set<string>> {
@@ -20132,7 +20340,7 @@ async function getPostedVideoIds(params: {
 
     const where: string[] = [
         `(
-            status IN ('success', 'posting')
+            status = 'success'
             OR TRIM(COALESCE(fb_post_id, '')) <> ''
             OR TRIM(COALESCE(fb_reel_url, '')) <> ''
         )`,
@@ -20190,7 +20398,7 @@ async function getLatestPostedAtByVideoIds(params: {
             WHERE bot_id = ?
               AND video_id IN (${placeholders})
               AND (
-                status IN ('success', 'posting')
+                status = 'success'
                 OR TRIM(COALESCE(fb_post_id, '')) <> ''
                 OR TRIM(COALESCE(fb_reel_url, '')) <> ''
               )
@@ -20325,10 +20533,18 @@ async function getConfirmedPostedVideoIds(params: {
         ? `SELECT DISTINCT video_id
            FROM post_history
            WHERE bot_id = ?
-             AND TRIM(COALESCE(fb_post_id, '')) <> ''`
+             AND (
+               status = 'success'
+               OR TRIM(COALESCE(fb_post_id, '')) <> ''
+               OR TRIM(COALESCE(fb_reel_url, '')) <> ''
+             )`
         : `SELECT DISTINCT video_id
            FROM post_history
-           WHERE TRIM(COALESCE(fb_post_id, '')) <> ''`
+           WHERE (
+             status = 'success'
+             OR TRIM(COALESCE(fb_post_id, '')) <> ''
+             OR TRIM(COALESCE(fb_reel_url, '')) <> ''
+           )`
 
     const result = hasNamespace
         ? await params.db.prepare(sql).bind(namespaceId).all() as { results?: Array<{ video_id?: string }> }
@@ -23429,12 +23645,14 @@ async function autoSyncPagesForNamespace(
     }))
     for (const result of postResults) {
         if (result.status === 'rejected') {
-            const parsed = parseFacebookErrorLike(result.reason)
-            const msg = parsed?.message || (result.reason instanceof Error ? result.reason.message : String(result.reason))
+            const rejected = result as PromiseRejectedResult
+            const parsed = parseFacebookErrorLike(rejected.reason)
+            const msg = parsed?.message || (rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason))
             postFetchErrors.push(msg)
             continue
         }
-        for (const fbPage of result.value.fbPages) {
+        const fulfilled = result as PromiseFulfilledResult<{ candidate: AutoSyncTokenCandidate; fbPages: Awaited<ReturnType<typeof fetchMeAccountsViaHttp>> }>
+        for (const fbPage of fulfilled.value.fbPages) {
             const pageId = String(fbPage?.id || '').trim()
             if (!pageId) continue
             const pageAccessToken = String(fbPage?.access_token || '').trim()
@@ -23494,13 +23712,20 @@ async function autoSyncPagesForNamespace(
     }))
     for (const result of commentResults) {
         if (result.status === 'rejected') {
-            const parsed = parseFacebookErrorLike(result.reason)
-            const msg = parsed?.message || (result.reason instanceof Error ? result.reason.message : String(result.reason))
+            const rejected = result as PromiseRejectedResult
+            const parsed = parseFacebookErrorLike(rejected.reason)
+            const msg = parsed?.message || (rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason))
             commentFetchErrors.push(msg)
             continue
         }
-        const candidateToken = String(result.value.candidateToken || '').trim()
-        for (const item of result.value.commentPages) {
+        const fulfilled = result as PromiseFulfilledResult<{
+            candidate: AutoSyncTokenCandidate
+            candidateToken: string
+            commentPages: Array<{ id?: string; access_token?: string }>
+            pageIdentity: { id?: string; name?: string } | null
+        }>
+        const candidateToken = String(fulfilled.value.candidateToken || '').trim()
+        for (const item of fulfilled.value.commentPages) {
             const pid = String(item?.id || '').trim()
             const pageToken = String(item?.access_token || '').trim()
             if (!pid) continue
@@ -23509,7 +23734,7 @@ async function autoSyncPagesForNamespace(
             if (!isResolvedCommentToken(pageToken)) continue
             commentTokenByPage.set(pid, pageToken)
         }
-        const pageIdentity = result.value.pageIdentity
+        const pageIdentity = fulfilled.value.pageIdentity
         const identityPageId = String(pageIdentity?.id || '').trim()
         if (identityPageId && pageMap.has(identityPageId) && !commentTokenByPage.has(identityPageId) && isResolvedCommentToken(candidateToken)) {
             commentTokenByPage.set(identityPageId, candidateToken)
@@ -29193,9 +29418,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
            AND datetime(created_at) < datetime('now', '-2 minutes')`
     ).run().catch(() => { })
     await recoverStaleScheduledRun(env.DB).catch(() => { })
-    enqueueBackgroundTask(ctx, 'CRON AUTO-IMPORT', async () => {
-        await autoImportAndProcessForAdmin(env, ctx)
-    })
+    // Keep the posting cron isolated. Background import/warm-up/comment/ad jobs
+    // can consume subrequest slots and starve the auto-post loop before it gets
+    // to pages_visited; run them from their dedicated/manual paths instead.
     let scheduledRunLockKey = await tryAcquirePostingLock(env.DB, {
         scope: 'page',
         namespaceId: '__scheduled__',
@@ -29225,69 +29450,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         }).catch(() => { })
         return
     }
-
-    enqueueBackgroundTask(ctx, 'CRON WARM-UP', async () => {
-        const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-        const containerStub = env.MERGE_CONTAINER.get(containerId)
-        await containerStub.fetch('http://container/health')
-        console.log('[CRON] Container warm-up ping sent')
-    })
-    enqueueBackgroundTask(ctx, 'CRON PENDING COMMENTS', async () => {
-        await processPendingCommentBacklog(env)
-    })
-    enqueueBackgroundTask(ctx, 'CRON DASHBOARD FB GALLERY', async () => {
-        const result = await syncDashboardFacebookPageVideoCache(env, {
-            pageId: DASHBOARD_FACEBOOK_GALLERY_PAGE_ID,
-            pageName: DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME,
-        })
-        if (!result.skipped) {
-            console.log(`[CRON] dashboard gallery sync ok=${result.ok} inserted=${result.inserted} total=${result.totalOverThreshold} reason=${result.reason || ''}`)
-        }
-    })
-    enqueueBackgroundTask(ctx, 'CRON AD QUEUE', async () => {
-        // Watchdog: every cron tick, reset items stuck in 'processing' > 5 min.
-        // (Worker dying mid-flight can leave create-ad result orphaned without DB update.)
-        await recoverStuckAdQueueProcessing(env).catch((e) => {
-            console.error(`[AD QUEUE WATCHDOG] failed: ${e instanceof Error ? e.message : String(e)}`)
-        })
-        // Process one queued ad-creation job per 20-min interval.
-        // Tracked via dashboard_settings.ad_queue_last_run_at.
-        //
-        // RACE CONDITION FIX (2026-04-20): previously we set last_run AFTER
-        // processNextAdQueueItem (which takes 60-120s). That allowed every cron tick
-        // during that window (once per minute) to pass the elapsed check and start
-        // ANOTHER item in parallel — collapsing the 20-min spacing to ~1-min spacing.
-        // Observed: items #13 done 11:53:58, #14 done 11:54:55 (gap 55s, not 20min).
-        //
-        // Fix: STAMP last_run BEFORE processing, but only if there's actually a queued
-        // item (so empty ticks don't reset the timer). Subsequent ticks within the
-        // 20-min window see the stamped timestamp and skip.
-        const lastRunEntry = await getDashboardSetting(env.DB, AD_QUEUE_LAST_RUN_KEY).catch(() => null)
-        const lastRunMs = Date.parse(String(lastRunEntry?.value || '').trim())
-        const elapsed = Number.isFinite(lastRunMs) ? (Date.now() - lastRunMs) : Infinity
-        if (elapsed < AD_QUEUE_INTERVAL_MS) {
-            // Not yet time
-            return
-        }
-        // Cheap peek to see if there's work — don't advance timer on empty queue
-        await ensureAdQueueTable(env.DB)
-        const pending = await env.DB.prepare(
-            `SELECT id FROM dashboard_ad_queue WHERE status = 'queued' ORDER BY id ASC LIMIT 1`
-        ).first().catch(() => null) as { id?: number } | null
-        if (!pending) {
-            return
-        }
-        // Stamp last_run FIRST — concurrent ticks within the 20-min window will now
-        // see this timestamp and skip, preventing double-processing.
-        await setDashboardSetting(env.DB, AD_QUEUE_LAST_RUN_KEY, new Date().toISOString())
-        // Now actually process (may take 60-120s). processNextAdQueueItem uses an
-        // atomic claim (UPDATE...WHERE status='queued') so even if another tick
-        // somehow sneaks through, it can't grab the same item — worst case a second
-        // item gets processed early; the 20-min timer then prevents a third.
-        const result = await processNextAdQueueItem(env)
-        console.log(`[CRON AD QUEUE] processed queue_id=${result.queue_id} ok=${result.ok} error=${result.error || ''}`)
-    })
-
 
     // Get current time in Thailand timezone (UTC+7) using proper Intl
     const now = new Date()
@@ -29398,7 +29560,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         for (const page of pages) {
             const botId = page.bot_id || 'default'
             cronStats.pagesVisited += 1
-            await updateCronRuntimeState(env.DB, {
+            updateCronRuntimeState(env.DB, {
                 runId,
                 heartbeatAt: new Date().toISOString(),
                 currentPageId: String(page.id || ''),
@@ -29412,25 +29574,12 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             try {
                 // ใช้ bot_id ของ page เป็น namespace สำหรับหา videos
                 if (!reconciledNamespaces.has(botId)) {
-                    const namespaceBucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
-                    enqueueBackgroundTask(ctx, `CRON RECONCILE ${botId}`, async () => {
-                        await reconcilePostingHistoryRows({
-                            env,
-                            bucket: namespaceBucket,
-                            botId,
-                            logPrefix: 'CRON',
-                        })
-                    })
-                    enqueueBackgroundTask(ctx, `CRON RECOVER-FAILED ${botId}`, async () => {
-                        await recoverFailedHistoryRowsFromFeed({
-                            env,
-                            botId,
-                            logPrefix: 'CRON',
-                        })
-                    })
+                    // Reconcile/recover maintenance is intentionally not launched
+                    // inside the scheduled posting loop; keeping the loop free of
+                    // background fetch/R2 work prevents subrequest starvation.
                     reconciledNamespaces.add(botId)
                 }
-                await failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
+                failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
 
                 // Universal min-gap guard — prevents back-to-back posts regardless of schedule mode.
                 // Catches bucket-boundary races (every:N) and stale last_post_at across cron ticks.
@@ -30511,18 +30660,17 @@ async function watchdogStuckJobs(env: Env) {
 export default {
     fetch: app.fetch,
     scheduled: async (event: ScheduledEvent, env: Env, _ctx: ExecutionContext) => {
-        enqueueBackgroundTask(_ctx, 'CRON WATCHDOG', async () => {
-            await watchdogStuckJobs(env)
-        })
-        enqueueBackgroundTask(_ctx, 'CRON CONTAINER-WARMUP', async () => {
-            await warmPipelineContainer(env)
-        })
-        enqueueBackgroundTask(_ctx, 'CRON READY INBOX', async () => {
-            await autoProcessReadyInboxForNamespaces(env, _ctx)
-        })
+        // Keep scheduled posting deterministic: run the posting loop first.
+        // Inbox processing and pending comments run only after posting has yielded;
+        // this preserves cron isolation while still draining user-submitted videos.
         await handleScheduled(env, _ctx)
-        enqueueBackgroundTask(_ctx, 'CRON PENDING COMMENTS', async () => {
-            await processPendingCommentBacklog(env)
-        })
+        _ctx.waitUntil(autoProcessReadyInboxForNamespaces(env, _ctx).then((report) => {
+            console.log(`[CRON-AUTO-INBOX] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total}`)
+        }).catch((error) => {
+            console.error(`[CRON-AUTO-INBOX] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        _ctx.waitUntil(processPendingCommentBacklog(env).catch((error) => {
+            console.error(`[CRON-COMMENTS] ${error instanceof Error ? error.message : String(error)}`)
+        }))
     },
 }

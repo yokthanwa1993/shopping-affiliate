@@ -11,10 +11,26 @@ const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
 const GEMINI_API_KEY_SETTING_KEY = 'gemini_api_key_v1'
 const GEMINI_API_KEYS_SETTING_KEY = 'gemini_api_keys_v2'
+const GEMINI_API_KEY_HEALTH_SETTING_KEY = 'gemini_api_key_health_v1'
 const SYSTEM_GEMINI_NAMESPACE_ID = '__system_gemini__'
 const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_GEMINI_API_KEY_SLOTS = 5
 const MAX_VOICE_PROMPT_CHARS = 12000
+const GEMINI_API_KEY_DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+type GeminiApiKeyHealthStatus = 'ok' | 'quota_limited' | 'invalid' | 'error'
+
+type GeminiApiKeyHealthRecord = {
+    hash: string
+    masked_key: string
+    slot?: number
+    status: GeminiApiKeyHealthStatus
+    disabled_until?: string | null
+    last_error?: string
+    last_failed_at?: string | null
+    last_checked_at?: string | null
+    model?: string
+}
 const MAX_VOICE_STYLE_PROMPT_CHARS = 4000
 const MAX_VOICE_SCRIPT_PROMPT_CHARS = 12000
 const MAX_VOICE_TONE_SELECTIONS = 3
@@ -155,6 +171,10 @@ export type Env = {
     R2_ACCESS_KEY_ID: string
     R2_SECRET_ACCESS_KEY: string
     GEMINI_MODEL: string
+    VERTEX_TTS_ENDPOINT?: string
+    VERTEX_TTS_PROJECT_ID?: string
+    VERTEX_TTS_LOCATION?: string
+    VERTEX_TTS_MODEL?: string
     CORS_ORIGIN: string
     WEBAPP_URL?: string
     WEBAPP_DESKTOP_URL?: string
@@ -653,6 +673,158 @@ export async function getSystemGeminiApiKeys(db: D1Database): Promise<string[]> 
     return getLegacySystemGeminiApiKeys(db)
 }
 
+function maskGeminiApiKey(rawValue: string): string {
+    const value = String(rawValue || '').trim()
+    if (!value) return ''
+    if (value.length <= 8) return `${value.slice(0, 2)}...${value.slice(-2)}`
+    return `${value.slice(0, 4)}...${value.slice(-4)}`
+}
+
+async function hashGeminiApiKey(rawValue: string): Promise<string> {
+    const bytes = new TextEncoder().encode(String(rawValue || '').trim())
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function loadGeminiApiKeyHealth(db: D1Database): Promise<Record<string, GeminiApiKeyHealthRecord>> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(SYSTEM_GEMINI_NAMESPACE_ID, GEMINI_API_KEY_HEALTH_SETTING_KEY).first() as { value?: string } | null
+    let parsed: unknown = {}
+    try {
+        parsed = JSON.parse(String(row?.value || '{}'))
+    } catch {
+        parsed = {}
+    }
+    const records = (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+        ? parsed as Record<string, GeminiApiKeyHealthRecord>
+        : {}
+    const cleaned: Record<string, GeminiApiKeyHealthRecord> = {}
+    for (const [hash, record] of Object.entries(records)) {
+        const normalizedHash = String(hash || record?.hash || '').trim()
+        if (!normalizedHash) continue
+        cleaned[normalizedHash] = {
+            hash: normalizedHash,
+            masked_key: String(record?.masked_key || '').trim(),
+            slot: Number.isFinite(Number(record?.slot)) ? Number(record.slot) : undefined,
+            status: (['ok', 'quota_limited', 'invalid', 'error'].includes(String(record?.status)) ? record.status : 'error') as GeminiApiKeyHealthStatus,
+            disabled_until: String(record?.disabled_until || '').trim() || null,
+            last_error: String(record?.last_error || '').trim(),
+            last_failed_at: String(record?.last_failed_at || '').trim() || null,
+            last_checked_at: String(record?.last_checked_at || '').trim() || null,
+            model: String(record?.model || '').trim(),
+        }
+    }
+    return cleaned
+}
+
+async function saveGeminiApiKeyHealth(db: D1Database, records: Record<string, GeminiApiKeyHealthRecord>): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(SYSTEM_GEMINI_NAMESPACE_ID, GEMINI_API_KEY_HEALTH_SETTING_KEY, JSON.stringify(records)).run()
+}
+
+function isGeminiApiKeyHealthDisabled(record: GeminiApiKeyHealthRecord | undefined, nowMs = Date.now()): boolean {
+    if (!record || record.status === 'ok') return false
+    const disabledUntil = Date.parse(String(record.disabled_until || ''))
+    if (!Number.isFinite(disabledUntil)) return false
+    return disabledUntil > nowMs
+}
+
+export function classifyGeminiApiKeyFailure(status: number, message: string): GeminiApiKeyHealthStatus | null {
+    const text = String(message || '').toLowerCase()
+    if (status === 429 || text.includes('quota exceeded') || text.includes('rate limit') || text.includes('resource_exhausted')) return 'quota_limited'
+    if (status === 400 || status === 401 || status === 403 || text.includes('api key not valid') || text.includes('permission_denied')) return 'invalid'
+    return null
+}
+
+export async function recordGeminiApiKeyHealth(db: D1Database, params: {
+    apiKey: string
+    status: GeminiApiKeyHealthStatus
+    error?: string
+    model?: string
+    slot?: number
+    cooldownMs?: number
+}): Promise<GeminiApiKeyHealthRecord | null> {
+    const apiKey = String(params.apiKey || '').trim()
+    if (!apiKey) return null
+    const hash = await hashGeminiApiKey(apiKey)
+    const records = await loadGeminiApiKeyHealth(db)
+    const nowIso = new Date().toISOString()
+    const disabledUntil = params.status === 'ok'
+        ? null
+        : new Date(Date.now() + Math.max(60_000, params.cooldownMs || GEMINI_API_KEY_DEFAULT_COOLDOWN_MS)).toISOString()
+    const existing = records[hash]
+    const next: GeminiApiKeyHealthRecord = {
+        ...existing,
+        hash,
+        masked_key: maskGeminiApiKey(apiKey),
+        slot: Number.isFinite(Number(params.slot)) ? Number(params.slot) : existing?.slot,
+        status: params.status,
+        disabled_until: disabledUntil,
+        last_error: String(params.error || '').slice(0, 500),
+        last_checked_at: nowIso,
+        last_failed_at: params.status === 'ok' ? existing?.last_failed_at || null : nowIso,
+        model: String(params.model || existing?.model || '').trim(),
+    }
+    records[hash] = next
+    await saveGeminiApiKeyHealth(db, records)
+    return next
+}
+
+export async function filterUsableGeminiApiKeys(db: D1Database, keys: string[]): Promise<{ usable: string[]; skipped: GeminiApiKeyHealthRecord[] }> {
+    const normalized = normalizeGeminiApiKeys(keys)
+    if (!normalized.length) return { usable: [], skipped: [] }
+    const health = await loadGeminiApiKeyHealth(db).catch(() => ({} as Record<string, GeminiApiKeyHealthRecord>))
+    const usable: string[] = []
+    const skipped: GeminiApiKeyHealthRecord[] = []
+    for (let index = 0; index < normalized.length; index += 1) {
+        const key = normalized[index]
+        const hash = await hashGeminiApiKey(key)
+        const record = health[hash]
+        if (isGeminiApiKeyHealthDisabled(record)) {
+            skipped.push({ ...record, masked_key: record.masked_key || maskGeminiApiKey(key), slot: record.slot || index + 1 })
+            continue
+        }
+        usable.push(key)
+    }
+    return { usable, skipped }
+}
+
+export async function getGeminiApiKeyHealthSummary(db: D1Database): Promise<{ keys: Array<GeminiApiKeyHealthRecord & { active: boolean }>; active_count: number; disabled_count: number }> {
+    const systemKeys = await getSystemGeminiApiKeys(db).catch(() => [])
+    const health = await loadGeminiApiKeyHealth(db).catch(() => ({} as Record<string, GeminiApiKeyHealthRecord>))
+    const rows: Array<GeminiApiKeyHealthRecord & { active: boolean }> = []
+    for (let index = 0; index < systemKeys.length; index += 1) {
+        const key = systemKeys[index]
+        const hash = await hashGeminiApiKey(key)
+        const record = health[hash] || {
+            hash,
+            masked_key: maskGeminiApiKey(key),
+            slot: index + 1,
+            status: 'ok' as GeminiApiKeyHealthStatus,
+            disabled_until: null,
+        }
+        const disabled = isGeminiApiKeyHealthDisabled(record)
+        rows.push({
+            ...record,
+            masked_key: record.masked_key || maskGeminiApiKey(key),
+            slot: index + 1,
+            active: !disabled,
+        })
+    }
+    return {
+        keys: rows,
+        active_count: rows.filter((row) => row.active).length,
+        disabled_count: rows.filter((row) => !row.active).length,
+    }
+}
+
 // ==================== Telegram Helpers ====================
 
 export async function sendTelegram(token: string, method: string, body: Record<string, unknown>) {
@@ -816,11 +988,18 @@ export async function runPipeline(
     const namespaceApiKeys = await getNamespaceGeminiApiKeys(env.DB, botId).catch(() => [])
     const systemApiKeys = await getSystemGeminiApiKeys(env.DB).catch(() => [])
     const envApiKeys = getEnvGeminiApiKeys(env)
-    const apiKeys = normalizeGeminiApiKeys([...namespaceApiKeys, ...systemApiKeys, ...envApiKeys])
-    if (apiKeys.length === 0) {
-        throw new Error('ยังไม่ได้ตั้ง Gemini API key กลางของระบบ')
+    const rawApiKeys = normalizeGeminiApiKeys([...namespaceApiKeys, ...systemApiKeys, ...envApiKeys])
+    const filteredApiKeys = await filterUsableGeminiApiKeys(env.DB, rawApiKeys).catch(() => ({ usable: rawApiKeys, skipped: [] }))
+    const apiKeys = filteredApiKeys.usable
+    if (rawApiKeys.length > 0 && filteredApiKeys.skipped.length > 0) {
+        console.warn(`[PIPELINE] skipped disabled Gemini keys: ${filteredApiKeys.skipped.map((row) => `${row.masked_key || 'unknown'}:${row.status}`).join(', ')}`)
     }
-    console.log(`[PIPELINE] Gemini key pool namespace=${namespaceApiKeys.length} system=${systemApiKeys.length} env=${envApiKeys.length} merged=${apiKeys.length}`)
+    if (apiKeys.length === 0) {
+        throw new Error(rawApiKeys.length > 0
+            ? 'Gemini API key ทั้งหมดถูกพักใช้งานชั่วคราวจาก quota/rate limit — กรุณาเปลี่ยน key หรือรอ disabled_until'
+            : 'ยังไม่ได้ตั้ง Gemini API key กลางของระบบ')
+    }
+    console.log(`[PIPELINE] Gemini key pool namespace=${namespaceApiKeys.length} system=${systemApiKeys.length} env=${envApiKeys.length} merged=${rawApiKeys.length} usable=${apiKeys.length} skipped=${filteredApiKeys.skipped.length}`)
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
     const voiceSettings = await getNamespaceVoiceSettings(env.DB, botId)
         .catch(() => ({
@@ -857,6 +1036,10 @@ export async function runPipeline(
             api_key: apiKeys[0],
             api_keys: apiKeys,
             model,
+            vertex_tts_endpoint: String(env.VERTEX_TTS_ENDPOINT || '').trim() || 'https://aiplatform.googleapis.com',
+            vertex_tts_project_id: String(env.VERTEX_TTS_PROJECT_ID || '').trim() || undefined,
+            vertex_tts_location: String(env.VERTEX_TTS_LOCATION || '').trim() || 'global',
+            vertex_tts_model: String(env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts',
             script_prompt: voiceSettings.scriptPrompt,
             voice_name: voiceSettings.profile.voice_name,
             tts_prompt_template: voiceSettings.ttsPromptTemplate,

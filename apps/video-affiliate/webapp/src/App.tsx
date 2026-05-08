@@ -672,6 +672,15 @@ interface FacebookPage {
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type InboxFilterView = 'unprocessed' | 'missing_links' | 'processed'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
+type GeminiKeyHealthRow = {
+  slot?: number
+  masked_key?: string
+  status?: string
+  active?: boolean
+  disabled_until?: string | null
+  last_error?: string
+  last_checked_at?: string | null
+}
 type SettingsSection = 'menu' | 'account' | 'pages' | 'team' | 'gemini' | 'shortlink' | 'post' | 'voice' | 'cover' | 'comment' | 'members' | 'monitor' | 'ads'
 type PostingOrderOption = 'oldest_first' | 'newest_first' | 'random'
 type VoiceSettingsSource = 'default' | 'legacy' | 'structured'
@@ -3404,6 +3413,8 @@ function App({
   const [geminiApiKeyMessage, setGeminiApiKeyMessage] = useState('')
   const [geminiApiKeyLoading, setGeminiApiKeyLoading] = useState(false)
   const [geminiApiKeySaving, setGeminiApiKeySaving] = useState(false)
+  const [geminiApiKeyChecking, setGeminiApiKeyChecking] = useState(false)
+  const [geminiApiKeyHealth, setGeminiApiKeyHealth] = useState<GeminiKeyHealthRow[]>([])
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
   const [geminiApiKeyMaxSlots, setGeminiApiKeyMaxSlots] = useState(DEFAULT_GEMINI_KEY_SLOTS)
   const [shortlinkAccountDraft, setShortlinkAccountDraft] = useState(() => getStoredShortlinkAccount(botScope))
@@ -5734,6 +5745,7 @@ function App({
         updated_at?: string
         max_chars?: number
         max_slots?: number
+        health?: { keys?: GeminiKeyHealthRow[] }
       }
       const maxSlots = typeof data.max_slots === 'number' && data.max_slots > 0
         ? Math.max(1, Math.min(5, data.max_slots))
@@ -5746,6 +5758,7 @@ function App({
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
       setGeminiApiKeyMaxSlots(maxSlots)
+      setGeminiApiKeyHealth(Array.isArray(data.health?.keys) ? data.health.keys : [])
       setGeminiApiKeyDrafts(createEmptyGeminiKeySlots(maxSlots))
       setGeminiApiKeyMessage('')
     } catch {
@@ -5794,6 +5807,7 @@ function App({
         updated_at?: string
         max_chars?: number
         max_slots?: number
+        health?: { keys?: GeminiKeyHealthRow[] }
       }
       const maxSlots = typeof data.max_slots === 'number' && data.max_slots > 0
         ? Math.max(1, Math.min(5, data.max_slots))
@@ -5806,12 +5820,50 @@ function App({
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
       setGeminiApiKeyMaxSlots(maxSlots)
+      setGeminiApiKeyHealth(Array.isArray(data.health?.keys) ? data.health.keys : [])
       setGeminiApiKeyDrafts(createEmptyGeminiKeySlots(maxSlots))
       setGeminiApiKeyMessage(isClear ? 'ล้าง Gemini API key กลางของระบบแล้ว' : 'บันทึก Gemini API key กลางของระบบแล้ว')
     } catch {
       setGeminiApiKeyMessage('บันทึก Gemini API key ไม่สำเร็จ')
     } finally {
       setGeminiApiKeySaving(false)
+    }
+  }
+
+  async function checkGeminiApiKeys() {
+    const session = getToken()
+    if (!session) return
+    setGeminiApiKeyChecking(true)
+    setGeminiApiKeyMessage('กำลังเช็คคีย์ Gemini ทีละช่อง...')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/gemini-key/check`, { method: 'POST' })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setGeminiApiKeyMessage('บัญชีนี้ไม่มีสิทธิ์เช็ค Gemini API key')
+        return
+      }
+      const data = await resp.json().catch(() => ({})) as { results?: GeminiKeyHealthRow[]; health?: { keys?: GeminiKeyHealthRow[] }; error?: string }
+      if (!resp.ok) {
+        setGeminiApiKeyMessage(data.error || 'เช็ค Gemini API key ไม่สำเร็จ')
+        return
+      }
+      const rows = Array.isArray(data.health?.keys)
+        ? data.health.keys
+        : Array.isArray(data.results)
+          ? data.results
+          : []
+      setGeminiApiKeyHealth(rows)
+      const badRows = rows.filter((row) => row.active === false || (row.status && row.status !== 'ok'))
+      setGeminiApiKeyMessage(badRows.length
+        ? `พบคีย์มีปัญหา ${badRows.map((row) => `Key ${row.slot || '?'} ${row.status || 'error'}`).join(', ')} — ระบบจะข้ามคีย์นี้ชั่วคราว`
+        : 'เช็คแล้ว: ทุก key ใช้งานได้')
+    } catch {
+      setGeminiApiKeyMessage('เช็ค Gemini API key ไม่สำเร็จ')
+    } finally {
+      setGeminiApiKeyChecking(false)
     }
   }
 
@@ -6460,13 +6512,19 @@ function App({
         success?: boolean
         reset_count?: number
         posted_total?: number
+        visible_posted_total?: number
+        skipped_without_history?: number
         error?: string
       }
       if (!resp.ok || !data.success) {
         alert(`ย้ายคลิปไม่สำเร็จ: ${data.error || resp.statusText || 'unknown error'}`)
         return
       }
-      alert(`ย้ายคลิป ${data.reset_count ?? 0} คลิป กลับไป "ยังไม่โพสต์" สำเร็จ`)
+      const skipped = Number(data.skipped_without_history || 0)
+      alert(
+        `ย้ายคลิป ${data.reset_count ?? 0} คลิป กลับไป "ยังไม่โพสต์" สำเร็จ` +
+        (skipped > 0 ? `\nข้าม ${skipped} คลิป เพราะยังไม่มีประวัติโพสต์จริง` : '')
+      )
       void loadGallerySnapshotBundle({ reset: true })
     } catch (e) {
       alert(`เกิดข้อผิดพลาด: ${e instanceof Error ? e.message : String(e)}`)
@@ -8067,6 +8125,9 @@ function App({
                             {Array.from({ length: geminiApiKeyMaxSlots }, (_, index) => {
                               const masked = geminiApiKeyMaskedList[index] || ''
                               const value = geminiApiKeyDrafts[index] || ''
+                              const health = geminiApiKeyHealth.find((row) => Number(row.slot || 0) === index + 1 || (masked && row.masked_key === masked))
+                              const healthStatus = String(health?.status || '').trim()
+                              const healthProblem = !!healthStatus && healthStatus !== 'ok'
                               return (
                                 <div key={`gemini-slot-${index}`} className="space-y-1">
                                   <div className="flex items-center justify-between">
@@ -8088,6 +8149,12 @@ function App({
                                   {masked && (
                                     <p className="text-[11px] text-gray-400 break-all">คีย์ปัจจุบัน: {masked}</p>
                                   )}
+                                  {healthStatus && (
+                                    <p className={`text-[11px] ${healthProblem ? 'text-red-500' : 'text-green-600'}`}>
+                                      สถานะ: {healthProblem ? `มีปัญหา (${healthStatus})` : 'ใช้งานได้'}
+                                      {health?.disabled_until ? ` • พักถึง ${new Date(health.disabled_until).toLocaleString()}` : ''}
+                                    </p>
+                                  )}
                                 </div>
                               )
                             })}
@@ -8102,10 +8169,19 @@ function App({
                             <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(geminiApiKeyUpdatedAt).toLocaleString()}</p>
                           )}
                           {geminiApiKeyMessage && (
-                            <p className={`text-xs ${geminiApiKeyMessage.includes('ไม่สำเร็จ') || geminiApiKeyMessage.includes('ไม่มีสิทธิ์') ? 'text-red-500' : 'text-green-600'}`}>
+                            <p className={`text-xs ${geminiApiKeyMessage.includes('ไม่สำเร็จ') || geminiApiKeyMessage.includes('ไม่มีสิทธิ์') || geminiApiKeyMessage.includes('มีปัญหา') ? 'text-red-500' : 'text-green-600'}`}>
                               {geminiApiKeyMessage}
                             </p>
                           )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => void checkGeminiApiKeys()}
+                              disabled={geminiApiKeyChecking || geminiApiKeySaving || geminiApiKeyMaskedList.every((value) => !value)}
+                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-amber-200 text-amber-700 bg-amber-50 active:scale-95 transition-all disabled:opacity-40"
+                            >
+                              {geminiApiKeyChecking ? 'กำลังเช็ค...' : 'เช็คคีย์'}
+                            </button>
+                          </div>
                           <div className="flex gap-2">
                             <button
                               onClick={() => {

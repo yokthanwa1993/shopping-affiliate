@@ -45,6 +45,9 @@ pnpm-lock.yaml
 yarn.lock
 bun.lockb
 
-# Claude Code session-local state (per-machine, must never be committed)
-.claude/scheduled_tasks.lock
-.claude/settings.local.json
+# Agent/tool local state and runtime artifacts (per-machine, must never be committed)
+.claude/
+.gitnexus
+.wrangler/cache/
+*.zip
+*.mp4

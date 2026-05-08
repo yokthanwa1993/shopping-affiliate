@@ -1,5 +1,6 @@
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{json, Value};
 use tokio::fs;
 use tokio::process::Command;
@@ -14,6 +15,9 @@ use crate::version::PIPELINE_ENGINE_VERSION;
 const FAST_MODE_DEFAULT_SKIP_GEMINI_AUDIO_SYNC: bool = true;
 const GEMINI_WAIT_MAX_POLLS: usize = 20;
 const GEMINI_WAIT_POLL_SECONDS: u64 = 2;
+const VERTEX_TTS_DEFAULT_ENDPOINT: &str = "https://aiplatform.googleapis.com";
+const VERTEX_TTS_DEFAULT_LOCATION: &str = "global";
+const VERTEX_TTS_DEFAULT_MODEL: &str = "gemini-2.5-flash-preview-tts";
 
 #[derive(Deserialize, Clone)]
 pub struct PipelineRequest {
@@ -37,6 +41,10 @@ pub struct PipelineRequest {
     /// Sent separately from the script body so the model can apply voice direction without
     /// reading the style guide aloud. Falls back to `tts_prompt_template` when missing.
     pub tts_style_instructions: Option<String>,
+    pub vertex_tts_endpoint: Option<String>,
+    pub vertex_tts_project_id: Option<String>,
+    pub vertex_tts_location: Option<String>,
+    pub vertex_tts_model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -742,7 +750,198 @@ fn extract_style_from_legacy_template(template: Option<&str>) -> Option<String> 
     }
 }
 
-async fn gemini_tts(
+#[derive(Deserialize)]
+struct VertexServiceAccount {
+    client_email: String,
+    private_key: String,
+    token_uri: Option<String>,
+    project_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct VertexJwtClaims {
+    iss: String,
+    scope: String,
+    aud: String,
+    iat: i64,
+    exp: i64,
+}
+
+fn redact_vertex_error(body: &str) -> String {
+    body.replace('\n', " ")
+        .chars()
+        .take(300)
+        .collect::<String>()
+}
+
+fn load_vertex_service_account() -> Result<VertexServiceAccount, Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(raw_json) = std::env::var("VERTEX_TTS_SERVICE_ACCOUNT_JSON") {
+        let trimmed = raw_json.trim();
+        if !trimmed.is_empty() {
+            return Ok(serde_json::from_str(trimmed)?);
+        }
+    }
+    let path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+        .map_err(|_| "Vertex TTS service account is not configured (GOOGLE_APPLICATION_CREDENTIALS or VERTEX_TTS_SERVICE_ACCOUNT_JSON)")?;
+    let raw_json = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw_json)?)
+}
+
+async fn fetch_vertex_access_token(
+    client: &Client,
+    service_account: &VertexServiceAccount,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let token_uri = service_account
+        .token_uri
+        .as_deref()
+        .unwrap_or("https://oauth2.googleapis.com/token");
+    let now = chrono::Utc::now().timestamp();
+    let claims = VertexJwtClaims {
+        iss: service_account.client_email.clone(),
+        scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
+        aud: token_uri.to_string(),
+        iat: now,
+        exp: now + 3600,
+    };
+    let jwt = jsonwebtoken::encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(service_account.private_key.as_bytes())?,
+    )?;
+    let form_body = format!(
+        "grant_type={}&assertion={}",
+        urlencoding::encode("urn:ietf:params:oauth:grant-type:jwt-bearer"),
+        urlencoding::encode(&jwt),
+    );
+    let resp = client
+        .post(token_uri)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(form_body)
+        .send()
+        .await?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    if !(200..300).contains(&status) {
+        return Err(format!("Vertex OAuth token exchange failed: http_{} {}", status, redact_vertex_error(&body)).into());
+    }
+    let data: Value = serde_json::from_str(&body)?;
+    let token = data.get("access_token").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if token.is_empty() {
+        return Err("Vertex OAuth token exchange returned no access_token".into());
+    }
+    Ok(token.to_string())
+}
+
+fn build_tts_payload(script: &str, voice_name: Option<&str>, tts_prompt_template: Option<&str>, tts_style_instructions: Option<&str>) -> Value {
+    let selected_voice = voice_name
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Puck");
+    let style_text: String = tts_style_instructions
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| extract_style_from_legacy_template(tts_prompt_template))
+        .unwrap_or_default();
+    let script_only = script.trim().to_string();
+    let final_text = if style_text.is_empty() {
+        build_tts_input(script, tts_prompt_template)
+    } else {
+        format!("[Voice direction: {}]\n\n{}", style_text, script_only)
+    };
+    json!({
+        "contents": [{"role": "user", "parts": [{"text": final_text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": selected_voice}}}
+        }
+    })
+}
+
+fn extract_tts_audio_b64(json: &Value) -> Option<String> {
+    json.get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.get(0))
+        .and_then(|p| p.get("inlineData"))
+        .and_then(|i| i.get("data"))
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string())
+}
+
+async fn vertex_gemini_tts(
+    script: &str,
+    voice_name: Option<&str>,
+    tts_prompt_template: Option<&str>,
+    tts_style_instructions: Option<&str>,
+    request_project_id: Option<&str>,
+    request_location: Option<&str>,
+    request_model: Option<&str>,
+    request_endpoint: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = Client::new();
+    let service_account = load_vertex_service_account()?;
+    let access_token = fetch_vertex_access_token(&client, &service_account).await?;
+    let env_project_id = std::env::var("VERTEX_TTS_PROJECT_ID").ok();
+    let project_id = request_project_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| env_project_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+        .or_else(|| service_account.project_id.clone().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+        .ok_or("Vertex TTS project_id is not configured")?;
+    let env_location = std::env::var("VERTEX_TTS_LOCATION").ok();
+    let location = request_location
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| env_location.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| VERTEX_TTS_DEFAULT_LOCATION.to_string());
+    if location != "global" {
+        return Err(format!("Vertex TTS location must be global, got {}", location).into());
+    }
+    let env_model = std::env::var("VERTEX_TTS_MODEL").ok();
+    let model = request_model
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| env_model.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| VERTEX_TTS_DEFAULT_MODEL.to_string());
+    let env_endpoint = std::env::var("VERTEX_TTS_ENDPOINT").ok();
+    let endpoint = request_endpoint
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| env_endpoint.map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| VERTEX_TTS_DEFAULT_ENDPOINT.to_string());
+    let url = format!(
+        "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        endpoint, project_id, location, model
+    );
+    let payload = build_tts_payload(script, voice_name, tts_prompt_template, tts_style_instructions);
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        println!("[PIPELINE] vertex_gemini_tts using model={} location={} attempt={}", model, location, attempt + 1);
+        let res = client
+            .post(&url)
+            .bearer_auth(&access_token)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        let body = res.text().await.unwrap_or_default();
+        if (200..300).contains(&status) {
+            let json: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+            if let Some(data) = extract_tts_audio_b64(&json) {
+                return Ok(data);
+            }
+            last_err = format!("Vertex TTS success_without_audio_body: {}", redact_vertex_error(&body));
+        } else {
+            last_err = format!("Vertex TTS http_{}: {}", status, redact_vertex_error(&body));
+        }
+        println!("[PIPELINE] vertex_gemini_tts attempt {} failed: {}", attempt + 1, last_err);
+        sleep(Duration::from_secs(5 + (attempt as u64 * 3))).await;
+    }
+    Err(format!("Vertex TTS failed after retries: {}", last_err).into())
+}
+
+async fn gemini_tts_api_key_fallback(
     script: &str,
     api_key: &str,
     voice_name: Option<&str>,
@@ -750,39 +949,7 @@ async fn gemini_tts(
     tts_style_instructions: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
-    let selected_voice = voice_name
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Puck");
-
-    // gemini-3.1-flash-tts-preview pattern: Script in `contents.parts.text`,
-    // Style Instructions in `systemInstruction.parts.text`.
-    // For older models the systemInstruction field is harmlessly ignored.
-    let style_text: String = tts_style_instructions
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| extract_style_from_legacy_template(tts_prompt_template))
-        .unwrap_or_default();
-
-    // gemini-3.1-flash-tts-preview rejects `systemInstruction`. Both 3.1 and 2.5 still need
-    // voiceConfig. Style Instructions are inlined as a prefix to the script text so the model
-    // follows the delivery direction without reading the prefix aloud (matches Vertex Studio UX).
-    let script_only = script.trim().to_string();
-    let final_text = if style_text.is_empty() {
-        // Legacy path: use combined template if no style provided.
-        build_tts_input(script, tts_prompt_template)
-    } else {
-        format!("[Voice direction: {}]\n\n{}", style_text, script_only)
-    };
-
-    let payload = json!({
-        "contents": [{"parts": [{"text": final_text}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": selected_voice}}}
-        }
-    });
-
+    let payload = build_tts_payload(script, voice_name, tts_prompt_template, tts_style_instructions);
     let mut last_err = String::new();
     let tts_models = [
         "gemini-3.1-flash-tts-preview",
@@ -796,44 +963,61 @@ async fn gemini_tts(
             model,
             api_key
         );
-        println!("[PIPELINE] gemini_tts using model={}", model);
+        println!("[PIPELINE] gemini_tts_api_key_fallback using model={}", model);
         for attempt in 0..3 {
             let res = client.post(&url).json(&payload).send().await?;
             let status = res.status().as_u16();
             let body = res.text().await.unwrap_or_default();
-            if status >= 200 && status < 300 {
+            if (200..300).contains(&status) {
                 let json: Value = serde_json::from_str(&body).unwrap_or(json!({}));
-                if let Some(data) = json
-                    .get("candidates")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("content"))
-                    .and_then(|c| c.get("parts"))
-                    .and_then(|p| p.get(0))
-                    .and_then(|p| p.get("inlineData"))
-                    .and_then(|i| i.get("data"))
-                    .and_then(|d| d.as_str())
-                {
-                    return Ok(data.to_string());
+                if let Some(data) = extract_tts_audio_b64(&json) {
+                    return Ok(data);
                 }
-                last_err = format!(
-                    "TTS model={} success_without_audio_body: {}",
-                    model,
-                    body.chars().take(300).collect::<String>()
-                );
-                println!("[PIPELINE] gemini_tts attempt {} missing audio: {}", attempt + 1, last_err);
+                last_err = format!("TTS fallback model={} success_without_audio_body: {}", model, redact_vertex_error(&body));
             } else {
-                last_err = format!(
-                    "TTS model={} http_{}: {}",
-                    model,
-                    status,
-                    body.chars().take(300).collect::<String>()
-                );
-                println!("[PIPELINE] gemini_tts attempt {} failed: {}", attempt + 1, last_err);
+                last_err = format!("TTS fallback model={} http_{}: {}", model, status, redact_vertex_error(&body));
             }
+            println!("[PIPELINE] gemini_tts_api_key_fallback attempt {} failed: {}", attempt + 1, last_err);
             sleep(Duration::from_secs(5 + (attempt as u64 * 3))).await;
         }
     }
-    Err(format!("TTS failed after retries: {}", last_err).into())
+    Err(format!("TTS API-key fallback failed after retries: {}", last_err).into())
+}
+
+async fn gemini_tts(
+    script: &str,
+    api_key: &str,
+    voice_name: Option<&str>,
+    tts_prompt_template: Option<&str>,
+    tts_style_instructions: Option<&str>,
+    request_project_id: Option<&str>,
+    request_location: Option<&str>,
+    request_model: Option<&str>,
+    request_endpoint: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match vertex_gemini_tts(
+        script,
+        voice_name,
+        tts_prompt_template,
+        tts_style_instructions,
+        request_project_id,
+        request_location,
+        request_model,
+        request_endpoint,
+    ).await {
+        Ok(audio) => Ok(audio),
+        Err(vertex_err) => {
+            let allow_fallback = std::env::var("VIDEO_AFFILIATE_TTS_ALLOW_API_KEY_FALLBACK")
+                .ok()
+                .and_then(|v| parse_env_bool(&v))
+                .unwrap_or(false);
+            if allow_fallback {
+                println!("[PIPELINE] Vertex TTS failed; using API-key fallback: {}", vertex_err);
+                return gemini_tts_api_key_fallback(script, api_key, voice_name, tts_prompt_template, tts_style_instructions).await;
+            }
+            Err(vertex_err)
+        }
+    }
 }
 
 // Fallback: Simple script to SRT when Whisper fails
@@ -1583,6 +1767,10 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
                     req.voice_name.as_deref(),
                     req.tts_prompt_template.as_deref(),
                     req.tts_style_instructions.as_deref(),
+                    req.vertex_tts_project_id.as_deref(),
+                    req.vertex_tts_location.as_deref(),
+                    req.vertex_tts_model.as_deref(),
+                    req.vertex_tts_endpoint.as_deref(),
                 ).await?;
                 let raw_audio = tmp_path.join("audio.raw");
                 fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;
