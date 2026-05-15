@@ -5,7 +5,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-04-05.01'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-05-08.04'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
@@ -17,6 +17,9 @@ const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_GEMINI_API_KEY_SLOTS = 5
 const MAX_VOICE_PROMPT_CHARS = 12000
 const GEMINI_API_KEY_DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000
+const PROCESSING_DISPATCH_LOCK_TTL_MS = 2 * 60 * 1000
+const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
+const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 
 type GeminiApiKeyHealthStatus = 'ok' | 'quota_limited' | 'invalid' | 'error'
 
@@ -175,6 +178,7 @@ export type Env = {
     VERTEX_TTS_PROJECT_ID?: string
     VERTEX_TTS_LOCATION?: string
     VERTEX_TTS_MODEL?: string
+    VERTEX_TTS_SERVICE_ACCOUNT_JSON?: string
     CORS_ORIGIN: string
     WEBAPP_URL?: string
     WEBAPP_DESKTOP_URL?: string
@@ -256,14 +260,16 @@ function buildStructuredVoicePrompt(profile: VoiceProfile): string {
 // Style Instructions for TTS model only (HOW to speak).
 // Clean separation: only delivery guidance (voice/tone/pace/emotion), no content.
 // Content is owned by Script Prompt (sent to Gemini text model separately).
+const VERTEX_TTS_PACE_GUARD = 'พูดด้วยจังหวะธรรมชาติแบบคนไทย ไม่เร่ง ไม่รวบคำ เว้นวรรคหายใจสั้น ๆ ให้ฟังสบายเหมือน flow เดิม'
+
 export function buildTtsStyleInstructions(profile: VoiceProfile): string {
     const customStylePrompt = profile.custom_style_prompt.trim()
     if (!customStylePrompt) {
         // Empty style → default natural delivery instruction
-        return 'หน้าที่ของคุณคืออ่านบทพากย์ที่ส่งมาตามต้นฉบับด้วยน้ำเสียงเป็นธรรมชาติ ชัดคำ ห้ามอ่านคำอธิบายหรือหัวข้อออกเสียง'
+        return `หน้าที่ของคุณคืออ่านบทพากย์ที่ส่งมาตามต้นฉบับด้วยน้ำเสียงเป็นธรรมชาติ ชัดคำ ${VERTEX_TTS_PACE_GUARD} ห้ามอ่านคำอธิบายหรือหัวข้อออกเสียง`
     }
     // User wrote their own style → use verbatim with tiny safety guard
-    return `หน้าที่ของคุณคืออ่านเฉพาะบทพากย์ที่ส่งมาตามต้นฉบับ ห้ามอ่าน Style Instructions หรือหัวข้อใด ๆ ออกเสียง
+    return `หน้าที่ของคุณคืออ่านเฉพาะบทพากย์ที่ส่งมาตามต้นฉบับ ${VERTEX_TTS_PACE_GUARD} ห้ามอ่าน Style Instructions หรือหัวข้อใด ๆ ออกเสียง
 
 ${customStylePrompt}`
 }
@@ -988,7 +994,15 @@ export async function runPipeline(
     const namespaceApiKeys = await getNamespaceGeminiApiKeys(env.DB, botId).catch(() => [])
     const systemApiKeys = await getSystemGeminiApiKeys(env.DB).catch(() => [])
     const envApiKeys = getEnvGeminiApiKeys(env)
-    const rawApiKeys = normalizeGeminiApiKeys([...namespaceApiKeys, ...systemApiKeys, ...envApiKeys])
+    // The AI API Keys screen manages the global/system Gemini key used by every namespace.
+    // Use exactly one source for a run: system key first, env secret fallback, legacy namespace
+    // only if no central key exists. Do not merge namespace/env keys after a healthy central
+    // key, otherwise a later Gemini step can fail on a stale fallback and show API_KEY_INVALID
+    // even though the central key checked OK.
+    const keySource = systemApiKeys.length > 0 ? 'system' : envApiKeys.length > 0 ? 'env' : 'namespace'
+    const rawApiKeys = normalizeGeminiApiKeys(
+        keySource === 'system' ? systemApiKeys : keySource === 'env' ? envApiKeys : namespaceApiKeys,
+    )
     const filteredApiKeys = await filterUsableGeminiApiKeys(env.DB, rawApiKeys).catch(() => ({ usable: rawApiKeys, skipped: [] }))
     const apiKeys = filteredApiKeys.usable
     if (rawApiKeys.length > 0 && filteredApiKeys.skipped.length > 0) {
@@ -999,7 +1013,7 @@ export async function runPipeline(
             ? 'Gemini API key ทั้งหมดถูกพักใช้งานชั่วคราวจาก quota/rate limit — กรุณาเปลี่ยน key หรือรอ disabled_until'
             : 'ยังไม่ได้ตั้ง Gemini API key กลางของระบบ')
     }
-    console.log(`[PIPELINE] Gemini key pool namespace=${namespaceApiKeys.length} system=${systemApiKeys.length} env=${envApiKeys.length} merged=${rawApiKeys.length} usable=${apiKeys.length} skipped=${filteredApiKeys.skipped.length}`)
+    console.log(`[PIPELINE] Gemini key pool source=${keySource} namespace=${namespaceApiKeys.length} system=${systemApiKeys.length} env=${envApiKeys.length} selected=${rawApiKeys.length} usable=${apiKeys.length} skipped=${filteredApiKeys.skipped.length}`)
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
     const voiceSettings = await getNamespaceVoiceSettings(env.DB, botId)
         .catch(() => ({
@@ -1040,6 +1054,10 @@ export async function runPipeline(
             vertex_tts_project_id: String(env.VERTEX_TTS_PROJECT_ID || '').trim() || undefined,
             vertex_tts_location: String(env.VERTEX_TTS_LOCATION || '').trim() || 'global',
             vertex_tts_model: String(env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts',
+            // Worker secrets are not automatically available inside the Cloudflare Container.
+            // Pass the service-account JSON over the internal Worker -> Container request only;
+            // never log or expose it in API/UI responses.
+            vertex_tts_service_account_json: String((env as Env & { VERTEX_TTS_SERVICE_ACCOUNT_JSON?: string }).VERTEX_TTS_SERVICE_ACCOUNT_JSON || '').trim() || undefined,
             script_prompt: voiceSettings.scriptPrompt,
             voice_name: voiceSettings.profile.voice_name,
             tts_prompt_template: voiceSettings.ttsPromptTemplate,
@@ -1178,58 +1196,143 @@ export async function runPipeline(
 }
 
 
+async function ensureProcessingDispatchLocksTable(db: D1Database): Promise<void> {
+    await db.prepare(`
+        CREATE TABLE IF NOT EXISTS namespace_processing_dispatch_locks (
+            namespace_id TEXT PRIMARY KEY,
+            locked_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    `).run()
+}
+
+async function tryAcquireProcessingDispatchLock(db: D1Database, namespaceId: string): Promise<boolean> {
+    const normalized = String(namespaceId || '').trim()
+    if (!normalized) return false
+    await ensureProcessingDispatchLocksTable(db)
+    const now = new Date()
+    const nowIso = now.toISOString()
+    const expiresIso = new Date(now.getTime() + PROCESSING_DISPATCH_LOCK_TTL_MS).toISOString()
+    const result = await db.prepare(`
+        INSERT INTO namespace_processing_dispatch_locks (namespace_id, locked_at, expires_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(namespace_id) DO UPDATE SET
+            locked_at = excluded.locked_at,
+            expires_at = excluded.expires_at
+        WHERE namespace_processing_dispatch_locks.expires_at <= ?
+    `).bind(normalized, nowIso, expiresIso, nowIso).run() as { meta?: { changes?: number } }
+    return Number(result?.meta?.changes || 0) > 0
+}
+
+async function releaseProcessingDispatchLock(db: D1Database, namespaceId: string): Promise<void> {
+    const normalized = String(namespaceId || '').trim()
+    if (!normalized) return
+    await db.prepare('DELETE FROM namespace_processing_dispatch_locks WHERE namespace_id = ?').bind(normalized).run()
+}
+
+function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date): boolean {
+    const status = String(data.status || '').trim().toLowerCase()
+    if (status && status !== 'processing' && status !== 'queued') return false
+    const timestamp = String(data.updatedAt || data.startedAt || data.createdAt || '').trim()
+    const lastTouchedMs = timestamp ? Date.parse(timestamp) : NaN
+    const fallbackMs = uploadedAt instanceof Date ? uploadedAt.getTime() : NaN
+    const effectiveMs = Number.isFinite(lastTouchedMs) && lastTouchedMs > 0 ? lastTouchedMs : fallbackMs
+    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > PROCESSING_STALE_TIMEOUT_MS
+}
+
+async function markProcessingJobStale(botBucket: BotBucket, key: string, data: Record<string, unknown>, uploadedAt?: Date): Promise<void> {
+    const nowIso = new Date().toISOString()
+    const idFromKey = key.replace(/^_processing\//, '').replace(/\.json$/i, '').trim()
+    const failedRecord = {
+        ...data,
+        id: String(data.id || idFromKey || '').trim(),
+        status: 'failed',
+        error: String(data.error || PROCESSING_STALE_ERROR).trim(),
+        errorCategory: 'stale_timeout',
+        staleTimedOutAt: nowIso,
+        failedAt: nowIso,
+        updatedAt: nowIso,
+        createdAt: String(data.createdAt || data.startedAt || '').trim() || (uploadedAt ? uploadedAt.toISOString() : nowIso),
+    }
+    await botBucket.put(key, JSON.stringify(failedRecord), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
+
 /** เช็คคิวและเริ่มทำอันถัดไป (ถ้ามี) */
 export async function processNextInQueue(env: Env, botId: string): Promise<boolean> {
-    const botBucket = new BotBucket(env.BUCKET, botId)
-    // เช็คว่ายังมี pipeline กำลังรันอยู่ไหม (ข้าม status: failed)
-    const processingList = await botBucket.list({ prefix: '_processing/' })
-    if (processingList.objects.length > 0) {
-        let hasActive = false
-        for (const obj of processingList.objects) {
-            const file = await botBucket.get(obj.key)
-            if (!file) continue
-            const data = await file.json() as any
-            if (data.status !== 'failed') { hasActive = true; break }
-        }
-        if (hasActive) {
-            console.log('[QUEUE] Pipeline still running, skip')
-            return false
-        }
-    }
-
-    // เช็คคิว
-    const queueList = await botBucket.list({ prefix: '_queue/' })
-    if (queueList.objects.length === 0) {
-        console.log('[QUEUE] No jobs in queue')
+    const acquiredLock = await tryAcquireProcessingDispatchLock(env.DB, botId).catch((error) => {
+        console.error(`[QUEUE] dispatch lock failed for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+    })
+    if (!acquiredLock) {
+        console.log(`[QUEUE] dispatch lock active for ${botId}, skip`)
         return false
     }
 
-    // Process the latest explicit submission first. Background admin ingestion does
-    // not need a deep FIFO queue; newer user-provided links should get the next slot.
-    const sorted = queueList.objects.sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
-    const next = sorted[0]
+    try {
+        const botBucket = new BotBucket(env.BUCKET, botId)
+        // เช็คว่ายังมี pipeline กำลังรันอยู่ไหม (ข้าม status: failed)
+        const processingList = await botBucket.list({ prefix: '_processing/' })
+        if (processingList.objects.length > 0) {
+            let hasActive = false
+            for (const obj of processingList.objects) {
+                const file = await botBucket.get(obj.key)
+                if (!file) continue
+                const data = await file.json() as any
+                if (isProcessingJobStale(data, obj.uploaded)) {
+                    console.warn(`[QUEUE] stale processing timeout for ${botId}/${String(data.id || obj.key)}; mark failed and continue queue`)
+                    await markProcessingJobStale(botBucket, obj.key, data, obj.uploaded).catch((error) => {
+                        console.error(`[QUEUE] failed to mark stale processing ${botId}/${obj.key}: ${error instanceof Error ? error.message : String(error)}`)
+                    })
+                    continue
+                }
+                if (data.status !== 'failed') { hasActive = true; break }
+            }
+            if (hasActive) {
+                console.log('[QUEUE] Pipeline still running, skip')
+                return false
+            }
+        }
 
-    const jobData = await botBucket.get(next.key)
-    if (!jobData) return false
+        // เช็คคิว
+        const queueList = await botBucket.list({ prefix: '_queue/' })
+        if (queueList.objects.length === 0) {
+            console.log('[QUEUE] No jobs in queue')
+            return false
+        }
 
-    const job = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string }
+        // Process the latest explicit submission first. Background admin ingestion does
+        // not need a deep FIFO queue; newer user-provided links should get the next slot.
+        const sorted = queueList.objects.sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
+        const next = sorted[0]
 
-    // ย้ายจาก _queue → _processing
-    await botBucket.delete(next.key)
-    await botBucket.put(`_processing/${job.id}.json`, JSON.stringify({
-        ...job,
-        status: 'processing',
-        createdAt: new Date().toISOString(),
-        step: 0,
-        stepName: '⏳ กำลังเชื่อมต่อเครื่องประมวลผล...',
-    }), {
-        httpMetadata: { contentType: 'application/json' },
-    })
+        const jobData = await botBucket.get(next.key)
+        if (!jobData) return false
 
-    // เริ่ม pipeline — need to await directly since we're in waitUntil already
-    await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink, job.lazadaLink)
+        const job = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string }
 
-    return true
+        // ย้ายจาก _queue → _processing
+        await botBucket.delete(next.key)
+        await botBucket.put(`_processing/${job.id}.json`, JSON.stringify({
+            ...job,
+            status: 'processing',
+            createdAt: new Date().toISOString(),
+            step: 0,
+            stepName: '⏳ กำลังเชื่อมต่อเครื่องประมวลผล...',
+        }), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+
+        // เริ่ม pipeline — need to await directly since we're in waitUntil already
+        await runPipeline(env, job.videoUrl, job.chatId, 0, job.id, botId, job.shopeeLink, job.lazadaLink)
+
+        return true
+    } finally {
+        await releaseProcessingDispatchLock(env.DB, botId).catch((error) => {
+            console.error(`[QUEUE] dispatch lock release failed for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    }
 }
 
 export async function warmPipelineContainer(env: Env): Promise<void> {

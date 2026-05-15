@@ -56,7 +56,10 @@ export function InboxCard({
   const thumbnailUrl = String(resolveThumbnailUrl(video) || video.thumbnailUrl || '').trim()
   const fallbackThumbnailUrl = String(video.fallbackThumbnailUrl || '').trim()
   const playbackPosterUrl = thumbnailUrl
-  const createdAtLabel = new Date(video.createdAt).toLocaleString('th-TH', {
+  const displayTimestamp = isProcessedView
+    ? String(video.processedAt || video.updatedAt || video.createdAt || '').trim()
+    : String(video.createdAt || video.updatedAt || '').trim()
+  const createdAtLabel = new Date(displayTimestamp).toLocaleString('th-TH', {
     day: '2-digit',
     month: 'short',
     hour: '2-digit',

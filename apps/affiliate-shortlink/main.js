@@ -337,6 +337,7 @@ const consecutiveFailures = { shopee: 0, lazada: 0 };
 const FAILURES_BEFORE_RESTART = 3;                // 3 full-wrapper failures in a row → relaunch
 const MIN_RESTART_INTERVAL_MS = 10 * 60 * 1000;   // rate-limit: at most 1 restart per 10 min
 const MANUAL_LOGIN_GRACE_MS = 15 * 60 * 1000;     // keep login pages stable while a human signs in
+const LAZADA_MTOP_COOKIE_NAMES = new Set(['_m_h5_tk', '_m_h5_tk_enc']);
 const manualLoginUntil = { shopee: 0, lazada: 0 };
 let lastAppRestartAt = 0;
 let restartScheduled = false;
@@ -414,6 +415,23 @@ async function reloadAndWait(win, loadUrl) {
     await new Promise(r => setTimeout(r, 1500));
 }
 
+async function loadUrlAndWait(win, loadUrl) {
+    if (!win || win.isDestroyed()) return;
+    await new Promise((resolve) => {
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            try { win.webContents.removeListener('did-finish-load', done); } catch {}
+            resolve();
+        };
+        try { win.webContents.once('did-finish-load', done); } catch {}
+        try { win.loadURL(loadUrl, { userAgent: CHROME_UA }); } catch {}
+        setTimeout(done, 10000);
+    });
+    await new Promise(r => setTimeout(r, 1500));
+}
+
 async function reloadWindowSerialized(platform, win, loadUrl) {
     if (isManualLoginProtected(platform, win)) {
         console.log(`[${platform}] reload skipped — manual login guard is active`);
@@ -424,6 +442,50 @@ async function reloadWindowSerialized(platform, win, loadUrl) {
     reloadLocks[platform] = p;
     try { await p; } finally { reloadLocks[platform] = null; }
     return p;
+}
+
+function cookieRemovalUrl(cookie) {
+    const domain = String(cookie && cookie.domain || '').replace(/^\./, '') || 'www.lazada.co.th';
+    const rawPath = String(cookie && cookie.path || '/');
+    const pathPart = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+    const protocol = cookie && cookie.secure === false ? 'http' : 'https';
+    return `${protocol}://${domain}${pathPart}`;
+}
+
+async function clearLazadaMtopCookies() {
+    const ses = session.fromPartition(lazadaSession);
+    const cookies = await ses.cookies.get({});
+    const targets = cookies.filter(cookie => {
+        const name = String(cookie.name || '');
+        const domain = String(cookie.domain || '').toLowerCase();
+        return LAZADA_MTOP_COOKIE_NAMES.has(name) && domain.includes('lazada.');
+    });
+
+    let removed = 0;
+    for (const cookie of targets) {
+        try {
+            await ses.cookies.remove(cookieRemovalUrl(cookie), cookie.name);
+            removed++;
+        } catch (err) {
+            console.warn(`[Lazada] failed to clear mtop cookie ${cookie.name}: ${err.message || err}`);
+        }
+    }
+    if (targets.length) console.log(`[Lazada] cleared ${removed}/${targets.length} mtop token cookies`);
+    return removed;
+}
+
+async function recoverLazadaSession(reason = '') {
+    const win = createLazadaWindow(false);
+    if (isManualLoginProtected('lazada', win)) {
+        console.warn('[Lazada] auto recovery skipped — manual login guard is active');
+        return false;
+    }
+
+    const suffix = reason ? ` after ${reason}` : '';
+    console.log(`[Lazada] refreshing mtop session${suffix}`);
+    await clearLazadaMtopCookies();
+    await loadUrlAndWait(win, LAZADA_URL);
+    return true;
 }
 
 async function shortenShopeeOnce(productUrl, subIds) {
@@ -577,28 +639,25 @@ async function shortenLazada(productUrl) {
             try {
                 const result = await shortenLazadaOnce(productUrl);
                 consecutiveFailures.lazada = 0;
+                manualLoginUntil.lazada = 0;
                 return result;
             } catch (err) {
                 lastErr = err;
                 const recoverable = isSessionLikelyExpired(err);
                 console.warn(`[Lazada] attempt ${attempt}/${MAX_SHORTEN_ATTEMPTS} failed (${recoverable ? 'recoverable' : 'non-recoverable'}): ${err.message}`);
-                if (recoverable && isManualLoginProtected('lazada', lazadaWindow)) {
-                    console.warn('[Lazada] manual login guard active — not reloading while user signs in');
-                    break;
-                }
-                if (recoverable && /SESSION|TOKEN_EMPTY|TOKEN_EXPIRED|ILLEGAL_ACCESS|UNAUTHORIZED|LOGIN|CSRF|FAIL_SYS|401|403/i.test(String(err.message || err))) {
-                    markManualLogin('lazada', 'session-expired');
-                    createLazadaWindow(true);
-                    break;
-                }
                 if (!recoverable || attempt === MAX_SHORTEN_ATTEMPTS) break;
                 await new Promise(r => setTimeout(r, BETWEEN_ATTEMPT_DELAY_MS[attempt] || 3500));
-                await reloadWindowSerialized('lazada', createLazadaWindow(), LAZADA_URL);
+                const recovered = await recoverLazadaSession(err.message || String(err));
+                if (!recovered) break;
             }
         }
         consecutiveFailures.lazada++;
         if (consecutiveFailures.lazada >= FAILURES_BEFORE_RESTART) {
             triggerAppRestartIfStuck('lazada');
+        }
+        if (lastErr && isSessionLikelyExpired(lastErr)) {
+            markManualLogin('lazada', 'session-expired-after-auto-recovery');
+            createLazadaWindow(true);
         }
         throw lastErr;
     } finally {
@@ -629,7 +688,11 @@ function schedulePeriodicRefresh(platform, getWin, loadUrl, offsetMs = 0) {
             }
             console.log(`[${platform}] periodic refresh (every ${REFRESH_INTERVAL_MS / 60000}m)`);
             try {
-                await reloadWindowSerialized(platform, win, loadUrl);
+                if (platform === 'lazada') {
+                    await recoverLazadaSession('periodic-refresh');
+                } else {
+                    await reloadWindowSerialized(platform, win, loadUrl);
+                }
             } catch (e) {
                 console.warn(`[${platform}] periodic refresh failed:`, e.message || e);
             }

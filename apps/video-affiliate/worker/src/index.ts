@@ -106,7 +106,7 @@ async function getFacebookAdsApi(): Promise<FacebookSdkApi> {
 const app = new Hono<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>()
 const MAX_VOICE_PROMPT_CHARS = 12000
 const MAX_GEMINI_API_KEY_CHARS = 512
-const MAX_GEMINI_API_KEY_SLOTS = 5
+const MAX_GEMINI_API_KEY_SLOTS = 1
 const MAX_SHORTLINK_BASE_URL_CHARS = 512
 const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
@@ -1967,12 +1967,11 @@ async function claimGalleryVideoForPosting(params: {
             // "โพสต์แล้ว" within minutes WITHOUT actually posting to FB.
             // Operator complaint: "โพสต์ ต้องถูกโพสต์จริงๆสิ ถึงจะย้ายไป โพสต์แล้ว"
             //
-            // Critically we DO NOT bypass the dedup `continue` — the page guard
-            // is still seeded so the cron will not re-post this video to a page
-            // that already has it (would cause duplicates). Net effect: video
-            // stays in "ยังไม่โพสต์" tab and is not picked up for posting again.
-            // Operator can delete the post_history row(s) manually if they want
-            // a true repost, OR move to a fresh page.
+            // If the operator manually moved this video back to "ยังไม่โพสต์"
+            // after its last successful post, treat that as explicit repost intent.
+            // Older behavior left the card visible in the unposted tab but still
+            // skipped it at claim time, which made the UI say there were no usable
+            // videos even though the operator had just clicked repost.
             let manualUnpostedAtMs = 0
             try {
                 const muRow = await params.db.prepare(
@@ -1999,37 +1998,36 @@ async function claimGalleryVideoForPosting(params: {
             // video. The dedup `continue` below is enough to prevent re-posting
             // — and recordPagePostedVideoGuard (seeded right after) gives the
             // next cron tick a fast O(1) skip without re-running the expensive
-            // post_history query, so we don't pay perf for keeping state honest.
-            //
-            // Tradeoff: the duplicate-content video will sit in "ยังไม่โพสต์"
-            // tab forever. Operator can delete it manually if they don't want
-            // it lingering. This is the trade-off they explicitly asked for —
-            // "โพสต์ ต้องถูกโพสต์จริงๆ ถึงจะย้ายไป โพสต์แล้ว".
-            const matchAction = operatorReverted
-                ? 'manual_unposted_at protects (skip heal)'
-                : 'fingerprint/video_id match (skip heal — state stays honest)'
-            console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'}) — ${matchAction}`)
+            // post_history query. If manual_unposted_at is newer than the history,
+            // the operator explicitly requested a repost, so we allow the candidate
+            // through while keeping old history from auto-healing state.posted_at.
+            if (operatorReverted) {
+                console.log(`[CLAIM-DEDUP] Allow manual repost ${videoId} ns=${namespaceId} — previous ${matchKind} history_id=${existingNamespacePost.id ?? '?'} posted_at=${postedAt} manual_unposted_at=${new Date(manualUnpostedAtMs).toISOString()}`)
+            } else {
+                const matchAction = 'fingerprint/video_id match (skip heal — state stays honest)'
+                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'}) — ${matchAction}`)
 
-            if (seenPageId) {
+                if (seenPageId) {
+                    await recordPagePostedVideoGuard(params.db, {
+                        namespaceId,
+                        pageId: seenPageId,
+                        videoId,
+                        sourceFingerprint,
+                        historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
+                        postedAt,
+                    }).catch(() => { })
+                }
+                // Also seed a guard for the CURRENT page so the next race can't re-post here either.
                 await recordPagePostedVideoGuard(params.db, {
                     namespaceId,
-                    pageId: seenPageId,
+                    pageId,
                     videoId,
                     sourceFingerprint,
                     historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
                     postedAt,
                 }).catch(() => { })
+                continue
             }
-            // Also seed a guard for the CURRENT page so the next race can't re-post here either.
-            await recordPagePostedVideoGuard(params.db, {
-                namespaceId,
-                pageId,
-                videoId,
-                sourceFingerprint,
-                historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
-                postedAt,
-            }).catch(() => { })
-            continue
         }
 
         const namespaceDuplicateCheck = await ensureNamespaceVideoNeverPosted({
@@ -2079,9 +2077,8 @@ async function ensureNamespaceVideoNeverPosted(params: {
 
     // 2026-05-04: Same heal-suppression as claimGalleryVideoForPosting (above).
     // If operator manually unposted via the orange refresh button after the last
-    // successful post, do NOT write state.posted_at back. The dedup `ok: false`
-    // return is preserved so we never repost — UI stays "ยังไม่โพสต์" until
-    // manually intervened with (e.g. delete post_history row, or repost via UI).
+    // successful post, do NOT write state.posted_at back and do NOT block the
+    // repost attempt. Page-level guards are still checked separately below.
     let manualUnpostedAtMs = 0
     try {
         const muRow = await params.db.prepare(
@@ -2099,17 +2096,22 @@ async function ensureNamespaceVideoNeverPosted(params: {
         && Number.isFinite(postedAtMs)
         && postedAtMs <= manualUnpostedAtMs
 
+    // If manual_unposted_at is newer than the latest successful namespace
+    // history row, the operator clicked repost/reset after that Facebook post.
+    // Treat it as explicit repost intent: keep old history from healing
+    // state.posted_at, but do not block the newly requested post attempt.
+    if (operatorReverted) {
+        console.log(`[NS-NEVER-POSTED] Allow manual repost ${params.videoId} ns=${params.namespaceId}. post_history.posted_at=${postedAt} manual_unposted_at=${new Date(manualUnpostedAtMs).toISOString()}.`)
+        return { ok: true }
+    }
+
     // 2026-05-04 (v3): Same as claimGalleryVideoForPosting — NEVER write
-    // state.posted_at back on dedup match (whether operator-reverted or not).
-    // Just block re-posting via ok:false. Operator wants UI to reflect actual
-    // FB state; auto-healing posted_at from a sibling post_history row was
-    // surfacing fake "posted at 2026-04-25" timestamps for videos uploaded
-    // today that share a source_fingerprint with an old post.
-    const matchAction = operatorReverted
-        ? 'manual_unposted_at protects'
-        : 'sibling history match (skip heal — state stays honest)'
-    console.log(`[NS-NEVER-POSTED] Skip ${params.videoId} ns=${params.namespaceId} — ${matchAction}. post_history.posted_at=${postedAt} manual_unposted_at=${manualUnpostedAtMs ? new Date(manualUnpostedAtMs).toISOString() : '-'}.`)
-    void operatorReverted
+    // state.posted_at back on dedup match. Just block re-posting via ok:false.
+    // Operator wants UI to reflect actual FB state; auto-healing posted_at from
+    // a sibling post_history row was surfacing fake "posted at 2026-04-25"
+    // timestamps for videos uploaded today that share a source_fingerprint with
+    // an old post.
+    console.log(`[NS-NEVER-POSTED] Skip ${params.videoId} ns=${params.namespaceId} — sibling history match (skip heal — state stays honest). post_history.posted_at=${postedAt} manual_unposted_at=-.`)
     return {
         ok: false,
         postedAt: postedAt || null,
@@ -3070,6 +3072,14 @@ async function isNamespaceAffiliateShortlinkRequired(db: D1Database, namespaceId
     const adminManaged = await isNamespaceShortlinkAdminManaged(db, normalizedNamespaceId)
     if (!adminManaged) return false
     return await getNamespaceShopeeShortlinkRequired(db, normalizedNamespaceId).catch(() => false)
+}
+
+async function isNamespaceAffiliateShortlinkProcessingRequired(db: D1Database, namespaceId: string): Promise<boolean> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) return false
+    const adminManaged = await isNamespaceShortlinkAdminManaged(db, normalizedNamespaceId)
+    if (!adminManaged) return false
+    return await getNamespaceShopeeShortlinkProcessingRequired(db, normalizedNamespaceId).catch(() => false)
 }
 
 function isUnifiedGalleryEnabled(): boolean {
@@ -4519,6 +4529,202 @@ function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | nu
     return hasShopeeLink && hasLazadaLink
 }
 
+type DashboardGalleryView = 'ready' | 'used'
+
+type DashboardGalleryPageResult = {
+    videos: Array<Record<string, unknown>>
+    total: number
+    overallTotal: number
+    readyTotal: number
+    usedTotal: number
+    inventoryTotal: number
+    libraryTotal: number
+    hasMore: boolean
+}
+
+const DASHBOARD_GALLERY_SELECT_COLUMNS = `
+    gi.namespace_id,
+    gi.video_id,
+    gi.owner_email,
+    gi.script,
+    gi.title,
+    gi.category,
+    gi.duration,
+    COALESCE(NULLIF(TRIM(nvs.shopee_link), ''), gi.shopee_link) AS shopee_link,
+    COALESCE(NULLIF(TRIM(nvs.lazada_link), ''), gi.lazada_link) AS lazada_link,
+    COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), gi.shopee_original_link) AS shopee_original_link,
+    COALESCE(NULLIF(TRIM(nvs.lazada_original_link), ''), gi.lazada_original_link) AS lazada_original_link,
+    COALESCE(NULLIF(TRIM(nvs.shopee_converted_at), ''), gi.shopee_converted_at) AS shopee_converted_at,
+    COALESCE(NULLIF(TRIM(nvs.lazada_converted_at), ''), gi.lazada_converted_at) AS lazada_converted_at,
+    COALESCE(NULLIF(TRIM(nvs.lazada_member_id), ''), gi.lazada_member_id) AS lazada_member_id,
+    gi.public_url,
+    gi.original_url,
+    gi.thumbnail_url,
+    gi.created_at,
+    gi.processed_at,
+    gi.updated_at,
+    gi.is_original_only,
+    COALESCE(nvs.posted_at, '') AS posted_at,
+    COALESCE(nvs.manual_unposted_at, '') AS manual_unposted_at,
+    COALESCE(nvs.source_fingerprint, '') AS source_fingerprint
+`
+
+const DASHBOARD_GALLERY_FROM_JOIN = `
+    FROM gallery_index gi
+    LEFT JOIN namespace_video_state nvs
+      ON nvs.namespace_id = gi.namespace_id
+     AND nvs.video_id = gi.video_id
+`
+
+const DASHBOARD_GALLERY_DISPLAY_WHERE = `
+    gi.namespace_id = ?
+    AND gi.has_public_video = 1
+    AND TRIM(COALESCE(gi.public_url, '')) <> ''
+    AND TRIM(COALESCE(COALESCE(NULLIF(TRIM(nvs.shopee_link), ''), gi.shopee_link, gi.shopee_original_link), '')) <> ''
+    AND TRIM(COALESCE(COALESCE(NULLIF(TRIM(nvs.lazada_link), ''), gi.lazada_link, gi.lazada_original_link), '')) <> ''
+`
+
+const DASHBOARD_GALLERY_POSTED_SQL = `
+    TRIM(COALESCE(nvs.posted_at, '')) <> ''
+    AND NOT (
+        strftime('%s', nvs.posted_at) IS NOT NULL
+        AND strftime('%s', gi.processed_at) IS NOT NULL
+        AND CAST(strftime('%s', nvs.posted_at) AS INTEGER) < CAST(strftime('%s', gi.processed_at) AS INTEGER)
+    )
+`
+
+function buildDashboardGallerySearchWhere(searchQuery: string, binds: Array<string | number>): string {
+    const normalizedSearch = normalizeGallerySearchQuery(searchQuery)
+    if (!normalizedSearch) return ''
+    const likeNeedle = `%${normalizedSearch}%`
+    const idNeedle = `%${normalizeGalleryVideoIdSearchToken(searchQuery)}%`
+    binds.push(likeNeedle, likeNeedle, likeNeedle, likeNeedle, likeNeedle, likeNeedle, idNeedle, idNeedle)
+    return `
+        AND (
+            lower(COALESCE(gi.video_id, '')) LIKE ?
+            OR lower(COALESCE(gi.title, '')) LIKE ?
+            OR lower(COALESCE(gi.script, '')) LIKE ?
+            OR lower(COALESCE(gi.category, '')) LIKE ?
+            OR lower(COALESCE(gi.owner_email, '')) LIKE ?
+            OR lower(COALESCE(gi.namespace_id, '')) LIKE ?
+            OR replace(lower(COALESCE(gi.video_id, '')), 'o', '0') LIKE ?
+            OR replace(lower(COALESCE(gi.video_id, '')), ' ', '') LIKE ?
+        )
+    `
+}
+
+function mapDashboardGalleryRow(row: Record<string, unknown>, namespaceId: string): Record<string, unknown> {
+    const videoId = String(row.video_id || '').trim()
+    return {
+        id: videoId,
+        namespace_id: namespaceId,
+        owner_email: String(row.owner_email || '').trim(),
+        script: String(row.script || '').trim(),
+        title: String(row.title || '').trim(),
+        category: String(row.category || '').trim(),
+        duration: Number(row.duration || 0),
+        originalUrl: String(row.original_url || '').trim(),
+        createdAt: String(row.created_at || '').trim(),
+        processedAt: String(row.processed_at || '').trim(),
+        updatedAt: String(row.updated_at || row.processed_at || row.created_at || '').trim(),
+        publicUrl: String(row.public_url || '').trim(),
+        thumbnailUrl: String(row.thumbnail_url || '').trim(),
+        shopeeLink: String(row.shopee_link || '').trim(),
+        lazadaLink: String(row.lazada_link || '').trim(),
+        shopeeOriginalLink: String(row.shopee_original_link || '').trim(),
+        lazadaOriginalLink: String(row.lazada_original_link || '').trim(),
+        shopeeConvertedAt: String(row.shopee_converted_at || '').trim(),
+        lazadaConvertedAt: String(row.lazada_converted_at || '').trim(),
+        lazadaMemberId: String(row.lazada_member_id || '').trim(),
+        sourceFingerprint: String(row.source_fingerprint || '').trim(),
+        postedAt: String(row.posted_at || '').trim(),
+        manualUnpostedAt: String(row.manual_unposted_at || '').trim(),
+        manual_unposted_at: String(row.manual_unposted_at || '').trim(),
+        gallery_ready: true,
+        original_only: Number(row.is_original_only || 0) === 1,
+    }
+}
+
+async function getDashboardGalleryPageFast(db: D1Database, params: {
+    namespaceId: string
+    view: DashboardGalleryView
+    offset: number
+    limit: number
+    searchQuery: string
+}): Promise<DashboardGalleryPageResult> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const view = params.view === 'used' ? 'used' : 'ready'
+    const safeOffset = Math.max(0, Number(params.offset || 0))
+    const safeLimit = Math.min(Math.max(Number(params.limit || 24), 1), 120)
+    const postedClause = `(${DASHBOARD_GALLERY_POSTED_SQL})`
+    const viewClause = view === 'used' ? postedClause : `NOT ${postedClause}`
+    const countBaseWhere = `${DASHBOARD_GALLERY_DISPLAY_WHERE}`
+    const viewBinds: Array<string | number> = [namespaceId]
+    const searchWhere = buildDashboardGallerySearchWhere(params.searchQuery, viewBinds)
+    const orderBy = view === 'used'
+        ? `ORDER BY COALESCE(NULLIF(TRIM(nvs.posted_at), ''), NULLIF(TRIM(gi.processed_at), ''), NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id DESC`
+        : `ORDER BY COALESCE(NULLIF(TRIM(gi.processed_at), ''), NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id ASC`
+
+    await Promise.all([
+        ensureGalleryIndexTable(db),
+        ensureNamespaceVideoStateColumns(db),
+    ])
+
+    const [rowsRes, viewTotalRow, readyTotalRow, usedTotalRow, libraryTotalRow] = await Promise.all([
+        db.prepare(
+            `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
+             ${DASHBOARD_GALLERY_FROM_JOIN}
+             WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
+               AND ${viewClause}
+               ${searchWhere}
+             ${orderBy}
+             LIMIT ? OFFSET ?`
+        ).bind(...viewBinds, safeLimit, safeOffset).all() as Promise<{ results?: Array<Record<string, unknown>> }>,
+        db.prepare(
+            `SELECT COUNT(*) AS total
+             ${DASHBOARD_GALLERY_FROM_JOIN}
+             WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
+               AND ${viewClause}
+               ${searchWhere}`
+        ).bind(...viewBinds).first() as Promise<{ total?: number } | null>,
+        db.prepare(
+            `SELECT COUNT(*) AS total
+             ${DASHBOARD_GALLERY_FROM_JOIN}
+             WHERE ${countBaseWhere}
+               AND NOT ${postedClause}`
+        ).bind(namespaceId).first() as Promise<{ total?: number } | null>,
+        db.prepare(
+            `SELECT COUNT(*) AS total
+             ${DASHBOARD_GALLERY_FROM_JOIN}
+             WHERE ${countBaseWhere}
+               AND ${postedClause}`
+        ).bind(namespaceId).first() as Promise<{ total?: number } | null>,
+        db.prepare(
+            `SELECT COUNT(*) AS total
+             FROM gallery_index
+             WHERE namespace_id = ?
+               AND has_public_video = 1`
+        ).bind(namespaceId).first() as Promise<{ total?: number } | null>,
+    ])
+
+    const videos = (rowsRes.results || []).map((row) => mapDashboardGalleryRow(row, namespaceId))
+    const total = Number(viewTotalRow?.total || 0)
+    const readyTotal = Number(readyTotalRow?.total || 0)
+    const usedTotal = Number(usedTotalRow?.total || 0)
+    const inventoryTotal = readyTotal + usedTotal
+    const overallTotal = view === 'used' ? usedTotal : readyTotal
+    return {
+        videos,
+        total,
+        overallTotal,
+        readyTotal,
+        usedTotal,
+        inventoryTotal,
+        libraryTotal: Number(libraryTotalRow?.total || 0),
+        hasMore: safeOffset + videos.length < total,
+    }
+}
+
 // Per-isolate in-memory cache for namespace inventory.
 // Workers reuse isolates across requests, so consecutive paginated loads (scroll → loadMore)
 // hit this cache instead of re-running the full D1 + hydration pipeline every time.
@@ -4589,7 +4795,7 @@ async function loadNamespaceGalleryInventoryFresh(env: Env, normalizedNamespaceI
         listNamespaceVideoStates(env.DB, normalizedNamespaceId),
         resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, normalizedNamespaceId).catch(() => ''),
         resolveNamespaceLazadaExpectedMemberId(env.DB, normalizedNamespaceId).catch(() => ''),
-        isNamespaceAffiliateShortlinkRequired(env.DB, normalizedNamespaceId).catch(() => false),
+        isNamespaceAffiliateShortlinkProcessingRequired(env.DB, normalizedNamespaceId).catch(() => false),
     ])
 
     const stateByVideoId = new Map(
@@ -4681,7 +4887,7 @@ async function getSystemGalleryInventory(env: Env): Promise<{
             listNamespaceVideoStates(env.DB, namespaceId),
             resolveNamespaceShopeeShortlinkExpectedUtmId(env.DB, namespaceId).catch(() => ''),
             resolveNamespaceLazadaExpectedMemberId(env.DB, namespaceId).catch(() => ''),
-            isNamespaceAffiliateShortlinkRequired(env.DB, namespaceId).catch(() => false),
+            isNamespaceAffiliateShortlinkProcessingRequired(env.DB, namespaceId).catch(() => false),
         ])
         return { namespaceId, stateRows, expectedUtmId, expectedLazadaMemberId, shortlinkRequired }
     }))
@@ -5867,34 +6073,24 @@ app.get('/api/dashboard/gallery', async (c) => {
     const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
 
     try {
-        const inventory = await getNamespaceGalleryInventory(c.env, namespaceId)
-        const allVideos = inventory.videos
-        const readyVideos = allVideos.filter((video) => {
-            const row = video as Record<string, unknown>
-            return isNamespaceGalleryVideoDisplayReady(row) && !isNamespaceGalleryVideoPosted(row)
+        const page = await getDashboardGalleryPageFast(c.env.DB, {
+            namespaceId,
+            view,
+            offset,
+            limit,
+            searchQuery,
         })
-        const usedVideos = allVideos.filter((video) => {
-            const row = video as Record<string, unknown>
-            return isNamespaceGalleryVideoVisibleInUsedTab(row)
-        })
-        const sourceVideos = view === 'used'
-            ? sortUsedGalleryVideosNewestFirst(usedVideos as Array<Record<string, unknown>>)
-            : readyVideos
-        const searchedVideos = searchQuery
-            ? sourceVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
-            : sourceVideos
-        const page = sliceGalleryPage(searchedVideos, offset, limit)
 
         return c.json({
             ok: true,
             namespace_id: namespaceId,
             videos: page.videos,
-            total: searchedVideos.length,
-            overall_total: sourceVideos.length,
-            ready_total: readyVideos.length,
-            used_total: usedVideos.length,
-            inventory_total: allVideos.length,
-            library_total: inventory.sourceTotal,
+            total: page.total,
+            overall_total: page.overallTotal,
+            ready_total: page.readyTotal,
+            used_total: page.usedTotal,
+            inventory_total: page.inventoryTotal,
+            library_total: page.libraryTotal,
             has_more: page.hasMore,
             offset,
             limit,
@@ -7334,6 +7530,14 @@ app.post('/admin/api/comments/retry', async (c) => {
                 shopeeLink,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
             })
+            if (!shortShopeeLink) {
+                const err = 'shopee_shortlink_failed'
+                await c.env.DB.prepare(
+                    "UPDATE post_history SET comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
+                ).bind(err, commentTokenHint, historyId).run()
+                results.push({ id: historyId, ok: false, error: err })
+                continue
+            }
 
             const commentResult = await postShopeeCommentStrict({
                 env: c.env,
@@ -7380,14 +7584,14 @@ const createOwnerWorkspaceId = (): string => {
 
 const resolveNamespaceForOwnerEmail = async (db: D1Database, emailLower: string): Promise<string> => {
     try {
-        const mapped = await db.prepare('SELECT namespace_id FROM email_namespaces WHERE email = ?').bind(emailLower).first() as any
+        const mapped = await db.prepare('SELECT namespace_id FROM email_namespaces WHERE lower(trim(email)) = ? LIMIT 1').bind(emailLower).first() as any
         if (mapped?.namespace_id) return String(mapped.namespace_id).trim()
     } catch {
         // ignore missing mapping table in older db states
     }
 
     const fromUsers = await db.prepare(
-        'SELECT namespace_id FROM users WHERE email = ? ORDER BY datetime(created_at) ASC, telegram_id ASC LIMIT 1'
+        'SELECT namespace_id FROM users WHERE lower(trim(email)) = ? ORDER BY datetime(created_at) ASC, telegram_id ASC LIMIT 1'
     ).bind(emailLower).first() as any
     return String(fromUsers?.namespace_id || '').trim()
 }
@@ -8345,9 +8549,16 @@ app.get('/api/settings/gemini-key', async (c) => {
     const namespaceId = c.get('botId')
     const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
     const health = await getGeminiApiKeyHealthSummary(c.env.DB).catch(() => ({ keys: [], active_count: settings.keys_count || 0, disabled_count: 0 }))
+    const vertexTtsSecretPresent = !!String((c.env as Env & { VERTEX_TTS_SERVICE_ACCOUNT_JSON?: string }).VERTEX_TTS_SERVICE_ACCOUNT_JSON || '').trim()
     return c.json({
         ...settings,
-        health,
+        health: { ...health, keys: Array.isArray(health.keys) ? health.keys.slice(0, MAX_GEMINI_API_KEY_SLOTS) : [] },
+        vertex_tts: {
+            configured: vertexTtsSecretPresent,
+            project_id: String(c.env.VERTEX_TTS_PROJECT_ID || '').trim() || null,
+            location: String(c.env.VERTEX_TTS_LOCATION || '').trim() || 'global',
+            model: String(c.env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts',
+        },
         max_chars: MAX_GEMINI_API_KEY_CHARS,
         max_slots: MAX_GEMINI_API_KEY_SLOTS,
     })
@@ -8365,7 +8576,7 @@ app.post('/api/settings/gemini-key/check', async (c) => {
     const adminCheck = await requireSystemAdminSession(c)
     if (!adminCheck.ok) return adminCheck.response
 
-    const keys = await getSystemGeminiApiKeys(c.env.DB).catch(() => [])
+    const keys = (await getSystemGeminiApiKeys(c.env.DB).catch(() => [])).slice(0, MAX_GEMINI_API_KEY_SLOTS)
     const results: Array<Record<string, unknown>> = []
     for (let index = 0; index < keys.length; index += 1) {
         const apiKey = keys[index]
@@ -8442,23 +8653,17 @@ app.put('/api/settings/gemini-key', async (c) => {
     }
 
     const namespaceId = c.get('botId')
-    const incomingTrimmed = rawIncomingKeys.map((value) => String(value || '').trim())
+    const incomingTrimmed = rawIncomingKeys.map((value) => String(value || '').trim()).slice(0, MAX_GEMINI_API_KEY_SLOTS)
     const nextKeys = incomingTrimmed.some(Boolean)
         ? preserveExisting
             ? (() => {
                 const build = async () => {
                     const existing = (await getSystemGeminiApiKeyEntries(c.env.DB)).keys
-                    const merged: string[] = []
-                    for (let index = 0; index < MAX_GEMINI_API_KEY_SLOTS; index += 1) {
-                        const incoming = String(incomingTrimmed[index] || '').trim()
-                        const current = String(existing[index] || '').trim()
-                        merged.push(incoming || current)
-                    }
-                    return merged
+                    return [String(incomingTrimmed[0] || existing[0] || '').trim()].filter(Boolean)
                 }
                 return build()
             })()
-            : Promise.resolve(incomingTrimmed)
+            : Promise.resolve(incomingTrimmed.slice(0, MAX_GEMINI_API_KEY_SLOTS))
         : Promise.resolve([])
     await setSystemGeminiApiKeys(c.env.DB, await nextKeys)
     const settings = await getNamespaceGeminiApiKeySettings(c.env.DB, namespaceId)
@@ -8648,6 +8853,25 @@ app.put('/api/settings/shopee-shortlink/requirement', async (c) => {
     })
 })
 
+app.put('/api/settings/shopee-shortlink/processing-requirement', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const body = await c.req.json().catch(() => ({})) as { required?: boolean }
+    const required = body.required === true
+    const namespaceId = c.get('botId')
+    await setNamespaceShopeeShortlinkProcessingRequired(c.env.DB, namespaceId, required)
+    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    return c.json({
+        ok: true,
+        ...settings,
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
+    })
+})
+
 app.delete('/api/settings/shopee-shortlink', async (c) => {
     const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
@@ -8657,6 +8881,7 @@ app.delete('/api/settings/shopee-shortlink', async (c) => {
     await setNamespaceShopeeShortlinkBaseUrl(c.env.DB, namespaceId, '')
     await setNamespaceLazadaShortlinkBaseUrl(c.env.DB, namespaceId, '')
     await setNamespaceShopeeShortlinkRequired(c.env.DB, namespaceId, false)
+    await setNamespaceShopeeShortlinkProcessingRequired(c.env.DB, namespaceId, false)
     await setNamespaceShopeeShortlinkExpectedUtmId(c.env.DB, namespaceId, '')
     await setNamespaceLazadaExpectedMemberId(c.env.DB, namespaceId, '')
     await clearNamespaceVideoState(c.env.DB, namespaceId)
@@ -14542,6 +14767,9 @@ async function backfillNamespaceInboxOriginalAssets(params: {
 }
 
 async function hasActiveProcessingJob(bucket: R2Bucket): Promise<boolean> {
+    await expireStaleProcessingJobs(bucket).catch((error) => {
+        console.error(`[PROCESSING-STALE] failed before active check: ${error instanceof Error ? error.message : String(error)}`)
+    })
     const processingList = await bucket.list({ prefix: '_processing/' })
     for (const obj of processingList.objects) {
         const file = await bucket.get(obj.key)
@@ -14943,20 +15171,20 @@ async function prepareInboxVideoForManagedLinks(params: {
         return null
     }
 
-    const [adminManaged, shortlinkRequired, primaryAdminNamespaceId] = await Promise.all([
+    const [adminManaged, shortlinkProcessingRequired, primaryAdminNamespaceId] = await Promise.all([
         isNamespaceShortlinkAdminManaged(params.env.DB, namespaceId).catch(() => false),
-        isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false),
+        isNamespaceAffiliateShortlinkProcessingRequired(params.env.DB, namespaceId).catch(() => false),
         resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => ''),
     ])
     const forceManagedShortlink = !!primaryAdminNamespaceId && primaryAdminNamespaceId === namespaceId
-    if (adminManaged && !shortlinkRequired) {
-        console.log(`[${params.logPrefix}] Admin managed shortlink is not enabled for ${namespaceId}`)
-        recordFailure('Admin managed shortlink not enabled for this namespace', 'shortlink_disabled')
-        return null
+    if (adminManaged && !shortlinkProcessingRequired) {
+        console.log(`[${params.logPrefix}] Processing shortlink is disabled for ${namespaceId} — processing video with submitted links as-is`)
+        return item
     }
-    if (!shortlinkRequired) return item
+    if (!shortlinkProcessingRequired) return item
 
-    const sourceShopeeLink = sanitizeAffiliateTrackingLink(pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || '')
+    const sourceShopeeCandidate = sanitizeAffiliateTrackingLink(pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || '')
+    const sourceShopeeLink = isUsableShopeeLink(sourceShopeeCandidate) ? sourceShopeeCandidate : ''
     const sourceLazadaLink = sanitizeAffiliateTrackingLink(pickFirstLazadaUrl(String(item.lazadaOriginalLink || item.lazadaLink || '')) || '')
     if (!sourceShopeeLink || !sourceLazadaLink) {
         recordFailure(
@@ -14988,6 +15216,7 @@ async function prepareInboxVideoForManagedLinks(params: {
         namespaceId,
         shopeeLink: sourceShopeeLink,
         logPrefix: `${params.logPrefix} SHOPEE`,
+        allowFallbackWhenEnforced: true,
         trace: shopeeTrace,
     })
     const shopeeReady = (
@@ -15007,6 +15236,11 @@ async function prepareInboxVideoForManagedLinks(params: {
             && (!normalizedExpectedUtmId || resolvedShopeeUtmSource === normalizedExpectedUtmId)
         if (inferredShopeeReady) {
             nextShopeeLink = sourceShopeeLink
+        } else if (isManagedShortlinkTransientFailure(shopeeTrace.error)) {
+            const reason = `Shopee shortlink bridge failed transiently; blocking processing instead of posting original link for ${item.id}`
+            console.warn(`[${params.logPrefix}] ${reason}`)
+            recordFailure(reason, 'shopee_shortlink_transient_failure', { error: shopeeTrace.error || null })
+            return null
         } else {
             console.log(`[${params.logPrefix}] Admin managed Shopee shortlink not ready for ${item.id}`)
             return null
@@ -15025,6 +15259,7 @@ async function prepareInboxVideoForManagedLinks(params: {
         lazadaLink: sourceLazadaLink,
         logPrefix: `${params.logPrefix} LAZADA`,
         forceShortlink: forceManagedShortlink,
+        allowFallbackWhenEnforced: true,
         trace: lazadaTrace,
     })
     let normalizedMemberId = normalizeLazadaMemberId(String(lazadaTrace.memberId || ''))
@@ -15039,6 +15274,10 @@ async function prepareInboxVideoForManagedLinks(params: {
         const inferredLazadaReady = !!resolvedLazadaTrackingLink
             && isLikelyConvertedLazadaLink(resolvedLazadaTrackingLink)
         if (inferredLazadaReady) {
+            nextLazadaLink = sourceLazadaLink
+            normalizedMemberId = resolvedLazadaMemberId
+        } else if (isManagedShortlinkTransientFailure(lazadaTrace.error)) {
+            console.warn(`[${params.logPrefix}] Lazada shortlink bridge failed transiently; continuing processing with original link for ${item.id}`)
             nextLazadaLink = sourceLazadaLink
             normalizedMemberId = resolvedLazadaMemberId
         } else {
@@ -15077,6 +15316,7 @@ async function startInboxVideoProcessing(params: {
     executionCtx: ExecutionContext
     botId: string
     item: InboxVideoRecord
+    runInline?: boolean
 }): Promise<{ status: 'queued' | 'processing'; id: string }> {
     const nowIso = new Date().toISOString()
     const item = normalizeInboxVideoRecord(params.item)
@@ -15131,7 +15371,7 @@ async function startInboxVideoProcessing(params: {
     }), {
         httpMetadata: { contentType: 'application/json' },
     })
-    params.executionCtx.waitUntil((async () => {
+    const run = async () => {
         try {
             await runPipeline(
                 params.env,
@@ -15151,7 +15391,12 @@ async function startInboxVideoProcessing(params: {
                 })
             }
         }
-    })())
+    }
+    if (params.runInline) {
+        await run()
+    } else {
+        params.executionCtx.waitUntil(run())
+    }
     return { status: 'processing', id: item.id }
 }
 
@@ -15194,6 +15439,7 @@ async function ensureInboxVideoProcessingStarted(params: {
     botId: string
     item: InboxVideoRecord
     skipIfAlreadyProcessed?: boolean
+    runInline?: boolean
 }): Promise<InboxProcessingStartResult> {
     const botId = String(params.botId || '').trim()
     if (!botId) throw new Error('missing_bot_id')
@@ -15272,6 +15518,7 @@ async function ensureInboxVideoProcessingStarted(params: {
         executionCtx: params.executionCtx,
         botId,
         item,
+        runInline: params.runInline,
     })
 
     await putInboxVideoRecord(params.bucket, {
@@ -15291,9 +15538,16 @@ async function ensureInboxVideoProcessingStarted(params: {
     return { outcome: 'started', item, job: started }
 }
 
-async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Record<string, unknown>>> {
-    const list = await bucket.list({ prefix: '_processing/' })
-    const prefix = '_processing/'
+const PROCESSING_HISTORY_PREFIX = '_processing_history/'
+const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
+const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
+
+async function readProcessingListPrefix(
+    bucket: R2Bucket,
+    prefix: '_processing/' | '_queue/' | typeof PROCESSING_HISTORY_PREFIX,
+    defaultStatus: 'processing' | 'queued' | 'processed',
+): Promise<Array<Record<string, unknown>>> {
+    const list = await bucket.list({ prefix })
     const tasks = await Promise.all(
         list.objects.map(async obj => {
             const data = await bucket.get(obj.key)
@@ -15315,31 +15569,116 @@ async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Recor
                 return null
             }
 
-            const createdAt = String(json.createdAt || '').trim() || obj.uploaded.toISOString()
-            const status = String(json.status || '').trim() || 'processing'
-            const error = sanitizeProcessingError(json.error || json.error_message)
+            const createdAt = String(json.createdAt || json.startedAt || '').trim() || obj.uploaded.toISOString()
+            const completedAt = String(json.completedAt || json.processedAt || '').trim()
+            const updatedAt = String(json.updatedAt || completedAt || '').trim() || obj.uploaded.toISOString()
+            const status = String(json.status || '').trim() || defaultStatus
+            const error = sanitizeProcessingError(json.error || json.error_message || json.last_error)
 
             return {
                 ...json,
                 id,
                 createdAt,
+                updatedAt,
+                completedAt: completedAt || undefined,
                 status,
                 error,
                 stepName: normalizeProcessingStepName(json.stepName),
+                historyKey: prefix === PROCESSING_HISTORY_PREFIX ? obj.key : undefined,
             }
         })
     )
-    const videos = (tasks.filter(Boolean) as Array<Record<string, unknown>>)
-        .filter((video) => String(video.status || '').trim().toLowerCase() === 'processing')
-    videos.sort((a, b) => {
-        const at = new Date(String(a.createdAt || '')).getTime()
-        const bt = new Date(String(b.createdAt || '')).getTime()
-        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
-    })
-    return videos
+    return tasks.filter(Boolean) as Array<Record<string, unknown>>
 }
 
-async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, namespaceId: string): Promise<boolean> {
+async function putProcessingHistoryRecord(
+    bucket: R2Bucket,
+    videoId: string,
+    payload: Record<string, unknown>,
+): Promise<void> {
+    const id = String(videoId || payload.id || '').trim()
+    if (!id) return
+    const nowIso = new Date().toISOString()
+    const record = {
+        ...payload,
+        id,
+        createdAt: String(payload.createdAt || payload.startedAt || '').trim() || nowIso,
+        updatedAt: String(payload.updatedAt || payload.completedAt || '').trim() || nowIso,
+    }
+    await bucket.put(`${PROCESSING_HISTORY_PREFIX}${id}.json`, JSON.stringify(record, null, 2), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
+
+function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date): boolean {
+    const status = String(data.status || '').trim().toLowerCase()
+    if (status && status !== 'processing' && status !== 'queued') return false
+    const timestamp = String(data.updatedAt || data.startedAt || data.createdAt || '').trim()
+    const lastTouchedMs = timestamp ? Date.parse(timestamp) : NaN
+    const fallbackMs = uploadedAt instanceof Date ? uploadedAt.getTime() : NaN
+    const effectiveMs = Number.isFinite(lastTouchedMs) && lastTouchedMs > 0 ? lastTouchedMs : fallbackMs
+    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > PROCESSING_STALE_TIMEOUT_MS
+}
+
+async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
+    const processingList = await bucket.list({ prefix: '_processing/' })
+    let expired = 0
+    for (const obj of processingList.objects) {
+        const dataObj = await bucket.get(obj.key).catch(() => null)
+        if (!dataObj) continue
+        const data = await dataObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        if (!isProcessingJobStale(data, obj.uploaded)) continue
+
+        const nowIso = new Date().toISOString()
+        const idFromKey = obj.key.replace(/^_processing\//, '').replace(/\.json$/i, '').trim()
+        const id = String(data.id || idFromKey || '').trim()
+        const failedRecord = {
+            ...data,
+            id,
+            status: 'failed',
+            error: sanitizeProcessingError(data.error || PROCESSING_STALE_ERROR),
+            errorCategory: 'stale_timeout',
+            staleTimedOutAt: nowIso,
+            failedAt: nowIso,
+            updatedAt: nowIso,
+            createdAt: String(data.createdAt || data.startedAt || '').trim() || obj.uploaded.toISOString(),
+        }
+        await bucket.put(obj.key, JSON.stringify(failedRecord, null, 2), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+        await putProcessingHistoryRecord(bucket, id, failedRecord).catch(() => { })
+        expired += 1
+    }
+    return expired
+}
+
+async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Record<string, unknown>>> {
+    await expireStaleProcessingJobs(bucket).catch((error) => {
+        console.error(`[PROCESSING-STALE] failed to expire stale jobs: ${error instanceof Error ? error.message : String(error)}`)
+    })
+    const [processing, queued, history] = await Promise.all([
+        readProcessingListPrefix(bucket, '_processing/', 'processing'),
+        readProcessingListPrefix(bucket, '_queue/', 'queued'),
+        readProcessingListPrefix(bucket, PROCESSING_HISTORY_PREFIX, 'processed'),
+    ])
+
+    const seen = new Set<string>()
+    const videos = [...processing, ...queued, ...history].filter((video) => {
+        const id = String(video.id || '').trim()
+        if (!id || seen.has(id)) return false
+        seen.add(id)
+        return true
+    })
+
+    videos.sort((a, b) => {
+        const at = new Date(String(a.completedAt || a.updatedAt || a.createdAt || '')).getTime()
+        const bt = new Date(String(b.completedAt || b.updatedAt || b.createdAt || '')).getTime()
+        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
+    })
+    return videos.slice(0, 120)
+}
+
+async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, namespaceId: string, options: { runInline?: boolean } = {}): Promise<boolean> {
     const botId = String(namespaceId || '').trim()
     if (!botId) return false
 
@@ -15399,6 +15738,7 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
                 botId,
                 item,
                 skipIfAlreadyProcessed: true,
+                runInline: options.runInline,
             })
             if (result.outcome === 'started') {
                 console.log(`[PROCESSING-AUTOSTART] Started ${botId}/${item.id}: ${result.job.status}`)
@@ -15418,12 +15758,16 @@ app.get('/api/processing', async (c) => {
         const namespaceId = String(c.get('botId') || '').trim()
         const includeSummary = String(c.req.query('summary') || '').trim() === '1'
         const videos = await listActiveProcessingVideos(c.get('bucket'))
+        const activeProcessingVideos = videos.filter((video) => {
+            const status = String(video.status || '').trim().toLowerCase()
+            return status === 'processing' || status === 'queued'
+        })
         // Auto-start next video moved to background (waitUntil) so the user's
         // processing tab loads fast even when no jobs are in flight. Previously
         // this synchronous call could take 10-30s for admin namespaces because
         // managed-shortlink conversion (Shopee + Lazada) runs inside
         // ensureInboxVideoProcessingStarted with retry timeouts.
-        if (videos.length === 0 && namespaceId) {
+        if (activeProcessingVideos.length === 0 && namespaceId) {
             c.executionCtx.waitUntil(
                 startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceId).catch((error) => {
                     console.error(`[PROCESSING-AUTOSTART] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
@@ -15440,7 +15784,7 @@ app.get('/api/processing', async (c) => {
         if (includeSummary && namespaceId) {
             const [inventory, shortlinkRequired] = await Promise.all([
                 getNamespaceGalleryInventory(c.env, namespaceId),
-                isNamespaceAffiliateShortlinkRequired(c.env.DB, namespaceId).catch(() => false),
+                isNamespaceAffiliateShortlinkProcessingRequired(c.env.DB, namespaceId).catch(() => false),
             ])
             pendingShortlinkVideos = shortlinkRequired
                 ? inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
@@ -15455,7 +15799,8 @@ app.get('/api/processing', async (c) => {
         return c.json({
             videos,
             pending_shortlink_videos: pendingShortlinkVideos,
-            processing_total: videos.length,
+            processing_total: activeProcessingVideos.length,
+            history_total: Math.max(0, videos.length - activeProcessingVideos.length),
             pending_total: pendingShortlinkVideos.length,
             pending_has_lazada_total: pendingHasLazadaTotal,
             pending_missing_lazada_total: Math.max(0, pendingShortlinkVideos.length - pendingHasLazadaTotal),
@@ -16181,7 +16526,21 @@ app.delete('/api/inbox/:id', async (c) => {
 
 app.delete('/api/processing/:id', async (c) => {
     try {
-        await c.get('bucket').delete(`_processing/${c.req.param('id')}.json`)
+        const id = String(c.req.param('id') || '').trim()
+        const existing = id ? await c.get('bucket').get(`_processing/${id}.json`).catch(() => null) : null
+        const nowIso = new Date().toISOString()
+        if (id && existing) {
+            const job = await existing.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+            await putProcessingHistoryRecord(c.get('bucket'), id, {
+                ...job,
+                id,
+                status: 'cancelled',
+                cancelledAt: nowIso,
+                updatedAt: nowIso,
+                error: sanitizeProcessingError(job.error || 'ผู้ใช้ยกเลิกงานประมวลผล'),
+            }).catch(() => { })
+        }
+        if (id) await c.get('bucket').delete(`_processing/${id}.json`)
         c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
         return c.json({ ok: true })
     } catch (e) {
@@ -16419,10 +16778,46 @@ app.post('/api/gallery/refresh/:id', async (c) => {
         }
         await c.get('bucket').delete(`_link_context/${videoId}.json`).catch(() => { })
 
+        const processingObj = await c.get('bucket').get(`_processing/${videoId}.json`).catch(() => null)
+        const processingJob = processingObj
+            ? await processingObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+            : {}
+        await putProcessingHistoryRecord(c.get('bucket'), videoId, {
+            ...processingJob,
+            id: videoId,
+            status: 'processed',
+            completedAt: refreshCompletedAt,
+            processedAt: refreshCompletedAt,
+            updatedAt: refreshCompletedAt,
+            step: 5,
+            stepName: 'ประมวลผลสำเร็จ',
+            shopeeLink: String(linkContext?.shopeeLink || processingJob.shopeeLink || '').trim() || undefined,
+            lazadaLink: String(linkContext?.lazadaLink || processingJob.lazadaLink || '').trim() || undefined,
+        }).catch(() => { })
         await c.get('bucket').delete(`_processing/${videoId}.json`).catch(() => { })
 
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
-        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
+        // ถ้าคิวว่างแต่คลังต้นฉบับยังมี ready items ให้ kick ตัวถัดไปทันที
+        // ไม่ต้องรอให้ผู้ใช้เปิดหน้า Processing หรือรอ cron tick ถัดไป
+        const namespaceIdForNext = String(c.get('botId') || '').trim()
+        c.executionCtx.waitUntil((async () => {
+            const queuedStarted = await processNextInQueue(c.env, namespaceIdForNext)
+            if (queuedStarted) {
+                console.log(`[PROCESSING-COMPLETE-AUTOSTART] queue started next for ${namespaceIdForNext}`)
+            }
+            if (!queuedStarted && namespaceIdForNext) {
+                const readyStarted = await startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceIdForNext, { runInline: true })
+                console.log(`[PROCESSING-COMPLETE-AUTOSTART] ready scan for ${namespaceIdForNext}: started=${readyStarted ? 'yes' : 'no'}`)
+                if (!readyStarted) {
+                    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(c.env.DB).catch(() => '')
+                    if (adminNamespaceId && adminNamespaceId === namespaceIdForNext) {
+                        await autoImportAndProcessForAdmin(c.env, c.executionCtx)
+                    }
+                }
+            }
+        })().catch((error) => {
+            console.error(`[PROCESSING-COMPLETE-AUTOSTART] failed: ${error instanceof Error ? error.message : String(error)}`)
+        }))
 
         return c.json({ ok: true })
     } catch (e) {
@@ -16458,7 +16853,21 @@ app.get('/api/queue', async (c) => {
 // Delete queue item
 app.delete('/api/queue/:id', async (c) => {
     try {
-        await c.get('bucket').delete(`_queue/${c.req.param('id')}.json`)
+        const id = String(c.req.param('id') || '').trim()
+        const existing = id ? await c.get('bucket').get(`_queue/${id}.json`).catch(() => null) : null
+        const nowIso = new Date().toISOString()
+        if (id && existing) {
+            const job = await existing.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+            await putProcessingHistoryRecord(c.get('bucket'), id, {
+                ...job,
+                id,
+                status: 'cancelled',
+                cancelledAt: nowIso,
+                updatedAt: nowIso,
+                error: 'ผู้ใช้ยกเลิกคิวประมวลผล',
+            }).catch(() => { })
+        }
+        if (id) await c.get('bucket').delete(`_queue/${id}.json`)
         c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
         return c.json({ ok: true })
     } catch (e) {
@@ -17630,6 +18039,7 @@ const NS_SETTING_POSTING_ORDER = 'posting_order_v1'
 const NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT = 'affiliate_shortlink_account_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
+const NS_SETTING_SHOPEE_SHORTLINK_PROCESSING_REQUIRED = 'shopee_shortlink_processing_required_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_utm_id_v1'
 const NS_SETTING_LAZADA_SHORTLINK_BASE_URL = 'lazada_shortlink_base_url_v1'
 const NS_SETTING_LAZADA_EXPECTED_MEMBER_ID = 'lazada_expected_member_id_v1'
@@ -18467,6 +18877,24 @@ function sanitizeAffiliateTrackingLink(rawLink: string): string {
     return value.replace(/[^\w\-._~:/?#[\]@!$&'()*+,;=%]+$/gu, '')
 }
 
+function isShopeeHomepageOnlyLink(link: string): boolean {
+    const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
+    if (!rawLink) return false
+    try {
+        const parsed = new URL(rawLink)
+        const host = parsed.hostname.toLowerCase()
+        if (!host.endsWith('shopee.co.th') && !host.endsWith('shopee.co.id') && !host.endsWith('shopee.com.my') && !host.endsWith('shopee.ph') && !host.endsWith('shopee.sg') && !host.endsWith('shopee.vn')) return false
+        return parsed.pathname.replace(/\/+$/g, '') === ''
+    } catch {
+        return false
+    }
+}
+
+function isUsableShopeeLink(link: string): boolean {
+    const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
+    return !!rawLink && !isShopeeHomepageOnlyLink(rawLink)
+}
+
 function isLikelyConvertedShopeeLink(link: string, expectedUtmId = ''): boolean {
     const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
     if (!rawLink) return false
@@ -18604,7 +19032,7 @@ async function listVideosAwaitingAffiliateConversion(env: Env, namespaceId: stri
     void options
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return []
-    const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(env.DB, normalizedNamespaceId).catch(() => false)
+    const shortlinkRequired = await isNamespaceAffiliateShortlinkProcessingRequired(env.DB, normalizedNamespaceId).catch(() => false)
     if (!shortlinkRequired) return []
 
     const inventory = await getNamespaceGalleryInventory(env, normalizedNamespaceId)
@@ -18645,7 +19073,7 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
     ))
 
     for (const namespaceId of namespaceIds) {
-        const shortlinkRequired = await isNamespaceAffiliateShortlinkRequired(env.DB, namespaceId).catch(() => false)
+        const shortlinkRequired = await isNamespaceAffiliateShortlinkProcessingRequired(env.DB, namespaceId).catch(() => false)
         if (!shortlinkRequired) continue
         const pendingVideos = await listVideosAwaitingAffiliateConversion(env, namespaceId, { systemWide: true }).catch(() => [])
         if (pendingVideos.length === 0) continue
@@ -19046,6 +19474,8 @@ type AutoInboxGuardianNamespaceResult = {
     detail?: string
 }
 
+const AUTO_INBOX_GUARDIAN_MAX_STARTS_PER_RUN = 1
+
 type AutoInboxGuardianReport = {
     ran_at: string
     total_namespaces: number
@@ -19134,6 +19564,12 @@ async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContex
 
                 const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
                 if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+
+                if (report.started_total >= AUTO_INBOX_GUARDIAN_MAX_STARTS_PER_RUN) {
+                    mark({ namespace_id: namespaceId, outcome: 'idle', video_id: item.id, detail: 'start_deferred_quota_guard' })
+                    startedOrActive = true
+                    break
+                }
 
                 try {
                     const result = await ensureInboxVideoProcessingStarted({
@@ -19286,6 +19722,15 @@ async function getNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: 
     return value === '1' || value === 'true' || value === 'yes' || value === 'on'
 }
 
+async function getNamespaceShopeeShortlinkProcessingRequired(db: D1Database, namespaceId: string): Promise<boolean> {
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare(
+        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_PROCESSING_REQUIRED).first() as { value?: string } | null
+    const value = String(row?.value || '').trim().toLowerCase()
+    return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+}
+
 async function resolveNamespaceShopeeShortlinkExpectedUtmId(db: D1Database, namespaceId: string): Promise<string> {
     const row = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
     return row.expectedUtmId
@@ -19335,6 +19780,22 @@ async function setNamespaceShopeeShortlinkRequired(db: D1Database, namespaceId: 
          ON CONFLICT(namespace_id, key)
          DO UPDATE SET value = '1', updated_at = datetime('now')`
     ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_REQUIRED).run()
+}
+
+async function setNamespaceShopeeShortlinkProcessingRequired(db: D1Database, namespaceId: string, required: boolean): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    if (!required) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_PROCESSING_REQUIRED).run()
+        return
+    }
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, '1', datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = '1', updated_at = datetime('now')`
+    ).bind(namespaceId, NS_SETTING_SHOPEE_SHORTLINK_PROCESSING_REQUIRED).run()
 }
 
 async function setNamespaceShopeeShortlinkExpectedUtmId(db: D1Database, namespaceId: string, rawExpectedUtmId: string): Promise<void> {
@@ -19422,6 +19883,7 @@ async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: 
     const row = await getNamespaceShopeeShortlinkBaseUrlEntry(db, namespaceId)
     const lazadaRow = await getNamespaceLazadaShortlinkBaseUrlEntry(db, namespaceId)
     const explicitRequired = await getNamespaceShopeeShortlinkRequired(db, namespaceId)
+    const processingRequired = await getNamespaceShopeeShortlinkProcessingRequired(db, namespaceId)
     const expected = await getNamespaceShopeeShortlinkExpectedUtmIdEntry(db, namespaceId)
     const lazadaExpected = await getNamespaceLazadaExpectedMemberIdEntry(db, namespaceId)
     const effectiveShopeeBaseUrl = derivedAccount ? deriveAffiliateShortlinkBaseUrl('shopee', derivedAccount) : row.baseUrl
@@ -19439,6 +19901,7 @@ async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: 
         enabled: !!effectiveShopeeBaseUrl,
         lazada_enabled: !!effectiveLazadaBaseUrl,
         required,
+        processing_required: processingRequired,
         expected_utm_id: expected.expectedUtmId,
         lazada_expected_member_id: lazadaExpected.expectedMemberId,
         updated_at: updatedAt,
@@ -21406,26 +21869,40 @@ function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string,
     return renderedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
+async function getEffectiveNamespaceCommentTemplate(db: D1Database, namespaceId: string): Promise<{
+    template: string
+    source: 'default' | 'custom'
+    updated_at: string | null
+    lookupError: string | null
+}> {
+    const ns = String(namespaceId || '').trim()
+    if (!ns) {
+        return { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null, lookupError: null }
+    }
+    try {
+        const settings = await getNamespaceCommentTemplateSettings(db, ns)
+        return { ...settings, lookupError: null }
+    } catch (e) {
+        return {
+            template: DEFAULT_COMMENT_TEMPLATE,
+            source: 'default' as const,
+            updated_at: null,
+            lookupError: e instanceof Error ? e.message : String(e),
+        }
+    }
+}
+
+async function namespaceCommentTemplateRequiresLazadaLink(db: D1Database, namespaceId: string): Promise<boolean> {
+    const settings = await getEffectiveNamespaceCommentTemplate(db, namespaceId)
+    return normalizeCommentTemplate(settings.template).includes(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER)
+}
+
 async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string, shopeeLink: string, lazadaLink = ''): Promise<string> {
     const shopee = String(shopeeLink || '').trim()
     if (!shopee) return ''
     const ns = String(namespaceId || '').trim()
-    let settings: { template: string; source: 'default' | 'custom'; updated_at: string | null }
-    let lookupError: string | null = null
-    if (ns) {
-        try {
-            settings = await getNamespaceCommentTemplateSettings(db, ns)
-        } catch (e) {
-            lookupError = e instanceof Error ? e.message : String(e)
-            settings = {
-                template: DEFAULT_COMMENT_TEMPLATE,
-                source: 'default' as const,
-                updated_at: null,
-            }
-        }
-    } else {
-        settings = { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null }
-    }
+    const settings = await getEffectiveNamespaceCommentTemplate(db, ns)
+    const lookupError = settings.lookupError
     // DEBUG: log namespace + which template source was picked. Helps diagnose when
     // custom template isn't being used despite user saving one (e.g., empty namespaceId
     // passed by caller, DB read error, wrong namespace_id column value in post_history).
@@ -21449,6 +21926,7 @@ async function shortenLazadaLinkForNamespace(params: {
     lazadaLink: string
     logPrefix: string
     forceShortlink?: boolean
+    allowFallbackWhenEnforced?: boolean
     trace?: {
         utmSource?: string | null
         memberId?: string | null
@@ -21510,7 +21988,7 @@ async function shortenLazadaLinkForNamespace(params: {
         const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
         if (!baseUrl) {
             writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
-            if (fallbackDisallowed) throw new Error('admin_lazada_shortlink_disabled')
+            if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error('admin_lazada_shortlink_disabled')
             return originalLink
         }
         const requestUrl = new URL(baseUrl)
@@ -21534,11 +22012,10 @@ async function shortenLazadaLinkForNamespace(params: {
             const delayMs = lazadaRetryDelaysMs[attempt - 1]
             if (delayMs > 0) await waitMs(delayMs)
             const resp = await fetchWithTimeout(finalLazadaRequestUrl, {}, 30000, 'lazada_shortlink')
-            if (!resp.ok) {
-                const errText = await resp.text().catch(() => '')
-                throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
-            }
-            const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+            const responseText = await resp.text().catch(() => '')
+            const data = responseText
+                ? JSON.parse(responseText) as Record<string, unknown>
+                : {} as Record<string, unknown>
             const shortLink = pickFirstLazadaUrl(
                 String(
                     data.shortLink ||
@@ -21561,6 +22038,10 @@ async function shortenLazadaLinkForNamespace(params: {
                 if (attempt > 1) console.log(`[${params.logPrefix}] Lazada shortlink succeeded on attempt ${attempt}/${maxAttempts}`)
                 return shortLink
             }
+            if (!resp.ok) {
+                const successTextWithoutLink = /SUCCESS::|调用成功/i.test(responseText)
+                throw new Error(`HTTP ${resp.status}${successTextWithoutLink ? ': success_response_without_lazada_link' : responseText ? `: ${responseText.slice(0, 120)}` : ''}`)
+            }
             throw new Error('missing_short_link_in_response')
         } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
@@ -21571,7 +22052,7 @@ async function shortenLazadaLinkForNamespace(params: {
     }
 
     writeTrace({ utmSource: null, memberId: null, status: 'fallback', error: lastError })
-    if (fallbackDisallowed) throw new Error(lastError || 'admin_lazada_shortlink_failed')
+    if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error(lastError || 'admin_lazada_shortlink_failed')
     return originalLink
 }
 
@@ -21580,6 +22061,7 @@ async function shortenShopeeLinkForNamespace(params: {
     namespaceId: string
     shopeeLink: string
     logPrefix: string
+    allowFallbackWhenEnforced?: boolean
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -21598,8 +22080,8 @@ async function shortenShopeeLinkForNamespace(params: {
         return ''
     }
     const originalLink = await resolveCanonicalAffiliateShortlinkInput('shopee', sourceLink, params.logPrefix)
-    if (!originalLink) {
-        writeTrace({ utmSource: null, status: 'disabled', error: 'empty_canonical_shopee_link' })
+    if (!originalLink || isShopeeHomepageOnlyLink(originalLink)) {
+        writeTrace({ utmSource: null, status: 'disabled', error: !originalLink ? 'empty_canonical_shopee_link' : 'invalid_shopee_homepage_link' })
         return ''
     }
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
@@ -21620,7 +22102,7 @@ async function shortenShopeeLinkForNamespace(params: {
         const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(params.env.DB, params.namespaceId)
         if (!baseUrl) {
             writeTrace({ utmSource: null, status: 'disabled', error: null })
-            if (fallbackDisallowed) throw new Error('admin_shopee_shortlink_disabled')
+            if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error('admin_shopee_shortlink_disabled')
             return originalLink
         }
         const requestUrl = new URL(baseUrl)
@@ -21635,14 +22117,15 @@ async function shortenShopeeLinkForNamespace(params: {
 
     let lastError: string | null = null
     // Same extended retry schedule as Lazada — Electron bridge returns transient HTTP 500
-    // during puppeteer session refresh. Was 2 attempts @ 250ms, now 5 attempts over ~11s.
+    // during puppeteer session refresh. Use a longer per-attempt timeout because Shopee
+    // bridge sessions can also need more than the old 8s window.
     const shopeeRetryDelaysMs = [0, 500, 2000, 4000, 8000]
     const maxAttempts = shopeeRetryDelaysMs.length
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
             const delayMs = shopeeRetryDelaysMs[attempt - 1]
             if (delayMs > 0) await waitMs(delayMs)
-            const resp = await fetchWithTimeout(finalRequestUrl, {}, 8000, 'shortlink')
+            const resp = await fetchWithTimeout(finalRequestUrl, {}, 30000, 'shopee_shortlink')
             if (!resp.ok) {
                 const errText = await resp.text().catch(() => '')
                 throw new Error(`HTTP ${resp.status}${errText ? `: ${errText.slice(0, 120)}` : ''}`)
@@ -21661,14 +22144,14 @@ async function shortenShopeeLinkForNamespace(params: {
             ) || ''
             const affiliateId = String(data.id || data.affiliate_id || data.affiliateId || '').trim()
             const utmSource = String(data.utm_source || data.utmSource || '').trim() || (affiliateId ? `an_${affiliateId}` : '') || null
-            if (shortLink) {
+            if (shortLink && !isShopeeHomepageOnlyLink(shortLink)) {
                 // Strip ?lp=aff that Shopee appends on redirect (not our code)
                 const cleanedShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
                 writeTrace({ utmSource, status: 'shortened', error: null })
                 if (attempt > 1) console.log(`[${params.logPrefix}] Shopee shortlink succeeded on attempt ${attempt}/${maxAttempts}`)
                 return cleanedShortLink
             }
-            throw new Error('missing_short_link_in_response')
+            throw new Error(shortLink ? 'invalid_shopee_homepage_short_link_in_response' : 'missing_short_link_in_response')
         } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
             lastError = msg
@@ -21678,8 +22161,19 @@ async function shortenShopeeLinkForNamespace(params: {
     }
 
     writeTrace({ utmSource: null, status: 'fallback', error: lastError })
-    if (fallbackDisallowed) throw new Error(lastError || 'admin_shopee_shortlink_failed')
+    if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error(lastError || 'admin_shopee_shortlink_failed')
     return originalLink
+}
+
+function isManagedShortlinkTransientFailure(error: unknown): boolean {
+    const normalized = String(error || '').toLowerCase()
+    return normalized.includes('failed to fetch')
+        || normalized.includes('timeout')
+        || normalized.includes('http 500')
+        || normalized.includes('http 502')
+        || normalized.includes('http 503')
+        || normalized.includes('http 504')
+        || normalized.includes('shortlink')
 }
 
 async function resolvePostingShopeeLinkForNamespace(params: {
@@ -21701,8 +22195,8 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     }
 
     const link = pickFirstShopeeUrl(params.shopeeLink || '') || String(params.shopeeLink || '').trim()
-    if (!link) {
-        writeTrace({ utmSource: null, status: 'disabled', error: null })
+    if (!link || isShopeeHomepageOnlyLink(link)) {
+        writeTrace({ utmSource: null, status: 'disabled', error: !link ? null : 'invalid_shopee_homepage_link' })
         return ''
     }
 
@@ -21730,19 +22224,22 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     // → Shortlink). This lets admin change sub_id and have it apply to every future
     // post without re-importing videos.
     try {
+        const trace = params.trace || {}
         const shortened = await shortenShopeeLinkForNamespace({
             env: params.env,
             namespaceId: params.namespaceId,
             shopeeLink: link,
             logPrefix: params.logPrefix,
-            trace: params.trace,
+            trace,
         })
-        if (shortened) return shortened
+        if (shortened && trace.status === 'shortened' && !isShopeeHomepageOnlyLink(shortened)) return shortened
+        throw new Error(trace.error || 'admin_shopee_shortlink_failed')
     } catch (e) {
-        console.log(`[${params.logPrefix}] shortenShopeeLinkForNamespace failed, falling back to submitted link: ${e instanceof Error ? e.message : String(e)}`)
+        const msg = e instanceof Error ? e.message : String(e)
+        console.log(`[${params.logPrefix}] shortenShopeeLinkForNamespace failed; blocking admin posting instead of falling back to submitted link: ${msg}`)
+        writeTrace({ utmSource: null, status: 'fallback', error: msg || 'admin_shopee_shortlink_failed' })
+        return ''
     }
-    writeTrace({ utmSource: extractShopeeUtmSourceFromLink(link) || null, status: 'fallback', error: null })
-    return link
 }
 
 type PostingAffiliatePlatformVerification = {
@@ -24342,22 +24839,27 @@ async function reconcilePostingHistoryRows(params: {
                         shopeeLink,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
                     })
-                    const commentResult = await postShopeeCommentWithFallback({
-                        env,
-                        namespaceId: botId,
-                        fbVideoId: recoveredCommentTargetId,
-                        shopeeLink: shortShopeeLink,
-                        lazadaLink,
-                        commentTokens: recoveredCommentTokens,
-                        pageId: row.page_id,
-                        logPrefix: `${logPrefix} RECON ${row.id}`,
-                    })
-                    if (commentResult.ok) {
-                        commentStatus = 'success'
-                        commentFbId = commentResult.id || null
-                    } else {
+                    if (!shortShopeeLink) {
                         commentStatus = 'failed'
-                        commentError = commentResult.error || 'comment_failed'
+                        commentError = 'shopee_shortlink_failed'
+                    } else {
+                        const commentResult = await postShopeeCommentWithFallback({
+                            env,
+                            namespaceId: botId,
+                            fbVideoId: recoveredCommentTargetId,
+                            shopeeLink: shortShopeeLink,
+                            lazadaLink,
+                            commentTokens: recoveredCommentTokens,
+                            pageId: row.page_id,
+                            logPrefix: `${logPrefix} RECON ${row.id}`,
+                        })
+                        if (commentResult.ok) {
+                            commentStatus = 'success'
+                            commentFbId = commentResult.id || null
+                        } else {
+                            commentStatus = 'failed'
+                            commentError = commentResult.error || 'comment_failed'
+                        }
                     }
                 }
 
@@ -28828,6 +29330,9 @@ app.post('/api/manual-post-reel', async (c) => {
                 logPrefix: 'MANUAL-REEL',
             })
             : ''
+        if (shopeeLink && !effectiveShopeeLink) {
+            return c.json({ error: 'shopee_shortlink_failed', details: 'Shopee shortlink is required before posting' }, 409)
+        }
 
         await ensurePostHistoryTraceColumns(c.env.DB)
         const nowIso = new Date().toISOString()
@@ -29208,6 +29713,12 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 shopeeLink,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
             })
+            if (!shortShopeeLink) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                ).bind('shopee_shortlink_failed', commentTokenHint, commentProfile.profileId, commentProfile.profileName, historyId).run().catch(() => { })
+                continue
+            }
             const lazadaLink = await resolveLazadaLinkForRetry({
                 bucket,
                 videoId,
@@ -29870,9 +30381,16 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const normalizedShopeeUtmMatch = null
         const publicUrl = metaToString(meta, 'publicUrl')
         const rawLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
+        const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
+        const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
+        const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
+        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        const commentTemplateRequiresLazada = await namespaceCommentTemplateRequiresLazadaLink(env.DB, botId).catch(() => true)
+        const oneCardRequiresLazada = pageOneCardEnabled && pageOneCardCta !== 'NO_BUTTON' && pageOneCardLinkMode === 'lazada'
+        const lazadaLinkRequiredForPosting = !!rawLazadaLink && !pageAdsPublishEnabled && (commentTemplateRequiresLazada || oneCardRequiresLazada)
         const lazadaShortlinkTrace: { utmSource?: string | null; memberId?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         let normalizedLazadaLink = rawLazadaLink
-        if (isAdminNamespace && rawLazadaLink) {
+        if (isAdminNamespace && rawLazadaLink && lazadaLinkRequiredForPosting) {
             try {
                 normalizedLazadaLink = await shortenLazadaLinkForNamespace({
                     env,
@@ -29888,6 +30406,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 lazadaShortlinkTrace.error = errMsg
                 console.error(`[CRON] Page ${page.name}: lazada shortlink failed — ${errMsg}`)
             }
+        } else if (rawLazadaLink && !lazadaLinkRequiredForPosting) {
+            lazadaShortlinkTrace.status = 'disabled'
+            console.log(`[CRON] Page ${page.name}: lazada shortlink skipped — not required by comment template or OneCard link mode`)
         } else if (rawLazadaLink) {
             // Member namespace: use raw link as-is, mark as disabled (no conversion needed)
             lazadaShortlinkTrace.status = 'disabled'
@@ -29905,7 +30426,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     : null
         const combinedConversionError = shopeeShortlinkTrace.error || lazadaShortlinkTrace.error || null
         const shopeeShortlinkFailed = rawShopeeLink && shopeeShortlinkTrace.status !== 'shortened' && shopeeShortlinkTrace.status !== 'disabled'
-        const lazadaShortlinkFailed = rawLazadaLink && lazadaShortlinkTrace.status !== 'shortened' && lazadaShortlinkTrace.status !== 'disabled'
+        const lazadaShortlinkFailed = lazadaLinkRequiredForPosting && lazadaShortlinkTrace.status !== 'shortened' && lazadaShortlinkTrace.status !== 'disabled'
         if (shopeeShortlinkFailed || lazadaShortlinkFailed) {
             const failedPlatforms = [shopeeShortlinkFailed ? 'shopee' : '', lazadaShortlinkFailed ? 'lazada' : ''].filter(Boolean).join('+')
             const shortlinkErrorMsg = `shortlink_failed:${failedPlatforms} — ${combinedConversionError || 'unknown'}`
@@ -30045,10 +30566,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
 
         let fbVideoId = ''
-        const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
-        const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
-        const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
-        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
         // Cron normal-post path always uses page post tokens from settings (organic Reel).
         let postingTokenUsed = pageAdsPublishEnabled
             ? 'ads_publish'

@@ -14,6 +14,7 @@ apps/video-affiliate/worker/.wrangler/
 apps/video-affiliate/worker/.wrangler-dryrun/
 apps/video-affiliate/worker/deploy.tar
 apps/video-affiliate/worker/_processing/
+apps/video-affiliate/worker/_admin_launch/
 apps/video-affiliate/worker/_waiting_video/
 apps/video-affiliate/worker/videos/
 apps/video-affiliate/worker/[0-9]*/

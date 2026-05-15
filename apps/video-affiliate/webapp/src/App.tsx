@@ -24,7 +24,7 @@ const VERTICAL_VIEWER_FRAME_STYLE = {
 
 const COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER = '{{shopee_link}}'
 const COMMENT_TEMPLATE_LAZADA_PLACEHOLDER = '{{lazada_link}}'
-const DEFAULT_GEMINI_KEY_SLOTS = 5
+const DEFAULT_GEMINI_KEY_SLOTS = 1
 const createEmptyGeminiKeySlots = (count = DEFAULT_GEMINI_KEY_SLOTS) => Array.from({ length: Math.max(0, count) }, () => '')
 const DEFAULT_COMMENT_TEMPLATE = `📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้ 👇
 🧡 Shopee : {{shopee_link}}
@@ -1018,7 +1018,7 @@ const getSettingsSectionTitle = (section: SettingsSection): string => {
     case 'team':
       return 'Team'
     case 'gemini':
-      return 'Gemini API Key'
+      return 'AI API Keys'
     case 'shortlink':
       return 'Shortlink'
     case 'post':
@@ -1623,6 +1623,8 @@ function VideoCard({
   keepInPostedOnLinkSave = false,
   showRepostAction = false,
   onRepost,
+  initialExpanded = false,
+  renderCollapsed = true,
 }: {
   video: Video
   currentNamespaceId?: string
@@ -1635,8 +1637,10 @@ function VideoCard({
   keepInPostedOnLinkSave?: boolean
   showRepostAction?: boolean
   onRepost?: (id: string, namespaceId?: string) => Promise<void> | void
+  initialExpanded?: boolean
+  renderCollapsed?: boolean
 }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(initialExpanded)
   const [deleting, setDeleting] = useState(false)
   const [importing, setImporting] = useState(false)
   const [reposting, setReposting] = useState(false)
@@ -2242,6 +2246,8 @@ function VideoCard({
       </div>
     )
   }
+
+  if (!renderCollapsed) return null
 
   return (
     <div
@@ -3218,6 +3224,9 @@ function App({
     setGeminiApiKeySaving(false)
     setGeminiApiKeyMaxChars(512)
     setGeminiApiKeyMaxSlots(DEFAULT_GEMINI_KEY_SLOTS)
+    setVertexTtsConfigured(false)
+    setVertexTtsModel('')
+    setVertexTtsProjectId('')
     setShortlinkBaseUrlCurrent('')
     setLazadaShortlinkBaseUrlCurrent('')
     setShortlinkAccountCurrent('')
@@ -3227,6 +3236,7 @@ function App({
     setLazadaExpectedMemberIdCurrent('')
     setLazadaExpectedMemberIdDraft('')
     setShortlinkEnabled(false)
+    setShortlinkProcessingEnabled(false)
     setShortlinkUpdatedAt('')
     setShortlinkMessage('')
     setShortlinkLoading(false)
@@ -3417,6 +3427,9 @@ function App({
   const [geminiApiKeyHealth, setGeminiApiKeyHealth] = useState<GeminiKeyHealthRow[]>([])
   const [geminiApiKeyMaxChars, setGeminiApiKeyMaxChars] = useState(512)
   const [geminiApiKeyMaxSlots, setGeminiApiKeyMaxSlots] = useState(DEFAULT_GEMINI_KEY_SLOTS)
+  const [vertexTtsConfigured, setVertexTtsConfigured] = useState(false)
+  const [vertexTtsModel, setVertexTtsModel] = useState('')
+  const [vertexTtsProjectId, setVertexTtsProjectId] = useState('')
   const [shortlinkAccountDraft, setShortlinkAccountDraft] = useState(() => getStoredShortlinkAccount(botScope))
   const [shortlinkAccountCurrent, setShortlinkAccountCurrent] = useState(() => getStoredShortlinkAccount(botScope))
   const [shortlinkBaseUrlCurrent, setShortlinkBaseUrlCurrent] = useState(() => getStoredShortlinkBaseUrl(botScope))
@@ -3438,6 +3451,7 @@ function App({
   }, [voicePreviewUrl])
   const [lazadaExpectedMemberIdCurrent, setLazadaExpectedMemberIdCurrent] = useState(() => getStoredLazadaExpectedMemberId(botScope))
   const [shortlinkEnabled, setShortlinkEnabled] = useState(false)
+  const [shortlinkProcessingEnabled, setShortlinkProcessingEnabled] = useState(false)
   const [shortlinkUpdatedAt, setShortlinkUpdatedAt] = useState('')
   const [shortlinkMessage, setShortlinkMessage] = useState('')
   const [shortlinkLoading, setShortlinkLoading] = useState(false)
@@ -3739,6 +3753,37 @@ function App({
     }
     syncAppUrl(t, gallerySearchInput, 'push')
   }
+  const openProcessedVideoInGallery = async (videoOrId: string | Partial<Video>) => {
+    const source = typeof videoOrId === 'string' ? { id: videoOrId } : videoOrId
+    const videoId = String(source?.id || '').trim()
+    if (!videoId) return
+
+    const sourceNamespaceId = String((source as Record<string, unknown>)?.namespace_id || namespaceId || '').trim()
+    const sameVideo = (video: Video) => String(video.id || '').trim() === videoId
+    const cachedVideo = [...videos, ...usedVideos].find(sameVideo)
+    if (cachedVideo) {
+      setVideoViewerOpen(true)
+      setSelectedProcessedGalleryVideo(cachedVideo)
+      return
+    }
+
+    try {
+      const url = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(videoId)}`)
+      if (sourceNamespaceId) url.searchParams.set('namespace_id', sourceNamespaceId)
+      const resp = await apiFetch(url.toString())
+      if (!resp.ok) throw new Error(`gallery_detail_${resp.status}`)
+      const data = await resp.json() as Video
+      const detailVideo = {
+        ...data,
+        id: String((data as Record<string, unknown>).id || videoId).trim() || videoId,
+        namespace_id: String((data as Record<string, unknown>).namespace_id || sourceNamespaceId || '').trim() || undefined,
+      } as Video
+      setVideoViewerOpen(true)
+      setSelectedProcessedGalleryVideo(detailVideo)
+    } catch {
+      alert('เปิดรายละเอียดวิดีโอไม่สำเร็จ ลองรีเฟรชแล้วกดใหม่อีกครั้ง')
+    }
+  }
   const openSettingsSection = (section: SettingsSection) => {
     setSelectedPage(null)
     setSelectedPageHistoryId('')
@@ -3792,6 +3837,7 @@ function App({
   const [startingInboxId, setStartingInboxId] = useState<string | null>(null)
   const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
+  const [selectedProcessedGalleryVideo, setSelectedProcessedGalleryVideo] = useState<Video | null>(null)
   const processingFetchInFlightRef = useRef(false)
   const postHistoryFetchInFlightRef = useRef(false)
   const lastPostHistoryFetchKeyRef = useRef('')
@@ -4201,6 +4247,7 @@ function App({
     setLazadaExpectedMemberIdCurrent(storedLazadaExpectedMemberId)
     setLazadaExpectedMemberIdDraft(storedLazadaExpectedMemberId)
     setShortlinkEnabled(false)
+    setShortlinkProcessingEnabled(false)
     setInboxLoading(cachedInbox.length === 0)
     setProcessingVideos([])
     setPendingShortlinkVideos([])
@@ -5746,10 +5793,9 @@ function App({
         max_chars?: number
         max_slots?: number
         health?: { keys?: GeminiKeyHealthRow[] }
+        vertex_tts?: { configured?: boolean; model?: string; project_id?: string }
       }
-      const maxSlots = typeof data.max_slots === 'number' && data.max_slots > 0
-        ? Math.max(1, Math.min(5, data.max_slots))
-        : DEFAULT_GEMINI_KEY_SLOTS
+      const maxSlots = DEFAULT_GEMINI_KEY_SLOTS
       const maskedKeys = Array.isArray(data.masked_keys)
         ? data.masked_keys.map((value) => String(value || ''))
         : [String(data.masked_key || '')]
@@ -5758,7 +5804,10 @@ function App({
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
       setGeminiApiKeyMaxSlots(maxSlots)
-      setGeminiApiKeyHealth(Array.isArray(data.health?.keys) ? data.health.keys : [])
+      setGeminiApiKeyHealth(Array.isArray(data.health?.keys) ? data.health.keys.slice(0, maxSlots) : [])
+      setVertexTtsConfigured(data.vertex_tts?.configured === true)
+      setVertexTtsModel(String(data.vertex_tts?.model || ''))
+      setVertexTtsProjectId(String(data.vertex_tts?.project_id || ''))
       setGeminiApiKeyDrafts(createEmptyGeminiKeySlots(maxSlots))
       setGeminiApiKeyMessage('')
     } catch {
@@ -5783,7 +5832,7 @@ function App({
       } : {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_keys: trimmedKeys, preserve_existing: true }),
+        body: JSON.stringify({ api_key: trimmedKeys[0] || '', preserve_existing: false }),
       })
 
       if (resp.status === 401) {
@@ -5808,10 +5857,9 @@ function App({
         max_chars?: number
         max_slots?: number
         health?: { keys?: GeminiKeyHealthRow[] }
+        vertex_tts?: { configured?: boolean; model?: string; project_id?: string }
       }
-      const maxSlots = typeof data.max_slots === 'number' && data.max_slots > 0
-        ? Math.max(1, Math.min(5, data.max_slots))
-        : DEFAULT_GEMINI_KEY_SLOTS
+      const maxSlots = DEFAULT_GEMINI_KEY_SLOTS
       const maskedKeys = Array.isArray(data.masked_keys)
         ? data.masked_keys.map((value) => String(value || ''))
         : [String(data.masked_key || '')]
@@ -5820,7 +5868,10 @@ function App({
       setGeminiApiKeyUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_chars === 'number' && data.max_chars > 0) setGeminiApiKeyMaxChars(data.max_chars)
       setGeminiApiKeyMaxSlots(maxSlots)
-      setGeminiApiKeyHealth(Array.isArray(data.health?.keys) ? data.health.keys : [])
+      setGeminiApiKeyHealth(Array.isArray(data.health?.keys) ? data.health.keys.slice(0, maxSlots) : [])
+      setVertexTtsConfigured(data.vertex_tts?.configured === true)
+      setVertexTtsModel(String(data.vertex_tts?.model || ''))
+      setVertexTtsProjectId(String(data.vertex_tts?.project_id || ''))
       setGeminiApiKeyDrafts(createEmptyGeminiKeySlots(maxSlots))
       setGeminiApiKeyMessage(isClear ? 'ล้าง Gemini API key กลางของระบบแล้ว' : 'บันทึก Gemini API key กลางของระบบแล้ว')
     } catch {
@@ -5834,7 +5885,7 @@ function App({
     const session = getToken()
     if (!session) return
     setGeminiApiKeyChecking(true)
-    setGeminiApiKeyMessage('กำลังเช็คคีย์ Gemini ทีละช่อง...')
+    setGeminiApiKeyMessage('กำลังเช็ค Gemini API key...')
     try {
       const resp = await apiFetch(`${WORKER_URL}/api/settings/gemini-key/check`, { method: 'POST' })
       if (resp.status === 401) {
@@ -5858,8 +5909,8 @@ function App({
       setGeminiApiKeyHealth(rows)
       const badRows = rows.filter((row) => row.active === false || (row.status && row.status !== 'ok'))
       setGeminiApiKeyMessage(badRows.length
-        ? `พบคีย์มีปัญหา ${badRows.map((row) => `Key ${row.slot || '?'} ${row.status || 'error'}`).join(', ')} — ระบบจะข้ามคีย์นี้ชั่วคราว`
-        : 'เช็คแล้ว: ทุก key ใช้งานได้')
+        ? `Gemini API key มีปัญหา: ${badRows[0]?.status || 'error'} — กรุณาเปลี่ยนคีย์หรือรอ quota`
+        : 'เช็คแล้ว: Gemini API key ใช้งานได้')
     } catch {
       setGeminiApiKeyMessage('เช็ค Gemini API key ไม่สำเร็จ')
     } finally {
@@ -5893,6 +5944,7 @@ function App({
         enabled?: boolean
         lazada_enabled?: boolean
         required?: boolean
+        processing_required?: boolean
         expected_utm_id?: string
         lazada_expected_member_id?: string
         shortlink_url_template?: string
@@ -5921,6 +5973,7 @@ function App({
       setLazadaExpectedMemberIdCurrent(lazadaExpectedMemberId)
       setLazadaExpectedMemberIdDraft(lazadaExpectedMemberId)
       setShortlinkEnabled(data.required === true)
+      setShortlinkProcessingEnabled(data.processing_required === true)
       setShortlinkUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
@@ -5989,6 +6042,7 @@ function App({
         enabled?: boolean
         lazada_enabled?: boolean
         required?: boolean
+        processing_required?: boolean
         expected_utm_id?: string
         lazada_expected_member_id?: string
         updated_at?: string
@@ -6011,6 +6065,7 @@ function App({
       setLazadaExpectedMemberIdCurrent(lazadaExpectedMemberId)
       setLazadaExpectedMemberIdDraft(lazadaExpectedMemberId)
       setShortlinkEnabled(data.required === true)
+      setShortlinkProcessingEnabled(data.processing_required === true)
       setShortlinkUpdatedAt(String(data.updated_at || ''))
       if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setShortlinkAccountMaxChars(data.max_account_chars)
       if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setShortlinkExpectedUtmIdMaxChars(data.max_expected_utm_chars)
@@ -6052,12 +6107,55 @@ function App({
         setShortlinkMessage(data.error || 'บันทึกการย่อลิงก์ไม่สำเร็จ')
         return
       }
-      const data = await resp.json().catch(() => ({})) as { required?: boolean; updated_at?: string }
+      const data = await resp.json().catch(() => ({})) as { required?: boolean; processing_required?: boolean; updated_at?: string }
       setShortlinkEnabled(data.required === true)
+      setShortlinkProcessingEnabled(data.processing_required === true)
       setShortlinkUpdatedAt(String(data.updated_at || ''))
       setShortlinkMessage(required ? 'เปิดย่อลิงก์ตอนโพสต์แล้ว' : 'ปิดย่อลิงก์ตอนโพสต์แล้ว')
     } catch {
       setShortlinkMessage('บันทึกการย่อลิงก์ไม่สำเร็จ')
+    } finally {
+      setShortlinkSaving(false)
+    }
+  }
+
+
+  async function saveShortlinkProcessingRequirement(required: boolean) {
+    const session = getToken()
+    if (!session) return
+    setShortlinkSaving(true)
+    setShortlinkMessage('')
+    try {
+      const resp = await apiFetch(`${WORKER_URL}/api/settings/shopee-shortlink/processing-requirement`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ required }),
+      })
+      if (resp.status === 401) {
+        await recoverSessionOrLogout()
+        return
+      }
+      if (resp.status === 403) {
+        setShortlinkMessage('บัญชีนี้ไม่มีสิทธิ์แก้การย่อลิงก์')
+        return
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string }
+        setShortlinkMessage(data.error || 'บันทึกการย่อลิงก์ตอนประมวลผลไม่สำเร็จ')
+        return
+      }
+      const data = await resp.json().catch(() => ({})) as { required?: boolean; processing_required?: boolean; updated_at?: string }
+      setShortlinkEnabled(data.required === true)
+      setShortlinkProcessingEnabled(data.processing_required === true)
+      setShortlinkUpdatedAt(String(data.updated_at || ''))
+      setShortlinkMessage(required ? 'เปิดย่อลิงก์ตอนประมวลผลแล้ว' : 'ปิดย่อลิงก์ตอนประมวลผลแล้ว')
+      setVideos([])
+      setUsedVideos([])
+      setGalleryLoading(true)
+      void loadAll()
+      void loadProcessingSnapshot()
+    } catch {
+      setShortlinkMessage('บันทึกการย่อลิงก์ตอนประมวลผลไม่สำเร็จ')
     } finally {
       setShortlinkSaving(false)
     }
@@ -6243,7 +6341,14 @@ function App({
     try {
       const endpoint = isQueued ? 'queue' : 'processing'
       await apiFetch(`${WORKER_URL}/api/${endpoint}/${id}`, { method: 'DELETE' })
-      setProcessingVideos(prev => prev.filter(v => v.id !== id))
+      const nowIso = new Date().toISOString()
+      setProcessingVideos(prev => prev.map(v => v.id === id ? {
+        ...v,
+        status: 'cancelled',
+        updatedAt: nowIso,
+        error: isQueued ? 'ผู้ใช้ยกเลิกคิวประมวลผล' : 'ผู้ใช้ยกเลิกงานประมวลผล',
+      } : v))
+      void loadProcessingSnapshot()
     } catch { }
   }
 
@@ -7264,6 +7369,7 @@ function App({
             processingVideos={processingVideos}
             onCancel={handleCancelJob}
             onReprocess={handleReprocessJob}
+            onOpenProcessedVideo={openProcessedVideoInGallery}
             retryingProcessingId={retryingProcessingId}
           />
         )}
@@ -7959,11 +8065,11 @@ function App({
                   {isSystemAdmin && (
                     <SettingsMenuItem
                       icon="🔑"
-                      title="Gemini API Key"
+                      title="AI API Keys"
                       subtitle={
                         geminiApiKeySource === 'system' || geminiApiKeySource === 'legacy'
-                          ? `ใช้ร่วมทุก namespace • ${geminiApiKeyMaskedList.filter(Boolean).length}/${geminiApiKeyMaxSlots} key`
-                          : 'ตั้งค่า Gemini key กลางของระบบ'
+                          ? `Gemini กลาง: ${geminiApiKeyMaskedList.find(Boolean) || 'ตั้งแล้ว'} • Vertex TTS ${vertexTtsConfigured ? 'พร้อม' : 'ยังไม่พร้อม'}`
+                          : 'ตั้งค่า Gemini key + Vertex TTS'
                       }
                       onClick={() => openSettingsSection('gemini')}
                     />
@@ -8110,60 +8216,74 @@ function App({
 
                 {settingsSection === 'gemini' && isSystemAdmin && (
                   <div className="space-y-3">
-                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
+                    <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-4">
                       <p className="text-xs text-gray-500 leading-relaxed">
-                        ตั้งค่า Gemini key กลางของระบบได้สูงสุด 5 key และทุก namespace จะใช้ชุดนี้ร่วมกัน ถ้า key แรกมีปัญหา ระบบจะขยับไปใช้อีก key ทันที
-                      </p>
-                      <p className="text-[11px] text-gray-400 leading-relaxed">
-                        กรอกเฉพาะช่องที่อยากเปลี่ยนได้ ช่องที่เว้นว่างจะใช้ค่าเดิมต่อ
+                        หน้านี้เหลือ 2 ค่าเท่านั้น: Gemini API key สำหรับวิเคราะห์วิดีโอ/สร้างสคริปต์ และ Vertex TTS สำหรับสร้างเสียงพากย์
                       </p>
                       {geminiApiKeyLoading ? (
-                        <p className="text-sm text-gray-400 py-3">กำลังโหลด Gemini API key...</p>
+                        <p className="text-sm text-gray-400 py-3">กำลังโหลดคีย์...</p>
                       ) : (
                         <>
-                          <div className="space-y-2">
-                            {Array.from({ length: geminiApiKeyMaxSlots }, (_, index) => {
-                              const masked = geminiApiKeyMaskedList[index] || ''
-                              const value = geminiApiKeyDrafts[index] || ''
-                              const health = geminiApiKeyHealth.find((row) => Number(row.slot || 0) === index + 1 || (masked && row.masked_key === masked))
-                              const healthStatus = String(health?.status || '').trim()
-                              const healthProblem = !!healthStatus && healthStatus !== 'ok'
-                              return (
-                                <div key={`gemini-slot-${index}`} className="space-y-1">
-                                  <div className="flex items-center justify-between">
-                                    <p className="text-[11px] font-bold text-gray-500">Key {index + 1}</p>
-                                    <p className="text-[11px] text-gray-400">{value.length}/{geminiApiKeyMaxChars}</p>
-                                  </div>
-                                  <input
-                                    type="password"
-                                    value={value}
-                                    onChange={(e) => {
-                                      const next = [...geminiApiKeyDrafts]
-                                      next[index] = e.target.value
-                                      setGeminiApiKeyDrafts(next)
-                                      if (geminiApiKeyMessage) setGeminiApiKeyMessage('')
-                                    }}
-                                    placeholder={masked ? `${masked} (กรอกใหม่เพื่อแทนค่าเดิม)` : 'AIza...'}
-                                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                                  />
-                                  {masked && (
-                                    <p className="text-[11px] text-gray-400 break-all">คีย์ปัจจุบัน: {masked}</p>
-                                  )}
-                                  {healthStatus && (
-                                    <p className={`text-[11px] ${healthProblem ? 'text-red-500' : 'text-green-600'}`}>
-                                      สถานะ: {healthProblem ? `มีปัญหา (${healthStatus})` : 'ใช้งานได้'}
-                                      {health?.disabled_until ? ` • พักถึง ${new Date(health.disabled_until).toLocaleString()}` : ''}
-                                    </p>
-                                  )}
+                          {(() => {
+                            const masked = geminiApiKeyMaskedList[0] || ''
+                            const value = geminiApiKeyDrafts[0] || ''
+                            const health = geminiApiKeyHealth.find((row) => Number(row.slot || 0) === 1 || (masked && row.masked_key === masked))
+                            const healthStatus = String(health?.status || '').trim()
+                            const healthProblem = !!healthStatus && healthStatus !== 'ok'
+                            return (
+                              <div className="space-y-1">
+                                <div className="flex items-center justify-between">
+                                  <p className="text-[11px] font-bold text-gray-500">Gemini API key</p>
+                                  <p className="text-[11px] text-gray-400">{value.length}/{geminiApiKeyMaxChars}</p>
                                 </div>
-                              )
-                            })}
+                                <input
+                                  type="password"
+                                  value={value}
+                                  onChange={(e) => {
+                                    setGeminiApiKeyDrafts([e.target.value])
+                                    if (geminiApiKeyMessage) setGeminiApiKeyMessage('')
+                                  }}
+                                  placeholder={masked ? `${masked} (กรอกใหม่เพื่อแทนค่าเดิม)` : 'AIza...'}
+                                  className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
+                                />
+                                <p className="text-[11px] text-gray-400 leading-relaxed">
+                                  ใช้สำหรับวิเคราะห์วิดีโอ, สร้างสคริปต์ และซิงก์ซับ
+                                </p>
+                                {masked && (
+                                  <p className="text-[11px] text-gray-400 break-all">คีย์ปัจจุบัน: {masked}</p>
+                                )}
+                                {healthStatus && (
+                                  <p className={`text-[11px] ${healthProblem ? 'text-red-500' : 'text-green-600'}`}>
+                                    สถานะ Gemini: {healthProblem ? `มีปัญหา (${healthStatus})` : 'ใช้งานได้'}
+                                    {health?.disabled_until ? ` • พักถึง ${new Date(health.disabled_until).toLocaleString()}` : ''}
+                                  </p>
+                                )}
+                              </div>
+                            )
+                          })()}
+
+                          <div className="space-y-1">
+                            <p className="text-[11px] font-bold text-gray-500">Vertex TTS key</p>
+                            <input
+                              type="password"
+                              value={vertexTtsConfigured ? 'ตั้งค่าแล้วใน Cloudflare Secret' : ''}
+                              readOnly
+                              placeholder="ยังไม่ได้ตั้ง Vertex TTS secret"
+                              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none text-gray-400"
+                            />
+                            <p className="text-[11px] text-gray-400 leading-relaxed">
+                              ใช้สำหรับสร้างเสียง TTS เท่านั้น • {vertexTtsModel || 'Vertex TTS'}{vertexTtsProjectId ? ` • project ${vertexTtsProjectId}` : ''}
+                            </p>
+                            <p className={`text-[11px] ${vertexTtsConfigured ? 'text-green-600' : 'text-red-500'}`}>
+                              สถานะ Vertex TTS: {vertexTtsConfigured ? 'พร้อมใช้งาน' : 'ยังไม่พบ secret'}
+                            </p>
                           </div>
+
                           <div className="flex items-center justify-between text-[11px] text-gray-400">
                             <span>
-                              แหล่งที่ใช้งาน: {geminiApiKeySource === 'system' ? 'กลางของระบบ' : geminiApiKeySource === 'legacy' ? 'กำลังใช้คีย์เก่าของ admin' : 'ยังไม่ตั้งค่า'}
+                              แหล่ง Gemini: {geminiApiKeySource === 'system' ? 'กลางของระบบ' : geminiApiKeySource === 'legacy' ? 'คีย์เก่าของ admin' : 'ยังไม่ตั้งค่า'}
                             </span>
-                            <span>ใช้งานอยู่ {geminiApiKeyMaskedList.filter(Boolean).length}/{geminiApiKeyMaxSlots}</span>
+                            <span>Gemini 1/1 • Vertex {vertexTtsConfigured ? 'พร้อม' : 'ไม่พร้อม'}</span>
                           </div>
                           {geminiApiKeyUpdatedAt && (
                             <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(geminiApiKeyUpdatedAt).toLocaleString()}</p>
@@ -8176,29 +8296,29 @@ function App({
                           <div className="flex gap-2">
                             <button
                               onClick={() => void checkGeminiApiKeys()}
-                              disabled={geminiApiKeyChecking || geminiApiKeySaving || geminiApiKeyMaskedList.every((value) => !value)}
+                              disabled={geminiApiKeyChecking || geminiApiKeySaving || !geminiApiKeyMaskedList[0]}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-amber-200 text-amber-700 bg-amber-50 active:scale-95 transition-all disabled:opacity-40"
                             >
-                              {geminiApiKeyChecking ? 'กำลังเช็ค...' : 'เช็คคีย์'}
+                              {geminiApiKeyChecking ? 'กำลังเช็ค...' : 'เช็ค Gemini'}
                             </button>
                           </div>
                           <div className="flex gap-2">
                             <button
                               onClick={() => {
-                                if (geminiApiKeySaving || geminiApiKeyDrafts.some((value) => value.length > geminiApiKeyMaxChars)) return
-                                void saveGeminiApiKeys(geminiApiKeyDrafts)
+                                if (geminiApiKeySaving || (geminiApiKeyDrafts[0] || '').length > geminiApiKeyMaxChars) return
+                                void saveGeminiApiKeys([geminiApiKeyDrafts[0] || ''])
                               }}
-                              disabled={geminiApiKeySaving || geminiApiKeyDrafts.some((value) => value.length > geminiApiKeyMaxChars) || geminiApiKeyDrafts.every((value) => !String(value || '').trim())}
+                              disabled={geminiApiKeySaving || (geminiApiKeyDrafts[0] || '').length > geminiApiKeyMaxChars || !String(geminiApiKeyDrafts[0] || '').trim()}
                               className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
                             >
-                              {geminiApiKeySaving ? 'กำลังบันทึก...' : 'บันทึก Gemini API key'}
+                              {geminiApiKeySaving ? 'กำลังบันทึก...' : 'บันทึก Gemini key'}
                             </button>
                             <button
                               onClick={() => {
                                 if (geminiApiKeySaving) return
                                 void saveGeminiApiKeys([])
                               }}
-                              disabled={geminiApiKeySaving || (geminiApiKeySource === 'none' && geminiApiKeyMaskedList.every((value) => !value))}
+                              disabled={geminiApiKeySaving || (geminiApiKeySource === 'none' && !geminiApiKeyMaskedList[0])}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               ล้างค่า
@@ -8238,32 +8358,57 @@ function App({
                 {settingsSection === 'shortlink' && (
                   <div className="space-y-3">
                     <div className="bg-white border border-gray-100 rounded-2xl p-4 space-y-3">
-                      <div className="flex items-start justify-between gap-3 rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3">
-                        <div className="space-y-1">
-                          <p className="text-sm font-bold text-gray-800">ย่อลิงก์ตอนโพสต์</p>
-                          <p className="text-[11px] leading-relaxed text-gray-500">
-                            เปิดไว้เฉพาะ namespace ที่ต้องการให้ระบบย่อลิงก์ตอนโพสต์เท่านั้น การประมวลผลและแท็บยังไม่โพสต์จะไม่รอย่อลิงก์แล้ว
-                          </p>
+                      <div className="space-y-2">
+                        <div className="flex items-start justify-between gap-3 rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3">
+                          <div className="space-y-1">
+                            <p className="text-sm font-bold text-gray-800">ย่อลิงก์ตอนโพสต์</p>
+                            <p className="text-[11px] leading-relaxed text-gray-500">
+                              เปิดเฉพาะ namespace ที่ต้องการให้ระบบย่อลิงก์ก่อนคอมเมนต์ตอนโพสต์
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (shortlinkSaving) return
+                              void saveShortlinkRequirement(!shortlinkEnabled)
+                            }}
+                            disabled={shortlinkSaving}
+                            className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors ${shortlinkEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${shortlinkSaving ? 'opacity-60' : ''}`}
+                            aria-pressed={shortlinkEnabled}
+                            title={shortlinkEnabled ? 'ปิดย่อลิงก์ตอนโพสต์' : 'เปิดย่อลิงก์ตอนโพสต์'}
+                          >
+                            <span
+                              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${shortlinkEnabled ? 'translate-x-6' : 'translate-x-1'}`}
+                            />
+                          </button>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (shortlinkSaving) return
-                            void saveShortlinkRequirement(!shortlinkEnabled)
-                          }}
-                          disabled={shortlinkSaving}
-                          className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors ${shortlinkEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${shortlinkSaving ? 'opacity-60' : ''}`}
-                          aria-pressed={shortlinkEnabled}
-                          title={shortlinkEnabled ? 'ปิดย่อลิงก์ตอนโพสต์' : 'เปิดย่อลิงก์ตอนโพสต์'}
-                        >
-                          <span
-                            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${shortlinkEnabled ? 'translate-x-6' : 'translate-x-1'}`}
-                          />
-                        </button>
+                        <div className="flex items-start justify-between gap-3 rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3">
+                          <div className="space-y-1">
+                            <p className="text-sm font-bold text-gray-800">ย่อลิงก์ตอนประมวลผล</p>
+                            <p className="text-[11px] leading-relaxed text-gray-500">
+                              ถ้าไม่เปิด ระบบจะไม่เรียก shortlink ตอนประมวลผลคลังต้นฉบับ และจะใช้ลิงก์เดิมไปก่อน
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (shortlinkSaving) return
+                              void saveShortlinkProcessingRequirement(!shortlinkProcessingEnabled)
+                            }}
+                            disabled={shortlinkSaving}
+                            className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors ${shortlinkProcessingEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${shortlinkSaving ? 'opacity-60' : ''}`}
+                            aria-pressed={shortlinkProcessingEnabled}
+                            title={shortlinkProcessingEnabled ? 'ปิดย่อลิงก์ตอนประมวลผล' : 'เปิดย่อลิงก์ตอนประมวลผล'}
+                          >
+                            <span
+                              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${shortlinkProcessingEnabled ? 'translate-x-6' : 'translate-x-1'}`}
+                            />
+                          </button>
+                        </div>
                       </div>
                       <p className="text-xs text-gray-500 leading-relaxed">
                         {isSystemAdmin
-                          ? 'ใส่ค่า affiliate ของ workspace นี้สำหรับย่อลิงก์ตอนโพสต์เท่านั้น ถ้าปิดสวิตช์ด้านบน ระบบจะไม่ย่อลิงก์'
+                          ? 'ใส่ค่า affiliate ของ workspace นี้ ใช้ร่วมกับสวิตช์ย่อลิงก์ตอนโพสต์และตอนประมวลผล'
                           : 'ใส่ Shopee ID กับ Lazada ID ของ workspace นี้เพื่อใช้ตรวจตอนโพสต์ โดย member จะไม่มีการย่อลิงก์'}
                       </p>
                       {shortlinkLoading ? (
@@ -8397,7 +8542,7 @@ function App({
                                 if (shortlinkSaving) return
                                 void saveShortlinkSettings('')
                               }}
-                              disabled={shortlinkSaving || (!shortlinkEnabled && !shortlinkExpectedUtmIdCurrent && !lazadaExpectedMemberIdCurrent && !shortlinkAccountCurrent)}
+                              disabled={shortlinkSaving || (!shortlinkEnabled && !shortlinkProcessingEnabled && !shortlinkExpectedUtmIdCurrent && !lazadaExpectedMemberIdCurrent && !shortlinkAccountCurrent)}
                               className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
                             >
                               ล้างค่า
@@ -9421,6 +9566,23 @@ function App({
           </div>
         )}
       </div>
+
+      {selectedProcessedGalleryVideo && (
+        <VideoCard
+          key={`processed-detail-${selectedProcessedGalleryVideo.id}`}
+          video={selectedProcessedGalleryVideo}
+          currentNamespaceId={namespaceId}
+          formatDuration={formatDuration}
+          onDelete={handleDelete}
+          onUpdate={handleUpdateVideo}
+          onExpandedChange={(isOpen) => {
+            setVideoViewerOpen(isOpen)
+            if (!isOpen) setSelectedProcessedGalleryVideo(null)
+          }}
+          initialExpanded
+          renderCollapsed={false}
+        />
+      )}
 
       {!videoViewerOpen && (
         <BottomNav tab={tab} onChangeTab={setTab} />

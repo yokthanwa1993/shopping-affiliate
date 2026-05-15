@@ -1,1 +1,1 @@
-pub const PIPELINE_ENGINE_VERSION: &str = "2026-04-05.01";
+pub const PIPELINE_ENGINE_VERSION: &str = "2026-05-08.04";

@@ -8,20 +8,26 @@ export function isInboxVideoOwnedByCurrentNamespace(video: InboxVideo, currentNa
 
 export function compareInboxVideosForSystemView(a: InboxVideo, b: InboxVideo, currentNamespaceId?: string): number {
   void currentNamespaceId
+  const aProcessedTs = new Date(String(a.processedAt || '')).getTime()
+  const bProcessedTs = new Date(String(b.processedAt || '')).getTime()
   const aUpdatedTs = new Date(String(a.updatedAt || '')).getTime()
   const bUpdatedTs = new Date(String(b.updatedAt || '')).getTime()
   const aCreatedTs = new Date(String(a.createdAt || '')).getTime()
   const bCreatedTs = new Date(String(b.createdAt || '')).getTime()
-  const aTs = Number.isFinite(aUpdatedTs) && aUpdatedTs > 0
-    ? aUpdatedTs
-    : Number.isFinite(aCreatedTs) && aCreatedTs > 0
-      ? aCreatedTs
-      : aUpdatedTs
-  const bTs = Number.isFinite(bUpdatedTs) && bUpdatedTs > 0
-    ? bUpdatedTs
-    : Number.isFinite(bCreatedTs) && bCreatedTs > 0
-      ? bCreatedTs
-      : bUpdatedTs
+  const aTs = Number.isFinite(aProcessedTs) && aProcessedTs > 0
+    ? aProcessedTs
+    : Number.isFinite(aUpdatedTs) && aUpdatedTs > 0
+      ? aUpdatedTs
+      : Number.isFinite(aCreatedTs) && aCreatedTs > 0
+        ? aCreatedTs
+        : aUpdatedTs
+  const bTs = Number.isFinite(bProcessedTs) && bProcessedTs > 0
+    ? bProcessedTs
+    : Number.isFinite(bUpdatedTs) && bUpdatedTs > 0
+      ? bUpdatedTs
+      : Number.isFinite(bCreatedTs) && bCreatedTs > 0
+        ? bCreatedTs
+        : bUpdatedTs
   return (Number.isFinite(bTs) ? bTs : 0) - (Number.isFinite(aTs) ? aTs : 0)
 }
 

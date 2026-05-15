@@ -1,6 +1,6 @@
 import { useMemo, type RefObject } from 'react'
 import { InboxCard } from '../components/InboxCard'
-import { getInboxVideoIdentityKey } from '../inboxUtils'
+import { compareInboxVideosForSystemView, getInboxVideoIdentityKey } from '../inboxUtils'
 import type { InboxVideo } from '../sharedTypes'
 
 export function InboxTab({
@@ -68,14 +68,14 @@ export function InboxTab({
       : inboxView === 'missing_links'
         ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
         : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
-  )), [filteredSystemInboxVideos, inboxView])
+  )).sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId)), [filteredSystemInboxVideos, inboxView, namespaceId])
   const visibleInboxVideos = useMemo(() => inboxVideos.filter((video) => (
     inboxView === 'processed'
       ? !!String(video.processedAt || '').trim()
       : inboxView === 'missing_links'
         ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
         : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
-  )), [inboxVideos, inboxView])
+  )).sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId)), [inboxVideos, inboxView, namespaceId])
 
   if (isSystemAdmin) {
     const currentTotal = inboxView === 'processed'

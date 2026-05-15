@@ -45,6 +45,7 @@ pub struct PipelineRequest {
     pub vertex_tts_project_id: Option<String>,
     pub vertex_tts_location: Option<String>,
     pub vertex_tts_model: Option<String>,
+    pub vertex_tts_service_account_json: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -715,18 +716,6 @@ async fn gemini_script(
     })
 }
 
-fn build_tts_input(script: &str, template: Option<&str>) -> String {
-    let trimmed_script = script.trim();
-    let trimmed_template = template.unwrap_or("").trim();
-    if trimmed_template.is_empty() {
-        return trimmed_script.to_string();
-    }
-    if trimmed_template.contains("{{script}}") {
-        return trimmed_template.replace("{{script}}", trimmed_script);
-    }
-    format!("{}\n\nบทพากย์:\n{}", trimmed_template, trimmed_script)
-}
-
 /// Given a legacy combined template like "...style guide...\n\nบทพากย์:\n{{script}}",
 /// extract just the style guide portion (everything before "บทพากย์:" or "{{script}}").
 /// Returns None if the template is empty or has no separable style portion.
@@ -774,7 +763,13 @@ fn redact_vertex_error(body: &str) -> String {
         .collect::<String>()
 }
 
-fn load_vertex_service_account() -> Result<VertexServiceAccount, Box<dyn std::error::Error + Send + Sync>> {
+fn load_vertex_service_account(request_raw_json: Option<&str>) -> Result<VertexServiceAccount, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(raw_json) = request_raw_json {
+        let trimmed = raw_json.trim();
+        if !trimmed.is_empty() {
+            return Ok(serde_json::from_str(trimmed)?);
+        }
+    }
     if let Ok(raw_json) = std::env::var("VERTEX_TTS_SERVICE_ACCOUNT_JSON") {
         let trimmed = raw_json.trim();
         if !trimmed.is_empty() {
@@ -843,18 +838,22 @@ fn build_tts_payload(script: &str, voice_name: Option<&str>, tts_prompt_template
         .or_else(|| extract_style_from_legacy_template(tts_prompt_template))
         .unwrap_or_default();
     let script_only = script.trim().to_string();
-    let final_text = if style_text.is_empty() {
-        build_tts_input(script, tts_prompt_template)
-    } else {
-        format!("[Voice direction: {}]\n\n{}", style_text, script_only)
-    };
-    json!({
-        "contents": [{"role": "user", "parts": [{"text": final_text}]}],
+    let mut payload = json!({
+        "contents": [{"role": "user", "parts": [{"text": script_only}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": selected_voice}}}
         }
-    })
+    });
+    if !style_text.is_empty() {
+        payload["systemInstruction"] = json!({
+            "parts": [{"text": format!(
+                "นี่คือคำสั่งกำกับสไตล์เสียงเท่านั้น ห้ามอ่านออกเสียง ห้ามใส่คำสั่งนี้ในเสียงพากย์ ให้พูดเฉพาะข้อความบทพากย์จากผู้ใช้เท่านั้น\n{}",
+                style_text
+            )}]
+        });
+    }
+    payload
 }
 
 fn extract_tts_audio_b64(json: &Value) -> Option<String> {
@@ -878,9 +877,10 @@ async fn vertex_gemini_tts(
     request_location: Option<&str>,
     request_model: Option<&str>,
     request_endpoint: Option<&str>,
+    request_service_account_json: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
-    let service_account = load_vertex_service_account()?;
+    let service_account = load_vertex_service_account(request_service_account_json)?;
     let access_token = fetch_vertex_access_token(&client, &service_account).await?;
     let env_project_id = std::env::var("VERTEX_TTS_PROJECT_ID").ok();
     let project_id = request_project_id
@@ -914,7 +914,10 @@ async fn vertex_gemini_tts(
         "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
         endpoint, project_id, location, model
     );
-    let payload = build_tts_payload(script, voice_name, tts_prompt_template, tts_style_instructions);
+    // Vertex Gemini TTS currently rejects systemInstruction for AUDIO generation with
+    // a generic INVALID_ARGUMENT on some models. Keep the spoken payload script-only
+    // to prevent prompt leakage and keep production processing unblocked.
+    let payload = build_tts_payload(script, voice_name, None, None);
     let mut last_err = String::new();
     for attempt in 0..3 {
         println!("[PIPELINE] vertex_gemini_tts using model={} location={} attempt={}", model, location, attempt + 1);
@@ -994,6 +997,7 @@ async fn gemini_tts(
     request_location: Option<&str>,
     request_model: Option<&str>,
     request_endpoint: Option<&str>,
+    request_service_account_json: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     match vertex_gemini_tts(
         script,
@@ -1004,6 +1008,7 @@ async fn gemini_tts(
         request_location,
         request_model,
         request_endpoint,
+        request_service_account_json,
     ).await {
         Ok(audio) => Ok(audio),
         Err(vertex_err) => {
@@ -1428,13 +1433,27 @@ fn build_atempo_filter(mut factor: f64) -> String {
 mod tests {
     use super::{
         build_srt_from_lines_with_timing, extract_speech_srt_time_span, extract_srt_payload,
-        normalize_srt_blocks, parse_srt_time_range,
+        build_tts_payload, normalize_srt_blocks, parse_srt_time_range,
     };
 
     fn extract_time_lines(srt: &str) -> Vec<(f64, f64)> {
         srt.lines()
             .filter_map(|l| parse_srt_time_range(l))
             .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn tts_payload_keeps_voice_direction_out_of_spoken_text() {
+        let payload = build_tts_payload(
+            "พูดประโยคนี้เท่านั้น",
+            Some("Kore"),
+            Some("พูดแบบสดใส\n\nบทพากย์:\n{{script}}"),
+            None,
+        );
+        let spoken = payload["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert_eq!(spoken, "พูดประโยคนี้เท่านั้น");
+        assert!(!spoken.contains("พูดแบบสดใส"));
+        assert!(payload["systemInstruction"]["parts"][0]["text"].as_str().unwrap().contains("พูดแบบสดใส"));
     }
 
     #[test]
@@ -1771,6 +1790,7 @@ async fn rust_pipeline(req: PipelineRequest) -> Result<(), Box<dyn std::error::E
                     req.vertex_tts_location.as_deref(),
                     req.vertex_tts_model.as_deref(),
                     req.vertex_tts_endpoint.as_deref(),
+                    req.vertex_tts_service_account_json.as_deref(),
                 ).await?;
                 let raw_audio = tmp_path.join("audio.raw");
                 fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;
