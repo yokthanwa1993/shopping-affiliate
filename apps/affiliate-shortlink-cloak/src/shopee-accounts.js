@@ -1,7 +1,18 @@
 'use strict';
 
+const { sanitizeAccount } = require('./accounts');
+
 const DEFAULT_SHOPEE_ID_TO_ACCOUNT = Object.freeze({
-  '15142270000': 'affiliate_neezs.com',
+  '15142270000': Object.freeze({
+    id: '15142270000',
+    account: 'affiliate_neezs.com',
+    displayAccount: 'affiliate@neezs.com',
+  }),
+  '15130770000': Object.freeze({
+    id: '15130770000',
+    account: 'affiliate_neezs.com',
+    displayAccount: 'affiliate@neezs.com',
+  }),
 });
 
 function normalizeShopeeAffiliateId(value) {
@@ -24,19 +35,50 @@ function parseEnvMap(rawEnv) {
   const out = {};
   for (const [k, v] of Object.entries(parsed)) {
     const id = normalizeShopeeAffiliateId(k);
-    const account = String(v == null ? '' : v).trim();
-    if (id && account) out[id] = account;
+    const meta = normalizeShopeeAccountMapping(id, v);
+    if (meta) out[id] = meta;
   }
   return out;
 }
 
-function resolveShopeeAccountFromId(rawId, { envValue = process.env.SHOPEE_ID_ACCOUNT_MAP } = {}) {
+function normalizeShopeeAccountMapping(id, value) {
+  if (!id) return null;
+  if (typeof value === 'string') {
+    const rawAccount = value.trim();
+    if (!rawAccount) return null;
+    return {
+      id,
+      account: sanitizeAccount(rawAccount),
+      displayAccount: rawAccount,
+    };
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const rawAccount = String(value.account == null ? '' : value.account).trim();
+  const rawDisplayAccount = String(value.displayAccount == null ? '' : value.displayAccount).trim();
+  const accountSource = rawAccount || rawDisplayAccount;
+  if (!accountSource) return null;
+  return {
+    id,
+    account: sanitizeAccount(accountSource),
+    displayAccount: rawDisplayAccount || rawAccount || sanitizeAccount(accountSource),
+  };
+}
+
+function resolveShopeeAccountMetadataFromId(rawId, { envValue = process.env.SHOPEE_ID_ACCOUNT_MAP } = {}) {
   const id = normalizeShopeeAffiliateId(rawId);
-  if (!id) return '';
+  if (!id) return null;
   const envMap = parseEnvMap(envValue);
   if (Object.prototype.hasOwnProperty.call(envMap, id)) return envMap[id];
   if (Object.prototype.hasOwnProperty.call(DEFAULT_SHOPEE_ID_TO_ACCOUNT, id)) {
     return DEFAULT_SHOPEE_ID_TO_ACCOUNT[id];
+  }
+  return null;
+}
+
+function resolveShopeeAccountFromId(rawId, opts = {}) {
+  const meta = resolveShopeeAccountMetadataFromId(rawId, opts);
+  if (meta) {
+    return meta.account;
   }
   return '';
 }
@@ -45,5 +87,6 @@ module.exports = {
   DEFAULT_SHOPEE_ID_TO_ACCOUNT,
   normalizeShopeeAffiliateId,
   parseEnvMap,
+  resolveShopeeAccountMetadataFromId,
   resolveShopeeAccountFromId,
 };

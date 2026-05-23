@@ -49,6 +49,8 @@ GET /shorten?account=CHEARB&url=<shopee_or_lazada_url>&sub1=yok
 GET /shorten?id=15142270000&url=<shopee_url>&sub1=yok
 ```
 
+Shopee `id=` aliases can select the internal browser profile while returning a human account label in JSON; for example `id=15142270000` and `id=15130770000` use profile `affiliate_neezs.com` and return `"account": "affiliate@neezs.com"`.
+
 Shopee shortening uses the Affiliate Portal home page (`https://affiliate.shopee.co.th/`) as the browser origin and calls Shopee's `batchCustomLink` API from that authenticated context. The old `/offer/custom_link` page can redirect to Affiliate Portal `/404`; when the bridge sees that route it navigates back to the portal home before calling the API. If Shopee still keeps the browser on `/404`, the response uses the readable reason `shopee_custom_link_route_not_found` instead of a misleading login-selector reason.
 
 Incoming Shopee short URLs such as `https://s.shopee.co.th/...` are resolved first and the resolved canonical product URL is sent to Shopee `batchCustomLink`; the public response still preserves the original incoming `link` value.

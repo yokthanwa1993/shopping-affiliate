@@ -308,7 +308,29 @@ test('handleShorten resolves Shopee account from id when account is omitted', as
     sub1: 'idonly',
   });
 
-  assert.equal(result.account, 'affiliate_neezs.com');
+  assert.equal(result.account, 'affiliate@neezs.com');
+  assert.equal(stub.getPageCalls[0].platform, 'shopee');
+  assert.equal(stub.getPageCalls[0].account, 'affiliate_neezs.com');
+});
+
+test('handleShorten resolves Shopee account from 15130770000 id alias', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server.recordSessionState('shopee', 'affiliate_neezs.com', {
+    sessionValid: true,
+    customLinkAuthenticated: true,
+  });
+  const stub = stubShopeeShortenSuccess(t, {
+    shortLink: 'https://s.shopee.co.th/ID151307',
+    longLink: 'https://shopee.co.th/product/111/222?utm_content=id151307-sub2-sub3-sub4-sub5',
+  });
+
+  const result = await server.handleShorten({
+    url: 'https://shopee.co.th/-i.111.222',
+    id: '15130770000',
+    sub1: 'id151307',
+  });
+
+  assert.equal(result.account, 'affiliate@neezs.com');
   assert.equal(stub.getPageCalls[0].platform, 'shopee');
   assert.equal(stub.getPageCalls[0].account, 'affiliate_neezs.com');
 });
@@ -376,7 +398,7 @@ test('handleShorten uses explicit Shopee id in payload even when tracking utm_so
 
   assert.equal(result.id, '15142270000');
   assert.equal(result.utm_source, 'an_999999999');
-  assert.equal(result.account, 'affiliate_neezs.com');
+  assert.equal(result.account, 'affiliate@neezs.com');
 });
 
 test('handleShorten reuses authenticated Shopee dashboard context after auto reauth and returns shortLink', async (t) => {

@@ -47,7 +47,7 @@ const {
   sanitizeDiagnosticUrl: sanitizeShopeeDiagnosticUrl,
 } = require('./shopee-route');
 const {
-  resolveShopeeAccountFromId,
+  resolveShopeeAccountMetadataFromId,
   normalizeShopeeAffiliateId,
 } = require('./shopee-accounts');
 
@@ -620,14 +620,20 @@ async function handleShorten(query, opts = {}) {
   const rawAccount = String(query.account || '').trim();
   const explicitId = normalizeShopeeAffiliateId(query.id);
   let account;
+  let responseAccount;
   if (rawAccount) {
     account = sanitizeAccount(rawAccount);
+    responseAccount = account;
   } else if (platform === 'shopee' && explicitId) {
-    const resolvedAccount = resolveShopeeAccountFromId(explicitId);
-    if (!resolvedAccount) throw new Error('Unknown Shopee affiliate id: ' + explicitId);
-    account = sanitizeAccount(resolvedAccount);
+    const resolvedAccount = resolveShopeeAccountMetadataFromId(explicitId);
+    if (!resolvedAccount || !resolvedAccount.account) {
+      throw new Error('Unknown Shopee affiliate id: ' + explicitId);
+    }
+    account = sanitizeAccount(resolvedAccount.account);
+    responseAccount = String(resolvedAccount.displayAccount || account).trim();
   } else {
     account = sanitizeAccount(query.account);
+    responseAccount = account;
   }
   const autoReauth = opts.autoReauth !== false;
 
@@ -652,7 +658,7 @@ async function handleShorten(query, opts = {}) {
       shortLink: d.shortLink,
       id: explicitId,
       utmSource: extractUtmSource(resolvedShortLink),
-      account,
+      account: responseAccount,
       sub1: query.sub1 || '',
     });
   }
