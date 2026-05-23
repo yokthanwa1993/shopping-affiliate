@@ -16,6 +16,12 @@ import {
 } from './gallery-index'
 import { getBotId } from './utils/botAuth'
 import {
+    finalizePostingAffiliateVerification,
+    validateAffiliateCommentPreflight,
+    type PostingAffiliatePlatformVerification,
+    type PostingAffiliateVerificationResult,
+} from './affiliate-verification-policy'
+import {
     type Env,
     buildTtsPromptTemplate,
     buildTtsStyleInstructions,
@@ -23330,25 +23336,6 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     }
 }
 
-type PostingAffiliatePlatformVerification = {
-    inputLink: string
-    resolvedLink: string
-    expectedId: string
-    actualId: string
-    status: 'skipped' | 'missing_link' | 'verified' | 'mismatch' | 'error'
-    match: number | null
-    error: string | null
-}
-
-type PostingAffiliateVerificationResult = {
-    ok: boolean
-    enforced: boolean
-    status: 'skipped' | 'verified' | 'failed'
-    error: string | null
-    shopee: PostingAffiliatePlatformVerification
-    lazada: PostingAffiliatePlatformVerification
-}
-
 async function isNamespaceAffiliateVerificationEnforced(db: D1Database, namespaceId: string): Promise<boolean> {
     const normalizedNamespaceId = String(namespaceId || '').trim()
     if (!normalizedNamespaceId) return false
@@ -23366,6 +23353,7 @@ async function verifyAffiliateLinksForPosting(params: {
     namespaceId: string
     shopeeLink?: string | null
     lazadaLink?: string | null
+    requireLazadaLink?: boolean
     logPrefix: string
 }): Promise<PostingAffiliateVerificationResult> {
     const namespaceId = String(params.namespaceId || '').trim()
@@ -23429,30 +23417,22 @@ async function verifyAffiliateLinksForPosting(params: {
         }
     }
 
-    const blockingErrors = [shopee.error, lazada.error].filter((value) => !!String(value || '').trim())
-    const verifiedAny = shopee.status === 'verified' || lazada.status === 'verified'
-    const ok = enforced ? blockingErrors.length === 0 : true
-    const status: 'skipped' | 'verified' | 'failed' = enforced
-        ? (ok ? (verifiedAny ? 'verified' : 'skipped') : 'failed')
-        : (verifiedAny ? 'verified' : 'skipped')
-    const error = blockingErrors.join(' | ') || null
-
-    if (enforced && !ok) {
-        console.log(`[${params.logPrefix}] affiliate verification blocked posting: ${error}`)
-    } else if (verifiedAny) {
-        console.log(`[${params.logPrefix}] affiliate verification OK shopee=${shopee.actualId || '-'} lazada=${lazada.actualId || '-'}`)
-    } else if (!enforced && error) {
-        console.log(`[${params.logPrefix}] affiliate verification trace only (non-admin namespace): ${error}`)
-    }
-
-    return {
-        ok,
+    const result = finalizePostingAffiliateVerification({
         enforced,
-        status,
-        error,
         shopee,
         lazada,
+        lazadaRequired: !!params.requireLazadaLink,
+    })
+
+    if (enforced && !result.ok) {
+        console.log(`[${params.logPrefix}] affiliate verification blocked posting: ${result.error}`)
+    } else if (result.shopee.status === 'verified' || result.lazada.status === 'verified') {
+        console.log(`[${params.logPrefix}] affiliate verification OK shopee=${result.shopee.actualId || '-'} lazada=${result.lazada.actualId || '-'}`)
+    } else if (!enforced && result.error) {
+        console.log(`[${params.logPrefix}] affiliate verification trace only (non-admin namespace): ${result.error}`)
     }
+
+    return result
 }
 
 async function updatePostHistoryAffiliateVerificationById(db: D1Database, historyId: number, verification: PostingAffiliateVerificationResult): Promise<void> {
@@ -28815,6 +28795,24 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             }, 400)
         }
 
+        const affiliateCommentPreflight = validateAffiliateCommentPreflight({
+            shopeeLink: normalizedShopeeLink,
+            hasCommentToken,
+            skipComment,
+        })
+        if (!affiliateCommentPreflight.ok) {
+            const errorCode = affiliateCommentPreflight.error || 'affiliate_comment_not_configured'
+            if (retryHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted', comment_error = ? WHERE id = ? AND status = 'posting'"
+                ).bind(errorCode, errorCode, retryHistoryId).run().catch(() => { })
+            }
+            return c.json({
+                error: errorCode,
+                details: 'Affiliate comment token is required before posting',
+            }, 409)
+        }
+
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(attemptPostedAtIso, pageId, botId).run()
 
         const realVideoUrl = resolvePostingVideoDownloadUrl(env, selectedVideoNamespaceId, selectedVideoId, publicUrl)
@@ -29843,6 +29841,27 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }, 400)
         }
 
+        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        if (!pageAdsPublishEnabled) {
+            const affiliateCommentPreflight = validateAffiliateCommentPreflight({
+                shopeeLink: normalizedShopeeLink,
+                hasCommentToken,
+                skipComment,
+            })
+            if (!affiliateCommentPreflight.ok) {
+                const errorCode = affiliateCommentPreflight.error || 'affiliate_comment_not_configured'
+                if (forceHistoryId) {
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted', comment_error = ? WHERE id = ? AND status = 'posting'"
+                    ).bind(errorCode, errorCode, forceHistoryId).run().catch(() => { })
+                }
+                return c.json({
+                    error: errorCode,
+                    details: 'Affiliate comment token is required before posting',
+                }, 409)
+            }
+        }
+
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ?').bind(nowStr, page.id).run()
 
         // Handle legacy publicUrl without namespace path
@@ -29851,7 +29870,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // AUTO-ADS MODE (per-page toggle, admin-only).
         // Mirrors the cron branch: skip normal Reel post entirely, route through
         // /api/dashboard/create-ad (upload → creative → adset → ad → publish-to-page → comment).
-        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
         if (pageAdsPublishEnabled) {
             const namespaceIsAdminManaged = await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
             if (!namespaceIsAdminManaged) {
@@ -31553,6 +31571,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             logPrefix: `CRON ${page.name}`,
         })
         const commentTokenCandidates = tokenCandidates.commentTokens
+        const pageCommentToken = commentTokenCandidates[0] || null
         const fallbackPostTokenCandidates = tokenCandidates.postTokens.length > 0
             ? tokenCandidates.postTokens
             : normalizePostTokenPool([String(page.access_token || '')])
@@ -31565,7 +31584,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const commentTokenHint = deriveCommentTokenHint(commentTokenCandidates[0] || null)
         const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
         const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
-        const hasCommentToken = commentTokenCandidates.length > 0
+        const hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
         if (primaryPostingTokenCandidates.length === 0) {
             throw new Error('access_token_missing')
         }
@@ -31608,6 +31627,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             namespaceId: botId,
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
+            requireLazadaLink: lazadaLinkRequiredForPosting,
             logPrefix: `CRON ${page.name} VERIFY`,
         })
         if (cronHistoryId) {
@@ -31626,6 +31646,26 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             await botBucket.delete(dedupKey).catch(() => { })
             await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
             continue
+        }
+
+        if (!pageAdsPublishEnabled) {
+            const affiliateCommentPreflight = validateAffiliateCommentPreflight({
+                shopeeLink: normalizedShopeeLink,
+                hasCommentToken,
+            })
+            if (!affiliateCommentPreflight.ok) {
+                const errorCode = affiliateCommentPreflight.error || 'affiliate_comment_not_configured'
+                if (cronHistoryId) {
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted', comment_error = ? WHERE id = ? AND status = 'posting'"
+                    ).bind(errorCode, errorCode, cronHistoryId).run().catch(() => { })
+                }
+                console.error(`[CRON] Page ${page.name}: blocked before publish - ${errorCode}`)
+                await botBucket.delete(dedupKey).catch(() => { })
+                await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
+                cronStats.pagesFailed++
+                continue
+            }
         }
 
         await env.DB.prepare('UPDATE pages SET last_post_at = ? WHERE id = ? AND bot_id = ?').bind(nowISO, page.id, botId).run()
