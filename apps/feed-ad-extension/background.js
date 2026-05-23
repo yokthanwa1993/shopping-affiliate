@@ -27,6 +27,17 @@ const SHORTLINK_BASE = 'https://short.wwoom.com'
 const DEFAULT_AD_ACCOUNT = 'act_1030797047648459'
 const DEFAULT_TEMPLATE_ADSET = '120244389710100263'
 
+function pickExistingCampaignForName(campaigns, campaignName, objective) {
+    const name = String(campaignName || '').trim()
+    const wantedObjective = String(objective || '').trim()
+    if (!name || !wantedObjective || !Array.isArray(campaigns)) return null
+    return campaigns.find(c =>
+        String(c?.name || '').trim() === name
+        && String(c?.objective || '').trim() === wantedObjective
+        && String(c?.status || '').trim() !== 'DELETED'
+    ) || null
+}
+
 const ADS_MANAGER_TAB_PATTERNS = [
     'https://adsmanager.facebook.com/*',
     'https://www.facebook.com/adsmanager/*',
@@ -491,6 +502,7 @@ function shopeePageXhr(endpoint, body) {
 async function runCreateAdPipeline(payload) {
     const {
         videoUrl, videoId, caption, shopeeUrl,
+        adName, sourceVideoId,
         campaignId, newCampaignName,
         adAccount, templateAdset,
         thumbnailUrl,
@@ -560,6 +572,7 @@ async function runCreateAdPipeline(payload) {
         pageId: FEED_PAGE_ID,
         videoId: String(videoId || ''),
         videoUrl: String(videoUrl || ''),
+        adName: String(adName || sourceVideoId || videoId || ''),
         caption: finalCaption,
         ctaLink: shortLink,
         adAccount: effAdAccount,
@@ -626,7 +639,7 @@ async function runCreateAdPipeline(payload) {
 // All arguments are serialized — must pass primitives only.
 
 async function fbAdPipelineMainWorld(args) {
-    const { pageId, videoId, videoUrl, caption, ctaLink, adAccount, templateAdset, campaignId, newCampaignName, thumbnailUrl, commentText } = args
+    const { pageId, videoId, videoUrl, adName, caption, ctaLink, adAccount, templateAdset, campaignId, newCampaignName, thumbnailUrl, commentText } = args
 
     const accessToken = window.__accessToken
     if (!accessToken) {
@@ -704,6 +717,7 @@ async function fbAdPipelineMainWorld(args) {
         if (r.json?.effective_object_story_id) { storyId = r.json.effective_object_story_id; break }
     }
     if (!storyId) return { ok: false, step: 'story_id', error: 'Timeout (150s) — FB ยังสร้าง story ไม่เสร็จ', creative_id: creativeId, video_id: vidId }
+    const finalAdName = String(adName || videoId || vidId || storyId || caption || '').substring(0, 255)
 
     // ── Step 5: resolve campaign (existing or new) ──
     //
@@ -719,22 +733,32 @@ async function fbAdPipelineMainWorld(args) {
     if (!targetCampaignId && newCampaignName) {
         const tpl = await fbFetch(`https://graph.facebook.com/v21.0/${templateAdset}?fields=campaign{objective,buying_type}&access_token=${encodeURIComponent(accessToken)}`)
         const objective = tpl.json?.campaign?.objective || 'OUTCOME_ENGAGEMENT'
-        const newCamp = await fbFetch(
-            `https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`,
-            {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    name: newCampaignName,
-                    objective,
-                    status: 'ACTIVE',
-                    special_ad_categories: [],
-                    daily_budget: '100000',
-                    bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
-                }),
-            }
+        const exactCampaignName = String(newCampaignName || '').trim()
+        const escapedName = exactCampaignName.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+        const existing = await fbFetch(
+            `https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}&fields=id,name,status,objective&limit=50&filtering=[{"field":"name","operator":"EQUAL","value":"${escapedName}"}]`
         )
-        if (newCamp.json?.error) return { ok: false, step: 'new_campaign', error: newCamp.json.error.message, fb_error_code: newCamp.json.error.code, fb_trace_id: newCamp.json.error.fbtrace_id, creative_id: creativeId, story_id: storyId, attempted_objective: objective }
-        targetCampaignId = newCamp.json?.id
+        const reusable = pickExistingCampaignForName(existing.json?.data || [], exactCampaignName, objective)
+        if (reusable) {
+            targetCampaignId = reusable.id
+        } else {
+            const newCamp = await fbFetch(
+                `https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`,
+                {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: exactCampaignName,
+                        objective,
+                        status: 'ACTIVE',
+                        special_ad_categories: [],
+                        daily_budget: '100000',
+                        bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+                    }),
+                }
+            )
+            if (newCamp.json?.error) return { ok: false, step: 'new_campaign', error: newCamp.json.error.message, fb_error_code: newCamp.json.error.code, fb_trace_id: newCamp.json.error.fbtrace_id, creative_id: creativeId, story_id: storyId, attempted_objective: objective }
+            targetCampaignId = newCamp.json?.id
+        }
     }
     if (!targetCampaignId) return { ok: false, step: 'campaign', error: 'ต้องระบุ campaign_id หรือ new_campaign_name', creative_id: creativeId, story_id: storyId }
 
@@ -743,7 +767,10 @@ async function fbAdPipelineMainWorld(args) {
         `https://graph.facebook.com/v21.0/${templateAdset}/copies?access_token=${encodeURIComponent(accessToken)}`,
         {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ deep_copy: true, status_option: 'PAUSED', campaign_id: targetCampaignId }),
+            // Copy only the adset shell/settings. We create a fresh ad below;
+            // deep-copying template ads can make Meta reject /copies with
+            // code=1 "Please reduce the amount of data you're asking for".
+            body: JSON.stringify({ deep_copy: false, status_option: 'PAUSED', campaign_id: targetCampaignId }),
         }
     )
     if (copy.json?.error) return { ok: false, step: 'copy', error: copy.json.error.message, fb_error_code: copy.json.error.code, fb_trace_id: copy.json.error.fbtrace_id, template_adset: templateAdset, target_campaign: targetCampaignId, creative_id: creativeId, story_id: storyId }
@@ -755,7 +782,7 @@ async function fbAdPipelineMainWorld(args) {
         `https://graph.facebook.com/v21.0/${adAccount}/ads?access_token=${encodeURIComponent(accessToken)}`,
         {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: caption.substring(0, 50), adset_id: newAdset, creative: { creative_id: creativeId }, status: 'PAUSED' }),
+            body: JSON.stringify({ name: finalAdName, adset_id: newAdset, creative: { creative_id: creativeId }, status: 'PAUSED' }),
         }
     )
     if (adResp.json?.error) return { ok: false, step: 'ad', error: adResp.json.error.message, fb_error_code: adResp.json.error.code, fb_trace_id: adResp.json.error.fbtrace_id, adset_id: newAdset, creative_id: creativeId, story_id: storyId }

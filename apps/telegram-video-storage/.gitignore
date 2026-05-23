@@ -1,0 +1,13 @@
+/target
+
+.env
+.env.*
+
+*.session
+*.session-wal
+*.session-shm
+
+config.local.*
+session/
+sessions/
+.secrets/

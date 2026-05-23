@@ -1,0 +1,44 @@
+[package]
+name = "telegram-video-storage"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Headless Telegram cold-storage pilot for video archiving (Hermes pilot, no production R2 impact)."
+
+[[bin]]
+name = "telegram-video-storage"
+path = "src/main.rs"
+
+[features]
+# Default build keeps the dependency graph tight so `cargo test` runs the pure
+# routing/config layer without pulling the Telegram client tree.
+# Production deployments should build with `--features real_telegram`.
+default = []
+real_telegram = ["dep:grammers-client", "dep:grammers-session", "dep:tokio-util"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "signal"] }
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Real Telegram backend (gated behind `real_telegram` feature)
+grammers-client = { version = "0.7", optional = true }
+grammers-session = { version = "0.7", optional = true }
+tokio-util = { version = "0.7", optional = true, features = ["io", "compat"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

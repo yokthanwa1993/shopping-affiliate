@@ -56,6 +56,35 @@ process.stderr.on("error", (e) => { if (e?.code !== "EPIPE") throw e; });
 function loadStore() { try { return JSON.parse(fs.readFileSync(storePath, "utf8")); } catch { return {}; } }
 function saveStore(d) { fs.writeFileSync(storePath, JSON.stringify({ ...loadStore(), ...d }), "utf8"); }
 
+function extractVideoIdFromAssetUrl(rawUrl) {
+  const raw = String(rawUrl || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    const galleryMatch = parsed.pathname.match(/\/api\/gallery\/([^/]+)\/asset\//i);
+    if (galleryMatch?.[1]) return decodeURIComponent(galleryMatch[1]).trim();
+    const r2Match = parsed.pathname.match(/\/videos\/([a-zA-Z0-9_-]+)(?:_(?:original|line_original|thumb))?\.(?:mp4|webm|mov|m4v|webp|jpg|jpeg|png)$/i);
+    if (r2Match?.[1]) return decodeURIComponent(r2Match[1]).trim();
+  } catch {
+    const galleryMatch = raw.match(/\/api\/gallery\/([^/?#]+)\/asset\//i);
+    if (galleryMatch?.[1]) return decodeURIComponent(galleryMatch[1]).trim();
+    const r2Match = raw.match(/\/videos\/([a-zA-Z0-9_-]+)(?:_(?:original|line_original|thumb))?\.(?:mp4|webm|mov|m4v|webp|jpg|jpeg|png)(?:[?#]|$)/i);
+    if (r2Match?.[1]) return decodeURIComponent(r2Match[1]).trim();
+  }
+  return "";
+}
+
+function resolveCreateAdName(body, videoUrl, existingVideoId) {
+  return String(
+    body.ad_name
+    || body.source_video_id
+    || body.system_video_id
+    || extractVideoIdFromAssetUrl(videoUrl)
+    || existingVideoId
+    || ""
+  ).trim();
+}
+
 // Electron net.request with session cookies
 function elFetch(url, opts = {}) {
   return new Promise((resolve, reject) => {
@@ -239,6 +268,43 @@ function startServer() {
       return res.end(JSON.stringify({ ok: true, accessToken, fbDtsg, cookies: cookies.length }));
     }
 
+    // /graph — local maintenance helper: proxy Graph API through Electron session
+    // cookies + current Ads Manager access token. Never returns the token itself.
+    if (p === "/graph") {
+      try {
+        const graphPath = String(params.path || "").replace(/^\/+/, "");
+        if (!graphPath || graphPath.includes("..")) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: "Missing/invalid graph path" })); }
+        const method = String(params.method || req.method || "GET").toUpperCase();
+        const fields = String(params.fields || "").trim();
+        const qs = new URLSearchParams();
+        if (params.query && typeof params.query === "object") {
+          Object.entries(params.query).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== "") qs.set(k, String(v)); });
+        }
+        if (fields) qs.set("fields", fields);
+        const graphBody = params.body && typeof params.body === "object" ? { ...params.body } : {};
+        // Support both shapes:
+        //   1) { body: { message, access_token } } from maintenance scripts
+        //   2) { message, access_token } from dashboard Worker POST /graph
+        // Before this, dashboard comment POST sent top-level message/access_token,
+        // but /graph forwarded an empty body to Facebook → comment was skipped.
+        for (const [k, v] of Object.entries(params)) {
+          if (["path", "method", "fields", "query", "body"].includes(k)) continue;
+          if (v !== undefined && v !== null && v !== "" && graphBody[k] === undefined) graphBody[k] = v;
+        }
+        const explicitAccessToken = typeof graphBody.access_token === "string" && graphBody.access_token ? graphBody.access_token : "";
+        if (explicitAccessToken) delete graphBody.access_token;
+        qs.set("access_token", explicitAccessToken || accessToken || "");
+        const graphUrl = `https://graph.facebook.com/v21.0/${graphPath}?${qs.toString()}`;
+        const graphResp = await elFetch(graphUrl, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          ...(method === "GET" ? {} : { body: JSON.stringify(graphBody) }),
+        });
+        res.writeHead(graphResp.status || 200);
+        return res.end(graphResp.text());
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
     // /pages — ดึงเพจผ่าน Electron session
     if (p === "/pages") {
       try {
@@ -291,6 +357,8 @@ function startServer() {
         const shortlink = String(body.shortlink || "").trim();
         const shopeeUrl = String(body.shopee_url || "").trim();
         const thumbnailUrl = String(body.thumbnail_url || body.image_url || "").trim();
+        const skipPublishToPage = body.skip_publish_to_page === true || body.skip_publish_to_page === "true";
+        const requestedAdName = resolveCreateAdName(body, videoUrl, existingVideoId);
         // CTA destination MUST be the wwoom shortlink — it's the only URL that
         // carries our sub_id tracking params (configured in dashboard /settings, e.g.
         // sub_id=20APR26FBSPCAD). The shortlink redirects to Shopee with full attribution.
@@ -304,27 +372,62 @@ function startServer() {
         // gets mirrored to every new ad we create. Falls back to SHOP_NOW (matches
         // current "การมีส่วนร่วม" template) if lookup fails.
         let ctaType = "SHOP_NOW";
+        let instagramActorId = "";
+        let instagramUserId = "";
         try {
           const tplAdsResp = await elFetch(`https://graph.facebook.com/v21.0/${templateAdset}/ads?fields=creative{id}&limit=1&access_token=${encodeURIComponent(accessToken)}`);
           const tplAdsData = tplAdsResp.json();
           const tplCreativeId = tplAdsData?.data?.[0]?.creative?.id;
           if (tplCreativeId) {
-            const tplCrResp = await elFetch(`https://graph.facebook.com/v21.0/${tplCreativeId}?fields=call_to_action_type&access_token=${encodeURIComponent(accessToken)}`);
+            const tplCrResp = await elFetch(`https://graph.facebook.com/v21.0/${tplCreativeId}?fields=call_to_action_type,instagram_actor_id,object_story_spec&access_token=${encodeURIComponent(accessToken)}`);
             const tplCrData = tplCrResp.json();
             if (tplCrData?.call_to_action_type) ctaType = String(tplCrData.call_to_action_type).trim();
+            instagramActorId = String(tplCrData?.instagram_actor_id || tplCrData?.object_story_spec?.instagram_actor_id || "").trim();
+            instagramUserId = String(tplCrData?.object_story_spec?.instagram_user_id || "").trim();
           }
         } catch (e) {
           console.log(`[CREATE-AD] Could not read template CTA, using fallback ${ctaType}: ${e.message}`);
         }
-        console.log(`[CREATE-AD] Template adset=${templateAdset} → CTA type=${ctaType} link=${ctaLink || '(none)'} (shopee=${shopeeUrl ? 'y' : 'n'}, short=${shortlink ? 'y' : 'n'})`);
+        console.log(`[CREATE-AD] Template adset=${templateAdset} → CTA type=${ctaType} IG actor=${instagramActorId ? 'y' : 'n'} link=${ctaLink || '(none)'} (shopee=${shopeeUrl ? 'y' : 'n'}, short=${shortlink ? 'y' : 'n'})`);
 
         // 1. Upload video (or use existing video_id)
+        // Instagram-only is more reliable when the creative uses an ad-account
+        // advideo object. Reusing a Facebook Page video object is inconsistent:
+        // Meta accepts some clips but rejects others at /ads with code=100 /
+        // subcode=1443078 (“IG ไม่รองรับสื่อโฆษณา”). For IG-only requests,
+        // if the dashboard supplied a source URL we upload it to the ad account;
+        // if it only supplied a Page video_id, try to read `source` from Graph
+        // and upload that. Facebook-only keeps the old Page-video behavior so
+        // page publish + comment can still target the original post.
         let vid;
-        if (existingVideoId) {
+        let uploadedForInstagram = false;
+        let resolvedVideoUrl = String(videoUrl || "").trim();
+        if (skipPublishToPage && !resolvedVideoUrl && existingVideoId) {
+          try {
+            const srcResp = await elFetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(existingVideoId)}?fields=source&access_token=${encodeURIComponent(accessToken)}`);
+            const srcData = srcResp.json();
+            if (srcData?.source && /^https?:\/\//i.test(String(srcData.source))) {
+              resolvedVideoUrl = String(srcData.source).trim();
+              console.log(`[CREATE-AD] Resolved Page video source for IG re-upload video_id=${existingVideoId}`);
+            } else if (srcData?.error) {
+              console.log(`[CREATE-AD] Could not resolve source for IG re-upload code=${srcData.error.code || ""}: ${srcData.error.message || ""}`);
+            }
+          } catch (e) {
+            console.log(`[CREATE-AD] Source resolve exception for IG re-upload: ${e.message || e}`);
+          }
+        }
+
+        if (skipPublishToPage && resolvedVideoUrl) {
+          const uv = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(resolvedVideoUrl)}`, { method: "POST" });
+          vid = uv.json();
+          if (vid.error) return res.end(JSON.stringify({ ok: false, step: "upload", error: vid.error.message, fb_error_code: vid.error.code, fb_error_subcode: vid.error.error_subcode, fb_trace_id: vid.error.fbtrace_id, upload_mode: "instagram_advideo" }));
+          uploadedForInstagram = true;
+          console.log(`[CREATE-AD] Uploaded source as ad-account advideo for IG-only: ${vid.id}`);
+        } else if (existingVideoId) {
           vid = { id: existingVideoId };
           console.log(`[CREATE-AD] Using existing video_id: ${existingVideoId}`);
         } else {
-          const uv = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: "POST" });
+          const uv = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/advideos?access_token=${encodeURIComponent(accessToken)}&file_url=${encodeURIComponent(resolvedVideoUrl)}`, { method: "POST" });
           vid = uv.json();
           if (vid.error) return res.end(JSON.stringify({ ok: false, step: "upload", error: vid.error.message, fb_error_code: vid.error.code, fb_error_subcode: vid.error.error_subcode, fb_trace_id: vid.error.fbtrace_id }));
         }
@@ -354,7 +457,8 @@ function startServer() {
                 fb_error_code: td.error.code,
                 fb_error_subcode: td.error.error_subcode,
                 fb_trace_id: td.error.fbtrace_id || td.__www_request_id,
-                used_existing_video: !!existingVideoId
+                used_existing_video: !!existingVideoId && !uploadedForInstagram,
+                uploaded_for_instagram: uploadedForInstagram
               }));
             }
             if (td.thumbnails?.data?.length >= 1) { thumb = td.thumbnails.data[0].uri; console.log(`[CREATE-AD] thumbnail ready after ${i+1} polls`); break; }
@@ -375,8 +479,11 @@ function startServer() {
           : { type: ctaType, value: { link: ctaLink, link_format: "VIDEO_LPP" } };
         const crBody = {
           name: caption.substring(0, 50),
+          ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
           object_story_spec: {
             page_id: pageId,
+            ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+            ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
             video_data: {
               video_id: vid.id, message: caption, image_url: thumb,
               call_to_action: ctaSpec
@@ -387,7 +494,7 @@ function startServer() {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(crBody)
         });
         const crData = cr.json();
-        if (crData.error) return res.end(JSON.stringify({ ok: false, step: "creative", error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: ctaLink || null, used_existing_video: !!existingVideoId }));
+        if (crData.error) return res.end(JSON.stringify({ ok: false, step: "creative", error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: ctaLink || null, used_existing_video: !!existingVideoId && !uploadedForInstagram, uploaded_for_instagram: uploadedForInstagram }));
 
         // 4. Get story ID — poll up to 50 × 3s = 150s.
         // FB story-resolution latency is variable (often 30-80s, occasionally
@@ -408,6 +515,7 @@ function startServer() {
           if (i % 5 === 0) console.log(`[CREATE-AD] story_id poll ${i+1}/50 — not ready yet`);
         }
         if (!storyId) return res.end(JSON.stringify({ ok: false, step: "story_id", error: "Timeout (150s, FB still creating story)", creative_id: crData.id }));
+        const adName = (requestedAdName || existingVideoId || String(vid.id || '') || caption).substring(0, 255);
 
         // 5. หาแคมเปญ: ใช้ campaign_id ที่ระบุ / สร้างใหม่ด้วย new_campaign_name / หาอัตโนมัติ
         const maxAdsetsPerCampaign = 10;
@@ -435,16 +543,21 @@ function startServer() {
           console.log(`[CREATE-AD] Could not read template objective, using fallback ${templateObjective}: ${e.message}`);
         }
 
-        // ถ้าระบุชื่อแคมเปญใหม่ → สร้างเลย (use template's objective!)
-        if (!targetCampaignId && body.new_campaign_name) {
+        // ถ้าระบุชื่อแคมเปญใหม่ → สร้างแคมเปญใหม่ทุกครั้ง แม้ชื่อซ้ำ
+        // Operator intentionally uses the same campaign name for multiple separate
+        // campaigns. Do not reuse exact-name campaigns here; Meta allows duplicate
+        // names and the dashboard label says "สร้างแคมเปญใหม่".
+        if (body.new_campaign_name) {
+          targetCampaignId = "";
+          const exactCampaignName = String(body.new_campaign_name || "").trim();
           const newCampResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/campaigns?access_token=${encodeURIComponent(accessToken)}`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: body.new_campaign_name, objective: templateObjective, status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
+            body: JSON.stringify({ name: exactCampaignName, objective: templateObjective, status: "ACTIVE", special_ad_categories: [], daily_budget: "100000", bid_strategy: "LOWEST_COST_WITHOUT_CAP" })
           });
           const newCamp = newCampResp.json();
           if (newCamp.error) return res.end(JSON.stringify({ ok: false, step: "campaign", error: newCamp.error.message, fb_error_code: newCamp.error.code, fb_error_subcode: newCamp.error.error_subcode, fb_trace_id: newCamp.error.fbtrace_id, attempted_objective: templateObjective }));
           targetCampaignId = newCamp.id;
-          console.log(`[CREATE-AD] Created new campaign "${body.new_campaign_name}" objective=${templateObjective}: ${targetCampaignId}`);
+          console.log(`[CREATE-AD] Created duplicate-name campaign "${exactCampaignName}" objective=${templateObjective}: ${targetCampaignId}`);
         }
 
         // ถ้ายังไม่มี → หาแคมเปญที่ยังไม่เต็มอัตโนมัติ
@@ -483,21 +596,63 @@ function startServer() {
         }
 
         // Copy adset ไปแคมเปญที่เลือก
+        // Copy only the adset shell/settings. Do NOT deep-copy ads from the
+        // template adset: we create a fresh ad below, and deep_copy=true makes
+        // Meta drag old ads/creatives along. On adsets with existing ads this
+        // can fail with code=1 "Please reduce the amount of data you're asking
+        // for" at the /copies step.
         const copy = await elFetch(`https://graph.facebook.com/v21.0/${templateAdset}/copies?access_token=${encodeURIComponent(accessToken)}`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ deep_copy: true, status_option: "PAUSED", campaign_id: targetCampaignId })
+          body: JSON.stringify({ deep_copy: false, status_option: "PAUSED", campaign_id: targetCampaignId })
         });
         const copyData = copy.json();
         if (copyData.error) return res.end(JSON.stringify({ ok: false, step: "copy", error: copyData.error.message, fb_error_code: copyData.error.code, fb_error_subcode: copyData.error.error_subcode, fb_trace_id: copyData.error.fbtrace_id, template_adset: templateAdset, target_campaign: targetCampaignId }));
         const newAdset = copyData.copied_adset_id;
 
         // 6. สร้าง ad ใหม่ใน adset ที่ copy มา
-        const adResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/ads?access_token=${encodeURIComponent(accessToken)}`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: caption.substring(0, 50), adset_id: newAdset, creative: { creative_id: crData.id }, status: "PAUSED" })
-        });
-        const adData = adResp.json();
-        if (adData.error) return res.end(JSON.stringify({ ok: false, step: "ad", error: adData.error.message, fb_error_code: adData.error.code, fb_error_subcode: adData.error.error_subcode, fb_trace_id: adData.error.fbtrace_id, adset_id: newAdset, creative_id: crData.id }));
+        // Meta sometimes returns code=100/subcode=1443078 immediately after
+        // copying/creating a campaign+adset because the copied adset is not fully
+        // usable yet. Retry inside the same adset so the operator doesn't have to
+        // click again (which would create another campaign/adset).
+        let adData = null;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          const adResp = await elFetch(`https://graph.facebook.com/v21.0/${adAccount}/ads?access_token=${encodeURIComponent(accessToken)}`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: adName, adset_id: newAdset, creative: { creative_id: crData.id }, status: "PAUSED" })
+          });
+          adData = adResp.json();
+          if (!adData.error) break;
+          const code = Number(adData.error.code || 0);
+          const subcode = Number(adData.error.error_subcode || 0);
+          const retryable = adData.error.is_transient === true;
+          console.log(`[CREATE-AD] Ad create attempt ${attempt} failed: code=${code} subcode=${subcode} transient=${retryable} user_msg=${adData.error.error_user_msg || ''}`);
+          if (!retryable || attempt === 4) break;
+          await new Promise(resolve => setTimeout(resolve, attempt * 3000));
+        }
+        if (adData.error) {
+          // If ad creation fails after copying the adset, remove the empty copied
+          // adset so the operator doesn't see stale "IG - สำเนา" shells.
+          try {
+            await elFetch(`https://graph.facebook.com/v21.0/${newAdset}?access_token=${encodeURIComponent(accessToken)}`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ status: "DELETED" })
+            });
+          } catch {}
+          return res.end(JSON.stringify({
+            ok: false,
+            step: "ad",
+            error: adData.error.message,
+            fb_error_code: adData.error.code,
+            fb_error_subcode: adData.error.error_subcode,
+            fb_error_user_title: adData.error.error_user_title,
+            fb_error_user_msg: adData.error.error_user_msg,
+            fb_is_transient: adData.error.is_transient,
+            fb_trace_id: adData.error.fbtrace_id,
+            adset_id: newAdset,
+            creative_id: crData.id,
+            uploaded_for_instagram: uploadedForInstagram,
+          }));
+        }
         const newAd = adData.id;
 
         // 7. Rename adset + activate
@@ -534,6 +689,10 @@ function startServer() {
         // For OUTCOME_ENGAGEMENT campaigns this boosts organic reach + algorithm signal.
         let publishedToPage = false;
         let publishError = "";
+        if (skipPublishToPage) {
+          publishError = "skipped_by_placement_template";
+          console.log(`[CREATE-AD] Skip page publish for placement/template request video=${vid.id}`);
+        } else {
         try {
           // Need a PAGE access token to publish (user token can't toggle is_published on a page post)
           const pagesRes = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id&limit=100&access_token=${encodeURIComponent(accessToken)}`);
@@ -561,6 +720,7 @@ function startServer() {
           publishError = e.message || String(e);
           console.log(`[CREATE-AD] Publish to page exception: ${publishError}`);
         }
+        }
 
         // Mark video as posted
         if (body.video_gallery_id && body.bot_id) {
@@ -574,7 +734,7 @@ function startServer() {
           } catch {}
         }
 
-        return res.end(JSON.stringify({ ok: true, story_id: storyId, adset_id: newAdset, ad_id: newAd, video_id: vid.id, creative_id: crData.id, published_to_page: publishedToPage, publish_error: publishError || undefined }));
+        return res.end(JSON.stringify({ ok: true, story_id: storyId, campaign_id: targetCampaignId, adset_id: newAdset, ad_id: newAd, video_id: vid.id, creative_id: crData.id, published_to_page: publishedToPage, publish_error: publishError || undefined, uploaded_for_instagram: uploadedForInstagram }));
       } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
     }
 

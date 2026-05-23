@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Cham Ad Creator",
-    "version": "1.15.0",
+    "version": "1.15.1",
     "description": "เบื้องหลังของ dashboard /cham — shortlink + ดึงโทเค้น/cookies จาก Ads Manager tab + รัน FB pipeline. ไม่มี UI (ทำงานเงียบๆ ผ่าน dashboard.oomnn.com/cham เท่านั้น). ฉ่ำเท่านั้น เฉียบไม่แตะ",
     "permissions": [
         "tabs",

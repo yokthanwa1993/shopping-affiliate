@@ -113,7 +113,7 @@ const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
 const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
-const MERGE_CONTAINER_ENGINE_VERSION = '2026-04-05.01'
+const MERGE_CONTAINER_ENGINE_VERSION = '2026-05-23.05'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
 const MAX_VOICE_PREVIEW_TEXT_CHARS = 280
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
@@ -2420,7 +2420,7 @@ async function orderVideoIdsNewestFirst(bucket: R2Bucket, candidateIds: string[]
 }
 
 function hasShopeeLinkInMeta(meta: Record<string, unknown>): boolean {
-    return !!normalizeMetaShopeeLink(meta)
+    return isUsableShopeeLink(normalizeMetaShopeeLink(meta) || '')
 }
 
 function hasLazadaLinkInMeta(meta: Record<string, unknown>): boolean {
@@ -2877,6 +2877,34 @@ function buildWorkerGalleryAssetUrl(workerUrl: string, namespaceId: string, vide
     } catch {
         return `${normalizedWorkerUrl}/api/gallery/${encodeURIComponent(normalizedVideoId)}/asset/${variant}?namespace_id=${encodeURIComponent(normalizedNamespaceId)}`
     }
+}
+
+function extractGalleryVideoIdFromUrl(url: string): string {
+    const raw = String(url || '').trim()
+    if (!raw) return ''
+    try {
+        const parsed = new URL(raw)
+        const galleryMatch = parsed.pathname.match(/\/api\/gallery\/([^/]+)\/asset\//i)
+        if (galleryMatch?.[1]) return decodeURIComponent(galleryMatch[1]).trim()
+        const r2Match = parsed.pathname.match(/\/videos\/([a-zA-Z0-9_-]+)(?:_(?:original|line_original|thumb))?\.(?:mp4|webm|mov|m4v|webp|jpg|jpeg|png)$/i)
+        if (r2Match?.[1]) return decodeURIComponent(r2Match[1]).trim()
+    } catch {
+        const galleryMatch = raw.match(/\/api\/gallery\/([^/?#]+)\/asset\//i)
+        if (galleryMatch?.[1]) return decodeURIComponent(galleryMatch[1]).trim()
+        const r2Match = raw.match(/\/videos\/([a-zA-Z0-9_-]+)(?:_(?:original|line_original|thumb))?\.(?:mp4|webm|mov|m4v|webp|jpg|jpeg|png)(?:[?#]|$)/i)
+        if (r2Match?.[1]) return decodeURIComponent(r2Match[1]).trim()
+    }
+    return ''
+}
+
+function resolveCreateAdVideoName(params: { explicitName?: string; sourceVideoId?: string; videoUrl?: string; videoId?: string }): string {
+    const explicitName = String(params.explicitName || '').trim()
+    if (explicitName) return explicitName
+    const sourceVideoId = String(params.sourceVideoId || '').trim()
+    if (sourceVideoId) return sourceVideoId
+    const urlVideoId = extractGalleryVideoIdFromUrl(String(params.videoUrl || ''))
+    if (urlVideoId) return urlVideoId
+    return String(params.videoId || '').trim()
 }
 
 function buildWorkerGalleryFrameUrl(
@@ -3399,6 +3427,7 @@ let facebookPageVideoCacheTablesReady: Promise<void> | null = null
 let dashboardSettingsTableReady: Promise<void> | null = null
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_ID = '1008898512617594'
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME = 'เฉียบ'
+const DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID = '1774858894802785816'
 const DASHBOARD_FACEBOOK_GALLERY_BATCH_SIZE = 100
 const DASHBOARD_FACEBOOK_GALLERY_SYNC_COOLDOWN_MS = 30 * 1000
 const DASHBOARD_FACEBOOK_GALLERY_ERROR_COOLDOWN_MS = 60 * 60 * 1000
@@ -3406,22 +3435,42 @@ const DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN = 'facebook_sync_token'
 
 // Resolve the Graph API token used by the dashboard's FB-page-videos sync flow.
 // Order:
-//   1. dashboard_settings.facebook_sync_token (operator-pasted, full user token, preferred)
-//   2. pages.access_token of the gallery page itself (page-scoped fallback so the
-//      "โหลดโพสต์ไม่สำเร็จ — facebook_sync_token_missing" error never bricks the
-//      dashboard just because the operator hasn't pasted a dedicated sync token)
+//   1. namespace pages token pool for namespace 1774858894802785816 (source of truth
+//      from the app.oomnn.com Pages screen; supports many source pages)
+//   2. pages.access_token scoped to that namespace/page
+//   3. legacy pages.access_token by page id (old rows)
+//   4. dashboard_settings.facebook_sync_token manual fallback
 // Returning '' tells the caller "still no token, surface the missing-token error".
-async function resolveFacebookSyncToken(db: D1Database, pageId: string): Promise<string> {
-    // Resolution order: per-page token → dashboard_settings fallback.
-    //
-    // History note (2026-05-01): Originally dashboard_settings was queried FIRST
-    // so dashboard sync would always use a single global token. That broke when
-    // we added support for multiple FB pages (เฉียบ + ฟีด): page tokens are
-    // page-scoped, so reusing เฉียบ's token to sync ฟีด returns FB code 100.
-    // Switched the order so each page gets its own valid token, while
-    // dashboard_settings remains as a manual override (e.g. paste a User Access
-    // Token that has access to multiple pages).
+async function resolveFacebookSyncToken(db: D1Database, pageId: string, namespaceId = DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID): Promise<string> {
     const normalizedPageId = String(pageId || '').trim()
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+
+    // Use the token pool saved by the app Pages settings first. This is what the
+    // operator actually sees as enabled pages, and lets page-posts pull videos
+    // from every page in the namespace — not just เฉียบ/ฉ่ำ. Prefer post tokens;
+    // comment tokens are a fallback because some setups only stored one token.
+    if (normalizedPageId && normalizedNamespaceId) {
+        try {
+            const tokenPool = await getNamespacePagesTokenPool(db, normalizedNamespaceId)
+            const poolEntry = tokenPool[normalizedPageId]
+            const candidates = normalizeDirectVideoTokenPool([
+                ...normalizePostTokenPool(poolEntry?.post_tokens || []),
+                ...normalizeCommentTokenPool(poolEntry?.comment_tokens || []),
+            ])
+            if (candidates.length > 0) return candidates[0]
+        } catch { /* fall through */ }
+    }
+
+    if (normalizedPageId && normalizedNamespaceId) {
+        try {
+            const row = await db.prepare(
+                'SELECT access_token FROM pages WHERE id = ? AND bot_id = ? AND access_token IS NOT NULL AND access_token != "" LIMIT 1'
+            ).bind(normalizedPageId, normalizedNamespaceId).first() as { access_token?: string | null } | null
+            const pageToken = String(row?.access_token || '').trim()
+            if (pageToken) return pageToken
+        } catch { /* fall through */ }
+    }
+
     if (normalizedPageId) {
         try {
             const row = await db.prepare(
@@ -4511,7 +4560,7 @@ function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | nu
     const publicUrl = String(video.publicUrl || video.public_url || '').trim()
     if (!publicUrl) return false
 
-    const hasShopeeLink = !!String(
+    const shopeeLink = String(
         video.shopeeLink
         || video.shopee_link
         || video.shopeeOriginalLink
@@ -4525,8 +4574,9 @@ function isNamespaceGalleryVideoDisplayReady(video: Record<string, unknown> | nu
         || video.lazada_original_link
         || ''
     ).trim()
-    if (explicitGalleryReady !== null) return explicitGalleryReady && hasShopeeLink && hasLazadaLink
-    return hasShopeeLink && hasLazadaLink
+    const hasUsableShopeeLink = isUsableShopeeLink(shopeeLink)
+    if (explicitGalleryReady !== null) return explicitGalleryReady && hasUsableShopeeLink && hasLazadaLink
+    return hasUsableShopeeLink && hasLazadaLink
 }
 
 type DashboardGalleryView = 'ready' | 'used'
@@ -4645,6 +4695,198 @@ function mapDashboardGalleryRow(row: Record<string, unknown>, namespaceId: strin
     }
 }
 
+type FastGalleryPostingClaimStats = {
+    source: 'gallery_index'
+    candidateTotal: number
+    scanned: number
+    pages: number
+    pageSize: number
+    elapsedMs: number
+}
+
+type FastGalleryPostingClaimResult = {
+    video: Record<string, unknown>
+    videoLockKey: string
+}
+
+type FastGalleryPostingClaimOutcome = {
+    picked: FastGalleryPostingClaimResult | null
+    stats: FastGalleryPostingClaimStats
+}
+
+const FAST_GALLERY_POSTING_PAGE_SIZE = 24
+const FAST_GALLERY_POSTING_MAX_PAGES = 15
+
+function buildFastGalleryPostingOrderBy(postingOrder: NamespacePostingOrder): string {
+    const sortExpr = `COALESCE(NULLIF(TRIM(gi.processed_at), ''), NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), ''))`
+    if (postingOrder === 'newest_first') {
+        return `ORDER BY ${sortExpr} DESC, gi.video_id DESC`
+    }
+    return `ORDER BY ${sortExpr} ASC, gi.video_id ASC`
+}
+
+async function hydrateFastPostingCandidateSourceFingerprint(params: {
+    env: Env
+    namespaceId: string
+    bucket: R2Bucket
+    video: Record<string, unknown>
+}): Promise<void> {
+    const videoId = String(params.video.id || params.video.video_id || '').trim()
+    if (!videoId) return
+
+    const existingFingerprint = normalizeNamespaceVideoSourceFingerprint(
+        params.video.sourceFingerprint || params.video.source_fingerprint,
+    )
+    if (existingFingerprint) return
+
+    const sourceFingerprint = await resolveNamespaceVideoSourceFingerprint({
+        env: params.env,
+        namespaceId: params.namespaceId,
+        videoId,
+        bucket: params.bucket,
+        currentState: {
+            namespace_id: params.namespaceId,
+            video_id: videoId,
+            source_fingerprint: '',
+        },
+        sourceMeta: params.video,
+    }).catch(() => '')
+    if (!sourceFingerprint) return
+
+    params.video.sourceFingerprint = sourceFingerprint
+    params.video.source_fingerprint = sourceFingerprint
+    await upsertNamespaceVideoState(params.env.DB, params.namespaceId, videoId, {
+        source_fingerprint: sourceFingerprint,
+    }).catch(() => { })
+}
+
+async function countFastGalleryPostingCandidates(db: D1Database, namespaceId: string): Promise<number> {
+    const row = await db.prepare(
+        `SELECT COUNT(*) AS total
+         ${DASHBOARD_GALLERY_FROM_JOIN}
+         WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
+           AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})`
+    ).bind(namespaceId).first() as { total?: number } | null
+    return Math.max(0, Number(row?.total || 0))
+}
+
+async function listFastGalleryPostingCandidatePage(params: {
+    db: D1Database
+    namespaceId: string
+    postingOrder: NamespacePostingOrder
+    limit: number
+    offset: number
+}): Promise<Array<Record<string, unknown>>> {
+    const rows = await params.db.prepare(
+        `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
+         ${DASHBOARD_GALLERY_FROM_JOIN}
+         WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
+           AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})
+         ${buildFastGalleryPostingOrderBy(params.postingOrder)}
+         LIMIT ? OFFSET ?`
+    ).bind(params.namespaceId, params.limit, params.offset).all() as { results?: Array<Record<string, unknown>> }
+
+    return (rows.results || []).map((row) => ({
+        ...mapDashboardGalleryRow(row, params.namespaceId),
+        sourceNamespaceId: params.namespaceId,
+        source_namespace_id: params.namespaceId,
+    }))
+}
+
+async function claimFastGalleryVideoForPosting(params: {
+    env: Env
+    namespaceId: string
+    pageId: string
+    postingOrder: NamespacePostingOrder
+    pageSize?: number
+    maxPages?: number
+}): Promise<FastGalleryPostingClaimOutcome> {
+    const startedAt = Date.now()
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const pageSize = Math.min(Math.max(Math.floor(Number(params.pageSize || FAST_GALLERY_POSTING_PAGE_SIZE)), 1), 100)
+    const maxPages = Math.min(Math.max(Math.floor(Number(params.maxPages || FAST_GALLERY_POSTING_MAX_PAGES)), 1), 50)
+    const stats: FastGalleryPostingClaimStats = {
+        source: 'gallery_index',
+        candidateTotal: 0,
+        scanned: 0,
+        pages: 0,
+        pageSize,
+        elapsedMs: 0,
+    }
+
+    const finish = (picked: FastGalleryPostingClaimResult | null): FastGalleryPostingClaimOutcome => {
+        stats.elapsedMs = Date.now() - startedAt
+        return { picked, stats }
+    }
+
+    if (!namespaceId || !pageId) return finish(null)
+
+    await Promise.all([
+        ensureGalleryIndexTable(params.env.DB),
+        ensureNamespaceVideoStateColumns(params.env.DB),
+    ])
+
+    stats.candidateTotal = await countFastGalleryPostingCandidates(params.env.DB, namespaceId)
+    if (stats.candidateTotal <= 0) return finish(null)
+
+    const candidateBucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
+    const seenVideoIds = new Set<string>()
+    const sequentialPages = Math.ceil(stats.candidateTotal / pageSize)
+    const pagesToScan = params.postingOrder === 'random'
+        ? maxPages
+        : Math.min(maxPages, sequentialPages)
+
+    for (let pageIndex = 0; pageIndex < pagesToScan; pageIndex += 1) {
+        const maxOffset = Math.max(0, stats.candidateTotal - pageSize)
+        const offset = params.postingOrder === 'random'
+            ? Math.floor(Math.random() * (maxOffset + 1))
+            : pageIndex * pageSize
+
+        const page = await listFastGalleryPostingCandidatePage({
+            db: params.env.DB,
+            namespaceId,
+            postingOrder: params.postingOrder,
+            limit: pageSize,
+            offset,
+        })
+        stats.pages += 1
+        if (page.length === 0) {
+            if (params.postingOrder !== 'random') break
+            continue
+        }
+
+        const orderedPage = orderGalleryVideosForPosting(page, params.postingOrder)
+        for (const candidate of orderedPage) {
+            const videoId = String(candidate.id || '').trim()
+            if (!videoId || seenVideoIds.has(videoId)) continue
+            seenVideoIds.add(videoId)
+            stats.scanned += 1
+
+            await hydrateFastPostingCandidateSourceFingerprint({
+                env: params.env,
+                namespaceId,
+                bucket: candidateBucket,
+                video: candidate,
+            })
+
+            const picked = await claimGalleryVideoForPosting({
+                db: params.env.DB,
+                namespaceId,
+                pageId,
+                videos: [candidate],
+                postingOrder: params.postingOrder,
+            })
+            if (picked) return finish(picked)
+        }
+
+        if (params.postingOrder !== 'random' && page.length < pageSize) break
+        if (seenVideoIds.size >= stats.candidateTotal) break
+    }
+
+    return finish(null)
+}
+
 async function getDashboardGalleryPageFast(db: D1Database, params: {
     namespaceId: string
     view: DashboardGalleryView
@@ -4735,6 +4977,143 @@ const namespaceInventoryCache = new Map<string, {
     pending?: Promise<{ sourceTotal: number; videos: Array<Record<string, unknown>> }>
     value?: { sourceTotal: number; videos: Array<Record<string, unknown>> }
 }>()
+
+const SHOPEE_HOMEPAGE_SQL_DOMAINS = [
+    'shopee.co.th',
+    'shopee.co.id',
+    'shopee.com.my',
+    'shopee.ph',
+    'shopee.sg',
+    'shopee.vn',
+]
+
+const SHOPEE_HOMEPAGE_SQL_VALUES = SHOPEE_HOMEPAGE_SQL_DOMAINS.flatMap((domain) => [
+    `http://${domain}`,
+    `http://${domain}/`,
+    `https://${domain}`,
+    `https://${domain}/`,
+    `http://www.${domain}`,
+    `http://www.${domain}/`,
+    `https://www.${domain}`,
+    `https://www.${domain}/`,
+])
+
+function quoteSqlString(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`
+}
+
+function buildShopeeHomepageOnlySql(rawExpr: string): string {
+    const expr = `lower(trim(coalesce(${rawExpr}, '')))`
+    const exactValues = SHOPEE_HOMEPAGE_SQL_VALUES.map(quoteSqlString).join(', ')
+    const queryOrHashPatterns = SHOPEE_HOMEPAGE_SQL_VALUES
+        .map((value) => `${value}[?#]*`)
+        .map((pattern) => `${expr} GLOB ${quoteSqlString(pattern)}`)
+        .join(' OR ')
+    return `(${expr} IN (${exactValues})
+        OR ${queryOrHashPatterns})`
+}
+
+function buildUsableShopeeSql(rawExpr: string): string {
+    return `(trim(coalesce(${rawExpr}, '')) <> '' AND NOT ${buildShopeeHomepageOnlySql(rawExpr)})`
+}
+
+const GALLERY_INDEX_SHOPEE_LINK_SQL = "coalesce(nullif(trim(shopee_link), ''), nullif(trim(shopee_original_link), ''))"
+const GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL = buildUsableShopeeSql(GALLERY_INDEX_SHOPEE_LINK_SQL)
+const GALLERY_INDEX_HAS_LAZADA_LINK_SQL = "trim(coalesce(coalesce(nullif(trim(lazada_link), ''), nullif(trim(lazada_original_link), '')), '')) <> ''"
+
+const NAMESPACE_STATE_SHOPEE_LINK_SQL = "coalesce(nullif(trim(nvs.shopee_link), ''), nullif(trim(gi.shopee_link), ''), nullif(trim(gi.shopee_original_link), ''))"
+const NAMESPACE_STATE_LAZADA_LINK_SQL = "coalesce(nullif(trim(nvs.lazada_link), ''), nullif(trim(gi.lazada_link), ''), nullif(trim(gi.lazada_original_link), ''))"
+const NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL = buildUsableShopeeSql(NAMESPACE_STATE_SHOPEE_LINK_SQL)
+const NAMESPACE_STATE_HAS_LAZADA_LINK_SQL = `trim(coalesce(${NAMESPACE_STATE_LAZADA_LINK_SQL}, '')) <> ''`
+
+type NamespaceProcessingSummaryFast = {
+    libraryTotal: number
+    inventoryTotal: number
+    readyTotal: number
+    pendingTotal: number
+    pendingHasLazadaTotal: number
+    pendingShortlinkVideos: Array<Record<string, unknown>>
+}
+
+async function getNamespaceProcessingSummaryFast(env: Env, namespaceId: string, shortlinkRequired: boolean): Promise<NamespaceProcessingSummaryFast> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    if (!normalizedNamespaceId) {
+        return { libraryTotal: 0, inventoryTotal: 0, readyTotal: 0, pendingTotal: 0, pendingHasLazadaTotal: 0, pendingShortlinkVideos: [] }
+    }
+
+    await Promise.all([
+        ensureGalleryIndexTable(env.DB),
+        ensureNamespaceVideoStateColumns(env.DB),
+    ])
+    await seedNamespaceVideoStateFromLegacy(env.DB, normalizedNamespaceId).catch(() => { })
+
+    const playableSql = "gi.namespace_id = ? AND gi.has_public_video = 1 AND trim(coalesce(gi.public_url, '')) <> ''"
+    const readySql = `${playableSql} AND ${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL} AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL}`
+    const pendingSql = `${playableSql} AND NOT (${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL} AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL})`
+
+    const [totals, pendingRows] = await Promise.all([
+        env.DB.prepare(
+            `SELECT
+                COUNT(*) AS library_total,
+                SUM(CASE WHEN ${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL} AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL} THEN 1 ELSE 0 END) AS ready_total,
+                SUM(CASE WHEN NOT (${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL} AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL}) THEN 1 ELSE 0 END) AS pending_total,
+                SUM(CASE WHEN NOT (${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL} AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL}) AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL} THEN 1 ELSE 0 END) AS pending_has_lazada_total
+             ${DASHBOARD_GALLERY_FROM_JOIN}
+             WHERE ${playableSql}`
+        ).bind(normalizedNamespaceId).first() as Promise<{
+            library_total?: number
+            ready_total?: number
+            pending_total?: number
+            pending_has_lazada_total?: number
+        } | null>,
+        shortlinkRequired
+            ? env.DB.prepare(
+                `SELECT
+                    gi.namespace_id,
+                    gi.video_id,
+                    gi.owner_email,
+                    gi.script,
+                    gi.title,
+                    gi.category,
+                    gi.duration,
+                    ${NAMESPACE_STATE_SHOPEE_LINK_SQL} AS shopee_link,
+                    ${NAMESPACE_STATE_LAZADA_LINK_SQL} AS lazada_link,
+                    gi.shopee_original_link,
+                    gi.lazada_original_link,
+                    gi.public_url,
+                    gi.original_url,
+                    gi.thumbnail_url,
+                    gi.created_at,
+                    gi.processed_at,
+                    gi.updated_at
+                 ${DASHBOARD_GALLERY_FROM_JOIN}
+                 WHERE ${pendingSql}
+                 ORDER BY COALESCE(NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id ASC
+                 LIMIT 50`
+            ).bind(normalizedNamespaceId).all() as Promise<{ results?: Array<Record<string, unknown>> }>
+            : Promise.resolve({ results: [] }),
+    ])
+
+    const pendingShortlinkVideos = shortlinkRequired
+        ? (pendingRows.results || [])
+            .map((row) => buildInboxVideoResponseFromGalleryIndex(env, row, String(row.owner_email || '').trim(), { shortlinkRequired: true }))
+            .filter((video): video is Record<string, unknown> => !!video)
+        : []
+
+    const libraryTotal = Math.max(0, Number(totals?.library_total || 0))
+    const readyTotal = Math.max(0, Number(totals?.ready_total || 0))
+    const pendingTotal = shortlinkRequired ? Math.max(0, Number(totals?.pending_total || 0)) : 0
+    const pendingHasLazadaTotal = shortlinkRequired ? Math.max(0, Number(totals?.pending_has_lazada_total || 0)) : 0
+
+    return {
+        libraryTotal,
+        inventoryTotal: libraryTotal,
+        readyTotal,
+        pendingTotal,
+        pendingHasLazadaTotal,
+        pendingShortlinkVideos,
+    }
+}
 
 function invalidateNamespaceInventoryCache(namespaceId: string) {
     const key = String(namespaceId || '').trim()
@@ -6004,6 +6383,109 @@ app.get('/admin/api/gallery/index/status', async (c) => {
     return c.json({ ok: true, ...summary })
 })
 
+app.get('/api/dashboard/facebook-page-sources', async (c) => {
+    const namespaceId = String(c.req.query('namespace_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    try {
+        const tokenPool = await getNamespacePagesTokenPool(c.env.DB, namespaceId)
+        const rows = await c.env.DB.prepare(
+            `SELECT id, name, image_url, access_token, is_active
+             FROM pages
+             WHERE bot_id = ?
+             ORDER BY CASE WHEN is_active = 1 THEN 0 ELSE 1 END, name COLLATE NOCASE ASC`
+        ).bind(namespaceId).all() as { results?: Array<{ id?: string; name?: string; image_url?: string; access_token?: string | null; is_active?: number }> }
+        const stablePageIconUrl = (id: string): string => id ? `https://graph.facebook.com/${encodeURIComponent(id)}/picture?type=large` : ''
+        const byId = new Map<string, { id: string; name: string; iconUrl: string; active: boolean; hasToken: boolean }>()
+        for (const row of (rows.results || [])) {
+            const id = String(row.id || '').trim()
+            if (!id) continue
+            const poolEntry = tokenPool[id]
+            const hasPoolToken = normalizeDirectVideoTokenPool([
+                ...normalizePostTokenPool(poolEntry?.post_tokens || []),
+                ...normalizeCommentTokenPool(poolEntry?.comment_tokens || []),
+            ]).length > 0
+            byId.set(id, {
+                id,
+                name: String(row.name || '').trim() || id,
+                iconUrl: stablePageIconUrl(id),
+                active: Number(row.is_active || 0) > 0,
+                hasToken: hasPoolToken || !!String(row.access_token || '').trim(),
+            })
+        }
+        // Do NOT surface token-pool-only pages here. The token pool can keep stale
+        // entries after an operator deletes a page from the Pages screen; the page
+        // list itself is the source of truth for what should be selectable.
+        const pages = Array.from(byId.values()).filter((p) => p.active || p.hasToken)
+        return c.json({ ok: true, namespace_id: namespaceId, pages }, 200, { 'Cache-Control': 'no-store' })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 500, { 'Cache-Control': 'no-store' })
+    }
+})
+
+app.get('/api/dashboard/facebook-video-thumbnail', async (c) => {
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const videoId = String(c.req.query('video_id') || '').trim()
+    const fallbackUrl = String(c.req.query('fallback_url') || '').trim()
+    if (!pageId) return c.text('page_id_required', 400)
+    if (!videoId) return c.text('video_id_required', 400)
+
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId)
+    const candidates: string[] = []
+    if (token) {
+        // For many Reels, /{video}/picture returns 404 while /{video}?fields=thumbnails
+        // still returns usable thumbnail URIs. Prefer preferred thumbnails, then any URI.
+        try {
+            const metaResp = await fetch(
+                `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}?fields=thumbnails&access_token=${encodeURIComponent(token)}`,
+                { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; dashboard-thumb-proxy/1.0)' } },
+            )
+            const meta = await metaResp.json().catch(() => ({})) as { thumbnails?: { data?: Array<{ uri?: string; is_preferred?: boolean }> } }
+            const thumbs = Array.isArray(meta?.thumbnails?.data) ? meta.thumbnails.data : []
+            for (const thumb of thumbs.filter((t) => !!t?.is_preferred)) {
+                const uri = String(thumb.uri || '').trim()
+                if (uri) candidates.push(uri)
+            }
+            for (const thumb of thumbs) {
+                const uri = String(thumb.uri || '').trim()
+                if (uri) candidates.push(uri)
+            }
+        } catch { /* fall through to picture endpoint */ }
+        candidates.push(
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}/picture?type=large&access_token=${encodeURIComponent(token)}`,
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}/picture?access_token=${encodeURIComponent(token)}`,
+        )
+    }
+    if (fallbackUrl && /^https:\/\//i.test(fallbackUrl)) candidates.push(fallbackUrl)
+
+    for (const url of candidates) {
+        try {
+            const resp = await fetch(url, {
+                redirect: 'follow',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; dashboard-thumb-proxy/1.0)',
+                    'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                },
+            })
+            const contentType = String(resp.headers.get('content-type') || '')
+            if (!resp.ok || !contentType.toLowerCase().startsWith('image/')) continue
+            const headers = new Headers()
+            headers.set('Content-Type', contentType)
+            headers.set('Cache-Control', 'public, max-age=21600, s-maxage=21600')
+            const contentLength = resp.headers.get('content-length')
+            if (contentLength) headers.set('Content-Length', contentLength)
+            return new Response(resp.body, { status: 200, headers })
+        } catch { /* try next candidate */ }
+    }
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="720" height="1200" viewBox="0 0 720 1200"><rect width="720" height="1200" fill="#e2e8f0"/><g fill="#64748b" font-family="Arial, sans-serif" font-weight="700" text-anchor="middle"><text x="360" y="570" font-size="34">Thumbnail unavailable</text><text x="360" y="620" font-size="26">Open video link to view</text></g></svg>`
+    return new Response(svg, {
+        status: 200,
+        headers: {
+            'Content-Type': 'image/svg+xml; charset=utf-8',
+            'Cache-Control': 'public, max-age=300, s-maxage=300',
+        },
+    })
+})
+
 app.get('/api/dashboard/facebook-page-videos', async (c) => {
     const pageId = String(c.req.query('page_id') || '').trim()
     const pageName = String(c.req.query('page_name') || '').trim()
@@ -6023,27 +6505,182 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
         getFacebookPageVideoSyncState(c.env.DB, pageId),
     ])
 
+    const normalizePageVideoTextKey = (value: unknown): string => String(value || '')
+        .split(/\r?\n/)
+        .map((line) => line.replace(/https?:\/\/\S+/gi, ' ').trim())
+        .map((line) => line.replace(/#[^\s#]+/g, ' ').replace(/\s+/g, ' ').trim())
+        // Many page captions start with "📌 พิกัด : <shortlink>". If we use
+        // that as the lookup key, cross-page cards cannot find their system
+        // gallery video and the UI falls back to expired fbcdn thumbnails.
+        // Skip pin/link-only lines and match on the actual product caption.
+        .filter((line) => line && !line.startsWith('#'))
+        .filter((line) => !/^📌?\s*พิกัด\s*:?\s*$/i.test(line))
+        .filter((line) => !/^สนใจสั่งซื้อ|^ดูราคา/i.test(line))
+        [0]
+        ?.trim()
+        .toLowerCase() || ''
+
+    const postIds = Array.from(new Set(items.map((item) => String(item.post_id || '').trim()).filter(Boolean)))
+    const systemVideoByPostId = new Map<string, string>()
+    if (postIds.length > 0) {
+        try {
+            const placeholders = postIds.map(() => '?').join(',')
+            const rows = await c.env.DB.prepare(
+                `SELECT fb_post_id, video_id
+                 FROM post_history
+                 WHERE bot_id = '1774858894802785816'
+                   AND page_id = ?
+                   AND fb_post_id IN (${placeholders})
+                   AND TRIM(COALESCE(video_id, '')) <> ''
+                 ORDER BY datetime(posted_at) DESC`
+            ).bind(pageId, ...postIds).all() as { results?: Array<{ fb_post_id?: string; video_id?: string }> }
+            for (const row of (rows.results || [])) {
+                const fbPostId = String(row.fb_post_id || '').trim()
+                const systemVideoId = String(row.video_id || '').trim()
+                if (!fbPostId || !systemVideoId) continue
+                if (!systemVideoByPostId.has(fbPostId)) systemVideoByPostId.set(fbPostId, systemVideoId)
+                const shortPostId = fbPostId.includes('_') ? fbPostId.split('_').pop() || '' : ''
+                if (shortPostId && !systemVideoByPostId.has(shortPostId)) systemVideoByPostId.set(shortPostId, systemVideoId)
+            }
+        } catch (e) {
+            console.log(`[DASHBOARD PAGE VIDEOS] system video id lookup failed page=${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+    const systemVideoByFbVideoId = new Map<string, string>()
+    const systemVideoByShopeeLink = new Map<string, string>()
+    const systemVideoByTextKey = new Map<string, string>()
+    const systemVideoByFuzzyTextKey = new Map<string, string>()
+    for (const item of items) {
+        const fbVideoId = String(item.video_id || '').trim()
+        if (!fbVideoId) continue
+        const postId = String(item.post_id || '').trim()
+        if (postId && systemVideoByPostId.get(postId)) continue
+        try {
+            const row = await c.env.DB.prepare(
+                `SELECT video_id
+                 FROM post_history
+                 WHERE bot_id = '1774858894802785816'
+                   AND page_id = ?
+                   AND TRIM(COALESCE(video_id, '')) <> ''
+                   AND (fb_reel_url LIKE ? OR fb_reel_url LIKE ? OR fb_post_id = ? OR fb_post_id = ?)
+                 ORDER BY datetime(posted_at) DESC LIMIT 1`
+            ).bind(pageId, `%${fbVideoId}%`, `%/reel/${fbVideoId}%`, fbVideoId, `${pageId}_${fbVideoId}`).first() as { video_id?: string } | null
+            const systemVideoId = String(row?.video_id || '').trim()
+            if (systemVideoId) systemVideoByFbVideoId.set(fbVideoId, systemVideoId)
+        } catch { }
+    }
+    const shopeeLinks = Array.from(new Set(items.map((item) => String(item.shopee_link || '').trim()).filter(Boolean)))
+    for (const link of shopeeLinks) {
+        try {
+            const row = await c.env.DB.prepare(
+                `SELECT video_id
+                 FROM namespace_video_state
+                 WHERE namespace_id = '1774858894802785816'
+                   AND TRIM(COALESCE(video_id, '')) <> ''
+                   AND (shopee_original_link = ? OR shopee_link = ?)
+                 ORDER BY datetime(updated_at) DESC LIMIT 1`
+            ).bind(link, link).first() as { video_id?: string } | null
+            const systemVideoId = String(row?.video_id || '').trim()
+            if (systemVideoId) systemVideoByShopeeLink.set(link, systemVideoId)
+        } catch { }
+    }
+
+    const textKeys = Array.from(new Set(items
+        .flatMap((item) => [normalizePageVideoTextKey(item.description), normalizePageVideoTextKey(item.title)])
+        .filter(Boolean)))
+        .slice(0, 400)
+    if (textKeys.length > 0) {
+        try {
+            const chunkSize = 40
+            for (let i = 0; i < textKeys.length; i += chunkSize) {
+                const chunk = textKeys.slice(i, i + chunkSize)
+                const placeholders = chunk.map(() => '?').join(',')
+                const rows = await c.env.DB.prepare(
+                    `SELECT video_id, title, script, updated_at, created_at
+                     FROM gallery_index
+                     WHERE namespace_id = '1774858894802785816'
+                       AND (
+                         lower(trim(title)) IN (${placeholders})
+                         OR lower(trim(script)) IN (${placeholders})
+                       )
+                     ORDER BY datetime(COALESCE(NULLIF(updated_at, ''), created_at)) DESC`
+                ).bind(...chunk, ...chunk).all() as { results?: Array<{ video_id?: string; title?: string; script?: string }> }
+                for (const row of (rows.results || [])) {
+                    const systemVideoId = String(row.video_id || '').trim()
+                    if (!systemVideoId) continue
+                    for (const key of [normalizePageVideoTextKey(row.title), normalizePageVideoTextKey(row.script)]) {
+                        if (key && !systemVideoByTextKey.has(key)) systemVideoByTextKey.set(key, systemVideoId)
+                    }
+                }
+            }
+        } catch (e) {
+            console.log(`[DASHBOARD PAGE VIDEOS] gallery title lookup failed page=${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+
+    // Last-resort fuzzy title lookup for old page posts whose caption format or
+    // shortlink line prevents exact matching. This fixes blank cards for older
+    // days by letting the UI use system thumbnails instead of expired fbcdn URLs.
+    for (const item of items) {
+        const postId = String(item.post_id || '').trim()
+        const fbVideoId = String(item.video_id || '').trim()
+        const shopeeLink = String(item.shopee_link || '').trim()
+        const textKey = normalizePageVideoTextKey(item.description || item.title)
+        if (!textKey || systemVideoByTextKey.has(textKey) || systemVideoByPostId.get(postId)
+            || systemVideoByFbVideoId.get(fbVideoId) || systemVideoByShopeeLink.get(shopeeLink)) continue
+        const fuzzyNeedle = textKey.slice(0, 36).trim()
+        if (fuzzyNeedle.length < 8) continue
+        try {
+            const row = await c.env.DB.prepare(
+                `SELECT video_id
+                 FROM gallery_index
+                 WHERE namespace_id = '1774858894802785816'
+                   AND TRIM(COALESCE(video_id, '')) <> ''
+                   AND (lower(COALESCE(title, '')) LIKE ? OR lower(COALESCE(script, '')) LIKE ?)
+                 ORDER BY datetime(COALESCE(NULLIF(updated_at, ''), created_at)) DESC
+                 LIMIT 1`
+            ).bind(`%${fuzzyNeedle}%`, `%${fuzzyNeedle}%`).first() as { video_id?: string } | null
+            const systemVideoId = String(row?.video_id || '').trim()
+            if (systemVideoId) systemVideoByFuzzyTextKey.set(textKey, systemVideoId)
+        } catch { }
+    }
+
     return c.json({
         ok: true,
         page_id: pageId,
         page_name: String(sync?.page_name || pageName || '').trim(),
         total,
-        items: items.map((item) => ({
-            storyId: String(item.post_id || '').trim() ? `${pageId}_${item.post_id}` : String(item.video_id || '').trim(),
+        items: items.map((item) => {
+            const postId = String(item.post_id || '').trim()
+            const fbVideoId = String(item.video_id || '').trim()
+            const shopeeLink = String(item.shopee_link || '').trim()
+            const textKey = normalizePageVideoTextKey(item.description || item.title)
+            const systemVideoId = systemVideoByPostId.get(postId)
+                || systemVideoByFbVideoId.get(fbVideoId)
+                || systemVideoByShopeeLink.get(shopeeLink)
+                || systemVideoByTextKey.get(textKey)
+                || systemVideoByFuzzyTextKey.get(textKey)
+                || ''
+            const proxiedFacebookThumb = fbVideoId
+                ? `/worker-api/api/dashboard/facebook-video-thumbnail?page_id=${encodeURIComponent(pageId)}&video_id=${encodeURIComponent(fbVideoId)}${String(item.picture || '').trim() ? `&fallback_url=${encodeURIComponent(String(item.picture || '').trim())}` : ''}`
+                : String(item.picture || '').trim()
+            return ({
+            storyId: postId ? `${pageId}_${postId}` : fbVideoId,
             pageName: String(item.page_name || '').trim(),
             createdAt: String(item.created_time || '').trim(),
             postedAt: String(item.created_time || '').trim(),
             postUrl: buildFacebookUrl(String(item.permalink_url || '').trim()),
-            facebookThumb: String(item.picture || '').trim(),
+            facebookThumb: proxiedFacebookThumb,
             views: Number(item.views || 0),
-            videoId: String(item.video_id || '').trim(),
+            videoId: fbVideoId,
+            systemVideoId,
             videoTitle: String(item.description || item.title || 'โพสต์จากเพจ Facebook').trim(),
             videoUrl: String(item.source_url || '').trim(),
-            videoThumb: String(item.picture || '').trim(),
+            videoThumb: proxiedFacebookThumb,
             adsetId: '-',
-            shopeeLink: String(item.shopee_link || '').trim(),
-            postId: String(item.post_id || '').trim(),
-        })),
+            shopeeLink,
+            postId,
+        })}),
         sync: {
             nextAfter: String(sync?.next_after || '').trim(),
             lastAttemptAt: String(sync?.last_attempt_at || '').trim(),
@@ -6111,6 +6748,7 @@ app.get('/api/dashboard/gallery', async (c) => {
 const DASHBOARD_SETTING_KEYS = [
     'facebook_sync_token', 'sub_id', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5',
     'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset',
+    'template_adset_facebook', 'template_adset_instagram',
     'campaign_prefix', 'ads_per_round', 'auto_create_time',
     // Per-page choice for how the create-ad pipeline shortens Shopee URLs:
     //   'api'        → call short.wwoom.com (default; same as the Electron flow)
@@ -6123,7 +6761,7 @@ const DASHBOARD_SETTING_KEYS = [
 const DASHBOARD_SETTING_ALIASES: Record<string, string> = {
     facebookSyncToken: 'facebook_sync_token', subId: 'sub_id', shortlinkUrl: 'shortlink_url',
     commentTemplate: 'comment_template', defaultPage: 'default_page', adAccount: 'ad_account',
-    templateAdset: 'template_adset', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round',
+    templateAdset: 'template_adset', templateAdsetFacebook: 'template_adset_facebook', templateAdsetInstagram: 'template_adset_instagram', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round',
     autoCreateTime: 'auto_create_time', shortlinkProvider: 'shortlink_provider',
 }
 
@@ -6677,6 +7315,9 @@ async function ensureAdQueueTable(db: D1Database): Promise<void> {
         `ALTER TABLE dashboard_ad_queue ADD COLUMN video_url TEXT NOT NULL DEFAULT ''`
     ).run().catch(() => undefined)
     await db.prepare(
+        `ALTER TABLE dashboard_ad_queue ADD COLUMN ad_name TEXT NOT NULL DEFAULT ''`
+    ).run().catch(() => undefined)
+    await db.prepare(
         `CREATE INDEX IF NOT EXISTS idx_dashboard_ad_queue_status ON dashboard_ad_queue(status, created_at)`
     ).run()
 }
@@ -6686,6 +7327,8 @@ app.post('/api/dashboard/ad-queue/enqueue', async (c) => {
         page_id?: string
         video_id?: string
         video_url?: string
+        ad_name?: string
+        source_video_id?: string
         caption?: string
         shopee_url?: string
         story_id?: string
@@ -6695,6 +7338,7 @@ app.post('/api/dashboard/ad-queue/enqueue', async (c) => {
     const pageId = String(body.page_id || '').trim()
     const videoId = String(body.video_id || '').trim()
     const videoUrl = String(body.video_url || '').trim()
+    const adName = String(body.ad_name || body.source_video_id || '').trim()
     // Accept either video_id (for already-on-FB videos) or video_url (for unposted
     // gallery videos that the electron pipeline will upload to FB Ads first).
     if (!pageId || (!videoId && !videoUrl)) {
@@ -6705,12 +7349,13 @@ app.post('/api/dashboard/ad-queue/enqueue', async (c) => {
     }
     await ensureAdQueueTable(c.env.DB)
     const insert = await c.env.DB.prepare(
-        `INSERT INTO dashboard_ad_queue (page_id, video_id, video_url, caption, shopee_url, story_id, campaign_id, new_campaign_name)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO dashboard_ad_queue (page_id, video_id, video_url, ad_name, caption, shopee_url, story_id, campaign_id, new_campaign_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
         pageId,
         videoId,
         videoUrl,
+        adName,
         String(body.caption || '').trim(),
         String(body.shopee_url || '').trim(),
         String(body.story_id || '').trim(),
@@ -6808,6 +7453,8 @@ async function processNextAdQueueItem(env: Env): Promise<{
                 page_id: row.page_id,
                 video_id: row.video_id,
                 video_url: row.video_url || '',
+                ad_name: row.ad_name || '',
+                source_video_id: row.ad_name || '',
                 caption: row.caption,
                 story_id: row.story_id,
                 shopee_url: row.shopee_url,
@@ -6928,6 +7575,10 @@ app.post('/api/dashboard/create-ad', async (c) => {
         sub_id3?: string
         sub_id4?: string
         sub_id5?: string
+        placement_template?: string
+        template_adset?: string
+        ad_name?: string
+        source_video_id?: string
     }
     const pageId = String(body.page_id || '').trim()
     const videoUrl = String(body.video_url || '').trim()
@@ -6935,8 +7586,17 @@ app.post('/api/dashboard/create-ad', async (c) => {
     const caption = String(body.caption || '').trim()
     const shopeeUrl = String(body.shopee_url || '').trim()
     const originalStoryId = String(body.story_id || '').trim()
+    const lookupVideoId = videoId || (/^\d{8,}$/.test(originalStoryId) ? originalStoryId : '')
     const campaignId = String(body.campaign_id || '').trim()
     const newCampaignName = String(body.new_campaign_name || '').trim()
+    const placementTemplate = String(body.placement_template || '').trim().toLowerCase()
+    const templateAdsetOverride = String(body.template_adset || '').trim()
+    const adName = resolveCreateAdVideoName({
+        explicitName: body.ad_name,
+        sourceVideoId: body.source_video_id,
+        videoUrl,
+        videoId,
+    })
     // Per-ad Sub ID overrides — when blank, fall back to settings defaults below.
     const overrideSub2 = String(body.sub_id2 || '').trim()
     const overrideSub3 = String(body.sub_id3 || '').trim()
@@ -6962,18 +7622,19 @@ app.post('/api/dashboard/create-ad', async (c) => {
         // posted page videos it is a valid FB thumbnail URL, and lets video-onecard
         // avoid calling `/{video_id}?fields=thumbnails` during temporary FB blocks.
         let cacheRow: { shopee_link?: string; post_id?: string; picture?: string } | null = null
-        if (videoId) {
+        if (lookupVideoId) {
             cacheRow = await c.env.DB.prepare(
                 `SELECT shopee_link, post_id, picture FROM facebook_page_video_cache WHERE page_id = ? AND video_id = ? LIMIT 1`
-            ).bind(pageId, videoId).first().catch(() => null) as { shopee_link?: string; post_id?: string; picture?: string } | null
+            ).bind(pageId, lookupVideoId).first().catch(() => null) as { shopee_link?: string; post_id?: string; picture?: string } | null
             if (cacheRow?.picture && /^https?:\/\//i.test(cacheRow.picture)) thumbnailUrl = cacheRow.picture
             if (cacheRow?.shopee_link) shopeeLink = cacheRow.shopee_link
         }
 
         // Direct lookup from cache table
-        if (!shopeeLink && videoId) {
+        const shouldResolveOriginalShopee = /^https?:\/\/s\.shopee\.co\.th\//i.test(shopeeLink)
+        if ((!shopeeLink || shouldResolveOriginalShopee) && lookupVideoId) {
             // Also try via post_id → post_history → namespace_video_state for ORIGINAL link
-            if (!shopeeLink && cacheRow?.post_id) {
+            if (cacheRow?.post_id) {
                 const nvs = await c.env.DB.prepare(
                     `SELECT nvs.shopee_original_link, nvs.shopee_link FROM post_history ph
                      JOIN namespace_video_state nvs ON nvs.video_id = ph.video_id AND nvs.namespace_id = ph.bot_id
@@ -6981,20 +7642,22 @@ app.post('/api/dashboard/create-ad', async (c) => {
                      AND (nvs.shopee_original_link != '' OR nvs.shopee_link != '')
                      ORDER BY ph.posted_at DESC LIMIT 1`
                 ).bind(cacheRow.post_id).first().catch(() => null) as { shopee_original_link?: string; shopee_link?: string } | null
-                shopeeLink = nvs?.shopee_original_link || nvs?.shopee_link || ''
+                const resolvedShopeeLink = nvs?.shopee_original_link || nvs?.shopee_link || ''
+                if (resolvedShopeeLink) shopeeLink = resolvedShopeeLink
             }
         }
 
         // Fallback: post_history via fb_reel_url
-        if (!shopeeLink && videoId) {
+        if (!shopeeLink && lookupVideoId) {
             const mapped = await c.env.DB.prepare(
                 `SELECT nvs.shopee_original_link, nvs.shopee_link FROM post_history ph
                  JOIN namespace_video_state nvs ON nvs.video_id = ph.video_id AND nvs.namespace_id = ph.bot_id
                  WHERE ph.bot_id = '1774858894802785816' AND ph.fb_reel_url LIKE ?
                  AND (nvs.shopee_original_link != '' OR nvs.shopee_link != '')
                  ORDER BY ph.posted_at DESC LIMIT 1`
-            ).bind(`%${videoId}%`).first().catch(() => null) as { shopee_original_link?: string; shopee_link?: string } | null
-            shopeeLink = mapped?.shopee_original_link || mapped?.shopee_link || ''
+            ).bind(`%${lookupVideoId}%`).first().catch(() => null) as { shopee_original_link?: string; shopee_link?: string } | null
+            const mappedShopeeLink = mapped?.shopee_original_link || mapped?.shopee_link || ''
+            if (mappedShopeeLink) shopeeLink = mappedShopeeLink
         }
 
         // Fallback: ANY shopee_link from post_history matching same caption
@@ -7013,6 +7676,23 @@ app.post('/api/dashboard/create-ad', async (c) => {
         if (!shopeeLink) {
             const descMatch = caption.match(/https?:\/\/(?:[^\s]+\.)?shopee\.[^\s]+/i)
             if (descMatch) shopeeLink = descMatch[0]
+        }
+
+        // If the page-card supplied an already-short Shopee URL, short.wwoom may
+        // fail to fetch it. When we have the internal system video id as adName,
+        // recover the original Shopee URL from gallery/state and shorten that —
+        // matching the normal dashboard data source instead of re-shortening s.shopee.
+        if (/^https?:\/\/s\.shopee\.co\.th\//i.test(shopeeLink) && adName) {
+            const originalBySystemId = await c.env.DB.prepare(
+                `SELECT COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), NULLIF(TRIM(gi.shopee_original_link), '')) AS original_link
+                 FROM gallery_index gi
+                 LEFT JOIN namespace_video_state nvs ON nvs.namespace_id = gi.namespace_id AND nvs.video_id = gi.video_id
+                 WHERE gi.namespace_id = '1774858894802785816' AND gi.video_id = ?
+                 LIMIT 1`
+            ).bind(adName).first().catch(() => null) as { original_link?: string } | null
+            if (originalBySystemId?.original_link && /^https?:\/\//i.test(originalBySystemId.original_link)) {
+                shopeeLink = originalBySystemId.original_link
+            }
         }
 
         // ALWAYS shorten with current sub_ids — per-ad override (from popup
@@ -7048,10 +7728,10 @@ app.post('/api/dashboard/create-ad', async (c) => {
 
         // 3. Stop if no shopee link found
         if (!shopeeLink) {
-            return c.json({ ok: false, error: 'ไม่พบลิ้ง Shopee สำหรับวีดีโอนี้', step: 'shopee_link_not_found', video_id: videoId }, 400)
+            return c.json({ ok: false, error: 'ไม่พบลิ้ง Shopee สำหรับวีดีโอนี้', step: 'shopee_link_not_found', video_id: lookupVideoId || videoId }, 400)
         }
         if (!shortLink) {
-            return c.json({ ok: false, error: 'ย่อลิ้ง Shopee ไม่สำเร็จ', step: 'shortlink_failed', video_id: videoId, shopeeLink }, 400)
+            return c.json({ ok: false, error: 'ย่อลิ้ง Shopee ไม่สำเร็จ', step: 'shortlink_failed', video_id: lookupVideoId || videoId, shopeeLink }, 400)
         }
 
         // 4. Caption stays exactly what the operator typed/pulled — matches the
@@ -7076,41 +7756,69 @@ app.post('/api/dashboard/create-ad', async (c) => {
         // reads call_to_action_type dynamically from the template adset's first ad, so
         // whatever CTA the operator set in their new template (SHOP_NOW, LEARN_MORE,
         // LIKE_PAGE, etc.) automatically flows through.
-        const templateAdsetRow = await getPageSetting(c.env.DB, pageId, 'template_adset').catch(() => null)
+        const templateSettingKey = placementTemplate === 'facebook'
+            ? 'template_adset_facebook'
+            : (placementTemplate === 'instagram' ? 'template_adset_instagram' : 'template_adset')
+        const templateAdsetRow = await getPageSetting(c.env.DB, pageId, templateSettingKey).catch(() => null)
+        const fallbackTemplateAdsetRow = templateSettingKey === 'template_adset'
+            ? null
+            : await getPageSetting(c.env.DB, pageId, 'template_adset').catch(() => null)
+        const facebookTemplateAdsetRow = await getPageSetting(c.env.DB, pageId, 'template_adset_facebook').catch(() => null)
         const adAccountRow = await getPageSetting(c.env.DB, pageId, 'ad_account').catch(() => null)
-        const templateAdsetFromSettings = String(templateAdsetRow?.value || '').trim()
+        const templateAdsetFromSettings = templateAdsetOverride || String(templateAdsetRow?.value || fallbackTemplateAdsetRow?.value || '').trim()
+        const facebookTemplateAdset = String(facebookTemplateAdsetRow?.value || '').trim()
         const adAccountFromSettings = String(adAccountRow?.value || '').trim()
 
-        const resp = await fetch(`${baseUrl}/create-ad`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                page_id: pageId,
-                video_url: videoUrl,
-                video_id: videoId,
-                caption: finalCaption,
-                shortlink: cleanShortLink,
-                shopee_url: shopeeLink,
-                ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
-                ...(templateAdsetFromSettings ? { template_adset: templateAdsetFromSettings } : {}),
-                ...(adAccountFromSettings ? { ad_account: adAccountFromSettings } : {}),
-                ...(campaignId ? { campaign_id: campaignId } : {}),
-                ...(newCampaignName ? { new_campaign_name: newCampaignName } : {}),
-            }),
-        })
-        const upstreamText = await resp.text()
-        let data: Record<string, unknown>
-        try {
-            data = upstreamText ? JSON.parse(upstreamText) as Record<string, unknown> : { ok: false, error: 'empty_response' }
-        } catch {
-            data = {
-                ok: false,
-                error: 'invalid_response',
-                step: 'video_onecard_response',
-                upstream_status: resp.status,
-                upstream_content_type: resp.headers.get('content-type') || '',
-                upstream_preview: upstreamText.substring(0, 300),
+        const callVideoOnecardCreateAd = async (templateAdsetForAttempt: string, fallbackReason = '') => {
+            const onecardResp = await fetch(`${baseUrl}/create-ad`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    page_id: pageId,
+                    ...(videoUrl ? { video_url: videoUrl } : { video_id: videoId }),
+                    caption: finalCaption,
+                    ...(adName ? { ad_name: adName, source_video_id: adName } : {}),
+                    shortlink: cleanShortLink,
+                    shopee_url: shopeeLink,
+                    ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
+                    ...(templateAdsetForAttempt ? { template_adset: templateAdsetForAttempt } : {}),
+                    ...(adAccountFromSettings ? { ad_account: adAccountFromSettings } : {}),
+                    ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
+                    ...(placementTemplate === 'instagram' ? { skip_publish_to_page: true } : {}),
+                    // New campaign name must win over selected existing campaign.
+                    // UI can keep an existing campaign highlighted while operator types
+                    // a duplicate-name campaign; sending campaign_id here would merge the
+                    // new adset into the old campaign instead of creating a new campaign.
+                    ...(!newCampaignName && campaignId ? { campaign_id: campaignId } : {}),
+                    ...(newCampaignName ? { new_campaign_name: newCampaignName } : {}),
+                }),
+            })
+            const text = await onecardResp.text()
+            let parsed: Record<string, unknown>
+            try {
+                parsed = text ? JSON.parse(text) as Record<string, unknown> : { ok: false, error: 'empty_response' }
+            } catch {
+                parsed = {
+                    ok: false,
+                    error: 'invalid_response',
+                    step: 'video_onecard_response',
+                    upstream_status: onecardResp.status,
+                    upstream_content_type: onecardResp.headers.get('content-type') || '',
+                    upstream_preview: text.substring(0, 300),
+                }
             }
+            return { resp: onecardResp, data: parsed }
+        }
+
+        let { resp, data } = await callVideoOnecardCreateAd(templateAdsetFromSettings)
+        const isIgUnsupportedMedia = Number(data.fb_error_code || 0) === 100
+            && Number(data.fb_error_subcode || 0) === 1443078
+            && /instagram|ig/i.test(String(data.fb_error_user_msg || data.error || ''))
+        // If operator selected Instagram, keep it Instagram. Do NOT auto-fallback
+        // to Facebook placements: Thanwa wants IG-only to create an ad only, with
+        // no page-feed publish/comment side effects.
+        if (isIgUnsupportedMedia && placementTemplate === 'instagram') {
+            console.log(`[CREATE-AD] IG template rejected media for video=${videoId}; keeping IG-only failure visible (no FB fallback)`)
         }
         if (!data.ok || !data.story_id) {
             return c.json(data, resp.ok ? 200 : 502)
@@ -7125,7 +7833,9 @@ app.post('/api/dashboard/create-ad', async (c) => {
         // namespaceId derived from pages.bot_id since this dashboard endpoint accepts
         // page_id as the only routing input.
         let commentId = ''
-        if (cleanShortLink) {
+        let commentError = ''
+        let commentTargetId = ''
+        if (cleanShortLink && placementTemplate !== 'instagram') {
             const storyId = String(data.story_id || '').trim()
             try {
                 let commentToken = ''
@@ -7150,27 +7860,199 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     commentToken = pageEntry?.access_token || ''
                 }
 
-                if (commentToken && storyId && commentText) {
-                    // Comment via onecard /graph proxy with the resolved comment token
-                    const commentResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(storyId)}/comments`, {
+                const postComment = async (token: string, targetId: string) => {
+                    if (!token || !targetId || !commentText) return {} as Record<string, unknown>
+                    const commentResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(targetId)}/comments`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ message: commentText, access_token: commentToken }),
+                        body: JSON.stringify({ message: commentText, access_token: token }),
                     })
-                    const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
-                    if (commentData.error) {
-                        console.error(`[CREATE-AD] Comment error: ${JSON.stringify(commentData.error).substring(0, 200)}`)
+                    return await commentResp.json().catch(() => ({})) as Record<string, unknown>
+                }
+
+                const tryCommentTargets = async (token: string, tokenLabel: string) => {
+                    // Dark ad story IDs can be inaccessible/comment-blocked via Graph even
+                    // after is_published=true. For dashboard page-post boosts, the source
+                    // video_id is the actual page post/reel and is commentable, so fall
+                    // back to it instead of reporting "ข้าม".
+                    const targets = [storyId, videoId].map((v) => String(v || '').trim()).filter(Boolean)
+                    const uniqueTargets = Array.from(new Set(targets))
+                    let lastData = {} as Record<string, unknown>
+                    for (const targetId of uniqueTargets) {
+                        const data = await postComment(token, targetId)
+                        lastData = data
+                        if (!data.error && data.id) {
+                            commentTargetId = targetId
+                            return data
+                        }
+                        if (data.error) {
+                            commentError = String((data.error as any)?.message || JSON.stringify(data.error)).substring(0, 240)
+                            console.error(`[CREATE-AD] Comment error with ${tokenLabel} token target=${targetId}: ${JSON.stringify(data.error).substring(0, 200)}`)
+                        }
+                    }
+                    return lastData
+                }
+
+                if (commentToken && commentText && (storyId || videoId)) {
+                    // First try the dedicated token across storyId → source videoId.
+                    // If it fails, fall back to the page token from /me/accounts.
+                    let commentData = await tryCommentTargets(commentToken, 'primary')
+                    if (commentData.error || !commentData.id) {
+                        const pagesResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent('me/accounts')}&fields=id,access_token&limit=100`)
+                        const pagesData = await pagesResp.json().catch(() => ({})) as { data?: Array<{ id: string; access_token: string }> }
+                        const pageEntry = (pagesData.data || []).find((p) => p.id === pageId)
+                        const fallbackToken = pageEntry?.access_token || ''
+                        if (fallbackToken && fallbackToken !== commentToken) {
+                            commentData = await tryCommentTargets(fallbackToken, 'fallback')
+                        }
                     }
                     commentId = String(commentData.id || '').trim()
                 }
-            } catch {}
+            } catch (e) {
+                commentError = e instanceof Error ? e.message : String(e)
+                console.error(`[CREATE-AD] Comment exception: ${commentError}`)
+            }
         }
 
         return c.json({
             ...data,
             shortLink,
             commentId,
+            commentTargetId,
             commentPosted: !!commentId,
+            ...(commentId ? {} : { commentError }),
+        })
+    } catch (e) {
+        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 502)
+    }
+})
+
+app.get('/api/dashboard/ad-links', async (c) => {
+    const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
+    const pattern = String(c.req.query('pattern') || '^16MAY26FBSPCAD \\((\\d+)\\)$').trim()
+    const limitRaw = Number(c.req.query('limit') || 20)
+    const campaignLimit = Number.isFinite(limitRaw) ? Math.min(60, Math.max(1, Math.floor(limitRaw))) : 20
+    const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+
+    const graph = async (path: string, fields: string, limit = 100) => {
+        const resp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(path)}&fields=${encodeURIComponent(fields)}&limit=${encodeURIComponent(String(limit))}`)
+        const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+        return { ok: resp.ok && !(data as any)?.error, status: resp.status, data }
+    }
+
+    const collectLinks = (value: unknown): string[] => {
+        const links: string[] = []
+        const walk = (node: unknown) => {
+            if (!node) return
+            if (typeof node === 'string') {
+                const trimmed = node.trim()
+                if (/^https?:\/\//i.test(trimmed)) links.push(trimmed)
+                const matches = trimmed.match(/https?:\/\/[^\s\"'<>]+/gi) || []
+                for (const match of matches) links.push(match.replace(/[),.;\]]+$/g, ''))
+                return
+            }
+            if (Array.isArray(node)) {
+                for (const item of node) walk(item)
+                return
+            }
+            if (typeof node === 'object') {
+                for (const item of Object.values(node as Record<string, unknown>)) walk(item)
+            }
+        }
+        walk(value)
+        return Array.from(new Set(links))
+    }
+
+    const pickClickLink = (creative: Record<string, unknown>): string => {
+        const spec = (creative.object_story_spec || {}) as any
+        const videoData = spec.video_data || {}
+        const linkData = spec.link_data || {}
+        const assetFeed = (creative.asset_feed_spec || {}) as any
+        const candidates = [
+            videoData?.call_to_action?.value?.link,
+            videoData?.call_to_action?.value?.link_url,
+            linkData?.link,
+            linkData?.call_to_action?.value?.link,
+            linkData?.call_to_action?.value?.link_url,
+            Array.isArray(assetFeed?.link_urls) ? assetFeed.link_urls?.[0]?.website_url : '',
+            Array.isArray(assetFeed?.link_urls) ? assetFeed.link_urls?.[0]?.url : '',
+            creative.object_url,
+        ].map((v) => String(v || '').trim()).filter(Boolean)
+        const first = candidates.find((v) => /^https?:\/\//i.test(v))
+        if (first) return first
+        return collectLinks(creative)[0] || ''
+    }
+
+    try {
+        const campResp = await graph(adAccount + '/campaigns', 'id,name,effective_status,daily_budget,start_time', 60)
+        if (!campResp.ok) return c.json({ ok: false, step: 'campaigns', error: (campResp.data as any)?.error || campResp.data }, 502)
+        const rx = new RegExp(pattern)
+        const campaigns = (((campResp.data as any)?.data || []) as any[])
+            .filter((camp) => String(camp?.effective_status || '').trim() === 'ACTIVE')
+            .filter((camp) => rx.test(String(camp?.name || '')))
+            .slice(0, campaignLimit)
+
+        const rows: Array<Record<string, unknown>> = []
+        const errors: Array<Record<string, unknown>> = []
+        for (const camp of campaigns) {
+            const adsetResp = await graph(`${camp.id}/adsets`, 'id,name,effective_status,daily_budget', 200)
+            if (!adsetResp.ok) {
+                errors.push({ campaign_id: camp.id, campaign_name: camp.name, step: 'adsets', error: (adsetResp.data as any)?.error || adsetResp.data })
+                continue
+            }
+            const adsets = (((adsetResp.data as any)?.data || []) as any[])
+            for (const adset of adsets) {
+                const adsResp = await graph(`${adset.id}/ads`, 'id,name,effective_status,creative{id,name,object_story_spec,asset_feed_spec,object_url,url_tags}', 50)
+                if (!adsResp.ok) {
+                    errors.push({ campaign_id: camp.id, campaign_name: camp.name, adset_id: adset.id, adset_name: adset.name, step: 'ads', error: (adsResp.data as any)?.error || adsResp.data })
+                    rows.push({ campaign_id: camp.id, campaign_name: camp.name, campaign_status: camp.effective_status, adset_id: adset.id, adset_name: adset.name, adset_status: adset.effective_status, ad_id: '', ad_name: '', ad_status: '', click_link: '', all_links: [], link_count: 0, short_wwoom: false, has_subid: false, error: 'ads_fetch_failed' })
+                    continue
+                }
+                const ads = (((adsResp.data as any)?.data || []) as any[])
+                if (!ads.length) {
+                    rows.push({ campaign_id: camp.id, campaign_name: camp.name, campaign_status: camp.effective_status, adset_id: adset.id, adset_name: adset.name, adset_status: adset.effective_status, ad_id: '', ad_name: '', ad_status: '', click_link: '', all_links: [], link_count: 0, short_wwoom: false, has_subid: false })
+                    continue
+                }
+                for (const ad of ads) {
+                    const creative = (ad.creative || {}) as Record<string, unknown>
+                    const allLinks = collectLinks(creative)
+                    const clickLink = pickClickLink(creative)
+                    rows.push({
+                        campaign_id: camp.id,
+                        campaign_name: camp.name,
+                        campaign_status: camp.effective_status,
+                        adset_id: adset.id,
+                        adset_name: adset.name,
+                        adset_status: adset.effective_status,
+                        ad_id: ad.id,
+                        ad_name: ad.name,
+                        ad_status: ad.effective_status,
+                        creative_id: (creative as any)?.id || '',
+                        click_link: clickLink,
+                        all_links: allLinks,
+                        link_count: allLinks.length,
+                        short_wwoom: /short\.wwoom\.com/i.test(clickLink) || allLinks.some((link) => /short\.wwoom\.com/i.test(link)),
+                        has_subid: /16MAY26FBSPCAD/i.test(clickLink) || allLinks.some((link) => /16MAY26FBSPCAD/i.test(link)),
+                    })
+                }
+            }
+        }
+
+        const adsRows = rows.filter((row) => String(row.ad_id || '').trim())
+        const adsetIds = new Set(rows.map((row) => String(row.adset_id || '')).filter(Boolean))
+        return c.json({
+            ok: true,
+            ad_account: adAccount,
+            campaign_count: campaigns.length,
+            adset_count: adsetIds.size,
+            row_count: rows.length,
+            ad_count: adsRows.length,
+            ads_with_click_link: adsRows.filter((row) => String(row.click_link || '').trim()).length,
+            ads_without_click_link: adsRows.filter((row) => !String(row.click_link || '').trim()).length,
+            short_wwoom_ads: adsRows.filter((row) => row.short_wwoom).length,
+            subid_ads: adsRows.filter((row) => row.has_subid).length,
+            errors,
+            rows,
         })
     } catch (e) {
         return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 502)
@@ -7179,16 +8061,59 @@ app.post('/api/dashboard/create-ad', async (c) => {
 
 app.get('/api/dashboard/campaigns', async (c) => {
     const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
+    const mode = String(c.req.query('mode') || '').trim().toLowerCase()
     const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
     try {
-        // Pull more than the visible limit (30) so after we filter out paused
+        // Pull more than the visible limit (60) so after we filter out paused
         // /archived/etc. we still have enough ACTIVE campaigns to show. Operator
         // wants only ACTIVE in the create-ad picker — paused ones just clutter
         // the list (same FB UX as Ads Manager's 'Active' filter).
-        const campResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=30`)
+        const campResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(adAccount)}/campaigns&fields=id,name,effective_status,daily_budget,start_time&limit=60`)
         const campData = await campResp.json().catch(() => ({})) as Record<string, unknown>
         const allCampaigns = Array.isArray((campData as any)?.data) ? (campData as any).data : []
-        const campaigns = allCampaigns.filter((c: any) => String(c?.effective_status || '').trim() === 'ACTIVE').slice(0, 10)
+        const campaigns = allCampaigns.filter((c: any) => String(c?.effective_status || '').trim() === 'ACTIVE').slice(0, 20)
+
+        // Create-ad popup needs a fast picker list, but adset counts must be
+        // live. Previously mode=picker returned adsetCount=0 for every campaign
+        // to avoid the slow insights loop, which made filled campaigns look
+        // empty and caused duplicate-selection risk. Keep picker fast by only
+        // fetching adset counts (no insights) in parallel.
+        if (mode === 'picker') {
+            const withCounts = await Promise.all(campaigns.map(async (camp: any) => {
+                let adsets: any[] = []
+                try {
+                    const adsetResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(String(camp.id))}/adsets&fields=id,name,effective_status&limit=200`)
+                    const adsetData = await adsetResp.json().catch(() => ({})) as Record<string, unknown>
+                    adsets = Array.isArray((adsetData as any)?.data) ? (adsetData as any).data : []
+                } catch (_e) {
+                    adsets = []
+                }
+                return {
+                    id: camp.id,
+                    name: camp.name,
+                    status: camp.effective_status,
+                    dailyBudget: camp.daily_budget,
+                    startTime: camp.start_time,
+                    adsets: adsets.map((a: any) => ({
+                        id: a.id,
+                        name: a.name,
+                        status: a.effective_status,
+                    })),
+                    adsetCount: adsets.length,
+                    activeAdsetCount: adsets.filter((a: any) => a.effective_status === 'ACTIVE').length,
+                    reach: '0',
+                    impressions: '0',
+                    spend: '0',
+                    costPerResult: '0',
+                    costPerLinkClick: '',
+                }
+            }))
+            return c.json({
+                ok: true,
+                mode: 'picker',
+                campaigns: withCounts,
+            })
+        }
 
         // Helper: pull the per-action numeric cost out of the FB insights array
         // shape. cost_per_action_type returns:
@@ -10432,6 +11357,28 @@ async function clearLineWaitingVideoState(bucket: R2Bucket, lineUserId: string):
     await bucket.delete(`_waiting_video/${lineUserId}.json`).catch(() => { })
 }
 
+async function markLineWaitingVideoCancelled(bucket: R2Bucket, lineUserId: string, videoId: string): Promise<void> {
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!String(lineUserId || '').trim() || !normalizedVideoId) return
+    await bucket.put(`_waiting_video_cancelled/${lineUserId}.json`, JSON.stringify({
+        videoId: normalizedVideoId,
+        cancelledAt: new Date().toISOString(),
+    }), { httpMetadata: { contentType: 'application/json' } }).catch(() => { })
+}
+
+async function clearLineWaitingVideoCancelled(bucket: R2Bucket, lineUserId: string): Promise<void> {
+    await bucket.delete(`_waiting_video_cancelled/${lineUserId}.json`).catch(() => { })
+}
+
+async function isLineWaitingVideoCancelled(bucket: R2Bucket, lineUserId: string, videoId: string): Promise<boolean> {
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!String(lineUserId || '').trim() || !normalizedVideoId) return false
+    const obj = await bucket.get(`_waiting_video_cancelled/${lineUserId}.json`).catch(() => null)
+    if (!obj) return false
+    const raw = await obj.json().catch(() => null) as { videoId?: unknown } | null
+    return String(raw?.videoId || '').trim() === normalizedVideoId
+}
+
 async function listReadyLineWaitingVideoStates(bucket: R2Bucket): Promise<LineWaitingVideoState[]> {
     const list = await bucket.list({ prefix: '_waiting_video/' })
     const tasks = await Promise.all(list.objects.map(async (obj) => {
@@ -10976,6 +11923,10 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
     const waitingState = normalizeLineWaitingVideoState(params.waitingState)
     if (!waitingState) throw new Error('invalid_line_waiting_state')
     const manualCaption = normalizeManualCaption(params.manualCaption || waitingState.manualCaption)
+    if (await isLineWaitingVideoCancelled(params.bucket, params.lineUserId, waitingState.id)) {
+        await clearLineWaitingVideoState(params.bucket, params.lineUserId)
+        return
+    }
     const hasShopeeLink = !!String(waitingState.shopeeLink || '').trim()
     const hasLazadaLink = !!String(waitingState.lazadaLink || '').trim()
     if (!hasShopeeLink || !hasLazadaLink) {
@@ -11048,6 +11999,10 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
             })
         },
     } as ExecutionContext
+    if (await isLineWaitingVideoCancelled(params.bucket, params.lineUserId, waitingState.id)) {
+        await clearLineWaitingVideoState(params.bucket, params.lineUserId)
+        return
+    }
     const startResult = await ensureInboxVideoProcessingStarted({
         env: params.env,
         bucket: params.bucket,
@@ -11058,6 +12013,7 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
     })
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
+    await clearLineWaitingVideoCancelled(params.bucket, params.lineUserId)
 
     const hasLinks = !!String(inboxRecord.shopeeLink || '').trim() || !!String(inboxRecord.lazadaLink || '').trim()
     const jobStatus = startResult.outcome === 'started'
@@ -11702,8 +12658,11 @@ async function handleLineEvent(event: any, env: Env, channelAccessToken: string,
     const namespaceId = await resolveLineNamespace(env.DB, lineUserId, displayName)
     const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
 
-    if (replyToken) {
-        await lineStartLoading(channelAccessToken, lineUserId, 60)
+    const incomingText = event.type === 'message' && event.message?.type === 'text'
+        ? String(event.message?.text || '').trim()
+        : ''
+    if (replyToken && !isLineCancelCommand(incomingText)) {
+        await lineStartLoading(channelAccessToken, lineUserId, 20)
     }
 
     if (event.type === 'postback') {
@@ -11774,6 +12733,7 @@ async function handleLineVideoMessage(params: {
 }) {
     const { env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, messageId } = params
     const videoId = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
+    await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
     try {
         // Download video content from LINE
@@ -11831,6 +12791,54 @@ async function handleLineVideoMessage(params: {
     }
 }
 
+async function ackAndStartLineWaitingVideoFinalization(params: {
+    env: Env
+    bucket: R2Bucket
+    executionCtx?: ExecutionContext
+    namespaceId: string
+    channelAccessToken: string
+    replyToken: string
+    lineUserId: string
+    waitingState: LineWaitingVideoState
+    manualCaption?: string
+}) {
+    const waitingState = normalizeLineWaitingVideoState(params.waitingState)
+    if (!waitingState) throw new Error('invalid_line_waiting_state')
+
+    await lineReplyOrPush({
+        replyToken: params.replyToken,
+        channelAccessToken: params.channelAccessToken,
+        lineUserId: params.lineUserId,
+        messages: [
+            { type: 'text', text: `รับคำสั่งแล้ว กำลังเริ่มประมวลผล ID: ${waitingState.id}\nถ้าไม่ต้องการรอในแชท เปิดหน้าประมวลผลดูสถานะได้เลย` },
+        ],
+    })
+
+    const finalizePromise = finalizeLineWaitingVideoAndStartProcessing({
+        env: params.env,
+        bucket: params.bucket,
+        executionCtx: params.executionCtx,
+        namespaceId: params.namespaceId,
+        channelAccessToken: params.channelAccessToken,
+        replyToken: '',
+        lineUserId: params.lineUserId,
+        waitingState,
+        manualCaption: params.manualCaption,
+        pushOnly: true,
+    }).catch(async (error) => {
+        console.error('[LINE] Async finalize error:', error instanceof Error ? error.message : String(error))
+        await linePushMessage(params.channelAccessToken, params.lineUserId, [
+            { type: 'text', text: buildLineShortErrorMessage(error) },
+        ]).catch(() => { })
+    })
+
+    if (params.executionCtx) {
+        params.executionCtx.waitUntil(finalizePromise)
+    } else {
+        await finalizePromise
+    }
+}
+
 async function handleLineTextMessage(params: {
     env: Env
     bucket: R2Bucket
@@ -11859,6 +12867,7 @@ async function handleLineTextMessage(params: {
 
     if (isLineCancelCommand(text)) {
         if (waitingState) {
+            await markLineWaitingVideoCancelled(bucket, lineUserId, waitingState.id)
             await clearLineWaitingVideoState(bucket, lineUserId)
             await lineReply(replyToken, channelAccessToken, [
                 { type: 'text', text: 'ยกเลิกงานที่ค้างไว้แล้ว ส่งวิดีโอหรือลิงก์ใหม่ได้เลย' },
@@ -12152,14 +13161,19 @@ async function handleLineTextMessage(params: {
     if (waitingState?.awaitingStep === 'caption') {
         if (isLineCoverSkipCommand(text)) {
             try {
-                await finalizeLineWaitingVideoAndStartProcessing({
+                await ackAndStartLineWaitingVideoFinalization({
                     env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                 })
             } catch (e) {
                 console.error('[LINE] Skip cover during caption error:', e instanceof Error ? e.message : String(e))
-                await lineReply(replyToken, channelAccessToken, [
-                    { type: 'text', text: buildLineShortErrorMessage(e) },
-                ]).catch(() => { })
+                await lineReplyOrPush({
+                    replyToken,
+                    channelAccessToken,
+                    lineUserId,
+                    messages: [
+                        { type: 'text', text: buildLineShortErrorMessage(e) },
+                    ],
+                }).catch(() => { })
             }
             return
         }
@@ -12173,7 +13187,7 @@ async function handleLineTextMessage(params: {
 
         if (isLineCaptionSkipCommand(text)) {
             try {
-                await finalizeLineWaitingVideoAndStartProcessing({
+                await ackAndStartLineWaitingVideoFinalization({
                     env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, waitingState,
                 })
             } catch (e) {
@@ -12249,6 +13263,7 @@ async function handleLineTextMessage(params: {
     if (xhsMatch) {
         const xhsUrl = xhsMatch[0]
         const videoId = crypto.randomUUID().slice(0, 8)
+        await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
         await lineStartLoading(channelAccessToken, lineUserId, 20).catch(() => { })
 
@@ -13992,7 +15007,9 @@ function buildInboxVideoResponseFromGalleryIndex(
     const processedAt = String(video.processedAt || video.processed_at || '').trim()
     const shopeeLink = String(video.shopeeLink || video.shopee_link || '').trim()
     const lazadaLink = String(video.lazadaLink || video.lazada_link || '').trim()
-    const readyToProcess = !processedAt && !!shopeeLink && !!lazadaLink
+    const shopeeLinkError = getShopeeLinkValidationError(shopeeLink)
+    const hasUsableShopeeLink = !shopeeLinkError
+    const readyToProcess = !processedAt && hasUsableShopeeLink && !!lazadaLink
     const fallbackThumbnailUrl = buildWorkerGalleryFrameUrl(
         String(env.WORKER_URL || '').trim(),
         namespaceId,
@@ -14022,10 +15039,16 @@ function buildInboxVideoResponseFromGalleryIndex(
         sourceLabel: 'Admin original',
         shopeeLink,
         lazadaLink,
-        hasShopeeLink: !!shopeeLink,
+        hasShopeeLink: hasUsableShopeeLink,
         hasLazadaLink: !!lazadaLink,
+        ...(shopeeLinkError ? {
+            shopeeLinkError,
+            linkError: shopeeLinkError === 'invalid_shopee_homepage_link'
+                ? 'ลิงก์ Shopee เป็นหน้าแรก กรุณาใส่ลิงก์สินค้า/affiliate short link'
+                : 'ยังไม่มีลิงก์ Shopee',
+        } : {}),
         readyToProcess,
-        canStartProcessing: !processedAt,
+        canStartProcessing: readyToProcess,
         canDelete: true,
         namespace_id: namespaceId,
         ...(ownerEmail ? { owner_email: ownerEmail } : {}),
@@ -14062,7 +15085,7 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
          WHERE namespace_id = ?
            AND TRIM(COALESCE(original_url,'')) <> ''
            AND TRIM(COALESCE(processed_at,'')) = ''
-           AND TRIM(COALESCE(shopee_link,'')) <> ''
+           AND ${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}
            AND TRIM(COALESCE(lazada_link,'')) <> ''
          ORDER BY COALESCE(NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, video_id ASC
          LIMIT 12`
@@ -14088,7 +15111,7 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
         const originalUrl = String(row.original_url || '').trim()
         const shopeeLink = String(row.shopee_link || '').trim()
         const lazadaLink = String(row.lazada_link || '').trim()
-        if (!originalUrl || !shopeeLink || !lazadaLink) continue
+        if (!originalUrl || !isUsableShopeeLink(shopeeLink) || !lazadaLink) continue
 
         const existing = await getInboxVideoRecord(params.bucket, id).catch(() => null)
         const timestamp = String(row.updated_at || row.created_at || '').trim() || new Date().toISOString()
@@ -14131,7 +15154,7 @@ async function syncReadyInboxLinksToNamespaceIndex(params: {
          WHERE namespace_id = ?
            AND TRIM(COALESCE(original_url,'')) <> ''
            AND TRIM(COALESCE(processed_at,'')) = ''
-           AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')
+           AND (NOT (${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}) OR TRIM(COALESCE(lazada_link,'')) = '')
          ORDER BY COALESCE(NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, video_id ASC
          LIMIT ?`
     ).bind(namespaceId, limit).all().catch(() => ({ results: [] })) as { results?: Array<{ video_id?: string }> }
@@ -14148,7 +15171,7 @@ async function syncReadyInboxLinksToNamespaceIndex(params: {
         const videoId = String(item.id || '').trim()
         const shopeeLink = String(item.shopeeLink || '').trim()
         const lazadaLink = String(item.lazadaLink || '').trim()
-        if (!videoId || !shopeeLink || !lazadaLink) continue
+        if (!videoId || !isUsableShopeeLink(shopeeLink) || !lazadaLink) continue
 
         const shopeeOriginalLink = String(item.shopeeOriginalLink || shopeeLink).trim()
         const lazadaOriginalLink = String(item.lazadaOriginalLink || lazadaLink).trim()
@@ -14162,7 +15185,7 @@ async function syncReadyInboxLinksToNamespaceIndex(params: {
 
         const result = await params.env.DB.prepare(
             `UPDATE gallery_index
-             SET shopee_link = CASE WHEN TRIM(COALESCE(shopee_link,'')) = '' THEN ? ELSE shopee_link END,
+             SET shopee_link = CASE WHEN NOT (${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}) THEN ? ELSE shopee_link END,
                  lazada_link = CASE WHEN TRIM(COALESCE(lazada_link,'')) = '' THEN ? ELSE lazada_link END,
                  shopee_original_link = CASE WHEN TRIM(COALESCE(shopee_original_link,'')) = '' THEN ? ELSE shopee_original_link END,
                  lazada_original_link = CASE WHEN TRIM(COALESCE(lazada_original_link,'')) = '' THEN ? ELSE lazada_original_link END,
@@ -14170,7 +15193,7 @@ async function syncReadyInboxLinksToNamespaceIndex(params: {
              WHERE namespace_id = ?
                AND video_id = ?
                AND TRIM(COALESCE(processed_at,'')) = ''
-               AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')`
+               AND (NOT (${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}) OR TRIM(COALESCE(lazada_link,'')) = '')`
         ).bind(
             shopeeLink,
             lazadaLink,
@@ -14299,8 +15322,8 @@ async function getNamespaceInboxGalleryIndexPage(params: {
     const processedClause = params.view === 'processed'
         ? "AND TRIM(COALESCE(processed_at,'')) <> ''"
         : params.view === 'missing_links'
-            ? "AND TRIM(COALESCE(processed_at,'')) = '' AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '')"
-            : "AND TRIM(COALESCE(processed_at,'')) = '' AND TRIM(COALESCE(shopee_link,'')) <> '' AND TRIM(COALESCE(lazada_link,'')) <> ''"
+            ? `AND TRIM(COALESCE(processed_at,'')) = '' AND (NOT (${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}) OR TRIM(COALESCE(lazada_link,'')) = '')`
+            : `AND TRIM(COALESCE(processed_at,'')) = '' AND ${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL} AND TRIM(COALESCE(lazada_link,'')) <> ''`
     const [pageRows, totals] = await Promise.all([
         params.env.DB.prepare(
             `SELECT
@@ -14332,8 +15355,8 @@ async function getNamespaceInboxGalleryIndexPage(params: {
             `SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) <> '' THEN 1 ELSE 0 END) AS processed_total,
-                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' AND TRIM(COALESCE(shopee_link,'')) <> '' AND TRIM(COALESCE(lazada_link,'')) <> '' THEN 1 ELSE 0 END) AS unprocessed_total,
-                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' AND (TRIM(COALESCE(shopee_link,'')) = '' OR TRIM(COALESCE(lazada_link,'')) = '') THEN 1 ELSE 0 END) AS missing_link_total
+                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' AND ${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL} AND TRIM(COALESCE(lazada_link,'')) <> '' THEN 1 ELSE 0 END) AS unprocessed_total,
+                SUM(CASE WHEN TRIM(COALESCE(processed_at,'')) = '' AND (NOT (${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}) OR TRIM(COALESCE(lazada_link,'')) = '') THEN 1 ELSE 0 END) AS missing_link_total
              FROM gallery_index
              WHERE namespace_id = ?
                AND TRIM(COALESCE(original_url,'')) <> ''`
@@ -15184,17 +16207,20 @@ async function prepareInboxVideoForManagedLinks(params: {
     if (!shortlinkProcessingRequired) return item
 
     const sourceShopeeCandidate = sanitizeAffiliateTrackingLink(pickFirstShopeeUrl(String(item.shopeeOriginalLink || item.shopeeLink || '')) || '')
-    const sourceShopeeLink = isUsableShopeeLink(sourceShopeeCandidate) ? sourceShopeeCandidate : ''
+    const sourceShopeeError = getShopeeLinkValidationError(sourceShopeeCandidate)
+    const sourceShopeeLink = sourceShopeeError ? '' : sourceShopeeCandidate
     const sourceLazadaLink = sanitizeAffiliateTrackingLink(pickFirstLazadaUrl(String(item.lazadaOriginalLink || item.lazadaLink || '')) || '')
     if (!sourceShopeeLink || !sourceLazadaLink) {
         recordFailure(
-            !sourceShopeeLink && !sourceLazadaLink
+            sourceShopeeError === 'invalid_shopee_homepage_link'
+                ? 'Shopee link points to the homepage; submit a product URL or affiliate short link'
+                : !sourceShopeeLink && !sourceLazadaLink
                 ? 'Missing both Shopee and Lazada source links'
                 : !sourceShopeeLink
                     ? 'Missing Shopee source link'
                     : 'Missing Lazada source link',
-            'missing_source_link',
-            { shopee: !!sourceShopeeLink, lazada: !!sourceLazadaLink }
+            sourceShopeeError || 'missing_source_link',
+            { shopee: !!sourceShopeeLink, lazada: !!sourceLazadaLink, shopee_error: sourceShopeeError || null }
         )
         return null
     }
@@ -15465,14 +16491,29 @@ async function ensureInboxVideoProcessingStarted(params: {
         return false
     })
 
+    const failureTrace: ManagedLinkFailureTrace = {}
     const preparedItem = await prepareInboxVideoForManagedLinks({
         env: params.env,
         bucket: params.bucket,
         namespaceId: botId,
         item,
         logPrefix: `INBOX-PROCESS ${botId}/${item.id}`,
+        failureTrace,
     })
     if (!preparedItem) {
+        const readableReason = String(failureTrace.reason || '').trim()
+            || 'Shopee/Lazada shortlink for this workspace is not ready'
+        await writeProcessingJobFailure(params.bucket, {
+            id: item.id,
+            chatId: item.chatId,
+            videoUrl: item.videoUrl,
+            shopeeLink: String(item.shopeeLink || '').trim(),
+            lazadaLink: String(item.lazadaLink || '').trim(),
+            manualCaption: normalizeManualCaption(item.manualCaption),
+            error: readableReason,
+            errorCategory: String(failureTrace.category || 'managed_shortlink_conversion_failed'),
+            errorDetails: failureTrace.details,
+        }).catch(() => { })
         throw new Error('managed_shortlink_conversion_failed')
     }
     item = preparedItem
@@ -15540,16 +16581,25 @@ async function ensureInboxVideoProcessingStarted(params: {
 
 const PROCESSING_HISTORY_PREFIX = '_processing_history/'
 const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
+const PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS = 7 * 60 * 1000
 const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
+const PROCESSING_GEMINI_PREP_STALE_ERROR = 'gemini_preparation_stale_timeout — งานค้างที่ขั้นเตรียมวิดีโอให้ Gemini เกิน 7 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 
 async function readProcessingListPrefix(
     bucket: R2Bucket,
     prefix: '_processing/' | '_queue/' | typeof PROCESSING_HISTORY_PREFIX,
     defaultStatus: 'processing' | 'queued' | 'processed',
+    options: { maxObjects?: number } = {},
 ): Promise<Array<Record<string, unknown>>> {
     const list = await bucket.list({ prefix })
+    const objects = typeof options.maxObjects === 'number' && options.maxObjects > 0
+        ? list.objects
+            .slice()
+            .sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
+            .slice(0, Math.floor(options.maxObjects))
+        : list.objects
     const tasks = await Promise.all(
-        list.objects.map(async obj => {
+        objects.map(async obj => {
             const data = await bucket.get(obj.key)
             if (!data) return null
 
@@ -15617,7 +16667,33 @@ function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date):
     const lastTouchedMs = timestamp ? Date.parse(timestamp) : NaN
     const fallbackMs = uploadedAt instanceof Date ? uploadedAt.getTime() : NaN
     const effectiveMs = Number.isFinite(lastTouchedMs) && lastTouchedMs > 0 ? lastTouchedMs : fallbackMs
-    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > PROCESSING_STALE_TIMEOUT_MS
+    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > getProcessingJobStaleTimeoutMs(data)
+}
+
+function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
+    const step = Number(data.step)
+    const stepName = String(data.stepName || '').trim()
+    return step === 2.2
+        || stepName.includes('แปลงวิดีโอให้ Gemini อ่านได้')
+        || stepName.toLowerCase().includes('gemini-safe transcode')
+}
+
+function getProcessingJobStaleTimeoutMs(data: Record<string, unknown>): number {
+    return isGeminiPreparationStep(data)
+        ? PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS
+        : PROCESSING_STALE_TIMEOUT_MS
+}
+
+function getProcessingJobStaleError(data: Record<string, unknown>): string {
+    return isGeminiPreparationStep(data)
+        ? PROCESSING_GEMINI_PREP_STALE_ERROR
+        : PROCESSING_STALE_ERROR
+}
+
+function getProcessingJobStaleCategory(data: Record<string, unknown>): string {
+    return isGeminiPreparationStep(data)
+        ? 'gemini_preparation_stale_timeout'
+        : 'stale_timeout'
 }
 
 async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
@@ -15636,8 +16712,8 @@ async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
             ...data,
             id,
             status: 'failed',
-            error: sanitizeProcessingError(data.error || PROCESSING_STALE_ERROR),
-            errorCategory: 'stale_timeout',
+            error: sanitizeProcessingError(data.error || getProcessingJobStaleError(data)),
+            errorCategory: String(data.errorCategory || getProcessingJobStaleCategory(data)).trim(),
             staleTimedOutAt: nowIso,
             failedAt: nowIso,
             updatedAt: nowIso,
@@ -15659,7 +16735,7 @@ async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Recor
     const [processing, queued, history] = await Promise.all([
         readProcessingListPrefix(bucket, '_processing/', 'processing'),
         readProcessingListPrefix(bucket, '_queue/', 'queued'),
-        readProcessingListPrefix(bucket, PROCESSING_HISTORY_PREFIX, 'processed'),
+        readProcessingListPrefix(bucket, PROCESSING_HISTORY_PREFIX, 'processed', { maxObjects: 120 }),
     ])
 
     const seen = new Set<string>()
@@ -15776,34 +16852,30 @@ app.get('/api/processing', async (c) => {
             )
         }
         let pendingShortlinkVideos: Array<Record<string, unknown>> = []
+        let pendingTotal = 0
         let pendingHasLazadaTotal = 0
         let readyTotal = 0
         let inventoryTotal = 0
         let libraryTotal = 0
 
         if (includeSummary && namespaceId) {
-            const [inventory, shortlinkRequired] = await Promise.all([
-                getNamespaceGalleryInventory(c.env, namespaceId),
-                isNamespaceAffiliateShortlinkProcessingRequired(c.env.DB, namespaceId).catch(() => false),
-            ])
-            pendingShortlinkVideos = shortlinkRequired
-                ? inventory.videos.filter((video) => !Boolean((video as Record<string, unknown>).gallery_ready))
-                : []
-            readyTotal = inventory.videos.filter((video) => !!(video as Record<string, unknown>).gallery_ready).length
-            inventoryTotal = inventory.videos.length
-            libraryTotal = inventory.sourceTotal
-            pendingHasLazadaTotal = pendingShortlinkVideos.filter((video) =>
-                String((video as Record<string, unknown>).pending_bucket || '').trim() === 'has-lazada'
-            ).length
+            const shortlinkRequired = await isNamespaceAffiliateShortlinkProcessingRequired(c.env.DB, namespaceId).catch(() => false)
+            const summary = await getNamespaceProcessingSummaryFast(c.env, namespaceId, shortlinkRequired)
+            pendingShortlinkVideos = summary.pendingShortlinkVideos
+            readyTotal = summary.readyTotal
+            inventoryTotal = summary.inventoryTotal
+            libraryTotal = summary.libraryTotal
+            pendingTotal = summary.pendingTotal
+            pendingHasLazadaTotal = summary.pendingHasLazadaTotal
         }
         return c.json({
             videos,
             pending_shortlink_videos: pendingShortlinkVideos,
             processing_total: activeProcessingVideos.length,
             history_total: Math.max(0, videos.length - activeProcessingVideos.length),
-            pending_total: pendingShortlinkVideos.length,
+            pending_total: pendingTotal,
             pending_has_lazada_total: pendingHasLazadaTotal,
-            pending_missing_lazada_total: Math.max(0, pendingShortlinkVideos.length - pendingHasLazadaTotal),
+            pending_missing_lazada_total: Math.max(0, pendingTotal - pendingHasLazadaTotal),
             ready_total: readyTotal,
             inventory_total: inventoryTotal,
             library_total: libraryTotal,
@@ -17856,6 +18928,13 @@ app.get('/api/gallery/:id/asset/:variant', async (c) => {
         response.status === 404
         && (variant === 'original-thumb' || variant === 'thumb')
     ) {
+        if (variant === 'thumb') {
+            const originalThumbKey = await resolveGalleryAssetKey(bucket, id, 'original-thumb').catch(() => '')
+            const originalThumbResponse = originalThumbKey
+                ? await buildGalleryAssetResponse(bucket, originalThumbKey, 'original-thumb', c.req.header('range')).catch(() => null)
+                : null
+            if (originalThumbResponse && originalThumbResponse.status !== 404) return originalThumbResponse
+        }
         try {
             const frameUrl = buildWorkerGalleryFrameUrl(
                 String(c.env.WORKER_URL || '').trim(),
@@ -18895,6 +19974,13 @@ function isUsableShopeeLink(link: string): boolean {
     return !!rawLink && !isShopeeHomepageOnlyLink(rawLink)
 }
 
+function getShopeeLinkValidationError(link: string): string {
+    const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
+    if (!rawLink) return 'missing_shopee_link'
+    if (isShopeeHomepageOnlyLink(rawLink)) return 'invalid_shopee_homepage_link'
+    return ''
+}
+
 function isLikelyConvertedShopeeLink(link: string, expectedUtmId = ''): boolean {
     const rawLink = pickFirstShopeeUrl(link) || String(link || '').trim()
     if (!rawLink) return false
@@ -18957,8 +20043,10 @@ function getVideoAffiliateConversionState(
 
     const shopeeSourceLink = getVideoSourceShopeeLink(video)
     const shopeeCurrentLink = normalizeMetaShopeeLink(video) || ''
-    const hasShopeeSource = !!shopeeSourceLink
-    const hasShopeeLink = !!(shopeeCurrentLink || shopeeSourceLink)
+    const shopeeSourceUsable = isUsableShopeeLink(shopeeSourceLink)
+    const shopeeCurrentUsable = isUsableShopeeLink(shopeeCurrentLink)
+    const hasShopeeSource = shopeeSourceUsable
+    const hasShopeeLink = shopeeCurrentUsable || shopeeSourceUsable
     const shopeeConvertedAt = String(video.shopeeConvertedAt || video.shopee_converted_at || '').trim()
     const hasManagedShopeeConversion = !!shopeeConvertedAt && hasShopeeLink
     const explicitShortlinkRequired = getBooleanFlag(video.shortlink_required)
@@ -19457,7 +20545,7 @@ async function collectNamespacesWithReadyGalleryIndexInbox(env: Env): Promise<st
          WHERE TRIM(COALESCE(namespace_id, '')) <> ''
            AND TRIM(COALESCE(original_url,'')) <> ''
            AND TRIM(COALESCE(processed_at,'')) = ''
-           AND TRIM(COALESCE(shopee_link,'')) <> ''
+           AND ${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}
            AND TRIM(COALESCE(lazada_link,'')) <> ''
          GROUP BY namespace_id
          ORDER BY datetime(last_ready_at) DESC`
@@ -28628,23 +29716,21 @@ app.post('/api/pages/:id/force-post', async (c) => {
             throw new Error('access_token_missing')
         }
 
-        const namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
-        const unpostedVideos = namespaceGalleryVideos.filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
-        console.log(`[FORCE-POST] Page ${page.name}: ready=${namespaceGalleryVideos.length}, unposted=${unpostedVideos.length}, posted=${Math.max(0, namespaceGalleryVideos.length - unpostedVideos.length)}`)
-
         const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
         console.log(`[FORCE-POST] Page ${page.name}: posting_order=${postingOrder}`)
-        const pickedVideoEntry = await claimGalleryVideoForPosting({
-            db: env.DB,
+        const fastClaim = await claimFastGalleryVideoForPosting({
+            env,
             namespaceId: botId,
             pageId: page.id,
-            videos: unpostedVideos as Array<Record<string, unknown>>,
             postingOrder,
         })
-        if (!pickedVideoEntry) return c.json({ error: 'No unposted gallery video left' }, 404)
+        console.log(`[FORCE-POST] Page ${page.name}: fast_gallery source=${fastClaim.stats.source} candidates=${fastClaim.stats.candidateTotal} scanned=${fastClaim.stats.scanned} pages=${fastClaim.stats.pages} elapsed_ms=${fastClaim.stats.elapsedMs}`)
+        if (!fastClaim.picked) return c.json({ error: 'No unposted gallery video left' }, 404)
+        const pickedVideoEntry = fastClaim.picked
         const pickedVideo = pickedVideoEntry.video
         videoPostingLockKey = pickedVideoEntry.videoLockKey
         const unpostedId = String(pickedVideo.id || '').trim()
+        console.log(`[FORCE-POST] Page ${page.name}: fast_gallery picked=${unpostedId} candidates=${fastClaim.stats.candidateTotal} scanned=${fastClaim.stats.scanned}`)
         selectedSourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
             pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
         )
@@ -30279,74 +31365,53 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         continue
                     }
 
-                    let namespaceGalleryVideos = galleryVideosByNamespace.get(botId)
-                    if (!namespaceGalleryVideos) {
-                        namespaceGalleryVideos = await listNamespaceGalleryVideos(env, botId)
-                        galleryVideosByNamespace.set(botId, namespaceGalleryVideos)
-                    }
-                    if (namespaceGalleryVideos.length === 0) {
-                        await env.DB.prepare(
-                            `UPDATE post_history
-                             SET status = 'failed',
-                                 error_message = 'gallery_empty',
-                                 comment_status = CASE WHEN comment_status = 'pending' THEN 'failed' ELSE comment_status END,
-                                 comment_error = CASE WHEN comment_status = 'pending' THEN 'gallery_empty' ELSE comment_error END
-                             WHERE bot_id = ? AND page_id = ? AND status = 'posting'`
-                        ).bind(botId, page.id).run().catch(() => { })
-                        console.log(`[CRON] Page ${page.name}: skip (gallery empty for namespace ${botId})`)
-                        await botBucket.delete(dedupKey).catch(() => { })
+                    // Read posting order fresh for every page selection. This is intentionally
+                    // not cached: when a member changes Settings > Post, the next cron/force
+                    // selection must obey the live namespace setting exactly.
+                    const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
+                    console.log(`[CRON] Page ${page.name}: posting_order=${postingOrder}`)
+                    const fastClaim = await claimFastGalleryVideoForPosting({
+                        env,
+                        namespaceId: botId,
+                        pageId: String(page.id || ''),
+                        postingOrder,
+                    })
+                    console.log(`[CRON] Page ${page.name}: fast_gallery source=${fastClaim.stats.source} candidates=${fastClaim.stats.candidateTotal} scanned=${fastClaim.stats.scanned} pages=${fastClaim.stats.pages} elapsed_ms=${fastClaim.stats.elapsedMs}`)
+                    if (!fastClaim.picked) {
+                        console.log(`[CRON] Page ${page.name}: no unposted gallery video left (fast candidates=${fastClaim.stats.candidateTotal}, scanned=${fastClaim.stats.scanned})`)
+                        await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
                         await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
                         continue
                     }
-
-                    const unpostedVideos = namespaceGalleryVideos.filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
-                    console.log(`[CRON] Page ${page.name}: ready=${namespaceGalleryVideos.length}, unposted=${unpostedVideos.length}, posted=${Math.max(0, namespaceGalleryVideos.length - unpostedVideos.length)}`)
-
-        // Read posting order fresh for every page selection. This is intentionally
-        // not cached: when a member changes Settings > Post, the next cron/force
-        // selection must obey the live namespace setting exactly.
-        const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
-        console.log(`[CRON] Page ${page.name}: posting_order=${postingOrder}`)
-        const pickedVideoEntry = await claimGalleryVideoForPosting({
-            db: env.DB,
-            namespaceId: botId,
-            pageId: String(page.id || ''),
-            videos: unpostedVideos as Array<Record<string, unknown>>,
-            postingOrder,
-        })
-        if (!pickedVideoEntry) {
-            console.log(`[CRON] Page ${page.name}: no unposted gallery video left`)
-            await botBucket.delete(dedupKey).catch(() => { }) // Clean up dedup key
-            await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
-            continue
-        }
-        const pickedVideo = pickedVideoEntry.video
-        videoPostingLockKey = pickedVideoEntry.videoLockKey
-        const unpostedId = String(pickedVideo.id || '').trim()
-        const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
-            pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
-        )
-        const sourceNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
-        const duplicateCheck = await ensurePageVideoNeverPosted({
-            db: env.DB,
-            namespaceId: botId,
-            pageId: String(page.id || ''),
-            videoId: unpostedId,
-            sourceFingerprint,
-        })
-        if (duplicateCheck.ok === false) {
-            await releasePostingLock(env.DB, videoPostingLockKey)
-            videoPostingLockKey = null
-            console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (already posted history=${duplicateCheck.historyId || 'n/a'})`)
-            continue
-        }
-        // Get video metadata
-        const sourceBucket = sourceNamespaceId === botId
-            ? botBucket
-            : new BotBucket(env.BUCKET, sourceNamespaceId) as unknown as R2Bucket
-        const meta = await loadLatestVideoMetaForPosting(sourceBucket, unpostedId, pickedVideo)
-        // === SHORTLINK BEFORE POSTING: ONLY for admin namespace. Members use raw links from gallery as-is ===
-        const [isAdminManaged, shortlinkRequired] = await Promise.all([
+                    const pickedVideoEntry = fastClaim.picked
+                    const pickedVideo = pickedVideoEntry.video
+                    videoPostingLockKey = pickedVideoEntry.videoLockKey
+                    const unpostedId = String(pickedVideo.id || '').trim()
+                    console.log(`[CRON] Page ${page.name}: fast_gallery picked=${unpostedId} candidates=${fastClaim.stats.candidateTotal} scanned=${fastClaim.stats.scanned}`)
+                    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+                        pickedVideo.sourceFingerprint || pickedVideo.source_fingerprint,
+                    )
+                    const sourceNamespaceId = String(pickedVideo.sourceNamespaceId || pickedVideo.source_namespace_id || botId).trim() || botId
+                    const duplicateCheck = await ensurePageVideoNeverPosted({
+                        db: env.DB,
+                        namespaceId: botId,
+                        pageId: String(page.id || ''),
+                        videoId: unpostedId,
+                        sourceFingerprint,
+                    })
+                    if (duplicateCheck.ok === false) {
+                        await releasePostingLock(env.DB, videoPostingLockKey)
+                        videoPostingLockKey = null
+                        console.log(`[CRON] Page ${page.name}: skip ${unpostedId} (already posted history=${duplicateCheck.historyId || 'n/a'})`)
+                        continue
+                    }
+                    // Get video metadata
+                    const sourceBucket = sourceNamespaceId === botId
+                        ? botBucket
+                        : new BotBucket(env.BUCKET, sourceNamespaceId) as unknown as R2Bucket
+                    const meta = await loadLatestVideoMetaForPosting(sourceBucket, unpostedId, pickedVideo)
+                    // === SHORTLINK BEFORE POSTING: ONLY for admin namespace. Members use raw links from gallery as-is ===
+                    const [isAdminManaged, shortlinkRequired] = await Promise.all([
             isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false),
             isNamespaceAffiliateShortlinkRequired(env.DB, botId).catch(() => false),
         ])

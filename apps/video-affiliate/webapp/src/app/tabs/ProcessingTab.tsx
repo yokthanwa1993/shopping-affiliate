@@ -30,6 +30,7 @@ const getStatusBucket = (statusRaw: unknown) => {
 
 export function ProcessingTab({
   loading,
+  error,
   processingVideos,
   onCancel,
   onReprocess,
@@ -37,6 +38,7 @@ export function ProcessingTab({
   retryingProcessingId,
 }: {
   loading: boolean
+  error?: string
   processingVideos: any[]
   onCancel: (id: string, isQueued: boolean) => void
   onReprocess: (id: string) => void
@@ -71,6 +73,7 @@ export function ProcessingTab({
     processed: dayVideos.filter((video) => getStatusBucket(video.status) === 'processed').length,
   }), [dayVideos])
   const activeVideos = dayVideos.filter((video) => getStatusBucket(video.status) === statusTab)
+  const showInitialLoading = loading && processingVideos.length === 0
   const tabs: Array<{ key: 'active' | 'failed' | 'processed'; label: string; count: number }> = [
     { key: 'active', label: 'กำลังประมวลผล', count: tabCounts.active },
     { key: 'failed', label: 'ล้มเหลว', count: tabCounts.failed },
@@ -131,11 +134,25 @@ export function ProcessingTab({
         ))}
       </div>
 
-      {loading ? (
+      {error && !showInitialLoading && processingVideos.length > 0 ? (
+        <div className="mb-3 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm font-bold text-red-700">
+          โหลดข้อมูลงานประมวลผลไม่สำเร็จ: {error}
+        </div>
+      ) : null}
+
+      {showInitialLoading ? (
         <div className="space-y-2.5">
           {[1, 2, 3].map((i) => (
             <div key={i} className="h-24 rounded-2xl bg-gray-100 animate-pulse" />
           ))}
+        </div>
+      ) : error && processingVideos.length === 0 ? (
+        <div className="flex flex-col items-center justify-center h-[45vh] text-center px-6">
+          <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+            <span className="text-4xl grayscale opacity-50">!</span>
+          </div>
+          <p className="text-gray-900 font-bold text-lg">โหลดข้อมูลไม่สำเร็จ</p>
+          <p className="text-gray-400 text-sm mt-1">{error}</p>
         </div>
       ) : activeVideos.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-[45vh] text-center px-6">

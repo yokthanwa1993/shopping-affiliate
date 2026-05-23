@@ -5,7 +5,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-05-08.04'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-05-23.05'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
@@ -19,7 +19,9 @@ const MAX_VOICE_PROMPT_CHARS = 12000
 const GEMINI_API_KEY_DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000
 const PROCESSING_DISPATCH_LOCK_TTL_MS = 2 * 60 * 1000
 const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
+const PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS = 7 * 60 * 1000
 const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
+const PROCESSING_GEMINI_PREP_STALE_ERROR = 'gemini_preparation_stale_timeout — งานค้างที่ขั้นเตรียมวิดีโอให้ Gemini เกิน 7 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 
 type GeminiApiKeyHealthStatus = 'ok' | 'quota_limited' | 'invalid' | 'error'
 
@@ -470,6 +472,17 @@ async function fetchWithTimeout(
     } finally {
         clearTimeout(timeoutId)
     }
+}
+
+function categorizePipelineError(message: string): string {
+    const normalized = String(message || '').toLowerCase()
+    if (normalized.includes('container_health_timeout')) return 'container_health_timeout'
+    if (normalized.includes('container_dispatch_timeout')) return 'container_dispatch_timeout'
+    if (normalized.includes('container version mismatch')) return 'container_version_mismatch'
+    if (normalized.includes('container health response invalid')) return 'container_health_invalid'
+    if (normalized.includes('container pipeline error')) return 'container_pipeline_error'
+    if (normalized.includes('gemini api key') || normalized.includes('gemini api')) return 'gemini_configuration_error'
+    return 'pipeline_dispatch_failed'
 }
 
 async function getStoredVoicePromptRow(db: D1Database, namespaceId: string): Promise<{ value?: string; updated_at?: string } | null> {
@@ -1156,6 +1169,7 @@ export async function runPipeline(
             }
 
             const nowIso = new Date().toISOString()
+            const errorCategory = categorizePipelineError(errMsg)
             await botBucket.put(key, JSON.stringify({
                 ...current,
                 id: videoId,
@@ -1165,6 +1179,8 @@ export async function runPipeline(
                 chatId,
                 status: 'failed',
                 error: errMsg,
+                errorCategory,
+                failedAt: nowIso,
                 updatedAt: nowIso,
                 createdAt: String(current.createdAt || '').trim() || nowIso,
             }), {
@@ -1237,7 +1253,33 @@ function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date):
     const lastTouchedMs = timestamp ? Date.parse(timestamp) : NaN
     const fallbackMs = uploadedAt instanceof Date ? uploadedAt.getTime() : NaN
     const effectiveMs = Number.isFinite(lastTouchedMs) && lastTouchedMs > 0 ? lastTouchedMs : fallbackMs
-    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > PROCESSING_STALE_TIMEOUT_MS
+    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > getProcessingJobStaleTimeoutMs(data)
+}
+
+function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
+    const step = Number(data.step)
+    const stepName = String(data.stepName || '').trim()
+    return step === 2.2
+        || stepName.includes('แปลงวิดีโอให้ Gemini อ่านได้')
+        || stepName.toLowerCase().includes('gemini-safe transcode')
+}
+
+function getProcessingJobStaleTimeoutMs(data: Record<string, unknown>): number {
+    return isGeminiPreparationStep(data)
+        ? PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS
+        : PROCESSING_STALE_TIMEOUT_MS
+}
+
+function getProcessingJobStaleError(data: Record<string, unknown>): string {
+    return isGeminiPreparationStep(data)
+        ? PROCESSING_GEMINI_PREP_STALE_ERROR
+        : PROCESSING_STALE_ERROR
+}
+
+function getProcessingJobStaleCategory(data: Record<string, unknown>): string {
+    return isGeminiPreparationStep(data)
+        ? 'gemini_preparation_stale_timeout'
+        : 'stale_timeout'
 }
 
 async function markProcessingJobStale(botBucket: BotBucket, key: string, data: Record<string, unknown>, uploadedAt?: Date): Promise<void> {
@@ -1247,8 +1289,8 @@ async function markProcessingJobStale(botBucket: BotBucket, key: string, data: R
         ...data,
         id: String(data.id || idFromKey || '').trim(),
         status: 'failed',
-        error: String(data.error || PROCESSING_STALE_ERROR).trim(),
-        errorCategory: 'stale_timeout',
+        error: String(data.error || getProcessingJobStaleError(data)).trim(),
+        errorCategory: String(data.errorCategory || getProcessingJobStaleCategory(data)).trim(),
         staleTimedOutAt: nowIso,
         failedAt: nowIso,
         updatedAt: nowIso,

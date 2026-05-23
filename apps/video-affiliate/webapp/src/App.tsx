@@ -3250,6 +3250,7 @@ function App({
     setProcessingVideos([])
     setPendingShortlinkVideos([])
     setProcessingLoading(true)
+    setProcessingError('')
     setSystemGalleryStats({ total: 0, withLink: 0, withoutLink: 0, shopeeTotal: 0, lazadaTotal: 0 })
     setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
     setProcessingSummary({
@@ -3272,6 +3273,8 @@ function App({
     setGlobalOriginalVideos([])
     setGlobalOriginalLoading(false)
     setPostHistory([])
+    setPostHistoryLoading(false)
+    setPostHistoryError('')
     setLoading(true)
     setGalleryLoading(true)
   }
@@ -3533,6 +3536,8 @@ function App({
     if (ns) return readCache<PostHistory[]>(nsCacheKey('history', ns), [])
     return []
   })
+  const [postHistoryLoading, setPostHistoryLoading] = useState(false)
+  const [postHistoryError, setPostHistoryError] = useState('')
   const [deletingLogId, setDeletingLogId] = useState<number | null>(null)
   const [retryingLogId, setRetryingLogId] = useState<number | null>(null)
   const [expandedLogId, setExpandedLogId] = useState<number | null>(null)
@@ -3553,8 +3558,9 @@ function App({
     const ns = getStoredNamespace(botScope)
     return ns ? readCache<Video[]>(processingCacheKey(ns), []).length === 0 : true
   })
+  const [processingError, setProcessingError] = useState('')
   const [retryingProcessingId, setRetryingProcessingId] = useState<string | null>(null)
-  const [loading, setLoading] = useState(() => {
+  const [, setLoading] = useState(() => {
     if (FORCE_SYSTEM_WIDE_GALLERY) {
       return readCache<Video[]>(systemGalleryCacheKey(botScope), []).length === 0
     }
@@ -3960,6 +3966,8 @@ function App({
     setGalleryReadyTotalCount(cachedVideos.length)
     setGalleryUsedTotalCount(cachedUsedVideos.length)
     setPostHistory(cachedHistory)
+    setPostHistoryLoading(false)
+    setPostHistoryError('')
     setInboxVideos(cachedInbox)
     setInboxTotalCount(cachedInbox.length)
     setInboxProcessedTotalCount(cachedInbox.filter((video) => !!String(video.processedAt || '').trim()).length)
@@ -4170,7 +4178,7 @@ function App({
       return
     }
 
-    if (loading && postHistory.length === 0) {
+    if (postHistoryLoading && postHistory.length === 0) {
       setVisibleLogCount(0)
       return
     }
@@ -4198,7 +4206,7 @@ function App({
     }, LOGS_REVEAL_INTERVAL_MS)
 
     return () => window.clearInterval(timer)
-  }, [filteredLogHistory.length, loading, postHistory.length, tab])
+  }, [filteredLogHistory.length, postHistory.length, postHistoryLoading, tab])
 
   useEffect(() => {
     if (tab !== 'logs') return
@@ -4251,6 +4259,7 @@ function App({
     setInboxLoading(cachedInbox.length === 0)
     setProcessingVideos([])
     setPendingShortlinkVideos([])
+    setProcessingError('')
     setGallerySummary({ libraryTotal: 0, inventoryTotal: 0, readyTotal: 0 })
     setProcessingSummary({
       libraryTotal: 0,
@@ -4681,6 +4690,7 @@ function App({
       : []
     setProcessingVideos(cachedProcessing)
     setProcessingLoading(cachedProcessing.length === 0)
+    setProcessingError('')
     setGalleryReadyTotalCount(cachedVideos.length)
     setGalleryUsedTotalCount(cachedUsedVideos.length)
     setGalleryLoading(cachedVideos.length === 0)
@@ -4780,26 +4790,35 @@ function App({
     processingFetchInFlightRef.current = true
     const shouldShowLoading = processingVideos.length === 0
     if (shouldShowLoading) setProcessingLoading(true)
+    setProcessingError('')
     try {
-      const processingResp = await apiFetch(`${WORKER_URL}/api/processing?summary=0`)
+      const processingResp = await withTimeout(
+        apiFetch(`${WORKER_URL}/api/processing?summary=0`),
+        20_000,
+        'processing',
+      )
 
       if (processingResp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
 
-      const procData = processingResp.ok
-        ? await processingResp.json() as {
-            videos?: Video[]
-            pending_shortlink_videos?: Video[]
-            library_total?: number
-            inventory_total?: number
-            ready_total?: number
-            pending_total?: number
-            pending_has_lazada_total?: number
-            pending_missing_lazada_total?: number
-        }
-        : { videos: [], pending_shortlink_videos: [] }
+      if (!processingResp.ok) {
+        const data = await processingResp.json().catch(() => ({})) as { error?: string; details?: string }
+        setProcessingError(String(data.details || data.error || `HTTP ${processingResp.status}`))
+        return
+      }
+
+      const procData = await processingResp.json() as {
+        videos?: Video[]
+        pending_shortlink_videos?: Video[]
+        library_total?: number
+        inventory_total?: number
+        ready_total?: number
+        pending_total?: number
+        pending_has_lazada_total?: number
+        pending_missing_lazada_total?: number
+      }
       const processingVideos = procData.videos || []
       const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
       setProcessingVideos(processingVideos)
@@ -4812,10 +4831,10 @@ function App({
         pendingHasLazadaTotal: Number(procData.pending_has_lazada_total || 0),
         pendingMissingLazadaTotal: Number(procData.pending_missing_lazada_total || 0),
       })
-    } catch {
-      // Keep previous processing snapshot on transient errors.
+    } catch (e) {
+      setProcessingError(e instanceof Error ? e.message : 'โหลดข้อมูลประมวลผลไม่สำเร็จ')
     } finally {
-      if (shouldShowLoading) setProcessingLoading(false)
+      setProcessingLoading(false)
       processingFetchInFlightRef.current = false
     }
   }
@@ -5312,10 +5331,16 @@ function App({
     // Cache-bust on forced refresh (e.g. after delete/retry) so the worker's
     // Cache-Control: max-age=15 header doesn't keep serving the stale row.
     if (force) params.set('_t', String(Date.now()))
+    setPostHistoryLoading(true)
+    setPostHistoryError('')
     try {
-      const historyResp = await apiFetch(
-        `${WORKER_URL}/api/post-history?${params.toString()}`,
-        force ? { cache: 'no-store' } : {},
+      const historyResp = await withTimeout(
+        apiFetch(
+          `${WORKER_URL}/api/post-history?${params.toString()}`,
+          force ? { cache: 'no-store' } : {},
+        ),
+        15_000,
+        'post history',
       )
       if (historyResp.status === 401) {
         await recoverSessionOrLogout()
@@ -5326,8 +5351,15 @@ function App({
         setPostHistory(data.history || [])
         lastPostHistoryFetchKeyRef.current = fetchKey
         lastPostHistoryFetchAtRef.current = Date.now()
+        return
       }
+      const data = await historyResp.json().catch(() => ({})) as { error?: string; details?: string }
+      setPostHistoryError(String(data.details || data.error || `HTTP ${historyResp.status}`))
+    } catch (e) {
+      setPostHistoryError(e instanceof Error ? e.message : 'โหลดประวัติไม่สำเร็จ')
     } finally {
+      setPostHistoryLoading(false)
+      setLoading(false)
       postHistoryFetchInFlightRef.current = false
     }
   }
@@ -7366,6 +7398,7 @@ function App({
         {tab === 'processing' && (
           <ProcessingTab
             loading={processingLoading}
+            error={processingError}
             processingVideos={processingVideos}
             onCancel={handleCancelJob}
             onReprocess={handleReprocessJob}
@@ -7523,7 +7556,7 @@ function App({
             </div>
 
             {(() => {
-              if (loading && postHistory.length === 0) {
+              if (postHistoryLoading && postHistory.length === 0) {
                 return (
                   <div className="space-y-2.5">
                     {[1, 2, 3].map((i) => (
@@ -7532,6 +7565,12 @@ function App({
                   </div>
                 )
               }
+
+              if (postHistoryError) return (
+                <div className="rounded-2xl border border-red-100 bg-red-50 px-4 py-4 text-sm font-bold text-red-700">
+                  โหลดประวัติไม่สำเร็จ: {postHistoryError}
+                </div>
+              )
 
               if (filteredLogHistory.length === 0) return (
                 <div className="flex flex-col items-center justify-center h-[40vh]">

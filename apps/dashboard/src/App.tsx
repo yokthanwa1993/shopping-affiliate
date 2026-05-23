@@ -1,8 +1,11 @@
 import {
   Activity,
   BarChart3,
+  Check,
   ChevronRight,
   Clock,
+  Copy,
+  Download,
   ExternalLink,
   Facebook,
   LayoutDashboard,
@@ -75,6 +78,7 @@ type GalleryLinkedItem = {
   facebookThumb: string
   views: number
   videoId: string
+  systemVideoId?: string
   videoTitle: string
   videoUrl: string
   videoThumb: string
@@ -94,6 +98,7 @@ type GallerySyncState = {
 }
 
 type ShortlinkProvider = 'api' | 'extension'
+type CreateAdPlacementTemplate = 'facebook' | 'instagram' | 'facebook_instagram'
 type DashboardSettings = {
   subId: string
   subId2: string
@@ -106,6 +111,8 @@ type DashboardSettings = {
   defaultPage: string
   adAccount: string
   templateAdset: string
+  templateAdsetFacebook: string
+  templateAdsetInstagram: string
   campaignPrefix: string
   adsPerRound: string
   autoCreateTime: string
@@ -195,16 +202,16 @@ const statusClass = {
 // (downloaded once from FB Graph picture API). They get bundled into dist/ at
 // build time so the browser never re-fetches FB CDN — fast + no token needed.
 const CHIEB_NAMESPACE_ID = '1774858894802785816'
-const PAGES = [
+const PAGES: PageOption[] = [
     { id: '1008898512617594', name: 'เฉียบ', slug: 'chearb', iconUrl: '/page-icons/chieb.jpg' },
     { id: '114142457961643', name: 'ฉ่ำ', slug: 'cham', iconUrl: '/page-icons/cham.jpg' },
-] as const
-type PageOption = typeof PAGES[number]
+]
+type PageOption = { id: string; name: string; slug: string; iconUrl: string }
 const DEFAULT_PAGE: PageOption = PAGES[0]
 const PAGE_BY_SLUG: Record<string, PageOption> = Object.fromEntries(PAGES.map(p => [p.slug, p]))
 const PAGE_BY_ID: Record<string, PageOption> = Object.fromEntries(PAGES.map(p => [p.id, p]))
 const GALLERY_MIN_VIEWS = 100000
-const GALLERY_READ_LIMIT = 300
+const GALLERY_READ_LIMIT = 250
 const SYSTEM_GALLERY_BATCH_SIZE = 30
 
 type SystemGalleryView = 'ready' | 'used'
@@ -246,12 +253,20 @@ const DEFAULT_SETTINGS: DashboardSettings = {
   commentTemplate: '🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}',
   defaultPage: DEFAULT_PAGE.id,
   adAccount: 'act_1030797047648459',
-  templateAdset: '120244070706570263',
+  templateAdset: '120245945429000263',
+  templateAdsetFacebook: '120245974971840263',
+  templateAdsetInstagram: '120245945429000263',
   campaignPrefix: 'ADS_PUBLISH_',
   adsPerRound: '10',
   autoCreateTime: '00:00',
   facebookSyncToken: '',
   facebookSyncTokenUpdatedAt: '',
+}
+
+function resolveTemplateAdsetForPlacement(settings: DashboardSettings, placement: CreateAdPlacementTemplate): string {
+  if (placement === 'facebook') return settings.templateAdsetFacebook || settings.templateAdset
+  if (placement === 'instagram') return settings.templateAdsetInstagram || settings.templateAdset
+  return settings.templateAdset || settings.templateAdsetFacebook || settings.templateAdsetInstagram
 }
 
 function formatThaiDate(value: string) {
@@ -321,15 +336,34 @@ function hasAffiliateLink(video: SystemGalleryVideo): boolean {
 //   - public / thumb         = ประมวลผลแล้ว (after AI processing — what dashboard/app shows)
 //   - original / original-thumb = คลังต้นฉบับ (raw uploaded source)
 // We want the PROCESSED version, so use 'public' (video) + 'thumb' (poster).
-// Proxy via /worker-api to stay on dashboard.oomnn.com.
+// Proxy via /worker-api on the current dashboard origin.
+// IMPORTANT: create-ad sends playback URL to Meta Graph `advideos?file_url=`.
+// Meta cannot fetch relative URLs, so keep these absolute even though <video>/<img>
+// would work with relative paths in the browser.
+function getDashboardOrigin(): string {
+  if (typeof window !== 'undefined' && window.location?.origin) return window.location.origin
+  return 'https://dashboard.oomnn.com'
+}
+
 function buildVideoThumbnailUrl(videoId: string, namespaceId: string): string {
   if (!videoId || !namespaceId) return ''
-  return `/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/thumb?namespace_id=${encodeURIComponent(namespaceId)}`
+  return `${getDashboardOrigin()}/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/thumb?namespace_id=${encodeURIComponent(namespaceId)}`
 }
 
 function buildVideoPlaybackUrl(videoId: string, namespaceId: string): string {
   if (!videoId || !namespaceId) return ''
-  return `/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/public?namespace_id=${encodeURIComponent(namespaceId)}`
+  return `${getDashboardOrigin()}/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/public?namespace_id=${encodeURIComponent(namespaceId)}`
+}
+
+function buildVideoDownloadFilename(videoId: string): string {
+  const safeId = String(videoId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '')
+  return `${safeId || 'video'}_original.mp4`
+}
+
+function buildOriginalVideoDownloadUrl(videoId: string, namespaceId: string): string {
+  if (!videoId || !namespaceId) return ''
+  const filename = buildVideoDownloadFilename(videoId)
+  return `${getDashboardOrigin()}/worker-api/api/gallery/${encodeURIComponent(videoId)}/asset/original?namespace_id=${encodeURIComponent(namespaceId)}&download=1&filename=${encodeURIComponent(filename)}`
 }
 
 // Parse `/<slug>/<tab>` (or `/<slug>` or `/<tab>` legacy) into routing state.
@@ -556,7 +590,7 @@ export default function App() {
   // (no FB video_id yet). The submit handler routes between two paths:
   //   - videoUrl set  → send `video_url` so electron uploads to FB Ads first
   //   - videoUrl empty → send `video_id` so electron reuses existing FB video
-  const [createAdPopup, setCreateAdPopup] = useState<{ videoId: string; caption: string; storyId: string; shopeeLink: string; videoUrl: string } | null>(null)
+  const [createAdPopup, setCreateAdPopup] = useState<{ videoId: string; caption: string; storyId: string; shopeeLink: string; videoUrl: string; systemId: string } | null>(null)
   const [adQueueItems, setAdQueueItems] = useState<AdQueueItem[]>([])
   const [adQueueCounts, setAdQueueCounts] = useState<Record<string, number>>({})
   const [adQueueLastRun, setAdQueueLastRun] = useState<string>('')
@@ -564,6 +598,7 @@ export default function App() {
   const [adQueueLoading, setAdQueueLoading] = useState(false)
   const [adQueueIntervalMinutes, setAdQueueIntervalMinutes] = useState(20)
   const [createAdShopeeLink, setCreateAdShopeeLink] = useState('')
+  const [createAdCaption, setCreateAdCaption] = useState('')
   // Per-ad Sub ID overrides — when blank, the worker/extension falls back to
   // settings.subId2-5 (the page-level defaults). Lets the operator stamp an
   // ad with extra utm_content sub-ids (campaign-specific tracking) without
@@ -582,6 +617,7 @@ export default function App() {
   const [createAdProgress, setCreateAdProgress] = useState(0)
   const [createAdSelectedCampaign, setCreateAdSelectedCampaign] = useState('')
   const [createAdNewCampaignName, setCreateAdNewCampaignName] = useState('')
+  const [createAdTemplate, setCreateAdTemplate] = useState<CreateAdPlacementTemplate>('facebook')
 
   const [galleryLinkedItems, setGalleryLinkedItems] = useState<GalleryLinkedItem[]>([])
   const [galleryLoading, setGalleryLoading] = useState(false)
@@ -596,7 +632,11 @@ export default function App() {
   // here on purpose: e.g. /chearb workspace can browse ฉ่ำ's high-view clips
   // and create an ad that posts to เฉียบ.
   const [pagePostsSourcePageId, setPagePostsSourcePageId] = useState<string>(initialUrl.page.id)
-  const pagePostsSource = PAGE_BY_ID[pagePostsSourcePageId] ?? selectedPage
+  const [pagePostSourcePages, setPagePostSourcePages] = useState<PageOption[]>(PAGES)
+  const pagePostsSource = pagePostSourcePages.find((p) => p.id === pagePostsSourcePageId) || PAGE_BY_ID[pagePostsSourcePageId] || selectedPage
+  const pagePostsSourcePageIdRef = useRef<string>(pagePostsSourcePageId)
+  useEffect(() => { pagePostsSourcePageIdRef.current = pagePostsSourcePageId }, [pagePostsSourcePageId])
+  const [copiedPagePostRef, setCopiedPagePostRef] = useState<string>('')
 
   // System gallery (new /gallery tab — เหมือน mobile app)
   const [systemGalleryView, setSystemGalleryView] = useState<SystemGalleryView>('ready')
@@ -609,6 +649,8 @@ export default function App() {
   const [systemGalleryError, setSystemGalleryError] = useState<string | null>(null)
   const [systemGallerySearch, setSystemGallerySearch] = useState('')
   const [videoPreview, setVideoPreview] = useState<SystemGalleryVideo | null>(null)
+  const mainScrollRef = useRef<HTMLElement | null>(null)
+  const systemGalleryLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const [settings, setSettings] = useState<DashboardSettings>(DEFAULT_SETTINGS)
   const [settingsLoading, setSettingsLoading] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -625,14 +667,57 @@ export default function App() {
     reach: string; impressions: string; spend: string; costPerResult: string
     adsets: Array<{ id: string; name: string; status: string }>
   }
+
+  function escapeRegex(value: string) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+
+  function displayCampaignName(name: string) {
+    const raw = String(name || '').trim()
+    const subId = String(settings.subId || '').trim()
+    if (!subId) return raw
+    const match = raw.match(new RegExp(`^${escapeRegex(subId)}\\s*\\((\\d+)\\)$`, 'i'))
+    return match ? `Campaign ${match[1]}` : raw
+  }
+
   const [liveCampaigns, setLiveCampaigns] = useState<LiveCampaign[]>([])
   const [campaignsLoading, setCampaignsLoading] = useState(false)
 
-  async function openCreateAdPopup(videoId: string, caption: string, storyId = '', shopeeLink = '', videoUrl = '') {
-    setCreateAdPopup({ videoId, caption, storyId, shopeeLink, videoUrl })
+  async function copyPagePostRef(ref: string) {
+    const value = String(ref || '').trim()
+    if (!value) return
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = value
+        textarea.setAttribute('readonly', 'true')
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setCopiedPagePostRef(value)
+      window.setTimeout(() => setCopiedPagePostRef((current) => (current === value ? '' : current)), 1600)
+    } catch (e) {
+      console.error('copy page-post ref failed', e)
+    }
+  }
+
+  async function openCreateAdPopup(videoId: string, caption: string, storyId = '', shopeeLink = '', videoUrl = '', systemId = '') {
+    setCreateAdPopup({ videoId, caption, storyId, shopeeLink, videoUrl, systemId })
+    setCreateAdCaption(caption)
     setCreateAdShopeeLink(shopeeLink)
     setCreateAdSelectedCampaign('')
-    setCreateAdNewCampaignName('')
+    setCreateAdTemplate('facebook')
+    // Default to creating/reusing today's campaign from Settings (Sub ID), same
+    // intent as the operator's normal "create ads" flow. Leaving both
+    // campaign_id and new_campaign_name empty makes video-onecard auto-pick an
+    // old ADS_PUBLISH_* campaign with free slots, which is not what Thanwa wants.
+    setCreateAdNewCampaignName(String(settings.subId || '').trim())
     setCreateAdSubId2('')
     setCreateAdSubId3('')
     setCreateAdSubId4('')
@@ -658,7 +743,7 @@ export default function App() {
         }
       } else {
         // เฉียบ + อื่นๆ → list via worker proxy that hits Electron's /graph.
-        const resp = await fetch(`/worker-api/api/dashboard/campaigns?ad_account=${encodeURIComponent(adAccount)}`)
+        const resp = await fetch(`/worker-api/api/dashboard/campaigns?ad_account=${encodeURIComponent(adAccount)}&mode=picker`)
         if (resp.ok) {
           const data = await resp.json() as { campaigns?: Array<{ id: string; name: string; status: string; adsetCount: number; costPerLinkClick?: string }> }
           setCreateAdCampaigns(data.campaigns || [])
@@ -675,25 +760,37 @@ export default function App() {
 
   async function submitCreateAdImmediate() {
     if (!createAdPopup) return
+    if (!createAdSelectedCampaign && !String(createAdNewCampaignName || '').trim()) {
+      const msg = '❌ ต้องเลือกแคมเปญ หรือใส่ชื่อแคมเปญใหม่ก่อนสร้างแอด'
+      setCreateAdStep(msg)
+      setCreateAdResultBanner({ type: 'error', text: msg })
+      return
+    }
     setCreateAdResultBanner(null)
     setCreateAdCreating(true)
-    setCreateAdStep('⚡ กำลังสร้างแอดทันที...')
+    const isInstagramTemplate = createAdTemplate === 'instagram'
+    const selectedTemplateAdset = resolveTemplateAdsetForPlacement(settings, createAdTemplate)
+    setCreateAdStep(isInstagramTemplate ? '⚡ กำลังสร้างแอด Instagram...' : '⚡ กำลังสร้างแอด + โพสต์หน้าเพจ...')
     setCreateAdProgress(10)
 
     // Progress simulation while waiting for FB API (upload + thumbnail wait + adset copy)
-    const steps = [
-      { delay: 3000, step: '📤 กำลังอัปโหลดวิดีโอไปยัง Ad Account...', progress: 25 },
-      { delay: 8000, step: '🖼️ รอ Facebook สร้าง thumbnail...', progress: 45 },
-      { delay: 18000, step: '⚙️ กำลังคัดลอก adset จาก template...', progress: 65 },
-      { delay: 30000, step: '🌐 กำลังเผยแพร่ไปหน้าเพจ...', progress: 80 },
-      { delay: 45000, step: '💬 กำลังคอมเมนต์ลิงก์...', progress: 90 },
-    ]
+    const steps = isInstagramTemplate
+      ? [
+          { delay: 3000, step: '📤 กำลังเตรียมวิดีโอสำหรับ Instagram Ads...', progress: 25 },
+          { delay: 8000, step: '🖼️ รอ Meta สร้าง thumbnail/creative...', progress: 45 },
+          { delay: 18000, step: '⚙️ กำลังคัดลอก IG adset จาก template...', progress: 65 },
+          { delay: 30000, step: '📣 กำลังสร้างโฆษณา Instagram — ไม่โพสต์หน้าเพจ', progress: 85 },
+        ]
+      : [
+          { delay: 3000, step: '📤 กำลังอัปโหลดวิดีโอไปยัง Ad Account...', progress: 25 },
+          { delay: 8000, step: '🖼️ รอ Facebook สร้าง thumbnail...', progress: 45 },
+          { delay: 18000, step: '⚙️ กำลังคัดลอก adset จาก template...', progress: 65 },
+          { delay: 30000, step: '🌐 กำลังเผยแพร่ไปหน้าเพจ...', progress: 80 },
+          { delay: 45000, step: '💬 กำลังคอมเมนต์ลิงก์...', progress: 90 },
+        ]
     const timers = steps.map(({ delay, step, progress }) =>
       setTimeout(() => { setCreateAdStep(step); setCreateAdProgress(progress) }, delay)
     )
-
-    let finalStatus: 'success' | 'error' = 'error'
-    let finalMessage = ''
 
     try {
       // ฉ่ำ vs เฉียบ split:
@@ -713,12 +810,9 @@ export default function App() {
 
       if (isFeed && !feedExtension.available) {
         timers.forEach(clearTimeout)
-        finalStatus = 'error'
-        finalMessage = `❌ ติดตั้ง Feed Ad Creator extension ก่อน\n\nเพจฉ่ำสร้างแอดผ่าน extension เท่านั้น — โหลด apps/feed-ad-extension/ ใน chrome://extensions แล้วรีโหลดหน้านี้\n\nถ้าติดตั้งแล้วยังเห็นข้อความนี้ ให้รีเฟรชหน้าหรือ disable+enable extension ใหม่`
         setCreateAdStep('❌ ไม่พบ extension')
         setCreateAdProgress(0)
         setCreateAdResultBanner({ type: 'error', text: '❌ ติดตั้ง Feed Ad Creator extension ก่อน' })
-        alert(finalMessage)
         setCreateAdCreating(false)
         return
       }
@@ -729,6 +823,8 @@ export default function App() {
         step?: string
         fb_error_code?: number
         fb_error_subcode?: number
+        fb_error_user_title?: string
+        fb_error_user_msg?: string
         fb_trace_id?: string
         story_id?: string
         ad_id?: string
@@ -743,7 +839,9 @@ export default function App() {
         const extResp = await createAdViaExtension({
           videoId: createAdPopup.videoUrl ? '' : createAdPopup.videoId,
           videoUrl: createAdPopup.videoUrl || '',
-          caption: createAdPopup.caption,
+          adName: createAdPopup.systemId || createAdPopup.videoId || '',
+          sourceVideoId: createAdPopup.systemId || createAdPopup.videoId || '',
+          caption: createAdCaption,
           shopeeUrl: createAdShopeeLink || '',
           campaignId: createAdSelectedCampaign || '',
           newCampaignName: createAdNewCampaignName || '',
@@ -751,6 +849,7 @@ export default function App() {
           subId3: createAdSubId3 || '',
           subId4: createAdSubId4 || '',
           subId5: createAdSubId5 || '',
+          templateAdset: selectedTemplateAdset,
         })
         timers.forEach(clearTimeout)
         // Translate extension response into the same shape the existing UI expects.
@@ -760,6 +859,9 @@ export default function App() {
           error: typeof r.error === 'string' ? r.error : undefined,
           step: typeof r.step === 'string' ? r.step : undefined,
           fb_error_code: typeof r.fb_error_code === 'number' ? r.fb_error_code : undefined,
+          fb_error_subcode: typeof r.fb_error_subcode === 'number' ? r.fb_error_subcode : undefined,
+          fb_error_user_title: typeof r.fb_error_user_title === 'string' ? r.fb_error_user_title : undefined,
+          fb_error_user_msg: typeof r.fb_error_user_msg === 'string' ? r.fb_error_user_msg : undefined,
           fb_trace_id: typeof r.fb_trace_id === 'string' ? r.fb_trace_id : undefined,
           story_id: typeof r.story_id === 'string' ? r.story_id : undefined,
           ad_id: typeof r.ad_id === 'string' ? r.ad_id : undefined,
@@ -784,9 +886,13 @@ export default function App() {
             ...(createAdPopup.videoUrl
               ? { video_url: createAdPopup.videoUrl }
               : { video_id: createAdPopup.videoId }),
-            caption: createAdPopup.caption,
+            caption: createAdCaption,
+            ad_name: createAdPopup.systemId || '',
+            source_video_id: createAdPopup.systemId || '',
             story_id: createAdPopup.storyId || '',
             shopee_url: createAdShopeeLink || '',
+            placement_template: createAdTemplate,
+            template_adset: selectedTemplateAdset,
             campaign_id: createAdSelectedCampaign || undefined,
             new_campaign_name: createAdNewCampaignName || undefined,
             // Per-ad Sub ID overrides — empty = worker uses settings defaults.
@@ -804,54 +910,55 @@ export default function App() {
       }
 
       if (httpStatus < 400 && data.ok) {
-        finalStatus = 'success'
         // Make the comment status actionable: show the reason when it was
         // skipped so operator can fix it (empty template, FB token, etc.)
         // without having to open DevTools console.
-        const commentLine = data.commentPosted
-          ? 'โพสต์แล้ว'
-          : `ข้าม${data.commentError ? ` (${data.commentError})` : ''}`
-        finalMessage = `✅ สำเร็จ!\n\nstory_id: ${data.story_id || '-'}\nad_id: ${data.ad_id || '-'}\nadset_id: ${data.adset_id || '-'}\nคอมเมนต์: ${commentLine}`
+        const commentLine = isInstagramTemplate
+          ? 'ไม่ทำ — Instagram only'
+          : (data.commentPosted
+              ? 'โพสต์แล้ว'
+              : `ข้าม${data.commentError ? ` (${data.commentError})` : ''}`)
         setCreateAdProgress(100)
-        setCreateAdStep(`✅ สำเร็จ! story=${data.story_id || '-'} ${data.commentPosted ? '(คอมเมนต์แล้ว)' : ''}`)
-        setCreateAdResultBanner({ type: 'success', text: `✅ story=${data.story_id || '-'} ${data.commentPosted ? '· คอมเมนต์แล้ว' : ''}` })
+        setCreateAdStep(isInstagramTemplate
+          ? `✅ สร้างแอด Instagram สำเร็จ! ad=${data.ad_id || '-'}`
+          : `✅ สำเร็จ! story=${data.story_id || '-'} ${data.commentPosted ? '(คอมเมนต์แล้ว)' : ''}`)
+        setCreateAdResultBanner({ type: 'success', text: `story_id: ${data.story_id || '-'}\nad_id: ${data.ad_id || '-'}\nadset_id: ${data.adset_id || '-'}\nคอมเมนต์: ${commentLine}` })
       } else {
-        finalStatus = 'error'
         const stepLabel = data.step ? `[${data.step}] ` : ''
         const fbCode = data.fb_error_code ? ` (FB code=${data.fb_error_code}${data.fb_error_subcode ? `/subcode=${data.fb_error_subcode}` : ''})` : ''
         const traceId = data.fb_trace_id ? `\ntrace_id: ${data.fb_trace_id}` : ''
+        const requestContext = `\npage=${selectedPage.id}\nad_account=${settings.adAccount || '-'}\ntemplate=${selectedTemplateAdset || '-'}`
         const shortSummary = `${stepLabel}${data.error || `HTTP ${httpStatus}`}${fbCode}`
-        finalMessage = `❌ สร้างแอดไม่สำเร็จ — HTTP ${httpStatus}\n\n${shortSummary}${traceId}\n\n(Invalid parameter บ่อยครั้งเป็น transient — ลองกดซ้ำอีกครั้ง)`
+        const fbUserDetail = data.fb_error_user_msg
+          ? `\n\nMeta: ${data.fb_error_user_title ? `${data.fb_error_user_title} — ` : ''}${data.fb_error_user_msg}`
+          : ''
         setCreateAdStep(`❌ ${shortSummary}`)
         setCreateAdProgress(0)
-        setCreateAdResultBanner({ type: 'error', text: `❌ ${shortSummary}${traceId ? `\ntrace=${data.fb_trace_id}` : ''}` })
+        setCreateAdResultBanner({ type: 'error', text: `❌ ${shortSummary}${fbUserDetail}${requestContext}${traceId ? `\ntrace=${data.fb_trace_id}` : ''}` })
       }
     } catch (e) {
       timers.forEach(clearTimeout)
       const msg = e instanceof Error ? e.message : String(e)
-      finalStatus = 'error'
-      finalMessage = `❌ Exception: ${msg}`
       setCreateAdStep(`❌ ${msg}`)
       setCreateAdProgress(0)
       setCreateAdResultBanner({ type: 'error', text: `❌ Exception — ${msg}` })
     } finally {
       timers.forEach(clearTimeout)
       setCreateAdCreating(false)
-      // Always show alert with final result — user sees unambiguous outcome even if
-      // popup timing was tight or they looked away during the 60-120s wait.
-      if (finalMessage) {
-        alert(finalMessage)
-      }
-      if (finalStatus === 'success') {
-        setCreateAdPopup(null)
-        setCreateAdResultBanner(null)
-      }
-      // On error: leave popup open AND banner visible so user can see message + retry
+      // Result is shown inside the same dashboard modal. Do not use native alert(),
+      // because it creates a second browser popup over the custom spinner/result UI.
+      // Keep popup open on success/error so operator can read IDs and retry/copy.
     }
   }
 
   async function submitCreateAd() {
     if (!createAdPopup) return
+    if (!createAdSelectedCampaign && !String(createAdNewCampaignName || '').trim()) {
+      const msg = '❌ ต้องเลือกแคมเปญ หรือใส่ชื่อแคมเปญใหม่ก่อนเพิ่มคิว'
+      setCreateAdStep(msg)
+      setCreateAdResultBanner({ type: 'error', text: msg })
+      return
+    }
 
     // Queue mode = "เพิ่มเข้าคิว" — relies on the worker-side cron picking up
     // the job every ~20 minutes and processing it via Electron. ฉ่ำ's pipeline
@@ -859,14 +966,13 @@ export default function App() {
     // cron-triggered queue can't drive it. We block queue mode for ฉ่ำ and
     // funnel them to immediate ("โพสต์เลย") instead, which calls the extension.
     if (selectedPage.slug === 'cham') {
-      const msg = '❌ คิวสร้างแอดไม่รองรับสำหรับเพจฉ่ำ\n\nคิวนี้รันโดย worker cron ที่เรียก Electron — เพจฉ่ำสร้างแอดผ่าน extension ใน Chrome ของพี่เท่านั้น (worker ไม่มี session ของ Ads Manager)\n\nกด "⚡ โพสต์เลย" แทนเพื่อให้ extension สร้างแอดทันที'
       setCreateAdResultBanner({ type: 'error', text: '❌ ฉ่ำใช้ "โพสต์เลย" เท่านั้น — queue ไม่รองรับ' })
-      alert(msg)
       return
     }
 
     setCreateAdResultBanner(null)
     setCreateAdCreating(true)
+    const selectedTemplateAdset = resolveTemplateAdsetForPlacement(settings, createAdTemplate)
     setCreateAdStep('📥 กำลังเพิ่มเข้าคิว...')
     setCreateAdProgress(40)
 
@@ -882,9 +988,13 @@ export default function App() {
           ...(createAdPopup.videoUrl
             ? { video_url: createAdPopup.videoUrl }
             : { video_id: createAdPopup.videoId }),
-          caption: createAdPopup.caption,
+          caption: createAdCaption,
+          ad_name: createAdPopup.systemId || '',
+          source_video_id: createAdPopup.systemId || '',
           story_id: createAdPopup.storyId || '',
           shopee_url: createAdShopeeLink || '',
+          placement_template: createAdTemplate,
+          template_adset: selectedTemplateAdset,
           campaign_id: createAdSelectedCampaign || undefined,
           new_campaign_name: createAdNewCampaignName || undefined,
         }),
@@ -899,9 +1009,6 @@ export default function App() {
         const successText = `✅ เพิ่มเข้าคิวแล้ว #${data.queue_id} · ${data.queued_count || 0} งานในคิว · รันถัดไป ${nextRun}`
         setCreateAdStep(successText)
         setCreateAdResultBanner({ type: 'success', text: successText })
-        await new Promise(r => setTimeout(r, 1800))
-        setCreateAdPopup(null)
-        setCreateAdResultBanner(null)
         // Refresh queue page if user is on it
         void loadAdQueue()
       } else {
@@ -909,14 +1016,12 @@ export default function App() {
         setCreateAdStep(errText)
         setCreateAdResultBanner({ type: 'error', text: errText })
         setCreateAdProgress(0)
-        alert(errText)
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setCreateAdStep(`❌ ${msg}`)
       setCreateAdResultBanner({ type: 'error', text: `❌ Exception — ${msg}` })
       setCreateAdProgress(0)
-      alert(`❌ Exception: ${msg}`)
     } finally {
       setCreateAdCreating(false)
     }
@@ -1033,6 +1138,8 @@ export default function App() {
         defaultPage: String(p.default_page || current.defaultPage || ''),
         adAccount: String(p.ad_account || current.adAccount || ''),
         templateAdset: String(p.template_adset || current.templateAdset || ''),
+        templateAdsetFacebook: String(p.template_adset_facebook || current.templateAdsetFacebook || ''),
+        templateAdsetInstagram: String(p.template_adset_instagram || current.templateAdsetInstagram || ''),
         campaignPrefix: String(p.campaign_prefix || current.campaignPrefix || ''),
         adsPerRound: String(p.ads_per_round || current.adsPerRound || ''),
         autoCreateTime: String(p.auto_create_time || current.autoCreateTime || ''),
@@ -1068,6 +1175,8 @@ export default function App() {
           default_page: settings.defaultPage,
           ad_account: settings.adAccount,
           template_adset: settings.templateAdset,
+          template_adset_facebook: settings.templateAdsetFacebook,
+          template_adset_instagram: settings.templateAdsetInstagram,
           campaign_prefix: settings.campaignPrefix,
           ads_per_round: settings.adsPerRound,
           auto_create_time: settings.autoCreateTime,
@@ -1084,12 +1193,14 @@ export default function App() {
   }
 
   async function loadGalleryFromWorker(showSpinner = true) {
+    const requestedSourceId = pagePostsSource.id
+    const requestedSourceName = pagePostsSource.name
     if (showSpinner) setGalleryLoading(true)
     setGalleryError(null)
     try {
       const search = new URLSearchParams({
-        page_id: pagePostsSource.id,
-        page_name: pagePostsSource.name,
+        page_id: requestedSourceId,
+        page_name: requestedSourceName,
         min_views: String(GALLERY_MIN_VIEWS),
         limit: String(GALLERY_READ_LIMIT),
       })
@@ -1101,6 +1212,9 @@ export default function App() {
         items?: GalleryLinkedItem[]
         sync?: Partial<GallerySyncState>
       }
+      // Source switches can overlap with in-flight fetches. Never let an older
+      // response (e.g. เฉียบ) overwrite the currently selected source (e.g. ลั่น).
+      if (pagePostsSourcePageIdRef.current !== requestedSourceId) return
       const items = Array.isArray(payload.items) ? payload.items : []
       setGalleryLinkedItems(items.map((item) => ({
         ...item,
@@ -1128,26 +1242,38 @@ export default function App() {
     setGallerySyncing(true)
     setGalleryError(null)
     try {
-      const syncResponse = await fetch(`/worker-api/api/dashboard/facebook-page-videos/auto-sync`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          page_id: pagePostsSource.id,
-          page_name: pagePostsSource.name,
-          force: true,
-        }),
-      })
-      const syncPayload = await syncResponse.json().catch(() => ({})) as { ok?: boolean; reason?: string; totalOverThreshold?: number }
-      if (!syncResponse.ok || syncPayload.ok === false) {
-        // Still reload cached data even if sync failed
-        await loadGalleryFromWorker(false)
-        if (syncPayload.reason?.includes('facebook_graph_http')) {
-          // Facebook API error — data may still be partially cached, don't show error
-          return
+      // Pull the whole page archive in one user action. The worker syncs one
+      // Graph page per request to avoid Cloudflare/Facebook timeouts, so the UI
+      // loops until `fullyScanned` or there is no `nextAfter`. This matches the
+      // operator expectation: show EVERY Reels post with >=100K views, not just
+      // the first Facebook page after repeated manual clicks.
+      let fullyScanned = false
+      let nextAfter = ''
+      for (let i = 0; i < 50; i += 1) {
+        const syncResponse = await fetch(`/worker-api/api/dashboard/facebook-page-videos/auto-sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page_id: pagePostsSource.id,
+            page_name: pagePostsSource.name,
+            force: true,
+          }),
+        })
+        const syncPayload = await syncResponse.json().catch(() => ({})) as {
+          ok?: boolean
+          reason?: string
+          sync?: Partial<GallerySyncState>
         }
-        throw new Error(syncPayload.reason || `sync ไม่สำเร็จ (${syncResponse.status})`)
+        if (!syncResponse.ok || syncPayload.ok === false) {
+          await loadGalleryFromWorker(false)
+          if (syncPayload.reason?.includes('facebook_graph_http')) return
+          throw new Error(syncPayload.reason || `sync ไม่สำเร็จ (${syncResponse.status})`)
+        }
+        fullyScanned = !!syncPayload.sync?.fullyScanned
+        nextAfter = String(syncPayload.sync?.nextAfter || '')
+        await loadGalleryFromWorker(false)
+        if (fullyScanned || !nextAfter) break
       }
-      await loadGalleryFromWorker(false)
     } catch (error) {
       setGalleryError(error instanceof Error ? error.message : 'โหลดโพสต์ไม่สำเร็จ')
     } finally {
@@ -1194,6 +1320,33 @@ export default function App() {
   }
 
   useEffect(() => {
+    let cancelled = false
+    async function loadPagePostSources() {
+      try {
+        const params = new URLSearchParams({ namespace_id: CHIEB_NAMESPACE_ID })
+        const response = await fetch(`/worker-api/api/dashboard/facebook-page-sources?${params.toString()}`)
+        if (!response.ok) return
+        const data = await response.json() as { pages?: Array<{ id?: string; name?: string; iconUrl?: string }> }
+        const remotePages = (Array.isArray(data.pages) ? data.pages : [])
+          .map((p) => ({
+            id: String(p.id || '').trim(),
+            name: String(p.name || '').trim(),
+            slug: String(p.id || '').trim(),
+            iconUrl: String(p.iconUrl || '').trim(),
+          }))
+          .filter((p) => p.id && p.name)
+        if (cancelled || remotePages.length === 0) return
+        const merged = new Map<string, PageOption>()
+        for (const p of PAGES) merged.set(p.id, p)
+        for (const p of remotePages) merged.set(p.id, { ...p, iconUrl: p.iconUrl || merged.get(p.id)?.iconUrl || '' })
+        setPagePostSourcePages(Array.from(merged.values()))
+      } catch { /* keep built-in เฉียบ/ฉ่ำ fallback */ }
+    }
+    void loadPagePostSources()
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
     // Workspace change → reset source picker back to current workspace + clear
     // gallery so the picker doesn't appear stuck on the previous workspace's
     // page when the operator hops to /chearb ↔ /feed.
@@ -1222,21 +1375,14 @@ export default function App() {
     return () => clearInterval(id)
   }, [tab])
 
-  // Auto-sync: keep syncing until fully scanned. Re-bootstraps when the user
-  // switches FB page (via galleryBootstrapped reset above).
+  // Do not auto-sync on page open. The cache load is fast, but auto-sync can
+  // take 30–60s per Facebook batch and used to keep the page stuck at
+  // "กำลังโหลด/กำลังรีเฟรช" for many minutes. Let operators click refresh
+  // manually when they need new posts; page open should show cached posts first.
   useEffect(() => {
-    if (tab !== 'page-posts' || galleryLoading || gallerySyncing) return
-    if (!galleryBootstrapped) {
-      setGalleryBootstrapped(true)
-      void syncNextGalleryBatch()
-      return
-    }
-    // Continue syncing if not fully scanned yet
-    if (gallerySyncState && !gallerySyncState.fullyScanned && gallerySyncState.nextAfter) {
-      const timer = setTimeout(() => void syncNextGalleryBatch(), 3000)
-      return () => clearTimeout(timer)
-    }
-  }, [tab, galleryLoading, gallerySyncing, galleryBootstrapped, gallerySyncState?.fullyScanned, gallerySyncState?.nextAfter])
+    if (tab !== 'page-posts') return
+    if (!galleryBootstrapped) setGalleryBootstrapped(true)
+  }, [tab, galleryBootstrapped])
 
   // ==================== SYSTEM GALLERY (new /gallery tab) ====================
   async function loadSystemGalleryPage(view: SystemGalleryView, options: { reset?: boolean; search?: string } = {}) {
@@ -1292,6 +1438,28 @@ export default function App() {
     return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [systemGallerySearch])
+
+  // Auto-load more system gallery rows when the operator scrolls near the bottom.
+  // Keep the manual button too as a fallback, but normal browsing should be
+  // infinite-scroll like the mobile gallery.
+  useEffect(() => {
+    if (tab !== 'gallery') return
+    const root = mainScrollRef.current
+    const target = systemGalleryLoadMoreRef.current
+    if (!root || !target || !systemGalleryHasMore || systemGalleryLoading) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          void loadSystemGalleryPage(systemGalleryView, { reset: false })
+        }
+      },
+      { root, rootMargin: '700px 0px', threshold: 0.01 }
+    )
+    observer.observe(target)
+    return () => observer.disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, systemGalleryView, systemGalleryHasMore, systemGalleryLoading, systemGalleryReadyItems.length, systemGalleryUsedItems.length])
 
   return (
     <div className="h-screen overflow-hidden bg-[#f6f8fb] text-slate-900">
@@ -1386,6 +1554,14 @@ export default function App() {
                   </a>
                 )}
                 <a
+                  href={buildOriginalVideoDownloadUrl(String(videoPreview.id), CHIEB_NAMESPACE_ID)}
+                  download={buildVideoDownloadFilename(String(videoPreview.id))}
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-600"
+                >
+                  <Download size={12} /> ดาวน์โหลด
+                </a>
+                <a
                   href={buildVideoPlaybackUrl(String(videoPreview.id), CHIEB_NAMESPACE_ID)}
                   target="_blank"
                   rel="noreferrer"
@@ -1401,11 +1577,27 @@ export default function App() {
 
       {/* Create Ad Popup */}
       {createAdPopup && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => { if (!createAdCreating) { setCreateAdPopup(null); setCreateAdResultBanner(null) } }}>
-          <div className="mx-4 w-full max-w-lg rounded-3xl bg-white p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-bold text-slate-900">สร้างแอด LikePage</h2>
-            <p className="mt-1 text-sm text-slate-500">Video ID: {createAdPopup.videoId}</p>
-            <p className="mt-1 truncate text-xs text-slate-400">{createAdPopup.caption}</p>
+        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/55 p-3 backdrop-blur-sm sm:p-5" onClick={() => { if (!createAdCreating) { setCreateAdPopup(null); setCreateAdResultBanner(null) } }}>
+          <div className="flex max-h-[calc(100dvh-2rem)] w-full max-w-4xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl ring-1 ring-black/10" onClick={(e) => e.stopPropagation()}>
+            <div className="flex shrink-0 items-start justify-between gap-3 border-b border-slate-100 px-4 py-3 sm:px-5">
+              <div className="min-w-0">
+                <h2 className="text-base font-bold text-slate-900 sm:text-lg">สร้างแอด LikePage</h2>
+                <p className="mt-0.5 text-xs text-slate-500">Video ID: {createAdPopup.videoId}</p>
+                <p className="mt-0.5 truncate text-xs text-slate-400">{createAdCaption || createAdPopup.caption}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => { if (!createAdCreating) { setCreateAdPopup(null); setCreateAdResultBanner(null) } }}
+                disabled={createAdCreating}
+                className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-sm font-bold text-slate-500 transition hover:bg-slate-50 disabled:opacity-40"
+                aria-label="ปิด popup"
+              >
+                ×
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 sm:px-5">
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(340px,0.95fr)] lg:items-start">
+                <div className="min-w-0 space-y-3">
 
             {/* Provider badge — makes it obvious whether the click will go through
                 Electron (เฉียบ) or the Chrome extension (ฉ่ำ). For ฉ่ำ we also
@@ -1428,6 +1620,27 @@ export default function App() {
                 <span>สร้างผ่าน Electron (video-onecard) — ปกติของ {selectedPage.name}</span>
               </div>
             )}
+
+            <div className="mt-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-semibold text-slate-700">แคปชั่นโพสต์/แอด</p>
+                <button
+                  type="button"
+                  onClick={() => setCreateAdCaption(createAdPopup.caption)}
+                  className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-500 hover:bg-slate-200"
+                >
+                  รีเซ็ต
+                </button>
+              </div>
+              <textarea
+                value={createAdCaption}
+                onChange={(e) => setCreateAdCaption(e.target.value)}
+                rows={4}
+                placeholder="แก้แคปชั่นก่อนสร้างแอด..."
+                className="mt-1 w-full resize-none rounded-xl border border-slate-200 px-3 py-2.5 text-sm leading-relaxed text-slate-900 focus:border-blue-500 focus:outline-none"
+              />
+              <p className="mt-1 text-[11px] text-slate-400">ข้อความนี้จะถูกส่งไปสร้าง creative/ad ทันที</p>
+            </div>
 
             <div className="mt-3">
               <p className="text-sm font-semibold text-slate-700">Shopee Link</p>
@@ -1607,8 +1820,69 @@ export default function App() {
               )
             })()}
 
-            <div className="mt-4 space-y-3">
-              <p className="text-sm font-semibold text-slate-700">เลือกแคมเปญ</p>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+              <p className="text-sm font-semibold text-slate-700">เลือก Template ตำแหน่งโฆษณา</p>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <button
+                  type="button"
+                  onClick={() => setCreateAdTemplate('facebook')}
+                  className={`rounded-xl border px-3 py-2 text-left text-xs font-semibold ${createAdTemplate === 'facebook' ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}
+                >
+                  <span className="block">Facebook only</span>
+                  <span className="block text-[10px] font-normal opacity-70">Feed + Stories + Reels</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreateAdTemplate('instagram')}
+                  className={`rounded-xl border px-3 py-2 text-left text-xs font-semibold ${createAdTemplate === 'instagram' ? 'border-pink-500 bg-pink-50 text-pink-700' : 'border-slate-200 bg-white text-slate-600'}`}
+                >
+                  <span className="block">Instagram only</span>
+                  <span className="block text-[10px] font-normal opacity-70">Stories + Reels</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreateAdTemplate('facebook_instagram')}
+                  className={`rounded-xl border px-3 py-2 text-left text-xs font-semibold ${createAdTemplate === 'facebook_instagram' ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-600'}`}
+                >
+                  <span className="block">FB & IG Story</span>
+                  <span className="block text-[10px] font-normal opacity-70">ใช้ Template FB+IG</span>
+                </button>
+              </div>
+              <p className="mt-2 rounded-lg bg-white px-2 py-1 font-mono text-[11px] font-semibold text-slate-600">
+                template: {resolveTemplateAdsetForPlacement(settings, createAdTemplate) || '-'}
+              </p>
+              <p className="mt-2 text-[11px] text-slate-500">หมายเหตุ: Meta ไม่ยอมให้ Facebook Stories เดี่ยว ๆ ต้องมี Facebook Feed ติดไปด้วย จึงตั้ง FB template เป็น Feed + Stories + Reels</p>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+              <p className="text-sm font-semibold text-slate-700">สร้างแคมเปญใหม่</p>
+              <p className="mt-0.5 text-[11px] text-slate-400">สร้าง 1 แคมเปญ + 1 ชุดโฆษณา + 1 โฆษณา</p>
+              <input
+                type="text"
+                placeholder="ชื่อแคมเปญใหม่ เช่น ADS_PUBLISH_11"
+                value={createAdNewCampaignName}
+                onChange={(e) => { setCreateAdNewCampaignName(e.target.value); setCreateAdSelectedCampaign('') }}
+                className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+                </div>
+
+            <div className="min-w-0 rounded-2xl border border-blue-100 bg-blue-50/40 p-3 shadow-sm lg:sticky lg:top-0">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-sm font-bold text-slate-800">เลือกแคมเปญเดิม</p>
+                  <p className="mt-0.5 text-[11px] text-slate-500">เพิ่มชุดโฆษณาใหม่เข้า campaign นี้</p>
+                </div>
+                {createAdSelectedCampaign && (
+                  <button
+                    type="button"
+                    onClick={() => setCreateAdSelectedCampaign('')}
+                    className="rounded-full bg-white px-2 py-1 text-[10px] font-semibold text-slate-500 ring-1 ring-slate-200"
+                  >
+                    ล้าง
+                  </button>
+                )}
+              </div>
               {createAdLoading ? (
                 <div className="h-12 rounded-xl bg-slate-100 animate-pulse" />
               ) : createAdCampaigns.length === 0 ? (
@@ -1620,7 +1894,7 @@ export default function App() {
                   <p className="mt-1 text-[11px] text-amber-700">ดูสถานะ extension ด้านบน เลือกสร้างแคมเปญใหม่ด้านล่างก็ได้</p>
                 </div>
               ) : (
-                <div className="space-y-2 max-h-48 overflow-y-auto">
+                <div className="grid grid-cols-1 gap-2 overflow-y-auto rounded-xl border border-slate-100 bg-white/70 p-1.5 max-h-[42dvh] sm:max-h-[50dvh] lg:max-h-[calc(100dvh-18rem)] xl:grid-cols-2">
                   {createAdCampaigns.map((camp) => {
                     // FB cost_per_action_type returns the value pre-formatted
                     // in the ad_account currency (THB). Show 2 decimals to
@@ -1634,101 +1908,127 @@ export default function App() {
                       <button
                         key={camp.id}
                         onClick={() => { setCreateAdSelectedCampaign(camp.id); setCreateAdNewCampaignName('') }}
-                        className={`w-full rounded-xl border p-3 text-left transition ${createAdSelectedCampaign === camp.id ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}`}
+                        className={`min-w-0 rounded-xl border p-3 text-left transition ${createAdSelectedCampaign === camp.id ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}`}
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-semibold text-slate-900">{camp.name} ({camp.adsetCount} adsets)</span>
-                          <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${camp.status === 'ACTIVE' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{camp.status}</span>
+                        <div className="min-w-0">
+                          <span className="block whitespace-normal break-words text-sm font-bold leading-tight text-slate-900">{displayCampaignName(camp.name)}</span>
                         </div>
-                        <div className="mt-0.5 flex items-center justify-between text-[11px]">
-                          <span className="text-slate-400">{camp.id}</span>
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                          <div className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-1.5 text-white shadow-sm">
+                            <span className="text-[10px] font-semibold opacity-85">ชุดโฆษณา</span>
+                            <span className="text-lg font-black leading-none">{camp.adsetCount}</span>
+                            <span className="text-[10px] font-semibold opacity-85">ชุด</span>
+                          </div>
                           {cpcDisplay && (
-                            <span className="font-semibold text-emerald-700">{cpcDisplay}</span>
+                            <span className="shrink-0 rounded-full bg-emerald-50 px-2 py-1 text-[11px] font-bold text-emerald-700">{cpcDisplay}</span>
                           )}
+                        </div>
+                        <div className="mt-0.5 truncate font-mono text-[11px] text-slate-400">
+                          ID {camp.id}
                         </div>
                       </button>
                     )
                   })}
                 </div>
               )}
-
-              <div className="relative">
-                <div className="absolute inset-x-0 top-1/2 border-t border-slate-200" />
-                <p className="relative mx-auto w-fit bg-white px-3 text-xs text-slate-400">หรือ</p>
-              </div>
-
-              <div>
-                <p className="text-sm font-semibold text-slate-700">สร้างแคมเปญใหม่</p>
-                <input
-                  type="text"
-                  placeholder="ชื่อแคมเปญใหม่ เช่น ADS_PUBLISH_11"
-                  value={createAdNewCampaignName}
-                  onChange={(e) => { setCreateAdNewCampaignName(e.target.value); setCreateAdSelectedCampaign('') }}
-                  className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm focus:border-blue-500 focus:outline-none"
-                />
-              </div>
             </div>
+              </div>
 
-            {/* Persistent result banner — shown AFTER request finishes, stays until user
-                 retries or cancels. Critical so user doesn't miss success/error message. */}
+            {/* Result overlay — same custom popup layer as the spinner, no native alert(). */}
             {!createAdCreating && createAdResultBanner && (
-              <div className={`mt-6 rounded-xl p-4 text-sm font-semibold ${
-                createAdResultBanner.type === 'success'
-                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                  : 'bg-red-50 text-red-700 border border-red-200'
-              }`}>
-                <p className="whitespace-pre-wrap break-words">{createAdResultBanner.text}</p>
+              <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/45 px-4 backdrop-blur-sm" onClick={(e) => e.stopPropagation()}>
+                <div className={`w-full max-w-md rounded-3xl border px-6 py-6 text-center shadow-2xl ring-1 ring-black/5 ${
+                  createAdResultBanner.type === 'success'
+                    ? 'border-emerald-100 bg-white text-emerald-700'
+                    : 'border-red-100 bg-white text-red-700'
+                }`}>
+                  <div className={`mx-auto flex h-16 w-16 items-center justify-center rounded-full text-3xl ${
+                    createAdResultBanner.type === 'success' ? 'bg-emerald-50' : 'bg-red-50'
+                  }`}>
+                    {createAdResultBanner.type === 'success' ? '✅' : '❌'}
+                  </div>
+                  <p className="mt-4 text-lg font-bold text-slate-900">
+                    {createAdResultBanner.type === 'success' ? 'สำเร็จ' : 'สร้างไม่สำเร็จ'}
+                  </p>
+                  <p className="mt-3 whitespace-pre-wrap break-words text-sm font-semibold leading-relaxed">
+                    {createAdResultBanner.text}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const wasSuccess = createAdResultBanner.type === 'success'
+                      setCreateAdResultBanner(null)
+                      if (wasSuccess) setCreateAdPopup(null)
+                    }}
+                    className={`mt-5 h-12 w-full rounded-xl text-sm font-bold text-white ${
+                      createAdResultBanner.type === 'success' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-red-600 hover:bg-red-700'
+                    }`}
+                  >
+                    OK
+                  </button>
+                </div>
               </div>
             )}
 
             {createAdCreating ? (
-              <div className="mt-6 space-y-3">
-                <div className="rounded-xl bg-slate-50 p-4">
-                  <p className="text-sm font-semibold text-slate-900">{createAdStep}</p>
-                  <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-200">
-                    <div
-                      className="h-full rounded-full bg-[#1877f2] transition-all duration-700"
-                      style={{ width: `${createAdProgress}%` }}
-                    />
+              <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/45 px-4 backdrop-blur-sm" onClick={(e) => e.stopPropagation()}>
+                <div className="w-full max-w-sm rounded-3xl border border-white/40 bg-white/95 px-6 py-7 text-center shadow-2xl ring-1 ring-black/5">
+                  <div className="relative mx-auto h-20 w-20">
+                    <div className="absolute inset-0 rounded-full border-4 border-blue-100" />
+                    <div className="absolute inset-0 rounded-full border-4 border-transparent border-t-blue-600 border-r-orange-400 animate-spin" />
+                    <div className="absolute inset-3 flex items-center justify-center rounded-full bg-gradient-to-br from-blue-50 to-orange-50 text-2xl shadow-inner">
+                      ⚡
+                    </div>
                   </div>
-                  <p className="mt-2 text-right text-xs text-slate-400">{createAdProgress}%</p>
+                  <p className="mt-5 text-base font-bold text-slate-900">กำลังสร้างแอด</p>
+                  <p className="mx-auto mt-2 max-w-xs text-sm font-medium text-slate-500">{createAdStep}</p>
+                  <p className="mt-2 text-xs font-semibold text-slate-400">{createAdProgress}%</p>
+                  <div className="mt-5 flex items-center justify-center gap-1.5">
+                    <span className="h-2 w-2 animate-bounce rounded-full bg-blue-500 [animation-delay:-0.2s]" />
+                    <span className="h-2 w-2 animate-bounce rounded-full bg-orange-400 [animation-delay:-0.1s]" />
+                    <span className="h-2 w-2 animate-bounce rounded-full bg-blue-500" />
+                  </div>
                 </div>
               </div>
             ) : (
-              <div className="mt-6 space-y-2">
-                <div className="flex gap-3">
+              <div className="sticky bottom-0 -mx-4 mt-4 border-t border-slate-100 bg-white/95 px-4 pb-3 pt-3 backdrop-blur sm:-mx-5 sm:px-5">
+                <div className="flex items-stretch gap-3">
                   <button
                     onClick={() => { setCreateAdPopup(null); setCreateAdResultBanner(null) }}
-                    className="flex-1 rounded-xl border border-slate-200 py-2.5 text-sm font-semibold text-slate-700"
+                    className="h-14 flex-1 rounded-xl border border-red-200 bg-red-50 text-sm font-bold text-red-600 transition hover:bg-red-100 active:scale-[0.99]"
                   >
                     ยกเลิก
                   </button>
                   <button
+                    onClick={() => void submitCreateAdImmediate()}
+                    disabled={
+                      (!createAdSelectedCampaign && !createAdNewCampaignName)
+                      || (selectedPage.slug === 'cham' && !feedExtension.available)
+                    }
+                    title={
+                      selectedPage.slug === 'cham' && !feedExtension.available
+                        ? 'ติดตั้ง Feed Ad Creator extension ก่อน'
+                        : 'รันเลยโดยไม่รอคิว 20 นาที (extension ใช้ ~80-200 วินาที, electron ~60-120 วินาที)'
+                    }
+                    className="h-14 flex-[2] rounded-xl bg-orange-500 text-sm font-bold text-white transition-colors hover:bg-orange-600 disabled:opacity-50"
+                  >
+                    {createAdTemplate === 'instagram'
+                      ? '⚡ สร้างแอด IG'
+                      : `⚡ โพสต์เลย ${selectedPage.slug === 'cham' ? '(ผ่าน extension)' : '(ข้ามคิว)'}`}
+                  </button>
+                  <button
                     onClick={() => void submitCreateAd()}
                     disabled={(!createAdSelectedCampaign && !createAdNewCampaignName) || selectedPage.slug === 'cham'}
-                    title={selectedPage.slug === 'cham' ? 'ฉ่ำใช้ extension — queue ไม่รองรับ กด "โพสต์เลย" แทน' : ''}
-                    className="flex-1 rounded-xl bg-[#1877f2] py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+                    title={selectedPage.slug === 'cham' ? 'ฉ่ำใช้ extension — queue ไม่รองรับ กด "โพสต์เลย" แทน' : 'เพิ่มเข้าคิว'}
+                    className="h-14 w-14 shrink-0 rounded-xl bg-[#1877f2] text-xs font-bold leading-tight text-white transition hover:bg-blue-600 disabled:opacity-50"
+                    aria-label="เพิ่มเข้าคิว"
                   >
-                    เพิ่มเข้าคิว
+                    +คิว
                   </button>
                 </div>
-                <button
-                  onClick={() => void submitCreateAdImmediate()}
-                  disabled={
-                    (!createAdSelectedCampaign && !createAdNewCampaignName)
-                    || (selectedPage.slug === 'cham' && !feedExtension.available)
-                  }
-                  title={
-                    selectedPage.slug === 'cham' && !feedExtension.available
-                      ? 'ติดตั้ง Feed Ad Creator extension ก่อน'
-                      : 'รันเลยโดยไม่รอคิว 20 นาที (extension ใช้ ~80-200 วินาที, electron ~60-120 วินาที)'
-                  }
-                  className="w-full rounded-xl bg-orange-500 hover:bg-orange-600 py-2.5 text-sm font-semibold text-white disabled:opacity-50 transition-colors"
-                >
-                  ⚡ โพสต์เลย {selectedPage.slug === 'cham' ? '(ผ่าน extension)' : '(ข้ามคิว)'}
-                </button>
               </div>
             )}
+            </div>
           </div>
         </div>
       )}
@@ -1900,7 +2200,7 @@ export default function App() {
               </div>
             </header>
 
-            <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 py-4 sm:px-6">
+            <main ref={mainScrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-4 py-4 sm:px-6">
               {tab === 'dashboard' && (
                 <div className="space-y-4">
                   <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
@@ -2173,26 +2473,38 @@ export default function App() {
                                       uploads to FB Ads first instead of reusing an
                                       existing video. shopeeLink/lazadaLink come straight
                                       from the gallery row so the popup pre-fills. */}
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      const fileUrl = `${window.location.origin}${buildVideoPlaybackUrl(vid, CHIEB_NAMESPACE_ID)}`
-                                      const link = String(video.shopeeLink || video.lazadaLink || '').trim()
-                                      void openCreateAdPopup('', title || vid, '', link, fileUrl)
-                                    }}
-                                    disabled={!linked}
-                                    title={linked ? 'สร้างแอด LikePage จากคลิปนี้' : 'ต้องมี Shopee/Lazada link ใน metadata ก่อน'}
-                                    className="w-full rounded-xl bg-[#1877f2] px-3 py-2 text-sm font-semibold text-white transition active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
-                                  >
-                                    สร้างแอด
-                                  </button>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <a
+                                      href={buildOriginalVideoDownloadUrl(vid, CHIEB_NAMESPACE_ID)}
+                                      download={buildVideoDownloadFilename(vid)}
+                                      onClick={(e) => e.stopPropagation()}
+                                      title="ดาวน์โหลดวิดีโอนี้"
+                                      className="inline-flex items-center justify-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 active:scale-95"
+                                    >
+                                      <Download size={15} />
+                                      ดาวน์โหลด
+                                    </a>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const fileUrl = buildVideoPlaybackUrl(vid, CHIEB_NAMESPACE_ID)
+                                        const link = String(video.shopeeLink || video.lazadaLink || '').trim()
+                                        void openCreateAdPopup('', title || vid, '', link, fileUrl, vid)
+                                      }}
+                                      disabled={!linked}
+                                      title={linked ? 'สร้างแอด LikePage จากคลิปนี้' : 'ต้องมี Shopee/Lazada link ใน metadata ก่อน'}
+                                      className="rounded-xl bg-[#1877f2] px-3 py-2 text-sm font-semibold text-white transition active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+                                    >
+                                      สร้างแอด
+                                    </button>
+                                  </div>
                                 </div>
                               </article>
                             )
                           })}
                         </div>
                         {systemGalleryHasMore && (
-                          <div className="flex justify-center pt-2">
+                          <div ref={systemGalleryLoadMoreRef} className="flex justify-center pt-2">
                             <button
                               onClick={() => void loadSystemGalleryPage(systemGalleryView, { reset: false })}
                               disabled={systemGalleryLoading}
@@ -2228,21 +2540,37 @@ export default function App() {
                           )}
                         </p>
                       </div>
-                      <div className="flex gap-1.5">
-                        {PAGES.map((p) => {
+                      <div className="flex max-w-full flex-wrap gap-1.5">
+                        {pagePostSourcePages.map((p) => {
                           const active = p.id === pagePostsSource.id
                           return (
                             <button
                               key={p.id}
                               type="button"
-                              onClick={() => setPagePostsSourcePageId(p.id)}
+                              onClick={() => {
+                                setPagePostsSourcePageId(p.id)
+                                setGalleryLinkedItems([])
+                                setGallerySyncState(null)
+                                setGalleryError(null)
+                                setGalleryLoading(true)
+                              }}
                               className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold transition ${
                                 active
                                   ? 'border-slate-900 bg-slate-900 text-white'
                                   : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
                               }`}
                             >
-                              <img src={p.iconUrl} alt={p.name} className="h-5 w-5 rounded-md object-cover" />
+                              <span className="relative flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-200 text-[10px] font-black text-slate-600">
+                                {p.name.slice(0, 1)}
+                                {p.iconUrl && (
+                                  <img
+                                    src={p.iconUrl}
+                                    alt={p.name}
+                                    onError={(e) => { e.currentTarget.style.display = 'none' }}
+                                    className="absolute inset-0 h-full w-full object-cover"
+                                  />
+                                )}
+                              </span>
                               <span>{p.name}</span>
                             </button>
                           )
@@ -2273,7 +2601,7 @@ export default function App() {
                         disabled={gallerySyncing}
                         className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        {gallerySyncing ? 'กำลังโหลด…' : galleryLinkedItems.length > 0 ? 'โหลดโพสต์เพิ่ม' : 'ดึงโพสต์จาก Facebook'}
+                        {gallerySyncing ? 'กำลังดึงให้ครบ…' : galleryLinkedItems.length > 0 ? 'ดึงโพสต์ 100K ให้ครบ' : 'ดึงโพสต์จาก Facebook'}
                       </button>
                     </div>
                   </div>
@@ -2293,7 +2621,22 @@ export default function App() {
                             rel="noreferrer"
                             className="relative block aspect-[3/5] overflow-hidden bg-slate-100"
                           >
-                            <img src={item.facebookThumb} alt={item.storyId} className="h-full w-full object-cover" />
+                            {(item.videoUrl || item.systemVideoId) && (
+                              <video
+                                src={item.videoUrl || (item.systemVideoId ? buildVideoPlaybackUrl(item.systemVideoId, CHIEB_NAMESPACE_ID) : '')}
+                                poster={item.facebookThumb || (item.systemVideoId ? buildVideoThumbnailUrl(item.systemVideoId, CHIEB_NAMESPACE_ID) : undefined)}
+                                muted
+                                playsInline
+                                preload="metadata"
+                                className="absolute inset-0 h-full w-full object-cover"
+                              />
+                            )}
+                            <img
+                              src={item.facebookThumb}
+                              alt=""
+                              onError={(e) => { e.currentTarget.style.display = 'none' }}
+                              className="absolute inset-0 h-full w-full object-cover"
+                            />
                             <div className="absolute inset-x-0 top-0 flex items-start justify-between p-3">
                               <span className="rounded-full bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-white backdrop-blur">
                                 {pagePostsSource.name}
@@ -2314,12 +2657,31 @@ export default function App() {
                           </a>
                           <div className="space-y-3 p-3">
                             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Post ID</p>
-                              <p className="mt-1 truncate text-sm font-medium text-slate-900">{item.storyId}</p>
+                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">System Video ID</p>
+                              <div className="mt-1 flex items-center gap-2">
+                                <p className="min-w-0 flex-1 truncate text-sm font-bold text-slate-900">{item.systemVideoId || `FB:${item.videoId}`}</p>
+                                <button
+                                  type="button"
+                                  onClick={() => void copyPagePostRef(item.systemVideoId || `FB:${item.videoId}`)}
+                                  className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-bold text-slate-700 shadow-sm active:scale-95"
+                                  title="คัดลอกรหัสสั่งงาน"
+                                >
+                                  {copiedPagePostRef === (item.systemVideoId || `FB:${item.videoId}`) ? <Check size={13} /> : <Copy size={13} />}
+                                  {copiedPagePostRef === (item.systemVideoId || `FB:${item.videoId}`) ? 'คัดลอกแล้ว' : 'คัดลอก'}
+                                </button>
+                              </div>
+                              <p className="mt-1 truncate text-[11px] text-slate-400">{item.systemVideoId ? `FB Video ID: ${item.videoId || '-'}` : 'ยังหา system id ไม่เจอ — ใช้รหัส FB นี้สั่งงานได้'}</p>
                             </div>
                             <div className="grid grid-cols-1 gap-2">
                               <button
-                                onClick={() => openCreateAdPopup(item.videoId, item.videoTitle || '', item.storyId || '', item.shopeeLink || '')}
+                                onClick={() => openCreateAdPopup(
+                                  item.systemVideoId ? '' : item.videoId,
+                                  item.videoTitle || '',
+                                  item.storyId || '',
+                                  item.shopeeLink || '',
+                                  item.systemVideoId ? buildVideoPlaybackUrl(item.systemVideoId, CHIEB_NAMESPACE_ID) : item.videoUrl || '',
+                                  item.systemVideoId || `FB:${item.videoId}`,
+                                )}
                                 className="rounded-xl bg-[#1877f2] px-3 py-2 text-sm font-semibold text-white active:scale-95 transition-transform"
                               >
                                 สร้างแอด
@@ -2645,10 +3007,24 @@ export default function App() {
                           className="field-input"
                         />
                       </Field>
-                      <Field label="Template Adset">
+                      <Field label="Template FB & IG Story" help="ใช้กับตัวเลือก FB & IG Story ในหน้าสร้างแอด">
                         <input
                           value={settings.templateAdset}
                           onChange={(event) => setSettings((current) => ({ ...current, templateAdset: event.target.value }))}
+                          className="field-input"
+                        />
+                      </Field>
+                      <Field label="Template Facebook only" help="ใช้กับแคมเปญ/ชุดโฆษณา Facebook placements">
+                        <input
+                          value={settings.templateAdsetFacebook}
+                          onChange={(event) => setSettings((current) => ({ ...current, templateAdsetFacebook: event.target.value }))}
+                          className="field-input"
+                        />
+                      </Field>
+                      <Field label="Template Instagram only" help="ใช้กับแคมเปญ/ชุดโฆษณา Instagram Stories/Reels">
+                        <input
+                          value={settings.templateAdsetInstagram}
+                          onChange={(event) => setSettings((current) => ({ ...current, templateAdsetInstagram: event.target.value }))}
                           className="field-input"
                         />
                       </Field>
