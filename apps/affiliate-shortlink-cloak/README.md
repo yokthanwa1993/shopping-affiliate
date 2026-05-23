@@ -46,6 +46,7 @@ Auto-detects Shopee vs Lazada from the `url`. Pass `?platform=shopee|lazada` to 
 ```
 GET /?account=CHEARB&url=<shopee_or_lazada_url>&sub1=yok
 GET /shorten?account=CHEARB&url=<shopee_or_lazada_url>&sub1=yok
+GET /shorten?id=15142270000&url=<shopee_url>&sub1=yok
 ```
 
 Shopee shortening uses the Affiliate Portal home page (`https://affiliate.shopee.co.th/`) as the browser origin and calls Shopee's `batchCustomLink` API from that authenticated context. The old `/offer/custom_link` page can redirect to Affiliate Portal `/404`; when the bridge sees that route it navigates back to the portal home before calling the API. If Shopee still keeps the browser on `/404`, the response uses the readable reason `shopee_custom_link_route_not_found` instead of a misleading login-selector reason.

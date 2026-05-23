@@ -71,6 +71,72 @@ function stopTestServer(instance) {
   return new Promise((resolve) => instance.close(() => resolve()));
 }
 
+function stubShopeeShortenSuccess(t, opts = {}) {
+  const originalGetPage = browser.getPage;
+  const originalEnsureOnPlatformPage = browser.ensureOnPlatformPage;
+  const originalFetch = global.fetch;
+  const shortLink = opts.shortLink || 'https://s.shopee.co.th/STUB';
+  const longLink = opts.longLink || 'https://shopee.co.th/product/111/222?utm_content=stub-sub2-sub3-sub4-sub5';
+  const resolvedShortLinkUrl = opts.resolvedShortLinkUrl
+    || 'https://shopee.co.th/product/111/222?utm_source=an_999999999&utm_content=stub-sub2-sub3-sub4-sub5';
+  const getPageCalls = [];
+  const posts = [];
+
+  t.after(() => {
+    browser.getPage = originalGetPage;
+    browser.ensureOnPlatformPage = originalEnsureOnPlatformPage;
+    global.fetch = originalFetch;
+    server._resetSessionStateCacheForTest();
+  });
+
+  global.fetch = async (input) => {
+    const requested = String(input || '');
+    return {
+      url: requested === shortLink ? resolvedShortLinkUrl : requested,
+      headers: { get: () => 'text/plain' },
+      text: async () => '',
+    };
+  };
+
+  browser.getPage = async (platform, account, browserOpts = {}) => {
+    getPageCalls.push({ platform, account, opts: browserOpts });
+    return {
+      record: {
+        context: {
+          cookies: async () => [],
+          request: {
+            post: async (requestUrl, requestOptions) => {
+              posts.push({ requestUrl, options: requestOptions });
+              return {
+                status: () => 200,
+                text: async () => JSON.stringify({
+                  data: {
+                    batchCustomLink: [
+                      { shortLink, longLink, failCode: 0 },
+                    ],
+                  },
+                }),
+              };
+            },
+          },
+        },
+      },
+      page: {
+        url: () => 'https://affiliate.shopee.co.th/',
+        goto: async () => {},
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        evaluate: async () => {
+          throw new Error('page.evaluate should not run when context.request succeeds');
+        },
+      },
+    };
+  };
+  browser.ensureOnPlatformPage = async () => {};
+
+  return { getPageCalls, posts };
+}
+
 test('handleHealth returns ok + backend info shape', () => {
   const h = server.handleHealth();
   assert.equal(h.status, 'ok');
@@ -223,6 +289,94 @@ test('handleShorten sends canonical Shopee product URL to batch API and preserve
   assert.equal(result.link, rawUrl);
   assert.equal(result.originalLink, 'https://shopee.co.th/product/818732663/26493987387');
   assert.equal(result.sub1, 'canonical_probe');
+});
+
+test('handleShorten resolves Shopee account from id when account is omitted', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server.recordSessionState('shopee', 'affiliate_neezs.com', {
+    sessionValid: true,
+    customLinkAuthenticated: true,
+  });
+  const stub = stubShopeeShortenSuccess(t, {
+    shortLink: 'https://s.shopee.co.th/IDONLY',
+    longLink: 'https://shopee.co.th/product/111/222?utm_content=idonly-sub2-sub3-sub4-sub5',
+  });
+
+  const result = await server.handleShorten({
+    url: 'https://shopee.co.th/-i.111.222',
+    id: '15142270000',
+    sub1: 'idonly',
+  });
+
+  assert.equal(result.account, 'affiliate_neezs.com');
+  assert.equal(stub.getPageCalls[0].platform, 'shopee');
+  assert.equal(stub.getPageCalls[0].account, 'affiliate_neezs.com');
+});
+
+test('handleShorten keeps explicit Shopee account authoritative over id alias', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server.recordSessionState('shopee', 'affiliate_chearb.com', {
+    sessionValid: true,
+    customLinkAuthenticated: true,
+  });
+  const stub = stubShopeeShortenSuccess(t, {
+    shortLink: 'https://s.shopee.co.th/EXPLICIT',
+    longLink: 'https://shopee.co.th/product/333/444?utm_content=explicit-sub2-sub3-sub4-sub5',
+  });
+
+  const result = await server.handleShorten({
+    account: 'affiliate_chearb.com',
+    url: 'https://shopee.co.th/-i.333.444',
+    id: '15142270000',
+    sub1: 'explicit',
+  });
+
+  assert.equal(result.account, 'affiliate_chearb.com');
+  assert.equal(stub.getPageCalls[0].account, 'affiliate_chearb.com');
+});
+
+test('handleShorten rejects unknown Shopee id alias before opening a browser', async (t) => {
+  server._resetSessionStateCacheForTest();
+  t.after(() => server._resetSessionStateCacheForTest());
+  const originalGetPage = browser.getPage;
+  const getPageCalls = [];
+  browser.getPage = async (...args) => {
+    getPageCalls.push(args);
+    throw new Error('browser.getPage must not run for an unknown id alias');
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  await assert.rejects(
+    () => server.handleShorten({
+      url: 'https://shopee.co.th/-i.111.222',
+      id: '999999999999',
+    }),
+    /Unknown Shopee affiliate id: 999999999999/,
+  );
+  assert.equal(getPageCalls.length, 0);
+});
+
+test('handleShorten uses explicit Shopee id in payload even when tracking utm_source differs', async (t) => {
+  server._resetSessionStateCacheForTest();
+  server.recordSessionState('shopee', 'affiliate_neezs.com', {
+    sessionValid: true,
+    customLinkAuthenticated: true,
+  });
+  stubShopeeShortenSuccess(t, {
+    shortLink: 'https://s.shopee.co.th/PAYLOADID',
+    longLink: 'https://shopee.co.th/product/555/666?utm_content=payload-sub2-sub3-sub4-sub5',
+    resolvedShortLinkUrl: 'https://shopee.co.th/product/555/666?utm_source=an_999999999&utm_content=payload-sub2-sub3-sub4-sub5',
+  });
+
+  const result = await server.handleShorten({
+    url: 'https://shopee.co.th/-i.555.666',
+    id: 'an_15142270000',
+    sub1: 'payload',
+  });
+
+  assert.equal(result.id, '15142270000');
+  assert.equal(result.utm_source, 'an_999999999');
+  assert.equal(result.account, 'affiliate_neezs.com');
 });
 
 test('handleShorten reuses authenticated Shopee dashboard context after auto reauth and returns shortLink', async (t) => {

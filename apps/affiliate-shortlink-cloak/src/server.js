@@ -46,6 +46,10 @@ const {
   shopeeCustomLinkLoginRequiredDiagnostic,
   sanitizeDiagnosticUrl: sanitizeShopeeDiagnosticUrl,
 } = require('./shopee-route');
+const {
+  resolveShopeeAccountFromId,
+  normalizeShopeeAffiliateId,
+} = require('./shopee-accounts');
 
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 const MAX_RECENT_LOGIN_DIAGNOSTICS = 8;
@@ -613,7 +617,18 @@ async function handleShorten(query, opts = {}) {
   const platform = explicitPlatform || detectPlatform(rawUrl);
   if (!platform) throw new Error(`Cannot detect platform from url: ${rawUrl}`);
 
-  const account = sanitizeAccount(query.account);
+  const rawAccount = String(query.account || '').trim();
+  const explicitId = normalizeShopeeAffiliateId(query.id);
+  let account;
+  if (rawAccount) {
+    account = sanitizeAccount(rawAccount);
+  } else if (platform === 'shopee' && explicitId) {
+    const resolvedAccount = resolveShopeeAccountFromId(explicitId);
+    if (!resolvedAccount) throw new Error('Unknown Shopee affiliate id: ' + explicitId);
+    account = sanitizeAccount(resolvedAccount);
+  } else {
+    account = sanitizeAccount(query.account);
+  }
   const autoReauth = opts.autoReauth !== false;
 
   const onSessionExpired = autoReauth
@@ -635,6 +650,7 @@ async function handleShorten(query, opts = {}) {
       link: rawUrl,
       longLink: d.longLink || resolvedOriginalLink || '',
       shortLink: d.shortLink,
+      id: explicitId,
       utmSource: extractUtmSource(resolvedShortLink),
       account,
       sub1: query.sub1 || '',

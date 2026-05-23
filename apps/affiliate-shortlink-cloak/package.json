@@ -8,7 +8,7 @@
     "start": "node bin/start.js",
     "smoke": "node --test \"test/**/*.test.js\"",
     "test": "node --test \"test/**/*.test.js\"",
-    "check": "node --check bin/start.js && node --check src/server.js && node --check src/browser.js && node --check src/accounts.js && node --check src/normalize.js && node --check src/payload.js && node --check src/platforms.js && node --check src/config.js && node --check src/shopee-route.js && node --check src/shopee.js && node --check src/lazada.js && node --check src/login.js && node --check src/keychain.js"
+    "check": "node --check bin/start.js && node --check src/server.js && node --check src/browser.js && node --check src/accounts.js && node --check src/normalize.js && node --check src/payload.js && node --check src/platforms.js && node --check src/config.js && node --check src/shopee-route.js && node --check src/shopee-accounts.js && node --check src/shopee.js && node --check src/lazada.js && node --check src/login.js && node --check src/keychain.js"
   },
   "dependencies": {
     "cloakbrowser": "^0.3.30",
