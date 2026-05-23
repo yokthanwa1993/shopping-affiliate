@@ -95,7 +95,7 @@ export function finalizePostingAffiliateVerification(params: {
         markShopeeRequiredFailure(shopee)
     }
 
-    const lazadaMustVerify = hasValue(lazada.expectedId) && (hasValue(lazada.inputLink) || !!params.lazadaRequired)
+    const lazadaMustVerify = hasValue(lazada.expectedId) && !!params.lazadaRequired
     if (lazadaMustVerify) {
         markLazadaRequiredFailure(lazada)
     }

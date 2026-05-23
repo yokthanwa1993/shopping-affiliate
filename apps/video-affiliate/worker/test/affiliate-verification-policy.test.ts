@@ -33,7 +33,7 @@ test('enforced namespace blocks Shopee when an expected id exists but no link is
     assert.match(result.error || '', /Shopee affiliate link missing/)
 })
 
-test('enforced namespace blocks Lazada when a present link cannot resolve member_id', () => {
+test('enforced namespace blocks required Lazada when a present link cannot resolve member_id', () => {
     const result = finalizePostingAffiliateVerification({
         enforced: true,
         shopee: platform(),
@@ -43,6 +43,7 @@ test('enforced namespace blocks Lazada when a present link cannot resolve member
             status: 'skipped',
             match: 0,
         }),
+        lazadaRequired: true,
     })
 
     assert.equal(result.ok, false)
@@ -76,6 +77,36 @@ test('enforced namespace keeps optional missing Lazada trace non-blocking', () =
     assert.equal(result.ok, true)
     assert.equal(result.status, 'skipped')
     assert.equal(result.error, null)
+})
+
+test('enforced namespace keeps optional present Lazada mismatch non-blocking when Shopee is verified', () => {
+    for (const options of [{}, { lazadaRequired: false }]) {
+        const result = finalizePostingAffiliateVerification({
+            enforced: true,
+            shopee: platform({
+                inputLink: 'https://s.shopee.co.th/example',
+                resolvedLink: 'https://shopee.co.th/product/example',
+                expectedId: '15130770000',
+                actualId: '15130770000',
+                status: 'verified',
+                match: 1,
+            }),
+            lazada: platform({
+                inputLink: 'https://s.lazada.co.th/example',
+                expectedId: '199431090',
+                status: 'mismatch',
+                match: 0,
+            }),
+            ...options,
+        })
+
+        assert.equal(result.ok, true)
+        assert.equal(result.status, 'verified')
+        assert.equal(result.error, null)
+        assert.equal(result.shopee.status, 'verified')
+        assert.equal(result.lazada.status, 'mismatch')
+        assert.equal(result.lazada.match, 0)
+    }
 })
 
 test('non-enforced namespace records invalid affiliate state without blocking', () => {
