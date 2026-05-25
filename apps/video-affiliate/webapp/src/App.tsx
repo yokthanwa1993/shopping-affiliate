@@ -663,6 +663,7 @@ interface FacebookPage {
   is_active: number
   onecard_enabled?: number
   ads_publish_enabled?: number
+  caption_link_enabled?: number
   onecard_link_mode?: 'shopee' | 'lazada' | 'none'
   onecard_cta?: 'SHOP_NOW' | 'NO_BUTTON'
   last_post_at?: string
@@ -2633,6 +2634,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [isActive, setIsActive] = useState(page.is_active === 1)
   const [oneCardEnabled, setOneCardEnabled] = useState(page.onecard_enabled === 1)
   const [adsPublishEnabled, setAdsPublishEnabled] = useState(page.ads_publish_enabled === 1)
+  const [captionLinkEnabled, setCaptionLinkEnabled] = useState(page.caption_link_enabled === 1)
   const [adsSubId, setAdsSubId] = useState('')
   const [adsShortlinkUrl, setAdsShortlinkUrl] = useState('https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}')
   const [adsCommentTemplate, setAdsCommentTemplate] = useState('🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}')
@@ -2684,6 +2686,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     setIsActive(page.is_active === 1)
     setOneCardEnabled(page.onecard_enabled === 1)
     setAdsPublishEnabled(page.ads_publish_enabled === 1)
+    setCaptionLinkEnabled(page.caption_link_enabled === 1)
     setOneCardLinkMode(() => {
       const value = String(page.onecard_link_mode || '').trim().toLowerCase()
       if (value === 'lazada') return 'lazada'
@@ -2705,6 +2708,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     page.is_active,
     page.onecard_enabled,
     page.ads_publish_enabled,
+    page.caption_link_enabled,
     page.onecard_link_mode,
     page.onecard_cta,
     page.access_token,
@@ -2841,6 +2845,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         base_is_active: page.is_active === 1 ? 1 : 0,
         onecard_enabled: oneCardEnabled,
         ads_publish_enabled: adsPublishEnabled,
+        caption_link_enabled: captionLinkEnabled,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
       }
@@ -2865,6 +2870,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         is_active: isActive ? 1 : 0,
         onecard_enabled: oneCardEnabled ? 1 : 0,
         ads_publish_enabled: adsPublishEnabled ? 1 : 0,
+        caption_link_enabled: captionLinkEnabled ? 1 : 0,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
         access_token: nextToken,
@@ -2977,6 +2983,25 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           >
             <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${isActive ? 'right-1' : 'left-1'}`}></div>
           </button>
+        </div>
+
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">ใส่ลิงก์ในแคปชั่น</p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                เปิด = ระบบจะโพสต์โดยใส่ Shopee link บรรทัดแรกก่อน แล้วหลังโพสต์สำเร็จจะพยายามแก้แคปชั่นเอาลิงก์ออก เพื่อลดความเสี่ยงกฎ Facebook
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setCaptionLinkEnabled(!captionLinkEnabled)}
+              className={`shrink-0 w-12 h-7 rounded-full relative transition-colors ${captionLinkEnabled ? 'bg-green-500' : 'bg-gray-300'}`}
+              aria-pressed={captionLinkEnabled}
+            >
+              <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${captionLinkEnabled ? 'right-1' : 'left-1'}`}></div>
+            </button>
+          </div>
         </div>
 
         <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-4">

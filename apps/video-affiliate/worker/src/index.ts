@@ -19220,6 +19220,7 @@ app.get('/api/gallery/:id', async (c) => {
 // ==================== PAGES API ====================
 
 const FB_GRAPH_V19 = 'https://graph.facebook.com/v19.0'
+const FB_GRAPH_V21 = 'https://graph.facebook.com/v21.0'
 const FACEBOOK_GRAPH_SDK_TIMEOUT_MS = 45000
 const DEFAULT_BROWSERSAVING_WORKER_URL = 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev'
 const DEFAULT_BROWSERSAVING_API_URL = 'https://browsersaving-api.lslly.com'
@@ -23046,6 +23047,57 @@ async function facebookGraphDelete(
         }
     } catch (err) {
         throw toFacebookRequestFailedError(err, 'facebook_graph_delete_failed')
+    }
+}
+
+function buildCaptionLinkFirstDescription(caption: string, shopeeLink: string): string {
+    const link = String(shopeeLink || '').trim()
+    const originalCaption = String(caption || '')
+    if (!link) return originalCaption
+    return originalCaption ? `${link}\n${originalCaption}` : link
+}
+
+function sanitizeFacebookCaptionCleanupError(raw: unknown): string {
+    const parsed = parseFacebookErrorLike(raw)
+    const rawMessage = parsed?.message || (raw instanceof Error ? raw.message : String(raw))
+    return String(rawMessage || 'unknown')
+        .replace(/access_token=([^&\s]+)/gi, 'access_token=[REDACTED]')
+        .replace(/\bEA[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]')
+        .slice(0, 300)
+}
+
+async function cleanupFacebookVideoDescriptionAfterCaptionLink(params: {
+    fbVideoId: string
+    postingToken: string
+    caption: string
+    logPrefix: string
+}): Promise<void> {
+    const fbVideoId = String(params.fbVideoId || '').trim()
+    const postingToken = String(params.postingToken || '').trim()
+    const caption = String(params.caption || '')
+    if (!fbVideoId || !postingToken) {
+        console.warn(`[${params.logPrefix}] caption link cleanup skipped target=${fbVideoId || '(missing)'} reason=${fbVideoId ? 'posting_token_missing' : 'fb_video_id_missing'}`)
+        return
+    }
+
+    try {
+        const form = new URLSearchParams()
+        form.set('access_token', postingToken)
+        form.set('description', caption)
+        const resp = await fetchWithTimeout(`${FB_GRAPH_V21}/${encodeURIComponent(fbVideoId)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: form.toString(),
+        }, FACEBOOK_GRAPH_SDK_TIMEOUT_MS, 'facebook_caption_link_cleanup')
+        const data = await resp.json().catch(() => ({}))
+        const graphErr = parseFacebookErrorLike(data)
+        if (!resp.ok || graphErr?.message) {
+            const message = graphErr?.message || `facebook_caption_link_cleanup_http_${resp.status}`
+            throw new FacebookRequestFailedError(message, Number(graphErr?.code || 0), Number(graphErr?.error_subcode || 0))
+        }
+        console.log(`[${params.logPrefix}] caption link cleanup ok target=${fbVideoId} description_len=${caption.length}`)
+    } catch (err) {
+        console.warn(`[${params.logPrefix}] caption link cleanup failed target=${fbVideoId} error=${sanitizeFacebookCaptionCleanupError(err)}`)
     }
 }
 
@@ -27594,6 +27646,7 @@ async function ensurePagesOneCardColumns(db: D1Database): Promise<void> {
         `ALTER TABLE pages ADD COLUMN onecard_link_mode TEXT DEFAULT 'shopee'`,
         `ALTER TABLE pages ADD COLUMN onecard_cta TEXT DEFAULT 'SHOP_NOW'`,
         `ALTER TABLE pages ADD COLUMN ads_publish_enabled INTEGER DEFAULT 0`,
+        `ALTER TABLE pages ADD COLUMN caption_link_enabled INTEGER DEFAULT 0`,
     ]
     for (const sql of alterStatements) {
         await db.prepare(sql).run().catch(() => undefined)
@@ -27913,7 +27966,7 @@ app.get('/api/pages', async (c) => {
         const botId = c.get('botId')
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
         c.header('Cache-Control', 'private, no-store')
         return c.json({ pages })
@@ -27939,7 +27992,7 @@ app.get('/api/admin/pages', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(requestedNamespaceId).all()).results || []) as any[])
         return c.json({ pages, namespace_id: requestedNamespaceId })
     } catch (e) {
@@ -28267,7 +28320,7 @@ app.get('/api/pages/:id', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
         if (!page) return c.json({ error: 'Page not found' }, 404)
         c.header('Cache-Control', 'private, no-store')
@@ -28755,18 +28808,19 @@ app.delete('/api/pages/:id/tag-profiles/:profileId', async (c) => {
 app.post('/api/pages', async (c) => {
     try {
         const body = await c.req.json()
-        const { id, name, image_url, access_token, post_interval_minutes = 60, onecard_enabled = false, onecard_link_mode, onecard_cta } = body
+        const { id, name, image_url, access_token, post_interval_minutes = 60, onecard_enabled = false, onecard_link_mode, onecard_cta, caption_link_enabled = false } = body
         const botId = c.get('botId')
         const postToken = String(access_token || '').trim()
         const onecardEnabled = onecard_enabled === true || Number(onecard_enabled || 0) === 1 ? 1 : 0
+        const captionLinkEnabled = caption_link_enabled === true || Number(caption_link_enabled || 0) === 1 ? 1 : 0
         const onecardLinkMode = normalizePageOneCardLinkMode(onecard_link_mode)
         const onecardCta = normalizePageOneCardCta(onecard_cta)
         await ensurePagesOneCardColumns(c.env.DB)
         const existingInNamespace = await c.env.DB.prepare(
-            'SELECT id FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, botId).first()
         if (existingInNamespace) {
-            return c.json({ success: true, id, updated: false })
+            return c.json({ success: true, id, updated: false, page: existingInNamespace })
         }
 
         const existingInOtherNamespace = await c.env.DB.prepare(
@@ -28781,10 +28835,13 @@ app.post('/api/pages', async (c) => {
         }
 
         await c.env.DB.prepare(
-            'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, bot_id, onecard_enabled, onecard_link_mode, onecard_cta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-        ).bind(id, name, image_url, postToken, post_interval_minutes, botId, onecardEnabled, onecardLinkMode, onecardCta).run()
+            'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, bot_id, onecard_enabled, onecard_link_mode, onecard_cta, caption_link_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(id, name, image_url, postToken, post_interval_minutes, botId, onecardEnabled, onecardLinkMode, onecardCta, captionLinkEnabled).run()
 
-        return c.json({ success: true, id })
+        const page = await c.env.DB.prepare(
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(id, botId).first()
+        return c.json({ success: true, id, page })
     } catch (e) {
         return c.json({ error: 'Failed to create page' }, 500)
     }
@@ -28805,6 +28862,7 @@ app.put('/api/pages/:id', async (c) => {
             onecard_link_mode,
             onecard_cta,
             ads_publish_enabled,
+            caption_link_enabled,
             base_post_hours,
             base_post_interval_minutes,
             base_is_active,
@@ -28814,11 +28872,12 @@ app.put('/api/pages/:id', async (c) => {
         // over a server-cleared post_hours='' — visible only by knowing PUT was hit and
         // with which payload. token redacted to a short tail to avoid leaking secrets.
         const tokenTail = access_token !== undefined ? String(access_token || '').trim().slice(-6) : '(unset)'
-        console.log(`[PAGES-PUT] page=${id} ns=${c.get('botId')} post_hours=${JSON.stringify(post_hours ?? null)} post_interval_minutes=${JSON.stringify(post_interval_minutes ?? null)} is_active=${JSON.stringify(is_active ?? null)} access_token_tail=${tokenTail} onecard_enabled=${JSON.stringify(onecard_enabled ?? null)} ads_publish_enabled=${JSON.stringify(ads_publish_enabled ?? null)}`)
+        console.log(`[PAGES-PUT] page=${id} ns=${c.get('botId')} post_hours=${JSON.stringify(post_hours ?? null)} post_interval_minutes=${JSON.stringify(post_interval_minutes ?? null)} is_active=${JSON.stringify(is_active ?? null)} access_token_tail=${tokenTail} onecard_enabled=${JSON.stringify(onecard_enabled ?? null)} ads_publish_enabled=${JSON.stringify(ads_publish_enabled ?? null)} caption_link_enabled=${JSON.stringify(caption_link_enabled ?? null)}`)
         // comment_token is now treated as access_token (unified token model)
         let normalizedPostHours = post_hours as string | undefined
         let normalizedInterval = post_interval_minutes as number | undefined
         const nextOneCardEnabled = onecard_enabled !== undefined ? ((onecard_enabled === true || Number(onecard_enabled || 0) === 1) ? 1 : 0) : undefined
+        const nextCaptionLinkEnabled = caption_link_enabled !== undefined ? ((caption_link_enabled === true || Number(caption_link_enabled || 0) === 1) ? 1 : 0) : undefined
         const nextOneCardLinkMode = onecard_link_mode !== undefined ? normalizePageOneCardLinkMode(onecard_link_mode) : undefined
         const nextOneCardCta = onecard_cta !== undefined ? normalizePageOneCardCta(onecard_cta) : undefined
 
@@ -28962,6 +29021,11 @@ app.put('/api/pages/:id', async (c) => {
                 'UPDATE pages SET onecard_cta = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(nextOneCardCta, id, c.get('botId')).run()
         }
+        if (nextCaptionLinkEnabled !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET caption_link_enabled = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextCaptionLinkEnabled, id, c.get('botId')).run()
+        }
 
         const tokenUpdated = access_token !== undefined || comment_token !== undefined
         const resolved: { access_token?: string; comment_token?: string } = {}
@@ -29073,7 +29137,7 @@ app.put('/api/pages/:id', async (c) => {
         }
 
         const updatedPage = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
 
         return c.json({ success: true, resolved, resolved_details, page: updatedPage })
@@ -30557,6 +30621,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let pageOneCardEnabled = false
     let pageOneCardLinkMode: PageOneCardLinkMode = 'shopee'
     let pageOneCardCta: PageOneCardCta = 'SHOP_NOW'
+    let pageCaptionLinkEnabled = false
 
     try {
         // Check if skip comment
@@ -30567,8 +30632,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Get page info
         await ensurePagesOneCardColumns(env.DB)
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled FROM pages WHERE id = ? AND bot_id = ?'
-        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null } | null
+            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null; caption_link_enabled?: number | null } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
         pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
@@ -30584,6 +30649,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
         pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
         pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
+        pageCaptionLinkEnabled = Number(page.caption_link_enabled || 0) === 1
         pageCommentToken = null
         const tokenCandidates = await ensurePageTokenCandidates({
             env,
@@ -30853,6 +30919,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
         })
+        const captionLinkCleanupEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
+        const publishDescription = captionLinkCleanupEnabled
+            ? buildCaptionLinkFirstDescription(caption, normalizedShopeeLink)
+            : caption
 
         const reelResult = pageOneCardEnabled
             ? await publishVideoViaOneCard({
@@ -30871,13 +30941,21 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 videoBuffer,
                 thumbnailBuffer: postingThumbnail?.buffer || null,
                 thumbnailContentType: postingThumbnail?.contentType || '',
-                description: caption,
+                description: publishDescription,
                 logPrefix: 'FORCE-POST',
             })
         postingTokenUsed = reelResult.postingToken
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
         fbVideoId = reelResult.id
+        if (captionLinkCleanupEnabled) {
+            c.executionCtx.waitUntil(cleanupFacebookVideoDescriptionAfterCaptionLink({
+                fbVideoId,
+                postingToken: reelResult.postingToken,
+                caption,
+                logPrefix: 'FORCE-POST',
+            }))
+        }
         const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
         let commentShopeeLink = normalizedShopeeLink
         if (commentShopeeLink && !skipComment && hasCommentToken) {
@@ -32058,7 +32136,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     // The API-side drift guard already ensures post_hours stays in sync with
     // interval-mode saves, so a NULL/empty post_hours genuinely means "off".
     const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta
+        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta, caption_link_enabled, ads_publish_enabled
         FROM pages
         WHERE is_active = 1
           AND post_hours IS NOT NULL
@@ -32074,6 +32152,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             onecard_enabled?: number | null
             onecard_link_mode?: string | null
             onecard_cta?: string | null
+            caption_link_enabled?: number | null
+            ads_publish_enabled?: number | null
         }>
     }
     // Visibility: dump every page the cron picked up plus its schedule so a future
@@ -32420,7 +32500,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
         const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
         const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
-        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        const pageCaptionLinkEnabled = Number(page.caption_link_enabled || 0) === 1
+        const pageAdsPublishEnabled = Number(page.ads_publish_enabled || 0) === 1
         const commentTemplateRequiresLazada = await namespaceCommentTemplateRequiresLazadaLink(env.DB, botId).catch(() => true)
         const oneCardRequiresLazada = pageOneCardEnabled && pageOneCardCta !== 'NO_BUTTON' && pageOneCardLinkMode === 'lazada'
         const lazadaLinkRequiredForPosting = !!rawLazadaLink && !pageAdsPublishEnabled && (commentTemplateRequiresLazada || oneCardRequiresLazada)
@@ -32740,6 +32821,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 shopeeLink: normalizedShopeeLink,
                 lazadaLink: normalizedLazadaLink,
             })
+            const captionLinkCleanupEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
+            const publishDescription = captionLinkCleanupEnabled
+                ? buildCaptionLinkFirstDescription(caption, normalizedShopeeLink)
+                : caption
 
             const reelResult = pageOneCardEnabled
                 ? await publishVideoViaOneCard({
@@ -32758,12 +32843,25 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     videoBuffer,
                     thumbnailBuffer: postingThumbnail?.buffer || null,
                     thumbnailContentType: postingThumbnail?.contentType || '',
-                    description: caption,
+                    description: publishDescription,
                     logPrefix: `CRON ${page.name}`,
                 })
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id
+            if (captionLinkCleanupEnabled) {
+                const cleanupTask = cleanupFacebookVideoDescriptionAfterCaptionLink({
+                    fbVideoId,
+                    postingToken: reelResult.postingToken,
+                    caption,
+                    logPrefix: `CRON ${page.name}`,
+                })
+                if (ctx) {
+                    ctx.waitUntil(cleanupTask)
+                } else {
+                    cleanupTask.catch(() => undefined)
+                }
+            }
             const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
             const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
             const scheduledCommentDelaySeconds = normalizedShopeeLink && hasCommentToken
