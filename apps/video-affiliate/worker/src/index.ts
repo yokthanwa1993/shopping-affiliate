@@ -29703,16 +29703,32 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
 
         fbVideoId = reelResult.id
         const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+        let commentShopeeLink = normalizedShopeeLink
+        if (commentShopeeLink && !skipComment && hasCommentToken) {
+            try {
+                const reshortened = await resolvePostingShopeeLinkForNamespace({
+                    env,
+                    namespaceId: botId,
+                    shopeeLink: rawShopeeLink || normalizedShopeeLink,
+                    logPrefix: 'RETRY-POST COMMENT-SHORTLINK',
+                    postSubId2: confirmedPostId,
+                    postSubId3: pageId,
+                })
+                if (reshortened) commentShopeeLink = reshortened
+            } catch (reshortenErr) {
+                console.log(`[RETRY-POST COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+            }
+        }
         const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
-        const scheduledCommentDelaySeconds = normalizedShopeeLink && !skipComment && hasCommentToken
+        const scheduledCommentDelaySeconds = commentShopeeLink && !skipComment && hasCommentToken
             ? getRandomCommentDelaySeconds()
             : null
         const scheduledCommentDueAt = scheduledCommentDelaySeconds
             ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
             : null
-        const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+        const postReadyCommentState = getPostReadyCommentTraceState(!!commentShopeeLink, hasCommentToken, skipComment)
         await env.DB.prepare(
-            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE id = ? AND status = 'posting'"
+            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ?, shopee_link = ? WHERE id = ? AND status = 'posting'"
         ).bind(
             confirmedPostId,
             fbReelUrl,
@@ -29724,6 +29740,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             postReadyCommentState.error,
             scheduledCommentDelaySeconds,
             scheduledCommentDueAt,
+            commentShopeeLink || normalizedShopeeLink || null,
             retryHistoryId,
         ).run()
 
@@ -29734,7 +29751,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         let commentProfileId: string | null = null
         let commentProfileName: string | null = null
 
-        if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+        if (commentShopeeLink && !skipComment && hasCommentToken) {
             commentStatus = 'pending'
             commentError = null
         } else if (skipComment) {
@@ -29743,7 +29760,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         }
 
         await env.DB.prepare(
-            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status = 'posting'"
+            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ?, shopee_link = ? WHERE id = ? AND status = 'posting'"
         ).bind(
             confirmedPostId,
             fbReelUrl,
@@ -29756,6 +29773,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             commentProfileName,
             commentError,
             commentFbId,
+            commentShopeeLink || normalizedShopeeLink || null,
             retryHistoryId,
         ).run()
         await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
@@ -29814,7 +29832,23 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                 }
 
                 if (recoveredPostId) {
-                    const recoveredCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+                    let commentShopeeLink = normalizedShopeeLink
+                    if (commentShopeeLink && !skipComment && hasCommentToken) {
+                        try {
+                            const reshortened = await resolvePostingShopeeLinkForNamespace({
+                                env,
+                                namespaceId: botId,
+                                shopeeLink: normalizedShopeeLink,
+                                logPrefix: 'RETRY-POST-RECOVER COMMENT-SHORTLINK',
+                                postSubId2: recoveredPostId,
+                                postSubId3: pageId,
+                            })
+                            if (reshortened) commentShopeeLink = reshortened
+                        } catch (reshortenErr) {
+                            console.log(`[RETRY-POST-RECOVER COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                        }
+                    }
+                    const recoveredCommentState = getPostReadyCommentTraceState(!!commentShopeeLink, hasCommentToken, skipComment)
                     let commentStatus = recoveredCommentState.status
                     let commentError: string | null = recoveredCommentState.error
                     let commentFbId: string | null = null
@@ -29823,14 +29857,14 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                     let commentProfileName: string | null = null
                     const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
 
-                    if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+                    if (commentShopeeLink && !skipComment && hasCommentToken) {
                         const commentWaitMs = getRandomCommentDelayMs()
                         await waitMs(commentWaitMs)
                         const commentResult = await postShopeeCommentWithFallback({
                             env,
                             namespaceId: botId,
                             fbVideoId: commentTargetId,
-                            shopeeLink: normalizedShopeeLink,
+                            shopeeLink: commentShopeeLink,
                             lazadaLink: normalizedLazadaLink,
                             commentTokens: commentTokenCandidates,
                             pageId,
@@ -30845,17 +30879,33 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         fbVideoId = reelResult.id
         const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+        let commentShopeeLink = normalizedShopeeLink
+        if (commentShopeeLink && !skipComment && hasCommentToken) {
+            try {
+                const reshortened = await resolvePostingShopeeLinkForNamespace({
+                    env,
+                    namespaceId: botId,
+                    shopeeLink: normalizedShopeeLink,
+                    logPrefix: 'FORCE-POST COMMENT-SHORTLINK',
+                    postSubId2: confirmedPostId,
+                    postSubId3: pageId,
+                })
+                if (reshortened) commentShopeeLink = reshortened
+            } catch (reshortenErr) {
+                console.log(`[FORCE-POST COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+            }
+        }
         const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
-        const scheduledCommentDelaySeconds = normalizedShopeeLink && !skipComment && hasCommentToken
+        const scheduledCommentDelaySeconds = commentShopeeLink && !skipComment && hasCommentToken
             ? getRandomCommentDelaySeconds()
             : null
         const scheduledCommentDueAt = scheduledCommentDelaySeconds
             ? new Date(Date.now() + (scheduledCommentDelaySeconds * 1000)).toISOString()
             : null
-        const postReadyCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, skipComment)
+        const postReadyCommentState = getPostReadyCommentTraceState(!!commentShopeeLink, hasCommentToken, skipComment)
         if (forceHistoryId) {
             await env.DB.prepare(
-                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ? WHERE id = ? AND status = 'posting'"
+                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_error = ?, comment_delay_seconds = ?, comment_due_at = ?, shopee_link = ? WHERE id = ? AND status = 'posting'"
             ).bind(
                 confirmedPostId,
                 fbReelUrl,
@@ -30867,6 +30917,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 postReadyCommentState.error,
                 scheduledCommentDelaySeconds,
                 scheduledCommentDueAt,
+                commentShopeeLink || normalizedShopeeLink || null,
                 forceHistoryId,
             ).run()
         }
@@ -30878,7 +30929,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         let commentProfileId: string | null = null
         let commentProfileName: string | null = null
 
-        if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+        if (commentShopeeLink && !skipComment && hasCommentToken) {
             commentStatus = 'pending'
             commentError = null
         } else if (skipComment) {
@@ -30890,7 +30941,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Update to success
         if (forceHistoryId) {
             await env.DB.prepare(
-                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status = 'posting'"
+                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ?, shopee_link = ? WHERE id = ? AND status = 'posting'"
             ).bind(
                 confirmedPostId,
                 fbReelUrl,
@@ -30903,6 +30954,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 commentProfileName,
                 commentError,
                 commentFbId,
+                commentShopeeLink || normalizedShopeeLink || null,
                 forceHistoryId,
             ).run()
         }
