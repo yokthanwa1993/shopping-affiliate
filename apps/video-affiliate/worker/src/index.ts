@@ -8521,6 +8521,7 @@ app.post('/admin/api/comments/retry', async (c) => {
                 shopeeLink,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
                 postSubId2: fbPostId,
+                postSubId3: pageId,
             })
             if (!shortShopeeLink) {
                 const err = 'shopee_shortlink_failed'
@@ -23607,6 +23608,13 @@ async function shortenShopeeLinkForNamespace(params: {
     // conversion callers should leave this undefined so settings sub_id2
     // continues to apply.
     postSubId2?: string
+    // Optional override for Sub ID 3 used only at posting/comment time. When
+    // supplied (e.g. Facebook page id), it replaces the namespace-configured
+    // sub_id3 for this request only so the affiliate report can attribute
+    // clicks back to the specific page that owns the post. Processing-time
+    // conversion callers should leave this undefined so settings sub_id3
+    // continues to apply.
+    postSubId3?: string
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -23640,7 +23648,12 @@ async function shortenShopeeLinkForNamespace(params: {
     // back to the configured sub_id2 when no override is supplied.
     const overriddenSub2 = normalizeShortlinkSubId(params.postSubId2 || '')
     const effectiveSub2 = overriddenSub2 || subIds.sub2
-    const effectiveSubIds = { ...subIds, sub1: effectiveSub1, sub2: effectiveSub2 }
+    // Posting-time callers may also inject the Facebook page id as Sub ID 3 so
+    // the operator can tell which page a click belongs to. Fall back to the
+    // configured sub_id3 when no override is supplied.
+    const overriddenSub3 = normalizeShortlinkSubId(params.postSubId3 || '')
+    const effectiveSub3 = overriddenSub3 || subIds.sub3
+    const effectiveSubIds = { ...subIds, sub1: effectiveSub1, sub2: effectiveSub2, sub3: effectiveSub3 }
     const urlTemplate = shortlinkSettings.urlTemplate
 
     // Priority: 1) URL template from settings  2) baseUrl derived from account
@@ -23660,7 +23673,7 @@ async function shortenShopeeLinkForNamespace(params: {
         requestUrl.searchParams.set('url', originalLink)
         requestUrl.searchParams.set('sub1', effectiveSub1)
         if (effectiveSub2) requestUrl.searchParams.set('sub2', effectiveSub2)
-        if (subIds.sub3) requestUrl.searchParams.set('sub3', subIds.sub3)
+        if (effectiveSub3) requestUrl.searchParams.set('sub3', effectiveSub3)
         if (subIds.sub4) requestUrl.searchParams.set('sub4', subIds.sub4)
         if (subIds.sub5) requestUrl.searchParams.set('sub5', subIds.sub5)
         finalRequestUrl = requestUrl.toString()
@@ -23737,6 +23750,11 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     // Pass undefined when no post id is available so the namespace-configured
     // sub_id2 is used instead.
     postSubId2?: string
+    // Facebook page id used to populate shortlink Sub ID 3 for the comment
+    // that will be attached to the freshly published post/reel so the operator
+    // can attribute clicks back to a specific page. Pass undefined when no
+    // page id is available so the namespace-configured sub_id3 is used.
+    postSubId3?: string
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -23787,6 +23805,7 @@ async function resolvePostingShopeeLinkForNamespace(params: {
             shopeeLink: link,
             logPrefix: params.logPrefix,
             postSubId2: params.postSubId2,
+            postSubId3: params.postSubId3,
             trace,
         })
         if (shortened && trace.status === 'shortened' && !isShopeeHomepageOnlyLink(shortened)) return shortened
@@ -26569,6 +26588,7 @@ async function reconcilePostingHistoryRows(params: {
                         shopeeLink,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
                         postSubId2: recoveredPostId,
+                        postSubId3: String(row.page_id || ''),
                     })
                     if (!shortShopeeLink) {
                         commentStatus = 'failed'
@@ -31423,6 +31443,7 @@ app.post('/api/manual-post-reel', async (c) => {
                         shopeeLink,
                         logPrefix: 'MANUAL-REEL',
                         postSubId2: confirmedPostId,
+                        postSubId3: pageId,
                     })
                     if (reshortened) commentShopeeLink = reshortened
                 } catch (reshortenErr) {
@@ -31685,6 +31706,7 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 shopeeLink,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
                 postSubId2: fbPostIdRaw,
+                postSubId3: pageId,
             })
             if (!shortShopeeLink) {
                 await env.DB.prepare(

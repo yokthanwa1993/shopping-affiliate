@@ -81,3 +81,27 @@ test('postSubId2 override is sanitized of unsafe characters before use', () => {
     assert.ok(!/[\r\n\t]/.test(sanitized))
     assert.ok(sanitized.startsWith('1008898512617594_1277758961195466'))
 })
+
+test('postSubId3 override semantics: empty override falls back to settings sub3', () => {
+    // Mirrors the override resolution used in shortenShopeeLinkForNamespace:
+    //   effectiveSub3 = normalizeShortlinkSubId(postSubId3 || '') || settingsSub3
+    const settingsSub3 = 'configuredSub3'
+    const resolve = (override?: string) => normalizeShortlinkSubId(override || '') || settingsSub3
+
+    assert.equal(resolve(undefined), settingsSub3)
+    assert.equal(resolve(''), settingsSub3)
+    assert.equal(resolve('   '), settingsSub3)
+    assert.equal(resolve('1008898512617594'), '1008898512617594')
+})
+
+test('buildShortlinkRequestUrlFromTemplate fills sub_id3 with provided page id', () => {
+    const pageId = '1008898512617594'
+    const url = buildShortlinkRequestUrlFromTemplate(SHOPEE_URL_TEMPLATE, PRODUCT_URL, {
+        sub1: 'configuredSub1',
+        sub2: '1008898512617594_1277758961195466',
+        sub3: pageId,
+        sub4: '',
+        sub5: '',
+    })
+    assert.match(url, new RegExp(`sub3=${pageId}`))
+})
