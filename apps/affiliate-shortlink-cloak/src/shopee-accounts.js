@@ -3,13 +3,13 @@
 const { sanitizeAccount } = require('./accounts');
 
 const DEFAULT_SHOPEE_ID_TO_ACCOUNT = Object.freeze({
-  '15142270000': Object.freeze({
-    id: '15142270000',
-    account: 'affiliate_neezs.com',
-    displayAccount: 'affiliate@neezs.com',
-  }),
   '15130770000': Object.freeze({
     id: '15130770000',
+    account: 'affiliate_chearb.com',
+    displayAccount: 'affiliate@chearb.com',
+  }),
+  '15142270000': Object.freeze({
+    id: '15142270000',
     account: 'affiliate_neezs.com',
     displayAccount: 'affiliate@neezs.com',
   }),
@@ -67,11 +67,11 @@ function normalizeShopeeAccountMapping(id, value) {
 function resolveShopeeAccountMetadataFromId(rawId, { envValue = process.env.SHOPEE_ID_ACCOUNT_MAP } = {}) {
   const id = normalizeShopeeAffiliateId(rawId);
   if (!id) return null;
-  const envMap = parseEnvMap(envValue);
-  if (Object.prototype.hasOwnProperty.call(envMap, id)) return envMap[id];
   if (Object.prototype.hasOwnProperty.call(DEFAULT_SHOPEE_ID_TO_ACCOUNT, id)) {
     return DEFAULT_SHOPEE_ID_TO_ACCOUNT[id];
   }
+  const envMap = parseEnvMap(envValue);
+  if (Object.prototype.hasOwnProperty.call(envMap, id)) return envMap[id];
   return null;
 }
 

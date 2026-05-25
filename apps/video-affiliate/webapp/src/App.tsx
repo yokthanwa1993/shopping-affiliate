@@ -669,6 +669,69 @@ interface FacebookPage {
   updated_at?: string
 }
 
+interface PageShortlinkSettingsForm {
+  override_enabled: boolean
+  account: string
+  base_url: string
+  lazada_base_url: string
+  expected_utm_id: string
+  lazada_expected_member_id: string
+  shortlink_url_template: string
+  sub_id1: string
+  sub_id2: string
+  sub_id3: string
+  sub_id4: string
+  sub_id5: string
+  updated_at?: string | null
+}
+
+interface PageShortlinkSettingsResponse {
+  ok?: boolean
+  global?: Partial<PageShortlinkSettingsForm>
+  override?: Partial<PageShortlinkSettingsForm>
+  effective?: Partial<PageShortlinkSettingsForm> & { source?: 'global' | 'page'; page_override_enabled?: boolean }
+  max_account_chars?: number
+  max_chars?: number
+  max_expected_utm_chars?: number
+  max_lazada_member_id_chars?: number
+  max_template_chars?: number
+  max_sub_id_chars?: number
+  error?: string
+}
+
+const createEmptyPageShortlinkSettingsForm = (): PageShortlinkSettingsForm => ({
+  override_enabled: false,
+  account: '',
+  base_url: '',
+  lazada_base_url: '',
+  expected_utm_id: '',
+  lazada_expected_member_id: '',
+  shortlink_url_template: '',
+  sub_id1: '',
+  sub_id2: '',
+  sub_id3: '',
+  sub_id4: '',
+  sub_id5: '',
+  updated_at: null,
+})
+
+const normalizePageShortlinkSettingsForm = (raw?: Partial<PageShortlinkSettingsForm> | null): PageShortlinkSettingsForm => ({
+  ...createEmptyPageShortlinkSettingsForm(),
+  override_enabled: raw?.override_enabled === true,
+  account: String(raw?.account || ''),
+  base_url: String(raw?.base_url || ''),
+  lazada_base_url: String(raw?.lazada_base_url || ''),
+  expected_utm_id: String(raw?.expected_utm_id || ''),
+  lazada_expected_member_id: String(raw?.lazada_expected_member_id || ''),
+  shortlink_url_template: String(raw?.shortlink_url_template || ''),
+  sub_id1: String(raw?.sub_id1 || ''),
+  sub_id2: String(raw?.sub_id2 || ''),
+  sub_id3: String(raw?.sub_id3 || ''),
+  sub_id4: String(raw?.sub_id4 || ''),
+  sub_id5: String(raw?.sub_id5 || ''),
+  updated_at: raw?.updated_at ?? null,
+})
+
 type GalleryFilter = 'missing-lazada' | 'pending-shortlink' | 'ready' | 'used' | 'all-original'
 type InboxFilterView = 'unprocessed' | 'missing_links' | 'processed'
 type GeminiKeySource = 'system' | 'legacy' | 'none'
@@ -2591,6 +2654,28 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [forcingPost, setForcingPost] = useState(false)
   const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
+  const [pageShortlinkLoaded, setPageShortlinkLoaded] = useState(false)
+  const [pageShortlinkLoading, setPageShortlinkLoading] = useState(false)
+  const [pageShortlinkMessage, setPageShortlinkMessage] = useState('')
+  const [globalShortlinkSettings, setGlobalShortlinkSettings] = useState<PageShortlinkSettingsForm>(() => createEmptyPageShortlinkSettingsForm())
+  const [pageShortlinkOverrideEnabled, setPageShortlinkOverrideEnabled] = useState(false)
+  const [pageShortlinkAccount, setPageShortlinkAccount] = useState('')
+  const [pageShortlinkBaseUrl, setPageShortlinkBaseUrl] = useState('')
+  const [pageLazadaShortlinkBaseUrl, setPageLazadaShortlinkBaseUrl] = useState('')
+  const [pageShortlinkExpectedUtmId, setPageShortlinkExpectedUtmId] = useState('')
+  const [pageLazadaExpectedMemberId, setPageLazadaExpectedMemberId] = useState('')
+  const [pageShortlinkUrlTemplate, setPageShortlinkUrlTemplate] = useState('')
+  const [pageShortlinkSubId1, setPageShortlinkSubId1] = useState('')
+  const [pageShortlinkSubId2, setPageShortlinkSubId2] = useState('')
+  const [pageShortlinkSubId3, setPageShortlinkSubId3] = useState('')
+  const [pageShortlinkSubId4, setPageShortlinkSubId4] = useState('')
+  const [pageShortlinkSubId5, setPageShortlinkSubId5] = useState('')
+  const [pageShortlinkMaxAccountChars, setPageShortlinkMaxAccountChars] = useState(64)
+  const [pageShortlinkMaxBaseUrlChars, setPageShortlinkMaxBaseUrlChars] = useState(512)
+  const [pageShortlinkMaxExpectedUtmChars, setPageShortlinkMaxExpectedUtmChars] = useState(32)
+  const [pageShortlinkMaxLazadaMemberChars, setPageShortlinkMaxLazadaMemberChars] = useState(32)
+  const [pageShortlinkMaxTemplateChars, setPageShortlinkMaxTemplateChars] = useState(2048)
+  const [pageShortlinkMaxSubIdChars, setPageShortlinkMaxSubIdChars] = useState(128)
 
   useEffect(() => {
     setHourMinutes(parsePostHours(page.post_hours || ''))
@@ -2625,6 +2710,56 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     page.access_token,
   ])
 
+  useEffect(() => {
+    let cancelled = false
+    const applySettings = (data: PageShortlinkSettingsResponse) => {
+      const globalSettings = normalizePageShortlinkSettingsForm(data.global)
+      const overrideSettings = normalizePageShortlinkSettingsForm(data.override)
+      setGlobalShortlinkSettings(globalSettings)
+      setPageShortlinkOverrideEnabled(overrideSettings.override_enabled)
+      setPageShortlinkAccount(overrideSettings.account)
+      setPageShortlinkBaseUrl(overrideSettings.base_url)
+      setPageLazadaShortlinkBaseUrl(overrideSettings.lazada_base_url)
+      setPageShortlinkExpectedUtmId(overrideSettings.expected_utm_id)
+      setPageLazadaExpectedMemberId(overrideSettings.lazada_expected_member_id)
+      setPageShortlinkUrlTemplate(overrideSettings.shortlink_url_template)
+      setPageShortlinkSubId1(overrideSettings.sub_id1)
+      setPageShortlinkSubId2(overrideSettings.sub_id2)
+      setPageShortlinkSubId3(overrideSettings.sub_id3)
+      setPageShortlinkSubId4(overrideSettings.sub_id4)
+      setPageShortlinkSubId5(overrideSettings.sub_id5)
+      if (typeof data.max_account_chars === 'number' && data.max_account_chars > 0) setPageShortlinkMaxAccountChars(data.max_account_chars)
+      if (typeof data.max_chars === 'number' && data.max_chars > 0) setPageShortlinkMaxBaseUrlChars(data.max_chars)
+      if (typeof data.max_expected_utm_chars === 'number' && data.max_expected_utm_chars > 0) setPageShortlinkMaxExpectedUtmChars(data.max_expected_utm_chars)
+      if (typeof data.max_lazada_member_id_chars === 'number' && data.max_lazada_member_id_chars > 0) setPageShortlinkMaxLazadaMemberChars(data.max_lazada_member_id_chars)
+      if (typeof data.max_template_chars === 'number' && data.max_template_chars > 0) setPageShortlinkMaxTemplateChars(data.max_template_chars)
+      if (typeof data.max_sub_id_chars === 'number' && data.max_sub_id_chars > 0) setPageShortlinkMaxSubIdChars(data.max_sub_id_chars)
+    }
+
+    const loadPageShortlinkSettings = async () => {
+      setPageShortlinkLoading(true)
+      setPageShortlinkLoaded(false)
+      setPageShortlinkMessage('')
+      try {
+        const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/shortlink-settings`)
+        const data = await resp.json().catch(() => ({})) as PageShortlinkSettingsResponse
+        if (!resp.ok) throw new Error(data.error || 'โหลด Shortlink เฉพาะเพจไม่สำเร็จ')
+        if (cancelled) return
+        applySettings(data)
+        setPageShortlinkLoaded(true)
+      } catch (e) {
+        if (!cancelled) {
+          setPageShortlinkMessage(e instanceof Error ? e.message : String(e))
+        }
+      } finally {
+        if (!cancelled) setPageShortlinkLoading(false)
+      }
+    }
+
+    void loadPageShortlinkSettings()
+    return () => { cancelled = true }
+  }, [page.id])
+
   // Hours 00-23 for display
   const hourOptions = Array.from({ length: 24 }, (_, i) => i)
 
@@ -2646,8 +2781,50 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
 
   const postHoursString = selectedHours.map(h => `${h}:${hourMinutes[h].toString().padStart(2, '0')}`).join(',')
 
+  const savePageShortlinkSettings = async () => {
+    if (!pageShortlinkLoaded) return
+    const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/shortlink-settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        override_enabled: pageShortlinkOverrideEnabled,
+        account: pageShortlinkAccount.trim(),
+        base_url: pageShortlinkBaseUrl.trim(),
+        lazada_base_url: pageLazadaShortlinkBaseUrl.trim(),
+        expected_utm_id: pageShortlinkExpectedUtmId.trim(),
+        lazada_expected_member_id: pageLazadaExpectedMemberId.trim(),
+        shortlink_url_template: pageShortlinkUrlTemplate.trim(),
+        sub_id1: pageShortlinkSubId1.trim(),
+        sub_id2: pageShortlinkSubId2.trim(),
+        sub_id3: pageShortlinkSubId3.trim(),
+        sub_id4: pageShortlinkSubId4.trim(),
+        sub_id5: pageShortlinkSubId5.trim(),
+      }),
+    })
+    const data = await resp.json().catch(() => ({})) as PageShortlinkSettingsResponse
+    if (!resp.ok) {
+      throw new Error(data.error || 'บันทึก Shortlink เฉพาะเพจไม่สำเร็จ')
+    }
+    const overrideSettings = normalizePageShortlinkSettingsForm(data.override)
+    const globalSettings = normalizePageShortlinkSettingsForm(data.global)
+    setGlobalShortlinkSettings(globalSettings)
+    setPageShortlinkOverrideEnabled(overrideSettings.override_enabled)
+    setPageShortlinkAccount(overrideSettings.account)
+    setPageShortlinkBaseUrl(overrideSettings.base_url)
+    setPageLazadaShortlinkBaseUrl(overrideSettings.lazada_base_url)
+    setPageShortlinkExpectedUtmId(overrideSettings.expected_utm_id)
+    setPageLazadaExpectedMemberId(overrideSettings.lazada_expected_member_id)
+    setPageShortlinkUrlTemplate(overrideSettings.shortlink_url_template)
+    setPageShortlinkSubId1(overrideSettings.sub_id1)
+    setPageShortlinkSubId2(overrideSettings.sub_id2)
+    setPageShortlinkSubId3(overrideSettings.sub_id3)
+    setPageShortlinkSubId4(overrideSettings.sub_id4)
+    setPageShortlinkSubId5(overrideSettings.sub_id5)
+  }
+
   const handleSave = async () => {
     setSaving(true)
+    setPageShortlinkMessage('')
     try {
       const normalizedInterval = normalizeInterval(intervalMinutes)
       const schedulePostHours = scheduleMode === 'interval'
@@ -2697,9 +2874,13 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
       setScheduleMode(detectScheduleMode(savedPage.post_hours))
       setIntervalMinutes(parseInterval(savedPage.post_hours, savedPage.post_interval_minutes || normalizedInterval))
       onSave(savedPage)
+      await savePageShortlinkSettings()
       onBack()
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e))
+      if (pageShortlinkLoaded && String(e instanceof Error ? e.message : e).includes('Shortlink')) {
+        setPageShortlinkMessage(e instanceof Error ? e.message : String(e))
+      }
     } finally {
       setSaving(false)
     }
@@ -2746,6 +2927,13 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
       setForcingPost(false)
     }
   }
+
+  const globalShortlinkSummary = [
+    globalShortlinkSettings.account ? `Account ${globalShortlinkSettings.account}` : '',
+    globalShortlinkSettings.expected_utm_id ? `Shopee ${globalShortlinkSettings.expected_utm_id}` : '',
+    globalShortlinkSettings.lazada_expected_member_id ? `Lazada ${globalShortlinkSettings.lazada_expected_member_id}` : '',
+  ].filter(Boolean).join(' • ')
+  const pageShortlinkMessageIsError = !!pageShortlinkMessage && !pageShortlinkMessage.includes('บันทึกแล้ว')
 
   return (
     <div className="h-full flex flex-col px-5">
@@ -2843,6 +3031,138 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
                 </div>
               )}
             </>
+          )}
+        </div>
+
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">Shortlink เฉพาะเพจนี้</p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                {pageShortlinkOverrideEnabled ? 'ใช้ค่าของเพจนี้ตอน cron โพสต์' : 'ใช้ค่ารวมของระบบ'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPageShortlinkOverrideEnabled(!pageShortlinkOverrideEnabled)}
+              disabled={pageShortlinkLoading}
+              className={`shrink-0 w-12 h-7 rounded-full relative transition-colors ${pageShortlinkOverrideEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${pageShortlinkLoading ? 'opacity-60' : ''}`}
+              aria-pressed={pageShortlinkOverrideEnabled}
+            >
+              <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${pageShortlinkOverrideEnabled ? 'right-1' : 'left-1'}`}></div>
+            </button>
+          </div>
+
+          {pageShortlinkLoading ? (
+            <p className="text-sm text-gray-400 py-2">กำลังโหลด Shortlink...</p>
+          ) : pageShortlinkOverrideEnabled ? (
+            <div className="space-y-3">
+              <div className="grid grid-cols-1 gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold text-gray-600 mb-1">Shortlink account</p>
+                  <input
+                    value={pageShortlinkAccount}
+                    maxLength={pageShortlinkMaxAccountChars}
+                    onChange={(e) => {
+                      setPageShortlinkAccount(e.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, ''))
+                      if (pageShortlinkMessage) setPageShortlinkMessage('')
+                    }}
+                    placeholder="CHEARB"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-gray-600 mb-1">Shortlink URL template</p>
+                  <input
+                    value={pageShortlinkUrlTemplate}
+                    maxLength={pageShortlinkMaxTemplateChars}
+                    onChange={(e) => { setPageShortlinkUrlTemplate(e.target.value); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                    placeholder="https://short.wwoom.com/?account={account}&url={url}&sub1={sub_id}"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-gray-600 mb-1">Sub ID 1</p>
+                  <input
+                    value={pageShortlinkSubId1}
+                    maxLength={pageShortlinkMaxSubIdChars}
+                    onChange={(e) => { setPageShortlinkSubId1(e.target.value); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                    placeholder="page-sub1"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold text-gray-600 mb-1">Shopee expected UTM</p>
+                  <input
+                    value={pageShortlinkExpectedUtmId}
+                    maxLength={pageShortlinkMaxExpectedUtmChars}
+                    inputMode="numeric"
+                    onChange={(e) => { setPageShortlinkExpectedUtmId(e.target.value.replace(/[^\d]/g, '')); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                    placeholder="15130770000"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-gray-600 mb-1">Lazada member_id</p>
+                  <input
+                    value={pageLazadaExpectedMemberId}
+                    maxLength={pageShortlinkMaxLazadaMemberChars}
+                    inputMode="numeric"
+                    onChange={(e) => { setPageLazadaExpectedMemberId(e.target.value.replace(/[^\d]/g, '')); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                    placeholder="199431090"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+
+              <details className="rounded-xl border border-gray-100 bg-gray-50 px-3 py-2">
+                <summary className="cursor-pointer text-xs font-bold text-gray-600">Base URL และ Sub ID เพิ่มเติม</summary>
+                <div className="mt-3 space-y-3">
+                  <input
+                    value={pageShortlinkBaseUrl}
+                    maxLength={pageShortlinkMaxBaseUrlChars}
+                    onChange={(e) => { setPageShortlinkBaseUrl(e.target.value); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                    placeholder="Shopee base URL"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <input
+                    value={pageLazadaShortlinkBaseUrl}
+                    maxLength={pageShortlinkMaxBaseUrlChars}
+                    onChange={(e) => { setPageLazadaShortlinkBaseUrl(e.target.value); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                    placeholder="Lazada base URL"
+                    className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { value: pageShortlinkSubId2, setter: setPageShortlinkSubId2, label: 'Sub ID 2' },
+                      { value: pageShortlinkSubId3, setter: setPageShortlinkSubId3, label: 'Sub ID 3' },
+                      { value: pageShortlinkSubId4, setter: setPageShortlinkSubId4, label: 'Sub ID 4' },
+                      { value: pageShortlinkSubId5, setter: setPageShortlinkSubId5, label: 'Sub ID 5' },
+                    ].map((item) => (
+                      <input
+                        key={item.label}
+                        value={item.value}
+                        maxLength={pageShortlinkMaxSubIdChars}
+                        onChange={(e) => { item.setter(e.target.value); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
+                        placeholder={item.label}
+                        className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    ))}
+                  </div>
+                </div>
+              </details>
+            </div>
+          ) : (
+            <div className="rounded-xl bg-gray-50 px-3 py-2 text-xs text-gray-500">
+              ใช้ค่ารวมของระบบ{globalShortlinkSummary ? `: ${globalShortlinkSummary}` : ''}
+            </div>
+          )}
+
+          {pageShortlinkMessage && (
+            <p className={`text-xs ${pageShortlinkMessageIsError ? 'text-red-500' : 'text-green-600'}`}>{pageShortlinkMessage}</p>
           )}
         </div>
 
@@ -3409,8 +3729,16 @@ function App({
   const [coverTextStyleSaving, setCoverTextStyleSaving] = useState(false)
   const [coverTextPreviewText, setCoverTextPreviewText] = useState(DEFAULT_COVER_TEXT_PREVIEW_TEXT)
   const [coverTextPreviewVideo, setCoverTextPreviewVideo] = useState<Video | null>(null)
+  const COMMENT_TEMPLATE_SLOT_COUNT = 3
+  const makeDefaultCommentTemplateSlots = () => {
+    const slots: string[] = new Array(COMMENT_TEMPLATE_SLOT_COUNT).fill('')
+    slots[0] = DEFAULT_COMMENT_TEMPLATE
+    return slots
+  }
   const [commentTemplate, setCommentTemplate] = useState(DEFAULT_COMMENT_TEMPLATE)
   const [commentTemplateDraft, setCommentTemplateDraft] = useState(DEFAULT_COMMENT_TEMPLATE)
+  const [commentTemplates, setCommentTemplates] = useState<string[]>(() => makeDefaultCommentTemplateSlots())
+  const [commentTemplatesDraft, setCommentTemplatesDraft] = useState<string[]>(() => makeDefaultCommentTemplateSlots())
   const [commentTemplateSource, setCommentTemplateSource] = useState<'default' | 'custom'>('default')
   const [commentTemplateUpdatedAt, setCommentTemplateUpdatedAt] = useState('')
   const [commentTemplateMessage, setCommentTemplateMessage] = useState('')
@@ -3879,7 +4207,11 @@ function App({
   const [galleryReadyTotalCount, setGalleryReadyTotalCount] = useState(videos.length)
   const [galleryUsedTotalCount, setGalleryUsedTotalCount] = useState(usedVideos.length)
   const [galleryUsedHasMore, setGalleryUsedHasMore] = useState(false)
-  const galleryCurrentTotal = categoryFilter === 'used' ? galleryUsedTotalCount : galleryReadyTotalCount
+  const galleryCurrentTotal = categoryFilter === 'used'
+    ? galleryUsedTotalCount
+    : categoryFilter === 'pending-shortlink'
+      ? pendingShortlinkVideos.length
+      : galleryReadyTotalCount
 
   const syncNavigationStateFromLocation = () => {
     const nextTab = getTabFromCurrentLocation()
@@ -5625,6 +5957,43 @@ function App({
     }
   }
 
+  function normalizeCommentTemplateSlotsForUi(input: unknown): string[] {
+    const slots: string[] = new Array(COMMENT_TEMPLATE_SLOT_COUNT).fill('')
+    if (Array.isArray(input)) {
+      for (let i = 0; i < COMMENT_TEMPLATE_SLOT_COUNT && i < input.length; i += 1) {
+        slots[i] = String(input[i] ?? '').replace(/\r\n?/g, '\n')
+      }
+    } else if (typeof input === 'string') {
+      slots[0] = input.replace(/\r\n?/g, '\n')
+    }
+    return slots
+  }
+
+  function applyCommentTemplateResponse(data: {
+    template?: string
+    templates?: unknown
+    source?: 'default' | 'custom'
+    updated_at?: string
+    max_chars?: number
+  }) {
+    let slots: string[]
+    let fallbackTemplate: string
+    if (Array.isArray(data.templates)) {
+      slots = normalizeCommentTemplateSlotsForUi(data.templates)
+      fallbackTemplate = String(data.template || slots.find((entry) => entry.trim().length > 0) || DEFAULT_COMMENT_TEMPLATE)
+    } else {
+      fallbackTemplate = String(data.template || DEFAULT_COMMENT_TEMPLATE)
+      slots = normalizeCommentTemplateSlotsForUi([fallbackTemplate])
+    }
+    setCommentTemplate(fallbackTemplate)
+    setCommentTemplateDraft(fallbackTemplate)
+    setCommentTemplates(slots)
+    setCommentTemplatesDraft(slots.slice())
+    setCommentTemplateSource(data.source === 'custom' ? 'custom' : 'default')
+    setCommentTemplateUpdatedAt(String(data.updated_at || ''))
+    if (typeof data.max_chars === 'number' && data.max_chars > 0) setCommentTemplateMaxChars(data.max_chars)
+  }
+
   async function loadCommentTemplate() {
     const session = getToken()
     if (!session) return
@@ -5646,17 +6015,13 @@ function App({
       }
       const data = await resp.json() as {
         template?: string
+        templates?: unknown
         source?: 'default' | 'custom'
         updated_at?: string
         max_chars?: number
       }
-      const template = String(data.template || DEFAULT_COMMENT_TEMPLATE)
-      setCommentTemplate(template)
-      setCommentTemplateDraft(template)
-      setCommentTemplateSource(data.source === 'custom' ? 'custom' : 'default')
-      setCommentTemplateUpdatedAt(String(data.updated_at || ''))
+      applyCommentTemplateResponse(data)
       setCommentTemplateMessage('')
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setCommentTemplateMaxChars(data.max_chars)
     } catch {
       setCommentTemplateMessage('โหลดเทมเพลตคอมเมนต์ไม่สำเร็จ')
     } finally {
@@ -5664,20 +6029,21 @@ function App({
     }
   }
 
-  async function saveCommentTemplate(nextTemplate: string) {
+  async function saveCommentTemplates(nextTemplates: string[]) {
     const session = getToken()
     if (!session) return
     setCommentTemplateSaving(true)
     setCommentTemplateMessage('')
     try {
-      const trimmed = String(nextTemplate || '').trim()
-      const isReset = !trimmed
+      const slots = normalizeCommentTemplateSlotsForUi(nextTemplates)
+      const hasAny = slots.some((entry) => entry.trim().length > 0)
+      const isReset = !hasAny
       const resp = await apiFetch(`${WORKER_URL}/api/settings/comment-template`, isReset ? {
         method: 'DELETE',
       } : {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ template: nextTemplate }),
+        body: JSON.stringify({ templates: slots }),
       })
       if (resp.status === 401) {
         await recoverSessionOrLogout()
@@ -5694,22 +6060,27 @@ function App({
       }
       const data = await resp.json() as {
         template?: string
+        templates?: unknown
         source?: 'default' | 'custom'
         updated_at?: string
         max_chars?: number
       }
-      const template = String(data.template || DEFAULT_COMMENT_TEMPLATE)
-      setCommentTemplate(template)
-      setCommentTemplateDraft(template)
-      setCommentTemplateSource(data.source === 'custom' ? 'custom' : 'default')
-      setCommentTemplateUpdatedAt(String(data.updated_at || ''))
-      if (typeof data.max_chars === 'number' && data.max_chars > 0) setCommentTemplateMaxChars(data.max_chars)
+      applyCommentTemplateResponse(data)
       setCommentTemplateMessage(isReset ? 'รีเซ็ตเทมเพลตคอมเมนต์เป็นค่าเริ่มต้นแล้ว' : 'บันทึกเทมเพลตคอมเมนต์แล้ว')
     } catch {
       setCommentTemplateMessage('บันทึกเทมเพลตคอมเมนต์ไม่สำเร็จ')
     } finally {
       setCommentTemplateSaving(false)
     }
+  }
+
+  async function saveCommentTemplate(nextTemplate: string) {
+    // Legacy single-template path kept for backwards-compat. Writes into slot 0 and
+    // preserves any other slots the user has already configured.
+    const slots = commentTemplatesDraft.slice()
+    while (slots.length < COMMENT_TEMPLATE_SLOT_COUNT) slots.push('')
+    slots[0] = String(nextTemplate || '')
+    await saveCommentTemplates(slots)
   }
 
   async function saveVoicePrompt(nextProfile?: VoiceProfile | null, options: { reset?: boolean } = {}) {
@@ -6793,12 +7164,19 @@ function App({
     const postedVideos = dedupeGalleryVideos(
       filterDeletedGalleryVideos(usedVideos, deletedGalleryKeysRef.current)
     )
-    const availableVideos = categoryFilter === 'used' ? postedVideos : readyVideos
+    const pendingVideos = dedupeGalleryVideos(
+      filterDeletedGalleryVideos(pendingShortlinkVideos, deletedGalleryKeysRef.current)
+    )
+    const availableVideos = categoryFilter === 'used'
+      ? postedVideos
+      : categoryFilter === 'pending-shortlink'
+        ? pendingVideos
+        : readyVideos
 
     return {
       galleryAvailableVideos: availableVideos,
     }
-  }, [videos, usedVideos, categoryFilter])
+  }, [videos, usedVideos, pendingShortlinkVideos, categoryFilter])
   const showGalleryFilterBar = tab === 'gallery' && (
     galleryLoading ||
     galleryReadyTotalCount > 0 ||
@@ -7475,8 +7853,9 @@ function App({
                       onDelete={(id, targetNamespaceId) => {
                         const deletedKey = targetNamespaceId ? `${targetNamespaceId}:${id}` : id
                         deletedGalleryKeysRef.current.add(deletedKey)
-                        setVideos(videos.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
-                        setUsedVideos(usedVideos.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
+                        setVideos((prev) => prev.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
+                        setUsedVideos((prev) => prev.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
+                        setPendingShortlinkVideos((prev) => prev.filter(v => getVideoIdentityKey(v as unknown as Record<string, unknown>) !== deletedKey));
                       }}
                       onUpdate={updateGalleryVideoState}
                       onImport={useSystemWideAdminGallery ? handleImportVideo : undefined}
@@ -8670,60 +9049,89 @@ function App({
                         <p className="text-sm text-gray-400 py-3">กำลังโหลดเทมเพลตคอมเมนต์...</p>
                       ) : (
                         <>
-                          <textarea
-                            key={`ct-${commentTemplateSource}-${commentTemplateUpdatedAt}`}
-                            defaultValue={commentTemplateDraft}
-                            onChange={(e) => {
-                              setCommentTemplateDraft(e.target.value)
-                              if (commentTemplateMessage) setCommentTemplateMessage('')
-                            }}
-                            rows={9}
-                            placeholder="ใส่เทมเพลตคอมเมนต์ที่นี่... เช่น {{shopee_link}}"
-                            className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-sm outline-none focus:border-blue-400"
-                          />
-                          <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
-                            <p>ต้องมี <span className="font-semibold text-gray-700">{COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER}</span> อย่างน้อย 1 จุด</p>
-                            <p>ถ้าไม่ต้องการ Lazada ในบางโพสต์ ปล่อย <span className="font-semibold text-gray-700">{COMMENT_TEMPLATE_LAZADA_PLACEHOLDER}</span> ไว้ได้ ระบบจะใส่เฉพาะตอนมีลิงก์</p>
-                          </div>
-                          <div className="flex items-center justify-between text-[11px] text-gray-400">
-                            <span>{commentTemplateSource === 'custom' ? 'กำลังใช้เทมเพลตคอมเมนต์ที่กำหนดเอง' : 'กำลังใช้เทมเพลตคอมเมนต์ค่าเริ่มต้น'}</span>
-                            <span>{commentTemplateDraft.length}/{commentTemplateMaxChars}</span>
-                          </div>
-                          {commentTemplateUpdatedAt && (
-                            <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(commentTemplateUpdatedAt).toLocaleString()}</p>
-                          )}
-                          {commentTemplateMessage && (
-                            <p className={`text-xs ${commentTemplateMessage.includes('ไม่สำเร็จ') || commentTemplateMessage.includes('ไม่มีสิทธิ์') || commentTemplateMessage.includes('ต้องมี') ? 'text-red-500' : 'text-green-600'}`}>
-                              {commentTemplateMessage}
-                            </p>
-                          )}
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => {
-                                if (commentTemplateSaving || commentTemplateDraft.length > commentTemplateMaxChars) return
-                                void saveCommentTemplate(commentTemplateDraft)
-                              }}
-                              disabled={
-                                commentTemplateSaving ||
-                                commentTemplateDraft.length > commentTemplateMaxChars ||
-                                !commentTemplateDraft.trim() ||
-                                commentTemplateDraft === commentTemplate
-                              }
-                              className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
-                            >
-                              {commentTemplateSaving ? 'กำลังบันทึก...' : 'บันทึกเทมเพลต'}
-                            </button>
-                            <button
-                              onClick={() => {
-                                if (commentTemplateSaving) return
-                                void saveCommentTemplate('')
-                              }}
-                              disabled={commentTemplateSaving || commentTemplateSource === 'default'}
-                              className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
-                            >
-                              รีเซ็ตค่าเริ่มต้น
-                            </button>
-                          </div>
+                          {(() => {
+                            const slotLabels = ['คอมเมนต์ 1', 'คอมเมนต์ 2', 'คอมเมนต์ 3']
+                            const anyTooLong = commentTemplatesDraft.some((entry) => entry.length > commentTemplateMaxChars)
+                            const allEmpty = commentTemplatesDraft.every((entry) => !entry.trim())
+                            const noChanges = commentTemplatesDraft.length === commentTemplates.length
+                              && commentTemplatesDraft.every((entry, i) => entry === commentTemplates[i])
+                            const saveDisabled = commentTemplateSaving || anyTooLong || allEmpty || noChanges
+                            return (
+                              <>
+                                <div className="space-y-3">
+                                  {Array.from({ length: COMMENT_TEMPLATE_SLOT_COUNT }).map((_, idx) => {
+                                    const value = commentTemplatesDraft[idx] ?? ''
+                                    const tooLong = value.length > commentTemplateMaxChars
+                                    return (
+                                      <div key={`comment-slot-${idx}`} className="space-y-1.5">
+                                        <div className="flex items-center justify-between">
+                                          <label className="text-[12px] font-semibold text-gray-700">{slotLabels[idx]}</label>
+                                          <span className={`text-[11px] ${tooLong ? 'text-red-500' : 'text-gray-400'}`}>
+                                            {value.length}/{commentTemplateMaxChars}
+                                          </span>
+                                        </div>
+                                        <textarea
+                                          key={`ct-${idx}-${commentTemplateSource}-${commentTemplateUpdatedAt}`}
+                                          defaultValue={value}
+                                          onChange={(e) => {
+                                            const next = commentTemplatesDraft.slice()
+                                            while (next.length < COMMENT_TEMPLATE_SLOT_COUNT) next.push('')
+                                            next[idx] = e.target.value
+                                            setCommentTemplatesDraft(next)
+                                            if (idx === 0) setCommentTemplateDraft(e.target.value)
+                                            if (commentTemplateMessage) setCommentTemplateMessage('')
+                                          }}
+                                          rows={idx === 0 ? 9 : 5}
+                                          placeholder={idx === 0
+                                            ? 'ใส่เทมเพลตคอมเมนต์ที่นี่... เช่น {{shopee_link}}'
+                                            : 'เว้นว่างได้ ถ้าไม่ต้องการคอมเมนต์เพิ่ม'}
+                                          className={`w-full bg-gray-50 border rounded-xl px-3 py-2.5 text-base sm:text-sm outline-none focus:border-blue-400 ${tooLong ? 'border-red-300' : 'border-gray-200'}`}
+                                        />
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                                <div className="rounded-xl border border-gray-200 bg-gray-50 px-3 py-3 text-[11px] text-gray-500 space-y-1">
+                                  <p>ต้องมี <span className="font-semibold text-gray-700">{COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER}</span> อย่างน้อย 1 จุดในเทมเพลตที่ใช้งาน</p>
+                                  <p>ถ้าไม่ต้องการ Lazada ในบางโพสต์ ปล่อย <span className="font-semibold text-gray-700">{COMMENT_TEMPLATE_LAZADA_PLACEHOLDER}</span> ไว้ได้ ระบบจะใส่เฉพาะตอนมีลิงก์</p>
+                                  <p>ระบบจะโพสต์เรียงตามช่อง 1 → 2 → 3 ช่องที่เว้นว่างจะถูกข้าม</p>
+                                </div>
+                                <div className="flex items-center justify-between text-[11px] text-gray-400">
+                                  <span>{commentTemplateSource === 'custom' ? 'กำลังใช้เทมเพลตคอมเมนต์ที่กำหนดเอง' : 'กำลังใช้เทมเพลตคอมเมนต์ค่าเริ่มต้น'}</span>
+                                </div>
+                                {commentTemplateUpdatedAt && (
+                                  <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(commentTemplateUpdatedAt).toLocaleString()}</p>
+                                )}
+                                {commentTemplateMessage && (
+                                  <p className={`text-xs ${commentTemplateMessage.includes('ไม่สำเร็จ') || commentTemplateMessage.includes('ไม่มีสิทธิ์') || commentTemplateMessage.includes('ต้องมี') ? 'text-red-500' : 'text-green-600'}`}>
+                                    {commentTemplateMessage}
+                                  </p>
+                                )}
+                                <div className="flex gap-2">
+                                  <button
+                                    onClick={() => {
+                                      if (saveDisabled) return
+                                      void saveCommentTemplates(commentTemplatesDraft)
+                                    }}
+                                    disabled={saveDisabled}
+                                    className="flex-1 bg-gray-900 text-white px-4 py-2.5 rounded-xl text-sm font-bold active:scale-95 transition-all disabled:opacity-40"
+                                  >
+                                    {commentTemplateSaving ? 'กำลังบันทึก...' : 'บันทึกเทมเพลต'}
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      if (commentTemplateSaving) return
+                                      void saveCommentTemplates([])
+                                    }}
+                                    disabled={commentTemplateSaving || commentTemplateSource === 'default'}
+                                    className="px-4 py-2.5 rounded-xl text-sm font-bold border border-gray-200 text-gray-700 bg-gray-50 active:scale-95 transition-all disabled:opacity-40"
+                                  >
+                                    รีเซ็ตค่าเริ่มต้น
+                                  </button>
+                                </div>
+                              </>
+                            )
+                          })()}
                         </>
                       )}
                     </div>

@@ -201,6 +201,54 @@ function parseRememberFlag(value) {
   return true;
 }
 
+function sanitizePublicDiagnosticValue(value) {
+  return String(value == null ? '' : value)
+    .trim()
+    .replace(/[^A-Za-z0-9@._:-]/g, '_')
+    .slice(0, 128);
+}
+
+function expectedShopeeUtmSourceForId(id) {
+  const normalized = normalizeShopeeAffiliateId(id);
+  return normalized ? `an_${normalized}` : '';
+}
+
+function shopeeAffiliateValidationError(reason, details = {}) {
+  const normalizedRequestedId = normalizeShopeeAffiliateId(details.requestedId);
+  const requestedId = normalizedRequestedId || sanitizePublicDiagnosticValue(details.requestedId || '');
+  const expectedUtmSource = sanitizePublicDiagnosticValue(
+    details.expectedUtmSource || expectedShopeeUtmSourceForId(normalizedRequestedId),
+  );
+  const actualUtmSource = sanitizePublicDiagnosticValue(details.actualUtmSource || '');
+  const account = details.account ? sanitizeAccount(details.account) : '';
+  const displayAccount = sanitizePublicDiagnosticValue(details.displayAccount || '');
+  const requestedAccount = details.requestedAccount
+    ? sanitizeAccount(details.requestedAccount)
+    : '';
+  const message = String(details.message || reason).trim();
+  const payload = {
+    status: 'error',
+    error: reason,
+    reason,
+    platform: 'shopee',
+    message,
+  };
+  if (requestedId) payload.requestedId = requestedId;
+  if (expectedUtmSource) payload.expected_utm_source = expectedUtmSource;
+  if (Object.prototype.hasOwnProperty.call(details, 'actualUtmSource')) {
+    payload.actual_utm_source = actualUtmSource;
+  }
+  if (account) payload.account = account;
+  if (displayAccount) payload.displayAccount = displayAccount;
+  if (requestedAccount) payload.requestedAccount = requestedAccount;
+
+  const err = new Error(message);
+  err.reason = reason;
+  err.statusCode = 400;
+  err.publicPayload = payload;
+  return err;
+}
+
 function clientWantsJson(req, query) {
   if (isTruthyFlag(query && query.json)) return true;
   const accept = String((req && req.headers && req.headers.accept) || '').toLowerCase();
@@ -618,19 +666,42 @@ async function handleShorten(query, opts = {}) {
   if (!platform) throw new Error(`Cannot detect platform from url: ${rawUrl}`);
 
   const rawAccount = String(query.account || '').trim();
-  const explicitId = normalizeShopeeAffiliateId(query.id);
+  const rawShopeeId = String(query.id == null ? '' : query.id).trim();
+  const explicitId = normalizeShopeeAffiliateId(rawShopeeId);
   let account;
   let responseAccount;
-  if (rawAccount) {
-    account = sanitizeAccount(rawAccount);
-    responseAccount = account;
-  } else if (platform === 'shopee' && explicitId) {
+  if (platform === 'shopee' && rawShopeeId && !explicitId) {
+    throw shopeeAffiliateValidationError('shopee_affiliate_id_invalid', {
+      requestedId: rawShopeeId,
+      requestedAccount: rawAccount,
+      message: 'Invalid Shopee affiliate id',
+    });
+  }
+  if (platform === 'shopee' && explicitId) {
     const resolvedAccount = resolveShopeeAccountMetadataFromId(explicitId);
     if (!resolvedAccount || !resolvedAccount.account) {
-      throw new Error('Unknown Shopee affiliate id: ' + explicitId);
+      throw shopeeAffiliateValidationError('shopee_affiliate_id_unknown', {
+        requestedId: explicitId,
+        expectedUtmSource: expectedShopeeUtmSourceForId(explicitId),
+        requestedAccount: rawAccount,
+        message: 'Unknown Shopee affiliate id: ' + explicitId,
+      });
     }
     account = sanitizeAccount(resolvedAccount.account);
     responseAccount = String(resolvedAccount.displayAccount || account).trim();
+    if (rawAccount && sanitizeAccount(rawAccount) !== account) {
+      throw shopeeAffiliateValidationError('shopee_affiliate_account_conflict', {
+        requestedId: explicitId,
+        expectedUtmSource: expectedShopeeUtmSourceForId(explicitId),
+        requestedAccount: rawAccount,
+        account,
+        displayAccount: responseAccount,
+        message: 'Shopee affiliate id does not match requested account',
+      });
+    }
+  } else if (rawAccount) {
+    account = sanitizeAccount(rawAccount);
+    responseAccount = account;
   } else {
     account = sanitizeAccount(query.account);
     responseAccount = account;
@@ -652,12 +723,28 @@ async function handleShorten(query, opts = {}) {
       { onSessionExpired },
     );
     const resolvedShortLink = await resolveTrackingLink(d.shortLink);
+    const actualUtmSource = extractUtmSource(resolvedShortLink);
+    if (explicitId) {
+      const expectedUtmSource = expectedShopeeUtmSourceForId(explicitId);
+      if (actualUtmSource !== expectedUtmSource) {
+        throw shopeeAffiliateValidationError('shopee_affiliate_utm_source_mismatch', {
+          requestedId: explicitId,
+          expectedUtmSource,
+          actualUtmSource,
+          account,
+          displayAccount: responseAccount,
+          message: actualUtmSource
+            ? 'Shopee shortLink resolved to the wrong affiliate utm_source'
+            : 'Shopee shortLink resolved without an affiliate utm_source',
+        });
+      }
+    }
     return buildShopeeShortlinkPayload({
       link: rawUrl,
       longLink: d.longLink || resolvedOriginalLink || '',
       shortLink: d.shortLink,
       id: explicitId,
-      utmSource: extractUtmSource(resolvedShortLink),
+      utmSource: actualUtmSource,
       account: responseAccount,
       sub1: query.sub1 || '',
     });
@@ -1923,12 +2010,18 @@ function createServer() {
           if (err && err.manualLoginRequired) {
             return sendJson(res, 200, buildManualLoginRequiredPayload(query, err));
           }
+          if (err && err.publicPayload) {
+            return sendJson(res, err.statusCode || 400, err.publicPayload);
+          }
           throw err;
         }
       }
 
       return sendJson(res, 404, { error: 'Not found', path: pathname });
     } catch (err) {
+      if (err && err.publicPayload) {
+        return sendJson(res, err.statusCode || 500, err.publicPayload);
+      }
       return sendJson(res, 500, { error: err && err.message ? err.message : String(err) });
     }
   });

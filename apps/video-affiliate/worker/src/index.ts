@@ -22,6 +22,25 @@ import {
     type PostingAffiliateVerificationResult,
 } from './affiliate-verification-policy'
 import {
+    buildExistingCommentDedupCandidates,
+    buildVisibleCommentTargetCandidates,
+    isAffiliateCommentMatch,
+} from './comment-targeting'
+import {
+    COMMENT_TEMPLATE_LAZADA_PLACEHOLDER,
+    COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
+    COMMENT_TEMPLATE_SLOT_COUNT,
+    DEFAULT_COMMENT_TEMPLATE_TEXT,
+    encodeCommentTemplatesForStorage,
+    mergeLegacyCommentTemplate,
+    normalizeCommentTemplateSlots,
+    normalizeCommentTemplateText,
+    parseStoredCommentTemplatesValue,
+    renderCommentTemplatesForPosting,
+    selectNonEmptyCommentTemplates,
+    validateCommentTemplateSlots,
+} from './comment-template'
+import {
     type Env,
     buildTtsPromptTemplate,
     buildTtsStyleInstructions,
@@ -47,6 +66,13 @@ import {
     setVoicePromptTemplate,
 } from './pipeline'
 import { ADMIN_HTML } from './admin-page'
+import {
+    MAX_SHORTLINK_URL_TEMPLATE_CHARS,
+    MAX_SHORTLINK_SUB_ID_CHARS,
+    normalizeShortlinkUrlTemplate,
+    normalizeShortlinkSubId,
+    buildShortlinkRequestUrlFromTemplate,
+} from './shortlink-template'
 
 type FacebookSdkApiClient = {
     call: (method: string, path: string, params?: Record<string, unknown>) => Promise<unknown>
@@ -119,7 +145,7 @@ const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
 const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
-const MERGE_CONTAINER_ENGINE_VERSION = '2026-05-23.05'
+const MERGE_CONTAINER_ENGINE_VERSION = '2026-05-26.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
 const MAX_VOICE_PREVIEW_TEXT_CHARS = 280
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
@@ -4806,6 +4832,12 @@ async function claimFastGalleryVideoForPosting(params: {
     postingOrder: NamespacePostingOrder
     pageSize?: number
     maxPages?: number
+    // Thai-local date 'YYYY-MM-DD'. When set, any video_id with a
+    // status='failed' AND trigger_source='cron' row for this page on that date
+    // is excluded from selection. The cron path passes today's Thai date so a
+    // single failed preflight (shortlink / affiliate verification / comment
+    // preflight) does not get re-attempted every minute.
+    skipFailedTodayThaiDate?: string
 }): Promise<FastGalleryPostingClaimOutcome> {
     const startedAt = Date.now()
     const namespaceId = String(params.namespaceId || '').trim()
@@ -4832,6 +4864,24 @@ async function claimFastGalleryVideoForPosting(params: {
         ensureGalleryIndexTable(params.env.DB),
         ensureNamespaceVideoStateColumns(params.env.DB),
     ])
+
+    const skipFailedTodayVideoIds = new Set<string>()
+    const skipDate = String(params.skipFailedTodayThaiDate || '').trim()
+    if (/^\d{4}-\d{2}-\d{2}$/.test(skipDate)) {
+        const failedRows = await params.env.DB.prepare(
+            `SELECT DISTINCT video_id
+             FROM post_history
+             WHERE bot_id = ?
+               AND page_id = ?
+               AND status = 'failed'
+               AND trigger_source = 'cron'
+               AND date(datetime(posted_at, '+7 hours')) = ?`
+        ).bind(namespaceId, pageId, skipDate).all().catch(() => null) as { results?: Array<{ video_id?: string }> } | null
+        for (const row of failedRows?.results || []) {
+            const v = String(row?.video_id || '').trim()
+            if (v) skipFailedTodayVideoIds.add(v)
+        }
+    }
 
     stats.candidateTotal = await countFastGalleryPostingCandidates(params.env.DB, namespaceId)
     if (stats.candidateTotal <= 0) return finish(null)
@@ -4868,6 +4918,11 @@ async function claimFastGalleryVideoForPosting(params: {
             if (!videoId || seenVideoIds.has(videoId)) continue
             seenVideoIds.add(videoId)
             stats.scanned += 1
+
+            if (skipFailedTodayVideoIds.has(videoId)) {
+                console.log(`[CRON-FAIL-DEDUP] Skip ${videoId} ns=${namespaceId} page=${pageId} — failed cron row already exists for ${skipDate}`)
+                continue
+            }
 
             await hydrateFastPostingCandidateSourceFingerprint({
                 env: params.env,
@@ -8403,10 +8458,15 @@ app.post('/admin/api/comments/retry', async (c) => {
             const fbReelUrl = String(row.fb_reel_url || '').trim()
             const manualLink = body?.links ? body.links[String(historyId)] : ''
 
-            const targetFromUrl = fbReelUrl
-                ? extractReelIdFromPermalink(normalizeFacebookPermalink(fbReelUrl))
-                : ''
-            const targetId = targetFromUrl || fbPostId
+            // Story-first: try the visible page-story target before the reel
+            // object id. Comments posted on the reel object do NOT show on the
+            // page-story feed that operators view.
+            const visibleCandidates = buildVisibleCommentTargetCandidates({
+                pageId,
+                fbPostId,
+                fbReelUrlOrId: fbReelUrl,
+            })
+            const targetId = visibleCandidates[0] || fbPostId
 
             if (!pageId || !targetId) {
                 const err = 'comment_target_missing'
@@ -8460,6 +8520,7 @@ app.post('/admin/api/comments/retry', async (c) => {
                 namespaceId: botId,
                 shopeeLink,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
+                postSubId2: fbPostId,
             })
             if (!shortShopeeLink) {
                 const err = 'shopee_shortlink_failed'
@@ -8474,6 +8535,8 @@ app.post('/admin/api/comments/retry', async (c) => {
                 env: c.env,
                 namespaceId: botId,
                 fbVideoId: targetId,
+                fbPostId,
+                fbReelUrlOrId: fbReelUrl,
                 shopeeLink: shortShopeeLink,
                 lazadaLink: String(row.lazada_link || '').trim(),
                 commentToken,
@@ -9293,17 +9356,37 @@ app.put('/api/settings/comment-template', async (c) => {
     const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
 
-    const body = await c.req.json().catch(() => ({})) as { template?: string }
-    const template = normalizeCommentTemplate(String(body.template || ''))
-    if (template.length > MAX_COMMENT_TEMPLATE_CHARS) {
-        return c.json({ error: `Comment template too long (max ${MAX_COMMENT_TEMPLATE_CHARS} chars)` }, 400)
+    const body = await c.req.json().catch(() => ({})) as { template?: string; templates?: unknown }
+    // Accept new shape `{ templates: string[] }` and fall back to legacy
+    // `{ template: string }` so older clients keep working unchanged.
+    let slots: string[]
+    if (Array.isArray(body.templates)) {
+        slots = normalizeCommentTemplateSlots(body.templates)
+    } else if (typeof body.template === 'string') {
+        slots = normalizeCommentTemplateSlots([body.template])
+    } else {
+        slots = normalizeCommentTemplateSlots([])
     }
-    if (template && !template.includes(COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER)) {
-        return c.json({ error: `Comment template ต้องมี ${COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER} อย่างน้อย 1 จุด` }, 400)
+
+    const validation = validateCommentTemplateSlots({
+        slots,
+        maxChars: MAX_COMMENT_TEMPLATE_CHARS,
+        shopeePlaceholder: COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
+    })
+    if (validation.ok !== true) {
+        const validationError = validation.error
+        return c.json({ error: validationError.message, slot: validationError.slot, code: validationError.code }, 400)
+    }
+
+    const nonEmpty = selectNonEmptyCommentTemplates(validation.slots)
+    if (nonEmpty.length === 0) {
+        return c.json({
+            error: `ต้องมีอย่างน้อย 1 เทมเพลตคอมเมนต์ (At least one comment template required)`,
+        }, 400)
     }
 
     const namespaceId = c.get('botId')
-    await setNamespaceCommentTemplate(c.env.DB, namespaceId, template)
+    await setNamespaceCommentTemplates(c.env.DB, namespaceId, validation.slots)
     const settings = await getNamespaceCommentTemplateSettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
@@ -9393,7 +9476,7 @@ app.delete('/api/settings/comment-template', async (c) => {
     if (!ownerCheck.ok) return ownerCheck.response
 
     const namespaceId = c.get('botId')
-    await setNamespaceCommentTemplate(c.env.DB, namespaceId, '')
+    await setNamespaceCommentTemplates(c.env.DB, namespaceId, [])
     const settings = await getNamespaceCommentTemplateSettings(c.env.DB, namespaceId)
     return c.json({
         ok: true,
@@ -9623,23 +9706,9 @@ app.delete('/api/settings/gemini-key', async (c) => {
 
 app.get('/api/settings/shopee-shortlink', async (c) => {
     const namespaceId = c.get('botId')
-    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
-    // Load sub IDs + template
-    await ensureNamespaceSettingsTable(c.env.DB)
-    const extraKeys = ['shortlink_url_template_v1', 'shortlink_sub_id1_v1', 'shortlink_sub_id2_v1', 'shortlink_sub_id3_v1', 'shortlink_sub_id4_v1', 'shortlink_sub_id5_v1']
-    const extras: Record<string, string> = {}
-    for (const key of extraKeys) {
-        const row = await c.env.DB.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, key).first().catch(() => null) as { value?: string } | null
-        extras[key] = String(row?.value || '').trim()
-    }
+    const settings = await getNamespaceShortlinkSettingsForApi(c.env.DB, namespaceId)
     return c.json({
         ...settings,
-        shortlink_url_template: extras.shortlink_url_template_v1,
-        sub_id1: extras.shortlink_sub_id1_v1,
-        sub_id2: extras.shortlink_sub_id2_v1,
-        sub_id3: extras.shortlink_sub_id3_v1,
-        sub_id4: extras.shortlink_sub_id4_v1,
-        sub_id5: extras.shortlink_sub_id5_v1,
         max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
         max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
         max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
@@ -9674,7 +9743,9 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
     const hasLazadaBaseUrl = Object.prototype.hasOwnProperty.call(body, 'lazada_base_url') || Object.prototype.hasOwnProperty.call(body, 'lazadaBaseUrl')
     const hasExpectedUtmId = Object.prototype.hasOwnProperty.call(body, 'expected_utm_id') || Object.prototype.hasOwnProperty.call(body, 'expectedUtmId')
     const hasLazadaExpectedMemberId = Object.prototype.hasOwnProperty.call(body, 'lazada_expected_member_id') || Object.prototype.hasOwnProperty.call(body, 'lazadaExpectedMemberId')
-    if (!hasAccount && !hasBaseUrl && !hasLazadaBaseUrl && !hasExpectedUtmId && !hasLazadaExpectedMemberId) {
+    const hasTemplate = Object.prototype.hasOwnProperty.call(body, 'shortlink_url_template')
+    const hasSubIds = ['sub_id1', 'sub_id2', 'sub_id3', 'sub_id4', 'sub_id5'].some((field) => Object.prototype.hasOwnProperty.call(body, field))
+    if (!hasAccount && !hasBaseUrl && !hasLazadaBaseUrl && !hasExpectedUtmId && !hasLazadaExpectedMemberId && !hasTemplate && !hasSubIds) {
         return c.json({ error: 'Shortlink settings payload is required' }, 400)
     }
 
@@ -9743,18 +9814,26 @@ app.put('/api/settings/shopee-shortlink', async (c) => {
     }
     // Save shortlink URL template + sub IDs
     if (body.shortlink_url_template !== undefined) {
+        const template = normalizeShortlinkUrlTemplate(String(body.shortlink_url_template || ''))
+        if (String(body.shortlink_url_template || '').trim().length > MAX_SHORTLINK_URL_TEMPLATE_CHARS) {
+            return c.json({ error: `Shortlink URL template too long (max ${MAX_SHORTLINK_URL_TEMPLATE_CHARS} chars)` }, 400)
+        }
         await ensureNamespaceSettingsTable(c.env.DB)
         await c.env.DB.prepare('INSERT INTO namespace_settings (namespace_id, key, value) VALUES (?, ?, ?) ON CONFLICT(namespace_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')')
-            .bind(namespaceId, 'shortlink_url_template_v1', String(body.shortlink_url_template || '').trim()).run()
+            .bind(namespaceId, NS_SETTING_SHORTLINK_URL_TEMPLATE, template).run()
     }
-    for (const [field, key] of [['sub_id1', 'shortlink_sub_id1_v1'], ['sub_id2', 'shortlink_sub_id2_v1'], ['sub_id3', 'shortlink_sub_id3_v1'], ['sub_id4', 'shortlink_sub_id4_v1'], ['sub_id5', 'shortlink_sub_id5_v1']] as const) {
+    for (const [field, key] of [['sub_id1', NS_SETTING_SHORTLINK_SUB_ID_KEYS[0]], ['sub_id2', NS_SETTING_SHORTLINK_SUB_ID_KEYS[1]], ['sub_id3', NS_SETTING_SHORTLINK_SUB_ID_KEYS[2]], ['sub_id4', NS_SETTING_SHORTLINK_SUB_ID_KEYS[3]], ['sub_id5', NS_SETTING_SHORTLINK_SUB_ID_KEYS[4]]] as const) {
         if ((body as Record<string, unknown>)[field] !== undefined) {
+            const subId = normalizeShortlinkSubId(String((body as Record<string, unknown>)[field] || ''))
+            if (String((body as Record<string, unknown>)[field] || '').trim().length > MAX_SHORTLINK_SUB_ID_CHARS) {
+                return c.json({ error: `${field} too long (max ${MAX_SHORTLINK_SUB_ID_CHARS} chars)` }, 400)
+            }
             await ensureNamespaceSettingsTable(c.env.DB)
             await c.env.DB.prepare('INSERT INTO namespace_settings (namespace_id, key, value) VALUES (?, ?, ?) ON CONFLICT(namespace_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')')
-                .bind(namespaceId, key, String((body as Record<string, unknown>)[field] || '').trim()).run()
+                .bind(namespaceId, key, subId).run()
         }
     }
-    const settings = await getNamespaceShopeeShortlinkSettings(c.env.DB, namespaceId)
+    const settings = await getNamespaceShortlinkSettingsForApi(c.env.DB, namespaceId)
     return c.json({
         ok: true,
         ...settings,
@@ -13271,10 +13350,12 @@ async function handleLineTextMessage(params: {
         const videoId = crypto.randomUUID().slice(0, 8)
         await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
-        await lineStartLoading(channelAccessToken, lineUserId, 20).catch(() => { })
+        // handleLineEvent already invoked lineStartLoading for non-cancel text,
+        // so we intentionally do not call it again here to avoid double-start.
 
         // Resolve XHS URL to direct video URL
         let resolvedVideoUrl = xhsUrl
+        let resolverFailureReason: 'no_video' | 'request_failed' | null = null
         try {
             const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
             const containerStub = env.MERGE_CONTAINER.get(containerId)
@@ -13285,13 +13366,24 @@ async function handleLineTextMessage(params: {
             })
             if (resolveResp.ok) {
                 const resolveData = await resolveResp.json() as { video_url?: string }
-                if (resolveData?.video_url) resolvedVideoUrl = resolveData.video_url
+                if (resolveData?.video_url) {
+                    resolvedVideoUrl = resolveData.video_url
+                } else {
+                    resolverFailureReason = 'no_video'
+                }
+            } else if (resolveResp.status === 404) {
+                resolverFailureReason = 'no_video'
+            } else {
+                resolverFailureReason = 'request_failed'
             }
-        } catch {}
+        } catch {
+            resolverFailureReason = 'request_failed'
+        }
 
         // Download video and store in R2
         let r2VideoUrl = xhsUrl
         let originalStored = false
+        let downloadFailed = false
         try {
             if (resolvedVideoUrl !== xhsUrl) {
                 const videoResp = await fetch(resolvedVideoUrl, { headers: { 'Referer': 'https://www.xiaohongshu.com/' } })
@@ -13308,17 +13400,32 @@ async function handleLineTextMessage(params: {
                     })
                     await backfillOriginalThumbnail(env, namespaceId, videoId).catch(() => { })
                     originalStored = true
+                } else {
+                    downloadFailed = true
                 }
             }
-        } catch {}
+        } catch {
+            downloadFailed = true
+        }
 
         if (!originalStored) {
+            // Make sure we don't leave behind a stale waiting state or
+            // cancel marker that would confuse the next message.
+            await clearLineWaitingVideoState(bucket, lineUserId).catch(() => { })
+            await clearLineWaitingVideoCancelled(bucket, lineUserId).catch(() => { })
+
+            const failureText = resolverFailureReason === 'no_video'
+                ? 'ลิงก์ XHS นี้อาจไม่ใช่โพสต์วิดีโอ ลองส่งลิงก์ที่เป็นวิดีโอใหม่อีกครั้ง'
+                : downloadFailed || resolverFailureReason === 'request_failed'
+                    ? 'โหลดวิดีโอจาก XHS ไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
+                    : 'รับลิงก์ XHS แล้ว แต่ดึงวิดีโอไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
+
             await lineReplyOrPush({
                 replyToken,
                 channelAccessToken,
                 lineUserId,
                 messages: [
-                    { type: 'text', text: 'รับลิงก์ XHS แล้ว แต่ดึงวิดีโอไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง' },
+                    { type: 'text', text: failureText },
                 ],
             }).catch(() => { })
             return
@@ -18884,7 +18991,8 @@ app.post('/api/gallery/mark-posted-bulk', async (c) => {
 })
 
 app.delete('/api/gallery/:id', async (c) => {
-    const id = c.req.param('id')
+    const id = String(c.req.param('id') || '').trim()
+    if (!id) return c.json({ error: 'id is required' }, 400)
     try {
         const currentNamespaceId = c.get('botId')
         const requestedNamespaceId = String(c.req.query('namespace_id') || '').trim()
@@ -18895,16 +19003,25 @@ app.delete('/api/gallery/:id', async (c) => {
         const bucket = targetNamespaceId === currentNamespaceId
             ? c.get('bucket')
             : new BotBucket(c.env.BUCKET, targetNamespaceId) as unknown as R2Bucket
-        await Promise.all([
-            bucket.delete(`videos/${id}.json`),
-            bucket.delete(`videos/${id}.mp4`),
-            bucket.delete(`videos/${id}_thumb.webp`),
-        ])
+        const keysToDelete = [
+            `videos/${id}.json`,
+            `videos/${id}.mp4`,
+            `videos/${id}_thumb.webp`,
+            ...getOriginalVideoAssetKeys(id),
+            getOriginalThumbnailAssetKey(id),
+            `_inbox/${id}.json`,
+            `_processing/${id}.json`,
+            `_queue/${id}.json`,
+            `_processing_history/${id}.json`,
+        ]
+        await Promise.all(keysToDelete.map((key) => bucket.delete(key).catch(() => { })))
         await removeFromGalleryCache(bucket, id).catch(() => { })
-        await syncGalleryIndexEntry(c.env, targetNamespaceId, id).catch((error) => {
-            console.log(`[GALLERY-DELETE] sync gallery index failed ns=${targetNamespaceId} video=${id}: ${error instanceof Error ? error.message : String(error)}`)
-            return deleteGalleryIndexEntry(c.env.DB, targetNamespaceId, id).catch(() => { })
-        })
+        await deleteGalleryIndexEntry(c.env.DB, targetNamespaceId, id).catch(() => { })
+        await c.env.DB
+            .prepare('DELETE FROM namespace_video_state WHERE namespace_id = ? AND video_id = ?')
+            .bind(targetNamespaceId, id)
+            .run()
+            .catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_videos.json').catch(() => { })
         await c.env.BUCKET.delete('_admin_cache/all_gallery_owner_videos.json').catch(() => { })
         invalidateNamespaceInventoryCache(targetNamespaceId)
@@ -19117,6 +19234,7 @@ const NS_SETTING_PAGES_LINKED_TAGGED_PROFILES_V1 = 'pages_linked_tagged_profiles
 const NS_SETTING_GEMINI_API_KEY = 'gemini_api_key_v1'
 const NS_SETTING_GEMINI_API_KEYS = 'gemini_api_keys_v2'
 const NS_SETTING_COMMENT_TEMPLATE = 'comment_template_v1'
+const NS_SETTING_COMMENT_TEMPLATES = 'comment_templates_v1'
 const NS_SETTING_DEDICATED_COMMENT_TOKEN = 'dedicated_comment_token_v1'
 const NS_SETTING_COVER_TEMPLATE = 'cover_template_v1'
 const NS_SETTING_COVER_TEXT_STYLE = 'cover_text_style_v1'
@@ -19128,6 +19246,15 @@ const NS_SETTING_SHOPEE_SHORTLINK_PROCESSING_REQUIRED = 'shopee_shortlink_proces
 const NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID = 'shopee_shortlink_expected_utm_id_v1'
 const NS_SETTING_LAZADA_SHORTLINK_BASE_URL = 'lazada_shortlink_base_url_v1'
 const NS_SETTING_LAZADA_EXPECTED_MEMBER_ID = 'lazada_expected_member_id_v1'
+const NS_SETTING_SHORTLINK_URL_TEMPLATE = 'shortlink_url_template_v1'
+const NS_SETTING_SHORTLINK_SUB_ID_KEYS = [
+    'shortlink_sub_id1_v1',
+    'shortlink_sub_id2_v1',
+    'shortlink_sub_id3_v1',
+    'shortlink_sub_id4_v1',
+    'shortlink_sub_id5_v1',
+] as const
+const NS_SETTING_PAGE_SHORTLINK_OVERRIDE_ENABLED = 'shortlink_override_enabled_v1'
 const DEFAULT_SHOPEE_SHORTLINK_WORKER_URL = 'https://short.wwoom.com/'
 const DEFAULT_LAZADA_SHORTLINK_WORKER_URL = 'https://short.wwoom.com/'
 const ADMIN_SHORTLINK_ACCOUNT = 'CHEARB'
@@ -19202,6 +19329,39 @@ type PageTokenPoolEntry = {
 type NamespacePageTokenPool = Record<string, PageTokenPoolEntry>
 type NamespacePageHiddenTaggedProfiles = Record<string, string[]>
 type NamespacePageLinkedTaggedProfiles = Record<string, string[]>
+
+type ShortlinkSubIds = {
+    sub1: string
+    sub2: string
+    sub3: string
+    sub4: string
+    sub5: string
+}
+
+type PageShortlinkOverrideSettings = {
+    overrideEnabled: boolean
+    account: string
+    shopeeBaseUrl: string
+    lazadaBaseUrl: string
+    expectedUtmId: string
+    lazadaExpectedMemberId: string
+    urlTemplate: string
+    subIds: ShortlinkSubIds
+    updatedAt: string | null
+}
+
+type EffectiveShortlinkSettings = {
+    source: 'global' | 'page'
+    account: string
+    shopeeBaseUrl: string
+    lazadaBaseUrl: string
+    expectedUtmId: string
+    lazadaExpectedMemberId: string
+    urlTemplate: string
+    subIds: ShortlinkSubIds
+    pageOverrideEnabled: boolean
+}
+
 function canonicalPageTokenFromRows(row: { access_token?: string | null }): string {
     return String(row?.access_token || '').trim()
 }
@@ -19451,42 +19611,119 @@ async function getNamespaceGeminiApiKeySettings(db: D1Database, _namespaceId: st
     }
 }
 
-async function getNamespaceCommentTemplateEntry(db: D1Database, namespaceId: string): Promise<{ template: string; updatedAt: string | null }> {
+async function getNamespaceCommentTemplatesEntry(db: D1Database, namespaceId: string): Promise<{
+    slots: string[]
+    updatedAt: string | null
+    hasCustom: boolean
+}> {
     await ensureNamespaceSettingsTable(db)
-    const row = await db.prepare(
+    const newRow = await db.prepare(
         'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
-    ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).first() as { value?: string; updated_at?: string } | null
+    ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATES).first() as { value?: string; updated_at?: string } | null
+
+    let slots = parseStoredCommentTemplatesValue(newRow?.value || '')
+    let updatedAt = String(newRow?.updated_at || '').trim() || null
+    let hasCustom = selectNonEmptyCommentTemplates(slots).length > 0
+
+    if (!hasCustom) {
+        // Legacy single-template fallback. Only consulted when the new key is empty,
+        // so admins migrating from the old UI keep their existing template visible
+        // (and we won't accidentally show an old draft after the user clears slots).
+        const legacyRow = await db.prepare(
+            'SELECT value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).first() as { value?: string; updated_at?: string } | null
+        const legacyTemplate = normalizeCommentTemplateText(legacyRow?.value || '')
+        if (legacyTemplate) {
+            slots = mergeLegacyCommentTemplate(slots, legacyTemplate)
+            updatedAt = String(legacyRow?.updated_at || '').trim() || updatedAt
+            hasCustom = true
+        }
+    }
+
+    return { slots, updatedAt, hasCustom }
+}
+
+async function getNamespaceCommentTemplateEntry(db: D1Database, namespaceId: string): Promise<{ template: string; updatedAt: string | null }> {
+    const entry = await getNamespaceCommentTemplatesEntry(db, namespaceId)
+    const firstNonEmpty = selectNonEmptyCommentTemplates(entry.slots)[0] || ''
     return {
-        template: normalizeCommentTemplate(String(row?.value || '')),
-        updatedAt: String(row?.updated_at || '').trim() || null,
+        template: firstNonEmpty,
+        updatedAt: entry.updatedAt,
     }
 }
 
-async function setNamespaceCommentTemplate(db: D1Database, namespaceId: string, rawTemplate: string): Promise<void> {
+async function setNamespaceCommentTemplates(db: D1Database, namespaceId: string, rawSlots: unknown): Promise<void> {
     await ensureNamespaceSettingsTable(db)
-    const template = normalizeCommentTemplate(rawTemplate).slice(0, MAX_COMMENT_TEMPLATE_CHARS)
-    if (!template) {
+    const slots = normalizeCommentTemplateSlots(rawSlots)
+        .map((entry) => entry.slice(0, MAX_COMMENT_TEMPLATE_CHARS))
+    const nonEmpty = selectNonEmptyCommentTemplates(slots)
+
+    if (nonEmpty.length === 0) {
+        // Empty save = reset. Drop both the new key and the legacy key so the
+        // workspace falls back to DEFAULT_COMMENT_TEMPLATE on next read.
         await db.prepare(
             'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
-        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).run()
+        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATES).run().catch(() => { })
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).run().catch(() => { })
         return
     }
 
+    const encoded = encodeCommentTemplatesForStorage(slots)
     await db.prepare(
         `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
          VALUES (?, ?, ?, datetime('now'), datetime('now'))
          ON CONFLICT(namespace_id, key)
          DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
-    ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE, template).run()
+    ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATES, encoded).run()
+
+    // Keep the legacy single-template key in sync with slot 0 so any external reader
+    // still hitting the old key sees the operator-facing primary template.
+    const legacyValue = slots[0] || ''
+    if (legacyValue) {
+        await db.prepare(
+            `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+             VALUES (?, ?, ?, datetime('now'), datetime('now'))
+             ON CONFLICT(namespace_id, key)
+             DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE, legacyValue).run().catch(() => { })
+    } else {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, NS_SETTING_COMMENT_TEMPLATE).run().catch(() => { })
+    }
+}
+
+async function setNamespaceCommentTemplate(db: D1Database, namespaceId: string, rawTemplate: string): Promise<void> {
+    const template = normalizeCommentTemplate(rawTemplate).slice(0, MAX_COMMENT_TEMPLATE_CHARS)
+    if (!template) {
+        await setNamespaceCommentTemplates(db, namespaceId, [])
+        return
+    }
+    await setNamespaceCommentTemplates(db, namespaceId, [template, '', ''])
 }
 
 async function getNamespaceCommentTemplateSettings(db: D1Database, namespaceId: string) {
-    const workspace = await getNamespaceCommentTemplateEntry(db, namespaceId)
-    const source: 'default' | 'custom' = workspace.template ? 'custom' : 'default'
+    const entry = await getNamespaceCommentTemplatesEntry(db, namespaceId)
+    const hasCustom = entry.hasCustom
+    const source: 'default' | 'custom' = hasCustom ? 'custom' : 'default'
+    const firstNonEmpty = selectNonEmptyCommentTemplates(entry.slots)[0] || ''
+    const template = firstNonEmpty || DEFAULT_COMMENT_TEMPLATE
+    // For backward-compat clients: `template` mirrors slot 0 (or the default when
+    // nothing is configured). `templates` is the full ordered list of length
+    // COMMENT_TEMPLATE_SLOT_COUNT — empty slots stay empty, slot 0 falls back to
+    // the default when source === 'default'.
+    const templates = entry.slots.slice()
+    if (!hasCustom) {
+        templates[0] = DEFAULT_COMMENT_TEMPLATE
+    }
     return {
-        template: workspace.template || DEFAULT_COMMENT_TEMPLATE,
+        template,
+        templates,
         source,
-        updated_at: workspace.updatedAt,
+        updated_at: entry.updatedAt,
+        slot_count: COMMENT_TEMPLATE_SLOT_COUNT,
     }
 }
 
@@ -19683,6 +19920,11 @@ function normalizeLazadaMemberId(rawValue: string): string {
     if (!value) return ''
     if (!/^\d+$/.test(value)) return ''
     return value.slice(0, MAX_LAZADA_MEMBER_ID_CHARS)
+}
+
+function parseStoredBooleanFlag(rawValue: string): boolean {
+    const value = String(rawValue || '').trim().toLowerCase()
+    return value === '1' || value === 'true' || value === 'yes' || value === 'on'
 }
 
 function computeShortlinkUtmMatchValue(expectedUtmId: string, actualUtmSource?: string | null): number | null {
@@ -20964,6 +21206,152 @@ async function setNamespaceLazadaShortlinkBaseUrl(db: D1Database, namespaceId: s
     ).bind(namespaceId, NS_SETTING_LAZADA_SHORTLINK_BASE_URL, baseUrl).run()
 }
 
+function buildPageShortlinkSettingKey(pageId: string, settingKey: string): string {
+    const normalizedPageId = String(pageId || '').trim()
+    return normalizedPageId ? `page:${normalizedPageId}:${settingKey}` : ''
+}
+
+function emptyShortlinkSubIds(): ShortlinkSubIds {
+    return { sub1: '', sub2: '', sub3: '', sub4: '', sub5: '' }
+}
+
+function serializePageShortlinkSettings(settings: PageShortlinkOverrideSettings) {
+    return {
+        override_enabled: settings.overrideEnabled,
+        account: settings.account,
+        base_url: settings.shopeeBaseUrl,
+        lazada_base_url: settings.lazadaBaseUrl,
+        expected_utm_id: settings.expectedUtmId,
+        lazada_expected_member_id: settings.lazadaExpectedMemberId,
+        shortlink_url_template: settings.urlTemplate,
+        sub_id1: settings.subIds.sub1,
+        sub_id2: settings.subIds.sub2,
+        sub_id3: settings.subIds.sub3,
+        sub_id4: settings.subIds.sub4,
+        sub_id5: settings.subIds.sub5,
+        updated_at: settings.updatedAt,
+    }
+}
+
+function serializeEffectiveShortlinkSettings(settings: EffectiveShortlinkSettings) {
+    return {
+        source: settings.source,
+        page_override_enabled: settings.pageOverrideEnabled,
+        account: settings.account,
+        base_url: settings.shopeeBaseUrl,
+        lazada_base_url: settings.lazadaBaseUrl,
+        expected_utm_id: settings.expectedUtmId,
+        lazada_expected_member_id: settings.lazadaExpectedMemberId,
+        shortlink_url_template: settings.urlTemplate,
+        sub_id1: settings.subIds.sub1,
+        sub_id2: settings.subIds.sub2,
+        sub_id3: settings.subIds.sub3,
+        sub_id4: settings.subIds.sub4,
+        sub_id5: settings.subIds.sub5,
+    }
+}
+
+function getPageShortlinkSettingKeys(pageId: string): Record<string, string> {
+    return {
+        overrideEnabled: buildPageShortlinkSettingKey(pageId, NS_SETTING_PAGE_SHORTLINK_OVERRIDE_ENABLED),
+        account: buildPageShortlinkSettingKey(pageId, NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT),
+        shopeeBaseUrl: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHOPEE_SHORTLINK_BASE_URL),
+        lazadaBaseUrl: buildPageShortlinkSettingKey(pageId, NS_SETTING_LAZADA_SHORTLINK_BASE_URL),
+        expectedUtmId: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHOPEE_SHORTLINK_EXPECTED_UTM_ID),
+        lazadaExpectedMemberId: buildPageShortlinkSettingKey(pageId, NS_SETTING_LAZADA_EXPECTED_MEMBER_ID),
+        urlTemplate: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHORTLINK_URL_TEMPLATE),
+        sub1: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHORTLINK_SUB_ID_KEYS[0]),
+        sub2: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHORTLINK_SUB_ID_KEYS[1]),
+        sub3: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHORTLINK_SUB_ID_KEYS[2]),
+        sub4: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHORTLINK_SUB_ID_KEYS[3]),
+        sub5: buildPageShortlinkSettingKey(pageId, NS_SETTING_SHORTLINK_SUB_ID_KEYS[4]),
+    }
+}
+
+async function getPageShortlinkOverrideSettings(db: D1Database, namespaceId: string, pageId: string): Promise<PageShortlinkOverrideSettings> {
+    await ensureNamespaceSettingsTable(db)
+    const keysByName = getPageShortlinkSettingKeys(pageId)
+    const keys = Object.values(keysByName).filter(Boolean)
+    const rows = keys.length > 0
+        ? await db.prepare(
+            `SELECT key, value, updated_at FROM namespace_settings WHERE namespace_id = ? AND key IN (${keys.map(() => '?').join(',')})`
+        ).bind(namespaceId, ...keys).all().catch(() => ({ results: [] })) as { results?: Array<{ key?: string; value?: string; updated_at?: string }> }
+        : { results: [] as Array<{ key?: string; value?: string; updated_at?: string }> }
+    const byKey = new Map<string, { value: string; updatedAt: string | null }>()
+    const updatedAtCandidates: string[] = []
+    for (const row of rows.results || []) {
+        const key = String(row?.key || '').trim()
+        if (!key) continue
+        const updatedAt = String(row?.updated_at || '').trim() || null
+        byKey.set(key, { value: String(row?.value || ''), updatedAt })
+        if (updatedAt) updatedAtCandidates.push(updatedAt)
+    }
+    const getValue = (name: keyof ReturnType<typeof getPageShortlinkSettingKeys>) => byKey.get(keysByName[name])?.value || ''
+    return {
+        overrideEnabled: parseStoredBooleanFlag(getValue('overrideEnabled')),
+        account: normalizeShortlinkAccount(getValue('account')),
+        shopeeBaseUrl: normalizeShortlinkBaseUrl(getValue('shopeeBaseUrl')),
+        lazadaBaseUrl: normalizeShortlinkBaseUrl(getValue('lazadaBaseUrl')),
+        expectedUtmId: normalizeShortlinkExpectedUtmId(getValue('expectedUtmId')),
+        lazadaExpectedMemberId: normalizeLazadaMemberId(getValue('lazadaExpectedMemberId')),
+        urlTemplate: normalizeShortlinkUrlTemplate(getValue('urlTemplate')),
+        subIds: {
+            sub1: normalizeShortlinkSubId(getValue('sub1')),
+            sub2: normalizeShortlinkSubId(getValue('sub2')),
+            sub3: normalizeShortlinkSubId(getValue('sub3')),
+            sub4: normalizeShortlinkSubId(getValue('sub4')),
+            sub5: normalizeShortlinkSubId(getValue('sub5')),
+        },
+        updatedAt: updatedAtCandidates.sort().at(-1) || null,
+    }
+}
+
+async function setNamespaceSettingValue(db: D1Database, namespaceId: string, key: string, value: string): Promise<void> {
+    await ensureNamespaceSettingsTable(db)
+    const normalizedKey = String(key || '').trim()
+    if (!normalizedKey) return
+    if (!String(value || '').trim()) {
+        await db.prepare(
+            'DELETE FROM namespace_settings WHERE namespace_id = ? AND key = ?'
+        ).bind(namespaceId, normalizedKey).run()
+        return
+    }
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, normalizedKey, value).run()
+}
+
+async function setPageShortlinkOverrideSettings(db: D1Database, namespaceId: string, pageId: string, settings: PageShortlinkOverrideSettings): Promise<void> {
+    const keys = getPageShortlinkSettingKeys(pageId)
+    await ensureNamespaceSettingsTable(db)
+    // OFF is an explicit flag and keeps the page values for quick re-enable.
+    // Resolution always checks overrideEnabled before reading these values, so OFF
+    // cannot accidentally use stale page-specific settings.
+    await db.prepare(
+        `INSERT INTO namespace_settings (namespace_id, key, value, created_at, updated_at)
+         VALUES (?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, key)
+         DO UPDATE SET value = excluded.value, updated_at = datetime('now')`
+    ).bind(namespaceId, keys.overrideEnabled, settings.overrideEnabled ? '1' : '0').run()
+
+    await Promise.all([
+        setNamespaceSettingValue(db, namespaceId, keys.account, settings.account),
+        setNamespaceSettingValue(db, namespaceId, keys.shopeeBaseUrl, settings.shopeeBaseUrl),
+        setNamespaceSettingValue(db, namespaceId, keys.lazadaBaseUrl, settings.lazadaBaseUrl),
+        setNamespaceSettingValue(db, namespaceId, keys.expectedUtmId, settings.expectedUtmId),
+        setNamespaceSettingValue(db, namespaceId, keys.lazadaExpectedMemberId, settings.lazadaExpectedMemberId),
+        setNamespaceSettingValue(db, namespaceId, keys.urlTemplate, settings.urlTemplate),
+        setNamespaceSettingValue(db, namespaceId, keys.sub1, settings.subIds.sub1),
+        setNamespaceSettingValue(db, namespaceId, keys.sub2, settings.subIds.sub2),
+        setNamespaceSettingValue(db, namespaceId, keys.sub3, settings.subIds.sub3),
+        setNamespaceSettingValue(db, namespaceId, keys.sub4, settings.subIds.sub4),
+        setNamespaceSettingValue(db, namespaceId, keys.sub5, settings.subIds.sub5),
+    ])
+}
+
 async function resolveNamespaceShopeeShortlinkBaseUrl(db: D1Database, namespaceId: string): Promise<string> {
     const account = await resolveNamespaceAffiliateShortlinkAccount(db, namespaceId)
     if (account) return deriveAffiliateShortlinkBaseUrl('shopee', account)
@@ -21002,6 +21390,21 @@ async function getNamespaceShopeeShortlinkSettings(db: D1Database, namespaceId: 
     }
 }
 
+async function getNamespaceShortlinkSettingsForApi(db: D1Database, namespaceId: string) {
+    const settings = await getNamespaceShopeeShortlinkSettings(db, namespaceId)
+    const subIds = await resolveNamespaceShortlinkSubIds(db, namespaceId).catch(() => emptyShortlinkSubIds())
+    const urlTemplate = await resolveNamespaceShortlinkUrlTemplate(db, namespaceId).catch(() => '')
+    return {
+        ...settings,
+        shortlink_url_template: urlTemplate,
+        sub_id1: subIds.sub1,
+        sub_id2: subIds.sub2,
+        sub_id3: subIds.sub3,
+        sub_id4: subIds.sub4,
+        sub_id5: subIds.sub5,
+    }
+}
+
 function deriveShortlinkSub1(namespaceId: string): string {
     const normalized = String(namespaceId || '').trim().toLowerCase()
     const fromEmail = normalized.includes('@') ? normalized.split('@')[0] : normalized
@@ -21012,35 +21415,74 @@ function deriveShortlinkSub1(namespaceId: string): string {
 }
 
 async function resolveNamespaceShortlinkSubIds(db: D1Database, namespaceId: string): Promise<{ sub1: string; sub2: string; sub3: string; sub4: string; sub5: string }> {
-    const keys = ['shortlink_sub_id1_v1', 'shortlink_sub_id2_v1', 'shortlink_sub_id3_v1', 'shortlink_sub_id4_v1', 'shortlink_sub_id5_v1'] as const
+    await ensureNamespaceSettingsTable(db)
+    const keys = NS_SETTING_SHORTLINK_SUB_ID_KEYS
     const result: Record<string, string> = {}
     for (const key of keys) {
         const row = await db.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, key).first().catch(() => null) as { value?: string } | null
-        result[key] = String(row?.value || '').trim()
+        result[key] = normalizeShortlinkSubId(String(row?.value || ''))
     }
     return {
-        sub1: result['shortlink_sub_id1_v1'] || '',
-        sub2: result['shortlink_sub_id2_v1'] || '',
-        sub3: result['shortlink_sub_id3_v1'] || '',
-        sub4: result['shortlink_sub_id4_v1'] || '',
-        sub5: result['shortlink_sub_id5_v1'] || '',
+        sub1: result[NS_SETTING_SHORTLINK_SUB_ID_KEYS[0]] || '',
+        sub2: result[NS_SETTING_SHORTLINK_SUB_ID_KEYS[1]] || '',
+        sub3: result[NS_SETTING_SHORTLINK_SUB_ID_KEYS[2]] || '',
+        sub4: result[NS_SETTING_SHORTLINK_SUB_ID_KEYS[3]] || '',
+        sub5: result[NS_SETTING_SHORTLINK_SUB_ID_KEYS[4]] || '',
     }
 }
 
 async function resolveNamespaceShortlinkUrlTemplate(db: D1Database, namespaceId: string): Promise<string> {
-    const row = await db.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, 'shortlink_url_template_v1').first().catch(() => null) as { value?: string } | null
-    return String(row?.value || '').trim()
+    await ensureNamespaceSettingsTable(db)
+    const row = await db.prepare('SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?').bind(namespaceId, NS_SETTING_SHORTLINK_URL_TEMPLATE).first().catch(() => null) as { value?: string } | null
+    return normalizeShortlinkUrlTemplate(String(row?.value || ''))
 }
 
-function buildShortlinkRequestUrlFromTemplate(template: string, productUrl: string, subIds: { sub1: string; sub2: string; sub3: string; sub4: string; sub5: string }, account?: string): string {
-    return template
-        .replace(/\{account\}/g, encodeURIComponent(account || ''))
-        .replace(/\{url\}/g, encodeURIComponent(productUrl))
-        .replace(/\{sub_id\}/g, encodeURIComponent(subIds.sub1))
-        .replace(/\{sub_id2\}/g, encodeURIComponent(subIds.sub2))
-        .replace(/\{sub_id3\}/g, encodeURIComponent(subIds.sub3))
-        .replace(/\{sub_id4\}/g, encodeURIComponent(subIds.sub4))
-        .replace(/\{sub_id5\}/g, encodeURIComponent(subIds.sub5))
+async function resolveEffectiveShortlinkSettings(db: D1Database, namespaceId: string, pageId?: string): Promise<EffectiveShortlinkSettings> {
+    const normalizedPageId = String(pageId || '').trim()
+    if (normalizedPageId) {
+        const pageSettings = await getPageShortlinkOverrideSettings(db, namespaceId, normalizedPageId)
+        if (pageSettings.overrideEnabled) {
+            const account = pageSettings.account
+                || extractShortlinkAccountFromBaseUrl(pageSettings.shopeeBaseUrl)
+                || extractShortlinkAccountFromBaseUrl(pageSettings.lazadaBaseUrl)
+                || ''
+            return {
+                source: 'page',
+                account,
+                shopeeBaseUrl: account ? deriveAffiliateShortlinkBaseUrl('shopee', account) : pageSettings.shopeeBaseUrl,
+                lazadaBaseUrl: account ? deriveAffiliateShortlinkBaseUrl('lazada', account) : pageSettings.lazadaBaseUrl,
+                expectedUtmId: pageSettings.expectedUtmId,
+                lazadaExpectedMemberId: pageSettings.lazadaExpectedMemberId,
+                urlTemplate: pageSettings.urlTemplate,
+                subIds: {
+                    ...pageSettings.subIds,
+                    sub1: pageSettings.subIds.sub1 || deriveShortlinkSub1(normalizedPageId),
+                },
+                pageOverrideEnabled: true,
+            }
+        }
+    }
+
+    const [account, shopeeBaseUrl, lazadaBaseUrl, expectedUtmId, lazadaExpectedMemberId, subIds, urlTemplate] = await Promise.all([
+        resolveNamespaceAffiliateShortlinkAccount(db, namespaceId).catch(() => ''),
+        resolveNamespaceShopeeShortlinkBaseUrl(db, namespaceId).catch(() => ''),
+        resolveNamespaceLazadaShortlinkBaseUrl(db, namespaceId).catch(() => ''),
+        resolveNamespaceShopeeShortlinkExpectedUtmId(db, namespaceId).catch(() => ''),
+        resolveNamespaceLazadaExpectedMemberId(db, namespaceId).catch(() => ''),
+        resolveNamespaceShortlinkSubIds(db, namespaceId).catch(() => emptyShortlinkSubIds()),
+        resolveNamespaceShortlinkUrlTemplate(db, namespaceId).catch(() => ''),
+    ])
+    return {
+        source: 'global',
+        account,
+        shopeeBaseUrl,
+        lazadaBaseUrl,
+        expectedUtmId,
+        lazadaExpectedMemberId,
+        urlTemplate,
+        subIds,
+        pageOverrideEnabled: false,
+    }
 }
 
 async function getNamespacePagesLastSyncAtMs(db: D1Database, namespaceId: string): Promise<number> {
@@ -22921,46 +23363,43 @@ function normalizePageName(raw: string): string {
     return String(raw || '').trim().toLowerCase()
 }
 
-const COMMENT_MESSAGE_TEMPLATE_TEXT = `
-📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้ 👇
-🧡 Shopee : {{shopee_link}}
-💙 Lazada : {{lazada_link}}
-
-✨ ของจริงงานดีนะ ลองเข้าไปส่องก่อน 👀🛍️
-🛡️ เพจเราเป็น Partner Shopee & Lazada ปลอดภัย ✅💯
-`
-
-const DEFAULT_COMMENT_TEMPLATE = COMMENT_MESSAGE_TEMPLATE_TEXT.trim()
-const COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER = '{{shopee_link}}'
-const COMMENT_TEMPLATE_LAZADA_PLACEHOLDER = '{{lazada_link}}'
+const DEFAULT_COMMENT_TEMPLATE = DEFAULT_COMMENT_TEMPLATE_TEXT
 
 function normalizeCommentTemplate(rawTemplate: string): string {
-    return String(rawTemplate || '')
-        .replace(/\r\n?/g, '\n')
-        .trim()
+    return normalizeCommentTemplateText(rawTemplate)
 }
 
-function renderAffiliateCommentTemplate(rawTemplate: string, shopeeLink: string, lazadaLink = ''): string {
-    const template = normalizeCommentTemplate(rawTemplate) || DEFAULT_COMMENT_TEMPLATE
-    const shopee = String(shopeeLink || '').trim().replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
-    const lazada = String(lazadaLink || '').trim()
-
-    const renderedLines = template
-        .split('\n')
-        .map((line) =>
-            line
-                .split(COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER).join(shopee)
-                .split(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER).join(lazada)
-        )
-        .filter((line) => {
-            const trimmed = line.trim()
-            if (!trimmed) return true
-            if (!shopee && /shopee/i.test(trimmed) && !/https?:\/\//i.test(trimmed)) return false
-            if (!lazada && /lazada/i.test(trimmed) && !/https?:\/\//i.test(trimmed)) return false
-            return true
-        })
-
-    return renderedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+async function getEffectiveNamespaceCommentTemplates(db: D1Database, namespaceId: string): Promise<{
+    slots: string[]
+    source: 'default' | 'custom'
+    updated_at: string | null
+    lookupError: string | null
+}> {
+    const ns = String(namespaceId || '').trim()
+    if (!ns) {
+        return {
+            slots: normalizeCommentTemplateSlots([DEFAULT_COMMENT_TEMPLATE]),
+            source: 'default' as const,
+            updated_at: null,
+            lookupError: null,
+        }
+    }
+    try {
+        const entry = await getNamespaceCommentTemplatesEntry(db, ns)
+        return {
+            slots: entry.slots,
+            source: entry.hasCustom ? 'custom' : 'default',
+            updated_at: entry.updatedAt,
+            lookupError: null,
+        }
+    } catch (e) {
+        return {
+            slots: normalizeCommentTemplateSlots([DEFAULT_COMMENT_TEMPLATE]),
+            source: 'default' as const,
+            updated_at: null,
+            lookupError: e instanceof Error ? e.message : String(e),
+        }
+    }
 }
 
 async function getEffectiveNamespaceCommentTemplate(db: D1Database, namespaceId: string): Promise<{
@@ -22969,49 +23408,52 @@ async function getEffectiveNamespaceCommentTemplate(db: D1Database, namespaceId:
     updated_at: string | null
     lookupError: string | null
 }> {
-    const ns = String(namespaceId || '').trim()
-    if (!ns) {
-        return { template: DEFAULT_COMMENT_TEMPLATE, source: 'default' as const, updated_at: null, lookupError: null }
-    }
-    try {
-        const settings = await getNamespaceCommentTemplateSettings(db, ns)
-        return { ...settings, lookupError: null }
-    } catch (e) {
-        return {
-            template: DEFAULT_COMMENT_TEMPLATE,
-            source: 'default' as const,
-            updated_at: null,
-            lookupError: e instanceof Error ? e.message : String(e),
-        }
+    const entry = await getEffectiveNamespaceCommentTemplates(db, namespaceId)
+    const firstNonEmpty = selectNonEmptyCommentTemplates(entry.slots)[0] || DEFAULT_COMMENT_TEMPLATE
+    return {
+        template: firstNonEmpty,
+        source: entry.source,
+        updated_at: entry.updated_at,
+        lookupError: entry.lookupError,
     }
 }
 
 async function namespaceCommentTemplateRequiresLazadaLink(db: D1Database, namespaceId: string): Promise<boolean> {
-    const settings = await getEffectiveNamespaceCommentTemplate(db, namespaceId)
-    return normalizeCommentTemplate(settings.template).includes(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER)
+    const entry = await getEffectiveNamespaceCommentTemplates(db, namespaceId)
+    const nonEmpty = selectNonEmptyCommentTemplates(entry.slots)
+    const effective = nonEmpty.length > 0 ? nonEmpty : [DEFAULT_COMMENT_TEMPLATE]
+    return effective.some((template) => normalizeCommentTemplateText(template).includes(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER))
+}
+
+async function buildAffiliateCommentMessages(db: D1Database, namespaceId: string, shopeeLink: string, lazadaLink = ''): Promise<string[]> {
+    const shopee = String(shopeeLink || '').trim()
+    if (!shopee) return []
+    const ns = String(namespaceId || '').trim()
+    const settings = await getEffectiveNamespaceCommentTemplates(db, ns)
+    const lookupError = settings.lookupError
+    const lazada = String(lazadaLink || '').trim()
+    const rendered = renderCommentTemplatesForPosting({
+        slots: settings.slots,
+        shopeeLink: shopee,
+        lazadaLink: lazada,
+        fallbackTemplate: DEFAULT_COMMENT_TEMPLATE,
+    })
+    // DEBUG: log namespace + which template source was picked + how many messages
+    // we are about to post. Helps diagnose when a custom template isn't being used
+    // despite the user saving one (e.g., empty namespaceId, DB read error, wrong
+    // namespace_id column value in post_history) and how many comments the system
+    // will actually create per video.
+    console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} source=${settings.source} slots=${settings.slots.length} non_empty=${selectNonEmptyCommentTemplates(settings.slots).length} rendered_count=${rendered.length} lookup_error=${lookupError || 'none'}`)
+    console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} shopee_link=${shopee} lazada_link=${lazada || '(none)'} template_updated_at=${settings.updated_at || '(default)'}`)
+    rendered.forEach((message, idx) => {
+        console.log(`[COMMENT-BUILD] rendered[${idx + 1}/${rendered.length}] len=${message.length} text=${JSON.stringify(message)}`)
+    })
+    return rendered
 }
 
 async function buildAffiliateCommentMessage(db: D1Database, namespaceId: string, shopeeLink: string, lazadaLink = ''): Promise<string> {
-    const shopee = String(shopeeLink || '').trim()
-    if (!shopee) return ''
-    const ns = String(namespaceId || '').trim()
-    const settings = await getEffectiveNamespaceCommentTemplate(db, ns)
-    const lookupError = settings.lookupError
-    // DEBUG: log namespace + which template source was picked. Helps diagnose when
-    // custom template isn't being used despite user saving one (e.g., empty namespaceId
-    // passed by caller, DB read error, wrong namespace_id column value in post_history).
-    console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} source=${settings.source} template_len=${settings.template.length} has_lazada_placeholder=${settings.template.includes(COMMENT_TEMPLATE_LAZADA_PLACEHOLDER)} lookup_error=${lookupError || 'none'}`)
-    const lazada = String(lazadaLink || '').trim()
-    const rendered = renderAffiliateCommentTemplate(settings.template, shopee, lazada)
-    // Heavy diagnostic: log the EXACT template + rendered text + input links. Lets us
-    // verify in `wrangler tail` whether a "weird" comment in production really came
-    // from this code path or from somewhere else entirely. Length-prefixed so the
-    // first/last bytes are visible even if a renderer truncates the line.
-    console.log(`[COMMENT-BUILD] namespace=${ns || '(empty)'} shopee_link=${shopee} lazada_link=${lazada || '(none)'}`)
-    console.log(`[COMMENT-BUILD] template_updated_at=${settings.updated_at || '(default)'} template_text=${JSON.stringify(settings.template)}`)
-    console.log(`[COMMENT-BUILD] rendered_len=${rendered.length} rendered_text=${JSON.stringify(rendered)}`)
-    // DO NOT auto-append lazada link. Respect user's template exactly — if {{lazada_link}} is not in template, user does not want lazada link in comment.
-    return rendered
+    const messages = await buildAffiliateCommentMessages(db, namespaceId, shopeeLink, lazadaLink)
+    return messages[0] || ''
 }
 
 async function shortenLazadaLinkForNamespace(params: {
@@ -23019,6 +23461,7 @@ async function shortenLazadaLinkForNamespace(params: {
     namespaceId: string
     lazadaLink: string
     logPrefix: string
+    pageId?: string
     forceShortlink?: boolean
     allowFallbackWhenEnforced?: boolean
     trace?: {
@@ -23047,7 +23490,8 @@ async function shortenLazadaLinkForNamespace(params: {
         return ''
     }
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
-    const expectedMemberId = normalizeLazadaMemberId(await resolveNamespaceLazadaExpectedMemberId(params.env.DB, params.namespaceId).catch(() => ''))
+    const shortlinkSettings = await resolveEffectiveShortlinkSettings(params.env.DB, params.namespaceId, params.pageId)
+    const expectedMemberId = normalizeLazadaMemberId(shortlinkSettings.lazadaExpectedMemberId)
     const sourceMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(sourceLink))
     const originalMemberId = normalizeLazadaMemberId(extractLazadaMemberIdFromLink(originalLink))
     const bridgeInputLink = params.forceShortlink ? sourceLink : originalLink
@@ -23066,20 +23510,20 @@ async function shortenLazadaLinkForNamespace(params: {
         return alreadyConvertedLink
     }
 
-    // Load sub IDs + URL template from namespace settings
-    const lazadaSubIds = await resolveNamespaceShortlinkSubIds(params.env.DB, params.namespaceId).catch(() => ({ sub1: '', sub2: '', sub3: '', sub4: '', sub5: '' }))
+    // Load sub IDs + URL template (per-page override when enabled, else namespace)
+    const lazadaSubIds = shortlinkSettings.subIds
     const effectiveLazadaSub1 = lazadaSubIds.sub1 || deriveShortlinkSub1(params.namespaceId)
     const effectiveLazadaSubIds = { ...lazadaSubIds, sub1: effectiveLazadaSub1 }
-    const lazadaUrlTemplate = await resolveNamespaceShortlinkUrlTemplate(params.env.DB, params.namespaceId).catch(() => '')
+    const lazadaUrlTemplate = shortlinkSettings.urlTemplate
 
     // Priority: 1) URL template from settings  2) baseUrl derived from account
-    const lazadaAccount = await resolveNamespaceAffiliateShortlinkAccount(params.env.DB, params.namespaceId).catch(() => '')
+    const lazadaAccount = shortlinkSettings.account
     let finalLazadaRequestUrl: string
     if (lazadaUrlTemplate && lazadaUrlTemplate.includes('{url}')) {
         finalLazadaRequestUrl = buildShortlinkRequestUrlFromTemplate(lazadaUrlTemplate, bridgeInputLink, effectiveLazadaSubIds, lazadaAccount)
-        console.log(`[${params.logPrefix}] Using URL template from settings`)
+        console.log(`[${params.logPrefix}] Using ${shortlinkSettings.source} URL template from settings`)
     } else {
-        const baseUrl = await resolveNamespaceLazadaShortlinkBaseUrl(params.env.DB, params.namespaceId)
+        const baseUrl = shortlinkSettings.lazadaBaseUrl
         if (!baseUrl) {
             writeTrace({ utmSource: null, memberId: null, status: 'disabled', error: null })
             if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error('admin_lazada_shortlink_disabled')
@@ -23155,7 +23599,14 @@ async function shortenShopeeLinkForNamespace(params: {
     namespaceId: string
     shopeeLink: string
     logPrefix: string
+    pageId?: string
     allowFallbackWhenEnforced?: boolean
+    // Optional override for Sub ID 2 used only at posting/comment time. When
+    // supplied (e.g. Facebook post id like `pageId_postId`), it replaces the
+    // namespace-configured sub_id2 for this request only. Processing-time
+    // conversion callers should leave this undefined so settings sub_id2
+    // continues to apply.
+    postSubId2?: string
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -23179,21 +23630,27 @@ async function shortenShopeeLinkForNamespace(params: {
         return ''
     }
     const fallbackDisallowed = await isNamespaceShortlinkFallbackDisallowed(params.env.DB, params.namespaceId).catch(() => false)
+    const shortlinkSettings = await resolveEffectiveShortlinkSettings(params.env.DB, params.namespaceId, params.pageId)
 
-    // Load sub IDs + URL template from namespace settings
-    const subIds = await resolveNamespaceShortlinkSubIds(params.env.DB, params.namespaceId).catch(() => ({ sub1: '', sub2: '', sub3: '', sub4: '', sub5: '' }))
+    // Load sub IDs + URL template (per-page override when enabled, else namespace)
+    const subIds = shortlinkSettings.subIds
     const effectiveSub1 = subIds.sub1 || deriveShortlinkSub1(params.namespaceId)
-    const effectiveSubIds = { ...subIds, sub1: effectiveSub1 }
-    const urlTemplate = await resolveNamespaceShortlinkUrlTemplate(params.env.DB, params.namespaceId).catch(() => '')
+    // Posting-time callers may inject the Facebook post id as Sub ID 2 so the
+    // affiliate report can attribute clicks back to the visible page post. Fall
+    // back to the configured sub_id2 when no override is supplied.
+    const overriddenSub2 = normalizeShortlinkSubId(params.postSubId2 || '')
+    const effectiveSub2 = overriddenSub2 || subIds.sub2
+    const effectiveSubIds = { ...subIds, sub1: effectiveSub1, sub2: effectiveSub2 }
+    const urlTemplate = shortlinkSettings.urlTemplate
 
     // Priority: 1) URL template from settings  2) baseUrl derived from account
-    const shopeeAccount = await resolveNamespaceAffiliateShortlinkAccount(params.env.DB, params.namespaceId).catch(() => '')
+    const shopeeAccount = shortlinkSettings.account
     let finalRequestUrl: string
     if (urlTemplate && urlTemplate.includes('{url}')) {
         finalRequestUrl = buildShortlinkRequestUrlFromTemplate(urlTemplate, originalLink, effectiveSubIds, shopeeAccount)
-        console.log(`[${params.logPrefix}] Using URL template from settings`)
+        console.log(`[${params.logPrefix}] Using ${shortlinkSettings.source} URL template from settings`)
     } else {
-        const baseUrl = await resolveNamespaceShopeeShortlinkBaseUrl(params.env.DB, params.namespaceId)
+        const baseUrl = shortlinkSettings.shopeeBaseUrl
         if (!baseUrl) {
             writeTrace({ utmSource: null, status: 'disabled', error: null })
             if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error('admin_shopee_shortlink_disabled')
@@ -23202,7 +23659,7 @@ async function shortenShopeeLinkForNamespace(params: {
         const requestUrl = new URL(baseUrl)
         requestUrl.searchParams.set('url', originalLink)
         requestUrl.searchParams.set('sub1', effectiveSub1)
-        if (subIds.sub2) requestUrl.searchParams.set('sub2', subIds.sub2)
+        if (effectiveSub2) requestUrl.searchParams.set('sub2', effectiveSub2)
         if (subIds.sub3) requestUrl.searchParams.set('sub3', subIds.sub3)
         if (subIds.sub4) requestUrl.searchParams.set('sub4', subIds.sub4)
         if (subIds.sub5) requestUrl.searchParams.set('sub5', subIds.sub5)
@@ -23275,6 +23732,11 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     namespaceId: string
     shopeeLink: string
     logPrefix: string
+    // Facebook post id (`pageId_postId`) used to populate shortlink Sub ID 2
+    // for the comment that will be attached to a freshly published post/reel.
+    // Pass undefined when no post id is available so the namespace-configured
+    // sub_id2 is used instead.
+    postSubId2?: string
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -23324,6 +23786,7 @@ async function resolvePostingShopeeLinkForNamespace(params: {
             namespaceId: params.namespaceId,
             shopeeLink: link,
             logPrefix: params.logPrefix,
+            postSubId2: params.postSubId2,
             trace,
         })
         if (shortened && trace.status === 'shortened' && !isShopeeHomepageOnlyLink(shortened)) return shortened
@@ -23351,6 +23814,7 @@ async function isNamespaceShortlinkFallbackDisallowed(db: D1Database, namespaceI
 async function verifyAffiliateLinksForPosting(params: {
     env: Env
     namespaceId: string
+    pageId?: string
     shopeeLink?: string | null
     lazadaLink?: string | null
     requireLazadaLink?: boolean
@@ -23361,10 +23825,9 @@ async function verifyAffiliateLinksForPosting(params: {
     const lazadaInputLink = pickFirstLazadaUrl(params.lazadaLink || '') || String(params.lazadaLink || '').trim()
     const enforced = await isNamespaceAffiliateVerificationEnforced(params.env.DB, namespaceId)
 
-    const [expectedShopeeId, expectedLazadaMemberId] = await Promise.all([
-        resolveNamespaceShopeeShortlinkExpectedUtmId(params.env.DB, namespaceId).catch(() => ''),
-        resolveNamespaceLazadaExpectedMemberId(params.env.DB, namespaceId).catch(() => ''),
-    ])
+    const shortlinkSettings = await resolveEffectiveShortlinkSettings(params.env.DB, namespaceId, params.pageId)
+    const expectedShopeeId = shortlinkSettings.expectedUtmId
+    const expectedLazadaMemberId = shortlinkSettings.lazadaExpectedMemberId
 
     const shopee: PostingAffiliatePlatformVerification = {
         inputLink: shopeeInputLink,
@@ -25478,27 +25941,49 @@ async function findExistingAffiliateComment(params: {
     pageId?: string
     accessToken: string
     logPrefix: string
+    fbPostId?: string
+    fbReelUrlOrId?: string
 }): Promise<{ id: string; targetId: string } | null> {
     const accessToken = String(params.accessToken || '').trim()
     const targetId = String(params.targetId || '').trim()
-    if (!accessToken || !targetId) return null
+    if (!accessToken) return null
 
-    const shopeeHostPattern = /s\.shopee\.co\.th|shopee\.co\.th/i
-    const candidates = buildCommentTargetCandidates(targetId, params.pageId)
-    try {
-        const resolved = await resolveCommentTargetIdViaGraph({
-            targetId,
-            accessToken,
-            logPrefix: params.logPrefix,
-        })
-        if (resolved) {
-            candidates.unshift(resolved)
-            for (const candidate of buildCommentTargetCandidates(resolved, params.pageId)) {
-                candidates.push(candidate)
+    const hasStoryTarget = !!String(params.fbPostId || '').trim()
+    const candidates: string[] = []
+
+    if (hasStoryTarget) {
+        // Visible page-story target exists. Dedup ONLY against story-target
+        // candidates so an old affiliate comment on the reel/video fallback
+        // object cannot be mistaken for proof and skip posting to the real
+        // page-story target (the operator-visible regression).
+        for (const c of buildExistingCommentDedupCandidates({
+            pageId: params.pageId,
+            fbPostId: params.fbPostId,
+        })) candidates.push(c)
+    } else {
+        // No story target — fall back to dedup against the reel/video object
+        // and any related ids we can derive.
+        if (!targetId) return null
+        for (const c of buildExistingCommentDedupCandidates({
+            pageId: params.pageId,
+            fbReelUrlOrId: params.fbReelUrlOrId,
+        })) candidates.push(c)
+        for (const c of buildCommentTargetCandidates(targetId, params.pageId)) candidates.push(c)
+        try {
+            const resolved = await resolveCommentTargetIdViaGraph({
+                targetId,
+                accessToken,
+                logPrefix: params.logPrefix,
+            })
+            if (resolved) {
+                candidates.push(resolved)
+                for (const candidate of buildCommentTargetCandidates(resolved, params.pageId)) {
+                    candidates.push(candidate)
+                }
             }
+        } catch {
+            // ignore graph resolution failure and continue with local candidates
         }
-    } catch {
-        // ignore graph resolution failure and continue with local candidates
     }
 
     for (const candidate of uniqueTokens(candidates)) {
@@ -25507,11 +25992,14 @@ async function findExistingAffiliateComment(params: {
                 `${FB_GRAPH_V19}/${candidate}/comments`,
                 { access_token: accessToken, limit: '25' },
             )
-            const existingId = (existingComments.data || []).find((comment) =>
-                shopeeHostPattern.test(String(comment.message || ''))
-            )?.id || ''
-            if (existingId) {
-                return { id: existingId, targetId: candidate }
+            const match = isAffiliateCommentMatch(existingComments.data, {})
+            if (match.matched) {
+                const matchedId = (existingComments.data || []).find((comment) =>
+                    isAffiliateCommentMatch([comment], {}).matched,
+                )?.id || ''
+                if (matchedId) {
+                    return { id: matchedId, targetId: candidate }
+                }
             }
         } catch (e) {
             console.log(`[${params.logPrefix}] comment dedup check failed for ${candidate}: ${e instanceof Error ? e.message : String(e)}`)
@@ -25519,6 +26007,43 @@ async function findExistingAffiliateComment(params: {
     }
 
     return null
+}
+
+// Confirm the comment we just POSTed is actually visible when we read the same
+// target's /comments. If verify fails on the page-story target, we treat the
+// comment as not delivered to readers — even if Graph returned an id — so the
+// History row will NOT be marked success and operators won't see a false green.
+async function verifyAffiliateCommentOnTarget(params: {
+    targetId: string
+    commentId?: string
+    accessToken: string
+    expectedMessage?: string
+    logPrefix: string
+}): Promise<{ ok: boolean; matchedBy?: 'comment_id' | 'comment_id_suffix' | 'message'; error?: string }> {
+    const targetId = String(params.targetId || '').trim()
+    const accessToken = String(params.accessToken || '').trim()
+    if (!targetId || !accessToken) {
+        return { ok: false, error: 'verify_input_missing' }
+    }
+    try {
+        const data = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string }> }>(
+            `${FB_GRAPH_V19}/${targetId}/comments`,
+            { access_token: accessToken, limit: '25' },
+        )
+        const match = isAffiliateCommentMatch(data?.data, {
+            commentId: params.commentId,
+            expectedMessage: params.expectedMessage,
+        })
+        if (match.matched) {
+            return { ok: true, matchedBy: match.matchedBy }
+        }
+        return { ok: false, error: 'verify_no_match_on_target' }
+    } catch (e) {
+        const parsed = parseFacebookErrorLike(e)
+        const message = String(parsed?.message || (e instanceof Error ? e.message : String(e)))
+        console.log(`[${params.logPrefix}] verify comment failed target=${targetId}: ${message}`)
+        return { ok: false, error: `verify_request_failed:${message}` }
+    }
 }
 
 async function resolveCommentTargetIdViaGraph(params: {
@@ -25567,12 +26092,17 @@ async function postShopeeCommentStrict(params: {
     env: Env
     namespaceId?: string
     fbVideoId: string
+    // Optional story-first hints. When supplied we build the visible page-story
+    // target first (e.g. `pageId_fbPostId`) and fall back to the reel id only if
+    // the story target rejects the POST with a Graph error.
+    fbPostId?: string
+    fbReelUrlOrId?: string
     shopeeLink: string
     lazadaLink?: string
     commentToken?: string | null
     pageId?: string
     logPrefix: string
-}): Promise<{ ok: boolean; id?: string; error?: string; code?: number; subcode?: number }> {
+}): Promise<{ ok: boolean; id?: string; targetId?: string; error?: string; code?: number; subcode?: number }> {
     const rawCommentToken = String(params.commentToken || '').trim()
     if (!rawCommentToken) {
         return { ok: false, error: 'access_token_missing', code: 0, subcode: 0 }
@@ -25584,83 +26114,200 @@ async function postShopeeCommentStrict(params: {
     }
 
     const initialTargetId = String(params.fbVideoId || '').trim()
-    if (!initialTargetId) {
+    const hasStoryHint = !!(String(params.fbPostId || '').trim() || String(params.fbReelUrlOrId || '').trim())
+    if (!initialTargetId && !hasStoryHint) {
         return { ok: false, error: 'comment_target_missing', code: 0, subcode: 0 }
     }
 
-    const commentMessage = await buildAffiliateCommentMessage(
+    const commentMessages = await buildAffiliateCommentMessages(
         params.env.DB,
         String(params.namespaceId || '').trim(),
         params.shopeeLink,
         params.lazadaLink,
     )
-    if (!commentMessage) {
+    if (commentMessages.length === 0) {
         return { ok: false, error: 'comment_message_empty', code: 0, subcode: 0 }
+    }
+    const primaryMessage = commentMessages[0]
+    const additionalMessages = commentMessages.slice(1)
+
+    // Build the unique, ORDERED candidate list. Story-first when hints provided.
+    const orderedCandidates: string[] = []
+    if (hasStoryHint) {
+        for (const c of buildVisibleCommentTargetCandidates({
+            pageId,
+            fbPostId: params.fbPostId,
+            fbReelUrlOrId: params.fbReelUrlOrId,
+        })) orderedCandidates.push(c)
+    }
+    if (initialTargetId) {
+        orderedCandidates.push(initialTargetId)
+        for (const c of buildCommentTargetCandidates(initialTargetId, pageId)) orderedCandidates.push(c)
+    }
+    const candidateList = uniqueTokens(orderedCandidates)
+    if (candidateList.length === 0) {
+        return { ok: false, error: 'comment_target_missing', code: 0, subcode: 0 }
     }
 
     const tried = new Set<string>()
-    const tryPostComment = async (targetId: string) => {
-        const tid = String(targetId || '').trim()
-        if (!tid || tried.has(tid)) return { ok: false as const, error: 'empty_target', code: 0, subcode: 0 }
+    let postErrorMessage = ''
+    let postErrorCode = 0
+    let postErrorSubcode = 0
+    let verifyFailureLast: { id: string; targetId: string; reason: string } | null = null
+
+    const tokenHint = String(commentToken || '').trim().slice(-8)
+    const totalMessages = commentMessages.length
+
+    for (const candidate of candidateList) {
+        const tid = String(candidate || '').trim()
+        if (!tid || tried.has(tid)) continue
         tried.add(tid)
-        // DIAGNOSTIC: log the EXACT outbound payload to FB so a future "comment doesn't
-        // match my template" report can be answered by tailing `wrangler tail` without
-        // guesswork. JSON-stringify the message so multi-line/Unicode survives the line.
-        const tokenHint = String(commentToken || '').trim().slice(-8)
-        console.log(`[${params.logPrefix}] comment OUTBOUND target=${tid} token_tail=${tokenHint} ns=${params.namespaceId} page=${params.pageId} message_len=${commentMessage.length}`)
-        console.log(`[${params.logPrefix}] comment OUTBOUND message=${JSON.stringify(commentMessage)}`)
-        const result = await facebookGraphRawPost<{ id?: string }>(
-            `${FB_GRAPH_V19}/${tid}/comments`,
-            {
-                message: commentMessage,
-                access_token: commentToken,
-            },
-        )
-        if (result.id) {
-            console.log(`[${params.logPrefix}] comment SUCCESS (COMMENT_TOKEN) target=${tid} id=${result.id}`)
-            return { ok: true as const, id: result.id }
-        }
-        console.error(`[${params.logPrefix}] comment FAILED (COMMENT_TOKEN): missing_comment_id target=${tid}`)
-        return { ok: false as const, error: 'missing_comment_id', code: 0, subcode: 0 }
-    }
 
-    try {
-        const firstAttempt = await tryPostComment(initialTargetId)
-        if (firstAttempt.ok) return firstAttempt
-        return { ok: false, error: firstAttempt.error, code: 0, subcode: 0 }
-    } catch (e) {
-        const parsed = parseFacebookErrorLike(e)
-        const err = String(parsed?.message || (e instanceof Error ? e.message : String(e)))
-        const code = Number(parsed?.code || 0)
-        const subcode = Number(parsed?.error_subcode || 0)
-
-        if (isDeprecatedSingularStatusesError(err, code)) {
-            const candidates = buildCommentTargetCandidates(initialTargetId, params.pageId)
-            try {
-                const resolved = await resolveCommentTargetIdViaGraph({
-                    targetId: initialTargetId,
-                    accessToken: commentToken,
-                    logPrefix: params.logPrefix,
-                })
-                if (resolved) candidates.unshift(resolved)
-            } catch {
-                // ignore resolve errors and continue with candidates
+        let postedId = ''
+        try {
+            // DIAGNOSTIC: log the EXACT outbound payload to FB so a future "comment doesn't
+            // match my template" report can be answered by tailing `wrangler tail` without
+            // guesswork. JSON-stringify the message so multi-line/Unicode survives the line.
+            console.log(`[${params.logPrefix}] comment OUTBOUND target=${tid} token_tail=${tokenHint} ns=${params.namespaceId} page=${pageId} message_len=${primaryMessage.length} round=1/${totalMessages}`)
+            console.log(`[${params.logPrefix}] comment OUTBOUND message=${JSON.stringify(primaryMessage)}`)
+            const result = await facebookGraphRawPost<{ id?: string }>(
+                `${FB_GRAPH_V19}/${tid}/comments`,
+                {
+                    message: primaryMessage,
+                    access_token: commentToken,
+                },
+            )
+            postedId = String(result?.id || '').trim()
+            if (!postedId) {
+                console.error(`[${params.logPrefix}] comment FAILED (COMMENT_TOKEN): missing_comment_id target=${tid}`)
+                postErrorMessage = postErrorMessage || 'missing_comment_id'
+                continue
             }
+            console.log(`[${params.logPrefix}] comment SUCCESS (COMMENT_TOKEN) target=${tid} id=${postedId} round=1/${totalMessages}`)
+        } catch (e) {
+            const parsed = parseFacebookErrorLike(e)
+            const err = String(parsed?.message || (e instanceof Error ? e.message : String(e)))
+            const code = Number(parsed?.code || 0)
+            const subcode = Number(parsed?.error_subcode || 0)
+            postErrorMessage = err
+            postErrorCode = code
+            postErrorSubcode = subcode
+            const isUnsupportedTarget = isDeprecatedSingularStatusesError(err, code)
+            console.error(`[${params.logPrefix}] comment EXCEPTION (COMMENT_TOKEN) target=${tid} unsupported=${isUnsupportedTarget}: ${err}`)
+            // Fall through to next candidate. For any POST-side graph error we try
+            // the next candidate (story → reel fallback). We do NOT post twice to
+            // a target that already accepted us.
+            continue
+        }
 
-            for (const candidate of candidates) {
+        // POST returned an id. Confirm it is visible on the SAME target before
+        // declaring success. If the visible page-story can't see it, the comment
+        // is effectively invisible to readers — operator's complaint.
+        const verify = await verifyAffiliateCommentOnTarget({
+            targetId: tid,
+            commentId: postedId,
+            accessToken: commentToken,
+            expectedMessage: primaryMessage,
+            logPrefix: params.logPrefix,
+        })
+        if (verify.ok) {
+            console.log(`[${params.logPrefix}] comment VERIFIED target=${tid} id=${postedId} via=${verify.matchedBy} round=1/${totalMessages}`)
+
+            // Post any remaining template rounds (คอมเมนต์ 2, 3) to the SAME
+            // verified target with the SAME token. The candidate sweep already
+            // proved this is the visible page-story / reel object, so re-running
+            // it for each round would just risk duping into a fallback target.
+            const postedIds: string[] = [postedId]
+            for (let i = 0; i < additionalMessages.length; i += 1) {
+                const message = additionalMessages[i]
+                const round = i + 2
                 try {
-                    const attempt = await tryPostComment(candidate)
-                    if (attempt.ok) return attempt
-                } catch (retryErr) {
-                    const retryParsed = parseFacebookErrorLike(retryErr)
-                    const retryMsg = String(retryParsed?.message || (retryErr instanceof Error ? retryErr.message : String(retryErr)))
-                    console.error(`[${params.logPrefix}] comment retry failed target=${candidate}: ${retryMsg}`)
+                    console.log(`[${params.logPrefix}] comment OUTBOUND target=${tid} token_tail=${tokenHint} ns=${params.namespaceId} page=${pageId} message_len=${message.length} round=${round}/${totalMessages}`)
+                    console.log(`[${params.logPrefix}] comment OUTBOUND message=${JSON.stringify(message)}`)
+                    const followup = await facebookGraphRawPost<{ id?: string }>(
+                        `${FB_GRAPH_V19}/${tid}/comments`,
+                        {
+                            message,
+                            access_token: commentToken,
+                        },
+                    )
+                    const followupId = String(followup?.id || '').trim()
+                    if (!followupId) {
+                        console.error(`[${params.logPrefix}] comment FOLLOWUP missing_id target=${tid} round=${round}/${totalMessages}`)
+                        return {
+                            ok: false,
+                            id: postedIds.join('|'),
+                            targetId: tid,
+                            error: `comment_round_${round}_missing_id`,
+                            code: 0,
+                            subcode: 0,
+                        }
+                    }
+                    const verifyFollowup = await verifyAffiliateCommentOnTarget({
+                        targetId: tid,
+                        commentId: followupId,
+                        accessToken: commentToken,
+                        expectedMessage: message,
+                        logPrefix: params.logPrefix,
+                    })
+                    if (!verifyFollowup.ok) {
+                        const reason = verifyFollowup.error || 'verify_no_match_on_target'
+                        console.warn(`[${params.logPrefix}] comment FOLLOWUP NOT VISIBLE target=${tid} id=${followupId} round=${round}/${totalMessages} reason=${reason}`)
+                        return {
+                            ok: false,
+                            id: [...postedIds, followupId].join('|'),
+                            targetId: tid,
+                            error: 'comment_verify_failed_target_not_visible',
+                            code: 0,
+                            subcode: 0,
+                        }
+                    }
+                    postedIds.push(followupId)
+                    console.log(`[${params.logPrefix}] comment VERIFIED target=${tid} id=${followupId} round=${round}/${totalMessages} via=${verifyFollowup.matchedBy}`)
+                } catch (e) {
+                    const parsed = parseFacebookErrorLike(e)
+                    const err = String(parsed?.message || (e instanceof Error ? e.message : String(e)))
+                    const code = Number(parsed?.code || 0)
+                    const subcode = Number(parsed?.error_subcode || 0)
+                    console.error(`[${params.logPrefix}] comment FOLLOWUP EXCEPTION target=${tid} round=${round}/${totalMessages}: ${err}`)
+                    return {
+                        ok: false,
+                        id: postedIds.join('|'),
+                        targetId: tid,
+                        error: err || `comment_round_${round}_failed`,
+                        code,
+                        subcode,
+                    }
                 }
             }
+
+            return { ok: true, id: postedIds.join('|'), targetId: tid }
         }
 
-        console.error(`[${params.logPrefix}] comment EXCEPTION (COMMENT_TOKEN): ${err}`)
-        return { ok: false, error: err, code, subcode }
+        // POST succeeded but verify failed. Do NOT keep posting to other targets —
+        // we already created a real comment somewhere and another POST would dupe.
+        const reason = verify.error || 'verify_no_match_on_target'
+        console.warn(`[${params.logPrefix}] comment NOT VISIBLE target=${tid} id=${postedId} reason=${reason}`)
+        verifyFailureLast = { id: postedId, targetId: tid, reason }
+        break
+    }
+
+    if (verifyFailureLast) {
+        return {
+            ok: false,
+            id: verifyFailureLast.id,
+            targetId: verifyFailureLast.targetId,
+            error: 'comment_verify_failed_target_not_visible',
+            code: 0,
+            subcode: 0,
+        }
+    }
+
+    return {
+        ok: false,
+        error: postErrorMessage || 'comment_failed',
+        code: postErrorCode,
+        subcode: postErrorSubcode,
     }
 }
 
@@ -25668,12 +26315,17 @@ async function postShopeeCommentWithFallback(params: {
     env: Env
     namespaceId?: string
     fbVideoId: string
+    // Optional story-first hints. Callers that have the raw fb_post_id and
+    // fb_reel_url SHOULD pass them here so the page-story target is tried before
+    // the reel object id. See buildVisibleCommentTargetCandidates.
+    fbPostId?: string
+    fbReelUrlOrId?: string
     shopeeLink: string
     lazadaLink?: string
     commentTokens: string[]
     pageId?: string
     logPrefix: string
-}): Promise<{ ok: boolean; id?: string; error?: string; code?: number; subcode?: number; tried: number; commentToken?: string }> {
+}): Promise<{ ok: boolean; id?: string; targetId?: string; error?: string; code?: number; subcode?: number; tried: number; commentToken?: string }> {
     const commentTokens = await resolveCommentPageTokenPoolForPage(
         params.env,
         String(params.pageId || '').trim(),
@@ -25690,10 +26342,12 @@ async function postShopeeCommentWithFallback(params: {
         pageId: params.pageId,
         accessToken: checkToken,
         logPrefix: params.logPrefix,
+        fbPostId: params.fbPostId,
+        fbReelUrlOrId: params.fbReelUrlOrId,
     })
     if (existingComment) {
         console.log(`[${params.logPrefix}] comment SKIPPED (already commented: ${existingComment.id} via ${existingComment.targetId})`)
-        return { ok: true, id: existingComment.id, tried: 0, commentToken: checkToken }
+        return { ok: true, id: existingComment.id, targetId: existingComment.targetId, tried: 0, commentToken: checkToken }
     }
 
     let lastError = 'comment_failed'
@@ -25706,6 +26360,8 @@ async function postShopeeCommentWithFallback(params: {
             env: params.env,
             namespaceId: params.namespaceId,
             fbVideoId: params.fbVideoId,
+            fbPostId: params.fbPostId,
+            fbReelUrlOrId: params.fbReelUrlOrId,
             shopeeLink: params.shopeeLink,
             lazadaLink: params.lazadaLink,
             commentToken: token,
@@ -25713,6 +26369,12 @@ async function postShopeeCommentWithFallback(params: {
             logPrefix: `${params.logPrefix}${commentTokens.length > 1 ? `(${i + 1}/${commentTokens.length})` : ''}`,
         })
         if (result.ok) return { ...result, tried: i + 1, commentToken: token }
+
+        // verify_failed is terminal — same comment got posted but isn't visible
+        // on any target we tried. Re-trying with another token would dupe.
+        if (result.error === 'comment_verify_failed_target_not_visible') {
+            return { ...result, tried: i + 1, commentToken: token }
+        }
 
         lastError = `${deriveCommentTokenHint(token) || 'unknown_token'}: ${result.error || lastError}`
         lastCode = result.code || 0
@@ -25906,6 +26568,7 @@ async function reconcilePostingHistoryRows(params: {
                         namespaceId: botId,
                         shopeeLink,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
+                        postSubId2: recoveredPostId,
                     })
                     if (!shortShopeeLink) {
                         commentStatus = 'failed'
@@ -27262,6 +27925,182 @@ app.get('/api/admin/pages', async (c) => {
     } catch (e) {
         return c.json({ error: 'Failed to fetch pages', details: e instanceof Error ? e.message : String(e) }, 500)
     }
+})
+
+app.get('/api/pages/:id/shortlink-settings', async (c) => {
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = c.get('botId')
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const [globalSettings, pageSettings, effective] = await Promise.all([
+        getNamespaceShortlinkSettingsForApi(c.env.DB, namespaceId),
+        getPageShortlinkOverrideSettings(c.env.DB, namespaceId, pageId),
+        resolveEffectiveShortlinkSettings(c.env.DB, namespaceId, pageId),
+    ])
+
+    c.header('Cache-Control', 'private, no-store')
+    return c.json({
+        ok: true,
+        page: {
+            id: String(page.id || pageId),
+            name: String(page.name || ''),
+        },
+        global: globalSettings,
+        override: serializePageShortlinkSettings(pageSettings),
+        effective: serializeEffectiveShortlinkSettings(effective),
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
+        max_template_chars: MAX_SHORTLINK_URL_TEMPLATE_CHARS,
+        max_sub_id_chars: MAX_SHORTLINK_SUB_ID_CHARS,
+    })
+})
+
+app.put('/api/pages/:id/shortlink-settings', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = c.get('botId')
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const body = await c.req.json().catch(() => ({})) as {
+        override_enabled?: boolean
+        overrideEnabled?: boolean
+        account?: string
+        accountName?: string
+        base_url?: string
+        baseUrl?: string
+        lazada_base_url?: string
+        lazadaBaseUrl?: string
+        expected_utm_id?: string
+        expectedUtmId?: string
+        lazada_expected_member_id?: string
+        lazadaExpectedMemberId?: string
+        shortlink_url_template?: string
+        shortlinkUrlTemplate?: string
+        sub_id1?: string
+        sub_id2?: string
+        sub_id3?: string
+        sub_id4?: string
+        sub_id5?: string
+    }
+    const overrideEnabled = body.override_enabled === true || body.overrideEnabled === true
+
+    const accountInput = String(body.account ?? body.accountName ?? '').trim()
+    if (accountInput.length > MAX_SHORTLINK_ACCOUNT_CHARS) {
+        return c.json({ error: `Shortlink account too long (max ${MAX_SHORTLINK_ACCOUNT_CHARS} chars)` }, 400)
+    }
+    const normalizedAccount = accountInput ? normalizeShortlinkAccount(accountInput) : ''
+    if (accountInput && !normalizedAccount) {
+        return c.json({ error: 'Shortlink account ใช้ได้เฉพาะ A-Z, 0-9, _ และ - เช่น CHEARB' }, 400)
+    }
+
+    const baseUrl = String(body.base_url ?? body.baseUrl ?? '').trim()
+    if (baseUrl.length > MAX_SHORTLINK_BASE_URL_CHARS) {
+        return c.json({ error: `Shortlink base URL too long (max ${MAX_SHORTLINK_BASE_URL_CHARS} chars)` }, 400)
+    }
+    const normalizedBaseUrl = baseUrl ? normalizeShortlinkBaseUrl(baseUrl) : ''
+    if (baseUrl && !normalizedBaseUrl) return c.json({ error: 'Shortlink base URL is invalid' }, 400)
+
+    const lazadaBaseUrl = String(body.lazada_base_url ?? body.lazadaBaseUrl ?? '').trim()
+    if (lazadaBaseUrl.length > MAX_SHORTLINK_BASE_URL_CHARS) {
+        return c.json({ error: `Lazada shortlink base URL too long (max ${MAX_SHORTLINK_BASE_URL_CHARS} chars)` }, 400)
+    }
+    const normalizedLazadaBaseUrl = lazadaBaseUrl ? normalizeShortlinkBaseUrl(lazadaBaseUrl) : ''
+    if (lazadaBaseUrl && !normalizedLazadaBaseUrl) return c.json({ error: 'Lazada shortlink base URL is invalid' }, 400)
+
+    const expectedUtmIdInput = String(body.expected_utm_id ?? body.expectedUtmId ?? '').trim()
+    if (expectedUtmIdInput.length > MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS) {
+        return c.json({ error: `Expected UTM ID too long (max ${MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS} chars)` }, 400)
+    }
+    const normalizedExpectedUtmId = expectedUtmIdInput ? normalizeShortlinkExpectedUtmId(expectedUtmIdInput) : ''
+    if (expectedUtmIdInput && !normalizedExpectedUtmId) {
+        return c.json({ error: 'Expected UTM ID must be digits only เช่น 15130770000' }, 400)
+    }
+
+    const lazadaExpectedMemberIdInput = String(body.lazada_expected_member_id ?? body.lazadaExpectedMemberId ?? '').trim()
+    if (lazadaExpectedMemberIdInput.length > MAX_LAZADA_MEMBER_ID_CHARS) {
+        return c.json({ error: `Lazada member_id too long (max ${MAX_LAZADA_MEMBER_ID_CHARS} chars)` }, 400)
+    }
+    const normalizedLazadaExpectedMemberId = lazadaExpectedMemberIdInput ? normalizeLazadaMemberId(lazadaExpectedMemberIdInput) : ''
+    if (lazadaExpectedMemberIdInput && !normalizedLazadaExpectedMemberId) {
+        return c.json({ error: 'Lazada member_id must be digits only เช่น 199431090' }, 400)
+    }
+
+    const templateInput = String(body.shortlink_url_template ?? body.shortlinkUrlTemplate ?? '').trim()
+    if (templateInput.length > MAX_SHORTLINK_URL_TEMPLATE_CHARS) {
+        return c.json({ error: `Shortlink URL template too long (max ${MAX_SHORTLINK_URL_TEMPLATE_CHARS} chars)` }, 400)
+    }
+    const normalizedTemplate = normalizeShortlinkUrlTemplate(templateInput)
+    if (normalizedTemplate && !normalizedTemplate.includes('{url}')) {
+        return c.json({ error: 'Shortlink URL template must include {url}' }, 400)
+    }
+
+    const subIds: ShortlinkSubIds = emptyShortlinkSubIds()
+    for (const [field, target] of [
+        ['sub_id1', 'sub1'],
+        ['sub_id2', 'sub2'],
+        ['sub_id3', 'sub3'],
+        ['sub_id4', 'sub4'],
+        ['sub_id5', 'sub5'],
+    ] as const) {
+        const raw = String((body as Record<string, unknown>)[field] || '').trim()
+        if (raw.length > MAX_SHORTLINK_SUB_ID_CHARS) {
+            return c.json({ error: `${field} too long (max ${MAX_SHORTLINK_SUB_ID_CHARS} chars)` }, 400)
+        }
+        subIds[target] = normalizeShortlinkSubId(raw)
+    }
+
+    if (overrideEnabled && !normalizedAccount && !normalizedBaseUrl && !normalizedTemplate) {
+        return c.json({ error: 'เปิด Shortlink เฉพาะเพจแล้ว ต้องใส่ account, base URL หรือ URL template อย่างน้อย 1 ค่า' }, 400)
+    }
+
+    await setPageShortlinkOverrideSettings(c.env.DB, namespaceId, pageId, {
+        overrideEnabled,
+        account: normalizedAccount,
+        shopeeBaseUrl: normalizedBaseUrl,
+        lazadaBaseUrl: normalizedLazadaBaseUrl,
+        expectedUtmId: normalizedExpectedUtmId,
+        lazadaExpectedMemberId: normalizedLazadaExpectedMemberId,
+        urlTemplate: normalizedTemplate,
+        subIds,
+        updatedAt: null,
+    })
+
+    const [globalSettings, pageSettings, effective] = await Promise.all([
+        getNamespaceShortlinkSettingsForApi(c.env.DB, namespaceId),
+        getPageShortlinkOverrideSettings(c.env.DB, namespaceId, pageId),
+        resolveEffectiveShortlinkSettings(c.env.DB, namespaceId, pageId),
+    ])
+
+    return c.json({
+        ok: true,
+        page: {
+            id: String(page.id || pageId),
+            name: String(page.name || ''),
+        },
+        global: globalSettings,
+        override: serializePageShortlinkSettings(pageSettings),
+        effective: serializeEffectiveShortlinkSettings(effective),
+        max_account_chars: MAX_SHORTLINK_ACCOUNT_CHARS,
+        max_chars: MAX_SHORTLINK_BASE_URL_CHARS,
+        max_expected_utm_chars: MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS,
+        max_lazada_member_id_chars: MAX_LAZADA_MEMBER_ID_CHARS,
+        max_template_chars: MAX_SHORTLINK_URL_TEMPLATE_CHARS,
+        max_sub_id_chars: MAX_SHORTLINK_SUB_ID_CHARS,
+    })
 })
 
 app.get('/api/dashboard', async (c) => {
@@ -28776,6 +29615,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
             namespaceId: botId,
+            pageId: String(page.id || ''),
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
             logPrefix: 'RETRY-POST VERIFY',
@@ -30570,12 +31410,31 @@ app.post('/api/manual-post-reel', async (c) => {
             const commentWaitMs = getRandomCommentDelayMs()
             console.log(`[MANUAL-REEL] Waiting ${Math.ceil(commentWaitMs / 1000)}s before commenting...`)
             await waitMs(commentWaitMs)
+            // Re-shorten with the freshly known Facebook post id as Sub ID 2 so
+            // affiliate clicks can be attributed to the visible page post. The
+            // pre-upload `effectiveShopeeLink` is kept as a validated fallback
+            // in case the re-shorten transiently fails.
+            let commentShopeeLink = effectiveShopeeLink
+            if (confirmedPostId) {
+                try {
+                    const reshortened = await resolvePostingShopeeLinkForNamespace({
+                        env: c.env,
+                        namespaceId,
+                        shopeeLink,
+                        logPrefix: 'MANUAL-REEL',
+                        postSubId2: confirmedPostId,
+                    })
+                    if (reshortened) commentShopeeLink = reshortened
+                } catch (reshortenErr) {
+                    console.log(`[MANUAL-REEL] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                }
+            }
             try {
                 const res = await postShopeeCommentWithFallback({
                     env: c.env,
                     namespaceId,
                     fbVideoId: fbVideoId || confirmedPostId,
-                    shopeeLink: effectiveShopeeLink,
+                    shopeeLink: commentShopeeLink,
                     lazadaLink: effectiveLazadaLink,
                     commentTokens: [commentToken || ''],
                     pageId,
@@ -30733,10 +31592,19 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
         const botId = String(row.bot_id || '').trim()
         const pageId = String(row.page_id || '').trim()
         const pageName = String(row.page_name || '').trim()
-        const targetFromUrl = String(row.fb_reel_url || '').trim()
-            ? extractReelIdFromPermalink(normalizeFacebookPermalink(String(row.fb_reel_url || '').trim()))
-            : ''
-        const targetId = targetFromUrl || String(row.fb_post_id || '').trim()
+        const fbPostIdRaw = String(row.fb_post_id || '').trim()
+        const fbReelUrlRaw = String(row.fb_reel_url || '').trim()
+        // Story-first: page-story target before reel object. Comments posted on
+        // the reel object do NOT appear on the visible page-story feed, which
+        // was the operator-visible bug ("History says comment success but the
+        // page post shows no comments"). Build the candidate list here so we
+        // can also report a sensible target id when both are empty.
+        const visibleCandidates = buildVisibleCommentTargetCandidates({
+            pageId,
+            fbPostId: fbPostIdRaw,
+            fbReelUrlOrId: fbReelUrlRaw,
+        })
+        const targetId = visibleCandidates[0] || fbPostIdRaw
         const videoId = String(row.video_id || '').trim()
         const pageLockKey = buildPostingLockKey({ scope: 'page', namespaceId: botId, pageId })
         const videoLockKey = buildPostingLockKey({ scope: 'video', namespaceId: botId, videoId })
@@ -30816,6 +31684,7 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 namespaceId: botId,
                 shopeeLink,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+                postSubId2: fbPostIdRaw,
             })
             if (!shortShopeeLink) {
                 await env.DB.prepare(
@@ -30833,6 +31702,8 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 env,
                 namespaceId: botId,
                 fbVideoId: targetId,
+                fbPostId: fbPostIdRaw,
+                fbReelUrlOrId: fbReelUrlRaw,
                 shopeeLink: shortShopeeLink,
                 lazadaLink,
                 commentTokens: tokenCandidates.commentTokens,
@@ -31275,8 +32146,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         continue
                     }
 
+                    // Failed cron rows count as a "slot fill" so the same minute
+                    // slot does not get hammered every tick when shortlink /
+                    // affiliate-verification / comment preflight fails. Without
+                    // this, a single 18:00 slot with a broken shortlink keeps
+                    // re-firing every minute until the late-grace window closes,
+                    // and post_history fills with duplicate failure rows.
                     const { results: todayPosts } = await env.DB.prepare(
-                        "SELECT posted_at FROM post_history WHERE page_id = ? AND bot_id = ? AND status IN ('success','posting')"
+                        "SELECT posted_at FROM post_history WHERE page_id = ? AND bot_id = ? AND (status IN ('success','posting') OR (status = 'failed' AND trigger_source = 'cron'))"
                     ).bind(page.id, botId).all() as { results: Array<{ posted_at: string }> }
 
                     const getThaiTimeParts = (isoDate: string) => {
@@ -31393,6 +32270,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         namespaceId: botId,
                         pageId: String(page.id || ''),
                         postingOrder,
+                        skipFailedTodayThaiDate: todayStr,
                     })
                     console.log(`[CRON] Page ${page.name}: fast_gallery source=${fastClaim.stats.source} candidates=${fastClaim.stats.candidateTotal} scanned=${fastClaim.stats.scanned} pages=${fastClaim.stats.pages} elapsed_ms=${fastClaim.stats.elapsedMs}`)
                     if (!fastClaim.picked) {
@@ -31442,6 +32320,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 normalizedShopeeLink = await shortenShopeeLinkForNamespace({
                     env,
                     namespaceId: botId,
+                    pageId: String(page.id || ''),
                     shopeeLink: rawShopeeLink,
                     logPrefix: `CRON ${page.name} SHORTLINK`,
                     trace: shopeeShortlinkTrace,
@@ -31478,6 +32357,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 normalizedLazadaLink = await shortenLazadaLinkForNamespace({
                     env,
                     namespaceId: botId,
+                    pageId: String(page.id || ''),
                     lazadaLink: rawLazadaLink,
                     logPrefix: `CRON ${page.name} SHORTLINK`,
                     trace: lazadaShortlinkTrace,
