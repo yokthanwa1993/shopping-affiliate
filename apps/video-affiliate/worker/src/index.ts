@@ -19220,7 +19220,6 @@ app.get('/api/gallery/:id', async (c) => {
 // ==================== PAGES API ====================
 
 const FB_GRAPH_V19 = 'https://graph.facebook.com/v19.0'
-const FB_GRAPH_V21 = 'https://graph.facebook.com/v21.0'
 const FACEBOOK_GRAPH_SDK_TIMEOUT_MS = 45000
 const DEFAULT_BROWSERSAVING_WORKER_URL = 'https://browsersaving-worker.yokthanwa1993-bc9.workers.dev'
 const DEFAULT_BROWSERSAVING_API_URL = 'https://browsersaving-api.lslly.com'
@@ -23055,50 +23054,6 @@ function buildCaptionLinkFirstDescription(caption: string, shopeeLink: string): 
     const originalCaption = String(caption || '')
     if (!link) return originalCaption
     return originalCaption ? `${link}\n${originalCaption}` : link
-}
-
-function sanitizeFacebookCaptionCleanupError(raw: unknown): string {
-    const parsed = parseFacebookErrorLike(raw)
-    const rawMessage = parsed?.message || (raw instanceof Error ? raw.message : String(raw))
-    return String(rawMessage || 'unknown')
-        .replace(/access_token=([^&\s]+)/gi, 'access_token=[REDACTED]')
-        .replace(/\bEA[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]')
-        .slice(0, 300)
-}
-
-async function cleanupFacebookVideoDescriptionAfterCaptionLink(params: {
-    fbVideoId: string
-    postingToken: string
-    caption: string
-    logPrefix: string
-}): Promise<void> {
-    const fbVideoId = String(params.fbVideoId || '').trim()
-    const postingToken = String(params.postingToken || '').trim()
-    const caption = String(params.caption || '')
-    if (!fbVideoId || !postingToken) {
-        console.warn(`[${params.logPrefix}] caption link cleanup skipped target=${fbVideoId || '(missing)'} reason=${fbVideoId ? 'posting_token_missing' : 'fb_video_id_missing'}`)
-        return
-    }
-
-    try {
-        const form = new URLSearchParams()
-        form.set('access_token', postingToken)
-        form.set('description', caption)
-        const resp = await fetchWithTimeout(`${FB_GRAPH_V21}/${encodeURIComponent(fbVideoId)}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: form.toString(),
-        }, FACEBOOK_GRAPH_SDK_TIMEOUT_MS, 'facebook_caption_link_cleanup')
-        const data = await resp.json().catch(() => ({}))
-        const graphErr = parseFacebookErrorLike(data)
-        if (!resp.ok || graphErr?.message) {
-            const message = graphErr?.message || `facebook_caption_link_cleanup_http_${resp.status}`
-            throw new FacebookRequestFailedError(message, Number(graphErr?.code || 0), Number(graphErr?.error_subcode || 0))
-        }
-        console.log(`[${params.logPrefix}] caption link cleanup ok target=${fbVideoId} description_len=${caption.length}`)
-    } catch (err) {
-        console.warn(`[${params.logPrefix}] caption link cleanup failed target=${fbVideoId} error=${sanitizeFacebookCaptionCleanupError(err)}`)
-    }
 }
 
 type BrowserSavingTokenMode = 'post' | 'comment'
@@ -30919,8 +30874,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
         })
-        const captionLinkCleanupEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
-        const publishDescription = captionLinkCleanupEnabled
+        const captionLinkFirstEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
+        const publishDescription = captionLinkFirstEnabled
             ? buildCaptionLinkFirstDescription(caption, normalizedShopeeLink)
             : caption
 
@@ -30948,14 +30903,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
         fbVideoId = reelResult.id
-        if (captionLinkCleanupEnabled) {
-            c.executionCtx.waitUntil(cleanupFacebookVideoDescriptionAfterCaptionLink({
-                fbVideoId,
-                postingToken: reelResult.postingToken,
-                caption,
-                logPrefix: 'FORCE-POST',
-            }))
-        }
         const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
         let commentShopeeLink = normalizedShopeeLink
         if (commentShopeeLink && !skipComment && hasCommentToken) {
@@ -32821,8 +32768,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 shopeeLink: normalizedShopeeLink,
                 lazadaLink: normalizedLazadaLink,
             })
-            const captionLinkCleanupEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
-            const publishDescription = captionLinkCleanupEnabled
+            const captionLinkFirstEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
+            const publishDescription = captionLinkFirstEnabled
                 ? buildCaptionLinkFirstDescription(caption, normalizedShopeeLink)
                 : caption
 
@@ -32849,19 +32796,6 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id
-            if (captionLinkCleanupEnabled) {
-                const cleanupTask = cleanupFacebookVideoDescriptionAfterCaptionLink({
-                    fbVideoId,
-                    postingToken: reelResult.postingToken,
-                    caption,
-                    logPrefix: `CRON ${page.name}`,
-                })
-                if (ctx) {
-                    ctx.waitUntil(cleanupTask)
-                } else {
-                    cleanupTask.catch(() => undefined)
-                }
-            }
             const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
             const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
             const scheduledCommentDelaySeconds = normalizedShopeeLink && hasCommentToken

@@ -2990,7 +2990,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
             <div className="min-w-0">
               <p className="font-bold text-gray-900">ใส่ลิงก์ในแคปชั่น</p>
               <p className="text-xs text-gray-400 mt-0.5">
-                เปิด = ระบบจะโพสต์โดยใส่ Shopee link บรรทัดแรกก่อน แล้วหลังโพสต์สำเร็จจะพยายามแก้แคปชั่นเอาลิงก์ออก เพื่อลดความเสี่ยงกฎ Facebook
+                เปิด = ใส่ Shopee link บรรทัดแรกของแคปชั่นตอนโพสต์
               </p>
             </div>
             <button
