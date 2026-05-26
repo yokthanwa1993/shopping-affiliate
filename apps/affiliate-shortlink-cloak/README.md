@@ -105,35 +105,136 @@ Post-reauth Shopee API/session rejections use precise reasons such as `shopee_ap
 
 Returns the Shopee Affiliate **click_report** API as JSON for a given Shopee affiliate id and a single Asia/Bangkok local day. Reuses the same CloakBrowser persistent profile and session manager as `/shorten`, so it does not fight `/shorten` over the profile lock.
 
+Two response modes:
+
+- **Summary mode (default)** — aggregates click rows for the requested day into a per-`sub_id` breakdown. The response carries no raw `list`. The bridge fetches the underlying Shopee API at `page_size=100`. Shopee's list pagination tops out before `total_count` for high-volume days (page ~101 returns an empty list even though `total_count` is in the tens of thousands), so summary mode reports a `breakdown_mode` field to make the trustworthiness of the breakdown explicit:
+  - `breakdown_mode: "filtered"` — set when the request includes `sub_id=<value>`. Only page 1 is fetched and the response is a single-entry `sub_ids` array whose `count` is the Shopee-reported `total_count`. This is the recommended way to get an exact count for one sub.
+  - `breakdown_mode: "complete"` — set when the unfiltered row enumeration reached `total_count`. The entries use `count` and `percent`, and `percent` is genuinely the share of `total_count`.
+  - `breakdown_mode: "sample"` — set when Shopee capped the list before `total_count` was reached. The entries use `sample_count` and `sample_percent` (not `count`/`percent`) so the percentage cannot be mistaken for a share of `total_count`. `truncated: true` and a human-readable `warning` are included; rerun with `sub_id=<value>` to get exact counts.
+- **Raw mode** — opt-in via `raw=1` or `mode=raw`. Returns one page of raw Shopee rows, honoring `page_num`/`page_size`. Useful for debugging and inspection.
+
 Query parameters:
 
 | Param | Default | Notes |
 |---|---|---|
 | `id` | `15130770000` | Built-in alias (or `SHOPEE_ID_ACCOUNT_MAP` entry). Selects the persistent profile / Keychain account. `an_<digits>` is also accepted. |
 | `time` | today (Asia/Bangkok) | Accepts `DD/MM/YYYY`, `YYYY-MM-DD`, `today`, or `yesterday`. The day is interpreted in Asia/Bangkok (UTC+7) and translated to `click_time_s` (00:00:00) / `click_time_e` (23:59:59) Unix seconds — no reliance on server local timezone. |
-| `page_num` (or `page`) | `1` | Floored at `1`. |
-| `page_size` | `20` | Clamped to `[1, 100]`. |
-| `sub_id`, `click_id`, `click_region` | _(omitted)_ | Passed through to the Shopee API when non-empty. |
+| `raw` / `mode` | _(unset)_ | `raw=1`, `raw=true`, or `mode=raw` switches to raw single-page mode. Otherwise the bridge returns the summary. |
+| `page_num` (or `page`) | `1` | Raw mode only. Floored at `1`. Ignored in summary mode. |
+| `page_size` | raw: `20` / summary: `100` | Raw mode honors caller-supplied value, clamped to `[1, 100]`. Summary mode always uses `100`. |
+| `sub_id`, `click_id`, `click_region` | _(omitted)_ | Passed through to the Shopee API when non-empty. In summary mode, supplying `sub_id` triggers `breakdown_mode: "filtered"` — the response reports Shopee's `total_count` as the exact count for that sub instead of trying to enumerate rows. This is the only reliable way to get an exact per-sub count on high-volume days. |
 
 The bridge resolves `id → account` using the same alias table as `/shorten` (so id `15130770000` → `affiliate_chearb.com`, id `15142270000` → `affiliate_neezs.com`). The persistent profile is opened headless and `fetch('/api/v1/click_report/list?...', { credentials: 'include' })` runs from the `affiliate.shopee.co.th` origin, just like the click report dashboard does.
 
 Examples:
 
 ```
-# clickreport.wwoom.com — the Host header maps `/` directly to /click-report
+# Summary by default — daily total + sub_id breakdown for the chosen affiliate id
+curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026'
 curl 'https://clickreport.wwoom.com/?time=26/05/2026'
-curl 'https://clickreport.wwoom.com/?id=15130770000&time=26/05/2026'
 
-# Direct on the local bridge
-curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=yesterday&page_size=5'
-curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=2026-05-25'
+# Summary filtered to a single sub_id (Shopee filters on the server side; summary aggregates the filtered rows)
+curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026&sub_id=16MAY26FBSPCAD'
+
+# Raw mode — inspect Shopee rows verbatim, one page at a time
+curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=yesterday&raw=1&page_size=5'
+curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=2026-05-25&mode=raw&page_num=2'
 ```
 
-Healthy response shape (Shopee row fields are passed through unchanged):
+**Summary response shape — `breakdown_mode: "complete"`** (small days where Shopee returns every row):
 
 ```json
 {
   "status": "ok",
+  "mode": "summary",
+  "id": "15130770000",
+  "account": "affiliate@chearb.com",
+  "accountInternal": "affiliate_chearb.com",
+  "time": "25/05/2026",
+  "range": {
+    "timezone": "Asia/Bangkok",
+    "click_time_s": 1748102400,
+    "click_time_e": 1748188799
+  },
+  "source": "shopee_click_report_api",
+  "total_count": 3,
+  "unique_sub_id_count": 2,
+  "sub_ids": [
+    { "sub_id": "yok", "count": 2, "percent": 66.67 },
+    { "sub_id": "", "count": 1, "percent": 33.33 }
+  ],
+  "pages_fetched": 1,
+  "page_size": 100,
+  "row_sample_count": 3,
+  "truncated": false,
+  "breakdown_mode": "complete",
+  "affiliate_id": "15130770000"
+}
+```
+
+**Summary response shape — `breakdown_mode: "sample"`** (Shopee caps list pagination before `total_count`):
+
+```json
+{
+  "status": "ok",
+  "mode": "summary",
+  "id": "15130770000",
+  "account": "affiliate@chearb.com",
+  "accountInternal": "affiliate_chearb.com",
+  "time": "25/05/2026",
+  "range": { "timezone": "Asia/Bangkok", "click_time_s": 1748102400, "click_time_e": 1748188799 },
+  "source": "shopee_click_report_api",
+  "total_count": 49774,
+  "unique_sub_id_count": 3,
+  "sub_ids": [
+    { "sub_id": "16MAY26FBSPCAD----", "sample_count": 6500, "sample_percent": 65.00 },
+    { "sub_id": "17MAY26FBSPCAD----", "sample_count": 2500, "sample_percent": 25.00 },
+    { "sub_id": "",                    "sample_count": 1000, "sample_percent": 10.00 }
+  ],
+  "pages_fetched": 100,
+  "page_size": 100,
+  "row_sample_count": 10000,
+  "truncated": true,
+  "breakdown_mode": "sample",
+  "warning": "Shopee list pagination caps before total_count is reached; per-sub_id breakdown reflects the fetched sample only. Use sub_id=<value> to get the exact count for one sub.",
+  "affiliate_id": "15130770000"
+}
+```
+
+**Summary response shape — `breakdown_mode: "filtered"`** (recommended for exact per-sub counts):
+
+```json
+{
+  "status": "ok",
+  "mode": "summary",
+  "id": "15130770000",
+  "account": "affiliate@chearb.com",
+  "accountInternal": "affiliate_chearb.com",
+  "time": "25/05/2026",
+  "range": { "timezone": "Asia/Bangkok", "click_time_s": 1748102400, "click_time_e": 1748188799 },
+  "source": "shopee_click_report_api",
+  "total_count": 32247,
+  "unique_sub_id_count": 1,
+  "sub_ids": [
+    { "sub_id": "16MAY26FBSPCAD----", "requested_sub_id": "16MAY26FBSPCAD", "count": 32247, "percent": 100 }
+  ],
+  "pages_fetched": 1,
+  "page_size": 100,
+  "row_sample_count": 100,
+  "truncated": false,
+  "breakdown_mode": "filtered",
+  "affiliate_id": "15130770000"
+}
+```
+
+`sub_ids` is sorted by count descending, with the `sub_id` string used as the ascending tiebreaker. The empty-string entry represents Shopee rows with no `sub_id`. Percentages are rounded to two decimals; with no rows they stay `0`. In `complete` mode entries use `count` + `percent` (share of `total_count`); in `sample` mode they use `sample_count` + `sample_percent` (share of the fetched row sample only) so the percentage cannot be mistaken for a share of `total_count`. `truncated` is `true` whenever Shopee's list pagination capped before `total_count` was reached or the 1000-page safety guard fired.
+
+**Raw response shape** (`raw=1` / `mode=raw`):
+
+```json
+{
+  "status": "ok",
+  "mode": "raw",
   "id": "15142270000",
   "account": "affiliate@neezs.com",
   "accountInternal": "affiliate_neezs.com",

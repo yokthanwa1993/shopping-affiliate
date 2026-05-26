@@ -292,7 +292,7 @@ function stubBrowserForClickReport(t, opts = {}) {
   return { evaluates, getPageCalls };
 }
 
-test('handleClickReport returns ok payload with total_count, list, affiliate_id from stubbed Shopee response', async (t) => {
+test('handleClickReport raw mode returns ok payload with total_count, list, affiliate_id from stubbed Shopee response', async (t) => {
   const stub = stubBrowserForClickReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: {
@@ -313,11 +313,12 @@ test('handleClickReport returns ok payload with total_count, list, affiliate_id 
   });
 
   const result = await clickReport.handleClickReport(
-    { id: '15142270000', time: '25/05/2026', page_size: '50' },
+    { id: '15142270000', time: '25/05/2026', page_size: '50', raw: '1' },
     { now: FROZEN_NOW },
   );
 
   assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'raw');
   assert.equal(result.id, '15142270000');
   assert.equal(result.account, 'affiliate@neezs.com');
   assert.equal(result.accountInternal, 'affiliate_neezs.com');
@@ -334,6 +335,324 @@ test('handleClickReport returns ok payload with total_count, list, affiliate_id 
   assert.deepEqual(stub.getPageCalls[0].opts, { headless: true });
   // Sanity: response must not leak cookie/token/password fields.
   assert.equal(/cookie|token|password|secret/i.test(JSON.stringify(result)), false);
+});
+
+test('handleClickReport default summary mode aggregates multi-page sub_id counts with no list key', async (t) => {
+  // Page 1: 100 rows -> 50 alpha + 50 beta (forces a second page; list.length === pageSize).
+  // Page 2: 40 rows -> 30 alpha + 10 empty sub_id (list.length < pageSize -> stop).
+  // Aggregate: alpha=80 (57.14%), beta=50 (35.71%), '' (empty) = 10 (7.14%).
+  const buildRows = (count, subId) => {
+    const rows = [];
+    for (let i = 0; i < count; i += 1) {
+      rows.push({ click_id: `${subId || 'empty'}-${i}`, click_time: 1748226000 + i, click_region: 'TH', sub_id: subId, referrer: '' });
+    }
+    return rows;
+  };
+  const pages = {
+    1: { affiliate_id: 15142270000, total_count: 140, list: [].concat(buildRows(50, 'alpha'), buildRows(50, 'beta')) },
+    2: { affiliate_id: 15142270000, total_count: 140, list: [].concat(buildRows(30, 'alpha'), buildRows(10, '')) },
+  };
+  const stub = stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: (args) => {
+      const apiUrl = args[0];
+      const url = new URL(apiUrl);
+      const pageNum = Number(url.searchParams.get('page_num'));
+      const pageSize = Number(url.searchParams.get('page_size'));
+      assert.equal(pageSize, 100, 'summary mode must request page_size=100');
+      const data = pages[pageNum] || { affiliate_id: 15142270000, total_count: 140, list: [] };
+      return { status: 200, parsed: true, body: { code: 0, data } };
+    },
+  });
+
+  const result = await clickReport.handleClickReport(
+    { id: '15142270000', time: '25/05/2026', page_size: '50' },
+    { now: FROZEN_NOW },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.id, '15142270000');
+  assert.equal(result.account, 'affiliate@neezs.com');
+  assert.equal(result.accountInternal, 'affiliate_neezs.com');
+  assert.equal(result.time, '25/05/2026');
+  assert.equal(result.range.timezone, 'Asia/Bangkok');
+  assert.equal(result.total_count, 140);
+  assert.equal(result.page_size, 100);
+  assert.equal(result.pages_fetched, 2);
+  assert.equal(result.row_sample_count, 140);
+  assert.equal(result.truncated, false);
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'warning'), false);
+  assert.equal(result.unique_sub_id_count, 3);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'list'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'page_num'), false);
+  // Sort: count desc, sub_id asc as tiebreaker.
+  assert.deepEqual(result.sub_ids, [
+    { sub_id: 'alpha', count: 80, percent: 57.14 },
+    { sub_id: 'beta', count: 50, percent: 35.71 },
+    { sub_id: '', count: 10, percent: 7.14 },
+  ]);
+  // Stub recorded one apiUrl per fetched page; both should target the same date range.
+  assert.equal(stub.evaluates.length, 2);
+  // Sanity: response must not leak cookie/token/password fields.
+  assert.equal(/cookie|token|password|secret/i.test(JSON.stringify(result)), false);
+});
+
+test('handleClickReport default summary mode stops on first page when list shorter than page_size', async (t) => {
+  const stub = stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: 3,
+          list: [
+            { click_id: 'c1', click_time: 1748226000, click_region: 'TH', sub_id: 'yok', referrer: '' },
+            { click_id: 'c2', click_time: 1748226100, click_region: 'TH', sub_id: 'yok', referrer: '' },
+            { click_id: 'c3', click_time: 1748226200, click_region: 'TH', sub_id: '', referrer: '' },
+          ],
+        },
+      },
+    },
+  });
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.pages_fetched, 1);
+  assert.equal(result.total_count, 3);
+  assert.equal(result.row_sample_count, 3);
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(result.truncated, false);
+  assert.equal(result.unique_sub_id_count, 2);
+  assert.deepEqual(result.sub_ids, [
+    { sub_id: 'yok', count: 2, percent: 66.67 },
+    { sub_id: '', count: 1, percent: 33.33 },
+  ]);
+  assert.equal(stub.evaluates.length, 1);
+});
+
+test('handleClickReport summary mode honors sub_id filter passthrough', async (t) => {
+  const stub = stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: (args) => {
+      const apiUrl = args[0];
+      const url = new URL(apiUrl);
+      assert.equal(url.searchParams.get('sub_id'), '16MAY26FBSPCAD');
+      assert.equal(url.searchParams.get('page_size'), '100');
+      assert.equal(url.searchParams.get('page_num'), '1');
+      return {
+        status: 200,
+        parsed: true,
+        body: {
+          code: 0,
+          data: {
+            affiliate_id: 15130770000,
+            total_count: 2,
+            list: [
+              { click_id: 'a', click_time: 1748226000, click_region: 'TH', sub_id: '16MAY26FBSPCAD----', referrer: '' },
+              { click_id: 'b', click_time: 1748226001, click_region: 'TH', sub_id: '16MAY26FBSPCAD----', referrer: '' },
+            ],
+          },
+        },
+      };
+    },
+  });
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026', sub_id: '16MAY26FBSPCAD' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.total_count, 2);
+  assert.equal(result.unique_sub_id_count, 1);
+  assert.equal(result.breakdown_mode, 'filtered');
+  assert.equal(result.pages_fetched, 1);
+  assert.equal(result.row_sample_count, 2);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(result.sub_ids, [
+    { sub_id: '16MAY26FBSPCAD----', requested_sub_id: '16MAY26FBSPCAD', count: 2, percent: 100 },
+  ]);
+  assert.equal(stub.evaluates.length, 1);
+});
+
+test('handleClickReport filtered summary uses total_count even when Shopee caps the row list', async (t) => {
+  // Reproduces the live bug: Shopee reports total_count=32247 but the list
+  // pagination only ever yields up to ~10,000 rows. Summary mode with a
+  // sub_id filter must report 32247, not the enumerable row count.
+  const buildRow = (idx) => ({
+    click_id: 'cid-' + idx,
+    click_time: 1748226000 + idx,
+    click_region: 'TH',
+    sub_id: '16MAY26FBSPCAD----',
+    referrer: '',
+  });
+  const rows = [];
+  for (let i = 0; i < 100; i += 1) rows.push(buildRow(i));
+  const stub = stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: (args) => {
+      const url = new URL(args[0]);
+      assert.equal(url.searchParams.get('sub_id'), '16MAY26FBSPCAD');
+      assert.equal(url.searchParams.get('page_num'), '1');
+      return {
+        status: 200,
+        parsed: true,
+        body: {
+          code: 0,
+          data: {
+            affiliate_id: 15130770000,
+            total_count: 32247,
+            list: rows,
+          },
+        },
+      };
+    },
+  });
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026', sub_id: '16MAY26FBSPCAD' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.total_count, 32247);
+  assert.equal(result.unique_sub_id_count, 1);
+  assert.equal(result.breakdown_mode, 'filtered');
+  assert.equal(result.pages_fetched, 1, 'filtered summary must stop after first page');
+  assert.equal(result.row_sample_count, 100);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(result.sub_ids, [
+    { sub_id: '16MAY26FBSPCAD----', requested_sub_id: '16MAY26FBSPCAD', count: 32247, percent: 100 },
+  ]);
+  // Only one Shopee fetch should happen for filtered mode.
+  assert.equal(stub.evaluates.length, 1);
+});
+
+test('handleClickReport unfiltered summary marks breakdown_mode sample when Shopee caps pagination below total_count', async (t) => {
+  // Simulate Shopee capping the row list at 2 pages even though total_count is huge.
+  // Page 1: 100 rows (alpha). Page 2: 100 rows (beta). Page 3: empty -> stop.
+  // Aggregate rowSampleCount=200, totalCount=32247 -> sample mode.
+  const buildRows = (count, subId) => {
+    const out = [];
+    for (let i = 0; i < count; i += 1) {
+      out.push({ click_id: `${subId}-${i}`, click_time: 1748226000 + i, click_region: 'TH', sub_id: subId, referrer: '' });
+    }
+    return out;
+  };
+  const pages = {
+    1: { affiliate_id: 15130770000, total_count: 32247, list: buildRows(100, 'alpha') },
+    2: { affiliate_id: 15130770000, total_count: 32247, list: buildRows(100, 'beta') },
+    3: { affiliate_id: 15130770000, total_count: 32247, list: [] },
+  };
+  const stub = stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: (args) => {
+      const url = new URL(args[0]);
+      const pageNum = Number(url.searchParams.get('page_num'));
+      assert.equal(url.searchParams.get('page_size'), '100');
+      assert.equal(url.searchParams.has('sub_id'), false, 'unfiltered must not send sub_id');
+      const data = pages[pageNum] || { affiliate_id: 15130770000, total_count: 32247, list: [] };
+      return { status: 200, parsed: true, body: { code: 0, data } };
+    },
+  });
+
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.breakdown_mode, 'sample');
+  assert.equal(result.truncated, true);
+  assert.equal(result.total_count, 32247);
+  assert.equal(result.row_sample_count, 200);
+  assert.equal(result.pages_fetched, 3);
+  // Sample entries must use sample_count/sample_percent (NOT count/percent) to
+  // avoid implying the percentage is of total_count.
+  assert.equal(result.unique_sub_id_count, 2);
+  assert.deepEqual(result.sub_ids, [
+    { sub_id: 'alpha', sample_count: 100, sample_percent: 50 },
+    { sub_id: 'beta', sample_count: 100, sample_percent: 50 },
+  ]);
+  for (const entry of result.sub_ids) {
+    assert.equal(Object.prototype.hasOwnProperty.call(entry, 'count'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(entry, 'percent'), false);
+  }
+  assert.match(result.warning, /sub_id=/);
+  assert.equal(stub.evaluates.length, 3);
+});
+
+test('handleClickReport unfiltered summary stays breakdown_mode complete with percent when row sample matches total_count', async (t) => {
+  // Reuse the small-total scenario: total_count=3, all rows fit on first page.
+  // This is the canonical "complete" case and must keep the original
+  // count/percent field shape (no sample_count, no warning).
+  stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: 3,
+          list: [
+            { click_id: 'c1', click_time: 1748226000, click_region: 'TH', sub_id: 'yok', referrer: '' },
+            { click_id: 'c2', click_time: 1748226100, click_region: 'TH', sub_id: 'yok', referrer: '' },
+            { click_id: 'c3', click_time: 1748226200, click_region: 'TH', sub_id: '', referrer: '' },
+          ],
+        },
+      },
+    },
+  });
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(result.truncated, false);
+  assert.equal(result.total_count, 3);
+  assert.equal(result.row_sample_count, 3);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'warning'), false);
+  assert.deepEqual(result.sub_ids, [
+    { sub_id: 'yok', count: 2, percent: 66.67 },
+    { sub_id: '', count: 1, percent: 33.33 },
+  ]);
+});
+
+test('handleClickReport summary mode propagates manual_login_required from first page', async (t) => {
+  stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } },
+  });
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'manual_login_required');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.reason, 'shopee_login_required');
+  assert.equal(result.loginUi, '/login?platform=shopee');
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'list'), false);
+});
+
+test('isRawClickReportMode accepts raw=1, raw=true, mode=raw; rejects others', () => {
+  assert.equal(clickReport.isRawClickReportMode({ raw: '1' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ raw: 'true' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ raw: 'yes' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ mode: 'raw' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ mode: 'RAW' }), true);
+  assert.equal(clickReport.isRawClickReportMode({}), false);
+  assert.equal(clickReport.isRawClickReportMode({ raw: '0' }), false);
+  assert.equal(clickReport.isRawClickReportMode({ mode: 'summary' }), false);
+  assert.equal(clickReport.isRawClickReportMode(null), false);
 });
 
 test('handleClickReport returns manual_login_required when Shopee responds with code 30001', async (t) => {
@@ -432,13 +751,24 @@ test('GET /click-report returns click_report_time_invalid JSON for garbage time 
   assert.equal(getPageCalls.length, 0);
 });
 
-test('GET / on Host clickreport.wwoom.com is routed to /click-report', async (t) => {
+test('GET / on Host clickreport.wwoom.com is routed to /click-report and returns summary by default', async (t) => {
   stubBrowserForClickReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: {
       status: 200,
       parsed: true,
-      body: { code: 0, data: { affiliate_id: 15130770000, total_count: 5, list: [] } },
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: 3,
+          list: [
+            { click_id: 'c1', click_time: 1748226000, click_region: 'TH', sub_id: 'yok', referrer: '' },
+            { click_id: 'c2', click_time: 1748226100, click_region: 'TH', sub_id: 'yok', referrer: '' },
+            { click_id: 'c3', click_time: 1748226200, click_region: 'TH', sub_id: '', referrer: '' },
+          ],
+        },
+      },
     },
   });
 
@@ -453,10 +783,60 @@ test('GET / on Host clickreport.wwoom.com is routed to /click-report', async (t)
   assert.match(String(res.headers['content-type'] || ''), /application\/json/);
   const parsed = JSON.parse(res.body);
   assert.equal(parsed.status, 'ok');
+  assert.equal(parsed.mode, 'summary');
   assert.equal(parsed.id, '15130770000');
   assert.equal(parsed.account, 'affiliate@chearb.com');
-  assert.equal(parsed.total_count, 5);
+  assert.equal(parsed.total_count, 3);
+  assert.equal(parsed.unique_sub_id_count, 2);
+  assert.equal(parsed.page_size, 100);
+  assert.equal(parsed.pages_fetched, 1);
+  assert.equal(parsed.row_sample_count, 3);
+  assert.equal(parsed.breakdown_mode, 'complete');
+  assert.equal(parsed.truncated, false);
   assert.equal(parsed.source, 'shopee_click_report_api');
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'list'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'warning'), false);
+  assert.deepEqual(parsed.sub_ids, [
+    { sub_id: 'yok', count: 2, percent: 66.67 },
+    { sub_id: '', count: 1, percent: 33.33 },
+  ]);
+});
+
+test('GET /click-report?raw=1 preserves single-page list response', async (t) => {
+  stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: 9,
+          list: [
+            { click_id: 'c1', click_time: 1748226000, click_region: 'TH', sub_id: 'yok', referrer: '' },
+          ],
+        },
+      },
+    },
+  });
+
+  const instance = await startTestServer();
+  t.after(() => stopTestServer(instance));
+
+  const res = await httpRequest(instance, {
+    path: '/click-report?id=15130770000&time=25/05/2026&raw=1&page_size=5&page_num=2',
+  });
+  assert.equal(res.statusCode, 200);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.status, 'ok');
+  assert.equal(parsed.mode, 'raw');
+  assert.equal(parsed.total_count, 9);
+  assert.equal(parsed.page_num, 2);
+  assert.equal(parsed.page_size, 5);
+  assert.equal(Array.isArray(parsed.list), true);
+  assert.equal(parsed.list.length, 1);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'sub_ids'), false);
 });
 
 test('GET / on default Host still serves the shortlink index HTML (no regression)', async (t) => {

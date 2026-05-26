@@ -1361,7 +1361,7 @@ function indexHtml() {
     '<li><code>GET /api/credentials?platform=shopee&account=X</code> (status only, never returns password)</li>',
     '<li><code>POST /api/credentials</code> (JSON {platform, account, username, password} — stored in macOS Keychain)</li>',
     '<li><code>DELETE /api/credentials?platform=shopee&account=X</code></li>',
-    '<li><code>GET /click-report?id=15130770000&amp;time=DD/MM/YYYY</code> (Shopee click_report API JSON; <code>id</code> defaults to <code>15130770000</code>; <code>time</code> defaults to today in Asia/Bangkok)</li>',
+    '<li><code>GET /click-report?id=15130770000&amp;time=DD/MM/YYYY</code> (Shopee click_report summary JSON: per-sub_id counts + percentages, no raw list; <code>id</code> defaults to <code>15130770000</code>; <code>time</code> defaults to today in Asia/Bangkok; add <code>&amp;raw=1</code> or <code>&amp;mode=raw</code> to return one page of raw rows with <code>page_num</code>/<code>page_size</code>)</li>',
     '<li><code>GET /accounts</code> (profiles + loaded contexts + Keychain credential presence booleans)</li>',
     '<li><code>GET /health</code></li>',
     '<li><code>GET /debug</code> (sanitized — no cookies/tokens/passwords; includes recent redacted login diagnostics)</li>',

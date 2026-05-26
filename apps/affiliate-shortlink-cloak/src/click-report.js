@@ -11,6 +11,8 @@ const SHOPEE_CLICK_REPORT_API_BASE = 'https://affiliate.shopee.co.th/api/v1/clic
 const SHOPEE_CLICK_REPORT_HOST_PATTERN = /^clickreport\.wwoom\.com$/i;
 const SHOPEE_CLICK_REPORT_PAGE_SIZE_DEFAULT = 20;
 const SHOPEE_CLICK_REPORT_PAGE_SIZE_MAX = 100;
+const SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE = 100;
+const SHOPEE_CLICK_REPORT_SUMMARY_MAX_PAGES = 1000;
 const SHOPEE_CLICK_REPORT_DEFAULT_ID = '15130770000';
 const BANGKOK_TIMEZONE = 'Asia/Bangkok';
 const BANGKOK_UTC_OFFSET_SECONDS = 7 * 3600;
@@ -135,6 +137,19 @@ function safePassthroughExtras(query) {
     if (v) out[key] = v;
   }
   return out;
+}
+
+function isTruthyFlag(value) {
+  if (value === true) return true;
+  const str = String(value == null ? '' : value).trim().toLowerCase();
+  return str === '1' || str === 'true' || str === 'yes' || str === 'on';
+}
+
+function isRawClickReportMode(query) {
+  if (!query || typeof query !== 'object') return false;
+  if (isTruthyFlag(query.raw)) return true;
+  const mode = String(query.mode == null ? '' : query.mode).trim().toLowerCase();
+  return mode === 'raw';
 }
 
 function clickReportIdError(reason, message, requestedId) {
@@ -301,17 +316,300 @@ function baseResponseShape(spec) {
   };
 }
 
+function classifyClickReportFetchResult(result) {
+  if (!result || typeof result !== 'object') {
+    return {
+      status: 'error',
+      error: 'click_report_empty_response',
+      reason: 'click_report_empty_response',
+    };
+  }
+  if (result.status === 401 || result.status === 403) {
+    return {
+      status: 'manual_login_required',
+      error: 'manual_login_required',
+      manualLoginRequired: true,
+      needsManual: true,
+      reason: 'shopee_unauthorized',
+      httpStatus: result.status,
+      loginUi: '/login?platform=shopee',
+    };
+  }
+  if (!result.parsed) {
+    return {
+      status: 'error',
+      error: 'click_report_invalid_json',
+      reason: 'click_report_invalid_json',
+      httpStatus: result.status,
+    };
+  }
+  const loginReason = classifyClickReportFailure(result.body);
+  if (loginReason) {
+    return {
+      status: 'manual_login_required',
+      error: 'manual_login_required',
+      manualLoginRequired: true,
+      needsManual: true,
+      reason: loginReason,
+      loginUi: '/login?platform=shopee',
+    };
+  }
+  return null;
+}
+
+function summarizeSubIdCounts(counts, opts = {}) {
+  const countField = opts.countField || 'count';
+  const percentField = opts.percentField || 'percent';
+  const entries = [];
+  let total = 0;
+  for (const [subId, count] of counts.entries()) {
+    total += count;
+    entries.push({ sub_id: subId, [countField]: count });
+  }
+  entries.sort((a, b) => {
+    if (b[countField] !== a[countField]) return b[countField] - a[countField];
+    if (a.sub_id < b.sub_id) return -1;
+    if (a.sub_id > b.sub_id) return 1;
+    return 0;
+  });
+  for (const entry of entries) {
+    entry[percentField] = total > 0
+      ? Number(((entry[countField] / total) * 100).toFixed(2))
+      : 0;
+  }
+  return { entries, aggregatedTotal: total };
+}
+
+async function fetchClickReportPageOnce(page, apiUrl) {
+  return page.evaluate(
+    new Function('args', 'return (' + CLICK_REPORT_FETCH_SCRIPT + ')(args);'),
+    [apiUrl],
+  );
+}
+
+function summaryResponseShape(spec) {
+  return {
+    status: 'ok',
+    mode: 'summary',
+    id: spec.id,
+    account: spec.displayAccount,
+    accountInternal: spec.accountInternal,
+    time: spec.time,
+    range: spec.range,
+    source: 'shopee_click_report_api',
+  };
+}
+
+async function handleClickReportRawMode(spec, page) {
+  const apiUrl = buildClickReportFetchUrl(spec);
+  let result;
+  try {
+    result = await fetchClickReportPageOnce(page, apiUrl);
+  } catch (err) {
+    return Object.assign(baseResponseShape(spec), {
+      mode: 'raw',
+      status: 'error',
+      error: 'click_report_fetch_failed',
+      reason: 'click_report_fetch_failed',
+      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+    });
+  }
+  const classification = classifyClickReportFetchResult(result);
+  if (classification) {
+    return Object.assign(baseResponseShape(spec), { mode: 'raw' }, classification);
+  }
+  const body = result.body;
+  return Object.assign(baseResponseShape(spec), {
+    mode: 'raw',
+    status: 'ok',
+    total_count: pickTotalCount(body),
+    list: pickList(body),
+    affiliate_id: pickAffiliateId(body),
+  });
+}
+
+const SHOPEE_SAMPLE_SUMMARY_WARNING = 'Shopee list pagination caps before total_count is reached; per-sub_id breakdown reflects the fetched sample only. Use sub_id=<value> to get the exact count for one sub.';
+
+async function handleClickReportFilteredSummary(spec, page) {
+  const pageSize = SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE;
+  const requestedSubId = String(spec.extras && spec.extras.sub_id != null ? spec.extras.sub_id : '');
+  const apiUrl = buildClickReportFetchUrl({
+    range: spec.range,
+    page_num: 1,
+    page_size: pageSize,
+    extras: spec.extras,
+  });
+  let result;
+  try {
+    result = await fetchClickReportPageOnce(page, apiUrl);
+  } catch (err) {
+    return Object.assign(summaryResponseShape(spec), {
+      status: 'error',
+      error: 'click_report_fetch_failed',
+      reason: 'click_report_fetch_failed',
+      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+      pages_fetched: 0,
+      page_size: pageSize,
+    });
+  }
+  const classification = classifyClickReportFetchResult(result);
+  if (classification) {
+    return Object.assign(summaryResponseShape(spec), classification, {
+      pages_fetched: 0,
+      page_size: pageSize,
+    });
+  }
+  const body = result.body;
+  const totalCount = pickTotalCount(body);
+  const list = pickList(body);
+  const affiliateId = pickAffiliateId(body);
+  const rows = Array.isArray(list) ? list : [];
+  const firstRowSubId = rows.length > 0 && rows[0] && rows[0].sub_id != null
+    ? String(rows[0].sub_id)
+    : '';
+  const displaySubId = firstRowSubId || requestedSubId;
+  return Object.assign(summaryResponseShape(spec), {
+    total_count: totalCount,
+    unique_sub_id_count: totalCount > 0 ? 1 : 0,
+    sub_ids: totalCount > 0
+      ? [{
+        sub_id: displaySubId,
+        requested_sub_id: requestedSubId,
+        count: totalCount,
+        percent: 100,
+      }]
+      : [],
+    pages_fetched: 1,
+    page_size: pageSize,
+    row_sample_count: rows.length,
+    truncated: false,
+    breakdown_mode: 'filtered',
+    affiliate_id: affiliateId,
+  });
+}
+
+async function handleClickReportSummaryMode(spec, page) {
+  if (spec.extras && spec.extras.sub_id) {
+    return handleClickReportFilteredSummary(spec, page);
+  }
+  const pageSize = SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE;
+  const counts = new Map();
+  let totalCount = 0;
+  let affiliateId = null;
+  let firstResultTotal = null;
+  let pagesFetched = 0;
+  let rowSampleCount = 0;
+  let maxPagesHit = false;
+  let pageNum = 1;
+
+  while (true) {
+    const apiUrl = buildClickReportFetchUrl({
+      range: spec.range,
+      page_num: pageNum,
+      page_size: pageSize,
+      extras: spec.extras,
+    });
+    let result;
+    try {
+      result = await fetchClickReportPageOnce(page, apiUrl);
+    } catch (err) {
+      return Object.assign(summaryResponseShape(spec), {
+        status: 'error',
+        error: 'click_report_fetch_failed',
+        reason: 'click_report_fetch_failed',
+        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+        pages_fetched: pagesFetched,
+        page_size: pageSize,
+      });
+    }
+    const classification = classifyClickReportFetchResult(result);
+    if (classification) {
+      return Object.assign(summaryResponseShape(spec), classification, {
+        pages_fetched: pagesFetched,
+        page_size: pageSize,
+      });
+    }
+    const body = result.body;
+    const pageTotal = pickTotalCount(body);
+    const list = pickList(body);
+    if (pagesFetched === 0) {
+      totalCount = pageTotal;
+      affiliateId = pickAffiliateId(body);
+      firstResultTotal = pageTotal;
+    }
+    pagesFetched += 1;
+    const rows = Array.isArray(list) ? list : [];
+    rowSampleCount += rows.length;
+    for (const row of rows) {
+      const subId = row && row.sub_id != null ? String(row.sub_id) : '';
+      counts.set(subId, (counts.get(subId) || 0) + 1);
+    }
+    if (rows.length === 0) break;
+    if (rows.length < pageSize) break;
+    if (firstResultTotal != null && firstResultTotal > 0 && rowSampleCount >= firstResultTotal) break;
+    if (pagesFetched >= SHOPEE_CLICK_REPORT_SUMMARY_MAX_PAGES) {
+      maxPagesHit = true;
+      break;
+    }
+    pageNum += 1;
+  }
+
+  const sampleComplete = totalCount <= 0 || rowSampleCount >= totalCount;
+  if (sampleComplete && !maxPagesHit) {
+    const { entries } = summarizeSubIdCounts(counts);
+    return Object.assign(summaryResponseShape(spec), {
+      total_count: totalCount,
+      unique_sub_id_count: entries.length,
+      sub_ids: entries,
+      pages_fetched: pagesFetched,
+      page_size: pageSize,
+      row_sample_count: rowSampleCount,
+      truncated: false,
+      breakdown_mode: 'complete',
+      affiliate_id: affiliateId,
+    });
+  }
+
+  const { entries } = summarizeSubIdCounts(counts, {
+    countField: 'sample_count',
+    percentField: 'sample_percent',
+  });
+  return Object.assign(summaryResponseShape(spec), {
+    total_count: totalCount,
+    unique_sub_id_count: entries.length,
+    sub_ids: entries,
+    pages_fetched: pagesFetched,
+    page_size: pageSize,
+    row_sample_count: rowSampleCount,
+    truncated: true,
+    breakdown_mode: 'sample',
+    warning: SHOPEE_SAMPLE_SUMMARY_WARNING,
+    affiliate_id: affiliateId,
+  });
+}
+
 async function handleClickReport(query = {}, deps = {}) {
   const browserDep = deps.browser || browser;
   const now = deps.now instanceof Date ? deps.now : new Date();
-  const spec = resolveClickReportRequest(query, { now });
-  const apiUrl = buildClickReportFetchUrl(spec);
+  const rawMode = isRawClickReportMode(query);
+
+  // Summary mode always fetches with the largest page_size starting at page 1.
+  // The caller-supplied page_num/page_size are honored only in raw mode.
+  const workingQuery = rawMode ? query : Object.assign({}, query, {
+    page_size: SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE,
+    page_num: 1,
+  });
+  const spec = resolveClickReportRequest(workingQuery, { now });
+
+  const errorShape = () => (rawMode
+    ? Object.assign(baseResponseShape(spec), { mode: 'raw' })
+    : summaryResponseShape(spec));
 
   let pageRecord;
   try {
     pageRecord = await browserDep.getPage('shopee', spec.account, { headless: true });
   } catch (err) {
-    return Object.assign(baseResponseShape(spec), {
+    return Object.assign(errorShape(), {
       status: 'error',
       error: 'browser_unavailable',
       reason: 'browser_unavailable',
@@ -321,7 +619,7 @@ async function handleClickReport(query = {}, deps = {}) {
 
   const page = pageRecord && pageRecord.page;
   if (!page) {
-    return Object.assign(baseResponseShape(spec), {
+    return Object.assign(errorShape(), {
       status: 'error',
       error: 'browser_unavailable',
       reason: 'browser_unavailable',
@@ -340,7 +638,7 @@ async function handleClickReport(query = {}, deps = {}) {
     : /affiliate\.shopee\.co\.th/i.test(currentUrl);
 
   if (isLoginRedirectUrl(currentUrl) || !onAffiliateOrigin) {
-    return Object.assign(baseResponseShape(spec), {
+    return Object.assign(errorShape(), {
       status: 'manual_login_required',
       error: 'manual_login_required',
       manualLoginRequired: true,
@@ -350,69 +648,9 @@ async function handleClickReport(query = {}, deps = {}) {
     });
   }
 
-  let result;
-  try {
-    result = await page.evaluate(
-      new Function('args', 'return (' + CLICK_REPORT_FETCH_SCRIPT + ')(args);'),
-      [apiUrl],
-    );
-  } catch (err) {
-    return Object.assign(baseResponseShape(spec), {
-      status: 'error',
-      error: 'click_report_fetch_failed',
-      reason: 'click_report_fetch_failed',
-      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
-    });
-  }
-
-  if (!result || typeof result !== 'object') {
-    return Object.assign(baseResponseShape(spec), {
-      status: 'error',
-      error: 'click_report_empty_response',
-      reason: 'click_report_empty_response',
-    });
-  }
-
-  if (result.status === 401 || result.status === 403) {
-    return Object.assign(baseResponseShape(spec), {
-      status: 'manual_login_required',
-      error: 'manual_login_required',
-      manualLoginRequired: true,
-      needsManual: true,
-      reason: 'shopee_unauthorized',
-      httpStatus: result.status,
-      loginUi: '/login?platform=shopee',
-    });
-  }
-
-  if (!result.parsed) {
-    return Object.assign(baseResponseShape(spec), {
-      status: 'error',
-      error: 'click_report_invalid_json',
-      reason: 'click_report_invalid_json',
-      httpStatus: result.status,
-    });
-  }
-
-  const body = result.body;
-  const loginReason = classifyClickReportFailure(body);
-  if (loginReason) {
-    return Object.assign(baseResponseShape(spec), {
-      status: 'manual_login_required',
-      error: 'manual_login_required',
-      manualLoginRequired: true,
-      needsManual: true,
-      reason: loginReason,
-      loginUi: '/login?platform=shopee',
-    });
-  }
-
-  return Object.assign(baseResponseShape(spec), {
-    status: 'ok',
-    total_count: pickTotalCount(body),
-    list: pickList(body),
-    affiliate_id: pickAffiliateId(body),
-  });
+  return rawMode
+    ? handleClickReportRawMode(spec, page)
+    : handleClickReportSummaryMode(spec, page);
 }
 
 function isClickReportHost(hostHeader) {
@@ -427,12 +665,16 @@ module.exports = {
   SHOPEE_CLICK_REPORT_DEFAULT_ID,
   SHOPEE_CLICK_REPORT_PAGE_SIZE_DEFAULT,
   SHOPEE_CLICK_REPORT_PAGE_SIZE_MAX,
+  SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE,
+  SHOPEE_CLICK_REPORT_SUMMARY_MAX_PAGES,
+  SHOPEE_SAMPLE_SUMMARY_WARNING,
   BANGKOK_TIMEZONE,
   CLICK_REPORT_EXTRA_KEYS,
   parseClickReportDate,
   clampPageNum,
   clampPageSize,
   safePassthroughExtras,
+  isRawClickReportMode,
   resolveClickReportRequest,
   buildClickReportFetchUrl,
   classifyClickReportFailure,
