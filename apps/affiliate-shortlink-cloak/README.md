@@ -101,6 +101,68 @@ Post-reauth Shopee API/session rejections use precise reasons such as `shopee_ap
 }
 ```
 
+### `GET /click-report`
+
+Returns the Shopee Affiliate **click_report** API as JSON for a given Shopee affiliate id and a single Asia/Bangkok local day. Reuses the same CloakBrowser persistent profile and session manager as `/shorten`, so it does not fight `/shorten` over the profile lock.
+
+Query parameters:
+
+| Param | Default | Notes |
+|---|---|---|
+| `id` | `15130770000` | Built-in alias (or `SHOPEE_ID_ACCOUNT_MAP` entry). Selects the persistent profile / Keychain account. `an_<digits>` is also accepted. |
+| `time` | today (Asia/Bangkok) | Accepts `DD/MM/YYYY`, `YYYY-MM-DD`, `today`, or `yesterday`. The day is interpreted in Asia/Bangkok (UTC+7) and translated to `click_time_s` (00:00:00) / `click_time_e` (23:59:59) Unix seconds — no reliance on server local timezone. |
+| `page_num` (or `page`) | `1` | Floored at `1`. |
+| `page_size` | `20` | Clamped to `[1, 100]`. |
+| `sub_id`, `click_id`, `click_region` | _(omitted)_ | Passed through to the Shopee API when non-empty. |
+
+The bridge resolves `id → account` using the same alias table as `/shorten` (so id `15130770000` → `affiliate_chearb.com`, id `15142270000` → `affiliate_neezs.com`). The persistent profile is opened headless and `fetch('/api/v1/click_report/list?...', { credentials: 'include' })` runs from the `affiliate.shopee.co.th` origin, just like the click report dashboard does.
+
+Examples:
+
+```
+# clickreport.wwoom.com — the Host header maps `/` directly to /click-report
+curl 'https://clickreport.wwoom.com/?time=26/05/2026'
+curl 'https://clickreport.wwoom.com/?id=15130770000&time=26/05/2026'
+
+# Direct on the local bridge
+curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=yesterday&page_size=5'
+curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=2026-05-25'
+```
+
+Healthy response shape (Shopee row fields are passed through unchanged):
+
+```json
+{
+  "status": "ok",
+  "id": "15142270000",
+  "account": "affiliate@neezs.com",
+  "accountInternal": "affiliate_neezs.com",
+  "time": "25/05/2026",
+  "range": {
+    "timezone": "Asia/Bangkok",
+    "click_time_s": 1748102400,
+    "click_time_e": 1748188799
+  },
+  "page_num": 1,
+  "page_size": 20,
+  "total_count": 26437,
+  "affiliate_id": "15142270000",
+  "list": [
+    { "click_id": "...", "click_time": 1748102500, "click_region": "TH", "sub_id": "yok", "referrer": "" }
+  ],
+  "source": "shopee_click_report_api"
+}
+```
+
+Failure shapes (no cookies / tokens / passwords are ever included):
+
+- Unknown / invalid `id` → HTTP `400` with `status: "error"`, `reason: "shopee_affiliate_id_unknown"` or `"shopee_affiliate_id_invalid"`.
+- Invalid `time` → HTTP `400` with `status: "error"`, `reason: "click_report_time_invalid"`.
+- Shopee responds with `code: 30001`, redirects to `shopee.co.th/buyer/login`, or returns HTTP `401`/`403` → `status: "manual_login_required"`, `reason: "shopee_login_required"` or `"shopee_unauthorized"`, plus `loginUi: "/login?platform=shopee"`.
+- Browser/fetch transport failure → `status: "error"`, `reason: "click_report_fetch_failed"` (or `"click_report_invalid_json"`, `"click_report_empty_response"`).
+
+When the request Host is `clickreport.wwoom.com` (any port), `GET /` is treated as `GET /click-report`. Other hosts keep the existing shortlink behavior on `/` and `/shorten`.
+
 ### `GET /login`
 
 The single user-facing credential-saving page. Polished mobile-friendly card UI with a gradient background, platform dropdown (Shopee/Lazada), `username` + `password` inputs, a live "Account ที่จะใช้" preview, and a *remember in macOS Keychain* checkbox (checked by default).

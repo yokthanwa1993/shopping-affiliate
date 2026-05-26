@@ -1,0 +1,19 @@
+name = "clickreport-wwoom-proxy"
+main = "src/index.js"
+compatibility_date = "2026-05-26"
+
+# Public hostname binding.
+# Custom domains are the recommended route style for proxying a whole hostname:
+#   https://developers.cloudflare.com/workers/configuration/routing/custom-domains/
+#
+# If `clickreport.wwoom.com` is already mapped to a Cloudflare Tunnel or another
+# Worker, remove that mapping before applying this. To switch to the legacy
+# route-pattern style, replace the [[routes]] block with:
+#   routes = [
+#     { pattern = "clickreport.wwoom.com/*", zone_name = "wwoom.com" }
+#   ]
+[[routes]]
+pattern = "clickreport.wwoom.com"
+custom_domain = true
+
+# No vars / secrets required. Upstream origin is a fixed public URL.

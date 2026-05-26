@@ -50,6 +50,7 @@ const {
   resolveShopeeAccountMetadataFromId,
   normalizeShopeeAffiliateId,
 } = require('./shopee-accounts');
+const clickReport = require('./click-report');
 
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 const MAX_RECENT_LOGIN_DIAGNOSTICS = 8;
@@ -1360,6 +1361,7 @@ function indexHtml() {
     '<li><code>GET /api/credentials?platform=shopee&account=X</code> (status only, never returns password)</li>',
     '<li><code>POST /api/credentials</code> (JSON {platform, account, username, password} — stored in macOS Keychain)</li>',
     '<li><code>DELETE /api/credentials?platform=shopee&account=X</code></li>',
+    '<li><code>GET /click-report?id=15130770000&amp;time=DD/MM/YYYY</code> (Shopee click_report API JSON; <code>id</code> defaults to <code>15130770000</code>; <code>time</code> defaults to today in Asia/Bangkok)</li>',
     '<li><code>GET /accounts</code> (profiles + loaded contexts + Keychain credential presence booleans)</li>',
     '<li><code>GET /health</code></li>',
     '<li><code>GET /debug</code> (sanitized — no cookies/tokens/passwords; includes recent redacted login diagnostics)</li>',
@@ -1998,6 +2000,26 @@ function createServer() {
         return sendHtml(res, 200, loginHtmlPage({ platform: query.platform, account: query.account }));
       }
 
+      const hostHeader = req && req.headers ? req.headers.host : '';
+      const treatAsClickReport = pathname === '/click-report'
+        || (pathname === '/' && clickReport.isClickReportHost(hostHeader));
+
+      if (treatAsClickReport) {
+        if (req.method !== 'GET') {
+          res.setHeader('Allow', 'GET');
+          return sendJson(res, 405, { error: 'Method not allowed (use GET)' });
+        }
+        try {
+          const payload = await clickReport.handleClickReport(query);
+          return sendJson(res, 200, payload);
+        } catch (err) {
+          if (err && err.publicPayload) {
+            return sendJson(res, err.statusCode || 400, err.publicPayload);
+          }
+          throw err;
+        }
+      }
+
       if (pathname === '/' || pathname === '/shorten') {
         if (!query.url) {
           if (pathname === '/') return sendHtml(res, 200, indexHtml());
@@ -2041,6 +2063,8 @@ module.exports = {
   createServer,
   start,
   handleShorten,
+  handleClickReport: clickReport.handleClickReport,
+  isClickReportHost: clickReport.isClickReportHost,
   handleLogin,
   handleLoginAndShorten,
   handleLoginOnly,
