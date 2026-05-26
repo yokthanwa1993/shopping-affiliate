@@ -51,6 +51,7 @@ const {
   normalizeShopeeAffiliateId,
 } = require('./shopee-accounts');
 const clickReport = require('./click-report');
+const conversionReport = require('./conversion-report');
 
 const MAX_JSON_BODY_BYTES = 64 * 1024;
 const MAX_RECENT_LOGIN_DIAGNOSTICS = 8;
@@ -2020,6 +2021,25 @@ function createServer() {
         }
       }
 
+      const treatAsConversionReport = pathname === '/conversion-report'
+        || (pathname === '/' && conversionReport.isConversionReportHost(hostHeader));
+
+      if (treatAsConversionReport) {
+        if (req.method !== 'GET') {
+          res.setHeader('Allow', 'GET');
+          return sendJson(res, 405, { error: 'Method not allowed (use GET)' });
+        }
+        try {
+          const payload = await conversionReport.handleConversionReport(query);
+          return sendJson(res, 200, payload);
+        } catch (err) {
+          if (err && err.publicPayload) {
+            return sendJson(res, err.statusCode || 400, err.publicPayload);
+          }
+          throw err;
+        }
+      }
+
       if (pathname === '/' || pathname === '/shorten') {
         if (!query.url) {
           if (pathname === '/') return sendHtml(res, 200, indexHtml());
@@ -2065,6 +2085,8 @@ module.exports = {
   handleShorten,
   handleClickReport: clickReport.handleClickReport,
   isClickReportHost: clickReport.isClickReportHost,
+  handleConversionReport: conversionReport.handleConversionReport,
+  isConversionReportHost: conversionReport.isConversionReportHost,
   handleLogin,
   handleLoginAndShorten,
   handleLoginOnly,
