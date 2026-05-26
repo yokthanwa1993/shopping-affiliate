@@ -12,7 +12,6 @@ const SHOPEE_CLICK_REPORT_HOST_PATTERN = /^clickreport\.wwoom\.com$/i;
 const SHOPEE_CLICK_REPORT_PAGE_SIZE_DEFAULT = 20;
 const SHOPEE_CLICK_REPORT_PAGE_SIZE_MAX = 100;
 const SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE = 100;
-const SHOPEE_CLICK_REPORT_SUMMARY_MAX_PAGES = 1000;
 const SHOPEE_CLICK_REPORT_DEFAULT_ID = '15130770000';
 const BANGKOK_TIMEZONE = 'Asia/Bangkok';
 const BANGKOK_UTC_OFFSET_SECONDS = 7 * 3600;
@@ -428,7 +427,7 @@ async function handleClickReportRawMode(spec, page) {
   });
 }
 
-const SHOPEE_SAMPLE_SUMMARY_WARNING = 'Shopee list pagination caps before total_count is reached; per-sub_id breakdown reflects the fetched sample only. Use sub_id=<value> to get the exact count for one sub.';
+const SHOPEE_DISCOVERED_SUMMARY_WARNING = 'sub_id discovery is based on the first sample of rows from Shopee; additional sub_ids may exist beyond the sample.';
 
 async function handleClickReportFilteredSummary(spec, page) {
   const pageSize = SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE;
@@ -493,75 +492,52 @@ async function handleClickReportSummaryMode(spec, page) {
     return handleClickReportFilteredSummary(spec, page);
   }
   const pageSize = SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE;
-  const counts = new Map();
-  let totalCount = 0;
-  let affiliateId = null;
-  let firstResultTotal = null;
-  let pagesFetched = 0;
-  let rowSampleCount = 0;
-  let maxPagesHit = false;
-  let pageNum = 1;
-
-  while (true) {
-    const apiUrl = buildClickReportFetchUrl({
-      range: spec.range,
-      page_num: pageNum,
+  const unfilteredUrl = buildClickReportFetchUrl({
+    range: spec.range,
+    page_num: 1,
+    page_size: pageSize,
+    extras: spec.extras,
+  });
+  let unfilteredResult;
+  try {
+    unfilteredResult = await fetchClickReportPageOnce(page, unfilteredUrl);
+  } catch (err) {
+    return Object.assign(summaryResponseShape(spec), {
+      status: 'error',
+      error: 'click_report_fetch_failed',
+      reason: 'click_report_fetch_failed',
+      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+      pages_fetched: 0,
       page_size: pageSize,
-      extras: spec.extras,
     });
-    let result;
-    try {
-      result = await fetchClickReportPageOnce(page, apiUrl);
-    } catch (err) {
-      return Object.assign(summaryResponseShape(spec), {
-        status: 'error',
-        error: 'click_report_fetch_failed',
-        reason: 'click_report_fetch_failed',
-        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
-        pages_fetched: pagesFetched,
-        page_size: pageSize,
-      });
-    }
-    const classification = classifyClickReportFetchResult(result);
-    if (classification) {
-      return Object.assign(summaryResponseShape(spec), classification, {
-        pages_fetched: pagesFetched,
-        page_size: pageSize,
-      });
-    }
-    const body = result.body;
-    const pageTotal = pickTotalCount(body);
-    const list = pickList(body);
-    if (pagesFetched === 0) {
-      totalCount = pageTotal;
-      affiliateId = pickAffiliateId(body);
-      firstResultTotal = pageTotal;
-    }
-    pagesFetched += 1;
-    const rows = Array.isArray(list) ? list : [];
-    rowSampleCount += rows.length;
+  }
+  const classification = classifyClickReportFetchResult(unfilteredResult);
+  if (classification) {
+    return Object.assign(summaryResponseShape(spec), classification, {
+      pages_fetched: 0,
+      page_size: pageSize,
+    });
+  }
+  const body = unfilteredResult.body;
+  const totalCount = pickTotalCount(body);
+  const list = pickList(body);
+  const affiliateId = pickAffiliateId(body);
+  const rows = Array.isArray(list) ? list : [];
+  const rowSampleCount = rows.length;
+
+  const sampleComplete = totalCount <= 0 || rowSampleCount >= totalCount;
+  if (sampleComplete) {
+    const counts = new Map();
     for (const row of rows) {
       const subId = row && row.sub_id != null ? String(row.sub_id) : '';
       counts.set(subId, (counts.get(subId) || 0) + 1);
     }
-    if (rows.length === 0) break;
-    if (rows.length < pageSize) break;
-    if (firstResultTotal != null && firstResultTotal > 0 && rowSampleCount >= firstResultTotal) break;
-    if (pagesFetched >= SHOPEE_CLICK_REPORT_SUMMARY_MAX_PAGES) {
-      maxPagesHit = true;
-      break;
-    }
-    pageNum += 1;
-  }
-
-  const sampleComplete = totalCount <= 0 || rowSampleCount >= totalCount;
-  if (sampleComplete && !maxPagesHit) {
     const { entries } = summarizeSubIdCounts(counts);
     return Object.assign(summaryResponseShape(spec), {
       total_count: totalCount,
       unique_sub_id_count: entries.length,
       sub_ids: entries,
-      pages_fetched: pagesFetched,
+      pages_fetched: 1,
       page_size: pageSize,
       row_sample_count: rowSampleCount,
       truncated: false,
@@ -570,20 +546,78 @@ async function handleClickReportSummaryMode(spec, page) {
     });
   }
 
-  const { entries } = summarizeSubIdCounts(counts, {
-    countField: 'sample_count',
-    percentField: 'sample_percent',
+  // Sample is shorter than total_count. Discover unique sub_ids from the
+  // sample rows, then ask Shopee for the exact filtered total_count per sub.
+  const discoveredSet = new Set();
+  for (const row of rows) {
+    if (row && row.sub_id != null) discoveredSet.add(String(row.sub_id));
+  }
+  const discoveredSubIds = Array.from(discoveredSet).filter((s) => s !== '');
+  discoveredSubIds.sort();
+
+  const entries = [];
+  let filteredFetchCount = 0;
+  for (const subId of discoveredSubIds) {
+    const filteredUrl = buildClickReportFetchUrl({
+      range: spec.range,
+      page_num: 1,
+      page_size: pageSize,
+      extras: Object.assign({}, spec.extras || {}, { sub_id: subId }),
+    });
+    let subResult;
+    try {
+      subResult = await fetchClickReportPageOnce(page, filteredUrl);
+    } catch (err) {
+      return Object.assign(summaryResponseShape(spec), {
+        status: 'error',
+        error: 'click_report_sub_count_failed',
+        reason: 'click_report_sub_count_failed',
+        failed_sub_id: sanitizeExtraValue(subId),
+        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+        pages_fetched: 1 + filteredFetchCount,
+        page_size: pageSize,
+      });
+    }
+    filteredFetchCount += 1;
+    const subClassification = classifyClickReportFetchResult(subResult);
+    if (subClassification) {
+      return Object.assign(summaryResponseShape(spec), {
+        status: 'error',
+        error: 'click_report_sub_count_failed',
+        reason: 'click_report_sub_count_failed',
+        failed_sub_id: sanitizeExtraValue(subId),
+        underlying: subClassification.reason || subClassification.error || null,
+        pages_fetched: 1 + filteredFetchCount,
+        page_size: pageSize,
+      });
+    }
+    const subTotal = pickTotalCount(subResult.body);
+    entries.push({ sub_id: subId, count: subTotal });
+  }
+
+  entries.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    if (a.sub_id < b.sub_id) return -1;
+    if (a.sub_id > b.sub_id) return 1;
+    return 0;
   });
+  for (const entry of entries) {
+    entry.percent = totalCount > 0
+      ? Number(((entry.count / totalCount) * 100).toFixed(2))
+      : 0;
+  }
+
   return Object.assign(summaryResponseShape(spec), {
     total_count: totalCount,
     unique_sub_id_count: entries.length,
+    discovered_sub_id_count: discoveredSet.size,
     sub_ids: entries,
-    pages_fetched: pagesFetched,
+    pages_fetched: 1 + filteredFetchCount,
     page_size: pageSize,
     row_sample_count: rowSampleCount,
     truncated: true,
-    breakdown_mode: 'sample',
-    warning: SHOPEE_SAMPLE_SUMMARY_WARNING,
+    breakdown_mode: 'discovered_filtered',
+    warning: SHOPEE_DISCOVERED_SUMMARY_WARNING,
     affiliate_id: affiliateId,
   });
 }
@@ -666,8 +700,7 @@ module.exports = {
   SHOPEE_CLICK_REPORT_PAGE_SIZE_DEFAULT,
   SHOPEE_CLICK_REPORT_PAGE_SIZE_MAX,
   SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE,
-  SHOPEE_CLICK_REPORT_SUMMARY_MAX_PAGES,
-  SHOPEE_SAMPLE_SUMMARY_WARNING,
+  SHOPEE_DISCOVERED_SUMMARY_WARNING,
   BANGKOK_TIMEZONE,
   CLICK_REPORT_EXTRA_KEYS,
   parseClickReportDate,
