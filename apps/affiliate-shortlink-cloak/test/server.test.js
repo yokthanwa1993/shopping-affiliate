@@ -632,7 +632,7 @@ test('handleLogin rejects unknown platform', async () => {
   await assert.rejects(() => server.handleLogin({ platform: 'amazon' }), /Invalid or missing platform/);
 });
 
-test('handleLogin requests a headed visible browser context', async (t) => {
+test('handleLogin opt-out flags request a headed visible browser context without Keychain autofill', async (t) => {
   const originalGetPage = browser.getPage;
   const calls = [];
   const navigations = [];
@@ -650,8 +650,13 @@ test('handleLogin requests a headed visible browser context', async (t) => {
   t.after(() => {
     browser.getPage = originalGetPage;
   });
+  stubKeychain(t, {
+    findCredential: async () => {
+      throw new Error('Keychain must not be read when login autofill is explicitly disabled');
+    },
+  });
 
-  const result = await server.handleLogin({ platform: 'shopee', account: 'CHEARB' });
+  const result = await server.handleLogin({ platform: 'shopee', account: 'CHEARB', noAutofill: '1' });
 
   assert.equal(result.status, 'login_window_opened');
   assert.equal(calls[0][0], 'shopee');
@@ -659,6 +664,118 @@ test('handleLogin requests a headed visible browser context', async (t) => {
   assert.deepEqual(calls[0][2], { headless: false, forceVisible: true });
   assert.match(navigations[0][0], /shopee\.co\.th\/buyer\/login/);
   assert.match(navigations[0][0], /next=https%3A%2F%2Faffiliate\.shopee\.co\.th%2F/);
+
+  await server.handleLogin({ platform: 'shopee', account: 'CHEARB', autofill: '0' });
+  await server.handleLogin({ platform: 'shopee', account: 'CHEARB', autoFill: '0' });
+  assert.equal(calls.length, 3);
+  assert.equal(calls.every((call) => call[2] && call[2].forceVisible === true), true);
+});
+
+test('handleLogin attempts Keychain autofill by default when stored credential exists', async (t) => {
+  const originalGetPage = browser.getPage;
+  const calls = [];
+  const PW = 'stored-password-never-returned';
+
+  browser.getPage = async (...args) => {
+    calls.push(args);
+    return {
+      page: {
+        url: () => 'https://shopee.co.th/buyer/login',
+        bringToFront: async () => {},
+        goto: async () => {},
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        content: async () => '<html><body>OTP verification required</body></html>',
+      },
+    };
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  stubKeychain(t, {
+    isSupported: () => true,
+    findCredential: async () => ({ username: 'stored-user', password: PW }),
+  });
+
+  const result = await server.handleLogin({
+    platform: 'shopee',
+    account: 'affiliate_neezs.com',
+  });
+
+  assert.equal(result.status, 'captcha_or_otp_detected');
+  assert.equal(result.reason, 'captcha_or_otp_detected');
+  assert.equal(result.autofill.attempted, true);
+  assert.equal(result.autofill.ok, false);
+  assert.equal(result.autofill.needsManual, true);
+  assert.equal(result.autofill.reason, 'captcha_or_otp_detected');
+  assert.deepEqual(calls[0][2], { headless: false, forceNew: false });
+  assert.equal(JSON.stringify(result).includes('stored-user'), false, 'username must not appear in login response');
+  assert.equal(JSON.stringify(result).includes(PW), false, 'password must not appear in login response');
+});
+
+test('handleLogin falls back to manual login by default when no Keychain credential exists', async (t) => {
+  const originalGetPage = browser.getPage;
+  const calls = [];
+  const navigations = [];
+  browser.getPage = async (...args) => {
+    calls.push(args);
+    return {
+      page: {
+        bringToFront: async () => {},
+        goto: async (...gotoArgs) => {
+          navigations.push(gotoArgs);
+        },
+      },
+    };
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  stubKeychain(t, {
+    isSupported: () => true,
+    findCredential: async () => null,
+  });
+
+  const result = await server.handleLogin({
+    platform: 'shopee',
+    account: 'affiliate_chearb.com',
+  });
+
+  assert.equal(result.status, 'login_window_opened');
+  assert.equal(result.account, 'affiliate_chearb.com');
+  assert.deepEqual(calls[0][2], { headless: false, forceVisible: true });
+  assert.match(navigations[0][0], /shopee\.co\.th\/buyer\/login/);
+  assert.equal('autofill' in result, false);
+  assert.equal(/password|secret/i.test(JSON.stringify(result)), false);
+});
+
+test('handleLogin falls back to manual login by default when Keychain is unavailable', async (t) => {
+  const originalGetPage = browser.getPage;
+  const calls = [];
+  browser.getPage = async (...args) => {
+    calls.push(args);
+    return {
+      page: {
+        bringToFront: async () => {},
+        goto: async () => {},
+      },
+    };
+  };
+  t.after(() => { browser.getPage = originalGetPage; });
+
+  stubKeychain(t, {
+    isSupported: () => false,
+    findCredential: async () => {
+      throw new Error('findCredential must not be called when Keychain is unavailable');
+    },
+  });
+
+  const result = await server.handleLogin({
+    platform: 'shopee',
+    account: 'affiliate_chearb.com',
+  });
+
+  assert.equal(result.status, 'login_window_opened');
+  assert.deepEqual(calls[0][2], { headless: false, forceVisible: true });
+  assert.equal('autofill' in result, false);
 });
 
 test('loginUiHtml renders only username/password as visible inputs (no platform/account/url/sub1 visible fields)', () => {
@@ -1115,7 +1232,7 @@ test('GET /login/shopee with ?account=CHEARB still redirects (account is ignored
   assert.equal(String(res.headers['location'] || ''), '/login?platform=shopee');
 });
 
-test('GET /login with Accept: application/json preserves the legacy JSON handleLogin behavior', async (t) => {
+test('GET /login with Accept: application/json and noAutofill=1 opens the manual login window', async (t) => {
   const originalGetPage = browser.getPage;
   const calls = [];
   browser.getPage = async (...args) => {
@@ -1134,7 +1251,7 @@ test('GET /login with Accept: application/json preserves the legacy JSON handleL
 
   const res = await httpRequest(instance, {
     method: 'GET',
-    path: '/login?platform=shopee&account=CHEARB',
+    path: '/login?platform=shopee&account=CHEARB&noAutofill=1',
     headers: { Accept: 'application/json' },
   });
   assert.equal(res.statusCode, 200);
@@ -1148,7 +1265,7 @@ test('GET /login with Accept: application/json preserves the legacy JSON handleL
   assert.deepEqual(calls[0][2], { headless: false, forceVisible: true });
 });
 
-test('GET /login?json=1&platform=shopee&account=CHEARB also returns JSON (no Accept header needed)', async (t) => {
+test('GET /login?json=1&platform=shopee&account=CHEARB&noAutofill=1 returns manual-login JSON', async (t) => {
   const originalGetPage = browser.getPage;
   browser.getPage = async () => ({
     page: { bringToFront: async () => {}, goto: async () => {} },
@@ -1160,7 +1277,7 @@ test('GET /login?json=1&platform=shopee&account=CHEARB also returns JSON (no Acc
 
   const res = await httpRequest(instance, {
     method: 'GET',
-    path: '/login?json=1&platform=shopee&account=CHEARB',
+    path: '/login?json=1&platform=shopee&account=CHEARB&noAutofill=1',
   });
   assert.equal(res.statusCode, 200);
   assert.match(String(res.headers['content-type'] || ''), /application\/json/);
@@ -1168,7 +1285,7 @@ test('GET /login?json=1&platform=shopee&account=CHEARB also returns JSON (no Acc
   assert.equal(parsed.status, 'login_window_opened');
 });
 
-test('handleLogin autofill reports missing Keychain credential without opening browser', async (t) => {
+test('handleLogin explicit autofill=1 reports missing Keychain credential without opening browser', async (t) => {
   const originalGetPage = browser.getPage;
   const getPageCalls = [];
   browser.getPage = async (...args) => {

@@ -4,19 +4,66 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-04-15",
   "compatibility_flags": [
-    "global_fetch_strictly_public"
+    "global_fetch_strictly_public",
+    "nodejs_compat"
   ],
   "workers_dev": true,
   "routes": [
     {
+      "pattern": "dashboard.pubilo.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "admin.pubilo.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "www.pubilo.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "pubilo.com/*",
+      "zone_name": "pubilo.com"
+    },
+    {
       "pattern": "dashboard.oomnn.com",
       "custom_domain": true
+    },
+    {
+      "pattern": "admin.oomnn.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "www.oomnn.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "oomnn.com/*",
+      "zone_name": "oomnn.com"
     }
   ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  // Identity namespace is physically shared with video-affiliate so the future
+  // Mini App migration can reuse the same passkey credentials/users.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "video-affiliate-db",
+      "database_id": "742796ce-d973-49d3-bc38-7a44a576d67f",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "PASSKEY_RP_ID": "pubilo.com",
+    "PASSKEY_RP_NAME": "PUBILO Dashboard",
+    "PASSKEY_NAMESPACE_ID": "1774858894802785816",
+    "PASSKEY_WORKSPACE_NAME": "PUBILO",
+    "PASSKEY_BOOTSTRAP_DISPLAY_NAME": "YOK"
   },
   "observability": {
     "enabled": true

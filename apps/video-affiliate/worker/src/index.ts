@@ -73,6 +73,37 @@ import {
     normalizeShortlinkSubId,
     buildShortlinkRequestUrlFromTemplate,
 } from './shortlink-template'
+import { extractShopeeAffiliateIdFromLink } from './shopee-affiliate-id'
+import { handleReportProxyRequest } from './report-proxy'
+import {
+    PAGE_VIDEO_ASSET_WINNERS_INDEX_SQL,
+    PAGE_VIDEO_ASSET_WINNERS_TABLE_SQL,
+    buildAssetLibraryVideoDescription,
+    buildAssetLibraryVideoTitle,
+    parsePageVideoSubId,
+} from './page-video-asset-winners'
+import {
+    PROCESSED_VIDEO_ASSET_LIBRARY_ADVIDEO_INDEX_SQL,
+    PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
+    buildProcessedVideoAssetFileUrl,
+    normalizeMetaVideoStatus,
+    parseProcessedVideoR2Key,
+    sanitizeMetaGraphError,
+} from './processed-video-asset-library'
+import {
+    AVATAR_CHROMAKEY_BLEND_KEY,
+    AVATAR_CHROMAKEY_SIMILARITY_KEY,
+    AVATAR_ENABLED_KEY,
+    AVATAR_UPDATED_AT_KEY,
+    AVATAR_VERSION_KEY,
+    AVATAR_VIDEO_KEY_KEY,
+    buildPageAvatarVideoKey,
+    clampChromakeyBlend,
+    clampChromakeySimilarity,
+    sanitizeAvatarVersion,
+    serializePageAvatarSettings,
+    type PageAvatarSettings,
+} from './avatar-settings'
 
 type FacebookSdkApiClient = {
     call: (method: string, path: string, params?: Record<string, unknown>) => Promise<unknown>
@@ -147,11 +178,33 @@ const MAX_COMMENT_TEMPLATE_CHARS = 4000
 const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
 const MERGE_CONTAINER_ENGINE_VERSION = '2026-05-26.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
+
+// Call the merge service. When env.MERGE_SERVICE_URL is set, route to the external
+// HTTP endpoint (e.g. http://merge-api.lslly.com); otherwise fall back to the
+// Cloudflare Container Durable Object so rollback is a wrangler var change only.
+function fetchMergeService(
+    env: Pick<Env, 'MERGE_CONTAINER' | 'MERGE_SERVICE_URL'>,
+    path: string,
+    init?: RequestInit,
+): Promise<Response> {
+    if (!path.startsWith('/')) {
+        throw new Error(`merge_service_invalid_path: ${path}`)
+    }
+    const baseUrl = String(env.MERGE_SERVICE_URL || '').trim().replace(/\/+$/, '')
+    if (baseUrl) {
+        return fetch(`${baseUrl}${path}`, init)
+    }
+    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
+    const containerStub = env.MERGE_CONTAINER.get(containerId)
+    return containerStub.fetch(`http://container${path}`, init)
+}
 const MAX_VOICE_PREVIEW_TEXT_CHARS = 280
 const DEFAULT_VOICE_PREVIEW_TEXT = 'สวัสดีค่ะ วันนี้มีของดีมาแนะนำ ลองฟังน้ำเสียงนี้ก่อนว่าเข้ากับสไตล์ช่องของคุณไหม'
 const SESSION_COOKIE_NAME = 'chearb_sess'
 const SESSION_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
 const DEFAULT_ALLOWED_WEB_ORIGINS = new Set([
+    'https://app.pubilo.com',
+    'https://web.pubilo.com',
     'https://app.oomnn.com',
     'https://web.oomnn.com',
     'https://video-affiliate-webapp.pages.dev',
@@ -215,6 +268,8 @@ function resolveCorsOrigin(requestOrigin: string | undefined, env: Env): string 
             const hostname = String(parsed.hostname || '').trim().toLowerCase()
             if (
                 DEFAULT_ALLOWED_WEB_ORIGINS.has(normalizedOrigin)
+                || hostname === 'app.pubilo.com'
+                || hostname === 'web.pubilo.com'
                 || hostname === 'app.oomnn.com'
                 || hostname === 'web.oomnn.com'
                 || hostname === 'video-affiliate-webapp.pages.dev'
@@ -229,7 +284,7 @@ function resolveCorsOrigin(requestOrigin: string | undefined, env: Env): string 
 
     const configuredOrigin = String(env.CORS_ORIGIN || '').trim()
     if (configuredOrigin && configuredOrigin !== '*') return configuredOrigin
-    return normalizedOrigin || 'https://app.oomnn.com'
+    return normalizedOrigin || 'https://app.pubilo.com'
 }
 
 function buildWavFromPcm16le(pcmBytes: Uint8Array, sampleRate = 24000, channels = 1, bitsPerSample = 16): Uint8Array {
@@ -1051,11 +1106,16 @@ function buildScopedLiffPermanentPathUrl(baseUrl: string, botScope: string, targ
 }
 
 function getAppWebBaseUrl(env: Env): string {
-    return String(env.WEBAPP_URL || 'https://app.oomnn.com').trim() || 'https://app.oomnn.com'
+    return String(env.WEBAPP_URL || 'https://app.pubilo.com').trim() || 'https://app.pubilo.com'
 }
 
 function getDesktopWebBaseUrl(env: Env): string {
-    return String(env.WEBAPP_DESKTOP_URL || 'https://web.oomnn.com').trim() || 'https://web.oomnn.com'
+    // web.* host is not currently bound to the webapp wrangler (no web.pubilo.com
+    // route in apps/video-affiliate/webapp/wrangler.jsonc). Fall back to the
+    // canonical app host so the desktop link never points at a host without an
+    // active route during the pubilo cutover. Set WEBAPP_DESKTOP_URL explicitly
+    // (env var) once a dedicated web.* deployment exists.
+    return String(env.WEBAPP_DESKTOP_URL || 'https://app.pubilo.com').trim() || 'https://app.pubilo.com'
 }
 
 // Push sync from BrowserSaving after tag updates.
@@ -1410,6 +1470,33 @@ app.put('/api/r2-upload/:key{.+}', async (c) => {
         httpMetadata: { contentType },
     })
 
+    const processedVideoId = parseProcessedVideoR2Key(key)
+    if (processedVideoId) {
+        const scopedNamespaceId = String(c.get('botId') || '').trim()
+        const fallbackNamespaceId = String(
+            c.req.query('namespace_id')
+            || c.req.header('x-namespace-id')
+            || c.req.header('x-bot-id')
+            || '',
+        ).trim()
+        const namespaceId = scopedNamespaceId && scopedNamespaceId !== 'default'
+            ? scopedNamespaceId
+            : fallbackNamespaceId || scopedNamespaceId
+        if (namespaceId) {
+            c.executionCtx.waitUntil(
+                uploadProcessedVideoToMetaAssetLibrary({
+                    env: c.env,
+                    namespaceId,
+                    videoId: processedVideoId,
+                }).catch((error) => {
+                    console.error(
+                        `[PROCESSED-ASSET-LIBRARY] waitUntil failed namespace=${namespaceId} video=${processedVideoId} error=${sanitizeMetaGraphError(error)}`
+                    )
+                }),
+            )
+        }
+    }
+
     return c.json({ ok: true, key, size: requestBody ? (Number.isFinite(contentLength) ? contentLength : null) : fallbackBody?.byteLength || 0 })
 })
 
@@ -1590,10 +1677,12 @@ function pickRandomGalleryVideoForPostingOrder(videos: Array<Record<string, unkn
     return videos[index] || null
 }
 
-type NamespacePostingOrder = 'oldest_first' | 'newest_first' | 'random'
+const POSTING_ORDER_VALUES = ['oldest_first', 'newest_first', 'random'] as const
+type NamespacePostingOrder = typeof POSTING_ORDER_VALUES[number]
+type PostingOrderSource = 'global' | 'page'
 
 function isNamespacePostingOrder(value: string): value is NamespacePostingOrder {
-    return value === 'oldest_first' || value === 'newest_first' || value === 'random'
+    return POSTING_ORDER_VALUES.includes(value as NamespacePostingOrder)
 }
 
 function pickGalleryVideoForPostingByOrder(
@@ -3457,6 +3546,8 @@ type DashboardSettingRow = {
 
 let facebookPageVideoCacheTablesReady: Promise<void> | null = null
 let dashboardSettingsTableReady: Promise<void> | null = null
+let pageVideoAssetWinnersTableReady: Promise<void> | null = null
+let processedVideoAssetLibraryTableReady: Promise<void> | null = null
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_ID = '1008898512617594'
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME = 'เฉียบ'
 const DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID = '1774858894802785816'
@@ -3468,7 +3559,7 @@ const DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN = 'facebook_sync_token'
 // Resolve the Graph API token used by the dashboard's FB-page-videos sync flow.
 // Order:
 //   1. namespace pages token pool for namespace 1774858894802785816 (source of truth
-//      from the app.oomnn.com Pages screen; supports many source pages)
+//      from the app.pubilo.com Pages screen; supports many source pages)
 //   2. pages.access_token scoped to that namespace/page
 //   3. legacy pages.access_token by page id (old rows)
 //   4. dashboard_settings.facebook_sync_token manual fallback
@@ -3579,6 +3670,30 @@ async function ensureDashboardSettingsTable(db: D1Database): Promise<void> {
     await dashboardSettingsTableReady
 }
 
+async function ensurePageVideoAssetWinnersTable(db: D1Database): Promise<void> {
+    if (!pageVideoAssetWinnersTableReady) {
+        pageVideoAssetWinnersTableReady = (async () => {
+            await db.prepare(PAGE_VIDEO_ASSET_WINNERS_TABLE_SQL).run()
+            await db.prepare(PAGE_VIDEO_ASSET_WINNERS_INDEX_SQL).run().catch(() => { })
+            await db.prepare(
+                `CREATE INDEX IF NOT EXISTS idx_page_video_asset_winners_advideo
+                 ON page_video_asset_winners(ad_account, advideo_id)`
+            ).run().catch(() => { })
+        })()
+    }
+    await pageVideoAssetWinnersTableReady
+}
+
+async function ensureProcessedVideoAssetLibraryTable(db: D1Database): Promise<void> {
+    if (!processedVideoAssetLibraryTableReady) {
+        processedVideoAssetLibraryTableReady = (async () => {
+            await db.prepare(PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL).run()
+            await db.prepare(PROCESSED_VIDEO_ASSET_LIBRARY_ADVIDEO_INDEX_SQL).run().catch(() => { })
+        })()
+    }
+    await processedVideoAssetLibraryTableReady
+}
+
 async function getDashboardSetting(db: D1Database, key: string): Promise<DashboardSettingRow | null> {
     await ensureDashboardSettingsTable(db)
     const normalizedKey = String(key || '').trim()
@@ -3641,6 +3756,415 @@ async function setPageSetting(db: D1Database, pageId: string, key: string, value
     const normalizedPageId = String(pageId || '').trim()
     const targetKey = normalizedPageId ? pageScopedSettingKey(normalizedPageId, key) : key
     return setDashboardSetting(db, targetKey, value)
+}
+
+type ProcessedVideoAssetLibraryRow = {
+    advideo_id?: string | null
+    upload_status?: string | null
+}
+
+type ProcessedVideoAssetLibraryUpsert = {
+    namespaceId: string
+    systemVideoId: string
+    adAccount: string
+    advideoId?: string
+    advideoStatus?: string
+    fileUrl: string
+    uploadStatus: string
+    error?: string
+    uploadedAt?: string
+    lastCheckedAt?: string
+}
+
+function normalizeProcessedVideoAssetUploadStatus(status: string): string {
+    const normalized = String(status || '').trim().toLowerCase()
+    if (normalized === 'ready') return 'ready'
+    if (normalized === 'uploading') return 'uploading'
+    if (normalized === 'success' || normalized === 'complete' || normalized === 'completed') return 'success'
+    if (normalized === 'processing' || normalized === 'in_progress') return 'in_progress'
+    return normalized || 'in_progress'
+}
+
+function isReusableProcessedVideoAssetRow(row: ProcessedVideoAssetLibraryRow | null): boolean {
+    const advideoId = String(row?.advideo_id || '').trim()
+    const uploadStatus = String(row?.upload_status || '').trim().toLowerCase()
+    return !!advideoId && ['success', 'ready', 'uploading', 'in_progress'].includes(uploadStatus)
+}
+
+async function upsertProcessedVideoAssetLibraryRow(db: D1Database, row: ProcessedVideoAssetLibraryUpsert): Promise<void> {
+    await ensureProcessedVideoAssetLibraryTable(db)
+    await db.prepare(
+        `INSERT INTO processed_video_asset_library (
+            namespace_id, system_video_id, ad_account, advideo_id, advideo_status,
+            file_url, upload_status, error, uploaded_at, last_checked_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(namespace_id, system_video_id, ad_account) DO UPDATE SET
+            advideo_id = CASE
+                WHEN excluded.advideo_id != '' THEN excluded.advideo_id
+                ELSE processed_video_asset_library.advideo_id
+            END,
+            advideo_status = excluded.advideo_status,
+            file_url = excluded.file_url,
+            upload_status = excluded.upload_status,
+            error = excluded.error,
+            uploaded_at = CASE
+                WHEN excluded.uploaded_at != '' THEN excluded.uploaded_at
+                ELSE processed_video_asset_library.uploaded_at
+            END,
+            last_checked_at = CASE
+                WHEN excluded.last_checked_at != '' THEN excluded.last_checked_at
+                ELSE processed_video_asset_library.last_checked_at
+            END,
+            updated_at = datetime('now')`
+    ).bind(
+        row.namespaceId,
+        row.systemVideoId,
+        row.adAccount,
+        String(row.advideoId || '').trim(),
+        String(row.advideoStatus || '').trim(),
+        row.fileUrl,
+        row.uploadStatus,
+        String(row.error || '').trim().slice(0, 1000),
+        String(row.uploadedAt || '').trim(),
+        String(row.lastCheckedAt || '').trim(),
+    ).run()
+}
+
+async function getProcessedVideoAssetLibraryRow(
+    db: D1Database,
+    namespaceId: string,
+    systemVideoId: string,
+    adAccount: string,
+): Promise<ProcessedVideoAssetLibraryRow | null> {
+    await ensureProcessedVideoAssetLibraryTable(db)
+    return await db.prepare(
+        `SELECT advideo_id, upload_status
+         FROM processed_video_asset_library
+         WHERE namespace_id = ? AND system_video_id = ? AND ad_account = ?
+         LIMIT 1`
+    ).bind(namespaceId, systemVideoId, adAccount).first() as ProcessedVideoAssetLibraryRow | null
+}
+
+function getMetaGraphErrorText(responseBody: unknown, status: number): string {
+    if (responseBody && typeof responseBody === 'object') {
+        const data = responseBody as Record<string, unknown>
+        const graphError = data.error
+        if (graphError && typeof graphError === 'object') {
+            const err = graphError as Record<string, unknown>
+            const message = String(err.message || err.error_user_msg || err.type || '').trim()
+            const code = String(err.code || err.error_subcode || '').trim()
+            return sanitizeMetaGraphError([`graph_http_${status}`, code, message].filter(Boolean).join(': '))
+        }
+        const message = String(data.message || '').trim()
+        if (message) return sanitizeMetaGraphError(`graph_http_${status}: ${message}`)
+    }
+    return sanitizeMetaGraphError(`graph_http_${status}`)
+}
+
+async function readMetaGraphJson(resp: Response): Promise<Record<string, unknown>> {
+    const text = await resp.text().catch(() => '')
+    if (!text) return {}
+    try {
+        return JSON.parse(text) as Record<string, unknown>
+    } catch {
+        return { message: text.slice(0, 1000) }
+    }
+}
+
+async function uploadProcessedVideoToMetaAssetLibrary(params: {
+    env: Env
+    namespaceId: string
+    videoId: string
+}): Promise<void> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const videoId = String(params.videoId || '').trim()
+    const fileUrl = buildProcessedVideoAssetFileUrl(
+        String(params.env.WORKER_URL || 'https://api.pubilo.com').trim() || 'https://api.pubilo.com',
+        namespaceId,
+        videoId,
+    )
+    if (!namespaceId || !videoId || !fileUrl) return
+
+    await ensureProcessedVideoAssetLibraryTable(params.env.DB)
+
+    const defaultPageRow = await getDashboardSetting(params.env.DB, 'default_page').catch(() => null)
+    const pageId = String(defaultPageRow?.value || '').trim()
+    const adAccountRow = await getPageSetting(params.env.DB, pageId, 'ad_account').catch(() => null)
+    const adAccount = String(adAccountRow?.value || '').trim()
+    const token = await resolveFacebookSyncToken(params.env.DB, pageId, namespaceId).catch(() => '')
+
+    if (!adAccount || !token) {
+        const missing = [
+            !adAccount ? 'missing_ad_account' : '',
+            !token ? 'missing_facebook_sync_token' : '',
+        ].filter(Boolean).join(',')
+        await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
+            namespaceId,
+            systemVideoId: videoId,
+            adAccount,
+            fileUrl,
+            uploadStatus: 'skipped_missing_config',
+            error: missing,
+        })
+        return
+    }
+
+    const existing = await getProcessedVideoAssetLibraryRow(params.env.DB, namespaceId, videoId, adAccount).catch(() => null)
+    if (isReusableProcessedVideoAssetRow(existing)) return
+
+    await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
+        namespaceId,
+        systemVideoId: videoId,
+        adAccount,
+        fileUrl,
+        uploadStatus: 'in_progress',
+        error: '',
+    })
+
+    const uploadedAt = new Date().toISOString()
+    try {
+        const body = new URLSearchParams()
+        body.set('file_url', fileUrl)
+        body.set('access_token', token)
+        body.set('title', `processed_${videoId}`.slice(0, 120))
+        body.set('description', `source:processed-gallery | namespace:${namespaceId} | system_video:${videoId}`.slice(0, 1000))
+
+        const uploadResp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(adAccount)}/advideos`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body,
+        })
+        const uploadData = await readMetaGraphJson(uploadResp)
+        if (!uploadResp.ok) {
+            await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
+                namespaceId,
+                systemVideoId: videoId,
+                adAccount,
+                fileUrl,
+                uploadStatus: 'failed',
+                error: getMetaGraphErrorText(uploadData, uploadResp.status),
+                lastCheckedAt: uploadedAt,
+            })
+            return
+        }
+
+        const advideoId = String(uploadData.id || '').trim()
+        if (!advideoId) {
+            await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
+                namespaceId,
+                systemVideoId: videoId,
+                adAccount,
+                fileUrl,
+                uploadStatus: 'failed',
+                error: 'graph_advideo_id_missing',
+                lastCheckedAt: uploadedAt,
+            })
+            return
+        }
+
+        let advideoStatus = normalizeMetaVideoStatus(uploadData) || 'processing'
+        let lastCheckedAt = uploadedAt
+        const statusUrl = new URL(`https://graph.facebook.com/v21.0/${encodeURIComponent(advideoId)}`)
+        statusUrl.searchParams.set('fields', 'id,status')
+        statusUrl.searchParams.set('access_token', token)
+        const statusResp = await fetch(statusUrl.toString()).catch(() => null)
+        if (statusResp) {
+            lastCheckedAt = new Date().toISOString()
+            if (statusResp.ok) {
+                const statusData = await readMetaGraphJson(statusResp)
+                advideoStatus = normalizeMetaVideoStatus(statusData) || advideoStatus
+            }
+        }
+
+        await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
+            namespaceId,
+            systemVideoId: videoId,
+            adAccount,
+            advideoId,
+            advideoStatus,
+            fileUrl,
+            uploadStatus: normalizeProcessedVideoAssetUploadStatus(advideoStatus),
+            error: '',
+            uploadedAt,
+            lastCheckedAt,
+        })
+    } catch (error) {
+        const sanitized = sanitizeMetaGraphError(error)
+        await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
+            namespaceId,
+            systemVideoId: videoId,
+            adAccount,
+            fileUrl,
+            uploadStatus: 'failed',
+            error: sanitized,
+            lastCheckedAt: new Date().toISOString(),
+        }).catch(() => { })
+        console.error(`[PROCESSED-ASSET-LIBRARY] upload failed namespace=${namespaceId} video=${videoId} error=${sanitized}`)
+    }
+}
+
+async function getPageAvatarSettings(db: D1Database, pageId: string): Promise<PageAvatarSettings> {
+    const [
+        enabledRow,
+        videoKeyRow,
+        versionRow,
+        similarityRow,
+        blendRow,
+        updatedAtRow,
+    ] = await Promise.all([
+        getPageSetting(db, pageId, AVATAR_ENABLED_KEY).catch(() => null),
+        getPageSetting(db, pageId, AVATAR_VIDEO_KEY_KEY).catch(() => null),
+        getPageSetting(db, pageId, AVATAR_VERSION_KEY).catch(() => null),
+        getPageSetting(db, pageId, AVATAR_CHROMAKEY_SIMILARITY_KEY).catch(() => null),
+        getPageSetting(db, pageId, AVATAR_CHROMAKEY_BLEND_KEY).catch(() => null),
+        getPageSetting(db, pageId, AVATAR_UPDATED_AT_KEY).catch(() => null),
+    ])
+    return {
+        enabled: ['1', 'true', 'yes', 'on'].includes(String(enabledRow?.value || '').trim().toLowerCase()),
+        videoKey: String(videoKeyRow?.value || '').trim(),
+        version: sanitizeAvatarVersion(versionRow?.value || ''),
+        chromakeySimilarity: clampChromakeySimilarity(similarityRow?.value),
+        chromakeyBlend: clampChromakeyBlend(blendRow?.value),
+        updatedAt: String(updatedAtRow?.value || updatedAtRow?.updated_at || '').trim(),
+    }
+}
+
+async function setPageAvatarSettings(db: D1Database, pageId: string, settings: PageAvatarSettings): Promise<void> {
+    await Promise.all([
+        setPageSetting(db, pageId, AVATAR_ENABLED_KEY, settings.enabled ? '1' : '0'),
+        setPageSetting(db, pageId, AVATAR_VIDEO_KEY_KEY, settings.videoKey),
+        setPageSetting(db, pageId, AVATAR_VERSION_KEY, settings.version),
+        setPageSetting(db, pageId, AVATAR_CHROMAKEY_SIMILARITY_KEY, String(settings.chromakeySimilarity)),
+        setPageSetting(db, pageId, AVATAR_CHROMAKEY_BLEND_KEY, String(settings.chromakeyBlend)),
+        setPageSetting(db, pageId, AVATAR_UPDATED_AT_KEY, settings.updatedAt),
+    ])
+}
+
+function buildAvatarObjectUrl(env: Env, namespaceId: string, avatarVideoKey: string): string {
+    const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+    const keyMatch = String(avatarVideoKey || '').match(/^page-assets\/([^/]+)\/avatar\/[^/]+\.mp4$/)
+    const pageId = keyMatch?.[1] || ''
+    if (!workerUrl || !normalizedNamespaceId || !pageId) return ''
+    try {
+        const url = new URL(`${workerUrl}/api/pages/${encodeURIComponent(pageId)}/avatar-video/public`)
+        url.searchParams.set('namespace_id', normalizedNamespaceId)
+        return url.toString()
+    } catch {
+        return `${workerUrl}/api/pages/${encodeURIComponent(pageId)}/avatar-video/public?namespace_id=${encodeURIComponent(normalizedNamespaceId)}`
+    }
+}
+
+const AVATAR_COMPOSE_FETCH_TIMEOUT_MS = 25_000
+const AVATAR_COMPOSE_POLL_INTERVAL_MS = 4_500
+const AVATAR_COMPOSE_MAX_WAIT_MS = 300_000
+const AVATAR_COMPOSE_JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+// TEMP hotfix: disable avatar-compose before Facebook posting while investigating dark overlay output.
+// Keep avatar settings/data intact; posting falls back to the normal processed video download path.
+const TEMP_DISABLE_AVATAR_COMPOSE_FOR_POSTING = false
+
+async function fetchMergeServiceWithTimeout<T>(
+    env: Pick<Env, 'MERGE_CONTAINER' | 'MERGE_SERVICE_URL'>,
+    path: string,
+    init: RequestInit,
+    timeoutMs: number,
+    label: string,
+    handleResponse: (resp: Response) => Promise<T>,
+): Promise<T> {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(`${label}_timeout_${timeoutMs}ms`), timeoutMs)
+    try {
+        const resp = await fetchMergeService(env, path, {
+            ...init,
+            signal: controller.signal,
+        })
+        return await handleResponse(resp)
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const normalized = message.toLowerCase()
+        if (message.startsWith('avatar_compose_failed:')) {
+            throw error instanceof Error ? error : new Error(message)
+        }
+        if (normalized.includes('abort') || normalized.includes('timeout')) {
+            throw new Error(`avatar_compose_failed: ${label}_timeout`)
+        }
+        throw new Error(`avatar_compose_failed: ${label}_request_failed`)
+    } finally {
+        clearTimeout(timeoutId)
+    }
+}
+
+async function composeAvatarVideoForPosting(params: {
+    env: Env
+    baseVideoUrl: string
+    avatarVideoUrl: string
+    chromakeySimilarity: number
+    chromakeyBlend: number
+}): Promise<ArrayBuffer> {
+    const startData = await fetchMergeServiceWithTimeout(
+        params.env,
+        '/avatar-compose/start',
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                video_url: params.baseVideoUrl,
+                avatar_video_url: params.avatarVideoUrl,
+                chromakey_similarity: params.chromakeySimilarity,
+                chromakey_blend: params.chromakeyBlend,
+            }),
+        },
+        AVATAR_COMPOSE_FETCH_TIMEOUT_MS,
+        'merge_start',
+        async (resp) => {
+            if (!resp.ok) {
+                throw new Error(`avatar_compose_failed: merge_start_http_${resp.status}`)
+            }
+            return await resp.json().catch(() => null) as { job_id?: unknown; status?: unknown } | null
+        },
+    )
+    const jobId = String(startData?.job_id || '').trim()
+    if (!AVATAR_COMPOSE_JOB_ID_PATTERN.test(jobId)) {
+        throw new Error('avatar_compose_failed: merge_start_invalid_response')
+    }
+
+    const deadlineAt = Date.now() + AVATAR_COMPOSE_MAX_WAIT_MS
+    while (Date.now() < deadlineAt) {
+        const waitForMs = Math.min(AVATAR_COMPOSE_POLL_INTERVAL_MS, Math.max(0, deadlineAt - Date.now()))
+        if (waitForMs > 0) await waitMs(waitForMs)
+        const remainingMs = deadlineAt - Date.now()
+        if (remainingMs <= 0) break
+        const requestTimeoutMs = Math.min(AVATAR_COMPOSE_FETCH_TIMEOUT_MS, remainingMs)
+        const result = await fetchMergeServiceWithTimeout(
+            params.env,
+            `/avatar-compose/result/${encodeURIComponent(jobId)}`,
+            { method: 'GET' },
+            requestTimeoutMs,
+            'merge_result',
+            async (resp) => {
+                if (resp.status === 202) {
+                    return { status: 'processing' as const }
+                }
+                if (resp.status === 200) {
+                    const output = await resp.arrayBuffer().catch(() => {
+                        throw new Error('avatar_compose_failed: output_read_failed')
+                    })
+                    return { status: 'done' as const, output }
+                }
+                throw new Error(`avatar_compose_failed: merge_result_http_${resp.status}`)
+            },
+        )
+        if (result.status === 'processing') {
+            continue
+        }
+        if (result.output.byteLength < 100000) {
+            throw new Error(`avatar_compose_failed: output_too_small_${result.output.byteLength}`)
+        }
+        return result.output
+    }
+
+    throw new Error('avatar_compose_failed: merge_job_timeout')
 }
 
 function normalizeFacebookPageVideoCacheRow(pageId: string, raw: Record<string, unknown>): FacebookPageVideoCacheRow | null {
@@ -5782,8 +6306,6 @@ async function generateThumbnailViaContainer(
         outlineWidth?: number
     },
 ): Promise<NodeBuffer> {
-    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-    const containerStub = env.MERGE_CONTAINER.get(containerId)
     const safeTargetWidth = Number.isFinite(targetWidth) ? Math.max(120, Math.min(1440, Math.round(Number(targetWidth)))) : undefined
     const safeTargetHeight = Number.isFinite(targetHeight) ? Math.max(160, Math.min(2560, Math.round(Number(targetHeight)))) : undefined
     const overlayText = normalizeLineCoverText(overlay?.text)
@@ -5800,7 +6322,7 @@ async function generateThumbnailViaContainer(
     const overlayMode = normalizeCoverTextStyleMode(overlay?.mode)
     const overlayOutlineColor = normalizeHexColor(String(overlay?.outlineColor || '').trim())
     const overlayOutlineWidth = normalizeCoverTextStyleOutlineWidth(overlay?.outlineWidth)
-    const resp = await containerStub.fetch('http://container/thumbnail', {
+    const resp = await fetchMergeService(env, '/thumbnail', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -5996,9 +6518,7 @@ async function materializeOriginalVideoAsset(params: {
 
     if (params.sourceType === 'xhs_url' && /xhs|xiaohongshu/i.test(normalizedSourceUrl)) {
         try {
-            const containerId = params.env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-            const containerStub = params.env.MERGE_CONTAINER.get(containerId)
-            const resolveResp = await containerStub.fetch('http://container/xhs/resolve', {
+            const resolveResp = await fetchMergeService(params.env, '/xhs/resolve', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: normalizedSourceUrl }),
@@ -6706,6 +7226,26 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
         } catch { }
     }
 
+    const assetWinnerByFbVideoId = new Map<string, Record<string, unknown>>()
+    const fbVideoIdsForAssetLookup = Array.from(new Set(items.map((item) => String(item.video_id || '').trim()).filter(Boolean))).slice(0, 1000)
+    if (fbVideoIdsForAssetLookup.length > 0) {
+        try {
+            await ensurePageVideoAssetWinnersTable(c.env.DB)
+            const placeholders = fbVideoIdsForAssetLookup.map(() => '?').join(',')
+            const rows = await c.env.DB.prepare(
+                `SELECT fb_video_id, system_video_id, ad_account, advideo_id, advideo_status, orders_1d, orders_7d, commission_7d, source_sub_id, last_synced_at
+                 FROM page_video_asset_winners
+                 WHERE namespace_id = ? AND page_id = ? AND fb_video_id IN (${placeholders})`
+            ).bind(DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID, pageId, ...fbVideoIdsForAssetLookup).all() as { results?: Array<Record<string, unknown>> }
+            for (const row of (rows.results || [])) {
+                const fbVideoId = String(row.fb_video_id || '').trim()
+                if (fbVideoId) assetWinnerByFbVideoId.set(fbVideoId, row)
+            }
+        } catch (e) {
+            console.log(`[DASHBOARD PAGE VIDEOS] asset winner lookup failed page=${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+
     return c.json({
         ok: true,
         page_id: pageId,
@@ -6725,6 +7265,7 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
             const proxiedFacebookThumb = fbVideoId
                 ? `/worker-api/api/dashboard/facebook-video-thumbnail?page_id=${encodeURIComponent(pageId)}&video_id=${encodeURIComponent(fbVideoId)}${String(item.picture || '').trim() ? `&fallback_url=${encodeURIComponent(String(item.picture || '').trim())}` : ''}`
                 : String(item.picture || '').trim()
+            const assetWinner = assetWinnerByFbVideoId.get(fbVideoId) || null
             return ({
             storyId: postId ? `${pageId}_${postId}` : fbVideoId,
             pageName: String(item.page_name || '').trim(),
@@ -6741,6 +7282,16 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
             adsetId: '-',
             shopeeLink,
             postId,
+            assetLibrary: assetWinner ? {
+                advideoId: String(assetWinner.advideo_id || '').trim(),
+                adAccount: String(assetWinner.ad_account || '').trim(),
+                status: String(assetWinner.advideo_status || '').trim(),
+                orders1d: Number(assetWinner.orders_1d || 0),
+                orders7d: Number(assetWinner.orders_7d || 0),
+                commission7d: Number(assetWinner.commission_7d || 0),
+                sourceSubId: String(assetWinner.source_sub_id || '').trim(),
+                lastSyncedAt: String(assetWinner.last_synced_at || '').trim(),
+            } : null,
         })}),
         sync: {
             nextAfter: String(sync?.next_after || '').trim(),
@@ -6756,7 +7307,106 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
     })
 })
 
-// Namespace-scoped gallery for dashboard.oomnn.com.
+app.get('/api/dashboard/page-video-asset-winners', async (c) => {
+    const namespaceId = String(c.req.query('namespace_id') || c.req.query('bot_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    const pageId = String(c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
+    const limitRaw = Number(c.req.query('limit') || 100)
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 100
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+
+    await ensurePageVideoAssetWinnersTable(c.env.DB)
+    const rows = await c.env.DB.prepare(
+        `SELECT namespace_id, page_id, fb_video_id, system_video_id, ad_account, advideo_id, advideo_status,
+                title, description, source_sub_id, source_shopee_link, orders_1d, orders_7d, commission_7d,
+                last_synced_at, created_at, updated_at
+         FROM page_video_asset_winners
+         WHERE namespace_id = ? AND page_id = ?
+         ORDER BY orders_7d DESC, commission_7d DESC, datetime(updated_at) DESC
+         LIMIT ?`
+    ).bind(namespaceId, pageId, limit).all() as { results?: Array<Record<string, unknown>> }
+
+    return c.json({
+        ok: true,
+        namespace_id: namespaceId,
+        page_id: pageId,
+        count: (rows.results || []).length,
+        items: rows.results || [],
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.post('/api/dashboard/page-video-asset-winners', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const namespaceId = String(body.namespace_id || body.namespaceId || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
+    let pageId = String(body.page_id || body.pageId || '').trim()
+    let fbVideoId = String(body.fb_video_id || body.fbVideoId || body.video_id || body.videoId || '').trim()
+    const sourceSubId = String(body.source_sub_id || body.sourceSubId || body.sub_id || body.subId || '').trim()
+    const parsedSubId = sourceSubId ? parsePageVideoSubId(sourceSubId, pageId || undefined) : null
+    if (!pageId && parsedSubId) pageId = parsedSubId.pageId
+    if (!fbVideoId && parsedSubId) fbVideoId = parsedSubId.fbVideoId
+    const adAccount = String(body.ad_account || body.adAccount || '').trim()
+    const advideoId = String(body.advideo_id || body.advideoId || body.asset_video_id || body.assetVideoId || '').trim()
+    const advideoStatus = String(body.advideo_status || body.advideoStatus || body.status || '').trim()
+    const systemVideoId = String(body.system_video_id || body.systemVideoId || '').trim()
+    const orders1d = Math.max(0, Math.trunc(Number(body.orders_1d || body.orders1d || 0) || 0))
+    const orders7d = Math.max(0, Math.trunc(Number(body.orders_7d || body.orders7d || 0) || 0))
+    const commission7d = Number(body.commission_7d || body.commission7d || 0) || 0
+    const sourceShopeeLink = String(body.source_shopee_link || body.sourceShopeeLink || body.shopee_link || body.shopeeLink || '').trim()
+    const originalTitle = String(body.title || body.video_title || body.videoTitle || '').trim()
+    const title = buildAssetLibraryVideoTitle({ systemVideoId, fbVideoId, orders7d, originalTitle })
+    const description = buildAssetLibraryVideoDescription({ namespaceId, pageId, fbVideoId, systemVideoId, sourceSubId, orders7d })
+
+    if (!namespaceId) return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+    if (!fbVideoId) return c.json({ ok: false, error: 'fb_video_id_required' }, 400)
+    if (!advideoId) return c.json({ ok: false, error: 'advideo_id_required' }, 400)
+
+    await ensurePageVideoAssetWinnersTable(c.env.DB)
+    await c.env.DB.prepare(
+        `INSERT INTO page_video_asset_winners (
+            namespace_id, page_id, fb_video_id, system_video_id, ad_account, advideo_id, advideo_status,
+            title, description, source_sub_id, source_shopee_link, orders_1d, orders_7d, commission_7d,
+            last_synced_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), datetime('now'))
+         ON CONFLICT(namespace_id, page_id, fb_video_id) DO UPDATE SET
+            system_video_id = excluded.system_video_id,
+            ad_account = excluded.ad_account,
+            advideo_id = excluded.advideo_id,
+            advideo_status = excluded.advideo_status,
+            title = excluded.title,
+            description = excluded.description,
+            source_sub_id = excluded.source_sub_id,
+            source_shopee_link = excluded.source_shopee_link,
+            orders_1d = excluded.orders_1d,
+            orders_7d = excluded.orders_7d,
+            commission_7d = excluded.commission_7d,
+            last_synced_at = datetime('now'),
+            updated_at = datetime('now')`
+    ).bind(
+        namespaceId,
+        pageId,
+        fbVideoId,
+        systemVideoId,
+        adAccount,
+        advideoId,
+        advideoStatus,
+        title,
+        description,
+        sourceSubId,
+        sourceShopeeLink,
+        orders1d,
+        orders7d,
+        commission7d,
+    ).run()
+
+    const row = await c.env.DB.prepare(
+        `SELECT * FROM page_video_asset_winners WHERE namespace_id = ? AND page_id = ? AND fb_video_id = ?`
+    ).bind(namespaceId, pageId, fbVideoId).first() as Record<string, unknown> | null
+
+    return c.json({ ok: true, item: row }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Namespace-scoped gallery for dashboard.pubilo.com.
 // Trusted like other /api/dashboard/* endpoints — no session auth required,
 // but namespace_id is required so we never fall back to a surprise default.
 app.get('/api/dashboard/gallery', async (c) => {
@@ -7506,7 +8156,7 @@ async function processNextAdQueueItem(env: Env): Promise<{
         // Forward video_url too — if the queued row was enqueued from the
         // gallery tab (no FB video_id yet), this is what tells the electron
         // pipeline to upload the file to FB Ads first.
-        const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
+        const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
         const resp = await fetch(`${workerUrl}/api/dashboard/create-ad`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -8297,15 +8947,13 @@ app.get('/admin/api/test-cover', async (c) => {
     const assetUrl = buildWorkerGalleryAssetUrl(workerUrl, ns, videoId, 'original')
 
     try {
-        // Test 1: Can container be reached?
-        const containerId = c.env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-        const containerStub = c.env.MERGE_CONTAINER.get(containerId)
-        const healthResp = await containerStub.fetch('http://container/health')
+        // Test 1: Can the merge service be reached?
+        const healthResp = await fetchMergeService(c.env, '/health')
         const healthOk = healthResp.ok
         const healthBody = await healthResp.text().catch(() => '')
 
-        // Test 2: Can container download the video?
-        const thumbResp = await containerStub.fetch('http://container/thumbnail', {
+        // Test 2: Can the merge service download the video?
+        const thumbResp = await fetchMergeService(c.env, '/thumbnail', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -8518,6 +9166,7 @@ app.post('/admin/api/comments/retry', async (c) => {
             const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
                 env: c.env,
                 namespaceId: botId,
+                pageId,
                 shopeeLink,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
                 postSubId2: fbPostId,
@@ -12114,7 +12763,7 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
             : 'คลิปนี้มีไฟล์ประมวลผลแล้ว'
     // Surface the video id in the headline so the operator can correlate the
     // LINE confirmation with the matching row on the processing/gallery page
-    // at app.oomnn.com (same id appears under each clip card). Previously this
+    // at app.pubilo.com (same id appears under each clip card). Previously this
     // said "✅ รับลิงก์ครบแล้ว" without identifying which clip — the operator
     // had no way to tell two consecutive uploads apart from chat history.
     const videoIdShort = String(inboxRecord.id || '').trim()
@@ -13354,13 +14003,11 @@ async function handleLineTextMessage(params: {
         // handleLineEvent already invoked lineStartLoading for non-cancel text,
         // so we intentionally do not call it again here to avoid double-start.
 
-        // Resolve XHS URL to direct video URL
+        // Resolve XHS URL to direct video URL via merge service
         let resolvedVideoUrl = xhsUrl
         let resolverFailureReason: 'no_video' | 'request_failed' | null = null
         try {
-            const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-            const containerStub = env.MERGE_CONTAINER.get(containerId)
-            const resolveResp = await containerStub.fetch('http://container/xhs/resolve', {
+            const resolveResp = await fetchMergeService(env, '/xhs/resolve', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: xhsUrl }),
@@ -15908,7 +16555,15 @@ async function hasActiveProcessingJob(bucket: R2Bucket): Promise<boolean> {
         console.error(`[PROCESSING-STALE] failed before active check: ${error instanceof Error ? error.message : String(error)}`)
     })
     const processingList = await bucket.list({ prefix: '_processing/' })
-    for (const obj of processingList.objects) {
+    // Active jobs are always recent. Old records left in `_processing/` are
+    // terminal `failed` entries that were mirrored to history but never
+    // deleted. Sort newest-first and bound the scan so this stays O(small)
+    // even when the namespace has hundreds of historical failures.
+    const candidates = processingList.objects
+        .slice()
+        .sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
+        .slice(0, PROCESSING_ACTIVE_LIST_MAX)
+    for (const obj of candidates) {
         const file = await bucket.get(obj.key)
         if (!file) continue
         const data = await file.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
@@ -15974,6 +16629,13 @@ async function writeProcessingJobFailure(bucket: R2Bucket, params: {
     await bucket.put(`_processing/${id}.json`, JSON.stringify(payload), {
         httpMetadata: { contentType: 'application/json' },
     }).catch(() => { })
+    // Mirror into `_processing_history/` so the UI's history view shows this
+    // failure immediately, regardless of the active-list cap. Best-effort:
+    // history is a denormalised mirror, and a write failure here must never
+    // hide the primary `_processing/` failure record from reprocess/UI logic.
+    await putProcessingHistoryRecord(bucket, id, payload).catch((error) => {
+        console.warn(`[PROCESSING-FAILURE] history mirror failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
+    })
 }
 
 async function getGalleryIndexProcessedAt(db: D1Database, namespaceId: string, videoId: string): Promise<string> {
@@ -16370,10 +17032,14 @@ async function prepareInboxVideoForManagedLinks(params: {
     )
     if (!shopeeReady) {
         const resolvedShopeeTrackingLink = await resolveAffiliateTrackingLink(sourceShopeeLink, `${params.logPrefix} SHOPEE_RESOLVE`).catch(() => sourceShopeeLink)
-        const resolvedShopeeUtmSource = normalizeShortlinkExpectedUtmId(extractShopeeUtmSourceFromLink(resolvedShopeeTrackingLink))
+        // extractShopeeAffiliateIdFromLink accepts both utm_source=an_<id> (legacy)
+        // and mmp_pid=an_<id> (newer Shopee affiliate bridge output). Strict
+        // fail-closed semantics are preserved: an unrelated or missing id still
+        // returns '' and falls through to the not-ready branch below.
+        const resolvedShopeeAffiliateId = extractShopeeAffiliateIdFromLink(resolvedShopeeTrackingLink)
         const inferredShopeeReady = !!resolvedShopeeTrackingLink
-            && !!resolvedShopeeUtmSource
-            && (!normalizedExpectedUtmId || resolvedShopeeUtmSource === normalizedExpectedUtmId)
+            && !!resolvedShopeeAffiliateId
+            && (!normalizedExpectedUtmId || resolvedShopeeAffiliateId === normalizedExpectedUtmId)
         if (inferredShopeeReady) {
             nextShopeeLink = sourceShopeeLink
         } else if (isManagedShortlinkTransientFailure(shopeeTrace.error)) {
@@ -16382,7 +17048,17 @@ async function prepareInboxVideoForManagedLinks(params: {
             recordFailure(reason, 'shopee_shortlink_transient_failure', { error: shopeeTrace.error || null })
             return null
         } else {
-            console.log(`[${params.logPrefix}] Admin managed Shopee shortlink not ready for ${item.id}`)
+            const traceErr = sanitizeProcessingError(shopeeTrace.error)
+            const reason = normalizedExpectedUtmId
+                ? `Shopee affiliate id ไม่ตรง (expected ${normalizedExpectedUtmId}, actual ${resolvedShopeeAffiliateId || '-'})`
+                : 'Shopee ย่อลิงก์ไม่สำเร็จ ตรวจสอบลิงก์ Shopee ที่ส่งมาให้ครบและถูกต้อง'
+            console.log(`[${params.logPrefix}] Admin managed Shopee shortlink not ready for ${item.id}: ${reason}${traceErr ? ` | trace=${traceErr}` : ''}`)
+            recordFailure(reason, 'shopee_shortlink_not_ready', {
+                expected_utm_id: normalizedExpectedUtmId || null,
+                resolved_affiliate_id: resolvedShopeeAffiliateId || null,
+                shortener_status: shopeeTrace.status || null,
+                shortener_error: traceErr || null,
+            })
             return null
         }
     }
@@ -16421,7 +17097,19 @@ async function prepareInboxVideoForManagedLinks(params: {
             nextLazadaLink = sourceLazadaLink
             normalizedMemberId = resolvedLazadaMemberId
         } else {
-            console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}; source=${sourceLazadaLink} short=${nextLazadaLink || '-'} status=${lazadaTrace.status || '-'} error=${String(lazadaTrace.error || '').trim() || '-'} member_id=${normalizedMemberId || '-'} expected_member_id=${expectedLazadaMemberId || '-'}`)
+            const traceErr = sanitizeProcessingError(lazadaTrace.error)
+            const reason = expectedLazadaMemberId && normalizedMemberId && normalizedMemberId !== expectedLazadaMemberId
+                ? `Lazada member id ไม่ตรง (expected ${expectedLazadaMemberId}, actual ${normalizedMemberId})`
+                : !isLikelyConvertedLazadaLink(nextLazadaLink || sourceLazadaLink)
+                    ? 'Lazada ย่อลิงก์ไม่สำเร็จ: ลิงก์ที่ได้กลับมายังไม่ใช่ short link ที่ใช้งานได้'
+                    : 'Lazada ย่อลิงก์ไม่สำเร็จ ตรวจสอบลิงก์ Lazada ที่ส่งมาให้ครบและถูกต้อง'
+            console.log(`[${params.logPrefix}] Admin managed Lazada shortlink not ready for ${item.id}; source=${sourceLazadaLink} short=${nextLazadaLink || '-'} status=${lazadaTrace.status || '-'} error=${traceErr || '-'} member_id=${normalizedMemberId || '-'} expected_member_id=${expectedLazadaMemberId || '-'}`)
+            recordFailure(reason, 'lazada_shortlink_not_ready', {
+                expected_member_id: expectedLazadaMemberId || null,
+                resolved_member_id: normalizedMemberId || null,
+                shortener_status: lazadaTrace.status || null,
+                shortener_error: traceErr || null,
+            })
             return null
         }
     }
@@ -16696,6 +17384,19 @@ async function ensureInboxVideoProcessingStarted(params: {
 const PROCESSING_HISTORY_PREFIX = '_processing_history/'
 const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
 const PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS = 7 * 60 * 1000
+// Bound how much of `_processing/` we touch on each /api/processing load.
+// Namespaces accumulate hundreds of old failed records that linger here even
+// after they've been mirrored into `_processing_history/`. Reading every one
+// per request was pushing /api/processing past the webapp's 20s budget. Active
+// jobs are always the most recent uploads, so capping by upload time + small N
+// keeps the active view truthful while skipping historical noise.
+const PROCESSING_ACTIVE_LIST_MAX = 60
+const PROCESSING_STALE_CHECK_MAX = 30
+// Records uploaded longer ago than this haven't been written since creation —
+// they're either already terminal (failed/processed and not re-touched) or
+// they're well past every possible stale-timeout we currently use. A small
+// safety multiplier on the longest configured timeout keeps the check honest.
+const PROCESSING_STALE_CHECK_WINDOW_MS = PROCESSING_STALE_TIMEOUT_MS * 2
 const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 const PROCESSING_GEMINI_PREP_STALE_ERROR = 'gemini_preparation_stale_timeout — งานค้างที่ขั้นเตรียมวิดีโอให้ Gemini เกิน 7 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 
@@ -16812,12 +17513,26 @@ function getProcessingJobStaleCategory(data: Record<string, unknown>): string {
 
 async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
     const processingList = await bucket.list({ prefix: '_processing/' })
-    let expired = 0
-    for (const obj of processingList.objects) {
+    // Only records uploaded within the stale-check window can still flip from
+    // active → stale. Anything older is either already-marked-failed (and we'd
+    // rewrite the same status) or so old that subsequent passes will have
+    // handled it. Filtering here is the main /api/processing speedup: a
+    // namespace with hundreds of old failed `_processing/*.json` records no
+    // longer fans out hundreds of R2 GETs per page load.
+    const nowMs = Date.now()
+    const candidates = processingList.objects
+        .filter((obj) => {
+            const uploadedMs = obj.uploaded instanceof Date ? obj.uploaded.getTime() : NaN
+            return !Number.isFinite(uploadedMs) || nowMs - uploadedMs <= PROCESSING_STALE_CHECK_WINDOW_MS
+        })
+        .sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
+        .slice(0, PROCESSING_STALE_CHECK_MAX)
+
+    const results = await Promise.all(candidates.map(async (obj) => {
         const dataObj = await bucket.get(obj.key).catch(() => null)
-        if (!dataObj) continue
+        if (!dataObj) return 0
         const data = await dataObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
-        if (!isProcessingJobStale(data, obj.uploaded)) continue
+        if (!isProcessingJobStale(data, obj.uploaded)) return 0
 
         const nowIso = new Date().toISOString()
         const idFromKey = obj.key.replace(/^_processing\//, '').replace(/\.json$/i, '').trim()
@@ -16837,19 +17552,30 @@ async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
             httpMetadata: { contentType: 'application/json' },
         })
         await putProcessingHistoryRecord(bucket, id, failedRecord).catch(() => { })
-        expired += 1
-    }
-    return expired
+        return 1
+    }))
+    return results.reduce((acc, n) => acc + n, 0)
 }
 
-async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Record<string, unknown>>> {
+async function listActiveProcessingVideos(
+    bucket: R2Bucket,
+    options: { resultLimit?: number; historyMaxObjects?: number } = {},
+): Promise<Array<Record<string, unknown>>> {
+    const resultLimit = Math.min(Math.max(Math.floor(options.resultLimit ?? 120), 1), 120)
+    const historyMaxObjects = Math.min(Math.max(Math.floor(options.historyMaxObjects ?? 120), 1), 120)
     await expireStaleProcessingJobs(bucket).catch((error) => {
         console.error(`[PROCESSING-STALE] failed to expire stale jobs: ${error instanceof Error ? error.message : String(error)}`)
     })
+    // `_processing/` accumulates terminal `failed` records that get mirrored
+    // into `_processing_history/` but never deleted from production. Reading
+    // every one on each /api/processing call drove the endpoint past 30s for
+    // large namespaces. Capping at the most-recent N covers any active job
+    // (active uploads are always newest) and yields enough recently-failed
+    // records for the UI; older failures still surface via the history prefix.
     const [processing, queued, history] = await Promise.all([
-        readProcessingListPrefix(bucket, '_processing/', 'processing'),
+        readProcessingListPrefix(bucket, '_processing/', 'processing', { maxObjects: PROCESSING_ACTIVE_LIST_MAX }),
         readProcessingListPrefix(bucket, '_queue/', 'queued'),
-        readProcessingListPrefix(bucket, PROCESSING_HISTORY_PREFIX, 'processed', { maxObjects: 120 }),
+        readProcessingListPrefix(bucket, PROCESSING_HISTORY_PREFIX, 'processed', { maxObjects: historyMaxObjects }),
     ])
 
     const seen = new Set<string>()
@@ -16865,7 +17591,7 @@ async function listActiveProcessingVideos(bucket: R2Bucket): Promise<Array<Recor
         const bt = new Date(String(b.completedAt || b.updatedAt || b.createdAt || '')).getTime()
         return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
     })
-    return videos.slice(0, 120)
+    return videos.slice(0, resultLimit)
 }
 
 async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, namespaceId: string, options: { runInline?: boolean } = {}): Promise<boolean> {
@@ -16947,7 +17673,14 @@ app.get('/api/processing', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
         const includeSummary = String(c.req.query('summary') || '').trim() === '1'
-        const videos = await listActiveProcessingVideos(c.get('bucket'))
+        const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 120)
+        const requestedHistoryLimit = parseNonNegativeInt(c.req.query('history_limit'), 120)
+        const resultLimit = Math.min(Math.max(requestedLimit || 120, 1), 120)
+        const historyMaxObjects = Math.min(Math.max(requestedHistoryLimit || 120, 1), 120)
+        const videos = await listActiveProcessingVideos(c.get('bucket'), {
+            resultLimit,
+            historyMaxObjects,
+        })
         const activeProcessingVideos = videos.filter((video) => {
             const status = String(video.status || '').trim().toLowerCase()
             return status === 'processing' || status === 'queued'
@@ -19240,6 +19973,7 @@ const NS_SETTING_DEDICATED_COMMENT_TOKEN = 'dedicated_comment_token_v1'
 const NS_SETTING_COVER_TEMPLATE = 'cover_template_v1'
 const NS_SETTING_COVER_TEXT_STYLE = 'cover_text_style_v1'
 const NS_SETTING_POSTING_ORDER = 'posting_order_v1'
+const NS_SETTING_PAGE_POSTING_ORDER_OVERRIDE_ENABLED = 'posting_order_override_enabled_v1'
 const NS_SETTING_AFFILIATE_SHORTLINK_ACCOUNT = 'affiliate_shortlink_account_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_BASE_URL = 'shopee_shortlink_base_url_v1'
 const NS_SETTING_SHOPEE_SHORTLINK_REQUIRED = 'shopee_shortlink_required_v1'
@@ -19361,6 +20095,23 @@ type EffectiveShortlinkSettings = {
     urlTemplate: string
     subIds: ShortlinkSubIds
     pageOverrideEnabled: boolean
+}
+
+type PagePostingOrderOverrideSettings = {
+    overrideEnabled: boolean
+    postingOrder: NamespacePostingOrder | null
+    updatedAt: string | null
+}
+
+type EffectivePagePostingOrderSettings = {
+    source: PostingOrderSource
+    postingOrder: NamespacePostingOrder
+    updatedAt: string | null
+    pageOverrideEnabled: boolean
+    pagePostingOrder: NamespacePostingOrder | null
+    pageUpdatedAt: string | null
+    globalPostingOrder: NamespacePostingOrder
+    globalUpdatedAt: string | null
 }
 
 function canonicalPageTokenFromRows(row: { access_token?: string | null }): string {
@@ -19866,7 +20617,103 @@ async function getNamespacePostingOrderSettings(db: D1Database, namespaceId: str
         posting_order: workspace.postingOrder,
         source: workspace.updatedAt ? 'custom' : 'default',
         updated_at: workspace.updatedAt,
-        options: ['oldest_first', 'newest_first', 'random'],
+        options: POSTING_ORDER_VALUES,
+    }
+}
+
+function serializePagePostingOrderOverrideSettings(settings: PagePostingOrderOverrideSettings) {
+    return {
+        override_enabled: settings.overrideEnabled,
+        posting_order: settings.postingOrder || '',
+        updated_at: settings.updatedAt,
+    }
+}
+
+function serializeEffectivePagePostingOrderSettings(settings: EffectivePagePostingOrderSettings) {
+    return {
+        source: settings.source,
+        posting_order: settings.postingOrder,
+        updated_at: settings.updatedAt,
+        page_override_enabled: settings.pageOverrideEnabled,
+        page_posting_order: settings.pagePostingOrder || '',
+        page_updated_at: settings.pageUpdatedAt,
+        global_posting_order: settings.globalPostingOrder,
+        global_updated_at: settings.globalUpdatedAt,
+    }
+}
+
+async function getPagePostingOrderOverrideSettings(db: D1Database, pageId: string): Promise<PagePostingOrderOverrideSettings> {
+    const normalizedPageId = String(pageId || '').trim()
+    if (!normalizedPageId) {
+        return {
+            overrideEnabled: false,
+            postingOrder: null,
+            updatedAt: null,
+        }
+    }
+
+    const [overrideRow, postingOrderRow] = await Promise.all([
+        getDashboardSetting(db, pageScopedSettingKey(normalizedPageId, NS_SETTING_PAGE_POSTING_ORDER_OVERRIDE_ENABLED)).catch(() => null),
+        getDashboardSetting(db, pageScopedSettingKey(normalizedPageId, NS_SETTING_POSTING_ORDER)).catch(() => null),
+    ])
+    const rawPostingOrder = String(postingOrderRow?.value || '').trim().toLowerCase()
+    const updatedAtCandidates = [
+        String(overrideRow?.updated_at || '').trim(),
+        String(postingOrderRow?.updated_at || '').trim(),
+    ].filter(Boolean)
+
+    return {
+        overrideEnabled: parseStoredBooleanFlag(String(overrideRow?.value || '')),
+        postingOrder: isNamespacePostingOrder(rawPostingOrder) ? rawPostingOrder : null,
+        updatedAt: updatedAtCandidates.sort().at(-1) || null,
+    }
+}
+
+async function setPagePostingOrderOverrideSettings(
+    db: D1Database,
+    pageId: string,
+    settings: Pick<PagePostingOrderOverrideSettings, 'overrideEnabled'> & { postingOrder: NamespacePostingOrder },
+): Promise<void> {
+    await Promise.all([
+        setPageSetting(db, pageId, NS_SETTING_PAGE_POSTING_ORDER_OVERRIDE_ENABLED, settings.overrideEnabled ? '1' : '0'),
+        setPageSetting(db, pageId, NS_SETTING_POSTING_ORDER, settings.postingOrder),
+    ])
+}
+
+async function resolveEffectivePagePostingOrder(
+    db: D1Database,
+    namespaceId: string,
+    pageId?: string,
+): Promise<EffectivePagePostingOrderSettings> {
+    const globalSettings = await getNamespacePostingOrderEntry(db, namespaceId)
+    const normalizedPageId = String(pageId || '').trim()
+    let pageSettings: PagePostingOrderOverrideSettings | null = null
+
+    if (normalizedPageId) {
+        pageSettings = await getPagePostingOrderOverrideSettings(db, normalizedPageId)
+        if (pageSettings.overrideEnabled && pageSettings.postingOrder) {
+            return {
+                source: 'page',
+                postingOrder: pageSettings.postingOrder,
+                updatedAt: pageSettings.updatedAt,
+                pageOverrideEnabled: true,
+                pagePostingOrder: pageSettings.postingOrder,
+                pageUpdatedAt: pageSettings.updatedAt,
+                globalPostingOrder: globalSettings.postingOrder,
+                globalUpdatedAt: globalSettings.updatedAt,
+            }
+        }
+    }
+
+    return {
+        source: 'global',
+        postingOrder: globalSettings.postingOrder,
+        updatedAt: globalSettings.updatedAt,
+        pageOverrideEnabled: pageSettings?.overrideEnabled === true,
+        pagePostingOrder: pageSettings?.postingOrder || null,
+        pageUpdatedAt: pageSettings?.updatedAt || null,
+        globalPostingOrder: globalSettings.postingOrder,
+        globalUpdatedAt: globalSettings.updatedAt,
     }
 }
 
@@ -20474,10 +21321,11 @@ async function processPendingAffiliateConversions(env: Env): Promise<void> {
                         nextStateFields.shopee_converted_at = convertedAt
                     } else {
                         const resolvedShopeeTrackingLink = await resolveAffiliateTrackingLink(sourceShopeeLink, `AFFILIATE-CONVERT ${namespaceId}/${videoId} SHOPEE_RESOLVE`).catch(() => sourceShopeeLink)
-                        const resolvedShopeeUtmSource = normalizeShortlinkExpectedUtmId(extractShopeeUtmSourceFromLink(resolvedShopeeTrackingLink))
+                        // Accepts utm_source=an_<id> or mmp_pid=an_<id>.
+                        const resolvedShopeeAffiliateId = extractShopeeAffiliateIdFromLink(resolvedShopeeTrackingLink)
                         const inferredShopeeReady = !!resolvedShopeeTrackingLink
-                            && !!resolvedShopeeUtmSource
-                            && (!expectedUtmId || resolvedShopeeUtmSource === normalizeShortlinkExpectedUtmId(expectedUtmId))
+                            && !!resolvedShopeeAffiliateId
+                            && (!expectedUtmId || resolvedShopeeAffiliateId === normalizeShortlinkExpectedUtmId(expectedUtmId))
                         if (inferredShopeeReady) {
                             const convertedAt = String(
                                 pendingVideo.shopeeConvertedAt ||
@@ -23747,9 +24595,155 @@ function isManagedShortlinkTransientFailure(error: unknown): boolean {
         || normalized.includes('shortlink')
 }
 
+type PostingShortlinkTrace = {
+    utmSource?: string | null
+    status?: 'disabled' | 'shortened' | 'fallback'
+    error?: string | null
+}
+
+type PostingLazadaShortlinkTrace = PostingShortlinkTrace & {
+    memberId?: string | null
+}
+
+type PrePostingShortlinkResolution = {
+    rawShopeeLink: string
+    shopeeLink: string
+    shopeeTrace: PostingShortlinkTrace
+    rawLazadaLink: string
+    lazadaLink: string
+    lazadaTrace: PostingLazadaShortlinkTrace
+    lazadaMemberId: string
+    lazadaRequired: boolean
+    conversionStatus: 'disabled' | 'shortened' | 'fallback' | null
+    conversionError: string | null
+    errorMessage: string | null
+}
+
+async function resolvePrePostingShortlinksForNamespace(params: {
+    env: Env
+    namespaceId: string
+    pageId: string
+    pageName?: string
+    shopeeLink: string
+    lazadaLink?: string
+    lazadaMemberId?: string
+    pageOneCardEnabled?: boolean
+    pageOneCardLinkMode?: PageOneCardLinkMode
+    pageOneCardCta?: PageOneCardCta
+    pageAdsPublishEnabled?: boolean
+    logPrefix: string
+}): Promise<PrePostingShortlinkResolution> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const pageName = String(params.pageName || pageId || namespaceId).trim()
+    const rawShopeeLink = pickFirstShopeeUrl(String(params.shopeeLink || '').trim()) || String(params.shopeeLink || '').trim()
+    const rawLazadaLink = pickFirstLazadaUrl(String(params.lazadaLink || '').trim()) || String(params.lazadaLink || '').trim()
+    const [isAdminManaged, shortlinkRequired] = await Promise.all([
+        isNamespaceShortlinkAdminManaged(params.env.DB, namespaceId).catch(() => false),
+        isNamespaceAffiliateShortlinkRequired(params.env.DB, namespaceId).catch(() => false),
+    ])
+    const isAdminNamespace = isAdminManaged && shortlinkRequired
+
+    const shopeeTrace: PostingShortlinkTrace = {}
+    let shopeeLink = rawShopeeLink
+    if (isAdminNamespace && rawShopeeLink) {
+        try {
+            shopeeLink = await shortenShopeeLinkForNamespace({
+                env: params.env,
+                namespaceId,
+                pageId,
+                shopeeLink: rawShopeeLink,
+                logPrefix: `${params.logPrefix} SHORTLINK`,
+                trace: shopeeTrace,
+            })
+            console.log(`[${params.logPrefix}] Page ${pageName}: shopee shortlink ${shopeeTrace.status} — ${rawShopeeLink.slice(0, 80)} → ${shopeeLink.slice(0, 80)}`)
+        } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            shopeeTrace.status = 'fallback'
+            shopeeTrace.error = errMsg
+            console.error(`[${params.logPrefix}] Page ${pageName}: shopee shortlink failed — ${errMsg}`)
+        }
+    } else if (rawShopeeLink) {
+        shopeeTrace.status = 'disabled'
+        console.log(`[${params.logPrefix}] Page ${pageName}: member namespace — using raw shopee link as-is`)
+    }
+
+    const pageOneCardEnabled = !!params.pageOneCardEnabled
+    const pageOneCardLinkMode = normalizePageOneCardLinkMode(params.pageOneCardLinkMode)
+    const pageOneCardCta = normalizePageOneCardCta(params.pageOneCardCta)
+    const commentTemplateRequiresLazada = rawLazadaLink
+        ? await namespaceCommentTemplateRequiresLazadaLink(params.env.DB, namespaceId).catch(() => true)
+        : false
+    const oneCardRequiresLazada = pageOneCardEnabled && pageOneCardCta !== 'NO_BUTTON' && pageOneCardLinkMode === 'lazada'
+    const lazadaRequired = !!rawLazadaLink && !params.pageAdsPublishEnabled && (commentTemplateRequiresLazada || oneCardRequiresLazada)
+    const lazadaTrace: PostingLazadaShortlinkTrace = {}
+    let lazadaLink = rawLazadaLink
+    if (isAdminNamespace && rawLazadaLink && lazadaRequired) {
+        try {
+            lazadaLink = await shortenLazadaLinkForNamespace({
+                env: params.env,
+                namespaceId,
+                pageId,
+                lazadaLink: rawLazadaLink,
+                logPrefix: `${params.logPrefix} SHORTLINK`,
+                trace: lazadaTrace,
+            })
+            console.log(`[${params.logPrefix}] Page ${pageName}: lazada shortlink ${lazadaTrace.status} — ${rawLazadaLink.slice(0, 80)} → ${lazadaLink.slice(0, 80)}`)
+        } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e)
+            lazadaTrace.status = 'fallback'
+            lazadaTrace.error = errMsg
+            console.error(`[${params.logPrefix}] Page ${pageName}: lazada shortlink failed — ${errMsg}`)
+        }
+    } else if (rawLazadaLink && !lazadaRequired) {
+        lazadaTrace.status = 'disabled'
+        console.log(`[${params.logPrefix}] Page ${pageName}: lazada shortlink skipped — not required by comment template or OneCard link mode`)
+    } else if (rawLazadaLink) {
+        lazadaTrace.status = 'disabled'
+        console.log(`[${params.logPrefix}] Page ${pageName}: member namespace — using raw lazada link as-is`)
+    }
+
+    const conversionStatus = (shopeeTrace.status === 'fallback' || lazadaTrace.status === 'fallback')
+        ? 'fallback'
+        : (shopeeTrace.status === 'shortened' || lazadaTrace.status === 'shortened')
+            ? 'shortened'
+            : (shopeeTrace.status === 'disabled' || lazadaTrace.status === 'disabled')
+                ? 'disabled'
+                : null
+    const conversionError = shopeeTrace.error || lazadaTrace.error || null
+    const shopeeShortlinkFailed = !!rawShopeeLink && shopeeTrace.status !== 'shortened' && shopeeTrace.status !== 'disabled'
+    const lazadaShortlinkFailed = lazadaRequired && lazadaTrace.status !== 'shortened' && lazadaTrace.status !== 'disabled'
+    const failedPlatforms = [
+        shopeeShortlinkFailed ? 'shopee' : '',
+        lazadaShortlinkFailed ? 'lazada' : '',
+    ].filter(Boolean).join('+')
+    const errorMessage = failedPlatforms
+        ? `shortlink_failed:${failedPlatforms} — ${conversionError || 'unknown'}`
+        : null
+
+    if (errorMessage) {
+        console.error(`[${params.logPrefix}] Page ${pageName}: BLOCKED — ${errorMessage}`)
+    }
+
+    return {
+        rawShopeeLink,
+        shopeeLink,
+        shopeeTrace,
+        rawLazadaLink,
+        lazadaLink,
+        lazadaTrace,
+        lazadaMemberId: String(lazadaTrace.memberId || params.lazadaMemberId || '').trim(),
+        lazadaRequired,
+        conversionStatus,
+        conversionError,
+        errorMessage,
+    }
+}
+
 async function resolvePostingShopeeLinkForNamespace(params: {
     env: Env
     namespaceId: string
+    pageId?: string
     shopeeLink: string
     logPrefix: string
     // Facebook post id (`pageId_postId`) used to populate shortlink Sub ID 2
@@ -23809,6 +24803,7 @@ async function resolvePostingShopeeLinkForNamespace(params: {
         const shortened = await shortenShopeeLinkForNamespace({
             env: params.env,
             namespaceId: params.namespaceId,
+            pageId: params.pageId,
             shopeeLink: link,
             logPrefix: params.logPrefix,
             postSubId2: params.postSubId2,
@@ -23868,9 +24863,11 @@ async function verifyAffiliateLinksForPosting(params: {
     if (shopeeInputLink && expectedShopeeId) {
         try {
             shopee.resolvedLink = await resolveAffiliateTrackingLink(shopeeInputLink, `${params.logPrefix}_shopee`)
-            const actualUtmSource = extractShopeeUtmSourceFromLink(shopee.resolvedLink)
-            shopee.actualId = normalizeShortlinkExpectedUtmId(actualUtmSource)
-            shopee.match = computeShortlinkUtmMatchValue(expectedShopeeId, actualUtmSource)
+            // Accept either utm_source=an_<id> or mmp_pid=an_<id>; both are valid
+            // shapes of the Shopee affiliate id on the final product URL.
+            const actualAffiliateId = extractShopeeAffiliateIdFromLink(shopee.resolvedLink)
+            shopee.actualId = actualAffiliateId
+            shopee.match = computeShortlinkUtmMatchValue(expectedShopeeId, actualAffiliateId)
             shopee.status = shopee.match === 1 ? 'verified' : 'mismatch'
             if (shopee.status !== 'verified') {
                 shopee.error = `Shopee affiliate id ไม่ตรง (expected ${expectedShopeeId}, actual ${shopee.actualId || '-'})`
@@ -24338,7 +25335,9 @@ async function syncTaggedPagesFromProfileMetadata(env: Env, namespaceId: string)
     const selectedProfiles = collectProfilesBySelectors(profiles, mergedSelectors)
         .filter((profile) => !isHiddenTaggedProfileForDerivedPage(hiddenProfiles, profile))
 
-    await env.DB.prepare("DELETE FROM pages WHERE bot_id = ? AND id LIKE 'tagged-%'").bind(ns).run().catch(() => { })
+    // Do not prune tagged/feed pages before rebuilding. BrowserSaving profile
+    // metadata can be empty or partial during outages; tags no longer control
+    // page existence, so this sync path must only upsert what it can verify.
 
     // First, collect all verified page ids from /me/accounts across all profiles
     const verifiedPageIds = new Set<string>()
@@ -26592,6 +27591,7 @@ async function reconcilePostingHistoryRows(params: {
                     const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
                         env,
                         namespaceId: botId,
+                        pageId: String(row.page_id || ''),
                         shopeeLink,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
                         postSubId2: recoveredPostId,
@@ -27955,6 +28955,96 @@ app.get('/api/admin/pages', async (c) => {
     }
 })
 
+app.get('/api/pages/:id/posting-order-settings', async (c) => {
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = c.get('botId')
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const [globalSettings, pageSettings, effectiveSettings] = await Promise.all([
+        getNamespacePostingOrderSettings(c.env.DB, namespaceId),
+        getPagePostingOrderOverrideSettings(c.env.DB, pageId),
+        resolveEffectivePagePostingOrder(c.env.DB, namespaceId, pageId),
+    ])
+
+    c.header('Cache-Control', 'private, no-store')
+    return c.json({
+        ok: true,
+        page: {
+            id: String(page.id || pageId),
+            name: String(page.name || ''),
+        },
+        global: globalSettings,
+        override: serializePagePostingOrderOverrideSettings(pageSettings),
+        effective: serializeEffectivePagePostingOrderSettings(effectiveSettings),
+        options: POSTING_ORDER_VALUES,
+    })
+})
+
+app.put('/api/pages/:id/posting-order-settings', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = c.get('botId')
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const body = await c.req.json().catch(() => ({})) as {
+        override_enabled?: unknown
+        overrideEnabled?: unknown
+        posting_order?: string
+        postingOrder?: string
+        order?: string
+    }
+    const rawPostingOrder = String(body.posting_order || body.postingOrder || body.order || '').trim().toLowerCase()
+    if (rawPostingOrder && !isNamespacePostingOrder(rawPostingOrder)) {
+        return c.json({
+            error: 'invalid_posting_order',
+            allowed: POSTING_ORDER_VALUES,
+        }, 400)
+    }
+
+    const previousPageSettings = await getPagePostingOrderOverrideSettings(c.env.DB, pageId)
+    const globalSettings = await getNamespacePostingOrderEntry(c.env.DB, namespaceId)
+    const overrideFlag = getBooleanFlag(body.override_enabled ?? body.overrideEnabled)
+    const overrideEnabled = overrideFlag ?? previousPageSettings.overrideEnabled
+    const postingOrder: NamespacePostingOrder = rawPostingOrder
+        ? rawPostingOrder as NamespacePostingOrder
+        : previousPageSettings.postingOrder || globalSettings.postingOrder
+
+    await setPagePostingOrderOverrideSettings(c.env.DB, pageId, {
+        overrideEnabled,
+        postingOrder,
+    })
+
+    const [globalView, pageSettings, effectiveSettings] = await Promise.all([
+        getNamespacePostingOrderSettings(c.env.DB, namespaceId),
+        getPagePostingOrderOverrideSettings(c.env.DB, pageId),
+        resolveEffectivePagePostingOrder(c.env.DB, namespaceId, pageId),
+    ])
+
+    return c.json({
+        ok: true,
+        page: {
+            id: String(page.id || pageId),
+            name: String(page.name || ''),
+        },
+        global: globalView,
+        override: serializePagePostingOrderOverrideSettings(pageSettings),
+        effective: serializeEffectivePagePostingOrderSettings(effectiveSettings),
+        options: POSTING_ORDER_VALUES,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
 app.get('/api/pages/:id/shortlink-settings', async (c) => {
     const pageId = String(c.req.param('id') || '').trim()
     const namespaceId = c.get('botId')
@@ -28129,6 +29219,112 @@ app.put('/api/pages/:id/shortlink-settings', async (c) => {
         max_template_chars: MAX_SHORTLINK_URL_TEMPLATE_CHARS,
         max_sub_id_chars: MAX_SHORTLINK_SUB_ID_CHARS,
     })
+})
+
+app.get('/api/pages/:id/avatar-settings', async (c) => {
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = c.get('botId')
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const settings = await getPageAvatarSettings(c.env.DB, pageId)
+    c.header('Cache-Control', 'private, no-store')
+    return c.json({
+        ok: true,
+        page: {
+            id: String(page.id || pageId),
+            name: String(page.name || ''),
+        },
+        settings: serializePageAvatarSettings(settings),
+    })
+})
+
+app.get('/api/pages/:id/avatar-video/public', async (c) => {
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = String(c.req.query('namespace_id') || c.get('botId') || '').trim()
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+    if (!namespaceId) return c.json({ error: 'namespace_id_required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const settings = await getPageAvatarSettings(c.env.DB, pageId)
+    if (!settings.enabled || !settings.videoKey) return c.json({ error: 'avatar_video_not_enabled' }, 404)
+
+    const bucket = new BotBucket(c.env.BUCKET, namespaceId) as unknown as R2Bucket
+    const head = await bucket.head(settings.videoKey).catch(() => null)
+    if (!head) return c.json({ error: 'avatar_video_not_found' }, 404)
+
+    const response = await buildGalleryAssetResponse(bucket, settings.videoKey, 'public', c.req.header('range'))
+    response.headers.set('Cache-Control', 'public, max-age=300')
+    response.headers.set('X-Avatar-Version', settings.version || '')
+    return response
+})
+
+app.put('/api/pages/:id/avatar-settings', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = c.get('botId')
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const previous = await getPageAvatarSettings(c.env.DB, pageId)
+    const clearVideo = body.clear_video === true || body.remove_video === true || body.video_key === ''
+    const nextVersion = clearVideo
+        ? ''
+        : sanitizeAvatarVersion(body.version ?? body.avatar_version ?? previous.version)
+    const nextVideoKey = clearVideo
+        ? ''
+        : (nextVersion ? buildPageAvatarVideoKey(pageId, nextVersion) : previous.videoKey)
+
+    if (!clearVideo && nextVersion && !nextVideoKey) {
+        return c.json({ error: 'avatar_version_invalid' }, 400)
+    }
+    if (nextVideoKey) {
+        const uploaded = await c.get('bucket').head(nextVideoKey).catch(() => null)
+        if (!uploaded) return c.json({ error: 'avatar_video_not_uploaded' }, 400)
+    }
+
+    const enabledRaw = body.enabled ?? body.avatar_enabled
+    const enabled = enabledRaw === undefined
+        ? previous.enabled
+        : enabledRaw === true || enabledRaw === 1 || String(enabledRaw).trim().toLowerCase() === 'true'
+    if (enabled && !nextVideoKey) {
+        return c.json({ error: 'avatar_video_required' }, 400)
+    }
+
+    const updatedAt = new Date().toISOString()
+    const nextSettings: PageAvatarSettings = {
+        enabled,
+        videoKey: nextVideoKey,
+        version: nextVersion,
+        chromakeySimilarity: clampChromakeySimilarity(body.chromakey_similarity ?? body.chromakeySimilarity ?? previous.chromakeySimilarity),
+        chromakeyBlend: clampChromakeyBlend(body.chromakey_blend ?? body.chromakeyBlend ?? previous.chromakeyBlend),
+        updatedAt,
+    }
+    await setPageAvatarSettings(c.env.DB, pageId, nextSettings)
+
+    return c.json({
+        ok: true,
+        page: {
+            id: String(page.id || pageId),
+            name: String(page.name || ''),
+        },
+        settings: serializePageAvatarSettings(nextSettings),
+    }, 200, { 'Cache-Control': 'no-store' })
 })
 
 app.get('/api/dashboard', async (c) => {
@@ -29527,11 +30723,23 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         }
 
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token FROM pages WHERE id = ? AND bot_id = ? LIMIT 1'
-        ).bind(pageId, botId).first() as { id?: string; name?: string; access_token?: string } | null
+            'SELECT id, name, access_token, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled FROM pages WHERE id = ? AND bot_id = ? LIMIT 1'
+        ).bind(pageId, botId).first() as {
+            id?: string
+            name?: string
+            access_token?: string
+            onecard_enabled?: number | null
+            onecard_link_mode?: string | null
+            onecard_cta?: string | null
+            ads_publish_enabled?: number | null
+        } | null
         if (!page?.id) {
             return c.json({ error: 'Page not found' }, 404)
         }
+        const pageOneCardEnabled = Number(page.onecard_enabled || 0) === 1
+        const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
+        const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
+        const pageAdsPublishEnabled = Number(page.ads_publish_enabled || 0) === 1
 
         pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
             scope: 'page',
@@ -29573,14 +30781,9 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         }
         const rawShopeeLink = pickFirstShopeeUrl(String(sourceRow.shopee_link || '').trim()) || videoRef.shopeeLink || ''
 
-        normalizedShopeeLink = rawShopeeLink
-        const normalizedShopeeUtmSource = null
-        const normalizedShopeeStatus = null
-        const normalizedShopeeError = null
-        const normalizedShopeeUtmMatch = null
-
         const publicUrl = metaToString(meta, 'publicUrl')
-        normalizedLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
+        const rawLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
+        const rawLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
         const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
         const hasManualCaption = !!normalizeManualCaption(meta.manualCaption || meta.caption || '')
         const title = metaToString(meta, 'title')
@@ -29591,6 +30794,28 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
         const caption = await buildPostingCaptionFromMeta(meta, apiKeys, model)
         selectedCaption = caption
+
+        const shortlinkResolution = await resolvePrePostingShortlinksForNamespace({
+            env,
+            namespaceId: botId,
+            pageId: String(page.id || ''),
+            pageName,
+            shopeeLink: rawShopeeLink,
+            lazadaLink: rawLazadaLink,
+            lazadaMemberId: rawLazadaMemberId,
+            pageOneCardEnabled,
+            pageOneCardLinkMode,
+            pageOneCardCta,
+            pageAdsPublishEnabled,
+            logPrefix: 'RETRY-POST',
+        })
+        normalizedShopeeLink = shortlinkResolution.shopeeLink
+        normalizedLazadaLink = shortlinkResolution.lazadaLink
+        const normalizedLazadaMemberId = shortlinkResolution.lazadaMemberId
+        const normalizedShopeeUtmSource = shortlinkResolution.shopeeTrace.utmSource ?? null
+        const normalizedShopeeStatus = shortlinkResolution.shopeeTrace.status ?? null
+        const normalizedShopeeError = shortlinkResolution.shopeeTrace.error ?? null
+        const normalizedShopeeUtmMatch = null
 
         const tokenCandidates = await ensurePageTokenCandidates({
             env,
@@ -29621,10 +30846,9 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
         hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
         const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
-        const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
         attemptPostedAtIso = new Date().toISOString()
         const inserted = await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, shortlink_conversion_status, shortlink_conversion_error, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             pageId,
             selectedVideoId,
@@ -29647,9 +30871,23 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             normalizedShopeeError,
             null,
             normalizedShopeeUtmMatch,
+            shortlinkResolution.conversionStatus,
+            shortlinkResolution.conversionError,
             selectedSourceFingerprint || null,
         ).run() as { meta?: { last_row_id?: number } }
         retryHistoryId = Number(inserted?.meta?.last_row_id || 0) || null
+
+        if (shortlinkResolution.errorMessage) {
+            if (retryHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(shortlinkResolution.errorMessage, retryHistoryId).run().catch(() => { })
+            }
+            return c.json({
+                error: 'shortlink_failed',
+                details: shortlinkResolution.errorMessage,
+            }, 409)
+        }
 
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
@@ -29657,6 +30895,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             pageId: String(page.id || ''),
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
+            requireLazadaLink: shortlinkResolution.lazadaRequired,
             logPrefix: 'RETRY-POST VERIFY',
         })
         if (retryHistoryId) {
@@ -29696,9 +30935,35 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
 
         const realVideoUrl = resolvePostingVideoDownloadUrl(env, selectedVideoNamespaceId, selectedVideoId, publicUrl)
 
-        const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'retry_post_download_video')
-        if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
-        const videoBuffer = await videoResp.arrayBuffer()
+        let videoBuffer: ArrayBuffer | null = null
+        const avatarSettings = await getPageAvatarSettings(env.DB, pageId).catch(() => null)
+        if (avatarSettings?.enabled && !TEMP_DISABLE_AVATAR_COMPOSE_FOR_POSTING) {
+            if (!avatarSettings.videoKey) throw new Error('avatar_compose_failed: avatar_video_key_missing')
+            const avatarHead = await c.get('bucket').head(avatarSettings.videoKey).catch(() => null)
+            if (!avatarHead) throw new Error('avatar_compose_failed: avatar_video_missing')
+            const avatarVideoUrl = buildAvatarObjectUrl(env, botId, avatarSettings.videoKey)
+            if (!avatarVideoUrl) throw new Error('avatar_compose_failed: avatar_url_missing')
+            try {
+                const parsedAvatarUrl = new URL(avatarVideoUrl)
+                if (!['http:', 'https:'].includes(parsedAvatarUrl.protocol)) {
+                    throw new Error('invalid_protocol')
+                }
+            } catch {
+                throw new Error('avatar_compose_failed: avatar_url_invalid')
+            }
+            videoBuffer = await composeAvatarVideoForPosting({
+                env,
+                baseVideoUrl: realVideoUrl,
+                avatarVideoUrl,
+                chromakeySimilarity: avatarSettings.chromakeySimilarity,
+                chromakeyBlend: avatarSettings.chromakeyBlend,
+            })
+        }
+        if (!videoBuffer) {
+            const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'retry_post_download_video')
+            if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
+            videoBuffer = await videoResp.arrayBuffer()
+        }
         if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
         const postingThumbnail = await loadPostingThumbnailAsset({
             env,
@@ -29728,6 +30993,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                 const reshortened = await resolvePostingShopeeLinkForNamespace({
                     env,
                     namespaceId: botId,
+                    pageId,
                     shopeeLink: rawShopeeLink || normalizedShopeeLink,
                     logPrefix: 'RETRY-POST COMMENT-SHORTLINK',
                     postSubId2: confirmedPostId,
@@ -29857,6 +31123,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                             const reshortened = await resolvePostingShopeeLinkForNamespace({
                                 env,
                                 namespaceId: botId,
+                                pageId,
                                 shopeeLink: normalizedShopeeLink,
                                 logPrefix: 'RETRY-POST-RECOVER COMMENT-SHORTLINK',
                                 postSubId2: recoveredPostId,
@@ -30577,6 +31844,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
     let pageOneCardLinkMode: PageOneCardLinkMode = 'shopee'
     let pageOneCardCta: PageOneCardCta = 'SHOP_NOW'
     let pageCaptionLinkEnabled = false
+    let avatarApplied = false
+    let avatarVersion = ''
 
     try {
         // Check if skip comment
@@ -30629,8 +31898,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
             throw new Error('access_token_missing')
         }
 
-        const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
-        console.log(`[FORCE-POST] Page ${page.name}: posting_order=${postingOrder}`)
+        const postingOrderSettings = await resolveEffectivePagePostingOrder(env.DB, botId, page.id)
+        const postingOrder = postingOrderSettings.postingOrder
+        const postingOrderSource = postingOrderSettings.source
+        console.log(`[FORCE-POST] Page ${page.name}: posting_order=${postingOrder} source=${postingOrderSource}`)
         const fastClaim = await claimFastGalleryVideoForPosting({
             env,
             namespaceId: botId,
@@ -30671,13 +31942,11 @@ app.post('/api/pages/:id/force-post', async (c) => {
             ? c.get('bucket')
             : new BotBucket(env.BUCKET, selectedVideoNamespaceId) as unknown as R2Bucket
         const meta = await loadLatestVideoMetaForPosting(sourceBucket, unpostedId, pickedVideo)
-        normalizedShopeeLink = normalizeMetaShopeeLink(meta) || ''
-        const normalizedShopeeUtmSource = null
-        const normalizedShopeeStatus = null
-        const normalizedShopeeError = null
-        const normalizedShopeeUtmMatch = null
+        const rawShopeeLink = normalizeMetaShopeeLink(meta) || ''
         const publicUrl = metaToString(meta, 'publicUrl')
-        normalizedLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
+        const rawLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
+        const rawLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
+        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
 
         // Use title if available, otherwise generate caption from script
         const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
@@ -30690,7 +31959,28 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
         const caption = await buildPostingCaptionFromMeta(meta, apiKeys, model)
         selectedCaption = caption
-        const normalizedLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
+
+        const shortlinkResolution = await resolvePrePostingShortlinksForNamespace({
+            env,
+            namespaceId: botId,
+            pageId: String(page.id || ''),
+            pageName: page.name,
+            shopeeLink: rawShopeeLink,
+            lazadaLink: rawLazadaLink,
+            lazadaMemberId: rawLazadaMemberId,
+            pageOneCardEnabled,
+            pageOneCardLinkMode,
+            pageOneCardCta,
+            pageAdsPublishEnabled,
+            logPrefix: 'FORCE-POST',
+        })
+        normalizedShopeeLink = shortlinkResolution.shopeeLink
+        normalizedLazadaLink = shortlinkResolution.lazadaLink
+        const normalizedLazadaMemberId = shortlinkResolution.lazadaMemberId
+        const normalizedShopeeUtmSource = shortlinkResolution.shopeeTrace.utmSource ?? null
+        const normalizedShopeeStatus = shortlinkResolution.shopeeTrace.status ?? null
+        const normalizedShopeeError = shortlinkResolution.shopeeTrace.error ?? null
+        const normalizedShopeeUtmMatch = null
 
         await ensurePostHistoryTraceColumns(env.DB)
         commentTokenHint = deriveCommentTokenHint(pageCommentToken)
@@ -30704,7 +31994,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const nowStr = new Date().toISOString()
         attemptPostedAtIso = nowStr
         const inserted = await env.DB.prepare(
-            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)' 
+            'INSERT INTO post_history (page_id, video_id, posted_at, status, trigger_source, bot_id, post_token_hint, post_profile_id, post_profile_name, comment_status, comment_token_hint, comment_error, comment_fb_id, shopee_link, lazada_link, lazada_member_id, shortlink_utm_source, shortlink_status, shortlink_error, shortlink_expected_utm_id, shortlink_utm_match, shortlink_conversion_status, shortlink_conversion_error, source_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).bind(
             page.id,
             unpostedId,
@@ -30727,15 +32017,31 @@ app.post('/api/pages/:id/force-post', async (c) => {
             normalizedShopeeError,
             null,
             normalizedShopeeUtmMatch,
+            shortlinkResolution.conversionStatus,
+            shortlinkResolution.conversionError,
             selectedSourceFingerprint || null,
         ).run()
         forceHistoryId = Number(inserted.meta?.last_row_id || 0) || null
 
+        if (shortlinkResolution.errorMessage) {
+            if (forceHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status = 'failed', error_message = ?, comment_status = 'not_attempted' WHERE id = ? AND status = 'posting'"
+                ).bind(shortlinkResolution.errorMessage, forceHistoryId).run().catch(() => { })
+            }
+            return c.json({
+                error: 'shortlink_failed',
+                details: shortlinkResolution.errorMessage,
+            }, 409)
+        }
+
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
             namespaceId: botId,
+            pageId: String(page.id || ''),
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
+            requireLazadaLink: shortlinkResolution.lazadaRequired,
             logPrefix: 'FORCE-POST VERIFY',
         })
         if (forceHistoryId) {
@@ -30756,7 +32062,6 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }, 400)
         }
 
-        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
         if (!pageAdsPublishEnabled) {
             const affiliateCommentPreflight = validateAffiliateCommentPreflight({
                 shopeeLink: normalizedShopeeLink,
@@ -30790,7 +32095,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             if (!namespaceIsAdminManaged) {
                 throw new Error('ads_publish_admin_only_runtime_check_failed')
             }
-            const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
+            const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
             const adsResp = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -30853,9 +32158,39 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }
 
         // Prefer the stored page-scoped token pool, then fall back to legacy tokens if needed.
-        const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'force_download_video')
-        if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
-        const videoBuffer = await videoResp.arrayBuffer()
+        let videoBuffer: ArrayBuffer | null = null
+        if (!pageOneCardEnabled) {
+            const avatarSettings = await getPageAvatarSettings(env.DB, page.id).catch(() => null)
+            if (avatarSettings?.enabled && !TEMP_DISABLE_AVATAR_COMPOSE_FOR_POSTING) {
+                if (!avatarSettings.videoKey) throw new Error('avatar_compose_failed: avatar_video_key_missing')
+                const avatarHead = await c.get('bucket').head(avatarSettings.videoKey).catch(() => null)
+                if (!avatarHead) throw new Error('avatar_compose_failed: avatar_video_missing')
+                const avatarVideoUrl = buildAvatarObjectUrl(env, botId, avatarSettings.videoKey)
+                if (!avatarVideoUrl) throw new Error('avatar_compose_failed: avatar_url_missing')
+                try {
+                    const parsedAvatarUrl = new URL(avatarVideoUrl)
+                    if (!['http:', 'https:'].includes(parsedAvatarUrl.protocol)) {
+                        throw new Error('invalid_protocol')
+                    }
+                } catch {
+                    throw new Error('avatar_compose_failed: avatar_url_invalid')
+                }
+                videoBuffer = await composeAvatarVideoForPosting({
+                    env,
+                    baseVideoUrl: realVideoUrl,
+                    avatarVideoUrl,
+                    chromakeySimilarity: avatarSettings.chromakeySimilarity,
+                    chromakeyBlend: avatarSettings.chromakeyBlend,
+                })
+                avatarApplied = true
+                avatarVersion = avatarSettings.version || avatarSettings.updatedAt || 'v1'
+            }
+        }
+        if (!videoBuffer) {
+            const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'force_download_video')
+            if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
+            videoBuffer = await videoResp.arrayBuffer()
+        }
         if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
         const postingThumbnail = pageOneCardEnabled
             ? null
@@ -30910,6 +32245,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 const reshortened = await resolvePostingShopeeLinkForNamespace({
                     env,
                     namespaceId: botId,
+                    pageId,
                     shopeeLink: normalizedShopeeLink,
                     logPrefix: 'FORCE-POST COMMENT-SHORTLINK',
                     postSubId2: confirmedPostId,
@@ -30994,13 +32330,22 @@ app.post('/api/pages/:id/force-post', async (c) => {
         }).catch(() => { })
 
         await clearVideoShopeeLink(c.get('bucket'), unpostedId)
-        return c.json({ success: true, page: page.name, video_id: unpostedId, fb_video_id: fbVideoId, fb_post_id: confirmedPostId, fb_reel_url: fbReelUrl })
+        return c.json({
+            success: true,
+            page: page.name,
+            video_id: unpostedId,
+            fb_video_id: fbVideoId,
+            fb_post_id: confirmedPostId,
+            fb_reel_url: fbReelUrl,
+            ...(avatarApplied ? { avatar_applied: true, avatar_version: avatarVersion } : {}),
+        })
     } catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e)
+        const isAvatarComposeError = errorMsg.includes('avatar_compose_failed')
 
         // Recovery path: if Facebook already accepted the reel and it becomes published
         // after a transient upload/finish error, mark history as success instead of failed.
-        if (pageAccessToken && pageId && selectedVideoId) {
+        if (!isAvatarComposeError && pageAccessToken && pageId && selectedVideoId) {
             try {
                 let recoveredPostId = ''
                 let recoveredReelUrl = ''
@@ -31148,7 +32493,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 ).bind(errorMsg, pageId, botId, attemptPostedAtIso).run()
             }
         } catch { }
-        return c.json({ error: 'Post failed', details: errorMsg }, 500)
+        return c.json({
+            error: isAvatarComposeError ? 'avatar_compose_failed' : 'Post failed',
+            details: errorMsg,
+        }, 500)
     } finally {
         await releasePostingLock(env.DB, videoPostingLockKey)
         await releasePostingLock(env.DB, pagePostingLockKey)
@@ -31349,6 +32697,7 @@ app.post('/api/manual-post-reel', async (c) => {
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env: c.env,
             namespaceId,
+            pageId,
             shopeeLink: shopeeLink || '',
             lazadaLink: effectiveLazadaLink,
             logPrefix: 'MANUAL-REEL VERIFY',
@@ -31367,6 +32716,7 @@ app.post('/api/manual-post-reel', async (c) => {
             ? await resolvePostingShopeeLinkForNamespace({
                 env: c.env,
                 namespaceId,
+                pageId,
                 shopeeLink,
                 logPrefix: 'MANUAL-REEL',
             })
@@ -31517,6 +32867,7 @@ app.post('/api/manual-post-reel', async (c) => {
                     const reshortened = await resolvePostingShopeeLinkForNamespace({
                         env: c.env,
                         namespaceId,
+                        pageId,
                         shopeeLink,
                         logPrefix: 'MANUAL-REEL',
                         postSubId2: confirmedPostId,
@@ -31780,6 +33131,7 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
             const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
                 env,
                 namespaceId: botId,
+                pageId,
                 shopeeLink,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
                 postSubId2: fbPostIdRaw,
@@ -32364,8 +33716,10 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     // Read posting order fresh for every page selection. This is intentionally
                     // not cached: when a member changes Settings > Post, the next cron/force
                     // selection must obey the live namespace setting exactly.
-                    const postingOrder = (await getNamespacePostingOrderEntry(env.DB, botId)).postingOrder
-                    console.log(`[CRON] Page ${page.name}: posting_order=${postingOrder}`)
+                    const postingOrderSettings = await resolveEffectivePagePostingOrder(env.DB, botId, String(page.id || ''))
+                    const postingOrder = postingOrderSettings.postingOrder
+                    const postingOrderSource = postingOrderSettings.source
+                    console.log(`[CRON] Page ${page.name}: posting_order=${postingOrder} source=${postingOrderSource}`)
                     const fastClaim = await claimFastGalleryVideoForPosting({
                         env,
                         namespaceId: botId,
@@ -32607,6 +33961,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const affiliateVerification = await verifyAffiliateLinksForPosting({
             env,
             namespaceId: botId,
+            pageId: String(page.id || ''),
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
             requireLazadaLink: lazadaLinkRequiredForPosting,
@@ -32674,7 +34029,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 if (!namespaceIsAdminManaged) {
                     throw new Error('ads_publish_admin_only_runtime_check_failed')
                 }
-                const workerUrl = String(env.WORKER_URL || 'https://api.oomnn.com').trim().replace(/\/+$/, '')
+                const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
                 const adsResp = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -32754,8 +34109,38 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             // Download video and publish via the preferred page-scoped token pool first.
             const videoResp = await fetchWithTimeout(realVideoUrl, {}, 60000, 'cron_download_video')
             if (!videoResp.ok) throw new Error(`Fetch video failed with status ${videoResp.status}`)
-            const videoBuffer = await videoResp.arrayBuffer()
+            let videoBuffer = await videoResp.arrayBuffer()
             if (videoBuffer.byteLength < 100000) throw new Error(`Video too small (${videoBuffer.byteLength} bytes). Download failed.`)
+            let avatarApplied = false
+            let avatarVersion = ''
+            if (!pageOneCardEnabled && !pageAdsPublishEnabled) {
+                const avatarSettings = await getPageAvatarSettings(env.DB, page.id).catch(() => null)
+                if (avatarSettings?.enabled && !TEMP_DISABLE_AVATAR_COMPOSE_FOR_POSTING) {
+                    if (!avatarSettings.videoKey) throw new Error('avatar_compose_failed: avatar_video_key_missing')
+                    const avatarHead = await botBucket.head(avatarSettings.videoKey).catch(() => null)
+                    if (!avatarHead) throw new Error('avatar_compose_failed: avatar_video_missing')
+                    const avatarVideoUrl = buildAvatarObjectUrl(env, botId, avatarSettings.videoKey)
+                    if (!avatarVideoUrl) throw new Error('avatar_compose_failed: avatar_url_missing')
+                    try {
+                        const parsedAvatarUrl = new URL(avatarVideoUrl)
+                        if (!['http:', 'https:'].includes(parsedAvatarUrl.protocol)) {
+                            throw new Error('invalid_protocol')
+                        }
+                    } catch {
+                        throw new Error('avatar_compose_failed: avatar_url_invalid')
+                    }
+                    videoBuffer = await composeAvatarVideoForPosting({
+                        env,
+                        baseVideoUrl: realVideoUrl,
+                        avatarVideoUrl,
+                        chromakeySimilarity: avatarSettings.chromakeySimilarity,
+                        chromakeyBlend: avatarSettings.chromakeyBlend,
+                    })
+                    avatarApplied = true
+                    avatarVersion = avatarSettings.version || avatarSettings.updatedAt || 'v1'
+                    console.log(`[CRON] Page ${page.name}: avatar applied version=${avatarVersion}`)
+                }
+            }
             const postingThumbnail = pageOneCardEnabled
                 ? null
                 : await loadPostingThumbnailAsset({
@@ -32875,150 +34260,153 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             }).catch(() => { })
 
             await clearVideoShopeeLink(botBucket, unpostedId)
-            console.log(`[CRON] Page ${page.name}: posted successfully (fb_video_id: ${fbVideoId}, post_id: ${confirmedPostId})`)
+            console.log(`[CRON] Page ${page.name}: posted successfully (fb_video_id: ${fbVideoId}, post_id: ${confirmedPostId}${avatarApplied ? `, avatar_version: ${avatarVersion}` : ''})`)
 
         } catch (e) {
             const errorMsg = e instanceof Error ? e.message : String(e)
+            const isAvatarComposeError = errorMsg.includes('avatar_compose_failed')
             console.error(`[CRON] Page ${page.name}: post failed - ${errorMsg}`)
 
             // Recovery path: Facebook may already publish this reel even when upload/finish returns transient errors.
             let recovered = false
-            try {
-                let recoveredPostId = ''
-                let recoveredReelUrl = ''
+            if (!isAvatarComposeError) {
+                try {
+                    let recoveredPostId = ''
+                    let recoveredReelUrl = ''
 
-                if (fbVideoId) {
-                    const recoveredResult = await pollPublishedReelAfterProcessing({
-                        accessToken: postingTokenUsed || String(page.access_token || ''),
-                        fbVideoId,
-                        logPrefix: `CRON ${page.name} RECOVER`,
-                    })
-                    if (recoveredResult.published && recoveredResult.post_id) {
-                        recoveredPostId = String(recoveredResult.post_id || '').trim() || fbVideoId
-                        recoveredReelUrl = String(recoveredResult.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
-                    }
-                }
-
-                if (!recoveredPostId && caption) {
-                    const feedRecovered = await recoverPublishedReelFromRecentFeed({
-                        accessToken: page.access_token,
-                        pageId: page.id,
-                        expectedCaption: caption,
-                        notBeforeIso: nowISO,
-                        logPrefix: `CRON ${page.name} RECOVER-FEED`,
-                    })
-                    if (feedRecovered.published && feedRecovered.post_id) {
-                        recoveredPostId = String(feedRecovered.post_id || '').trim()
-                        recoveredReelUrl = String(feedRecovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
-                    }
-                }
-
-                if (recoveredPostId) {
-                    if (!recoveredReelUrl) {
-                        recoveredReelUrl = `https://www.facebook.com/reel/${recoveredPostId}`
-                    }
-
-                    const recoveredCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, false)
-                    let commentStatus = recoveredCommentState.status
-                    let commentError: string | null = recoveredCommentState.error
-                    let commentFbId: string | null = null
-                    let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
-                    let commentProfileId: string | null = null
-                    let commentProfileName: string | null = null
-                    const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
-                    const commentTargetDedupKey = buildCommentTargetDedupKey(commentTargetId, page.id)
-
-                    if (normalizedShopeeLink && hasCommentToken) {
-                        if (dedupCommentTargets.has(commentTargetDedupKey)) {
-                            console.log(`[CRON] Page ${page.name}: recovery comment skip for ${commentTargetId} (already commented in this run)`)
-                            commentStatus = 'success'
-                        } else {
-                            const commentWaitMs = getRandomCommentDelayMs()
-                            console.log(`[CRON] Page ${page.name}: recovery comment wait ${Math.ceil(commentWaitMs / 1000)}s...`)
-                            await waitMs(commentWaitMs)
-                            const commentResult = await postShopeeCommentWithFallback({
-                                env,
-                                namespaceId: botId,
-                                fbVideoId: commentTargetId,
-                                shopeeLink: normalizedShopeeLink,
-                                lazadaLink: normalizedLazadaLink,
-                                commentTokens: commentTokenCandidates,
-                                pageId: page.id,
-                                logPrefix: `CRON ${page.name} RECOVER`,
-                            })
-                            if (!commentResult.ok) {
-                                commentStatus = 'failed'
-                                commentError = commentResult.error || 'comment_failed'
-                                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                                commentProfileId = commentProfile.profileId
-                                commentProfileName = commentProfile.profileName
-                                await notifyCommentTokenIssue(
-                                    env,
-                                    botId,
-                                    page.id,
-                                    page.name,
-                                    commentError,
-                                ).catch((notifyErr) => {
-                                    console.error(`[CRON] Page ${page.name}: recover notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
-                                })
-                            } else {
-                                dedupCommentTargets.add(commentTargetDedupKey)
-                                commentStatus = 'success'
-                                commentFbId = commentResult.id || null
-                                commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
-                                const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
-                                commentProfileId = commentProfile.profileId
-                                commentProfileName = commentProfile.profileName
-                            }
+                    if (fbVideoId) {
+                        const recoveredResult = await pollPublishedReelAfterProcessing({
+                            accessToken: postingTokenUsed || String(page.access_token || ''),
+                            fbVideoId,
+                            logPrefix: `CRON ${page.name} RECOVER`,
+                        })
+                        if (recoveredResult.published && recoveredResult.post_id) {
+                            recoveredPostId = String(recoveredResult.post_id || '').trim() || fbVideoId
+                            recoveredReelUrl = String(recoveredResult.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
                         }
                     }
 
-                    const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
-                    if (cronHistoryId) {
-                        await env.DB.prepare(
-                            "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status IN ('posting','failed')"
-                        ).bind(
-                            recoveredPostId,
-                            recoveredReelUrl,
-                            deriveCommentTokenHint(postingTokenUsed),
-                            recoveredPostProfile.profileId,
-                            recoveredPostProfile.profileName,
-                            commentStatus,
-                            deriveCommentTokenHint(commentTokenUsed),
-                            commentProfileId,
-                            commentProfileName,
-                            commentError,
-                            commentFbId,
-                            cronHistoryId,
-                        ).run()
+                    if (!recoveredPostId && caption) {
+                        const feedRecovered = await recoverPublishedReelFromRecentFeed({
+                            accessToken: page.access_token,
+                            pageId: page.id,
+                            expectedCaption: caption,
+                            notBeforeIso: nowISO,
+                            logPrefix: `CRON ${page.name} RECOVER-FEED`,
+                        })
+                        if (feedRecovered.published && feedRecovered.post_id) {
+                            recoveredPostId = String(feedRecovered.post_id || '').trim()
+                            recoveredReelUrl = String(feedRecovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
+                        }
                     }
-                    const recoveredPostedAtIso = new Date().toISOString()
-                    await markNamespaceVideoPosted(env.DB, botId, unpostedId, recoveredPostedAtIso)
-                    markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, recoveredPostedAtIso)
-                    await recordPagePostedVideoGuard(env.DB, {
-                        namespaceId: botId,
-                        pageId: page.id,
-                        videoId: unpostedId,
-                        sourceFingerprint,
-                        historyId: cronHistoryId,
-                        postedAt: nowISO,
-                    }).catch(() => { })
-                    cronStats.pagesPosted += 1
-                    updateCronRuntimeState(env.DB, {
-                        runId,
-                        heartbeatAt: new Date().toISOString(),
-                        pagesVisited: cronStats.pagesVisited,
-                        pagesPosted: cronStats.pagesPosted,
-                        pagesFailed: cronStats.pagesFailed,
-                    }).catch(() => { })
 
-                    await clearVideoShopeeLink(botBucket, unpostedId)
-                    console.log(`[CRON] Page ${page.name}: recovered as success (fb_video_id: ${fbVideoId}, post_id: ${recoveredPostId})`)
-                    recovered = true
+                    if (recoveredPostId) {
+                        if (!recoveredReelUrl) {
+                            recoveredReelUrl = `https://www.facebook.com/reel/${recoveredPostId}`
+                        }
+
+                        const recoveredCommentState = getPostReadyCommentTraceState(!!normalizedShopeeLink, hasCommentToken, false)
+                        let commentStatus = recoveredCommentState.status
+                        let commentError: string | null = recoveredCommentState.error
+                        let commentFbId: string | null = null
+                        let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
+                        let commentProfileId: string | null = null
+                        let commentProfileName: string | null = null
+                        const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
+                        const commentTargetDedupKey = buildCommentTargetDedupKey(commentTargetId, page.id)
+
+                        if (normalizedShopeeLink && hasCommentToken) {
+                            if (dedupCommentTargets.has(commentTargetDedupKey)) {
+                                console.log(`[CRON] Page ${page.name}: recovery comment skip for ${commentTargetId} (already commented in this run)`)
+                                commentStatus = 'success'
+                            } else {
+                                const commentWaitMs = getRandomCommentDelayMs()
+                                console.log(`[CRON] Page ${page.name}: recovery comment wait ${Math.ceil(commentWaitMs / 1000)}s...`)
+                                await waitMs(commentWaitMs)
+                                const commentResult = await postShopeeCommentWithFallback({
+                                    env,
+                                    namespaceId: botId,
+                                    fbVideoId: commentTargetId,
+                                    shopeeLink: normalizedShopeeLink,
+                                    lazadaLink: normalizedLazadaLink,
+                                    commentTokens: commentTokenCandidates,
+                                    pageId: page.id,
+                                    logPrefix: `CRON ${page.name} RECOVER`,
+                                })
+                                if (!commentResult.ok) {
+                                    commentStatus = 'failed'
+                                    commentError = commentResult.error || 'comment_failed'
+                                    commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                                    const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                                    commentProfileId = commentProfile.profileId
+                                    commentProfileName = commentProfile.profileName
+                                    await notifyCommentTokenIssue(
+                                        env,
+                                        botId,
+                                        page.id,
+                                        page.name,
+                                        commentError,
+                                    ).catch((notifyErr) => {
+                                        console.error(`[CRON] Page ${page.name}: recover notifyCommentTokenIssue failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`)
+                                    })
+                                } else {
+                                    dedupCommentTargets.add(commentTargetDedupKey)
+                                    commentStatus = 'success'
+                                    commentFbId = commentResult.id || null
+                                    commentTokenUsed = String(commentResult.commentToken || commentTokenUsed || '').trim()
+                                    const commentProfile = await resolvePostHistoryProfileByToken(env, commentTokenUsed)
+                                    commentProfileId = commentProfile.profileId
+                                    commentProfileName = commentProfile.profileName
+                                }
+                            }
+                        }
+
+                        const recoveredPostProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
+                        if (cronHistoryId) {
+                            await env.DB.prepare(
+                                "UPDATE post_history SET fb_post_id = ?, fb_reel_url = ?, status = 'success', error_message = NULL, post_token_hint = ?, post_profile_id = ?, post_profile_name = ?, comment_status = ?, comment_token_hint = ?, comment_profile_id = ?, comment_profile_name = ?, comment_error = ?, comment_fb_id = ? WHERE id = ? AND status IN ('posting','failed')"
+                            ).bind(
+                                recoveredPostId,
+                                recoveredReelUrl,
+                                deriveCommentTokenHint(postingTokenUsed),
+                                recoveredPostProfile.profileId,
+                                recoveredPostProfile.profileName,
+                                commentStatus,
+                                deriveCommentTokenHint(commentTokenUsed),
+                                commentProfileId,
+                                commentProfileName,
+                                commentError,
+                                commentFbId,
+                                cronHistoryId,
+                            ).run()
+                        }
+                        const recoveredPostedAtIso = new Date().toISOString()
+                        await markNamespaceVideoPosted(env.DB, botId, unpostedId, recoveredPostedAtIso)
+                        markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, recoveredPostedAtIso)
+                        await recordPagePostedVideoGuard(env.DB, {
+                            namespaceId: botId,
+                            pageId: page.id,
+                            videoId: unpostedId,
+                            sourceFingerprint,
+                            historyId: cronHistoryId,
+                            postedAt: nowISO,
+                        }).catch(() => { })
+                        cronStats.pagesPosted += 1
+                        updateCronRuntimeState(env.DB, {
+                            runId,
+                            heartbeatAt: new Date().toISOString(),
+                            pagesVisited: cronStats.pagesVisited,
+                            pagesPosted: cronStats.pagesPosted,
+                            pagesFailed: cronStats.pagesFailed,
+                        }).catch(() => { })
+
+                        await clearVideoShopeeLink(botBucket, unpostedId)
+                        console.log(`[CRON] Page ${page.name}: recovered as success (fb_video_id: ${fbVideoId}, post_id: ${recoveredPostId})`)
+                        recovered = true
+                    }
+                } catch (recoverErr) {
+                    console.error(`[CRON] Page ${page.name}: recover failed - ${recoverErr instanceof Error ? recoverErr.message : String(recoverErr)}`)
                 }
-            } catch (recoverErr) {
-                console.error(`[CRON] Page ${page.name}: recover failed - ${recoverErr instanceof Error ? recoverErr.message : String(recoverErr)}`)
             }
 
             if (recovered) {
@@ -33266,7 +34654,13 @@ async function watchdogStuckJobs(env: Env) {
 }
 
 export default {
-    fetch: app.fetch,
+    fetch: async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
+        // Public report aliases bypass Hono so they never touch session/admin
+        // middleware and never accidentally inherit auth requirements.
+        const reportResponse = await handleReportProxyRequest(request)
+        if (reportResponse) return reportResponse
+        return app.fetch(request, env, ctx)
+    },
     scheduled: async (event: ScheduledEvent, env: Env, _ctx: ExecutionContext) => {
         // Keep scheduled posting deterministic: run the posting loop first.
         // Inbox processing and pending comments run only after posting has yielded;

@@ -79,7 +79,12 @@ fn compute_seek_seconds(duration_secs: f64, frame_seed: &str) -> f64 {
     let seed_parts: Vec<&str> = frame_seed.trim().split('|').collect();
     if seed_parts.len() == 5 && seed_parts[0] == "line-cover" {
         let slot_index = seed_parts[3].trim().parse::<usize>().unwrap_or(1).max(1);
-        let slot_total = seed_parts[4].trim().parse::<usize>().unwrap_or(slot_index).max(slot_index).max(1);
+        let slot_total = seed_parts[4]
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(slot_index)
+            .max(slot_index)
+            .max(1);
         let segment_span = (max_seek - min_seek) / (slot_total as f64);
         if segment_span.is_finite() && segment_span > 0.0 {
             let segment_start = min_seek + segment_span * ((slot_index - 1) as f64);
@@ -95,8 +100,7 @@ fn compute_seek_seconds(duration_secs: f64, frame_seed: &str) -> f64 {
         }
     }
 
-    (min_seek + ((max_seek - min_seek) * fraction))
-        .clamp(0.1, (safe_duration - 0.05).max(0.1))
+    (min_seek + ((max_seek - min_seek) * fraction)).clamp(0.1, (safe_duration - 0.05).max(0.1))
 }
 
 fn normalize_overlay_text(input: &str) -> String {
@@ -115,7 +119,12 @@ fn normalize_overlay_text(input: &str) -> String {
         .collect::<String>()
 }
 
-fn wrap_overlay_text(input: &str, max_chars_per_line: usize, max_lines: usize, split_long_words: bool) -> String {
+fn wrap_overlay_text(
+    input: &str,
+    max_chars_per_line: usize,
+    max_lines: usize,
+    split_long_words: bool,
+) -> String {
     let normalized = normalize_overlay_text(input);
     if normalized.is_empty() {
         return String::new();
@@ -294,7 +303,13 @@ fn hex_to_ass_bgr(hex: &str, alpha_hex: &str) -> String {
     if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
         return format!("&H{}FFFFFF", alpha_hex.to_ascii_uppercase());
     }
-    format!("&H{}{}{}{}", alpha_hex.to_ascii_uppercase(), &h[4..6], &h[2..4], &h[0..2])
+    format!(
+        "&H{}{}{}{}",
+        alpha_hex.to_ascii_uppercase(),
+        &h[4..6],
+        &h[2..4],
+        &h[0..2]
+    )
 }
 
 fn opacity_to_ass_alpha_hex(opacity: f64) -> String {
@@ -372,7 +387,9 @@ fn build_thumbnail_plan(
         .max(1) as f64;
     // Base font size at 100% scale: 13% of frame width (≈140px on 1080px wide).
     // Auto-fit still shrinks long text, but short headlines no longer dominate the cover.
-    let mut font_size = (((target_width as f64) * 0.13) * size_scale).round().max(56.0);
+    let mut font_size = (((target_width as f64) * 0.13) * size_scale)
+        .round()
+        .max(56.0);
     // Max text width 92% of frame — allow long text without excessive shrink.
     let max_text_width = (target_width as f64) * 0.92;
     let estimated_char_width = font_size * 0.62;
@@ -386,7 +403,9 @@ fn build_thumbnail_plan(
         font_size *= (max_text_height / estimated_text_height).clamp(0.72, 1.0);
     }
     let font_size = font_size.round().max(28.0) as i32;
-    let panel_h = ((((font_size as f64) * 1.32 * line_count) + ((font_size as f64) * 0.95)).max(96.0)).round() as i32;
+    let panel_h = ((((font_size as f64) * 1.32 * line_count) + ((font_size as f64) * 0.95))
+        .max(96.0))
+    .round() as i32;
     let line_spacing_px = ((font_size as f64) * 0.18).round().max(6.0) as i32;
     let box_border_w = ((font_size as f64) * 0.34).round().max(12.0) as i32;
     let raw_panel_y = ((target_height as f64) * (y_pct / 100.0)).round() as i32 - (panel_h / 2);
@@ -405,23 +424,28 @@ fn build_thumbnail_plan(
 
     // mode=outline → draw text with thick outline, no box. mode=box (default) → filled box behind text.
     let is_outline_mode = overlay_mode.eq_ignore_ascii_case("outline");
-    let (effective_bg_color, effective_bg_opacity, effective_outline_color, effective_outline_width) =
-        if is_outline_mode {
-            let normalized_outline = normalize_overlay_color(overlay_outline_color, "#000000");
-            let width = overlay_outline_width.unwrap_or(8).clamp(0, 40);
-            (String::new(), 0.0, normalized_outline, width)
-        } else {
-            (bg_color, bg_opacity, String::new(), 0)
-        };
+    let (
+        effective_bg_color,
+        effective_bg_opacity,
+        effective_outline_color,
+        effective_outline_width,
+    ) = if is_outline_mode {
+        let normalized_outline = normalize_overlay_color(overlay_outline_color, "#000000");
+        let width = overlay_outline_width.unwrap_or(8).clamp(0, 40);
+        (String::new(), 0.0, normalized_outline, width)
+    } else {
+        (bg_color, bg_opacity, String::new(), 0)
+    };
 
     // Secondary fill: used for line 2+ when in outline mode and a distinct secondary
     // color is provided (matches reference project's line1=orange line2=white pattern).
     let secondary_trimmed = overlay_secondary_text_color.trim();
-    let secondary_effective = if !secondary_trimmed.is_empty() && !secondary_trimmed.eq_ignore_ascii_case(&text_color) {
-        normalize_overlay_color(overlay_secondary_text_color, &text_color)
-    } else {
-        String::new()
-    };
+    let secondary_effective =
+        if !secondary_trimmed.is_empty() && !secondary_trimmed.eq_ignore_ascii_case(&text_color) {
+            normalize_overlay_color(overlay_secondary_text_color, &text_color)
+        } else {
+            String::new()
+        };
 
     let params = json!({
         "text": overlay_text,
@@ -465,23 +489,36 @@ pub async fn handle_thumbnail(
 ) -> Result<Json<ThumbnailResponse>, (StatusCode, Json<serde_json::Value>)> {
     let video_url = payload.video_url.trim().to_string();
     if video_url.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "video_url_required" }))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "video_url_required" })),
+        ));
     }
 
-    let tmp_dir = tempdir().map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": e.to_string() })),
-    ))?;
+    let tmp_dir = tempdir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
     let tmp_path = tmp_dir.path();
     let video_path = tmp_path.join("video.mp4");
     let output_format = match payload.output_format.trim().to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => "jpg",
         _ => "webp",
     };
-    let thumb_path = tmp_path.join(if output_format == "jpg" { "thumb.jpg" } else { "thumb.webp" });
+    let thumb_path = tmp_path.join(if output_format == "jpg" {
+        "thumb.jpg"
+    } else {
+        "thumb.webp"
+    });
     let overlay_text = wrap_overlay_text(
         &payload.overlay_text,
-        if payload.target_width.unwrap_or(270) >= 720 { 16 } else { 12 },
+        if payload.target_width.unwrap_or(270) >= 720 {
+            16
+        } else {
+            12
+        },
         3,
         normalize_overlay_auto_fit(payload.overlay_auto_fit),
     );
@@ -492,40 +529,57 @@ pub async fn handle_thumbnail(
         Some(tmp_path.join("overlay.png"))
     };
 
-    let video_resp = reqwest::get(&video_url).await.map_err(|e| (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": format!("download_failed: {}", e) })),
-    ))?;
+    let video_resp = reqwest::get(&video_url).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("download_failed: {}", e) })),
+        )
+    })?;
     if !video_resp.status().is_success() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({
-            "error": format!("download_failed_status: {}", video_resp.status())
-        }))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("download_failed_status: {}", video_resp.status())
+            })),
+        ));
     }
-    let video_bytes = video_resp.bytes().await.map_err(|e| (
-        StatusCode::BAD_REQUEST,
-        Json(json!({ "error": format!("download_body_failed: {}", e) })),
-    ))?;
-    fs::write(&video_path, &video_bytes).await.map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": format!("write_video_failed: {}", e) })),
-    ))?;
+    let video_bytes = video_resp.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("download_body_failed: {}", e) })),
+        )
+    })?;
+    fs::write(&video_path, &video_bytes).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("write_video_failed: {}", e) })),
+        )
+    })?;
 
     let probe_out = Command::new("ffprobe")
         .args(&[
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=nokey=1:noprint_wrappers=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
             video_path.to_str().unwrap(),
         ])
         .output()
         .await
-        .map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("ffprobe_failed: {}", e) })),
-        ))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("ffprobe_failed: {}", e) })),
+            )
+        })?;
 
     let duration_secs = if probe_out.status.success() {
-        String::from_utf8_lossy(&probe_out.stdout).trim().parse::<f64>().unwrap_or(0.0)
+        String::from_utf8_lossy(&probe_out.stdout)
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(0.0)
     } else {
         0.0
     };
@@ -539,10 +593,7 @@ pub async fn handle_thumbnail(
     let target_height = payload.target_height.unwrap_or(480).clamp(160, 2560);
     let scale_filter = format!(
         "scale={}:{}:force_original_aspect_ratio=increase:flags=lanczos,crop={}:{}",
-        target_width,
-        target_height,
-        target_width,
-        target_height,
+        target_width, target_height, target_width, target_height,
     );
     let plan = build_thumbnail_plan(
         &scale_filter,
@@ -571,26 +622,35 @@ pub async fn handle_thumbnail(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("spawn_overlay_python_failed: {}", e) })),
-            ))?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("spawn_overlay_python_failed: {}", e) })),
+                )
+            })?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(params_json.as_bytes()).await.map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("write_overlay_params_failed: {}", e) })),
-            ))?;
+            stdin.write_all(params_json.as_bytes()).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("write_overlay_params_failed: {}", e) })),
+                )
+            })?;
             stdin.shutdown().await.ok();
         }
-        let py_out = child.wait_with_output().await.map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("overlay_python_wait_failed: {}", e) })),
-        ))?;
+        let py_out = child.wait_with_output().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("overlay_python_wait_failed: {}", e) })),
+            )
+        })?;
         if !py_out.status.success() {
             let stderr = String::from_utf8_lossy(&py_out.stderr).trim().to_string();
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
-                "error": format!("overlay_python_failed: {}", stderr)
-            }))));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("overlay_python_failed: {}", stderr)
+                })),
+            ));
         }
     }
 
@@ -628,24 +688,36 @@ pub async fn handle_thumbnail(
         .args(&ffmpeg_args)
         .output()
         .await
-        .map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("ffmpeg_failed: {}", e) })),
-        ))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("ffmpeg_failed: {}", e) })),
+            )
+        })?;
 
     if !ffmpeg_out.status.success() {
-        let stderr = String::from_utf8_lossy(&ffmpeg_out.stderr).trim().to_string();
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
-            "error": format!("ffmpeg_thumbnail_failed: {}", stderr)
-        }))));
+        let stderr = String::from_utf8_lossy(&ffmpeg_out.stderr)
+            .trim()
+            .to_string();
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("ffmpeg_thumbnail_failed: {}", stderr)
+            })),
+        ));
     }
 
-    let thumb_bytes = fs::read(&thumb_path).await.map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": format!("read_thumbnail_failed: {}", e) })),
-    ))?;
+    let thumb_bytes = fs::read(&thumb_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("read_thumbnail_failed: {}", e) })),
+        )
+    })?;
     if thumb_bytes.is_empty() {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "thumbnail_empty" }))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "thumbnail_empty" })),
+        ));
     }
 
     Ok(Json(ThumbnailResponse {

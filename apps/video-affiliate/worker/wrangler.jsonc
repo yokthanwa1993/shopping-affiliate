@@ -10,6 +10,14 @@
     ],
     "routes": [
         {
+            "pattern": "api.pubilo.com/*",
+            "zone_name": "pubilo.com"
+        },
+        {
+            "pattern": "api.pubilo.com",
+            "zone_name": "pubilo.com"
+        },
+        {
             "pattern": "api.oomnn.com/*",
             "zone_name": "oomnn.com"
         },
@@ -22,11 +30,11 @@
     "limits": {
         "cpu_ms": 300000
     },
-    // Container: FFmpeg merge service
+    // Merge service container (kept as fallback when MERGE_SERVICE_URL is unset)
     "containers": [
         {
             "class_name": "MergeContainer",
-            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-05-26.01",
+            "image": "registry.cloudflare.com/bc9db0f4b48f964b6e445dccc240af87/video-affiliate-worker-mergecontainer:v2026-05-28-normalize-720-01",
             "instance_type": "standard-4",
             "max_instances": 2
         }
@@ -67,18 +75,19 @@
     // Environment variables
     "vars": {
         "CORS_ORIGIN": "*",
-        "WORKER_URL": "https://api.oomnn.com",
+        "WORKER_URL": "https://api.pubilo.com",
         "R2_PUBLIC_URL": "https://pub-14b6c1dd39f14ed7a219a84afc93c182.r2.dev",
         "GEMINI_MODEL": "gemini-3-flash-preview",
         "VERTEX_TTS_ENDPOINT": "https://aiplatform.googleapis.com",
-        "VERTEX_TTS_PROJECT_ID": "healthy-keyword-495705-h0",
+        "VERTEX_TTS_PROJECT_ID": "neezs-489110",
         "VERTEX_TTS_LOCATION": "global",
         "VERTEX_TTS_MODEL": "gemini-2.5-flash-preview-tts",
-        "WEBAPP_URL": "https://app.oomnn.com",
-        "WEBAPP_DESKTOP_URL": "https://web.oomnn.com",
+        "WEBAPP_URL": "https://app.pubilo.com",
+        "WEBAPP_DESKTOP_URL": "https://app.pubilo.com",
         "VIDEO_ONECARD_WORKER_URL": "https://video-onecard.wwoom.com",
         "BROWSERSAVING_WORKER_URL": "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev",
-        "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com"
+        "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com",
+        "MERGE_SERVICE_URL": "http://merge-api.lslly.com"
     },
     "observability": {
         "enabled": true

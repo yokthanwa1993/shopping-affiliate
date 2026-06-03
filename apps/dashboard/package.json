@@ -1,28 +1,27 @@
 {
   "name": "ads-dashboard",
   "private": true,
-  "version": "0.0.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview",
+    "dev": "astro dev --host 0.0.0.0 --port 4174",
+    "build": "astro build",
+    "check": "astro check",
+    "preview": "astro preview",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {
-    "lucide-react": "^0.563.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "@astrojs/svelte": "^8.1.2",
+    "@simplewebauthn/browser": "^13.3.0",
+    "@simplewebauthn/server": "^13.3.1",
+    "astro": "^6.3.8",
+    "svelte": "^5.55.9"
   },
   "devDependencies": {
-    "@types/react": "^19.2.5",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.1",
-    "autoprefixer": "^10.4.24",
-    "postcss": "^8.5.6",
-    "tailwindcss": "^3.4.19",
+    "@astrojs/check": "^0.9.9",
+    "@tailwindcss/vite": "^4.3.0",
+    "tailwindcss": "^4.3.0",
     "typescript": "~5.9.3",
-    "vite": "^7.2.4",
-    "wrangler": "^4.78.0"
+    "wrangler": "^4.95.0"
   }
 }

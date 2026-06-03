@@ -1,15 +1,15 @@
 use axum::{
+    Json, Router,
     routing::{get, post},
-    Router, Json,
 };
-use tower_http::cors::CorsLayer;
 use serde_json::json;
+use tower_http::cors::CorsLayer;
 
 mod merge;
-mod thumbnail;
-mod xhs;
 mod pipeline;
+mod thumbnail;
 mod version;
+mod xhs;
 
 fn build_id() -> String {
     if let Ok(v) = std::env::var("VIDEO_AFFILIATE_BUILD_ID") {
@@ -38,6 +38,15 @@ async fn main() {
         .route("/thumbnail", post(thumbnail::handle_thumbnail))
         .route("/xhs/resolve", post(xhs::handle_resolve))
         .route("/pipeline", post(pipeline::handle_pipeline))
+        .route("/avatar-compose", post(pipeline::handle_avatar_compose))
+        .route(
+            "/avatar-compose/start",
+            post(pipeline::handle_avatar_compose_start),
+        )
+        .route(
+            "/avatar-compose/result/{job_id}",
+            get(pipeline::handle_avatar_compose_result),
+        )
         .layer(CorsLayer::permissive());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -48,14 +57,18 @@ async fn main() {
         build_id(),
         version::PIPELINE_ENGINE_VERSION
     );
-    
+
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
 async fn health_check() -> Json<serde_json::Value> {
     let mut ffmpeg_ok = false;
-    if let Ok(output) = tokio::process::Command::new("ffmpeg").arg("-version").output().await {
+    if let Ok(output) = tokio::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .await
+    {
         if output.status.success() {
             ffmpeg_ok = true;
         }

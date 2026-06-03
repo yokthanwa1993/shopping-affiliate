@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState, type MouseEvent, type SyntheticEvent } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type MouseEvent, type SyntheticEvent } from 'react'
 import { API_BASE_URL } from './apiBaseUrl'
 import { getAppTabPath, getInviteNamespaceFromSearch, getMergedSearchParams, type AppTabRoute } from './app/appRoutes'
 import { useViewerHistory } from './app/hooks/useViewerHistory'
@@ -230,6 +230,34 @@ const apiFetch = async (url: string, options: RequestInit = {}) => {
     credentials: 'include',
     cache: method === 'GET' || method === 'HEAD' ? options.cache : 'no-store',
   })
+}
+
+// AbortController-backed timeout so a slow API actually cancels the in-flight
+// request instead of leaking it past the racing setTimeout in withTimeout().
+const apiFetchWithTimeout = async (
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 15_000,
+): Promise<Response> => {
+  const controller = new AbortController()
+  const externalSignal = options.signal
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort()
+    else externalSignal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
+  const timer = setTimeout(() => controller.abort(), Math.max(1_000, timeoutMs))
+  try {
+    return await apiFetch(url, { ...options, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const isAbortError = (error: unknown): boolean => {
+  if (!error) return false
+  if (error instanceof DOMException && error.name === 'AbortError') return true
+  if (error instanceof Error && (error.name === 'AbortError' || /aborted|timeout/i.test(error.message))) return true
+  return false
 }
 
 const copyPlainText = async (value: string): Promise<boolean> => {
@@ -700,6 +728,47 @@ interface PageShortlinkSettingsResponse {
   error?: string
 }
 
+interface PagePostingOrderSettingsResponse {
+  ok?: boolean
+  global?: {
+    posting_order?: PostingOrderOption | string
+    source?: string
+    updated_at?: string | null
+  }
+  override?: {
+    override_enabled?: boolean
+    posting_order?: PostingOrderOption | string
+    updated_at?: string | null
+  }
+  effective?: {
+    source?: 'global' | 'page'
+    posting_order?: PostingOrderOption | string
+    updated_at?: string | null
+    page_override_enabled?: boolean
+    page_posting_order?: PostingOrderOption | string
+    page_updated_at?: string | null
+    global_posting_order?: PostingOrderOption | string
+    global_updated_at?: string | null
+  }
+  options?: Array<PostingOrderOption | string>
+  error?: string
+}
+
+interface PageAvatarSettingsView {
+  enabled: boolean
+  has_video: boolean
+  version: string
+  chromakey_similarity: number
+  chromakey_blend: number
+  updated_at: string
+}
+
+interface PageAvatarSettingsResponse {
+  ok?: boolean
+  settings?: Partial<PageAvatarSettingsView>
+  error?: string
+}
+
 const createEmptyPageShortlinkSettingsForm = (): PageShortlinkSettingsForm => ({
   override_enabled: false,
   account: '',
@@ -715,6 +784,27 @@ const createEmptyPageShortlinkSettingsForm = (): PageShortlinkSettingsForm => ({
   sub_id5: '',
   updated_at: null,
 })
+
+const createDefaultPageAvatarSettings = (): PageAvatarSettingsView => ({
+  enabled: false,
+  has_video: false,
+  version: '',
+  chromakey_similarity: 0.14,
+  chromakey_blend: 0.02,
+  updated_at: '',
+})
+
+const normalizePageAvatarSettings = (raw?: Partial<PageAvatarSettingsView> | null): PageAvatarSettingsView => {
+  const defaults = createDefaultPageAvatarSettings()
+  return {
+    enabled: raw?.enabled === true,
+    has_video: raw?.has_video === true,
+    version: String(raw?.version || ''),
+    chromakey_similarity: defaults.chromakey_similarity,
+    chromakey_blend: defaults.chromakey_blend,
+    updated_at: String(raw?.updated_at || ''),
+  }
+}
 
 const normalizePageShortlinkSettingsForm = (raw?: Partial<PageShortlinkSettingsForm> | null): PageShortlinkSettingsForm => ({
   ...createEmptyPageShortlinkSettingsForm(),
@@ -1072,6 +1162,16 @@ const POSTING_ORDER_OPTIONS: Array<{ value: PostingOrderOption; title: string; s
   { value: 'oldest_first', title: 'โพสต์เก่าสุดก่อน', subtitle: 'ไล่จากคลิปเก่าก่อน' },
   { value: 'random', title: 'โพสต์สุ่ม', subtitle: 'สุ่มจากคลิปที่ยังไม่โพสต์' },
 ]
+
+const normalizePostingOrderOption = (rawValue: unknown, fallback: PostingOrderOption = 'oldest_first'): PostingOrderOption => {
+  const value = String(rawValue || '').trim()
+  return POSTING_ORDER_OPTIONS.some((option) => option.value === value)
+    ? value as PostingOrderOption
+    : fallback
+}
+
+const getPostingOrderOptionMeta = (value: PostingOrderOption) =>
+  POSTING_ORDER_OPTIONS.find((option) => option.value === value) || POSTING_ORDER_OPTIONS.find((option) => option.value === 'oldest_first') || POSTING_ORDER_OPTIONS[0]
 
 const getSettingsSectionTitle = (section: SettingsSection): string => {
   switch (section) {
@@ -1670,6 +1770,137 @@ function VideoWorkspaceBadge({
     >
       {isCurrentWorkspace ? <WorkspaceCurrentIcon /> : <WorkspaceOtherIcon />}
       {showLabel && <span>{label}</span>}
+    </div>
+  )
+}
+
+function ProcessedVideoDetailOverlay({
+  video,
+  currentNamespaceId,
+  formatDuration,
+  onClose,
+}: {
+  video: Partial<Video> & Record<string, unknown>
+  currentNamespaceId?: string
+  formatDuration: (s: number) => string
+  onClose: () => void
+}) {
+  const id = String(video.id || video.video_id || '').trim()
+  const namespaceId = String(video.namespace_id || currentNamespaceId || '').trim()
+  const safeVideo = { ...video, id, namespace_id: namespaceId } as Partial<Video> & Record<string, unknown>
+  const playableUrl = String(resolvePlayableVideoUrl(safeVideo)).trim()
+  const posterUrl = String(resolveThumbnailDisplayUrl(safeVideo)).trim()
+  const title = String(video.title || '').trim()
+  const caption = String(video.script || video.caption || '').trim()
+  const durationSeconds = Number(video.duration || video.durationSeconds || 0)
+  const durationText = String(Number.isFinite(durationSeconds) && durationSeconds > 0 ? formatDuration(durationSeconds) : '').trim()
+  const genericLink = String(video.link || '').trim()
+  const shopeeLink = String(getVideoShopeeLink(safeVideo) || '').trim()
+  const lazadaLink = String(getVideoLazadaLink(safeVideo) || extractLazadaLink(genericLink)).trim()
+  const detailRows = [
+    { label: 'Video ID', value: id },
+    { label: 'Workspace', value: namespaceId },
+    { label: 'Duration', value: durationText },
+  ].filter((row) => row.value)
+
+  return (
+    <div className="fixed inset-0 z-50 bg-[#fafafa] text-gray-900">
+      <div className="mx-auto flex h-full w-full max-w-md flex-col bg-[#fafafa]">
+        <div
+          aria-hidden="true"
+          className="sticky top-0 z-10 bg-[#fafafa]"
+          style={{ height: 'calc(env(safe-area-inset-top, 0px) + 8px)' }}
+        />
+        <div className="flex items-center gap-2 px-4 pb-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-700 shadow-sm active:scale-95 transition-transform"
+            aria-label="ปิดรายละเอียดวิดีโอ"
+          >
+            <CloseIcon />
+          </button>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-black text-gray-900">{title || caption || id || 'วิดีโอที่ประมวลผลแล้ว'}</p>
+            <p className="truncate text-xs font-semibold text-gray-400">{namespaceId || 'ไม่พบ workspace'}</p>
+          </div>
+        </div>
+
+        <div data-allow-touch-scroll="true" className="flex-1 overflow-y-auto app-scroll">
+          <div
+            className="space-y-4 px-4"
+            style={{
+              paddingTop: '8px',
+              paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) + 24px)',
+            }}
+          >
+            <div
+              className="mx-auto overflow-hidden rounded-[28px] border border-gray-200 bg-white shadow-sm"
+              style={VERTICAL_VIEWER_FRAME_STYLE}
+            >
+              {playableUrl ? (
+                <video
+                  src={playableUrl}
+                  className="block h-full w-full bg-white object-contain"
+                  controls
+                  autoPlay
+                  playsInline
+                  preload="metadata"
+                  poster={posterUrl || undefined}
+                />
+              ) : (
+                <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-gray-100 px-6 text-center">
+                  <p className="text-sm font-black text-gray-700">ไม่พบไฟล์วิดีโอ</p>
+                  <p className="break-all text-xs font-semibold text-gray-400">{id || 'ไม่มี video id'}</p>
+                </div>
+              )}
+            </div>
+
+            {(title || caption) && (
+              <div className="rounded-2xl border border-gray-200 bg-white p-3 shadow-sm">
+                {title && <p className="text-sm font-black text-gray-900">{title}</p>}
+                {caption && <p className="mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-gray-700">{caption}</p>}
+              </div>
+            )}
+
+            {detailRows.length > 0 && (
+              <div className="grid grid-cols-1 gap-2">
+                {detailRows.map((row) => (
+                  <div key={row.label} className="rounded-2xl border border-gray-200 bg-white px-3 py-2.5 shadow-sm">
+                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gray-400">{row.label}</p>
+                    <p className="break-all text-sm font-semibold text-gray-900">{row.value}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {(shopeeLink || lazadaLink) && (
+              <div className="space-y-2">
+                {shopeeLink && (
+                  <a
+                    href={shopeeLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block rounded-2xl border border-orange-100 bg-orange-50 px-3 py-3 text-sm font-black text-orange-700 shadow-sm active:scale-[0.99] transition-transform"
+                  >
+                    Shopee: <span className="break-all font-semibold">{shopeeLink}</span>
+                  </a>
+                )}
+                {lazadaLink && (
+                  <a
+                    href={lazadaLink}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block rounded-2xl border border-blue-100 bg-blue-50 px-3 py-3 text-sm font-black text-blue-700 shadow-sm active:scale-[0.99] transition-transform"
+                  >
+                    Lazada: <span className="break-all font-semibold">{lazadaLink}</span>
+                  </a>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -2678,6 +2909,23 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [pageShortlinkMaxLazadaMemberChars, setPageShortlinkMaxLazadaMemberChars] = useState(32)
   const [pageShortlinkMaxTemplateChars, setPageShortlinkMaxTemplateChars] = useState(2048)
   const [pageShortlinkMaxSubIdChars, setPageShortlinkMaxSubIdChars] = useState(128)
+  const [pagePostingOrderLoaded, setPagePostingOrderLoaded] = useState(false)
+  const [pagePostingOrderLoading, setPagePostingOrderLoading] = useState(false)
+  const [pagePostingOrderMessage, setPagePostingOrderMessage] = useState('')
+  const [pagePostingOrderOverrideEnabled, setPagePostingOrderOverrideEnabled] = useState(false)
+  const [pagePostingOrderDraft, setPagePostingOrderDraft] = useState<PostingOrderOption>('oldest_first')
+  const [pagePostingOrderGlobal, setPagePostingOrderGlobal] = useState<PostingOrderOption>('oldest_first')
+  const [pagePostingOrderUpdatedAt, setPagePostingOrderUpdatedAt] = useState('')
+  const [pagePostingOrderGlobalUpdatedAt, setPagePostingOrderGlobalUpdatedAt] = useState('')
+  const [pageAvatarLoaded, setPageAvatarLoaded] = useState(false)
+  const [pageAvatarLoading, setPageAvatarLoading] = useState(false)
+  const [pageAvatarEnabled, setPageAvatarEnabled] = useState(false)
+  const [pageAvatarHasVideo, setPageAvatarHasVideo] = useState(false)
+  const [pageAvatarVersion, setPageAvatarVersion] = useState('')
+  const [pageAvatarUpdatedAt, setPageAvatarUpdatedAt] = useState('')
+  const [pageAvatarFile, setPageAvatarFile] = useState<File | null>(null)
+  const [pageAvatarRemoveVideo, setPageAvatarRemoveVideo] = useState(false)
+  const [pageAvatarMessage, setPageAvatarMessage] = useState('')
 
   useEffect(() => {
     setHourMinutes(parsePostHours(page.post_hours || ''))
@@ -2764,6 +3012,85 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     return () => { cancelled = true }
   }, [page.id])
 
+  useEffect(() => {
+    let cancelled = false
+    const applySettings = (data: PagePostingOrderSettingsResponse) => {
+      const globalOrder = normalizePostingOrderOption(
+        data.global?.posting_order || data.effective?.global_posting_order,
+        'oldest_first',
+      )
+      const effectiveOrder = normalizePostingOrderOption(data.effective?.posting_order, globalOrder)
+      const pageOrder = normalizePostingOrderOption(
+        data.override?.posting_order || data.effective?.page_posting_order || effectiveOrder,
+        effectiveOrder,
+      )
+      setPagePostingOrderGlobal(globalOrder)
+      setPagePostingOrderDraft(pageOrder)
+      setPagePostingOrderOverrideEnabled(data.override?.override_enabled === true)
+      setPagePostingOrderUpdatedAt(String(data.override?.updated_at || data.effective?.page_updated_at || ''))
+      setPagePostingOrderGlobalUpdatedAt(String(data.global?.updated_at || data.effective?.global_updated_at || ''))
+    }
+
+    const loadPagePostingOrderSettings = async () => {
+      setPagePostingOrderLoading(true)
+      setPagePostingOrderLoaded(false)
+      setPagePostingOrderMessage('')
+      try {
+        const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/posting-order-settings`)
+        const data = await resp.json().catch(() => ({})) as PagePostingOrderSettingsResponse
+        if (!resp.ok) throw new Error(data.error || 'โหลดลำดับโพสต์เฉพาะเพจไม่สำเร็จ')
+        if (cancelled) return
+        applySettings(data)
+        setPagePostingOrderLoaded(true)
+      } catch (e) {
+        if (!cancelled) {
+          setPagePostingOrderMessage(e instanceof Error ? e.message : 'โหลดลำดับโพสต์เฉพาะเพจไม่สำเร็จ')
+        }
+      } finally {
+        if (!cancelled) setPagePostingOrderLoading(false)
+      }
+    }
+
+    void loadPagePostingOrderSettings()
+    return () => { cancelled = true }
+  }, [page.id])
+
+  useEffect(() => {
+    let cancelled = false
+    const applySettings = (raw?: Partial<PageAvatarSettingsView> | null) => {
+      const settings = normalizePageAvatarSettings(raw)
+      setPageAvatarEnabled(settings.enabled)
+      setPageAvatarHasVideo(settings.has_video)
+      setPageAvatarVersion(settings.version)
+      setPageAvatarUpdatedAt(settings.updated_at)
+      setPageAvatarFile(null)
+      setPageAvatarRemoveVideo(false)
+    }
+
+    const loadPageAvatarSettings = async () => {
+      setPageAvatarLoading(true)
+      setPageAvatarLoaded(false)
+      setPageAvatarMessage('')
+      try {
+        const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/avatar-settings`)
+        const data = await resp.json().catch(() => ({})) as PageAvatarSettingsResponse
+        if (!resp.ok) throw new Error(data.error || 'โหลด Avatar เฉพาะเพจไม่สำเร็จ')
+        if (cancelled) return
+        applySettings(data.settings)
+        setPageAvatarLoaded(true)
+      } catch (e) {
+        if (!cancelled) {
+          setPageAvatarMessage(e instanceof Error ? e.message : String(e))
+        }
+      } finally {
+        if (!cancelled) setPageAvatarLoading(false)
+      }
+    }
+
+    void loadPageAvatarSettings()
+    return () => { cancelled = true }
+  }, [page.id])
+
   // Hours 00-23 for display
   const hourOptions = Array.from({ length: 24 }, (_, i) => i)
 
@@ -2826,9 +3153,99 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     setPageShortlinkSubId5(overrideSettings.sub_id5)
   }
 
+  const savePagePostingOrderSettings = async () => {
+    if (!pagePostingOrderLoaded) return
+    setPagePostingOrderMessage('')
+    const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/posting-order-settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        override_enabled: pagePostingOrderOverrideEnabled,
+        posting_order: pagePostingOrderDraft,
+      }),
+    })
+    const data = await resp.json().catch(() => ({})) as PagePostingOrderSettingsResponse
+    if (!resp.ok) {
+      throw new Error(data.error || 'บันทึกลำดับโพสต์เฉพาะเพจไม่สำเร็จ')
+    }
+
+    const globalOrder = normalizePostingOrderOption(
+      data.global?.posting_order || data.effective?.global_posting_order,
+      pagePostingOrderGlobal,
+    )
+    const effectiveOrder = normalizePostingOrderOption(data.effective?.posting_order, globalOrder)
+    const pageOrder = normalizePostingOrderOption(
+      data.override?.posting_order || data.effective?.page_posting_order || effectiveOrder,
+      effectiveOrder,
+    )
+    setPagePostingOrderGlobal(globalOrder)
+    setPagePostingOrderDraft(pageOrder)
+    setPagePostingOrderOverrideEnabled(data.override?.override_enabled === true)
+    setPagePostingOrderUpdatedAt(String(data.override?.updated_at || data.effective?.page_updated_at || ''))
+    setPagePostingOrderGlobalUpdatedAt(String(data.global?.updated_at || data.effective?.global_updated_at || ''))
+    setPagePostingOrderMessage('บันทึกลำดับโพสต์แล้ว')
+  }
+
+  const buildPageAvatarUploadKey = (version: string) => {
+    const safePageId = String(page.id || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64)
+    const safeVersion = String(version || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40)
+    if (!safePageId || !safeVersion) return ''
+    return `page-assets/${safePageId}/avatar/${safeVersion}.mp4`
+  }
+
+  const savePageAvatarSettings = async () => {
+    if (!pageAvatarLoaded) return
+    setPageAvatarMessage('')
+
+    let nextVersion = pageAvatarVersion
+    let clearVideo = pageAvatarRemoveVideo
+    if (pageAvatarFile) {
+      if (!String(pageAvatarFile.type || '').startsWith('video/')) {
+        throw new Error('ไฟล์ Avatar ต้องเป็นวิดีโอ')
+      }
+      nextVersion = String(Date.now())
+      const uploadKey = buildPageAvatarUploadKey(nextVersion)
+      if (!uploadKey) throw new Error('สร้างที่เก็บวิดีโอ Avatar ไม่สำเร็จ')
+      const uploadResp = await apiFetch(`${WORKER_URL}/api/r2-upload/${uploadKey}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': pageAvatarFile.type || 'video/mp4' },
+        body: pageAvatarFile,
+      })
+      if (!uploadResp.ok) {
+        const data = await uploadResp.json().catch(() => ({})) as { error?: string }
+        throw new Error(data.error || `อัปโหลด Avatar ไม่สำเร็จ (${uploadResp.status})`)
+      }
+      clearVideo = false
+    }
+
+    const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/avatar-settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: pageAvatarEnabled,
+        version: nextVersion,
+        clear_video: clearVideo,
+      }),
+    })
+    const data = await resp.json().catch(() => ({})) as PageAvatarSettingsResponse
+    if (!resp.ok) {
+      throw new Error(data.error || 'บันทึก Avatar เฉพาะเพจไม่สำเร็จ')
+    }
+    const settings = normalizePageAvatarSettings(data.settings)
+    setPageAvatarEnabled(settings.enabled)
+    setPageAvatarHasVideo(settings.has_video)
+    setPageAvatarVersion(settings.version)
+    setPageAvatarUpdatedAt(settings.updated_at)
+    setPageAvatarFile(null)
+    setPageAvatarRemoveVideo(false)
+    setPageAvatarMessage('บันทึก Avatar แล้ว')
+  }
+
   const handleSave = async () => {
     setSaving(true)
     setPageShortlinkMessage('')
+    setPagePostingOrderMessage('')
+    setPageAvatarMessage('')
     try {
       const normalizedInterval = normalizeInterval(intervalMinutes)
       const schedulePostHours = scheduleMode === 'interval'
@@ -2881,11 +3298,19 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
       setIntervalMinutes(parseInterval(savedPage.post_hours, savedPage.post_interval_minutes || normalizedInterval))
       onSave(savedPage)
       await savePageShortlinkSettings()
+      await savePagePostingOrderSettings()
+      await savePageAvatarSettings()
       onBack()
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e))
       if (pageShortlinkLoaded && String(e instanceof Error ? e.message : e).includes('Shortlink')) {
         setPageShortlinkMessage(e instanceof Error ? e.message : String(e))
+      }
+      if (pagePostingOrderLoaded && String(e instanceof Error ? e.message : e).includes('ลำดับโพสต์')) {
+        setPagePostingOrderMessage(e instanceof Error ? e.message : String(e))
+      }
+      if (pageAvatarLoaded && String(e instanceof Error ? e.message : e).includes('Avatar')) {
+        setPageAvatarMessage(e instanceof Error ? e.message : String(e))
       }
     } finally {
       setSaving(false)
@@ -2939,7 +3364,13 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     globalShortlinkSettings.expected_utm_id ? `Shopee ${globalShortlinkSettings.expected_utm_id}` : '',
     globalShortlinkSettings.lazada_expected_member_id ? `Lazada ${globalShortlinkSettings.lazada_expected_member_id}` : '',
   ].filter(Boolean).join(' • ')
+  const globalPostingOrderMeta = getPostingOrderOptionMeta(pagePostingOrderGlobal)
+  const pagePostingOrderMessageIsError = !!pagePostingOrderMessage && !pagePostingOrderMessage.includes('บันทึก')
+  const pagePostingOrderTimestamp = pagePostingOrderOverrideEnabled
+    ? pagePostingOrderUpdatedAt
+    : pagePostingOrderGlobalUpdatedAt
   const pageShortlinkMessageIsError = !!pageShortlinkMessage && !pageShortlinkMessage.includes('บันทึกแล้ว')
+  const pageAvatarMessageIsError = !!pageAvatarMessage && !pageAvatarMessage.includes('บันทึก')
 
   return (
     <div className="h-full flex flex-col px-5">
@@ -3188,6 +3619,163 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
 
           {pageShortlinkMessage && (
             <p className={`text-xs ${pageShortlinkMessageIsError ? 'text-red-500' : 'text-green-600'}`}>{pageShortlinkMessage}</p>
+          )}
+        </div>
+
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">ใช้ลำดับโพสต์เฉพาะเพจ</p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                {pagePostingOrderOverrideEnabled ? 'เพจนี้เลือกคลิปตามค่าด้านล่าง' : `ใช้ค่ารวมของระบบ: ${globalPostingOrderMeta.title}`}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setPagePostingOrderOverrideEnabled(!pagePostingOrderOverrideEnabled)
+                if (pagePostingOrderMessage) setPagePostingOrderMessage('')
+              }}
+              disabled={pagePostingOrderLoading}
+              className={`shrink-0 w-12 h-7 rounded-full relative transition-colors ${pagePostingOrderOverrideEnabled ? 'bg-blue-600' : 'bg-gray-300'} ${pagePostingOrderLoading ? 'opacity-60' : ''}`}
+              aria-pressed={pagePostingOrderOverrideEnabled}
+            >
+              <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${pagePostingOrderOverrideEnabled ? 'right-1' : 'left-1'}`}></div>
+            </button>
+          </div>
+
+          {pagePostingOrderLoading ? (
+            <p className="text-sm text-gray-400 py-2">กำลังโหลดลำดับโพสต์...</p>
+          ) : (
+            <div className="space-y-3">
+              {!pagePostingOrderOverrideEnabled && (
+                <div className="rounded-xl bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-500">
+                  ใช้ค่ารวมของระบบ: <span className="font-bold text-gray-700">{globalPostingOrderMeta.title}</span>
+                  <span className="block">{globalPostingOrderMeta.subtitle}</span>
+                </div>
+              )}
+
+              {pagePostingOrderOverrideEnabled && (
+                <div className="space-y-2">
+                  {POSTING_ORDER_OPTIONS.map((option) => {
+                    const active = pagePostingOrderDraft === option.value
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => {
+                          setPagePostingOrderDraft(option.value)
+                          if (pagePostingOrderMessage) setPagePostingOrderMessage('')
+                        }}
+                        className={`w-full rounded-2xl border px-4 py-3 text-left transition-all active:scale-[0.99] ${
+                          active
+                            ? 'border-blue-500 bg-blue-50 shadow-sm'
+                            : 'border-gray-200 bg-gray-50'
+                        }`}
+                      >
+                        <div className="flex items-start gap-3">
+                          <div className={`mt-0.5 h-4 w-4 rounded-full border ${
+                            active
+                              ? 'border-blue-500 bg-blue-500 shadow-[inset_0_0_0_3px_white]'
+                              : 'border-gray-300 bg-white'
+                          }`} />
+                          <div className="min-w-0">
+                            <p className={`text-sm font-bold ${active ? 'text-blue-700' : 'text-gray-900'}`}>{option.title}</p>
+                            <p className="mt-0.5 text-xs text-gray-500">{option.subtitle}</p>
+                          </div>
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
+              )}
+
+              {pagePostingOrderTimestamp && (
+                <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(pagePostingOrderTimestamp).toLocaleString()}</p>
+              )}
+            </div>
+          )}
+
+          {pagePostingOrderMessage && (
+            <p className={`text-xs ${pagePostingOrderMessageIsError ? 'text-red-500' : 'text-green-600'}`}>{pagePostingOrderMessage}</p>
+          )}
+        </div>
+
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">Avatar video เฉพาะเพจนี้</p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                ใช้เฉพาะตอนโพสต์จริง หลังระบบเลือกเพจแล้ว ก่อนส่ง Facebook
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPageAvatarEnabled(!pageAvatarEnabled)}
+              disabled={pageAvatarLoading}
+              className={`shrink-0 w-12 h-7 rounded-full relative transition-colors ${pageAvatarEnabled ? 'bg-green-500' : 'bg-gray-300'} ${pageAvatarLoading ? 'opacity-60' : ''}`}
+              aria-pressed={pageAvatarEnabled}
+            >
+              <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${pageAvatarEnabled ? 'right-1' : 'left-1'}`}></div>
+            </button>
+          </div>
+
+          <p className="rounded-xl bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-500">
+            วิดีโอ Avatar ต้องจัดตำแหน่งมาเต็มเฟรมแล้ว ระบบจะ scale ทั้งเฟรมเป็น 720x1280, ตัด green screen และวางทับที่มุม 0:0 โดยไม่ crop, ไม่ย้ายตำแหน่ง และไม่ย่อคนในคลิป
+          </p>
+
+          {pageAvatarLoading ? (
+            <p className="text-sm text-gray-400 py-2">กำลังโหลด Avatar...</p>
+          ) : (
+            <div className="space-y-3">
+              <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50 px-3 py-3">
+                <input
+                  type="file"
+                  accept="video/mp4,video/*"
+                  onChange={(e) => {
+                    const file = e.currentTarget.files?.[0] || null
+                    setPageAvatarFile(file)
+                    if (file) {
+                      setPageAvatarRemoveVideo(false)
+                      setPageAvatarHasVideo(true)
+                    }
+                    if (pageAvatarMessage) setPageAvatarMessage('')
+                  }}
+                  className="w-full text-sm text-gray-600 file:mr-3 file:rounded-lg file:border-0 file:bg-blue-600 file:px-3 file:py-2 file:text-sm file:font-bold file:text-white"
+                />
+                <div className="mt-2 flex items-center justify-between gap-3 text-xs">
+                  <span className={pageAvatarHasVideo ? 'text-green-600' : 'text-gray-400'}>
+                    {pageAvatarFile
+                      ? `เตรียมอัปโหลด: ${pageAvatarFile.name}`
+                      : pageAvatarHasVideo
+                        ? 'มีวิดีโอ Avatar แล้ว'
+                        : 'ยังไม่มีวิดีโอ Avatar'}
+                  </span>
+                  {(pageAvatarHasVideo || pageAvatarFile) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPageAvatarFile(null)
+                        setPageAvatarHasVideo(false)
+                        setPageAvatarRemoveVideo(true)
+                        setPageAvatarEnabled(false)
+                      }}
+                      className="shrink-0 font-bold text-red-500"
+                    >
+                      ล้างวิดีโอ
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {pageAvatarUpdatedAt && (
+                <p className="text-[11px] text-gray-400">อัปเดตล่าสุด: {new Date(pageAvatarUpdatedAt).toLocaleString()}</p>
+              )}
+            </div>
+          )}
+
+          {pageAvatarMessage && (
+            <p className={`text-xs ${pageAvatarMessageIsError ? 'text-red-500' : 'text-green-600'}`}>{pageAvatarMessage}</p>
           )}
         </div>
 
@@ -4197,6 +4785,10 @@ function App({
   const [deletingInboxId, setDeletingInboxId] = useState<string | null>(null)
   const [videoViewerOpen, setVideoViewerOpen] = useState(false)
   const [selectedProcessedGalleryVideo, setSelectedProcessedGalleryVideo] = useState<Video | null>(null)
+  const handleCloseProcessedVideoDetail = useCallback(() => {
+    setSelectedProcessedGalleryVideo(null)
+    setVideoViewerOpen(false)
+  }, [])
   const processingFetchInFlightRef = useRef(false)
   const postHistoryFetchInFlightRef = useRef(false)
   const lastPostHistoryFetchKeyRef = useRef('')
@@ -5145,40 +5737,53 @@ function App({
     if (!session) return
 
     processingFetchInFlightRef.current = true
-    const shouldShowLoading = processingVideos.length === 0
+    const hadPriorData = processingVideos.length > 0
+    const shouldShowLoading = !hadPriorData
     if (shouldShowLoading) setProcessingLoading(true)
     setProcessingError('')
-    try {
-      const processingResp = await withTimeout(
-        apiFetch(`${WORKER_URL}/api/processing?summary=0`),
-        20_000,
-        'processing',
-      )
 
-      if (processingResp.status === 401) {
+    type ProcessingResponse = {
+      videos?: Video[]
+      pending_shortlink_videos?: Video[]
+      library_total?: number
+      inventory_total?: number
+      ready_total?: number
+      pending_total?: number
+      pending_has_lazada_total?: number
+      pending_missing_lazada_total?: number
+    }
+
+    const fetchSnapshot = async (limit: number, historyLimit: number, timeoutMs: number) => {
+      const url = `${WORKER_URL}/api/processing?summary=0&limit=${limit}&history_limit=${historyLimit}`
+      return apiFetchWithTimeout(url, {}, timeoutMs)
+    }
+
+    try {
+      let resp: Response
+      let usedFallback = false
+      try {
+        resp = await fetchSnapshot(60, 60, 15_000)
+      } catch (primaryError) {
+        if (!isAbortError(primaryError)) throw primaryError
+        usedFallback = true
+        resp = await fetchSnapshot(24, 24, 12_000)
+      }
+
+      if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
 
-      if (!processingResp.ok) {
-        const data = await processingResp.json().catch(() => ({})) as { error?: string; details?: string }
-        setProcessingError(String(data.details || data.error || `HTTP ${processingResp.status}`))
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({})) as { error?: string; details?: string }
+        setProcessingError(String(data.details || data.error || `HTTP ${resp.status}`))
         return
       }
 
-      const procData = await processingResp.json() as {
-        videos?: Video[]
-        pending_shortlink_videos?: Video[]
-        library_total?: number
-        inventory_total?: number
-        ready_total?: number
-        pending_total?: number
-        pending_has_lazada_total?: number
-        pending_missing_lazada_total?: number
-      }
-      const processingVideos = procData.videos || []
+      const procData = await resp.json() as ProcessingResponse
+      const nextProcessingVideos = procData.videos || []
       const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
-      setProcessingVideos(processingVideos)
+      setProcessingVideos(nextProcessingVideos)
       setPendingShortlinkVideos(pendingVideos)
       setProcessingSummary({
         libraryTotal: Number(procData.library_total || 0),
@@ -5188,8 +5793,18 @@ function App({
         pendingHasLazadaTotal: Number(procData.pending_has_lazada_total || 0),
         pendingMissingLazadaTotal: Number(procData.pending_missing_lazada_total || 0),
       })
+      if (usedFallback) {
+        // Soft notice — primary timed out, but fallback succeeded with data.
+        setProcessingError('โหลดช้ากว่าปกติ ใช้ข้อมูลย่อชั่วคราว')
+      }
     } catch (e) {
-      setProcessingError(e instanceof Error ? e.message : 'โหลดข้อมูลประมวลผลไม่สำเร็จ')
+      // Never clear current/stale data on transient errors — keep what we have
+      // so the UI stays useful while the user retries.
+      if (isAbortError(e)) {
+        setProcessingError(hadPriorData ? 'โหลดช้า กำลังลองใหม่' : 'โหลดช้า แตะลองโหลดใหม่')
+      } else {
+        setProcessingError(e instanceof Error ? e.message : 'โหลดข้อมูลประมวลผลไม่สำเร็จ')
+      }
     } finally {
       setProcessingLoading(false)
       processingFetchInFlightRef.current = false
@@ -5281,6 +5896,7 @@ function App({
       params.set('view', inboxView)
       if (offset === 0) {
         params.set('_ts', String(Date.now()))
+        params.set('fresh', '1')
       }
       const resp = await apiFetch(`${WORKER_URL}/api/inbox/system?${params.toString()}`)
       if (resp.status === 401) {
@@ -6840,10 +7456,25 @@ function App({
     try {
       const url = new URL(`${WORKER_URL}/api/inbox/${encodeURIComponent(id)}`)
       if (namespaceId) url.searchParams.set('namespace_id', namespaceId)
+      // Delete from gallery/index first. Deleting only /api/inbox can leave the
+      // gallery_index/original-library source row alive, so the item reappears on
+      // the next system-inbox refresh/backfill.
+      const hardDeleteUrl = new URL(`${WORKER_URL}/api/gallery/${encodeURIComponent(id)}`)
+      if (namespaceId) hardDeleteUrl.searchParams.set('namespace_id', namespaceId)
+      const hardDeleteResp = await apiFetch(hardDeleteUrl.toString(), {
+        method: 'DELETE',
+      })
+      if (!hardDeleteResp.ok) {
+        const data = await hardDeleteResp.json().catch(() => ({})) as { error?: string }
+        throw new Error(String(data.error || 'ลบถาวรจาก Gallery ไม่สำเร็จ'))
+      }
+
+      // Best-effort cleanup for legacy/source-only records. The hard delete above
+      // usually removes _inbox too; a 404 here means it is already gone.
       const resp = await apiFetch(url.toString(), {
         method: 'DELETE',
       })
-      if (!resp.ok) {
+      if (!resp.ok && resp.status !== 404) {
         const data = await resp.json().catch(() => ({})) as { error?: string }
         throw new Error(String(data.error || 'ลบจาก Inbox ไม่สำเร็จ'))
       }
@@ -6875,6 +7506,11 @@ function App({
         })
         return matched && String(matched.processedAt || '').trim() ? Math.max(0, prev - 1) : prev
       })
+      if (isSystemAdmin) {
+        void loadSystemInbox({ reset: true })
+      } else {
+        void loadInbox({ reset: true })
+      }
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e))
     } finally {
@@ -7807,6 +8443,10 @@ function App({
             onReprocess={handleReprocessJob}
             onOpenProcessedVideo={openProcessedVideoInGallery}
             retryingProcessingId={retryingProcessingId}
+            onRetryProcessing={() => { void loadProcessingSnapshot() }}
+            isRefreshing={processingLoading}
+            currentNamespaceId={namespaceId}
+            workerUrl={WORKER_URL}
           />
         )}
 
@@ -10040,19 +10680,12 @@ function App({
       </div>
 
       {selectedProcessedGalleryVideo && (
-        <VideoCard
+        <ProcessedVideoDetailOverlay
           key={`processed-detail-${selectedProcessedGalleryVideo.id}`}
           video={selectedProcessedGalleryVideo}
           currentNamespaceId={namespaceId}
           formatDuration={formatDuration}
-          onDelete={handleDelete}
-          onUpdate={handleUpdateVideo}
-          onExpandedChange={(isOpen) => {
-            setVideoViewerOpen(isOpen)
-            if (!isOpen) setSelectedProcessedGalleryVideo(null)
-          }}
-          initialExpanded
-          renderCollapsed={false}
+          onClose={handleCloseProcessedVideoDetail}
         />
       )}
 

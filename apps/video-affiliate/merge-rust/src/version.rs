@@ -1,1 +1,1 @@
-pub const PIPELINE_ENGINE_VERSION: &str = "2026-05-23.05";
+pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-02.avatar-colorkey.01";

@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import GalleryPanel from '../components/GalleryPanel.svelte'
+---
+
+<Layout
+  title="แกลลี่วิดีโอในระบบ"
+  subtitle="คลิปที่ import เข้าระบบแล้ว"
+  headerBadge="gallery"
+  active="gallery"
+>
+  <GalleryPanel client:load />
+</Layout>

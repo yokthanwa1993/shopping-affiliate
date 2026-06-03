@@ -258,6 +258,52 @@ CREATE TABLE IF NOT EXISTS imported_videos (
     PRIMARY KEY (namespace_id, video_id)
 );
 
+CREATE TABLE IF NOT EXISTS page_video_asset_winners (
+  namespace_id TEXT NOT NULL,
+  page_id TEXT NOT NULL,
+  fb_video_id TEXT NOT NULL,
+  system_video_id TEXT NOT NULL DEFAULT '',
+  ad_account TEXT NOT NULL DEFAULT '',
+  advideo_id TEXT NOT NULL DEFAULT '',
+  advideo_status TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  source_sub_id TEXT NOT NULL DEFAULT '',
+  source_shopee_link TEXT NOT NULL DEFAULT '',
+  orders_1d INTEGER NOT NULL DEFAULT 0,
+  orders_7d INTEGER NOT NULL DEFAULT 0,
+  commission_7d REAL NOT NULL DEFAULT 0,
+  last_synced_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (namespace_id, page_id, fb_video_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_page_video_asset_winners_rank
+ON page_video_asset_winners(namespace_id, page_id, orders_7d DESC, commission_7d DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_page_video_asset_winners_advideo
+ON page_video_asset_winners(ad_account, advideo_id);
+
+CREATE TABLE IF NOT EXISTS processed_video_asset_library (
+    namespace_id TEXT NOT NULL,
+    system_video_id TEXT NOT NULL,
+    ad_account TEXT NOT NULL,
+    advideo_id TEXT NOT NULL DEFAULT '',
+    advideo_status TEXT NOT NULL DEFAULT '',
+    file_url TEXT NOT NULL DEFAULT '',
+    upload_status TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    uploaded_at TEXT NOT NULL DEFAULT '',
+    last_checked_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (namespace_id, system_video_id, ad_account)
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_video_asset_library_advideo
+ON processed_video_asset_library(ad_account, advideo_id);
+
 CREATE TABLE IF NOT EXISTS line_users (
     line_user_id TEXT PRIMARY KEY,
     namespace_id TEXT NOT NULL,

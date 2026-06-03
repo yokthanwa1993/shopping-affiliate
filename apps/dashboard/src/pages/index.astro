@@ -1,0 +1,129 @@
+---
+import Layout from '../layouts/Layout.astro'
+import OverviewCards from '../components/OverviewCards.svelte'
+
+const recentUploadCards = [
+  { label: 'แกลลี่',      view: '/gallery',          desc: 'คลิปที่ import พร้อมโพสต์' },
+  { label: 'คลังต้นฉบับ', view: '/source-inventory', desc: 'วิดีโอต้นฉบับจาก LINE Mini App' },
+  { label: 'Processing', view: '/processing',       desc: 'สถานะ pipeline แปลงคลิป' },
+  { label: 'โพสต์เพจ',    view: '/page-posts',       desc: 'โพสต์เพจที่มียอดวิว ≥ 100K' },
+  { label: 'Campaigns',  view: '/campaigns',        desc: 'real-time จาก Facebook Ads Manager' },
+  { label: 'Create Ads', view: '/create-ads',       desc: 'เลือกคลิป → enqueue สร้างแอด' },
+  { label: 'คิวสร้างแอด', view: '/queue',            desc: 'งานสร้างแอดที่กำลังทำ' },
+  { label: 'History',    view: '/history',          desc: 'โพสต์ที่ promote แล้ววันนี้' },
+]
+
+const campaignRows = [
+  { name: 'เฉียบ — Shopee LikePage',  status: 'Live',   platform: 'Facebook',           payRate: 'CPL · auto', creators: 'pipeline', submissions: 'cron', paid: '—', budget: 'ตามตั้งใน Ads Manager' },
+  { name: 'ฉ่ำ — Feed Ad Creator',     status: 'Live',   platform: 'Facebook · IG',      payRate: 'extension',  creators: 'manual',   submissions: 'manual', paid: '—', budget: 'ตามตั้งใน Ads Manager' },
+  { name: 'Pubilo migration cutover',  status: 'Paused', platform: 'oomnn → pubilo',    payRate: '—',          creators: 'ops',      submissions: '—',     paid: '—', budget: '—' },
+]
+---
+
+<Layout title="Campaigns" subtitle="Ads manager workspace" active="dashboard">
+  <div class="space-y-4">
+    <OverviewCards client:load />
+
+    <section class="grid gap-4 xl:grid-cols-[1.1fr,0.9fr]">
+      <article class="rounded-3xl border border-slate-200 bg-white p-5">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Monthly delivery</h2>
+            <p class="mt-0.5 text-xs text-slate-500">มุมมองรวมจาก worker pipeline · 30 วันล่าสุด</p>
+          </div>
+          <span class="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600">demo trend</span>
+        </div>
+        <div class="mt-4 rounded-3xl border border-slate-200 bg-gradient-to-b from-emerald-50/80 via-white to-white p-4">
+          <div class="relative h-64 overflow-hidden rounded-2xl">
+            <div class="absolute inset-0 bg-[linear-gradient(to_bottom,transparent_0%,transparent_24%,rgba(148,163,184,0.14)_24%,rgba(148,163,184,0.14)_25%,transparent_25%,transparent_49%,rgba(148,163,184,0.14)_49%,rgba(148,163,184,0.14)_50%,transparent_50%,transparent_74%,rgba(148,163,184,0.14)_74%,rgba(148,163,184,0.14)_75%,transparent_75%)]"></div>
+            <svg viewBox="0 0 100 50" class="absolute inset-0 h-full w-full" preserveAspectRatio="none">
+              <defs>
+                <linearGradient id="viewsFill" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stop-color="rgba(16,185,129,0.20)"/>
+                  <stop offset="100%" stop-color="rgba(16,185,129,0.02)"/>
+                </linearGradient>
+              </defs>
+              <path d="M0 42 C8 38, 10 45, 18 36 S30 20, 38 32 S46 16, 54 12 S62 34, 70 24 S78 28, 86 14 S94 18, 100 10" fill="none" stroke="#16a34a" stroke-width="1.6"/>
+              <path d="M0 50 L0 42 C8 38, 10 45, 18 36 S30 20, 38 32 S46 16, 54 12 S62 34, 70 24 S78 28, 86 14 S94 18, 100 10 L100 50 Z" fill="url(#viewsFill)"/>
+            </svg>
+            <div class="absolute bottom-2 right-3 text-xs text-slate-400">30d</div>
+            <div class="absolute left-2 top-2 text-xs text-slate-400">300k</div>
+            <div class="absolute left-2 top-1/2 -translate-y-1/2 text-xs text-slate-400">150k</div>
+            <div class="absolute bottom-2 left-2 text-xs text-slate-400">0</div>
+          </div>
+        </div>
+      </article>
+
+      <article class="rounded-3xl border border-slate-200 bg-white p-5">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">ทางลัด</h2>
+            <p class="mt-0.5 text-xs text-slate-500">ไปยังเครื่องมือหลักของ operator console</p>
+          </div>
+        </div>
+        <div class="mt-4 grid grid-cols-2 gap-3">
+          {recentUploadCards.map((item) => (
+            <a
+              href={item.view}
+              class="overflow-hidden rounded-3xl border border-slate-200 bg-white p-3 transition hover:border-slate-300 hover:shadow-[0_8px_30px_rgba(15,23,42,0.06)]"
+            >
+              <p class="text-sm font-semibold text-slate-900">{item.label}</p>
+              <p class="mt-1 text-[11px] text-slate-500">{item.desc}</p>
+              <p class="mt-3 text-[11px] font-mono text-slate-400">{item.view}</p>
+            </a>
+          ))}
+        </div>
+      </article>
+    </section>
+
+    <article class="rounded-3xl border border-slate-200 bg-white p-5">
+      <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h2 class="text-base font-semibold text-slate-900">Campaigns</h2>
+          <p class="mt-0.5 text-xs text-slate-500">รายการ pipeline ที่ระบบดูแลอยู่ในตอนนี้</p>
+        </div>
+        <div class="flex flex-1 items-center justify-end gap-2">
+          <input class="field-input max-w-xs" placeholder="ค้นหา campaign..." />
+          <button class="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-600 hover:bg-slate-50">Filter</button>
+          <button class="rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800">+ New campaign</button>
+        </div>
+      </div>
+      <div class="overflow-hidden rounded-3xl border border-slate-200">
+        <div class="overflow-auto">
+          <table class="min-w-full divide-y divide-slate-200 text-sm">
+            <thead class="bg-slate-50 text-left text-slate-400">
+              <tr>
+                {['Campaign name', 'Status', 'Platforms', 'Mode', 'Source', 'Submissions', 'Paid', 'Budget'].map((head) => (
+                  <th class="px-4 py-3 font-medium">{head}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100 bg-white">
+              {campaignRows.map((row) => (
+                <tr>
+                  <td class="px-4 py-3 font-medium text-slate-900">{row.name}</td>
+                  <td class="px-4 py-3">
+                    <span
+                      class:list={[
+                        'rounded-full px-2.5 py-1 text-[11px] font-bold',
+                        row.status === 'Live' && 'bg-emerald-50 text-emerald-700',
+                        row.status === 'Paused' && 'bg-amber-50 text-amber-700',
+                        row.status === 'Draft' && 'bg-slate-100 text-slate-600',
+                      ]}
+                    >{row.status}</span>
+                  </td>
+                  <td class="px-4 py-3 text-slate-500">{row.platform}</td>
+                  <td class="px-4 py-3 font-medium text-emerald-600">{row.payRate}</td>
+                  <td class="px-4 py-3 text-slate-500">{row.creators}</td>
+                  <td class="px-4 py-3 text-slate-500">{row.submissions}</td>
+                  <td class="px-4 py-3 text-slate-700">{row.paid}</td>
+                  <td class="px-4 py-3 text-slate-700">{row.budget}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </article>
+  </div>
+</Layout>

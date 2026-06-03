@@ -1,7 +1,8 @@
 // Content script — bridges dashboard /feed page ↔ extension background.
 //
 // Runs on:
-//   - https://dashboard.oomnn.com/* (production)
+//   - https://dashboard.pubilo.com/* (production)
+//   - https://dashboard.oomnn.com/* (legacy, still served during pubilo cutover)
 //   - https://ads-manager-dashboard.yokthanwa1993-bc9.workers.dev/* (workers.dev preview)
 //
 // Protocol (all via window.postMessage on the dashboard origin):

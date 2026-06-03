@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import PagePostsPanel from '../components/PagePostsPanel.svelte'
+---
+
+<Layout
+  title="โพสต์เพจ"
+  subtitle="คลิปที่โพสต์ขึ้นเพจแล้ว · /api/dashboard/facebook-page-videos"
+  headerBadge="page-posts"
+  active="page-posts"
+>
+  <PagePostsPanel client:load />
+</Layout>

@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import CampaignsPanel from '../components/CampaignsPanel.svelte'
+---
+
+<Layout
+  title="Campaigns"
+  subtitle="Real-time จาก Facebook Ads Manager · /api/dashboard/campaigns"
+  headerBadge="campaigns"
+  active="running"
+>
+  <CampaignsPanel client:load />
+</Layout>

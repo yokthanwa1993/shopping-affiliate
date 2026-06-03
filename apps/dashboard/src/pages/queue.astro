@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import AdQueuePanel from '../components/AdQueuePanel.svelte'
+---
+
+<Layout
+  title="คิวสร้างแอด"
+  subtitle="คิวงานสร้างแอด · /api/dashboard/ad-queue/list"
+  headerBadge="queue"
+  active="queue"
+>
+  <AdQueuePanel client:load />
+</Layout>

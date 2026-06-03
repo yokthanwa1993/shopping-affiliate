@@ -191,6 +191,12 @@ function isTruthyFlag(value) {
   return str === '1' || str === 'true' || str === 'yes' || str === 'on';
 }
 
+function isExplicitFalseFlag(value) {
+  if (value === false) return true;
+  const str = String(value == null ? '' : value).trim().toLowerCase();
+  return str === '0' || str === 'false' || str === 'no' || str === 'off';
+}
+
 // remember defaults to true: missing/null/empty/unrecognized => true.
 // Only explicit false-y forms (false, '0', 'false', 'no', 'off') disable saving.
 function parseRememberFlag(value) {
@@ -772,11 +778,33 @@ async function handleLogin(query) {
   const account = sanitizeAccount(query.account);
   const profileDir = ensureProfileDir(platform, account);
   const target = platform === 'shopee' ? SHOPEE_LOGIN_URL : LAZADA_LOGIN_URL;
-  if (isTruthyFlag(query.autofill) || isTruthyFlag(query.autoFill)) {
+  const explicitAutofill = isTruthyFlag(query.autofill) || isTruthyFlag(query.autoFill);
+  const autofillOptOut = isExplicitFalseFlag(query.autofill)
+    || isExplicitFalseFlag(query.autoFill)
+    || isTruthyFlag(query.noAutofill)
+    || isTruthyFlag(query.noAutoFill);
+  if (!autofillOptOut) {
     const autofillResult = await attemptReauthWithStoredCredential(platform, account, {
       headless: false,
       forceNew: false,
     });
+    if (!explicitAutofill && (
+      autofillResult.reason === 'keychain_credential_not_found'
+      || autofillResult.reason === 'keychain_unavailable'
+      || autofillResult.reason === 'keychain_lookup_failed'
+    )) {
+      const { page } = await browser.getPage(platform, account, { headless: false, forceVisible: true });
+      await page.bringToFront().catch(() => {});
+      await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      return {
+        status: 'login_window_opened',
+        platform,
+        account,
+        profileDir,
+        loginUrl: target,
+        backend: browser.backendInfo(),
+      };
+    }
     // Custom-link probe truth is the load-bearing signal: origin/dashboard
     // alone can lie when Shopee redirects protected routes to /buyer/login.
     const sessionValid = !!(autofillResult.ok && autofillResult.sessionValid);
@@ -1354,7 +1382,7 @@ function indexHtml() {
     '<ul>',
     '<li><code>GET /?url=SHOPEE_OR_LAZADA_URL&account=X&sub1=Y</code> (auto-detect)</li>',
     '<li><code>GET /shorten?url=...</code> (same contract)</li>',
-    '<li><code>GET /login</code> (credential-only HTML form; Accept: application/json or <code>?json=1</code> keeps the legacy JSON window-open behavior; add <code>&amp;autofill=1</code> to read Keychain and attempt autofill without returning the secret)</li>',
+    '<li><code>GET /login</code> (credential-only HTML form; Accept: application/json or <code>?json=1</code> opens the account browser and attempts stored Keychain autofill by default when credentials exist; add <code>&amp;noAutofill=1</code> or <code>&amp;autofill=0</code> for manual mode; secrets are never returned)</li>',
     '<li><code>GET /login/shopee</code> · <code>GET /login/lazada</code> (302 compatibility redirects to <code>/login?platform=shopee|lazada</code> — not primary)</li>',
     '<li><code>GET /login-ui?account=X&url=Y</code> (legacy interactive login + shorten form; url required; account still passed as a hidden field for backward compat)</li>',
     '<li><code>POST /api/login</code> (credential-save-only JSON — does NOT open a browser or attempt login; <code>account</code> optional, derived from <code>username</code> when blank; <code>remember</code> defaults to true and persists in macOS Keychain; <code>remember:false</code> returns credential.status=credential_save_skipped)</li>',
@@ -2024,6 +2052,22 @@ function createServer() {
       const treatAsConversionReport = pathname === '/conversion-report'
         || (pathname === '/' && conversionReport.isConversionReportHost(hostHeader));
 
+      if (pathname === '/daily-income-report' || pathname === '/income-report') {
+        if (req.method !== 'GET') {
+          res.setHeader('Allow', 'GET');
+          return sendJson(res, 405, { error: 'Method not allowed (use GET)' });
+        }
+        try {
+          const payload = await conversionReport.handleDailyIncomeReport(query);
+          return sendJson(res, 200, payload);
+        } catch (err) {
+          if (err && err.publicPayload) {
+            return sendJson(res, err.statusCode || 400, err.publicPayload);
+          }
+          throw err;
+        }
+      }
+
       if (treatAsConversionReport) {
         if (req.method !== 'GET') {
           res.setHeader('Allow', 'GET');
@@ -2086,6 +2130,7 @@ module.exports = {
   handleClickReport: clickReport.handleClickReport,
   isClickReportHost: clickReport.isClickReportHost,
   handleConversionReport: conversionReport.handleConversionReport,
+  handleDailyIncomeReport: conversionReport.handleDailyIncomeReport,
   isConversionReportHost: conversionReport.isConversionReportHost,
   handleLogin,
   handleLoginAndShorten,

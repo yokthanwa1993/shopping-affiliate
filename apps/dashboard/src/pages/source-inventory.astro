@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import SourceInventoryPanel from '../components/SourceInventoryPanel.svelte'
+---
+
+<Layout
+  title="คลังต้นฉบับ"
+  subtitle="วิดีโอจาก LINE Mini App · /worker-api/api/inbox"
+  headerBadge="inbox"
+  active="inbox"
+>
+  <SourceInventoryPanel client:load />
+</Layout>

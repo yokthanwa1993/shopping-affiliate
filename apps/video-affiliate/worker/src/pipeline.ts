@@ -1,11 +1,13 @@
 /**
- * Dubbing Pipeline — 100% Cloudflare Native
- * ffmpeg merge รันใน Cloudflare Container
+ * Dubbing Pipeline — Cloudflare Worker side
+ * ffmpeg merge ทำงานบน external merge service (MERGE_SERVICE_URL)
+ * และจะ fallback กลับไปยัง Cloudflare Container เดิม (env.MERGE_CONTAINER)
+ * ถ้า MERGE_SERVICE_URL ไม่ได้ตั้งค่าไว้ — เพื่อให้ rollback ได้โดยไม่ต้องแก้ code
  */
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-05-23.05'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-02.avatar-colorkey.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
@@ -168,6 +170,7 @@ export type Env = {
     DB: D1Database
     BUCKET: R2Bucket // Raw bucket, use with BotBucket if needed
     MERGE_CONTAINER: DurableObjectNamespace
+    MERGE_SERVICE_URL?: string
     BROWSERSAVING_SERVICE?: Fetcher
     TELEGRAM_BOT_TOKEN: string
     WORKER_URL?: string
@@ -190,7 +193,6 @@ export type Env = {
     TAG_SYNC_PUSH_SECRET?: string
     LINE_CHANNEL_SECRET?: string
     LINE_CHANNEL_ACCESS_TOKEN?: string
-    GOOGLE_API_KEY?: string
 }
 
 async function ensureNamespaceSettingsTable(db: D1Database) {
@@ -449,6 +451,37 @@ function resolvePipelineSourceUrl(workerUrl: string, botId: string, videoUrl: st
     return normalizedUrl
 }
 
+type MergeServiceFetcher = {
+    fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+    buildUrl: (path: string) => string
+}
+
+function getMergeServiceFetcher(env: Pick<Env, 'MERGE_CONTAINER' | 'MERGE_SERVICE_URL'>): MergeServiceFetcher {
+    const baseUrl = String(env.MERGE_SERVICE_URL || '').trim().replace(/\/+$/, '')
+    if (baseUrl) {
+        return {
+            fetcher: (input, init) => fetch(input, init),
+            buildUrl: (path) => {
+                if (!path.startsWith('/')) {
+                    throw new Error(`merge_service_invalid_path: ${path}`)
+                }
+                return `${baseUrl}${path}`
+            },
+        }
+    }
+    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
+    const containerStub = env.MERGE_CONTAINER.get(containerId)
+    return {
+        fetcher: containerStub.fetch.bind(containerStub),
+        buildUrl: (path) => {
+            if (!path.startsWith('/')) {
+                throw new Error(`merge_service_invalid_path: ${path}`)
+            }
+            return `http://container${path}`
+        },
+    }
+}
+
 async function fetchWithTimeout(
     fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
     input: RequestInfo | URL,
@@ -608,14 +641,6 @@ export async function setVoicePromptTemplate(db: D1Database, namespaceId: string
     return { prompt: normalized, source: 'custom' as const }
 }
 
-async function getNamespaceGeminiApiKey(db: D1Database, namespaceId: string): Promise<string> {
-    await ensureNamespaceSettingsTable(db)
-    const row = await db.prepare(
-        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
-    ).bind(namespaceId, GEMINI_API_KEY_SETTING_KEY).first() as { value?: string } | null
-    return String(row?.value || '').trim()
-}
-
 function normalizeGeminiApiKeys(rawKeys: unknown): string[] {
     const source = Array.isArray(rawKeys)
         ? rawKeys
@@ -635,10 +660,6 @@ function normalizeGeminiApiKeys(rawKeys: unknown): string[] {
     return out
 }
 
-function getEnvGeminiApiKeys(env: Pick<Env, 'GOOGLE_API_KEY'>): string[] {
-    return normalizeGeminiApiKeys([String(env.GOOGLE_API_KEY || '').trim()])
-}
-
 async function getLegacySystemGeminiApiKeys(db: D1Database): Promise<string[]> {
     await ensureNamespaceSettingsTable(db)
     const rows = await db.prepare(
@@ -653,27 +674,6 @@ async function getLegacySystemGeminiApiKeys(db: D1Database): Promise<string[]> {
          ORDER BY datetime(ns.updated_at) DESC, datetime(ns.created_at) DESC`
     ).bind(GEMINI_API_KEY_SETTING_KEY).all() as { results?: Array<{ value?: string }> }
     return normalizeGeminiApiKeys((rows.results || []).map((row) => row?.value || ''))
-}
-
-async function getNamespaceGeminiApiKeys(db: D1Database, namespaceId: string): Promise<string[]> {
-    await ensureNamespaceSettingsTable(db)
-    const normalizedNamespaceId = String(namespaceId || '').trim()
-    if (!normalizedNamespaceId) return []
-
-    const multiRow = await db.prepare(
-        'SELECT value FROM namespace_settings WHERE namespace_id = ? AND key = ?'
-    ).bind(normalizedNamespaceId, GEMINI_API_KEYS_SETTING_KEY).first() as { value?: string } | null
-    let parsed: unknown = []
-    try {
-        parsed = JSON.parse(String(multiRow?.value || '[]'))
-    } catch {
-        parsed = []
-    }
-    const multiKeys = normalizeGeminiApiKeys(parsed)
-    if (multiKeys.length > 0) return multiKeys
-
-    const legacyKey = await getNamespaceGeminiApiKey(db, normalizedNamespaceId)
-    return normalizeGeminiApiKeys(legacyKey ? [legacyKey] : [])
 }
 
 export async function getSystemGeminiApiKeys(db: D1Database): Promise<string[]> {
@@ -796,25 +796,6 @@ export async function recordGeminiApiKeyHealth(db: D1Database, params: {
     return next
 }
 
-export async function filterUsableGeminiApiKeys(db: D1Database, keys: string[]): Promise<{ usable: string[]; skipped: GeminiApiKeyHealthRecord[] }> {
-    const normalized = normalizeGeminiApiKeys(keys)
-    if (!normalized.length) return { usable: [], skipped: [] }
-    const health = await loadGeminiApiKeyHealth(db).catch(() => ({} as Record<string, GeminiApiKeyHealthRecord>))
-    const usable: string[] = []
-    const skipped: GeminiApiKeyHealthRecord[] = []
-    for (let index = 0; index < normalized.length; index += 1) {
-        const key = normalized[index]
-        const hash = await hashGeminiApiKey(key)
-        const record = health[hash]
-        if (isGeminiApiKeyHealthDisabled(record)) {
-            skipped.push({ ...record, masked_key: record.masked_key || maskGeminiApiKey(key), slot: record.slot || index + 1 })
-            continue
-        }
-        usable.push(key)
-    }
-    return { usable, skipped }
-}
-
 export async function getGeminiApiKeyHealthSummary(db: D1Database): Promise<{ keys: Array<GeminiApiKeyHealthRecord & { active: boolean }>; active_count: number; disabled_count: number }> {
     const systemKeys = await getSystemGeminiApiKeys(db).catch(() => [])
     const health = await loadGeminiApiKeyHealth(db).catch(() => ({} as Record<string, GeminiApiKeyHealthRecord>))
@@ -858,11 +839,10 @@ export async function sendTelegram(token: string, method: string, body: Record<s
 // ==================== XHS Download ====================
 
 async function resolveXhsVideo(url: string, env: Env): Promise<string | null> {
-    // เรียก Container เพื่อ resolve XHS URL
-    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-    const containerStub = env.MERGE_CONTAINER.get(containerId)
+    // เรียก merge service เพื่อ resolve XHS URL
+    const { fetcher, buildUrl } = getMergeServiceFetcher(env)
 
-    const resp = await containerStub.fetch('http://container/xhs/resolve', {
+    const resp = await fetcher(buildUrl('/xhs/resolve'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
@@ -1004,29 +984,15 @@ export async function runPipeline(
     } catch (e) {
         console.log(`[PIPELINE] DB lookup failed, using default token: ${e}`)
     }
-    const namespaceApiKeys = await getNamespaceGeminiApiKeys(env.DB, botId).catch(() => [])
-    const systemApiKeys = await getSystemGeminiApiKeys(env.DB).catch(() => [])
-    const envApiKeys = getEnvGeminiApiKeys(env)
-    // The AI API Keys screen manages the global/system Gemini key used by every namespace.
-    // Use exactly one source for a run: system key first, env secret fallback, legacy namespace
-    // only if no central key exists. Do not merge namespace/env keys after a healthy central
-    // key, otherwise a later Gemini step can fail on a stale fallback and show API_KEY_INVALID
-    // even though the central key checked OK.
-    const keySource = systemApiKeys.length > 0 ? 'system' : envApiKeys.length > 0 ? 'env' : 'namespace'
-    const rawApiKeys = normalizeGeminiApiKeys(
-        keySource === 'system' ? systemApiKeys : keySource === 'env' ? envApiKeys : namespaceApiKeys,
-    )
-    const filteredApiKeys = await filterUsableGeminiApiKeys(env.DB, rawApiKeys).catch(() => ({ usable: rawApiKeys, skipped: [] }))
-    const apiKeys = filteredApiKeys.usable
-    if (rawApiKeys.length > 0 && filteredApiKeys.skipped.length > 0) {
-        console.warn(`[PIPELINE] skipped disabled Gemini keys: ${filteredApiKeys.skipped.map((row) => `${row.masked_key || 'unknown'}:${row.status}`).join(', ')}`)
+    const vertexTtsEndpoint = String(env.VERTEX_TTS_ENDPOINT || '').trim() || 'https://aiplatform.googleapis.com'
+    const vertexTtsProjectId = String(env.VERTEX_TTS_PROJECT_ID || '').trim() || undefined
+    const vertexTtsLocation = String(env.VERTEX_TTS_LOCATION || '').trim() || 'global'
+    const vertexTtsModel = String(env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts'
+    const vertexTtsServiceAccountJson = String((env as Env & { VERTEX_TTS_SERVICE_ACCOUNT_JSON?: string }).VERTEX_TTS_SERVICE_ACCOUNT_JSON || '').trim()
+    if (vertexTtsServiceAccountJson.length === 0) {
+        throw new Error('ยังไม่ได้ตั้ง Vertex service account สำหรับ Vertex Gemini processing')
     }
-    if (apiKeys.length === 0) {
-        throw new Error(rawApiKeys.length > 0
-            ? 'Gemini API key ทั้งหมดถูกพักใช้งานชั่วคราวจาก quota/rate limit — กรุณาเปลี่ยน key หรือรอ disabled_until'
-            : 'ยังไม่ได้ตั้ง Gemini API key กลางของระบบ')
-    }
-    console.log(`[PIPELINE] Gemini key pool source=${keySource} namespace=${namespaceApiKeys.length} system=${systemApiKeys.length} env=${envApiKeys.length} selected=${rawApiKeys.length} usable=${apiKeys.length} skipped=${filteredApiKeys.skipped.length}`)
+    console.log('[PIPELINE] AI generation auth=vertex_service_account provider=Vertex Gemini')
     const model = env.GEMINI_MODEL || 'gemini-3-flash-preview'
     const voiceSettings = await getNamespaceVoiceSettings(env.DB, botId)
         .catch(() => ({
@@ -1051,26 +1017,23 @@ export async function runPipeline(
         const workerUrl = String(env.WORKER_URL || '').trim() || 'https://video-affiliate-worker.onlyy-gor.workers.dev'
         directVideoUrl = await ensurePipelineSourceUrlAvailable(env, workerUrl, botId, videoId, directVideoUrl)
 
-        // ส่งงานทั้งหมดไป Container /pipeline — รัน background ไม่มี time limit
-        const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-        const containerStub = env.MERGE_CONTAINER.get(containerId)
+        // ส่งงานทั้งหมดไป merge service /pipeline — รัน background ไม่มี time limit
+        const { fetcher: mergeFetcher, buildUrl: mergeBuildUrl } = getMergeServiceFetcher(env)
 
         const payload = JSON.stringify({
             token,
             video_url: directVideoUrl,
             chat_id: chatId,
             msg_id: statusMsgId,
-            api_key: apiKeys[0],
-            api_keys: apiKeys,
             model,
-            vertex_tts_endpoint: String(env.VERTEX_TTS_ENDPOINT || '').trim() || 'https://aiplatform.googleapis.com',
-            vertex_tts_project_id: String(env.VERTEX_TTS_PROJECT_ID || '').trim() || undefined,
-            vertex_tts_location: String(env.VERTEX_TTS_LOCATION || '').trim() || 'global',
-            vertex_tts_model: String(env.VERTEX_TTS_MODEL || '').trim() || 'gemini-2.5-flash-preview-tts',
+            vertex_tts_endpoint: vertexTtsEndpoint,
+            vertex_tts_project_id: vertexTtsProjectId,
+            vertex_tts_location: vertexTtsLocation,
+            vertex_tts_model: vertexTtsModel,
             // Worker secrets are not automatically available inside the Cloudflare Container.
             // Pass the service-account JSON over the internal Worker -> Container request only;
             // never log or expose it in API/UI responses.
-            vertex_tts_service_account_json: String((env as Env & { VERTEX_TTS_SERVICE_ACCOUNT_JSON?: string }).VERTEX_TTS_SERVICE_ACCOUNT_JSON || '').trim() || undefined,
+            vertex_tts_service_account_json: vertexTtsServiceAccountJson || undefined,
             script_prompt: voiceSettings.scriptPrompt,
             voice_name: voiceSettings.profile.voice_name,
             tts_prompt_template: voiceSettings.ttsPromptTemplate,
@@ -1089,13 +1052,13 @@ export async function runPipeline(
             lazada_link: String(lazadaLink || '').trim() || undefined,
         })
 
-        // Health check ก่อน — รอ Container boot สูงสุด 3 ครั้ง × 3 วินาที = 9 วินาที
+        // Health check ก่อน — รอ merge service พร้อมสูงสุด 3 ครั้ง × 3 วินาที = 9 วินาที
         let containerReady = false
         for (let i = 0; i < 3; i++) {
             try {
                 const hResp = await fetchWithTimeout(
-                    containerStub.fetch.bind(containerStub),
-                    'http://container/health',
+                    mergeFetcher,
+                    mergeBuildUrl('/health'),
                     undefined,
                     5000,
                     'container_health',
@@ -1122,7 +1085,7 @@ export async function runPipeline(
                 if (msg.includes('Container version mismatch') || msg.includes('Container health response invalid')) {
                     throw err
                 }
-                // Container ยัง boot
+                // merge service ยังไม่พร้อม
             }
             await new Promise(r => setTimeout(r, 3000))
         }
@@ -1131,10 +1094,10 @@ export async function runPipeline(
             throw new Error('⏳ Container กำลัง boot ใหม่ กรุณาลองส่งลิงก์อีกครั้งใน 30 วินาที')
         }
 
-        // Dispatch pipeline
+        // Dispatch pipeline ไปที่ merge service
         const resp = await fetchWithTimeout(
-            containerStub.fetch.bind(containerStub),
-            'http://container/pipeline',
+            mergeFetcher,
+            mergeBuildUrl('/pipeline'),
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1149,7 +1112,7 @@ export async function runPipeline(
             throw new Error(`Container pipeline error ${resp.status}: ${body.slice(0, 100)}`)
         }
 
-        console.log(`[PIPELINE] Dispatched to container for chat_id=${chatId}`)
+        console.log(`[PIPELINE] Dispatched to merge service for chat_id=${chatId}`)
 
     } catch (error) {
         const errMsg = error instanceof Error ? error.message : String(error)
@@ -1378,19 +1341,19 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
 }
 
 export async function warmPipelineContainer(env: Env): Promise<void> {
-    const containerId = env.MERGE_CONTAINER.idFromName(MERGE_CONTAINER_INSTANCE_NAME)
-    const containerStub = env.MERGE_CONTAINER.get(containerId)
+    // Warm merge service (external URL or Cloudflare Container fallback)
+    const { fetcher, buildUrl } = getMergeServiceFetcher(env)
     try {
         const resp = await fetchWithTimeout(
-            containerStub.fetch.bind(containerStub),
-            'http://container/health',
+            fetcher,
+            buildUrl('/health'),
             undefined,
             5000,
             'container_warmup',
         )
         const body = await resp.text().catch(() => '')
         if (resp.ok && !body.startsWith('<')) {
-            console.log('[PIPELINE] Warmed processing container')
+            console.log('[PIPELINE] Warmed merge service')
         } else {
             console.log(`[PIPELINE] Warmup response status=${resp.status}`)
         }

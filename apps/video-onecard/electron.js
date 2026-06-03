@@ -24,6 +24,9 @@ function ensureMacBackgroundOnly() {
 }
 
 ensureMacBackgroundOnly();
+if (process.env.ONECARD_REMOTE_DEBUG_PORT) {
+  try { app.commandLine.appendSwitch("remote-debugging-port", String(process.env.ONECARD_REMOTE_DEBUG_PORT)); } catch {}
+}
 
 const LOCAL_PORT = 3847;
 const TUNNEL_NAME = "onecard-wwoom";
@@ -266,6 +269,16 @@ function startServer() {
       // Return session info
       const cookies = await mainWindow.webContents.session.cookies.get({ domain: ".facebook.com" });
       return res.end(JSON.stringify({ ok: true, accessToken, fbDtsg, cookies: cookies.length }));
+    }
+
+    if (p === "/debug-eval") {
+      if (!fs.existsSync("/tmp/onecard-debug-eval-enabled")) { res.writeHead(403); return res.end(JSON.stringify({ ok: false, error: "debug eval disabled" })); }
+      try {
+        const code = String(params.code || "");
+        if (!code) { res.writeHead(400); return res.end(JSON.stringify({ ok: false, error: "Missing: code" })); }
+        const value = await mainWindow.webContents.executeJavaScript(code, true);
+        return res.end(JSON.stringify({ ok: true, value }));
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
     }
 
     // /graph — local maintenance helper: proxy Graph API through Electron session

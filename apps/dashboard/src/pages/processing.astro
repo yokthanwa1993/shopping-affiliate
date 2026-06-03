@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import ProcessingPanel from '../components/ProcessingPanel.svelte'
+---
+
+<Layout
+  title="ประมวลผลวิดีโอ"
+  subtitle="สถานะ pipeline แปลงคลิปจาก LINE Mini App · /worker-api/api/processing"
+  headerBadge="processing"
+  active="processing"
+>
+  <ProcessingPanel client:load />
+</Layout>

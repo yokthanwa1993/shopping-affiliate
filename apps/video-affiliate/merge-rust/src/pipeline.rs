@@ -1,25 +1,40 @@
 use crate::version::PIPELINE_ENGINE_VERSION;
-use axum::{Json, http::StatusCode};
+use axum::{
+    Json,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::Path;
+use std::process::Output;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tempfile::tempdir;
 use tokio::fs;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
-const FAST_MODE_DEFAULT_SKIP_GEMINI_AUDIO_SYNC: bool = true;
-const GEMINI_WAIT_MAX_POLLS: usize = 20;
-const GEMINI_WAIT_POLL_SECONDS: u64 = 2;
 const GEMINI_SAFE_TRANSCODE_TIMEOUT_SECS: u64 = 300;
 const GEMINI_SAFE_TRANSCODE_MIN_BYTES: usize = 1024;
 const GEMINI_INLINE_VIDEO_MAX_BYTES: usize = 14 * 1024 * 1024;
 const GEMINI_PREFLIGHT_MIN_DURATION_SECS: f64 = 0.3;
 const GEMINI_PREFLIGHT_MAX_DURATION_SECS: f64 = 1800.0;
+const VERTEX_GENERATION_INLINE_MAX_BYTES: usize = GEMINI_INLINE_VIDEO_MAX_BYTES;
+const VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS: u64 = 120;
+const GEMINI_STRICT_INLINE_TARGET_BYTES: usize = VERTEX_GENERATION_INLINE_MAX_BYTES * 85 / 100;
+const GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES: usize = 256 * 1024;
+const GEMINI_STRICT_MAX_SIDE: u32 = 360;
+const GEMINI_STRICT_FPS: u32 = 15;
+const GEMINI_STRICT_MIN_VIDEO_BITRATE_KBPS: u32 = 40;
+const GEMINI_STRICT_MAX_VIDEO_BITRATE_KBPS: u32 = 360;
+const SUBTITLE_BURN_TIMEOUT_SECS: u64 = 300;
 const VERTEX_TTS_DEFAULT_ENDPOINT: &str = "https://aiplatform.googleapis.com";
 const VERTEX_TTS_DEFAULT_LOCATION: &str = "global";
 const VERTEX_TTS_DEFAULT_MODEL: &str = "gemini-2.5-flash-preview-tts";
@@ -30,8 +45,6 @@ pub struct PipelineRequest {
     pub video_url: String,
     pub chat_id: u64,
     pub msg_id: Option<u64>,
-    pub api_key: String,
-    pub api_keys: Option<Vec<String>>,
     pub model: Option<String>,
     pub r2_public_url: String,
     pub worker_url: String,
@@ -58,53 +71,33 @@ pub struct PipelineResponse {
     pub status: String,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+pub struct AvatarComposeRequest {
+    #[serde(alias = "base_video_url", alias = "baseVideoUrl")]
+    pub video_url: String,
+    #[serde(alias = "avatarVideoUrl")]
+    pub avatar_video_url: String,
+    #[serde(
+        default = "default_avatar_chromakey_similarity",
+        alias = "chromakeySimilarity"
+    )]
+    pub chromakey_similarity: f64,
+    #[serde(default = "default_avatar_chromakey_blend", alias = "chromakeyBlend")]
+    pub chromakey_blend: f64,
+}
+
+#[derive(Serialize)]
+pub struct AvatarComposeStartResponse {
+    pub status: String,
+    pub job_id: String,
+}
+
 #[derive(Clone, Debug)]
 struct ScriptPack {
     script: String,
     title: String,
     category: String,
     subtitle_lines: Vec<String>,
-}
-
-fn normalize_gemini_api_keys(keys: Option<&Vec<String>>, fallback: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    if let Some(raw_keys) = keys {
-        for raw in raw_keys {
-            let key = raw.trim().to_string();
-            if key.is_empty() || seen.contains(&key) {
-                continue;
-            }
-            seen.insert(key.clone());
-            out.push(key);
-            if out.len() >= 5 {
-                break;
-            }
-        }
-    }
-
-    let fallback = fallback.trim().to_string();
-    if out.is_empty() && !fallback.is_empty() {
-        out.push(fallback);
-    }
-
-    out
-}
-
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn should_enable_gemini_audio_sync() -> bool {
-    std::env::var("VIDEO_AFFILIATE_ENABLE_GEMINI_AUDIO_SYNC")
-        .ok()
-        .and_then(|v| parse_env_bool(&v))
-        .unwrap_or(!FAST_MODE_DEFAULT_SKIP_GEMINI_AUDIO_SYNC)
 }
 
 // ==================== HTTP Helpers ====================
@@ -284,108 +277,7 @@ async fn update_step(
     .await;
 }
 
-// ==================== Gemini API ====================
-
-async fn gemini_upload_bytes(
-    file_bytes: &[u8],
-    mime_type: &str,
-    api_key: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=media&key={}",
-        api_key
-    );
-    let client = Client::new();
-    let res = client
-        .post(&url)
-        .header("Content-Type", mime_type)
-        .header("X-Goog-Upload-Protocol", "raw")
-        .body(file_bytes.to_vec())
-        .send()
-        .await?;
-
-    let json: Value = res.json().await?;
-    if let Some(uri) = json
-        .get("file")
-        .and_then(|f| f.get("uri"))
-        .and_then(|u| u.as_str())
-    {
-        Ok(uri.to_string())
-    } else {
-        Err(format!("Upload failed: {}", json).into())
-    }
-}
-
-fn extract_gemini_file_state(json: &Value) -> Option<String> {
-    json.get("state")
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .or_else(|| {
-            json.get("state")
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-        })
-        .or_else(|| {
-            json.get("file")
-                .and_then(|v| v.get("state"))
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-        })
-        .or_else(|| {
-            json.get("file")
-                .and_then(|v| v.get("state"))
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-        })
-}
-
-fn is_gemini_file_not_ready_error(status: u16, err: &str) -> bool {
-    status == 400
-        && (err.contains("FAILED_PRECONDITION")
-            || err.contains("not in an ACTIVE state")
-            || err.contains("usage is not allowed"))
-}
-
-fn is_gemini_file_processing_failed_error(err: &str) -> bool {
-    let normalized = err.to_ascii_lowercase();
-    normalized.contains("gemini file processing failed")
-        || (normalized.contains("\"state\":\"failed\"")
-            && normalized.contains("file failed to be processed"))
-        || (normalized.contains("state: failed")
-            && normalized.contains("file failed to be processed"))
-}
-
-fn extract_gemini_failed_summary(json: &Value) -> String {
-    let error_node = json
-        .get("error")
-        .or_else(|| json.get("file").and_then(|f| f.get("error")));
-    let code = error_node
-        .and_then(|e| e.get("code"))
-        .and_then(|c| c.as_i64());
-    let message = error_node
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let name = json
-        .get("name")
-        .or_else(|| json.get("file").and_then(|f| f.get("name")))
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(c) = code {
-        parts.push(format!("code {}", c));
-    }
-    if !message.is_empty() {
-        parts.push(message);
-    }
-    if !name.is_empty() {
-        parts.push(format!("file={}", name));
-    }
-    if parts.is_empty() {
-        "no error detail returned".to_string()
-    } else {
-        parts.join(" — ")
-    }
-}
+// ==================== Media processing helpers ====================
 
 fn pipeline_error_category(err: &str) -> &'static str {
     let normalized = err.to_ascii_lowercase();
@@ -439,16 +331,49 @@ impl GeminiTranscodeProfile {
     fn max_side(&self) -> u32 {
         match self {
             GeminiTranscodeProfile::Safe => 720,
-            GeminiTranscodeProfile::Strict => 480,
+            GeminiTranscodeProfile::Strict => GEMINI_STRICT_MAX_SIDE,
         }
     }
 
     fn fps(&self) -> u32 {
-        24
+        match self {
+            GeminiTranscodeProfile::Safe => 24,
+            GeminiTranscodeProfile::Strict => GEMINI_STRICT_FPS,
+        }
     }
 
     fn video_only(&self) -> bool {
         matches!(self, GeminiTranscodeProfile::Strict)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GeminiStrictVideoBudget {
+    bitrate_kbps: u32,
+    maxrate_kbps: u32,
+    bufsize_kbps: u32,
+}
+
+fn gemini_strict_video_budget(duration_secs: f64) -> GeminiStrictVideoBudget {
+    let duration_secs = if duration_secs.is_finite() && duration_secs > 0.0 {
+        duration_secs.max(GEMINI_PREFLIGHT_MIN_DURATION_SECS)
+    } else {
+        GEMINI_PREFLIGHT_MAX_DURATION_SECS
+    };
+    let video_budget_bytes = GEMINI_STRICT_INLINE_TARGET_BYTES
+        .saturating_sub(GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES);
+    let bitrate_kbps = ((video_budget_bytes as f64 * 8.0) / duration_secs / 1000.0)
+        .floor()
+        .max(1.0) as u32;
+    let bitrate_kbps = bitrate_kbps.clamp(
+        GEMINI_STRICT_MIN_VIDEO_BITRATE_KBPS,
+        GEMINI_STRICT_MAX_VIDEO_BITRATE_KBPS,
+    );
+
+    GeminiStrictVideoBudget {
+        bitrate_kbps,
+        maxrate_kbps: bitrate_kbps,
+        bufsize_kbps: bitrate_kbps * 2,
     }
 }
 
@@ -467,20 +392,6 @@ impl GeminiUploadVariant {
     }
 }
 
-fn should_retry_gemini_with_strict(variant: GeminiUploadVariant, err: &str) -> bool {
-    variant == GeminiUploadVariant::Safe && is_gemini_file_processing_failed_error(err)
-}
-
-fn should_retry_gemini_with_inline_video(
-    variant: GeminiUploadVariant,
-    err: &str,
-    bytes_len: usize,
-) -> bool {
-    variant == GeminiUploadVariant::Strict
-        && bytes_len <= GEMINI_INLINE_VIDEO_MAX_BYTES
-        && is_gemini_file_processing_failed_error(err)
-}
-
 fn build_gemini_transcode_filter(profile: GeminiTranscodeProfile) -> String {
     let max_side = profile.max_side();
     let fps = profile.fps();
@@ -494,6 +405,159 @@ fn build_gemini_transcode_filter(profile: GeminiTranscodeProfile) -> String {
     )
 }
 
+fn push_ffmpeg_args(args: &mut Vec<String>, values: &[&str]) {
+    args.extend(values.iter().map(|value| value.to_string()));
+}
+
+fn build_flip_processing_input_ffmpeg_args(input_str: &str, output_str: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    push_ffmpeg_args(&mut args, &["-y", "-i", input_str]);
+    push_ffmpeg_args(&mut args, &["-vf", "hflip,format=yuv420p"]);
+    push_ffmpeg_args(&mut args, &["-c:v", "libx264"]);
+    push_ffmpeg_args(&mut args, &["-preset", "fast", "-crf", "20"]);
+    push_ffmpeg_args(&mut args, &["-pix_fmt", "yuv420p"]);
+    push_ffmpeg_args(&mut args, &["-c:a", "aac", "-b:a", "128k"]);
+    push_ffmpeg_args(&mut args, &["-movflags", "+faststart"]);
+    args.push(output_str.to_string());
+    args
+}
+
+async fn create_flipped_processing_input(
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let input_str = input_path
+        .to_str()
+        .ok_or("source_video_path_invalid_for_flip")?;
+    let output_str = output_path
+        .to_str()
+        .ok_or("processing_video_path_invalid_for_flip")?;
+    let args = build_flip_processing_input_ffmpeg_args(input_str, output_str);
+    let output = tokio::time::timeout(
+        Duration::from_secs(300),
+        Command::new("ffmpeg").args(&args).output(),
+    )
+    .await
+    .map_err(|_| "FFmpeg flip timed out (>300s)")??;
+    if let Some(reason) = ffmpeg_nonzero_status_reason(&output) {
+        return Err(format!("FFmpeg flip failed: {}", reason).into());
+    }
+    Ok(())
+}
+
+fn build_gemini_transcode_ffmpeg_args(
+    input_str: &str,
+    output_str: &str,
+    profile: GeminiTranscodeProfile,
+    input_duration_secs: f64,
+) -> Vec<String> {
+    let vf_filter = build_gemini_transcode_filter(profile);
+    let mut args = Vec::new();
+    push_ffmpeg_args(
+        &mut args,
+        &[
+            "-y",
+            "-fflags",
+            "+genpts+igndts",
+            "-i",
+            input_str,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-sn",
+            "-dn",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-vf",
+            vf_filter.as_str(),
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "baseline",
+            "-level",
+            "3.1",
+            "-preset",
+            "medium",
+        ],
+    );
+
+    match profile {
+        GeminiTranscodeProfile::Safe => {
+            push_ffmpeg_args(&mut args, &["-crf", "26"]);
+        }
+        GeminiTranscodeProfile::Strict => {
+            let budget = gemini_strict_video_budget(input_duration_secs);
+            push_ffmpeg_args(&mut args, &["-b:v", &format!("{}k", budget.bitrate_kbps)]);
+            push_ffmpeg_args(
+                &mut args,
+                &["-maxrate", &format!("{}k", budget.maxrate_kbps)],
+            );
+            push_ffmpeg_args(
+                &mut args,
+                &["-bufsize", &format!("{}k", budget.bufsize_kbps)],
+            );
+        }
+    }
+
+    push_ffmpeg_args(
+        &mut args,
+        &[
+            "-bf",
+            "0",
+            "-refs",
+            "1",
+            "-g",
+            "48",
+            "-fps_mode",
+            "cfr",
+            "-tag:v",
+            "avc1",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    );
+
+    if profile.video_only() {
+        push_ffmpeg_args(&mut args, &["-an"]);
+    } else {
+        // Force a clean, mainstream audio track for the primary Gemini upload.
+        push_ffmpeg_args(
+            &mut args,
+            &[
+                "-af",
+                "asetpts=PTS-STARTPTS",
+                "-c:a",
+                "aac",
+                "-ar",
+                "44100",
+                "-ac",
+                "1",
+                "-b:a",
+                "96k",
+                "-async",
+                "1",
+            ],
+        );
+    }
+
+    push_ffmpeg_args(
+        &mut args,
+        &[
+            "-avoid_negative_ts",
+            "make_zero",
+            "-max_muxing_queue_size",
+            "4096",
+            "-movflags",
+            "+faststart",
+            output_str,
+        ],
+    );
+    args
+}
+
 async fn transcode_video_for_gemini_with_profile(
     input_path: &Path,
     output_path: &Path,
@@ -501,86 +565,16 @@ async fn transcode_video_for_gemini_with_profile(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let input_str = input_path.to_str().ok_or("invalid_input_path")?;
     let output_str = output_path.to_str().ok_or("invalid_output_path")?;
-    let vf_filter = build_gemini_transcode_filter(profile);
-
-    let mut args: Vec<&str> = vec![
-        "-y",
-        "-fflags",
-        "+genpts+igndts",
-        "-i",
-        input_str,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-sn",
-        "-dn",
-        "-map_metadata",
-        "-1",
-        "-map_chapters",
-        "-1",
-        "-vf",
-        vf_filter.as_str(),
-        "-c:v",
-        "libx264",
-    ];
-
-    match profile {
-        GeminiTranscodeProfile::Safe | GeminiTranscodeProfile::Strict => {
-            args.extend([
-                "-profile:v",
-                "baseline",
-                "-level",
-                "3.1",
-                "-preset",
-                "medium",
-                "-crf",
-                "26",
-                "-bf",
-                "0",
-                "-refs",
-                "1",
-                "-g",
-                "48",
-                "-fps_mode",
-                "cfr",
-                "-tag:v",
-                "avc1",
-            ]);
-        }
-    }
-
-    args.extend(["-pix_fmt", "yuv420p"]);
-
-    if profile.video_only() {
-        args.extend(["-an"]);
+    let input_duration_secs = if profile == GeminiTranscodeProfile::Strict {
+        preflight_probe_for_gemini(input_path)
+            .await
+            .map_err(|e| format!("{} source preflight failed: {}", profile.label(), e))?
+            .duration
     } else {
-        // Force a clean, mainstream audio track for the primary Gemini upload.
-        args.extend([
-            "-af",
-            "asetpts=PTS-STARTPTS",
-            "-c:a",
-            "aac",
-            "-ar",
-            "44100",
-            "-ac",
-            "1",
-            "-b:a",
-            "96k",
-            "-async",
-            "1",
-        ]);
-    }
-
-    args.extend([
-        "-avoid_negative_ts",
-        "make_zero",
-        "-max_muxing_queue_size",
-        "4096",
-        "-movflags",
-        "+faststart",
-        output_str,
-    ]);
+        0.0
+    };
+    let args =
+        build_gemini_transcode_ffmpeg_args(input_str, output_str, profile, input_duration_secs);
 
     let output =
         match tokio::time::timeout(Duration::from_secs(GEMINI_SAFE_TRANSCODE_TIMEOUT_SECS), {
@@ -614,6 +608,16 @@ async fn transcode_video_for_gemini_with_profile(
     let bytes = fs::read(output_path).await?;
     if bytes.len() < GEMINI_SAFE_TRANSCODE_MIN_BYTES {
         return Err(format!("{} transcode produced an empty video", profile.label()).into());
+    }
+    if profile == GeminiTranscodeProfile::Strict && bytes.len() > VERTEX_GENERATION_INLINE_MAX_BYTES
+    {
+        return Err(format!(
+            "{} transcode exceeded inline limit: {} bytes > {} bytes",
+            profile.label(),
+            bytes.len(),
+            VERTEX_GENERATION_INLINE_MAX_BYTES
+        )
+        .into());
     }
     let preflight = preflight_probe_for_gemini(output_path)
         .await
@@ -1036,146 +1040,6 @@ async fn detect_audio_activity_window(
     }
 }
 
-async fn gemini_srt_from_audio(
-    file_uri: &str,
-    subtitle_lines: &[String],
-    api_key: &str,
-    model: &str,
-    duration: f64,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let lines = normalize_subtitle_lines(subtitle_lines, 20);
-    let lines_text = if lines.is_empty() {
-        "(ไม่มี subtitle_lines)".to_string()
-    } else {
-        lines
-            .iter()
-            .enumerate()
-            .map(|(i, s)| format!("{}. {}", i + 1, s))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let prompt = format!(
-        "ให้ฟังไฟล์เสียงพากย์ภาษาไทยนี้ แล้วสร้างไฟล์ซับ .srt ที่ตรงกับจังหวะเสียงพูดจริง\n\
-         ข้อบังคับ:\n\
-         1) ใช้ข้อความซับจากรายการด้านล่างนี้เท่านั้น (ห้ามเปลี่ยนคำ ห้ามเพิ่ม ห้ามลด)\n\
-         2) คืนผลลัพธ์เป็น SRT ล้วนๆ เท่านั้น (ไม่ต้องมี markdown)\n\
-         3) ถ้ามีช่วงเงียบก่อนเริ่มพูด ให้ timecode แรกเริ่มตามเสียงจริง ไม่ต้องบังคับเริ่มที่ 0 เสมอไป\n\
-         4) จบบรรทัดสุดท้ายไม่เกิน {duration:.3} วินาที\n\
-         5) timecode ต้องเรียงต่อเนื่อง ไม่ย้อนเวลา\n\n\
-         รายการซับที่ต้องใช้:\n\
-         {lines_text}",
-        duration = duration.max(1.0),
-        lines_text = lines_text,
-    );
-
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
-    );
-    let client = Client::new();
-    let payload = json!({
-        "contents": [{
-            "parts": [
-                {"file_data": {"mime_type": "audio/wav", "file_uri": file_uri}},
-                {"text": prompt}
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0.1
-        }
-    });
-
-    let mut resp_text = String::new();
-    let mut last_err = String::new();
-    for attempt in 0..6 {
-        if attempt > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5 * attempt)).await;
-            println!("[PIPELINE] gemini_srt retry #{}", attempt);
-        }
-        let res = client.post(&url).json(&payload).send().await?;
-        if res.status().is_success() {
-            let json: Value = res.json().await?;
-            if let Some(text) = json
-                .get("candidates")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("content"))
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.get(0))
-                .and_then(|p| p.get("text"))
-                .and_then(|t| t.as_str())
-            {
-                resp_text = text.to_string();
-            }
-            break;
-        } else {
-            let status = res.status().as_u16();
-            let err = res.text().await?;
-            last_err = format!("Gemini SRT Error: {}", err);
-            println!(
-                "[PIPELINE] gemini_srt attempt {} failed ({}): {}",
-                attempt, status, err
-            );
-            if is_gemini_file_not_ready_error(status, &err) {
-                continue;
-            }
-            if status != 503 && status != 500 && status != 429 {
-                return Err(last_err.into());
-            }
-        }
-    }
-
-    if resp_text.is_empty() && !last_err.is_empty() {
-        return Err(last_err.into());
-    }
-
-    let extracted = extract_srt_payload(&resp_text);
-    let normalized = normalize_srt_blocks(&extracted, duration.max(1.0));
-    Ok(normalized)
-}
-
-async fn gemini_wait(
-    file_uri: &str,
-    api_key: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let file_name = file_uri.split("/files/").last().unwrap_or("");
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/files/{}?key={}",
-        file_name, api_key
-    );
-    let client = Client::new();
-    let mut last_state = String::new();
-
-    for attempt in 0..36 {
-        // max 3 mins (36 * 5s)
-        if let Ok(res) = client.get(&url).send().await {
-            if let Ok(json) = res.json::<Value>().await {
-                if let Some(state) = extract_gemini_file_state(&json) {
-                    last_state = state.clone();
-                    if state == "ACTIVE" {
-                        return Ok(file_uri.to_string());
-                    }
-                    if state == "FAILED" {
-                        let summary = extract_gemini_failed_summary(&json);
-                        return Err(format!("Gemini file processing failed: {}", summary).into());
-                    }
-                    println!("[PIPELINE] gemini_wait attempt {} state={}", attempt, state);
-                }
-            }
-        }
-        sleep(Duration::from_secs(5)).await;
-    }
-    Err(format!(
-        "Gemini file did not become ACTIVE in time (last_state={})",
-        if last_state.is_empty() {
-            "unknown"
-        } else {
-            &last_state
-        }
-    )
-    .into())
-}
-
 fn render_script_prompt_template(
     template: &str,
     duration: f64,
@@ -1236,42 +1100,6 @@ fn build_script_prompt(
     )
 }
 
-async fn gemini_script(
-    file_uri: &str,
-    api_key: &str,
-    model: &str,
-    duration: f64,
-    user_prompt: Option<&str>,
-) -> Result<ScriptPack, Box<dyn std::error::Error + Send + Sync>> {
-    gemini_script_with_video_part(
-        json!({"file_data": {"mime_type": "video/mp4", "file_uri": file_uri}}),
-        api_key,
-        model,
-        duration,
-        user_prompt,
-        "file",
-    )
-    .await
-}
-
-async fn gemini_script_inline_video(
-    file_bytes: &[u8],
-    api_key: &str,
-    model: &str,
-    duration: f64,
-    user_prompt: Option<&str>,
-) -> Result<ScriptPack, Box<dyn std::error::Error + Send + Sync>> {
-    gemini_script_with_video_part(
-        build_gemini_inline_video_part(file_bytes),
-        api_key,
-        model,
-        duration,
-        user_prompt,
-        "inline-video",
-    )
-    .await
-}
-
 fn build_gemini_inline_video_part(file_bytes: &[u8]) -> Value {
     json!({
         "inlineData": {
@@ -1281,80 +1109,27 @@ fn build_gemini_inline_video_part(file_bytes: &[u8]) -> Value {
     })
 }
 
-async fn gemini_script_with_video_part(
-    video_part: Value,
-    api_key: &str,
-    model: &str,
-    duration: f64,
-    user_prompt: Option<&str>,
-    source_label: &str,
-) -> Result<ScriptPack, Box<dyn std::error::Error + Send + Sync>> {
-    let max_chars = ((duration * 10.0) as i32).min(800);
-    let min_chars = ((duration * 7.0) as i32).max(80);
-
-    let prompt = build_script_prompt(user_prompt, duration, min_chars, max_chars);
-
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
-    );
-    let client = Client::new();
-    let payload = json!({
-        "contents": [{
-            "parts": [
-                video_part,
-                {"text": prompt}
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0.2
+fn build_inline_media_part(file_bytes: &[u8], mime_type: &str) -> Value {
+    json!({
+        "inlineData": {
+            "mimeType": mime_type,
+            "data": BASE64.encode(file_bytes),
         }
-    });
+    })
+}
 
-    let mut resp_text = String::new();
-    let mut last_err = String::new();
-    for attempt in 0..6 {
-        if attempt > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5 * attempt)).await;
-            println!(
-                "[PIPELINE] gemini_script {} retry #{}",
-                source_label, attempt
-            );
-        }
-        let res = client.post(&url).json(&payload).send().await?;
-        if res.status().is_success() {
-            let json: Value = res.json().await?;
-            if let Some(text) = json
-                .get("candidates")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("content"))
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.get(0))
-                .and_then(|p| p.get("text"))
-            {
-                resp_text = text.as_str().unwrap_or("").to_string();
-            }
-            break;
-        } else {
-            let status = res.status().as_u16();
-            let err = res.text().await?;
-            last_err = format!("Gemini Script Error: {}", err);
-            println!(
-                "[PIPELINE] gemini_script {} attempt {} failed ({}): {}",
-                source_label, attempt, status, err
-            );
-            if is_gemini_file_not_ready_error(status, &err) {
-                continue;
-            }
-            if status != 503 && status != 500 && status != 429 {
-                return Err(last_err.into());
-            }
-        }
-    }
-    if resp_text.is_empty() && !last_err.is_empty() {
-        return Err(last_err.into());
-    }
+fn extract_generate_content_text(json: &Value) -> Option<String> {
+    json.get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.get(0))
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
 
+fn parse_script_pack_from_response(resp_text: &str) -> ScriptPack {
     let clean = resp_text
         .replace("```json", "")
         .replace("```", "")
@@ -1392,12 +1167,12 @@ async fn gemini_script_with_video_part(
         subtitle_lines = split_subtitle_chunks(&script, 15);
     }
 
-    Ok(ScriptPack {
+    ScriptPack {
         script,
         title,
         category,
         subtitle_lines,
-    })
+    }
 }
 
 /// Given a legacy combined template like "...style guide...\n\nบทพากย์:\n{{script}}",
@@ -1522,6 +1297,273 @@ async fn fetch_vertex_access_token(
     Ok(token.to_string())
 }
 
+#[derive(Clone, Debug)]
+struct VertexGenerationContext {
+    client: Client,
+    access_token: String,
+    endpoint: String,
+    project_id: String,
+    location: String,
+    model: String,
+}
+
+fn has_vertex_service_account_config(request_raw_json: Option<&str>) -> bool {
+    request_raw_json
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || std::env::var("VERTEX_TTS_SERVICE_ACCOUNT_JSON")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        || std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
+fn resolve_vertex_endpoint(request_endpoint: Option<&str>) -> String {
+    request_endpoint
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("VERTEX_TTS_ENDPOINT")
+                .ok()
+                .map(|v| v.trim().trim_end_matches('/').to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(|| VERTEX_TTS_DEFAULT_ENDPOINT.to_string())
+}
+
+fn resolve_vertex_project_id(
+    request_project_id: Option<&str>,
+    service_account: &VertexServiceAccount,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    request_project_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("VERTEX_TTS_PROJECT_ID")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| {
+            service_account
+                .project_id
+                .clone()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .ok_or_else(|| "Vertex project_id is not configured".into())
+}
+
+fn resolve_vertex_location(request_location: Option<&str>) -> String {
+    request_location
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("VERTEX_TTS_LOCATION")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(|| VERTEX_TTS_DEFAULT_LOCATION.to_string())
+}
+
+async fn build_vertex_generation_context(
+    client: &Client,
+    req: &PipelineRequest,
+    model: &str,
+) -> Result<VertexGenerationContext, Box<dyn std::error::Error + Send + Sync>> {
+    if !has_vertex_service_account_config(req.vertex_tts_service_account_json.as_deref()) {
+        return Err("Vertex service account is required for Vertex Gemini processing".into());
+    }
+    let service_account =
+        load_vertex_service_account(req.vertex_tts_service_account_json.as_deref())?;
+    let access_token = fetch_vertex_access_token(client, &service_account).await?;
+    let endpoint = resolve_vertex_endpoint(req.vertex_tts_endpoint.as_deref());
+    let project_id =
+        resolve_vertex_project_id(req.vertex_tts_project_id.as_deref(), &service_account)?;
+    let location = resolve_vertex_location(req.vertex_tts_location.as_deref());
+    let model = model.trim();
+    let model = if model.is_empty() {
+        "gemini-3-flash-preview".to_string()
+    } else {
+        model.to_string()
+    };
+    println!(
+        "[PIPELINE] Vertex Gemini generation auth ready model={} location={}",
+        model, location
+    );
+    Ok(VertexGenerationContext {
+        client: client.clone(),
+        access_token,
+        endpoint,
+        project_id,
+        location,
+        model,
+    })
+}
+
+fn is_retryable_generation_status(status: u16) -> bool {
+    status == 500 || status == 503 || status == 429
+}
+
+async fn vertex_generate_content_text(
+    ctx: &VertexGenerationContext,
+    payload: &Value,
+    source_label: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!(
+        "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+        ctx.endpoint, ctx.project_id, ctx.location, ctx.model
+    );
+    let mut last_err = String::new();
+    for attempt in 0..6 {
+        if attempt > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5 * attempt)).await;
+            println!(
+                "[PIPELINE] vertex_generate_content {} retry #{}",
+                source_label, attempt
+            );
+        }
+        let res = ctx
+            .client
+            .post(&url)
+            .bearer_auth(&ctx.access_token)
+            .json(payload)
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        let body = res.text().await.unwrap_or_default();
+        if (200..300).contains(&status) {
+            let json: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+            if let Some(text) = extract_generate_content_text(&json) {
+                return Ok(text);
+            }
+            last_err = format!(
+                "Vertex Gemini {} success_without_text_body: {}",
+                source_label,
+                redact_vertex_error(&body)
+            );
+        } else {
+            last_err = format!(
+                "Vertex Gemini {} http_{}: {}",
+                source_label,
+                status,
+                redact_vertex_error(&body)
+            );
+            if !is_retryable_generation_status(status) {
+                return Err(last_err.into());
+            }
+        }
+    }
+    Err(last_err.into())
+}
+
+async fn vertex_gemini_script_inline_video(
+    file_bytes: &[u8],
+    ctx: &VertexGenerationContext,
+    duration: f64,
+    user_prompt: Option<&str>,
+    source_label: &str,
+) -> Result<ScriptPack, Box<dyn std::error::Error + Send + Sync>> {
+    if file_bytes.len() > VERTEX_GENERATION_INLINE_MAX_BYTES {
+        return Err(format!(
+            "Vertex inline video exceeds {} bytes after {} transcode; GCS fileData upload is not implemented",
+            VERTEX_GENERATION_INLINE_MAX_BYTES, source_label
+        )
+        .into());
+    }
+
+    let max_chars = ((duration * 10.0) as i32).min(800);
+    let min_chars = ((duration * 7.0) as i32).max(80);
+    let prompt = build_script_prompt(user_prompt, duration, min_chars, max_chars);
+    let payload = json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                build_gemini_inline_video_part(file_bytes),
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.2
+        }
+    });
+    let resp_text = vertex_generate_content_text(ctx, &payload, source_label).await?;
+    Ok(parse_script_pack_from_response(&resp_text))
+}
+
+async fn vertex_gemini_srt_from_audio_bytes(
+    file_bytes: &[u8],
+    subtitle_lines: &[String],
+    ctx: &VertexGenerationContext,
+    duration: f64,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if file_bytes.len() > VERTEX_GENERATION_INLINE_MAX_BYTES {
+        return Err(format!(
+            "Vertex inline audio exceeds {} bytes; deterministic subtitle fallback required",
+            VERTEX_GENERATION_INLINE_MAX_BYTES
+        )
+        .into());
+    }
+
+    let lines = normalize_subtitle_lines(subtitle_lines, 20);
+    let lines_text = if lines.is_empty() {
+        "(ไม่มี subtitle_lines)".to_string()
+    } else {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("{}. {}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let prompt = format!(
+        "ให้ฟังไฟล์เสียงพากย์ภาษาไทยนี้ แล้วสร้างไฟล์ซับ .srt ที่ตรงกับจังหวะเสียงพูดจริง\n\
+         ข้อบังคับ:\n\
+         1) ใช้ข้อความซับจากรายการด้านล่างนี้เท่านั้น (ห้ามเปลี่ยนคำ ห้ามเพิ่ม ห้ามลด)\n\
+         2) คืนผลลัพธ์เป็น SRT ล้วนๆ เท่านั้น (ไม่ต้องมี markdown)\n\
+         3) ถ้ามีช่วงเงียบก่อนเริ่มพูด ให้ timecode แรกเริ่มตามเสียงจริง ไม่ต้องบังคับเริ่มที่ 0 เสมอไป\n\
+         4) จบบรรทัดสุดท้ายไม่เกิน {duration:.3} วินาที\n\
+         5) timecode ต้องเรียงต่อเนื่อง ไม่ย้อนเวลา\n\n\
+         รายการซับที่ต้องใช้:\n\
+         {lines_text}",
+        duration = duration.max(1.0),
+        lines_text = lines_text,
+    );
+    let payload = json!({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                build_inline_media_part(file_bytes, "audio/wav"),
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0.1
+        }
+    });
+    let resp_text = vertex_generate_content_text(ctx, &payload, "audio-srt").await?;
+    let extracted = extract_srt_payload(&resp_text);
+    Ok(normalize_srt_blocks(&extracted, duration.max(1.0)))
+}
+
+fn should_retry_vertex_with_strict(variant: GeminiUploadVariant, err: &str) -> bool {
+    if variant != GeminiUploadVariant::Safe {
+        return false;
+    }
+    let normalized = err.to_ascii_lowercase();
+    normalized.contains("vertex inline video exceeds")
+        || normalized.contains("request entity too large")
+        || normalized.contains("payload too large")
+        || normalized.contains("request payload size")
+        || (normalized.contains("invalid_argument")
+            && (normalized.contains("video")
+                || normalized.contains("media")
+                || normalized.contains("mime")
+                || normalized.contains("inline")))
+}
+
 fn build_tts_payload(
     script: &str,
     voice_name: Option<&str>,
@@ -1571,8 +1613,8 @@ fn extract_tts_audio_b64(json: &Value) -> Option<String> {
 async fn vertex_gemini_tts(
     script: &str,
     voice_name: Option<&str>,
-    tts_prompt_template: Option<&str>,
-    tts_style_instructions: Option<&str>,
+    _tts_prompt_template: Option<&str>,
+    _tts_style_instructions: Option<&str>,
     request_project_id: Option<&str>,
     request_location: Option<&str>,
     request_model: Option<&str>,
@@ -1676,119 +1718,6 @@ async fn vertex_gemini_tts(
         sleep(Duration::from_secs(5 + (attempt as u64 * 3))).await;
     }
     Err(format!("Vertex TTS failed after retries: {}", last_err).into())
-}
-
-async fn gemini_tts_api_key_fallback(
-    script: &str,
-    api_key: &str,
-    voice_name: Option<&str>,
-    tts_prompt_template: Option<&str>,
-    tts_style_instructions: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::new();
-    let payload = build_tts_payload(
-        script,
-        voice_name,
-        tts_prompt_template,
-        tts_style_instructions,
-    );
-    let mut last_err = String::new();
-    let tts_models = [
-        "gemini-3.1-flash-tts-preview",
-        "gemini-2.5-pro-preview-tts",
-        "gemini-2.5-flash-preview-tts",
-    ];
-
-    for model in tts_models {
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, api_key
-        );
-        println!(
-            "[PIPELINE] gemini_tts_api_key_fallback using model={}",
-            model
-        );
-        for attempt in 0..3 {
-            let res = client.post(&url).json(&payload).send().await?;
-            let status = res.status().as_u16();
-            let body = res.text().await.unwrap_or_default();
-            if (200..300).contains(&status) {
-                let json: Value = serde_json::from_str(&body).unwrap_or(json!({}));
-                if let Some(data) = extract_tts_audio_b64(&json) {
-                    return Ok(data);
-                }
-                last_err = format!(
-                    "TTS fallback model={} success_without_audio_body: {}",
-                    model,
-                    redact_vertex_error(&body)
-                );
-            } else {
-                last_err = format!(
-                    "TTS fallback model={} http_{}: {}",
-                    model,
-                    status,
-                    redact_vertex_error(&body)
-                );
-            }
-            println!(
-                "[PIPELINE] gemini_tts_api_key_fallback attempt {} failed: {}",
-                attempt + 1,
-                last_err
-            );
-            sleep(Duration::from_secs(5 + (attempt as u64 * 3))).await;
-        }
-    }
-    Err(format!("TTS API-key fallback failed after retries: {}", last_err).into())
-}
-
-async fn gemini_tts(
-    script: &str,
-    api_key: &str,
-    voice_name: Option<&str>,
-    tts_prompt_template: Option<&str>,
-    tts_style_instructions: Option<&str>,
-    request_project_id: Option<&str>,
-    request_location: Option<&str>,
-    request_model: Option<&str>,
-    request_endpoint: Option<&str>,
-    request_service_account_json: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    match vertex_gemini_tts(
-        script,
-        voice_name,
-        tts_prompt_template,
-        tts_style_instructions,
-        request_project_id,
-        request_location,
-        request_model,
-        request_endpoint,
-        request_service_account_json,
-    )
-    .await
-    {
-        Ok(audio) => Ok(audio),
-        Err(vertex_err) => {
-            let allow_fallback = std::env::var("VIDEO_AFFILIATE_TTS_ALLOW_API_KEY_FALLBACK")
-                .ok()
-                .and_then(|v| parse_env_bool(&v))
-                .unwrap_or(false);
-            if allow_fallback {
-                println!(
-                    "[PIPELINE] Vertex TTS failed; using API-key fallback: {}",
-                    vertex_err
-                );
-                return gemini_tts_api_key_fallback(
-                    script,
-                    api_key,
-                    voice_name,
-                    tts_prompt_template,
-                    tts_style_instructions,
-                )
-                .await;
-            }
-            Err(vertex_err)
-        }
-    }
 }
 
 // Fallback: Simple script to SRT when Whisper fails
@@ -2206,12 +2135,17 @@ fn build_atempo_filter(mut factor: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GEMINI_INLINE_VIDEO_MAX_BYTES, GeminiPreflightError, GeminiTranscodeProfile,
-        GeminiUploadVariant, build_gemini_inline_video_part, build_gemini_transcode_filter,
-        build_srt_from_lines_with_timing, build_tts_payload, extract_speech_srt_time_span,
-        extract_srt_payload, format_gemini_preflight_info, normalize_srt_blocks,
+        AVATAR_COMPOSE_AUDIO_BITRATE, AVATAR_COMPOSE_VIDEO_BITRATE, AVATAR_COMPOSE_VIDEO_BUFSIZE,
+        AVATAR_COMPOSE_VIDEO_MAXRATE, AVATAR_COMPOSE_VIDEO_PRESET,
+        GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
+        GeminiPreflightError, GeminiTranscodeProfile, VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS,
+        VERTEX_GENERATION_INLINE_MAX_BYTES, build_avatar_compose_ffmpeg_args,
+        build_final_merge_ffmpeg_args, build_flip_processing_input_ffmpeg_args,
+        build_gemini_inline_video_part, build_gemini_transcode_ffmpeg_args,
+        build_gemini_transcode_filter, build_srt_from_lines_with_timing, build_tts_payload,
+        convert_to_ass, extract_speech_srt_time_span, extract_srt_payload,
+        ffmpeg_nonzero_status_reason, format_gemini_preflight_info, normalize_srt_blocks,
         parse_gemini_preflight_info, parse_srt_time_range, pipeline_error_category,
-        should_retry_gemini_with_inline_video, should_retry_gemini_with_strict,
         validate_gemini_safe_output,
     };
     use serde_json::json;
@@ -2239,6 +2173,117 @@ mod tests {
                 .unwrap()
                 .contains("พูดแบบสดใส")
         );
+    }
+
+    #[test]
+    fn vertex_gemini_audio_srt_timeout_is_bounded() {
+        assert!(
+            (90..=120).contains(&VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS),
+            "Vertex audio SRT sync timeout should stay within the operational guardrail"
+        );
+    }
+
+    #[test]
+    fn srt_burn_nonzero_status_has_fallback_reason() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let reason = ffmpeg_nonzero_status_reason(&output).expect("non-zero status fails");
+
+        assert!(reason.contains("exit_status="));
+        assert!(reason.contains('1'));
+    }
+
+    #[test]
+    fn flip_processing_input_ffmpeg_args_mirror_and_normalize_mp4() {
+        let args = build_flip_processing_input_ffmpeg_args("/tmp/video.mp4", "/tmp/processing.mp4");
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+        };
+
+        assert_eq!(value_after("-i"), Some("/tmp/video.mp4"));
+        assert_eq!(value_after("-vf"), Some("hflip,format=yuv420p"));
+        assert_eq!(value_after("-c:v"), Some("libx264"));
+        assert_eq!(value_after("-pix_fmt"), Some("yuv420p"));
+        assert_eq!(value_after("-c:a"), Some("aac"));
+        assert_eq!(value_after("-b:a"), Some("128k"));
+        assert_eq!(value_after("-movflags"), Some("+faststart"));
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/processing.mp4"));
+    }
+
+    #[test]
+    fn final_merge_ffmpeg_args_use_flipped_processing_input() {
+        let args = build_final_merge_ffmpeg_args(
+            "/tmp/video_processing_flipped.mp4",
+            "/tmp/audio_adj.wav",
+            12.5,
+            "/tmp/merged_nosub.mp4",
+        );
+        let first_input = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .and_then(|index| args.get(index + 1))
+            .map(String::as_str);
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+        };
+
+        assert_eq!(first_input, Some("/tmp/video_processing_flipped.mp4"));
+        assert!(!args.iter().any(|arg| arg == "/tmp/video.mp4"));
+        assert_eq!(value_after("-c:v"), Some("copy"));
+        assert_eq!(value_after("-c:a"), Some("aac"));
+        assert_eq!(value_after("-t"), Some("12.5"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/merged_nosub.mp4")
+        );
+    }
+
+    #[test]
+    fn convert_to_ass_uses_middle_center_subtitle_style() {
+        let ass = convert_to_ass(
+            "1\n00:00:00,000 --> 00:00:02,000\nทดสอบซับกลางจอ\n\n",
+            1080,
+            1920,
+        );
+        let style_line = ass
+            .lines()
+            .find(|line| line.starts_with("Style: Default,"))
+            .expect("default style line");
+        let style_fields = style_line
+            .strip_prefix("Style: ")
+            .expect("style prefix")
+            .split(',')
+            .collect::<Vec<_>>();
+
+        assert_eq!(style_fields.len(), 23, "ASS style field count changed");
+        assert_eq!(
+            style_fields[18], "5",
+            "subtitle style must be middle-center"
+        );
+        assert_eq!(
+            style_fields[21], "0",
+            "centered subtitles must not use bottom margin"
+        );
+        assert_ne!(
+            style_fields[18], "2",
+            "bottom-center alignment must not regress"
+        );
+        assert_ne!(
+            style_fields[21], "250",
+            "bottom MarginV=250 must not regress"
+        );
+        assert!(ass.contains("{\\an5\\pos(540,960)}ทดสอบซับกลางจอ"));
     }
 
     #[test]
@@ -2401,50 +2446,6 @@ mod tests {
     }
 
     #[test]
-    fn gemini_file_processing_failure_retries_safe_upload_with_strict_transcode() {
-        let code_12 = "Gemini file processing failed: code 12 — The file failed to be processed";
-
-        assert!(should_retry_gemini_with_strict(
-            GeminiUploadVariant::Safe,
-            code_12
-        ));
-        assert!(!should_retry_gemini_with_strict(
-            GeminiUploadVariant::Strict,
-            code_12
-        ));
-        assert!(!should_retry_gemini_with_strict(
-            GeminiUploadVariant::Safe,
-            "quota exceeded"
-        ));
-    }
-
-    #[test]
-    fn gemini_inline_video_fallback_is_strict_code12_and_size_gated() {
-        let code_12 = "Gemini file processing failed: code 12 — The file failed to be processed";
-
-        assert!(should_retry_gemini_with_inline_video(
-            GeminiUploadVariant::Strict,
-            code_12,
-            GEMINI_INLINE_VIDEO_MAX_BYTES
-        ));
-        assert!(!should_retry_gemini_with_inline_video(
-            GeminiUploadVariant::Safe,
-            code_12,
-            1024
-        ));
-        assert!(!should_retry_gemini_with_inline_video(
-            GeminiUploadVariant::Strict,
-            code_12,
-            GEMINI_INLINE_VIDEO_MAX_BYTES + 1
-        ));
-        assert!(!should_retry_gemini_with_inline_video(
-            GeminiUploadVariant::Strict,
-            "quota exceeded",
-            1024
-        ));
-    }
-
-    #[test]
     fn gemini_inline_video_part_uses_video_mp4_inline_data() {
         let part = build_gemini_inline_video_part(b"abc");
         let inline = part
@@ -2479,11 +2480,51 @@ mod tests {
 
         assert!(GeminiTranscodeProfile::Strict.video_only());
         assert!(!GeminiTranscodeProfile::Safe.video_only());
-        assert!(filter.contains("min(480"));
-        assert!(filter.contains("fps=24"));
+        assert!(filter.contains("min(360"));
+        assert!(filter.contains("fps=15"));
         assert!(filter.contains("setsar=1"));
-        assert!(filter.contains("setpts=N/(24*TB)"));
+        assert!(filter.contains("setpts=N/(15*TB)"));
         assert!(filter.contains("format=yuv420p"));
+    }
+
+    #[test]
+    fn gemini_strict_ffmpeg_args_bound_inline_size() {
+        let args = build_gemini_transcode_ffmpeg_args(
+            "/tmp/input.mp4",
+            "/tmp/output.mp4",
+            GeminiTranscodeProfile::Strict,
+            GEMINI_PREFLIGHT_MAX_DURATION_SECS,
+        );
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+        };
+        let parse_kbps = |flag: &str| {
+            value_after(flag)
+                .and_then(|value| value.strip_suffix('k'))
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("kbps ffmpeg argument")
+        };
+
+        let video_kbps = parse_kbps("-b:v");
+        let maxrate_kbps = parse_kbps("-maxrate");
+        let bufsize_kbps = parse_kbps("-bufsize");
+        let estimated_video_bytes = ((video_kbps as f64 * 1000.0 / 8.0)
+            * GEMINI_PREFLIGHT_MAX_DURATION_SECS)
+            .ceil() as usize;
+
+        assert_eq!(maxrate_kbps, video_kbps);
+        assert_eq!(bufsize_kbps, video_kbps * 2);
+        assert!(
+            estimated_video_bytes + GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES
+                <= VERTEX_GENERATION_INLINE_MAX_BYTES,
+            "strict budget must keep max-duration inline video under Vertex raw byte limit"
+        );
+        assert!(args.iter().any(|arg| arg == "-an"));
+        assert_eq!(value_after("-crf"), None);
+        assert_eq!(value_after("-b:a"), None);
     }
 
     #[test]
@@ -2503,6 +2544,32 @@ mod tests {
         .expect("probe parses before output validation");
         let err = validate_gemini_safe_output(&parsed).expect_err("odd dimensions rejected");
         assert!(err.contains("even dimensions"));
+    }
+
+    #[test]
+    fn avatar_compose_ffmpeg_args_bound_output_size() {
+        let args = build_avatar_compose_ffmpeg_args(
+            "/tmp/base.mp4",
+            "/tmp/avatar.mp4",
+            "[base][avatar]overlay[outv]",
+            "174.590",
+            "/tmp/output.mp4",
+        );
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+        };
+
+        assert_eq!(value_after("-preset"), Some(AVATAR_COMPOSE_VIDEO_PRESET));
+        assert_eq!(value_after("-b:v"), Some(AVATAR_COMPOSE_VIDEO_BITRATE));
+        assert_eq!(value_after("-maxrate"), Some(AVATAR_COMPOSE_VIDEO_MAXRATE));
+        assert_eq!(value_after("-bufsize"), Some(AVATAR_COMPOSE_VIDEO_BUFSIZE));
+        assert_eq!(value_after("-b:a"), Some(AVATAR_COMPOSE_AUDIO_BITRATE));
+        assert_eq!(value_after("-movflags"), Some("+faststart"));
+        assert!(!args.iter().any(|arg| arg == "ultrafast"));
+        assert!(!args.iter().any(|arg| arg == "-crf"));
     }
 }
 
@@ -2683,7 +2750,7 @@ fn convert_to_ass(srt: &str, vw: u32, vh: u32) -> String {
          Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, \
          Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
          Style: Default,Noto Sans Thai,{fs},\
-         &H00FFFFFF,&H00000000,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,10,0,2,10,10,250,1\n\n\
+         &H00FFFFFF,&H00000000,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,10,0,5,10,10,0,1\n\n\
          [Events]\n\
          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
         vw = vw,
@@ -2714,8 +2781,12 @@ fn convert_to_ass(srt: &str, vw: u32, vh: u32) -> String {
         let te = fmt_ass_time(parts[1]);
         let text = lines[ti + 1..].join(" ");
         events.push_str(&format!(
-            "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
-            ts, te, text
+            "Dialogue: 0,{},{},Default,,0,0,0,,{{\\an5\\pos({},{})}}{}\n",
+            ts,
+            te,
+            vw / 2,
+            vh / 2,
+            text
         ));
     }
     header + &events
@@ -2746,6 +2817,31 @@ async fn get_duration(path: &Path) -> f64 {
     }
 }
 
+fn ffmpeg_nonzero_status_reason(output: &Output) -> Option<String> {
+    if output.status.success() {
+        None
+    } else {
+        Some(format!("exit_status={}", output.status))
+    }
+}
+
+fn build_final_merge_ffmpeg_args(
+    video_input_str: &str,
+    adjusted_audio_str: &str,
+    duration: f64,
+    output_str: &str,
+) -> Vec<String> {
+    let duration_str = duration.to_string();
+    let mut args = Vec::new();
+    push_ffmpeg_args(&mut args, &["-y", "-i", video_input_str]);
+    push_ffmpeg_args(&mut args, &["-i", adjusted_audio_str]);
+    push_ffmpeg_args(&mut args, &["-c:v", "copy", "-c:a", "aac"]);
+    push_ffmpeg_args(&mut args, &["-map", "0:v:0", "-map", "1:a:0"]);
+    push_ffmpeg_args(&mut args, &["-t", &duration_str]);
+    args.push(output_str.to_string());
+    args
+}
+
 async fn rust_pipeline(
     req: PipelineRequest,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2757,9 +2853,11 @@ async fn rust_pipeline(
     let bot_id = req.bot_id.clone().unwrap_or_else(|| "default".to_string());
     let token = &req.token;
     let worker_url = &req.worker_url;
-    let gemini_api_keys = normalize_gemini_api_keys(req.api_keys.as_ref(), &req.api_key);
-    let mock_mode =
-        gemini_api_keys.len() == 1 && gemini_api_keys.get(0).map(|k| k == "mock").unwrap_or(false);
+    let mock_mode = req
+        .model
+        .as_deref()
+        .map(|model| model.trim() == "mock")
+        .unwrap_or(false);
 
     // 1. Download
     update_step(
@@ -2792,9 +2890,12 @@ async fn rust_pipeline(
     let tmp_path = tmp_dir.path();
     let video_path = tmp_path.join("video.mp4");
     fs::write(&video_path, &video_bytes).await?;
-    let source_preflight = preflight_probe_for_gemini(&video_path)
+    let processing_video_path = tmp_path.join("video_processing_flipped.mp4");
+    create_flipped_processing_input(&video_path, &processing_video_path).await?;
+    let processing_video_bytes = fs::read(&processing_video_path).await?;
+    let source_preflight = preflight_probe_for_gemini(&processing_video_path)
         .await
-        .map_err(|e| format!("source_video_invalid: {}", e))?;
+        .map_err(|e| format!("processing_video_invalid: {}", e))?;
     println!(
         "[PIPELINE] source preflight ok: {}",
         format_gemini_preflight_info(&source_preflight)
@@ -2807,8 +2908,13 @@ async fn rust_pipeline(
 
     let model = req
         .model
+        .clone()
         .unwrap_or_else(|| "gemini-3-flash-preview".to_string());
-    let mut selected_gemini_key = String::new();
+    let vertex_generation = if mock_mode {
+        None
+    } else {
+        Some(build_vertex_generation_context(&client, &req, &model).await?)
+    };
 
     let (script, subtitle_lines, title, category, a_dur, wav_audio) = if mock_mode {
         let wav = tmp_path.join("audio.wav");
@@ -2816,7 +2922,7 @@ async fn rust_pipeline(
             .args(&[
                 "-y",
                 "-i",
-                video_path.to_str().unwrap(),
+                processing_video_path.to_str().unwrap(),
                 "-f",
                 "s16le",
                 "-ar",
@@ -2838,9 +2944,9 @@ async fn rust_pipeline(
             wav,
         )
     } else {
-        if gemini_api_keys.is_empty() {
-            return Err("ยังไม่ได้ตั้ง Gemini API key กลางของระบบ".into());
-        }
+        let vertex_context = vertex_generation
+            .as_ref()
+            .ok_or("Vertex service account is required for Vertex Gemini processing")?;
 
         // 2. Analyze
         update_step(
@@ -2849,7 +2955,7 @@ async fn rust_pipeline(
             &bot_id,
             &video_id,
             2.0,
-            "🔍 อัปโหลดวิดีโอไป Gemini...",
+            "🔍 เตรียมวิดีโอสำหรับ Vertex Gemini...",
         )
         .await;
         edit_status(
@@ -2860,7 +2966,7 @@ async fn rust_pipeline(
         )
         .await;
         let mut analyze_result = None;
-        let mut last_gemini_err = String::new();
+        let mut last_vertex_err = String::new();
         let mut gemini_strict_video_bytes: Option<Vec<u8>> = None;
         let gemini_safe_video_path = tmp_path.join("gemini_safe.mp4");
         let gemini_strict_video_path = tmp_path.join("gemini_strict.mp4");
@@ -2871,226 +2977,176 @@ async fn rust_pipeline(
             &bot_id,
             &video_id,
             2.2,
-            "🔍 แปลงวิดีโอให้ Gemini อ่านได้ (Gemini-safe)...",
+            "🔍 แปลงวิดีโอให้ Vertex Gemini อ่านได้...",
         )
         .await;
         let gemini_safe_video_bytes =
-            transcode_video_for_gemini(&video_path, &gemini_safe_video_path).await?;
-        if gemini_safe_video_bytes == video_bytes {
+            transcode_video_for_gemini(&processing_video_path, &gemini_safe_video_path).await?;
+        if gemini_safe_video_bytes == processing_video_bytes {
             return Err(
-                "Gemini-safe output invalid: transcode output is identical to source".into(),
+                "Vertex Gemini transcode output invalid: output is identical to source".into(),
             );
         }
         println!(
-            "[PIPELINE] Gemini-safe upload artifact produced {} bytes",
+            "[PIPELINE] Vertex Gemini inline artifact produced {} bytes",
             gemini_safe_video_bytes.len()
         );
 
-        for (index, api_key) in gemini_api_keys.iter().enumerate() {
-            println!("[PIPELINE] Gemini key slot {} analyze start", index + 1);
-            for variant in [GeminiUploadVariant::Safe, GeminiUploadVariant::Strict] {
-                if variant == GeminiUploadVariant::Strict && gemini_strict_video_bytes.is_none() {
-                    update_step(
-                        worker_url,
-                        token,
-                        &bot_id,
-                        &video_id,
-                        2.2,
-                        "🔍 แปลงวิดีโอให้ Gemini อ่านได้แบบเข้มงวด...",
-                    )
-                    .await;
-                    match transcode_video_for_gemini_strict(&video_path, &gemini_strict_video_path)
-                        .await
-                    {
-                        Ok(bytes) => {
-                            println!(
-                                "[PIPELINE] Gemini-strict transcode produced {} bytes",
-                                bytes.len()
-                            );
-                            gemini_strict_video_bytes = Some(bytes);
-                        }
-                        Err(transcode_err) => {
-                            last_gemini_err = format!(
-                                "{}; Gemini-strict transcode failed: {}",
-                                last_gemini_err, transcode_err
-                            );
-                            println!(
-                                "[PIPELINE] Gemini-strict transcode failed: {}",
-                                transcode_err
-                            );
-                            break;
-                        }
-                    }
-                }
-                let variant_label = variant.label();
-                let upload_bytes: &[u8] = match variant {
-                    GeminiUploadVariant::Safe => gemini_safe_video_bytes.as_slice(),
-                    GeminiUploadVariant::Strict => match gemini_strict_video_bytes.as_ref() {
-                        Some(bytes) => bytes.as_slice(),
-                        None => break,
-                    },
-                };
-                let attempt = async {
-                    let wait_step_name = format!("🔍 รอ Gemini ประมวลผลไฟล์ {}...", variant_label);
-                    let gemini_uri = gemini_upload_bytes(upload_bytes, "video/mp4", api_key).await?;
-                    update_step(worker_url, token, &bot_id, &video_id, 2.3, &wait_step_name).await;
-                    let pack = match gemini_wait(&gemini_uri, api_key).await {
-                        Ok(active_uri) => {
-                            update_step(
-                                worker_url,
-                                token,
-                                &bot_id,
-                                &video_id,
-                                2.7,
-                                "🔍 สร้างบทพากย์...",
-                            )
-                            .await;
-                            gemini_script(
-                                &active_uri,
-                                api_key,
-                                &model,
-                                duration,
-                                req.script_prompt.as_deref(),
-                            )
-                            .await?
-                        }
-                        Err(wait_err)
-                            if should_retry_gemini_with_inline_video(
-                                variant,
-                                &wait_err.to_string(),
-                                upload_bytes.len(),
-                            ) =>
-                        {
-                            println!(
-                                "[PIPELINE] Gemini key slot {} strict File API failed after verified transcode; retrying inline video analysis ({} bytes): {}",
-                                index + 1,
-                                upload_bytes.len(),
-                                wait_err
-                            );
-                            update_step(
-                                worker_url,
-                                token,
-                                &bot_id,
-                                &video_id,
-                                2.7,
-                                "🔍 สร้างบทพากย์ผ่าน Gemini inline fallback...",
-                            )
-                            .await;
-                            gemini_script_inline_video(
-                                upload_bytes,
-                                api_key,
-                                &model,
-                                duration,
-                                req.script_prompt.as_deref(),
-                            )
-                            .await?
-                        }
-                        Err(wait_err) => return Err(wait_err),
-                    };
-
-                    update_step(
-                        worker_url,
-                        token,
-                        &bot_id,
-                        &video_id,
-                        3.0,
-                        "🎙 กำลังสร้างเสียงพากย์ไทย...",
-                    )
-                    .await;
-                    edit_status(
-                        token,
-                        req.chat_id,
-                        req.msg_id,
-                        "📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 กำลังสร้างเสียงพากย์",
-                    )
-                    .await;
-
-                    let tts_b64 = gemini_tts(
-                        &pack.script,
-                        api_key,
-                        req.voice_name.as_deref(),
-                        req.tts_prompt_template.as_deref(),
-                        req.tts_style_instructions.as_deref(),
-                        req.vertex_tts_project_id.as_deref(),
-                        req.vertex_tts_location.as_deref(),
-                        req.vertex_tts_model.as_deref(),
-                        req.vertex_tts_endpoint.as_deref(),
-                        req.vertex_tts_service_account_json.as_deref(),
-                    )
-                    .await?;
-                    let raw_audio = tmp_path.join("audio.raw");
-                    fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;
-
-                    let wav = tmp_path.join("audio.wav");
-                    Command::new("ffmpeg")
-                        .args(&[
-                            "-y",
-                            "-f",
-                            "s16le",
-                            "-ar",
-                            "24000",
-                            "-ac",
-                            "1",
-                            "-i",
-                            raw_audio.to_str().unwrap(),
-                            wav.to_str().unwrap(),
-                        ])
-                        .output()
-                        .await?;
-                    let d = get_duration(&wav).await;
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                        pack.script,
-                        pack.subtitle_lines,
-                        pack.title,
-                        pack.category,
-                        d,
-                        wav,
-                    ))
-                }
+        println!("[PIPELINE] Vertex Gemini analyze start");
+        for variant in [GeminiUploadVariant::Safe, GeminiUploadVariant::Strict] {
+            if variant == GeminiUploadVariant::Strict && gemini_strict_video_bytes.is_none() {
+                update_step(
+                    worker_url,
+                    token,
+                    &bot_id,
+                    &video_id,
+                    2.2,
+                    "🔍 แปลงวิดีโอให้ Vertex Gemini อ่านได้แบบเข้มงวด...",
+                )
                 .await;
-
-                match attempt {
-                    Ok(result) => {
-                        selected_gemini_key = api_key.clone();
-                        analyze_result = Some(result);
-                        break;
-                    }
-                    Err(err) => {
-                        last_gemini_err = err.to_string();
-                        if should_retry_gemini_with_strict(variant, &last_gemini_err) {
-                            last_gemini_err = format!(
-                                "Gemini-safe upload failed after verified transcode: {}",
-                                last_gemini_err
-                            );
-                            println!(
-                                "[PIPELINE] Gemini key slot {} rejected verified Gemini-safe upload; retrying with Gemini-strict transcode: {}",
-                                index + 1,
-                                last_gemini_err
-                            );
-                            continue;
-                        }
+                match transcode_video_for_gemini_strict(
+                    &processing_video_path,
+                    &gemini_strict_video_path,
+                )
+                .await
+                {
+                    Ok(bytes) => {
                         println!(
-                            "[PIPELINE] Gemini key slot {} analyze failed with {} variant: {}",
-                            index + 1,
-                            variant_label,
-                            last_gemini_err
+                            "[PIPELINE] Vertex Gemini strict transcode produced {} bytes",
+                            bytes.len()
+                        );
+                        gemini_strict_video_bytes = Some(bytes);
+                    }
+                    Err(transcode_err) => {
+                        last_vertex_err = format!(
+                            "{}; Vertex Gemini strict transcode failed: {}",
+                            last_vertex_err, transcode_err
+                        );
+                        println!(
+                            "[PIPELINE] Vertex Gemini strict transcode failed: {}",
+                            transcode_err
                         );
                         break;
                     }
                 }
             }
-            if analyze_result.is_some() {
-                break;
+            let variant_label = variant.label();
+            let upload_bytes: &[u8] = match variant {
+                GeminiUploadVariant::Safe => gemini_safe_video_bytes.as_slice(),
+                GeminiUploadVariant::Strict => match gemini_strict_video_bytes.as_ref() {
+                    Some(bytes) => bytes.as_slice(),
+                    None => break,
+                },
+            };
+            let attempt = async {
+                update_step(
+                    worker_url,
+                    token,
+                    &bot_id,
+                    &video_id,
+                    2.7,
+                    "🔍 สร้างบทพากย์ผ่าน Vertex Gemini...",
+                )
+                .await;
+                let pack = vertex_gemini_script_inline_video(
+                    upload_bytes,
+                    vertex_context,
+                    duration,
+                    req.script_prompt.as_deref(),
+                    variant_label,
+                )
+                .await?;
+
+                update_step(
+                    worker_url,
+                    token,
+                    &bot_id,
+                    &video_id,
+                    3.0,
+                    "🎙 กำลังสร้างเสียงพากย์ไทย...",
+                )
+                .await;
+                edit_status(
+                    token,
+                    req.chat_id,
+                    req.msg_id,
+                    "📥 ดาวน์โหลดวิดีโอ ✅\n🔍 วิเคราะห์วิดีโอ ✅\n🎙 กำลังสร้างเสียงพากย์",
+                )
+                .await;
+
+                let tts_b64 = vertex_gemini_tts(
+                    &pack.script,
+                    req.voice_name.as_deref(),
+                    req.tts_prompt_template.as_deref(),
+                    req.tts_style_instructions.as_deref(),
+                    req.vertex_tts_project_id.as_deref(),
+                    req.vertex_tts_location.as_deref(),
+                    req.vertex_tts_model.as_deref(),
+                    req.vertex_tts_endpoint.as_deref(),
+                    req.vertex_tts_service_account_json.as_deref(),
+                )
+                .await?;
+                let raw_audio = tmp_path.join("audio.raw");
+                fs::write(&raw_audio, BASE64.decode(&tts_b64)?).await?;
+
+                let wav = tmp_path.join("audio.wav");
+                Command::new("ffmpeg")
+                    .args(&[
+                        "-y",
+                        "-f",
+                        "s16le",
+                        "-ar",
+                        "24000",
+                        "-ac",
+                        "1",
+                        "-i",
+                        raw_audio.to_str().unwrap(),
+                        wav.to_str().unwrap(),
+                    ])
+                    .output()
+                    .await?;
+                let d = get_duration(&wav).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                    pack.script,
+                    pack.subtitle_lines,
+                    pack.title,
+                    pack.category,
+                    d,
+                    wav,
+                ))
+            }
+            .await;
+
+            match attempt {
+                Ok(result) => {
+                    analyze_result = Some(result);
+                    break;
+                }
+                Err(err) => {
+                    last_vertex_err = err.to_string();
+                    if should_retry_vertex_with_strict(variant, &last_vertex_err) {
+                        println!(
+                            "[PIPELINE] Vertex Gemini {} analysis failed; retrying with strict transcode: {}",
+                            variant_label, last_vertex_err
+                        );
+                        continue;
+                    }
+                    println!(
+                        "[PIPELINE] Vertex Gemini analyze failed with {} variant: {}",
+                        variant_label, last_vertex_err
+                    );
+                    break;
+                }
             }
         }
 
         match analyze_result {
             Some(result) => result,
             None => {
-                return Err(if last_gemini_err.is_empty() {
-                    "Gemini pipeline failed".into()
+                return Err(if last_vertex_err.is_empty() {
+                    "Vertex Gemini pipeline failed".into()
                 } else {
-                    last_gemini_err.into()
+                    last_vertex_err.into()
                 });
             }
         }
@@ -3153,14 +3209,14 @@ async fn rust_pipeline(
             .await?;
     }
 
-    // 5. Gemini SRT from generated dub audio (no whisper)
+    // 5. Vertex Gemini SRT from generated dub audio (no whisper)
     update_step(
         worker_url,
         token,
         &bot_id,
         &video_id,
         4.3,
-        "📝 กำลังสร้างซับจากเสียงพากย์ (Gemini SRT)...",
+        "📝 กำลังสร้างซับจากเสียงพากย์ (Vertex Gemini SRT)...",
     )
     .await;
     edit_status(token, req.chat_id, req.msg_id, "🎬 ตัดต่อ: กำลังฝังซับไตเติ้ล").await;
@@ -3169,47 +3225,38 @@ async fn rust_pipeline(
     if !mock_mode {
         let t_sync = std::time::Instant::now();
         let adjusted_bytes = fs::read(&adjusted).await?;
-        let mut audio_sync_keys = gemini_api_keys.clone();
-        if !selected_gemini_key.is_empty() {
-            audio_sync_keys.retain(|key| key != &selected_gemini_key);
-            audio_sync_keys.insert(0, selected_gemini_key.clone());
-        }
-        let mut last_audio_sync_err = String::new();
-        for (index, api_key) in audio_sync_keys.iter().enumerate() {
-            let attempt = async {
-                let audio_uri = gemini_upload_bytes(&adjusted_bytes, "audio/wav", api_key).await?;
-                let audio_uri = gemini_wait(&audio_uri, api_key).await?;
-                gemini_srt_from_audio(
-                    &audio_uri,
-                    &subtitle_lines,
-                    api_key,
-                    &model,
-                    adjusted_audio_dur,
-                )
-                .await
+        let vertex_context = vertex_generation
+            .as_ref()
+            .ok_or("Vertex service account is required for Vertex Gemini audio sync")?;
+        match tokio::time::timeout(
+            Duration::from_secs(VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS),
+            vertex_gemini_srt_from_audio_bytes(
+                &adjusted_bytes,
+                &subtitle_lines,
+                vertex_context,
+                adjusted_audio_dur,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(srt)) => {
+                raw_srt = srt;
             }
-            .await;
-
-            match attempt {
-                Ok(srt) => {
-                    raw_srt = srt;
-                    break;
-                }
-                Err(err) => {
-                    last_audio_sync_err = err.to_string();
-                    println!(
-                        "[PIPELINE] Gemini key slot {} audio sync failed: {}",
-                        index + 1,
-                        last_audio_sync_err
-                    );
-                }
+            Ok(Err(err)) => {
+                println!(
+                    "[PIPELINE] Vertex Gemini audio sync failed; deterministic subtitle fallback will be used: {}",
+                    err
+                );
             }
-        }
-        if raw_srt.trim().is_empty() && !last_audio_sync_err.is_empty() {
-            return Err(last_audio_sync_err.into());
+            Err(_) => {
+                println!(
+                    "[PIPELINE] Vertex Gemini audio sync timed out after {}s; deterministic subtitle fallback will be used",
+                    VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS
+                );
+            }
         }
         println!(
-            "[PIPELINE] Gemini audio sync -> {} chars, {} blocks ({:.1}s)",
+            "[PIPELINE] Vertex Gemini audio sync -> {} chars, {} blocks ({:.1}s)",
             raw_srt.len(),
             raw_srt
                 .split("\n\n")
@@ -3218,7 +3265,7 @@ async fn rust_pipeline(
             t_sync.elapsed().as_secs_f64()
         );
     } else {
-        println!("[PIPELINE] mock mode: skip gemini audio sync");
+        println!("[PIPELINE] mock mode: skip Vertex Gemini audio sync");
     }
 
     let audio_activity_window = detect_audio_activity_window(&adjusted, adjusted_audio_dur).await;
@@ -3275,7 +3322,7 @@ async fn rust_pipeline(
     let t_srt = std::time::Instant::now();
     let mut final_srt_text = normalize_srt_blocks(&raw_srt, subtitle_max_end);
     if !final_srt_text.trim().is_empty() && !srt_quality_ok(&script, &final_srt_text, 120) {
-        println!("[PIPELINE] Gemini SRT quality check failed -> deterministic fallback");
+        println!("[PIPELINE] Vertex Gemini SRT quality check failed -> deterministic fallback");
         final_srt_text.clear();
     }
 
@@ -3390,7 +3437,7 @@ async fn rust_pipeline(
             "stream=width,height",
             "-of",
             "csv=p=0:s=x",
-            video_path.to_str().unwrap(),
+            processing_video_path.to_str().unwrap(),
         ])
         .output()
         .await;
@@ -3416,24 +3463,12 @@ async fn rust_pipeline(
     let merge_out = tokio::time::timeout(
         Duration::from_secs(300),
         Command::new("ffmpeg")
-            .args(&[
-                "-y",
-                "-i",
-                video_path.to_str().unwrap(),
-                "-i",
+            .args(build_final_merge_ffmpeg_args(
+                processing_video_path.to_str().unwrap(),
                 adjusted.to_str().unwrap(),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-t",
-                &duration.to_string(),
+                duration,
                 nosub_path.to_str().unwrap(),
-            ])
+            ))
             .output(),
     )
     .await;
@@ -3448,30 +3483,39 @@ async fn rust_pipeline(
         "ass={}:fontsdir=/usr/local/share/fonts",
         ass_path.to_str().unwrap()
     );
+    let mut burn_cmd = Command::new("ffmpeg");
+    burn_cmd.kill_on_drop(true);
+    burn_cmd.args(&[
+        "-y",
+        "-i",
+        nosub_path.to_str().unwrap(),
+        "-vf",
+        &vf,
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "copy",
+        "-preset",
+        "fast",
+        output_mp4.to_str().unwrap(),
+    ]);
     let ffmpeg_burn = tokio::time::timeout(
-        Duration::from_secs(300),
-        Command::new("ffmpeg")
-            .args(&[
-                "-y",
-                "-i",
-                nosub_path.to_str().unwrap(),
-                "-vf",
-                &vf,
-                "-c:v",
-                "libx264",
-                "-c:a",
-                "copy",
-                "-preset",
-                "fast",
-                output_mp4.to_str().unwrap(),
-            ])
-            .output(),
+        Duration::from_secs(SUBTITLE_BURN_TIMEOUT_SECS),
+        burn_cmd.output(),
     )
     .await;
-    match ffmpeg_burn {
-        Err(_) => return Err("FFmpeg burn subtitles timed out (>300s)".into()),
-        Ok(Err(e)) => return Err(Box::new(e)),
-        Ok(Ok(_)) => {}
+    let burn_fallback_reason = match ffmpeg_burn {
+        Err(_) => Some(format!("timeout>{}s", SUBTITLE_BURN_TIMEOUT_SECS)),
+        Ok(Err(e)) => Some(format!("process_error={}", e)),
+        Ok(Ok(output)) => ffmpeg_nonzero_status_reason(&output),
+    };
+    if let Some(reason) = burn_fallback_reason {
+        println!(
+            "[PIPELINE] subtitle burn failed-open: {}; using no-subtitle mp4",
+            reason
+        );
+        let _ = fs::remove_file(&output_mp4).await;
+        fs::copy(&nosub_path, &output_mp4).await?;
     }
 
     let thumb_path = tmp_path.join("thumb.webp");
@@ -3612,6 +3656,362 @@ async fn rust_pipeline(
         .await;
 
     Ok(())
+}
+
+const AVATAR_COMPOSE_OUTPUT_MIN_BYTES: usize = 1024;
+const AVATAR_COMPOSE_JOB_TTL_SECS: u64 = 600;
+const AVATAR_COMPOSE_VIDEO_PRESET: &str = "veryfast";
+const AVATAR_COMPOSE_VIDEO_BITRATE: &str = "2500k";
+const AVATAR_COMPOSE_VIDEO_MAXRATE: &str = "3000k";
+const AVATAR_COMPOSE_VIDEO_BUFSIZE: &str = "6000k";
+const AVATAR_COMPOSE_AUDIO_BITRATE: &str = "128k";
+
+#[derive(Clone)]
+struct AvatarComposeInput {
+    video_url: String,
+    avatar_video_url: String,
+    chromakey_similarity: f64,
+    chromakey_blend: f64,
+}
+
+#[derive(Clone)]
+enum AvatarComposeJobState {
+    Processing,
+    Done(Vec<u8>),
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct AvatarComposeJob {
+    state: AvatarComposeJobState,
+    updated_at: Instant,
+}
+
+type AvatarComposeJobs = Arc<Mutex<HashMap<String, AvatarComposeJob>>>;
+
+static AVATAR_COMPOSE_JOBS: OnceLock<AvatarComposeJobs> = OnceLock::new();
+
+fn avatar_compose_jobs() -> &'static AvatarComposeJobs {
+    AVATAR_COMPOSE_JOBS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+fn default_avatar_chromakey_similarity() -> f64 {
+    0.14
+}
+
+fn default_avatar_chromakey_blend() -> f64 {
+    0.02
+}
+
+fn clamp_avatar_chromakey(value: f64, default_value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        default_value
+    }
+}
+
+fn validate_avatar_compose_url(raw: &str, label: &str) -> Result<String, String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err(format!("{}_missing", label));
+    }
+    let parsed = url::Url::parse(url).map_err(|_| format!("{}_invalid", label))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("{}_invalid", label));
+    }
+    Ok(url.to_string())
+}
+
+fn parse_avatar_compose_request(
+    payload: AvatarComposeRequest,
+) -> Result<AvatarComposeInput, String> {
+    Ok(AvatarComposeInput {
+        video_url: validate_avatar_compose_url(&payload.video_url, "video_url")?,
+        avatar_video_url: validate_avatar_compose_url(
+            &payload.avatar_video_url,
+            "avatar_video_url",
+        )?,
+        chromakey_similarity: clamp_avatar_chromakey(
+            payload.chromakey_similarity,
+            default_avatar_chromakey_similarity(),
+        ),
+        chromakey_blend: clamp_avatar_chromakey(
+            payload.chromakey_blend,
+            default_avatar_chromakey_blend(),
+        ),
+    })
+}
+
+fn avatar_compose_error_response(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<Value>) {
+    let message = message.into();
+    (
+        status,
+        Json(json!({
+            "error": "avatar_compose_failed",
+            "details": message,
+        })),
+    )
+}
+
+fn avatar_compose_status_for_error(message: &str) -> StatusCode {
+    if message.contains("_missing") || message.contains("_invalid") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn avatar_compose_video_response(output: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "video/mp4")],
+        output,
+    )
+        .into_response()
+}
+
+fn prune_avatar_compose_jobs(jobs: &mut HashMap<String, AvatarComposeJob>) {
+    jobs.retain(|_, job| job.updated_at.elapsed().as_secs() <= AVATAR_COMPOSE_JOB_TTL_SECS);
+}
+
+async fn download_avatar_compose_video(
+    client: &Client,
+    url: &str,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let response = tokio::time::timeout(Duration::from_secs(120), client.get(url).send())
+        .await
+        .map_err(|_| format!("{}_download_timeout", label))?
+        .map_err(|_| format!("{}_download_failed", label))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("{}_download_http_{}", label, status.as_u16()).into());
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| format!("{}_download_read_failed", label))?;
+    validate_downloaded_video(bytes.as_ref(), &content_type)
+        .map_err(|e| format!("{}_invalid: {}", label, e))?;
+    Ok(bytes.to_vec())
+}
+
+fn build_avatar_compose_ffmpeg_args(
+    base_path: &str,
+    avatar_path: &str,
+    filter_complex: &str,
+    duration: &str,
+    output_path: &str,
+) -> Vec<String> {
+    vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        base_path.to_string(),
+        "-i".to_string(),
+        avatar_path.to_string(),
+        "-filter_complex".to_string(),
+        filter_complex.to_string(),
+        "-map".to_string(),
+        "[outv]".to_string(),
+        "-map".to_string(),
+        "0:a:0?".to_string(),
+        "-t".to_string(),
+        duration.to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        AVATAR_COMPOSE_VIDEO_PRESET.to_string(),
+        "-b:v".to_string(),
+        AVATAR_COMPOSE_VIDEO_BITRATE.to_string(),
+        "-maxrate".to_string(),
+        AVATAR_COMPOSE_VIDEO_MAXRATE.to_string(),
+        "-bufsize".to_string(),
+        AVATAR_COMPOSE_VIDEO_BUFSIZE.to_string(),
+        "-pix_fmt".to_string(),
+        "yuv420p".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        AVATAR_COMPOSE_AUDIO_BITRATE.to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        output_path.to_string(),
+    ]
+}
+
+async fn compose_avatar_video(
+    input: AvatarComposeInput,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(15))
+        .build()?;
+    let base_bytes = download_avatar_compose_video(&client, &input.video_url, "base_video").await?;
+    let avatar_bytes =
+        download_avatar_compose_video(&client, &input.avatar_video_url, "avatar_video").await?;
+
+    let tmp_dir = tempdir()?;
+    let base_path = tmp_dir.path().join("base.mp4");
+    let avatar_path = tmp_dir.path().join("avatar.mp4");
+    let output_path = tmp_dir.path().join("avatar_composed.mp4");
+    fs::write(&base_path, base_bytes).await?;
+    fs::write(&avatar_path, avatar_bytes).await?;
+
+    let base_duration = get_duration(&base_path).await.max(0.1);
+    let base_path_str = base_path.to_str().ok_or("base_video_path_invalid")?;
+    let avatar_path_str = avatar_path.to_str().ok_or("avatar_video_path_invalid")?;
+    let output_path_str = output_path.to_str().ok_or("output_path_invalid")?;
+    // Use an RGBA colorkey pipeline for the full-canvas green-screen avatar.
+    // The previous yuv420p+chromakey pipeline produced a broken alpha mask on
+    // compressed green-screen MP4s, darkening the whole base video during FB posting.
+    let effective_similarity = input.chromakey_similarity.max(0.30);
+    let effective_blend = input.chromakey_blend.max(0.10);
+    let filter_complex = format!(
+        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=rgba[base];\
+         [1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:0x00c800,setsar=1,fps=30,format=rgba,colorkey=0x00c800:{:.4}:{:.4},format=rgba[avatar];\
+         [base][avatar]overlay=0:0:format=auto:eof_action=repeat:repeatlast=1,format=yuv420p[outv]",
+        effective_similarity, effective_blend,
+    );
+
+    let duration = format!("{:.3}", base_duration);
+    let ffmpeg_args = build_avatar_compose_ffmpeg_args(
+        base_path_str,
+        avatar_path_str,
+        &filter_complex,
+        &duration,
+        output_path_str,
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(300),
+        Command::new("ffmpeg").args(&ffmpeg_args).output(),
+    )
+    .await;
+
+    let output = match output {
+        Err(_) => return Err("avatar_compose_ffmpeg_timeout".into()),
+        Ok(Err(err)) => return Err(Box::new(err)),
+        Ok(Ok(output)) => output,
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "avatar_compose_ffmpeg_failed: {}",
+            stderr.chars().take(1200).collect::<String>()
+        )
+        .into());
+    }
+
+    let bytes = fs::read(&output_path).await?;
+    if bytes.len() < AVATAR_COMPOSE_OUTPUT_MIN_BYTES {
+        return Err(format!("avatar_compose_output_too_small_{}", bytes.len()).into());
+    }
+    Ok(bytes)
+}
+
+pub async fn handle_avatar_compose(
+    Json(payload): Json<AvatarComposeRequest>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let input = parse_avatar_compose_request(payload)
+        .map_err(|e| avatar_compose_error_response(StatusCode::BAD_REQUEST, e))?;
+    compose_avatar_video(input)
+        .await
+        .map(avatar_compose_video_response)
+        .map_err(|e| {
+            let message = e.to_string();
+            avatar_compose_error_response(avatar_compose_status_for_error(&message), message)
+        })
+}
+
+pub async fn handle_avatar_compose_start(
+    Json(payload): Json<AvatarComposeRequest>,
+) -> Result<Json<AvatarComposeStartResponse>, (StatusCode, Json<Value>)> {
+    let input = parse_avatar_compose_request(payload)
+        .map_err(|e| avatar_compose_error_response(StatusCode::BAD_REQUEST, e))?;
+    let job_id = Uuid::new_v4().to_string();
+    {
+        let mut jobs = avatar_compose_jobs().lock().await;
+        prune_avatar_compose_jobs(&mut jobs);
+        jobs.insert(
+            job_id.clone(),
+            AvatarComposeJob {
+                state: AvatarComposeJobState::Processing,
+                updated_at: Instant::now(),
+            },
+        );
+    }
+
+    let job_id_for_task = job_id.clone();
+    tokio::spawn(async move {
+        let result = compose_avatar_video(input).await;
+        let state = match result {
+            Ok(output) => AvatarComposeJobState::Done(output),
+            Err(err) => AvatarComposeJobState::Failed(err.to_string()),
+        };
+        let mut jobs = avatar_compose_jobs().lock().await;
+        prune_avatar_compose_jobs(&mut jobs);
+        jobs.insert(
+            job_id_for_task,
+            AvatarComposeJob {
+                state,
+                updated_at: Instant::now(),
+            },
+        );
+    });
+
+    Ok(Json(AvatarComposeStartResponse {
+        status: "started".to_string(),
+        job_id,
+    }))
+}
+
+pub async fn handle_avatar_compose_result(
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    if Uuid::parse_str(&job_id).is_err() {
+        return Err(avatar_compose_error_response(
+            StatusCode::BAD_REQUEST,
+            "job_id_invalid",
+        ));
+    }
+
+    let mut jobs = avatar_compose_jobs().lock().await;
+    prune_avatar_compose_jobs(&mut jobs);
+    let Some(job) = jobs.remove(&job_id) else {
+        return Err(avatar_compose_error_response(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+        ));
+    };
+
+    match job.state {
+        AvatarComposeJobState::Processing => {
+            jobs.insert(job_id, job);
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "processing",
+                })),
+            )
+                .into_response())
+        }
+        AvatarComposeJobState::Done(output) => Ok(avatar_compose_video_response(output)),
+        AvatarComposeJobState::Failed(message) => Err(avatar_compose_error_response(
+            avatar_compose_status_for_error(&message),
+            message,
+        )),
+    }
 }
 
 pub async fn handle_pipeline(

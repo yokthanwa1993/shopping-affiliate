@@ -3,6 +3,20 @@ import { ProcessingCard } from '../components/ProcessingCard'
 
 const getTodayString = () => new Date().toLocaleDateString('en-CA')
 const getEventTime = (video: any) => String(video.completedAt || video.processedAt || video.updatedAt || video.createdAt || '').trim()
+const getVideoId = (video: any) => String(video?.id || video?.video_id || '').trim()
+const hasAffiliateLink = (video: any) => !!(
+  video?.shopeeLink
+  || video?.shopee_link
+  || video?.lazadaLink
+  || video?.lazada_link
+  || video?.link
+)
+
+const formatDuration = (value: unknown) => {
+  const seconds = Math.floor(Number(value || 0))
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
 
 const getDateKey = (value: string) => {
   const date = new Date(value)
@@ -36,6 +50,10 @@ export function ProcessingTab({
   onReprocess,
   onOpenProcessedVideo,
   retryingProcessingId,
+  onRetryProcessing,
+  isRefreshing,
+  currentNamespaceId,
+  workerUrl,
 }: {
   loading: boolean
   error?: string
@@ -44,9 +62,27 @@ export function ProcessingTab({
   onReprocess: (id: string) => void
   onOpenProcessedVideo?: (video: any) => void
   retryingProcessingId: string | null
+  onRetryProcessing?: () => void
+  isRefreshing?: boolean
+  currentNamespaceId?: string
+  workerUrl?: string
 }) {
   const [selectedDate, setSelectedDate] = useState<string>(getTodayString())
   const [statusTab, setStatusTab] = useState<'active' | 'failed' | 'processed'>('active')
+  const getVideoNamespace = (video: any) => String(video?.namespace_id || currentNamespaceId || '').trim()
+  const buildGalleryAssetUrl = (video: any, variant: 'thumb' | 'public') => {
+    const id = getVideoId(video)
+    const ns = getVideoNamespace(video)
+    const baseUrl = String(workerUrl || '').trim().replace(/\/+$/, '')
+    if (!id || !ns || !baseUrl) return ''
+    try {
+      const url = new URL(`${baseUrl}/api/gallery/${encodeURIComponent(id)}/asset/${variant}`)
+      url.searchParams.set('namespace_id', ns)
+      return url.toString()
+    } catch {
+      return `${baseUrl}/api/gallery/${encodeURIComponent(id)}/asset/${variant}?namespace_id=${encodeURIComponent(ns)}`
+    }
+  }
 
   const grouped = useMemo(() => {
     const map = new Map<string, any[]>()
@@ -60,7 +96,7 @@ export function ProcessingTab({
       map.set(key, [...items].sort((a, b) => {
         const at = new Date(getEventTime(a)).getTime()
         const bt = new Date(getEventTime(b)).getTime()
-        return (Number.isFinite(at) ? at : 0) - (Number.isFinite(bt) ? bt : 0)
+        return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0)
       }))
     }
     return map
@@ -135,8 +171,18 @@ export function ProcessingTab({
       </div>
 
       {error && !showInitialLoading && processingVideos.length > 0 ? (
-        <div className="mb-3 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm font-bold text-red-700">
-          โหลดข้อมูลงานประมวลผลไม่สำเร็จ: {error}
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-2xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-800">
+          <span className="truncate">{error}</span>
+          {onRetryProcessing ? (
+            <button
+              type="button"
+              onClick={onRetryProcessing}
+              disabled={isRefreshing}
+              className="shrink-0 rounded-full bg-white px-3 py-1.5 text-xs font-black text-amber-700 shadow-sm active:scale-95 transition-all disabled:opacity-60"
+            >
+              {isRefreshing ? 'กำลังโหลด…' : 'ลองใหม่'}
+            </button>
+          ) : null}
         </div>
       ) : null}
 
@@ -148,11 +194,24 @@ export function ProcessingTab({
         </div>
       ) : error && processingVideos.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-[45vh] text-center px-6">
-          <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-4">
-            <span className="text-4xl grayscale opacity-50">!</span>
+          <div className="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mb-4">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 12a9 9 0 1 1-3.6-7.2" />
+              <polyline points="21 4 21 10 15 10" />
+            </svg>
           </div>
-          <p className="text-gray-900 font-bold text-lg">โหลดข้อมูลไม่สำเร็จ</p>
-          <p className="text-gray-400 text-sm mt-1">{error}</p>
+          <p className="text-gray-900 font-bold text-lg">โหลดช้ากว่าปกติ</p>
+          <p className="text-gray-500 text-sm mt-1 max-w-xs">เซิร์ฟเวอร์ตอบช้า แตะลองโหลดใหม่อีกครั้งได้เลย</p>
+          {onRetryProcessing ? (
+            <button
+              type="button"
+              onClick={onRetryProcessing}
+              disabled={isRefreshing}
+              className="mt-4 inline-flex items-center gap-2 rounded-2xl bg-blue-500 px-5 py-2.5 text-sm font-black text-white shadow-sm shadow-blue-200 active:scale-95 transition-all disabled:opacity-60"
+            >
+              {isRefreshing ? 'กำลังโหลด…' : 'ลองโหลดใหม่'}
+            </button>
+          ) : null}
         </div>
       ) : activeVideos.length === 0 ? (
         <div className="flex flex-col items-center justify-center h-[45vh] text-center px-6">
@@ -161,6 +220,75 @@ export function ProcessingTab({
           </div>
           <p className="text-gray-900 font-bold text-lg">ไม่มีงานในแท็บนี้</p>
           <p className="text-gray-400 text-sm mt-1">ลองเลือกวันอื่นหรือแท็บอื่น</p>
+        </div>
+      ) : statusTab === 'processed' ? (
+        <div className="space-y-3">
+          <div className="flex items-center justify-between px-1">
+            <p className="text-sm font-black text-gray-900">{formatThaiDate(selectedDate)}</p>
+            <span className="rounded-full bg-white px-3 py-1 text-xs font-black text-gray-500 shadow-sm">{activeVideos.length} งาน</span>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            {activeVideos.map((video, index) => {
+              const id = getVideoId(video)
+              const ns = getVideoNamespace(video)
+              const thumbUrl = buildGalleryAssetUrl(video, 'thumb')
+              const publicUrl = buildGalleryAssetUrl(video, 'public')
+              const durationLabel = formatDuration(video.duration || video.durationSeconds)
+              const shortId = id ? id.slice(0, 8) : 'video'
+              return (
+                <button
+                  key={`${ns || 'namespace'}-${id || index}`}
+                  type="button"
+                  onClick={() => onOpenProcessedVideo?.({ ...video, id: id || video.id, namespace_id: ns || video.namespace_id })}
+                  className="relative aspect-[9/16] rounded-2xl overflow-hidden bg-gray-100 shadow-sm active:scale-95 transition-transform duration-200 text-left"
+                >
+                  {thumbUrl ? (
+                    <img
+                      src={thumbUrl}
+                      alt={id ? `Video ${id}` : 'Processed video'}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                  ) : publicUrl ? (
+                    <video
+                      src={`${publicUrl}#t=0.1`}
+                      muted
+                      playsInline
+                      preload="metadata"
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-gray-100 px-2 text-center text-gray-400">
+                      <span className="text-2xl leading-none">▶</span>
+                      <span className="max-w-full truncate text-[10px] font-black">{shortId}</span>
+                    </div>
+                  )}
+
+                  {hasAffiliateLink(video) ? (
+                    <div className="absolute bottom-2 left-2 flex h-6 w-6 items-center justify-center rounded-full border border-white/20 bg-orange-500 text-white shadow-lg">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" strokeLinecap="round" strokeLinejoin="round" />
+                        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </div>
+                  ) : null}
+
+                  {durationLabel ? (
+                    <div className="absolute bottom-2 right-2 rounded-full bg-black/60 px-2 py-0.5 text-[10px] font-medium text-white backdrop-blur-md">
+                      {durationLabel}
+                    </div>
+                  ) : null}
+
+                  <div className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500 text-white shadow-lg">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                      <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
         </div>
       ) : (
         <div className="space-y-3">

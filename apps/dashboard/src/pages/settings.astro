@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import SettingsPanel from '../components/SettingsPanel.svelte'
+---
+
+<Layout
+  title="Settings"
+  subtitle="การตั้งค่าของเพจ · /worker-api/api/dashboard/settings"
+  headerBadge="settings"
+  active="settings"
+>
+  <SettingsPanel client:load />
+</Layout>

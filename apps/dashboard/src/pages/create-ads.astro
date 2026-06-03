@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import CreateAdsPanel from '../components/CreateAdsPanel.svelte'
+---
+
+<Layout
+  title="Create Ads"
+  subtitle="เลือกคลิปต้นทาง · เข้าคิวสร้างแอด"
+  headerBadge="create"
+  active="create"
+>
+  <CreateAdsPanel client:load />
+</Layout>

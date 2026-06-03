@@ -423,6 +423,95 @@ function buildOrderRow(idx, subId, purchaseValue = 100, commission = 5) {
   };
 }
 
+test('handleDailyIncomeReport paginates conversion rows and totals daily commission per account', async (t) => {
+  const stub = stubBrowserForConversionReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+    evaluateResult: (args) => {
+      const url = new URL(args[0]);
+      const pageNum = Number(url.searchParams.get('page_num'));
+      assert.equal(Number(url.searchParams.get('page_size')), 100);
+      if (pageNum === 1) {
+        return {
+          status: 200,
+          parsed: true,
+          body: {
+            code: 0,
+            data: {
+              affiliate_id: 15142270000,
+              total_count: 3,
+              list: [buildOrderRow(1, 'alpha', 100, 5), buildOrderRow(2, 'beta', 200, 10)],
+            },
+          },
+        };
+      }
+      return {
+        status: 200,
+        parsed: true,
+        body: {
+          code: 0,
+          data: {
+            affiliate_id: 15142270000,
+            total_count: 3,
+            list: [buildOrderRow(3, 'alpha', 50, 2.5)],
+          },
+        },
+      };
+    },
+  });
+
+  const result = await conversionReport.handleDailyIncomeReport(
+    { id: '15142270000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.report_type, 'daily_income_report');
+  assert.equal(result.time, '25/05/2026');
+  assert.equal(result.isoDate, '2026-05-25');
+  assert.equal(result.account_count, 1);
+  assert.equal(result.totals.orders, 3);
+  assert.equal(result.totals.purchase_value, 350);
+  assert.equal(result.totals.commission, 17.5);
+  assert.equal(result.accounts[0].id, '15142270000');
+  assert.equal(result.accounts[0].orders, 3);
+  assert.equal(result.accounts[0].pages_fetched, 2);
+  assert.equal(result.accounts[0].row_count, 3);
+  assert.equal(result.accounts[0].truncated, false);
+  assert.equal(stub.getPageCalls[0].account, 'affiliate_neezs.com');
+  assert.equal(stub.evaluates.length, 2);
+});
+
+test('GET /daily-income-report returns aggregated daily income JSON', async (t) => {
+  stubBrowserForConversionReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+    evaluateResult: {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: 1,
+          list: [buildOrderRow(1, 'alpha', 100, 5)],
+        },
+      },
+    },
+  });
+  const instance = await startTestServer();
+  t.after(() => stopTestServer(instance));
+
+  const response = await httpRequest(instance, {
+    path: '/daily-income-report?id=15130770000&time=25/05/2026',
+  });
+  const payload = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(payload.status, 'ok');
+  assert.equal(payload.report_type, 'daily_income_report');
+  assert.equal(payload.totals.orders, 1);
+  assert.equal(payload.totals.commission, 5);
+});
+
 test('handleConversionReport raw mode returns ok payload with total_count, list, affiliate_id from stubbed Shopee response', async (t) => {
   const stub = stubBrowserForConversionReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',

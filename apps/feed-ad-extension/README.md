@@ -1,6 +1,6 @@
 # Feed Ad Creator (Chrome Extension)
 
-**Headless extension** ที่ทำงานเบื้องหลังของ dashboard `/feed` — ผู้ใช้ไม่เคยกดเข้า extension. ทุกการกระทำเริ่มจากปุ่ม "สร้างแอด" บน `https://dashboard.oomnn.com/feed` แล้ว extension รับงานต่อในเงียบๆ
+**Headless extension** ที่ทำงานเบื้องหลังของ dashboard `/feed` — ผู้ใช้ไม่เคยกดเข้า extension. ทุกการกระทำเริ่มจากปุ่ม "สร้างแอด" บน `https://dashboard.pubilo.com/feed` แล้ว extension รับงานต่อในเงียบๆ
 
 > **ขอบเขต**: extension นี้ **lock เฉพาะเพจฟีด** (page id `116759241338040`). เพจเฉียบและเพจอื่นใช้ Electron `video-onecard` เหมือนเดิม ไม่กระทบ. Worker endpoint `/api/dashboard/extension-ad-log` reject `page_id` ที่ไม่ใช่ฟีดด้วย HTTP 403
 
@@ -38,7 +38,7 @@
 3. กด **Load unpacked** → เลือกโฟลเดอร์: `apps/feed-ad-extension/`
 4. ตรวจว่า icon "F" สีน้ำเงินโผล่บนแถบ extensions (pin หรือไม่ก็ได้)
 5. เปิด tab Ads Manager: `https://adsmanager.facebook.com/...` แล้ว login บัญชีที่มี admin บนเพจฟีด
-6. เปิด `https://dashboard.oomnn.com/feed` หรือ workers.dev URL
+6. เปิด `https://dashboard.pubilo.com/feed` หรือ workers.dev URL
 
 ## Pre-requisites ทุกครั้งที่ใช้
 
@@ -66,7 +66,7 @@
 apps/feed-ad-extension/
 ├── manifest.json     ← MV3, headless (no popup, no side panel)
 ├── background.js     ← service worker — message bus + shortlink + FB pipeline
-├── bridge.js         ← content script on dashboard.oomnn.com/* + workers.dev — handshake + forwarder
+├── bridge.js         ← content script on dashboard.pubilo.com/* + workers.dev — handshake + forwarder
 ├── icons/            ← icon-{16,48,128}.png
 └── README.md
 ```
@@ -108,7 +108,7 @@ Dashboard ใช้ handshake เพื่อโชว์ "✅ extension install
 ## Worker endpoint
 
 ```
-POST https://api.oomnn.com/api/dashboard/extension-ad-log
+POST https://api.pubilo.com/api/dashboard/extension-ad-log
 {
   "page_id": "116759241338040",      // hard-locked, อื่นๆ HTTP 403
   "video_id", "story_id",            // required
@@ -122,7 +122,7 @@ POST https://api.oomnn.com/api/dashboard/extension-ad-log
 ## Settings ที่ extension อ่านจาก worker
 
 ```
-GET https://api.oomnn.com/api/dashboard/settings?page_id=116759241338040
+GET https://api.pubilo.com/api/dashboard/settings?page_id=116759241338040
 ```
 
 ดึง `sub_id`, `sub_id2-5`, `shortlink_url`, `ad_account`, `template_adset` ของฟีด (ที่ตั้งใน dashboard `/feed` → tab Settings)

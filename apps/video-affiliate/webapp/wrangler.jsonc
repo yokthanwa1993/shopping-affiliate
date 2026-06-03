@@ -10,6 +10,14 @@
   ],
   "routes": [
     {
+      "pattern": "app.pubilo.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "web.pubilo.com",
+      "custom_domain": true
+    },
+    {
       "pattern": "app.oomnn.com/*",
       "zone_name": "oomnn.com"
     },
@@ -19,7 +27,7 @@
     }
   ],
   "vars": {
-    "API_BASE_URL": "https://api.oomnn.com"
+    "API_BASE_URL": "https://api.pubilo.com"
   },
   "observability": {
     "enabled": true

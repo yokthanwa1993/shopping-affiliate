@@ -1,9 +1,9 @@
 use axum::{Json, http::StatusCode};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tokio::fs;
 use tempfile::tempdir;
+use tokio::fs;
 use tokio::process::Command;
 
 #[derive(Deserialize)]
@@ -26,7 +26,14 @@ pub struct MergeResponse {
 
 async fn get_duration(path: &std::path::Path) -> f64 {
     if let Ok(output) = Command::new("ffprobe")
-        .args(&["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .args(&[
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
         .arg(path.to_str().unwrap())
         .output()
         .await
@@ -45,12 +52,27 @@ pub async fn handle_merge(
     let audio_base64 = payload.audio_base64;
     let sample_rate = payload.sample_rate.unwrap_or(24000);
 
-    let tmp_dir = tempdir().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+    let tmp_dir = tempdir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
     let tmp_path = tmp_dir.path();
 
     // 1. Download video
-    let video_resp = reqwest::get(&video_url).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Failed download: {}", e)}))))?;
-    let video_bytes = video_resp.bytes().await.map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Failed body: {}", e)}))))?;
+    let video_resp = reqwest::get(&video_url).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Failed download: {}", e)})),
+        )
+    })?;
+    let video_bytes = video_resp.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Failed body: {}", e)})),
+        )
+    })?;
     let video_path = tmp_path.join("video.mp4");
     fs::write(&video_path, &video_bytes).await.unwrap();
 
@@ -60,11 +82,31 @@ pub async fn handle_merge(
     // 2. Write audio raw
     let raw_audio_path = tmp_path.join("audio.raw");
     let wav_audio_path = tmp_path.join("audio.wav");
-    let decoded_audio = BASE64.decode(&audio_base64).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": "Invalid base64"}))))?;
+    let decoded_audio = BASE64.decode(&audio_base64).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid base64"})),
+        )
+    })?;
     fs::write(&raw_audio_path, &decoded_audio).await.unwrap();
 
     // 3. Convert to WAV
-    Command::new("ffmpeg").args(&["-y", "-f", "s16le", "-ar", &sample_rate.to_string(), "-ac", "1", "-i", raw_audio_path.to_str().unwrap(), wav_audio_path.to_str().unwrap()]).output().await.unwrap();
+    Command::new("ffmpeg")
+        .args(&[
+            "-y",
+            "-f",
+            "s16le",
+            "-ar",
+            &sample_rate.to_string(),
+            "-ac",
+            "1",
+            "-i",
+            raw_audio_path.to_str().unwrap(),
+            wav_audio_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
 
     let a_dur = get_duration(&wav_audio_path).await;
 
@@ -74,20 +116,63 @@ pub async fn handle_merge(
     if diff.abs() < 0.5 {
         fs::copy(&wav_audio_path, &adjusted_path).await.unwrap();
     } else if diff > 0.0 {
-        Command::new("ffmpeg").args(&["-y", "-i", wav_audio_path.to_str().unwrap(), "-af", &format!("apad=pad_dur={}", diff), adjusted_path.to_str().unwrap()]).output().await.unwrap();
+        Command::new("ffmpeg")
+            .args(&[
+                "-y",
+                "-i",
+                wav_audio_path.to_str().unwrap(),
+                "-af",
+                &format!("apad=pad_dur={}", diff),
+                adjusted_path.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .unwrap();
     } else {
-        Command::new("ffmpeg").args(&["-y", "-i", wav_audio_path.to_str().unwrap(), "-t", &v_dur.to_string(), adjusted_path.to_str().unwrap()]).output().await.unwrap();
+        Command::new("ffmpeg")
+            .args(&[
+                "-y",
+                "-i",
+                wav_audio_path.to_str().unwrap(),
+                "-t",
+                &v_dur.to_string(),
+                adjusted_path.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .unwrap();
     }
 
     // 5. Merge
     let output_path = tmp_path.join("output.mp4");
     let merge_out = Command::new("ffmpeg")
-        .args(&["-y", "-i", video_path.to_str().unwrap(), "-i", adjusted_path.to_str().unwrap(), "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", "-t", &v_dur.to_string(), output_path.to_str().unwrap()])
+        .args(&[
+            "-y",
+            "-i",
+            video_path.to_str().unwrap(),
+            "-i",
+            adjusted_path.to_str().unwrap(),
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-t",
+            &v_dur.to_string(),
+            output_path.to_str().unwrap(),
+        ])
         .output()
-        .await.unwrap();
+        .await
+        .unwrap();
 
     if !merge_out.status.success() {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Merge failed"}))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Merge failed"})),
+        ));
     }
 
     let out_dur = get_duration(&output_path).await;
@@ -95,12 +180,35 @@ pub async fn handle_merge(
 
     // 6. Thumbnail
     let thumb_path = tmp_path.join("thumb.webp");
-    Command::new("ffmpeg").args(&["-y", "-i", output_path.to_str().unwrap(), "-vframes", "1", "-ss", "0.1", "-vf", "scale=270:480:force_original_aspect_ratio=increase,crop=270:480", "-q:v", "80", thumb_path.to_str().unwrap()]).output().await.unwrap();
+    Command::new("ffmpeg")
+        .args(&[
+            "-y",
+            "-i",
+            output_path.to_str().unwrap(),
+            "-vframes",
+            "1",
+            "-ss",
+            "0.1",
+            "-vf",
+            "scale=270:480:force_original_aspect_ratio=increase,crop=270:480",
+            "-q:v",
+            "80",
+            thumb_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .unwrap();
 
     let out_bytes = fs::read(&output_path).await.unwrap();
     let thumb_enc = if let Ok(t) = fs::read(&thumb_path).await {
-        if !t.is_empty() { Some(BASE64.encode(t)) } else { None }
-    } else { None };
+        if !t.is_empty() {
+            Some(BASE64.encode(t))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(Json(MergeResponse {
         success: true,

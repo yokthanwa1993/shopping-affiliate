@@ -1,17 +1,17 @@
 // Feed Ad Creator — service worker (headless).
 //
-// No UI: extension runs entirely behind dashboard.oomnn.com/feed. The dashboard
+// No UI: extension runs entirely behind dashboard.pubilo.com/feed. The dashboard
 // page is the only thing the operator interacts with. This worker just:
 //   1. Receives 'feedExt.createAd' messages forwarded by content_script bridge.js
 //   2. Reads the operator's settings (sub_id, ad_account, template_adset) from
-//      api.oomnn.com so dashboard /feed/settings stays the source of truth
+//      api.pubilo.com so dashboard /feed/settings stays the source of truth
 //   3. Shortens the Shopee URL via short.wwoom.com (with affiliate-tab fallback)
 //   4. Pulls window.__accessToken + cookies out of the operator's logged-in
 //      Ads Manager tab via chrome.scripting.executeScript({ world: 'MAIN' })
 //      — same trick the Electron BrowserWindow used, just inside Chrome
 //   5. Runs the full FB Graph pipeline in that page's context (cookies attach
 //      automatically, anti-bot validators see calls coming from facebook.com)
-//   6. Logs the result to api.oomnn.com so post_history matches what cron sees
+//   6. Logs the result to api.pubilo.com so post_history matches what cron sees
 
 // ────────────────────── Constants ──────────────────────
 
@@ -21,7 +21,7 @@
 const FEED_PAGE_ID = '114142457961643'           // เพจ ฉ่ำ
 const FEED_PAGE_NAME = 'ฉ่ำ'
 
-const WORKER_BASE = 'https://api.oomnn.com'
+const WORKER_BASE = 'https://api.pubilo.com'
 const SHORTLINK_BASE = 'https://short.wwoom.com'
 
 const DEFAULT_AD_ACCOUNT = 'act_1030797047648459'

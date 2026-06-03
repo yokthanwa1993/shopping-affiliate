@@ -1,0 +1,13 @@
+---
+import Layout from '../layouts/Layout.astro'
+import HistoryPanel from '../components/HistoryPanel.svelte'
+---
+
+<Layout
+  title="History"
+  subtitle="ประวัติการเผยแพร่ · /worker-api/api/post-history"
+  headerBadge="history"
+  active="history"
+>
+  <HistoryPanel client:load />
+</Layout>

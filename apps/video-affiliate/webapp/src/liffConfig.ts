@@ -25,7 +25,7 @@ export const getMainLiffUrlForHost = (host = getCurrentHost()) => {
 
 export const getMissingMainLiffMessageForHost = (host = getCurrentHost()) =>
   isWebHost(host)
-    ? 'ยังไม่ได้ตั้งค่า LINE LIFF สำหรับเว็บ (web.oomnn.com)'
+    ? 'ยังไม่ได้ตั้งค่า LINE LIFF สำหรับเว็บ (web.pubilo.com)'
     : 'ยังไม่ได้ตั้งค่า LINE LIFF'
 
 export const getMainLiffInitOptionsForHost = (host = getCurrentHost()) => {

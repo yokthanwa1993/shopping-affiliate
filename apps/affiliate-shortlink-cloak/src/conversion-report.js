@@ -466,6 +466,187 @@ function summaryResponseShape(spec) {
   };
 }
 
+function parseDailyIncomeIds(query = {}) {
+  const raw = String(
+    query.ids != null && String(query.ids).trim() !== ''
+      ? query.ids
+      : (query.id != null && String(query.id).trim() !== '' ? query.id : '15130770000,15142270000'),
+  );
+  const ids = [];
+  const seen = new Set();
+  for (const part of raw.split(',')) {
+    const candidate = normalizeShopeeAffiliateId(part);
+    if (!candidate || seen.has(candidate)) continue;
+    // Reuse the normal request resolver so unknown IDs fail with the same public error.
+    resolveConversionReportRequest({ id: candidate, time: query.time });
+    seen.add(candidate);
+    ids.push(candidate);
+  }
+  if (!ids.length) {
+    throw conversionReportIdError('shopee_affiliate_id_invalid', 'Invalid Shopee affiliate id list', raw);
+  }
+  return ids;
+}
+
+async function handleDailyIncomeForSpec(spec, page, opts = {}) {
+  const pageSize = SHOPEE_CONVERSION_REPORT_SUMMARY_PAGE_SIZE;
+  const maxPages = Math.max(1, Math.min(1000, parseInteger(opts.max_pages, 1000)));
+  const rows = [];
+  let totalCount = 0;
+  let affiliateId = null;
+  let pagesFetched = 0;
+  let stoppedReason = 'total_reached';
+
+  for (let pageNum = 1; pageNum <= maxPages; pageNum += 1) {
+    const apiUrl = buildConversionReportFetchUrl({
+      range: spec.range,
+      page_num: pageNum,
+      page_size: pageSize,
+      extras: spec.extras,
+    });
+    let result;
+    try {
+      result = await fetchConversionReportPageOnce(page, apiUrl);
+    } catch (err) {
+      return Object.assign(baseResponseShape(spec), {
+        status: 'error',
+        error: 'conversion_report_fetch_failed',
+        reason: 'conversion_report_fetch_failed',
+        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+        pages_fetched: pagesFetched,
+        page_size: pageSize,
+      });
+    }
+    pagesFetched += 1;
+    const classification = classifyConversionReportFetchResult(result);
+    if (classification) {
+      return Object.assign(baseResponseShape(spec), classification, {
+        pages_fetched: pagesFetched,
+        page_size: pageSize,
+      });
+    }
+    const body = result.body;
+    if (pageNum === 1) {
+      totalCount = pickTotalCount(body);
+      affiliateId = pickAffiliateId(body);
+    }
+    const list = pickList(body);
+    const pageRows = Array.isArray(list) ? list : [];
+    rows.push(...pageRows);
+    if (!pageRows.length) {
+      stoppedReason = 'empty_page';
+      break;
+    }
+    if (totalCount <= 0 || rows.length >= totalCount) {
+      stoppedReason = 'total_reached';
+      break;
+    }
+  }
+
+  if (pagesFetched >= maxPages && rows.length < totalCount) stoppedReason = 'max_pages';
+  const amounts = summarizeRowAmounts(rows);
+  return Object.assign(baseResponseShape(spec), {
+    status: 'ok',
+    report_type: 'daily_income_account',
+    mode: 'daily_income',
+    total_count: totalCount,
+    orders: totalCount,
+    row_count: rows.length,
+    purchase_value: amounts.purchase_value,
+    commission: amounts.commission,
+    pages_fetched: pagesFetched,
+    page_size: pageSize,
+    truncated: totalCount > rows.length,
+    stopped_reason: stoppedReason,
+    affiliate_id: affiliateId,
+  });
+}
+
+async function handleDailyIncomeReport(query = {}, deps = {}) {
+  const browserDep = deps.browser || browser;
+  const now = deps.now instanceof Date ? deps.now : new Date();
+  const ids = parseDailyIncomeIds(query);
+  const accounts = [];
+  let firstSpec = null;
+
+  for (const id of ids) {
+    const spec = resolveConversionReportRequest(Object.assign({}, query, {
+      id,
+      page_size: SHOPEE_CONVERSION_REPORT_SUMMARY_PAGE_SIZE,
+      page_num: 1,
+    }), { now });
+    if (!firstSpec) firstSpec = spec;
+    let pageRecord;
+    try {
+      pageRecord = await browserDep.getPage('shopee', spec.account, { headless: true });
+    } catch (err) {
+      accounts.push(Object.assign(baseResponseShape(spec), {
+        status: 'error',
+        error: 'browser_unavailable',
+        reason: 'browser_unavailable',
+        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+      }));
+      continue;
+    }
+    const page = pageRecord && pageRecord.page;
+    if (!page) {
+      accounts.push(Object.assign(baseResponseShape(spec), {
+        status: 'error',
+        error: 'browser_unavailable',
+        reason: 'browser_unavailable',
+      }));
+      continue;
+    }
+    if (typeof browserDep.ensureOnPlatformPage === 'function') {
+      try { await browserDep.ensureOnPlatformPage(page, 'shopee'); } catch {}
+    }
+    let currentUrl = '';
+    try { currentUrl = typeof page.url === 'function' ? String(page.url() || '') : ''; } catch { currentUrl = ''; }
+    const onAffiliateOrigin = typeof browserDep.isOnPlatformOrigin === 'function'
+      ? browserDep.isOnPlatformOrigin(currentUrl, 'shopee')
+      : /affiliate\.shopee\.co\.th/i.test(currentUrl);
+    if (isLoginRedirectUrl(currentUrl) || !onAffiliateOrigin) {
+      accounts.push(Object.assign(baseResponseShape(spec), {
+        status: 'manual_login_required',
+        error: 'manual_login_required',
+        manualLoginRequired: true,
+        needsManual: true,
+        reason: 'shopee_login_required',
+        loginUi: '/login?platform=shopee',
+      }));
+      continue;
+    }
+    accounts.push(await handleDailyIncomeForSpec(spec, page, { max_pages: query.max_pages }));
+  }
+
+  const okAccounts = accounts.filter((account) => account.status === 'ok');
+  const totals = okAccounts.reduce((acc, account) => {
+    acc.orders += Number(account.orders || account.total_count || 0);
+    acc.row_count += Number(account.row_count || 0);
+    acc.purchase_value += Number(account.purchase_value || 0);
+    acc.commission += Number(account.commission || 0);
+    return acc;
+  }, { orders: 0, row_count: 0, purchase_value: 0, commission: 0 });
+  totals.purchase_value = roundTo2(totals.purchase_value);
+  totals.commission = roundTo2(totals.commission);
+  const failedAccounts = accounts.filter((account) => account.status !== 'ok');
+  return {
+    status: failedAccounts.length ? 'error' : 'ok',
+    report_type: 'daily_income_report',
+    mode: 'daily_income',
+    time: firstSpec ? firstSpec.time : '',
+    isoDate: firstSpec ? firstSpec.isoDate : '',
+    range: firstSpec ? firstSpec.range : null,
+    timezone: BANGKOK_TIMEZONE,
+    source: 'shopee_conversion_report_api',
+    account_count: accounts.length,
+    ok_account_count: okAccounts.length,
+    failed_account_count: failedAccounts.length,
+    totals,
+    accounts,
+  };
+}
+
 async function handleConversionReportRawMode(spec, page) {
   const apiUrl = buildConversionReportFetchUrl(spec);
   let result;
@@ -830,6 +1011,8 @@ module.exports = {
   buildConversionReportFetchUrl,
   classifyConversionReportFailure,
   handleConversionReport,
+  handleDailyIncomeReport,
+  parseDailyIncomeIds,
   isConversionReportHost,
   pickRowSubId,
   isPlaceholderSubId,
