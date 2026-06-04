@@ -383,6 +383,35 @@ function pickRowCommission(row) {
   return 0;
 }
 
+function pickRowEstimatedCommissionBaht(row) {
+  if (!row || typeof row !== 'object') return 0;
+  const candidates = [
+    row.estimated_total_commission,
+    row.estimatedTotalCommission,
+    row.estimated_total_commission_with_mcn,
+    row.estimatedTotalCommissionWithMcn,
+    row.affiliate_net_commission,
+    row.affiliateNetCommission,
+  ];
+  for (const candidate of candidates) {
+    if (candidate != null && candidate !== '') return pickNumber(candidate) / 100000;
+  }
+  return pickRowCommission(row);
+}
+
+function summarizeDailyIncomeRowAmounts(rows) {
+  let purchaseValue = 0;
+  let commission = 0;
+  for (const row of rows) {
+    purchaseValue += pickRowPurchaseValue(row);
+    commission += pickRowEstimatedCommissionBaht(row);
+  }
+  return {
+    purchase_value: roundTo2(purchaseValue),
+    commission: roundTo2(commission),
+  };
+}
+
 function roundTo2(value) {
   if (!Number.isFinite(value)) return 0;
   return Number(value.toFixed(2));
@@ -544,11 +573,12 @@ async function handleDailyIncomeForSpec(spec, page, opts = {}) {
   }
 
   if (pagesFetched >= maxPages && rows.length < totalCount) stoppedReason = 'max_pages';
-  const amounts = summarizeRowAmounts(rows);
+  const amounts = summarizeDailyIncomeRowAmounts(rows);
   return Object.assign(baseResponseShape(spec), {
     status: 'ok',
     report_type: 'daily_income_account',
     mode: 'daily_income',
+    amount_unit: 'THB',
     total_count: totalCount,
     orders: totalCount,
     row_count: rows.length,
@@ -559,6 +589,52 @@ async function handleDailyIncomeForSpec(spec, page, opts = {}) {
     truncated: totalCount > rows.length,
     stopped_reason: stoppedReason,
     affiliate_id: affiliateId,
+  });
+}
+
+function buildDashboardDetailFetchUrl(spec) {
+  const params = new URLSearchParams({
+    start_time: String(spec.range.purchase_time_s),
+    end_time: String(spec.range.purchase_time_e),
+  });
+  return `https://affiliate.shopee.co.th/api/v3/dashboard/detail?${params.toString()}`;
+}
+
+function dashboardMoney(value) {
+  return roundTo2(pickNumber(value) / 100000);
+}
+
+async function handleDashboardIncomeForSpec(spec, page) {
+  const apiUrl = buildDashboardDetailFetchUrl(spec);
+  let result;
+  try {
+    result = await fetchConversionReportPageOnce(page, apiUrl);
+  } catch (err) {
+    return Object.assign(baseResponseShape(spec), {
+      status: 'error',
+      error: 'dashboard_detail_fetch_failed',
+      reason: 'dashboard_detail_fetch_failed',
+      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+    });
+  }
+  const classification = classifyConversionReportFetchResult(result);
+  if (classification) return Object.assign(baseResponseShape(spec), classification);
+  const body = result.body || {};
+  const data = body.data && typeof body.data === 'object' ? body.data : {};
+  return Object.assign(baseResponseShape(spec), {
+    status: 'ok',
+    report_type: 'daily_income_account',
+    mode: 'dashboard_detail',
+    amount_unit: 'THB',
+    orders: pickNumber(data.cv_by_order_sum),
+    row_count: null,
+    item_sold: pickNumber(data.item_sold_sum),
+    clicks: pickNumber(data.clicks_sum),
+    purchase_value: dashboardMoney(data.order_amount_sum),
+    commission: dashboardMoney(data.est_commission_sum),
+    est_income: dashboardMoney(data.est_income_sum),
+    source_endpoint: '/api/v3/dashboard/detail',
+    last_update_time: data.last_update_time || body.last_update_time || null,
   });
 }
 
@@ -616,7 +692,7 @@ async function handleDailyIncomeReport(query = {}, deps = {}) {
       }));
       continue;
     }
-    accounts.push(await handleDailyIncomeForSpec(spec, page, { max_pages: query.max_pages }));
+    accounts.push(await handleDashboardIncomeForSpec(spec, page));
   }
 
   const okAccounts = accounts.filter((account) => account.status === 'ok');
@@ -643,6 +719,7 @@ async function handleDailyIncomeReport(query = {}, deps = {}) {
     ok_account_count: okAccounts.length,
     failed_account_count: failedAccounts.length,
     totals,
+    amount_unit: 'THB',
     accounts,
   };
 }

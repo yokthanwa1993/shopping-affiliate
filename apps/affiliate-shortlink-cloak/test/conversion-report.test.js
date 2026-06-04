@@ -423,36 +423,26 @@ function buildOrderRow(idx, subId, purchaseValue = 100, commission = 5) {
   };
 }
 
-test('handleDailyIncomeReport paginates conversion rows and totals daily commission per account', async (t) => {
+test('handleDailyIncomeReport reads Shopee dashboard/detail metrics so totals match dashboard cards', async (t) => {
   const stub = stubBrowserForConversionReport(t, {
-    currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: (args) => {
       const url = new URL(args[0]);
-      const pageNum = Number(url.searchParams.get('page_num'));
-      assert.equal(Number(url.searchParams.get('page_size')), 100);
-      if (pageNum === 1) {
-        return {
-          status: 200,
-          parsed: true,
-          body: {
-            code: 0,
-            data: {
-              affiliate_id: 15142270000,
-              total_count: 3,
-              list: [buildOrderRow(1, 'alpha', 100, 5), buildOrderRow(2, 'beta', 200, 10)],
-            },
-          },
-        };
-      }
+      assert.match(url.pathname, /\/api\/v3\/dashboard\/detail$/);
+      assert.match(url.searchParams.get('start_time'), /^\d+$/);
+      assert.match(url.searchParams.get('end_time'), /^\d+$/);
       return {
         status: 200,
         parsed: true,
         body: {
           code: 0,
           data: {
-            affiliate_id: 15142270000,
-            total_count: 3,
-            list: [buildOrderRow(3, 'alpha', 50, 2.5)],
+            clicks_sum: 45473,
+            cv_by_order_sum: 6100,
+            item_sold_sum: 10800,
+            order_amount_sum: 190000000000,
+            est_commission_sum: 323000000,
+            est_income_sum: 32300000,
           },
         },
       };
@@ -469,30 +459,31 @@ test('handleDailyIncomeReport paginates conversion rows and totals daily commiss
   assert.equal(result.time, '25/05/2026');
   assert.equal(result.isoDate, '2026-05-25');
   assert.equal(result.account_count, 1);
-  assert.equal(result.totals.orders, 3);
-  assert.equal(result.totals.purchase_value, 350);
-  assert.equal(result.totals.commission, 17.5);
+  assert.equal(result.amount_unit, 'THB');
+  assert.equal(result.totals.orders, 6100);
+  assert.equal(result.totals.purchase_value, 1900000);
+  assert.equal(result.totals.commission, 3230);
   assert.equal(result.accounts[0].id, '15142270000');
-  assert.equal(result.accounts[0].orders, 3);
-  assert.equal(result.accounts[0].pages_fetched, 2);
-  assert.equal(result.accounts[0].row_count, 3);
-  assert.equal(result.accounts[0].truncated, false);
+  assert.equal(result.accounts[0].mode, 'dashboard_detail');
+  assert.equal(result.accounts[0].orders, 6100);
+  assert.equal(result.accounts[0].item_sold, 10800);
+  assert.equal(result.accounts[0].clicks, 45473);
+  assert.equal(result.accounts[0].source_endpoint, '/api/v3/dashboard/detail');
   assert.equal(stub.getPageCalls[0].account, 'affiliate_neezs.com');
-  assert.equal(stub.evaluates.length, 2);
+  assert.equal(stub.evaluates.length, 1);
 });
 
-test('GET /daily-income-report returns aggregated daily income JSON', async (t) => {
+test('GET /daily-income-report returns dashboard/detail daily income JSON', async (t) => {
   stubBrowserForConversionReport(t, {
-    currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: {
       status: 200,
       parsed: true,
       body: {
         code: 0,
         data: {
-          affiliate_id: 15130770000,
-          total_count: 1,
-          list: [buildOrderRow(1, 'alpha', 100, 5)],
+          cv_by_order_sum: 1,
+          est_commission_sum: 500000,
         },
       },
     },
@@ -510,6 +501,32 @@ test('GET /daily-income-report returns aggregated daily income JSON', async (t) 
   assert.equal(payload.report_type, 'daily_income_report');
   assert.equal(payload.totals.orders, 1);
   assert.equal(payload.totals.commission, 5);
+});
+
+test('handleDailyIncomeReport uses dashboard est_commission_sum in THB', async (t) => {
+  stubBrowserForConversionReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          cv_by_order_sum: 1,
+          est_commission_sum: 639000,
+        },
+      },
+    },
+  });
+
+  const result = await conversionReport.handleDailyIncomeReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+
+  assert.equal(result.amount_unit, 'THB');
+  assert.equal(result.totals.commission, 6.39);
+  assert.equal(result.accounts[0].commission, 6.39);
 });
 
 test('handleConversionReport raw mode returns ok payload with total_count, list, affiliate_id from stubbed Shopee response', async (t) => {

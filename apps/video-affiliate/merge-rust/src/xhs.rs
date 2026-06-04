@@ -1,6 +1,8 @@
 use axum::{Json, http::StatusCode};
 use regex::Regex;
-use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, HeaderMap, HeaderValue, USER_AGENT,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -16,6 +18,28 @@ pub struct ResolveRequest {
 #[derive(Serialize)]
 pub struct ResolveResponse {
     pub video_url: String,
+    pub selected_source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoUrlSource {
+    OriginVideoKey,
+    BackupUrls,
+}
+
+impl VideoUrlSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginVideoKey => "originVideoKey",
+            Self::BackupUrls => "backupUrls",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedVideoUrl {
+    url: String,
+    source: VideoUrlSource,
 }
 
 pub async fn handle_resolve(
@@ -29,18 +53,37 @@ pub async fn handle_resolve(
         ));
     }
 
+    if !is_allowed_resolver_entry_url(&url) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unsupported XHS url host"})),
+        ));
+    }
+
     let client = build_mobile_client().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         )
     })?;
+    let cookie = resolve_xhs_cookie();
 
     let mut current_url = url.clone();
     let mut hops: usize = 0;
 
     loop {
-        let resp = client.get(&current_url).send().await.map_err(|e| {
+        let mut request = client.get(&current_url);
+        if should_send_xhs_cookie(&current_url) {
+            if let Some(cookie) = cookie
+                .as_deref()
+                .and_then(|value| HeaderValue::from_str(value.trim()).ok())
+            {
+                if !cookie.is_empty() {
+                    request = request.header(COOKIE, cookie);
+                }
+            }
+        }
+        let resp = request.send().await.map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("request failed: {}", e)})),
@@ -68,12 +111,17 @@ pub async fn handle_resolve(
             }
         }
 
-        if let Some(video_url) = parse_video_url(&html) {
-            return Ok(Json(ResolveResponse { video_url }));
+        if let Some(parsed) = parse_video_url_with_source(&html) {
+            return Ok(Json(ResolveResponse {
+                video_url: parsed.url,
+                selected_source: parsed.source.as_str(),
+            }));
         }
 
         let error_message = if looks_like_non_video_note(&html) {
             "ลิงก์ XHS นี้ไม่ใช่โพสต์วิดีโอ (อาจเป็นรูปภาพหรือบทความ)"
+        } else if looks_like_watermarked_only_video_note(&html) {
+            "no_no_watermark_video_url"
         } else {
             "ไม่พบวิดีโอใน XHS link นี้"
         };
@@ -82,6 +130,56 @@ pub async fn handle_resolve(
 }
 
 fn build_mobile_client() -> Result<reqwest::Client, reqwest::Error> {
+    let headers = build_mobile_headers(None);
+
+    reqwest::Client::builder()
+        .user_agent(MOBILE_USER_AGENT)
+        .default_headers(headers)
+        .build()
+}
+
+fn resolve_xhs_cookie() -> Option<String> {
+    for key in ["XHS_COOKIE", "REDNOTE_COOKIE"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn is_allowed_resolver_entry_url(url_str: &str) -> bool {
+    let Ok(parsed) = Url::parse(url_str) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    host_matches_domain(&host, "xiaohongshu.com")
+        || host_matches_domain(&host, "xhslink.com")
+        || host_matches_domain(&host, "xhscdn.com")
+        || host_matches_domain(&host, "rednote.com")
+        || host_matches_domain(&host, "weixin.qq.com")
+        || host_matches_domain(&host, "open.weixin.qq.com")
+        || host_matches_domain(&host, "wechat.com")
+}
+
+fn should_send_xhs_cookie(url_str: &str) -> bool {
+    let Ok(parsed) = Url::parse(url_str) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    host_matches_domain(&host, "xiaohongshu.com")
+        || host_matches_domain(&host, "xhslink.com")
+        || host_matches_domain(&host, "xhscdn.com")
+        || host_matches_domain(&host, "rednote.com")
+}
+
+fn build_mobile_headers(cookie: Option<&str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(MOBILE_USER_AGENT));
     headers.insert(
@@ -95,11 +193,12 @@ fn build_mobile_client() -> Result<reqwest::Client, reqwest::Error> {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=0"));
     headers.insert("Sec-Ch-Ua-Mobile", HeaderValue::from_static("?1"));
     headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static("\"iOS\""));
-
-    reqwest::Client::builder()
-        .user_agent(MOBILE_USER_AGENT)
-        .default_headers(headers)
-        .build()
+    if let Some(cookie) = cookie.and_then(|v| HeaderValue::from_str(v.trim()).ok()) {
+        if !cookie.is_empty() {
+            headers.insert(COOKIE, cookie);
+        }
+    }
+    headers
 }
 
 /// If `url_str` is an XHS login page like
@@ -108,7 +207,11 @@ fn build_mobile_client() -> Result<reqwest::Client, reqwest::Error> {
 pub fn extract_redirect_path(url_str: &str) -> Option<String> {
     let parsed = Url::parse(url_str).ok()?;
     let host = parsed.host_str().unwrap_or("");
-    if !host.contains("xiaohongshu") && !host.contains("xhscdn") && !host.contains("xhslink") {
+    if !host.contains("xiaohongshu")
+        && !host.contains("xhscdn")
+        && !host.contains("xhslink")
+        && !host.contains("rednote")
+    {
         return None;
     }
     if !parsed.path().contains("/login") {
@@ -156,28 +259,27 @@ fn resolve_relative(base: &Url, candidate: &str) -> Option<String> {
 ///      `height` only (no bitrate/size tiebreakers). Items are gathered in
 ///      `[*h264, *h265]` order and sorted stably, so when heights tie the
 ///      h265 variant wins — matching XHS-Downloader's default preference.
-///      For the chosen entry, `backupUrls[0]` (e.g. `sns-bak-*`) is
-///      preferred over `masterUrl`, because XHS serves a watermarked
-///      playback stream from `masterUrl` while `backupUrls` still points
-///      at the raw CDN clip.
-///   3. Legacy regex fallbacks for `masterUrl` / inline `"url"`.
+///      For the chosen entry, `backupUrls[0]` (e.g. `sns-bak-*`) is used.
+///
+/// Strict no-watermark contract: never return `masterUrl` / inline
+/// `sns-video` playback URLs as a successful candidate. Those often carry
+/// the visible XHS watermark. If XHS only exposes watermarked playback URLs,
+/// `/xhs/resolve` must fail instead of storing a bad original.
 pub fn parse_video_url(html: &str) -> Option<String> {
-    if let Some(url) = extract_origin_video_url(html) {
-        return Some(url);
+    parse_video_url_with_source(html).map(|parsed| parsed.url)
+}
+
+fn parse_video_url_with_source(html: &str) -> Option<ParsedVideoUrl> {
+    if let Some(parsed) = extract_origin_video_url(html) {
+        return Some(parsed);
     }
-    if let Some(url) = extract_best_stream_url(html) {
-        return Some(url);
-    }
-    if let Some(url) = extract_master_url(html) {
-        return Some(url);
-    }
-    if let Some(url) = extract_inline_video_url(html) {
-        return Some(url);
+    if let Some(parsed) = extract_best_stream_url(html) {
+        return Some(parsed);
     }
     None
 }
 
-fn extract_origin_video_url(html: &str) -> Option<String> {
+fn extract_origin_video_url(html: &str) -> Option<ParsedVideoUrl> {
     let re_origin = Regex::new(r#""originVideoKey"\s*:\s*"([^"]+)""#).ok()?;
     let caps = re_origin.captures(html)?;
     let key = decode_escaped_url(&caps[1]);
@@ -185,36 +287,21 @@ fn extract_origin_video_url(html: &str) -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    Some(format!("https://sns-video-bd.xhscdn.com/{}", key))
-}
-
-fn extract_master_url(html: &str) -> Option<String> {
-    let re_master = Regex::new(r#""masterUrl"\s*:\s*"([^"]+)""#).ok()?;
-    let caps = re_master.captures(html)?;
-    let v_url = decode_escaped_url(&caps[1]);
-    if v_url.contains("sns-video") {
-        Some(v_url)
-    } else {
-        None
-    }
-}
-
-fn extract_inline_video_url(html: &str) -> Option<String> {
-    let re_url = Regex::new(r#""url"\s*:\s*"(https?://sns-video[^"]+)""#).ok()?;
-    let caps = re_url.captures(html)?;
-    Some(decode_escaped_url(&caps[1]))
+    Some(ParsedVideoUrl {
+        url: format!("https://sns-video-bd.xhscdn.com/{}", key),
+        source: VideoUrlSource::OriginVideoKey,
+    })
 }
 
 /// Walks `h264` and `h265` stream arrays anywhere in the HTML/JSON blob,
-/// picks the highest-resolution entry, and returns its `backupUrls[0]` if
-/// present (preferred — no watermark) otherwise its `masterUrl`.
+/// picks the highest-resolution entry, and returns its `backupUrls[0]` only.
 ///
 /// Selection mirrors XHS-Downloader's default-resolution path exactly:
 /// concatenate `h264` then `h265`, stable-sort by `height` only, take the
 /// last. The stable sort means that on a height tie the later-inserted
 /// h265 entry wins — which is important because the h264 variant is the
 /// one carrying the visible XHS/username watermark.
-fn extract_best_stream_url(html: &str) -> Option<String> {
+fn extract_best_stream_url(html: &str) -> Option<ParsedVideoUrl> {
     let mut items: Vec<serde_json::Value> = Vec::new();
     for key in ["h264", "h265"] {
         if let Some(arr) = extract_balanced_json_array(html, key) {
@@ -233,14 +320,11 @@ fn extract_best_stream_url(html: &str) -> Option<String> {
         if let Some(first) = backups.iter().find_map(|v| v.as_str()) {
             let decoded = decode_escaped_url(first);
             if !decoded.is_empty() {
-                return Some(decoded);
+                return Some(ParsedVideoUrl {
+                    url: decoded,
+                    source: VideoUrlSource::BackupUrls,
+                });
             }
-        }
-    }
-    if let Some(master) = best.get("masterUrl").and_then(|v| v.as_str()) {
-        let decoded = decode_escaped_url(master);
-        if !decoded.is_empty() {
-            return Some(decoded);
         }
     }
     None
@@ -323,6 +407,10 @@ fn looks_like_non_video_note(html: &str) -> bool {
     has_note_marker && !has_video_hint
 }
 
+fn looks_like_watermarked_only_video_note(html: &str) -> bool {
+    html.contains("masterUrl") || html.contains("sns-video")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,8 +434,23 @@ mod tests {
     }
 
     #[test]
+    fn extract_redirect_path_accepts_rednote_login_host() {
+        let url = "https://www.rednote.com/login?redirectPath=https%3A%2F%2Fwww.rednote.com%2Fexplore%2F69fa78c7000000003701ea6c";
+        assert_eq!(
+            extract_redirect_path(url).as_deref(),
+            Some("https://www.rednote.com/explore/69fa78c7000000003701ea6c"),
+        );
+    }
+
+    #[test]
     fn extract_redirect_path_returns_none_when_no_login_segment() {
         let url = "https://www.xiaohongshu.com/discovery/item/123?redirectPath=foo";
+        assert!(extract_redirect_path(url).is_none());
+    }
+
+    #[test]
+    fn extract_redirect_path_returns_none_for_rednote_non_login_url() {
+        let url = "https://www.rednote.com/explore/69fa78c7000000003701ea6c?redirectPath=https%3A%2F%2Fwww.rednote.com%2Fexplore%2Fother";
         assert!(extract_redirect_path(url).is_none());
     }
 
@@ -374,12 +477,61 @@ mod tests {
     }
 
     #[test]
-    fn parse_video_url_returns_master_url_when_only_master_present() {
-        let html = r#"prefix..."masterUrl":"https://sns-video-bd.xhscdn.com/clip.mp4"...suffix"#;
+    fn build_mobile_headers_applies_cookie_when_provided() {
+        let headers = build_mobile_headers(Some("a=b; web_session=secret"));
         assert_eq!(
-            parse_video_url(html).as_deref(),
-            Some("https://sns-video-bd.xhscdn.com/clip.mp4"),
+            headers.get(COOKIE).and_then(|v| v.to_str().ok()),
+            Some("a=b; web_session=secret"),
         );
+    }
+
+    #[test]
+    fn build_mobile_headers_skips_invalid_cookie() {
+        let headers = build_mobile_headers(Some("bad\nvalue"));
+        assert!(headers.get(COOKIE).is_none());
+    }
+
+    #[test]
+    fn resolver_entry_url_rejects_lookalike_host() {
+        assert!(!is_allowed_resolver_entry_url(
+            "https://www.xiaohongshu.com.evil.example/discovery/item/123"
+        ));
+    }
+
+    #[test]
+    fn resolver_entry_url_allows_xhs_and_wechat_oauth_hosts() {
+        assert!(is_allowed_resolver_entry_url(
+            "https://www.xiaohongshu.com/discovery/item/123"
+        ));
+        assert!(is_allowed_resolver_entry_url(
+            "https://open.weixin.qq.com/connect/oauth2/authorize?redirect_uri=x"
+        ));
+    }
+
+    #[test]
+    fn xhs_cookie_is_only_sent_to_trusted_xhs_hosts() {
+        assert!(should_send_xhs_cookie(
+            "https://www.xiaohongshu.com/discovery/item/123"
+        ));
+        assert!(should_send_xhs_cookie(
+            "https://sns-bak-v8.xhscdn.com/a.mp4"
+        ));
+        assert!(should_send_xhs_cookie(
+            "https://www.rednote.com/explore/123"
+        ));
+        assert!(!should_send_xhs_cookie(
+            "https://open.weixin.qq.com/connect/oauth2/authorize"
+        ));
+        assert!(!should_send_xhs_cookie(
+            "https://www.xiaohongshu.com.evil.example/steal"
+        ));
+    }
+
+    #[test]
+    fn parse_video_url_rejects_master_url_when_only_master_present() {
+        let html = r#"prefix..."masterUrl":"https://sns-video-bd.xhscdn.com/clip.mp4"...suffix"#;
+        assert!(parse_video_url(html).is_none());
+        assert!(looks_like_watermarked_only_video_note(html));
     }
 
     #[test]
@@ -399,6 +551,10 @@ mod tests {
         assert_eq!(
             parse_video_url(html).as_deref(),
             Some("https://sns-video-bd.xhscdn.com/stream/v1/original"),
+        );
+        assert_eq!(
+            parse_video_url_with_source(html).map(|parsed| parsed.source),
+            Some(VideoUrlSource::OriginVideoKey),
         );
     }
 
@@ -423,22 +579,17 @@ mod tests {
 
     #[test]
     fn parse_video_url_skips_empty_origin_key() {
-        // Empty originVideoKey should fall through to masterUrl.
+        // Empty originVideoKey should not fall back to masterUrl because
+        // masterUrl is a watermarked playback stream.
         let html =
             r#"{"originVideoKey":"","masterUrl":"https://sns-video-bd.xhscdn.com/clip.mp4"}"#;
-        assert_eq!(
-            parse_video_url(html).as_deref(),
-            Some("https://sns-video-bd.xhscdn.com/clip.mp4"),
-        );
+        assert!(parse_video_url(html).is_none());
     }
 
     #[test]
-    fn parse_video_url_finds_inline_video_src() {
+    fn parse_video_url_rejects_inline_video_src() {
         let html = r#"foo "url":"https://sns-video-bd.xhscdn.com/clip.mp4" bar"#;
-        assert_eq!(
-            parse_video_url(html).as_deref(),
-            Some("https://sns-video-bd.xhscdn.com/clip.mp4"),
-        );
+        assert!(parse_video_url(html).is_none());
     }
 
     #[test]
@@ -478,15 +629,16 @@ mod tests {
             parse_video_url(html).as_deref(),
             Some("https://sns-bak-v8.xhscdn.com/bak_258.mp4"),
         );
+        assert_eq!(
+            parse_video_url_with_source(html).map(|parsed| parsed.source),
+            Some(VideoUrlSource::BackupUrls),
+        );
     }
 
     #[test]
-    fn parse_video_url_falls_back_to_master_url_when_backup_urls_empty() {
+    fn parse_video_url_rejects_master_url_when_backup_urls_empty() {
         let html = r#"{"video":{"media":{"stream":{"h264":[{"height":720,"masterUrl":"https://sns-video-bd.xhscdn.com/m.mp4","backupUrls":[]}],"h265":[]}}}}"#;
-        assert_eq!(
-            parse_video_url(html).as_deref(),
-            Some("https://sns-video-bd.xhscdn.com/m.mp4"),
-        );
+        assert!(parse_video_url(html).is_none());
     }
 
     #[test]

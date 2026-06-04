@@ -65,6 +65,11 @@ import {
     setNamespaceVoiceSettings,
     setVoicePromptTemplate,
 } from './pipeline'
+import {
+    dispatchNextProcessingJob,
+    runScheduledProcessingTick,
+    type ProcessingDispatchResult,
+} from './processing-dispatch'
 import { ADMIN_HTML } from './admin-page'
 import {
     MAX_SHORTLINK_URL_TEMPLATE_CHARS,
@@ -5666,7 +5671,7 @@ async function getNamespaceProcessingSummaryFast(env: Env, namespaceId: string, 
                     gi.shopee_original_link,
                     gi.lazada_original_link,
                     gi.public_url,
-                    gi.original_url,
+                    COALESCE(NULLIF(TRIM(gi.original_url), ''), NULLIF(TRIM(gi.public_url), '')) AS original_url,
                     gi.thumbnail_url,
                     gi.created_at,
                     gi.processed_at,
@@ -9000,12 +9005,24 @@ app.post('/admin/api/scheduled/run', async (c) => {
                 console.error(`[ADMIN-SCHEDULED] warm-up failed: ${error instanceof Error ? error.message : String(error)}`)
             })
         )
-        await handleScheduled(c.env, c.executionCtx)
-        c.executionCtx.waitUntil(autoProcessReadyInboxForNamespaces(c.env, c.executionCtx).then((report) => {
-            console.log(`[ADMIN-SCHEDULED-AUTO-INBOX] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total}`)
-        }).catch((error) => {
-            console.error(`[ADMIN-SCHEDULED-AUTO-INBOX] failed: ${error instanceof Error ? error.message : String(error)}`)
-        }))
+        // Mirror the cron tick: a posting failure must not skip the inbox guardian.
+        // Capture the posting error so this manual endpoint still surfaces a 500
+        // for observability, but only after the guardian has been registered.
+        let postingError: unknown = null
+        await runScheduledProcessingTick({
+            runPosting: () => handleScheduled(c.env, c.executionCtx),
+            onPostingError: (error) => { postingError = error },
+            runGuardian: () => c.executionCtx.waitUntil(autoProcessReadyInboxForNamespaces(c.env, c.executionCtx).then((report) => {
+                console.log(`[ADMIN-SCHEDULED-AUTO-INBOX] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total}`)
+            }).catch((error) => {
+                console.error(`[ADMIN-SCHEDULED-AUTO-INBOX] failed: ${error instanceof Error ? error.message : String(error)}`)
+            })),
+        })
+        if (postingError) {
+            const message = postingError instanceof Error ? postingError.message : String(postingError)
+            console.error(`[ADMIN-SCHEDULED] failed: ${message}`)
+            return c.json({ ok: false, error: message, auto_inbox_scheduled: true }, 500)
+        }
         return c.json({ ok: true, ran_at: new Date().toISOString(), auto_inbox_scheduled: true })
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -15832,24 +15849,24 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
 
     const page = await params.env.DB.prepare(
         `SELECT
-            namespace_id,
-            video_id,
-            title,
-            shopee_link,
-            lazada_link,
-            shopee_original_link,
-            lazada_original_link,
-            original_url,
-            created_at,
-            updated_at
-         FROM gallery_index
-         WHERE namespace_id = ?
-           AND TRIM(COALESCE(original_url,'')) <> ''
-           AND TRIM(COALESCE(processed_at,'')) = ''
-           AND ${GALLERY_INDEX_USABLE_SHOPEE_LINK_SQL}
-           AND TRIM(COALESCE(lazada_link,'')) <> ''
-         ORDER BY COALESCE(NULLIF(TRIM(updated_at), ''), NULLIF(TRIM(created_at), '')) DESC, video_id ASC
-         LIMIT 12`
+            gi.namespace_id,
+            gi.video_id,
+            gi.title,
+            ${NAMESPACE_STATE_SHOPEE_LINK_SQL} AS shopee_link,
+            ${NAMESPACE_STATE_LAZADA_LINK_SQL} AS lazada_link,
+            COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), gi.shopee_original_link, gi.shopee_link) AS shopee_original_link,
+            COALESCE(NULLIF(TRIM(nvs.lazada_original_link), ''), gi.lazada_original_link, gi.lazada_link) AS lazada_original_link,
+            gi.original_url,
+            gi.created_at,
+            gi.updated_at
+         ${DASHBOARD_GALLERY_FROM_JOIN}
+         WHERE gi.namespace_id = ?
+           AND TRIM(COALESCE(NULLIF(TRIM(gi.original_url), ''), NULLIF(TRIM(gi.public_url), ''))) <> ''
+           AND TRIM(COALESCE(gi.processed_at,'')) = ''
+           AND ${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL}
+           AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL}
+         ORDER BY COALESCE(NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id ASC
+         LIMIT 160`
     ).bind(namespaceId).all().catch(() => ({ results: [] })) as { results?: Array<Record<string, unknown>> }
 
     for (const row of page.results || []) {
@@ -16550,24 +16567,34 @@ async function backfillNamespaceInboxOriginalAssets(params: {
     }
 }
 
-async function hasActiveProcessingJob(bucket: R2Bucket): Promise<boolean> {
-    await expireStaleProcessingJobs(bucket).catch((error) => {
-        console.error(`[PROCESSING-STALE] failed before active check: ${error instanceof Error ? error.message : String(error)}`)
-    })
+async function hasActiveProcessingJob(bucket: R2Bucket, namespaceId = ''): Promise<boolean> {
+    const normalizedNamespaceId = String(namespaceId || '').trim()
     const processingList = await bucket.list({ prefix: '_processing/' })
-    // Active jobs are always recent. Old records left in `_processing/` are
-    // terminal `failed` entries that were mirrored to history but never
-    // deleted. Sort newest-first and bound the scan so this stays O(small)
-    // even when the namespace has hundreds of historical failures.
+    // Keep the hot-path active check bounded. A full stale sweep can exceed the
+    // Worker subrequest limit on large namespaces and then fail-safe blocks the
+    // dispatcher forever. Active jobs are recent, so scan only the newest small
+    // window and mark stale entries opportunistically.
     const candidates = processingList.objects
         .slice()
         .sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
-        .slice(0, PROCESSING_ACTIVE_LIST_MAX)
+        .slice(0, 24)
     for (const obj of candidates) {
         const file = await bucket.get(obj.key)
         if (!file) continue
         const data = await file.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
-        if (String(data.status || '').trim() !== 'failed') return true
+        if (normalizedNamespaceId) {
+            const jobNamespace = String(data.namespace_id || data.namespaceId || data.botId || data.bot_id || '').trim()
+            if (jobNamespace && jobNamespace !== normalizedNamespaceId) continue
+        }
+        const status = String(data.status || '').trim().toLowerCase()
+        if (!status || status === 'failed' || status === 'processed' || status === 'cancelled' || status === 'awaiting_links') continue
+        if (isProcessingJobStale(data, obj.uploaded)) {
+            await markProcessingJobStale(bucket, obj.key, data, obj.uploaded).catch((error) => {
+                console.error(`[PROCESSING-STALE] bounded active check failed to mark ${obj.key}: ${error instanceof Error ? error.message : String(error)}`)
+            })
+            continue
+        }
+        return true
     }
     return false
 }
@@ -17175,7 +17202,7 @@ async function startInboxVideoProcessing(params: {
         createdAt: nowIso,
     }
 
-    if (await hasActiveProcessingJob(params.bucket)) {
+    if (await hasActiveProcessingJob(params.bucket, params.botId)) {
         await params.bucket.put(`_queue/${item.id}.json`, JSON.stringify({
             ...queuedJobPayload,
             status: 'queued',
@@ -17212,11 +17239,19 @@ async function startInboxVideoProcessing(params: {
                 String(item.lazadaLink || '').trim(),
             )
         } finally {
-            const adminNamespaceId = await resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => '')
-            if (adminNamespaceId && adminNamespaceId === params.botId) {
-                await autoImportAndProcessForAdmin(params.env, params.executionCtx).catch((error) => {
-                    console.error(`[INBOX-PROCESS] failed to start next admin original after ${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+            if (!params.runInline) {
+                await dispatchNextProcessingJobForNamespace(params.env, params.executionCtx, params.botId, { runInline: true }).then((result) => {
+                    console.log(`[INBOX-PROCESS-AUTOSTART] ${params.botId}/${item.id}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+                }).catch((error) => {
+                    console.error(`[INBOX-PROCESS-AUTOSTART] failed after ${params.botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
                 })
+            } else {
+                const adminNamespaceId = await resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => '')
+                if (adminNamespaceId && adminNamespaceId === params.botId) {
+                    await autoImportAndProcessForAdmin(params.env, params.executionCtx).catch((error) => {
+                        console.error(`[INBOX-PROCESS] failed to start next admin original after ${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+                    })
+                }
             }
         }
     }
@@ -17384,6 +17419,8 @@ async function ensureInboxVideoProcessingStarted(params: {
 const PROCESSING_HISTORY_PREFIX = '_processing_history/'
 const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
 const PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS = 7 * 60 * 1000
+const PROCESSING_PIPELINE_HANDOFF_STALE_TIMEOUT_MS = 3 * 60 * 1000
+const PROCESSING_PIPELINE_HANDOFF_STALE_ERROR = 'pipeline_handoff_stale_timeout — งานค้างตอนเชื่อมต่อเครื่องประมวลผลเกิน 3 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 // Bound how much of `_processing/` we touch on each /api/processing load.
 // Namespaces accumulate hundreds of old failed records that linger here even
 // after they've been mirrored into `_processing_history/`. Reading every one
@@ -17485,6 +17522,15 @@ function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date):
     return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs > getProcessingJobStaleTimeoutMs(data)
 }
 
+function isPipelineHandoffStep(data: Record<string, unknown>): boolean {
+    const step = Number(data.step)
+    const stepName = String(data.stepName || '').trim().toLowerCase()
+    return step === 0
+        || stepName.includes('กำลังเชื่อมต่อเครื่องประมวลผล')
+        || stepName.includes('connecting')
+        || stepName.includes('เชื่อมต่อเครื่องประมวลผล')
+}
+
 function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
     const step = Number(data.step)
     const stepName = String(data.stepName || '').trim()
@@ -17494,18 +17540,21 @@ function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
 }
 
 function getProcessingJobStaleTimeoutMs(data: Record<string, unknown>): number {
+    if (isPipelineHandoffStep(data)) return PROCESSING_PIPELINE_HANDOFF_STALE_TIMEOUT_MS
     return isGeminiPreparationStep(data)
         ? PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS
         : PROCESSING_STALE_TIMEOUT_MS
 }
 
 function getProcessingJobStaleError(data: Record<string, unknown>): string {
+    if (isPipelineHandoffStep(data)) return PROCESSING_PIPELINE_HANDOFF_STALE_ERROR
     return isGeminiPreparationStep(data)
         ? PROCESSING_GEMINI_PREP_STALE_ERROR
         : PROCESSING_STALE_ERROR
 }
 
 function getProcessingJobStaleCategory(data: Record<string, unknown>): string {
+    if (isPipelineHandoffStep(data)) return 'pipeline_handoff_stale_timeout'
     return isGeminiPreparationStep(data)
         ? 'gemini_preparation_stale_timeout'
         : 'stale_timeout'
@@ -17599,7 +17648,7 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
     if (!botId) return false
 
     const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
-    if (await hasActiveProcessingJob(bucket).catch(() => true)) return false
+    if (await hasActiveProcessingJob(bucket, botId).catch(() => true)) return false
     await syncReadyInboxLinksToNamespaceIndex({
         env,
         bucket,
@@ -17669,6 +17718,41 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
     return false
 }
 
+// Single entry point every completion / scheduled / manual drainer uses to keep
+// the Processing flow self-perpetuating: drain the durable `_queue/` first, then
+// fall back to the ready inbox / gallery_index, then (admin only) import + start
+// from the original library. Guarantees at most one active job per namespace and
+// returns structured evidence so callers can log a sanitized one-liner. The
+// ordering lives in the import-free `processing-dispatch` module; this wrapper
+// just supplies the real side-effecting steps.
+async function dispatchNextProcessingJobForNamespace(
+    env: Env,
+    ctx: ExecutionContext,
+    namespaceId: string,
+    options: { runInline?: boolean } = {},
+): Promise<ProcessingDispatchResult> {
+    const botId = String(namespaceId || '').trim()
+    if (!botId) return { namespaceId: '', started: false, source: 'idle', detail: 'missing_namespace' }
+
+    const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+
+    return dispatchNextProcessingJob(botId, {
+        // On error, assume a job is active so we never race a second start.
+        hasActiveJob: () => hasActiveProcessingJob(bucket, botId).catch(() => true),
+        drainQueue: () => processNextInQueue(env, botId),
+        startReadyInbox: () => startNextReadyInboxForNamespace(env, ctx, botId, { runInline: options.runInline }),
+        startAdminOriginal: async () => {
+            const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+            if (!adminNamespaceId || adminNamespaceId !== botId) return false
+            // autoImportAndProcessForAdmin starts the next waiting admin original
+            // (if any) and refills the ready inbox from member namespaces. It
+            // returns void, so confirm a job is now in flight to report `started`.
+            await autoImportAndProcessForAdmin(env, ctx)
+            return hasActiveProcessingJob(bucket, botId).catch(() => false)
+        },
+    })
+}
+
 app.get('/api/processing', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
@@ -17685,17 +17769,18 @@ app.get('/api/processing', async (c) => {
             const status = String(video.status || '').trim().toLowerCase()
             return status === 'processing' || status === 'queued'
         })
-        // Auto-start next video moved to background (waitUntil) so the user's
-        // processing tab loads fast even when no jobs are in flight. Previously
-        // this synchronous call could take 10-30s for admin namespaces because
-        // managed-shortlink conversion (Shopee + Lazada) runs inside
-        // ensureInboxVideoProcessingStarted with retry timeouts.
+        // Auto-start the next available item in the same deterministic order as
+        // completion + cron. This keeps the Processing tab from becoming a
+        // partial ready-inbox-only drainer when active=0.
         if (activeProcessingVideos.length === 0 && namespaceId) {
             c.executionCtx.waitUntil(
-                startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceId).catch((error) => {
-                    console.error(`[PROCESSING-AUTOSTART] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
-                    return false
-                })
+                dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: true })
+                    .then((result) => {
+                        console.log(`[PROCESSING-AUTOSTART] ${namespaceId}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+                    })
+                    .catch((error) => {
+                        console.error(`[PROCESSING-AUTOSTART] Failed for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+                    })
             )
         }
         let pendingShortlinkVideos: Array<Record<string, unknown>> = []
@@ -18460,7 +18545,7 @@ app.delete('/api/processing/:id', async (c) => {
             }).catch(() => { })
         }
         if (id) await c.get('bucket').delete(`_processing/${id}.json`)
-        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
+        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: true }))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -18519,7 +18604,7 @@ app.post('/api/processing/:id/reprocess', async (c) => {
         await c.get('bucket').put(`_queue/${id}.json`, JSON.stringify(queuedJob), {
             httpMetadata: { contentType: 'application/json' },
         })
-        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
+        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: true }))
         return c.json({ ok: true, job: queuedJob })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -18718,25 +18803,19 @@ app.post('/api/gallery/refresh/:id', async (c) => {
         // เช็คคิว → ถ้ามีงานรอ ให้เริ่มทำอันถัดไป
         // ถ้าคิวว่างแต่คลังต้นฉบับยังมี ready items ให้ kick ตัวถัดไปทันที
         // ไม่ต้องรอให้ผู้ใช้เปิดหน้า Processing หรือรอ cron tick ถัดไป
+        // Deterministic backstop: the every-minute cron guardian runs the same
+        // dispatcher, so even if this waitUntil is cancelled the next ready/
+        // original item still starts within ~60s without opening the UI.
         const namespaceIdForNext = String(c.get('botId') || '').trim()
-        c.executionCtx.waitUntil((async () => {
-            const queuedStarted = await processNextInQueue(c.env, namespaceIdForNext)
-            if (queuedStarted) {
-                console.log(`[PROCESSING-COMPLETE-AUTOSTART] queue started next for ${namespaceIdForNext}`)
-            }
-            if (!queuedStarted && namespaceIdForNext) {
-                const readyStarted = await startNextReadyInboxForNamespace(c.env, c.executionCtx, namespaceIdForNext, { runInline: true })
-                console.log(`[PROCESSING-COMPLETE-AUTOSTART] ready scan for ${namespaceIdForNext}: started=${readyStarted ? 'yes' : 'no'}`)
-                if (!readyStarted) {
-                    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(c.env.DB).catch(() => '')
-                    if (adminNamespaceId && adminNamespaceId === namespaceIdForNext) {
-                        await autoImportAndProcessForAdmin(c.env, c.executionCtx)
-                    }
-                }
-            }
-        })().catch((error) => {
-            console.error(`[PROCESSING-COMPLETE-AUTOSTART] failed: ${error instanceof Error ? error.message : String(error)}`)
-        }))
+        c.executionCtx.waitUntil(
+            dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceIdForNext, { runInline: true })
+                .then((result) => {
+                    console.log(`[PROCESSING-COMPLETE-AUTOSTART] ${namespaceIdForNext || '(none)'}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+                })
+                .catch((error) => {
+                    console.error(`[PROCESSING-COMPLETE-AUTOSTART] failed: ${error instanceof Error ? error.message : String(error)}`)
+                })
+        )
 
         return c.json({ ok: true })
     } catch (e) {
@@ -18744,11 +18823,22 @@ app.post('/api/gallery/refresh/:id', async (c) => {
     }
 })
 
-// Process next queued job
+// Process the next available job for this namespace.
+// This intentionally uses the same dispatcher as completion + cron: drain the
+// durable queue first, then fall back to ready inbox/original backlog.
 app.post('/api/queue/next', async (c) => {
     try {
-        const started = await processNextInQueue(c.env, c.get('botId'))
-        return c.json({ ok: true, started })
+        const namespaceId = String(c.get('botId') || '').trim()
+        c.executionCtx.waitUntil(
+            dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: true })
+                .then((result) => {
+                    console.log(`[PROCESSING-MANUAL-DISPATCH] ${namespaceId || '(none)'}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+                })
+                .catch((error) => {
+                    console.error(`[PROCESSING-MANUAL-DISPATCH] ${namespaceId || '(none)'} failed: ${error instanceof Error ? error.message : String(error)}`)
+                }),
+        )
+        return c.json({ ok: true, accepted: true, started: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
     }
@@ -18787,7 +18877,7 @@ app.delete('/api/queue/:id', async (c) => {
             }).catch(() => { })
         }
         if (id) await c.get('bucket').delete(`_queue/${id}.json`)
-        c.executionCtx.waitUntil(processNextInQueue(c.env, c.get('botId')))
+        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: true }))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -21659,7 +21749,13 @@ type AutoInboxGuardianNamespaceResult = {
     detail?: string
 }
 
-const AUTO_INBOX_GUARDIAN_MAX_STARTS_PER_RUN = 1
+// Safety valve: caps how many *new* jobs a single guardian run starts across all
+// namespaces. One active job per namespace is always enforced separately (the
+// dispatcher's hasActiveJob check), so this only bounds cross-namespace fan-out
+// onto the shared merge container when many namespaces have a backlog at once.
+// The previous value of 1 made the cron a one-start-per-minute bottleneck that
+// could neither keep up with nor recover a single namespace's backlog.
+const AUTO_INBOX_GUARDIAN_MAX_STARTS_PER_RUN = 4
 
 type AutoInboxGuardianReport = {
     ran_at: string
@@ -21675,7 +21771,13 @@ type AutoInboxGuardianReport = {
 async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContext): Promise<AutoInboxGuardianReport> {
     const knownNamespaceIds = Array.from(await collectKnownNamespaceIds(env))
     const readyNamespaceIds = await collectNamespacesWithReadyGalleryIndexInbox(env).catch(() => [])
-    const namespaceIds = Array.from(new Set([...readyNamespaceIds, ...knownNamespaceIds])).filter(Boolean)
+    const dedupedNamespaceIds = Array.from(new Set([...readyNamespaceIds, ...knownNamespaceIds])).filter(Boolean)
+    // Process the primary admin namespace first so the bulk-processing workspace
+    // is never starved when the per-run start budget is tight.
+    const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
+    const namespaceIds = adminNamespaceId && dedupedNamespaceIds.includes(adminNamespaceId)
+        ? [adminNamespaceId, ...dedupedNamespaceIds.filter((id) => id !== adminNamespaceId)]
+        : dedupedNamespaceIds
     const report: AutoInboxGuardianReport = {
         ran_at: new Date().toISOString(),
         total_namespaces: namespaceIds.length,
@@ -21697,92 +21799,24 @@ async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContex
 
     for (const namespaceId of namespaceIds) {
         report.scanned_namespaces++
+        if (report.started_total >= AUTO_INBOX_GUARDIAN_MAX_STARTS_PER_RUN) {
+            // Already started the per-run maximum; defer the rest to the next
+            // tick. One active job per namespace is still guaranteed elsewhere.
+            mark({ namespace_id: namespaceId, outcome: 'idle', detail: 'start_budget_exhausted' })
+            continue
+        }
         try {
-            const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
-            if (await hasActiveProcessingJob(bucket).catch(() => true)) {
+            // Same dispatcher the completion callback uses: drain _queue, then
+            // ready inbox / gallery_index, then (admin) the original library.
+            const result = await dispatchNextProcessingJobForNamespace(env, ctx, namespaceId, { runInline: true })
+            if (result.started) {
+                console.log(`[AUTO-INBOX] Started ${namespaceId} via ${result.source}`)
+                mark({ namespace_id: namespaceId, outcome: 'started', detail: result.source })
+            } else if (result.source === 'active') {
                 mark({ namespace_id: namespaceId, outcome: 'active' })
-                continue
+            } else {
+                mark({ namespace_id: namespaceId, outcome: 'idle', detail: result.detail || result.source })
             }
-
-            await syncReadyInboxLinksToNamespaceIndex({
-                env,
-                bucket,
-                namespaceId,
-                limit: 200,
-            }).catch((error) => {
-                console.error(`[AUTO-INBOX] Failed to sync ready inbox links for ${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
-                return 0
-            })
-
-            const candidates: InboxVideoRecord[] = []
-            const galleryIndexVideo = await getNextReadyGalleryIndexInboxRecord({
-                env,
-                bucket,
-                namespaceId,
-            }).catch(() => null)
-            if (galleryIndexVideo) candidates.push(galleryIndexVideo)
-            const records = await listRecentInboxVideoRecords(bucket, 50).catch(() => [])
-            const seenCandidateIds = new Set(candidates.map((item) => String(item.id || '').trim()).filter(Boolean))
-            for (const record of records) {
-                const id = String(record.id || '').trim()
-                if (!id || seenCandidateIds.has(id)) continue
-                seenCandidateIds.add(id)
-                candidates.push(record)
-            }
-
-            let startedOrActive = false
-            for (const candidate of candidates) {
-                const item = normalizeInboxVideoRecord(candidate)
-                if (!item || item.status !== 'ready') continue
-
-                const processedAt = await getGalleryIndexProcessedAt(env.DB, namespaceId, item.id).catch(() => '')
-                if (processedAt || String(item.processedAt || '').trim()) {
-                    if (!String(item.processedAt || '').trim()) {
-                        await putInboxVideoRecord(bucket, {
-                            ...item,
-                            processedAt,
-                            updatedAt: new Date().toISOString(),
-                        }).catch(() => { })
-                    }
-                    continue
-                }
-
-                const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
-                if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
-
-                if (report.started_total >= AUTO_INBOX_GUARDIAN_MAX_STARTS_PER_RUN) {
-                    mark({ namespace_id: namespaceId, outcome: 'idle', video_id: item.id, detail: 'start_deferred_quota_guard' })
-                    startedOrActive = true
-                    break
-                }
-
-                try {
-                    const result = await ensureInboxVideoProcessingStarted({
-                        env,
-                        bucket,
-                        executionCtx: ctx,
-                        botId: namespaceId,
-                        item,
-                        skipIfAlreadyProcessed: true,
-                    })
-                    if (result.outcome === 'started') {
-                        console.log(`[AUTO-INBOX] Started ${namespaceId}/${item.id}: ${result.job.status}`)
-                        mark({ namespace_id: namespaceId, outcome: 'started', video_id: item.id, detail: result.job.status })
-                        startedOrActive = true
-                        break
-                    }
-                    if (result.outcome === 'already_running') {
-                        console.log(`[AUTO-INBOX] ${namespaceId}/${item.id} already ${result.status}`)
-                        mark({ namespace_id: namespaceId, outcome: 'active', video_id: item.id, detail: result.status })
-                        startedOrActive = true
-                        break
-                    }
-                } catch (error) {
-                    console.error(`[AUTO-INBOX] Failed ${namespaceId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
-                }
-            }
-
-            if (!startedOrActive) mark({ namespace_id: namespaceId, outcome: 'idle', detail: candidates.length ? 'no_startable_ready_candidate' : 'no_ready_candidate' })
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             console.error(`[AUTO-INBOX] Namespace ${namespaceId} failed: ${message}`)
@@ -34642,10 +34676,15 @@ async function watchdogStuckJobs(env: Env) {
                 }
             }
 
-            // ลองเริ่มอันถัดไปในคิวของ bot นี้
+            // ลองเริ่มอันถัดไปของ bot นี้ด้วย dispatcher เดียวกับ completion/cron:
+            // queue -> ready inbox -> admin original, while preserving one active job.
             if (hadProcessingEntries || queueDrainChecks < MAX_QUEUE_DRAIN_CHECKS) {
                 queueDrainChecks++
-                await processNextInQueue(env, botId)
+                if (ctx) {
+                    await dispatchNextProcessingJobForNamespace(env, ctx, botId, { runInline: true })
+                } else {
+                    await processNextInQueue(env, botId)
+                }
             }
         } catch (e) {
             console.error(`[WATCHDOG] Error for bot ${botId}:`, e instanceof Error ? e.message : String(e))
@@ -34665,14 +34704,25 @@ export default {
         // Keep scheduled posting deterministic: run the posting loop first.
         // Inbox processing and pending comments run only after posting has yielded;
         // this preserves cron isolation while still draining user-submitted videos.
-        await handleScheduled(env, _ctx)
-        _ctx.waitUntil(autoProcessReadyInboxForNamespaces(env, _ctx).then((report) => {
-            console.log(`[CRON-AUTO-INBOX] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total}`)
-        }).catch((error) => {
-            console.error(`[CRON-AUTO-INBOX] ${error instanceof Error ? error.message : String(error)}`)
-        }))
-        _ctx.waitUntil(processPendingCommentBacklog(env).catch((error) => {
-            console.error(`[CRON-COMMENTS] ${error instanceof Error ? error.message : String(error)}`)
-        }))
+        //
+        // CRITICAL: handleScheduled rethrows fatal posting errors. Run it through
+        // runScheduledProcessingTick so a posting failure can never skip the
+        // inbox-processing guardian — the only automatic, every-minute backstop
+        // that keeps draining the backlog one-at-a-time and recovers a missed
+        // completion callback (a job that finished but never had its next chained).
+        await runScheduledProcessingTick({
+            runPosting: () => handleScheduled(env, _ctx),
+            onPostingError: (error) => {
+                console.error(`[CRON-POSTING] ${error instanceof Error ? error.message : String(error)}`)
+            },
+            runGuardian: () => _ctx.waitUntil(autoProcessReadyInboxForNamespaces(env, _ctx).then((report) => {
+                console.log(`[CRON-AUTO-INBOX] scanned=${report.scanned_namespaces}/${report.total_namespaces} started=${report.started_total} active=${report.active_total} idle=${report.idle_total}`)
+            }).catch((error) => {
+                console.error(`[CRON-AUTO-INBOX] ${error instanceof Error ? error.message : String(error)}`)
+            })),
+            runComments: () => _ctx.waitUntil(processPendingCommentBacklog(env).catch((error) => {
+                console.error(`[CRON-COMMENTS] ${error instanceof Error ? error.message : String(error)}`)
+            })),
+        })
     },
 }
