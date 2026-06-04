@@ -1,1 +1,1 @@
-pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-04.vertex-send-retry.01";
+pub const PIPELINE_ENGINE_VERSION: &str = "2026-06-05.ffmpeg-step-timeout-ui.01";

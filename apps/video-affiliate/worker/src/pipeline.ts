@@ -7,7 +7,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-04.vertex-send-retry.01'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-05.ffmpeg-step-timeout-ui.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
@@ -1223,11 +1223,15 @@ function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date):
 function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
     const step = Number(data.step)
     const stepName = String(data.stepName || '').trim()
+    const lowerStepName = stepName.toLowerCase()
     return step === 2.2
         || step === 2.7
+        || step === 4.3
         || stepName.includes('แปลงวิดีโอให้ Gemini อ่านได้')
         || stepName.includes('สร้างบทพากย์ผ่าน Vertex Gemini')
-        || stepName.toLowerCase().includes('gemini-safe transcode')
+        || stepName.includes('สร้างซับจากเสียงพากย์')
+        || lowerStepName.includes('gemini-safe transcode')
+        || lowerStepName.includes('vertex gemini srt')
 }
 
 function getProcessingJobStaleTimeoutMs(data: Record<string, unknown>): number {

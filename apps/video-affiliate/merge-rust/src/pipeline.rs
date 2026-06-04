@@ -434,11 +434,11 @@ async fn create_flipped_processing_input(
         .ok_or("processing_video_path_invalid_for_flip")?;
     let args = build_flip_processing_input_ffmpeg_args(input_str, output_str);
     let output = tokio::time::timeout(
-        Duration::from_secs(300),
+        Duration::from_secs(180),
         Command::new("ffmpeg").args(&args).output(),
     )
     .await
-    .map_err(|_| "FFmpeg flip timed out (>300s)")??;
+    .map_err(|_| "FFmpeg flip timed out (>180s)")??;
     if let Some(reason) = ffmpeg_nonzero_status_reason(&output) {
         return Err(format!("FFmpeg flip failed: {}", reason).into());
     }
@@ -2903,6 +2903,16 @@ async fn rust_pipeline(
     let video_path = tmp_path.join("video.mp4");
     fs::write(&video_path, &video_bytes).await?;
     let processing_video_path = tmp_path.join("video_processing_flipped.mp4");
+    update_step(
+        worker_url,
+        token,
+        &bot_id,
+        &video_id,
+        1.2,
+        "🛠️ เตรียมไฟล์วิดีโอ",
+    )
+    .await;
+    edit_status(token, req.chat_id, req.msg_id, "🛠️ กำลังเตรียมไฟล์วิดีโอ").await;
     create_flipped_processing_input(&video_path, &processing_video_path).await?;
     let processing_video_bytes = fs::read(&processing_video_path).await?;
     let source_preflight = preflight_probe_for_gemini(&processing_video_path)

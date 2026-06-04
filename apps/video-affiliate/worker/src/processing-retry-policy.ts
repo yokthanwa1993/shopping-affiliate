@@ -35,7 +35,6 @@ const RATE_LIMIT_RETRY_BACKOFF_MS = [15 * 60_000, 30 * 60_000, 60 * 60_000, 2 * 
 const RETRYABLE_CATEGORIES = new Set([
     'pipeline_handoff_stale_timeout',
     'gemini_pipeline_failed',
-    'ffmpeg_timeout',
     'container_health_timeout',
     'container_dispatch_timeout',
     'container_pipeline_error',
@@ -55,6 +54,7 @@ const NON_RETRYABLE_CATEGORIES = new Set([
     'gemini_configuration_error',
     'gemini_safe_output_invalid',
     'gemini_strict_output_invalid',
+    'ffmpeg_timeout',
     'missing_original_video_asset_unrecoverable',
 ])
 

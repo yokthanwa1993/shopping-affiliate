@@ -18,18 +18,18 @@ test('retries transient Gemini request failures when due', () => {
     assert.equal(decision.attempts, 0)
 })
 
-test('waits until transient backoff is due', () => {
+test('does not retry FFmpeg preprocessing timeout because it blocks the queue', () => {
     const decision = decideProcessingRetry({
         status: 'failed',
         errorCategory: 'ffmpeg_timeout',
-        error: 'FFmpeg flip timed out (>300s)',
+        error: 'FFmpeg flip timed out (>180s)',
         failedAt: '2026-06-04T11:59:30.000Z',
         retryCount: 0,
         now,
     })
-    assert.equal(decision.action, 'wait')
-    assert.equal(decision.reason, 'backoff')
-    assert.equal(decision.nextRetryAt, '2026-06-04T12:00:30.000Z')
+    assert.equal(decision.action, 'terminal')
+    assert.equal(decision.retryable, false)
+    assert.equal(decision.reason, 'non_retryable:ffmpeg_timeout')
 })
 
 test('backs off Gemini 429/resource exhausted for a long cooldown', () => {

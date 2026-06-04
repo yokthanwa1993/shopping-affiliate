@@ -17833,7 +17833,7 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
         }
 
         const existingProcessingStatus = await getProcessingJobStatus(bucket, item.id).catch(() => '')
-        if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+        if (existingProcessingStatus) continue
 
         try {
             const result = await ensureInboxVideoProcessingStarted({
@@ -17878,6 +17878,19 @@ async function dispatchNextProcessingJobForNamespace(
 
     if (await hasRecentNamespaceGeminiRateLimitFailure(env, botId).catch(() => false)) {
         return { namespaceId: botId, started: false, source: 'idle', detail: 'gemini_rate_limit_cooldown' }
+    }
+
+    // Run the full queue stale-sweep before the fast active guard below. The
+    // fast guard is intentionally bounded and does not rewrite stale active
+    // records, so calling it first can leave a timed-out step 4.3/FFmpeg job
+    // blocking the namespace until the broad 30-minute fallback. processNextInQueue
+    // marks stale active jobs failed and then promotes exactly one queued job.
+    const queueSweepStarted = await processNextInQueue(env, botId).catch((error) => {
+        console.error(`[PROCESSING-DISPATCH] queue sweep failed for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+    })
+    if (queueSweepStarted) {
+        return { namespaceId: botId, started: true, source: 'queue', detail: 'queue_sweep' }
     }
 
     return dispatchNextProcessingJob(botId, {
@@ -34738,8 +34751,11 @@ async function watchdogStuckJobs(env: Env) {
 
                 if (job.status === 'failed') {
                     const errorText = String((job as Record<string, unknown>).error || '').trim()
+                    const errorCategory = String((job as Record<string, unknown>).errorCategory || '').trim()
                     const nonRetryableFailure =
-                        errorText.includes('missing_original_video_asset_unrecoverable')
+                        errorCategory === 'ffmpeg_timeout'
+                        || errorText.includes('FFmpeg flip timed out')
+                        || errorText.includes('missing_original_video_asset_unrecoverable')
                         || errorText.includes('missing_original_video_asset_recovery_failed_http_404')
                         || errorText.includes('missing_original_video_asset_recovery_invalid_content')
                     if (nonRetryableFailure) continue

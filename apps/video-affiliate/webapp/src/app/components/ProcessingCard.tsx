@@ -83,12 +83,12 @@ export function ProcessingCard({
   const [elapsed, setElapsed] = useState(0)
   useEffect(() => {
     if (!active) return
-    const start = new Date(video.createdAt).getTime()
+    const start = new Date(video.startedAt || video.updatedAt || video.createdAt).getTime()
     const tick = () => setElapsed(Math.max(0, Math.floor((Date.now() - start) / 1000)))
     tick()
     const id = setInterval(tick, 1000)
     return () => clearInterval(id)
-  }, [active, video.createdAt])
+  }, [active, video.startedAt, video.updatedAt, video.createdAt])
   const fmtElapsed = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`
   const eventTime = video.completedAt || video.processedAt || video.updatedAt || video.createdAt
 
