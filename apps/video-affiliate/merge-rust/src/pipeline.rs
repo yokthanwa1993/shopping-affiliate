@@ -1425,13 +1425,25 @@ async fn vertex_generate_content_text(
                 source_label, attempt
             );
         }
-        let res = ctx
+        let res = match ctx
             .client
             .post(&url)
             .bearer_auth(&ctx.access_token)
             .json(payload)
             .send()
-            .await?;
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                last_err = format!(
+                    "Vertex Gemini {} request_error attempt_{}: {}",
+                    source_label,
+                    attempt + 1,
+                    err
+                );
+                continue;
+            }
+        };
         let status = res.status().as_u16();
         let body = res.text().await.unwrap_or_default();
         if (200..300).contains(&status) {

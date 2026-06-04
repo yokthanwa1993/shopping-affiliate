@@ -7,7 +7,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-03.xhs-nowatermark.01'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-04.vertex-send-retry.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'
@@ -22,6 +22,7 @@ const GEMINI_API_KEY_DEFAULT_COOLDOWN_MS = 24 * 60 * 60 * 1000
 const PROCESSING_DISPATCH_LOCK_TTL_MS = 2 * 60 * 1000
 const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
 const PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS = 7 * 60 * 1000
+const PROCESSING_GEMINI_RATE_LIMIT_PAUSE_MS = 15 * 60 * 1000
 const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 const PROCESSING_GEMINI_PREP_STALE_ERROR = 'gemini_preparation_stale_timeout — งานค้างที่ขั้นเตรียมวิดีโอให้ Gemini เกิน 7 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 
@@ -1223,7 +1224,9 @@ function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
     const step = Number(data.step)
     const stepName = String(data.stepName || '').trim()
     return step === 2.2
+        || step === 2.7
         || stepName.includes('แปลงวิดีโอให้ Gemini อ่านได้')
+        || stepName.includes('สร้างบทพากย์ผ่าน Vertex Gemini')
         || stepName.toLowerCase().includes('gemini-safe transcode')
 }
 
@@ -1264,6 +1267,18 @@ async function markProcessingJobStale(botBucket: BotBucket, key: string, data: R
     })
 }
 
+function isRecentGeminiRateLimitFailure(data: Record<string, unknown>, uploadedAt?: Date): boolean {
+    const status = String(data.status || '').trim().toLowerCase()
+    if (status !== 'failed') return false
+    const combined = `${String(data.errorCategory || '')} ${String(data.error || (data as Record<string, unknown>)['last_error'] || '')}`.toLowerCase()
+    if (!combined.includes('429') && !combined.includes('resource exhausted') && !combined.includes('quota')) return false
+    const timestamp = String(data.failedAt || data.updatedAt || data.createdAt || '').trim()
+    const parsed = timestamp ? Date.parse(timestamp) : NaN
+    const fallbackMs = uploadedAt instanceof Date ? uploadedAt.getTime() : NaN
+    const effectiveMs = Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs
+    return Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs < PROCESSING_GEMINI_RATE_LIMIT_PAUSE_MS
+}
+
 /** เช็คคิวและเริ่มทำอันถัดไป (ถ้ามี) */
 export async function processNextInQueue(env: Env, botId: string): Promise<boolean> {
     const acquiredLock = await tryAcquireProcessingDispatchLock(env.DB, botId).catch((error) => {
@@ -1281,10 +1296,15 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
         const processingList = await botBucket.list({ prefix: '_processing/' })
         if (processingList.objects.length > 0) {
             let hasActive = false
+            let hasRecentRateLimit = false
             for (const obj of processingList.objects) {
                 const file = await botBucket.get(obj.key)
                 if (!file) continue
                 const data = await file.json() as any
+                if (isRecentGeminiRateLimitFailure(data, obj.uploaded)) {
+                    hasRecentRateLimit = true
+                    continue
+                }
                 if (isProcessingJobStale(data, obj.uploaded)) {
                     console.warn(`[QUEUE] stale processing timeout for ${botId}/${String(data.id || obj.key)}; mark failed and continue queue`)
                     await markProcessingJobStale(botBucket, obj.key, data, obj.uploaded).catch((error) => {
@@ -1298,6 +1318,10 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
                 console.log('[QUEUE] Pipeline still running, skip')
                 return false
             }
+            if (hasRecentRateLimit) {
+                console.log(`[QUEUE] Recent Gemini/Vertex 429 for ${botId}; pause dispatch cooldown`)
+                return false
+            }
         }
 
         // เช็คคิว
@@ -1309,13 +1333,30 @@ export async function processNextInQueue(env: Env, botId: string): Promise<boole
 
         // Process the latest explicit submission first. Background admin ingestion does
         // not need a deep FIFO queue; newer user-provided links should get the next slot.
+        // Auto-retry queue records may carry retryNextAt; keep them in _queue until due
+        // so Gemini/Vertex 429 cooldowns do not hammer the external API.
         const sorted = queueList.objects.sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
-        const next = sorted[0]
-
-        const jobData = await botBucket.get(next.key)
-        if (!jobData) return false
-
-        const job = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string }
+        let next: (typeof sorted)[number] | null = null
+        let job: { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string; retryNextAt?: string } | null = null
+        const nowMs = Date.now()
+        for (const candidate of sorted) {
+            const jobData = await botBucket.get(candidate.key)
+            if (!jobData) continue
+            const candidateJob = await jobData.json() as { id: string; videoUrl: string; chatId: number; shopeeLink?: string; lazadaLink?: string; retryNextAt?: string }
+            const retryNextAt = String(candidateJob.retryNextAt || '').trim()
+            const retryNextMs = retryNextAt ? Date.parse(retryNextAt) : NaN
+            if (Number.isFinite(retryNextMs) && retryNextMs > nowMs) {
+                console.log(`[QUEUE] Skip retry job ${candidateJob.id || candidate.key}; retryNextAt=${retryNextAt}`)
+                continue
+            }
+            next = candidate
+            job = candidateJob
+            break
+        }
+        if (!next || !job) {
+            console.log('[QUEUE] No due jobs in queue')
+            return false
+        }
 
         // ย้ายจาก _queue → _processing
         await botBucket.delete(next.key)

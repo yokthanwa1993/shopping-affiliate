@@ -18,6 +18,7 @@
 
 export type ProcessingDispatchSource =
     | 'active' // a job is already running for this namespace; nothing new started
+    | 'retry' // requeued a retryable failed processing record
     | 'queue' // started the next durable `_queue/` entry
     | 'ready_inbox' // started the next ready inbox / gallery_index candidate
     | 'admin_original' // imported + started the next admin original-library item
@@ -34,6 +35,10 @@ export interface ProcessingDispatchSteps {
     // True when the namespace already has a non-failed `_processing/` job in
     // flight. Enforces the one-active-job-per-namespace invariant.
     hasActiveJob: () => Promise<boolean>
+    // Optional: requeue one retryable failed `_processing/` record whose
+    // backoff is due before pulling fresh backlog. This lets transient failures
+    // heal automatically without blocking the one-active-job invariant.
+    retryFailedJob?: () => Promise<boolean>
     // Drains the durable `_queue/` first. Resolves true when a queued job was
     // promoted to processing.
     drainQueue: () => Promise<boolean>
@@ -60,6 +65,10 @@ export async function dispatchNextProcessingJob(
 
     if (await steps.hasActiveJob()) {
         return { namespaceId: botId, started: false, source: 'active' }
+    }
+
+    if (steps.retryFailedJob && (await steps.retryFailedJob())) {
+        return { namespaceId: botId, started: true, source: 'retry' }
     }
 
     if (await steps.drainQueue()) {

@@ -11,9 +11,10 @@ import {
 // records how many times each one ran, so tests can assert both the result and
 // that later steps are short-circuited once an earlier one starts work.
 function makeSteps(overrides: Partial<Record<keyof ProcessingDispatchSteps, boolean>> = {}) {
-    const calls = { hasActiveJob: 0, drainQueue: 0, startReadyInbox: 0, startAdminOriginal: 0 }
+    const calls = { hasActiveJob: 0, retryFailedJob: 0, drainQueue: 0, startReadyInbox: 0, startAdminOriginal: 0 }
     const steps: ProcessingDispatchSteps = {
         hasActiveJob: async () => { calls.hasActiveJob++; return overrides.hasActiveJob ?? false },
+        retryFailedJob: async () => { calls.retryFailedJob++; return overrides.retryFailedJob ?? false },
         drainQueue: async () => { calls.drainQueue++; return overrides.drainQueue ?? false },
         startReadyInbox: async () => { calls.startReadyInbox++; return overrides.startReadyInbox ?? false },
         startAdminOriginal: async () => { calls.startAdminOriginal++; return overrides.startAdminOriginal ?? false },
@@ -26,6 +27,17 @@ test('an active job short-circuits everything (one active job per namespace)', a
     const result = await dispatchNextProcessingJob('ns-1', steps)
     assert.deepEqual(result, { namespaceId: 'ns-1', started: false, source: 'active' })
     assert.equal(calls.hasActiveJob, 1)
+    assert.equal(calls.retryFailedJob, 0)
+    assert.equal(calls.drainQueue, 0)
+    assert.equal(calls.startReadyInbox, 0)
+    assert.equal(calls.startAdminOriginal, 0)
+})
+
+test('retryable failed jobs are requeued before fresh durable queue work', async () => {
+    const { steps, calls } = makeSteps({ retryFailedJob: true, drainQueue: true, startReadyInbox: true })
+    const result = await dispatchNextProcessingJob('ns-1', steps)
+    assert.deepEqual(result, { namespaceId: 'ns-1', started: true, source: 'retry' })
+    assert.equal(calls.retryFailedJob, 1)
     assert.equal(calls.drainQueue, 0)
     assert.equal(calls.startReadyInbox, 0)
     assert.equal(calls.startAdminOriginal, 0)

@@ -70,6 +70,10 @@ import {
     runScheduledProcessingTick,
     type ProcessingDispatchResult,
 } from './processing-dispatch'
+import {
+    decideProcessingRetry,
+    type ProcessingRetryDecision,
+} from './processing-retry-policy'
 import { ADMIN_HTML } from './admin-page'
 import {
     MAX_SHORTLINK_URL_TEMPLATE_CHARS,
@@ -17421,6 +17425,7 @@ const PROCESSING_STALE_TIMEOUT_MS = 30 * 60 * 1000
 const PROCESSING_GEMINI_PREP_STALE_TIMEOUT_MS = 7 * 60 * 1000
 const PROCESSING_PIPELINE_HANDOFF_STALE_TIMEOUT_MS = 3 * 60 * 1000
 const PROCESSING_PIPELINE_HANDOFF_STALE_ERROR = 'pipeline_handoff_stale_timeout — งานค้างตอนเชื่อมต่อเครื่องประมวลผลเกิน 3 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
+const PROCESSING_GEMINI_RATE_LIMIT_PAUSE_MS = 15 * 60 * 1000
 // Bound how much of `_processing/` we touch on each /api/processing load.
 // Namespaces accumulate hundreds of old failed records that linger here even
 // after they've been mirrored into `_processing_history/`. Reading every one
@@ -17435,7 +17440,7 @@ const PROCESSING_STALE_CHECK_MAX = 30
 // safety multiplier on the longest configured timeout keeps the check honest.
 const PROCESSING_STALE_CHECK_WINDOW_MS = PROCESSING_STALE_TIMEOUT_MS * 2
 const PROCESSING_STALE_ERROR = 'processing_stale_timeout — งานประมวลผลค้างเกิน 30 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
-const PROCESSING_GEMINI_PREP_STALE_ERROR = 'gemini_preparation_stale_timeout — งานค้างที่ขั้นเตรียมวิดีโอให้ Gemini เกิน 7 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
+const PROCESSING_GEMINI_PREP_STALE_ERROR = 'gemini_preparation_stale_timeout — งานค้างที่ขั้น Gemini เกิน 7 นาที ระบบข้ามไปทำวิดีโอถัดไปแล้ว'
 
 async function readProcessingListPrefix(
     bucket: R2Bucket,
@@ -17512,6 +17517,139 @@ async function putProcessingHistoryRecord(
     })
 }
 
+function buildProcessingRetryQueuedJob(
+    failedJob: Record<string, unknown>,
+    linkContext: Record<string, unknown> | null,
+    decision: ProcessingRetryDecision,
+): Record<string, unknown> | null {
+    const id = String(failedJob.id || linkContext?.id || '').trim()
+    const videoUrl = String(failedJob.videoUrl || linkContext?.videoUrl || '').trim()
+    if (!id || !videoUrl) return null
+    const chatIdRaw = Number(failedJob.chatId ?? linkContext?.chatId ?? 0)
+    const retryHistory = Array.isArray(failedJob.retryHistory) ? failedJob.retryHistory.slice(-10) : []
+    const nowIso = new Date().toISOString()
+    return {
+        id,
+        videoUrl,
+        shopeeLink: String(failedJob.shopeeLink || linkContext?.shopeeLink || '').trim(),
+        lazadaLink: String(failedJob.lazadaLink || linkContext?.lazadaLink || '').trim(),
+        manualCaption: normalizeManualCaption(failedJob.manualCaption || linkContext?.manualCaption || ''),
+        chatId: Number.isFinite(chatIdRaw) && chatIdRaw >= 0 ? chatIdRaw : 0,
+        createdAt: nowIso,
+        status: 'queued',
+        retryCount: decision.attempts + 1,
+        retryNextAt: decision.nextRetryAt,
+        retryHistory: [
+            ...retryHistory,
+            {
+                at: nowIso,
+                errorCategory: String(failedJob.errorCategory || '').trim(),
+                error: sanitizeProcessingError(failedJob.error || failedJob.last_error || ''),
+                decision: decision.reason,
+            },
+        ],
+        autoRetry: true,
+        autoRetryReason: decision.reason,
+    }
+}
+
+async function requeueDueFailedProcessingJob(env: Env, botId: string): Promise<boolean> {
+    const namespaceId = String(botId || '').trim()
+    if (!namespaceId) return false
+    const bucket = new BotBucket(env.BUCKET, namespaceId) as unknown as R2Bucket
+    const list = await bucket.list({ prefix: '_processing/' }).catch(() => null)
+    if (!list || list.objects.length === 0) return false
+
+    const failedObjects = list.objects
+        .slice()
+        .sort((a, b) => a.uploaded.getTime() - b.uploaded.getTime())
+        .slice(0, 120)
+
+    for (const obj of failedObjects) {
+        const dataObj = await bucket.get(obj.key).catch(() => null)
+        if (!dataObj) continue
+        const failedJob = await dataObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        const status = String(failedJob.status || '').trim().toLowerCase()
+        if (status !== 'failed') continue
+        const decision = decideProcessingRetry({
+            status,
+            errorCategory: failedJob.errorCategory,
+            error: failedJob.error || failedJob.last_error,
+            failedAt: failedJob.failedAt,
+            updatedAt: failedJob.updatedAt || obj.uploaded.toISOString(),
+            retryCount: failedJob.retryCount,
+            retryHistory: failedJob.retryHistory,
+            now: Date.now(),
+        })
+        if (decision.action === 'wait') continue
+        if (decision.action === 'terminal') {
+            if (decision.reason === 'max_attempts_exceeded' && String(failedJob.autoRetryTerminal || '') !== '1') {
+                const terminal = {
+                    ...failedJob,
+                    status: 'failed',
+                    autoRetryTerminal: '1',
+                    autoRetryReason: decision.reason,
+                    retryNextAt: decision.nextRetryAt,
+                    updatedAt: new Date().toISOString(),
+                }
+                await bucket.put(obj.key, JSON.stringify(terminal, null, 2), { httpMetadata: { contentType: 'application/json' } }).catch(() => { })
+                const id = String(failedJob['id'] || obj.key.replace(/^_processing\//, '').replace(/\.json$/i, '')).trim()
+                await putProcessingHistoryRecord(bucket, id, terminal).catch(() => { })
+            }
+            continue
+        }
+
+        const id = String(failedJob.id || obj.key.replace(/^_processing\//, '').replace(/\.json$/i, '')).trim()
+        const linkContextObj = id ? await bucket.get(`_link_context/${id}.json`).catch(() => null) : null
+        const linkContext = linkContextObj
+            ? await linkContextObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+            : null
+        const queuedJob = buildProcessingRetryQueuedJob({ ...failedJob, id }, linkContext, decision)
+        if (!queuedJob) continue
+        await putProcessingHistoryRecord(bucket, id, {
+            ...failedJob,
+            id,
+            status: 'retrying',
+            retryCount: decision.attempts + 1,
+            retryQueuedAt: new Date().toISOString(),
+            autoRetryReason: decision.reason,
+        }).catch(() => { })
+        await bucket.delete(obj.key).catch(() => { })
+        await bucket.put(`_queue/${id}.json`, JSON.stringify(queuedJob, null, 2), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+        console.log(`[PROCESSING-RETRY] Requeued ${namespaceId}/${id} attempt=${decision.attempts + 1}/${decision.maxAttempts} reason=${decision.reason}`)
+        return processNextInQueue(env, namespaceId).catch((error) => {
+            console.error(`[PROCESSING-RETRY] dispatch failed for ${namespaceId}/${id}: ${error instanceof Error ? error.message : String(error)}`)
+            return false
+        })
+    }
+
+    return false
+}
+
+async function hasRecentNamespaceGeminiRateLimitFailure(env: Env, namespaceId: string): Promise<boolean> {
+    const botId = String(namespaceId || '').trim()
+    if (!botId) return false
+    const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+    const list = await bucket.list({ prefix: '_processing/' }).catch(() => null)
+    if (!list || list.objects.length === 0) return false
+    for (const obj of list.objects.slice().sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime()).slice(0, 120)) {
+        const dataObj = await bucket.get(obj.key).catch(() => null)
+        if (!dataObj) continue
+        const data = await dataObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        if (String(data.status || '').trim().toLowerCase() !== 'failed') continue
+        const combined = `${String(data.errorCategory || '')} ${String(data.error || data['last_error'] || '')}`.toLowerCase()
+        if (!combined.includes('429') && !combined.includes('resource exhausted') && !combined.includes('quota')) continue
+        const timestamp = String(data.failedAt || data.updatedAt || data.createdAt || '').trim()
+        const parsed = timestamp ? Date.parse(timestamp) : NaN
+        const fallbackMs = obj.uploaded instanceof Date ? obj.uploaded.getTime() : NaN
+        const effectiveMs = Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMs
+        if (Number.isFinite(effectiveMs) && effectiveMs > 0 && Date.now() - effectiveMs < PROCESSING_GEMINI_RATE_LIMIT_PAUSE_MS) return true
+    }
+    return false
+}
+
 function isProcessingJobStale(data: Record<string, unknown>, uploadedAt?: Date): boolean {
     const status = String(data.status || '').trim().toLowerCase()
     if (status && status !== 'processing' && status !== 'queued') return false
@@ -17535,7 +17673,9 @@ function isGeminiPreparationStep(data: Record<string, unknown>): boolean {
     const step = Number(data.step)
     const stepName = String(data.stepName || '').trim()
     return step === 2.2
+        || step === 2.7
         || stepName.includes('แปลงวิดีโอให้ Gemini อ่านได้')
+        || stepName.includes('สร้างบทพากย์ผ่าน Vertex Gemini')
         || stepName.toLowerCase().includes('gemini-safe transcode')
 }
 
@@ -17736,9 +17876,14 @@ async function dispatchNextProcessingJobForNamespace(
 
     const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
 
+    if (await hasRecentNamespaceGeminiRateLimitFailure(env, botId).catch(() => false)) {
+        return { namespaceId: botId, started: false, source: 'idle', detail: 'gemini_rate_limit_cooldown' }
+    }
+
     return dispatchNextProcessingJob(botId, {
         // On error, assume a job is active so we never race a second start.
         hasActiveJob: () => hasActiveProcessingJob(bucket, botId).catch(() => true),
+        retryFailedJob: () => requeueDueFailedProcessingJob(env, botId),
         drainQueue: () => processNextInQueue(env, botId),
         startReadyInbox: () => startNextReadyInboxForNamespace(env, ctx, botId, { runInline: options.runInline }),
         startAdminOriginal: async () => {
@@ -34680,11 +34825,7 @@ async function watchdogStuckJobs(env: Env) {
             // queue -> ready inbox -> admin original, while preserving one active job.
             if (hadProcessingEntries || queueDrainChecks < MAX_QUEUE_DRAIN_CHECKS) {
                 queueDrainChecks++
-                if (ctx) {
-                    await dispatchNextProcessingJobForNamespace(env, ctx, botId, { runInline: true })
-                } else {
-                    await processNextInQueue(env, botId)
-                }
+                await processNextInQueue(env, botId)
             }
         } catch (e) {
             console.error(`[WATCHDOG] Error for bot ${botId}:`, e instanceof Error ? e.message : String(e))
