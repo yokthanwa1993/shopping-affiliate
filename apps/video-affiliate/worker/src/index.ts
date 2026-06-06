@@ -24,8 +24,41 @@ import {
 import {
     buildExistingCommentDedupCandidates,
     buildVisibleCommentTargetCandidates,
+    extractIdFromCommentTargetInput,
     isAffiliateCommentMatch,
 } from './comment-targeting'
+import {
+    CUSTOMLINK_DEFAULT_ID,
+    JOB_DEFAULT_BATCH_SIZE,
+    JOB_DEFAULT_DRY_RUN,
+    JOB_DEFAULT_STOP_ON_FIRST_ERROR,
+    PAGE_COMMENT_LINK_JOBS_INDEX_SQL,
+    PAGE_COMMENT_LINK_JOBS_TABLE_SQL,
+    PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL,
+    PAGE_COMMENT_LINK_REGISTRY_INDEX_SQL,
+    PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL,
+    REGISTRY_DEFAULT_LIMIT,
+    buildCustomlinkRequestUrl,
+    buildExpectedUtmContent,
+    buildTargetSubIds,
+    canonicalizeProductUrl,
+    clampBatchSize,
+    computeRegistryItemStatus,
+    computeWriteAction,
+    detectGraphStopSignal,
+    extractUrlsFromText,
+    isShortlinkCandidate,
+    normalizeJobBool,
+    normalizeRegistryLimit,
+    normalizeRegistryOffset,
+    parseTrackingSubIds,
+    pickPrimaryAffiliateUrl,
+    replaceShortlinkInMessage,
+    resolvePageCommentLinkJobStatus,
+    verifyRewrittenShortlink,
+    type JobItemStatus,
+    type RewriteAction,
+} from './comment-link-registry'
 import {
     COMMENT_TEMPLATE_LAZADA_PLACEHOLDER,
     COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
@@ -7314,6 +7347,1070 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
     }, 200, {
         'Cache-Control': 'no-store',
     })
+})
+
+// READ-ONLY audit of the comment/affiliate-link registry for a Facebook Page's
+// Reels. Combines cached page videos + post_history mapping + (when a Graph token
+// is available) a LIVE GET of top-level comments, then extracts/expands affiliate
+// links to surface the current sub1..sub5 tracking state per Reel.
+//
+// Strictly read-only: only Graph GET requests and redirect-following GET/HEAD
+// fetches are made; no D1 writes beyond the IF-NOT-EXISTS cache table bootstrap
+// done by the existing list/count helpers; no Facebook write of any kind. Per-item
+// live work is wrapped so a single failure degrades that item's status instead of
+// failing the whole endpoint. Tokens are never logged or echoed in the response.
+app.get('/api/dashboard/page-comment-link-registry', async (c) => {
+    const pageId = String(c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+    const namespaceId = DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID
+
+    const limit = normalizeRegistryLimit(c.req.query('limit') ?? REGISTRY_DEFAULT_LIMIT)
+    const offset = normalizeRegistryOffset(c.req.query('offset'))
+
+    const parseBoolFlag = (raw: string | undefined, fallback: boolean): boolean => {
+        const value = String(raw ?? '').trim().toLowerCase()
+        if (!value) return fallback
+        return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+    }
+    const expand = parseBoolFlag(c.req.query('expand'), true)
+    const includeFullComment = parseBoolFlag(c.req.query('include_full_comment'), false)
+    const filterHasComment = c.req.query('has_comment') != null ? parseBoolFlag(c.req.query('has_comment'), false) : null
+    const filterHasShopeeLink = c.req.query('has_shopee_link') != null ? parseBoolFlag(c.req.query('has_shopee_link'), false) : null
+    const filterSub1 = String(c.req.query('sub1') || c.req.query('sub_1') || '').trim()
+    const filterStatus = String(c.req.query('status') || '').trim()
+    const lastAuditedAt = new Date().toISOString()
+
+    // Over-fetch (offset+limit) from the cache and slice — the cache helper has no
+    // native offset. Bounded to 1000 to keep the read cheap.
+    const cacheWindow = Math.min(1000, offset + limit)
+    const [allItems, totalVideos] = await Promise.all([
+        listFacebookPageVideoCache(c.env.DB, { pageId, minViews: 0, limit: cacheWindow }),
+        countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 0 }),
+    ])
+    const pageItems = allItems.slice(offset, offset + limit)
+
+    type RegistryPostHistoryRow = {
+        video_id?: string
+        fb_post_id?: string
+        fb_reel_url?: string
+        shopee_link?: string
+        posted_at?: string
+        comment_status?: string
+        comment_error?: string
+        comment_fb_id?: string
+        comment_profile_id?: string
+        comment_profile_name?: string
+    }
+    // Stored mapping (post_history.comment_fb_id etc.) keyed by post id and by the
+    // fb video/reel id parsed from fb_reel_url.
+    const phByPostId = new Map<string, RegistryPostHistoryRow>()
+    const phByFbVideoId = new Map<string, RegistryPostHistoryRow>()
+    try {
+        const rows = await c.env.DB.prepare(
+            `SELECT video_id, fb_post_id, fb_reel_url, shopee_link, posted_at,
+                    comment_status, comment_error, comment_fb_id, comment_profile_id, comment_profile_name
+             FROM post_history
+             WHERE page_id = ? AND bot_id = ?
+             ORDER BY datetime(posted_at) DESC
+             LIMIT 1000`
+        ).bind(pageId, namespaceId).all() as { results?: RegistryPostHistoryRow[] }
+        for (const row of (rows.results || [])) {
+            const fbPostId = String(row.fb_post_id || '').trim()
+            if (fbPostId) {
+                if (!phByPostId.has(fbPostId)) phByPostId.set(fbPostId, row)
+                const tail = fbPostId.includes('_') ? fbPostId.split('_').pop() || '' : fbPostId
+                if (tail && !phByPostId.has(tail)) phByPostId.set(tail, row)
+            }
+            const reelId = extractIdFromCommentTargetInput(row.fb_reel_url || '')
+            if (reelId && !phByFbVideoId.has(reelId)) phByFbVideoId.set(reelId, row)
+        }
+    } catch (e) {
+        console.log(`[COMMENT LINK REGISTRY] post_history lookup failed page=${pageId}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+
+    // Resolve the Graph token once. Never logged or returned. Empty => no live read.
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
+    const hasToken = token.length > 0
+
+    type LiveComment = { id: string; message: string; fromId: string; fromName: string; createdTime: string }
+    async function fetchPageComments(target: string): Promise<{ ok: boolean; comments: LiveComment[] }> {
+        const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(target)}/comments?fields=id,message,from,created_time&limit=50&access_token=${encodeURIComponent(token)}`
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 8000)
+        try {
+            const resp = await fetch(url, { method: 'GET', signal: controller.signal })
+            const body = await readMetaGraphJson(resp)
+            if (!resp.ok) return { ok: false, comments: [] }
+            const data = Array.isArray((body as Record<string, unknown>).data) ? (body as { data: unknown[] }).data : []
+            const comments: LiveComment[] = data.map((entry) => {
+                const it = (entry || {}) as Record<string, unknown>
+                const from = (it.from || {}) as Record<string, unknown>
+                return {
+                    id: String(it.id || '').trim(),
+                    message: String(it.message || ''),
+                    fromId: String(from.id || '').trim(),
+                    fromName: String(from.name || '').trim(),
+                    createdTime: String(it.created_time || '').trim(),
+                }
+            })
+            return { ok: true, comments }
+        } catch {
+            return { ok: false, comments: [] }
+        } finally {
+            clearTimeout(timer)
+        }
+    }
+
+    async function expandUrl(url: string): Promise<{ state: 'ok' | 'failed'; finalUrl: string }> {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 8000)
+        try {
+            const resp = await fetch(url, {
+                method: 'GET',
+                redirect: 'follow',
+                signal: controller.signal,
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; registry-audit/1.0)' },
+            })
+            const finalUrl = String(resp.url || '').trim() || url
+            await resp.body?.cancel().catch(() => { })
+            return { state: 'ok', finalUrl }
+        } catch {
+            return { state: 'failed', finalUrl: '' }
+        } finally {
+            clearTimeout(timer)
+        }
+    }
+
+    async function buildItem(item: FacebookPageVideoCacheRow) {
+        const postId = String(item.post_id || '').trim()
+        const fbVideoId = String(item.video_id || '').trim()
+        const fbPostFull = postId ? (postId.includes('_') ? postId : `${pageId}_${postId}`) : ''
+        const ph = (postId ? (phByPostId.get(postId) || (fbPostFull ? phByPostId.get(fbPostFull) : undefined)) : undefined)
+            || (fbVideoId ? phByFbVideoId.get(fbVideoId) : undefined)
+            || null
+
+        const storedFbPostId = String(ph?.fb_post_id || '').trim() || fbPostFull
+        const storedReel = String(ph?.fb_reel_url || '').trim() || fbVideoId
+        const candidates = buildExistingCommentDedupCandidates({ pageId, fbPostId: storedFbPostId, fbReelUrlOrId: storedReel })
+        const commentTargetId = candidates[0] || ''
+
+        let commentFetch: 'ok' | 'failed' | 'missing_token' = hasToken ? 'failed' : 'missing_token'
+        let pageComments: LiveComment[] = []
+        let otherCommentCount = 0
+        let usedTarget = ''
+        if (hasToken && candidates.length > 0) {
+            let firstOk: { comments: LiveComment[]; target: string } | null = null
+            for (const target of candidates.slice(0, 3)) {
+                const res = await fetchPageComments(target)
+                if (!res.ok) continue
+                if (!firstOk) firstOk = { comments: res.comments, target }
+                const pageOwned = res.comments.filter((cm) => cm.fromId && cm.fromId === pageId)
+                if (pageOwned.length > 0) { firstOk = { comments: res.comments, target }; break }
+            }
+            if (firstOk) {
+                commentFetch = 'ok'
+                usedTarget = firstOk.target
+                pageComments = firstOk.comments.filter((cm) => cm.fromId && cm.fromId === pageId)
+                otherCommentCount = firstOk.comments.length - pageComments.length
+            }
+        }
+
+        const primaryComment = pageComments[0] || null
+        const commentMessageFull = String(primaryComment?.message || '')
+        const commentMessage = includeFullComment ? commentMessageFull : commentMessageFull.slice(0, 280)
+
+        // Collect candidate URLs: page-comment messages first (the live source of
+        // truth), then caption, then stored shopee_link.
+        const commentUrls = pageComments.flatMap((cm) => extractUrlsFromText(cm.message))
+        const captionUrls = [
+            ...extractUrlsFromText(String(item.description || '')),
+            ...extractUrlsFromText(String(item.title || '')),
+        ]
+        const storedShopee = String(item.shopee_link || ph?.shopee_link || '').trim()
+        const allUrls = [...commentUrls, ...captionUrls, ...(storedShopee ? [storedShopee] : [])]
+        const oldShortlink = pickPrimaryAffiliateUrl(allUrls) || storedShopee || ''
+        const hasLink = !!oldShortlink
+
+        let expandState: 'ok' | 'failed' | 'not_attempted' = 'not_attempted'
+        let expandedUrl = ''
+        if (oldShortlink && expand && isShortlinkCandidate(oldShortlink)) {
+            const result = await expandUrl(oldShortlink)
+            expandState = result.state
+            expandedUrl = result.finalUrl
+        }
+
+        let sub = parseTrackingSubIds(expandedUrl || oldShortlink)
+        const subEmpty = !sub.sub1 && !sub.sub2 && !sub.sub3 && !sub.sub4 && !sub.sub5
+        if (subEmpty && expandedUrl && oldShortlink && expandedUrl !== oldShortlink) {
+            const alt = parseTrackingSubIds(oldShortlink)
+            if (alt.sub1 || alt.sub2 || alt.sub3 || alt.sub4 || alt.sub5) sub = alt
+        }
+        const productUrl = canonicalizeProductUrl(expandedUrl || oldShortlink)
+
+        const status = computeRegistryItemStatus({
+            commentFetch,
+            pageCommentCount: pageComments.length,
+            otherCommentCount,
+            hasLink,
+            expandState,
+        })
+
+        return {
+            page_id: pageId,
+            reel_id: fbVideoId,
+            fb_video_id: fbVideoId,
+            post_id: postId,
+            post_canonical: storedFbPostId,
+            permalink_url: buildFacebookUrl(String(item.permalink_url || '').trim()),
+            comment_target_id: usedTarget || commentTargetId,
+            comment_id: String(primaryComment?.id || ph?.comment_fb_id || '').trim(),
+            comment_from_id: String(primaryComment?.fromId || '').trim(),
+            comment_from_name: String(primaryComment?.fromName || ph?.comment_profile_name || '').trim(),
+            comment_message: commentMessage,
+            comment_created_time: String(primaryComment?.createdTime || '').trim(),
+            page_comment_count: pageComments.length,
+            other_comment_count: otherCommentCount,
+            old_shortlink: oldShortlink,
+            expanded_url: expandedUrl,
+            utm_content: sub.utm_content,
+            sub1: sub.sub1,
+            sub2: sub.sub2,
+            sub3: sub.sub3,
+            sub4: sub.sub4,
+            sub5: sub.sub5,
+            product_url: productUrl,
+            status,
+            posted_at: String(ph?.posted_at || item.created_time || '').trim(),
+            last_audited_at: lastAuditedAt,
+            // Surface the stored post_history mapping for cross-checking the live read.
+            stored_comment_fb_id: String(ph?.comment_fb_id || '').trim(),
+            stored_comment_status: String(ph?.comment_status || '').trim(),
+            stored_comment_error: String(ph?.comment_error || '').trim(),
+            stored_shopee_link: storedShopee,
+        }
+    }
+
+    // Bounded concurrency so we never fan out more than a handful of Graph/redirect
+    // fetches at once.
+    async function mapWithConcurrency<T, R>(values: T[], concurrency: number, fn: (value: T) => Promise<R>): Promise<R[]> {
+        const results: R[] = new Array(values.length)
+        let cursor = 0
+        const workers = Array.from({ length: Math.min(concurrency, values.length || 1) }, async () => {
+            while (true) {
+                const index = cursor++
+                if (index >= values.length) break
+                results[index] = await fn(values[index])
+            }
+        })
+        await Promise.all(workers)
+        return results
+    }
+
+    const builtAll = await mapWithConcurrency(pageItems, 5, buildItem)
+    const items = builtAll.filter((it) => {
+        if (filterHasComment !== null && (!!it.comment_id) !== filterHasComment) return false
+        if (filterHasShopeeLink !== null && (!!it.old_shortlink) !== filterHasShopeeLink) return false
+        if (filterSub1 && it.sub1 !== filterSub1) return false
+        if (filterStatus && it.status !== filterStatus) return false
+        return true
+    })
+
+    const countsByStatus: Record<string, number> = {}
+    const countsBySub1: Record<string, number> = {}
+    for (const it of items) {
+        countsByStatus[it.status] = (countsByStatus[it.status] || 0) + 1
+        const key = it.sub1 || '(none)'
+        countsBySub1[key] = (countsBySub1[key] || 0) + 1
+    }
+
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        page_name: DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME,
+        namespace_id: namespaceId,
+        comments_source: hasToken ? 'live+cache' : 'cache_only',
+        token_available: hasToken,
+        expand_enabled: expand,
+        last_audited_at: lastAuditedAt,
+        summary: {
+            total_videos: totalVideos,
+            window_offset: offset,
+            window_limit: limit,
+            window_size: pageItems.length,
+            count_returned: items.length,
+            counts_by_status: countsByStatus,
+            counts_by_sub1: countsBySub1,
+            filters_applied: {
+                has_comment: filterHasComment,
+                has_shopee_link: filterHasShopeeLink,
+                sub1: filterSub1 || null,
+                status: filterStatus || null,
+            },
+        },
+        items,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// ===========================================================================
+// SAFE FULL WORKFLOW — rewrite the Shopee shortlink inside Page/Reel comments.
+// preview → jobs → run → verify, with dry_run + small batches by default and a
+// history-safe audit trail (old_message / old_shortlink kept for rollback).
+// The pure decisions live in comment-link-registry.ts; this owns Graph /
+// customlink / D1 I/O. Never deletes comments. Never writes unless dry_run is
+// explicitly false. Designed to sit alongside the existing read-only registry
+// audit endpoint above without touching its behaviour.
+// ===========================================================================
+
+let pageCommentLinkWorkflowTablesReady: Promise<void> | null = null
+async function ensurePageCommentLinkWorkflowTables(db: D1Database): Promise<void> {
+    if (!pageCommentLinkWorkflowTablesReady) {
+        pageCommentLinkWorkflowTablesReady = (async () => {
+            await db.prepare(PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL).run()
+            await db.prepare(PAGE_COMMENT_LINK_REGISTRY_INDEX_SQL).run().catch(() => { })
+            await db.prepare(PAGE_COMMENT_LINK_JOBS_TABLE_SQL).run()
+            await db.prepare(PAGE_COMMENT_LINK_JOBS_INDEX_SQL).run().catch(() => { })
+            await db.prepare(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL).run()
+        })()
+    }
+    await pageCommentLinkWorkflowTablesReady
+}
+
+type PageCommentLinkLiveComment = { id: string; message: string; fromId: string; fromName: string }
+
+// Live page-comment read (direct Graph, page token). Returns ok=false on any
+// fetch/HTTP error so the caller can decide without throwing.
+async function fetchPageCommentsLive(target: string, token: string): Promise<{ ok: boolean; comments: PageCommentLinkLiveComment[] }> {
+    const cleanTarget = String(target || '').trim()
+    if (!cleanTarget || !token) return { ok: false, comments: [] }
+    const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(cleanTarget)}/comments?fields=id,message,from&limit=50&access_token=${encodeURIComponent(token)}`
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8000)
+    try {
+        const resp = await fetch(url, { method: 'GET', signal: controller.signal })
+        const body = await readMetaGraphJson(resp)
+        if (!resp.ok) return { ok: false, comments: [] }
+        const data = Array.isArray((body as Record<string, unknown>).data) ? (body as { data: unknown[] }).data : []
+        const comments = data.map((entry) => {
+            const it = (entry || {}) as Record<string, unknown>
+            const from = (it.from || {}) as Record<string, unknown>
+            return {
+                id: String(it.id || '').trim(),
+                message: String(it.message || ''),
+                fromId: String(from.id || '').trim(),
+                fromName: String(from.name || '').trim(),
+            }
+        })
+        return { ok: true, comments }
+    } catch {
+        return { ok: false, comments: [] }
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+// Bounded redirect expansion to read the final Shopee URL (and its utm_content).
+async function expandShortlinkFinalUrl(url: string): Promise<{ state: 'ok' | 'failed'; finalUrl: string }> {
+    const target = String(url || '').trim()
+    if (!target) return { state: 'failed', finalUrl: '' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8000)
+    try {
+        const resp = await fetch(target, {
+            method: 'GET',
+            redirect: 'follow',
+            signal: controller.signal,
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; comment-link-rewrite/1.0)' },
+        })
+        const finalUrl = String(resp.url || '').trim() || target
+        await resp.body?.cancel().catch(() => { })
+        return { state: 'ok', finalUrl }
+    } catch {
+        return { state: 'failed', finalUrl: '' }
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+// Mint the new shortlink via customlink.wwoom.com (GET → { shortLink }). Only
+// called in real write mode — it is the one external side effect of a run.
+async function mintCustomlinkShortlink(requestUrl: string): Promise<{ ok: boolean; shortLink: string; error: string }> {
+    const url = String(requestUrl || '').trim()
+    if (!url) return { ok: false, shortLink: '', error: 'empty_request_url' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 12000)
+    try {
+        const resp = await fetch(url, { method: 'GET', signal: controller.signal })
+        const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+        const shortLink = String(data.shortLink || data.short_link || '').trim()
+        if (!resp.ok || !shortLink) return { ok: false, shortLink: '', error: 'shortlink_failed' }
+        return { ok: true, shortLink, error: '' }
+    } catch (e) {
+        return { ok: false, shortLink: '', error: sanitizeMetaGraphError(e) }
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+const PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN = /customlink\.[a-z0-9.-]+|s\.shopee\.[a-z.]+|shopee\.[a-z.]+|shp\.ee/i
+
+const str = (v: unknown): string => String(v == null ? '' : v).trim()
+
+// Normalise a registry-shaped input item (as returned by GET …/page-comment-link-registry)
+// and compute the rewrite PLAN. Pure-ish: no network, no DB. The action says how
+// the new link would land; status is 'skipped' when there is nothing to rewrite.
+function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string }) {
+    const pageId = opts.pageId
+    const fbVideoId = str(raw.fb_video_id) || str(raw.video_id) || str(raw.reel_id)
+    const reelId = str(raw.reel_id) || fbVideoId
+    const postId = str(raw.post_id)
+    const canonicalPostId = str(raw.canonical_post_id) || str(raw.post_canonical)
+    const commentTargetId = str(raw.comment_target_id)
+    const oldCommentId = str(raw.old_comment_id) || str(raw.comment_id)
+    const commentFromId = str(raw.comment_from_id)
+    const commentFromName = str(raw.comment_from_name)
+    const oldMessage = String(raw.old_message ?? raw.comment_message ?? '')
+    const oldShortlink = str(raw.old_shortlink)
+    const oldExpandedUrl = str(raw.old_expanded_url) || str(raw.expanded_url)
+    const oldUtmContent = str(raw.old_utm_content) || str(raw.utm_content)
+    const oldSub1 = str(raw.old_sub1) || str(raw.sub1)
+    const oldSub2 = str(raw.old_sub2) || str(raw.sub2)
+    const oldSub3 = str(raw.old_sub3) || str(raw.sub3)
+    const oldSub4 = str(raw.old_sub4) || str(raw.sub4)
+    const oldSub5 = str(raw.old_sub5) || str(raw.sub5)
+
+    const productUrl = canonicalizeProductUrl(str(raw.product_url) || oldExpandedUrl || oldShortlink)
+    const hasRewriteableLink = !!productUrl
+
+    const subs = buildTargetSubIds({ requestedSub1: opts.requestedSub1, pageId, canonicalPostId, fbVideoId, reelId })
+    const action: RewriteAction = computeWriteAction({ pageId, commentFromId, oldCommentId, hasRewriteableLink })
+    const expectedUtmContent = buildExpectedUtmContent(subs)
+    const customlinkRequestUrl = hasRewriteableLink
+        ? buildCustomlinkRequestUrl({ productUrl, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3 })
+        : ''
+
+    const reasons: string[] = []
+    if (subs.reason) reasons.push(subs.reason)
+    if (!hasRewriteableLink) reasons.push('no_product_url')
+    const status: JobItemStatus = action === 'skip' ? 'skipped' : 'planned'
+
+    return {
+        page_id: pageId,
+        fb_video_id: fbVideoId,
+        reel_id: reelId,
+        post_id: postId,
+        canonical_post_id: canonicalPostId,
+        comment_target_id: commentTargetId,
+        old_comment_id: oldCommentId,
+        new_comment_id: '',
+        comment_from_id: commentFromId,
+        comment_from_name: commentFromName,
+        old_message: oldMessage,
+        new_message: '',
+        old_shortlink: oldShortlink,
+        old_expanded_url: oldExpandedUrl,
+        old_utm_content: oldUtmContent,
+        old_sub1: oldSub1,
+        old_sub2: oldSub2,
+        old_sub3: oldSub3,
+        old_sub4: oldSub4,
+        old_sub5: oldSub5,
+        product_url: productUrl,
+        target_sub1: subs.sub1,
+        target_sub2: subs.sub2,
+        target_sub3: subs.sub3,
+        target_sub2_source: subs.sub2_source,
+        new_shortlink: '',
+        new_expanded_url: '',
+        new_utm_content: '',
+        customlink_request_url: customlinkRequestUrl,
+        expected_utm_content: expectedUtmContent,
+        action,
+        status,
+        reason: reasons.join(','),
+        error: '',
+        attempts: 0,
+    }
+}
+
+type PageCommentLinkPlanItem = ReturnType<typeof planPageCommentLinkItem>
+
+function readRewriteItemsFromBody(body: Record<string, unknown>): Record<string, unknown>[] {
+    const list = Array.isArray(body.items) ? body.items : (Array.isArray(body.rows) ? body.rows : [])
+    return list.filter((x) => x && typeof x === 'object') as Record<string, unknown>[]
+}
+
+// INSERT OR REPLACE a durable audit snapshot of an item's CURRENT (old) link
+// state. Read-only with respect to Facebook; this is our own history table.
+async function upsertPageCommentLinkRegistry(db: D1Database, item: PageCommentLinkPlanItem, auditedAt: string): Promise<void> {
+    if (!item.fb_video_id) return
+    await db.prepare(
+        `INSERT OR REPLACE INTO page_comment_link_registry
+            (page_id, fb_video_id, reel_id, post_id, canonical_post_id, comment_target_id, comment_id,
+             comment_from_id, comment_from_name, old_message, old_shortlink, old_expanded_url, old_utm_content,
+             old_sub1, old_sub2, old_sub3, old_sub4, old_sub5, product_url, status, last_audited_at,
+             created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?,?,?,
+             COALESCE((SELECT created_at FROM page_comment_link_registry WHERE page_id = ? AND fb_video_id = ?), datetime('now')),
+             datetime('now'))`
+    ).bind(
+        item.page_id, item.fb_video_id, item.reel_id, item.post_id, item.canonical_post_id, item.comment_target_id, item.old_comment_id,
+        item.comment_from_id, item.comment_from_name, item.old_message, item.old_shortlink, item.old_expanded_url, item.old_utm_content,
+        item.old_sub1, item.old_sub2, item.old_sub3, item.old_sub4, item.old_sub5, item.product_url, item.status, auditedAt,
+        item.page_id, item.fb_video_id,
+    ).run().catch(() => { })
+}
+
+async function insertPageCommentLinkJobItem(db: D1Database, jobId: string, index: number, item: PageCommentLinkPlanItem, auditedAt: string): Promise<void> {
+    await db.prepare(
+        `INSERT OR REPLACE INTO page_comment_link_job_items
+            (job_id, item_index, page_id, fb_video_id, reel_id, post_id, canonical_post_id, comment_target_id,
+             old_comment_id, new_comment_id, comment_from_id, comment_from_name, old_message, new_message,
+             old_shortlink, old_expanded_url, old_utm_content, old_sub1, old_sub2, old_sub3, old_sub4, old_sub5,
+             product_url, target_sub1, target_sub2, target_sub3, new_shortlink, new_expanded_url, new_utm_content,
+             action, status, reason, error, attempts, last_audited_at, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?, datetime('now'), datetime('now'))`
+    ).bind(
+        jobId, index, item.page_id, item.fb_video_id, item.reel_id, item.post_id, item.canonical_post_id, item.comment_target_id,
+        item.old_comment_id, item.new_comment_id, item.comment_from_id, item.comment_from_name, item.old_message, item.new_message,
+        item.old_shortlink, item.old_expanded_url, item.old_utm_content, item.old_sub1, item.old_sub2, item.old_sub3, item.old_sub4, item.old_sub5,
+        item.product_url, item.target_sub1, item.target_sub2, item.target_sub3, item.new_shortlink, item.new_expanded_url, item.new_utm_content,
+        item.action, item.status, item.reason, item.error, item.attempts, auditedAt,
+    ).run()
+}
+
+function summarizePlanItems(items: PageCommentLinkPlanItem[]) {
+    const counts = { planned: 0, skipped: 0, edit: 0, create_new: 0 }
+    for (const it of items) {
+        if (it.status === 'skipped') counts.skipped++
+        else counts.planned++
+        if (it.action === 'edit') counts.edit++
+        else if (it.action === 'create_new') counts.create_new++
+    }
+    return counts
+}
+
+// Operator-friendly per-status / per-action counts over persisted job_items rows
+// (the shape returned by loadPageCommentLinkJobItems). Used to expose top-level
+// `counts` on the job GET / run / verify / history responses.
+function countPageCommentLinkJobItems(items: Record<string, unknown>[]) {
+    const counts = {
+        total: items.length,
+        planned: 0, skipped: 0, done: 0, failed: 0, verify_failed: 0,
+        edit: 0, create_new: 0, skip: 0,
+    }
+    for (const it of items) {
+        const status = str(it.status) as keyof typeof counts
+        if (status && status in counts) (counts[status] as number)++
+        const action = str(it.action)
+        if (action === 'edit') counts.edit++
+        else if (action === 'create_new') counts.create_new++
+        else if (action === 'skip') counts.skip++
+    }
+    return counts
+}
+
+// POST preview — read-only. Compute the rewrite plan for the supplied items and
+// persist an audit snapshot. No Facebook writes and NO customlink minting.
+app.post('/api/dashboard/page-comment-link-rewrite-preview', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const pageId = str(body.page_id) || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
+    const requestedSub1 = str(body.target_sub1) || str(body.sub1)
+    const rawItems = readRewriteItemsFromBody(body)
+    if (rawItems.length === 0) return c.json({ ok: false, error: 'items_required' }, 400)
+
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const auditedAt = new Date().toISOString()
+    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1 }))
+    for (const item of items) await upsertPageCommentLinkRegistry(c.env.DB, item, auditedAt)
+
+    const summary = { total: items.length, ...summarizePlanItems(items) }
+    return c.json({
+        ok: true,
+        mode: 'preview',
+        read_only: true,
+        page_id: pageId,
+        // Operator-friendly top-level fields (mirrors nested summary/requested_sub1).
+        target_sub1: requestedSub1,
+        count_returned: items.length,
+        requested_sub1: requestedSub1,
+        customlink_id: CUSTOMLINK_DEFAULT_ID,
+        last_audited_at: auditedAt,
+        summary,
+        items,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// POST jobs — create a job (read-only). Stores the plan; nothing is written to
+// Facebook here. dry_run defaults true, batch_size small, stop_on_first_error on.
+app.post('/api/dashboard/page-comment-link-jobs', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const pageId = str(body.page_id) || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
+    const namespaceId = DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID
+    const requestedSub1 = str(body.target_sub1) || str(body.sub1)
+    const dryRun = normalizeJobBool(body.dry_run, JOB_DEFAULT_DRY_RUN)
+    const batchSize = clampBatchSize(body.batch_size)
+    const stopOnFirstError = normalizeJobBool(body.stop_on_first_error, JOB_DEFAULT_STOP_ON_FIRST_ERROR)
+    const customlinkId = str(body.customlink_id) || CUSTOMLINK_DEFAULT_ID
+    const rawItems = readRewriteItemsFromBody(body)
+    if (rawItems.length === 0) return c.json({ ok: false, error: 'items_required' }, 400)
+
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const auditedAt = new Date().toISOString()
+    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1 }))
+    const counts = summarizePlanItems(items)
+    const jobId = `pclj_${crypto.randomUUID().replace(/-/g, '')}`
+
+    await c.env.DB.prepare(
+        `INSERT INTO page_comment_link_jobs
+            (job_id, page_id, namespace_id, status, dry_run, batch_size, stop_on_first_error, requested_sub1,
+             customlink_id, total_items, planned_items, skipped_items, done_items, failed_items, error,
+             created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,0,0,'', datetime('now'), datetime('now'))`
+    ).bind(
+        jobId, pageId, namespaceId, 'planned', dryRun ? 1 : 0, batchSize, stopOnFirstError ? 1 : 0, requestedSub1,
+        customlinkId, items.length, counts.planned, counts.skipped,
+    ).run()
+
+    for (let i = 0; i < items.length; i++) {
+        await insertPageCommentLinkJobItem(c.env.DB, jobId, i, items[i], auditedAt)
+        await upsertPageCommentLinkRegistry(c.env.DB, items[i], auditedAt)
+    }
+
+    const summary = { total: items.length, ...counts }
+    return c.json({
+        ok: true,
+        mode: 'job_created',
+        read_only: true,
+        job_id: jobId,
+        // Operator-friendly top-level fields. Job creation never writes: write_mode
+        // is false here regardless of the persisted dry_run intent.
+        status: 'planned',
+        dry_run: dryRun,
+        write_mode: false,
+        target_sub1: requestedSub1,
+        counts: summary,
+        count_returned: items.length,
+        page_id: pageId,
+        batch_size: batchSize,
+        stop_on_first_error: stopOnFirstError,
+        requested_sub1: requestedSub1,
+        customlink_id: customlinkId,
+        summary,
+        items,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+async function loadPageCommentLinkJob(db: D1Database, jobId: string): Promise<Record<string, unknown> | null> {
+    return await db.prepare('SELECT * FROM page_comment_link_jobs WHERE job_id = ? LIMIT 1')
+        .bind(jobId).first().catch(() => null) as Record<string, unknown> | null
+}
+
+async function loadPageCommentLinkJobItems(db: D1Database, jobId: string): Promise<Record<string, unknown>[]> {
+    const rows = await db.prepare('SELECT * FROM page_comment_link_job_items WHERE job_id = ? ORDER BY item_index ASC')
+        .bind(jobId).all().catch(() => ({ results: [] })) as { results?: Record<string, unknown>[] }
+    return rows.results || []
+}
+
+// GET a job + its items (read-only).
+app.get('/api/dashboard/page-comment-link-jobs/:job_id', async (c) => {
+    const jobId = str(c.req.param('job_id'))
+    if (!jobId) return c.json({ ok: false, error: 'job_id_required' }, 400)
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const job = await loadPageCommentLinkJob(c.env.DB, jobId)
+    if (!job) return c.json({ ok: false, error: 'job_not_found' }, 404)
+    const items = await loadPageCommentLinkJobItems(c.env.DB, jobId)
+    const jobDryRun = Number(job.dry_run) === 1
+    return c.json({
+        ok: true,
+        // Operator-friendly top-level fields (the full row stays under `job`).
+        job_id: jobId,
+        status: str(job.status),
+        dry_run: jobDryRun,
+        write_mode: !jobDryRun,
+        target_sub1: str(job.requested_sub1),
+        counts: countPageCommentLinkJobItems(items),
+        count_returned: items.length,
+        job,
+        items,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// POST run — execute the job. WRITES ONLY when dry_run is explicitly false
+// (persisted at creation OR requested here). Otherwise returns would_* statuses
+// with no Facebook or customlink side effects. Never deletes comments. Stops on
+// Graph policy/rate-limit signals, and on first error when stop_on_first_error.
+app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
+    const jobId = str(c.req.param('job_id'))
+    if (!jobId) return c.json({ ok: false, error: 'job_id_required' }, 400)
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const job = await loadPageCommentLinkJob(c.env.DB, jobId)
+    if (!job) return c.json({ ok: false, error: 'job_not_found' }, 404)
+
+    const pageId = str(job.page_id)
+    const namespaceId = str(job.namespace_id) || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID
+    const customlinkId = str(job.customlink_id) || CUSTOMLINK_DEFAULT_ID
+    const jobDryRun = Number(job.dry_run) === 1
+    const stopOnFirstError = Number(job.stop_on_first_error) === 1
+    const batchSize = clampBatchSize(body.batch_size ?? job.batch_size)
+
+    // Write only when dry_run is explicitly false at the job level OR requested
+    // here. Any ambiguity stays in the SAFE dry-run path.
+    const bodyDryRunProvided = body.dry_run !== undefined && body.dry_run !== null && body.dry_run !== ''
+    const writeRequested = bodyDryRunProvided && normalizeJobBool(body.dry_run, true) === false
+    const writeMode = !jobDryRun || writeRequested
+
+    const limit = Math.min(batchSize, Math.max(1, Number(body.limit) > 0 ? Math.floor(Number(body.limit)) : batchSize))
+
+    // Resolve token once. Never logged/returned. No token ⇒ no writes possible.
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
+    const hasToken = token.length > 0
+
+    const allItems = await loadPageCommentLinkJobItems(c.env.DB, jobId)
+    const pending = allItems.filter((it) => str(it.status) === 'planned').slice(0, limit)
+
+    const updateItem = async (index: number, fields: Record<string, unknown>) => {
+        const keys = Object.keys(fields)
+        if (keys.length === 0) return
+        const setSql = keys.map((k) => `${k} = ?`).join(', ')
+        await c.env.DB.prepare(
+            `UPDATE page_comment_link_job_items SET ${setSql}, updated_at = datetime('now') WHERE job_id = ? AND item_index = ?`
+        ).bind(...keys.map((k) => fields[k]), jobId, index).run().catch(() => { })
+    }
+
+    const processed: Array<Record<string, unknown>> = []
+    let doneCount = 0
+    let failedCount = 0
+    let skippedCount = 0
+    let stoppedReason = ''
+
+    for (const row of pending) {
+        const index = Number(row.item_index)
+        const action = str(row.action) as RewriteAction
+        const targetSub1 = str(row.target_sub1)
+        const targetSub2 = str(row.target_sub2)
+        const targetSub3 = str(row.target_sub3)
+        const productUrl = str(row.product_url)
+        const oldShortlink = str(row.old_shortlink)
+        const oldMessage = String(row.old_message ?? '')
+        const oldCommentId = str(row.old_comment_id)
+
+        // Nothing to rewrite.
+        if (action === 'skip' || !productUrl) {
+            await updateItem(index, { status: 'skipped', reason: str(row.reason) || 'no_product_url' })
+            skippedCount++
+            processed.push({ item_index: index, status: 'skipped', action: 'skip' })
+            continue
+        }
+
+        // DRY RUN (default): describe what WOULD happen. No customlink, no Graph,
+        // and crucially DO NOT mutate the item — it stays 'planned' so a later
+        // real run (dry_run=false) can still pick it up. would_* is response-only.
+        if (!writeMode || !hasToken) {
+            const wouldStatus: JobItemStatus = action === 'edit' ? 'would_edit' : 'would_create'
+            processed.push({
+                item_index: index, status: wouldStatus, action, dry_run: true, token_available: hasToken,
+                customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, id: customlinkId }),
+                expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3 }),
+            })
+            continue
+        }
+
+        // ---- REAL WRITE PATH -------------------------------------------------
+        let attempts = Number(row.attempts) || 0
+        attempts++
+
+        // 1. Mint the new shortlink, then 2. expand + verify its sub ids BEFORE
+        //    we ever touch a comment — never post an unverified link.
+        const requestUrl = buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, id: customlinkId })
+        const minted = await mintCustomlinkShortlink(requestUrl)
+        if (!minted.ok) {
+            await updateItem(index, { status: 'failed', reason: 'shortlink_failed', error: minted.error, attempts })
+            failedCount++
+            processed.push({ item_index: index, status: 'failed', reason: 'shortlink_failed' })
+            if (stopOnFirstError) { stoppedReason = 'shortlink_failed'; break }
+            continue
+        }
+        const newShortlink = minted.shortLink
+        const expanded = await expandShortlinkFinalUrl(newShortlink)
+        const verifyLink = verifyRewrittenShortlink(expanded.finalUrl || newShortlink, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3 })
+        if (!verifyLink.ok) {
+            await updateItem(index, {
+                status: 'failed', reason: `shortlink_verify_${verifyLink.reason}`,
+                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, attempts,
+            })
+            failedCount++
+            processed.push({ item_index: index, status: 'failed', reason: `shortlink_verify_${verifyLink.reason}` })
+            if (stopOnFirstError) { stoppedReason = 'shortlink_verify_failed'; break }
+            continue
+        }
+
+        const rewrite = replaceShortlinkInMessage(oldMessage, oldShortlink, newShortlink)
+        const newMessage = rewrite.message
+
+        // 3. Land the link. Edit a page-owned comment first; on edit failure we
+        //    NEVER delete it — we create a fresh page comment instead.
+        let newCommentId = ''
+        let finalAction: RewriteAction = action
+        let writeError = ''
+
+        const graphEditComment = async (commentId: string): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
+            const form = new URLSearchParams()
+            form.set('message', newMessage)
+            form.set('access_token', token)
+            try {
+                const resp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(commentId)}`, {
+                    method: 'POST', body: form, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                })
+                const data = await readMetaGraphJson(resp)
+                return { ok: resp.ok && !data.error, data }
+            } catch (e) {
+                return { ok: false, data: { error: { message: sanitizeMetaGraphError(e) } } }
+            }
+        }
+        const graphCreateComment = async (targetId: string): Promise<{ ok: boolean; data: Record<string, unknown> }> => {
+            const form = new URLSearchParams()
+            form.set('message', newMessage)
+            form.set('access_token', token)
+            try {
+                const resp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}/comments`, {
+                    method: 'POST', body: form, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                })
+                const data = await readMetaGraphJson(resp)
+                return { ok: resp.ok && !data.error, data }
+            } catch (e) {
+                return { ok: false, data: { error: { message: sanitizeMetaGraphError(e) } } }
+            }
+        }
+
+        let stopSignal = { stop: false, reason: '' }
+        if (finalAction === 'edit' && oldCommentId) {
+            const edited = await graphEditComment(oldCommentId)
+            if (edited.ok) {
+                newCommentId = oldCommentId
+            } else {
+                stopSignal = detectGraphStopSignal((edited.data as Record<string, unknown>).error)
+                writeError = sanitizeMetaGraphError((edited.data as Record<string, unknown>).error)
+                if (stopSignal.stop) {
+                    await updateItem(index, { status: 'failed', reason: `stop_${stopSignal.reason}`, error: writeError, attempts })
+                    failedCount++
+                    processed.push({ item_index: index, status: 'failed', reason: `stop_${stopSignal.reason}` })
+                    stoppedReason = stopSignal.reason
+                    break
+                }
+                finalAction = 'create_new' // edit failed (e.g. cross-app); create instead, keep old.
+            }
+        }
+
+        let usedTarget = ''
+        if (!newCommentId && finalAction === 'create_new') {
+            const targets = buildVisibleCommentTargetCandidates({
+                pageId, fbPostId: str(row.canonical_post_id) || str(row.post_id), fbReelUrlOrId: str(row.reel_id) || str(row.fb_video_id),
+            })
+            for (const target of targets) {
+                const created = await graphCreateComment(target)
+                if (created.ok) {
+                    newCommentId = str((created.data as Record<string, unknown>).id)
+                    usedTarget = target
+                    break
+                }
+                const sig = detectGraphStopSignal((created.data as Record<string, unknown>).error)
+                writeError = sanitizeMetaGraphError((created.data as Record<string, unknown>).error)
+                if (sig.stop) { stopSignal = sig; break }
+            }
+            if (stopSignal.stop && !newCommentId) {
+                await updateItem(index, { status: 'failed', reason: `stop_${stopSignal.reason}`, error: writeError, attempts, new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_message: newMessage })
+                failedCount++
+                processed.push({ item_index: index, status: 'failed', reason: `stop_${stopSignal.reason}` })
+                stoppedReason = stopSignal.reason
+                break
+            }
+        }
+
+        if (!newCommentId) {
+            await updateItem(index, {
+                status: 'failed', reason: 'comment_write_failed', error: writeError || 'comment_write_failed', attempts,
+                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_message: newMessage,
+            })
+            failedCount++
+            processed.push({ item_index: index, status: 'failed', reason: 'comment_write_failed' })
+            if (stopOnFirstError) { stoppedReason = 'comment_write_failed'; break }
+            continue
+        }
+
+        // 4. Verify the written comment actually carries the new link before we
+        //    mark it done.
+        const verifyTarget = usedTarget || str(row.comment_target_id) || (str(row.canonical_post_id) || str(row.post_id) ? `${pageId}_${str(row.post_id)}` : str(row.reel_id))
+        const liveCheck = await fetchPageCommentsLive(verifyTarget, token)
+        const matched = liveCheck.ok && isAffiliateCommentMatch(liveCheck.comments, {
+            commentId: newCommentId, expectedMessage: newMessage, affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
+        }).matched
+        const finalStatus: JobItemStatus = matched ? 'done' : 'verify_failed'
+        await updateItem(index, {
+            status: finalStatus, action: finalAction, new_comment_id: newCommentId, new_message: newMessage,
+            new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content,
+            comment_target_id: verifyTarget, reason: matched ? '' : 'post_write_verify_failed', error: '', attempts,
+        })
+        if (matched) doneCount++; else failedCount++
+        processed.push({ item_index: index, status: finalStatus, action: finalAction, new_comment_id: newCommentId })
+        if (!matched && stopOnFirstError) { stoppedReason = 'verify_failed'; break }
+    }
+
+    // Roll up job-level counters and status.
+    const remainingPlanned = (await loadPageCommentLinkJobItems(c.env.DB, jobId)).filter((it) => str(it.status) === 'planned').length
+    const aggregate = await c.env.DB.prepare(
+        `SELECT
+            SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+            SUM(CASE WHEN status IN ('failed','verify_failed') THEN 1 ELSE 0 END) AS failed,
+            SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped
+         FROM page_comment_link_job_items WHERE job_id = ?`
+    ).bind(jobId).first().catch(() => null) as { done?: number; failed?: number; skipped?: number } | null
+    const totalDone = Number(aggregate?.done || 0)
+    const totalFailed = Number(aggregate?.failed || 0)
+    const totalSkipped = Number(aggregate?.skipped || 0)
+    const effectiveWriteMode = writeMode && hasToken
+    // An effective dry-run leaves items 'planned' and writes nothing, so it must
+    // not advance the job to 'running' (which would look in-progress/stuck).
+    const jobStatus = resolvePageCommentLinkJobStatus({
+        effectiveWriteMode,
+        previousStatus: str(job.status),
+        remainingPlanned,
+        doneCount: totalDone,
+        failedCount: totalFailed,
+        stoppedReason,
+    })
+
+    await c.env.DB.prepare(
+        `UPDATE page_comment_link_jobs SET status = ?, done_items = ?, failed_items = ?, skipped_items = ?,
+            error = ?, updated_at = datetime('now') WHERE job_id = ?`
+    ).bind(jobStatus, totalDone, totalFailed, totalSkipped, stoppedReason ? `stopped:${stoppedReason}` : '', jobId).run().catch(() => { })
+
+    return c.json({
+        ok: true,
+        mode: effectiveWriteMode ? 'run_write' : 'run_dry',
+        // Operator-friendly top-level fields. dry_run reflects what THIS run did
+        // (no writes unless a token was available AND write was requested/persisted).
+        job_id: jobId,
+        status: jobStatus,
+        dry_run: !effectiveWriteMode,
+        write_mode: effectiveWriteMode,
+        token_available: hasToken,
+        counts: {
+            total: allItems.length,
+            done: totalDone,
+            failed: totalFailed,
+            skipped: totalSkipped,
+            remaining_planned: remainingPlanned,
+        },
+        count_returned: processed.length,
+        job_status: jobStatus,
+        stopped_reason: stoppedReason || null,
+        batch: {
+            requested: pending.length,
+            done: doneCount,
+            failed: failedCount,
+            skipped: skippedCount,
+            remaining_planned: remainingPlanned,
+        },
+        processed,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// POST verify — re-read each written item's target and confirm the new link is
+// present + carries the expected utm sub ids. Read-only against Facebook.
+app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
+    const jobId = str(c.req.param('job_id'))
+    if (!jobId) return c.json({ ok: false, error: 'job_id_required' }, 400)
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const job = await loadPageCommentLinkJob(c.env.DB, jobId)
+    if (!job) return c.json({ ok: false, error: 'job_not_found' }, 404)
+
+    const pageId = str(job.page_id)
+    const namespaceId = str(job.namespace_id) || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID
+    const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
+    const hasToken = token.length > 0
+
+    const items = await loadPageCommentLinkJobItems(c.env.DB, jobId)
+    const written = items.filter((it) => ['done', 'verify_failed'].includes(str(it.status)) && str(it.new_comment_id))
+    const results: Array<Record<string, unknown>> = []
+
+    if (!hasToken) {
+        return c.json({
+            ok: true, mode: 'verify', token_available: false,
+            // Verify never writes: dry_run true / write_mode false always.
+            job_id: jobId, status: str(job.status), dry_run: true, write_mode: false,
+            counts: { checked: 0, verified: 0, failed: 0 }, count_returned: 0,
+            checked: 0, verified: 0, results: [], note: 'missing_token',
+        }, 200, { 'Cache-Control': 'no-store' })
+    }
+
+    let verifiedCount = 0
+    for (const row of written) {
+        const index = Number(row.item_index)
+        const target = str(row.comment_target_id)
+        const live = await fetchPageCommentsLive(target, token)
+        const linkVerify = verifyRewrittenShortlink(str(row.new_expanded_url) || str(row.new_shortlink), {
+            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3),
+        })
+        const matched = live.ok && isAffiliateCommentMatch(live.comments, {
+            commentId: str(row.new_comment_id), expectedMessage: String(row.new_message ?? ''), affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
+        }).matched
+        const ok = matched && linkVerify.ok
+        const status: JobItemStatus = ok ? 'done' : 'verify_failed'
+        await c.env.DB.prepare(
+            `UPDATE page_comment_link_job_items SET status = ?, reason = ?, last_audited_at = ?, updated_at = datetime('now') WHERE job_id = ? AND item_index = ?`
+        ).bind(status, ok ? '' : `verify_${matched ? linkVerify.reason || 'link' : 'comment_missing'}`, new Date().toISOString(), jobId, index).run().catch(() => { })
+        if (ok) verifiedCount++
+        results.push({ item_index: index, verified: ok, comment_present: matched, link_ok: linkVerify.ok, new_comment_id: str(row.new_comment_id) })
+    }
+
+    return c.json({
+        ok: true, mode: 'verify', token_available: true,
+        // Verify never writes: dry_run true / write_mode false always.
+        job_id: jobId, status: str(job.status), dry_run: true, write_mode: false,
+        counts: { checked: written.length, verified: verifiedCount, failed: written.length - verifiedCount },
+        count_returned: results.length,
+        checked: written.length, verified: verifiedCount, results,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// GET history / rollback evidence — returns the kept old_* and new_* fields per
+// item so an operator can manually restore the prior comment text/link. Purely
+// read-only; this workflow never deletes comments or evidence.
+app.get('/api/dashboard/page-comment-link-jobs/:job_id/history', async (c) => {
+    const jobId = str(c.req.param('job_id'))
+    if (!jobId) return c.json({ ok: false, error: 'job_id_required' }, 400)
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const job = await loadPageCommentLinkJob(c.env.DB, jobId)
+    if (!job) return c.json({ ok: false, error: 'job_not_found' }, 404)
+    const items = await loadPageCommentLinkJobItems(c.env.DB, jobId)
+    const history = items.map((it) => ({
+        item_index: Number(it.item_index),
+        page_id: str(it.page_id),
+        fb_video_id: str(it.fb_video_id),
+        comment_target_id: str(it.comment_target_id),
+        action: str(it.action),
+        status: str(it.status),
+        old_comment_id: str(it.old_comment_id),
+        new_comment_id: str(it.new_comment_id),
+        old_message: String(it.old_message ?? ''),
+        new_message: String(it.new_message ?? ''),
+        old_shortlink: str(it.old_shortlink),
+        new_shortlink: str(it.new_shortlink),
+        old_expanded_url: str(it.old_expanded_url),
+        new_expanded_url: str(it.new_expanded_url),
+        old_utm_content: str(it.old_utm_content),
+        new_utm_content: str(it.new_utm_content),
+    }))
+    const jobDryRun = Number(job.dry_run) === 1
+    return c.json({
+        ok: true, mode: 'history', read_only: true, job_id: jobId,
+        // Operator-friendly top-level fields (the full row stays under `job`).
+        status: str(job.status), dry_run: jobDryRun, write_mode: !jobDryRun,
+        counts: countPageCommentLinkJobItems(items), count_returned: history.length,
+        note: 'old_message/old_shortlink retained for manual rollback; this workflow never deletes comments.',
+        job, items: history,
+    }, 200, { 'Cache-Control': 'no-store' })
 })
 
 app.get('/api/dashboard/page-video-asset-winners', async (c) => {
