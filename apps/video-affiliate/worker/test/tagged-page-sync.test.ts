@@ -621,12 +621,15 @@ test('backfill-from-facebook CTA scan is read-only Graph GET and never returns t
     const routeSource = getBackfillFromFacebookRouteSource()
 
     assert.match(routeSource, /const scanCtaTarget = async \(targetId: string\)/)
-    assert.match(routeSource, /fields=\$\{fields\}&access_token=\$\{encodeURIComponent\(token\)\}/)
+    assert.match(routeSource, /fields=\$\{encodeURIComponent\(fields\)\}&access_token=\$\{encodeURIComponent\(token\)\}/)
     assert.match(routeSource, /call_to_action/)
-    assert.match(routeSource, /attachments\{call_to_action,title,description,type,url,unshimmed_url,target,subattachments\}/)
-    assert.match(routeSource, /child_attachments/)
     assert.match(routeSource, /link,permalink_url/)
+    assert.match(routeSource, /`\$\{targetPath\}\/attachments`/)
+    assert.doesNotMatch(routeSource, /attachments\{[^}]+\}/)
+    assert.doesNotMatch(routeSource, /child_attachments/)
+    assert.doesNotMatch(routeSource, /subattachments/)
     assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
+    assert.doesNotMatch(routeSource, /customlink\.wwoom\.com|\/api\/customlink|mintCustomlink/i)
     assert.doesNotMatch(routeSource, /token:\s*token/)
     assert.doesNotMatch(routeSource, /access_token:\s*token/)
 })
@@ -653,8 +656,22 @@ test('backfill-from-facebook CTA scan targets canonical post first with video fa
 
     assert.match(routeSource, /const ctaTargetId = postId \? buildPostCommentTarget\(postId\) : videoId/)
     assert.match(routeSource, /const cta = await scanCtaTarget\(ctaTargetId\)/)
-    assert.match(routeSource, /ctaScanStatus = cta\.ok \? 'scanned' : 'error'/)
+    assert.match(routeSource, /ctaScanStatus = cta\.status/)
     assert.match(routeSource, /ctaScanStatus = 'no_target'/)
+})
+
+test('backfill-from-facebook CTA scan retries Graph field failures without clamping audit limit', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    assert.match(routeSource, /code === '12'/)
+    assert.match(routeSource, /deprecate_post_aggregated_fields_for_attachement/)
+    assert.match(routeSource, /fieldUnavailable: isFieldUnavailableGraphError\(resp, json\)/)
+    assert.match(routeSource, /status: 'field_unavailable'/)
+    assert.match(routeSource, /status: 'scanned'/)
+    assert.match(routeSource, /const limit = Number\.isFinite\(limitRaw\) \? Math\.min\(150, Math\.max\(1, Math\.floor\(limitRaw\)\)\) : 100/)
+    assert.doesNotMatch(routeSource, /effectiveLimit\s*=\s*[^\n]*\?\s*1\s*:\s*limit/)
+    assert.doesNotMatch(routeSource, /includeCta[\s\S]{0,120}\?\s*1\s*:\s*limit/)
+    assert.doesNotMatch(routeSource, /clamped_to_safe_max/)
 })
 
 test('per-page posting order override wins when enabled with a valid order', () => {

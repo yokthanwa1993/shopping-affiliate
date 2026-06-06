@@ -9308,10 +9308,10 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         return { type, title, url }
     }
 
-    // Read-only bounded CTA reader: a SINGLE Graph GET per target that surfaces any
-    // call-to-action/button/attached link for a post (preferred) or video/reel id.
-    // It requests only CTA/attachment/link/permalink fields (GET, no pagination, no
-    // fan-out) and never writes. Graph errors are sanitized (token never surfaced).
+    // Read-only bounded CTA reader for a post (preferred) or video/reel id.
+    // It uses GET-only Graph reads and avoids deprecated inline attachment field
+    // expansion. Field-specific Graph rejects are retried with smaller field sets;
+    // only a successful Graph read can produce status=scanned.
     const scanCtaTarget = async (targetId: string): Promise<{
         present: boolean
         type: string
@@ -9319,64 +9319,103 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         url: string
         source: string
         ok: boolean
+        status: 'scanned' | 'field_unavailable' | 'unsupported' | 'error'
         error: string
     }> => {
-        const fields = 'call_to_action,attachments{call_to_action,title,description,type,url,unshimmed_url,target,subattachments},child_attachments,link,permalink_url'
-        const resp = await fetch(
-            `https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}?fields=${fields}&access_token=${encodeURIComponent(token)}`
-        )
-        const json = await resp.json().catch(() => ({})) as Record<string, unknown>
-        const graphErr = json.error as Record<string, unknown> | undefined
-        const errCode = graphErr?.code !== undefined ? sanitizeGraphErrorText(graphErr.code) : ''
-        const errType = graphErr?.type !== undefined ? sanitizeGraphErrorText(graphErr.type) : ''
-        const errMsg = sanitizeGraphErrorText((graphErr?.message) || `cta_fetch_${resp.status}`)
-        const error = resp.ok
-            ? ''
-            : [`http_${resp.status}`, errMsg, errCode ? `code=${errCode}` : '', errType ? `type=${errType}` : '']
+        const formatGraphCtaError = (resp: Response, json: Record<string, unknown>, fallback: string) => {
+            const graphErr = json.error as Record<string, unknown> | undefined
+            const errCode = graphErr?.code !== undefined ? sanitizeGraphErrorText(graphErr.code) : ''
+            const errType = graphErr?.type !== undefined ? sanitizeGraphErrorText(graphErr.type) : ''
+            const errMsg = sanitizeGraphErrorText((graphErr?.message) || fallback)
+            return [`http_${resp.status}`, errMsg, errCode ? `code=${errCode}` : '', errType ? `type=${errType}` : '']
                 .filter(Boolean)
                 .join(' ')
                 .slice(0, 200)
-        if (!resp.ok) {
-            return { present: false, type: '', title: '', url: '', source: '', ok: false, error }
+        }
+        const isFieldUnavailableGraphError = (resp: Response, json: Record<string, unknown>) => {
+            if (resp.ok) return false
+            const graphErr = json.error as Record<string, unknown> | undefined
+            const code = String(graphErr?.code ?? '')
+            const msg = String(graphErr?.message ?? '').toLowerCase()
+            return resp.status === 400 && (
+                code === '12' ||
+                msg.includes('deprecate_post_aggregated_fields_for_attachement') ||
+                msg.includes('unsupported get request') ||
+                msg.includes('nonexisting field') ||
+                msg.includes('unknown path components') ||
+                msg.includes('tried accessing nonexisting field')
+            )
+        }
+        const graphGet = async (path: string, fields: string) => {
+            const resp = await fetch(
+                `https://graph.facebook.com/v21.0/${path}?fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(token)}`
+            )
+            const json = await resp.json().catch(() => ({})) as Record<string, unknown>
+            const error = resp.ok ? '' : formatGraphCtaError(resp, json, `cta_fetch_${resp.status}`)
+            return { resp, json, error, fieldUnavailable: isFieldUnavailableGraphError(resp, json) }
+        }
+
+        const targetPath = encodeURIComponent(targetId)
+        const nodeFieldSets = [
+            'call_to_action,link,permalink_url',
+            'link,permalink_url',
+            'permalink_url',
+        ]
+        const attachmentFieldSets = [
+            'call_to_action,title,description,type,url,unshimmed_url,target',
+            'title,description,type,url,unshimmed_url',
+            'title,type,url',
+        ]
+
+        let nodeJson: Record<string, unknown> | null = null
+        let attData: unknown[] = []
+        let scannedAny = false
+        let lastFieldUnavailableError = ''
+
+        for (const fields of nodeFieldSets) {
+            const read = await graphGet(targetPath, fields)
+            if (read.resp.ok) { nodeJson = read.json; scannedAny = true; break }
+            if (read.fieldUnavailable) { lastFieldUnavailableError = read.error; continue }
+            return { present: false, type: '', title: '', url: '', source: '', ok: false, status: 'error', error: read.error }
+        }
+
+        for (const fields of attachmentFieldSets) {
+            const read = await graphGet(`${targetPath}/attachments`, fields)
+            if (read.resp.ok) {
+                scannedAny = true
+                attData = Array.isArray((read.json.data as unknown[] | undefined)) ? read.json.data as unknown[] : []
+                break
+            }
+            if (read.fieldUnavailable) { lastFieldUnavailableError = read.error; continue }
+            return { present: false, type: '', title: '', url: '', source: '', ok: false, status: 'error', error: read.error }
+        }
+
+        if (!scannedAny) {
+            return {
+                present: false,
+                type: '',
+                title: '',
+                url: '',
+                source: '',
+                ok: false,
+                status: 'field_unavailable',
+                error: lastFieldUnavailableError || 'cta_fields_unavailable',
+            }
         }
 
         let hit: { type: string; title: string; url: string } | null = null
         let source = ''
-        // 1. Explicit CTA button: top-level, then per-attachment, then nested subattachments.
-        hit = readCtaObject(json.call_to_action)
-        if (hit) source = 'call_to_action'
-        const attData = Array.isArray((json.attachments as { data?: unknown[] } | undefined)?.data)
-            ? (json.attachments as { data: unknown[] }).data
-            : []
+        if (nodeJson) {
+            hit = readCtaObject(nodeJson.call_to_action)
+            if (hit) source = 'call_to_action'
+        }
         if (!hit) {
             for (const att of attData) {
                 const a = (att && typeof att === 'object') ? att as Record<string, unknown> : {}
                 const aCta = readCtaObject(a.call_to_action)
                 if (aCta) { hit = aCta; if (!hit.title) hit.title = String(a.title || '').trim(); source = 'attachment'; break }
-                const subData = Array.isArray((a.subattachments as { data?: unknown[] } | undefined)?.data)
-                    ? (a.subattachments as { data: unknown[] }).data
-                    : []
-                for (const sub of subData) {
-                    const s = (sub && typeof sub === 'object') ? sub as Record<string, unknown> : {}
-                    const sCta = readCtaObject(s.call_to_action)
-                    if (sCta) { hit = sCta; if (!hit.title) hit.title = String(s.title || '').trim(); source = 'subattachment'; break }
-                }
-                if (hit) break
             }
         }
-        // child_attachments can come back as a bare array or wrapped in { data }.
-        const childData = Array.isArray((json.child_attachments as { data?: unknown[] } | undefined)?.data)
-            ? (json.child_attachments as { data: unknown[] }).data
-            : Array.isArray(json.child_attachments) ? json.child_attachments as unknown[] : []
-        if (!hit) {
-            for (const child of childData) {
-                const ch = (child && typeof child === 'object') ? child as Record<string, unknown> : {}
-                const cCta = readCtaObject(ch.call_to_action)
-                if (cCta) { hit = cCta; if (!hit.title) hit.title = String(ch.name || ch.title || '').trim(); source = 'child_attachment'; break }
-            }
-        }
-        // 2. No explicit CTA object: fall back to an attached link/button URL, then the
-        //    top-level link. These still represent an outbound CTA target on the post.
         if (!hit) {
             for (const att of attData) {
                 const a = (att && typeof att === 'object') ? att as Record<string, unknown> : {}
@@ -9385,8 +9424,8 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                 if (link) { hit = { type: String(a.type || '').trim(), title: String(a.title || '').trim(), url: link }; source = 'attachment_link'; break }
             }
         }
-        if (!hit) {
-            const topLink = String(json.link || '').trim()
+        if (!hit && nodeJson) {
+            const topLink = String(nodeJson.link || '').trim()
             if (topLink) { hit = { type: '', title: '', url: topLink }; source = 'link' }
         }
 
@@ -9397,6 +9436,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             url: hit?.url || '',
             source: hit ? source : '',
             ok: true,
+            status: 'scanned',
             error: '',
         }
     }
@@ -9576,7 +9616,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                     ctaTitle = cta.title
                     ctaUrl = sanitizeGraphErrorText(cta.url)
                     ctaSource = cta.source
-                    ctaScanStatus = cta.ok ? 'scanned' : 'error'
+                    ctaScanStatus = cta.status
                     ctaScanError = cta.ok ? '' : cta.error
                 } catch (err) {
                     ctaScanStatus = 'error'
