@@ -9167,6 +9167,14 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         if (!id) return ''
         return id.includes('_') ? id : `${pageId}_${id}`
     }
+    // Sanitize any Graph error text before surfacing it to the operator: never
+    // echo the access_token (neither the literal value nor an access_token=... pair).
+    const sanitizeGraphErrorText = (text: unknown): string => {
+        let s = String(text ?? '')
+        if (token) s = s.split(token).join('[REDACTED]')
+        s = s.replace(/access_token=[^&\s"']+/gi, 'access_token=[REDACTED]')
+        return s.trim()
+    }
     const pickShopeeLinkFromComments = (comments: Array<Record<string, unknown>>): string => {
         for (const cmt of comments) {
             const from = cmt.from as Record<string, unknown> | undefined
@@ -9201,6 +9209,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         page_comment_ids: string[]
         other_comment_count: number
         comment_scan_status: string
+        comment_scan_error: string
         post_id_resolution_status: string
         post_id_resolution_reason: string
     }> = []
@@ -9225,9 +9234,18 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         const data = Array.isArray((commentsJson as { data?: unknown[] }).data)
             ? ((commentsJson as { data: Array<Record<string, unknown>> }).data)
             : []
+        // Build a sanitized failure reason: HTTP status + Graph error message/code/
+        // type when available. Token is never included (see sanitizeGraphErrorText).
+        const graphErr = commentsJson.error as Record<string, unknown> | undefined
+        const errCode = graphErr?.code !== undefined ? sanitizeGraphErrorText(graphErr.code) : ''
+        const errType = graphErr?.type !== undefined ? sanitizeGraphErrorText(graphErr.type) : ''
+        const errMsg = sanitizeGraphErrorText((graphErr?.message) || `comments_fetch_${commentsResp.status}`)
         const error = commentsResp.ok
             ? ''
-            : String(((commentsJson.error as Record<string, unknown> | undefined)?.message) || `comments_fetch_${commentsResp.status}`).slice(0, 200)
+            : [`http_${commentsResp.status}`, errMsg, errCode ? `code=${errCode}` : '', errType ? `type=${errType}` : '']
+                .filter(Boolean)
+                .join(' ')
+                .slice(0, 200)
         let pageCommentCount = 0
         let otherCommentCount = 0
         let resolvedPostId = ''
@@ -9269,6 +9287,9 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         let otherCommentCount = 0
         let pageCommentIds: string[] = []
         let commentScanStatus = 'skipped'
+        // Sanitized reason for a failed comment scan (HTTP status + Graph code/type),
+        // surfaced so an 'error' status is never reported with an empty reason.
+        let commentScanError = ''
         let postIdResolutionStatus = postId ? 'cached' : 'unresolved'
         let postIdResolutionReason = postId ? 'cache_post_id_present' : 'post_id_missing'
 
@@ -9289,6 +9310,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             otherCommentCount = scan.otherCommentCount
             pageCommentIds = scan.pageCommentIds
             commentScanStatus = scan.ok ? scannedStatus : 'error'
+            if (!scan.ok && scan.error) commentScanError = scan.error
             if (!postId && scan.resolvedPostId) {
                 markResolvedPostId(scan.resolvedPostId, 'comment_id_prefix', `derived_from_${scannedStatus}`)
             }
@@ -9301,7 +9323,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         if (!videoId) {
             rowError = 'missing_video_id'
             errors.push({ video_id: '', error: rowError })
-            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus, post_id_resolution_status: postIdResolutionStatus, post_id_resolution_reason: postIdResolutionReason })
+            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus, comment_scan_error: commentScanError, post_id_resolution_status: postIdResolutionStatus, post_id_resolution_reason: postIdResolutionReason })
             continue
         }
 
@@ -9334,12 +9356,15 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                 // Preserve old behavior: do NOT scan comments for cached rows by
                 // default. Exception: if post_id is still missing after the metadata
                 // read, scan the video id target once to derive post_id from comment
-                // ids. With include_comment_counts=true and a present post_id, use the
-                // canonical post target for read-only counts.
+                // ids. Once post_id is known (cached or just resolved) and the operator
+                // asked for counts, re-scan the canonical post target so the counts and
+                // status reflect the post — never left as scanned_via_video_id after a
+                // post_id has been resolved in the same row.
                 if (!postId) {
                     const scan = await scanCommentWindow(videoId)
                     applyCommentScan(scan, 'scanned_via_video_id', 'video_id_comments_no_post_id_prefix')
-                } else if (includeCommentCounts) {
+                }
+                if (postId && includeCommentCounts) {
                     const commentTargetId = buildPostCommentTarget(postId)
                     const scan = await scanCommentWindow(commentTargetId)
                     applyCommentScan(scan, 'scanned', 'post_id_present')
@@ -9360,8 +9385,13 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                     }
                 }
 
+                // A link scan still avoids re-scanning when the video-id scan above
+                // already covered it. A comment-count scan, however, ALWAYS re-targets
+                // the canonical post once post_id is known — including a post_id just
+                // derived by the video-id scan — so include_comment_counts rows report
+                // 'scanned'/'error' for the canonical post, never scanned_via_video_id.
                 const needLinkScan = !foundLink && !!postId && !usedVideoIdCommentScan
-                const needCountScan = includeCommentCounts && !!postId && !usedVideoIdCommentScan
+                const needCountScan = includeCommentCounts && !!postId
                 if (needLinkScan || needCountScan) {
                     const commentTargetId = buildPostCommentTarget(postId)
                     const scan = await scanCommentWindow(commentTargetId)
@@ -9375,8 +9405,11 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                 }
             }
         } catch (err) {
-            rowError = String(err).slice(0, 200)
-            if ((includeCommentCounts || !postId) && !commentScanStatus.startsWith('scanned')) commentScanStatus = 'error'
+            rowError = sanitizeGraphErrorText(String(err)).slice(0, 200)
+            if ((includeCommentCounts || !postId) && !commentScanStatus.startsWith('scanned')) {
+                commentScanStatus = 'error'
+                if (!commentScanError) commentScanError = rowError
+            }
             if (!postId) {
                 postIdResolutionStatus = 'unresolved'
                 postIdResolutionReason = 'post_id_resolution_error'
@@ -9420,11 +9453,14 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             caption: caption.slice(0, 160),
             shopee_link: foundLink,
             source,
-            error: rowError,
+            // Surface the sanitized comment-scan reason when there is no harder row
+            // error, so an 'error' comment_scan_status is never empty/undiagnosable.
+            error: rowError || commentScanError,
             page_comment_count: pageCommentCount,
             page_comment_ids: pageCommentIds.slice(0, 5),
             other_comment_count: otherCommentCount,
             comment_scan_status: commentScanStatus,
+            comment_scan_error: commentScanError,
             post_id_resolution_status: postIdResolutionStatus,
             post_id_resolution_reason: postIdResolutionReason,
         })

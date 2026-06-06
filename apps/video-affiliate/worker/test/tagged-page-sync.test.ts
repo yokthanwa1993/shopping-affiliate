@@ -545,7 +545,10 @@ test('backfill-from-facebook preserves cached-link count opt-in while resolving 
         routeSource.indexOf('// 2. Read a small bounded comment window', cacheBranchAt),
     )
     assert.match(cacheBranch, /if \(!postId\) \{[\s\S]*scanCommentWindow\(videoId\)[\s\S]*scanned_via_video_id/)
-    assert.match(cacheBranch, /else if \(includeCommentCounts\) \{[\s\S]*const commentTargetId = buildPostCommentTarget\(postId\)[\s\S]*scanCommentWindow\(commentTargetId\)/)
+    // The canonical count scan is a separate (not else-if) branch so it also runs
+    // after a video-id scan has just resolved a missing post_id in this same row.
+    assert.match(cacheBranch, /if \(postId && includeCommentCounts\) \{[\s\S]*const commentTargetId = buildPostCommentTarget\(postId\)[\s\S]*scanCommentWindow\(commentTargetId\)/)
+    assert.doesNotMatch(cacheBranch, /else if \(includeCommentCounts\) \{/)
     assert.match(routeSource, /const buildPostCommentTarget = \(storedPostId: string\): string =>/)
     assert.match(routeSource, /return id\.includes\('_'\) \? id : `\$\{pageId\}_\$\{id\}`/)
     // Counting must never introduce writes/mutations in this path.
@@ -554,6 +557,55 @@ test('backfill-from-facebook preserves cached-link count opt-in while resolving 
     assert.equal(routeSource.match(/UPDATE\s+\w/gi)?.length, 1, 'route must still contain a single UPDATE statement')
     // No customlink minting call is introduced (the descriptive header comment aside).
     assert.doesNotMatch(routeSource, /mintCustomlink\s*\(|createCustomlink\s*\(|customlinks\.\w+\s*\(/i, 'comment counting must not mint customlinks')
+})
+
+test('backfill-from-facebook comment counts target the canonical post after post_id resolution', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Canonical target: a stored/current post_id that already contains an underscore
+    // is used as-is; a bare tail is re-prefixed with the page id. Never videoId.
+    assert.match(routeSource, /const buildPostCommentTarget = \(storedPostId: string\): string => \{/)
+    assert.match(routeSource, /return id\.includes\('_'\) \? id : `\$\{pageId\}_\$\{id\}`/)
+
+    // Once post_id is resolved in the same row, the comment-count scan targets the
+    // canonical post (buildPostCommentTarget(postId)) and does NOT fall back to videoId.
+    // The count scan must NOT be gated on !usedVideoIdCommentScan: a post_id derived
+    // by the video-id scan still gets a canonical re-scan when counts are requested.
+    assert.match(routeSource, /const needCountScan = includeCommentCounts && !!postId$/m)
+    assert.doesNotMatch(routeSource, /const needCountScan = includeCommentCounts && !!postId && !usedVideoIdCommentScan/)
+    assert.match(routeSource, /const commentTargetId = buildPostCommentTarget\(postId\)\s*\n\s*const scan = await scanCommentWindow\(commentTargetId\)/)
+    // The only videoId comment scan is guarded behind a missing post_id (post_id
+    // resolution fallback), so counts never target videoId once post_id is known.
+    assert.match(routeSource, /if \(!postId\) \{\s*\n\s*const scan = await scanCommentWindow\(videoId\)/)
+    // The link scan keeps the single-flight guard; only the count scan drops it.
+    assert.match(routeSource, /const needLinkScan = !foundLink && !!postId && !usedVideoIdCommentScan/)
+})
+
+test('backfill-from-facebook surfaces sanitized comment scan errors without leaking the token', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // A dedicated sanitizer strips the literal token and any access_token=... pair.
+    assert.match(routeSource, /const sanitizeGraphErrorText = \(text: unknown\): string =>/)
+    assert.match(routeSource, /if \(token\) s = s\.split\(token\)\.join\('\[REDACTED\]'\)/)
+    assert.match(routeSource, /s\.replace\(\/access_token=\[\^&\\s"'\]\+\/gi, 'access_token=\[REDACTED\]'\)/)
+
+    // The comment scan failure reason includes HTTP status + sanitized message/code/type.
+    assert.match(routeSource, /`http_\$\{commentsResp\.status\}`/)
+    assert.match(routeSource, /const errCode = graphErr\?\.code !== undefined \? sanitizeGraphErrorText\(graphErr\.code\) : ''/)
+    assert.match(routeSource, /errCode \? `code=\$\{errCode\}` : ''/)
+    assert.match(routeSource, /errType \? `type=\$\{errType\}` : ''/)
+    assert.match(routeSource, /const errMsg = sanitizeGraphErrorText\(\(graphErr\?\.message\) \|\| `comments_fetch_\$\{commentsResp\.status\}`\)/)
+
+    // applyCommentScan captures the scan error so an 'error' status is never empty.
+    assert.match(routeSource, /if \(!scan\.ok && scan\.error\) commentScanError = scan\.error/)
+
+    // Each item exposes comment_scan_error and item.error falls back to it.
+    assert.match(routeSource, /comment_scan_error: commentScanError/)
+    assert.match(routeSource, /error: rowError \|\| commentScanError/)
+
+    // Still no token surfaced anywhere in the route.
+    assert.doesNotMatch(routeSource, /token:\s*token/)
+    assert.doesNotMatch(routeSource, /access_token:\s*token/)
 })
 
 test('per-page posting order override wins when enabled with a valid order', () => {
