@@ -9046,6 +9046,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         offset?: number
         only_missing?: boolean
         dry_run?: boolean
+        include_comment_counts?: boolean
     }
     // Harmless query-string fallback for each param (body wins when present).
     const queryStr = (name: string): string => String(c.req.query(name) ?? '').trim()
@@ -9053,6 +9054,11 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     const isExplicitFalse = (v: unknown): boolean => {
         const s = String(v ?? '').trim().toLowerCase()
         return v === false || s === 'false' || s === '0' || s === 'no' || s === 'off'
+    }
+    // A value explicitly meaning "true" (used for default-off boolean opt-ins).
+    const isExplicitTrue = (v: unknown): boolean => {
+        const s = String(v ?? '').trim().toLowerCase()
+        return v === true || s === 'true' || s === '1' || s === 'yes' || s === 'on'
     }
 
     const pageId = String(body.page_id ?? queryStr('page_id') ?? '').trim()
@@ -9067,6 +9073,14 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     // have a cache shopee_link (counted as "existing").
     const onlyMissingRaw = body.only_missing !== undefined ? body.only_missing : c.req.query('only_missing')
     const onlyMissing = !isExplicitFalse(onlyMissingRaw)
+
+    // include_comment_counts defaults FALSE (preserves old "do not scan comments
+    // for cached rows" behavior); only an explicit true-like value opts in. Body
+    // wins over query. When on, each scanned item gets read-only comment counts.
+    const includeCommentCountsRaw = body.include_comment_counts !== undefined
+        ? body.include_comment_counts
+        : c.req.query('include_comment_counts')
+    const includeCommentCounts = isExplicitTrue(includeCommentCountsRaw)
 
     // Bounded scan window. limit is capped small (<=150); offset is bounded.
     const limitRaw = Number(body.limit ?? c.req.query('limit') ?? 100)
@@ -9084,6 +9098,14 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     // date range to keep the blast radius bounded. dry_run may run unbounded reads.
     if (writeMode) {
         if (!fromInput || !toInput) return c.json({ ok: false, error: 'date_range_required_for_write' }, 400)
+        if (fromInput.value > toInput.value) return c.json({ ok: false, error: 'invalid_date_range' }, 400)
+    }
+
+    // Comment-count scanning issues extra (read-only) Graph comment reads per row,
+    // so it requires an explicit, valid (ordered) date range too — even in dry_run —
+    // to keep the scan window bounded.
+    if (includeCommentCounts) {
+        if (!fromInput || !toInput) return c.json({ ok: false, error: 'date_range_required_for_comment_counts' }, 400)
         if (fromInput.value > toInput.value) return c.json({ ok: false, error: 'invalid_date_range' }, 400)
     }
 
@@ -9141,7 +9163,47 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         shopee_link: string
         source: string
         error: string
+        page_comment_count: number
+        page_comment_ids: string[]
+        other_comment_count: number
+        comment_scan_status: string
     }> = []
+
+    // Read-only bounded comment-window fetch (GET, limit 10) reused by both the
+    // existing link-resolution path and the new comment-count population. It counts
+    // page-authored vs. other comments and collects up to the first 5 page comment
+    // ids. The token is used only inside the Graph URL and never returned.
+    const scanCommentWindow = async (fullPostId: string): Promise<{
+        data: Array<Record<string, unknown>>
+        pageCommentCount: number
+        otherCommentCount: number
+        pageCommentIds: string[]
+    }> => {
+        const commentsResp = await fetch(
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(fullPostId)}/comments?fields=id,from,message&limit=10&access_token=${encodeURIComponent(token)}`
+        )
+        const commentsJson = commentsResp.ok ? await commentsResp.json().catch(() => ({})) as Record<string, unknown> : {}
+        const data = Array.isArray((commentsJson as { data?: unknown[] }).data)
+            ? ((commentsJson as { data: Array<Record<string, unknown>> }).data)
+            : []
+        let pageCommentCount = 0
+        let otherCommentCount = 0
+        const pageCommentIds: string[] = []
+        for (const cmt of data) {
+            const from = cmt.from as Record<string, unknown> | undefined
+            const fromId = String(from?.id || '').trim()
+            if (fromId && fromId === pageId) {
+                pageCommentCount++
+                if (pageCommentIds.length < 5) {
+                    const cid = String(cmt.id || '').trim()
+                    if (cid) pageCommentIds.push(cid)
+                }
+            } else {
+                otherCommentCount++
+            }
+        }
+        return { data, pageCommentCount, otherCommentCount, pageCommentIds }
+    }
 
     // Sequential, single-flight per row (no parallel fan-out) to keep Graph load low.
     for (const row of rows) {
@@ -9155,19 +9217,46 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         let foundLink = ''
         let source = ''
         let rowError = ''
+        // Read-only comment-count fields. Default to a non-scanned ("skipped") state
+        // so the old default behavior (no comment scan) is reflected truthfully.
+        let pageCommentCount = 0
+        let otherCommentCount = 0
+        let pageCommentIds: string[] = []
+        let commentScanStatus = 'skipped'
 
         if (!videoId) {
             rowError = 'missing_video_id'
             errors.push({ video_id: '', error: rowError })
-            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError })
+            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus })
             continue
         }
 
         if (cacheLink) {
-            // Already resolved in cache — count as existing, no Graph call needed.
+            // Already resolved in cache — count as existing, no link Graph call needed.
             foundLink = cacheLink
             source = 'cache'
             existing++
+            // Preserve old behavior: do NOT scan comments for cached rows by default.
+            // Only when the operator opts in (include_comment_counts=true and these
+            // cached-link rows are included via only_missing=false) do we issue a
+            // read-only comment scan to populate counts — and only if post_id exists.
+            if (includeCommentCounts) {
+                if (postId) {
+                    try {
+                        const fullPostId = `${pageId}_${postId}`
+                        const scan = await scanCommentWindow(fullPostId)
+                        pageCommentCount = scan.pageCommentCount
+                        otherCommentCount = scan.otherCommentCount
+                        pageCommentIds = scan.pageCommentIds
+                        commentScanStatus = 'scanned'
+                    } catch (err) {
+                        rowError = String(err).slice(0, 200)
+                        commentScanStatus = 'error'
+                    }
+                } else {
+                    commentScanStatus = 'no_post_id'
+                }
+            }
         } else {
             try {
                 // 1. Graph GET: caption/title/permalink/post_id/created_time.
@@ -9182,33 +9271,41 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                 const m1 = caption.match(shopeeRe)
                 if (m1) { foundLink = m1[0]; source = 'caption' }
 
-                // 2. Only if still unresolved, read a small bounded comment window
-                //    (limit 10) to classify the source. Prefer page-authored comments.
-                if (!foundLink && postId) {
+                // 2. Read a small bounded comment window (limit 10) when we still
+                //    need to resolve a link (existing behavior) OR when the operator
+                //    asked for comment counts. Either way it is a single GET, and the
+                //    same window is used both to classify the link source and to count
+                //    page-authored vs. other comments. Prefer page-authored comments.
+                const needLinkScan = !foundLink && !!postId
+                const needCountScan = includeCommentCounts && !!postId
+                if (needLinkScan || needCountScan) {
                     const fullPostId = `${pageId}_${postId}`
-                    const commentsResp = await fetch(
-                        `https://graph.facebook.com/v21.0/${encodeURIComponent(fullPostId)}/comments?fields=from,message&limit=10&access_token=${encodeURIComponent(token)}`
-                    )
-                    const commentsJson = commentsResp.ok ? await commentsResp.json().catch(() => ({})) as Record<string, unknown> : {}
-                    const commentArr = Array.isArray((commentsJson as { data?: unknown[] }).data)
-                        ? ((commentsJson as { data: Array<Record<string, unknown>> }).data)
-                        : []
-                    for (const cmt of commentArr) {
-                        const from = cmt.from as Record<string, unknown> | undefined
-                        const fromId = String(from?.id || '').trim()
-                        if (fromId && fromId !== pageId) continue // prefer page-authored
-                        const m2 = String(cmt.message || '').match(shopeeRe)
-                        if (m2) { foundLink = m2[0]; source = 'comment'; break }
-                    }
+                    const scan = await scanCommentWindow(fullPostId)
+                    pageCommentCount = scan.pageCommentCount
+                    otherCommentCount = scan.otherCommentCount
+                    pageCommentIds = scan.pageCommentIds
+                    commentScanStatus = 'scanned'
                     if (!foundLink) {
-                        for (const cmt of commentArr) {
+                        for (const cmt of scan.data) {
+                            const from = cmt.from as Record<string, unknown> | undefined
+                            const fromId = String(from?.id || '').trim()
+                            if (fromId && fromId !== pageId) continue // prefer page-authored
                             const m2 = String(cmt.message || '').match(shopeeRe)
                             if (m2) { foundLink = m2[0]; source = 'comment'; break }
                         }
+                        if (!foundLink) {
+                            for (const cmt of scan.data) {
+                                const m2 = String(cmt.message || '').match(shopeeRe)
+                                if (m2) { foundLink = m2[0]; source = 'comment'; break }
+                            }
+                        }
                     }
+                } else if (includeCommentCounts && !postId) {
+                    commentScanStatus = 'no_post_id'
                 }
             } catch (err) {
                 rowError = String(err).slice(0, 200)
+                if (includeCommentCounts && commentScanStatus !== 'scanned') commentScanStatus = 'error'
             }
         }
 
@@ -9248,6 +9345,10 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             shopee_link: foundLink,
             source,
             error: rowError,
+            page_comment_count: pageCommentCount,
+            page_comment_ids: pageCommentIds.slice(0, 5),
+            other_comment_count: otherCommentCount,
+            comment_scan_status: commentScanStatus,
         })
     }
 
@@ -9257,6 +9358,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         write_mode: writeMode,
         page_id: pageId,
         only_missing: onlyMissing,
+        include_comment_counts: includeCommentCounts,
         limit,
         offset,
         from_date: fromDate || null,

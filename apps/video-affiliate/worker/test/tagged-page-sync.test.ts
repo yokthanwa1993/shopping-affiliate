@@ -433,7 +433,8 @@ test('backfill-from-facebook reads via Graph GET only and never returns the toke
 
     // Graph reads use plain fetch (GET) with bounded comment window of 10.
     assert.match(routeSource, /fields=description,title,permalink_url,post_id,created_time/)
-    assert.match(routeSource, /\/comments\?fields=from,message&limit=10/)
+    // Comment window now also requests id (for page_comment_ids) but stays bounded at 10.
+    assert.match(routeSource, /\/comments\?fields=id,from,message&limit=10/)
     // No Graph mutations (method POST/DELETE) and no comment edits.
     assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
     // Token is only used inside the Graph URL, never surfaced in the response/items.
@@ -442,6 +443,82 @@ test('backfill-from-facebook reads via Graph GET only and never returns the toke
     // Response exposes audit counts + source classification, not secrets.
     assert.match(routeSource, /source_counts: sourceCounts/)
     assert.match(routeSource, /scanned,\s*\n\s*found,\s*\n\s*updated,\s*\n\s*missing,\s*\n\s*existing,/)
+})
+
+test('backfill-from-facebook adds opt-in comment counts that default off with body winning over query', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // include_comment_counts is a default-OFF opt-in: only an explicit true-like value enables it.
+    assert.match(routeSource, /const includeCommentCounts = isExplicitTrue\(includeCommentCountsRaw\)/)
+    // Body wins over query (same tri-state pattern as dry_run / only_missing).
+    assert.match(
+        routeSource,
+        /body\.include_comment_counts !== undefined\s*\n?\s*\?\s*body\.include_comment_counts\s*\n?\s*:\s*c\.req\.query\('include_comment_counts'\)/,
+    )
+    // The explicit-true helper recognizes the usual true-like values.
+    assert.match(routeSource, /v === true \|\| s === 'true' \|\| s === '1' \|\| s === 'yes' \|\| s === 'on'/)
+    // Mode is echoed back to the operator.
+    assert.match(routeSource, /include_comment_counts: includeCommentCounts/)
+})
+
+test('backfill-from-facebook requires a valid ordered date range when counting comments, even in dry run', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // include_comment_counts demands an explicit, valid range regardless of dry_run/write mode.
+    assert.match(
+        routeSource,
+        /if \(includeCommentCounts\) \{[\s\S]*date_range_required_for_comment_counts[\s\S]*invalid_date_range[\s\S]*\}/,
+    )
+    // This guard is independent of (and additional to) the write-mode date guard.
+    const writeGuardAt = routeSource.indexOf('date_range_required_for_write')
+    const countGuardAt = routeSource.indexOf('date_range_required_for_comment_counts')
+    assert.ok(writeGuardAt > -1 && countGuardAt > -1, 'both date guards must exist')
+    assert.ok(countGuardAt > writeGuardAt, 'comment-count date guard is separate from the write-mode guard')
+})
+
+test('backfill-from-facebook comment scan stays a bounded read-only GET with id/from/message limit 10', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Single shared bounded comment-window reader, GET only, limit 10, requesting id.
+    assert.match(routeSource, /const scanCommentWindow = async \(fullPostId: string\)/)
+    assert.match(routeSource, /\/comments\?fields=id,from,message&limit=10&access_token=\$\{encodeURIComponent\(token\)\}/)
+    // It classifies page-authored vs. other comments and caps collected page ids at 5.
+    assert.match(routeSource, /if \(fromId && fromId === pageId\) \{[\s\S]*pageCommentCount\+\+[\s\S]*pageCommentIds\.length < 5/)
+    assert.match(routeSource, /\} else \{\s*\n\s*otherCommentCount\+\+/)
+    // Still no Graph mutations and the token is never surfaced in the response.
+    assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
+    assert.doesNotMatch(routeSource, /token:\s*token/)
+    assert.doesNotMatch(routeSource, /access_token:\s*token/)
+})
+
+test('backfill-from-facebook exposes read-only comment-count fields on every scanned item', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Each item carries the four read-only comment fields, ids bounded to first 5.
+    assert.match(routeSource, /page_comment_count: pageCommentCount/)
+    assert.match(routeSource, /page_comment_ids: pageCommentIds\.slice\(0, 5\)/)
+    assert.match(routeSource, /other_comment_count: otherCommentCount/)
+    assert.match(routeSource, /comment_scan_status: commentScanStatus/)
+    // Default is a non-scanned ("skipped") state so the old no-scan default reads truthfully.
+    assert.match(routeSource, /let commentScanStatus = 'skipped'/)
+})
+
+test('backfill-from-facebook only scans cached-link rows for counts when explicitly opted in', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // The cached-link branch scans comments ONLY under include_comment_counts and a present post_id.
+    const cacheBranchAt = routeSource.indexOf("source = 'cache'")
+    assert.ok(cacheBranchAt > -1, 'cache branch must exist')
+    // Slice up to the non-cache Graph GET so the whole cached-link block is captured.
+    const cacheBranch = routeSource.slice(cacheBranchAt, routeSource.indexOf('// 1. Graph GET', cacheBranchAt))
+    assert.match(cacheBranch, /if \(includeCommentCounts\) \{[\s\S]*if \(postId\) \{[\s\S]*scanCommentWindow\(fullPostId\)/)
+    assert.match(cacheBranch, /commentScanStatus = 'no_post_id'/)
+    // Counting must never introduce writes/mutations in this path.
+    assert.doesNotMatch(routeSource, /INSERT\s+INTO/i)
+    assert.doesNotMatch(routeSource, /DELETE\s+FROM/i)
+    assert.equal(routeSource.match(/UPDATE\s+\w/gi)?.length, 1, 'route must still contain a single UPDATE statement')
+    // No customlink minting call is introduced (the descriptive header comment aside).
+    assert.doesNotMatch(routeSource, /mintCustomlink\s*\(|createCustomlink\s*\(|customlinks\.\w+\s*\(/i, 'comment counting must not mint customlinks')
 })
 
 test('per-page posting order override wins when enabled with a valid order', () => {
