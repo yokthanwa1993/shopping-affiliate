@@ -608,6 +608,55 @@ test('backfill-from-facebook surfaces sanitized comment scan errors without leak
     assert.doesNotMatch(routeSource, /access_token:\s*token/)
 })
 
+test('backfill-from-facebook adds opt-in CTA scan that requires a bounded date range', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    assert.match(routeSource, /body\.include_cta !== undefined\s*\n?\s*\?\s*body\.include_cta\s*\n?\s*:\s*c\.req\.query\('include_cta'\)/)
+    assert.match(routeSource, /const includeCta = isExplicitTrue\(includeCtaRaw\)/)
+    assert.match(routeSource, /include_cta: includeCta/)
+    assert.match(routeSource, /if \(includeCta\) \{[\s\S]*date_range_required_for_cta[\s\S]*invalid_date_range[\s\S]*\}/)
+})
+
+test('backfill-from-facebook CTA scan is read-only Graph GET and never returns the token', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    assert.match(routeSource, /const scanCtaTarget = async \(targetId: string\)/)
+    assert.match(routeSource, /fields=\$\{fields\}&access_token=\$\{encodeURIComponent\(token\)\}/)
+    assert.match(routeSource, /call_to_action/)
+    assert.match(routeSource, /attachments\{call_to_action,title,description,type,url,unshimmed_url,target,subattachments\}/)
+    assert.match(routeSource, /child_attachments/)
+    assert.match(routeSource, /link,permalink_url/)
+    assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
+    assert.doesNotMatch(routeSource, /token:\s*token/)
+    assert.doesNotMatch(routeSource, /access_token:\s*token/)
+})
+
+test('backfill-from-facebook exposes response-only CTA fields on every scanned item', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    assert.match(routeSource, /cta_present: ctaPresent/)
+    assert.match(routeSource, /cta_type: ctaType/)
+    assert.match(routeSource, /cta_title: ctaTitle/)
+    assert.match(routeSource, /cta_url: ctaUrl/)
+    assert.match(routeSource, /cta_source: ctaSource/)
+    assert.match(routeSource, /cta_scan_status: ctaScanStatus/)
+    assert.match(routeSource, /cta_scan_error: ctaScanError/)
+    assert.match(routeSource, /let ctaScanStatus = 'skipped'/)
+    assert.match(routeSource, /ctaUrl = sanitizeGraphErrorText\(cta\.url\)/)
+    assert.equal(routeSource.match(/UPDATE\s+\w/gi)?.length, 1, 'CTA audit must not add DB writes')
+    assert.doesNotMatch(routeSource, /INSERT\s+INTO/i)
+    assert.doesNotMatch(routeSource, /DELETE\s+FROM/i)
+})
+
+test('backfill-from-facebook CTA scan targets canonical post first with video fallback', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    assert.match(routeSource, /const ctaTargetId = postId \? buildPostCommentTarget\(postId\) : videoId/)
+    assert.match(routeSource, /const cta = await scanCtaTarget\(ctaTargetId\)/)
+    assert.match(routeSource, /ctaScanStatus = cta\.ok \? 'scanned' : 'error'/)
+    assert.match(routeSource, /ctaScanStatus = 'no_target'/)
+})
+
 test('per-page posting order override wins when enabled with a valid order', () => {
     const resolverSource = getPagePostingOrderResolverSource()
     const pageReturnAt = resolverSource.indexOf("source: 'page'")

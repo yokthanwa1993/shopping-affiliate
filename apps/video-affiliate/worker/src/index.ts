@@ -9047,6 +9047,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         only_missing?: boolean
         dry_run?: boolean
         include_comment_counts?: boolean
+        include_cta?: boolean
     }
     // Harmless query-string fallback for each param (body wins when present).
     const queryStr = (name: string): string => String(c.req.query(name) ?? '').trim()
@@ -9082,6 +9083,15 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         : c.req.query('include_comment_counts')
     const includeCommentCounts = isExplicitTrue(includeCommentCountsRaw)
 
+    // include_cta defaults FALSE (opt-in). When on, each scanned item gets a single
+    // read-only Graph GET that surfaces any call-to-action/button/attached link for
+    // the post (preferred) or video/reel. Body wins over query, same as the others.
+    // This NEVER writes D1 (CTA fields are response-only) and never mutates Facebook.
+    const includeCtaRaw = body.include_cta !== undefined
+        ? body.include_cta
+        : c.req.query('include_cta')
+    const includeCta = isExplicitTrue(includeCtaRaw)
+
     // Bounded scan window. limit is capped small (<=150); offset is bounded.
     const limitRaw = Number(body.limit ?? c.req.query('limit') ?? 100)
     const limit = Number.isFinite(limitRaw) ? Math.min(150, Math.max(1, Math.floor(limitRaw))) : 100
@@ -9106,6 +9116,14 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     // to keep the scan window bounded.
     if (includeCommentCounts) {
         if (!fromInput || !toInput) return c.json({ ok: false, error: 'date_range_required_for_comment_counts' }, 400)
+        if (fromInput.value > toInput.value) return c.json({ ok: false, error: 'invalid_date_range' }, 400)
+    }
+
+    // CTA auditing issues an extra (read-only) per-row Graph read, so — like the
+    // comment-count scan — it requires an explicit, valid (ordered) date range even
+    // in dry_run to keep the scan window bounded.
+    if (includeCta) {
+        if (!fromInput || !toInput) return c.json({ ok: false, error: 'date_range_required_for_cta' }, 400)
         if (fromInput.value > toInput.value) return c.json({ ok: false, error: 'invalid_date_range' }, 400)
     }
 
@@ -9212,6 +9230,13 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         comment_scan_error: string
         post_id_resolution_status: string
         post_id_resolution_reason: string
+        cta_present: boolean
+        cta_type: string
+        cta_title: string
+        cta_url: string
+        cta_source: string
+        cta_scan_status: string
+        cta_scan_error: string
     }> = []
 
     // Read-only bounded comment-window fetch (GET, limit 10) reused by both the
@@ -9269,6 +9294,113 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         return { data, pageCommentCount, otherCommentCount, pageCommentIds, resolvedPostId, ok: commentsResp.ok, error }
     }
 
+    // Normalize a Graph call_to_action object into {type,title,url}. CTA buttons can
+    // be shaped { type, value: { link|title } } (posts) or carry a flat title; this
+    // returns null when the object exposes no usable type/title/url. Never reads tokens.
+    const readCtaObject = (cta: unknown): { type: string; title: string; url: string } | null => {
+        if (!cta || typeof cta !== 'object') return null
+        const obj = cta as Record<string, unknown>
+        const value = (obj.value && typeof obj.value === 'object') ? obj.value as Record<string, unknown> : undefined
+        const type = String(obj.type || '').trim()
+        const title = String(value?.title || obj.title || '').trim()
+        const url = String(value?.link || value?.url || obj.link || obj.url || '').trim()
+        if (!type && !title && !url) return null
+        return { type, title, url }
+    }
+
+    // Read-only bounded CTA reader: a SINGLE Graph GET per target that surfaces any
+    // call-to-action/button/attached link for a post (preferred) or video/reel id.
+    // It requests only CTA/attachment/link/permalink fields (GET, no pagination, no
+    // fan-out) and never writes. Graph errors are sanitized (token never surfaced).
+    const scanCtaTarget = async (targetId: string): Promise<{
+        present: boolean
+        type: string
+        title: string
+        url: string
+        source: string
+        ok: boolean
+        error: string
+    }> => {
+        const fields = 'call_to_action,attachments{call_to_action,title,description,type,url,unshimmed_url,target,subattachments},child_attachments,link,permalink_url'
+        const resp = await fetch(
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}?fields=${fields}&access_token=${encodeURIComponent(token)}`
+        )
+        const json = await resp.json().catch(() => ({})) as Record<string, unknown>
+        const graphErr = json.error as Record<string, unknown> | undefined
+        const errCode = graphErr?.code !== undefined ? sanitizeGraphErrorText(graphErr.code) : ''
+        const errType = graphErr?.type !== undefined ? sanitizeGraphErrorText(graphErr.type) : ''
+        const errMsg = sanitizeGraphErrorText((graphErr?.message) || `cta_fetch_${resp.status}`)
+        const error = resp.ok
+            ? ''
+            : [`http_${resp.status}`, errMsg, errCode ? `code=${errCode}` : '', errType ? `type=${errType}` : '']
+                .filter(Boolean)
+                .join(' ')
+                .slice(0, 200)
+        if (!resp.ok) {
+            return { present: false, type: '', title: '', url: '', source: '', ok: false, error }
+        }
+
+        let hit: { type: string; title: string; url: string } | null = null
+        let source = ''
+        // 1. Explicit CTA button: top-level, then per-attachment, then nested subattachments.
+        hit = readCtaObject(json.call_to_action)
+        if (hit) source = 'call_to_action'
+        const attData = Array.isArray((json.attachments as { data?: unknown[] } | undefined)?.data)
+            ? (json.attachments as { data: unknown[] }).data
+            : []
+        if (!hit) {
+            for (const att of attData) {
+                const a = (att && typeof att === 'object') ? att as Record<string, unknown> : {}
+                const aCta = readCtaObject(a.call_to_action)
+                if (aCta) { hit = aCta; if (!hit.title) hit.title = String(a.title || '').trim(); source = 'attachment'; break }
+                const subData = Array.isArray((a.subattachments as { data?: unknown[] } | undefined)?.data)
+                    ? (a.subattachments as { data: unknown[] }).data
+                    : []
+                for (const sub of subData) {
+                    const s = (sub && typeof sub === 'object') ? sub as Record<string, unknown> : {}
+                    const sCta = readCtaObject(s.call_to_action)
+                    if (sCta) { hit = sCta; if (!hit.title) hit.title = String(s.title || '').trim(); source = 'subattachment'; break }
+                }
+                if (hit) break
+            }
+        }
+        // child_attachments can come back as a bare array or wrapped in { data }.
+        const childData = Array.isArray((json.child_attachments as { data?: unknown[] } | undefined)?.data)
+            ? (json.child_attachments as { data: unknown[] }).data
+            : Array.isArray(json.child_attachments) ? json.child_attachments as unknown[] : []
+        if (!hit) {
+            for (const child of childData) {
+                const ch = (child && typeof child === 'object') ? child as Record<string, unknown> : {}
+                const cCta = readCtaObject(ch.call_to_action)
+                if (cCta) { hit = cCta; if (!hit.title) hit.title = String(ch.name || ch.title || '').trim(); source = 'child_attachment'; break }
+            }
+        }
+        // 2. No explicit CTA object: fall back to an attached link/button URL, then the
+        //    top-level link. These still represent an outbound CTA target on the post.
+        if (!hit) {
+            for (const att of attData) {
+                const a = (att && typeof att === 'object') ? att as Record<string, unknown> : {}
+                const target = (a.target && typeof a.target === 'object') ? a.target as Record<string, unknown> : undefined
+                const link = String(target?.url || a.unshimmed_url || a.url || '').trim()
+                if (link) { hit = { type: String(a.type || '').trim(), title: String(a.title || '').trim(), url: link }; source = 'attachment_link'; break }
+            }
+        }
+        if (!hit) {
+            const topLink = String(json.link || '').trim()
+            if (topLink) { hit = { type: '', title: '', url: topLink }; source = 'link' }
+        }
+
+        return {
+            present: !!hit,
+            type: hit?.type || '',
+            title: hit?.title || '',
+            url: hit?.url || '',
+            source: hit ? source : '',
+            ok: true,
+            error: '',
+        }
+    }
+
     // Sequential, single-flight per row (no parallel fan-out) to keep Graph load low.
     for (const row of rows) {
         scanned++
@@ -9292,6 +9424,15 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         let commentScanError = ''
         let postIdResolutionStatus = postId ? 'cached' : 'unresolved'
         let postIdResolutionReason = postId ? 'cache_post_id_present' : 'post_id_missing'
+        // Read-only CTA audit fields. Default to a non-scanned ("skipped") state so
+        // rows reflect "no CTA read attempted" truthfully when include_cta is off.
+        let ctaPresent = false
+        let ctaType = ''
+        let ctaTitle = ''
+        let ctaUrl = ''
+        let ctaSource = ''
+        let ctaScanStatus = 'skipped'
+        let ctaScanError = ''
 
         const markResolvedPostId = (candidate: unknown, status: string, reason: string): boolean => {
             const normalized = normalizeGraphPostId(candidate)
@@ -9323,7 +9464,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         if (!videoId) {
             rowError = 'missing_video_id'
             errors.push({ video_id: '', error: rowError })
-            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus, comment_scan_error: commentScanError, post_id_resolution_status: postIdResolutionStatus, post_id_resolution_reason: postIdResolutionReason })
+            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus, comment_scan_error: commentScanError, post_id_resolution_status: postIdResolutionStatus, post_id_resolution_reason: postIdResolutionReason, cta_present: ctaPresent, cta_type: ctaType, cta_title: ctaTitle, cta_url: ctaUrl, cta_source: ctaSource, cta_scan_status: ctaScanStatus, cta_scan_error: ctaScanError })
             continue
         }
 
@@ -9416,6 +9557,34 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             }
         }
 
+        // Read-only CTA audit: a SINGLE Graph GET per row, run after post_id/comment/
+        // link resolution so it targets the canonical post (buildPostCommentTarget)
+        // when a post_id exists, else the video/reel id. Sequential and single-flight
+        // (no fan-out), matching the comment-scan discipline. Off by default (status
+        // 'skipped'); never writes D1 and never mutates Facebook. cta_url is redacted
+        // so neither the literal token nor an access_token=... pair can leak; normal
+        // affiliate URLs (which never carry the token) pass through unchanged.
+        if (includeCta) {
+            const ctaTargetId = postId ? buildPostCommentTarget(postId) : videoId
+            if (!ctaTargetId) {
+                ctaScanStatus = 'no_target'
+            } else {
+                try {
+                    const cta = await scanCtaTarget(ctaTargetId)
+                    ctaPresent = cta.present
+                    ctaType = cta.type
+                    ctaTitle = cta.title
+                    ctaUrl = sanitizeGraphErrorText(cta.url)
+                    ctaSource = cta.source
+                    ctaScanStatus = cta.ok ? 'scanned' : 'error'
+                    ctaScanError = cta.ok ? '' : cta.error
+                } catch (err) {
+                    ctaScanStatus = 'error'
+                    ctaScanError = sanitizeGraphErrorText(String(err)).slice(0, 200)
+                }
+            }
+        }
+
         if (rowError) {
             errors.push({ video_id: videoId, error: rowError })
         }
@@ -9463,6 +9632,13 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             comment_scan_error: commentScanError,
             post_id_resolution_status: postIdResolutionStatus,
             post_id_resolution_reason: postIdResolutionReason,
+            cta_present: ctaPresent,
+            cta_type: ctaType,
+            cta_title: ctaTitle,
+            cta_url: ctaUrl,
+            cta_source: ctaSource,
+            cta_scan_status: ctaScanStatus,
+            cta_scan_error: ctaScanError,
         })
     }
 
@@ -9473,6 +9649,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         page_id: pageId,
         only_missing: onlyMissing,
         include_comment_counts: includeCommentCounts,
+        include_cta: includeCta,
         limit,
         offset,
         from_date: fromDate || null,
