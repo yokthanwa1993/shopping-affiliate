@@ -380,10 +380,36 @@ export type TargetSubIds = {
 //   sub4 = stable internal log_id/post_history id when available.
 // Never throws; missing pieces are reported via sub2_source + reason so the
 // caller can decide whether the fallback is acceptable.
+export function resolveEffectiveTargetSub4(input: {
+    targetSub4?: unknown
+    target_sub4?: unknown
+    logId?: unknown
+    log_id?: unknown
+    historyId?: unknown
+    history_id?: unknown
+    postHistoryId?: unknown
+    post_history_id?: unknown
+}): string {
+    for (const value of [
+        input.targetSub4,
+        input.target_sub4,
+        input.logId,
+        input.log_id,
+        input.historyId,
+        input.history_id,
+        input.postHistoryId,
+        input.post_history_id,
+    ]) {
+        const text = String(value ?? '').trim()
+        if (text) return text
+    }
+    return ''
+}
+
 export function buildTargetSubIds(input: TargetSubBuildInput): TargetSubIds {
     const sub1 = String(input.requestedSub1 || '').trim()
     const sub3 = String(input.pageId || '').trim()
-    const sub4 = String(input.logId || '').trim()
+    const sub4 = resolveEffectiveTargetSub4({ logId: input.logId })
 
     const canonical = storyTail(input.canonicalPostId)
     const fbVideo = String(input.fbVideoId || '').trim()
@@ -539,10 +565,11 @@ export type WriteActionInput = {
     commentFromId?: string | null
     oldCommentId?: string | null
     hasRewriteableLink: boolean
+    allowCreateNew?: boolean
 }
 
-// Decide how to land the new link. Edit only a page-OWNED existing comment;
-// otherwise create a fresh page comment. Skip when there is nothing to rewrite.
+// Decide how to land the new link. Default is edit-only: edit only a page-OWNED
+// existing comment. Creating a fresh page comment is behind an explicit override.
 // Comments are NEVER deleted by this workflow.
 export function computeWriteAction(input: WriteActionInput): RewriteAction {
     if (!input.hasRewriteableLink) return 'skip'
@@ -550,7 +577,23 @@ export function computeWriteAction(input: WriteActionInput): RewriteAction {
     const fromId = String(input.commentFromId || '').trim()
     const commentId = String(input.oldCommentId || '').trim()
     if (commentId && pageId && fromId && fromId === pageId) return 'edit'
-    return 'create_new'
+    if (input.allowCreateNew === true) return 'create_new'
+    return 'skip'
+}
+
+export function resolveCreateNewBlockedReason(input: {
+    pageId: string
+    commentFromId?: string | null
+    oldCommentId?: string | null
+    allowCreateNew?: boolean
+}): string {
+    if (input.allowCreateNew === true) return ''
+    const pageId = String(input.pageId || '').trim()
+    const fromId = String(input.commentFromId || '').trim()
+    const commentId = String(input.oldCommentId || '').trim()
+    if (!commentId) return 'missing_existing_comment_id'
+    if (pageId && fromId && fromId !== pageId) return 'non_page_comment'
+    return 'create_new_not_allowed'
 }
 
 export type GraphStopSignal = {
@@ -635,6 +678,7 @@ export const PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS
     job_id TEXT NOT NULL,
     item_index INTEGER NOT NULL,
     page_id TEXT NOT NULL,
+    log_id TEXT NOT NULL DEFAULT '',
     fb_video_id TEXT NOT NULL DEFAULT '',
     reel_id TEXT NOT NULL DEFAULT '',
     post_id TEXT NOT NULL DEFAULT '',
@@ -658,6 +702,7 @@ export const PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS
     target_sub1 TEXT NOT NULL DEFAULT '',
     target_sub2 TEXT NOT NULL DEFAULT '',
     target_sub3 TEXT NOT NULL DEFAULT '',
+    target_sub4 TEXT NOT NULL DEFAULT '',
     new_shortlink TEXT NOT NULL DEFAULT '',
     new_expanded_url TEXT NOT NULL DEFAULT '',
     new_utm_content TEXT NOT NULL DEFAULT '',

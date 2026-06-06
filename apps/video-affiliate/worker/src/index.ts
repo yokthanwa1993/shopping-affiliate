@@ -54,6 +54,8 @@ import {
     parseTrackingSubIds,
     pickPrimaryAffiliateUrl,
     replaceShortlinkInMessage,
+    resolveCreateNewBlockedReason,
+    resolveEffectiveTargetSub4,
     resolvePageCommentLinkJobStatus,
     verifyRewrittenShortlink,
     type JobItemStatus,
@@ -7765,6 +7767,15 @@ async function ensurePageCommentLinkWorkflowTables(db: D1Database): Promise<void
             await db.prepare(PAGE_COMMENT_LINK_JOBS_TABLE_SQL).run()
             await db.prepare(PAGE_COMMENT_LINK_JOBS_INDEX_SQL).run().catch(() => { })
             await db.prepare(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL).run()
+            const addJobItemColumn = async (sql: string) => {
+                await db.prepare(sql).run().catch((err) => {
+                    const message = String(err?.message || err || '').toLowerCase()
+                    if (message.includes('duplicate column') || message.includes('already exists')) return
+                    throw err
+                })
+            }
+            await addJobItemColumn(`ALTER TABLE page_comment_link_job_items ADD COLUMN log_id TEXT NOT NULL DEFAULT ''`)
+            await addJobItemColumn(`ALTER TABLE page_comment_link_job_items ADD COLUMN target_sub4 TEXT NOT NULL DEFAULT ''`)
         })()
     }
     await pageCommentLinkWorkflowTablesReady
@@ -7853,7 +7864,7 @@ const str = (v: unknown): string => String(v == null ? '' : v).trim()
 // Normalise a registry-shaped input item (as returned by GET …/page-comment-link-registry)
 // and compute the rewrite PLAN. Pure-ish: no network, no DB. The action says how
 // the new link would land; status is 'skipped' when there is nothing to rewrite.
-function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string }) {
+function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string; allowCreateNew?: boolean }) {
     const pageId = opts.pageId
     const fbVideoId = str(raw.fb_video_id) || str(raw.video_id) || str(raw.reel_id)
     const reelId = str(raw.reel_id) || fbVideoId
@@ -7872,13 +7883,14 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const oldSub3 = str(raw.old_sub3) || str(raw.sub3)
     const oldSub4 = str(raw.old_sub4) || str(raw.sub4)
     const oldSub5 = str(raw.old_sub5) || str(raw.sub5)
-    const logId = str(raw.log_id) || str(raw.history_id) || str(raw.post_history_id)
+    const logId = resolveEffectiveTargetSub4(raw)
+    const allowCreateNew = opts.allowCreateNew === true
 
     const productUrl = canonicalizeProductUrl(str(raw.product_url) || oldExpandedUrl || oldShortlink)
     const hasRewriteableLink = !!productUrl
 
     const subs = buildTargetSubIds({ requestedSub1: opts.requestedSub1, pageId, canonicalPostId, fbVideoId, reelId, logId })
-    const action: RewriteAction = computeWriteAction({ pageId, commentFromId, oldCommentId, hasRewriteableLink })
+    const action: RewriteAction = computeWriteAction({ pageId, commentFromId, oldCommentId, hasRewriteableLink, allowCreateNew })
     const expectedUtmContent = buildExpectedUtmContent(subs)
     const customlinkRequestUrl = hasRewriteableLink
         ? buildCustomlinkRequestUrl({ productUrl, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: subs.sub4 })
@@ -7887,6 +7899,10 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const reasons: string[] = []
     if (subs.reason) reasons.push(subs.reason)
     if (!hasRewriteableLink) reasons.push('no_product_url')
+    const createBlockedReason = hasRewriteableLink && action === 'skip'
+        ? resolveCreateNewBlockedReason({ pageId, commentFromId, oldCommentId, allowCreateNew })
+        : ''
+    if (createBlockedReason) reasons.push(createBlockedReason)
     const status: JobItemStatus = action === 'skip' ? 'skipped' : 'planned'
 
     return {
@@ -7961,17 +7977,17 @@ async function upsertPageCommentLinkRegistry(db: D1Database, item: PageCommentLi
 async function insertPageCommentLinkJobItem(db: D1Database, jobId: string, index: number, item: PageCommentLinkPlanItem, auditedAt: string): Promise<void> {
     await db.prepare(
         `INSERT OR REPLACE INTO page_comment_link_job_items
-            (job_id, item_index, page_id, fb_video_id, reel_id, post_id, canonical_post_id, comment_target_id,
+            (job_id, item_index, page_id, log_id, fb_video_id, reel_id, post_id, canonical_post_id, comment_target_id,
              old_comment_id, new_comment_id, comment_from_id, comment_from_name, old_message, new_message,
              old_shortlink, old_expanded_url, old_utm_content, old_sub1, old_sub2, old_sub3, old_sub4, old_sub5,
-             product_url, target_sub1, target_sub2, target_sub3, new_shortlink, new_expanded_url, new_utm_content,
+             product_url, target_sub1, target_sub2, target_sub3, target_sub4, new_shortlink, new_expanded_url, new_utm_content,
              action, status, reason, error, attempts, last_audited_at, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?, ?,?,?,?,?,?, datetime('now'), datetime('now'))`
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))`
     ).bind(
-        jobId, index, item.page_id, item.fb_video_id, item.reel_id, item.post_id, item.canonical_post_id, item.comment_target_id,
+        jobId, index, item.page_id, item.log_id, item.fb_video_id, item.reel_id, item.post_id, item.canonical_post_id, item.comment_target_id,
         item.old_comment_id, item.new_comment_id, item.comment_from_id, item.comment_from_name, item.old_message, item.new_message,
         item.old_shortlink, item.old_expanded_url, item.old_utm_content, item.old_sub1, item.old_sub2, item.old_sub3, item.old_sub4, item.old_sub5,
-        item.product_url, item.target_sub1, item.target_sub2, item.target_sub3, item.new_shortlink, item.new_expanded_url, item.new_utm_content,
+        item.product_url, item.target_sub1, item.target_sub2, item.target_sub3, item.target_sub4, item.new_shortlink, item.new_expanded_url, item.new_utm_content,
         item.action, item.status, item.reason, item.error, item.attempts, auditedAt,
     ).run()
 }
@@ -8013,12 +8029,13 @@ app.post('/api/dashboard/page-comment-link-rewrite-preview', async (c) => {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
     const pageId = str(body.page_id) || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
     const requestedSub1 = str(body.target_sub1) || str(body.sub1)
+    const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
     const rawItems = readRewriteItemsFromBody(body)
     if (rawItems.length === 0) return c.json({ ok: false, error: 'items_required' }, 400)
 
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
     const auditedAt = new Date().toISOString()
-    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1 }))
+    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew }))
     for (const item of items) await upsertPageCommentLinkRegistry(c.env.DB, item, auditedAt)
 
     const summary = { total: items.length, ...summarizePlanItems(items) }
@@ -8026,6 +8043,7 @@ app.post('/api/dashboard/page-comment-link-rewrite-preview', async (c) => {
         ok: true,
         mode: 'preview',
         read_only: true,
+        allow_create_new: allowCreateNew,
         page_id: pageId,
         // Operator-friendly top-level fields (mirrors nested summary/requested_sub1).
         target_sub1: requestedSub1,
@@ -8045,6 +8063,7 @@ app.post('/api/dashboard/page-comment-link-jobs', async (c) => {
     const pageId = str(body.page_id) || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
     const namespaceId = DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID
     const requestedSub1 = str(body.target_sub1) || str(body.sub1)
+    const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
     const dryRun = normalizeJobBool(body.dry_run, JOB_DEFAULT_DRY_RUN)
     const batchSize = clampBatchSize(body.batch_size)
     const stopOnFirstError = normalizeJobBool(body.stop_on_first_error, JOB_DEFAULT_STOP_ON_FIRST_ERROR)
@@ -8054,7 +8073,7 @@ app.post('/api/dashboard/page-comment-link-jobs', async (c) => {
 
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
     const auditedAt = new Date().toISOString()
-    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1 }))
+    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew }))
     const counts = summarizePlanItems(items)
     const jobId = `pclj_${crypto.randomUUID().replace(/-/g, '')}`
 
@@ -8085,6 +8104,7 @@ app.post('/api/dashboard/page-comment-link-jobs', async (c) => {
         status: 'planned',
         dry_run: dryRun,
         write_mode: false,
+        allow_create_new: allowCreateNew,
         target_sub1: requestedSub1,
         counts: summary,
         count_returned: items.length,
@@ -8106,7 +8126,10 @@ async function loadPageCommentLinkJob(db: D1Database, jobId: string): Promise<Re
 async function loadPageCommentLinkJobItems(db: D1Database, jobId: string): Promise<Record<string, unknown>[]> {
     const rows = await db.prepare('SELECT * FROM page_comment_link_job_items WHERE job_id = ? ORDER BY item_index ASC')
         .bind(jobId).all().catch(() => ({ results: [] })) as { results?: Record<string, unknown>[] }
-    return rows.results || []
+    return (rows.results || []).map((row) => {
+        const targetSub4 = resolveEffectiveTargetSub4(row)
+        return targetSub4 && str(row.target_sub4) !== targetSub4 ? { ...row, target_sub4: targetSub4 } : row
+    })
 }
 
 // GET a job + its items (read-only).
@@ -8157,6 +8180,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
     const bodyDryRunProvided = body.dry_run !== undefined && body.dry_run !== null && body.dry_run !== ''
     const writeRequested = bodyDryRunProvided && normalizeJobBool(body.dry_run, true) === false
     const writeMode = !jobDryRun || writeRequested
+    const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
 
     const limit = Math.min(batchSize, Math.max(1, Number(body.limit) > 0 ? Math.floor(Number(body.limit)) : batchSize))
 
@@ -8188,17 +8212,37 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         const targetSub1 = str(row.target_sub1)
         const targetSub2 = str(row.target_sub2)
         const targetSub3 = str(row.target_sub3)
-        const targetSub4 = str(row.target_sub4)
+        const targetSub4 = resolveEffectiveTargetSub4(row)
         const productUrl = str(row.product_url)
         const oldShortlink = str(row.old_shortlink)
         const oldMessage = String(row.old_message ?? '')
         const oldCommentId = str(row.old_comment_id)
 
-        // Nothing to rewrite.
+        // Nothing to rewrite, or default edit-only policy blocked a create path.
         if (action === 'skip' || !productUrl) {
             await updateItem(index, { status: 'skipped', reason: str(row.reason) || 'no_product_url' })
             skippedCount++
-            processed.push({ item_index: index, status: 'skipped', action: 'skip' })
+            processed.push({ item_index: index, status: 'skipped', action: 'skip', reason: str(row.reason) || 'no_product_url' })
+            continue
+        }
+        const createBlockedReason = action === 'create_new' && !allowCreateNew
+            ? resolveCreateNewBlockedReason({ pageId, commentFromId: str(row.comment_from_id), oldCommentId, allowCreateNew })
+            : ''
+        const editBlockedReason = action === 'edit' && (!oldCommentId || str(row.comment_from_id) !== pageId)
+            ? resolveCreateNewBlockedReason({ pageId, commentFromId: str(row.comment_from_id), oldCommentId, allowCreateNew: false })
+            : ''
+        const blockedReason = createBlockedReason || editBlockedReason
+        if (blockedReason) {
+            await updateItem(index, { status: 'skipped', action: 'skip', reason: blockedReason, error: '' })
+            skippedCount++
+            processed.push({ item_index: index, status: 'skipped', action: 'skip', reason: blockedReason })
+            continue
+        }
+        if (str(row.log_id) && !targetSub4) {
+            await updateItem(index, { status: 'failed', reason: 'missing_target_sub4', error: 'log_id_without_target_sub4' })
+            failedCount++
+            processed.push({ item_index: index, status: 'failed', action, reason: 'missing_target_sub4' })
+            if (stopOnFirstError) { stoppedReason = 'missing_target_sub4'; break }
             continue
         }
 
@@ -8211,6 +8255,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                 item_index: index, status: wouldStatus, action, dry_run: true, token_available: hasToken,
                 customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId }),
                 expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 }),
+                target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: targetSub4,
             })
             continue
         }
@@ -8297,7 +8342,17 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                     stoppedReason = stopSignal.reason
                     break
                 }
-                finalAction = 'create_new' // edit failed (e.g. cross-app); create instead, keep old.
+                if (!allowCreateNew) {
+                    await updateItem(index, {
+                        status: 'failed', reason: 'edit_failed_create_new_not_allowed', error: writeError, attempts,
+                        new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_message: newMessage,
+                    })
+                    failedCount++
+                    processed.push({ item_index: index, status: 'failed', action: 'edit', reason: 'edit_failed_create_new_not_allowed' })
+                    if (stopOnFirstError) { stoppedReason = 'edit_failed_create_new_not_allowed'; break }
+                    continue
+                }
+                finalAction = 'create_new' // explicit override only; keep old comment, never delete.
             }
         }
 
@@ -8449,7 +8504,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
         const target = str(row.comment_target_id)
         const live = await fetchPageCommentsLive(target, token)
         const linkVerify = verifyRewrittenShortlink(str(row.new_expanded_url) || str(row.new_shortlink), {
-            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3), sub4: str(row.target_sub4),
+            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3), sub4: resolveEffectiveTargetSub4(row),
         })
         const matched = live.ok && isAffiliateCommentMatch(live.comments, {
             commentId: str(row.new_comment_id), expectedMessage: String(row.new_message ?? ''), affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
@@ -8500,6 +8555,10 @@ app.get('/api/dashboard/page-comment-link-jobs/:job_id/history', async (c) => {
         new_expanded_url: str(it.new_expanded_url),
         old_utm_content: str(it.old_utm_content),
         new_utm_content: str(it.new_utm_content),
+        target_sub1: str(it.target_sub1),
+        target_sub2: str(it.target_sub2),
+        target_sub3: str(it.target_sub3),
+        target_sub4: resolveEffectiveTargetSub4(it),
     }))
     const jobDryRun = Number(job.dry_run) === 1
     return c.json({

@@ -5,6 +5,7 @@ import {
     CUSTOMLINK_HOST,
     JOB_DEFAULT_BATCH_SIZE,
     JOB_MAX_BATCH_SIZE,
+    PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL,
     REGISTRY_DEFAULT_LIMIT,
     REGISTRY_MAX_LIMIT,
     buildCustomlinkRequestUrl,
@@ -25,6 +26,8 @@ import {
     parseTrackingSubIds,
     pickPrimaryAffiliateUrl,
     replaceShortlinkInMessage,
+    resolveCreateNewBlockedReason,
+    resolveEffectiveTargetSub4,
     resolvePageCommentLinkJobStatus,
     verifyRewrittenShortlink,
 } from '../src/comment-link-registry.js'
@@ -267,6 +270,38 @@ test('buildTargetSubIds reports missing sub2 when nothing resolves', () => {
     assert.ok(subs.reason.includes('missing_sub2'))
 })
 
+test('resolveEffectiveTargetSub4 preserves persisted sub4 and falls back to log/history ids', () => {
+    assert.equal(resolveEffectiveTargetSub4({ target_sub4: '25831', log_id: 'fallback' }), '25831')
+    assert.equal(resolveEffectiveTargetSub4({ target_sub4: '', log_id: 25831 }), '25831')
+    assert.equal(resolveEffectiveTargetSub4({ targetSub4: null, history_id: 'hist42' }), 'hist42')
+    assert.equal(resolveEffectiveTargetSub4({ post_history_id: 'ph99' }), 'ph99')
+    assert.equal(resolveEffectiveTargetSub4({}), '')
+})
+
+test('page comment job item schema persists log_id and target_sub4 for preview to run', () => {
+    assert.match(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL, /log_id TEXT NOT NULL DEFAULT ''/)
+    assert.match(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL, /target_sub4 TEXT NOT NULL DEFAULT ''/)
+})
+
+test('dry-run customlink path includes fallback sub4 from log_id', () => {
+    const targetSub4 = resolveEffectiveTargetSub4({ target_sub4: '', log_id: 25831 })
+    const requestUrl = buildCustomlinkRequestUrl({
+        productUrl: 'https://shopee.co.th/product/1/2',
+        sub1: '1JUN26FBSPCAD',
+        sub2: '1294666126171416',
+        sub3: '1008898512617594',
+        sub4: targetSub4,
+    })
+    const parsed = new URL(requestUrl)
+    assert.equal(parsed.searchParams.get('sub4'), '25831')
+    assert.equal(buildExpectedUtmContent({
+        sub1: '1JUN26FBSPCAD',
+        sub2: '1294666126171416',
+        sub3: '1008898512617594',
+        sub4: targetSub4,
+    }), '1JUN26FBSPCAD-1294666126171416-1008898512617594-25831-')
+})
+
 test('buildCustomlinkRequestUrl targets customlink host with default id and subs', () => {
     const url = buildCustomlinkRequestUrl({
         productUrl: 'https://shopee.co.th/product/1/2',
@@ -361,15 +396,24 @@ test('replaceShortlinkInMessage appends when there is no link, noops on empty ne
     assert.equal(noop.message, 'keep me')
 })
 
-test('computeWriteAction edits only page-owned comments, else creates new', () => {
+test('computeWriteAction defaults to edit-only and blocks create without explicit override', () => {
     assert.equal(computeWriteAction({
         pageId: 'P', commentFromId: 'P', oldCommentId: 'P_123', hasRewriteableLink: true,
     }), 'edit')
     assert.equal(computeWriteAction({
         pageId: 'P', commentFromId: 'OTHER', oldCommentId: 'OTHER_123', hasRewriteableLink: true,
-    }), 'create_new')
+    }), 'skip')
+    assert.equal(resolveCreateNewBlockedReason({
+        pageId: 'P', commentFromId: 'OTHER', oldCommentId: 'OTHER_123', allowCreateNew: false,
+    }), 'non_page_comment')
     assert.equal(computeWriteAction({
         pageId: 'P', commentFromId: '', oldCommentId: '', hasRewriteableLink: true,
+    }), 'skip')
+    assert.equal(resolveCreateNewBlockedReason({
+        pageId: 'P', commentFromId: '', oldCommentId: '', allowCreateNew: false,
+    }), 'missing_existing_comment_id')
+    assert.equal(computeWriteAction({
+        pageId: 'P', commentFromId: '', oldCommentId: '', hasRewriteableLink: true, allowCreateNew: true,
     }), 'create_new')
     assert.equal(computeWriteAction({
         pageId: 'P', commentFromId: 'P', oldCommentId: 'P_123', hasRewriteableLink: false,
