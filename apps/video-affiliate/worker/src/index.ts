@@ -17725,6 +17725,38 @@ function getProcessingJobStaleCategory(data: Record<string, unknown>): string {
         : 'stale_timeout'
 }
 
+// Marks a single active `_processing/{id}.json` record as failed because it has
+// stalled past its timeout, then mirrors the terminal record into
+// `_processing_history/`. Shared by the bounded active-job check
+// (hasActiveProcessingJob) and the full stale sweep (expireStaleProcessingJobs)
+// so both paths write identical stale-failure records and neither leaves a stale
+// job blocking the one-at-a-time dispatcher.
+async function markProcessingJobStale(
+    bucket: R2Bucket,
+    key: string,
+    data: Record<string, unknown>,
+    uploadedAt: Date,
+): Promise<void> {
+    const nowIso = new Date().toISOString()
+    const idFromKey = key.replace(/^_processing\//, '').replace(/\.json$/i, '').trim()
+    const id = String(data.id || idFromKey || '').trim()
+    const failedRecord = {
+        ...data,
+        id,
+        status: 'failed',
+        error: sanitizeProcessingError(data.error || getProcessingJobStaleError(data)),
+        errorCategory: String(data.errorCategory || getProcessingJobStaleCategory(data)).trim(),
+        staleTimedOutAt: nowIso,
+        failedAt: nowIso,
+        updatedAt: nowIso,
+        createdAt: String(data.createdAt || data.startedAt || '').trim() || uploadedAt.toISOString(),
+    }
+    await bucket.put(key, JSON.stringify(failedRecord, null, 2), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    await putProcessingHistoryRecord(bucket, id, failedRecord).catch(() => { })
+}
+
 async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
     const processingList = await bucket.list({ prefix: '_processing/' })
     // Only records uploaded within the stale-check window can still flip from
@@ -17748,24 +17780,7 @@ async function expireStaleProcessingJobs(bucket: R2Bucket): Promise<number> {
         const data = await dataObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
         if (!isProcessingJobStale(data, obj.uploaded)) return 0
 
-        const nowIso = new Date().toISOString()
-        const idFromKey = obj.key.replace(/^_processing\//, '').replace(/\.json$/i, '').trim()
-        const id = String(data.id || idFromKey || '').trim()
-        const failedRecord = {
-            ...data,
-            id,
-            status: 'failed',
-            error: sanitizeProcessingError(data.error || getProcessingJobStaleError(data)),
-            errorCategory: String(data.errorCategory || getProcessingJobStaleCategory(data)).trim(),
-            staleTimedOutAt: nowIso,
-            failedAt: nowIso,
-            updatedAt: nowIso,
-            createdAt: String(data.createdAt || data.startedAt || '').trim() || obj.uploaded.toISOString(),
-        }
-        await bucket.put(obj.key, JSON.stringify(failedRecord, null, 2), {
-            httpMetadata: { contentType: 'application/json' },
-        })
-        await putProcessingHistoryRecord(bucket, id, failedRecord).catch(() => { })
+        await markProcessingJobStale(bucket, obj.key, data, obj.uploaded)
         return 1
     }))
     return results.reduce((acc, n) => acc + n, 0)
