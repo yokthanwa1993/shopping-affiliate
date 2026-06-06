@@ -51,12 +51,15 @@ import {
     normalizeJobBool,
     normalizeRegistryLimit,
     normalizeRegistryOffset,
+    parseAffiliateId,
     parseTrackingSubIds,
     pickPrimaryAffiliateUrl,
     replaceShortlinkInMessage,
     resolveCreateNewBlockedReason,
     resolveEffectiveTargetSub4,
     resolvePageCommentLinkJobStatus,
+    resolveTargetAffiliateId,
+    verifyAffiliateId,
     verifyRewrittenShortlink,
     type JobItemStatus,
     type RewriteAction,
@@ -7656,6 +7659,7 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
             other_comment_count: otherCommentCount,
             old_shortlink: oldShortlink,
             expanded_url: expandedUrl,
+            old_affiliate_id: parseAffiliateId(expandedUrl || oldShortlink),
             utm_content: sub.utm_content,
             sub1: sub.sub1,
             sub2: sub.sub2,
@@ -7767,15 +7771,30 @@ async function ensurePageCommentLinkWorkflowTables(db: D1Database): Promise<void
             await db.prepare(PAGE_COMMENT_LINK_JOBS_TABLE_SQL).run()
             await db.prepare(PAGE_COMMENT_LINK_JOBS_INDEX_SQL).run().catch(() => { })
             await db.prepare(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL).run()
-            const addJobItemColumn = async (sql: string) => {
+            const addColumn = async (sql: string) => {
                 await db.prepare(sql).run().catch((err) => {
                     const message = String(err?.message || err || '').toLowerCase()
                     if (message.includes('duplicate column') || message.includes('already exists')) return
                     throw err
                 })
             }
-            await addJobItemColumn(`ALTER TABLE page_comment_link_job_items ADD COLUMN log_id TEXT NOT NULL DEFAULT ''`)
-            await addJobItemColumn(`ALTER TABLE page_comment_link_job_items ADD COLUMN target_sub4 TEXT NOT NULL DEFAULT ''`)
+            await addColumn(`ALTER TABLE page_comment_link_job_items ADD COLUMN log_id TEXT NOT NULL DEFAULT ''`)
+            await addColumn(`ALTER TABLE page_comment_link_job_items ADD COLUMN target_sub4 TEXT NOT NULL DEFAULT ''`)
+            // Affiliate id tracking (added after 0020/0021). Mirror migration 0022:
+            // add the five columns to BOTH tables, idempotent + safe on existing
+            // production tables (duplicate-column errors are swallowed above).
+            const affiliateColumns: Array<[string, string]> = [
+                ['old_affiliate_id', `TEXT NOT NULL DEFAULT ''`],
+                ['target_affiliate_id', `TEXT NOT NULL DEFAULT ''`],
+                ['new_affiliate_id', `TEXT NOT NULL DEFAULT ''`],
+                ['affiliate_verify_status', `TEXT NOT NULL DEFAULT ''`],
+                ['affiliate_id_match', `INTEGER NOT NULL DEFAULT 0`],
+            ]
+            for (const table of ['page_comment_link_registry', 'page_comment_link_job_items']) {
+                for (const [name, def] of affiliateColumns) {
+                    await addColumn(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`)
+                }
+            }
         })()
     }
     await pageCommentLinkWorkflowTablesReady
@@ -7864,7 +7883,7 @@ const str = (v: unknown): string => String(v == null ? '' : v).trim()
 // Normalise a registry-shaped input item (as returned by GET …/page-comment-link-registry)
 // and compute the rewrite PLAN. Pure-ish: no network, no DB. The action says how
 // the new link would land; status is 'skipped' when there is nothing to rewrite.
-function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string; allowCreateNew?: boolean }) {
+function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string; allowCreateNew?: boolean; customlinkId?: string }) {
     const pageId = opts.pageId
     const fbVideoId = str(raw.fb_video_id) || str(raw.video_id) || str(raw.reel_id)
     const reelId = str(raw.reel_id) || fbVideoId
@@ -7885,6 +7904,8 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const oldSub5 = str(raw.old_sub5) || str(raw.sub5)
     const logId = resolveEffectiveTargetSub4(raw)
     const allowCreateNew = opts.allowCreateNew === true
+    const targetAffiliateId = resolveTargetAffiliateId(opts.customlinkId)
+    const oldAffiliateId = str(raw.old_affiliate_id) || parseAffiliateId(oldExpandedUrl || oldShortlink)
 
     const productUrl = canonicalizeProductUrl(str(raw.product_url) || oldExpandedUrl || oldShortlink)
     const hasRewriteableLink = !!productUrl
@@ -7893,7 +7914,7 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const action: RewriteAction = computeWriteAction({ pageId, commentFromId, oldCommentId, hasRewriteableLink, allowCreateNew })
     const expectedUtmContent = buildExpectedUtmContent(subs)
     const customlinkRequestUrl = hasRewriteableLink
-        ? buildCustomlinkRequestUrl({ productUrl, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: subs.sub4 })
+        ? buildCustomlinkRequestUrl({ productUrl, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: subs.sub4, id: targetAffiliateId })
         : ''
 
     const reasons: string[] = []
@@ -7936,6 +7957,11 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
         new_shortlink: '',
         new_expanded_url: '',
         new_utm_content: '',
+        old_affiliate_id: oldAffiliateId,
+        target_affiliate_id: targetAffiliateId,
+        new_affiliate_id: '',
+        affiliate_verify_status: status === 'planned' ? 'pending' : '',
+        affiliate_id_match: 0,
         customlink_request_url: customlinkRequestUrl,
         expected_utm_content: expectedUtmContent,
         action,
@@ -7961,16 +7987,18 @@ async function upsertPageCommentLinkRegistry(db: D1Database, item: PageCommentLi
         `INSERT OR REPLACE INTO page_comment_link_registry
             (page_id, fb_video_id, reel_id, post_id, canonical_post_id, comment_target_id, comment_id,
              comment_from_id, comment_from_name, old_message, old_shortlink, old_expanded_url, old_utm_content,
-             old_sub1, old_sub2, old_sub3, old_sub4, old_sub5, product_url, status, last_audited_at,
+             old_sub1, old_sub2, old_sub3, old_sub4, old_sub5, product_url, old_affiliate_id, target_affiliate_id,
+             new_affiliate_id, affiliate_verify_status, affiliate_id_match, status, last_audited_at,
              created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?,?,?,
+         VALUES (?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?,?,
              COALESCE((SELECT created_at FROM page_comment_link_registry WHERE page_id = ? AND fb_video_id = ?), datetime('now')),
              datetime('now'))`
     ).bind(
         item.page_id, item.fb_video_id, item.reel_id, item.post_id, item.canonical_post_id, item.comment_target_id, item.old_comment_id,
         item.comment_from_id, item.comment_from_name, item.old_message, item.old_shortlink, item.old_expanded_url, item.old_utm_content,
-        item.old_sub1, item.old_sub2, item.old_sub3, item.old_sub4, item.old_sub5, item.product_url, item.status, auditedAt,
-        item.page_id, item.fb_video_id,
+        item.old_sub1, item.old_sub2, item.old_sub3, item.old_sub4, item.old_sub5, item.product_url,
+        item.old_affiliate_id, item.target_affiliate_id, item.new_affiliate_id, item.affiliate_verify_status, item.affiliate_id_match,
+        item.status, auditedAt, item.page_id, item.fb_video_id,
     ).run().catch(() => { })
 }
 
@@ -7981,13 +8009,15 @@ async function insertPageCommentLinkJobItem(db: D1Database, jobId: string, index
              old_comment_id, new_comment_id, comment_from_id, comment_from_name, old_message, new_message,
              old_shortlink, old_expanded_url, old_utm_content, old_sub1, old_sub2, old_sub3, old_sub4, old_sub5,
              product_url, target_sub1, target_sub2, target_sub3, target_sub4, new_shortlink, new_expanded_url, new_utm_content,
+             old_affiliate_id, target_affiliate_id, new_affiliate_id, affiliate_verify_status, affiliate_id_match,
              action, status, reason, error, attempts, last_audited_at, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))`
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))`
     ).bind(
         jobId, index, item.page_id, item.log_id, item.fb_video_id, item.reel_id, item.post_id, item.canonical_post_id, item.comment_target_id,
         item.old_comment_id, item.new_comment_id, item.comment_from_id, item.comment_from_name, item.old_message, item.new_message,
         item.old_shortlink, item.old_expanded_url, item.old_utm_content, item.old_sub1, item.old_sub2, item.old_sub3, item.old_sub4, item.old_sub5,
         item.product_url, item.target_sub1, item.target_sub2, item.target_sub3, item.target_sub4, item.new_shortlink, item.new_expanded_url, item.new_utm_content,
+        item.old_affiliate_id, item.target_affiliate_id, item.new_affiliate_id, item.affiliate_verify_status, item.affiliate_id_match,
         item.action, item.status, item.reason, item.error, item.attempts, auditedAt,
     ).run()
 }
@@ -8030,12 +8060,13 @@ app.post('/api/dashboard/page-comment-link-rewrite-preview', async (c) => {
     const pageId = str(body.page_id) || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID
     const requestedSub1 = str(body.target_sub1) || str(body.sub1)
     const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
+    const customlinkId = resolveTargetAffiliateId(str(body.customlink_id) || CUSTOMLINK_DEFAULT_ID)
     const rawItems = readRewriteItemsFromBody(body)
     if (rawItems.length === 0) return c.json({ ok: false, error: 'items_required' }, 400)
 
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
     const auditedAt = new Date().toISOString()
-    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew }))
+    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew, customlinkId }))
     for (const item of items) await upsertPageCommentLinkRegistry(c.env.DB, item, auditedAt)
 
     const summary = { total: items.length, ...summarizePlanItems(items) }
@@ -8049,7 +8080,7 @@ app.post('/api/dashboard/page-comment-link-rewrite-preview', async (c) => {
         target_sub1: requestedSub1,
         count_returned: items.length,
         requested_sub1: requestedSub1,
-        customlink_id: CUSTOMLINK_DEFAULT_ID,
+        customlink_id: customlinkId,
         last_audited_at: auditedAt,
         summary,
         items,
@@ -8067,13 +8098,13 @@ app.post('/api/dashboard/page-comment-link-jobs', async (c) => {
     const dryRun = normalizeJobBool(body.dry_run, JOB_DEFAULT_DRY_RUN)
     const batchSize = clampBatchSize(body.batch_size)
     const stopOnFirstError = normalizeJobBool(body.stop_on_first_error, JOB_DEFAULT_STOP_ON_FIRST_ERROR)
-    const customlinkId = str(body.customlink_id) || CUSTOMLINK_DEFAULT_ID
+    const customlinkId = resolveTargetAffiliateId(str(body.customlink_id) || CUSTOMLINK_DEFAULT_ID)
     const rawItems = readRewriteItemsFromBody(body)
     if (rawItems.length === 0) return c.json({ ok: false, error: 'items_required' }, 400)
 
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
     const auditedAt = new Date().toISOString()
-    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew }))
+    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew, customlinkId }))
     const counts = summarizePlanItems(items)
     const jobId = `pclj_${crypto.randomUUID().replace(/-/g, '')}`
 
@@ -8213,6 +8244,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         const targetSub2 = str(row.target_sub2)
         const targetSub3 = str(row.target_sub3)
         const targetSub4 = resolveEffectiveTargetSub4(row)
+        const targetAffiliateId = str(row.target_affiliate_id) || resolveTargetAffiliateId(customlinkId)
         const productUrl = str(row.product_url)
         const oldShortlink = str(row.old_shortlink)
         const oldMessage = String(row.old_message ?? '')
@@ -8256,6 +8288,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                 customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId }),
                 expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 }),
                 target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: targetSub4,
+                target_affiliate_id: targetAffiliateId, affiliate_verify_status: 'pending', affiliate_id_match: 0,
             })
             continue
         }
@@ -8269,7 +8302,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         const requestUrl = buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId })
         const minted = await mintCustomlinkShortlink(requestUrl)
         if (!minted.ok) {
-            await updateItem(index, { status: 'failed', reason: 'shortlink_failed', error: minted.error, attempts })
+            await updateItem(index, { status: 'failed', reason: 'shortlink_failed', error: minted.error, attempts, affiliate_verify_status: 'error', affiliate_id_match: 0 })
             failedCount++
             processed.push({ item_index: index, status: 'failed', reason: 'shortlink_failed' })
             if (stopOnFirstError) { stoppedReason = 'shortlink_failed'; break }
@@ -8277,15 +8310,31 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         }
         const newShortlink = minted.shortLink
         const expanded = await expandShortlinkFinalUrl(newShortlink)
-        const verifyLink = verifyRewrittenShortlink(expanded.finalUrl || newShortlink, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 })
+        const expandedNewUrl = expanded.finalUrl || newShortlink
+        const verifyLink = verifyRewrittenShortlink(expandedNewUrl, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 })
+        const affiliateVerify = verifyAffiliateId(expandedNewUrl, targetAffiliateId)
         if (!verifyLink.ok) {
             await updateItem(index, {
                 status: 'failed', reason: `shortlink_verify_${verifyLink.reason}`,
-                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, attempts,
+                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content,
+                new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status,
+                affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, attempts,
             })
             failedCount++
             processed.push({ item_index: index, status: 'failed', reason: `shortlink_verify_${verifyLink.reason}` })
             if (stopOnFirstError) { stoppedReason = 'shortlink_verify_failed'; break }
+            continue
+        }
+        if (affiliateVerify.affiliate_verify_status !== 'verified') {
+            await updateItem(index, {
+                status: 'failed', reason: `shortlink_verify_affiliate_${affiliateVerify.affiliate_verify_status}`,
+                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content,
+                new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status,
+                affiliate_id_match: 0, attempts,
+            })
+            failedCount++
+            processed.push({ item_index: index, status: 'failed', reason: `shortlink_verify_affiliate_${affiliateVerify.affiliate_verify_status}`, new_affiliate_id: affiliateVerify.new_affiliate_id, target_affiliate_id: targetAffiliateId })
+            if (stopOnFirstError) { stoppedReason = 'shortlink_verify_affiliate_failed'; break }
             continue
         }
 
@@ -8345,7 +8394,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                 if (!allowCreateNew) {
                     await updateItem(index, {
                         status: 'failed', reason: 'edit_failed_create_new_not_allowed', error: writeError, attempts,
-                        new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_message: newMessage,
+                        new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, new_message: newMessage,
                     })
                     failedCount++
                     processed.push({ item_index: index, status: 'failed', action: 'edit', reason: 'edit_failed_create_new_not_allowed' })
@@ -8373,7 +8422,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                 if (sig.stop) { stopSignal = sig; break }
             }
             if (stopSignal.stop && !newCommentId) {
-                await updateItem(index, { status: 'failed', reason: `stop_${stopSignal.reason}`, error: writeError, attempts, new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_message: newMessage })
+                await updateItem(index, { status: 'failed', reason: `stop_${stopSignal.reason}`, error: writeError, attempts, new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, new_message: newMessage })
                 failedCount++
                 processed.push({ item_index: index, status: 'failed', reason: `stop_${stopSignal.reason}` })
                 stoppedReason = stopSignal.reason
@@ -8384,7 +8433,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         if (!newCommentId) {
             await updateItem(index, {
                 status: 'failed', reason: 'comment_write_failed', error: writeError || 'comment_write_failed', attempts,
-                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_message: newMessage,
+                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, new_message: newMessage,
             })
             failedCount++
             processed.push({ item_index: index, status: 'failed', reason: 'comment_write_failed' })
@@ -8403,10 +8452,12 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         await updateItem(index, {
             status: finalStatus, action: finalAction, new_comment_id: newCommentId, new_message: newMessage,
             new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content,
+            new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status,
+            affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0,
             comment_target_id: verifyTarget, reason: matched ? '' : 'post_write_verify_failed', error: '', attempts,
         })
         if (matched) doneCount++; else failedCount++
-        processed.push({ item_index: index, status: finalStatus, action: finalAction, new_comment_id: newCommentId })
+        processed.push({ item_index: index, status: finalStatus, action: finalAction, new_comment_id: newCommentId, new_affiliate_id: affiliateVerify.new_affiliate_id, target_affiliate_id: targetAffiliateId, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, affiliate_verify_status: affiliateVerify.affiliate_verify_status })
         if (!matched && stopOnFirstError) { stoppedReason = 'verify_failed'; break }
     }
 
@@ -8509,13 +8560,14 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
         const matched = live.ok && isAffiliateCommentMatch(live.comments, {
             commentId: str(row.new_comment_id), expectedMessage: String(row.new_message ?? ''), affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
         }).matched
-        const ok = matched && linkVerify.ok
+        const affiliateVerify = verifyAffiliateId(str(row.new_expanded_url) || str(row.new_shortlink), str(row.target_affiliate_id))
+        const ok = matched && linkVerify.ok && affiliateVerify.affiliate_verify_status === 'verified'
         const status: JobItemStatus = ok ? 'done' : 'verify_failed'
         await c.env.DB.prepare(
-            `UPDATE page_comment_link_job_items SET status = ?, reason = ?, last_audited_at = ?, updated_at = datetime('now') WHERE job_id = ? AND item_index = ?`
-        ).bind(status, ok ? '' : `verify_${matched ? linkVerify.reason || 'link' : 'comment_missing'}`, new Date().toISOString(), jobId, index).run().catch(() => { })
+            `UPDATE page_comment_link_job_items SET status = ?, reason = ?, new_affiliate_id = ?, affiliate_verify_status = ?, affiliate_id_match = ?, last_audited_at = ?, updated_at = datetime('now') WHERE job_id = ? AND item_index = ?`
+        ).bind(status, ok ? '' : `verify_${matched ? (linkVerify.reason || (affiliateVerify.affiliate_verify_status !== 'verified' ? `affiliate_${affiliateVerify.affiliate_verify_status}` : 'link')) : 'comment_missing'}`, affiliateVerify.new_affiliate_id, affiliateVerify.affiliate_verify_status, affiliateVerify.affiliate_id_match ? 1 : 0, new Date().toISOString(), jobId, index).run().catch(() => { })
         if (ok) verifiedCount++
-        results.push({ item_index: index, verified: ok, comment_present: matched, link_ok: linkVerify.ok, new_comment_id: str(row.new_comment_id) })
+        results.push({ item_index: index, verified: ok, comment_present: matched, link_ok: linkVerify.ok, new_comment_id: str(row.new_comment_id), target_affiliate_id: str(row.target_affiliate_id), new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0 })
     }
 
     return c.json({
@@ -8555,6 +8607,11 @@ app.get('/api/dashboard/page-comment-link-jobs/:job_id/history', async (c) => {
         new_expanded_url: str(it.new_expanded_url),
         old_utm_content: str(it.old_utm_content),
         new_utm_content: str(it.new_utm_content),
+        old_affiliate_id: str(it.old_affiliate_id),
+        target_affiliate_id: str(it.target_affiliate_id),
+        new_affiliate_id: str(it.new_affiliate_id),
+        affiliate_verify_status: str(it.affiliate_verify_status),
+        affiliate_id_match: Number(it.affiliate_id_match || 0),
         target_sub1: str(it.target_sub1),
         target_sub2: str(it.target_sub2),
         target_sub3: str(it.target_sub3),

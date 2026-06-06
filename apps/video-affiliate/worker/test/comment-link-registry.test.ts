@@ -6,6 +6,7 @@ import {
     JOB_DEFAULT_BATCH_SIZE,
     JOB_MAX_BATCH_SIZE,
     PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL,
+    PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL,
     REGISTRY_DEFAULT_LIMIT,
     REGISTRY_MAX_LIMIT,
     buildCustomlinkRequestUrl,
@@ -23,12 +24,15 @@ import {
     normalizeJobBool,
     normalizeRegistryLimit,
     normalizeRegistryOffset,
+    parseAffiliateId,
     parseTrackingSubIds,
     pickPrimaryAffiliateUrl,
+    resolveTargetAffiliateId,
     replaceShortlinkInMessage,
     resolveCreateNewBlockedReason,
     resolveEffectiveTargetSub4,
     resolvePageCommentLinkJobStatus,
+    verifyAffiliateId,
     verifyRewrittenShortlink,
 } from '../src/comment-link-registry.js'
 
@@ -475,6 +479,76 @@ test('resolvePageCommentLinkJobStatus advances a real write run as before', () =
         effectiveWriteMode: true, previousStatus: 'running', remainingPlanned: 2,
         doneCount: 1, failedCount: 1, stoppedReason: 'policy_block_368',
     }), 'partial')
+})
+
+// --- Affiliate id tracking --------------------------------------------------
+
+test('parseAffiliateId reads the customlink id= param (digits only, fail-closed)', () => {
+    assert.equal(parseAffiliateId('https://customlink.wwoom.com/?id=15130770000&url=x'), '15130770000')
+    assert.equal(parseAffiliateId('https://customlink.wwoom.com/?id=an_15130770000'), '15130770000')
+    assert.equal(parseAffiliateId('https://customlink.wwoom.com/?id=https%3A%2F%2Fexample.com'), '')
+    // The minted short code form has no id= param → nothing to read here.
+    assert.equal(parseAffiliateId('https://customlink.wwoom.com/abcDEF'), '')
+})
+
+test('parseAffiliateId reads Shopee an_<id> from utm_source / mmp_pid', () => {
+    assert.equal(
+        parseAffiliateId('https://shopee.co.th/product/1/2?mmp_pid=an_15130770000&utm_source=an_15130770000'),
+        '15130770000',
+    )
+    assert.equal(parseAffiliateId('https://shopee.co.th/product/1/2?utm_source=an_99999'), '99999')
+    assert.equal(parseAffiliateId('https://shopee.co.th/product/1/2?mmp_pid=an_77777'), '77777')
+})
+
+test('parseAffiliateId fails closed for missing / non-affiliate / non-numeric markers', () => {
+    assert.equal(parseAffiliateId('https://shopee.co.th/product/1/2'), '')
+    assert.equal(parseAffiliateId('https://shopee.co.th/product/1/2?utm_source=organic'), '')
+    assert.equal(parseAffiliateId('https://shopee.co.th/product/1/2?mmp_pid=an_77777x'), '')
+    // utm_campaign is intentionally NOT parsed: the shared extractor only treats
+    // utm_source / mmp_pid as affiliate id sources, so this stays empty (safe).
+    assert.equal(parseAffiliateId('https://shopee.co.th/product/1/2?utm_campaign=an_55555'), '')
+    assert.equal(parseAffiliateId('not a url'), '')
+})
+
+test('resolveTargetAffiliateId defaults to the CHEARB customlink id, honours overrides', () => {
+    assert.equal(resolveTargetAffiliateId(''), CUSTOMLINK_DEFAULT_ID)
+    assert.equal(resolveTargetAffiliateId(undefined), CUSTOMLINK_DEFAULT_ID)
+    assert.equal(resolveTargetAffiliateId(null), CUSTOMLINK_DEFAULT_ID)
+    assert.equal(resolveTargetAffiliateId('25551212'), '25551212')
+    assert.equal(resolveTargetAffiliateId('an_25551212'), '25551212')
+    assert.equal(resolveTargetAffiliateId('mmp_pid=an_25551212'), CUSTOMLINK_DEFAULT_ID)
+})
+
+test('verifyAffiliateId flags match, mismatch and missing affiliate ids', () => {
+    const match = verifyAffiliateId('https://shopee.co.th/product/1/2?mmp_pid=an_15130770000', '15130770000')
+    assert.deepEqual(match, {
+        new_affiliate_id: '15130770000', affiliate_id_match: true, affiliate_verify_status: 'verified',
+    })
+
+    const mismatch = verifyAffiliateId('https://shopee.co.th/product/1/2?utm_source=an_99999', '15130770000')
+    assert.equal(mismatch.new_affiliate_id, '99999')
+    assert.equal(mismatch.affiliate_id_match, false)
+    assert.equal(mismatch.affiliate_verify_status, 'mismatch')
+
+    const missing = verifyAffiliateId('https://shopee.co.th/product/1/2', '15130770000')
+    assert.deepEqual(missing, {
+        new_affiliate_id: '', affiliate_id_match: false, affiliate_verify_status: 'missing',
+    })
+
+    // No target id to compare against → never a false "verified".
+    const noTarget = verifyAffiliateId('https://shopee.co.th/product/1/2?mmp_pid=an_15130770000', '')
+    assert.equal(noTarget.affiliate_id_match, false)
+    assert.equal(noTarget.affiliate_verify_status, 'mismatch')
+})
+
+test('page comment tables carry affiliate id tracking columns on registry and job items', () => {
+    for (const sql of [PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL, PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL]) {
+        assert.match(sql, /old_affiliate_id TEXT NOT NULL DEFAULT ''/)
+        assert.match(sql, /target_affiliate_id TEXT NOT NULL DEFAULT ''/)
+        assert.match(sql, /new_affiliate_id TEXT NOT NULL DEFAULT ''/)
+        assert.match(sql, /affiliate_verify_status TEXT NOT NULL DEFAULT ''/)
+        assert.match(sql, /affiliate_id_match INTEGER NOT NULL DEFAULT 0/)
+    }
 })
 
 test('resolvePageCommentLinkJobStatus reaches terminal state when nothing remains', () => {

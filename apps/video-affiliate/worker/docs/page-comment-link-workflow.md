@@ -48,6 +48,28 @@ unchanged.
 - `buildCustomlinkRequestUrl` canonicalizes `productUrl` defensively, so the
   customlink `url=` parameter can never carry stale Shopee tracking params.
 
+### Affiliate id (account id) tracking
+
+Separate from the `sub1..sub5` campaign ids, every link also carries an
+**affiliate account id**. Only the **plain numeric** id is ever parsed, stored or
+compared — e.g. `15130770000`, never `an_15130770000` and never a full
+`mmp_pid`/`utm_source` token:
+
+- `parseAffiliateId(url)` reads the id from the customlink wrapper
+  (`customlink.wwoom.com/?id=<id>`) or the expanded Shopee form
+  (`utm_source=an_<id>` / `mmp_pid=an_<id>`). Both go through the shared
+  fail-closed `normalizeShortlinkExpectedUtmId` (strips `an_`, digits-only,
+  length-capped), so a raw token can never be mistaken for an id. Returns `''`
+  when nothing valid is found.
+- `resolveTargetAffiliateId(override?)` is the id the rewrite SHOULD mint with:
+  the CHEARB `CUSTOMLINK_DEFAULT_ID` (`15130770000`) unless a numeric override
+  normalises cleanly.
+- `verifyAffiliateId(expandedUrl, target)` compares by **strict numeric-string
+  equality only** (`new_affiliate_id === target_affiliate_id`): no id on the
+  link → `missing`; present but unequal (or no target) → `mismatch`; equal →
+  `verified`. The raw customlink URL is NOT stored for this — the numeric id is
+  enough.
+
 ## Endpoints (all under `/api/dashboard`)
 
 | Method & path | Mode | Notes |
@@ -98,14 +120,22 @@ Tables added in `schema.sql` and `migrations/0020_page_comment_link_workflow.sql
 - `page_comment_link_jobs` — one rewrite batch (`dry_run`, `batch_size`, `stop_on_first_error`, counters).
 - `page_comment_link_job_items` — per-comment plan/result with full old/new history (PK `job_id, item_index`).
 
+Both the registry and job-items tables carry affiliate-id tracking columns:
+`old_affiliate_id`, `target_affiliate_id`, `new_affiliate_id` (plain numeric
+strings), `affiliate_verify_status` (`'' | verified | mismatch | missing`), and
+`affiliate_id_match` (`INTEGER 0/1`). Existing D1 tables receive those columns
+through `migrations/0022_page_comment_link_affiliate_id_tracking.sql`.
+
 Apply:
 
 ```bash
 # from repo root
 npm run db:migrate:video-affiliate:local   # local
 npm run db:migrate:video-affiliate          # prod (schema.sql)
-# or the single migration file:
+# or the workflow migration files:
 wrangler d1 execute video-affiliate-db --local --file=./migrations/0020_page_comment_link_workflow.sql
+wrangler d1 execute video-affiliate-db --local --file=./migrations/0021_page_comment_link_job_items_target_sub4.sql
+wrangler d1 execute video-affiliate-db --local --file=./migrations/0022_page_comment_link_affiliate_id_tracking.sql
 ```
 
 Tables are also auto-created at runtime via `ensurePageCommentLinkWorkflowTables`,

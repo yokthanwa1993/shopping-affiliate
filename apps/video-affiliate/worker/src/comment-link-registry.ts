@@ -9,6 +9,8 @@
 // bounded redirect expansion — but every decision that can be made from strings
 // alone lives here and is covered by test/comment-link-registry.test.ts.
 
+import { extractShopeeAffiliateIdFromLink, normalizeShortlinkExpectedUtmId } from './shopee-affiliate-id.js'
+
 export const REGISTRY_MAX_LIMIT = 100
 export const REGISTRY_DEFAULT_LIMIT = 25
 
@@ -171,6 +173,70 @@ export function parseTrackingSubIds(url: string): ParsedTrackingSubIds {
         }
     }
     return { utm_content: '', ...direct }
+}
+
+// Parse the affiliate/customlink ACCOUNT id from an affiliate URL — distinct
+// from the sub1..sub5 campaign tracking ids above. Two sources are recognised:
+//   1. customlink wrapper:  customlink.<tld>/?id=<affiliateId>
+//   2. Shopee redirect/expanded form:  utm_source=an_<id> | mmp_pid=an_<id>
+// Both go through the shared, fail-closed `normalizeShortlinkExpectedUtmId`
+// (strips an_, keeps a digits-only id, caps length) so a raw token / opaque
+// value can never be mistaken for — or stored as — an affiliate id. The Shopee
+// markers reuse the existing `extractShopeeAffiliateIdFromLink` helper.
+// `utm_campaign` is intentionally NOT read: the shared extractor only treats
+// utm_source / mmp_pid as affiliate id sources, so adding it here would be an
+// unverified, unsafe parse. Returns '' when no affiliate id can be recovered.
+export function parseAffiliateId(url: string): string {
+    const u = safeUrl(url)
+    if (!u) return ''
+    if (CUSTOMLINK_HOST_PATTERN.test(u.hostname)) {
+        const idParam = normalizeShortlinkExpectedUtmId(u.searchParams.get('id'))
+        if (idParam) return idParam
+    }
+    return extractShopeeAffiliateIdFromLink(url)
+}
+
+// Resolve the affiliate id the rewrite SHOULD mint with. Defaults to the CHEARB
+// customlink account id; an operator override is honoured ONLY when it normalises
+// to a valid numeric id (an_ stripped, digits-only, length-capped). Anything
+// invalid/non-numeric fails closed to the default so a raw token can never be
+// stored or sent as the target affiliate id.
+export function resolveTargetAffiliateId(rawOverride?: string | null | undefined): string {
+    const override = normalizeShortlinkExpectedUtmId(rawOverride)
+    return override || CUSTOMLINK_DEFAULT_ID
+}
+
+// Status carried by a verified link. The route handlers layer on two more states
+// that are NOT decidable from strings alone: 'pending' (dry-run, link not written
+// yet) and 'error' (the shortlink could not be minted at all).
+export type AffiliateVerifyStatus = 'verified' | 'mismatch' | 'missing'
+
+export type VerifyAffiliateIdResult = {
+    new_affiliate_id: string
+    affiliate_id_match: boolean
+    affiliate_verify_status: AffiliateVerifyStatus
+}
+
+// Verify the affiliate id carried by the NEW (expanded) shortlink against the
+// target id. Comparison is strict numeric-string equality only:
+//   new_affiliate_id === target_affiliate_id. No affiliate id on the link →
+// 'missing'; an exact match → 'verified'; present but unequal (or no target to
+// compare against) → 'mismatch' (never a false 'verified').
+export function verifyAffiliateId(
+    expandedUrl: string,
+    targetAffiliateId: string,
+): VerifyAffiliateIdResult {
+    const newId = parseAffiliateId(expandedUrl)
+    const target = normalizeShortlinkExpectedUtmId(targetAffiliateId)
+    if (!newId) {
+        return { new_affiliate_id: '', affiliate_id_match: false, affiliate_verify_status: 'missing' }
+    }
+    const match = !!target && newId === target
+    return {
+        new_affiliate_id: newId,
+        affiliate_id_match: match,
+        affiliate_verify_status: match ? 'verified' : 'mismatch',
+    }
 }
 
 // Strip tracking params (UTM, sub-ids, click-ids, Shopee mobile/redirect junk)
@@ -647,6 +713,11 @@ export const PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL = `CREATE TABLE IF NOT EXISTS 
     old_sub4 TEXT NOT NULL DEFAULT '',
     old_sub5 TEXT NOT NULL DEFAULT '',
     product_url TEXT NOT NULL DEFAULT '',
+    old_affiliate_id TEXT NOT NULL DEFAULT '',
+    target_affiliate_id TEXT NOT NULL DEFAULT '',
+    new_affiliate_id TEXT NOT NULL DEFAULT '',
+    affiliate_verify_status TEXT NOT NULL DEFAULT '',
+    affiliate_id_match INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT '',
     last_audited_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -706,6 +777,11 @@ export const PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS
     new_shortlink TEXT NOT NULL DEFAULT '',
     new_expanded_url TEXT NOT NULL DEFAULT '',
     new_utm_content TEXT NOT NULL DEFAULT '',
+    old_affiliate_id TEXT NOT NULL DEFAULT '',
+    target_affiliate_id TEXT NOT NULL DEFAULT '',
+    new_affiliate_id TEXT NOT NULL DEFAULT '',
+    affiliate_verify_status TEXT NOT NULL DEFAULT '',
+    affiliate_id_match INTEGER NOT NULL DEFAULT 0,
     action TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'planned',
     reason TEXT NOT NULL DEFAULT '',
