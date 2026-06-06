@@ -9029,72 +9029,165 @@ app.post('/api/dashboard/facebook-page-videos/refresh-all-views', async (c) => {
 // post description + first page-authored comment for shopee links.
 // Use this when DB-side fallback chain cannot find the link.
 app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c) => {
+    // Date-bounded, dry-run-by-default audit/backfill for Shopee links on cached
+    // Facebook page videos. Reads ONLY via Graph GET (video caption/title/permalink/
+    // post_id plus a small bounded comment window) and, in write mode, updates ONLY
+    // the D1 cache (shopee_link / post_id / audit timestamps). It never writes to
+    // Facebook, never edits comments, and never mints customlinks.
+    //
+    // Backward compatibility: old callers POST { page_id, limit } without dry_run.
+    // dry_run now DEFAULTS TO TRUE, so those callers become a safe read-only audit
+    // (no D1 writes) instead of silently mutating rows.
     const body = await c.req.json().catch(() => ({})) as {
         page_id?: string
+        from_date?: string
+        to_date?: string
         limit?: number
-        include_with_post_id?: boolean
+        offset?: number
+        only_missing?: boolean
+        dry_run?: boolean
     }
-    const pageId = String(body.page_id || '').trim()
-    const limitRaw = Number(body.limit || 100)
-    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 100
-    const includeWithPostId = !!body.include_with_post_id
+    // Harmless query-string fallback for each param (body wins when present).
+    const queryStr = (name: string): string => String(c.req.query(name) ?? '').trim()
+    // A value explicitly meaning "false" (used for tri-state boolean defaults).
+    const isExplicitFalse = (v: unknown): boolean => {
+        const s = String(v ?? '').trim().toLowerCase()
+        return v === false || s === 'false' || s === '0' || s === 'no' || s === 'off'
+    }
+
+    const pageId = String(body.page_id ?? queryStr('page_id') ?? '').trim()
     if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+
+    // dry_run defaults TRUE; only an explicit false (body or query) enables writes.
+    const dryRunRaw = body.dry_run !== undefined ? body.dry_run : c.req.query('dry_run')
+    const dryRun = !isExplicitFalse(dryRunRaw)
+    const writeMode = !dryRun
+
+    // only_missing defaults TRUE; only an explicit false includes rows that already
+    // have a cache shopee_link (counted as "existing").
+    const onlyMissingRaw = body.only_missing !== undefined ? body.only_missing : c.req.query('only_missing')
+    const onlyMissing = !isExplicitFalse(onlyMissingRaw)
+
+    // Bounded scan window. limit is capped small (<=150); offset is bounded.
+    const limitRaw = Number(body.limit ?? c.req.query('limit') ?? 100)
+    const limit = Number.isFinite(limitRaw) ? Math.min(150, Math.max(1, Math.floor(limitRaw))) : 100
+    const offsetRaw = Number(body.offset ?? c.req.query('offset') ?? 0)
+    const offset = Number.isFinite(offsetRaw) ? Math.min(10000, Math.max(0, Math.floor(offsetRaw))) : 0
+
+    // Dates validated with the same whitelist/next-day helpers used by the read API.
+    const fromInput = sanitizeFacebookPageVideoDateInput(body.from_date ?? c.req.query('from_date'))
+    const toInput = sanitizeFacebookPageVideoDateInput(body.to_date ?? c.req.query('to_date'))
+    const fromDate = fromInput?.value || ''
+    const toDate = toInput?.value || ''
+
+    // Write mode is the only path that mutates D1, so it requires an explicit, valid
+    // date range to keep the blast radius bounded. dry_run may run unbounded reads.
+    if (writeMode) {
+        if (!fromInput || !toInput) return c.json({ ok: false, error: 'date_range_required_for_write' }, 400)
+        if (fromInput.value > toInput.value) return c.json({ ok: false, error: 'invalid_date_range' }, 400)
+    }
 
     const token = await resolveFacebookSyncToken(c.env.DB, pageId)
     if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
 
-    const whereExtra = includeWithPostId ? '' : "AND (post_id = '' OR post_id IS NULL)"
+    await ensureFacebookPageVideoCacheTables(c.env.DB)
+
+    // Candidate query: constrained by page_id + (optional) date range + limit/offset.
+    // created_time holds sortable ISO strings, so lexical comparison is correct for
+    // both date-only and ISO inputs. Values flow through bound params only.
+    const conditions: string[] = ['page_id = ?']
+    const binds: unknown[] = [pageId]
+    if (fromInput) {
+        conditions.push('created_time >= ?')
+        binds.push(fromInput.value)
+    }
+    if (toInput) {
+        if (toInput.kind === 'date') {
+            conditions.push('created_time < ?')
+            binds.push(nextUtcDayFromDateOnly(toInput.value))
+        } else {
+            conditions.push('created_time <= ?')
+            binds.push(toInput.value)
+        }
+    }
+    if (onlyMissing) conditions.push("(shopee_link = '' OR shopee_link IS NULL)")
+    binds.push(limit, offset)
+
     const rowsQuery = await c.env.DB.prepare(
-        `SELECT video_id, post_id, description
+        `SELECT video_id, post_id, description, title, created_time, shopee_link
          FROM facebook_page_video_cache
-         WHERE page_id = ? AND (shopee_link = '' OR shopee_link IS NULL) ${whereExtra}
-         LIMIT ?`
-    ).bind(pageId, limit).all().catch(() => null) as {
-        results?: Array<{ video_id: string; post_id: string; description: string }>
+         WHERE ${conditions.join(' AND ')}
+         ORDER BY created_time DESC, views DESC
+         LIMIT ? OFFSET ?`
+    ).bind(...binds).all().catch(() => null) as {
+        results?: Array<{ video_id: string; post_id: string; description: string; title: string; created_time: string; shopee_link: string }>
     } | null
     const rows = Array.isArray(rowsQuery?.results) ? rowsQuery!.results : []
 
     const shopeeRe = /https?:\/\/(?:[^\s<>"']+\.)?shopee\.[^\s<>"']+/i
 
     let scanned = 0
+    let found = 0
     let updated = 0
+    let missing = 0
+    let existing = 0
+    const sourceCounts = { caption: 0, comment: 0, cache: 0 }
     const errors: Array<{ video_id: string; error: string }> = []
+    const items: Array<{
+        video_id: string
+        post_id: string
+        created_time: string
+        caption: string
+        shopee_link: string
+        source: string
+        error: string
+    }> = []
 
+    // Sequential, single-flight per row (no parallel fan-out) to keep Graph load low.
     for (const row of rows) {
         scanned++
         const videoId = String(row.video_id || '').trim()
-        if (!videoId) continue
+        const cacheLink = String(row.shopee_link || '').trim()
+        const originalPostId = String(row.post_id || '').trim()
+        let postId = originalPostId
+        let createdTime = String(row.created_time || '').trim()
+        let caption = String(row.description || row.title || '')
+        let foundLink = ''
+        let source = ''
+        let rowError = ''
 
-        try {
-            // 1. Fetch video metadata (description + from)
-            const vidResp = await fetch(
-                `https://graph.facebook.com/v21.0/${videoId}?fields=description,title,permalink_url&access_token=${encodeURIComponent(token)}`
-            )
-            const vid = vidResp.ok ? await vidResp.json().catch(() => ({})) as Record<string, unknown> : {}
-            const vidDesc = String(vid.description || vid.title || '')
-            let foundLink = ''
-            const m1 = vidDesc.match(shopeeRe)
-            if (m1) foundLink = m1[0]
+        if (!videoId) {
+            rowError = 'missing_video_id'
+            errors.push({ video_id: '', error: rowError })
+            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError })
+            continue
+        }
 
-            // 2. Try permalink → find post_id → fetch first page-authored comment
-            let foundPostId = String(row.post_id || '').trim()
-            if (!foundLink) {
-                const permalink = String(vid.permalink_url || '').trim()
-                // permalink for reels: /reel/{videoId}/  — doesn't help; try /posts lookup
-                // For /videos/ posts: /{pageId}/videos/{videoId}/ — we can query {pageId}_{videoId}? NO, post_id != video_id.
-                // Best shot: look up via edge /{videoId}/sharedposts or via ?fields=post_id (undocumented)
-                const metaResp = await fetch(
-                    `https://graph.facebook.com/v21.0/${videoId}?fields=post_id,from&access_token=${encodeURIComponent(token)}`
+        if (cacheLink) {
+            // Already resolved in cache — count as existing, no Graph call needed.
+            foundLink = cacheLink
+            source = 'cache'
+            existing++
+        } else {
+            try {
+                // 1. Graph GET: caption/title/permalink/post_id/created_time.
+                const vidResp = await fetch(
+                    `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}?fields=description,title,permalink_url,post_id,created_time&access_token=${encodeURIComponent(token)}`
                 )
-                const metaJson = metaResp.ok ? await metaResp.json().catch(() => ({})) as Record<string, unknown> : {}
-                const rawPostId = String(metaJson.post_id || '').trim()
-                if (rawPostId) foundPostId = rawPostId.includes('_') ? (rawPostId.split('_').pop() || '') : rawPostId
+                const vid = vidResp.ok ? await vidResp.json().catch(() => ({})) as Record<string, unknown> : {}
+                caption = String(vid.description || vid.title || caption || '')
+                if (!createdTime) createdTime = String(vid.created_time || '').trim()
+                const rawPostId = String(vid.post_id || '').trim()
+                if (rawPostId) postId = rawPostId.includes('_') ? (rawPostId.split('_').pop() || postId) : rawPostId
+                const m1 = caption.match(shopeeRe)
+                if (m1) { foundLink = m1[0]; source = 'caption' }
 
-                // If we now have a full post id, fetch comments from the page
-                if (foundPostId) {
-                    const fullPostId = `${pageId}_${foundPostId}`
+                // 2. Only if still unresolved, read a small bounded comment window
+                //    (limit 10) to classify the source. Prefer page-authored comments.
+                if (!foundLink && postId) {
+                    const fullPostId = `${pageId}_${postId}`
                     const commentsResp = await fetch(
-                        `https://graph.facebook.com/v21.0/${fullPostId}/comments?fields=from,message&limit=10&access_token=${encodeURIComponent(token)}`
+                        `https://graph.facebook.com/v21.0/${encodeURIComponent(fullPostId)}/comments?fields=from,message&limit=10&access_token=${encodeURIComponent(token)}`
                     )
                     const commentsJson = commentsResp.ok ? await commentsResp.json().catch(() => ({})) as Record<string, unknown> : {}
                     const commentArr = Array.isArray((commentsJson as { data?: unknown[] }).data)
@@ -9104,37 +9197,80 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                         const from = cmt.from as Record<string, unknown> | undefined
                         const fromId = String(from?.id || '').trim()
                         if (fromId && fromId !== pageId) continue // prefer page-authored
-                        const msg = String(cmt.message || '')
-                        const m2 = msg.match(shopeeRe)
-                        if (m2) { foundLink = m2[0]; break }
+                        const m2 = String(cmt.message || '').match(shopeeRe)
+                        if (m2) { foundLink = m2[0]; source = 'comment'; break }
                     }
-                    // If no match from page, try any comment
                     if (!foundLink) {
                         for (const cmt of commentArr) {
-                            const msg = String(cmt.message || '')
-                            const m2 = msg.match(shopeeRe)
-                            if (m2) { foundLink = m2[0]; break }
+                            const m2 = String(cmt.message || '').match(shopeeRe)
+                            if (m2) { foundLink = m2[0]; source = 'comment'; break }
                         }
                     }
                 }
+            } catch (err) {
+                rowError = String(err).slice(0, 200)
             }
-
-            if (foundPostId || foundLink) {
-                await c.env.DB.prepare(
-                    `UPDATE facebook_page_video_cache
-                     SET post_id = CASE WHEN ? != '' THEN ? ELSE post_id END,
-                         shopee_link = CASE WHEN ? != '' THEN ? ELSE shopee_link END,
-                         updated_at = datetime('now')
-                     WHERE page_id = ? AND video_id = ?`
-                ).bind(foundPostId, foundPostId, foundLink, foundLink, pageId, videoId).run().catch(() => { })
-                if (foundLink) updated++
-            }
-        } catch (err) {
-            errors.push({ video_id: videoId, error: String(err).slice(0, 200) })
         }
+
+        if (rowError) {
+            errors.push({ video_id: videoId, error: rowError })
+        }
+
+        if (foundLink) {
+            found++
+            if (source === 'caption') sourceCounts.caption++
+            else if (source === 'comment') sourceCounts.comment++
+            else if (source === 'cache') sourceCounts.cache++
+        } else if (!rowError) {
+            missing++
+        }
+
+        // Write mode persists ONLY to the D1 cache: shopee_link + post_id (if newly
+        // resolved) and audit timestamps. dry_run NEVER writes. No Facebook writes,
+        // no comment edits, no customlink minting anywhere in this path.
+        if (writeMode && !cacheLink && (foundLink || (postId && postId !== originalPostId))) {
+            await c.env.DB.prepare(
+                `UPDATE facebook_page_video_cache
+                 SET post_id = CASE WHEN ? != '' THEN ? ELSE post_id END,
+                     shopee_link = CASE WHEN ? != '' THEN ? ELSE shopee_link END,
+                     updated_at = datetime('now'),
+                     fetched_at = datetime('now')
+                 WHERE page_id = ? AND video_id = ?`
+            ).bind(postId, postId, foundLink, foundLink, pageId, videoId).run().catch(() => { })
+            if (foundLink) updated++
+        }
+
+        items.push({
+            video_id: videoId,
+            post_id: postId,
+            created_time: createdTime,
+            caption: caption.slice(0, 160),
+            shopee_link: foundLink,
+            source,
+            error: rowError,
+        })
     }
 
-    return c.json({ ok: true, scanned, updated, errors_count: errors.length, errors: errors.slice(0, 5) }, 200, {
+    return c.json({
+        ok: true,
+        dry_run: dryRun,
+        write_mode: writeMode,
+        page_id: pageId,
+        only_missing: onlyMissing,
+        limit,
+        offset,
+        from_date: fromDate || null,
+        to_date: toDate || null,
+        scanned,
+        found,
+        updated,
+        missing,
+        existing,
+        errors_count: errors.length,
+        source_counts: sourceCounts,
+        errors: errors.slice(0, 5),
+        items,
+    }, 200, {
         'Cache-Control': 'no-store',
     })
 })

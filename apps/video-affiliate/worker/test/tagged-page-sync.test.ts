@@ -90,6 +90,17 @@ function getFacebookPageVideosRouteSource(): string {
     return source.slice(start, end)
 }
 
+function getBackfillFromFacebookRouteSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf("app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook'")
+    assert.notEqual(start, -1, 'POST backfill-from-facebook route must exist')
+
+    const end = source.indexOf("\napp.post('/api/dashboard/facebook-page-videos/backfill-shopee-links'", start)
+    assert.notEqual(end, -1, 'backfill-from-facebook route end marker must exist')
+
+    return source.slice(start, end)
+}
+
 function getPrePostingShortlinkResolverSource(): string {
     const source = readFileSync('src/index.ts', 'utf8')
     const start = source.indexOf('async function resolvePrePostingShortlinksForNamespace')
@@ -357,6 +368,80 @@ test('force retry and manual posting responses expose log_id for comment-link au
     assert.match(retrySource, /log_id:\s*retryHistoryId/)
     assert.match(manualSource, /historyId:\s*manualHistoryId/)
     assert.match(manualSource, /log_id:\s*manualHistoryId/)
+})
+
+test('backfill-from-facebook stays POST, requires page_id, and defaults to dry run', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Still a POST handler with page_id required (preserves old callers).
+    assert.match(routeSource, /app\.post\('\/api\/dashboard\/facebook-page-videos\/backfill-from-facebook'/)
+    assert.match(routeSource, /if \(!pageId\) return c\.json\(\{ ok: false, error: 'page_id_required' \}, 400\)/)
+    // dry_run defaults to true: only an explicit false flips to write mode.
+    assert.match(routeSource, /const dryRun = !isExplicitFalse\(dryRunRaw\)/)
+    assert.match(routeSource, /const writeMode = !dryRun/)
+    // The response echoes the mode + bounds back to the operator.
+    assert.match(routeSource, /dry_run: dryRun/)
+    assert.match(routeSource, /write_mode: writeMode/)
+})
+
+test('backfill-from-facebook caps limit small and bounds offset', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // limit is capped to <=150 (small), floored to >=1.
+    assert.match(routeSource, /Math\.min\(150,\s*Math\.max\(1,\s*Math\.floor\(limitRaw\)\)\)/)
+    // offset is bounded 0..10000.
+    assert.match(routeSource, /Math\.min\(10000,\s*Math\.max\(0,\s*Math\.floor\(offsetRaw\)\)\)/)
+    // Candidate query is constrained by page_id and a bounded LIMIT/OFFSET window.
+    assert.match(routeSource, /WHERE \$\{conditions\.join\(' AND '\)\}/)
+    assert.match(routeSource, /LIMIT \? OFFSET \?/)
+})
+
+test('backfill-from-facebook requires a valid date range only for write mode', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Dates validated via the shared whitelist + next-day helpers.
+    assert.match(routeSource, /sanitizeFacebookPageVideoDateInput\(body\.from_date \?\? c\.req\.query\('from_date'\)\)/)
+    assert.match(routeSource, /sanitizeFacebookPageVideoDateInput\(body\.to_date \?\? c\.req\.query\('to_date'\)\)/)
+    assert.match(routeSource, /nextUtcDayFromDateOnly\(toInput\.value\)/)
+    // Write mode demands an explicit, valid (ordered) range; dry_run may read unbounded.
+    assert.match(routeSource, /if \(writeMode\) \{[\s\S]*date_range_required_for_write[\s\S]*invalid_date_range[\s\S]*\}/)
+    // Date values flow through bound params, never string-interpolated into SQL.
+    assert.match(routeSource, /\.bind\(\.\.\.binds\)/)
+    assert.doesNotMatch(routeSource, /created_time\s*[<>]=?\s*['"`]\$\{/)
+})
+
+test('backfill-from-facebook never updates D1 in dry run, only updates cache when writing', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // The ONLY DB write is gated behind writeMode (so dry_run never persists).
+    const updateAt = routeSource.indexOf('UPDATE facebook_page_video_cache')
+    assert.ok(updateAt > -1, 'write path must UPDATE the cache table')
+    const guardAt = routeSource.indexOf('if (writeMode && !cacheLink && (foundLink || (postId && postId !== originalPostId)))')
+    assert.ok(guardAt > -1, 'cache UPDATE must be guarded by writeMode')
+    assert.ok(guardAt < updateAt, 'writeMode guard must precede the UPDATE')
+    // Exactly one UPDATE and it targets only the cache table — no other DB writes.
+    assert.equal(routeSource.match(/UPDATE\s+\w/gi)?.length, 1, 'route must contain a single UPDATE statement')
+    assert.doesNotMatch(routeSource, /INSERT\s+INTO/i, 'backfill must not INSERT')
+    assert.doesNotMatch(routeSource, /DELETE\s+FROM/i, 'backfill must not DELETE')
+    // Writes are cache-only: shopee_link / post_id / audit timestamps.
+    assert.match(routeSource, /shopee_link = CASE WHEN \? != '' THEN \? ELSE shopee_link END/)
+    assert.match(routeSource, /updated_at = datetime\('now'\),\s*\n\s*fetched_at = datetime\('now'\)/)
+})
+
+test('backfill-from-facebook reads via Graph GET only and never returns the token', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Graph reads use plain fetch (GET) with bounded comment window of 10.
+    assert.match(routeSource, /fields=description,title,permalink_url,post_id,created_time/)
+    assert.match(routeSource, /\/comments\?fields=from,message&limit=10/)
+    // No Graph mutations (method POST/DELETE) and no comment edits.
+    assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
+    // Token is only used inside the Graph URL, never surfaced in the response/items.
+    assert.doesNotMatch(routeSource, /token:\s*token/)
+    assert.doesNotMatch(routeSource, /access_token:\s*token/)
+    // Response exposes audit counts + source classification, not secrets.
+    assert.match(routeSource, /source_counts: sourceCounts/)
+    assert.match(routeSource, /scanned,\s*\n\s*found,\s*\n\s*updated,\s*\n\s*missing,\s*\n\s*existing,/)
 })
 
 test('per-page posting order override wins when enabled with a valid order', () => {
