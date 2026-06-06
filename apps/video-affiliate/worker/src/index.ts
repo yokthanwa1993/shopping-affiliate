@@ -23,9 +23,11 @@ import {
 } from './affiliate-verification-policy'
 import {
     buildExistingCommentDedupCandidates,
+    buildPostingCommentTargetCandidates,
     buildVisibleCommentTargetCandidates,
     extractIdFromCommentTargetInput,
     isAffiliateCommentMatch,
+    resolveCanonicalCommentTarget,
 } from './comment-targeting'
 import {
     CUSTOMLINK_DEFAULT_ID,
@@ -7640,6 +7642,18 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
             expandState,
         })
 
+        // Canonical page-story target: <page_id>_<post_id> whenever a post_id
+        // exists; the reel/video object id is fallback only (flagged in reason).
+        // `usedTarget` (the audited visible target) is honoured first when set.
+        const canonicalTarget = resolveCanonicalCommentTarget({
+            pageId,
+            postId,
+            canonicalPostId: storedFbPostId,
+            reelId: storedReel,
+            existingTarget: usedTarget || commentTargetId,
+        })
+        const resolvedCommentTarget = usedTarget || canonicalTarget.target || commentTargetId
+
         return {
             page_id: pageId,
             log_id: Number(ph?.id || 0) || null,
@@ -7649,7 +7663,13 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
             post_id: postId,
             post_canonical: storedFbPostId,
             permalink_url: buildFacebookUrl(String(item.permalink_url || '').trim()),
-            comment_target_id: usedTarget || commentTargetId,
+            comment_target_id: resolvedCommentTarget,
+            // Alias of comment_target_id: the full canonical page-story object id
+            // (<page_id>_<post_id>) used for /comments, or the reel fallback.
+            page_story_object_id: resolvedCommentTarget,
+            comment_target_source: canonicalTarget.source,
+            comment_target_fallback: canonicalTarget.fallback,
+            comment_target_fallback_reason: canonicalTarget.fallback ? canonicalTarget.reason : '',
             comment_id: String(primaryComment?.id || ph?.comment_fb_id || '').trim(),
             comment_from_id: String(primaryComment?.fromId || '').trim(),
             comment_from_name: String(primaryComment?.fromName || ph?.comment_profile_name || '').trim(),
@@ -7889,7 +7909,16 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const reelId = str(raw.reel_id) || fbVideoId
     const postId = str(raw.post_id)
     const canonicalPostId = str(raw.canonical_post_id) || str(raw.post_canonical)
-    const commentTargetId = str(raw.comment_target_id)
+    // Canonical page-story target: <page_id>_<post_id> whenever post_id exists.
+    // The bare reel/video object id is fallback only and is flagged in `reason`.
+    const canonicalTarget = resolveCanonicalCommentTarget({
+        pageId,
+        postId,
+        canonicalPostId,
+        reelId: reelId || fbVideoId,
+        existingTarget: str(raw.comment_target_id),
+    })
+    const commentTargetId = canonicalTarget.target || str(raw.comment_target_id)
     const oldCommentId = str(raw.old_comment_id) || str(raw.comment_id)
     const commentFromId = str(raw.comment_from_id)
     const commentFromName = str(raw.comment_from_name)
@@ -7919,6 +7948,8 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
 
     const reasons: string[] = []
     if (subs.reason) reasons.push(subs.reason)
+    // Surface the reel fallback so a missing page-story object is never silent.
+    if (canonicalTarget.fallback && canonicalTarget.reason) reasons.push(canonicalTarget.reason)
     if (!hasRewriteableLink) reasons.push('no_product_url')
     const createBlockedReason = hasRewriteableLink && action === 'skip'
         ? resolveCreateNewBlockedReason({ pageId, commentFromId, oldCommentId, allowCreateNew })
@@ -7934,6 +7965,13 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
         post_id: postId,
         canonical_post_id: canonicalPostId,
         comment_target_id: commentTargetId,
+        // Alias of comment_target_id: the full canonical page-story object id
+        // (<page_id>_<post_id>) used for /comments, or the reel fallback when no
+        // page-story object exists.
+        page_story_object_id: commentTargetId,
+        comment_target_source: canonicalTarget.source,
+        comment_target_fallback: canonicalTarget.fallback,
+        comment_target_fallback_reason: canonicalTarget.fallback ? canonicalTarget.reason : '',
         old_comment_id: oldCommentId,
         new_comment_id: '',
         comment_from_id: commentFromId,
@@ -8159,7 +8197,33 @@ async function loadPageCommentLinkJobItems(db: D1Database, jobId: string): Promi
         .bind(jobId).all().catch(() => ({ results: [] })) as { results?: Record<string, unknown>[] }
     return (rows.results || []).map((row) => {
         const targetSub4 = resolveEffectiveTargetSub4(row)
-        return targetSub4 && str(row.target_sub4) !== targetSub4 ? { ...row, target_sub4: targetSub4 } : row
+        const storedTarget = str(row.comment_target_id)
+        const canonical = resolveCanonicalCommentTarget({
+            pageId: str(row.page_id),
+            postId: str(row.post_id),
+            canonicalPostId: str(row.canonical_post_id) || str(row.post_canonical),
+            reelId: str(row.reel_id) || str(row.fb_video_id),
+            existingTarget: storedTarget,
+        })
+        // Graph comment read/write/verify MUST always prefer the canonical
+        // page-story object id (`<page_id>_<post_id>`) whenever a post_id /
+        // page-story can be resolved — even for already-written rows whose stored
+        // comment_target_id is a legacy bare reel. (`new_comment_id` no longer pins
+        // a stale reel target: a written row with post_id still reports the
+        // page-story object so the verify endpoint re-reads the visible target, not
+        // the reel.) Fall back to the stored target / reel only when no page-story
+        // can be resolved — and that fallback stays flagged below.
+        const commentTargetId = canonical.fallback ? (storedTarget || canonical.target) : canonical.target
+        return {
+            ...row,
+            ...(targetSub4 && str(row.target_sub4) !== targetSub4 ? { target_sub4: targetSub4 } : {}),
+            comment_target_id: commentTargetId,
+            // Alias of comment_target_id (the full canonical page-story object id).
+            page_story_object_id: commentTargetId,
+            comment_target_source: canonical.source,
+            comment_target_fallback: canonical.fallback,
+            comment_target_fallback_reason: canonical.fallback ? canonical.reason : '',
+        }
     })
 }
 
@@ -8443,7 +8507,17 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
 
         // 4. Verify the written comment actually carries the new link before we
         //    mark it done.
-        const verifyTarget = usedTarget || str(row.comment_target_id) || (str(row.canonical_post_id) || str(row.post_id) ? `${pageId}_${str(row.post_id)}` : str(row.reel_id))
+        // Prefer the target we actually wrote to (create_new path); otherwise read
+        // back on the canonical page-story object — never a bare reel when a
+        // page-story exists — so an edited page comment is verified on the right id.
+        const canonicalVerify = resolveCanonicalCommentTarget({
+            pageId,
+            postId: str(row.post_id),
+            canonicalPostId: str(row.canonical_post_id) || str(row.post_canonical),
+            reelId: str(row.reel_id) || str(row.fb_video_id),
+            existingTarget: str(row.comment_target_id),
+        })
+        const verifyTarget = usedTarget || canonicalVerify.target || str(row.comment_target_id) || str(row.reel_id)
         const liveCheck = await fetchPageCommentsLive(verifyTarget, token)
         const matched = liveCheck.ok && isAffiliateCommentMatch(liveCheck.comments, {
             commentId: newCommentId, expectedMessage: newMessage, affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
@@ -8567,7 +8641,15 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
             `UPDATE page_comment_link_job_items SET status = ?, reason = ?, new_affiliate_id = ?, affiliate_verify_status = ?, affiliate_id_match = ?, last_audited_at = ?, updated_at = datetime('now') WHERE job_id = ? AND item_index = ?`
         ).bind(status, ok ? '' : `verify_${matched ? (linkVerify.reason || (affiliateVerify.affiliate_verify_status !== 'verified' ? `affiliate_${affiliateVerify.affiliate_verify_status}` : 'link')) : 'comment_missing'}`, affiliateVerify.new_affiliate_id, affiliateVerify.affiliate_verify_status, affiliateVerify.affiliate_id_match ? 1 : 0, new Date().toISOString(), jobId, index).run().catch(() => { })
         if (ok) verifiedCount++
-        results.push({ item_index: index, verified: ok, comment_present: matched, link_ok: linkVerify.ok, new_comment_id: str(row.new_comment_id), target_affiliate_id: str(row.target_affiliate_id), new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0 })
+        results.push({
+            item_index: index, verified: ok, comment_present: matched, link_ok: linkVerify.ok,
+            // The canonical target we re-read (page-story object id, or reel fallback)
+            // plus the source object ids so the fallback is never ambiguous.
+            comment_target_id: target, page_story_object_id: target,
+            reel_id: str(row.reel_id) || str(row.fb_video_id), fb_video_id: str(row.fb_video_id),
+            post_id: str(row.post_id),
+            new_comment_id: str(row.new_comment_id), target_affiliate_id: str(row.target_affiliate_id), new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0,
+        })
     }
 
     return c.json({
@@ -8594,7 +8676,14 @@ app.get('/api/dashboard/page-comment-link-jobs/:job_id/history', async (c) => {
         item_index: Number(it.item_index),
         page_id: str(it.page_id),
         fb_video_id: str(it.fb_video_id),
+        reel_id: str(it.reel_id) || str(it.fb_video_id),
+        post_id: str(it.post_id),
         comment_target_id: str(it.comment_target_id),
+        // Alias of comment_target_id (full canonical page-story object id) plus the
+        // resolution source / fallback reason from loadPageCommentLinkJobItems.
+        page_story_object_id: str(it.page_story_object_id) || str(it.comment_target_id),
+        comment_target_source: str(it.comment_target_source),
+        comment_target_fallback_reason: str(it.comment_target_fallback_reason),
         action: str(it.action),
         status: str(it.status),
         old_comment_id: str(it.old_comment_id),
@@ -29304,9 +29393,9 @@ async function postShopeeCommentStrict(params: {
     env: Env
     namespaceId?: string
     fbVideoId: string
-    // Optional story-first hints. When supplied we build the visible page-story
-    // target first (e.g. `pageId_fbPostId`) and fall back to the reel id only if
-    // the story target rejects the POST with a Graph error.
+    // Optional page-story hints. When a post_id/page-story exists, /comments
+    // read/write/verify stays on the story target and never silently falls back
+    // to the bare reel object.
     fbPostId?: string
     fbReelUrlOrId?: string
     shopeeLink: string
@@ -29326,8 +29415,8 @@ async function postShopeeCommentStrict(params: {
     }
 
     const initialTargetId = String(params.fbVideoId || '').trim()
-    const hasStoryHint = !!(String(params.fbPostId || '').trim() || String(params.fbReelUrlOrId || '').trim())
-    if (!initialTargetId && !hasStoryHint) {
+    const hasTargetHint = !!(String(params.fbPostId || '').trim() || String(params.fbReelUrlOrId || '').trim())
+    if (!initialTargetId && !hasTargetHint) {
         return { ok: false, error: 'comment_target_missing', code: 0, subcode: 0 }
     }
 
@@ -29343,20 +29432,15 @@ async function postShopeeCommentStrict(params: {
     const primaryMessage = commentMessages[0]
     const additionalMessages = commentMessages.slice(1)
 
-    // Build the unique, ORDERED candidate list. Story-first when hints provided.
-    const orderedCandidates: string[] = []
-    if (hasStoryHint) {
-        for (const c of buildVisibleCommentTargetCandidates({
-            pageId,
-            fbPostId: params.fbPostId,
-            fbReelUrlOrId: params.fbReelUrlOrId,
-        })) orderedCandidates.push(c)
-    }
-    if (initialTargetId) {
-        orderedCandidates.push(initialTargetId)
-        for (const c of buildCommentTargetCandidates(initialTargetId, pageId)) orderedCandidates.push(c)
-    }
-    const candidateList = uniqueTokens(orderedCandidates)
+    // Build the unique, ORDERED candidate list. If a page-story/post_id exists,
+    // keep the write/verify sweep story-only; bare reel fallback is allowed only
+    // when no page-story object can be inferred.
+    const candidateList = buildPostingCommentTargetCandidates({
+        pageId,
+        fbPostId: params.fbPostId,
+        fbReelUrlOrId: params.fbReelUrlOrId,
+        initialTargetId,
+    })
     if (candidateList.length === 0) {
         return { ok: false, error: 'comment_target_missing', code: 0, subcode: 0 }
     }
@@ -29406,9 +29490,9 @@ async function postShopeeCommentStrict(params: {
             postErrorSubcode = subcode
             const isUnsupportedTarget = isDeprecatedSingularStatusesError(err, code)
             console.error(`[${params.logPrefix}] comment EXCEPTION (COMMENT_TOKEN) target=${tid} unsupported=${isUnsupportedTarget}: ${err}`)
-            // Fall through to next candidate. For any POST-side graph error we try
-            // the next candidate (story → reel fallback). We do NOT post twice to
-            // a target that already accepted us.
+            // Fall through to the next candidate. With a page-story hint the
+            // candidate list remains story-only; reel fallback exists only for
+            // rows that have no post_id/page-story object.
             continue
         }
 

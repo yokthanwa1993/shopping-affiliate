@@ -24,12 +24,74 @@ unchanged.
 - Edit is preferred only for **page-owned** comments (`from.id === page_id`). If
   the edit fails (cross-app/token/permission), the old comment is left intact and
   a fresh page-owned comment is created (`action = create_new`).
-- Comment targeting is **story-first**: `<page_id>_<post_id>` (canonical), then
-  the reel/video object id as fallback.
+- Comment targeting is **story-first**: the canonical page-story target
+  `<page_id>_<post_id>` comes first, and the reel/video object id is used **only as
+  a fallback when no `post_id` / page-story object exists**. Whenever a page-story
+  target is known, no read/write/verify candidate list includes the bare reel
+  object id. See **Canonical comment target invariant**.
 - Stops the whole run on Graph code `368`, rate-limit codes (`4/17/32/613`),
   subcode `1390008`, or spam/blocked wording.
 - No token, or dry-run ⇒ `skipped` / `would_edit` / `would_create`, no writes.
 - All Graph/customlink errors are sanitized (`access_token`/`EAA…` redacted).
+
+## Canonical comment target invariant
+
+Facebook Reels expose **two** related object ids: the bare reel/video object id
+(surfaced as `fb_reel_url` / `reel_id` / `fb_video_id`) and the page-story object
+id `<page_id>_<post_id>` that actually appears on the page feed (`fb_post_id` /
+`post_id`). Comments on the reel object do **not** propagate to the page-story, so
+the canonical post/comment target for **rewrite, comment read/write and verify**
+**MUST** be the page-story object id `<page_id>_<post_id>` whenever a `post_id`
+exists. The bare reel object id is a fallback **only** when no `post_id` /
+page-story object exists. The same rule governs the candidate lists built by
+`buildVisibleCommentTargetCandidates` and `buildPostingCommentTargetCandidates`:
+when an `fb_post_id` / page-story exists they return only page-story candidates
+(full `<page_id>_<post_id>` and the bare story tail) and **never** the reel
+object id, so no read/write/verify can target the reel; the reel id is emitted
+solely when no `fb_post_id` / page-story is present.
+
+`resolveCanonicalCommentTarget` (in `src/comment-targeting.ts`) is the single
+enforcement point. The rule it applies:
+
+- `canonical_post_id` / `post_canonical` already full (`<digits>_<digits>`) ⇒ use
+  as-is (`source: canonical_post_id`).
+- A bare numeric `post_id` (or bare `canonical_post_id`) ⇒ compose
+  `<page_id>_<post_id>` (`source: page_story_object` / `canonical_post_id`).
+- An existing `comment_target_id` is honoured **only** when it is already a full
+  page-story id (`source: existing_full_story`). A **bare reel target is never
+  silently kept** when a page-story can be resolved.
+- No `post_id` / page-story at all ⇒ fall back to the reel object id
+  (`source: reel_id`, `fallback: true`, `reason:
+  comment_target_fallback_reel_id,page_story_object_missing`).
+
+### Response fields
+
+Every item/job/history/verify response that exposes `comment_target_id` also
+exposes the alias **`page_story_object_id`** (same value — the full canonical
+target). The existing `comment_target_id` D1 column is unchanged (no migration);
+the alias is a response/read-time addition. Responses additionally carry
+`reel_id` / `fb_video_id` (the reel/source video object), the numeric `post_id`
+tail when available, and — when the reel fallback is taken —
+`comment_target_source`, `comment_target_fallback` and
+`comment_target_fallback_reason` so the fallback is never silent. This holds for
+**every** item, including already-written ones: `comment_target_id` /
+`page_story_object_id` always report the canonical page-story object
+(`<page_id>_<post_id>`) whenever a post_id / page-story can be resolved — a
+`new_comment_id` on a row does **not** pin a stale bare reel target, so the
+verify endpoint always re-reads the visible page-story object, not the reel. The
+stored target (or reel) is only reported when no page-story object can be
+resolved, and that fallback stays flagged.
+
+### No Facebook writes
+
+Preview, job creation, `GET job`, verify and history are **read-only** against
+Facebook — they only resolve/compute the canonical target and read `/comments`.
+The **only** write path is `run` in effective write mode (`dry_run=false` AND a
+token is available), and even then only after the new shortlink is minted,
+expanded and verified. The canonical target rule applies identically to that
+write path: when a `post_id` / page-story object exists, a fresh page-owned
+comment is created and verified only on the page-story candidates. The bare reel
+object is a fallback only when no `post_id` / page-story object exists.
 
 ## Link logic
 
@@ -146,3 +208,11 @@ matching the existing `CREATE TABLE IF NOT EXISTS` pattern.
 `npm test` (in `worker/`) covers the pure helpers: target sub building,
 customlink URL, message replacement, verify parser, batch clamp, dry-run bool,
 write-action selection, and Graph stop-signal detection.
+
+`resolveCanonicalCommentTarget` is covered in `test/comment-targeting.test.ts`
+(and cross-checked in `test/comment-link-registry.test.ts`): a `reel_id` +
+`post_id` item resolves `target` / `page_story_object_id` to
+`<page_id>_<post_id>` (never the bare reel id), full/bare `canonical_post_id` and
+an existing full page-story id are honoured, and a missing `post_id` falls back
+to the reel id with `reason` containing `comment_target_fallback_reel_id` /
+`page_story_object_missing`.

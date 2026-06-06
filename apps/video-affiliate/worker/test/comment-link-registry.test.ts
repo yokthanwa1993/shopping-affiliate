@@ -35,6 +35,7 @@ import {
     verifyAffiliateId,
     verifyRewrittenShortlink,
 } from '../src/comment-link-registry.js'
+import { resolveCanonicalCommentTarget } from '../src/comment-targeting.js'
 
 test('extractUrlsFromText pulls unique URLs and strips trailing punctuation', () => {
     const text = 'พิกัด: https://s.shopee.co.th/abc123) และ https://s.shopee.co.th/abc123 #ของดี\nลิงก์ https://customlink.wwoom.com/?id=1&url=x.'
@@ -236,6 +237,34 @@ test('normalizeJobBool keeps SAFE default when unset, parses truthy/falsy', () =
     assert.equal(normalizeJobBool(false, true), false)
     assert.equal(normalizeJobBool('yes', false), true)
     assert.equal(normalizeJobBool('garbage', true), true)
+})
+
+// The page-comment-link job item persists comment_target_id (aliased as
+// page_story_object_id in responses) via resolveCanonicalCommentTarget. The
+// canonical comment/post target MUST be the page-story object <page_id>_<post_id>
+// whenever a post_id exists, with the bare reel object id used only as a flagged
+// fallback. These guard that contract at the registry/job layer.
+test('job item canonical target: reel_id + post_id => page_id_post_id (not the bare reel id)', () => {
+    const target = resolveCanonicalCommentTarget({
+        pageId: '1008898512617594',
+        postId: '1284990567138972',
+        reelId: '998726829758584',
+    })
+    assert.equal(target.target, '1008898512617594_1284990567138972')
+    assert.equal(target.pageStoryObjectId, '1008898512617594_1284990567138972')
+    assert.equal(target.fallback, false)
+    assert.notEqual(target.target, '998726829758584')
+})
+
+test('job item canonical target: missing post_id falls back to reel id with a visible reason', () => {
+    const target = resolveCanonicalCommentTarget({
+        pageId: '1008898512617594',
+        reelId: '998726829758584',
+    })
+    assert.equal(target.target, '998726829758584')
+    assert.equal(target.fallback, true)
+    assert.match(target.reason, /comment_target_fallback_reel_id/)
+    assert.match(target.reason, /page_story_object_missing/)
 })
 
 test('buildTargetSubIds uses canonical post_id for sub2 when present', () => {

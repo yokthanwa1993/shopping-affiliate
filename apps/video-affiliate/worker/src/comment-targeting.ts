@@ -9,8 +9,8 @@
 //
 // Comments posted to the reel object do NOT propagate to the page-story, so to
 // operators the page looks empty even though history says COMMENT succeeded. The
-// fix is to prefer the page-story target first and only fall back to the reel
-// object id when the story target genuinely cannot accept a comment.
+// fix is to target the page-story whenever it exists and only fall back to the
+// reel object id when no post_id / page-story object exists.
 
 export type VisibleCommentTargetInput = {
     pageId?: string | null
@@ -83,13 +83,199 @@ export function buildVisibleCommentTargetCandidates(input: VisibleCommentTargetI
         }
     }
 
-    if (reelId && reelId !== fbPostIdRaw) {
-        // Reel/video object id — fallback only. Comments here do NOT show on the
-        // page-story feed, which is the bug we are fixing.
+    if (!fbPostIdRaw && reelId) {
+        // Reel/video object id — fallback ONLY when no fb_post_id / page-story
+        // object exists. When a page-story target is known the bare reel object is
+        // never included: comments there do NOT show on the page-story feed, so a
+        // candidate list that read/wrote/verified it would target the wrong object.
         push(reelId)
     }
 
     return out
+}
+
+export type PostingCommentTargetCandidatesInput = VisibleCommentTargetInput & {
+    initialTargetId?: string | null
+}
+
+function buildLegacyCommentTargetCandidates(targetIdRaw: string, pageIdRaw?: string | null): string[] {
+    const targetId = String(targetIdRaw || '').trim()
+    const pageId = String(pageIdRaw || '').trim()
+    if (!targetId) return []
+
+    const candidates: string[] = [targetId]
+    const hasUnderscore = targetId.includes('_')
+
+    if (hasUnderscore) {
+        const tail = targetId.split('_').pop() || ''
+        if (tail) {
+            candidates.push(tail)
+            if (pageId) candidates.push(`${pageId}_${tail}`)
+        }
+    } else if (pageId) {
+        candidates.push(`${pageId}_${targetId}`)
+    }
+
+    if (pageId && !targetId.startsWith(`${pageId}_`)) {
+        candidates.push(`${pageId}_${targetId}`)
+    }
+
+    return uniqueCommentTargetTokens(candidates)
+}
+
+function uniqueCommentTargetTokens(candidates: string[]): string[] {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const candidate of candidates) {
+        const value = String(candidate || '').trim()
+        if (!value) continue
+        const key = value.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(value)
+    }
+    return out
+}
+
+export function buildPostingCommentTargetCandidates(input: PostingCommentTargetCandidatesInput): string[] {
+    const pageId = String(input.pageId || '').trim()
+    const fbPostIdRaw = String(input.fbPostId || '').trim()
+    const reelOrStoryId = extractIdFromCommentTargetInput(input.fbReelUrlOrId)
+    const initialTargetId = String(input.initialTargetId || '').trim()
+
+    if (fbPostIdRaw) {
+        return buildVisibleCommentTargetCandidates({
+            pageId,
+            fbPostId: fbPostIdRaw,
+        })
+    }
+
+    if (isLikelyFullStoryId(reelOrStoryId)) {
+        return buildVisibleCommentTargetCandidates({
+            pageId,
+            fbPostId: reelOrStoryId,
+        })
+    }
+
+    if (isLikelyFullStoryId(initialTargetId)) {
+        return buildVisibleCommentTargetCandidates({
+            pageId,
+            fbPostId: initialTargetId,
+        })
+    }
+
+    const orderedCandidates: string[] = []
+    for (const c of buildVisibleCommentTargetCandidates({
+        pageId,
+        fbReelUrlOrId: input.fbReelUrlOrId,
+    })) orderedCandidates.push(c)
+
+    if (initialTargetId) {
+        orderedCandidates.push(initialTargetId)
+        for (const c of buildLegacyCommentTargetCandidates(initialTargetId, pageId)) orderedCandidates.push(c)
+    }
+
+    return uniqueCommentTargetTokens(orderedCandidates)
+}
+
+export type CanonicalCommentTargetInput = {
+    pageId?: string | null
+    // Numeric post id tail (e.g. `1284990567138972`) or already-full `<page>_<post>`.
+    postId?: string | null
+    // canonical_post_id / post_canonical — may already be the full page-story form.
+    canonicalPostId?: string | null
+    // Reel/video object id (or a permalink we can extract it from). Fallback only.
+    reelId?: string | null
+    // Existing comment_target_id column (backwards compat). Only honoured when it is
+    // already a full page-story id — a bare reel target is never silently kept.
+    existingTarget?: string | null
+}
+
+export type CanonicalCommentTargetResult = {
+    // The canonical comment target to use for /comments reads & writes.
+    target: string
+    // The page-story object id when one exists; '' when we fell back to the reel.
+    pageStoryObjectId: string
+    // The numeric post id tail when known.
+    postTail: string
+    source: 'canonical_post_id' | 'page_story_object' | 'existing_full_story' | 'reel_id' | 'none'
+    fallback: boolean
+    // '' when a page-story target was resolved; a visible fallback reason otherwise.
+    reason: string
+}
+
+// Resolve the canonical Page-story comment target for a Reel/post.
+//
+// Facebook Reels expose BOTH a reel/video object id and a page-story object id
+// (`<page_id>_<post_id>`). The canonical post/comment target for rewrite, comment
+// read/write and verify MUST be the page-story object id whenever a post_id
+// exists. The bare reel object id is a fallback only when no post_id / page-story
+// object exists, and that fallback is always flagged via `reason` so responses can
+// surface it. This is the single enforcement point for that invariant.
+export function resolveCanonicalCommentTarget(input: CanonicalCommentTargetInput): CanonicalCommentTargetResult {
+    const pageId = String(input.pageId || '').trim()
+    const canonicalRaw = String(input.canonicalPostId || '').trim()
+    const postRaw = String(input.postId || '').trim()
+    const existingRaw = String(input.existingTarget || '').trim()
+    const reelId = extractIdFromCommentTargetInput(String(input.reelId || '').trim())
+
+    const story = (
+        full: string,
+        tail: string,
+        source: CanonicalCommentTargetResult['source'],
+    ): CanonicalCommentTargetResult => ({
+        target: full,
+        pageStoryObjectId: full,
+        postTail: tail,
+        source,
+        fallback: false,
+        reason: '',
+    })
+
+    // Compose a page-story id from a bare numeric tail when we know the page id;
+    // when the page id is unknown the bare story id is still better than the reel.
+    const composeStory = (tail: string): string => (pageId ? `${pageId}_${tail}` : tail)
+
+    // 1) canonical_post_id / post_canonical wins — full as-is, or composed.
+    if (canonicalRaw) {
+        if (isLikelyFullStoryId(canonicalRaw)) {
+            return story(canonicalRaw, extractStoryTailFromFullId(canonicalRaw), 'canonical_post_id')
+        }
+        if (/^\d+$/.test(canonicalRaw)) {
+            return story(composeStory(canonicalRaw), canonicalRaw, 'canonical_post_id')
+        }
+    }
+
+    // 2) post_id — full page-story as-is, or compose `<page_id>_<post_id>`.
+    if (postRaw) {
+        if (isLikelyFullStoryId(postRaw)) {
+            return story(postRaw, extractStoryTailFromFullId(postRaw), 'page_story_object')
+        }
+        if (/^\d+$/.test(postRaw)) {
+            return story(composeStory(postRaw), postRaw, 'page_story_object')
+        }
+    }
+
+    // 3) Existing comment_target_id, but ONLY when it is already a full page-story
+    //    id. A bare reel target is never kept here — see the fallback below.
+    if (existingRaw && isLikelyFullStoryId(existingRaw)) {
+        return story(existingRaw, extractStoryTailFromFullId(existingRaw), 'existing_full_story')
+    }
+
+    // 4) Fallback: the bare reel/video object id only. Always flagged so responses
+    //    make the fallback reason visible.
+    if (reelId) {
+        return {
+            target: reelId,
+            pageStoryObjectId: '',
+            postTail: '',
+            source: 'reel_id',
+            fallback: true,
+            reason: 'comment_target_fallback_reel_id,page_story_object_missing',
+        }
+    }
+
+    return { target: '', pageStoryObjectId: '', postTail: '', source: 'none', fallback: true, reason: 'page_story_object_missing' }
 }
 
 // Candidate list for "is there already an affiliate comment on the visible
