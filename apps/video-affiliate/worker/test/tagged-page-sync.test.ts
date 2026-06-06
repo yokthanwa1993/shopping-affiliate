@@ -68,6 +68,28 @@ function getRetryPostRouteSource(): string {
     return source.slice(start, end)
 }
 
+function getListFacebookPageVideoCacheSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function listFacebookPageVideoCache')
+    assert.notEqual(start, -1, 'listFacebookPageVideoCache must exist')
+
+    const end = source.indexOf('\nasync function countFacebookPageVideoCache', start)
+    assert.notEqual(end, -1, 'listFacebookPageVideoCache end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getFacebookPageVideosRouteSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf("app.get('/api/dashboard/facebook-page-videos'")
+    assert.notEqual(start, -1, 'GET /api/dashboard/facebook-page-videos route must exist')
+
+    const end = source.indexOf('\napp.', start + 1)
+    assert.notEqual(end, -1, 'facebook-page-videos route end marker must exist')
+
+    return source.slice(start, end)
+}
+
 function getPrePostingShortlinkResolverSource(): string {
     const source = readFileSync('src/index.ts', 'utf8')
     const start = source.indexOf('async function resolvePrePostingShortlinksForNamespace')
@@ -78,6 +100,121 @@ function getPrePostingShortlinkResolverSource(): string {
 
     return source.slice(start, end)
 }
+
+function getShortenShopeeLinkForNamespaceSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function shortenShopeeLinkForNamespace')
+    assert.notEqual(start, -1, 'shortenShopeeLinkForNamespace must exist')
+
+    const end = source.indexOf('\nfunction isManagedShortlinkTransientFailure', start)
+    assert.notEqual(end, -1, 'shortenShopeeLinkForNamespace end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getPostingShopeeLinkResolverSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function resolvePostingShopeeLinkForNamespace')
+    assert.notEqual(start, -1, 'resolvePostingShopeeLinkForNamespace must exist')
+
+    const end = source.indexOf('\nasync function isNamespaceAffiliateVerificationEnforced', start)
+    assert.notEqual(end, -1, 'resolvePostingShopeeLinkForNamespace end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getPendingCommentBacklogSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function processPendingCommentBacklog')
+    assert.notEqual(start, -1, 'processPendingCommentBacklog must exist')
+
+    const end = source.indexOf('\nasync function handleScheduled', start)
+    assert.notEqual(end, -1, 'processPendingCommentBacklog end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getManualPostReelRouteSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf("app.post('/api/manual-post-reel'")
+    assert.notEqual(start, -1, 'manual-post-reel route must exist')
+
+    const end = source.indexOf('\n// ==================== SCHEDULED HANDLER', start)
+    assert.notEqual(end, -1, 'manual-post-reel route end marker must exist')
+
+    return source.slice(start, end)
+}
+
+test('facebook page video cache list applies bounded offset and oldest ordering', () => {
+    const fnSource = getListFacebookPageVideoCacheSource()
+
+    // Offset is bounded 0..10000 and bound as a parameter, not interpolated.
+    assert.match(fnSource, /Math\.min\(10000,\s*Math\.max\(0,\s*Math\.floor\(offsetRaw\)\)\)/)
+    assert.match(fnSource, /LIMIT \? OFFSET \?/)
+    // oldest/asc flips only created_time direction; views DESC tiebreaker preserved.
+    assert.match(fnSource, /createdTimeOrder = directionRaw === 'oldest' \|\| directionRaw === 'asc' \? 'ASC' : 'DESC'/)
+    assert.match(fnSource, /ORDER BY created_time \$\{createdTimeOrder\}, views DESC/)
+})
+
+test('facebook page video cache list date filters are whitelisted and bound, not interpolated', () => {
+    const fnSource = getListFacebookPageVideoCacheSource()
+
+    // Date inputs are classified by strict whitelist (date-only + ISO prefix).
+    assert.match(fnSource, /sanitizeFacebookPageVideoDateInput\(params\.fromDate\)/)
+    assert.match(fnSource, /sanitizeFacebookPageVideoDateInput\(params\.toDate\)/)
+    // from_date is an inclusive lower bound via lexical >=.
+    assert.match(fnSource, /conditions\.push\('created_time >= \?'\)/)
+    // date-only to_date becomes an exclusive next-day upper bound (inclusive day).
+    assert.match(fnSource, /nextUtcDayFromDateOnly\(toInput\.value\)/)
+    assert.match(fnSource, /conditions\.push\('created_time < \?'\)/)
+    // ISO/prefix to_date uses a simple lexical <=.
+    assert.match(fnSource, /conditions\.push\('created_time <= \?'\)/)
+    // Values flow through bound params; no string interpolation of date input.
+    assert.match(fnSource, /\.bind\(\.\.\.binds\)/)
+    assert.doesNotMatch(fnSource, /created_time\s*[<>]=?\s*['"`]\$\{/)
+})
+
+test('facebook page video cache date sanitizer accepts date-only and ISO prefixes only', () => {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('function sanitizeFacebookPageVideoDateInput')
+    assert.notEqual(start, -1, 'sanitizeFacebookPageVideoDateInput must exist')
+    const end = source.indexOf('\nfunction nextUtcDayFromDateOnly', start)
+    assert.notEqual(end, -1, 'sanitizer end marker must exist')
+    const fnSource = source.slice(start, end)
+
+    assert.match(fnSource, /\/\^\\d\{4\}-\\d\{2\}-\\d\{2\}\$\//)
+    assert.match(fnSource, /\/\^\\d\{4\}-\\d\{2\}-\\d\{2\}\[T \]\[0-9:\.\+\\-Z\]\*\$\//)
+    assert.match(fnSource, /return null/)
+})
+
+test('facebook-page-videos route wires date range, offset, order and echoes data_source', () => {
+    const routeSource = getFacebookPageVideosRouteSource()
+
+    assert.match(routeSource, /c\.req\.query\('from_date'\)/)
+    assert.match(routeSource, /c\.req\.query\('to_date'\)/)
+    assert.match(routeSource, /listFacebookPageVideoCache\(c\.env\.DB,\s*\{[^}]*fromDate[^}]*toDate[^}]*\}\)/)
+    assert.match(routeSource, /data_source:\s*'facebook_page_video_cache'/)
+    assert.match(routeSource, /from_date:\s*fromDate \|\| null/)
+    assert.match(routeSource, /to_date:\s*toDate \|\| null/)
+})
+
+test('facebook-page-videos GET route is read-only and never persists sync state', () => {
+    const routeSource = getFacebookPageVideosRouteSource()
+
+    // No sync-state write call (a comment may mention the helper name, so we
+    // only forbid an actual invocation with an argument list).
+    assert.doesNotMatch(
+        routeSource,
+        /upsertFacebookPageVideoSyncState\s*\(/,
+        'GET facebook-page-videos must not call upsertFacebookPageVideoSyncState',
+    )
+    // No DB write SQL of any kind inside this GET handler.
+    assert.doesNotMatch(routeSource, /INSERT\s+INTO/i, 'GET facebook-page-videos must not INSERT')
+    assert.doesNotMatch(routeSource, /\bUPDATE\s+\w/i, 'GET facebook-page-videos must not UPDATE')
+    assert.doesNotMatch(routeSource, /DELETE\s+FROM/i, 'GET facebook-page-videos must not DELETE')
+    // page_name response is still derived via the sync/query fallback.
+    assert.match(routeSource, /page_name:\s*String\(sync\?\.page_name \|\| pageName \|\| ''\)\.trim\(\)/)
+})
 
 test('tagged page metadata sync never deletes pages rows when rebuilding', () => {
     const functionSource = getSyncTaggedPagesFromProfileMetadataSource()
@@ -185,6 +322,41 @@ test('pre-posting shortlink resolver uses effective page settings and fails clos
     assert.match(resolverSource, /const shopeeShortlinkFailed = !!rawShopeeLink && shopeeTrace\.status !== 'shortened' && shopeeTrace\.status !== 'disabled'/)
     assert.match(resolverSource, /const lazadaShortlinkFailed = lazadaRequired && lazadaTrace\.status !== 'shortened' && lazadaTrace\.status !== 'disabled'/)
     assert.match(resolverSource, /errorMessage = failedPlatforms[\s\S]*shortlink_failed:\$\{failedPlatforms\}/)
+})
+
+test('posting comment shortlink override carries sub4 log id and omits sub5', () => {
+    const shortenerSource = getShortenShopeeLinkForNamespaceSource()
+    const resolverSource = getPostingShopeeLinkResolverSource()
+
+    assert.match(shortenerSource, /postSubId4\?: string/)
+    assert.match(shortenerSource, /hasPostSubId4Override = params\.postSubId4 !== undefined/)
+    assert.match(shortenerSource, /effectiveSub4 = hasPostSubId4Override \? overriddenSub4 : subIds\.sub4/)
+    assert.match(shortenerSource, /effectiveSub5 = hasPostSubId4Override \? '' : subIds\.sub5/)
+    assert.match(shortenerSource, /if \(effectiveSub4\) requestUrl\.searchParams\.set\('sub4', effectiveSub4\)/)
+    assert.match(shortenerSource, /if \(effectiveSub5\) requestUrl\.searchParams\.set\('sub5', effectiveSub5\)/)
+    assert.match(resolverSource, /postSubId4\?: string/)
+    assert.match(resolverSource, /postSubId4:\s*params\.postSubId4/)
+})
+
+test('pending comments pass post_history id as postSubId4 when minting comment shortlink', () => {
+    const pendingSource = getPendingCommentBacklogSource()
+
+    assert.match(pendingSource, /const historyId = Number\(row\.id \|\| 0\)/)
+    assert.match(pendingSource, /buildPostingCommentShortlinkSubIds\(\{[\s\S]*historyId,[\s\S]*logPrefix: `PENDING-COMMENT/)
+    assert.match(pendingSource, /resolvePostingShopeeLinkForNamespace\(\{[\s\S]*\.\.\.commentSubIds/)
+})
+
+test('force retry and manual posting responses expose log_id for comment-link audits', () => {
+    const forceSource = getForcePostRouteSource()
+    const retrySource = getRetryPostRouteSource()
+    const manualSource = getManualPostReelRouteSource()
+
+    assert.match(forceSource, /historyId:\s*forceHistoryId/)
+    assert.match(forceSource, /log_id:\s*forceHistoryId/)
+    assert.match(retrySource, /historyId:\s*retryHistoryId/)
+    assert.match(retrySource, /log_id:\s*retryHistoryId/)
+    assert.match(manualSource, /historyId:\s*manualHistoryId/)
+    assert.match(manualSource, /log_id:\s*manualHistoryId/)
 })
 
 test('per-page posting order override wins when enabled with a valid order', () => {

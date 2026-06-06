@@ -361,12 +361,14 @@ export type TargetSubBuildInput = {
     canonicalPostId?: string | null
     fbVideoId?: string | null
     reelId?: string | null
+    logId?: string | number | null
 }
 
 export type TargetSubIds = {
     sub1: string
     sub2: string
     sub3: string
+    sub4: string
     sub2_source: 'canonical_post_id' | 'fb_video_id' | 'reel_id' | 'none'
     reason: string
 }
@@ -374,12 +376,14 @@ export type TargetSubIds = {
 // Build the affiliate sub-ids for the NEW shortlink:
 //   sub1 = operator-requested campaign,
 //   sub2 = canonical post_id when resolved, else fb_video_id / reel_id (flagged),
-//   sub3 = page_id.
+//   sub3 = page_id,
+//   sub4 = stable internal log_id/post_history id when available.
 // Never throws; missing pieces are reported via sub2_source + reason so the
 // caller can decide whether the fallback is acceptable.
 export function buildTargetSubIds(input: TargetSubBuildInput): TargetSubIds {
     const sub1 = String(input.requestedSub1 || '').trim()
     const sub3 = String(input.pageId || '').trim()
+    const sub4 = String(input.logId || '').trim()
 
     const canonical = storyTail(input.canonicalPostId)
     const fbVideo = String(input.fbVideoId || '').trim()
@@ -406,7 +410,7 @@ export function buildTargetSubIds(input: TargetSubBuildInput): TargetSubIds {
     }
     if (sub2_source === 'none') reasons.push('missing_sub2')
 
-    return { sub1, sub2, sub3, sub2_source, reason: reasons.join(',') }
+    return { sub1, sub2, sub3, sub4, sub2_source, reason: reasons.join(',') }
 }
 
 export type CustomlinkRequestInput = {
@@ -414,6 +418,7 @@ export type CustomlinkRequestInput = {
     sub1: string
     sub2: string
     sub3: string
+    sub4?: string
     id?: string
     account?: string
 }
@@ -431,13 +436,21 @@ export function buildCustomlinkRequestUrl(input: CustomlinkRequestInput): string
     u.searchParams.set('sub1', String(input.sub1 || '').trim())
     u.searchParams.set('sub2', String(input.sub2 || '').trim())
     u.searchParams.set('sub3', String(input.sub3 || '').trim())
+    const sub4 = String(input.sub4 || '').trim()
+    if (sub4) u.searchParams.set('sub4', sub4)
     return u.toString()
 }
 
-// The utm_content Shopee should carry after the rewrite: `<sub1>-<sub2>-<sub3>--`
-// (sub4/sub5 intentionally empty → trailing "--").
-export function buildExpectedUtmContent(subs: { sub1: string; sub2: string; sub3: string }): string {
-    return `${String(subs.sub1 || '').trim()}-${String(subs.sub2 || '').trim()}-${String(subs.sub3 || '').trim()}--`
+// The utm_content Shopee should carry after the rewrite:
+//   legacy/no log id: `<sub1>-<sub2>-<sub3>--`
+//   new comments:    `<sub1>-<sub2>-<sub3>-<sub4>-`
+// In both cases sub5 is intentionally empty.
+export function buildExpectedUtmContent(subs: { sub1: string; sub2: string; sub3: string; sub4?: string }): string {
+    const sub1 = String(subs.sub1 || '').trim()
+    const sub2 = String(subs.sub2 || '').trim()
+    const sub3 = String(subs.sub3 || '').trim()
+    const sub4 = String(subs.sub4 || '').trim()
+    return sub4 ? `${sub1}-${sub2}-${sub3}-${sub4}-` : `${sub1}-${sub2}-${sub3}--`
 }
 
 export type VerifyShortlinkResult = {
@@ -446,6 +459,7 @@ export type VerifyShortlinkResult = {
     sub1: string
     sub2: string
     sub3: string
+    sub4: string
     expected_utm_content: string
     reason: string
 }
@@ -454,7 +468,7 @@ export type VerifyShortlinkResult = {
 // sub1/sub2/sub3. Used both right after a write and by the verify endpoint.
 export function verifyRewrittenShortlink(
     expandedUrl: string,
-    expected: { sub1: string; sub2: string; sub3: string },
+    expected: { sub1: string; sub2: string; sub3: string; sub4?: string },
 ): VerifyShortlinkResult {
     const parsed = parseTrackingSubIds(expandedUrl)
     const expectedUtm = buildExpectedUtmContent(expected)
@@ -462,11 +476,13 @@ export function verifyRewrittenShortlink(
         sub1: String(expected.sub1 || '').trim(),
         sub2: String(expected.sub2 || '').trim(),
         sub3: String(expected.sub3 || '').trim(),
+        sub4: String(expected.sub4 || '').trim(),
     }
     const mismatches: string[] = []
     if (parsed.sub1 !== want.sub1) mismatches.push('sub1')
     if (parsed.sub2 !== want.sub2) mismatches.push('sub2')
     if (parsed.sub3 !== want.sub3) mismatches.push('sub3')
+    if (want.sub4 && parsed.sub4 !== want.sub4) mismatches.push('sub4')
     const hasAny = !!(parsed.sub1 || parsed.sub2 || parsed.sub3 || parsed.utm_content)
     const ok = hasAny && mismatches.length === 0
     let reason = ''
@@ -478,6 +494,7 @@ export function verifyRewrittenShortlink(
         sub1: parsed.sub1,
         sub2: parsed.sub2,
         sub3: parsed.sub3,
+        sub4: parsed.sub4,
         expected_utm_content: expectedUtm,
         reason,
     }

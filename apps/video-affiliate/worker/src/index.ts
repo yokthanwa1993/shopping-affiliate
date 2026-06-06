@@ -4403,10 +4403,40 @@ async function upsertFacebookPageVideoSyncState(
     return getFacebookPageVideoSyncState(db, normalizedPageId)
 }
 
+// Validate/classify a user-supplied date filter for the page-video cache.
+// Accepts date-only `YYYY-MM-DD` and ISO/prefix strings (date + `T`/space then
+// only time/zone chars). Anything else returns null and is ignored. Comparisons
+// always run through bound `?` params, so this is for predictability, not SQLi
+// defense — but the strict whitelist keeps garbage out of the query.
+function sanitizeFacebookPageVideoDateInput(value: unknown): { kind: 'date' | 'iso'; value: string } | null {
+    const raw = String(value ?? '').trim()
+    if (!raw) return null
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return { kind: 'date', value: raw }
+    if (/^\d{4}-\d{2}-\d{2}[T ][0-9:.+\-Z]*$/.test(raw)) return { kind: 'iso', value: raw }
+    return null
+}
+
+// Next UTC day for a `YYYY-MM-DD` string, so a date-only `to_date` becomes an
+// exclusive upper bound (`created_time < nextDay`) that includes the whole day.
+function nextUtcDayFromDateOnly(dateOnly: string): string {
+    const [y, m, d] = dateOnly.split('-').map((n) => Number(n))
+    const dt = new Date(Date.UTC(y, m - 1, d))
+    dt.setUTCDate(dt.getUTCDate() + 1)
+    const yy = dt.getUTCFullYear()
+    const mm = String(dt.getUTCMonth() + 1).padStart(2, '0')
+    const dd = String(dt.getUTCDate()).padStart(2, '0')
+    return `${yy}-${mm}-${dd}`
+}
+
 async function listFacebookPageVideoCache(db: D1Database, params: {
     pageId: string
     minViews?: number
     limit?: number
+    offset?: number
+    order?: 'newest' | 'oldest'
+    sort?: 'newest' | 'oldest'
+    fromDate?: string
+    toDate?: string
 }): Promise<FacebookPageVideoCacheRow[]> {
     await ensureFacebookPageVideoCacheTables(db)
     const normalizedPageId = String(params.pageId || '').trim()
@@ -4415,14 +4445,44 @@ async function listFacebookPageVideoCache(db: D1Database, params: {
     const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
     const limitRaw = Number(params.limit)
     const limit = Number.isFinite(limitRaw) ? Math.min(1000, Math.max(1, Math.floor(limitRaw))) : 250
+    const offsetRaw = Number(params.offset)
+    const offset = Number.isFinite(offsetRaw) ? Math.min(10000, Math.max(0, Math.floor(offsetRaw))) : 0
+    // Default newest-first (created_time DESC). `oldest` (order/sort) flips only the
+    // created_time direction; the views DESC tiebreaker is preserved either way.
+    // Value comes from a fixed whitelist below, so it is safe to interpolate.
+    const directionRaw = String(params.order ?? params.sort ?? '').trim().toLowerCase()
+    const createdTimeOrder = directionRaw === 'oldest' || directionRaw === 'asc' ? 'ASC' : 'DESC'
+    // Optional inclusive created_time range. created_time holds sortable ISO
+    // strings, so lexical comparison is correct for both date-only and ISO inputs.
+    const conditions: string[] = ['page_id = ?', 'views >= ?']
+    const binds: unknown[] = [normalizedPageId, minViews]
+    const fromInput = sanitizeFacebookPageVideoDateInput(params.fromDate)
+    if (fromInput) {
+        // Date-only `YYYY-MM-DD` lexically precedes any time on that day, so a plain
+        // `>=` already starts the range at the beginning of the day.
+        conditions.push('created_time >= ?')
+        binds.push(fromInput.value)
+    }
+    const toInput = sanitizeFacebookPageVideoDateInput(params.toDate)
+    if (toInput) {
+        if (toInput.kind === 'date') {
+            // Inclusive whole day: strictly before the next UTC day.
+            conditions.push('created_time < ?')
+            binds.push(nextUtcDayFromDateOnly(toInput.value))
+        } else {
+            conditions.push('created_time <= ?')
+            binds.push(toInput.value)
+        }
+    }
+    binds.push(limit, offset)
     const result = await db.prepare(
         `SELECT page_id, page_name, video_id, title, description, permalink_url,
                 picture, source_url, created_time, views, shopee_link, post_id, fetched_at, updated_at
          FROM facebook_page_video_cache
-         WHERE page_id = ? AND views >= ?
-         ORDER BY created_time DESC, views DESC
-         LIMIT ?`
-    ).bind(normalizedPageId, minViews, limit).all() as { results?: FacebookPageVideoCacheRow[] }
+         WHERE ${conditions.join(' AND ')}
+         ORDER BY created_time ${createdTimeOrder}, views DESC
+         LIMIT ? OFFSET ?`
+    ).bind(...binds).all() as { results?: FacebookPageVideoCacheRow[] }
     return Array.isArray(result.results) ? result.results : []
 }
 
@@ -7116,14 +7176,25 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
     const minViews = Number.isFinite(minViewsRaw) ? Math.max(0, Math.floor(minViewsRaw)) : 0
     const limitRaw = Number(c.req.query('limit') || 250)
     const limit = Number.isFinite(limitRaw) ? Math.min(1000, Math.max(1, Math.floor(limitRaw))) : 250
+    // Optional ordering: sort=oldest OR order=oldest -> created_time ASC. Anything
+    // else (including absent) keeps the default newest-first behavior.
+    const sortRaw = String(c.req.query('sort') || c.req.query('order') || '').trim().toLowerCase()
+    const order: 'newest' | 'oldest' = sortRaw === 'oldest' || sortRaw === 'asc' ? 'oldest' : 'newest'
+    // Optional native SQL OFFSET, bounded to 0..10000. Default 0.
+    const offsetRaw = Number(c.req.query('offset') || 0)
+    const offset = Number.isFinite(offsetRaw) ? Math.min(10000, Math.max(0, Math.floor(offsetRaw))) : 0
+    // Optional created_time range filters. Accept date-only YYYY-MM-DD and ISO
+    // prefixes; sanitization/whitelisting happens in listFacebookPageVideoCache.
+    const fromDate = String(c.req.query('from_date') || '').trim()
+    const toDate = String(c.req.query('to_date') || '').trim()
     if (!pageId) return c.json({ error: 'page_id_required' }, 400)
 
-    if (pageName) {
-        await upsertFacebookPageVideoSyncState(c.env.DB, pageId, { page_name: pageName }).catch(() => { })
-    }
+    // Read-only route: do NOT persist page_name here. The page_name response
+    // value is derived below via `sync?.page_name || pageName` fallback, so no
+    // upsertFacebookPageVideoSyncState write is needed for a GET.
 
     const [items, total, sync] = await Promise.all([
-        listFacebookPageVideoCache(c.env.DB, { pageId, minViews, limit }),
+        listFacebookPageVideoCache(c.env.DB, { pageId, minViews, limit, offset, order, fromDate, toDate }),
         countFacebookPageVideoCache(c.env.DB, { pageId, minViews }),
         getFacebookPageVideoSyncState(c.env.DB, pageId),
     ])
@@ -7293,6 +7364,14 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
         page_id: pageId,
         page_name: String(sync?.page_name || pageName || '').trim(),
         total,
+        // Additive metadata echoing the resolved query controls. Existing clients
+        // that ignore unknown fields are unaffected.
+        sort: order,
+        order,
+        offset,
+        from_date: fromDate || null,
+        to_date: toDate || null,
+        data_source: 'facebook_page_video_cache',
         items: items.map((item) => {
             const postId = String(item.post_id || '').trim()
             const fbVideoId = String(item.video_id || '').trim()
@@ -7390,6 +7469,7 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
     const pageItems = allItems.slice(offset, offset + limit)
 
     type RegistryPostHistoryRow = {
+        id?: number
         video_id?: string
         fb_post_id?: string
         fb_reel_url?: string
@@ -7407,7 +7487,7 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
     const phByFbVideoId = new Map<string, RegistryPostHistoryRow>()
     try {
         const rows = await c.env.DB.prepare(
-            `SELECT video_id, fb_post_id, fb_reel_url, shopee_link, posted_at,
+            `SELECT id, video_id, fb_post_id, fb_reel_url, shopee_link, posted_at,
                     comment_status, comment_error, comment_fb_id, comment_profile_id, comment_profile_name
              FROM post_history
              WHERE page_id = ? AND bot_id = ?
@@ -7557,6 +7637,8 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
 
         return {
             page_id: pageId,
+            log_id: Number(ph?.id || 0) || null,
+            history_id: Number(ph?.id || 0) || null,
             reel_id: fbVideoId,
             fb_video_id: fbVideoId,
             post_id: postId,
@@ -7587,6 +7669,19 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
             stored_comment_status: String(ph?.comment_status || '').trim(),
             stored_comment_error: String(ph?.comment_error || '').trim(),
             stored_shopee_link: storedShopee,
+            post_history_metadata: ph ? {
+                log_id: Number(ph.id || 0) || null,
+                page_id: pageId,
+                post_id: storedFbPostId,
+                fb_video_id: fbVideoId,
+                comment_id: String(ph.comment_fb_id || primaryComment?.id || '').trim(),
+                campaign: sub.sub1 || '',
+                sub1: sub.sub1 || '',
+                created_at: String(ph.posted_at || '').trim(),
+                platform: 'facebook',
+                source: 'post_history',
+                status: String(ph.comment_status || status || '').trim(),
+            } : null,
         }
     }
 
@@ -7777,15 +7872,16 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const oldSub3 = str(raw.old_sub3) || str(raw.sub3)
     const oldSub4 = str(raw.old_sub4) || str(raw.sub4)
     const oldSub5 = str(raw.old_sub5) || str(raw.sub5)
+    const logId = str(raw.log_id) || str(raw.history_id) || str(raw.post_history_id)
 
     const productUrl = canonicalizeProductUrl(str(raw.product_url) || oldExpandedUrl || oldShortlink)
     const hasRewriteableLink = !!productUrl
 
-    const subs = buildTargetSubIds({ requestedSub1: opts.requestedSub1, pageId, canonicalPostId, fbVideoId, reelId })
+    const subs = buildTargetSubIds({ requestedSub1: opts.requestedSub1, pageId, canonicalPostId, fbVideoId, reelId, logId })
     const action: RewriteAction = computeWriteAction({ pageId, commentFromId, oldCommentId, hasRewriteableLink })
     const expectedUtmContent = buildExpectedUtmContent(subs)
     const customlinkRequestUrl = hasRewriteableLink
-        ? buildCustomlinkRequestUrl({ productUrl, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3 })
+        ? buildCustomlinkRequestUrl({ productUrl, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: subs.sub4 })
         : ''
 
     const reasons: string[] = []
@@ -7795,6 +7891,7 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
 
     return {
         page_id: pageId,
+        log_id: logId,
         fb_video_id: fbVideoId,
         reel_id: reelId,
         post_id: postId,
@@ -7818,6 +7915,7 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
         target_sub1: subs.sub1,
         target_sub2: subs.sub2,
         target_sub3: subs.sub3,
+        target_sub4: subs.sub4,
         target_sub2_source: subs.sub2_source,
         new_shortlink: '',
         new_expanded_url: '',
@@ -8090,6 +8188,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         const targetSub1 = str(row.target_sub1)
         const targetSub2 = str(row.target_sub2)
         const targetSub3 = str(row.target_sub3)
+        const targetSub4 = str(row.target_sub4)
         const productUrl = str(row.product_url)
         const oldShortlink = str(row.old_shortlink)
         const oldMessage = String(row.old_message ?? '')
@@ -8110,8 +8209,8 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             const wouldStatus: JobItemStatus = action === 'edit' ? 'would_edit' : 'would_create'
             processed.push({
                 item_index: index, status: wouldStatus, action, dry_run: true, token_available: hasToken,
-                customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, id: customlinkId }),
-                expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3 }),
+                customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId }),
+                expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 }),
             })
             continue
         }
@@ -8122,7 +8221,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
 
         // 1. Mint the new shortlink, then 2. expand + verify its sub ids BEFORE
         //    we ever touch a comment — never post an unverified link.
-        const requestUrl = buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, id: customlinkId })
+        const requestUrl = buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId })
         const minted = await mintCustomlinkShortlink(requestUrl)
         if (!minted.ok) {
             await updateItem(index, { status: 'failed', reason: 'shortlink_failed', error: minted.error, attempts })
@@ -8133,7 +8232,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         }
         const newShortlink = minted.shortLink
         const expanded = await expandShortlinkFinalUrl(newShortlink)
-        const verifyLink = verifyRewrittenShortlink(expanded.finalUrl || newShortlink, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3 })
+        const verifyLink = verifyRewrittenShortlink(expanded.finalUrl || newShortlink, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 })
         if (!verifyLink.ok) {
             await updateItem(index, {
                 status: 'failed', reason: `shortlink_verify_${verifyLink.reason}`,
@@ -8350,7 +8449,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
         const target = str(row.comment_target_id)
         const live = await fetchPageCommentsLive(target, token)
         const linkVerify = verifyRewrittenShortlink(str(row.new_expanded_url) || str(row.new_shortlink), {
-            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3),
+            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3), sub4: str(row.target_sub4),
         })
         const matched = live.ok && isAffiliateCommentMatch(live.comments, {
             commentId: str(row.new_comment_id), expectedMessage: String(row.new_message ?? ''), affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
@@ -10281,14 +10380,21 @@ app.post('/admin/api/comments/retry', async (c) => {
                 results.push({ id: historyId, ok: false, error: err })
                 continue
             }
+            const commentSubIds = buildPostingCommentShortlinkSubIds({
+                canonicalPostId: fbPostId,
+                fbVideoId: targetId,
+                reelId: extractIdFromCommentTargetInput(fbReelUrl),
+                pageId,
+                historyId,
+                logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
+            })
             const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
                 env: c.env,
                 namespaceId: botId,
                 pageId,
                 shopeeLink,
                 logPrefix: `RETRY ${pageName || pageId} ${historyId}`,
-                postSubId2: fbPostId,
-                postSubId3: pageId,
+                ...commentSubIds,
             })
             if (!shortShopeeLink) {
                 const err = 'shopee_shortlink_failed'
@@ -25802,6 +25908,11 @@ async function shortenShopeeLinkForNamespace(params: {
     // conversion callers should leave this undefined so settings sub_id3
     // continues to apply.
     postSubId3?: string
+    // Optional override for Sub ID 4 used only at posting/comment time. This is
+    // the stable internal post_history/log id that lets operators map affiliate
+    // reports back to metadata. When this property is present, Sub ID 5 is
+    // intentionally omitted for new post comment links even if settings define it.
+    postSubId4?: string
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -25840,7 +25951,11 @@ async function shortenShopeeLinkForNamespace(params: {
     // configured sub_id3 when no override is supplied.
     const overriddenSub3 = normalizeShortlinkSubId(params.postSubId3 || '')
     const effectiveSub3 = overriddenSub3 || subIds.sub3
-    const effectiveSubIds = { ...subIds, sub1: effectiveSub1, sub2: effectiveSub2, sub3: effectiveSub3 }
+    const hasPostSubId4Override = params.postSubId4 !== undefined
+    const overriddenSub4 = normalizeShortlinkSubId(params.postSubId4 || '')
+    const effectiveSub4 = hasPostSubId4Override ? overriddenSub4 : subIds.sub4
+    const effectiveSub5 = hasPostSubId4Override ? '' : subIds.sub5
+    const effectiveSubIds = { ...subIds, sub1: effectiveSub1, sub2: effectiveSub2, sub3: effectiveSub3, sub4: effectiveSub4, sub5: effectiveSub5 }
     const urlTemplate = shortlinkSettings.urlTemplate
 
     // Priority: 1) URL template from settings  2) baseUrl derived from account
@@ -25861,8 +25976,8 @@ async function shortenShopeeLinkForNamespace(params: {
         requestUrl.searchParams.set('sub1', effectiveSub1)
         if (effectiveSub2) requestUrl.searchParams.set('sub2', effectiveSub2)
         if (effectiveSub3) requestUrl.searchParams.set('sub3', effectiveSub3)
-        if (subIds.sub4) requestUrl.searchParams.set('sub4', subIds.sub4)
-        if (subIds.sub5) requestUrl.searchParams.set('sub5', subIds.sub5)
+        if (effectiveSub4) requestUrl.searchParams.set('sub4', effectiveSub4)
+        if (effectiveSub5) requestUrl.searchParams.set('sub5', effectiveSub5)
         finalRequestUrl = requestUrl.toString()
     }
 
@@ -25914,6 +26029,56 @@ async function shortenShopeeLinkForNamespace(params: {
     writeTrace({ utmSource: null, status: 'fallback', error: lastError })
     if (fallbackDisallowed && !params.allowFallbackWhenEnforced) throw new Error(lastError || 'admin_shopee_shortlink_failed')
     return originalLink
+}
+
+type PostingCommentShortlinkSubIds = {
+    postSubId2: string
+    postSubId3: string
+    postSubId4: string
+}
+
+function normalizeFacebookPostSubIdForShortlink(value: string | null | undefined): string {
+    const raw = String(value || '').trim()
+    if (!raw) return ''
+    const tail = raw.includes('_') ? raw.split('_').pop() || '' : raw
+    return normalizeShortlinkSubId(tail)
+}
+
+function buildPostingCommentShortlinkSubIds(input: {
+    canonicalPostId?: string | null
+    fbVideoId?: string | null
+    reelId?: string | null
+    pageId?: string | null
+    historyId?: number | string | null
+    logPrefix: string
+}): PostingCommentShortlinkSubIds {
+    const canonicalPostId = normalizeFacebookPostSubIdForShortlink(input.canonicalPostId)
+    const fbVideoId = normalizeShortlinkSubId(input.fbVideoId || '')
+    const reelId = normalizeShortlinkSubId(input.reelId || '')
+
+    let postSubId2 = canonicalPostId
+    let source: 'canonical_post_id' | 'fb_video_id' | 'reel_id' | 'none' = canonicalPostId ? 'canonical_post_id' : 'none'
+    if (!postSubId2 && fbVideoId) {
+        postSubId2 = fbVideoId
+        source = 'fb_video_id'
+    } else if (!postSubId2 && reelId) {
+        postSubId2 = reelId
+        source = 'reel_id'
+    }
+
+    if (source === 'fb_video_id' || source === 'reel_id') {
+        console.log(`[${input.logPrefix}] Shopee comment shortlink sub2 fallback: canonical_post_id unavailable; using ${source}`)
+    } else if (source === 'none') {
+        console.log(`[${input.logPrefix}] Shopee comment shortlink sub2 missing: canonical_post_id, fb_video_id, and reel_id unavailable`)
+    }
+
+    const postSubId3 = normalizeShortlinkSubId(input.pageId || '')
+    const postSubId4 = normalizeShortlinkSubId(String(input.historyId || ''))
+    if (!postSubId4) {
+        console.log(`[${input.logPrefix}] Shopee comment shortlink sub4/log_id missing; omitting sub4`)
+    }
+
+    return { postSubId2, postSubId3, postSubId4 }
 }
 
 function isManagedShortlinkTransientFailure(error: unknown): boolean {
@@ -26088,6 +26253,10 @@ async function resolvePostingShopeeLinkForNamespace(params: {
     // can attribute clicks back to a specific page. Pass undefined when no
     // page id is available so the namespace-configured sub_id3 is used.
     postSubId3?: string
+    // Internal post_history/log id for Sub ID 4 on fresh post comments. Pass an
+    // empty string when this is a posting/comment call but no log id exists; that
+    // still keeps Sub ID 5 omitted for the new format.
+    postSubId4?: string
     trace?: {
         utmSource?: string | null
         status?: 'disabled' | 'shortened' | 'fallback'
@@ -26140,6 +26309,7 @@ async function resolvePostingShopeeLinkForNamespace(params: {
             logPrefix: params.logPrefix,
             postSubId2: params.postSubId2,
             postSubId3: params.postSubId3,
+            postSubId4: params.postSubId4,
             trace,
         })
         if (shortened && trace.status === 'shortened' && !isShopeeHomepageOnlyLink(shortened)) return shortened
@@ -28920,14 +29090,20 @@ async function reconcilePostingHistoryRows(params: {
 
                 if (shopeeLink) {
                     const lazadaLink = metaToString(meta, 'lazadaLink')
+                    const commentSubIds = buildPostingCommentShortlinkSubIds({
+                        canonicalPostId: recoveredPostId,
+                        fbVideoId: recoveredCommentTargetId,
+                        pageId: String(row.page_id || ''),
+                        historyId: row.id || null,
+                        logPrefix: `${logPrefix} RECON ${row.id}`,
+                    })
                     const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
                         env,
                         namespaceId: botId,
                         pageId: String(row.page_id || ''),
                         shopeeLink,
                         logPrefix: `${logPrefix} RECON ${row.id}`,
-                        postSubId2: recoveredPostId,
-                        postSubId3: String(row.page_id || ''),
+                        ...commentSubIds,
                     })
                     if (!shortShopeeLink) {
                         commentStatus = 'failed'
@@ -32318,18 +32494,25 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
         fbVideoId = reelResult.id
-        const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+        const confirmedCanonicalPostId = String(reelResult.postId || '').trim()
+        const confirmedPostId = confirmedCanonicalPostId || fbVideoId
         let commentShopeeLink = normalizedShopeeLink
         if (commentShopeeLink && !skipComment && hasCommentToken) {
             try {
+                const commentSubIds = buildPostingCommentShortlinkSubIds({
+                    canonicalPostId: confirmedCanonicalPostId,
+                    fbVideoId,
+                    pageId,
+                    historyId: retryHistoryId,
+                    logPrefix: 'RETRY-POST COMMENT-SHORTLINK',
+                })
                 const reshortened = await resolvePostingShopeeLinkForNamespace({
                     env,
                     namespaceId: botId,
                     pageId,
                     shopeeLink: rawShopeeLink || normalizedShopeeLink,
                     logPrefix: 'RETRY-POST COMMENT-SHORTLINK',
-                    postSubId2: confirmedPostId,
-                    postSubId3: pageId,
+                    ...commentSubIds,
                 })
                 if (reshortened) commentShopeeLink = reshortened
             } catch (reshortenErr) {
@@ -32413,6 +32596,8 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             fb_video_id: fbVideoId,
             fb_post_id: confirmedPostId,
             fb_reel_url: fbReelUrl,
+            log_id: retryHistoryId,
+            post_history_id: retryHistoryId,
         })
     } catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e)
@@ -32452,14 +32637,21 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                     let commentShopeeLink = normalizedShopeeLink
                     if (commentShopeeLink && !skipComment && hasCommentToken) {
                         try {
+                            const commentSubIds = buildPostingCommentShortlinkSubIds({
+                                canonicalPostId: recoveredPostId,
+                                fbVideoId,
+                                reelId: extractIdFromCommentTargetInput(recoveredReelUrl),
+                                pageId,
+                                historyId: retryHistoryId,
+                                logPrefix: 'RETRY-POST-RECOVER COMMENT-SHORTLINK',
+                            })
                             const reshortened = await resolvePostingShopeeLinkForNamespace({
                                 env,
                                 namespaceId: botId,
                                 pageId,
                                 shopeeLink: normalizedShopeeLink,
                                 logPrefix: 'RETRY-POST-RECOVER COMMENT-SHORTLINK',
-                                postSubId2: recoveredPostId,
-                                postSubId3: pageId,
+                                ...commentSubIds,
                             })
                             if (reshortened) commentShopeeLink = reshortened
                         } catch (reshortenErr) {
@@ -32550,6 +32742,8 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
                         recovered: true,
                         reposted_from_history_id: Number(id),
                         history_id: retryHistoryId,
+                        log_id: retryHistoryId,
+                        post_history_id: retryHistoryId,
                         page: pageName || pageId,
                         video_id: selectedVideoId,
                         fb_video_id: fbVideoId,
@@ -33486,6 +33680,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 fb_reel_url: fbReelUrl,
                 ads_publish: true,
                 comment_posted: !!adsData.commentPosted,
+                history_id: forceHistoryId,
+                log_id: forceHistoryId,
+                post_history_id: forceHistoryId,
             })
         }
 
@@ -33570,18 +33767,25 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
         fbVideoId = reelResult.id
-        const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+        const confirmedCanonicalPostId = String(reelResult.postId || '').trim()
+        const confirmedPostId = confirmedCanonicalPostId || fbVideoId
         let commentShopeeLink = normalizedShopeeLink
         if (commentShopeeLink && !skipComment && hasCommentToken) {
             try {
+                const commentSubIds = buildPostingCommentShortlinkSubIds({
+                    canonicalPostId: confirmedCanonicalPostId,
+                    fbVideoId,
+                    pageId,
+                    historyId: forceHistoryId,
+                    logPrefix: 'FORCE-POST COMMENT-SHORTLINK',
+                })
                 const reshortened = await resolvePostingShopeeLinkForNamespace({
                     env,
                     namespaceId: botId,
                     pageId,
                     shopeeLink: normalizedShopeeLink,
                     logPrefix: 'FORCE-POST COMMENT-SHORTLINK',
-                    postSubId2: confirmedPostId,
-                    postSubId3: pageId,
+                    ...commentSubIds,
                 })
                 if (reshortened) commentShopeeLink = reshortened
             } catch (reshortenErr) {
@@ -33669,6 +33873,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
             fb_video_id: fbVideoId,
             fb_post_id: confirmedPostId,
             fb_reel_url: fbReelUrl,
+            history_id: forceHistoryId,
+            log_id: forceHistoryId,
+            post_history_id: forceHistoryId,
             ...(avatarApplied ? { avatar_applied: true, avatar_version: avatarVersion } : {}),
         })
     } catch (e) {
@@ -33721,8 +33928,30 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     let commentProfileId: string | null = null
                     let commentProfileName: string | null = null
                     const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
+                    let recoveryCommentShopeeLink = normalizedShopeeLink
 
-                    if (normalizedShopeeLink && !skipComment && hasCommentToken) {
+                    if (recoveryCommentShopeeLink && !skipComment && hasCommentToken) {
+                        try {
+                            const commentSubIds = buildPostingCommentShortlinkSubIds({
+                                canonicalPostId: recoveredPostId,
+                                fbVideoId,
+                                reelId: extractIdFromCommentTargetInput(recoveredReelUrl),
+                                pageId,
+                                historyId: forceHistoryId,
+                                logPrefix: 'FORCE-POST-RECOVER COMMENT-SHORTLINK',
+                            })
+                            const reshortened = await resolvePostingShopeeLinkForNamespace({
+                                env,
+                                namespaceId: botId,
+                                pageId,
+                                shopeeLink: recoveryCommentShopeeLink,
+                                logPrefix: 'FORCE-POST-RECOVER COMMENT-SHORTLINK',
+                                ...commentSubIds,
+                            })
+                            if (reshortened) recoveryCommentShopeeLink = reshortened
+                        } catch (reshortenErr) {
+                            console.log(`[FORCE-POST-RECOVER COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                        }
                         const commentWaitMs = getRandomCommentDelayMs()
                         console.log(`[FORCE-POST-RECOVER] Waiting ${Math.ceil(commentWaitMs / 1000)}s before recovery comment...`)
                         await waitMs(commentWaitMs)
@@ -33730,7 +33959,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                             env,
                             namespaceId: botId,
                             fbVideoId: commentTargetId,
-                            shopeeLink: normalizedShopeeLink,
+                            shopeeLink: recoveryCommentShopeeLink,
                             lazadaLink: normalizedLazadaLink,
                             commentTokens: commentTokenCandidates,
                             pageId,
@@ -33803,6 +34032,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         fb_video_id: fbVideoId,
                         fb_post_id: recoveredPostId,
                         fb_reel_url: recoveredReelUrl,
+                        history_id: forceHistoryId,
+                        log_id: forceHistoryId,
+                        post_history_id: forceHistoryId,
                     })
                 }
             } catch (recoverErr) {
@@ -34145,7 +34377,8 @@ app.post('/api/manual-post-reel', async (c) => {
 
         const dur = ((Date.now() - t0) / 1000).toFixed(1)
         console.log(`[MANUAL-REEL] ✅ Published: ${fbVideoId} in ${dur}s`)
-        const confirmedPostId = String(finishData.post_id || '').trim() || fbVideoId
+        const confirmedCanonicalPostId = String(finishData.post_id || '').trim()
+        const confirmedPostId = confirmedCanonicalPostId || fbVideoId
         const fbReelUrl = String(finishData.permalink_url || '').trim() || `https://www.facebook.com/watch/?v=${fbVideoId}`
         if (historyVideoId && historyVideoId !== 'manual-reel') {
             await markNamespaceVideoPosted(c.env.DB, namespaceId, historyVideoId, new Date().toISOString()).catch(() => { })
@@ -34196,14 +34429,20 @@ app.post('/api/manual-post-reel', async (c) => {
             let commentShopeeLink = effectiveShopeeLink
             if (confirmedPostId) {
                 try {
+                    const commentSubIds = buildPostingCommentShortlinkSubIds({
+                        canonicalPostId: confirmedCanonicalPostId,
+                        fbVideoId,
+                        pageId,
+                        historyId: manualHistoryId,
+                        logPrefix: 'MANUAL-REEL',
+                    })
                     const reshortened = await resolvePostingShopeeLinkForNamespace({
                         env: c.env,
                         namespaceId,
                         pageId,
                         shopeeLink,
                         logPrefix: 'MANUAL-REEL',
-                        postSubId2: confirmedPostId,
-                        postSubId3: pageId,
+                        ...commentSubIds,
                     })
                     if (reshortened) commentShopeeLink = reshortened
                 } catch (reshortenErr) {
@@ -34283,6 +34522,9 @@ app.post('/api/manual-post-reel', async (c) => {
             pageId,
             namespaceId,
             historyId: manualHistoryId,
+            logId: manualHistoryId,
+            log_id: manualHistoryId,
+            post_history_id: manualHistoryId,
             caption: caption || '',
             duration: dur + 's',
             comment: commentResult,
@@ -34460,14 +34702,21 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 continue
             }
 
+            const commentSubIds = buildPostingCommentShortlinkSubIds({
+                canonicalPostId: fbPostIdRaw,
+                fbVideoId: targetId,
+                reelId: extractIdFromCommentTargetInput(fbReelUrlRaw),
+                pageId,
+                historyId,
+                logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+            })
             const shortShopeeLink = await resolvePostingShopeeLinkForNamespace({
                 env,
                 namespaceId: botId,
                 pageId,
                 shopeeLink,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
-                postSubId2: fbPostIdRaw,
-                postSubId3: pageId,
+                ...commentSubIds,
             })
             if (!shortShopeeLink) {
                 await env.DB.prepare(
@@ -35646,12 +35895,34 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         let commentProfileName: string | null = null
                         const commentTargetId = fbVideoId || extractReelIdFromPermalink(normalizeFacebookPermalink(recoveredReelUrl)) || recoveredPostId
                         const commentTargetDedupKey = buildCommentTargetDedupKey(commentTargetId, page.id)
+                        let recoveryCommentShopeeLink = normalizedShopeeLink
 
-                        if (normalizedShopeeLink && hasCommentToken) {
+                        if (recoveryCommentShopeeLink && hasCommentToken) {
                             if (dedupCommentTargets.has(commentTargetDedupKey)) {
                                 console.log(`[CRON] Page ${page.name}: recovery comment skip for ${commentTargetId} (already commented in this run)`)
                                 commentStatus = 'success'
                             } else {
+                                try {
+                                    const commentSubIds = buildPostingCommentShortlinkSubIds({
+                                        canonicalPostId: recoveredPostId,
+                                        fbVideoId,
+                                        reelId: extractIdFromCommentTargetInput(recoveredReelUrl),
+                                        pageId: page.id,
+                                        historyId: cronHistoryId,
+                                        logPrefix: `CRON ${page.name} RECOVER COMMENT-SHORTLINK`,
+                                    })
+                                    const reshortened = await resolvePostingShopeeLinkForNamespace({
+                                        env,
+                                        namespaceId: botId,
+                                        pageId: page.id,
+                                        shopeeLink: recoveryCommentShopeeLink,
+                                        logPrefix: `CRON ${page.name} RECOVER COMMENT-SHORTLINK`,
+                                        ...commentSubIds,
+                                    })
+                                    if (reshortened) recoveryCommentShopeeLink = reshortened
+                                } catch (reshortenErr) {
+                                    console.log(`[CRON ${page.name} RECOVER COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                                }
                                 const commentWaitMs = getRandomCommentDelayMs()
                                 console.log(`[CRON] Page ${page.name}: recovery comment wait ${Math.ceil(commentWaitMs / 1000)}s...`)
                                 await waitMs(commentWaitMs)
@@ -35659,7 +35930,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                                     env,
                                     namespaceId: botId,
                                     fbVideoId: commentTargetId,
-                                    shopeeLink: normalizedShopeeLink,
+                                    shopeeLink: recoveryCommentShopeeLink,
                                     lazadaLink: normalizedLazadaLink,
                                     commentTokens: commentTokenCandidates,
                                     pageId: page.id,

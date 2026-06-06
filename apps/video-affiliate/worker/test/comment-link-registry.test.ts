@@ -70,18 +70,18 @@ test('pickPrimaryAffiliateUrl prefers customlink, then shopee short link', () =>
     assert.equal(pickPrimaryAffiliateUrl(['https://example.com', '']), '')
 })
 
-test('parseTrackingSubIds reads explicit sub1..sub3 customlink params', () => {
+test('parseTrackingSubIds reads explicit sub1..sub4 customlink params', () => {
     const parsed = parseTrackingSubIds(
-        'https://customlink.wwoom.com/?id=15130770000&sub1=spring&sub2=1277758961195466&sub3=1008898512617594',
+        'https://customlink.wwoom.com/?id=15130770000&sub1=spring&sub2=1277758961195466&sub3=1008898512617594&sub4=98765',
     )
     assert.equal(parsed.sub1, 'spring')
     assert.equal(parsed.sub2, '1277758961195466')
     assert.equal(parsed.sub3, '1008898512617594')
-    assert.equal(parsed.sub4, '')
+    assert.equal(parsed.sub4, '98765')
     assert.equal(parsed.sub5, '')
 })
 
-test('parseTrackingSubIds splits shopee utm_content with trailing --', () => {
+test('parseTrackingSubIds splits legacy shopee utm_content with trailing --', () => {
     const parsed = parseTrackingSubIds('https://shopee.co.th/product/1/2?utm_content=spring-post-page--')
     assert.equal(parsed.utm_content, 'spring-post-page--')
     assert.equal(parsed.sub1, 'spring')
@@ -89,6 +89,20 @@ test('parseTrackingSubIds splits shopee utm_content with trailing --', () => {
     assert.equal(parsed.sub3, 'page')
     assert.equal(parsed.sub4, '')
     assert.equal(parsed.sub5, '')
+})
+
+test('parseTrackingSubIds reports sub4 from new shopee utm_content without sub5', () => {
+    const parsed = parseTrackingSubIds('https://shopee.co.th/product/1/2?utm_content=spring-post-page-log987-')
+    assert.equal(parsed.utm_content, 'spring-post-page-log987-')
+    assert.equal(parsed.sub1, 'spring')
+    assert.equal(parsed.sub2, 'post')
+    assert.equal(parsed.sub3, 'page')
+    assert.equal(parsed.sub4, 'log987')
+    assert.equal(parsed.sub5, '')
+
+    const compact = parseTrackingSubIds('https://shopee.co.th/product/1/2?utm_content=spring-post-page-log987')
+    assert.equal(compact.sub4, 'log987')
+    assert.equal(compact.sub5, '')
 })
 
 test('parseTrackingSubIds returns empty struct for non-URL', () => {
@@ -223,10 +237,12 @@ test('buildTargetSubIds uses canonical post_id for sub2 when present', () => {
         pageId: '1008898512617594',
         canonicalPostId: '1008898512617594_1284990567138972',
         fbVideoId: '998726829758584',
+        logId: 98765,
     })
     assert.equal(subs.sub1, 'spring')
     assert.equal(subs.sub2, '1284990567138972') // story tail of canonical post id
     assert.equal(subs.sub3, '1008898512617594')
+    assert.equal(subs.sub4, '98765')
     assert.equal(subs.sub2_source, 'canonical_post_id')
     assert.equal(subs.reason, '')
 })
@@ -257,6 +273,7 @@ test('buildCustomlinkRequestUrl targets customlink host with default id and subs
         sub1: 'spring',
         sub2: '1284990567138972',
         sub3: '1008898512617594',
+        sub4: '98765',
     })
     const parsed = new URL(url)
     assert.equal(parsed.hostname, CUSTOMLINK_HOST)
@@ -265,6 +282,8 @@ test('buildCustomlinkRequestUrl targets customlink host with default id and subs
     assert.equal(parsed.searchParams.get('sub1'), 'spring')
     assert.equal(parsed.searchParams.get('sub2'), '1284990567138972')
     assert.equal(parsed.searchParams.get('sub3'), '1008898512617594')
+    assert.equal(parsed.searchParams.get('sub4'), '98765')
+    assert.equal(parsed.searchParams.has('sub5'), false)
 })
 
 test('buildCustomlinkRequestUrl canonicalizes the product url so url= carries no stale tracking', () => {
@@ -279,23 +298,28 @@ test('buildCustomlinkRequestUrl canonicalizes the product url so url= carries no
     assert.equal(parsed.searchParams.get('sub1'), 'spring')
 })
 
-test('buildExpectedUtmContent renders <sub1>-<sub2>-<sub3>-- with trailing --', () => {
+test('buildExpectedUtmContent preserves legacy trailing -- without sub4', () => {
     assert.equal(buildExpectedUtmContent({ sub1: 'a', sub2: 'b', sub3: 'c' }), 'a-b-c--')
 })
 
+test('buildExpectedUtmContent renders sub4/log_id and leaves sub5 empty', () => {
+    assert.equal(buildExpectedUtmContent({ sub1: 'a', sub2: 'b', sub3: 'c', sub4: 'log987' }), 'a-b-c-log987-')
+})
+
 test('verifyRewrittenShortlink confirms matching utm_content sub ids', () => {
-    const expected = { sub1: 'spring', sub2: 'post123', sub3: 'page456' }
+    const expected = { sub1: 'spring', sub2: 'post123', sub3: 'page456', sub4: 'log987' }
     const ok = verifyRewrittenShortlink(
-        'https://shopee.co.th/product/1/2?utm_content=spring-post123-page456--',
+        'https://shopee.co.th/product/1/2?utm_content=spring-post123-page456-log987-',
         expected,
     )
     assert.equal(ok.ok, true)
-    assert.equal(ok.utm_content, 'spring-post123-page456--')
-    assert.equal(ok.expected_utm_content, 'spring-post123-page456--')
+    assert.equal(ok.utm_content, 'spring-post123-page456-log987-')
+    assert.equal(ok.sub4, 'log987')
+    assert.equal(ok.expected_utm_content, 'spring-post123-page456-log987-')
     assert.equal(ok.reason, '')
 
     const mismatch = verifyRewrittenShortlink(
-        'https://shopee.co.th/product/1/2?utm_content=spring-WRONG-page456--',
+        'https://shopee.co.th/product/1/2?utm_content=spring-WRONG-page456-log987-',
         expected,
     )
     assert.equal(mismatch.ok, false)
