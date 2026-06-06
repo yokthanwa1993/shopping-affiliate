@@ -7,6 +7,7 @@ import {
     JOB_MAX_BATCH_SIZE,
     PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL,
     PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL,
+    PAGE_POST_LINK_LEDGER_TABLE_SQL,
     REGISTRY_DEFAULT_LIMIT,
     REGISTRY_MAX_LIMIT,
     buildCustomlinkRequestUrl,
@@ -31,6 +32,9 @@ import {
     replaceShortlinkInMessage,
     resolveCreateNewBlockedReason,
     resolveEffectiveTargetSub4,
+    resolveRealRewriteRefusal,
+    resolveRewriteLogId,
+    ensureRewriteLogId,
     resolvePageCommentLinkJobStatus,
     verifyAffiliateId,
     verifyRewrittenShortlink,
@@ -333,6 +337,145 @@ test('dry-run customlink path includes fallback sub4 from log_id', () => {
         sub3: '1008898512617594',
         sub4: targetSub4,
     }), '1JUN26FBSPCAD-1294666126171416-1008898512617594-25831-')
+})
+
+// ---------------------------------------------------------------------------
+// Durable per-page-story ledger id — guarantees a non-empty target_sub4/log_id
+// for EVERY rewrite item, including cache/manual/imported posts that have no
+// post_history.id. Regression guard for the 2026-05-16 batch that minted
+// utm_content with an empty slot 4 (`...-<post_id>-<page_id>--`).
+// ---------------------------------------------------------------------------
+
+test('page_post_link_ledger schema has an autoincrement id and durable metadata columns', () => {
+    assert.match(PAGE_POST_LINK_LEDGER_TABLE_SQL, /id INTEGER PRIMARY KEY AUTOINCREMENT/)
+    assert.match(PAGE_POST_LINK_LEDGER_TABLE_SQL, /comment_target_id TEXT NOT NULL DEFAULT ''/)
+    assert.match(PAGE_POST_LINK_LEDGER_TABLE_SQL, /page_story_object_id TEXT NOT NULL DEFAULT ''/)
+    for (const col of [
+        'page_id', 'fb_video_id', 'reel_id', 'post_id', 'comment_id', 'posted_at', 'source',
+        'old_shortlink', 'new_shortlink', 'old_utm_content', 'new_utm_content',
+        'old_affiliate_id', 'new_affiliate_id',
+        'target_sub1', 'target_sub2', 'target_sub3', 'target_sub4',
+        'status', 'last_audited_at', 'last_rewrite_at', 'last_verified_at',
+    ]) {
+        assert.ok(PAGE_POST_LINK_LEDGER_TABLE_SQL.includes(col), `ledger schema missing column ${col}`)
+    }
+})
+
+test('resolveRewriteLogId prefers an existing durable id, else the ledger id, else empty', () => {
+    assert.equal(resolveRewriteLogId({ existing: '25831', ledgerId: 7 }), '25831')
+    assert.equal(resolveRewriteLogId({ existing: '', ledgerId: 7 }), '7')
+    assert.equal(resolveRewriteLogId({ existing: '  ', ledgerId: '42' }), '42')
+    assert.equal(resolveRewriteLogId({ existing: '', ledgerId: '' }), '')
+    assert.equal(resolveRewriteLogId({ existing: '', ledgerId: null }), '')
+})
+
+test('cache item without post_history id gets a ledger id and a populated target_sub4', async () => {
+    // In-memory ledger: a stable autoincrement id per (page_id, comment_target_id),
+    // standing in for the D1 page_post_link_ledger autoincrement. No Facebook, no DB.
+    const seen = new Map()
+    let next = 0
+    const store = {
+        resolveId: async (key) => {
+            const k = `${key.pageId}::${key.commentTargetId}`
+            if (!seen.has(k)) seen.set(k, ++next)
+            return seen.get(k)
+        },
+    }
+    // A 2026-05-16 cache/manual row: full page-story target, but NO log_id /
+    // history_id / post_history_id — exactly the shape that minted the empty slot 4.
+    const raw: Record<string, unknown> = {
+        page_id: '1008898512617594',
+        fb_video_id: '1294666126171416',
+        reel_id: '1294666126171416',
+        post_id: '1234567890',
+        comment_target_id: '1008898512617594_1234567890',
+        comment_id: '1008898512617594_1234567890_999',
+    }
+    assert.equal(resolveEffectiveTargetSub4(raw), '', 'precondition: no durable id on the raw cache row')
+
+    const logId = await ensureRewriteLogId(raw, {
+        pageId: '1008898512617594',
+        commentTargetId: '1008898512617594_1234567890',
+        store,
+    })
+    assert.equal(logId, '1', 'cache item must receive a durable ledger id, never empty')
+
+    const subs = buildTargetSubIds({
+        requestedSub1: '1JUN26FBSPCAD',
+        pageId: '1008898512617594',
+        canonicalPostId: '1008898512617594_1234567890',
+        fbVideoId: '1294666126171416',
+        reelId: '1294666126171416',
+        logId,
+    })
+    assert.equal(subs.sub4, '1')
+    const utm = buildExpectedUtmContent(subs)
+    assert.equal(utm, '1JUN26FBSPCAD-1234567890-1008898512617594-1-')
+    assert.ok(!utm.endsWith('--'), 'utm_content must never carry an empty slot 4')
+
+    // Idempotent: the same page-story target keeps the same ledger id (no churn).
+    const again = await ensureRewriteLogId(raw, {
+        pageId: '1008898512617594',
+        commentTargetId: '1008898512617594_1234567890',
+        store,
+    })
+    assert.equal(again, '1')
+})
+
+test('ensureRewriteLogId prefers an existing post_history id over allocating a ledger id', async () => {
+    let called = 0
+    const store = { resolveId: async () => { called++; return 999 } }
+    const logId = await ensureRewriteLogId(
+        { log_id: 25831 },
+        { pageId: '1008898512617594', commentTargetId: '1008898512617594_123', store },
+    )
+    assert.equal(logId, '25831')
+    assert.equal(called, 0, 'store must not be touched when a durable post_history id already exists')
+})
+
+test('ensureRewriteLogId returns empty when no durable id and no stable target to key on', async () => {
+    const store = { resolveId: async () => 5 }
+    assert.equal(await ensureRewriteLogId({}, { pageId: '1008898512617594', commentTargetId: '', store }), '')
+    assert.equal(await ensureRewriteLogId({}, { pageId: '1008898512617594', commentTargetId: 'P_1', store: null }), '')
+})
+
+test('real run refuses to mint when target_sub4 is empty and a comment target/id is known', () => {
+    assert.equal(resolveRealRewriteRefusal({
+        targetSub4: '', commentTargetId: '1008898512617594_1234567890', oldCommentId: '', commentId: '',
+    }), 'missing_target_sub4')
+    assert.equal(resolveRealRewriteRefusal({
+        targetSub4: '', commentTargetId: '', oldCommentId: '', commentId: '1008898512617594_1234567890_9',
+    }), 'missing_target_sub4')
+    assert.equal(resolveRealRewriteRefusal({
+        targetSub4: '', commentTargetId: '', oldCommentId: '1008898512617594_1234567890_9', commentId: '',
+    }), 'missing_target_sub4')
+    // A populated target_sub4 (post_history id OR ledger id) clears the refusal.
+    assert.equal(resolveRealRewriteRefusal({
+        targetSub4: '25831', commentTargetId: '1008898512617594_1234567890', oldCommentId: '', commentId: '',
+    }), '')
+    // No target/comment to key on at all → not refused on this basis.
+    assert.equal(resolveRealRewriteRefusal({
+        targetSub4: '', commentTargetId: '', oldCommentId: '', commentId: '',
+    }), '')
+})
+
+test('page_story_object_id stays the full <page_id>_<post_id> used to key the ledger', () => {
+    const canonical = resolveCanonicalCommentTarget({
+        pageId: '1008898512617594',
+        postId: '1234567890',
+        canonicalPostId: '',
+        reelId: '1294666126171416',
+        existingTarget: '',
+    })
+    assert.equal(canonical.target, '1008898512617594_1234567890')
+    assert.equal(canonical.fallback, false)
+})
+
+test('target affiliate id stays the numeric 15130770000 for the rewrite', () => {
+    assert.equal(resolveTargetAffiliateId(), '15130770000')
+    assert.equal(resolveTargetAffiliateId('an_15130770000'), '15130770000')
+    assert.equal(resolveTargetAffiliateId('garbage-token'), '15130770000')
+    assert.equal(parseAffiliateId('https://customlink.wwoom.com/?id=15130770000&url=x'), '15130770000')
 })
 
 test('buildCustomlinkRequestUrl targets customlink host with default id and subs', () => {

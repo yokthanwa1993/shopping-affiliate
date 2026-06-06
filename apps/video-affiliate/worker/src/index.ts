@@ -39,6 +39,8 @@ import {
     PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL,
     PAGE_COMMENT_LINK_REGISTRY_INDEX_SQL,
     PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL,
+    PAGE_POST_LINK_LEDGER_INDEX_SQL,
+    PAGE_POST_LINK_LEDGER_TABLE_SQL,
     REGISTRY_DEFAULT_LIMIT,
     buildCustomlinkRequestUrl,
     buildExpectedUtmContent,
@@ -59,11 +61,15 @@ import {
     replaceShortlinkInMessage,
     resolveCreateNewBlockedReason,
     resolveEffectiveTargetSub4,
+    ensureRewriteLogId,
+    resolveRealRewriteRefusal,
+    resolveRewriteLogId,
     resolvePageCommentLinkJobStatus,
     resolveTargetAffiliateId,
     verifyAffiliateId,
     verifyRewrittenShortlink,
     type JobItemStatus,
+    type PagePostLedgerStore,
     type RewriteAction,
 } from './comment-link-registry'
 import {
@@ -7791,6 +7797,8 @@ async function ensurePageCommentLinkWorkflowTables(db: D1Database): Promise<void
             await db.prepare(PAGE_COMMENT_LINK_JOBS_TABLE_SQL).run()
             await db.prepare(PAGE_COMMENT_LINK_JOBS_INDEX_SQL).run().catch(() => { })
             await db.prepare(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL).run()
+            await db.prepare(PAGE_POST_LINK_LEDGER_TABLE_SQL).run()
+            await db.prepare(PAGE_POST_LINK_LEDGER_INDEX_SQL).run().catch(() => { })
             const addColumn = async (sql: string) => {
                 await db.prepare(sql).run().catch((err) => {
                     const message = String(err?.message || err || '').toLowerCase()
@@ -7900,10 +7908,119 @@ const PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN = /customlink\.[a-z0-9.-]+|s\.sho
 
 const str = (v: unknown): string => String(v == null ? '' : v).trim()
 
+// D1-backed durable per-page-story ledger. Allocates a stable AUTOINCREMENT
+// numeric id per (page_id, comment_target_id) so cache/manual/imported posts
+// with no post_history.id still mint a non-empty target_sub4/log_id. Read-only
+// with respect to Facebook — this is our own table. resolveId is idempotent:
+// existing rows are returned (metadata refreshed); new rows are inserted and the
+// new rowid returned. Never throws; returns 0 on failure so the caller can fall
+// back rather than minting an empty slot 4.
+function createPagePostLedgerStore(db: D1Database, auditedAt: string): PagePostLedgerStore {
+    return {
+        async resolveId(key) {
+            const pageId = str(key.pageId)
+            const commentTargetId = str(key.commentTargetId)
+            if (!pageId || !commentTargetId) return 0
+            const existing = await db.prepare(
+                'SELECT id FROM page_post_link_ledger WHERE page_id = ? AND comment_target_id = ? LIMIT 1'
+            ).bind(pageId, commentTargetId).first().catch(() => null) as { id?: number } | null
+            if (existing && Number(existing.id) > 0) {
+                // Refresh durable metadata + last_audited_at without churning the id.
+                await db.prepare(
+                    `UPDATE page_post_link_ledger SET
+                        page_story_object_id = ?, fb_video_id = ?, reel_id = ?, post_id = ?, comment_id = ?,
+                        posted_at = COALESCE(NULLIF(?, ''), posted_at), source = COALESCE(NULLIF(?, ''), source),
+                        old_shortlink = COALESCE(NULLIF(?, ''), old_shortlink),
+                        old_utm_content = COALESCE(NULLIF(?, ''), old_utm_content),
+                        old_affiliate_id = COALESCE(NULLIF(?, ''), old_affiliate_id),
+                        last_audited_at = ?, updated_at = datetime('now')
+                     WHERE id = ?`
+                ).bind(
+                    commentTargetId, str(key.fbVideoId), str(key.reelId), str(key.postId), str(key.commentId),
+                    str(key.postedAt), str(key.source), str(key.oldShortlink), str(key.oldUtmContent), str(key.oldAffiliateId),
+                    auditedAt, Number(existing.id),
+                ).run().catch(() => { })
+                return Number(existing.id)
+            }
+            const inserted = await db.prepare(
+                `INSERT INTO page_post_link_ledger
+                    (page_id, comment_target_id, page_story_object_id, fb_video_id, reel_id, post_id, comment_id,
+                     posted_at, source, old_shortlink, old_utm_content, old_affiliate_id, status, last_audited_at,
+                     created_at, updated_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'), datetime('now'))`
+            ).bind(
+                pageId, commentTargetId, commentTargetId, str(key.fbVideoId), str(key.reelId), str(key.postId), str(key.commentId),
+                str(key.postedAt), str(key.source), str(key.oldShortlink), str(key.oldUtmContent), str(key.oldAffiliateId), 'planned', auditedAt,
+            ).run().catch(() => null)
+            const newId = Number(inserted?.meta?.last_row_id || 0)
+            if (newId > 0) return newId
+            // Lost an insert race (unique index) → re-read the winning row.
+            const reread = await db.prepare(
+                'SELECT id FROM page_post_link_ledger WHERE page_id = ? AND comment_target_id = ? LIMIT 1'
+            ).bind(pageId, commentTargetId).first().catch(() => null) as { id?: number } | null
+            return Number(reread?.id || 0)
+        },
+    }
+}
+
+// Best-effort durable ledger update keyed by (page_id, comment_target_id). Only
+// touches rows that exist (cache/manual items the ledger minted ids for); a no-op
+// for post_history-backed items. Never throws — ledger bookkeeping must never
+// break a run/verify.
+async function updatePagePostLedgerByTarget(
+    db: D1Database, pageId: string, commentTargetId: string, fields: Record<string, unknown>,
+): Promise<void> {
+    const page = str(pageId)
+    const target = str(commentTargetId)
+    const keys = Object.keys(fields)
+    if (!page || !target || keys.length === 0) return
+    const setSql = keys.map((k) => `${k} = ?`).join(', ')
+    await db.prepare(
+        `UPDATE page_post_link_ledger SET ${setSql}, updated_at = datetime('now') WHERE page_id = ? AND comment_target_id = ?`
+    ).bind(...keys.map((k) => fields[k]), page, target).run().catch(() => { })
+}
+
+// Plan an item AND guarantee a durable log_id/target_sub4: prefer the item's own
+// post_history.id, else allocate a stable ledger id for its canonical page-story
+// target. The allocated id flows into planPageCommentLinkItem as `ledgerId`.
+async function planPageCommentLinkItemWithLedger(
+    raw: Record<string, unknown>,
+    opts: { pageId: string; requestedSub1: string; allowCreateNew?: boolean; customlinkId?: string },
+    ledgerStore: PagePostLedgerStore | null,
+): Promise<PageCommentLinkPlanItem> {
+    const pageId = opts.pageId
+    const reelId = str(raw.reel_id) || str(raw.fb_video_id) || str(raw.video_id)
+    const canonical = resolveCanonicalCommentTarget({
+        pageId,
+        postId: str(raw.post_id),
+        canonicalPostId: str(raw.canonical_post_id) || str(raw.post_canonical),
+        reelId,
+        existingTarget: str(raw.comment_target_id),
+    })
+    const commentTargetId = canonical.target || str(raw.comment_target_id)
+    const ledgerId = await ensureRewriteLogId(raw, {
+        pageId,
+        commentTargetId,
+        store: ledgerStore,
+        metadata: {
+            fbVideoId: str(raw.fb_video_id) || str(raw.video_id) || reelId,
+            reelId,
+            postId: str(raw.post_id),
+            commentId: str(raw.comment_id) || str(raw.old_comment_id),
+            postedAt: str(raw.posted_at) || str(raw.comment_created_time) || str(raw.created_time),
+            source: str(raw.source) || (raw.post_history_metadata ? 'post_history' : 'facebook_page_video_cache'),
+            oldShortlink: str(raw.old_shortlink),
+            oldUtmContent: str(raw.old_utm_content) || str(raw.utm_content),
+            oldAffiliateId: str(raw.old_affiliate_id),
+        },
+    })
+    return planPageCommentLinkItem(raw, { ...opts, ledgerId })
+}
+
 // Normalise a registry-shaped input item (as returned by GET …/page-comment-link-registry)
 // and compute the rewrite PLAN. Pure-ish: no network, no DB. The action says how
 // the new link would land; status is 'skipped' when there is nothing to rewrite.
-function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string; allowCreateNew?: boolean; customlinkId?: string }) {
+function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: string; requestedSub1: string; allowCreateNew?: boolean; customlinkId?: string; ledgerId?: string }) {
     const pageId = opts.pageId
     const fbVideoId = str(raw.fb_video_id) || str(raw.video_id) || str(raw.reel_id)
     const reelId = str(raw.reel_id) || fbVideoId
@@ -7931,7 +8048,10 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
     const oldSub3 = str(raw.old_sub3) || str(raw.sub3)
     const oldSub4 = str(raw.old_sub4) || str(raw.sub4)
     const oldSub5 = str(raw.old_sub5) || str(raw.sub5)
-    const logId = resolveEffectiveTargetSub4(raw)
+    // Durable log id (target_sub4): the item's own post_history.id / persisted
+    // target_sub4 when present, else the ledger id allocated by the caller. Never
+    // silently empty for a real cache/manual rewrite.
+    const logId = resolveRewriteLogId({ existing: resolveEffectiveTargetSub4(raw), ledgerId: opts.ledgerId })
     const allowCreateNew = opts.allowCreateNew === true
     const targetAffiliateId = resolveTargetAffiliateId(opts.customlinkId)
     const oldAffiliateId = str(raw.old_affiliate_id) || parseAffiliateId(oldExpandedUrl || oldShortlink)
@@ -7991,6 +8111,9 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
         target_sub2: subs.sub2,
         target_sub3: subs.sub3,
         target_sub4: subs.sub4,
+        // The durable log id that lands in slot 4 — surfaced explicitly so preview/
+        // job responses match run/verify/history (never a silently-empty slot 4).
+        effective_target_sub4: subs.sub4,
         target_sub2_source: subs.sub2_source,
         new_shortlink: '',
         new_expanded_url: '',
@@ -8104,7 +8227,11 @@ app.post('/api/dashboard/page-comment-link-rewrite-preview', async (c) => {
 
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
     const auditedAt = new Date().toISOString()
-    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew, customlinkId }))
+    const ledgerStore = createPagePostLedgerStore(c.env.DB, auditedAt)
+    const items: PageCommentLinkPlanItem[] = []
+    for (const raw of rawItems) {
+        items.push(await planPageCommentLinkItemWithLedger(raw, { pageId, requestedSub1, allowCreateNew, customlinkId }, ledgerStore))
+    }
     for (const item of items) await upsertPageCommentLinkRegistry(c.env.DB, item, auditedAt)
 
     const summary = { total: items.length, ...summarizePlanItems(items) }
@@ -8142,7 +8269,11 @@ app.post('/api/dashboard/page-comment-link-jobs', async (c) => {
 
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
     const auditedAt = new Date().toISOString()
-    const items = rawItems.map((raw) => planPageCommentLinkItem(raw, { pageId, requestedSub1, allowCreateNew, customlinkId }))
+    const ledgerStore = createPagePostLedgerStore(c.env.DB, auditedAt)
+    const items: PageCommentLinkPlanItem[] = []
+    for (const raw of rawItems) {
+        items.push(await planPageCommentLinkItemWithLedger(raw, { pageId, requestedSub1, allowCreateNew, customlinkId }, ledgerStore))
+    }
     const counts = summarizePlanItems(items)
     const jobId = `pclj_${crypto.randomUUID().replace(/-/g, '')}`
 
@@ -8334,8 +8465,15 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             processed.push({ item_index: index, status: 'skipped', action: 'skip', reason: blockedReason })
             continue
         }
-        if (str(row.log_id) && !targetSub4) {
-            await updateItem(index, { status: 'failed', reason: 'missing_target_sub4', error: 'log_id_without_target_sub4' })
+        // A real write must NEVER mint/write with an empty target_sub4 — that is
+        // the 2026-05-16 empty-slot-4 defect. Refuse whenever a comment target/id
+        // is known and target_sub4 is empty, regardless of whether a log_id exists.
+        // (Job items now persist a durable ledger-backed target_sub4 at creation;
+        // this guards legacy rows written before the fix.)
+        if (writeMode && hasToken && resolveRealRewriteRefusal({
+            targetSub4, commentTargetId: str(row.comment_target_id), oldCommentId, commentId: str(row.comment_id),
+        })) {
+            await updateItem(index, { status: 'failed', reason: 'missing_target_sub4', error: 'missing_target_sub4' })
             failedCount++
             processed.push({ item_index: index, status: 'failed', action, reason: 'missing_target_sub4' })
             if (stopOnFirstError) { stoppedReason = 'missing_target_sub4'; break }
@@ -8349,6 +8487,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             const wouldStatus: JobItemStatus = action === 'edit' ? 'would_edit' : 'would_create'
             processed.push({
                 item_index: index, status: wouldStatus, action, dry_run: true, token_available: hasToken,
+                log_id: str(row.log_id), effective_target_sub4: targetSub4,
                 customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId }),
                 expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 }),
                 target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: targetSub4,
@@ -8530,8 +8669,16 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0,
             comment_target_id: verifyTarget, reason: matched ? '' : 'post_write_verify_failed', error: '', attempts,
         })
+        // Best-effort durable ledger update: only touches rows the ledger minted an
+        // id for (cache/manual items); a no-op for post_history-backed items. Never
+        // throws — bookkeeping must not break the run.
+        await updatePagePostLedgerByTarget(c.env.DB, pageId, str(row.comment_target_id), {
+            new_shortlink: newShortlink, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id,
+            target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: targetSub4,
+            status: finalStatus, last_rewrite_at: new Date().toISOString(),
+        })
         if (matched) doneCount++; else failedCount++
-        processed.push({ item_index: index, status: finalStatus, action: finalAction, new_comment_id: newCommentId, new_affiliate_id: affiliateVerify.new_affiliate_id, target_affiliate_id: targetAffiliateId, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, affiliate_verify_status: affiliateVerify.affiliate_verify_status })
+        processed.push({ item_index: index, status: finalStatus, action: finalAction, log_id: str(row.log_id), effective_target_sub4: targetSub4, target_sub4: targetSub4, new_comment_id: newCommentId, new_affiliate_id: affiliateVerify.new_affiliate_id, target_affiliate_id: targetAffiliateId, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, affiliate_verify_status: affiliateVerify.affiliate_verify_status })
         if (!matched && stopOnFirstError) { stoppedReason = 'verify_failed'; break }
     }
 
@@ -8640,9 +8787,15 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
         await c.env.DB.prepare(
             `UPDATE page_comment_link_job_items SET status = ?, reason = ?, new_affiliate_id = ?, affiliate_verify_status = ?, affiliate_id_match = ?, last_audited_at = ?, updated_at = datetime('now') WHERE job_id = ? AND item_index = ?`
         ).bind(status, ok ? '' : `verify_${matched ? (linkVerify.reason || (affiliateVerify.affiliate_verify_status !== 'verified' ? `affiliate_${affiliateVerify.affiliate_verify_status}` : 'link')) : 'comment_missing'}`, affiliateVerify.new_affiliate_id, affiliateVerify.affiliate_verify_status, affiliateVerify.affiliate_id_match ? 1 : 0, new Date().toISOString(), jobId, index).run().catch(() => { })
+        // Best-effort durable ledger update (cache/manual rows only; no-op otherwise).
+        await updatePagePostLedgerByTarget(c.env.DB, pageId, str(row.comment_target_id), {
+            new_shortlink: str(row.new_shortlink), new_utm_content: str(row.new_utm_content), new_affiliate_id: affiliateVerify.new_affiliate_id,
+            status, last_verified_at: new Date().toISOString(),
+        })
         if (ok) verifiedCount++
         results.push({
             item_index: index, verified: ok, comment_present: matched, link_ok: linkVerify.ok,
+            log_id: str(row.log_id), effective_target_sub4: resolveEffectiveTargetSub4(row),
             // The canonical target we re-read (page-story object id, or reel fallback)
             // plus the source object ids so the fallback is never ambiguous.
             comment_target_id: target, page_story_object_id: target,
@@ -8675,6 +8828,8 @@ app.get('/api/dashboard/page-comment-link-jobs/:job_id/history', async (c) => {
     const history = items.map((it) => ({
         item_index: Number(it.item_index),
         page_id: str(it.page_id),
+        log_id: str(it.log_id),
+        effective_target_sub4: resolveEffectiveTargetSub4(it),
         fb_video_id: str(it.fb_video_id),
         reel_id: str(it.reel_id) || str(it.fb_video_id),
         post_id: str(it.post_id),

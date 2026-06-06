@@ -472,6 +472,94 @@ export function resolveEffectiveTargetSub4(input: {
     return ''
 }
 
+// ---------------------------------------------------------------------------
+// Durable per-page-story ledger id.
+//
+// `target_sub4` (the rewrite's log_id) MUST never be empty for a real rewrite:
+// an empty slot 4 mints `utm_content = <sub1>-<sub2>-<sub3>--`, which is the
+// 2026-05-16 production defect. The id source is, in order of preference:
+//   1. an existing durable id on the item (post_history.id / persisted target_sub4)
+//   2. a stable id from the page_post_link_ledger table, allocated per
+//      (page_id, canonical page-story object id) for cache/manual/imported posts
+//      that have no post_history row.
+// The ledger row itself is created/looked up via an injected store so this logic
+// stays network-free and unit-testable; the Worker backs the store with D1.
+// ---------------------------------------------------------------------------
+
+// Identity + durable metadata for a ledger row. Identity is
+// (pageId, commentTargetId); the remaining fields are stored snapshot metadata
+// so the ledger is a self-contained audit trail even without a post_history row.
+export type PagePostLedgerKey = {
+    pageId: string
+    // Canonical page-story object id (`<page_id>_<post_id>`), or the reel object
+    // id only when no page-story object exists. This is the stable allocation key.
+    commentTargetId: string
+    fbVideoId?: string
+    reelId?: string
+    postId?: string
+    commentId?: string
+    postedAt?: string
+    source?: string
+    oldShortlink?: string
+    oldUtmContent?: string
+    oldAffiliateId?: string
+}
+
+// Allocates/returns a stable positive integer id for a ledger key, creating the
+// row on first use. Backed by D1 in the Worker; an in-memory map in tests.
+export type PagePostLedgerStore = {
+    resolveId(key: PagePostLedgerKey): Promise<number>
+}
+
+// Resolve the durable rewrite log id (target_sub4) from an existing durable id
+// first, then a freshly-allocated ledger id. Returns '' only when neither is
+// available. Pure — the ledger id is resolved by the caller.
+export function resolveRewriteLogId(input: { existing?: unknown; ledgerId?: unknown }): string {
+    const existing = String(input.existing ?? '').trim()
+    if (existing) return existing
+    const ledger = String(input.ledgerId ?? '').trim()
+    return ledger
+}
+
+// Resolve the durable rewrite log id for a registry-shaped raw item, allocating a
+// ledger id ONLY when the item carries no durable id (post_history.id / persisted
+// target_sub4) AND a stable page-story target exists to key on. Prefers the
+// existing durable id so post_history-backed items never touch the ledger.
+export async function ensureRewriteLogId(
+    raw: Record<string, unknown>,
+    ctx: { pageId: string; commentTargetId: string; store?: PagePostLedgerStore | null; metadata?: Partial<PagePostLedgerKey> },
+): Promise<string> {
+    const existing = resolveEffectiveTargetSub4(raw)
+    if (existing) return existing
+    const store = ctx.store
+    const commentTargetId = String(ctx.commentTargetId || '').trim()
+    if (!store || !commentTargetId) return ''
+    const id = await store.resolveId({
+        pageId: String(ctx.pageId || '').trim(),
+        commentTargetId,
+        ...(ctx.metadata || {}),
+    })
+    return Number.isFinite(id) && id > 0 ? String(id) : ''
+}
+
+// Real-run guard: a write/mint MUST be refused when target_sub4 is empty and a
+// comment target / comment id is known (i.e. this is a real rewrite target).
+// Returns 'missing_target_sub4' to refuse, '' to proceed. This fires regardless
+// of whether a log_id is present — an empty target_sub4 can never be minted.
+export function resolveRealRewriteRefusal(input: {
+    targetSub4?: unknown
+    commentTargetId?: unknown
+    oldCommentId?: unknown
+    commentId?: unknown
+}): string {
+    const targetSub4 = String(input.targetSub4 ?? '').trim()
+    if (targetSub4) return ''
+    const known = String(input.commentTargetId ?? '').trim()
+        || String(input.oldCommentId ?? '').trim()
+        || String(input.commentId ?? '').trim()
+    return known ? 'missing_target_sub4' : ''
+}
+
 export function buildTargetSubIds(input: TargetSubBuildInput): TargetSubIds {
     const sub1 = String(input.requestedSub1 || '').trim()
     const sub3 = String(input.pageId || '').trim()
@@ -792,6 +880,43 @@ export const PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (job_id, item_index)
 )`
+
+// Durable per-page-story ledger. Unlike page_comment_link_registry (PK
+// page_id, fb_video_id), this table mints a stable AUTOINCREMENT numeric `id`
+// keyed by (page_id, comment_target_id) so EVERY rewrite target — including
+// cache/manual/imported posts with no post_history.id — gets a non-empty
+// target_sub4/log_id. Mirrored in schema.sql + migrations/0023.
+export const PAGE_POST_LINK_LEDGER_TABLE_SQL = `CREATE TABLE IF NOT EXISTS page_post_link_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id TEXT NOT NULL,
+    comment_target_id TEXT NOT NULL DEFAULT '',
+    page_story_object_id TEXT NOT NULL DEFAULT '',
+    fb_video_id TEXT NOT NULL DEFAULT '',
+    reel_id TEXT NOT NULL DEFAULT '',
+    post_id TEXT NOT NULL DEFAULT '',
+    comment_id TEXT NOT NULL DEFAULT '',
+    posted_at TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    old_shortlink TEXT NOT NULL DEFAULT '',
+    new_shortlink TEXT NOT NULL DEFAULT '',
+    old_utm_content TEXT NOT NULL DEFAULT '',
+    new_utm_content TEXT NOT NULL DEFAULT '',
+    old_affiliate_id TEXT NOT NULL DEFAULT '',
+    new_affiliate_id TEXT NOT NULL DEFAULT '',
+    target_sub1 TEXT NOT NULL DEFAULT '',
+    target_sub2 TEXT NOT NULL DEFAULT '',
+    target_sub3 TEXT NOT NULL DEFAULT '',
+    target_sub4 TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    last_audited_at TEXT NOT NULL DEFAULT '',
+    last_rewrite_at TEXT NOT NULL DEFAULT '',
+    last_verified_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`
+
+export const PAGE_POST_LINK_LEDGER_INDEX_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_page_post_link_ledger_key
+ON page_post_link_ledger(page_id, comment_target_id)`
 
 export const PAGE_COMMENT_LINK_REGISTRY_INDEX_SQL = `CREATE INDEX IF NOT EXISTS idx_page_comment_link_registry_page
 ON page_comment_link_registry(page_id, status, updated_at DESC)`

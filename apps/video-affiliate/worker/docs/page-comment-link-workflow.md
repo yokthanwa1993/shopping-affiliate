@@ -100,7 +100,13 @@ object is a fallback only when no `post_id` / page-story object exists.
 - `target_sub2` = canonical `post_id` when resolved, else `fb_video_id` / `reel_id`
   (the fallback is flagged in `reason` via `sub2_fallback_*`).
 - `target_sub3` = `page_id`.
-- Expected `utm_content` on the expanded link: `<sub1>-<sub2>-<sub3>--`.
+- `target_sub4` = stable rewrite log id. Prefer existing `post_history.id`; if a
+  cache/manual/imported item has no `post_history` row, the Worker allocates a
+  durable `page_post_link_ledger.id` keyed by `(page_id, page_story_object_id)`.
+  Preview/job/run/verify/history responses expose both `log_id` and
+  `target_sub4`/`effective_target_sub4`. A real write refuses before minting with
+  `missing_target_sub4` when slot 4 is still empty for a known target/comment.
+- Expected `utm_content` on the expanded link: `<sub1>-<sub2>-<sub3>-<sub4>-`.
 - `product_url` is canonicalized. When the Shopee shop/item ids can be parsed
   (`.../product/<shop>/<item>`, `.../<shopname>/<shop>/<item>`,
   `.../<slug>-i.<shop>.<item>`, or `shopid`/`itemid` query params) the **entire**
@@ -181,6 +187,10 @@ Tables added in `schema.sql` and `migrations/0020_page_comment_link_workflow.sql
 - `page_comment_link_registry` — durable per-item audit snapshot (PK `page_id, fb_video_id`).
 - `page_comment_link_jobs` — one rewrite batch (`dry_run`, `batch_size`, `stop_on_first_error`, counters).
 - `page_comment_link_job_items` — per-comment plan/result with full old/new history (PK `job_id, item_index`).
+- `page_post_link_ledger` — durable per-page-story autoincrement ledger keyed by
+  `(page_id, comment_target_id/page_story_object_id)` for cache/manual items that
+  lack `post_history.id`; stores source ids, old/new link/utm/affiliate metadata,
+  target sub ids, status, and audit/rewrite/verify timestamps.
 
 Both the registry and job-items tables carry affiliate-id tracking columns:
 `old_affiliate_id`, `target_affiliate_id`, `new_affiliate_id` (plain numeric
@@ -198,6 +208,7 @@ npm run db:migrate:video-affiliate          # prod (schema.sql)
 wrangler d1 execute video-affiliate-db --local --file=./migrations/0020_page_comment_link_workflow.sql
 wrangler d1 execute video-affiliate-db --local --file=./migrations/0021_page_comment_link_job_items_target_sub4.sql
 wrangler d1 execute video-affiliate-db --local --file=./migrations/0022_page_comment_link_affiliate_id_tracking.sql
+wrangler d1 execute video-affiliate-db --local --file=./migrations/0023_page_post_link_ledger.sql
 ```
 
 Tables are also auto-created at runtime via `ensurePageCommentLinkWorkflowTables`,
