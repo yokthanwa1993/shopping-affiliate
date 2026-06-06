@@ -2152,13 +2152,13 @@ mod tests {
         GEMINI_PREFLIGHT_MAX_DURATION_SECS, GEMINI_STRICT_INLINE_CONTAINER_HEADROOM_BYTES,
         GeminiPreflightError, GeminiTranscodeProfile, VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS,
         VERTEX_GENERATION_INLINE_MAX_BYTES, build_avatar_compose_ffmpeg_args,
-        build_final_merge_ffmpeg_args, build_flip_processing_input_ffmpeg_args,
-        build_gemini_inline_video_part, build_gemini_transcode_ffmpeg_args,
-        build_gemini_transcode_filter, build_srt_from_lines_with_timing, build_tts_payload,
-        convert_to_ass, extract_speech_srt_time_span, extract_srt_payload,
-        ffmpeg_nonzero_status_reason, format_gemini_preflight_info, normalize_srt_blocks,
-        parse_gemini_preflight_info, parse_srt_time_range, pipeline_error_category,
-        validate_gemini_safe_output,
+        build_avatar_compose_filter_complex, build_final_merge_ffmpeg_args,
+        build_flip_processing_input_ffmpeg_args, build_gemini_inline_video_part,
+        build_gemini_transcode_ffmpeg_args, build_gemini_transcode_filter,
+        build_srt_from_lines_with_timing, build_tts_payload, convert_to_ass,
+        extract_speech_srt_time_span, extract_srt_payload, ffmpeg_nonzero_status_reason,
+        format_gemini_preflight_info, normalize_srt_blocks, parse_gemini_preflight_info,
+        parse_srt_time_range, pipeline_error_category, validate_gemini_safe_output,
     };
     use serde_json::json;
 
@@ -2582,6 +2582,32 @@ mod tests {
         assert_eq!(value_after("-movflags"), Some("+faststart"));
         assert!(!args.iter().any(|arg| arg == "ultrafast"));
         assert!(!args.iter().any(|arg| arg == "-crf"));
+
+        let avatar_input_index = args
+            .iter()
+            .position(|arg| arg == "/tmp/avatar.mp4")
+            .expect("avatar input present");
+        assert_eq!(
+            args.get(avatar_input_index.saturating_sub(3))
+                .map(String::as_str),
+            Some("-stream_loop"),
+            "avatar input must be looped before the -i avatar argument"
+        );
+        assert_eq!(
+            args.get(avatar_input_index.saturating_sub(2))
+                .map(String::as_str),
+            Some("-1"),
+            "avatar input must loop until bounded by base duration"
+        );
+    }
+
+    #[test]
+    fn avatar_compose_filter_does_not_freeze_last_avatar_frame() {
+        let filter = build_avatar_compose_filter_complex(0.30, 0.10);
+        assert!(filter.contains("eof_action=pass"));
+        assert!(filter.contains("repeatlast=0"));
+        assert!(!filter.contains("eof_action=repeat"));
+        assert!(!filter.contains("repeatlast=1"));
     }
 }
 
@@ -3830,6 +3856,15 @@ async fn download_avatar_compose_video(
     Ok(bytes.to_vec())
 }
 
+fn build_avatar_compose_filter_complex(chromakey_similarity: f64, chromakey_blend: f64) -> String {
+    format!(
+        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=rgba[base];\
+         [1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:0x00c800,setsar=1,fps=30,format=rgba,colorkey=0x00c800:{:.4}:{:.4},format=rgba[avatar];\
+         [base][avatar]overlay=0:0:format=auto:eof_action=pass:repeatlast=0,format=yuv420p[outv]",
+        chromakey_similarity, chromakey_blend,
+    )
+}
+
 fn build_avatar_compose_ffmpeg_args(
     base_path: &str,
     avatar_path: &str,
@@ -3841,6 +3876,8 @@ fn build_avatar_compose_ffmpeg_args(
         "-y".to_string(),
         "-i".to_string(),
         base_path.to_string(),
+        "-stream_loop".to_string(),
+        "-1".to_string(),
         "-i".to_string(),
         avatar_path.to_string(),
         "-filter_complex".to_string(),
@@ -3900,12 +3937,7 @@ async fn compose_avatar_video(
     // compressed green-screen MP4s, darkening the whole base video during FB posting.
     let effective_similarity = input.chromakey_similarity.max(0.30);
     let effective_blend = input.chromakey_blend.max(0.10);
-    let filter_complex = format!(
-        "[0:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=rgba[base];\
-         [1:v]scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:0x00c800,setsar=1,fps=30,format=rgba,colorkey=0x00c800:{:.4}:{:.4},format=rgba[avatar];\
-         [base][avatar]overlay=0:0:format=auto:eof_action=repeat:repeatlast=1,format=yuv420p[outv]",
-        effective_similarity, effective_blend,
-    );
+    let filter_complex = build_avatar_compose_filter_complex(effective_similarity, effective_blend);
 
     let duration = format!("{:.3}", base_duration);
     let ffmpeg_args = build_avatar_compose_ffmpeg_args(

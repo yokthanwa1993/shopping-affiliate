@@ -49,6 +49,21 @@ let tunnelReady = false;
 let tunnelError = null;
 let sessionReadyLogged = false;
 
+// FB Web comment-edit capture state (in-memory only — never persisted, never
+// returned raw). Populated by the page interceptor when the operator edits a
+// comment inside the Ads Manager window; replayed by POST /fb-comment/edit.
+// rawBody/parsedForm hold the captured x-www-form-urlencoded GraphQL mutation
+// (incl. fb_dtsg/doc_id) and MUST NOT leave the process in any response.
+let fbCommentCapture = {
+  captured: false,
+  capturedAt: null,   // ISO string
+  friendlyName: null, // fb_api_req_friendly_name (safe to expose)
+  docIdPresent: false,
+  rawBody: null,      // captured URL-encoded body (memory-only)
+  parsedForm: null,   // parsed form fields (memory-only)
+};
+let fbCommentInterceptorInstalled = false;
+
 function safeLog(...args) {
   try { process.stdout.write(`${args.join(" ")}\n`); } catch (e) { if (e?.code !== "EPIPE") throw e; }
 }
@@ -104,6 +119,153 @@ function elFetch(url, opts = {}) {
   });
 }
 
+// ---- FB Web comment-edit capture + replay helpers -------------------------
+// Page-side interceptor: monkeypatches fetch/XMLHttpRequest in mainWindow and
+// stashes the most recent /api/graphql/ body that looks like an edit-comment
+// mutation onto window.__onecardEditCapture. Idempotent (guarded by a flag).
+const FB_COMMENT_INTERCEPTOR_JS = `(function(){
+  if (window.__onecardEditCaptureInstalled) return 'already';
+  window.__onecardEditCaptureInstalled = true;
+  if (typeof window.__onecardEditCapture === 'undefined') window.__onecardEditCapture = null;
+  function looksLikeEdit(body){
+    if (typeof body !== 'string') return false;
+    if (body.indexOf('useCometUFIEditCommentMutation') !== -1) return true;
+    var m = body.match(/fb_api_req_friendly_name=([^&]+)/);
+    if (m) { try { if (/EditComment/i.test(decodeURIComponent(m[1]))) return true; } catch(e){} }
+    return false;
+  }
+  function store(url, body){
+    try {
+      if (typeof url === 'string' && url.indexOf('/api/graphql/') !== -1 && looksLikeEdit(body)) {
+        window.__onecardEditCapture = { url: String(url), body: String(body), at: Date.now() };
+      }
+    } catch(e){}
+  }
+  try {
+    var origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function(input, init){
+        try {
+          var url = (typeof input === 'string') ? input : (input && input.url);
+          var body = init && init.body;
+          if (typeof body === 'string') store(url, body);
+        } catch(e){}
+        return origFetch.apply(this, arguments);
+      };
+    }
+  } catch(e){}
+  try {
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url){ this.__onecardUrl = url; return origOpen.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function(body){ try { if (typeof body === 'string') store(this.__onecardUrl, body); } catch(e){} return origSend.apply(this, arguments); };
+  } catch(e){}
+  return 'installed';
+})()`;
+
+function fbParseForm(rawBody) {
+  const out = {};
+  try {
+    const sp = new URLSearchParams(String(rawBody || ""));
+    for (const [k, v] of sp.entries()) out[k] = v;
+  } catch {}
+  return out;
+}
+
+// Sanitized view of capture state — safe for HTTP responses (no token, cookie,
+// fb_dtsg, or raw body).
+function fbCommentSanitizedState() {
+  return {
+    captured: !!fbCommentCapture.captured,
+    doc_id_present: !!fbCommentCapture.docIdPresent,
+    friendly_name: fbCommentCapture.friendlyName || null,
+    captured_at: fbCommentCapture.capturedAt || null,
+  };
+}
+
+async function fbInstallCommentInterceptor() {
+  if (!mainWindow) return false;
+  try {
+    await mainWindow.webContents.executeJavaScript(FB_COMMENT_INTERCEPTOR_JS, true);
+    fbCommentInterceptorInstalled = true;
+    return true;
+  } catch { return false; }
+}
+
+// Pull the latest captured mutation from the page into the in-memory state.
+async function fbPullCaptureFromPage() {
+  if (!mainWindow) return;
+  try {
+    const raw = await mainWindow.webContents.executeJavaScript("JSON.stringify(window.__onecardEditCapture || null)");
+    const cap = raw ? JSON.parse(raw) : null;
+    if (cap && typeof cap.body === "string" && cap.body) {
+      const form = fbParseForm(cap.body);
+      fbCommentCapture = {
+        captured: true,
+        capturedAt: cap.at ? new Date(cap.at).toISOString() : new Date().toISOString(),
+        friendlyName: form.fb_api_req_friendly_name || null,
+        docIdPresent: !!form.doc_id,
+        rawBody: String(cap.body),
+        parsedForm: form,
+      };
+    }
+  } catch {}
+}
+
+// Recursively walk the GraphQL `variables` object and retarget fields that look
+// like a comment id or a comment message/body/text.
+//
+// Comment-id handling is deliberately conservative. A captured edit mutation
+// carries Facebook's OPAQUE internal GraphQL comment id (e.g. a ~56-char string),
+// NOT the numeric Graph API comment_id (e.g. 129313..._226...). Blindly swapping
+// the opaque id for a numeric one makes Facebook reject the mutation
+// (facebook_graphql_error — observed in live testing). So by default we PRESERVE
+// an opaque captured id and only retarget the message. This means the caller MUST
+// capture on the exact comment being edited; the post-edit verification against
+// the numeric Graph comment_id is the safety check that we edited the right one.
+//
+// We only replace the captured comment id when it already looks like a numeric
+// Graph id, or when the caller explicitly opts in with force_comment_id_replace.
+// Returns message/comment-id update counts plus whether an opaque id was kept.
+function fbApplyEditVariables(variables, targetCommentId, targetMessage, forceReplace) {
+  let messageUpdated = 0;
+  let commentIdUpdated = 0;
+  let commentIdPreserved = false;
+  const COMMENT_ID_KEY = /comment[_]?id/i;
+  const MESSAGE_KEY = /^(message|body|text)$/i;
+  // A numeric Graph comment_id is digits, optionally page_comment underscore form.
+  const targetIsNumeric = /^[0-9]+(_[0-9]+)?$/.test(String(targetCommentId));
+  function walk(node) {
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (node && typeof node === "object") {
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (MESSAGE_KEY.test(k)) {
+          if (typeof v === "string") { node[k] = targetMessage; messageUpdated++; }
+          else if (v && typeof v === "object") {
+            if (typeof v.text === "string") { v.text = targetMessage; messageUpdated++; }
+            else walk(v);
+          }
+        } else if (COMMENT_ID_KEY.test(k) && (typeof v === "string" || typeof v === "number")) {
+          const captured = String(v);
+          const capturedIsNumeric = /^[0-9]+(_[0-9]+)?$/.test(captured);
+          // Opaque captured id + numeric target → keep the opaque id unless forced.
+          const looksOpaque = !capturedIsNumeric && captured.length > 30 && targetIsNumeric;
+          if (looksOpaque && !forceReplace) {
+            commentIdPreserved = true;
+          } else {
+            node[k] = targetCommentId; commentIdUpdated++;
+          }
+        } else {
+          walk(v);
+        }
+      }
+    }
+  }
+  walk(variables);
+  return { messageUpdated, commentIdUpdated, commentIdPreserved };
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({ width: 1400, height: 900, show: false, webPreferences: { nodeIntegration: false, contextIsolation: true } });
   mainWindow.loadURL(ADS_MANAGER_URL);
@@ -112,6 +274,10 @@ function createWindow() {
   // Extract __accessToken + fb_dtsg after page loads
   mainWindow.webContents.on("did-finish-load", extractFromPage);
   setInterval(extractFromPage, 15000);
+
+  // Re-install the comment-edit interceptor after navigations/reloads once the
+  // operator has opted in (the page JS context is wiped on each load).
+  mainWindow.webContents.on("did-finish-load", () => { if (fbCommentInterceptorInstalled) fbInstallCommentInterceptor(); });
 
   // Auto-reload Ads Manager ทุก 2 ชั่วโมง เพื่อ refresh token/cookies
   setInterval(() => {
@@ -829,6 +995,127 @@ function startServer() {
         });
         return res.end(JSON.stringify(r.json()));
       } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /fb-comment/capture-edit-mutation — install the page interceptor and report
+    // sanitized capture state. The operator edits a comment once in the Ads
+    // Manager window; the interceptor stashes that mutation for replay. Response
+    // is sanitized: no token/cookie/fb_dtsg/raw body ever leaves the process.
+    if (p === "/fb-comment/capture-edit-mutation" && req.method === "POST") {
+      try {
+        const installed = await fbInstallCommentInterceptor();
+        await fbPullCaptureFromPage();
+        return res.end(JSON.stringify({ ok: true, interceptor_installed: installed, ...fbCommentSanitizedState() }));
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /fb-comment/capture-edit-mutation/status — sanitized capture state.
+    if (p === "/fb-comment/capture-edit-mutation/status" && req.method === "GET") {
+      try {
+        await fbPullCaptureFromPage();
+        return res.end(JSON.stringify({ ok: true, interceptor_installed: fbCommentInterceptorInstalled, ...fbCommentSanitizedState() }));
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ ok: false, error: e.message })); }
+    }
+
+    // /fb-comment/edit — replay the captured edit-comment mutation against a
+    // target comment_id + message. Fails CLOSED: this is strictly an EDIT
+    // mutation (fixed doc_id), so it can only edit an existing comment or error
+    // — it can never create a new comment. If anything is unknown/missing we
+    // return a blocker + fallback_required:true instead of faking success.
+    if (p === "/fb-comment/edit" && req.method === "POST") {
+      try {
+        const commentId = String(body.comment_id || "").trim();
+        const message = typeof body.message === "string" ? body.message : "";
+        const verify = body.verify !== false && body.verify !== "false"; // default true
+        const forceCommentIdReplace = body.force_comment_id_replace === true || body.force_comment_id_replace === "true";
+
+        if (!commentId || !/^[0-9_]+$/.test(commentId)) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, edited: false, verified: false, comment_id: commentId, fallback_required: true, blocker: "invalid_comment_id", error: "comment_id must be numeric (optionally page_comment form)" }));
+        }
+        if (!message || message.length > 20000) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, edited: false, verified: false, comment_id: commentId, fallback_required: true, blocker: "invalid_message", error: "message required and must be <= 20000 chars" }));
+        }
+
+        await fbPullCaptureFromPage();
+        if (!fbCommentCapture.captured || !fbCommentCapture.parsedForm) {
+          return res.end(JSON.stringify({ ok: false, edited: false, verified: false, comment_id: commentId, fallback_required: true, blocker: "capture_required", error: "No captured edit mutation. Edit a comment once in the Ads Manager window after calling /fb-comment/capture-edit-mutation." }));
+        }
+
+        const form = { ...fbCommentCapture.parsedForm };
+        const mutationName = fbCommentCapture.friendlyName || null;
+        const docIdPresent = fbCommentCapture.docIdPresent;
+
+        let variables;
+        try { variables = JSON.parse(form.variables || "null"); } catch { variables = null; }
+        if (!variables || typeof variables !== "object") {
+          return res.end(JSON.stringify({ ok: false, edited: false, verified: false, comment_id: commentId, mutation_name: mutationName, doc_id_present: docIdPresent, fallback_required: true, blocker: "unknown_payload_shape", error: "Captured payload has no parseable variables." }));
+        }
+
+        const applied = fbApplyEditVariables(variables, commentId, message, forceCommentIdReplace);
+        if (applied.messageUpdated < 1) {
+          // Could not locate the message field — refuse rather than send a
+          // mutation that would edit the captured comment with stale text.
+          // (The comment id may be intentionally preserved; see fbApplyEditVariables.)
+          return res.end(JSON.stringify({ ok: false, edited: false, verified: false, comment_id: commentId, mutation_name: mutationName, doc_id_present: docIdPresent, comment_id_updated: applied.commentIdUpdated, comment_id_preserved: applied.commentIdPreserved, fallback_required: true, blocker: "unknown_payload_shape", error: `Could not locate message field (msg:${applied.messageUpdated}).` }));
+        }
+
+        form.variables = JSON.stringify(variables);
+        if (fbDtsg) form.fb_dtsg = fbDtsg; // prefer the freshest token
+        const outBody = Object.entries(form).map(([k, v]) => k + "=" + encodeURIComponent(typeof v === "object" ? JSON.stringify(v) : String(v))).join("&");
+
+        let edited = false;
+        let fbError = null;
+        try {
+          const r = await elFetch("https://www.facebook.com/api/graphql/", {
+            method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: outBody,
+          });
+          const status = r.status || 0;
+          const cleaned = String(r.text() || "").replace(/^for ?\(;;\);/, "").trim();
+          let parsed = null;
+          try { parsed = JSON.parse(cleaned.split("\n")[0]); } catch {}
+          if (parsed && (parsed.errors || parsed.error)) {
+            fbError = "facebook_graphql_error";
+          } else if (status >= 200 && status < 300 && parsed && parsed.data) {
+            edited = true;
+          } else if (status >= 200 && status < 300 && !parsed) {
+            fbError = "ambiguous_response";
+          } else {
+            fbError = "http_" + status;
+          }
+        } catch (e) {
+          fbError = "request_failed";
+        }
+
+        let verified = false;
+        if (edited && verify) {
+          try {
+            const vr = await elFetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(commentId)}?fields=message,from&access_token=${encodeURIComponent(accessToken || "")}`);
+            const vd = vr.json();
+            if (vd && typeof vd.message === "string" && vd.message === message) verified = true;
+          } catch {}
+        }
+
+        const ok = edited && (!verify || verified);
+        return res.end(JSON.stringify({
+          ok,
+          edited,
+          verified,
+          comment_id: commentId,
+          mutation_name: mutationName,
+          doc_id_present: docIdPresent,
+          comment_id_updated: applied.commentIdUpdated,
+          comment_id_preserved: applied.commentIdPreserved,
+          fallback_required: !ok,
+          ...(fbError ? { error: fbError } : {}),
+          ...(edited && verify && !verified ? { blocker: "verification_failed" } : {}),
+          ...(!edited && !fbError ? { blocker: "edit_failed" } : {}),
+        }));
+      } catch (e) {
+        res.writeHead(500);
+        return res.end(JSON.stringify({ ok: false, edited: false, verified: false, fallback_required: true, blocker: "exception", error: e.message }));
+      }
     }
 
     // /graph — Proxy Graph API ผ่าน Electron net (session cookies + token)

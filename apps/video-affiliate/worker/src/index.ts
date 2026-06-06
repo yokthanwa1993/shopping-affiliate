@@ -15846,74 +15846,90 @@ async function getNextReadyGalleryIndexInboxRecord(params: {
     env: Env
     bucket: R2Bucket
     namespaceId: string
+    excludeVideoIds?: string[]
 }): Promise<InboxVideoRecord | null> {
     const namespaceId = String(params.namespaceId || '').trim()
     if (!namespaceId) return null
+    const excludeVideoIds = new Set((params.excludeVideoIds || []).map((id) => String(id || '').trim()).filter(Boolean))
     await ensureGalleryIndexTable(params.env.DB).catch(() => { })
 
-    const page = await params.env.DB.prepare(
-        `SELECT
-            gi.namespace_id,
-            gi.video_id,
-            gi.title,
-            ${NAMESPACE_STATE_SHOPEE_LINK_SQL} AS shopee_link,
-            ${NAMESPACE_STATE_LAZADA_LINK_SQL} AS lazada_link,
-            COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), gi.shopee_original_link, gi.shopee_link) AS shopee_original_link,
-            COALESCE(NULLIF(TRIM(nvs.lazada_original_link), ''), gi.lazada_original_link, gi.lazada_link) AS lazada_original_link,
-            gi.original_url,
-            gi.created_at,
-            gi.updated_at
-         ${DASHBOARD_GALLERY_FROM_JOIN}
-         WHERE gi.namespace_id = ?
-           AND TRIM(COALESCE(NULLIF(TRIM(gi.original_url), ''), NULLIF(TRIM(gi.public_url), ''))) <> ''
-           AND TRIM(COALESCE(gi.processed_at,'')) = ''
-           AND ${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL}
-           AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL}
-         ORDER BY COALESCE(NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id ASC
-         LIMIT 160`
-    ).bind(namespaceId).all().catch(() => ({ results: [] })) as { results?: Array<Record<string, unknown>> }
+    const pageSize = 160
+    const maxPages = 12
+    let scanned = 0
+    for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
+        const page = await params.env.DB.prepare(
+            `SELECT
+                gi.namespace_id,
+                gi.video_id,
+                gi.title,
+                ${NAMESPACE_STATE_SHOPEE_LINK_SQL} AS shopee_link,
+                ${NAMESPACE_STATE_LAZADA_LINK_SQL} AS lazada_link,
+                COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), gi.shopee_original_link, gi.shopee_link) AS shopee_original_link,
+                COALESCE(NULLIF(TRIM(nvs.lazada_original_link), ''), gi.lazada_original_link, gi.lazada_link) AS lazada_original_link,
+                gi.original_url,
+                gi.created_at,
+                gi.updated_at
+             ${DASHBOARD_GALLERY_FROM_JOIN}
+             WHERE gi.namespace_id = ?
+               AND TRIM(COALESCE(NULLIF(TRIM(gi.original_url), ''), NULLIF(TRIM(gi.public_url), ''))) <> ''
+               AND TRIM(COALESCE(gi.processed_at,'')) = ''
+               AND ${NAMESPACE_STATE_USABLE_SHOPEE_LINK_SQL}
+               AND ${NAMESPACE_STATE_HAS_LAZADA_LINK_SQL}
+             ORDER BY COALESCE(NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id ASC
+             LIMIT ? OFFSET ?`
+        ).bind(namespaceId, pageSize, pageIndex * pageSize).all().catch(() => ({ results: [] })) as { results?: Array<Record<string, unknown>> }
 
-    for (const row of page.results || []) {
-        const id = String(row.video_id || '').trim()
-        if (!id) continue
+        const rows = page.results || []
+        if (rows.length <= 0) break
+        scanned += rows.length
 
-        const processingRecord = await getProcessingJobRecord(params.bucket, id).catch(() => null)
-        const existingProcessingStatus = String(processingRecord?.status || '').trim().toLowerCase()
-        if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
-        if (existingProcessingStatus === 'failed') {
-            const failedAtMs = Date.parse(String(processingRecord?.failedAt || processingRecord?.updatedAt || ''))
-            if (Number.isFinite(failedAtMs) && (Date.now() - failedAtMs) < PROCESSING_FAILURE_COOLDOWN_MS) {
-                continue
+        for (const row of rows) {
+            const id = String(row.video_id || '').trim()
+            if (!id) continue
+
+            const processingRecord = await getProcessingJobRecord(params.bucket, id).catch(() => null)
+            const existingProcessingStatus = String(processingRecord?.status || '').trim().toLowerCase()
+            if (existingProcessingStatus && existingProcessingStatus !== 'failed') continue
+            if (existingProcessingStatus === 'failed') {
+                const failedAtMs = Date.parse(String(processingRecord?.failedAt || processingRecord?.updatedAt || ''))
+                if (Number.isFinite(failedAtMs) && (Date.now() - failedAtMs) < PROCESSING_FAILURE_COOLDOWN_MS) {
+                    continue
+                }
             }
+
+            const processedAt = await getGalleryIndexProcessedAt(params.env.DB, namespaceId, id).catch(() => '')
+            if (processedAt) continue
+
+            const originalUrl = String(row.original_url || '').trim()
+            const shopeeLink = String(row.shopee_link || '').trim()
+            const lazadaLink = String(row.lazada_link || '').trim()
+            if (!originalUrl || !isUsableShopeeLink(shopeeLink) || !lazadaLink) continue
+
+            if (scanned > pageSize) {
+                console.log(`[PROCESSING-DISPATCH] ready candidate found after deep scan scanned=${scanned}`)
+            }
+            const existing = await getInboxVideoRecord(params.bucket, id).catch(() => null)
+            const timestamp = String(row.updated_at || row.created_at || '').trim() || new Date().toISOString()
+            return putInboxVideoRecord(params.bucket, {
+                ...existing,
+                id,
+                videoUrl: originalUrl,
+                chatId: Number(existing?.chatId || 0),
+                createdAt: String(existing?.createdAt || row.created_at || timestamp).trim() || timestamp,
+                updatedAt: new Date().toISOString(),
+                sourceType: existing?.sourceType || 'line_video',
+                sourceLabel: String(existing?.sourceLabel || row.title || 'Admin original').trim().slice(0, 500) || 'Admin original',
+                shopeeLink,
+                lazadaLink,
+                shopeeOriginalLink: String(row.shopee_original_link || shopeeLink).trim(),
+                lazadaOriginalLink: String(row.lazada_original_link || lazadaLink).trim(),
+                linkRecordedAt: String(existing?.linkRecordedAt || timestamp).trim() || timestamp,
+                manualCaption: normalizeManualCaption(existing?.manualCaption || ''),
+                captionProvidedAt: String(existing?.captionProvidedAt || '').trim(),
+            })
         }
 
-        const processedAt = await getGalleryIndexProcessedAt(params.env.DB, namespaceId, id).catch(() => '')
-        if (processedAt) continue
-
-        const originalUrl = String(row.original_url || '').trim()
-        const shopeeLink = String(row.shopee_link || '').trim()
-        const lazadaLink = String(row.lazada_link || '').trim()
-        if (!originalUrl || !isUsableShopeeLink(shopeeLink) || !lazadaLink) continue
-
-        const existing = await getInboxVideoRecord(params.bucket, id).catch(() => null)
-        const timestamp = String(row.updated_at || row.created_at || '').trim() || new Date().toISOString()
-        return putInboxVideoRecord(params.bucket, {
-            ...existing,
-            id,
-            videoUrl: originalUrl,
-            chatId: Number(existing?.chatId || 0),
-            createdAt: String(existing?.createdAt || row.created_at || timestamp).trim() || timestamp,
-            updatedAt: new Date().toISOString(),
-            sourceType: existing?.sourceType || 'line_video',
-            sourceLabel: String(existing?.sourceLabel || row.title || 'Admin original').trim().slice(0, 500) || 'Admin original',
-            shopeeLink,
-            lazadaLink,
-            shopeeOriginalLink: String(row.shopee_original_link || shopeeLink).trim(),
-            lazadaOriginalLink: String(row.lazada_original_link || lazadaLink).trim(),
-            linkRecordedAt: String(existing?.linkRecordedAt || timestamp).trim() || timestamp,
-            manualCaption: normalizeManualCaption(existing?.manualCaption || ''),
-            captionProvidedAt: String(existing?.captionProvidedAt || '').trim(),
-        })
+        if (rows.length < pageSize) break
     }
 
     return null
@@ -16606,10 +16622,16 @@ async function hasActiveProcessingJob(bucket: R2Bucket, namespaceId = ''): Promi
 async function getProcessingJobStatus(bucket: R2Bucket, id: string): Promise<string> {
     const normalizedId = String(id || '').trim()
     if (!normalizedId) return ''
-    const obj = await bucket.get(`_processing/${normalizedId}.json`).catch(() => null)
-    if (!obj) return ''
-    const data = await obj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
-    return String(data.status || '').trim().toLowerCase()
+    const processingObj = await bucket.get(`_processing/${normalizedId}.json`).catch(() => null)
+    if (processingObj) {
+        const data = await processingObj.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        const status = String(data.status || '').trim().toLowerCase()
+        if (status) return status
+        return 'processing'
+    }
+    const queueObj = await bucket.get(`_queue/${normalizedId}.json`).catch(() => null)
+    if (queueObj) return 'queued'
+    return ''
 }
 
 // Returns the full _processing/{id}.json record so callers can inspect the
@@ -17231,6 +17253,7 @@ async function startInboxVideoProcessing(params: {
         httpMetadata: { contentType: 'application/json' },
     })
     const run = async () => {
+        let pipelineSucceeded = false
         try {
             await runPipeline(
                 params.env,
@@ -17242,21 +17265,23 @@ async function startInboxVideoProcessing(params: {
                 String(item.shopeeLink || '').trim(),
                 String(item.lazadaLink || '').trim(),
             )
+            pipelineSucceeded = true
         } finally {
-            if (!params.runInline) {
-                await dispatchNextProcessingJobForNamespace(params.env, params.executionCtx, params.botId, { runInline: true }).then((result) => {
-                    console.log(`[INBOX-PROCESS-AUTOSTART] ${params.botId}/${item.id}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+            if (pipelineSucceeded) {
+                const completedAt = new Date().toISOString()
+                await putInboxVideoRecord(params.bucket, {
+                    ...item,
+                    processedAt: completedAt,
+                    updatedAt: completedAt,
                 }).catch((error) => {
-                    console.error(`[INBOX-PROCESS-AUTOSTART] failed after ${params.botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+                    console.error(`[INBOX-PROCESS-AUTOSTART] failed to mark inbox processed before dispatch ${params.botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
                 })
-            } else {
-                const adminNamespaceId = await resolvePrimaryAdminNamespaceId(params.env.DB).catch(() => '')
-                if (adminNamespaceId && adminNamespaceId === params.botId) {
-                    await autoImportAndProcessForAdmin(params.env, params.executionCtx).catch((error) => {
-                        console.error(`[INBOX-PROCESS] failed to start next admin original after ${item.id}: ${error instanceof Error ? error.message : String(error)}`)
-                    })
-                }
             }
+            await dispatchNextProcessingJobForNamespace(params.env, params.executionCtx, params.botId, { runInline: false, excludeVideoIds: [item.id] }).then((result) => {
+                console.log(`[INBOX-PROCESS-AUTOSTART] ${params.botId}/${item.id}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
+            }).catch((error) => {
+                console.error(`[INBOX-PROCESS-AUTOSTART] failed after ${params.botId}/${item.id}: ${error instanceof Error ? error.message : String(error)}`)
+            })
         }
     }
     if (params.runInline) {
@@ -17783,9 +17808,10 @@ async function listActiveProcessingVideos(
     return videos.slice(0, resultLimit)
 }
 
-async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, namespaceId: string, options: { runInline?: boolean } = {}): Promise<boolean> {
+async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, namespaceId: string, options: { runInline?: boolean; excludeVideoIds?: string[] } = {}): Promise<boolean> {
     const botId = String(namespaceId || '').trim()
     if (!botId) return false
+    const excludeVideoIds = new Set((options.excludeVideoIds || []).map((id) => String(id || '').trim()).filter(Boolean))
 
     const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
     if (await hasActiveProcessingJob(bucket, botId).catch(() => true)) return false
@@ -17803,6 +17829,7 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
         env,
         bucket,
         namespaceId: botId,
+        excludeVideoIds: Array.from(excludeVideoIds),
     }).catch((error) => {
         console.error(`[PROCESSING-AUTOSTART] Failed to read gallery_index next ready video for ${botId}: ${error instanceof Error ? error.message : String(error)}`)
         return null
@@ -17818,6 +17845,7 @@ async function startNextReadyInboxForNamespace(env: Env, ctx: ExecutionContext, 
 
     for (const candidate of candidates) {
         const item = normalizeInboxVideoRecord(candidate)
+        if (item && excludeVideoIds.has(String(item.id || '').trim())) continue
         if (!item || item.status !== 'ready') continue
 
         const processedAt = await getGalleryIndexProcessedAt(env.DB, botId, item.id).catch(() => '')
@@ -17869,7 +17897,7 @@ async function dispatchNextProcessingJobForNamespace(
     env: Env,
     ctx: ExecutionContext,
     namespaceId: string,
-    options: { runInline?: boolean } = {},
+    options: { runInline?: boolean; excludeVideoIds?: string[] } = {},
 ): Promise<ProcessingDispatchResult> {
     const botId = String(namespaceId || '').trim()
     if (!botId) return { namespaceId: '', started: false, source: 'idle', detail: 'missing_namespace' }
@@ -17898,7 +17926,7 @@ async function dispatchNextProcessingJobForNamespace(
         hasActiveJob: () => hasActiveProcessingJob(bucket, botId).catch(() => true),
         retryFailedJob: () => requeueDueFailedProcessingJob(env, botId),
         drainQueue: () => processNextInQueue(env, botId),
-        startReadyInbox: () => startNextReadyInboxForNamespace(env, ctx, botId, { runInline: options.runInline }),
+        startReadyInbox: () => startNextReadyInboxForNamespace(env, ctx, botId, { runInline: options.runInline, excludeVideoIds: options.excludeVideoIds }),
         startAdminOriginal: async () => {
             const adminNamespaceId = await resolvePrimaryAdminNamespaceId(env.DB).catch(() => '')
             if (!adminNamespaceId || adminNamespaceId !== botId) return false
@@ -17932,7 +17960,7 @@ app.get('/api/processing', async (c) => {
         // partial ready-inbox-only drainer when active=0.
         if (activeProcessingVideos.length === 0 && namespaceId) {
             c.executionCtx.waitUntil(
-                dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: true })
+                dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: false })
                     .then((result) => {
                         console.log(`[PROCESSING-AUTOSTART] ${namespaceId}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
                     })
@@ -18703,7 +18731,7 @@ app.delete('/api/processing/:id', async (c) => {
             }).catch(() => { })
         }
         if (id) await c.get('bucket').delete(`_processing/${id}.json`)
-        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: true }))
+        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: false }))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -18762,7 +18790,7 @@ app.post('/api/processing/:id/reprocess', async (c) => {
         await c.get('bucket').put(`_queue/${id}.json`, JSON.stringify(queuedJob), {
             httpMetadata: { contentType: 'application/json' },
         })
-        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: true }))
+        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: false }))
         return c.json({ ok: true, job: queuedJob })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -18966,7 +18994,7 @@ app.post('/api/gallery/refresh/:id', async (c) => {
         // original item still starts within ~60s without opening the UI.
         const namespaceIdForNext = String(c.get('botId') || '').trim()
         c.executionCtx.waitUntil(
-            dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceIdForNext, { runInline: true })
+            dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceIdForNext, { runInline: false })
                 .then((result) => {
                     console.log(`[PROCESSING-COMPLETE-AUTOSTART] ${namespaceIdForNext || '(none)'}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
                 })
@@ -18988,7 +19016,7 @@ app.post('/api/queue/next', async (c) => {
     try {
         const namespaceId = String(c.get('botId') || '').trim()
         c.executionCtx.waitUntil(
-            dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: true })
+            dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, namespaceId, { runInline: false })
                 .then((result) => {
                     console.log(`[PROCESSING-MANUAL-DISPATCH] ${namespaceId || '(none)'}: started=${result.started ? 'yes' : 'no'} source=${result.source}${result.detail ? ` detail=${result.detail}` : ''}`)
                 })
@@ -19035,7 +19063,7 @@ app.delete('/api/queue/:id', async (c) => {
             }).catch(() => { })
         }
         if (id) await c.get('bucket').delete(`_queue/${id}.json`)
-        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: true }))
+        c.executionCtx.waitUntil(dispatchNextProcessingJobForNamespace(c.env, c.executionCtx, c.get('botId'), { runInline: false }))
         return c.json({ ok: true })
     } catch (e) {
         return c.json({ error: String(e) }, 500)
@@ -21966,7 +21994,7 @@ async function autoProcessReadyInboxForNamespaces(env: Env, ctx: ExecutionContex
         try {
             // Same dispatcher the completion callback uses: drain _queue, then
             // ready inbox / gallery_index, then (admin) the original library.
-            const result = await dispatchNextProcessingJobForNamespace(env, ctx, namespaceId, { runInline: true })
+            const result = await dispatchNextProcessingJobForNamespace(env, ctx, namespaceId, { runInline: false })
             if (result.started) {
                 console.log(`[AUTO-INBOX] Started ${namespaceId} via ${result.source}`)
                 mark({ namespace_id: namespaceId, outcome: 'started', detail: result.source })
