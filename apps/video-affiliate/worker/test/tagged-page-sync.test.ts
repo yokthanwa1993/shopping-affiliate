@@ -416,9 +416,15 @@ test('backfill-from-facebook never updates D1 in dry run, only updates cache whe
     // The ONLY DB write is gated behind writeMode (so dry_run never persists).
     const updateAt = routeSource.indexOf('UPDATE facebook_page_video_cache')
     assert.ok(updateAt > -1, 'write path must UPDATE the cache table')
-    const guardAt = routeSource.indexOf('if (writeMode && !cacheLink && (foundLink || (postId && postId !== originalPostId)))')
+    const guardAt = routeSource.indexOf('if (writeMode && (linkChanged || postIdChanged))')
     assert.ok(guardAt > -1, 'cache UPDATE must be guarded by writeMode')
     assert.ok(guardAt < updateAt, 'writeMode guard must precede the UPDATE')
+    // linkChanged never overwrites an existing cached link, but postIdChanged can
+    // still fill post_id for rows that already have shopee_link.
+    assert.match(routeSource, /const postIdChanged = !!postId && postId !== originalPostId/)
+    assert.match(routeSource, /const linkChanged = !cacheLink && !!foundLink/)
+    assert.match(routeSource, /postIdChanged \? postId : ''/)
+    assert.match(routeSource, /linkChanged \? foundLink : ''/)
     // Exactly one UPDATE and it targets only the cache table — no other DB writes.
     assert.equal(routeSource.match(/UPDATE\s+\w/gi)?.length, 1, 'route must contain a single UPDATE statement')
     assert.doesNotMatch(routeSource, /INSERT\s+INTO/i, 'backfill must not INSERT')
@@ -433,8 +439,8 @@ test('backfill-from-facebook reads via Graph GET only and never returns the toke
 
     // Graph reads use plain fetch (GET) with bounded comment window of 10.
     assert.match(routeSource, /fields=description,title,permalink_url,post_id,created_time/)
-    // Comment window now also requests id (for page_comment_ids) but stays bounded at 10.
-    assert.match(routeSource, /\/comments\?fields=id,from,message&limit=10/)
+    // Comment window now also requests id/created_time but stays bounded at 10.
+    assert.match(routeSource, /\/comments\?fields=id,from,message,created_time&limit=10/)
     // No Graph mutations (method POST/DELETE) and no comment edits.
     assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
     // Token is only used inside the Graph URL, never surfaced in the response/items.
@@ -480,15 +486,35 @@ test('backfill-from-facebook comment scan stays a bounded read-only GET with id/
     const routeSource = getBackfillFromFacebookRouteSource()
 
     // Single shared bounded comment-window reader, GET only, limit 10, requesting id.
-    assert.match(routeSource, /const scanCommentWindow = async \(fullPostId: string\)/)
-    assert.match(routeSource, /\/comments\?fields=id,from,message&limit=10&access_token=\$\{encodeURIComponent\(token\)\}/)
+    assert.match(routeSource, /const scanCommentWindow = async \(targetId: string\)/)
+    assert.match(routeSource, /\/comments\?fields=id,from,message,created_time&limit=10&access_token=\$\{encodeURIComponent\(token\)\}/)
     // It classifies page-authored vs. other comments and caps collected page ids at 5.
     assert.match(routeSource, /if \(fromId && fromId === pageId\) \{[\s\S]*pageCommentCount\+\+[\s\S]*pageCommentIds\.length < 5/)
     assert.match(routeSource, /\} else \{\s*\n\s*otherCommentCount\+\+/)
+    // It also derives a missing post_id from the canonical prefix of comment ids.
+    assert.match(routeSource, /resolvedPostId = derivePostIdFromCommentId\(cmt\.id\)/)
     // Still no Graph mutations and the token is never surfaced in the response.
     assert.doesNotMatch(routeSource, /method:\s*'(POST|DELETE)'/i)
     assert.doesNotMatch(routeSource, /token:\s*token/)
     assert.doesNotMatch(routeSource, /access_token:\s*token/)
+})
+
+test('backfill-from-facebook resolves missing post_id from bounded video-id comments', () => {
+    const routeSource = getBackfillFromFacebookRouteSource()
+
+    // Raw Graph post ids and comment-id prefixes normalize pageId_postTail to the stored tail.
+    assert.match(routeSource, /const normalizeGraphPostId = \(raw: unknown\): string =>/)
+    assert.match(routeSource, /const pagePrefix = `\$\{pageId\}_`/)
+    assert.match(routeSource, /return id\.startsWith\(pagePrefix\) \? id\.slice\(pagePrefix\.length\) : id/)
+    assert.match(routeSource, /const derivePostIdFromCommentId = \(raw: unknown\): string =>/)
+    assert.match(routeSource, /const splitAt = id\.lastIndexOf\('_'\)/)
+    assert.match(routeSource, /const prefix = id\.slice\(0, splitAt\)/)
+
+    // When metadata still leaves post_id missing, scan the video/reel id target itself.
+    assert.match(routeSource, /if \(!postId\) \{[\s\S]*const scan = await scanCommentWindow\(videoId\)[\s\S]*applyCommentScan\(scan, 'scanned_via_video_id', 'video_id_comments_no_post_id_prefix'\)/)
+    assert.match(routeSource, /markResolvedPostId\(scan\.resolvedPostId, 'comment_id_prefix', `derived_from_\$\{scannedStatus\}`\)/)
+    assert.match(routeSource, /postIdResolutionReason = scan\.ok \? unresolvedReason : `\$\{scannedStatus\}_comment_scan_error`/)
+    assert.doesNotMatch(routeSource, /mintCustomlink\s*\(|createCustomlink\s*\(|customlinks\.\w+\s*\(/i)
 })
 
 test('backfill-from-facebook exposes read-only comment-count fields on every scanned item', () => {
@@ -499,20 +525,29 @@ test('backfill-from-facebook exposes read-only comment-count fields on every sca
     assert.match(routeSource, /page_comment_ids: pageCommentIds\.slice\(0, 5\)/)
     assert.match(routeSource, /other_comment_count: otherCommentCount/)
     assert.match(routeSource, /comment_scan_status: commentScanStatus/)
+    assert.match(routeSource, /post_id_resolution_status: PostIdResolutionStatus/i)
+    assert.match(routeSource, /post_id_resolution_reason: PostIdResolutionReason/i)
     // Default is a non-scanned ("skipped") state so the old no-scan default reads truthfully.
     assert.match(routeSource, /let commentScanStatus = 'skipped'/)
+    assert.match(routeSource, /let postIdResolutionStatus = postId \? 'cached' : 'unresolved'/)
+    assert.match(routeSource, /let postIdResolutionReason = postId \? 'cache_post_id_present' : 'post_id_missing'/)
 })
 
-test('backfill-from-facebook only scans cached-link rows for counts when explicitly opted in', () => {
+test('backfill-from-facebook preserves cached-link count opt-in while resolving missing post_id', () => {
     const routeSource = getBackfillFromFacebookRouteSource()
 
-    // The cached-link branch scans comments ONLY under include_comment_counts and a present post_id.
+    // The cached-link branch keeps comment-count scans behind include_comment_counts
+    // when post_id exists, but still does the new video-id scan if post_id is absent.
     const cacheBranchAt = routeSource.indexOf("source = 'cache'")
     assert.ok(cacheBranchAt > -1, 'cache branch must exist')
-    // Slice up to the non-cache Graph GET so the whole cached-link block is captured.
-    const cacheBranch = routeSource.slice(cacheBranchAt, routeSource.indexOf('// 1. Graph GET', cacheBranchAt))
-    assert.match(cacheBranch, /if \(includeCommentCounts\) \{[\s\S]*if \(postId\) \{[\s\S]*scanCommentWindow\(fullPostId\)/)
-    assert.match(cacheBranch, /commentScanStatus = 'no_post_id'/)
+    const cacheBranch = routeSource.slice(
+        routeSource.indexOf('// Preserve old behavior: do NOT scan comments for cached rows', cacheBranchAt),
+        routeSource.indexOf('// 2. Read a small bounded comment window', cacheBranchAt),
+    )
+    assert.match(cacheBranch, /if \(!postId\) \{[\s\S]*scanCommentWindow\(videoId\)[\s\S]*scanned_via_video_id/)
+    assert.match(cacheBranch, /else if \(includeCommentCounts\) \{[\s\S]*const commentTargetId = buildPostCommentTarget\(postId\)[\s\S]*scanCommentWindow\(commentTargetId\)/)
+    assert.match(routeSource, /const buildPostCommentTarget = \(storedPostId: string\): string =>/)
+    assert.match(routeSource, /return id\.includes\('_'\) \? id : `\$\{pageId\}_\$\{id\}`/)
     // Counting must never introduce writes/mutations in this path.
     assert.doesNotMatch(routeSource, /INSERT\s+INTO/i)
     assert.doesNotMatch(routeSource, /DELETE\s+FROM/i)

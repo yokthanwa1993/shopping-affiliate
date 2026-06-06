@@ -9147,6 +9147,40 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     const rows = Array.isArray(rowsQuery?.results) ? rowsQuery!.results : []
 
     const shopeeRe = /https?:\/\/(?:[^\s<>"']+\.)?shopee\.[^\s<>"']+/i
+    const safeGraphIdRe = /^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*$/
+    const normalizeGraphPostId = (raw: unknown): string => {
+        const id = String(raw || '').trim()
+        if (!id || !safeGraphIdRe.test(id)) return ''
+        const pagePrefix = `${pageId}_`
+        return id.startsWith(pagePrefix) ? id.slice(pagePrefix.length) : id
+    }
+    const derivePostIdFromCommentId = (raw: unknown): string => {
+        const id = String(raw || '').trim()
+        if (!id || !safeGraphIdRe.test(id)) return ''
+        const splitAt = id.lastIndexOf('_')
+        if (splitAt <= 0) return ''
+        const prefix = id.slice(0, splitAt)
+        return normalizeGraphPostId(prefix)
+    }
+    const buildPostCommentTarget = (storedPostId: string): string => {
+        const id = String(storedPostId || '').trim()
+        if (!id) return ''
+        return id.includes('_') ? id : `${pageId}_${id}`
+    }
+    const pickShopeeLinkFromComments = (comments: Array<Record<string, unknown>>): string => {
+        for (const cmt of comments) {
+            const from = cmt.from as Record<string, unknown> | undefined
+            const fromId = String(from?.id || '').trim()
+            if (fromId && fromId !== pageId) continue // prefer page-authored
+            const m = String(cmt.message || '').match(shopeeRe)
+            if (m) return m[0]
+        }
+        for (const cmt of comments) {
+            const m = String(cmt.message || '').match(shopeeRe)
+            if (m) return m[0]
+        }
+        return ''
+    }
 
     let scanned = 0
     let found = 0
@@ -9167,29 +9201,41 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         page_comment_ids: string[]
         other_comment_count: number
         comment_scan_status: string
+        post_id_resolution_status: string
+        post_id_resolution_reason: string
     }> = []
 
     // Read-only bounded comment-window fetch (GET, limit 10) reused by both the
     // existing link-resolution path and the new comment-count population. It counts
     // page-authored vs. other comments and collects up to the first 5 page comment
     // ids. The token is used only inside the Graph URL and never returned.
-    const scanCommentWindow = async (fullPostId: string): Promise<{
+    const scanCommentWindow = async (targetId: string): Promise<{
         data: Array<Record<string, unknown>>
         pageCommentCount: number
         otherCommentCount: number
         pageCommentIds: string[]
+        resolvedPostId: string
+        ok: boolean
+        error: string
     }> => {
         const commentsResp = await fetch(
-            `https://graph.facebook.com/v21.0/${encodeURIComponent(fullPostId)}/comments?fields=id,from,message&limit=10&access_token=${encodeURIComponent(token)}`
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}/comments?fields=id,from,message,created_time&limit=10&access_token=${encodeURIComponent(token)}`
         )
-        const commentsJson = commentsResp.ok ? await commentsResp.json().catch(() => ({})) as Record<string, unknown> : {}
+        const commentsJson = await commentsResp.json().catch(() => ({})) as Record<string, unknown>
         const data = Array.isArray((commentsJson as { data?: unknown[] }).data)
             ? ((commentsJson as { data: Array<Record<string, unknown>> }).data)
             : []
+        const error = commentsResp.ok
+            ? ''
+            : String(((commentsJson.error as Record<string, unknown> | undefined)?.message) || `comments_fetch_${commentsResp.status}`).slice(0, 200)
         let pageCommentCount = 0
         let otherCommentCount = 0
+        let resolvedPostId = ''
         const pageCommentIds: string[] = []
         for (const cmt of data) {
+            if (!resolvedPostId) {
+                resolvedPostId = derivePostIdFromCommentId(cmt.id)
+            }
             const from = cmt.from as Record<string, unknown> | undefined
             const fromId = String(from?.id || '').trim()
             if (fromId && fromId === pageId) {
@@ -9202,7 +9248,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                 otherCommentCount++
             }
         }
-        return { data, pageCommentCount, otherCommentCount, pageCommentIds }
+        return { data, pageCommentCount, otherCommentCount, pageCommentIds, resolvedPostId, ok: commentsResp.ok, error }
     }
 
     // Sequential, single-flight per row (no parallel fan-out) to keep Graph load low.
@@ -9223,11 +9269,39 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         let otherCommentCount = 0
         let pageCommentIds: string[] = []
         let commentScanStatus = 'skipped'
+        let postIdResolutionStatus = postId ? 'cached' : 'unresolved'
+        let postIdResolutionReason = postId ? 'cache_post_id_present' : 'post_id_missing'
+
+        const markResolvedPostId = (candidate: unknown, status: string, reason: string): boolean => {
+            const normalized = normalizeGraphPostId(candidate)
+            if (!normalized) return false
+            postId = normalized
+            postIdResolutionStatus = status
+            postIdResolutionReason = reason
+            return true
+        }
+        const applyCommentScan = (
+            scan: Awaited<ReturnType<typeof scanCommentWindow>>,
+            scannedStatus: string,
+            unresolvedReason: string,
+        ) => {
+            pageCommentCount = scan.pageCommentCount
+            otherCommentCount = scan.otherCommentCount
+            pageCommentIds = scan.pageCommentIds
+            commentScanStatus = scan.ok ? scannedStatus : 'error'
+            if (!postId && scan.resolvedPostId) {
+                markResolvedPostId(scan.resolvedPostId, 'comment_id_prefix', `derived_from_${scannedStatus}`)
+            }
+            if (!postId) {
+                postIdResolutionStatus = 'unresolved'
+                postIdResolutionReason = scan.ok ? unresolvedReason : `${scannedStatus}_comment_scan_error`
+            }
+        }
 
         if (!videoId) {
             rowError = 'missing_video_id'
             errors.push({ video_id: '', error: rowError })
-            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus })
+            items.push({ video_id: '', post_id: postId, created_time: createdTime, caption: caption.slice(0, 160), shopee_link: '', source: '', error: rowError, page_comment_count: 0, page_comment_ids: [], other_comment_count: 0, comment_scan_status: commentScanStatus, post_id_resolution_status: postIdResolutionStatus, post_id_resolution_reason: postIdResolutionReason })
             continue
         }
 
@@ -9236,30 +9310,12 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             foundLink = cacheLink
             source = 'cache'
             existing++
-            // Preserve old behavior: do NOT scan comments for cached rows by default.
-            // Only when the operator opts in (include_comment_counts=true and these
-            // cached-link rows are included via only_missing=false) do we issue a
-            // read-only comment scan to populate counts — and only if post_id exists.
-            if (includeCommentCounts) {
-                if (postId) {
-                    try {
-                        const fullPostId = `${pageId}_${postId}`
-                        const scan = await scanCommentWindow(fullPostId)
-                        pageCommentCount = scan.pageCommentCount
-                        otherCommentCount = scan.otherCommentCount
-                        pageCommentIds = scan.pageCommentIds
-                        commentScanStatus = 'scanned'
-                    } catch (err) {
-                        rowError = String(err).slice(0, 200)
-                        commentScanStatus = 'error'
-                    }
-                } else {
-                    commentScanStatus = 'no_post_id'
-                }
-            }
-        } else {
-            try {
-                // 1. Graph GET: caption/title/permalink/post_id/created_time.
+        }
+
+        try {
+            // 1. Graph GET: caption/title/permalink/post_id/created_time. Cached-link
+            // rows skip this unless their post_id is missing and needs resolution.
+            if (!cacheLink || !postId) {
                 const vidResp = await fetch(
                     `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}?fields=description,title,permalink_url,post_id,created_time&access_token=${encodeURIComponent(token)}`
                 )
@@ -9267,45 +9323,63 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                 caption = String(vid.description || vid.title || caption || '')
                 if (!createdTime) createdTime = String(vid.created_time || '').trim()
                 const rawPostId = String(vid.post_id || '').trim()
-                if (rawPostId) postId = rawPostId.includes('_') ? (rawPostId.split('_').pop() || postId) : rawPostId
-                const m1 = caption.match(shopeeRe)
-                if (m1) { foundLink = m1[0]; source = 'caption' }
+                if (rawPostId) markResolvedPostId(rawPostId, 'graph_post_id', 'video_metadata_post_id')
+                if (!cacheLink) {
+                    const m1 = caption.match(shopeeRe)
+                    if (m1) { foundLink = m1[0]; source = 'caption' }
+                }
+            }
 
-                // 2. Read a small bounded comment window (limit 10) when we still
-                //    need to resolve a link (existing behavior) OR when the operator
-                //    asked for comment counts. Either way it is a single GET, and the
-                //    same window is used both to classify the link source and to count
-                //    page-authored vs. other comments. Prefer page-authored comments.
-                const needLinkScan = !foundLink && !!postId
-                const needCountScan = includeCommentCounts && !!postId
-                if (needLinkScan || needCountScan) {
-                    const fullPostId = `${pageId}_${postId}`
-                    const scan = await scanCommentWindow(fullPostId)
-                    pageCommentCount = scan.pageCommentCount
-                    otherCommentCount = scan.otherCommentCount
-                    pageCommentIds = scan.pageCommentIds
-                    commentScanStatus = 'scanned'
+            if (cacheLink) {
+                // Preserve old behavior: do NOT scan comments for cached rows by
+                // default. Exception: if post_id is still missing after the metadata
+                // read, scan the video id target once to derive post_id from comment
+                // ids. With include_comment_counts=true and a present post_id, use the
+                // canonical post target for read-only counts.
+                if (!postId) {
+                    const scan = await scanCommentWindow(videoId)
+                    applyCommentScan(scan, 'scanned_via_video_id', 'video_id_comments_no_post_id_prefix')
+                } else if (includeCommentCounts) {
+                    const commentTargetId = buildPostCommentTarget(postId)
+                    const scan = await scanCommentWindow(commentTargetId)
+                    applyCommentScan(scan, 'scanned', 'post_id_present')
+                }
+            } else {
+                // 2. Read a small bounded comment window (limit 10) when post_id is
+                //    missing (new video-id fallback), when we still need to resolve a
+                //    link (existing behavior), OR when the operator asked for comment
+                //    counts. Either way it is GET-only and single-flight per row.
+                let usedVideoIdCommentScan = false
+                if (!postId) {
+                    const scan = await scanCommentWindow(videoId)
+                    usedVideoIdCommentScan = true
+                    applyCommentScan(scan, 'scanned_via_video_id', 'video_id_comments_no_post_id_prefix')
                     if (!foundLink) {
-                        for (const cmt of scan.data) {
-                            const from = cmt.from as Record<string, unknown> | undefined
-                            const fromId = String(from?.id || '').trim()
-                            if (fromId && fromId !== pageId) continue // prefer page-authored
-                            const m2 = String(cmt.message || '').match(shopeeRe)
-                            if (m2) { foundLink = m2[0]; source = 'comment'; break }
-                        }
-                        if (!foundLink) {
-                            for (const cmt of scan.data) {
-                                const m2 = String(cmt.message || '').match(shopeeRe)
-                                if (m2) { foundLink = m2[0]; source = 'comment'; break }
-                            }
-                        }
+                        const commentLink = pickShopeeLinkFromComments(scan.data)
+                        if (commentLink) { foundLink = commentLink; source = 'comment' }
                     }
-                } else if (includeCommentCounts && !postId) {
+                }
+
+                const needLinkScan = !foundLink && !!postId && !usedVideoIdCommentScan
+                const needCountScan = includeCommentCounts && !!postId && !usedVideoIdCommentScan
+                if (needLinkScan || needCountScan) {
+                    const commentTargetId = buildPostCommentTarget(postId)
+                    const scan = await scanCommentWindow(commentTargetId)
+                    applyCommentScan(scan, 'scanned', 'post_comments_no_post_id_prefix')
+                    if (!foundLink) {
+                        const commentLink = pickShopeeLinkFromComments(scan.data)
+                        if (commentLink) { foundLink = commentLink; source = 'comment' }
+                    }
+                } else if (includeCommentCounts && !postId && !usedVideoIdCommentScan) {
                     commentScanStatus = 'no_post_id'
                 }
-            } catch (err) {
-                rowError = String(err).slice(0, 200)
-                if (includeCommentCounts && commentScanStatus !== 'scanned') commentScanStatus = 'error'
+            }
+        } catch (err) {
+            rowError = String(err).slice(0, 200)
+            if ((includeCommentCounts || !postId) && !commentScanStatus.startsWith('scanned')) commentScanStatus = 'error'
+            if (!postId) {
+                postIdResolutionStatus = 'unresolved'
+                postIdResolutionReason = 'post_id_resolution_error'
             }
         }
 
@@ -9325,7 +9399,9 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         // Write mode persists ONLY to the D1 cache: shopee_link + post_id (if newly
         // resolved) and audit timestamps. dry_run NEVER writes. No Facebook writes,
         // no comment edits, no customlink minting anywhere in this path.
-        if (writeMode && !cacheLink && (foundLink || (postId && postId !== originalPostId))) {
+        const postIdChanged = !!postId && postId !== originalPostId
+        const linkChanged = !cacheLink && !!foundLink
+        if (writeMode && (linkChanged || postIdChanged)) {
             await c.env.DB.prepare(
                 `UPDATE facebook_page_video_cache
                  SET post_id = CASE WHEN ? != '' THEN ? ELSE post_id END,
@@ -9333,8 +9409,8 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
                      updated_at = datetime('now'),
                      fetched_at = datetime('now')
                  WHERE page_id = ? AND video_id = ?`
-            ).bind(postId, postId, foundLink, foundLink, pageId, videoId).run().catch(() => { })
-            if (foundLink) updated++
+            ).bind(postIdChanged ? postId : '', postIdChanged ? postId : '', linkChanged ? foundLink : '', linkChanged ? foundLink : '', pageId, videoId).run().catch(() => { })
+            updated++
         }
 
         items.push({
@@ -9349,6 +9425,8 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             page_comment_ids: pageCommentIds.slice(0, 5),
             other_comment_count: otherCommentCount,
             comment_scan_status: commentScanStatus,
+            post_id_resolution_status: postIdResolutionStatus,
+            post_id_resolution_reason: postIdResolutionReason,
         })
     }
 
