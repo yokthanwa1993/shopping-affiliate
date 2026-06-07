@@ -5,6 +5,9 @@ import {
     CUSTOMLINK_HOST,
     JOB_DEFAULT_BATCH_SIZE,
     JOB_MAX_BATCH_SIZE,
+    GRAPH_COMMENT_BLOCK_SECONDS,
+    GRAPH_COMMENT_DEFAULT_MIN_SPACING_SECONDS,
+    GRAPH_COMMENT_GUARD_TABLE_SQL,
     PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL,
     PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL,
     PAGE_POST_LINK_LEDGER_TABLE_SQL,
@@ -15,6 +18,8 @@ import {
     buildTargetSubIds,
     canonicalizeProductUrl,
     clampBatchSize,
+    computeGraphCommentBlockUntil,
+    computeGraphCommentGuardDecision,
     computeRegistryItemStatus,
     computeWriteAction,
     detectGraphStopSignal,
@@ -32,9 +37,11 @@ import {
     replaceShortlinkInMessage,
     resolveCreateNewBlockedReason,
     resolveEffectiveTargetSub4,
+    resolveGraphCommentMinSpacingSeconds,
     resolveRealRewriteRefusal,
     resolveRewriteLogId,
     ensureRewriteLogId,
+    resolveRunCommentBatchLimit,
     resolvePageCommentLinkJobStatus,
     verifyAffiliateId,
     verifyRewrittenShortlink,
@@ -64,6 +71,73 @@ test('link classifiers recognise shopee, customlink and short hosts', () => {
     assert.ok(isShortlinkCandidate('https://s.shopee.co.th/abc'))
     assert.ok(isShortlinkCandidate('https://customlink.wwoom.com/?id=1'))
     assert.ok(!isShortlinkCandidate('https://random.example/x'))
+})
+
+
+test('Graph comment guard cooldown prevents immediate repeated comment calls', () => {
+    const now = Date.parse('2026-06-07T00:01:00.000Z')
+    const decision = computeGraphCommentGuardDecision(
+        { lastCommentOperationAt: '2026-06-07T00:00:30.000Z', blockUntil: '', blockReason: '' },
+        now,
+        GRAPH_COMMENT_DEFAULT_MIN_SPACING_SECONDS,
+    )
+
+    assert.equal(decision.allowed, false)
+    assert.equal(decision.status, 'cooldown')
+    assert.equal(decision.reason, 'min_spacing')
+    assert.equal(decision.block_until, '2026-06-07T00:01:30.000Z')
+})
+
+test('Graph 368/rate/spam stop signals map to at least a two-hour block', () => {
+    const now = Date.parse('2026-06-07T00:00:00.000Z')
+    assert.deepEqual(detectGraphStopSignal({ code: 368, message: 'temporarily blocked' }), {
+        stop: true,
+        reason: 'policy_block_368',
+    })
+    assert.equal(detectGraphStopSignal({ code: 4, message: 'rate limit' }).stop, true)
+    assert.equal(detectGraphStopSignal({ message: 'Too many spam comments, temporarily restricted' }).stop, true)
+
+    const blockUntil = computeGraphCommentBlockUntil({ nowMs: now, minBlockSeconds: GRAPH_COMMENT_BLOCK_SECONDS })
+    assert.ok(Date.parse(blockUntil) - now >= 2 * 60 * 60 * 1000)
+})
+
+test('Graph comment guard SQL stores page feature pacing and block state', () => {
+    assert.match(GRAPH_COMMENT_GUARD_TABLE_SQL, /page_id TEXT NOT NULL/)
+    assert.match(GRAPH_COMMENT_GUARD_TABLE_SQL, /feature TEXT NOT NULL/)
+    assert.match(GRAPH_COMMENT_GUARD_TABLE_SQL, /last_comment_operation_at TEXT NOT NULL DEFAULT ''/)
+    assert.match(GRAPH_COMMENT_GUARD_TABLE_SQL, /block_until TEXT NOT NULL DEFAULT ''/)
+    assert.match(GRAPH_COMMENT_GUARD_TABLE_SQL, /block_reason TEXT NOT NULL DEFAULT ''/)
+    assert.match(GRAPH_COMMENT_GUARD_TABLE_SQL, /PRIMARY KEY \(page_id, feature\)/)
+})
+
+test('Graph comment min spacing defaults to 60s and accepts bounded env override', () => {
+    assert.equal(resolveGraphCommentMinSpacingSeconds(undefined), 60)
+    assert.equal(resolveGraphCommentMinSpacingSeconds('90'), 90)
+    assert.equal(resolveGraphCommentMinSpacingSeconds('0'), 0)
+    assert.equal(resolveGraphCommentMinSpacingSeconds('99999'), 3600)
+    assert.equal(resolveGraphCommentMinSpacingSeconds('bad'), 60)
+})
+
+test('real page-comment run clamps writes to one item while dry-run can keep requested batch', () => {
+    assert.equal(resolveRunCommentBatchLimit({ writeMode: true, batchSize: 50, requestedLimit: 50 }), 1)
+    assert.equal(resolveRunCommentBatchLimit({ writeMode: true, batchSize: 5, requestedLimit: undefined }), 1)
+    assert.equal(resolveRunCommentBatchLimit({ writeMode: false, batchSize: 5, requestedLimit: 4 }), 4)
+})
+
+test('create_new remains blocked by default without explicit allow_create_new', () => {
+    assert.equal(computeWriteAction({
+        pageId: '1008898512617594',
+        commentFromId: '',
+        oldCommentId: '',
+        hasRewriteableLink: true,
+        allowCreateNew: false,
+    }), 'skip')
+    assert.equal(resolveCreateNewBlockedReason({
+        pageId: '1008898512617594',
+        commentFromId: '',
+        oldCommentId: '',
+        allowCreateNew: false,
+    }), 'missing_existing_comment_id')
 })
 
 test('pickPrimaryAffiliateUrl prefers customlink, then shopee short link', () => {

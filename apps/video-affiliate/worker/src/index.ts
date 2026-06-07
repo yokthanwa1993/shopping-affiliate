@@ -41,6 +41,11 @@ import {
     PAGE_COMMENT_LINK_REGISTRY_TABLE_SQL,
     PAGE_POST_LINK_LEDGER_INDEX_SQL,
     PAGE_POST_LINK_LEDGER_TABLE_SQL,
+    GRAPH_COMMENT_GUARD_TABLE_SQL,
+    GRAPH_COMMENT_BLOCK_SECONDS,
+    GRAPH_COMMENT_FEATURE_BACKFILL,
+    GRAPH_COMMENT_FEATURE_REGISTRY,
+    GRAPH_COMMENT_FEATURE_REWRITE,
     REGISTRY_DEFAULT_LIMIT,
     buildCustomlinkRequestUrl,
     buildExpectedUtmContent,
@@ -49,6 +54,8 @@ import {
     clampBatchSize,
     computeRegistryItemStatus,
     computeWriteAction,
+    computeGraphCommentBlockUntil,
+    computeGraphCommentGuardDecision,
     detectGraphStopSignal,
     extractUrlsFromText,
     isShortlinkCandidate,
@@ -62,8 +69,10 @@ import {
     resolveCreateNewBlockedReason,
     resolveEffectiveTargetSub4,
     ensureRewriteLogId,
+    resolveGraphCommentMinSpacingSeconds,
     resolveRealRewriteRefusal,
     resolveRewriteLogId,
+    resolveRunCommentBatchLimit,
     resolvePageCommentLinkJobStatus,
     resolveTargetAffiliateId,
     verifyAffiliateId,
@@ -7480,6 +7489,7 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
         countFacebookPageVideoCache(c.env.DB, { pageId, minViews: 0 }),
     ])
     const pageItems = allItems.slice(offset, offset + limit)
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
 
     type RegistryPostHistoryRow = {
         id?: number
@@ -7526,14 +7536,24 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
     const hasToken = token.length > 0
 
     type LiveComment = { id: string; message: string; fromId: string; fromName: string; createdTime: string }
-    async function fetchPageComments(target: string): Promise<{ ok: boolean; comments: LiveComment[] }> {
+    async function fetchPageComments(target: string): Promise<{ ok: boolean; comments: LiveComment[]; status?: 'ok' | 'cooldown' | 'graph_blocked'; reason?: string; block_until?: string }> {
+        const guard = await checkGraphCommentGuard(c.env.DB, c.env, pageId, GRAPH_COMMENT_FEATURE_REGISTRY)
+        if (!guard.allowed) return { ok: false, comments: [], status: guard.status, reason: guard.reason, block_until: guard.block_until }
         const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(target)}/comments?fields=id,message,from,created_time&limit=50&access_token=${encodeURIComponent(token)}`
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 8000)
         try {
             const resp = await fetch(url, { method: 'GET', signal: controller.signal })
             const body = await readMetaGraphJson(resp)
-            if (!resp.ok) return { ok: false, comments: [] }
+            await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REGISTRY)
+            if (!resp.ok) {
+                const sig = detectGraphStopSignal((body as Record<string, unknown>).error)
+                if (sig.stop) {
+                    const blocked = await blockGraphCommentGuard(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REGISTRY, sig.reason)
+                    return { ok: false, comments: [], status: blocked.status, reason: blocked.reason, block_until: blocked.block_until }
+                }
+                return { ok: false, comments: [] }
+            }
             const data = Array.isArray((body as Record<string, unknown>).data) ? (body as { data: unknown[] }).data : []
             const comments: LiveComment[] = data.map((entry) => {
                 const it = (entry || {}) as Record<string, unknown>
@@ -7587,7 +7607,7 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
         const candidates = buildExistingCommentDedupCandidates({ pageId, fbPostId: storedFbPostId, fbReelUrlOrId: storedReel })
         const commentTargetId = candidates[0] || ''
 
-        let commentFetch: 'ok' | 'failed' | 'missing_token' = hasToken ? 'failed' : 'missing_token'
+        let commentFetch: 'ok' | 'failed' | 'missing_token' | 'cooldown' | 'graph_blocked' = hasToken ? 'failed' : 'missing_token'
         let pageComments: LiveComment[] = []
         let otherCommentCount = 0
         let usedTarget = ''
@@ -7595,7 +7615,10 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
             let firstOk: { comments: LiveComment[]; target: string } | null = null
             for (const target of candidates.slice(0, 3)) {
                 const res = await fetchPageComments(target)
-                if (!res.ok) continue
+                if (!res.ok) {
+                    if (res.status === 'cooldown' || res.status === 'graph_blocked') { commentFetch = res.status; break }
+                    continue
+                }
                 if (!firstOk) firstOk = { comments: res.comments, target }
                 const pageOwned = res.comments.filter((cm) => cm.fromId && cm.fromId === pageId)
                 if (pageOwned.length > 0) { firstOk = { comments: res.comments, target }; break }
@@ -7717,23 +7740,10 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
         }
     }
 
-    // Bounded concurrency so we never fan out more than a handful of Graph/redirect
-    // fetches at once.
-    async function mapWithConcurrency<T, R>(values: T[], concurrency: number, fn: (value: T) => Promise<R>): Promise<R[]> {
-        const results: R[] = new Array(values.length)
-        let cursor = 0
-        const workers = Array.from({ length: Math.min(concurrency, values.length || 1) }, async () => {
-            while (true) {
-                const index = cursor++
-                if (index >= values.length) break
-                results[index] = await fn(values[index])
-            }
-        })
-        await Promise.all(workers)
-        return results
-    }
-
-    const builtAll = await mapWithConcurrency(pageItems, 5, buildItem)
+    // Keep Graph comment reads single-flight. The durable guard records each live
+    // comment operation, so concurrent item builds would defeat cooldown pacing.
+    const builtAll: Awaited<ReturnType<typeof buildItem>>[] = []
+    for (const item of pageItems) builtAll.push(await buildItem(item))
     const items = builtAll.filter((it) => {
         if (filterHasComment !== null && (!!it.comment_id) !== filterHasComment) return false
         if (filterHasShopeeLink !== null && (!!it.old_shortlink) !== filterHasShopeeLink) return false
@@ -7799,6 +7809,7 @@ async function ensurePageCommentLinkWorkflowTables(db: D1Database): Promise<void
             await db.prepare(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL).run()
             await db.prepare(PAGE_POST_LINK_LEDGER_TABLE_SQL).run()
             await db.prepare(PAGE_POST_LINK_LEDGER_INDEX_SQL).run().catch(() => { })
+            await db.prepare(GRAPH_COMMENT_GUARD_TABLE_SQL).run()
             const addColumn = async (sql: string) => {
                 await db.prepare(sql).run().catch((err) => {
                     const message = String(err?.message || err || '').toLowerCase()
@@ -7828,11 +7839,74 @@ async function ensurePageCommentLinkWorkflowTables(db: D1Database): Promise<void
     await pageCommentLinkWorkflowTablesReady
 }
 
+type GraphCommentGuardFeature = typeof GRAPH_COMMENT_FEATURE_REGISTRY | typeof GRAPH_COMMENT_FEATURE_REWRITE | typeof GRAPH_COMMENT_FEATURE_BACKFILL
+
+type GraphCommentGuardCheck = {
+    allowed: boolean
+    status: 'ok' | 'cooldown' | 'graph_blocked'
+    reason: string
+    block_until: string
+}
+
+function graphCommentMinSpacingSeconds(env: Env): number {
+    return resolveGraphCommentMinSpacingSeconds((env as unknown as Record<string, unknown>).GRAPH_COMMENT_MIN_SPACING_SECONDS)
+}
+
+async function checkGraphCommentGuard(db: D1Database, env: Env, pageId: string, feature: GraphCommentGuardFeature): Promise<GraphCommentGuardCheck> {
+    const page = str(pageId)
+    if (!page) return { allowed: true, status: 'ok', reason: '', block_until: '' }
+    const row = await db.prepare(
+        `SELECT last_comment_operation_at AS lastCommentOperationAt, block_until AS blockUntil, block_reason AS blockReason
+         FROM graph_comment_op_guard WHERE page_id = ? AND feature = ? LIMIT 1`
+    ).bind(page, feature).first().catch(() => null) as { lastCommentOperationAt?: string; blockUntil?: string; blockReason?: string } | null
+    return computeGraphCommentGuardDecision(row, Date.now(), graphCommentMinSpacingSeconds(env))
+}
+
+async function recordGraphCommentOperation(db: D1Database, pageId: string, feature: GraphCommentGuardFeature): Promise<void> {
+    const page = str(pageId)
+    if (!page) return
+    const now = new Date().toISOString()
+    await db.prepare(
+        `INSERT INTO graph_comment_op_guard (page_id, feature, last_comment_operation_at, block_until, block_reason, created_at, updated_at)
+         VALUES (?, ?, ?, '', '', datetime('now'), datetime('now'))
+         ON CONFLICT(page_id, feature) DO UPDATE SET
+            last_comment_operation_at = excluded.last_comment_operation_at,
+            updated_at = datetime('now')`
+    ).bind(page, feature, now).run().catch(() => { })
+}
+
+async function blockGraphCommentGuard(db: D1Database, pageId: string, feature: GraphCommentGuardFeature, reason: string): Promise<GraphCommentGuardCheck> {
+    const page = str(pageId)
+    const cleanReason = sanitizeMetaGraphError(reason || 'graph_blocked').slice(0, 160) || 'graph_blocked'
+    const blockUntil = computeGraphCommentBlockUntil({ nowMs: Date.now(), minBlockSeconds: GRAPH_COMMENT_BLOCK_SECONDS })
+    if (page) {
+        await db.prepare(
+            `INSERT INTO graph_comment_op_guard (page_id, feature, last_comment_operation_at, block_until, block_reason, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+             ON CONFLICT(page_id, feature) DO UPDATE SET
+                last_comment_operation_at = excluded.last_comment_operation_at,
+                block_until = excluded.block_until,
+                block_reason = excluded.block_reason,
+                updated_at = datetime('now')`
+        ).bind(page, feature, new Date().toISOString(), blockUntil, cleanReason).run().catch(() => { })
+    }
+    return { allowed: false, status: 'graph_blocked', reason: cleanReason, block_until: blockUntil }
+}
+
+function graphGuardResponseFields(guard: GraphCommentGuardCheck): Record<string, unknown> {
+    return {
+        graph_comment_guard: { status: guard.status, reason: guard.reason, block_until: guard.block_until },
+        graph_comment_guard_status: guard.status,
+        graph_comment_block_until: guard.block_until,
+        graph_comment_block_reason: guard.reason,
+    }
+}
+
 type PageCommentLinkLiveComment = { id: string; message: string; fromId: string; fromName: string }
 
 // Live page-comment read (direct Graph, page token). Returns ok=false on any
 // fetch/HTTP error so the caller can decide without throwing.
-async function fetchPageCommentsLive(target: string, token: string): Promise<{ ok: boolean; comments: PageCommentLinkLiveComment[] }> {
+async function fetchPageCommentsLive(target: string, token: string): Promise<{ ok: boolean; comments: PageCommentLinkLiveComment[]; error?: unknown }> {
     const cleanTarget = String(target || '').trim()
     if (!cleanTarget || !token) return { ok: false, comments: [] }
     const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(cleanTarget)}/comments?fields=id,message,from&limit=50&access_token=${encodeURIComponent(token)}`
@@ -7841,7 +7915,7 @@ async function fetchPageCommentsLive(target: string, token: string): Promise<{ o
     try {
         const resp = await fetch(url, { method: 'GET', signal: controller.signal })
         const body = await readMetaGraphJson(resp)
-        if (!resp.ok) return { ok: false, comments: [] }
+        if (!resp.ok) return { ok: false, comments: [], error: (body as Record<string, unknown>).error || body }
         const data = Array.isArray((body as Record<string, unknown>).data) ? (body as { data: unknown[] }).data : []
         const comments = data.map((entry) => {
             const it = (entry || {}) as Record<string, unknown>
@@ -8408,11 +8482,33 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
     const writeMode = !jobDryRun || writeRequested
     const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
 
-    const limit = Math.min(batchSize, Math.max(1, Number(body.limit) > 0 ? Math.floor(Number(body.limit)) : batchSize))
+    const effectiveWriteModeForLimit = writeMode
+    const limit = resolveRunCommentBatchLimit({ writeMode: effectiveWriteModeForLimit, batchSize, requestedLimit: body.limit })
 
     // Resolve token once. Never logged/returned. No token ⇒ no writes possible.
     const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
     const hasToken = token.length > 0
+    const effectiveWriteModePrecheck = writeMode && hasToken
+    if (effectiveWriteModePrecheck) {
+        const runGuard = await checkGraphCommentGuard(c.env.DB, c.env, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
+        if (!runGuard.allowed) {
+            return c.json({
+                ok: true,
+                mode: 'run_write',
+                job_id: jobId,
+                status: runGuard.status,
+                dry_run: false,
+                write_mode: true,
+                token_available: true,
+                counts: { total: 0, done: 0, failed: 0, skipped: 0, remaining_planned: 0 },
+                count_returned: 0,
+                stopped_reason: runGuard.reason,
+                batch: { requested: 0, done: 0, failed: 0, skipped: 0, remaining_planned: 0 },
+                processed: [],
+                ...graphGuardResponseFields(runGuard),
+            }, 200, { 'Cache-Control': 'no-store' })
+        }
+    }
 
     const allItems = await loadPageCommentLinkJobItems(c.env.DB, jobId)
     const pending = allItems.filter((it) => str(it.status) === 'planned').slice(0, limit)
@@ -8584,13 +8680,16 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             const edited = await graphEditComment(oldCommentId)
             if (edited.ok) {
                 newCommentId = oldCommentId
+                await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
             } else {
+                await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
                 stopSignal = detectGraphStopSignal((edited.data as Record<string, unknown>).error)
                 writeError = sanitizeMetaGraphError((edited.data as Record<string, unknown>).error)
                 if (stopSignal.stop) {
+                    const blocked = await blockGraphCommentGuard(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE, stopSignal.reason)
                     await updateItem(index, { status: 'failed', reason: `stop_${stopSignal.reason}`, error: writeError, attempts })
                     failedCount++
-                    processed.push({ item_index: index, status: 'failed', reason: `stop_${stopSignal.reason}` })
+                    processed.push({ item_index: index, status: 'failed', reason: `stop_${stopSignal.reason}`, ...graphGuardResponseFields(blocked) })
                     stoppedReason = stopSignal.reason
                     break
                 }
@@ -8615,6 +8714,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             })
             for (const target of targets) {
                 const created = await graphCreateComment(target)
+                await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
                 if (created.ok) {
                     newCommentId = str((created.data as Record<string, unknown>).id)
                     usedTarget = target
@@ -8622,7 +8722,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                 }
                 const sig = detectGraphStopSignal((created.data as Record<string, unknown>).error)
                 writeError = sanitizeMetaGraphError((created.data as Record<string, unknown>).error)
-                if (sig.stop) { stopSignal = sig; break }
+                if (sig.stop) { stopSignal = sig; await blockGraphCommentGuard(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE, sig.reason); break }
             }
             if (stopSignal.stop && !newCommentId) {
                 await updateItem(index, { status: 'failed', reason: `stop_${stopSignal.reason}`, error: writeError, attempts, new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status, affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0, new_message: newMessage })
@@ -8657,7 +8757,26 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             existingTarget: str(row.comment_target_id),
         })
         const verifyTarget = usedTarget || canonicalVerify.target || str(row.comment_target_id) || str(row.reel_id)
+        const verifyGuard = await checkGraphCommentGuard(c.env.DB, c.env, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
+        if (!verifyGuard.allowed) {
+            const finalStatus: JobItemStatus = 'verify_pending'
+            await updateItem(index, {
+                status: finalStatus, action: finalAction, new_comment_id: newCommentId, new_message: newMessage,
+                new_shortlink: newShortlink, new_expanded_url: expanded.finalUrl, new_utm_content: verifyLink.utm_content,
+                new_affiliate_id: affiliateVerify.new_affiliate_id, affiliate_verify_status: affiliateVerify.affiliate_verify_status,
+                affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0,
+                comment_target_id: verifyTarget, reason: 'post_write_verify_deferred_cooldown', error: '', attempts,
+            })
+            await updatePagePostLedgerByTarget(c.env.DB, pageId, str(row.comment_target_id), {
+                new_shortlink: newShortlink, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id,
+                target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: targetSub4,
+                status: finalStatus, last_rewrite_at: new Date().toISOString(),
+            })
+            processed.push({ item_index: index, status: finalStatus, action: finalAction, reason: 'post_write_verify_deferred_cooldown', log_id: str(row.log_id), effective_target_sub4: targetSub4, target_sub4: targetSub4, new_comment_id: newCommentId, ...graphGuardResponseFields(verifyGuard) })
+            continue
+        }
         const liveCheck = await fetchPageCommentsLive(verifyTarget, token)
+        await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
         const matched = liveCheck.ok && isAffiliateCommentMatch(liveCheck.comments, {
             commentId: newCommentId, expectedMessage: newMessage, affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
         }).matched
@@ -8683,7 +8802,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
     }
 
     // Roll up job-level counters and status.
-    const remainingPlanned = (await loadPageCommentLinkJobItems(c.env.DB, jobId)).filter((it) => str(it.status) === 'planned').length
+    const remainingPlanned = (await loadPageCommentLinkJobItems(c.env.DB, jobId)).filter((it) => ['planned', 'verify_pending'].includes(str(it.status))).length
     const aggregate = await c.env.DB.prepare(
         `SELECT
             SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
@@ -8757,7 +8876,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
     const hasToken = token.length > 0
 
     const items = await loadPageCommentLinkJobItems(c.env.DB, jobId)
-    const written = items.filter((it) => ['done', 'verify_failed'].includes(str(it.status)) && str(it.new_comment_id))
+    const written = items.filter((it) => ['done', 'verify_failed', 'verify_pending'].includes(str(it.status)) && str(it.new_comment_id))
     const results: Array<Record<string, unknown>> = []
 
     if (!hasToken) {
@@ -8770,11 +8889,33 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
         }, 200, { 'Cache-Control': 'no-store' })
     }
 
+    const verifyGuard = await checkGraphCommentGuard(c.env.DB, c.env, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
+    if (!verifyGuard.allowed) {
+        return c.json({
+            ok: true, mode: 'verify', token_available: true,
+            job_id: jobId, status: verifyGuard.status, dry_run: true, write_mode: false,
+            counts: { checked: 0, verified: 0, failed: 0 }, count_returned: 0,
+            checked: 0, verified: 0, results: [], note: verifyGuard.reason,
+            ...graphGuardResponseFields(verifyGuard),
+        }, 200, { 'Cache-Control': 'no-store' })
+    }
+
     let verifiedCount = 0
+    let verifyStoppedGuard: GraphCommentGuardCheck | null = null
     for (const row of written) {
         const index = Number(row.item_index)
         const target = str(row.comment_target_id)
         const live = await fetchPageCommentsLive(target, token)
+        await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE)
+        if (!live.ok) {
+            const stopSignal = detectGraphStopSignal(live.error)
+            if (stopSignal.stop) {
+                const blocked = await blockGraphCommentGuard(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_REWRITE, stopSignal.reason)
+                verifyStoppedGuard = blocked
+                results.push({ item_index: index, verified: false, status: blocked.status, note: blocked.reason, ...graphGuardResponseFields(blocked) })
+                break
+            }
+        }
         const linkVerify = verifyRewrittenShortlink(str(row.new_expanded_url) || str(row.new_shortlink), {
             sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3), sub4: resolveEffectiveTargetSub4(row),
         })
@@ -8808,10 +8949,11 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
     return c.json({
         ok: true, mode: 'verify', token_available: true,
         // Verify never writes: dry_run true / write_mode false always.
-        job_id: jobId, status: str(job.status), dry_run: true, write_mode: false,
-        counts: { checked: written.length, verified: verifiedCount, failed: written.length - verifiedCount },
+        job_id: jobId, status: verifyStoppedGuard?.status || str(job.status), dry_run: true, write_mode: false,
+        counts: { checked: results.length, verified: verifiedCount, failed: Math.max(0, results.length - verifiedCount) },
         count_returned: results.length,
-        checked: written.length, verified: verifiedCount, results,
+        checked: results.length, verified: verifiedCount, results,
+        ...(verifyStoppedGuard ? graphGuardResponseFields(verifyStoppedGuard) : {}),
     }, 200, { 'Cache-Control': 'no-store' })
 })
 
@@ -9491,6 +9633,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
 
     await ensureFacebookPageVideoCacheTables(c.env.DB)
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
 
     // Candidate query: constrained by page_id + (optional) date range + limit/offset.
     // created_time holds sortable ISO strings, so lexical comparison is correct for
@@ -9612,10 +9755,15 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         ok: boolean
         error: string
     }> => {
+        const guard = await checkGraphCommentGuard(c.env.DB, c.env, pageId, GRAPH_COMMENT_FEATURE_BACKFILL)
+        if (!guard.allowed) {
+            return { data: [], pageCommentCount: 0, otherCommentCount: 0, pageCommentIds: [], resolvedPostId: '', ok: false, error: `${guard.status}:${guard.reason}:${guard.block_until}`.slice(0, 200) }
+        }
         const commentsResp = await fetch(
             `https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}/comments?fields=id,from,message,created_time&limit=10&access_token=${encodeURIComponent(token)}`
         )
         const commentsJson = await commentsResp.json().catch(() => ({})) as Record<string, unknown>
+        await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_BACKFILL)
         const data = Array.isArray((commentsJson as { data?: unknown[] }).data)
             ? ((commentsJson as { data: Array<Record<string, unknown>> }).data)
             : []
@@ -9625,12 +9773,19 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         const errCode = graphErr?.code !== undefined ? sanitizeGraphErrorText(graphErr.code) : ''
         const errType = graphErr?.type !== undefined ? sanitizeGraphErrorText(graphErr.type) : ''
         const errMsg = sanitizeGraphErrorText((graphErr?.message) || `comments_fetch_${commentsResp.status}`)
-        const error = commentsResp.ok
+        let error = commentsResp.ok
             ? ''
             : [`http_${commentsResp.status}`, errMsg, errCode ? `code=${errCode}` : '', errType ? `type=${errType}` : '']
                 .filter(Boolean)
                 .join(' ')
                 .slice(0, 200)
+        if (!commentsResp.ok) {
+            const sig = detectGraphStopSignal(graphErr)
+            if (sig.stop) {
+                const blocked = await blockGraphCommentGuard(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_BACKFILL, sig.reason)
+                error = `${blocked.status}:${blocked.reason}:${blocked.block_until}`.slice(0, 200)
+            }
+        }
         let pageCommentCount = 0
         let otherCommentCount = 0
         let resolvedPostId = ''

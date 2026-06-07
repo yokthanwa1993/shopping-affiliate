@@ -274,6 +274,8 @@ export function canonicalizeProductUrl(finalUrl: string): string {
 export type RegistryStatus =
     | 'ok'
     | 'missing_token'
+    | 'cooldown'
+    | 'graph_blocked'
     | 'comment_fetch_failed'
     | 'missing_comment'
     | 'non_page_comment'
@@ -283,7 +285,7 @@ export type RegistryStatus =
 
 export type RegistryStatusInput = {
     // How the live Graph comment read went for this item's target.
-    commentFetch: 'ok' | 'failed' | 'missing_token'
+    commentFetch: 'ok' | 'failed' | 'missing_token' | 'cooldown' | 'graph_blocked'
     // Count of top-level comments authored by the page itself.
     pageCommentCount: number
     // Count of top-level comments authored by anyone other than the page.
@@ -298,6 +300,8 @@ export type RegistryStatusInput = {
 //   token/fetch blockers → comment presence → link presence → expand outcome.
 export function computeRegistryItemStatus(input: RegistryStatusInput): RegistryStatus {
     if (input.commentFetch === 'missing_token') return 'missing_token'
+    if (input.commentFetch === 'cooldown') return 'cooldown'
+    if (input.commentFetch === 'graph_blocked') return 'graph_blocked'
     if (input.commentFetch === 'failed') return 'comment_fetch_failed'
 
     if (input.pageCommentCount === 0) {
@@ -355,6 +359,7 @@ export type JobItemStatus =
     | 'would_edit'     // dry-run: would edit the page-owned comment
     | 'would_create'   // dry-run: would create a new page comment
     | 'done'           // write succeeded and verified
+    | 'verify_pending' // write happened; post-write verify intentionally deferred
     | 'failed'         // write or shortlink build failed
     | 'verify_failed'  // write happened but post-write verify did not confirm
 
@@ -400,6 +405,13 @@ export function clampBatchSize(raw: unknown): number {
     const value = Number(raw)
     if (!Number.isFinite(value)) return JOB_DEFAULT_BATCH_SIZE
     return Math.min(JOB_MAX_BATCH_SIZE, Math.max(1, Math.floor(value)))
+}
+
+export function resolveRunCommentBatchLimit(input: { writeMode: boolean; batchSize: number; requestedLimit?: unknown }): number {
+    const requested = Number(input.requestedLimit)
+    const requestedLimit = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : input.batchSize
+    const base = Math.min(input.batchSize, Math.max(1, requestedLimit))
+    return input.writeMode ? Math.min(1, base) : base
 }
 
 // Parse a boolean-ish flag (query/body) with an explicit default. Used for
@@ -774,6 +786,64 @@ export function detectGraphStopSignal(error: unknown): GraphStopSignal {
     }
     return { stop: false, reason: '' }
 }
+
+
+export const GRAPH_COMMENT_DEFAULT_MIN_SPACING_SECONDS = 60
+export const GRAPH_COMMENT_BLOCK_SECONDS = 2 * 60 * 60
+export const GRAPH_COMMENT_FEATURE_REGISTRY = 'page_comment_link_registry'
+export const GRAPH_COMMENT_FEATURE_REWRITE = 'page_comment_link_rewrite'
+export const GRAPH_COMMENT_FEATURE_BACKFILL = 'facebook_page_video_backfill'
+
+export type GraphCommentGuardRow = {
+    lastCommentOperationAt?: string | null
+    blockUntil?: string | null
+    blockReason?: string | null
+}
+
+export type GraphCommentGuardDecision = {
+    allowed: boolean
+    status: 'ok' | 'cooldown' | 'graph_blocked'
+    reason: string
+    block_until: string
+}
+
+export function resolveGraphCommentMinSpacingSeconds(raw: unknown): number {
+    if (raw === undefined || raw === null || raw === '') return GRAPH_COMMENT_DEFAULT_MIN_SPACING_SECONDS
+    const value = Number(raw)
+    if (!Number.isFinite(value) || value < 0) return GRAPH_COMMENT_DEFAULT_MIN_SPACING_SECONDS
+    return Math.min(3600, Math.max(0, Math.floor(value)))
+}
+
+export function computeGraphCommentBlockUntil(input: { nowMs?: number; minBlockSeconds?: number }): string {
+    const now = Number.isFinite(input.nowMs) ? Number(input.nowMs) : Date.now()
+    const seconds = Math.max(GRAPH_COMMENT_BLOCK_SECONDS, Math.floor(Number(input.minBlockSeconds || 0)))
+    return new Date(now + seconds * 1000).toISOString()
+}
+
+export function computeGraphCommentGuardDecision(row: GraphCommentGuardRow | null | undefined, nowMs = Date.now(), minSpacingSeconds = GRAPH_COMMENT_DEFAULT_MIN_SPACING_SECONDS): GraphCommentGuardDecision {
+    const blockUntil = String(row?.blockUntil || '').trim()
+    if (blockUntil && Date.parse(blockUntil) > nowMs) {
+        return { allowed: false, status: 'graph_blocked', reason: String(row?.blockReason || 'graph_blocked').trim() || 'graph_blocked', block_until: blockUntil }
+    }
+    const lastAt = String(row?.lastCommentOperationAt || '').trim()
+    const lastMs = lastAt ? Date.parse(lastAt) : NaN
+    const spacingMs = Math.max(0, Math.floor(minSpacingSeconds)) * 1000
+    if (Number.isFinite(lastMs) && spacingMs > 0 && nowMs - lastMs < spacingMs) {
+        return { allowed: false, status: 'cooldown', reason: 'min_spacing', block_until: new Date(lastMs + spacingMs).toISOString() }
+    }
+    return { allowed: true, status: 'ok', reason: '', block_until: '' }
+}
+
+export const GRAPH_COMMENT_GUARD_TABLE_SQL = `CREATE TABLE IF NOT EXISTS graph_comment_op_guard (
+    page_id TEXT NOT NULL,
+    feature TEXT NOT NULL,
+    last_comment_operation_at TEXT NOT NULL DEFAULT '',
+    block_until TEXT NOT NULL DEFAULT '',
+    block_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (page_id, feature)
+)`
 
 // ---------------------------------------------------------------------------
 // D1 schema for the workflow. registry = durable per-item audit snapshot;
