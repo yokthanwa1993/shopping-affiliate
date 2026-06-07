@@ -447,17 +447,16 @@ export type TargetSubIds = {
     sub2: string
     sub3: string
     sub4: string
-    sub2_source: 'canonical_post_id' | 'fb_video_id' | 'reel_id' | 'none'
+    sub2_source: 'canonical_post_id' | 'none'
     reason: string
 }
 
 // Build the affiliate sub-ids for the NEW shortlink:
 //   sub1 = operator-requested campaign,
-//   sub2 = canonical post_id when resolved, else fb_video_id / reel_id (flagged),
+//   sub2 = canonical post_id tail when resolved,
 //   sub3 = page_id,
 //   sub4 = stable internal log_id/post_history id when available.
-// Never throws; missing pieces are reported via sub2_source + reason so the
-// caller can decide whether the fallback is acceptable.
+// Never throws; missing Page story pieces are reported via sub2_source + reason.
 export function resolveEffectiveTargetSub4(input: {
     targetSub4?: unknown
     target_sub4?: unknown
@@ -578,31 +577,59 @@ export function buildTargetSubIds(input: TargetSubBuildInput): TargetSubIds {
     const sub4 = resolveEffectiveTargetSub4({ logId: input.logId })
 
     const canonical = storyTail(input.canonicalPostId)
-    const fbVideo = String(input.fbVideoId || '').trim()
-    const reel = String(input.reelId || '').trim()
 
     let sub2 = ''
     let sub2_source: TargetSubIds['sub2_source'] = 'none'
     if (canonical) {
         sub2 = canonical
         sub2_source = 'canonical_post_id'
-    } else if (fbVideo) {
-        sub2 = fbVideo
-        sub2_source = 'fb_video_id'
-    } else if (reel) {
-        sub2 = reel
-        sub2_source = 'reel_id'
     }
 
     const reasons: string[] = []
     if (!sub1) reasons.push('missing_sub1')
     if (!sub3) reasons.push('missing_page_id')
-    if (sub2_source === 'fb_video_id' || sub2_source === 'reel_id') {
-        reasons.push(`sub2_fallback_${sub2_source}`)
-    }
-    if (sub2_source === 'none') reasons.push('missing_sub2')
+    if (sub2_source === 'none') reasons.push('missing_sub2', 'missing_page_story_object_id')
 
     return { sub1, sub2, sub3, sub4, sub2_source, reason: reasons.join(',') }
+}
+
+function targetStoryTail(id: unknown): string {
+    const value = String(id ?? '').trim()
+    if (!value) return ''
+    return value.includes('_') ? (value.split('_').pop() || '') : value
+}
+
+function isFullPageStoryObjectId(id: unknown): boolean {
+    return /^\d+_\d+$/.test(String(id ?? '').trim())
+}
+
+export function resolvePageStoryRewriteBlockReason(input: {
+    commentTargetId?: unknown
+    pageStoryObjectId?: unknown
+    postId?: unknown
+    canonicalPostId?: unknown
+    reelId?: unknown
+    fbVideoId?: unknown
+    targetSub2?: unknown
+    targetSub3?: unknown
+}): string {
+    const target = String(input.commentTargetId ?? input.pageStoryObjectId ?? '').trim()
+    if (!isFullPageStoryObjectId(target)) return 'missing_page_story_object_id'
+
+    const explicitPostTail = targetStoryTail(input.postId) || targetStoryTail(input.canonicalPostId)
+    const targetTail = targetStoryTail(target)
+    const reelTail = targetStoryTail(input.reelId) || targetStoryTail(input.fbVideoId)
+    if (!explicitPostTail && reelTail && targetTail === reelTail) return 'missing_page_story_object_id'
+
+    const postTail = explicitPostTail || targetTail
+    const targetSub2 = String(input.targetSub2 ?? '').trim()
+    if (!postTail || !targetSub2 || targetSub2 !== postTail) return 'missing_page_story_object_id'
+
+    const targetSub3 = String(input.targetSub3 ?? '').trim()
+    const targetPage = target.split('_')[0] || ''
+    if (!targetSub3 || targetSub3 !== targetPage) return 'missing_page_story_object_id'
+
+    return ''
 }
 
 export type CustomlinkRequestInput = {

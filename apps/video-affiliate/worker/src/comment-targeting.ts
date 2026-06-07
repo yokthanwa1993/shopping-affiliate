@@ -9,8 +9,8 @@
 //
 // Comments posted to the reel object do NOT propagate to the page-story, so to
 // operators the page looks empty even though history says COMMENT succeeded. The
-// fix is to target the page-story whenever it exists and only fall back to the
-// reel object id when no post_id / page-story object exists.
+// operational comment target is therefore strictly the full Page story object
+// `<page_id>_<post_id>`. Bare Reel/video ids and bare post tails are metadata only.
 
 export type VisibleCommentTargetInput = {
     pageId?: string | null
@@ -46,15 +46,21 @@ export function extractIdFromCommentTargetInput(raw: string | null | undefined):
     return ''
 }
 
-// Story-first ordered list of unique Graph comment-target candidates. The list
-// is consumed left-to-right by the comment posting flow; the FIRST candidate
-// that accepts the POST *and* shows the comment when /comments is queried is
-// the one we commit to.
+// Ordered list of unique Graph comment-target candidates. Only full Page story
+// objects (`<page_id>_<post_id>`) are valid targets for reads, writes, verify and
+// dedup. Bare Reel/video ids and bare post tails are intentionally excluded.
 export function buildVisibleCommentTargetCandidates(input: VisibleCommentTargetInput): string[] {
     const pageId = String(input.pageId || '').trim()
     const fbPostIdRaw = String(input.fbPostId || '').trim()
     const reelInputRaw = String(input.fbReelUrlOrId || '').trim()
-    const reelId = extractIdFromCommentTargetInput(reelInputRaw)
+    const reelOrStoryId = extractIdFromCommentTargetInput(reelInputRaw)
+    const postIdIsBareReelId = !!(
+        fbPostIdRaw
+        && reelOrStoryId
+        && !isLikelyFullStoryId(fbPostIdRaw)
+        && !isLikelyFullStoryId(reelOrStoryId)
+        && fbPostIdRaw === reelOrStoryId
+    )
 
     const out: string[] = []
     const seen = new Set<string>()
@@ -67,7 +73,7 @@ export function buildVisibleCommentTargetCandidates(input: VisibleCommentTargetI
         out.push(value)
     }
 
-    if (fbPostIdRaw) {
+    if (fbPostIdRaw && !postIdIsBareReelId) {
         if (isLikelyFullStoryId(fbPostIdRaw)) {
             // Already pageid_storyid — use as-is (visible page-story target).
             push(fbPostIdRaw)
@@ -75,20 +81,17 @@ export function buildVisibleCommentTargetCandidates(input: VisibleCommentTargetI
             if (pageId && tail && !fbPostIdRaw.startsWith(`${pageId}_`)) {
                 push(`${pageId}_${tail}`)
             }
-            if (tail) push(tail)
         } else {
-            // Bare story id — build the visible page-story form first.
+            // Bare story id — valid only once we can build the full Page story id.
             if (pageId) push(`${pageId}_${fbPostIdRaw}`)
-            push(fbPostIdRaw)
         }
     }
 
-    if (!fbPostIdRaw && reelId) {
-        // Reel/video object id — fallback ONLY when no fb_post_id / page-story
-        // object exists. When a page-story target is known the bare reel object is
-        // never included: comments there do NOT show on the page-story feed, so a
-        // candidate list that read/wrote/verified it would target the wrong object.
-        push(reelId)
+    if (!fbPostIdRaw && isLikelyFullStoryId(reelOrStoryId)) {
+        for (const c of buildVisibleCommentTargetCandidates({
+            pageId,
+            fbPostId: reelOrStoryId,
+        })) push(c)
     }
 
     return out
@@ -164,18 +167,7 @@ export function buildPostingCommentTargetCandidates(input: PostingCommentTargetC
         })
     }
 
-    const orderedCandidates: string[] = []
-    for (const c of buildVisibleCommentTargetCandidates({
-        pageId,
-        fbReelUrlOrId: input.fbReelUrlOrId,
-    })) orderedCandidates.push(c)
-
-    if (initialTargetId) {
-        orderedCandidates.push(initialTargetId)
-        for (const c of buildLegacyCommentTargetCandidates(initialTargetId, pageId)) orderedCandidates.push(c)
-    }
-
-    return uniqueCommentTargetTokens(orderedCandidates)
+    return []
 }
 
 export type CanonicalCommentTargetInput = {
@@ -184,7 +176,7 @@ export type CanonicalCommentTargetInput = {
     postId?: string | null
     // canonical_post_id / post_canonical — may already be the full page-story form.
     canonicalPostId?: string | null
-    // Reel/video object id (or a permalink we can extract it from). Fallback only.
+    // Reel/video object id (or a permalink we can extract it from). Metadata only.
     reelId?: string | null
     // Existing comment_target_id column (backwards compat). Only honoured when it is
     // already a full page-story id — a bare reel target is never silently kept.
@@ -194,30 +186,43 @@ export type CanonicalCommentTargetInput = {
 export type CanonicalCommentTargetResult = {
     // The canonical comment target to use for /comments reads & writes.
     target: string
-    // The page-story object id when one exists; '' when we fell back to the reel.
+    // The page-story object id when one exists; '' when it cannot be built.
     pageStoryObjectId: string
     // The numeric post id tail when known.
     postTail: string
-    source: 'canonical_post_id' | 'page_story_object' | 'existing_full_story' | 'reel_id' | 'none'
+    source: 'canonical_post_id' | 'page_story_object' | 'existing_full_story' | 'none'
     fallback: boolean
-    // '' when a page-story target was resolved; a visible fallback reason otherwise.
+    // '' when a page-story target was resolved; a visible block reason otherwise.
     reason: string
 }
 
 // Resolve the canonical Page-story comment target for a Reel/post.
 //
 // Facebook Reels expose BOTH a reel/video object id and a page-story object id
-// (`<page_id>_<post_id>`). The canonical post/comment target for rewrite, comment
-// read/write and verify MUST be the page-story object id whenever a post_id
-// exists. The bare reel object id is a fallback only when no post_id / page-story
-// object exists, and that fallback is always flagged via `reason` so responses can
-// surface it. This is the single enforcement point for that invariant.
+// (`<page_id>_<post_id>`). The canonical post/comment target for rewrite,
+// comment read/write and verify MUST be the page-story object id. Bare reel/video
+// ids and bare post tails are never returned as operational targets. This is the
+// single enforcement point for that invariant.
 export function resolveCanonicalCommentTarget(input: CanonicalCommentTargetInput): CanonicalCommentTargetResult {
     const pageId = String(input.pageId || '').trim()
     const canonicalRaw = String(input.canonicalPostId || '').trim()
     const postRaw = String(input.postId || '').trim()
     const existingRaw = String(input.existingTarget || '').trim()
     const reelId = extractIdFromCommentTargetInput(String(input.reelId || '').trim())
+    const missing = (postTail = ''): CanonicalCommentTargetResult => ({
+        target: '',
+        pageStoryObjectId: '',
+        postTail,
+        source: 'none',
+        fallback: true,
+        reason: 'missing_page_story_object_id',
+    })
+    const isBareReelAlias = (value: string): boolean => !!(
+        reelId
+        && value
+        && /^\d+$/.test(value)
+        && value === reelId
+    )
 
     const story = (
         full: string,
@@ -232,18 +237,19 @@ export function resolveCanonicalCommentTarget(input: CanonicalCommentTargetInput
         reason: '',
     })
 
-    // Compose a page-story id from a bare numeric tail when we know the page id;
-    // when the page id is unknown the bare story id is still better than the reel.
-    const composeStory = (tail: string): string => (pageId ? `${pageId}_${tail}` : tail)
+    // Compose a page-story id from a bare numeric tail only when we know the page id.
+    const composeStory = (tail: string): string => (pageId ? `${pageId}_${tail}` : '')
 
     // 1) canonical_post_id / post_canonical wins — full as-is, or composed.
     if (canonicalRaw) {
         if (isLikelyFullStoryId(canonicalRaw)) {
             return story(canonicalRaw, extractStoryTailFromFullId(canonicalRaw), 'canonical_post_id')
         }
-        if (/^\d+$/.test(canonicalRaw)) {
-            return story(composeStory(canonicalRaw), canonicalRaw, 'canonical_post_id')
+        if (/^\d+$/.test(canonicalRaw) && !isBareReelAlias(canonicalRaw)) {
+            const full = composeStory(canonicalRaw)
+            return full ? story(full, canonicalRaw, 'canonical_post_id') : missing(canonicalRaw)
         }
+        if (isBareReelAlias(canonicalRaw)) return missing()
     }
 
     // 2) post_id — full page-story as-is, or compose `<page_id>_<post_id>`.
@@ -251,9 +257,11 @@ export function resolveCanonicalCommentTarget(input: CanonicalCommentTargetInput
         if (isLikelyFullStoryId(postRaw)) {
             return story(postRaw, extractStoryTailFromFullId(postRaw), 'page_story_object')
         }
-        if (/^\d+$/.test(postRaw)) {
-            return story(composeStory(postRaw), postRaw, 'page_story_object')
+        if (/^\d+$/.test(postRaw) && !isBareReelAlias(postRaw)) {
+            const full = composeStory(postRaw)
+            return full ? story(full, postRaw, 'page_story_object') : missing(postRaw)
         }
+        if (isBareReelAlias(postRaw)) return missing()
     }
 
     // 3) Existing comment_target_id, but ONLY when it is already a full page-story
@@ -262,20 +270,7 @@ export function resolveCanonicalCommentTarget(input: CanonicalCommentTargetInput
         return story(existingRaw, extractStoryTailFromFullId(existingRaw), 'existing_full_story')
     }
 
-    // 4) Fallback: the bare reel/video object id only. Always flagged so responses
-    //    make the fallback reason visible.
-    if (reelId) {
-        return {
-            target: reelId,
-            pageStoryObjectId: '',
-            postTail: '',
-            source: 'reel_id',
-            fallback: true,
-            reason: 'comment_target_fallback_reel_id,page_story_object_missing',
-        }
-    }
-
-    return { target: '', pageStoryObjectId: '', postTail: '', source: 'none', fallback: true, reason: 'page_story_object_missing' }
+    return missing()
 }
 
 // Candidate list for "is there already an affiliate comment on the visible
@@ -283,7 +278,8 @@ export function resolveCanonicalCommentTarget(input: CanonicalCommentTargetInput
 // this returns ONLY the story-target candidates — a stray affiliate comment on
 // the reel/video fallback object does NOT prove the page-story has one, and
 // counting it would skip posting to the real visible target. When no story
-// target is known, callers can still dedup against the reel/video object.
+// target is known, callers do not dedup against Reel/video objects; those are not
+// visible Page story targets.
 export function buildExistingCommentDedupCandidates(input: VisibleCommentTargetInput): string[] {
     const fbPostIdRaw = String(input.fbPostId || '').trim()
     if (fbPostIdRaw) {

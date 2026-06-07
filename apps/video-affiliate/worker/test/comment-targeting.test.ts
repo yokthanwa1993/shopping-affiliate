@@ -19,11 +19,9 @@ test('story-first: bare fb_post_id + pageId composes the visible page-story targ
         fbReelUrlOrId: '/reel/998726829758584/',
     })
 
-    assert.deepEqual(candidates, [
-        '1008898512617594_1284990567138972',
-        '1284990567138972',
-    ])
+    assert.deepEqual(candidates, ['1008898512617594_1284990567138972'])
     assert.ok(!candidates.includes('998726829758584'), 'reel id must be excluded when a page-story exists')
+    assert.ok(!candidates.includes('1284990567138972'), 'bare post tail must not be a Graph comment target')
 })
 
 test('full pageid_storyid fb_post_id is used as-is and the reel id is excluded', () => {
@@ -33,11 +31,9 @@ test('full pageid_storyid fb_post_id is used as-is and the reel id is excluded',
         fbReelUrlOrId: '998726829758584',
     })
 
-    assert.deepEqual(candidates, [
-        '1008898512617594_1284990567138972',
-        '1284990567138972',
-    ])
+    assert.deepEqual(candidates, ['1008898512617594_1284990567138972'])
     assert.ok(!candidates.includes('998726829758584'), 'reel id must be excluded when a page-story exists')
+    assert.ok(!candidates.includes('1284990567138972'), 'bare post tail must not be a Graph comment target')
 })
 
 test('full pageid_storyid with mismatched pageId still emits page-prefixed normalized form', () => {
@@ -49,27 +45,38 @@ test('full pageid_storyid with mismatched pageId still emits page-prefixed norma
     assert.deepEqual(candidates, [
         '1008898512617594_1284990567138972',
         '999000111222333_1284990567138972',
-        '1284990567138972',
     ])
 })
 
-test('missing pageId still emits the bare fb_post_id and still excludes the reel id', () => {
+test('missing pageId cannot build a visible page-story target from a bare fb_post_id', () => {
     const candidates = buildVisibleCommentTargetCandidates({
         fbPostId: '1284990567138972',
         fbReelUrlOrId: 'https://www.facebook.com/reel/998726829758584/',
     })
 
-    assert.deepEqual(candidates, ['1284990567138972'])
+    assert.deepEqual(candidates, [])
     assert.ok(!candidates.includes('998726829758584'), 'reel id must be excluded when a page-story exists')
+    assert.ok(!candidates.includes('1284990567138972'), 'bare post tail must not be a Graph comment target')
 })
 
-test('only reel url with no post id falls back to bare reel id', () => {
+test('only reel url with no post id returns no visible comment target candidate', () => {
     const candidates = buildVisibleCommentTargetCandidates({
         pageId: '1008898512617594',
         fbReelUrlOrId: 'https://www.facebook.com/reel/998726829758584/',
     })
 
-    assert.deepEqual(candidates, ['998726829758584'])
+    assert.deepEqual(candidates, [])
+})
+
+test('visible candidates do not page-prefix a reel id stored in fb_post_id', () => {
+    const candidates = buildVisibleCommentTargetCandidates({
+        pageId: '1008898512617594',
+        fbPostId: '998726829758584',
+        fbReelUrlOrId: 'https://www.facebook.com/reel/998726829758584/',
+    })
+
+    assert.deepEqual(candidates, [])
+    assert.ok(!candidates.includes('1008898512617594_998726829758584'))
 })
 
 test('empty input produces empty list', () => {
@@ -84,25 +91,32 @@ test('posting candidates: fbPostId keeps write path story-only even when initial
         initialTargetId: '998726829758584',
     })
 
-    assert.deepEqual(candidates, [
-        '1008898512617594_1284990567138972',
-        '1284990567138972',
-    ])
+    assert.deepEqual(candidates, ['1008898512617594_1284990567138972'])
     assert.ok(!candidates.includes('998726829758584'), 'bare reel fallback must not be in write candidates when page-story exists')
     assert.ok(!candidates.includes('1008898512617594_998726829758584'), 'legacy page-prefixed reel candidate must not be appended')
+    assert.ok(!candidates.includes('1284990567138972'), 'bare post tail must not be a write candidate')
 })
 
-test('posting candidates: no post_id/page-story preserves bare reel fallback candidates', () => {
+test('posting candidates: no post_id/page-story returns no reel fallback candidates', () => {
     const candidates = buildPostingCommentTargetCandidates({
         pageId: '1008898512617594',
         fbReelUrlOrId: 'https://www.facebook.com/reel/998726829758584/',
         initialTargetId: '998726829758584',
     })
 
-    assert.deepEqual(candidates, [
-        '998726829758584',
-        '1008898512617594_998726829758584',
-    ])
+    assert.deepEqual(candidates, [])
+})
+
+test('posting candidates: initial full page-story target is allowed without reel fallback', () => {
+    const candidates = buildPostingCommentTargetCandidates({
+        pageId: '1008898512617594',
+        fbReelUrlOrId: 'https://www.facebook.com/reel/998726829758584/',
+        initialTargetId: '1008898512617594_1284990567138972',
+    })
+
+    assert.deepEqual(candidates, ['1008898512617594_1284990567138972'])
+    assert.ok(!candidates.includes('998726829758584'))
+    assert.ok(!candidates.includes('1008898512617594_998726829758584'))
 })
 
 test('extractIdFromCommentTargetInput parses common Graph permalink shapes', () => {
@@ -164,11 +178,9 @@ test('dedup: when fb_post_id exists, reel/video target is EXCLUDED so a stray re
         fbReelUrlOrId: '/reel/998726829758584/',
     })
 
-    assert.deepEqual(candidates, [
-        '1008898512617594_1284990567138972',
-        '1284990567138972',
-    ])
+    assert.deepEqual(candidates, ['1008898512617594_1284990567138972'])
     assert.ok(!candidates.includes('998726829758584'), 'reel id must not be a dedup candidate when story exists')
+    assert.ok(!candidates.includes('1284990567138972'), 'bare post tail must not be a dedup candidate')
 })
 
 test('dedup: full pageid_storyid fb_post_id still excludes reel id', () => {
@@ -178,19 +190,16 @@ test('dedup: full pageid_storyid fb_post_id still excludes reel id', () => {
         fbReelUrlOrId: '998726829758584',
     })
 
-    assert.deepEqual(candidates, [
-        '1008898512617594_1284990567138972',
-        '1284990567138972',
-    ])
+    assert.deepEqual(candidates, ['1008898512617594_1284990567138972'])
 })
 
-test('dedup: no fb_post_id falls back to reel/video candidate (legacy behavior)', () => {
+test('dedup: no fb_post_id returns no reel/video fallback candidate', () => {
     const candidates = buildExistingCommentDedupCandidates({
         pageId: '1008898512617594',
         fbReelUrlOrId: 'https://www.facebook.com/reel/998726829758584/',
     })
 
-    assert.deepEqual(candidates, ['998726829758584'])
+    assert.deepEqual(candidates, [])
 })
 
 test('dedup: empty input returns empty list', () => {
@@ -271,18 +280,30 @@ test('canonical target: bare canonical_post_id composes <page_id>_<post_id>', ()
     assert.equal(result.source, 'canonical_post_id')
 })
 
-test('canonical target: missing post_id falls back to the reel id with a visible reason', () => {
+test('canonical target: missing post_id blocks instead of falling back to the reel id', () => {
     const result = resolveCanonicalCommentTarget({
         pageId: '1008898512617594',
         reelId: 'https://www.facebook.com/reel/998726829758584/',
     })
-    assert.equal(result.target, '998726829758584')
+    assert.equal(result.target, '')
     assert.equal(result.pageStoryObjectId, '')
     assert.equal(result.postTail, '')
-    assert.equal(result.source, 'reel_id')
+    assert.equal(result.source, 'none')
     assert.equal(result.fallback, true)
-    assert.match(result.reason, /comment_target_fallback_reel_id/)
-    assert.match(result.reason, /page_story_object_missing/)
+    assert.match(result.reason, /missing_page_story_object_id/)
+    assert.doesNotMatch(result.reason, /reel_id/)
+})
+
+test('canonical target: bare post_id equal to reel_id is treated as missing page-story object', () => {
+    const result = resolveCanonicalCommentTarget({
+        pageId: '1008898512617594',
+        postId: '998726829758584',
+        reelId: '998726829758584',
+    })
+    assert.equal(result.target, '')
+    assert.equal(result.source, 'none')
+    assert.equal(result.fallback, true)
+    assert.match(result.reason, /missing_page_story_object_id/)
 })
 
 test('canonical target: existing full page-story id is honoured when no post_id is given', () => {
@@ -296,14 +317,15 @@ test('canonical target: existing full page-story id is honoured when no post_id 
     assert.equal(result.fallback, false)
 })
 
-test('canonical target: missing pageId still prefers the bare post id over the reel', () => {
+test('canonical target: missing pageId cannot use a bare post id as a comment target', () => {
     const result = resolveCanonicalCommentTarget({
         postId: '1284990567138972',
         reelId: '998726829758584',
     })
-    assert.equal(result.target, '1284990567138972')
-    assert.equal(result.fallback, false)
-    assert.equal(result.source, 'page_story_object')
+    assert.equal(result.target, '')
+    assert.equal(result.fallback, true)
+    assert.equal(result.source, 'none')
+    assert.match(result.reason, /missing_page_story_object_id/)
 })
 
 test('canonical target: nothing resolvable reports source none and a missing reason', () => {
@@ -311,5 +333,5 @@ test('canonical target: nothing resolvable reports source none and a missing rea
     assert.equal(result.target, '')
     assert.equal(result.source, 'none')
     assert.equal(result.fallback, true)
-    assert.match(result.reason, /page_story_object_missing/)
+    assert.match(result.reason, /missing_page_story_object_id/)
 })

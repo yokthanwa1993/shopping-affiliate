@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
     CUSTOMLINK_DEFAULT_ID,
@@ -45,8 +46,18 @@ import {
     resolvePageCommentLinkJobStatus,
     verifyAffiliateId,
     verifyRewrittenShortlink,
+    resolvePageStoryRewriteBlockReason,
 } from '../src/comment-link-registry.js'
 import { resolveCanonicalCommentTarget } from '../src/comment-targeting.js'
+
+function indexFunctionSource(startMarker: string, endMarker: string): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf(startMarker)
+    assert.ok(start > -1, `${startMarker} must exist`)
+    const end = source.indexOf(endMarker, start)
+    assert.ok(end > start, `${endMarker} must exist after ${startMarker}`)
+    return source.slice(start, end)
+}
 
 test('extractUrlsFromText pulls unique URLs and strips trailing punctuation', () => {
     const text = 'พิกัด: https://s.shopee.co.th/abc123) และ https://s.shopee.co.th/abc123 #ของดี\nลิงก์ https://customlink.wwoom.com/?id=1&url=x.'
@@ -319,9 +330,9 @@ test('normalizeJobBool keeps SAFE default when unset, parses truthy/falsy', () =
 
 // The page-comment-link job item persists comment_target_id (aliased as
 // page_story_object_id in responses) via resolveCanonicalCommentTarget. The
-// canonical comment/post target MUST be the page-story object <page_id>_<post_id>
-// whenever a post_id exists, with the bare reel object id used only as a flagged
-// fallback. These guard that contract at the registry/job layer.
+// canonical comment/post target MUST be the page-story object <page_id>_<post_id>.
+// Bare Reel/video ids are metadata only and must never become registry/job/run/
+// verify targets.
 test('job item canonical target: reel_id + post_id => page_id_post_id (not the bare reel id)', () => {
     const target = resolveCanonicalCommentTarget({
         pageId: '1008898512617594',
@@ -334,15 +345,17 @@ test('job item canonical target: reel_id + post_id => page_id_post_id (not the b
     assert.notEqual(target.target, '998726829758584')
 })
 
-test('job item canonical target: missing post_id falls back to reel id with a visible reason', () => {
+test('job item canonical target: missing post_id blocks instead of falling back to reel id', () => {
     const target = resolveCanonicalCommentTarget({
         pageId: '1008898512617594',
         reelId: '998726829758584',
     })
-    assert.equal(target.target, '998726829758584')
+    assert.equal(target.target, '')
+    assert.equal(target.pageStoryObjectId, '')
+    assert.equal(target.source, 'none')
     assert.equal(target.fallback, true)
-    assert.match(target.reason, /comment_target_fallback_reel_id/)
-    assert.match(target.reason, /page_story_object_missing/)
+    assert.match(target.reason, /missing_page_story_object_id/)
+    assert.doesNotMatch(target.reason, /reel_id/)
 })
 
 test('buildTargetSubIds uses canonical post_id for sub2 when present', () => {
@@ -361,16 +374,18 @@ test('buildTargetSubIds uses canonical post_id for sub2 when present', () => {
     assert.equal(subs.reason, '')
 })
 
-test('buildTargetSubIds falls back to fb_video_id and flags the reason', () => {
+test('buildTargetSubIds does not fall back to fb_video_id when post_id is missing', () => {
     const subs = buildTargetSubIds({
         requestedSub1: 'spring',
         pageId: '1008898512617594',
         canonicalPostId: '',
         fbVideoId: '998726829758584',
     })
-    assert.equal(subs.sub2, '998726829758584')
-    assert.equal(subs.sub2_source, 'fb_video_id')
-    assert.ok(subs.reason.includes('sub2_fallback_fb_video_id'))
+    assert.equal(subs.sub2, '')
+    assert.equal(subs.sub2_source, 'none')
+    assert.ok(subs.reason.includes('missing_page_story_object_id'))
+    assert.ok(!subs.reason.includes('sub2_fallback_fb_video_id'))
+    assert.ok(!subs.reason.includes('sub2_fallback_reel_id'))
 })
 
 test('buildTargetSubIds reports missing sub2 when nothing resolves', () => {
@@ -379,6 +394,108 @@ test('buildTargetSubIds reports missing sub2 when nothing resolves', () => {
     assert.ok(subs.reason.includes('missing_sub1'))
     assert.ok(subs.reason.includes('missing_page_id'))
     assert.ok(subs.reason.includes('missing_sub2'))
+    assert.ok(subs.reason.includes('missing_page_story_object_id'))
+})
+
+test('run/verify target gate requires a full page-story object and post_id tail', () => {
+    assert.equal(resolvePageStoryRewriteBlockReason({
+        commentTargetId: '1008898512617594_1284990567138972',
+        targetSub2: '1284990567138972',
+        targetSub3: '1008898512617594',
+    }), '')
+    assert.equal(resolvePageStoryRewriteBlockReason({
+        commentTargetId: '1008898512617594_1284990567138972',
+        postId: '1284990567138972',
+        targetSub2: '1284990567138972',
+        targetSub3: '1008898512617594',
+    }), '')
+    assert.equal(resolvePageStoryRewriteBlockReason({
+        commentTargetId: '',
+        postId: '',
+        targetSub2: '',
+        targetSub3: '1008898512617594',
+    }), 'missing_page_story_object_id')
+    assert.equal(resolvePageStoryRewriteBlockReason({
+        commentTargetId: '998726829758584',
+        postId: '',
+        targetSub2: '998726829758584',
+        targetSub3: '1008898512617594',
+    }), 'missing_page_story_object_id')
+    assert.equal(resolvePageStoryRewriteBlockReason({
+        commentTargetId: '1008898512617594_998726829758584',
+        postId: '',
+        reelId: '998726829758584',
+        targetSub2: '998726829758584',
+        targetSub3: '1008898512617594',
+    }), 'missing_page_story_object_id')
+})
+
+test('page comment planner does not fall back to raw or bare reel targets', () => {
+    const withLedgerSource = indexFunctionSource(
+        'async function planPageCommentLinkItemWithLedger',
+        '// Normalise a registry-shaped input item',
+    )
+    assert.match(withLedgerSource, /const commentTargetId = canonical\.target/)
+    assert.doesNotMatch(withLedgerSource, /canonical\.target\s*\|\|/)
+
+    const plannerSource = indexFunctionSource(
+        'function planPageCommentLinkItem',
+        'type PageCommentLinkPlanItem',
+    )
+    assert.match(plannerSource, /const commentTargetId = canonicalTarget\.target/)
+    assert.doesNotMatch(plannerSource, /canonicalTarget\.target\s*\|\|\s*str\(raw\.comment_target_id\)/)
+    assert.doesNotMatch(plannerSource, /fallback to reel|reel fallback/i)
+})
+
+test('run and verify paths block missing page-story targets before live reads', () => {
+    const runSource = indexFunctionSource(
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/run'",
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify'",
+    )
+    assert.match(runSource, /const verifyTarget = usedTarget \|\| canonicalVerify\.target/)
+    assert.match(runSource, /const verifyBlockReason = resolvePageStoryRewriteBlockReason/)
+    assert.ok(runSource.indexOf('const verifyBlockReason = resolvePageStoryRewriteBlockReason') < runSource.indexOf('fetchPageCommentsLive(verifyTarget, token)'))
+    assert.doesNotMatch(runSource, /str\(row\.comment_target_id\)\s*\|\|\s*str\(row\.reel_id\)/)
+
+    const verifySource = indexFunctionSource(
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify'",
+        "app.get('/api/dashboard/page-comment-link-jobs/:job_id/history'",
+    )
+    assert.match(verifySource, /const canonicalVerifyTarget = resolveCanonicalCommentTarget/)
+    assert.match(verifySource, /const pageStoryBlockReason = resolvePageStoryRewriteBlockReason/)
+    assert.ok(verifySource.indexOf('const pageStoryBlockReason = resolvePageStoryRewriteBlockReason') < verifySource.indexOf('fetchPageCommentsLive(target, token)'))
+    assert.doesNotMatch(verifySource, /str\(row\.comment_target_id\)\s*\|\|\s*str\(row\.reel_id\)/)
+})
+
+test('Shopee comment posting dedup and target selection are story-only', () => {
+    const dedupSource = indexFunctionSource(
+        'async function findExistingAffiliateComment',
+        '// Confirm the comment we just POSTed',
+    )
+    assert.match(dedupSource, /else\s*\{\s*return null\s*\}/)
+    assert.doesNotMatch(dedupSource, /resolveCommentTargetIdViaGraph\(\{/)
+    assert.doesNotMatch(dedupSource, /buildCommentTargetCandidates\(/)
+
+    const strictSource = indexFunctionSource(
+        'async function postShopeeCommentStrict',
+        'async function postShopeeCommentWithFallback',
+    )
+    assert.match(strictSource, /candidateList\.length === 0[\s\S]*missing_page_story_object_id/)
+    assert.doesNotMatch(strictSource, /comment_target_missing/)
+    assert.doesNotMatch(strictSource, /reel fallback|fallback to reel/i)
+
+    const subSource = indexFunctionSource(
+        'function buildPostingCommentShortlinkSubIds',
+        'function isManagedShortlinkTransientFailure',
+    )
+    assert.match(subSource, /Shopee comment shortlink sub2 missing: missing_page_story_object_id/)
+    assert.doesNotMatch(subSource, /fb_video_id[\s\S]*reel_id[\s\S]*unavailable/)
+    assert.doesNotMatch(subSource, /fallback/i)
+})
+
+test('post history comment targets do not fall back to bare post ids', () => {
+    const source = readFileSync('src/index.ts', 'utf8')
+    assert.doesNotMatch(source, /visibleCandidates\[0\]\s*\|\|\s*fbPostId(?:Raw)?/)
 })
 
 test('resolveEffectiveTargetSub4 preserves persisted sub4 and falls back to log/history ids', () => {
