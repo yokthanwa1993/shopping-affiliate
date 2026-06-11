@@ -16693,18 +16693,12 @@ async function handleLineTextMessage(params: {
         const xhsDownloadTimeoutMs = 45_000
         await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
-        // Reply immediately so LINE users never see only the loading indicator
-        // while XHS resolve/download is still running. Follow-up messages use
-        // push because this consumes (or may expire) the reply token.
-        await lineReplyOrPush({
-            replyToken,
-            channelAccessToken,
-            lineUserId,
-            messages: [
-                { type: 'text', text: 'รับลิงก์ XHS แล้ว กำลังดึงวิดีโอให้ สักครู่นะ' },
-            ],
-        }).catch(() => { })
-        const followupReplyToken = ''
+        // Keep the cover-picker in the original reply flow. Sending an early
+        // "กำลังดึงวิดีโอ" reply consumes the reply token and forces the cover
+        // carousel onto LINE push; if push/background delivery fails, the user
+        // sees no cover options. The legacy UX waits for XHS resolve/download
+        // and replies with the cover picker directly.
+        const followupReplyToken = replyToken
 
         const withTimeoutSignal = (timeoutMs: number) => {
             const controller = new AbortController()
