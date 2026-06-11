@@ -191,12 +191,42 @@ const dashboardCacheKey = (namespaceId: string, date: string) => `dashboard_cach
 const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`inbox_system_cache:${CACHE_VERSION}`, botScope)
 const processingCacheKey = (namespaceId: string) => `processing_cache:${CACHE_VERSION}:${namespaceId}`
 const GALLERY_BATCH_SIZE = 24
+const GALLERY_REFRESH_INTERVAL_MS = 60_000
 // Bounded timeout for inbox load-more page fetches so a stalled API surfaces a
 // retry affordance instead of an infinite bottom spinner.
 const INBOX_PAGE_FETCH_TIMEOUT_MS = 20_000
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
 const FORCE_SYSTEM_WIDE_GALLERY = false
+
+type NavigatorConnectionInfo = {
+  effectiveType?: string
+  saveData?: boolean
+}
+
+function isSlowMobileConnection(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const connection = (
+    navigator as Navigator & {
+      connection?: NavigatorConnectionInfo
+      mozConnection?: NavigatorConnectionInfo
+      webkitConnection?: NavigatorConnectionInfo
+    }
+  ).connection || (
+    navigator as Navigator & {
+      mozConnection?: NavigatorConnectionInfo
+      webkitConnection?: NavigatorConnectionInfo
+    }
+  ).mozConnection || (
+    navigator as Navigator & {
+      webkitConnection?: NavigatorConnectionInfo
+    }
+  ).webkitConnection
+  if (!connection) return false
+  if (connection.saveData) return true
+  const effectiveType = String(connection.effectiveType || '').trim().toLowerCase()
+  return effectiveType === 'slow-2g' || effectiveType === '2g' || effectiveType === '3g'
+}
 
 const readGalleryCacheForScope = (botScope = getBotScopeFromLocation(), namespaceId = '', systemWide = false) => {
   if (FORCE_SYSTEM_WIDE_GALLERY || systemWide) {
@@ -373,6 +403,7 @@ interface GalleryPageResponse {
   lazada_total?: number
   with_link_total?: number
   without_link_total?: number
+  fast?: boolean
 }
 
 interface InboxPageResponse {
@@ -5641,12 +5672,14 @@ function App({
       if (document.visibilityState !== 'visible') return
       refreshGalleryView(hasCachedGallery() ? 'top' : 'reset')
     }
-    const timer = window.setInterval(() => refreshGalleryView('top'), 12000)
+    const timer = isSlowMobileConnection()
+      ? null
+      : window.setInterval(() => refreshGalleryView('top'), GALLERY_REFRESH_INTERVAL_MS)
     const handleFocus = () => refreshGalleryView(hasCachedGallery() ? 'top' : 'reset')
     window.addEventListener('focus', handleFocus)
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
-      window.clearInterval(timer)
+      if (timer !== null) window.clearInterval(timer)
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
@@ -6212,7 +6245,7 @@ function App({
     }
   }
 
-  async function loadReadyGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean } = {}) {
+  async function loadReadyGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean; forceFresh?: boolean; skipFast?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
@@ -6226,15 +6259,19 @@ function App({
     if (shouldShowLoading) setGalleryLoading(true)
     if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(true)
 
+    let shouldRefreshFullCounts = false
     try {
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
       if (gallerySearchQuery) params.set('q', gallerySearchQuery)
-      if (offset === 0) {
+      const shouldCacheBustFirstPage = offset === 0 && (!!options.forceFresh || (reset && videos.length === 0))
+      const shouldRequestFastFirstPage = !options.forceFresh && !options.skipFast && !options.silent && !gallerySearchQuery && offset === 0
+      if (shouldCacheBustFirstPage) {
         params.set('fresh', '1')
         params.set('_ts', String(Date.now()))
       }
+      if (shouldRequestFastFirstPage) params.set('fast', '1')
 
       const useAdminSystemRoute = useSystemWideAdminGallery && isSystemAdmin
       const requestParams = new URLSearchParams(params)
@@ -6270,10 +6307,17 @@ function App({
         Array.isArray(data.videos) ? data.videos : [],
         deletedGalleryKeysRef.current,
       )
-      setVideos((prev) => (reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos)))
-      setGalleryReadyTotalCount(Number(data.ready_total || data.total || data.overall_total || 0))
+      const shouldReplaceRows = reset || (refreshTop && !!gallerySearchQuery)
+      const nextReadyTotal = Number(data.ready_total || data.total || data.overall_total || 0)
+      const receivedFastResponse = data.fast === true
+      shouldRefreshFullCounts = receivedFastResponse
+      setVideos((prev) => (shouldReplaceRows ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos)))
+      setGalleryReadyTotalCount((prev) => (
+        receivedFastResponse ? Math.max(prev, nextReadyTotal, nextVideos.length) : nextReadyTotal
+      ))
       if (typeof data.used_total === 'number') {
-        setGalleryUsedTotalCount(Number(data.used_total || 0))
+        const nextUsedTotal = Number(data.used_total || 0)
+        setGalleryUsedTotalCount((prev) => (receivedFastResponse ? Math.max(prev, nextUsedTotal) : nextUsedTotal))
       }
       setSystemGalleryStats({
         total: Number(data.total || data.overall_total || 0),
@@ -6285,7 +6329,7 @@ function App({
       setGallerySummary({
         libraryTotal: Number(data.library_total || 0),
         inventoryTotal: Number(data.inventory_total || 0),
-        readyTotal: Number(data.ready_total || data.total || data.overall_total || 0),
+        readyTotal: nextReadyTotal,
       })
       setSystemGalleryHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
@@ -6294,11 +6338,16 @@ function App({
       if (requestId === systemGalleryRequestRef.current) {
         if (shouldShowLoading) setGalleryLoading(false)
         if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(false)
+        if (shouldRefreshFullCounts) {
+          window.setTimeout(() => {
+            void loadReadyGalleryPage({ refreshTop: true, silent: true, skipFast: true })
+          }, 0)
+        }
       }
     }
   }
 
-  async function loadUsedGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean } = {}) {
+  async function loadUsedGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean; forceFresh?: boolean; skipFast?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
@@ -6312,15 +6361,19 @@ function App({
     if (shouldShowLoading) setGalleryLoading(true)
     if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(true)
 
+    let shouldRefreshFullCounts = false
     try {
       const params = new URLSearchParams()
       params.set('offset', String(offset))
       params.set('limit', String(GALLERY_BATCH_SIZE))
       if (gallerySearchQuery) params.set('q', gallerySearchQuery)
-      if (offset === 0) {
+      const shouldCacheBustFirstPage = offset === 0 && (!!options.forceFresh || (reset && usedVideos.length === 0))
+      const shouldRequestFastFirstPage = !options.forceFresh && !options.skipFast && !options.silent && !gallerySearchQuery && offset === 0
+      if (shouldCacheBustFirstPage) {
         params.set('fresh', '1')
         params.set('_ts', String(Date.now()))
       }
+      if (shouldRequestFastFirstPage) params.set('fast', '1')
 
       const useAdminSystemRoute = useSystemWideAdminGallery && isSystemAdmin
       const requestParams = new URLSearchParams(params)
@@ -6351,10 +6404,17 @@ function App({
         Array.isArray(data.videos) ? data.videos : [],
         deletedGalleryKeysRef.current,
       )
-      setUsedVideos((prev) => (reset ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos)))
-      setGalleryUsedTotalCount(Number(data.used_total || data.total || data.overall_total || 0))
+      const shouldReplaceRows = reset || (refreshTop && !!gallerySearchQuery)
+      const nextUsedTotal = Number(data.used_total || data.total || data.overall_total || 0)
+      const receivedFastResponse = data.fast === true
+      shouldRefreshFullCounts = receivedFastResponse
+      setUsedVideos((prev) => (shouldReplaceRows ? dedupeGalleryVideos(nextVideos) : mergeGalleryPageVideos(prev, nextVideos)))
+      setGalleryUsedTotalCount((prev) => (
+        receivedFastResponse ? Math.max(prev, nextUsedTotal, nextVideos.length) : nextUsedTotal
+      ))
       if (typeof data.ready_total === 'number') {
-        setGalleryReadyTotalCount(Number(data.ready_total || 0))
+        const nextReadyTotal = Number(data.ready_total || 0)
+        setGalleryReadyTotalCount((prev) => (receivedFastResponse ? Math.max(prev, nextReadyTotal) : nextReadyTotal))
       }
       setGalleryUsedHasMore(!!data.has_more && nextVideos.length > 0)
     } catch {
@@ -6363,16 +6423,22 @@ function App({
       if (requestId === usedGalleryRequestRef.current) {
         if (shouldShowLoading) setGalleryLoading(false)
         if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(false)
+        if (shouldRefreshFullCounts) {
+          window.setTimeout(() => {
+            void loadUsedGalleryPage({ refreshTop: true, silent: true, skipFast: true })
+          }, 0)
+        }
       }
     }
   }
 
-  async function loadGallerySnapshotBundle(options: { reset?: boolean; refreshTop?: boolean } = {}) {
+  async function loadGallerySnapshotBundle(options: { reset?: boolean; refreshTop?: boolean; forceFresh?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
+    const forceFresh = !!options.forceFresh
     const visibleGalleryCount = categoryFilter === 'used' ? usedVideos.length : videos.length
     const shouldShowLoading = visibleGalleryCount === 0
     const shouldShowBootstrapPending = (reset || refreshTop) && shouldShowLoading
@@ -6382,11 +6448,11 @@ function App({
 
     try {
       if (categoryFilter === 'used') {
-        await loadUsedGalleryPage({ reset, refreshTop, silent: false })
-        void loadReadyGalleryPage({ reset, refreshTop, silent: true })
+        await loadUsedGalleryPage({ reset, refreshTop, forceFresh, silent: false })
+        void loadReadyGalleryPage({ reset, refreshTop, forceFresh, silent: true })
       } else {
-        await loadReadyGalleryPage({ reset, refreshTop, silent: false })
-        void loadUsedGalleryPage({ reset, refreshTop, silent: true })
+        await loadReadyGalleryPage({ reset, refreshTop, forceFresh, silent: false })
+        void loadUsedGalleryPage({ reset, refreshTop, forceFresh, silent: true })
       }
     } finally {
       if (reset && shouldShowLoading) setGalleryLoading(false)
@@ -6494,10 +6560,10 @@ function App({
       return
     }
 
-    // Always reset from page 1 when entering/re-entering gallery.
-    // Using refreshTop with cached data can keep stale cards around after
-    // clips are moved between ready/used or removed from gallery eligibility.
-    void loadGallerySnapshotBundle({ reset: true })
+    const hasVisibleCachedRows = categoryFilter === 'used'
+      ? galleryUsedCountRef.current > 0
+      : galleryReadyCountRef.current > 0
+    void loadGallerySnapshotBundle(hasVisibleCachedRows ? { refreshTop: true } : { reset: true })
     if (isOwner) void loadGlobalOriginalVideos()
   }, [tab, categoryFilter, token, authBootstrapping, isOwner, isSystemAdmin, systemWideGalleryMode, gallerySearchQuery])
 
@@ -7842,7 +7908,7 @@ function App({
         `ย้ายคลิป ${data.reset_count ?? 0} คลิป กลับไป "ยังไม่โพสต์" สำเร็จ` +
         (skipped > 0 ? `\nข้าม ${skipped} คลิป เพราะยังไม่มีประวัติโพสต์จริง` : '')
       )
-      void loadGallerySnapshotBundle({ reset: true })
+      void loadGallerySnapshotBundle({ reset: true, forceFresh: true })
     } catch (e) {
       alert(`เกิดข้อผิดพลาด: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
@@ -7887,7 +7953,7 @@ function App({
         return
       }
       alert(`ทำเครื่องหมาย ${data.marked_count ?? 0} คลิป เป็น "โพสต์แล้ว" สำเร็จ`)
-      void loadGallerySnapshotBundle({ reset: true })
+      void loadGallerySnapshotBundle({ reset: true, forceFresh: true })
     } catch (e) {
       alert(`เกิดข้อผิดพลาด: ${e instanceof Error ? e.message : String(e)}`)
     } finally {

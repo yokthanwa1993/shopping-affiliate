@@ -5422,6 +5422,13 @@ const DASHBOARD_GALLERY_DISPLAY_WHERE = `
     AND TRIM(COALESCE(COALESCE(NULLIF(TRIM(nvs.lazada_link), ''), gi.lazada_link, gi.lazada_original_link), '')) <> ''
 `
 
+const SYSTEM_GALLERY_FAST_DISPLAY_WHERE = `
+    gi.has_public_video = 1
+    AND TRIM(COALESCE(gi.public_url, '')) <> ''
+    AND TRIM(COALESCE(COALESCE(NULLIF(TRIM(nvs.shopee_link), ''), gi.shopee_link, gi.shopee_original_link), '')) <> ''
+    AND TRIM(COALESCE(COALESCE(NULLIF(TRIM(nvs.lazada_link), ''), gi.lazada_link, gi.lazada_original_link), '')) <> ''
+`
+
 const DASHBOARD_GALLERY_POSTED_SQL = `
     TRIM(COALESCE(nvs.posted_at, '')) <> ''
     AND NOT (
@@ -5704,6 +5711,50 @@ async function claimFastGalleryVideoForPosting(params: {
     return finish(null)
 }
 
+async function getSystemGalleryPageFast(db: D1Database, params: {
+    view: DashboardGalleryView
+    offset: number
+    limit: number
+}): Promise<DashboardGalleryPageResult> {
+    const view = params.view === 'used' ? 'used' : 'ready'
+    const safeOffset = Math.max(0, Number(params.offset || 0))
+    const safeLimit = Math.min(Math.max(Number(params.limit || 24), 1), 120)
+    const postedClause = `(${DASHBOARD_GALLERY_POSTED_SQL})`
+    const viewClause = view === 'used' ? postedClause : `NOT ${postedClause}`
+    const orderBy = view === 'used'
+        ? `ORDER BY COALESCE(NULLIF(TRIM(nvs.posted_at), ''), NULLIF(TRIM(gi.processed_at), ''), NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id DESC`
+        : `ORDER BY COALESCE(NULLIF(TRIM(gi.processed_at), ''), NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), '')) DESC, gi.video_id ASC`
+
+    await Promise.all([
+        ensureGalleryIndexTable(db),
+        ensureNamespaceVideoStateColumns(db),
+    ])
+
+    const rowsRes = await db.prepare(
+        `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
+         ${DASHBOARD_GALLERY_FROM_JOIN}
+         WHERE ${SYSTEM_GALLERY_FAST_DISPLAY_WHERE}
+           AND ${viewClause}
+         ${orderBy}
+         LIMIT ? OFFSET ?`
+    ).bind(safeLimit, safeOffset).all() as { results?: Array<Record<string, unknown>> }
+
+    const videos = (rowsRes.results || []).map((row) =>
+        mapDashboardGalleryRow(row, String(row.namespace_id || '').trim())
+    )
+    const conservativeTotal = safeOffset + videos.length
+    return {
+        videos,
+        total: conservativeTotal,
+        overallTotal: conservativeTotal,
+        readyTotal: view === 'ready' ? conservativeTotal : 0,
+        usedTotal: view === 'used' ? conservativeTotal : 0,
+        inventoryTotal: conservativeTotal,
+        libraryTotal: conservativeTotal,
+        hasMore: videos.length >= safeLimit,
+    }
+}
+
 async function getDashboardGalleryPageFast(db: D1Database, params: {
     namespaceId: string
     view: DashboardGalleryView
@@ -5729,16 +5780,18 @@ async function getDashboardGalleryPageFast(db: D1Database, params: {
         ensureNamespaceVideoStateColumns(db),
     ])
 
+    const rowsPromise = db.prepare(
+        `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
+         ${DASHBOARD_GALLERY_FROM_JOIN}
+         WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
+           AND ${viewClause}
+           ${searchWhere}
+         ${orderBy}
+         LIMIT ? OFFSET ?`
+    ).bind(...viewBinds, safeLimit, safeOffset).all() as Promise<{ results?: Array<Record<string, unknown>> }>
+
     const [rowsRes, viewTotalRow, readyTotalRow, usedTotalRow, libraryTotalRow] = await Promise.all([
-        db.prepare(
-            `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
-             ${DASHBOARD_GALLERY_FROM_JOIN}
-             WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
-               AND ${viewClause}
-               ${searchWhere}
-             ${orderBy}
-             LIMIT ? OFFSET ?`
-        ).bind(...viewBinds, safeLimit, safeOffset).all() as Promise<{ results?: Array<Record<string, unknown>> }>,
+        rowsPromise,
         db.prepare(
             `SELECT COUNT(*) AS total
              ${DASHBOARD_GALLERY_FROM_JOIN}
@@ -21972,6 +22025,7 @@ app.get('/api/gallery/system', async (c) => {
         const requestedLimit = parseNonNegativeInt(c.req.query('limit'), 24)
         const limit = Math.min(Math.max(requestedLimit, 1), 120)
         const forceFresh = String(c.req.query('fresh') || '').trim() === '1' && offset === 0
+        const fastRequested = String(c.req.query('fast') || '').trim() === '1'
         const view = String(c.req.query('view') || '').trim().toLowerCase() === 'used' ? 'used' : 'ready'
         const token = getSessionTokenFromRequest(c)
         if (!token.startsWith('sess_')) return c.json({ error: 'Unauthorized' }, 401)
@@ -21985,6 +22039,39 @@ app.get('/api/gallery/system', async (c) => {
         if (!sysAdmin) return c.json({ error: 'Forbidden' }, 403)
 
         const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
+        if (fastRequested && !searchQuery) {
+            const page = await getSystemGalleryPageFast(c.env.DB, {
+                view,
+                offset,
+                limit,
+            })
+
+            return c.json({
+                videos: page.videos,
+                total: page.total,
+                overall_total: page.overallTotal,
+                ready_total: page.readyTotal,
+                used_total: page.usedTotal,
+                pending_total: 0,
+                pending_has_lazada_total: 0,
+                pending_missing_lazada_total: 0,
+                inventory_total: page.inventoryTotal,
+                library_total: page.libraryTotal,
+                shopee_total: 0,
+                lazada_total: 0,
+                with_link_total: 0,
+                without_link_total: 0,
+                has_more: page.hasMore,
+                offset,
+                limit,
+                view,
+                fast: true,
+            }, 200, {
+                'Cache-Control': 'private, no-store',
+                'Vary': 'x-auth-token',
+            })
+        }
+
         const inventory = await getSystemGalleryInventory(c.env)
         const allVideos = inventory.videos
         const readyVideos = allVideos.filter((video) => {
