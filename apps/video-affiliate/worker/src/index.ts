@@ -20669,10 +20669,54 @@ app.get('/api/processing', async (c) => {
         const requestedHistoryLimit = parseNonNegativeInt(c.req.query('history_limit'), 120)
         const resultLimit = Math.min(Math.max(requestedLimit || 120, 1), 120)
         const historyMaxObjects = Math.min(Math.max(requestedHistoryLimit || 120, 1), 120)
-        const videos = await listActiveProcessingVideos(c.get('bucket'), {
+        const requestedSystemView = String(c.req.query('system') || '').trim() === '1'
+        let ownerEmail = ''
+        let processingNamespaceId = namespaceId
+        if (requestedSystemView) {
+            const authCheck = await requireSystemAdminSession(c)
+            if (!authCheck.ok) return authCheck.response
+            ownerEmail = authCheck.email
+            processingNamespaceId = authCheck.namespaceId || namespaceId
+        }
+
+        const processingHistoryVideos = await listActiveProcessingVideos(c.get('bucket'), {
             resultLimit,
             historyMaxObjects,
         })
+        const activeOrFailedProcessingVideos = processingHistoryVideos.filter((video) => {
+            const status = String(video.status || '').trim().toLowerCase()
+            return status === 'processing' || status === 'queued' || status === 'failed' || status === 'error' || status === 'cancelled' || status === 'canceled'
+        })
+        const processedGalleryPage = processingNamespaceId
+            ? await getNamespaceInboxGalleryIndexPage({
+                env: c.env,
+                namespaceId: processingNamespaceId,
+                ownerEmail,
+                view: 'processed',
+                offset: 0,
+                limit: resultLimit,
+            }).catch(() => null)
+            : null
+        const processedGalleryVideos = (processedGalleryPage?.videos || []).map((video) => {
+            const processedAt = String(video.processedAt || video.processed_at || video.updatedAt || video.createdAt || '').trim()
+            return {
+                ...video,
+                status: 'processed',
+                completedAt: processedAt,
+                processedAt,
+                processingSource: 'gallery_index',
+            }
+        })
+        const processedIds = new Set(processedGalleryVideos.map((video) => String(video.id || video.video_id || '').trim()).filter(Boolean))
+        const videos = [
+            ...activeOrFailedProcessingVideos,
+            ...processedGalleryVideos,
+            ...processingHistoryVideos.filter((video) => {
+                const status = String(video.status || '').trim().toLowerCase()
+                const id = String(video.id || video.video_id || '').trim()
+                return (status === 'processed' || status === 'success' || status === 'done') && (!id || !processedIds.has(id))
+            }),
+        ]
         const activeProcessingVideos = videos.filter((video) => {
             const status = String(video.status || '').trim().toLowerCase()
             return status === 'processing' || status === 'queued'

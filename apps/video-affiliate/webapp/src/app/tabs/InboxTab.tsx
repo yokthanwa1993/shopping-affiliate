@@ -62,20 +62,18 @@ export function InboxTab({
     !!String(video.thumbnailUrl || '').trim()
     || !!String(video.fallbackThumbnailUrl || '').trim()
   )), [systemInboxVideos])
-  const visibleSystemInboxVideos = useMemo(() => filteredSystemInboxVideos.filter((video) => (
-    inboxView === 'processed'
-      ? !!String(video.processedAt || '').trim()
-      : inboxView === 'missing_links'
-        ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
-        : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
-  )).sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId)), [filteredSystemInboxVideos, inboxView, namespaceId])
-  const visibleInboxVideos = useMemo(() => inboxVideos.filter((video) => (
-    inboxView === 'processed'
-      ? !!String(video.processedAt || '').trim()
-      : inboxView === 'missing_links'
-        ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
-        : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
-  )).sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId)), [inboxVideos, inboxView, namespaceId])
+  // The worker already returns rows for the selected inbox view. Re-filtering by
+  // processed/link flags on the client can diverge from the server predicates
+  // (for example shortlink-normalized Shopee links) and leave load-more stuck
+  // showing only a few visible cards while has_more remains true.
+  const visibleSystemInboxVideos = useMemo(
+    () => [...filteredSystemInboxVideos].sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId)),
+    [filteredSystemInboxVideos, namespaceId],
+  )
+  const visibleInboxVideos = useMemo(
+    () => [...inboxVideos].sort((a, b) => compareInboxVideosForSystemView(a, b, namespaceId)),
+    [inboxVideos, namespaceId],
+  )
 
   if (isSystemAdmin) {
     const currentTotal = inboxView === 'processed'

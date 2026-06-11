@@ -5758,7 +5758,12 @@ function App({
     }
 
     const fetchSnapshot = async (limit: number, historyLimit: number, timeoutMs: number) => {
-      const url = `${WORKER_URL}/api/processing?summary=0&limit=${limit}&history_limit=${historyLimit}`
+      const params = new URLSearchParams()
+      params.set('summary', '0')
+      params.set('limit', String(limit))
+      params.set('history_limit', String(historyLimit))
+      if (isSystemAdmin) params.set('system', '1')
+      const url = `${WORKER_URL}/api/processing?${params.toString()}`
       return apiFetchWithTimeout(url, {}, timeoutMs)
     }
 
@@ -5825,13 +5830,7 @@ function App({
     if (!reset && !refreshTop && (inboxLoadingMore || !inboxHasMore)) return
     if (refreshTop && inboxLoadingMore) return
 
-    const currentInboxViewLength = inboxVideos.filter((video) => (
-      inboxView === 'processed'
-        ? !!String(video.processedAt || '').trim()
-        : inboxView === 'missing_links'
-          ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
-          : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
-    )).length
+    const currentInboxViewLength = inboxVideos.length
     const offset = reset || refreshTop ? 0 : inboxViewFetchedCountRef.current
     const shouldShowLoading = reset && currentInboxViewLength === 0
     if (shouldShowLoading) setInboxLoading(true)
@@ -5888,13 +5887,7 @@ function App({
     if (!reset && !refreshTop && (systemInboxLoadingMore || !systemInboxHasMore)) return
     if (refreshTop && systemInboxLoadingMore) return
 
-    const currentSystemInboxViewLength = systemInboxVideos.filter((video) => (
-      inboxView === 'processed'
-        ? !!String(video.processedAt || '').trim()
-        : inboxView === 'missing_links'
-          ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
-          : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
-    )).length
+    const currentSystemInboxViewLength = systemInboxVideos.length
     const offset = reset || refreshTop ? 0 : systemInboxViewFetchedCountRef.current
     const shouldShowLoading = reset && currentSystemInboxViewLength === 0
     if (shouldShowLoading) setSystemInboxLoading(true)
