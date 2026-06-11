@@ -22067,7 +22067,11 @@ app.get('/api/gallery/system', async (c) => {
                 view,
                 fast: true,
             }, 200, {
-                'Cache-Control': 'private, no-store',
+                'Cache-Control': forceFresh
+                    ? 'private, no-store'
+                    : (offset === 0
+                        ? 'private, max-age=15, stale-while-revalidate=60'
+                        : 'private, max-age=30, stale-while-revalidate=120'),
                 'Vary': 'x-auth-token',
             })
         }

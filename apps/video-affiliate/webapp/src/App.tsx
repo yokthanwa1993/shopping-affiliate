@@ -192,6 +192,7 @@ const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStor
 const processingCacheKey = (namespaceId: string) => `processing_cache:${CACHE_VERSION}:${namespaceId}`
 const GALLERY_BATCH_SIZE = 24
 const GALLERY_REFRESH_INTERVAL_MS = 60_000
+const GALLERY_FULL_REFRESH_AFTER_FAST_MS = 12_000
 // Bounded timeout for inbox load-more page fetches so a stalled API surfaces a
 // retry affordance instead of an infinite bottom spinner.
 const INBOX_PAGE_FETCH_TIMEOUT_MS = 20_000
@@ -4881,6 +4882,8 @@ function App({
   const inboxLoadMoreRef = useRef<HTMLDivElement | null>(null)
   const systemGalleryRequestRef = useRef(0)
   const usedGalleryRequestRef = useRef(0)
+  const deferredReadyGalleryFullRefreshTimerRef = useRef<number | null>(null)
+  const deferredUsedGalleryFullRefreshTimerRef = useRef<number | null>(null)
   const systemAdminGalleryDefaultAppliedRef = useRef(false)
   const deletedGalleryKeysRef = useRef<Set<string>>(new Set())
   const deferredGallerySearchInput = useDeferredValue(gallerySearchInput)
@@ -5680,6 +5683,7 @@ function App({
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => {
       if (timer !== null) window.clearInterval(timer)
+      clearDeferredGalleryFullRefresh()
       window.removeEventListener('focus', handleFocus)
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
@@ -6245,12 +6249,41 @@ function App({
     }
   }
 
+  function scheduleDeferredGalleryFullRefresh(view: 'ready' | 'used') {
+    if (isSlowMobileConnection()) return
+    const timerRef = view === 'used'
+      ? deferredUsedGalleryFullRefreshTimerRef
+      : deferredReadyGalleryFullRefreshTimerRef
+    if (timerRef.current !== null) return
+
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      if (view === 'used') {
+        void loadUsedGalleryPage({ refreshTop: true, silent: true, skipFast: true })
+        return
+      }
+      void loadReadyGalleryPage({ refreshTop: true, silent: true, skipFast: true })
+    }, GALLERY_FULL_REFRESH_AFTER_FAST_MS)
+  }
+
+  function clearDeferredGalleryFullRefresh(view?: 'ready' | 'used') {
+    const clearTimer = (timerRef: typeof deferredReadyGalleryFullRefreshTimerRef) => {
+      if (timerRef.current === null) return
+      window.clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+    if (!view || view === 'ready') clearTimer(deferredReadyGalleryFullRefreshTimerRef)
+    if (!view || view === 'used') clearTimer(deferredUsedGalleryFullRefreshTimerRef)
+  }
+
   async function loadReadyGalleryPage(options: { reset?: boolean; refreshTop?: boolean; silent?: boolean; forceFresh?: boolean; skipFast?: boolean } = {}) {
     const session = getToken()
     if (!session) return
 
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
+    if (options.forceFresh) clearDeferredGalleryFullRefresh('ready')
     const requestId = reset || refreshTop ? ++systemGalleryRequestRef.current : systemGalleryRequestRef.current
     if (!reset && !refreshTop && (galleryLoadingMore || !systemGalleryHasMore)) return
 
@@ -6339,9 +6372,7 @@ function App({
         if (shouldShowLoading) setGalleryLoading(false)
         if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(false)
         if (shouldRefreshFullCounts) {
-          window.setTimeout(() => {
-            void loadReadyGalleryPage({ refreshTop: true, silent: true, skipFast: true })
-          }, 0)
+          scheduleDeferredGalleryFullRefresh('ready')
         }
       }
     }
@@ -6353,6 +6384,7 @@ function App({
 
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
+    if (options.forceFresh) clearDeferredGalleryFullRefresh('used')
     const requestId = reset || refreshTop ? ++usedGalleryRequestRef.current : usedGalleryRequestRef.current
     if (!reset && !refreshTop && (galleryLoadingMore || !galleryUsedHasMore)) return
 
@@ -6424,9 +6456,7 @@ function App({
         if (shouldShowLoading) setGalleryLoading(false)
         if (!reset && !refreshTop && !options.silent) setGalleryLoadingMore(false)
         if (shouldRefreshFullCounts) {
-          window.setTimeout(() => {
-            void loadUsedGalleryPage({ refreshTop: true, silent: true, skipFast: true })
-          }, 0)
+          scheduleDeferredGalleryFullRefresh('used')
         }
       }
     }
@@ -6439,6 +6469,7 @@ function App({
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
     const forceFresh = !!options.forceFresh
+    if (forceFresh) clearDeferredGalleryFullRefresh()
     const visibleGalleryCount = categoryFilter === 'used' ? usedVideos.length : videos.length
     const shouldShowLoading = visibleGalleryCount === 0
     const shouldShowBootstrapPending = (reset || refreshTop) && shouldShowLoading
