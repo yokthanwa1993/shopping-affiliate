@@ -386,6 +386,32 @@ interface InboxPageResponse {
   has_more?: boolean
 }
 
+function inboxProcessedVideoToProcessingItem(video: InboxVideo): Video {
+  const processedAt = String(video.processedAt || video.updatedAt || video.createdAt || '').trim()
+  const publicUrl = String(video.videoUrl || video.previewUrl || video.originalUrl || '').trim()
+  const thumbnailUrl = String(video.thumbnailUrl || video.fallbackThumbnailUrl || '').trim()
+  return {
+    id: String(video.id || '').trim(),
+    namespace_id: String(video.namespace_id || video.importedFromNamespaceId || '').trim() || undefined,
+    owner_email: '',
+    script: String(video.sourceLabel || '').trim(),
+    duration: 0,
+    originalUrl: String(video.originalUrl || video.videoUrl || video.previewUrl || '').trim(),
+    createdAt: String(video.createdAt || processedAt || '').trim(),
+    processedAt,
+    updatedAt: String(video.updatedAt || processedAt || video.createdAt || '').trim(),
+    publicUrl,
+    thumbnailUrl,
+    shopeeLink: video.shopeeLink,
+    lazadaLink: video.lazadaLink,
+    gallery_ready: true,
+    original_only: false,
+    status: 'processed',
+    completedAt: processedAt,
+    processingSource: 'gallery_index',
+  } as Video
+}
+
 interface SystemGalleryStats {
   total: number
   withLink: number
@@ -5779,6 +5805,16 @@ function App({
       return apiFetchWithTimeout(url, {}, timeoutMs)
     }
 
+    const fetchSystemProcessedInbox = async (limit: number, timeoutMs: number) => {
+      const params = new URLSearchParams()
+      params.set('view', 'processed')
+      params.set('offset', '0')
+      params.set('limit', String(limit))
+      params.set('fresh', '1')
+      const url = `${WORKER_URL}/api/inbox/system?${params.toString()}`
+      return apiFetchWithTimeout(url, {}, timeoutMs)
+    }
+
     try {
       let resp: Response
       let usedFallback = false
@@ -5802,7 +5838,31 @@ function App({
       }
 
       const procData = await resp.json() as ProcessingResponse
-      const nextProcessingVideos = procData.videos || []
+      let galleryProcessedVideos: Video[] = []
+      if (isSystemAdmin) {
+        const galleryResp = await fetchSystemProcessedInbox(resultLimit, 15_000)
+        if (galleryResp.status === 401) {
+          await recoverSessionOrLogout()
+          return
+        }
+        if (galleryResp.ok) {
+          const galleryData = await galleryResp.json().catch(() => ({})) as InboxPageResponse
+          galleryProcessedVideos = (Array.isArray(galleryData.videos) ? galleryData.videos : [])
+            .map(inboxProcessedVideoToProcessingItem)
+            .filter((video) => String(video.id || '').trim())
+        }
+      }
+      const rawProcessingVideos = Array.isArray(procData.videos) ? procData.videos : []
+      const galleryProcessedIds = new Set(galleryProcessedVideos.map((video) => `${String(video.namespace_id || '').trim()}::${String(video.id || '').trim()}`))
+      const nonGalleryProcessingVideos = rawProcessingVideos.filter((video) => {
+        const status = String((video as Record<string, unknown>).status || '').trim().toLowerCase()
+        const idKey = `${String(video.namespace_id || '').trim()}::${String(video.id || '').trim()}`
+        const isProcessed = status === 'processed' || status === 'success' || status === 'done'
+        return !isSystemAdmin || !isProcessed || !galleryProcessedIds.has(idKey)
+      })
+      const nextProcessingVideos = isSystemAdmin
+        ? [...nonGalleryProcessingVideos, ...galleryProcessedVideos]
+        : rawProcessingVideos
       const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
       setProcessingVideos(nextProcessingVideos)
       setPendingShortlinkVideos(pendingVideos)
