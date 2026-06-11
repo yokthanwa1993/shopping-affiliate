@@ -5816,42 +5816,66 @@ function App({
     }
 
     try {
-      let resp: Response
+      let procData: ProcessingResponse = {}
       let usedFallback = false
-      try {
-        resp = await fetchSnapshot(60, 60, 15_000)
-      } catch (primaryError) {
-        if (!isAbortError(primaryError)) throw primaryError
-        usedFallback = true
-        resp = await fetchSnapshot(24, 24, 12_000)
-      }
-
-      if (resp.status === 401) {
-        await recoverSessionOrLogout()
-        return
-      }
-
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({})) as { error?: string; details?: string }
-        setProcessingError(String(data.details || data.error || `HTTP ${resp.status}`))
-        return
-      }
-
-      const procData = await resp.json() as ProcessingResponse
+      let processingLoadFailed = false
       let galleryProcessedVideos: Video[] = []
+
       if (isSystemAdmin) {
-        const galleryResp = await fetchSystemProcessedInbox(resultLimit, 15_000)
-        if (galleryResp.status === 401) {
+        const processingPromise = fetchSnapshot(24, 24, 8_000)
+          .then(async (resp) => {
+            if (resp.status === 401) return { unauthorized: true, data: {} as ProcessingResponse }
+            if (!resp.ok) return { unauthorized: false, data: {} as ProcessingResponse, failed: true }
+            return { unauthorized: false, data: await resp.json() as ProcessingResponse }
+          })
+          .catch(() => ({ unauthorized: false, data: {} as ProcessingResponse, failed: true }))
+        const galleryPromise = fetchSystemProcessedInbox(60, 10_000)
+          .then(async (resp) => {
+            if (resp.status === 401) return { unauthorized: true, videos: [] as Video[] }
+            if (!resp.ok) return { unauthorized: false, videos: [] as Video[], failed: true }
+            const galleryData = await resp.json().catch(() => ({})) as InboxPageResponse
+            return {
+              unauthorized: false,
+              videos: (Array.isArray(galleryData.videos) ? galleryData.videos : [])
+                .map(inboxProcessedVideoToProcessingItem)
+                .filter((video) => String(video.id || '').trim()),
+            }
+          })
+          .catch(() => ({ unauthorized: false, videos: [] as Video[], failed: true }))
+
+        const [processingResult, galleryResult] = await Promise.all([processingPromise, galleryPromise])
+        if (processingResult.unauthorized || galleryResult.unauthorized) {
           await recoverSessionOrLogout()
           return
         }
-        if (galleryResp.ok) {
-          const galleryData = await galleryResp.json().catch(() => ({})) as InboxPageResponse
-          galleryProcessedVideos = (Array.isArray(galleryData.videos) ? galleryData.videos : [])
-            .map(inboxProcessedVideoToProcessingItem)
-            .filter((video) => String(video.id || '').trim())
+        procData = processingResult.data
+        processingLoadFailed = !!processingResult.failed
+        galleryProcessedVideos = galleryResult.videos
+        if (galleryResult.failed && galleryProcessedVideos.length === 0) usedFallback = true
+      } else {
+        let resp: Response
+        try {
+          resp = await fetchSnapshot(60, 60, 15_000)
+        } catch (primaryError) {
+          if (!isAbortError(primaryError)) throw primaryError
+          usedFallback = true
+          resp = await fetchSnapshot(24, 24, 12_000)
         }
+
+        if (resp.status === 401) {
+          await recoverSessionOrLogout()
+          return
+        }
+
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({})) as { error?: string; details?: string }
+          setProcessingError(String(data.details || data.error || `HTTP ${resp.status}`))
+          return
+        }
+
+        procData = await resp.json() as ProcessingResponse
       }
+
       const rawProcessingVideos = Array.isArray(procData.videos) ? procData.videos : []
       const galleryProcessedIds = new Set(galleryProcessedVideos.map((video) => `${String(video.namespace_id || '').trim()}::${String(video.id || '').trim()}`))
       const nonGalleryProcessingVideos = rawProcessingVideos.filter((video) => {
@@ -5864,7 +5888,7 @@ function App({
         ? [...nonGalleryProcessingVideos, ...galleryProcessedVideos]
         : rawProcessingVideos
       const pendingVideos = dedupeGalleryVideos(Array.isArray(procData.pending_shortlink_videos) ? procData.pending_shortlink_videos : [])
-      setProcessingVideos(nextProcessingVideos)
+      setProcessingVideos((prev) => nextProcessingVideos.length > 0 ? nextProcessingVideos : prev)
       setPendingShortlinkVideos(pendingVideos)
       setProcessingSummary({
         libraryTotal: Number(procData.library_total || 0),
@@ -5874,8 +5898,9 @@ function App({
         pendingHasLazadaTotal: Number(procData.pending_has_lazada_total || 0),
         pendingMissingLazadaTotal: Number(procData.pending_missing_lazada_total || 0),
       })
-      if (usedFallback) {
-        // Soft notice — primary timed out, but fallback succeeded with data.
+      if (processingLoadFailed && galleryProcessedVideos.length > 0) {
+        setProcessingError('โหลดสถานะกำลังทำช้า แต่แสดงรายการสำเร็จล่าสุดแล้ว')
+      } else if (usedFallback) {
         setProcessingError('โหลดช้ากว่าปกติ ใช้ข้อมูลย่อชั่วคราว')
       }
     } catch (e) {
