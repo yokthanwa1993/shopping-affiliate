@@ -669,6 +669,141 @@ test('shortenShopee invokes reauth and forces a fresh context after failCode 3',
   );
 });
 
+test('shortenShopee opportunistically reauths once after a fatal-looking Shopee failCode and retries on a fresh context', async (t) => {
+  let evalCalls = 0;
+  let sessionCbCalls = 0;
+  const getPageCalls = [];
+  const reauthInfos = [];
+
+  const restore = withBrowserStubs({
+    getPage: async (platform, account, opts) => {
+      getPageCalls.push({ platform, account, opts });
+      return {
+        page: makePage(async () => {
+          evalCalls += 1;
+          if (evalCalls === 1) throw new Error('failCode: 2 envelope: {"result":{"failCode":2}}');
+          return { shortLink: 's.shopee.co.th/AFTER2', longLink: 'long', originalLink: 'orig' };
+        }),
+        record: {},
+      };
+    },
+    ensureOnPlatformPage: async () => {},
+  });
+  t.after(restore);
+
+  const result = await shortenShopee(
+    'CHEARB',
+    'https://shopee.co.th/-i.6817918.28499498718',
+    ['yok'],
+    {
+      onSessionExpired: async (info) => {
+        sessionCbCalls += 1;
+        reauthInfos.push(info);
+        return { ok: true };
+      },
+    },
+  );
+
+  assert.equal(result.shortLink, 's.shopee.co.th/AFTER2');
+  assert.equal(evalCalls, 2, 'retry should run exactly once after opportunistic reauth');
+  assert.equal(sessionCbCalls, 1, 'opportunistic reauth should run at most once');
+  assert.equal(reauthInfos[0].opportunistic, true);
+  assert.match(reauthInfos[0].error.message, /failCode: 2/);
+  assert.ok(
+    getPageCalls.some((c) => c.opts && c.opts.forceNew === true),
+    'opportunistic reauth must force a fresh persistent context before retrying',
+  );
+});
+
+test('shortenShopee surfaces manual-login blocker from opportunistic reauth', async (t) => {
+  let sessionCbCalls = 0;
+
+  const restore = withBrowserStubs({
+    getPage: async () => ({
+      page: makePage(async () => {
+        throw new Error('failCode: 2 envelope: {"result":{"failCode":2}}');
+      }),
+      record: {},
+    }),
+    ensureOnPlatformPage: async () => {},
+  });
+  t.after(restore);
+
+  await assert.rejects(
+    () => shortenShopee(
+      'CHEARB',
+      'https://shopee.co.th/-i.6817918.28499498718',
+      ['yok'],
+      {
+        onSessionExpired: async () => {
+          sessionCbCalls += 1;
+          return {
+            ok: false,
+            manualLoginRequired: true,
+            reason: 'captcha_or_otp_detected',
+            diagnostic: {
+              reason: 'captcha_or_otp_detected',
+              source: 'auto_reauth',
+              frames: [],
+            },
+          };
+        },
+      },
+    ),
+    (err) => {
+      assert.equal(err.manualLoginRequired, true);
+      assert.equal(err.reason, 'captcha_or_otp_detected');
+      assert.equal(err.diagnostic.reason, 'captcha_or_otp_detected');
+      return true;
+    },
+  );
+  assert.equal(sessionCbCalls, 1, 'manual blocker should still come from exactly one opportunistic reauth');
+});
+
+test('shortenShopee does not opportunistically reauth fail-closed Shopee affiliate validation errors', async (t) => {
+  const reasons = [
+    'shopee_affiliate_id_unknown',
+    'shopee_affiliate_account_conflict',
+    'shopee_affiliate_utm_source_mismatch',
+  ];
+  let evalCalls = 0;
+  let sessionCbCalls = 0;
+  let currentReason = reasons[0];
+
+  const restore = withBrowserStubs({
+    getPage: async () => ({
+      page: makePage(async () => {
+        evalCalls += 1;
+        const err = new Error(currentReason);
+        err.reason = currentReason;
+        throw err;
+      }),
+      record: {},
+    }),
+    ensureOnPlatformPage: async () => {},
+  });
+  t.after(restore);
+
+  for (const reason of reasons) {
+    currentReason = reason;
+    await assert.rejects(
+      () => shortenShopee(
+        'CHEARB',
+        'https://shopee.co.th/-i.6817918.28499498718',
+        ['yok'],
+        { onSessionExpired: async () => { sessionCbCalls += 1; return { ok: true }; } },
+      ),
+      (err) => {
+        assert.equal(err.reason, reason);
+        return true;
+      },
+    );
+  }
+
+  assert.equal(evalCalls, reasons.length, 'validation errors should not retry');
+  assert.equal(sessionCbCalls, 0, 'validation errors must not be papered over by reauth');
+});
+
 test('shortenShopee invokes reauth after Shopee redirects off affiliate origin', async (t) => {
   let evalCalls = 0;
   let sessionCbCalls = 0;

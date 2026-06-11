@@ -149,6 +149,27 @@ function isHttp401Or403Error(err) {
   return postReauthErrorClass(err) === 'http_401_or_403';
 }
 
+function isFailClosedShopeeValidationError(err) {
+  const reason = String((err && err.reason) || '');
+  if (
+    reason === 'shopee_affiliate_id_unknown'
+    || reason === 'shopee_affiliate_account_conflict'
+    || reason === 'shopee_affiliate_utm_source_mismatch'
+  ) {
+    return true;
+  }
+  const msg = String((err && err.message) || err || '');
+  return /\bshopee_affiliate_(?:id_unknown|account_conflict|utm_source_mismatch)\b/.test(msg);
+}
+
+function createManualLoginRequiredError(reauthResult) {
+  const blockErr = new Error('MANUAL_LOGIN_REQUIRED');
+  blockErr.manualLoginRequired = true;
+  blockErr.reason = (reauthResult && reauthResult.reason) || 'manual_login_required';
+  if (reauthResult && reauthResult.diagnostic) blockErr.diagnostic = reauthResult.diagnostic;
+  return blockErr;
+}
+
 function sanitizeShopeeErrorMessageForLog(value) {
   let msg = String(value == null ? '' : value);
   if (!msg) return '';
@@ -484,7 +505,9 @@ async function shortenShopee(account, productUrl, subIds, opts = {}) {
   let lastWasNavIssue = false;
   let lastWasApiIssue = false;
   let lastWasNetIssue = false;
+  let lastWasSessionIssue = false;
   let reauthAttempted = false;
+  let opportunisticReauthAttempted = false;
   let lastReauthResult = null;
   let sawIneligibleError = false;
   for (let attempt = 1; attempt <= MAX_SHORTEN_ATTEMPTS; attempt++) {
@@ -515,6 +538,7 @@ async function shortenShopee(account, productUrl, subIds, opts = {}) {
         || (!timeoutIssue && !navIssue && !apiIssue && !netIssue && isAuthSessionError(err))
       );
       const recoverable = navIssue || timeoutIssue || apiIssue || netIssue || sessionIssue;
+      lastWasSessionIssue = sessionIssue;
       const tag = recoverable
         ? (timeoutIssue
             ? 'recoverable:timeout'
@@ -535,11 +559,7 @@ async function shortenShopee(account, productUrl, subIds, opts = {}) {
           const reauth = await onSessionExpired({ platform: 'shopee', account, attempt, error: err });
           lastReauthResult = reauth || null;
           if (reauth && reauth.manualLoginRequired) {
-            const blockErr = new Error('MANUAL_LOGIN_REQUIRED');
-            blockErr.manualLoginRequired = true;
-            blockErr.reason = reauth.reason || 'manual_login_required';
-            if (reauth.diagnostic) blockErr.diagnostic = reauth.diagnostic;
-            throw blockErr;
+            throw createManualLoginRequiredError(reauth);
           }
         } catch (reauthErr) {
           if (reauthErr && reauthErr.manualLoginRequired) throw reauthErr;
@@ -580,6 +600,55 @@ async function shortenShopee(account, productUrl, subIds, opts = {}) {
     if (cached) {
       console.warn(`[shopee:${account}] retries exhausted — serving last-known-good shortlink fallback`);
       return Object.assign({}, cached, { fallback: 'last_success' });
+    }
+  }
+  // Some Shopee route/state/API errors are not classified as session issues
+  // but still recover after a Keychain-backed login refresh. Give those one
+  // bounded reauth + fresh-context retry before surfacing the original error.
+  if (
+    onSessionExpired
+    && !reauthAttempted
+    && !opportunisticReauthAttempted
+    && !lastWasSessionIssue
+    && !isFailClosedShopeeValidationError(lastErr)
+  ) {
+    opportunisticReauthAttempted = true;
+    try {
+      const reauth = await onSessionExpired({
+        platform: 'shopee',
+        account,
+        attempt: MAX_SHORTEN_ATTEMPTS + 1,
+        error: lastErr,
+        opportunistic: true,
+      });
+      lastReauthResult = reauth || null;
+      if (reauth && reauth.manualLoginRequired) {
+        throw createManualLoginRequiredError(reauth);
+      }
+    } catch (reauthErr) {
+      if (reauthErr && reauthErr.manualLoginRequired) throw reauthErr;
+    }
+    try {
+      await resettleShopeePage(account, { forceNew: true });
+    } catch {}
+    try {
+      const result = await withTimeout(shortenShopeeOnce(account, productUrl, subIds), SHORTEN_TIMEOUT_MS);
+      recordLastSuccess(account, productUrl, subIds, result);
+      return result;
+    } catch (retryErr) {
+      lastErr = sanitizedErrorForSurface(retryErr);
+      if (
+        isShopeeOffDomainRedirect(retryErr)
+        || isShopeeSessionApiError(retryErr)
+        || isShopeeFailCode3(retryErr)
+        || isAuthSessionError(retryErr)
+      ) {
+        const blockErr = new Error('MANUAL_LOGIN_REQUIRED');
+        blockErr.manualLoginRequired = true;
+        blockErr.reason = postReauthFailureReason(retryErr, lastReauthResult);
+        blockErr.diagnostic = buildPostReauthDiagnostic(retryErr, lastReauthResult, MAX_SHORTEN_ATTEMPTS + 1, blockErr.reason);
+        throw blockErr;
+      }
     }
   }
   throw lastErr;

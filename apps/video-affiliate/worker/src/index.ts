@@ -148,6 +148,19 @@ import {
     parsePageVideoSubId,
 } from './page-video-asset-winners'
 import {
+    DEFAULT_PAGE_POST_INVENTORY_PAGE_ID,
+    PAGE_POST_INVENTORY_DATE_INDEX_SQL,
+    PAGE_POST_INVENTORY_RUNTIME_IMPORT_MAX_ROWS,
+    PAGE_POST_INVENTORY_SOURCE,
+    PAGE_POST_INVENTORY_TABLE_SQL,
+    PAGE_POST_INVENTORY_TAIL_INDEX_SQL,
+    type PagePostInventoryRow,
+    normalizePagePostInventoryDate,
+    normalizePagePostInventoryImportRow,
+    normalizePagePostInventoryLimit,
+    normalizePagePostInventoryOffset,
+} from './page-post-inventory'
+import {
     PROCESSED_VIDEO_ASSET_LIBRARY_ADVIDEO_INDEX_SQL,
     PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
     buildProcessedVideoAssetFileUrl,
@@ -3613,6 +3626,7 @@ let facebookPageVideoCacheTablesReady: Promise<void> | null = null
 let dashboardSettingsTableReady: Promise<void> | null = null
 let pageVideoAssetWinnersTableReady: Promise<void> | null = null
 let processedVideoAssetLibraryTableReady: Promise<void> | null = null
+let pagePostInventoryTableReady: Promise<void> | null = null
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_ID = '1008898512617594'
 const DASHBOARD_FACEBOOK_GALLERY_PAGE_NAME = 'เฉียบ'
 const DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID = '1774858894802785816'
@@ -3620,6 +3634,37 @@ const DASHBOARD_FACEBOOK_GALLERY_BATCH_SIZE = 100
 const DASHBOARD_FACEBOOK_GALLERY_SYNC_COOLDOWN_MS = 30 * 1000
 const DASHBOARD_FACEBOOK_GALLERY_ERROR_COOLDOWN_MS = 60 * 60 * 1000
 const DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN = 'facebook_sync_token'
+
+type FacebookTokenResolution = {
+    token: string
+    token_source: string
+    token_hash_prefix: string
+}
+
+function emptyFacebookTokenResolution(): FacebookTokenResolution {
+    return { token: '', token_source: '', token_hash_prefix: '' }
+}
+
+async function buildFacebookTokenResolution(tokenRaw: string, source: string): Promise<FacebookTokenResolution> {
+    const token = String(tokenRaw || '').trim()
+    if (!token) return emptyFacebookTokenResolution()
+    let tokenHashPrefix = ''
+    try {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))
+        tokenHashPrefix = Array.from(new Uint8Array(digest))
+            .map((byte) => byte.toString(16).padStart(2, '0'))
+            .join('')
+            .slice(0, 12)
+    } catch { /* best-effort debug hint only */ }
+    return { token, token_source: source, token_hash_prefix: tokenHashPrefix }
+}
+
+function facebookTokenDebugFields(resolution: FacebookTokenResolution): Record<'token_source' | 'token_hash_prefix', string> {
+    return {
+        token_source: resolution.token ? resolution.token_source : '',
+        token_hash_prefix: resolution.token ? resolution.token_hash_prefix : '',
+    }
+}
 
 // Resolve the Graph API token used by the dashboard's FB-page-videos sync flow.
 // Order:
@@ -3673,6 +3718,57 @@ async function resolveFacebookSyncToken(db: D1Database, pageId: string, namespac
     return String(settingEntry?.value || '').trim()
 }
 
+// Resolve the Graph API token used by Facebook Page comment read/write flows.
+// This intentionally differs from resolveFacebookSyncToken: comment operations
+// must prefer the namespace comment token slot so stale post_tokens[0] entries do
+// not shadow an operator's freshly rotated comment token.
+async function resolveFacebookCommentToken(
+    db: D1Database,
+    pageId: string,
+    namespaceId = DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID,
+): Promise<FacebookTokenResolution> {
+    const normalizedPageId = String(pageId || '').trim()
+    const normalizedNamespaceId = String(namespaceId || '').trim()
+
+    if (normalizedPageId && normalizedNamespaceId) {
+        try {
+            const tokenPool = await getNamespacePagesTokenPool(db, normalizedNamespaceId)
+            const poolEntry = tokenPool[normalizedPageId]
+            const commentCandidates = normalizeCommentTokenPool(poolEntry?.comment_tokens || [])
+            if (commentCandidates.length > 0) {
+                return await buildFacebookTokenResolution(commentCandidates[0], 'namespace_token_pool.comment_tokens[0]')
+            }
+            const postCandidates = normalizePostTokenPool(poolEntry?.post_tokens || [])
+            if (postCandidates.length > 0) {
+                return await buildFacebookTokenResolution(postCandidates[0], 'namespace_token_pool.post_tokens[0]')
+            }
+        } catch { /* fall through */ }
+    }
+
+    if (normalizedPageId && normalizedNamespaceId) {
+        try {
+            const row = await db.prepare(
+                'SELECT access_token FROM pages WHERE id = ? AND bot_id = ? AND access_token IS NOT NULL AND access_token != "" LIMIT 1'
+            ).bind(normalizedPageId, normalizedNamespaceId).first() as { access_token?: string | null } | null
+            const pageToken = String(row?.access_token || '').trim()
+            if (pageToken) return await buildFacebookTokenResolution(pageToken, 'pages.access_token.namespace_page')
+        } catch { /* fall through */ }
+    }
+
+    if (normalizedPageId) {
+        try {
+            const row = await db.prepare(
+                'SELECT access_token FROM pages WHERE id = ? AND access_token IS NOT NULL AND access_token != "" LIMIT 1'
+            ).bind(normalizedPageId).first() as { access_token?: string | null } | null
+            const pageToken = String(row?.access_token || '').trim()
+            if (pageToken) return await buildFacebookTokenResolution(pageToken, 'pages.access_token.legacy_page')
+        } catch { /* fall through */ }
+    }
+
+    const settingEntry = await getDashboardSetting(db, DASHBOARD_SETTING_FACEBOOK_SYNC_TOKEN).catch(() => null)
+    return await buildFacebookTokenResolution(String(settingEntry?.value || '').trim(), 'dashboard_settings.facebook_sync_token')
+}
+
 async function ensureFacebookPageVideoCacheTables(db: D1Database): Promise<void> {
     if (!facebookPageVideoCacheTablesReady) {
         facebookPageVideoCacheTablesReady = (async () => {
@@ -3720,6 +3816,17 @@ async function ensureFacebookPageVideoCacheTables(db: D1Database): Promise<void>
         })()
     }
     await facebookPageVideoCacheTablesReady
+}
+
+async function ensurePagePostInventoryTable(db: D1Database): Promise<void> {
+    if (!pagePostInventoryTableReady) {
+        pagePostInventoryTableReady = (async () => {
+            await db.prepare(PAGE_POST_INVENTORY_TABLE_SQL).run()
+            await db.prepare(PAGE_POST_INVENTORY_DATE_INDEX_SQL).run().catch(() => { })
+            await db.prepare(PAGE_POST_INVENTORY_TAIL_INDEX_SQL).run().catch(() => { })
+        })()
+    }
+    await pagePostInventoryTableReady
 }
 
 async function ensureDashboardSettingsTable(db: D1Database): Promise<void> {
@@ -7451,6 +7558,170 @@ app.get('/api/dashboard/facebook-page-videos', async (c) => {
     })
 })
 
+app.get('/api/dashboard/page-post-inventory', async (c) => {
+    const clean = (value: unknown): string => String(value == null ? '' : value).trim()
+    const pageId = clean(c.req.query('page_id') || DEFAULT_PAGE_POST_INVENTORY_PAGE_ID)
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+
+    const rawDate = c.req.query('date')
+    const date = normalizePagePostInventoryDate(rawDate)
+    if (rawDate != null && clean(rawDate) && !date) {
+        return c.json({ ok: false, error: 'invalid_date' }, 400)
+    }
+
+    const limit = normalizePagePostInventoryLimit(c.req.query('limit'))
+    const offset = normalizePagePostInventoryOffset(c.req.query('offset'))
+    await ensurePagePostInventoryTable(c.env.DB)
+
+    const conditions = ['page_id = ?']
+    const binds: unknown[] = [pageId]
+    if (date) {
+        conditions.push('date = ?')
+        binds.push(date)
+    }
+    const whereSql = conditions.join(' AND ')
+
+    const countsRow = await c.env.DB.prepare(
+        `SELECT
+             COUNT(*) AS total,
+             SUM(CASE WHEN LOWER(TRIM(page_commented)) IN ('yes', 'y', 'true', '1') THEN 1 ELSE 0 END) AS page_commented_yes,
+             SUM(CASE WHEN TRIM(COALESCE(page_comment_id, '')) <> '' THEN 1 ELSE 0 END) AS page_comment_id_present,
+             SUM(CASE WHEN LOWER(COALESCE(page_comment_link, '') || ' ' || COALESCE(page_comment, '') || ' ' || COALESCE(message, '')) LIKE '%shopee%' THEN 1 ELSE 0 END) AS shopee_link_present
+         FROM facebook_page_post_inventory
+         WHERE ${whereSql}`
+    ).bind(...binds).first() as {
+        total?: number
+        page_commented_yes?: number
+        page_comment_id_present?: number
+        shopee_link_present?: number
+    } | null
+
+    const result = await c.env.DB.prepare(
+        `SELECT page_id, date, time, post_id, post_id_tail, type, post_url, message,
+                page_commented, page_comment_id, page_comment_link, page_comment,
+                source, imported_at, updated_at
+         FROM facebook_page_post_inventory
+         WHERE ${whereSql}
+         ORDER BY date ASC, time ASC, post_id ASC
+         LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all() as { results?: Array<Record<string, unknown>> }
+
+    const rows = (Array.isArray(result.results) ? result.results : []).map((row) => ({
+        page_id: clean(row.page_id),
+        date: clean(row.date),
+        time: clean(row.time),
+        post_id: clean(row.post_id),
+        post_id_tail: clean(row.post_id_tail),
+        type: clean(row.type),
+        post_url: clean(row.post_url),
+        message: clean(row.message),
+        page_commented: clean(row.page_commented),
+        page_comment_id: clean(row.page_comment_id),
+        page_comment_link: clean(row.page_comment_link),
+        page_comment: clean(row.page_comment),
+        source: clean(row.source),
+        imported_at: clean(row.imported_at),
+        updated_at: clean(row.updated_at),
+    }))
+    const counts = {
+        total: Number(countsRow?.total || 0),
+        page_commented_yes: Number(countsRow?.page_commented_yes || 0),
+        page_comment_id_present: Number(countsRow?.page_comment_id_present || 0),
+        shopee_link_present: Number(countsRow?.shopee_link_present || 0),
+    }
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        date: date || null,
+        counts,
+        total: counts.total,
+        limit,
+        offset,
+        rows,
+        items: rows,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.post('/api/dashboard/page-post-inventory/import', async (c) => {
+    const clean = (value: unknown): string => String(value == null ? '' : value).trim()
+    const configuredSecret = clean((c.env as Env & { PAGE_POST_INVENTORY_IMPORT_KEY?: string }).PAGE_POST_INVENTORY_IMPORT_KEY)
+    const providedSecret = clean(c.req.header('X-Page-Inventory-Import-Key'))
+    if (!configuredSecret || !providedSecret || providedSecret !== configuredSecret) {
+        return c.json({ ok: false, error: 'forbidden' }, 403, { 'Cache-Control': 'no-store' })
+    }
+
+    const body = await c.req.json().catch(() => null) as { page_id?: unknown; rows?: unknown } | null
+    const pageId = clean(body?.page_id) || DEFAULT_PAGE_POST_INVENTORY_PAGE_ID
+    const countResponse = (ok: boolean, receivedRows: number, upsertedRows: number, invalidRows: number) => ({
+        ok,
+        mode: 'worker_runtime_import',
+        page_id: pageId,
+        received_rows: receivedRows,
+        upserted_rows: upsertedRows,
+        invalid_rows: invalidRows,
+        source: PAGE_POST_INVENTORY_SOURCE,
+    })
+
+    if (!Array.isArray(body?.rows)) {
+        return c.json(countResponse(false, 0, 0, 0), 400, { 'Cache-Control': 'no-store' })
+    }
+
+    const rawRows = body.rows
+    if (rawRows.length > PAGE_POST_INVENTORY_RUNTIME_IMPORT_MAX_ROWS) {
+        return c.json(countResponse(false, rawRows.length, 0, rawRows.length), 413, { 'Cache-Control': 'no-store' })
+    }
+
+    const rows: PagePostInventoryRow[] = []
+    for (const raw of rawRows) {
+        if (!raw || typeof raw !== 'object') continue
+        const normalized = normalizePagePostInventoryImportRow(raw as Record<string, unknown>, pageId)
+        if (normalized) rows.push(normalized)
+    }
+
+    await ensurePagePostInventoryTable(c.env.DB)
+    const upsertSql = `INSERT INTO facebook_page_post_inventory (
+            page_id, date, time, post_id, post_id_tail, type, post_url, message,
+            page_commented, page_comment_id, page_comment_link, page_comment, source,
+            imported_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(page_id, post_id) DO UPDATE SET
+            date = excluded.date,
+            time = excluded.time,
+            post_id_tail = excluded.post_id_tail,
+            type = excluded.type,
+            post_url = excluded.post_url,
+            message = excluded.message,
+            page_commented = excluded.page_commented,
+            page_comment_id = excluded.page_comment_id,
+            page_comment_link = excluded.page_comment_link,
+            page_comment = excluded.page_comment,
+            source = excluded.source,
+            updated_at = excluded.updated_at`
+
+    const statements = rows.map((row) => c.env.DB.prepare(upsertSql).bind(
+        row.page_id,
+        row.date,
+        row.time,
+        row.post_id,
+        row.post_id_tail,
+        row.type,
+        row.post_url,
+        row.message,
+        row.page_commented,
+        row.page_comment_id,
+        row.page_comment_link,
+        row.page_comment,
+        row.source,
+    ))
+    if (statements.length > 0) await c.env.DB.batch(statements)
+
+    return c.json(
+        countResponse(true, rawRows.length, rows.length, rawRows.length - rows.length),
+        200,
+        { 'Cache-Control': 'no-store' },
+    )
+})
+
 // READ-ONLY audit of the comment/affiliate-link registry for a Facebook Page's
 // Reels. Combines cached page videos + post_history mapping + (when a Graph token
 // is available) a LIVE GET of top-level comments, then extracts/expands affiliate
@@ -7532,8 +7803,9 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
         console.log(`[COMMENT LINK REGISTRY] post_history lookup failed page=${pageId}: ${e instanceof Error ? e.message : String(e)}`)
     }
 
-    // Resolve the Graph token once. Never logged or returned. Empty => no live read.
-    const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
+    // Resolve the Graph token once. Never log or return the token value. Empty => no live read.
+    const tokenResolution = await resolveFacebookCommentToken(c.env.DB, pageId, namespaceId).catch(() => emptyFacebookTokenResolution())
+    const token = tokenResolution.token
     const hasToken = token.length > 0
 
     type LiveComment = { id: string; message: string; fromId: string; fromName: string; createdTime: string }
@@ -7768,6 +8040,7 @@ app.get('/api/dashboard/page-comment-link-registry', async (c) => {
         namespace_id: namespaceId,
         comments_source: hasToken ? 'live+cache' : 'cache_only',
         token_available: hasToken,
+        ...facebookTokenDebugFields(tokenResolution),
         expand_enabled: expand,
         last_audited_at: lastAuditedAt,
         summary: {
@@ -8200,9 +8473,9 @@ function planPageCommentLinkItem(raw: Record<string, unknown>, opts: { pageId: s
         target_sub2: subs.sub2,
         target_sub3: subs.sub3,
         target_sub4: subs.sub4,
-        // The durable log id that lands in slot 4 — surfaced explicitly so preview/
-        // job responses match run/verify/history (never a silently-empty slot 4).
-        effective_target_sub4: subs.sub4,
+        // Durable internal log id remains available for audit, but it no longer
+        // lands in Shopee/customlink sub4. New URL shape leaves sub4/sub5 empty.
+        effective_target_sub4: logId,
         target_sub2_source: subs.sub2_source,
         new_shortlink: '',
         new_expanded_url: '',
@@ -8416,7 +8689,6 @@ async function loadPageCommentLinkJobItems(db: D1Database, jobId: string): Promi
     const rows = await db.prepare('SELECT * FROM page_comment_link_job_items WHERE job_id = ? ORDER BY item_index ASC')
         .bind(jobId).all().catch(() => ({ results: [] })) as { results?: Record<string, unknown>[] }
     return (rows.results || []).map((row) => {
-        const targetSub4 = resolveEffectiveTargetSub4(row)
         const storedTarget = str(row.comment_target_id)
         const canonical = resolveCanonicalCommentTarget({
             pageId: str(row.page_id),
@@ -8432,7 +8704,6 @@ async function loadPageCommentLinkJobItems(db: D1Database, jobId: string): Promi
         const commentTargetId = canonical.target
         return {
             ...row,
-            ...(targetSub4 && str(row.target_sub4) !== targetSub4 ? { target_sub4: targetSub4 } : {}),
             comment_target_id: commentTargetId,
             // Alias of comment_target_id (the full canonical page-story object id).
             page_story_object_id: commentTargetId,
@@ -8496,8 +8767,9 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
     const effectiveWriteModeForLimit = writeMode
     const limit = resolveRunCommentBatchLimit({ writeMode: effectiveWriteModeForLimit, batchSize, requestedLimit: body.limit })
 
-    // Resolve token once. Never logged/returned. No token ⇒ no writes possible.
-    const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
+    // Resolve token once. Never log or return the token value. No token ⇒ no writes possible.
+    const tokenResolution = await resolveFacebookCommentToken(c.env.DB, pageId, namespaceId).catch(() => emptyFacebookTokenResolution())
+    const token = tokenResolution.token
     const hasToken = token.length > 0
     const effectiveWriteModePrecheck = writeMode && hasToken
     if (effectiveWriteModePrecheck) {
@@ -8511,6 +8783,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
                 dry_run: false,
                 write_mode: true,
                 token_available: true,
+                ...facebookTokenDebugFields(tokenResolution),
                 counts: { total: 0, done: 0, failed: 0, skipped: 0, remaining_planned: 0 },
                 count_returned: 0,
                 stopped_reason: runGuard.reason,
@@ -8545,7 +8818,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         const targetSub1 = str(row.target_sub1)
         const targetSub2 = str(row.target_sub2)
         const targetSub3 = str(row.target_sub3)
-        const targetSub4 = resolveEffectiveTargetSub4(row)
+        const targetSub4 = str(row.target_sub4)
         const targetAffiliateId = str(row.target_affiliate_id) || resolveTargetAffiliateId(customlinkId)
         const productUrl = str(row.product_url)
         const oldShortlink = str(row.old_shortlink)
@@ -8602,18 +8875,17 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             processed.push({ item_index: index, status: 'skipped', action: 'skip', reason: blockedReason })
             continue
         }
-        // A real write must NEVER mint/write with an empty target_sub4 — that is
-        // the 2026-05-16 empty-slot-4 defect. Refuse whenever a comment target/id
-        // is known and target_sub4 is empty, regardless of whether a log_id exists.
-        // (Job items now persist a durable ledger-backed target_sub4 at creation;
-        // this guards legacy rows written before the fix.)
-        if (writeMode && hasToken && resolveRealRewriteRefusal({
+        // New policy: outbound Shopee/customlink tracking intentionally leaves
+        // sub4 empty. Keep log_id/effective_target_sub4 only for internal audit;
+        // do not refuse real writes just because target_sub4 is empty.
+        const refusal = writeMode && hasToken ? resolveRealRewriteRefusal({
             targetSub4, commentTargetId: str(row.comment_target_id), oldCommentId, commentId: str(row.comment_id),
-        })) {
-            await updateItem(index, { status: 'failed', reason: 'missing_target_sub4', error: 'missing_target_sub4' })
+        }) : ''
+        if (refusal) {
+            await updateItem(index, { status: 'failed', reason: refusal, error: refusal })
             failedCount++
-            processed.push({ item_index: index, status: 'failed', action, reason: 'missing_target_sub4' })
-            if (stopOnFirstError) { stoppedReason = 'missing_target_sub4'; break }
+            processed.push({ item_index: index, status: 'failed', action, reason: refusal })
+            if (stopOnFirstError) { stoppedReason = refusal; break }
             continue
         }
 
@@ -8625,8 +8897,8 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
             processed.push({
                 item_index: index, status: wouldStatus, action, dry_run: true, token_available: hasToken,
                 log_id: str(row.log_id), effective_target_sub4: targetSub4,
-                customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId }),
-                expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 }),
+                customlink_request_url: buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '', id: customlinkId }),
+                expected_utm_content: buildExpectedUtmContent({ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '' }),
                 target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: targetSub4,
                 target_affiliate_id: targetAffiliateId, affiliate_verify_status: 'pending', affiliate_id_match: 0,
             })
@@ -8639,7 +8911,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
 
         // 1. Mint the new shortlink, then 2. expand + verify its sub ids BEFORE
         //    we ever touch a comment — never post an unverified link.
-        const requestUrl = buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4, id: customlinkId })
+        const requestUrl = buildCustomlinkRequestUrl({ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '', id: customlinkId })
         const minted = await mintCustomlinkShortlink(requestUrl)
         if (!minted.ok) {
             await updateItem(index, { status: 'failed', reason: 'shortlink_failed', error: minted.error, attempts, affiliate_verify_status: 'error', affiliate_id_match: 0 })
@@ -8651,7 +8923,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         const newShortlink = minted.shortLink
         const expanded = await expandShortlinkFinalUrl(newShortlink)
         const expandedNewUrl = expanded.finalUrl || newShortlink
-        const verifyLink = verifyRewrittenShortlink(expandedNewUrl, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: targetSub4 })
+        const verifyLink = verifyRewrittenShortlink(expandedNewUrl, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '' })
         const affiliateVerify = verifyAffiliateId(expandedNewUrl, targetAffiliateId)
         if (!verifyLink.ok) {
             await updateItem(index, {
@@ -8910,6 +9182,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/run', async (c) => {
         dry_run: !effectiveWriteMode,
         write_mode: effectiveWriteMode,
         token_available: hasToken,
+        ...facebookTokenDebugFields(tokenResolution),
         counts: {
             total: allItems.length,
             done: totalDone,
@@ -8942,7 +9215,8 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
 
     const pageId = str(job.page_id)
     const namespaceId = str(job.namespace_id) || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID
-    const token = await resolveFacebookSyncToken(c.env.DB, pageId, namespaceId).catch(() => '')
+    const tokenResolution = await resolveFacebookCommentToken(c.env.DB, pageId, namespaceId).catch(() => emptyFacebookTokenResolution())
+    const token = tokenResolution.token
     const hasToken = token.length > 0
 
     const items = await loadPageCommentLinkJobItems(c.env.DB, jobId)
@@ -8952,6 +9226,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
     if (!hasToken) {
         return c.json({
             ok: true, mode: 'verify', token_available: false,
+            ...facebookTokenDebugFields(tokenResolution),
             // Verify never writes: dry_run true / write_mode false always.
             job_id: jobId, status: str(job.status), dry_run: true, write_mode: false,
             counts: { checked: 0, verified: 0, failed: 0 }, count_returned: 0,
@@ -8963,6 +9238,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
     if (!verifyGuard.allowed) {
         return c.json({
             ok: true, mode: 'verify', token_available: true,
+            ...facebookTokenDebugFields(tokenResolution),
             job_id: jobId, status: verifyGuard.status, dry_run: true, write_mode: false,
             counts: { checked: 0, verified: 0, failed: 0 }, count_returned: 0,
             checked: 0, verified: 0, results: [], note: verifyGuard.reason,
@@ -9021,7 +9297,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
             }
         }
         const linkVerify = verifyRewrittenShortlink(str(row.new_expanded_url) || str(row.new_shortlink), {
-            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3), sub4: resolveEffectiveTargetSub4(row),
+            sub1: str(row.target_sub1), sub2: str(row.target_sub2), sub3: str(row.target_sub3), sub4: '',
         })
         const matched = live.ok && isAffiliateCommentMatch(live.comments, {
             commentId: str(row.new_comment_id), expectedMessage: String(row.new_message ?? ''), affiliateHostPattern: PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN,
@@ -9051,6 +9327,7 @@ app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify', async (c) => {
 
     return c.json({
         ok: true, mode: 'verify', token_available: true,
+        ...facebookTokenDebugFields(tokenResolution),
         // Verify never writes: dry_run true / write_mode false always.
         job_id: jobId, status: verifyStoppedGuard?.status || str(job.status), dry_run: true, write_mode: false,
         counts: { checked: results.length, verified: verifiedCount, failed: Math.max(0, results.length - verifiedCount) },
@@ -9731,8 +10008,11 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         if (fromInput.value > toInput.value) return c.json({ ok: false, error: 'invalid_date_range' }, 400)
     }
 
-    const token = await resolveFacebookSyncToken(c.env.DB, pageId)
-    if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing' }, 400)
+    const syncToken = await resolveFacebookSyncToken(c.env.DB, pageId).catch(() => '')
+    const commentTokenResolution = await resolveFacebookCommentToken(c.env.DB, pageId).catch(() => emptyFacebookTokenResolution())
+    const commentReadToken = commentTokenResolution.token || syncToken
+    const token = syncToken || commentReadToken
+    if (!token) return c.json({ ok: false, error: 'facebook_sync_token_missing', ...facebookTokenDebugFields(commentTokenResolution) }, 400)
 
     await ensureFacebookPageVideoCacheTables(c.env.DB)
     await ensurePageCommentLinkWorkflowTables(c.env.DB)
@@ -9795,6 +10075,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
     const sanitizeGraphErrorText = (text: unknown): string => {
         let s = String(text ?? '')
         if (token) s = s.split(token).join('[REDACTED]')
+        if (commentReadToken && commentReadToken !== token) s = s.split(commentReadToken).join('[REDACTED]')
         s = s.replace(/access_token=[^&\s"']+/gi, 'access_token=[REDACTED]')
         return s.trim()
     }
@@ -9862,7 +10143,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
             return { data: [], pageCommentCount: 0, otherCommentCount: 0, pageCommentIds: [], resolvedPostId: '', ok: false, error: `${guard.status}:${guard.reason}:${guard.block_until}`.slice(0, 200) }
         }
         const commentsResp = await fetch(
-            `https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}/comments?fields=id,from,message,created_time&limit=10&access_token=${encodeURIComponent(token)}`
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(targetId)}/comments?fields=id,from,message,created_time&limit=10&access_token=${encodeURIComponent(commentReadToken)}`
         )
         const commentsJson = await commentsResp.json().catch(() => ({})) as Record<string, unknown>
         await recordGraphCommentOperation(c.env.DB, pageId, GRAPH_COMMENT_FEATURE_BACKFILL)
@@ -10307,6 +10588,7 @@ app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook', async (c)
         only_missing: onlyMissing,
         include_comment_counts: includeCommentCounts,
         include_cta: includeCta,
+        ...facebookTokenDebugFields(commentTokenResolution),
         limit,
         offset,
         from_date: fromDate || null,
@@ -16407,20 +16689,45 @@ async function handleLineTextMessage(params: {
     if (xhsMatch) {
         const xhsUrl = xhsMatch[0]
         const videoId = crypto.randomUUID().slice(0, 8)
+        const xhsResolveTimeoutMs = 15_000
+        const xhsDownloadTimeoutMs = 45_000
         await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
-        // handleLineEvent already invoked lineStartLoading for non-cancel text,
-        // so we intentionally do not call it again here to avoid double-start.
+        // Reply immediately so LINE users never see only the loading indicator
+        // while XHS resolve/download is still running. Follow-up messages use
+        // push because this consumes (or may expire) the reply token.
+        await lineReplyOrPush({
+            replyToken,
+            channelAccessToken,
+            lineUserId,
+            messages: [
+                { type: 'text', text: 'รับลิงก์ XHS แล้ว กำลังดึงวิดีโอให้ สักครู่นะ' },
+            ],
+        }).catch(() => { })
+        const followupReplyToken = ''
+
+        const withTimeoutSignal = (timeoutMs: number) => {
+            const controller = new AbortController()
+            const timeoutId = setTimeout(() => controller.abort(`xhs_timeout_${timeoutMs}ms`), timeoutMs)
+            return { controller, timeoutId }
+        }
 
         // Resolve XHS URL to direct video URL via merge service
         let resolvedVideoUrl = xhsUrl
         let resolverFailureReason: 'no_video' | 'request_failed' | null = null
         try {
-            const resolveResp = await fetchMergeService(env, '/xhs/resolve', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: xhsUrl }),
-            })
+            const { controller, timeoutId } = withTimeoutSignal(xhsResolveTimeoutMs)
+            let resolveResp: Response
+            try {
+                resolveResp = await fetchMergeService(env, '/xhs/resolve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: xhsUrl }),
+                    signal: controller.signal,
+                })
+            } finally {
+                clearTimeout(timeoutId)
+            }
             if (resolveResp.ok) {
                 const resolveData = await resolveResp.json() as { video_url?: string }
                 if (resolveData?.video_url) {
@@ -16433,7 +16740,8 @@ async function handleLineTextMessage(params: {
             } else {
                 resolverFailureReason = 'request_failed'
             }
-        } catch {
+        } catch (e) {
+            console.warn(`[LINE] XHS resolve failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
             resolverFailureReason = 'request_failed'
         }
 
@@ -16443,7 +16751,16 @@ async function handleLineTextMessage(params: {
         let downloadFailed = false
         try {
             if (resolvedVideoUrl !== xhsUrl) {
-                const videoResp = await fetch(resolvedVideoUrl, { headers: { 'Referer': 'https://www.xiaohongshu.com/' } })
+                const { controller, timeoutId } = withTimeoutSignal(xhsDownloadTimeoutMs)
+                let videoResp: Response
+                try {
+                    videoResp = await fetch(resolvedVideoUrl, {
+                        headers: { 'Referer': 'https://www.xiaohongshu.com/' },
+                        signal: controller.signal,
+                    })
+                } finally {
+                    clearTimeout(timeoutId)
+                }
                 if (videoResp.ok && videoResp.body) {
                     const videoBuffer = await videoResp.arrayBuffer()
                     assertDownloadedVideoResponse(videoResp, videoBuffer, resolvedVideoUrl)
@@ -16461,7 +16778,8 @@ async function handleLineTextMessage(params: {
                     downloadFailed = true
                 }
             }
-        } catch {
+        } catch (e) {
+            console.warn(`[LINE] XHS download failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
             downloadFailed = true
         }
 
@@ -16478,7 +16796,7 @@ async function handleLineTextMessage(params: {
                     : 'รับลิงก์ XHS แล้ว แต่ดึงวิดีโอไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
 
             await lineReplyOrPush({
-                replyToken,
+                replyToken: followupReplyToken,
                 channelAccessToken,
                 lineUserId,
                 messages: [
@@ -16508,14 +16826,15 @@ async function handleLineTextMessage(params: {
                 bucket,
                 namespaceId,
                 channelAccessToken,
-                replyToken,
+                replyToken: followupReplyToken,
                 lineUserId,
                 waitingState,
                 forceRefresh: true,
             })
-        } catch {
+        } catch (e) {
+            console.warn(`[LINE] XHS cover prompt failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
             await lineReplyOrPush({
-                replyToken,
+                replyToken: followupReplyToken,
                 channelAccessToken,
                 lineUserId,
                 messages: [
@@ -27244,10 +27563,9 @@ function buildPostingCommentShortlinkSubIds(input: {
     }
 
     const postSubId3 = normalizeShortlinkSubId(input.pageId || '')
-    const postSubId4 = normalizeShortlinkSubId(String(input.historyId || ''))
-    if (!postSubId4) {
-        console.log(`[${input.logPrefix}] Shopee comment shortlink sub4/log_id missing; omitting sub4`)
-    }
+    // New outbound tracking policy: keep post_history/log ids internal only.
+    // Do not send them as Shopee/customlink sub4 for newly posted comments.
+    const postSubId4 = ''
 
     return { postSubId2, postSubId3, postSubId4 }
 }
@@ -36175,13 +36493,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             ads_publish_enabled?: number | null
         }>
     }
-    // Visibility: dump every page the cron picked up plus its schedule so a future
-    // "why is this page posting" report has a starting point. Pages that aren't here
-    // are either is_active=0 or have empty post_hours (correctly skipped).
+    // Keep scheduled handler logs compact. Dumping every candidate page on every
+    // cron tick can consume enough Worker CPU to abort the run before posting.
     console.log(`[CRON] tick=${cronTickIso} candidate_pages=${pages.length}`)
-    for (const p of pages) {
-        console.log(`[CRON]   page=${p.id} ns=${p.bot_id} name=${JSON.stringify(p.name)} post_hours=${JSON.stringify(p.post_hours)} last_post_at=${p.last_post_at || 'never'}`)
-    }
 
     // Current time in minutes since midnight (Thailand)
     const nowMinutes = thaiHour * 60 + thaiMinute

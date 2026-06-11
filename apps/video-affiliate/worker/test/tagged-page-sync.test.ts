@@ -123,6 +123,17 @@ function getShortenShopeeLinkForNamespaceSource(): string {
     return source.slice(start, end)
 }
 
+function getPostingCommentShortlinkSubIdsSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('function buildPostingCommentShortlinkSubIds')
+    assert.notEqual(start, -1, 'buildPostingCommentShortlinkSubIds must exist')
+
+    const end = source.indexOf('\nfunction isManagedShortlinkTransientFailure', start)
+    assert.notEqual(end, -1, 'buildPostingCommentShortlinkSubIds end marker must exist')
+
+    return source.slice(start, end)
+}
+
 function getPostingShopeeLinkResolverSource(): string {
     const source = readFileSync('src/index.ts', 'utf8')
     const start = source.indexOf('async function resolvePostingShopeeLinkForNamespace')
@@ -335,9 +346,10 @@ test('pre-posting shortlink resolver uses effective page settings and fails clos
     assert.match(resolverSource, /errorMessage = failedPlatforms[\s\S]*shortlink_failed:\$\{failedPlatforms\}/)
 })
 
-test('posting comment shortlink override carries sub4 log id and omits sub5', () => {
+test('posting comment shortlink override intentionally omits sub4 and sub5', () => {
     const shortenerSource = getShortenShopeeLinkForNamespaceSource()
     const resolverSource = getPostingShopeeLinkResolverSource()
+    const subIdSource = getPostingCommentShortlinkSubIdsSource()
 
     assert.match(shortenerSource, /postSubId4\?: string/)
     assert.match(shortenerSource, /hasPostSubId4Override = params\.postSubId4 !== undefined/)
@@ -347,14 +359,18 @@ test('posting comment shortlink override carries sub4 log id and omits sub5', ()
     assert.match(shortenerSource, /if \(effectiveSub5\) requestUrl\.searchParams\.set\('sub5', effectiveSub5\)/)
     assert.match(resolverSource, /postSubId4\?: string/)
     assert.match(resolverSource, /postSubId4:\s*params\.postSubId4/)
+    assert.match(subIdSource, /const postSubId4 = ''/)
+    assert.doesNotMatch(subIdSource, /postSubId4\s*=\s*[^\n]*input\.historyId/)
 })
 
-test('pending comments pass post_history id as postSubId4 when minting comment shortlink', () => {
+test('pending comments keep post_history id internal when minting comment shortlink', () => {
     const pendingSource = getPendingCommentBacklogSource()
+    const subIdSource = getPostingCommentShortlinkSubIdsSource()
 
     assert.match(pendingSource, /const historyId = Number\(row\.id \|\| 0\)/)
     assert.match(pendingSource, /buildPostingCommentShortlinkSubIds\(\{[\s\S]*historyId,[\s\S]*logPrefix: `PENDING-COMMENT/)
     assert.match(pendingSource, /resolvePostingShopeeLinkForNamespace\(\{[\s\S]*\.\.\.commentSubIds/)
+    assert.match(subIdSource, /const postSubId4 = ''/)
 })
 
 test('force retry and manual posting responses expose log_id for comment-link audits', () => {
@@ -487,7 +503,7 @@ test('backfill-from-facebook comment scan stays a bounded read-only GET with id/
 
     // Single shared bounded comment-window reader, GET only, limit 10, requesting id.
     assert.match(routeSource, /const scanCommentWindow = async \(targetId: string\)/)
-    assert.match(routeSource, /\/comments\?fields=id,from,message,created_time&limit=10&access_token=\$\{encodeURIComponent\(token\)\}/)
+    assert.match(routeSource, /\/comments\?fields=id,from,message,created_time&limit=10&access_token=\$\{encodeURIComponent\(commentReadToken\)\}/)
     // It classifies page-authored vs. other comments and caps collected page ids at 5.
     assert.match(routeSource, /if \(fromId && fromId === pageId\) \{[\s\S]*pageCommentCount\+\+[\s\S]*pageCommentIds\.length < 5/)
     assert.match(routeSource, /\} else \{\s*\n\s*otherCommentCount\+\+/)

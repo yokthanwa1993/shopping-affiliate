@@ -1,0 +1,22 @@
+{
+  "name": "facebook-token-cloak",
+  "version": "1.0.0",
+  "description": "Side-by-side local Facebook token bridge via CloakBrowser and macOS Keychain",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node bin/start.js",
+    "launchd:install": "bash scripts/install-launchagent.sh",
+    "launchd:start": "bash scripts/start-launchagent.sh",
+    "launchd:stop": "bash scripts/stop-launchagent.sh",
+    "launchd:status": "bash scripts/status-launchagent.sh",
+    "launchd:uninstall": "bash scripts/uninstall-launchagent.sh",
+    "test": "node --test test/*.test.js",
+    "check": "node --check bin/start.js src/*.js test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "playwright-core": "^1.60.0"
+  }
+}

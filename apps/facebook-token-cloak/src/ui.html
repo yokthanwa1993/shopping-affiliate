@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Facebook Token Cloak</title>
+<style>
+  :root {
+    --bg: #f5f7fb;
+    --panel: #ffffff;
+    --panel-muted: #f8fafc;
+    --line: #d9e1ea;
+    --text: #172033;
+    --muted: #637083;
+    --accent: #1769e0;
+    --accent-soft: #e8f1ff;
+    --ok: #157f3b;
+    --ok-soft: #e7f7ed;
+    --warn: #9a5b00;
+    --warn-soft: #fff5dd;
+    --danger: #be2f45;
+    --danger-soft: #fff0f3;
+    --shadow: 0 10px 28px rgba(28, 42, 65, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15181d;
+      --panel: #20242b;
+      --panel-muted: #262b33;
+      --line: #353d49;
+      --text: #eef2f7;
+      --muted: #aab4c2;
+      --accent: #6aa7ff;
+      --accent-soft: #203754;
+      --ok: #58c878;
+      --ok-soft: #1c3425;
+      --warn: #e4a93a;
+      --warn-soft: #3a2d14;
+      --danger: #ff6b82;
+      --danger-soft: #3d1e28;
+      --shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .topbar {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 16px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    background: var(--accent);
+    color: #fff;
+    font-size: 18px;
+    font-weight: 800;
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.2;
+    font-weight: 750;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+  main {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 22px 20px 48px;
+    display: grid;
+    gap: 18px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .panel-head {
+    min-height: 54px;
+    padding: 13px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 720;
+  }
+  .panel-head .grow { flex: 1; }
+  .panel-body { padding: 16px; }
+  .status-line {
+    color: var(--muted);
+    font-size: 12.5px;
+  }
+  .table-wrap {
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 760px;
+  }
+  th, td {
+    padding: 11px 12px;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+    vertical-align: middle;
+  }
+  th {
+    color: var(--muted);
+    background: var(--panel-muted);
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: uppercase;
+  }
+  tbody tr {
+    cursor: pointer;
+  }
+  tbody tr:hover {
+    background: var(--panel-muted);
+  }
+  tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .strong {
+    font-weight: 700;
+  }
+  .muted {
+    color: var(--muted);
+  }
+  .empty {
+    color: var(--muted);
+    padding: 24px 16px;
+    text-align: center;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    background: var(--panel);
+    font-size: 12px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+  .badge.ok {
+    color: var(--ok);
+    background: var(--ok-soft);
+    border-color: transparent;
+  }
+  .badge.warn {
+    color: var(--warn);
+    background: var(--warn-soft);
+    border-color: transparent;
+  }
+  .badge.bad {
+    color: var(--danger);
+    background: var(--danger-soft);
+    border-color: transparent;
+  }
+  form {
+    display: grid;
+    gap: 14px;
+  }
+  .fields {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  @media (max-width: 760px) {
+    .fields { grid-template-columns: 1fr; }
+    .topbar { align-items: flex-start; }
+  }
+  label {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 5px;
+  }
+  input, select {
+    width: 100%;
+    height: 38px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    outline: none;
+    background: var(--panel-muted);
+    color: var(--text);
+    font: inherit;
+  }
+  input:focus, select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .row-actions {
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
+  }
+  button {
+    appearance: none;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 700;
+    min-height: 34px;
+    padding: 7px 12px;
+  }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  button.danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 42%, var(--line));
+  }
+  button:hover {
+    filter: brightness(0.98);
+  }
+  button:active {
+    transform: translateY(1px);
+  }
+  #result {
+    margin: 0;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel-muted);
+    color: var(--text);
+    min-height: 46px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 20px;
+    transform: translateX(-50%) translateY(12px);
+    max-width: 92vw;
+    padding: 10px 14px;
+    border-radius: 999px;
+    background: var(--text);
+    color: var(--bg);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .16s, transform .16s;
+    font-size: 13px;
+    font-weight: 700;
+    box-shadow: var(--shadow);
+  }
+  #toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  #toast.ok { background: var(--ok); color: #fff; }
+  #toast.err { background: var(--danger); color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <div class="mark">f</div>
+    <div>
+      <h1>Facebook Token Cloak</h1>
+      <div class="subtitle">Local account table and login flow</div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="panel" aria-labelledby="accounts-title">
+    <div class="panel-head">
+      <h2 id="accounts-title">Accounts</h2>
+      <div class="grow"></div>
+      <span class="status-line" id="accounts-status">Loading...</span>
+    </div>
+    <div class="table-wrap">
+      <table id="accounts-table">
+        <thead>
+          <tr>
+            <th>Account / namespace</th>
+            <th>User hint</th>
+            <th>Password?</th>
+            <th>2FA?</th>
+            <th>Token / session</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="accounts-body"></tbody>
+      </table>
+      <div class="empty" id="accounts-empty" hidden>No accounts saved yet.</div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="form-title">
+    <div class="panel-head">
+      <h2 id="form-title">Account form</h2>
+      <div class="grow"></div>
+      <span class="status-line" id="form-status">Password and 2FA are write-only.</span>
+    </div>
+    <div class="panel-body">
+      <form id="account-form" autocomplete="off" novalidate>
+        <div class="fields">
+          <div>
+            <label for="account-input">Account / namespace</label>
+            <input id="account-input" name="account" placeholder="CHEARB" autocapitalize="characters" required>
+          </div>
+          <div>
+            <label for="username-input">Username</label>
+            <input id="username-input" name="username" placeholder="email, phone, or login name">
+          </div>
+          <div>
+            <label for="password-input">Password</label>
+            <input id="password-input" name="password" type="password" placeholder="write-only">
+          </div>
+          <div>
+            <label for="totp-input">2FA secret/code</label>
+            <input id="totp-input" name="totp" type="password" placeholder="write-only">
+          </div>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit">Save</button>
+          <button type="button" id="login-button">Login/Get Token</button>
+          <button class="danger" type="button" id="delete-button">Delete</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="result-title">
+    <div class="panel-head">
+      <h2 id="result-title">Status</h2>
+    </div>
+    <div class="panel-body">
+      <pre id="result">Ready.</pre>
+    </div>
+  </section>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var state = {
+    accounts: [],
+    tokenStatusByAccount: Object.create(null)
+  };
+
+  function $(selector) {
+    return document.querySelector(selector);
+  }
+
+  function element(tag, attrs) {
+    var node = document.createElement(tag);
+    attrs = attrs || {};
+    Object.keys(attrs).forEach(function (key) {
+      var value = attrs[key];
+      if (value === undefined || value === null) return;
+      if (key === "className") node.className = value;
+      else if (key === "text") node.textContent = value;
+      else if (key === "onclick") node.addEventListener("click", value);
+      else node.setAttribute(key, value);
+    });
+    for (var i = 2; i < arguments.length; i++) {
+      var child = arguments[i];
+      if (child === undefined || child === null || child === false) continue;
+      node.appendChild(typeof child === "string" ? document.createTextNode(child) : child);
+    }
+    return node;
+  }
+
+  var toastTimer = null;
+  function toast(message, type) {
+    var node = $("#toast");
+    node.textContent = message;
+    node.className = "show" + (type ? " " + type : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { node.className = ""; }, 2600);
+  }
+
+  async function api(method, path, body) {
+    var options = { method: method, headers: {} };
+    if (body !== undefined) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(body);
+    }
+    var response = await fetch(path, options);
+    var data = {};
+    try { data = await response.json(); } catch (error) {}
+    if (!response.ok) {
+      var err = new Error(data && data.error ? data.error : "HTTP " + response.status);
+      err.status = response.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  function value(selector) {
+    var raw = $(selector).value;
+    var trimmed = raw && raw.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  function badge(text, kind) {
+    return element("span", { className: "badge" + (kind ? " " + kind : ""), text: text });
+  }
+
+  function yesNo(value) {
+    return value ? badge("Yes", "ok") : badge("No");
+  }
+
+  function userHint(account) {
+    return account.username || account.email || account.phone || "-";
+  }
+
+  function tokenLabel(account) {
+    var status = state.tokenStatusByAccount[account.account];
+    if (!status) return badge(account.credentialPresent ? "Stored login" : "Not checked", account.credentialPresent ? "warn" : "");
+    if (status.tokenPresent) return badge("OK " + (status.tokenPrefix || ""), "ok");
+    return badge(status.reason || status.status || "No token", "bad");
+  }
+
+  function safeResult(loginResult, refreshResult) {
+    var out = {
+      login: {
+        state: loginResult && loginResult.state,
+        autofilled: !!(loginResult && loginResult.autofilled),
+        submitted: !!(loginResult && loginResult.submitted)
+      },
+      token: {
+        status: refreshResult && refreshResult.status,
+        tokenPresent: !!(refreshResult && refreshResult.tokenPresent),
+        tokenPrefix: refreshResult && refreshResult.tokenPrefix,
+        pagesCount: refreshResult && refreshResult.pagesCount,
+        reason: refreshResult && refreshResult.reason
+      }
+    };
+    Object.keys(out.token).forEach(function (key) {
+      if (out.token[key] === undefined) delete out.token[key];
+    });
+    return JSON.stringify(out, null, 2);
+  }
+
+  function setResult(text) {
+    $("#result").textContent = text;
+  }
+
+  function fillForm(account) {
+    $("#account-input").value = account.account || "";
+    $("#username-input").value = account.username || account.email || account.phone || "";
+    clearSecretFields();
+    $("#form-status").textContent = "Selected " + (account.account || "");
+  }
+
+  function clearSecretFields() {
+    $("#password-input").value = "";
+    $("#totp-input").value = "";
+  }
+
+  function formAccount() {
+    var account = value("#account-input");
+    if (!account) throw new Error("Account / namespace is required");
+    var body = {
+      account: account,
+      username: value("#username-input"),
+      provider: "generic-keychain",
+      password: value("#password-input"),
+      totp: value("#totp-input")
+    };
+    return body;
+  }
+
+  function renderAccounts() {
+    var body = $("#accounts-body");
+    var empty = $("#accounts-empty");
+    body.textContent = "";
+    empty.hidden = state.accounts.length !== 0;
+    $("#accounts-status").textContent = state.accounts.length + " account" + (state.accounts.length === 1 ? "" : "s");
+
+    state.accounts.forEach(function (account) {
+      var row = element("tr", { onclick: function () { fillForm(account); } },
+        element("td", {}, element("div", { className: "strong", text: account.account }), account.displayName ? element("div", { className: "muted", text: account.displayName }) : null),
+        element("td", { text: userHint(account) }),
+        element("td", {}, yesNo(account.credentialPresent || account.passwordPresent)),
+        element("td", {}, yesNo(account.totpPresent)),
+        element("td", {}, tokenLabel(account)),
+        element("td", {},
+          element("div", { className: "row-actions" },
+            element("button", {
+              type: "button",
+              onclick: function (event) {
+                event.stopPropagation();
+                fillForm(account);
+                runLogin(account.account);
+              }
+            }, "Login/Get Token"),
+            element("button", {
+              type: "button",
+              className: "danger",
+              onclick: function (event) {
+                event.stopPropagation();
+                deleteAccount(account.account);
+              }
+            }, "Delete")
+          )
+        )
+      );
+      body.appendChild(row);
+    });
+  }
+
+  async function loadAccounts() {
+    try {
+      var data = await api("GET", "/accounts");
+      state.accounts = data.accounts || [];
+      renderAccounts();
+    } catch (error) {
+      $("#accounts-status").textContent = "Load failed";
+      toast("Could not load accounts: " + error.message, "err");
+    }
+  }
+
+  async function saveAccount(event) {
+    event.preventDefault();
+    var body;
+    try {
+      body = formAccount();
+    } catch (error) {
+      toast(error.message, "err");
+      return;
+    }
+    try {
+      var saved = await api("POST", "/accounts", body);
+      clearSecretFields();
+      fillForm(saved);
+      setResult(JSON.stringify({
+        account: saved.account,
+        saved: true,
+        usernamePresent: !!saved.usernamePresent,
+        passwordPresent: !!saved.passwordPresent,
+        twoFactorPresent: !!saved.totpPresent
+      }, null, 2));
+      await loadAccounts();
+      toast("Saved " + saved.account, "ok");
+    } catch (error) {
+      clearSecretFields();
+      toast("Save failed: " + error.message, "err");
+    }
+  }
+
+  async function runLogin(explicitAccount) {
+    var account = explicitAccount || value("#account-input");
+    if (!account) {
+      toast("Account / namespace is required", "err");
+      return;
+    }
+    try {
+      setResult("Opening login flow...");
+      var loginPath = "/login?account=" + encodeURIComponent(account) + "&visible=1&autofill=1&submit=1";
+      var loginResult = await api("GET", loginPath);
+      setResult("Checking token status...");
+      var refreshResult = await api("POST", "/token/refresh", { account: account, visible: false });
+      state.tokenStatusByAccount[loginResult.account || account] = refreshResult;
+      setResult(safeResult(loginResult, refreshResult));
+      await loadAccounts();
+      toast(refreshResult.tokenPresent ? "Token verified" : "Login opened; token not found yet", refreshResult.tokenPresent ? "ok" : "");
+    } catch (error) {
+      setResult(JSON.stringify({ error: error.message }, null, 2));
+      toast("Login failed: " + error.message, "err");
+    }
+  }
+
+  async function deleteAccount(explicitAccount) {
+    var account = explicitAccount || value("#account-input");
+    if (!account) {
+      toast("Account / namespace is required", "err");
+      return;
+    }
+    if (!window.confirm("Delete " + account + "?")) return;
+    try {
+      var result = await api("DELETE", "/accounts?account=" + encodeURIComponent(account));
+      delete state.tokenStatusByAccount[result.account || account];
+      setResult(JSON.stringify({ account: result.account || account, deleted: !!result.removed }, null, 2));
+      if (($("#account-input").value || "").toUpperCase() === (result.account || account).toUpperCase()) {
+        $("#account-input").value = "";
+        $("#username-input").value = "";
+        clearSecretFields();
+      }
+      await loadAccounts();
+      toast("Deleted " + (result.account || account), "ok");
+    } catch (error) {
+      toast("Delete failed: " + error.message, "err");
+    }
+  }
+
+  $("#account-form").addEventListener("submit", saveAccount);
+  $("#login-button").addEventListener("click", function () { runLogin(); });
+  $("#delete-button").addEventListener("click", function () { deleteAccount(); });
+
+  loadAccounts();
+})();
+</script>
+</body>
+</html>

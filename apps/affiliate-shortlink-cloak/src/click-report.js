@@ -12,6 +12,8 @@ const SHOPEE_CLICK_REPORT_HOST_PATTERN = /^clickreport\.wwoom\.com$/i;
 const SHOPEE_CLICK_REPORT_PAGE_SIZE_DEFAULT = 20;
 const SHOPEE_CLICK_REPORT_PAGE_SIZE_MAX = 100;
 const SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE = 100;
+const SHOPEE_CLICK_REPORT_PAGE_CAP_ROWS = 10000;
+const SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE = 100;
 const SHOPEE_CLICK_REPORT_DEFAULT_ID = '15130770000';
 const BANGKOK_TIMEZONE = 'Asia/Bangkok';
 const BANGKOK_UTC_OFFSET_SECONDS = 7 * 3600;
@@ -146,9 +148,28 @@ function isTruthyFlag(value) {
 
 function isRawClickReportMode(query) {
   if (!query || typeof query !== 'object') return false;
+  const raw = String(query.raw == null ? '' : query.raw).trim().toLowerCase();
+  if (raw === 'complete') return true;
   if (isTruthyFlag(query.raw)) return true;
   const mode = String(query.mode == null ? '' : query.mode).trim().toLowerCase();
-  return mode === 'raw';
+  return mode === 'raw' || mode === 'raw_complete' || mode === 'complete_raw';
+}
+
+function isCompleteClickReportMode(query) {
+  if (!query || typeof query !== 'object') return false;
+  if (isTruthyFlag(query.complete)) return true;
+  const mode = String(query.mode == null ? '' : query.mode).trim().toLowerCase();
+  return mode === 'complete';
+}
+
+function isCompleteRawClickReportMode(query) {
+  if (!query || typeof query !== 'object') return false;
+  const raw = String(query.raw == null ? '' : query.raw).trim().toLowerCase();
+  const mode = String(query.mode == null ? '' : query.mode).trim().toLowerCase();
+  return raw === 'complete'
+    || mode === 'raw_complete'
+    || mode === 'complete_raw'
+    || (isTruthyFlag(query.raw) && isTruthyFlag(query.complete));
 }
 
 function clickReportIdError(reason, message, requestedId) {
@@ -371,12 +392,66 @@ function summarizeSubIdCounts(counts, opts = {}) {
     if (a.sub_id > b.sub_id) return 1;
     return 0;
   });
+  const percentTotal = Number.isFinite(Number(opts.percentTotal)) ? Number(opts.percentTotal) : total;
   for (const entry of entries) {
-    entry[percentField] = total > 0
-      ? Number(((entry[countField] / total) * 100).toFixed(2))
+    entry[percentField] = percentTotal > 0
+      ? Number(((entry[countField] / percentTotal) * 100).toFixed(2))
       : 0;
   }
   return { entries, aggregatedTotal: total };
+}
+
+function parseClickReportSubParts(subId) {
+  const parts = String(subId == null ? '' : subId).split('-');
+  return {
+    sub1: parts[0] || '',
+    sub2: parts[1] || '',
+    sub3: parts[2] || '',
+  };
+}
+
+function summarizeNamedCounts(counts, valueField, totalForPercent) {
+  const entries = [];
+  let total = 0;
+  for (const [value, count] of counts.entries()) {
+    total += count;
+    entries.push({ [valueField]: value, count });
+  }
+  entries.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    if (a[valueField] < b[valueField]) return -1;
+    if (a[valueField] > b[valueField]) return 1;
+    return 0;
+  });
+  const percentTotal = Number.isFinite(Number(totalForPercent)) ? Number(totalForPercent) : total;
+  for (const entry of entries) {
+    entry.percent = percentTotal > 0
+      ? Number(((entry.count / percentTotal) * 100).toFixed(2))
+      : 0;
+  }
+  return entries;
+}
+
+function buildClickReportBreakdowns(rows, totalForPercent) {
+  const subIdCounts = new Map();
+  const sub1Counts = new Map();
+  const sub2Counts = new Map();
+  const sub3Counts = new Map();
+  for (const row of rows) {
+    const subId = row && row.sub_id != null ? String(row.sub_id) : '';
+    subIdCounts.set(subId, (subIdCounts.get(subId) || 0) + 1);
+    const parts = parseClickReportSubParts(subId);
+    sub1Counts.set(parts.sub1, (sub1Counts.get(parts.sub1) || 0) + 1);
+    sub2Counts.set(parts.sub2, (sub2Counts.get(parts.sub2) || 0) + 1);
+    sub3Counts.set(parts.sub3, (sub3Counts.get(parts.sub3) || 0) + 1);
+  }
+  const { entries: subIds } = summarizeSubIdCounts(subIdCounts, { percentTotal: totalForPercent });
+  return {
+    sub_ids: subIds,
+    sub1_breakdown: summarizeNamedCounts(sub1Counts, 'sub1', totalForPercent),
+    sub2_breakdown: summarizeNamedCounts(sub2Counts, 'sub2', totalForPercent),
+    sub3_breakdown: summarizeNamedCounts(sub3Counts, 'sub3', totalForPercent),
+  };
 }
 
 async function fetchClickReportPageOnce(page, apiUrl) {
@@ -384,6 +459,208 @@ async function fetchClickReportPageOnce(page, apiUrl) {
     new Function('args', 'return (' + CLICK_REPORT_FETCH_SCRIPT + ')(args);'),
     [apiUrl],
   );
+}
+
+async function fetchClickReportWindowPage(page, spec, range, pageNum, pageSize) {
+  const apiUrl = buildClickReportFetchUrl({
+    range,
+    page_num: pageNum,
+    page_size: pageSize,
+    extras: spec.extras,
+  });
+  let result;
+  try {
+    result = await fetchClickReportPageOnce(page, apiUrl);
+  } catch (err) {
+    return {
+      ok: false,
+      failure: {
+        status: 'error',
+        error: 'click_report_fetch_failed',
+        reason: 'click_report_fetch_failed',
+        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+      },
+    };
+  }
+  const classification = classifyClickReportFetchResult(result);
+  if (classification) return { ok: false, failure: classification };
+  const body = result.body;
+  return {
+    ok: true,
+    body,
+    total_count: pickTotalCount(body),
+    rows: pickList(body),
+    affiliate_id: pickAffiliateId(body),
+  };
+}
+
+function completeFetchFailure(base, failure) {
+  return Object.assign({}, failure, {
+    total_count: base.rootTotalCount == null ? 0 : base.rootTotalCount,
+    leaf_total_count: base.leafTotalCount,
+    rows_fetched: base.rowsFetched,
+    pages_fetched: base.pagesFetched,
+    probes_fetched: base.probesFetched,
+    windows_fetched: base.windowsFetched,
+    split_window_count: base.splitWindowCount,
+    max_window_depth: base.maxWindowDepth,
+    page_size: base.pageSize,
+  });
+}
+
+async function fetchCompleteClickReportRows(page, spec, opts = {}) {
+  const pageSize = opts.pageSize || SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE;
+  const capRows = opts.capRows || SHOPEE_CLICK_REPORT_PAGE_CAP_ROWS;
+  const maxPagesPerWindow = Math.max(1, Math.floor(capRows / pageSize));
+  const state = {
+    rootTotalCount: null,
+    leafTotalCount: 0,
+    rowsFetched: 0,
+    pagesFetched: 0,
+    probesFetched: 0,
+    windowsFetched: 0,
+    splitWindowCount: 0,
+    maxWindowDepth: 0,
+    pageSize,
+  };
+  const rows = [];
+  let affiliateId = null;
+  const pending = [{
+    start: spec.range.click_time_s,
+    end: spec.range.click_time_e,
+    depth: 0,
+    root: true,
+  }];
+
+  while (pending.length > 0) {
+    const window = pending.shift();
+    state.maxWindowDepth = Math.max(state.maxWindowDepth, window.depth);
+    const range = {
+      timezone: spec.range.timezone,
+      click_time_s: window.start,
+      click_time_e: window.end,
+    };
+    const firstPage = await fetchClickReportWindowPage(page, spec, range, 1, pageSize);
+    state.pagesFetched += 1;
+    state.probesFetched += 1;
+    if (!firstPage.ok) {
+      return {
+        ok: false,
+        failure: completeFetchFailure(state, firstPage.failure),
+      };
+    }
+
+    const windowTotal = firstPage.total_count;
+    if (window.root) state.rootTotalCount = windowTotal;
+    if (affiliateId == null && firstPage.affiliate_id != null) affiliateId = firstPage.affiliate_id;
+
+    if (windowTotal > capRows) {
+      if (window.start >= window.end) {
+        return {
+          ok: false,
+          failure: completeFetchFailure(state, {
+            status: 'error',
+            error: 'click_report_window_too_dense',
+            reason: 'click_report_window_too_dense',
+            truncated: true,
+            cap_rows: capRows,
+            window_total_count: windowTotal,
+            window: {
+              click_time_s: window.start,
+              click_time_e: window.end,
+            },
+            warning: 'Shopee returned more rows than the page cap inside a one-second click_time window; complete row enumeration cannot finish safely.',
+          }),
+        };
+      }
+      const mid = Math.floor((window.start + window.end) / 2);
+      if (mid < window.start || mid >= window.end) {
+        return {
+          ok: false,
+          failure: completeFetchFailure(state, {
+            status: 'error',
+            error: 'click_report_window_split_failed',
+            reason: 'click_report_window_split_failed',
+            truncated: true,
+            cap_rows: capRows,
+            window_total_count: windowTotal,
+            window: {
+              click_time_s: window.start,
+              click_time_e: window.end,
+            },
+            warning: 'The click_time window could not be split further without repeating the same timestamp range.',
+          }),
+        };
+      }
+      state.splitWindowCount += 1;
+      pending.push({ start: window.start, end: mid, depth: window.depth + 1, root: false });
+      pending.push({ start: mid + 1, end: window.end, depth: window.depth + 1, root: false });
+      continue;
+    }
+
+    state.windowsFetched += 1;
+    state.leafTotalCount += windowTotal;
+    const firstRows = Array.isArray(firstPage.rows) ? firstPage.rows : [];
+    let windowRowsFetched = firstRows.length;
+    rows.push(...firstRows);
+    state.rowsFetched += firstRows.length;
+
+    const pageCount = Math.ceil(windowTotal / pageSize);
+    const pagesToFetch = Math.min(pageCount, maxPagesPerWindow);
+    for (let pageNum = 2; pageNum <= pagesToFetch; pageNum += 1) {
+      const nextPage = await fetchClickReportWindowPage(page, spec, range, pageNum, pageSize);
+      state.pagesFetched += 1;
+      if (!nextPage.ok) {
+        return {
+          ok: false,
+          failure: completeFetchFailure(state, nextPage.failure),
+        };
+      }
+      if (affiliateId == null && nextPage.affiliate_id != null) affiliateId = nextPage.affiliate_id;
+      const pageRows = Array.isArray(nextPage.rows) ? nextPage.rows : [];
+      rows.push(...pageRows);
+      state.rowsFetched += pageRows.length;
+      windowRowsFetched += pageRows.length;
+      if (pageRows.length === 0 && windowRowsFetched < windowTotal) break;
+    }
+
+    if (windowRowsFetched < windowTotal) {
+      return {
+        ok: false,
+        failure: completeFetchFailure(state, {
+          status: 'error',
+          error: 'click_report_window_incomplete',
+          reason: 'click_report_window_incomplete',
+          truncated: true,
+          cap_rows: capRows,
+          window_total_count: windowTotal,
+          window_rows_fetched: windowRowsFetched,
+          window: {
+            click_time_s: window.start,
+            click_time_e: window.end,
+          },
+          warning: 'Shopee returned fewer rows than total_count for a window that should fit below the page cap.',
+        }),
+      };
+    }
+  }
+
+  const totalCount = state.rootTotalCount == null ? state.leafTotalCount : state.rootTotalCount;
+  return {
+    ok: true,
+    total_count: totalCount,
+    leaf_total_count: state.leafTotalCount,
+    rows,
+    rows_fetched: state.rowsFetched,
+    pages_fetched: state.pagesFetched,
+    probes_fetched: state.probesFetched,
+    windows_fetched: state.windowsFetched,
+    split_window_count: state.splitWindowCount,
+    max_window_depth: state.maxWindowDepth,
+    page_size: pageSize,
+    affiliate_id: affiliateId,
+    truncated: false,
+  };
 }
 
 function summaryResponseShape(spec) {
@@ -424,6 +701,39 @@ async function handleClickReportRawMode(spec, page) {
     total_count: pickTotalCount(body),
     list: pickList(body),
     affiliate_id: pickAffiliateId(body),
+  });
+}
+
+async function handleClickReportCompleteRawMode(spec, page) {
+  const complete = await fetchCompleteClickReportRows(page, spec, {
+    pageSize: SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE,
+  });
+  const shape = Object.assign(baseResponseShape(spec), {
+    mode: 'raw_complete',
+    page_num: 1,
+    page_size: SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE,
+  });
+  if (!complete.ok) return Object.assign(shape, complete.failure);
+  const breakdowns = buildClickReportBreakdowns(complete.rows, complete.total_count);
+  return Object.assign(shape, {
+    status: 'ok',
+    total_count: complete.total_count,
+    leaf_total_count: complete.leaf_total_count,
+    rows_fetched: complete.rows_fetched,
+    list: complete.rows,
+    sub_ids: breakdowns.sub_ids,
+    sub1_breakdown: breakdowns.sub1_breakdown,
+    sub2_breakdown: breakdowns.sub2_breakdown,
+    sub3_breakdown: breakdowns.sub3_breakdown,
+    unique_sub_id_count: breakdowns.sub_ids.length,
+    pages_fetched: complete.pages_fetched,
+    probes_fetched: complete.probes_fetched,
+    windows_fetched: complete.windows_fetched,
+    split_window_count: complete.split_window_count,
+    max_window_depth: complete.max_window_depth,
+    truncated: complete.truncated,
+    breakdown_mode: 'complete',
+    affiliate_id: complete.affiliate_id,
   });
 }
 
@@ -487,138 +797,36 @@ async function handleClickReportFilteredSummary(spec, page) {
   });
 }
 
-async function handleClickReportSummaryMode(spec, page) {
-  if (spec.extras && spec.extras.sub_id) {
+async function handleClickReportSummaryMode(spec, page, opts = {}) {
+  if (spec.extras && spec.extras.sub_id && !opts.forceComplete) {
     return handleClickReportFilteredSummary(spec, page);
   }
-  const pageSize = SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE;
-  const unfilteredUrl = buildClickReportFetchUrl({
-    range: spec.range,
-    page_num: 1,
-    page_size: pageSize,
-    extras: spec.extras,
+
+  const complete = await fetchCompleteClickReportRows(page, spec, {
+    pageSize: SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE,
   });
-  let unfilteredResult;
-  try {
-    unfilteredResult = await fetchClickReportPageOnce(page, unfilteredUrl);
-  } catch (err) {
-    return Object.assign(summaryResponseShape(spec), {
-      status: 'error',
-      error: 'click_report_fetch_failed',
-      reason: 'click_report_fetch_failed',
-      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
-      pages_fetched: 0,
-      page_size: pageSize,
-    });
-  }
-  const classification = classifyClickReportFetchResult(unfilteredResult);
-  if (classification) {
-    return Object.assign(summaryResponseShape(spec), classification, {
-      pages_fetched: 0,
-      page_size: pageSize,
-    });
-  }
-  const body = unfilteredResult.body;
-  const totalCount = pickTotalCount(body);
-  const list = pickList(body);
-  const affiliateId = pickAffiliateId(body);
-  const rows = Array.isArray(list) ? list : [];
-  const rowSampleCount = rows.length;
-
-  const sampleComplete = totalCount <= 0 || rowSampleCount >= totalCount;
-  if (sampleComplete) {
-    const counts = new Map();
-    for (const row of rows) {
-      const subId = row && row.sub_id != null ? String(row.sub_id) : '';
-      counts.set(subId, (counts.get(subId) || 0) + 1);
-    }
-    const { entries } = summarizeSubIdCounts(counts);
-    return Object.assign(summaryResponseShape(spec), {
-      total_count: totalCount,
-      unique_sub_id_count: entries.length,
-      sub_ids: entries,
-      pages_fetched: 1,
-      page_size: pageSize,
-      row_sample_count: rowSampleCount,
-      truncated: false,
-      breakdown_mode: 'complete',
-      affiliate_id: affiliateId,
-    });
-  }
-
-  // Sample is shorter than total_count. Discover unique sub_ids from the
-  // sample rows, then ask Shopee for the exact filtered total_count per sub.
-  const discoveredSet = new Set();
-  for (const row of rows) {
-    if (row && row.sub_id != null) discoveredSet.add(String(row.sub_id));
-  }
-  const discoveredSubIds = Array.from(discoveredSet).filter((s) => s !== '');
-  discoveredSubIds.sort();
-
-  const entries = [];
-  let filteredFetchCount = 0;
-  for (const subId of discoveredSubIds) {
-    const filteredUrl = buildClickReportFetchUrl({
-      range: spec.range,
-      page_num: 1,
-      page_size: pageSize,
-      extras: Object.assign({}, spec.extras || {}, { sub_id: subId }),
-    });
-    let subResult;
-    try {
-      subResult = await fetchClickReportPageOnce(page, filteredUrl);
-    } catch (err) {
-      return Object.assign(summaryResponseShape(spec), {
-        status: 'error',
-        error: 'click_report_sub_count_failed',
-        reason: 'click_report_sub_count_failed',
-        failed_sub_id: sanitizeExtraValue(subId),
-        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
-        pages_fetched: 1 + filteredFetchCount,
-        page_size: pageSize,
-      });
-    }
-    filteredFetchCount += 1;
-    const subClassification = classifyClickReportFetchResult(subResult);
-    if (subClassification) {
-      return Object.assign(summaryResponseShape(spec), {
-        status: 'error',
-        error: 'click_report_sub_count_failed',
-        reason: 'click_report_sub_count_failed',
-        failed_sub_id: sanitizeExtraValue(subId),
-        underlying: subClassification.reason || subClassification.error || null,
-        pages_fetched: 1 + filteredFetchCount,
-        page_size: pageSize,
-      });
-    }
-    const subTotal = pickTotalCount(subResult.body);
-    entries.push({ sub_id: subId, count: subTotal });
-  }
-
-  entries.sort((a, b) => {
-    if (b.count !== a.count) return b.count - a.count;
-    if (a.sub_id < b.sub_id) return -1;
-    if (a.sub_id > b.sub_id) return 1;
-    return 0;
-  });
-  for (const entry of entries) {
-    entry.percent = totalCount > 0
-      ? Number(((entry.count / totalCount) * 100).toFixed(2))
-      : 0;
-  }
-
+  if (!complete.ok) return Object.assign(summaryResponseShape(spec), complete.failure);
+  const breakdowns = buildClickReportBreakdowns(complete.rows, complete.total_count);
   return Object.assign(summaryResponseShape(spec), {
-    total_count: totalCount,
-    unique_sub_id_count: entries.length,
-    discovered_sub_id_count: discoveredSet.size,
-    sub_ids: entries,
-    pages_fetched: 1 + filteredFetchCount,
-    page_size: pageSize,
-    row_sample_count: rowSampleCount,
-    truncated: true,
-    breakdown_mode: 'discovered_filtered',
-    warning: SHOPEE_DISCOVERED_SUMMARY_WARNING,
-    affiliate_id: affiliateId,
+    total_count: complete.total_count,
+    leaf_total_count: complete.leaf_total_count,
+    unique_sub_id_count: breakdowns.sub_ids.length,
+    sub_ids: breakdowns.sub_ids,
+    sub1_breakdown: breakdowns.sub1_breakdown,
+    sub2_breakdown: breakdowns.sub2_breakdown,
+    sub3_breakdown: breakdowns.sub3_breakdown,
+    pages_fetched: complete.pages_fetched,
+    page_size: complete.page_size,
+    row_sample_count: complete.rows_fetched,
+    rows_fetched: complete.rows_fetched,
+    aggregated_total: complete.rows_fetched,
+    probes_fetched: complete.probes_fetched,
+    windows_fetched: complete.windows_fetched,
+    split_window_count: complete.split_window_count,
+    max_window_depth: complete.max_window_depth,
+    truncated: complete.truncated,
+    breakdown_mode: 'complete',
+    affiliate_id: complete.affiliate_id,
   });
 }
 
@@ -626,17 +834,20 @@ async function handleClickReport(query = {}, deps = {}) {
   const browserDep = deps.browser || browser;
   const now = deps.now instanceof Date ? deps.now : new Date();
   const rawMode = isRawClickReportMode(query);
+  const completeRawMode = isCompleteRawClickReportMode(query);
+  const completeSummaryMode = isCompleteClickReportMode(query);
 
   // Summary mode always fetches with the largest page_size starting at page 1.
-  // The caller-supplied page_num/page_size are honored only in raw mode.
-  const workingQuery = rawMode ? query : Object.assign({}, query, {
-    page_size: SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE,
+  // Complete modes also force the largest page_size and own pagination.
+  // The caller-supplied page_num/page_size are honored only in single-page raw mode.
+  const workingQuery = rawMode && !completeRawMode ? query : Object.assign({}, query, {
+    page_size: SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE,
     page_num: 1,
   });
   const spec = resolveClickReportRequest(workingQuery, { now });
 
   const errorShape = () => (rawMode
-    ? Object.assign(baseResponseShape(spec), { mode: 'raw' })
+    ? Object.assign(baseResponseShape(spec), { mode: completeRawMode ? 'raw_complete' : 'raw' })
     : summaryResponseShape(spec));
 
   let pageRecord;
@@ -682,9 +893,9 @@ async function handleClickReport(query = {}, deps = {}) {
     });
   }
 
-  return rawMode
-    ? handleClickReportRawMode(spec, page)
-    : handleClickReportSummaryMode(spec, page);
+  if (completeRawMode) return handleClickReportCompleteRawMode(spec, page);
+  if (rawMode) return handleClickReportRawMode(spec, page);
+  return handleClickReportSummaryMode(spec, page, { forceComplete: completeSummaryMode });
 }
 
 function isClickReportHost(hostHeader) {
@@ -700,6 +911,8 @@ module.exports = {
   SHOPEE_CLICK_REPORT_PAGE_SIZE_DEFAULT,
   SHOPEE_CLICK_REPORT_PAGE_SIZE_MAX,
   SHOPEE_CLICK_REPORT_SUMMARY_PAGE_SIZE,
+  SHOPEE_CLICK_REPORT_PAGE_CAP_ROWS,
+  SHOPEE_CLICK_REPORT_COMPLETE_PAGE_SIZE,
   SHOPEE_DISCOVERED_SUMMARY_WARNING,
   BANGKOK_TIMEZONE,
   CLICK_REPORT_EXTRA_KEYS,
@@ -708,6 +921,8 @@ module.exports = {
   clampPageSize,
   safePassthroughExtras,
   isRawClickReportMode,
+  isCompleteClickReportMode,
+  isCompleteRawClickReportMode,
   resolveClickReportRequest,
   buildClickReportFetchUrl,
   classifyClickReportFailure,

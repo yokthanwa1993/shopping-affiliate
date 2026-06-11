@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.affiliate.facebook-token-cloak</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>HOME=/Users/yok-macmini</string>
+    <string>NODE_ENV=production</string>
+    <string>PORT=8820</string>
+    <string>npm</string>
+    <string>--prefix</string>
+    <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/facebook-token-cloak</string>
+    <string>start</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/facebook-token-cloak</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/yok-macmini</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PATH</key>
+    <string>/Users/yok-macmini/.local/opt/node-v24.14.1-darwin-arm64/bin:/Users/yok-macmini/.local/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/yok-macmini/Library/Logs/facebook-token-cloak.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/yok-macmini/Library/Logs/facebook-token-cloak.err.log</string>
+</dict>
+</plist>

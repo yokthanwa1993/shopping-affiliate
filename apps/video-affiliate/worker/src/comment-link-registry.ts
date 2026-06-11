@@ -553,28 +553,26 @@ export async function ensureRewriteLogId(
     return Number.isFinite(id) && id > 0 ? String(id) : ''
 }
 
-// Real-run guard: a write/mint MUST be refused when target_sub4 is empty and a
-// comment target / comment id is known (i.e. this is a real rewrite target).
-// Returns 'missing_target_sub4' to refuse, '' to proceed. This fires regardless
-// of whether a log_id is present — an empty target_sub4 can never be minted.
+// Real-run guard kept for backward compatibility with callers/tests. New
+// Shopee/customlink tracking intentionally leaves sub4 empty, so an empty
+// target_sub4 is no longer a refusal reason.
 export function resolveRealRewriteRefusal(input: {
     targetSub4?: unknown
     commentTargetId?: unknown
     oldCommentId?: unknown
     commentId?: unknown
 }): string {
-    const targetSub4 = String(input.targetSub4 ?? '').trim()
-    if (targetSub4) return ''
-    const known = String(input.commentTargetId ?? '').trim()
-        || String(input.oldCommentId ?? '').trim()
-        || String(input.commentId ?? '').trim()
-    return known ? 'missing_target_sub4' : ''
+    void input
+    return ''
 }
 
 export function buildTargetSubIds(input: TargetSubBuildInput): TargetSubIds {
     const sub1 = String(input.requestedSub1 || '').trim()
     const sub3 = String(input.pageId || '').trim()
-    const sub4 = resolveEffectiveTargetSub4({ logId: input.logId })
+    // Do not leak the internal log/ledger id into affiliate tracking URLs.
+    // Desired utm_content shape: <campaign>-<post_tail>-<page_id>--.
+    void input.logId
+    const sub4 = ''
 
     const canonical = storyTail(input.canonicalPostId)
 

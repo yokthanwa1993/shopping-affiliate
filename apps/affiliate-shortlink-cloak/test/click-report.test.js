@@ -292,6 +292,65 @@ function stubBrowserForClickReport(t, opts = {}) {
   return { evaluates, getPageCalls };
 }
 
+function buildMockClickRows(totalRows, range) {
+  const rows = [];
+  const seconds = range.click_time_e - range.click_time_s + 1;
+  const sub1Values = ['16MAY26FBSPCAD', '1JUN26FBSPCAD', '20APR26FBRAD', ''];
+  const sub2Values = ['postA', 'postB', 'postC', ''];
+  const sub3Values = ['1008898512617594', '100091776353444', ''];
+  for (let i = 0; i < totalRows; i += 1) {
+    const sub1 = sub1Values[i % sub1Values.length];
+    const sub2 = sub2Values[Math.floor(i / sub1Values.length) % sub2Values.length];
+    const sub3 = sub3Values[Math.floor(i / (sub1Values.length * sub2Values.length)) % sub3Values.length];
+    rows.push({
+      click_id: 'cid-' + i,
+      click_time: range.click_time_s + Math.floor((i * seconds) / totalRows),
+      click_region: 'TH',
+      sub_id: `${sub1}-${sub2}-${sub3}--`,
+      referrer: '',
+    });
+  }
+  return rows;
+}
+
+function makeMockClickReportEvaluate(rows, opts = {}) {
+  const seen = opts.seen || [];
+  return (args) => {
+    const url = new URL(args[0]);
+    const pageNum = Number(url.searchParams.get('page_num'));
+    const pageSize = Number(url.searchParams.get('page_size'));
+    const start = Number(url.searchParams.get('click_time_s'));
+    const end = Number(url.searchParams.get('click_time_e'));
+    const subId = url.searchParams.get('sub_id');
+    assert.ok(pageNum >= 1, 'page_num must be >= 1');
+    assert.ok(pageNum <= 100, 'complete fetch must not request beyond Shopee page cap');
+    assert.equal(pageSize, 100, 'complete fetch should use page_size=100');
+    const matched = [];
+    for (const row of rows) {
+      if (row.click_time < start || row.click_time > end) continue;
+      if (subId && !String(row.sub_id || '').startsWith(subId)) continue;
+      matched.push(row);
+    }
+    seen.push({ pageNum, pageSize, start, end, total: matched.length, subId });
+    return {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: matched.length,
+          list: pageNum > 100 ? [] : matched.slice((pageNum - 1) * pageSize, pageNum * pageSize),
+        },
+      },
+    };
+  };
+}
+
+function sumCounts(entries) {
+  return (Array.isArray(entries) ? entries : []).reduce((sum, entry) => sum + Number(entry.count || 0), 0);
+}
+
 test('handleClickReport raw mode returns ok payload with total_count, list, affiliate_id from stubbed Shopee response', async (t) => {
   const stub = stubBrowserForClickReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
@@ -337,16 +396,13 @@ test('handleClickReport raw mode returns ok payload with total_count, list, affi
   assert.equal(/cookie|token|password|secret/i.test(JSON.stringify(result)), false);
 });
 
-test('handleClickReport default summary mode does 1 unfiltered + 2 filtered fetches and reports exact filtered count per discovered sub_id', async (t) => {
-  // Day total is large (140) but Shopee only returns the first 100 sample rows
-  // to the unfiltered query. We use those rows to discover sub_ids, then call
-  // Shopee once per discovered sub_id and trust its filtered total_count.
-  const buildRows = (count, subId) => {
+test('handleClickReport default summary mode paginates exact rows so sub_id counts sum to total_count', async (t) => {
+  const buildRows = (count, subId, offset = 0) => {
     const rows = [];
     for (let i = 0; i < count; i += 1) {
       rows.push({
-        click_id: `${subId}-${i}`,
-        click_time: 1748226000 + i,
+        click_id: `${subId}-${offset + i}`,
+        click_time: 1748226000 + offset + i,
         click_region: 'TH',
         sub_id: subId,
         referrer: '',
@@ -354,8 +410,6 @@ test('handleClickReport default summary mode does 1 unfiltered + 2 filtered fetc
     }
     return rows;
   };
-  // Filtered API returns the true total per sub_id. Day total = 80 + 50 + 10 = 140.
-  const filteredTotalsBySubId = { alpha: 80, beta: 50 };
   const calls = [];
   const stub = stubBrowserForClickReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
@@ -364,26 +418,11 @@ test('handleClickReport default summary mode does 1 unfiltered + 2 filtered fetc
       const url = new URL(apiUrl);
       const pageNum = Number(url.searchParams.get('page_num'));
       const pageSize = Number(url.searchParams.get('page_size'));
-      assert.equal(pageNum, 1, 'every fetch must target page_num=1');
       assert.equal(pageSize, 100, 'summary mode must request page_size=100');
-      const subId = url.searchParams.get('sub_id');
-      calls.push(subId == null ? null : subId);
-      if (subId == null) {
-        // Unfiltered: 100 rows in sample -> 50 alpha + 50 beta (no empty yet).
-        return {
-          status: 200,
-          parsed: true,
-          body: {
-            code: 0,
-            data: {
-              affiliate_id: 15142270000,
-              total_count: 140,
-              list: [].concat(buildRows(50, 'alpha'), buildRows(50, 'beta')),
-            },
-          },
-        };
-      }
-      const subTotal = filteredTotalsBySubId[subId] || 0;
+      assert.equal(url.searchParams.has('sub_id'), false, 'unfiltered summary must not use Shopee fuzzy sub_id filtering');
+      calls.push(pageNum);
+      const allRows = [].concat(buildRows(80, 'alpha'), buildRows(50, 'beta', 80), buildRows(10, '', 130));
+      const startIdx = (pageNum - 1) * pageSize;
       return {
         status: 200,
         parsed: true,
@@ -391,8 +430,8 @@ test('handleClickReport default summary mode does 1 unfiltered + 2 filtered fetc
           code: 0,
           data: {
             affiliate_id: 15142270000,
-            total_count: subTotal,
-            list: buildRows(Math.min(subTotal, 100), subId),
+            total_count: allRows.length,
+            list: allRows.slice(startIdx, startIdx + pageSize),
           },
         },
       };
@@ -410,36 +449,30 @@ test('handleClickReport default summary mode does 1 unfiltered + 2 filtered fetc
   assert.equal(result.account, 'affiliate@neezs.com');
   assert.equal(result.accountInternal, 'affiliate_neezs.com');
   assert.equal(result.time, '25/05/2026');
-  assert.equal(result.range.timezone, 'Asia/Bangkok');
   assert.equal(result.total_count, 140);
+  assert.equal(result.leaf_total_count, 140);
   assert.equal(result.page_size, 100);
-  // 1 unfiltered + 2 filtered (one per discovered sub_id) = 3 fetches.
-  assert.equal(stub.evaluates.length, 3);
-  assert.equal(result.pages_fetched, 3);
-  assert.equal(result.row_sample_count, 100);
-  assert.equal(result.discovered_sub_id_count, 2);
-  assert.equal(result.unique_sub_id_count, 2);
-  assert.equal(result.truncated, true);
-  assert.equal(result.breakdown_mode, 'discovered_filtered');
-  assert.match(result.warning, /sub_id discovery is based on/);
-  // First call must be unfiltered, then one filtered call per discovered sub_id (sorted asc).
-  assert.deepEqual(calls, [null, 'alpha', 'beta']);
-  // Entries use count/percent (filtered total_count), not sample_count/sample_percent.
+  assert.equal(stub.evaluates.length, 2);
+  assert.equal(result.pages_fetched, 2);
+  assert.equal(result.probes_fetched, 1);
+  assert.equal(result.windows_fetched, 1);
+  assert.equal(result.rows_fetched, 140);
+  assert.equal(result.row_sample_count, 140);
+  assert.equal(result.unique_sub_id_count, 3);
+  assert.equal(result.truncated, false);
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.deepEqual(calls.sort((a, b) => a - b), [1, 2]);
   assert.deepEqual(result.sub_ids, [
     { sub_id: 'alpha', count: 80, percent: 57.14 },
     { sub_id: 'beta', count: 50, percent: 35.71 },
+    { sub_id: '', count: 10, percent: 7.14 },
   ]);
-  for (const entry of result.sub_ids) {
-    assert.equal(Object.prototype.hasOwnProperty.call(entry, 'sample_count'), false);
-    assert.equal(Object.prototype.hasOwnProperty.call(entry, 'sample_percent'), false);
-  }
   assert.equal(Object.prototype.hasOwnProperty.call(result, 'list'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(result, 'page_num'), false);
-  // Sanity: response must not leak cookie/token/password fields.
   assert.equal(/cookie|token|password|secret/i.test(JSON.stringify(result)), false);
 });
 
-test('handleClickReport default summary mode returns click_report_sub_count_failed (with sanitized failed_sub_id) when a filtered sub call hits login error', async (t) => {
+test('handleClickReport default summary mode returns error when an exact row page hits login error', async (t) => {
   const buildRows = (count, subId) => {
     const rows = [];
     for (let i = 0; i < count; i += 1) {
@@ -452,26 +485,11 @@ test('handleClickReport default summary mode returns click_report_sub_count_fail
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: (args) => {
       const url = new URL(args[0]);
-      const subId = url.searchParams.get('sub_id');
-      calls.push(subId);
-      if (subId == null) {
-        return {
-          status: 200,
-          parsed: true,
-          body: {
-            code: 0,
-            data: {
-              affiliate_id: 15142270000,
-              total_count: 140,
-              list: [].concat(buildRows(50, 'alpha'), buildRows(50, 'beta')),
-            },
-          },
-        };
+      const pageNum = Number(url.searchParams.get('page_num'));
+      calls.push(pageNum);
+      if (pageNum === 1) {
+        return { status: 200, parsed: true, body: { code: 0, data: { affiliate_id: 15142270000, total_count: 140, list: buildRows(100, 'alpha') } } };
       }
-      if (subId === 'alpha') {
-        return { status: 200, parsed: true, body: { code: 0, data: { affiliate_id: 15142270000, total_count: 80, list: [] } } };
-      }
-      // The second filtered call (beta) hits Shopee's login envelope.
       return { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } };
     },
   });
@@ -481,18 +499,15 @@ test('handleClickReport default summary mode returns click_report_sub_count_fail
     { now: FROZEN_NOW },
   );
 
-  assert.equal(result.status, 'error');
+  assert.equal(result.status, 'manual_login_required');
   assert.equal(result.mode, 'summary');
-  assert.equal(result.reason, 'click_report_sub_count_failed');
-  assert.equal(result.error, 'click_report_sub_count_failed');
-  assert.equal(result.failed_sub_id, 'beta');
-  assert.equal(result.underlying, 'shopee_login_required');
-  assert.equal(result.pages_fetched, 3);
+  assert.equal(result.reason, 'shopee_login_required');
+  assert.equal(result.error, 'manual_login_required');
+  assert.equal(result.pages_fetched, 2);
+  assert.equal(result.rows_fetched, 100);
   assert.equal(result.page_size, 100);
-  // No partial sub_ids should leak on failure.
   assert.equal(Object.prototype.hasOwnProperty.call(result, 'sub_ids'), false);
-  assert.deepEqual(calls, [null, 'alpha', 'beta']);
-  // Sanity: no secret leakage.
+  assert.deepEqual(calls.sort((a, b) => a - b), [1, 2]);
   assert.equal(/cookie|token|password|secret/i.test(JSON.stringify(result)), false);
 });
 
@@ -631,31 +646,36 @@ test('handleClickReport filtered summary uses total_count even when Shopee caps 
   assert.equal(stub.evaluates.length, 1);
 });
 
-test('handleClickReport unfiltered summary discovers sub_ids from sample then uses filtered total_count per sub when day total exceeds the sample', async (t) => {
-  // Day total is 32247 (Shopee caps the unfiltered list at one page of 100).
-  // Sample page contains a single sub_id "alpha" -> we discover it, then
-  // call the filtered API once and trust its total_count for that sub.
-  const buildRows = (count, subId) => {
-    const out = [];
-    for (let i = 0; i < count; i += 1) {
-      out.push({ click_id: `${subId}-${i}`, click_time: 1748226000 + i, click_region: 'TH', sub_id: subId, referrer: '' });
-    }
-    return out;
-  };
+test('handleClickReport unfiltered summary splits oversized time windows and aggregates exact row buckets', async (t) => {
+  const startRange = clickReport.parseClickReportDate('25/05/2026').click_time_s;
+  const endRange = clickReport.parseClickReportDate('25/05/2026').click_time_e;
+  const mid = Math.floor((startRange + endRange) / 2);
   const calls = [];
-  const stub = stubBrowserForClickReport(t, {
+  const rowsForRange = (s, e, pageNum) => {
+    // First whole-day query is intentionally too large and must be split.
+    if (s === startRange && e === endRange) return { total: 11000, rows: [] };
+    const left = e <= mid;
+    const total = left ? 6000 : 5000;
+    const sub = left ? 'alpha' : 'beta';
+    const rows = [];
+    const pageSize = 100;
+    const startIdx = (pageNum - 1) * pageSize;
+    for (let i = startIdx; i < Math.min(startIdx + pageSize, total); i += 1) {
+      rows.push({ click_id: `${sub}-${i}`, click_time: s + i, click_region: 'TH', sub_id: sub, referrer: '' });
+    }
+    return { total, rows };
+  };
+  stubBrowserForClickReport(t, {
     currentUrl: 'https://affiliate.shopee.co.th/dashboard',
     evaluateResult: (args) => {
       const url = new URL(args[0]);
-      assert.equal(url.searchParams.get('page_size'), '100');
-      assert.equal(url.searchParams.get('page_num'), '1');
-      const subId = url.searchParams.get('sub_id');
-      calls.push(subId);
-      if (subId == null) {
-        return { status: 200, parsed: true, body: { code: 0, data: { affiliate_id: 15130770000, total_count: 32247, list: buildRows(100, 'alpha') } } };
-      }
-      assert.equal(subId, 'alpha');
-      return { status: 200, parsed: true, body: { code: 0, data: { affiliate_id: 15130770000, total_count: 32100, list: buildRows(100, 'alpha') } } };
+      const s = Number(url.searchParams.get('click_time_s'));
+      const e = Number(url.searchParams.get('click_time_e'));
+      const pageNum = Number(url.searchParams.get('page_num'));
+      assert.equal(url.searchParams.has('sub_id'), false);
+      calls.push({ s, e, pageNum });
+      const { total, rows } = rowsForRange(s, e, pageNum);
+      return { status: 200, parsed: true, body: { code: 0, data: { affiliate_id: 15130770000, total_count: total, list: rows } } };
     },
   });
 
@@ -665,26 +685,82 @@ test('handleClickReport unfiltered summary discovers sub_ids from sample then us
   );
   assert.equal(result.status, 'ok');
   assert.equal(result.mode, 'summary');
-  assert.equal(result.breakdown_mode, 'discovered_filtered');
-  assert.equal(result.truncated, true);
-  assert.equal(result.total_count, 32247);
-  assert.equal(result.row_sample_count, 100);
-  assert.equal(result.discovered_sub_id_count, 1);
-  assert.equal(result.unique_sub_id_count, 1);
-  // 1 unfiltered + 1 filtered (alpha) = 2 fetches.
-  assert.equal(result.pages_fetched, 2);
-  assert.equal(stub.evaluates.length, 2);
-  assert.deepEqual(calls, [null, 'alpha']);
-  // Filtered total for alpha (32100) is reported as the exact count.
-  // percent = 32100 / 32247 = 99.5440195... -> 99.54
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(result.truncated, false);
+  assert.equal(result.total_count, 11000);
+  assert.equal(result.leaf_total_count, 11000);
+  assert.equal(result.aggregated_total, 11000);
+  assert.equal(result.rows_fetched, 11000);
+  assert.equal(result.windows_fetched, 2);
+  assert.equal(result.split_window_count, 1);
+  assert.equal(result.max_window_depth, 1);
+  assert.equal(result.unique_sub_id_count, 2);
+  assert.equal(result.pages_fetched, 111);
   assert.deepEqual(result.sub_ids, [
-    { sub_id: 'alpha', count: 32100, percent: 99.54 },
+    { sub_id: 'alpha', count: 6000, percent: 54.55 },
+    { sub_id: 'beta', count: 5000, percent: 45.45 },
   ]);
-  for (const entry of result.sub_ids) {
-    assert.equal(Object.prototype.hasOwnProperty.call(entry, 'sample_count'), false);
-    assert.equal(Object.prototype.hasOwnProperty.call(entry, 'sample_percent'), false);
-  }
-  assert.match(result.warning, /sub_id discovery is based on/);
+  assert.equal(calls.some((c) => c.s === startRange && c.e === endRange), true);
+});
+
+test('handleClickReport default summary fetches complete 73,000-row day and aggregates Sub1/Sub2/Sub3 exactly', async (t) => {
+  const range = clickReport.parseClickReportDate('25/05/2026');
+  const rows = buildMockClickRows(73000, range);
+  const seen = [];
+  const stub = stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: makeMockClickReportEvaluate(rows, { seen }),
+  });
+
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(result.total_count, 73000);
+  assert.equal(result.leaf_total_count, 73000);
+  assert.equal(result.rows_fetched, 73000);
+  assert.equal(result.aggregated_total, 73000);
+  assert.equal(result.truncated, false);
+  assert.ok(result.split_window_count > 0, 'large day must be split into smaller time windows');
+  assert.ok(result.windows_fetched > 1, 'split fetch should have more than one safe leaf window');
+  assert.equal(sumCounts(result.sub_ids), 73000);
+  assert.equal(sumCounts(result.sub1_breakdown), 73000);
+  assert.equal(sumCounts(result.sub2_breakdown), 73000);
+  assert.equal(sumCounts(result.sub3_breakdown), 73000);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'list'), false);
+  assert.equal(seen.some((call) => call.total > 10000), true, 'fixture must exercise oversized probe windows');
+  assert.equal(seen.every((call) => call.pageNum <= 100), true);
+  assert.equal(stub.evaluates.length, result.pages_fetched);
+});
+
+test('handleClickReport raw=complete returns all rows while raw=1 remains single-page elsewhere', async (t) => {
+  const range = clickReport.parseClickReportDate('25/05/2026');
+  const rows = buildMockClickRows(10050, range);
+  stubBrowserForClickReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+    evaluateResult: makeMockClickReportEvaluate(rows),
+  });
+
+  const result = await clickReport.handleClickReport(
+    { id: '15130770000', time: '25/05/2026', raw: 'complete', page_size: '5', page_num: '9' },
+    { now: FROZEN_NOW },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'raw_complete');
+  assert.equal(result.page_num, 1);
+  assert.equal(result.page_size, 100);
+  assert.equal(result.total_count, 10050);
+  assert.equal(result.rows_fetched, 10050);
+  assert.equal(result.list.length, 10050);
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(sumCounts(result.sub1_breakdown), 10050);
+  assert.equal(sumCounts(result.sub2_breakdown), 10050);
+  assert.equal(sumCounts(result.sub3_breakdown), 10050);
 });
 
 test('handleClickReport unfiltered summary stays breakdown_mode complete with percent when row sample matches total_count', async (t) => {
@@ -742,15 +818,24 @@ test('handleClickReport summary mode propagates manual_login_required from first
   assert.equal(Object.prototype.hasOwnProperty.call(result, 'list'), false);
 });
 
-test('isRawClickReportMode accepts raw=1, raw=true, mode=raw; rejects others', () => {
+test('isRawClickReportMode accepts raw=1, raw=complete, mode=raw; rejects others', () => {
   assert.equal(clickReport.isRawClickReportMode({ raw: '1' }), true);
   assert.equal(clickReport.isRawClickReportMode({ raw: 'true' }), true);
   assert.equal(clickReport.isRawClickReportMode({ raw: 'yes' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ raw: 'complete' }), true);
   assert.equal(clickReport.isRawClickReportMode({ mode: 'raw' }), true);
   assert.equal(clickReport.isRawClickReportMode({ mode: 'RAW' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ mode: 'raw_complete' }), true);
+  assert.equal(clickReport.isRawClickReportMode({ mode: 'complete_raw' }), true);
+  assert.equal(clickReport.isCompleteRawClickReportMode({ raw: 'complete' }), true);
+  assert.equal(clickReport.isCompleteRawClickReportMode({ raw: '1', complete: '1' }), true);
+  assert.equal(clickReport.isCompleteClickReportMode({ complete: '1' }), true);
+  assert.equal(clickReport.isCompleteClickReportMode({ mode: 'complete' }), true);
   assert.equal(clickReport.isRawClickReportMode({}), false);
   assert.equal(clickReport.isRawClickReportMode({ raw: '0' }), false);
   assert.equal(clickReport.isRawClickReportMode({ mode: 'summary' }), false);
+  assert.equal(clickReport.isCompleteRawClickReportMode({ raw: '1' }), false);
+  assert.equal(clickReport.isCompleteClickReportMode({ mode: 'raw' }), false);
   assert.equal(clickReport.isRawClickReportMode(null), false);
 });
 

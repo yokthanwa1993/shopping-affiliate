@@ -107,11 +107,11 @@ Returns the Shopee Affiliate **click_report** API as JSON for a given Shopee aff
 
 Two response modes:
 
-- **Summary mode (default)** — aggregates click rows for the requested day into a per-`sub_id` breakdown. The response carries no raw `list`. The bridge fetches the underlying Shopee API at `page_size=100`. Shopee's list pagination tops out before `total_count` for high-volume days (page ~101 returns an empty list even though `total_count` is in the tens of thousands), so summary mode reports a `breakdown_mode` field to make the trustworthiness of the breakdown explicit:
-  - `breakdown_mode: "filtered"` — set when the request includes `sub_id=<value>`. Only page 1 is fetched and the response is a single-entry `sub_ids` array whose `count` is the Shopee-reported `total_count`. This is the recommended way to get an exact count for one sub.
-  - `breakdown_mode: "complete"` — set when the unfiltered row enumeration reached `total_count`. The entries use `count` and `percent`, and `percent` is genuinely the share of `total_count`.
-  - `breakdown_mode: "sample"` — set when Shopee capped the list before `total_count` was reached. The entries use `sample_count` and `sample_percent` (not `count`/`percent`) so the percentage cannot be mistaken for a share of `total_count`. `truncated: true` and a human-readable `warning` are included; rerun with `sub_id=<value>` to get exact counts.
-- **Raw mode** — opt-in via `raw=1` or `mode=raw`. Returns one page of raw Shopee rows, honoring `page_num`/`page_size`. Useful for debugging and inspection.
+- **Summary mode (default)** — aggregates click rows for the requested day into exact per-`sub_id`, Sub1, Sub2, and Sub3 breakdowns. For unfiltered requests the bridge probes `page_num=1&page_size=100`, recursively splits `click_time_s/e` windows whenever Shopee reports more than the 10,000-row page cap, then paginates each safe window without requesting beyond page 100. The response carries no raw `list`.
+  - `breakdown_mode: "complete"` — set when row enumeration reached `total_count`. Entries use `count` and `percent`, and `percent` is the share of `total_count`.
+  - `breakdown_mode: "filtered"` — set when the request includes `sub_id=<value>` without `complete=1`. Only page 1 is fetched and the response reports Shopee's server-side `total_count` for that sub.
+  - If a one-second window still exceeds the cap, the response is a clear `status: "error"` / `reason: "click_report_window_too_dense"` with `truncated: true` instead of looping.
+- **Raw mode** — `raw=1` or `mode=raw` preserves the existing one-page raw response honoring `page_num`/`page_size`. Use `raw=complete` (or `raw=1&complete=1`) to fetch complete raw rows using the same split-window strategy.
 
 Query parameters:
 
@@ -119,10 +119,11 @@ Query parameters:
 |---|---|---|
 | `id` | `15130770000` | Built-in alias (or `SHOPEE_ID_ACCOUNT_MAP` entry). Selects the persistent profile / Keychain account. `an_<digits>` is also accepted. |
 | `time` | today (Asia/Bangkok) | Accepts `DD/MM/YYYY`, `YYYY-MM-DD`, `today`, or `yesterday`. The day is interpreted in Asia/Bangkok (UTC+7) and translated to `click_time_s` (00:00:00) / `click_time_e` (23:59:59) Unix seconds — no reliance on server local timezone. |
-| `raw` / `mode` | _(unset)_ | `raw=1`, `raw=true`, or `mode=raw` switches to raw single-page mode. Otherwise the bridge returns the summary. |
+| `raw` / `mode` | _(unset)_ | `raw=1`, `raw=true`, or `mode=raw` switches to raw single-page mode. `raw=complete`, `mode=raw_complete`, or `mode=complete_raw` returns complete raw rows. `mode=complete` keeps summary mode and forces complete row enumeration even with filters. |
+| `complete` | _(unset)_ | `complete=1` forces complete row enumeration. Combined with `raw=1`, it returns complete raw rows. |
 | `page_num` (or `page`) | `1` | Raw mode only. Floored at `1`. Ignored in summary mode. |
 | `page_size` | raw: `20` / summary: `100` | Raw mode honors caller-supplied value, clamped to `[1, 100]`. Summary mode always uses `100`. |
-| `sub_id`, `click_id`, `click_region` | _(omitted)_ | Passed through to the Shopee API when non-empty. In summary mode, supplying `sub_id` triggers `breakdown_mode: "filtered"` — the response reports Shopee's `total_count` as the exact count for that sub instead of trying to enumerate rows. This is the only reliable way to get an exact per-sub count on high-volume days. |
+| `sub_id`, `click_id`, `click_region` | _(omitted)_ | Passed through to the Shopee API when non-empty. In summary mode, supplying `sub_id` triggers `breakdown_mode: "filtered"` unless `complete=1` is also supplied. |
 
 The bridge resolves `id → account` using the same alias table as `/shorten` (so id `15130770000` → `affiliate_chearb.com`, id `15142270000` → `affiliate_neezs.com`). The persistent profile is opened headless and `fetch('/api/v1/click_report/list?...', { credentials: 'include' })` runs from the `affiliate.shopee.co.th` origin, just like the click report dashboard does.
 
@@ -132,6 +133,7 @@ Examples:
 # Summary by default — daily total + sub_id breakdown for the chosen affiliate id
 curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026'
 curl 'https://clickreport.wwoom.com/?time=26/05/2026'
+curl 'https://clickreport.wwoom.com/?time=2026-06-09&complete=1'
 
 # Summary filtered to a single sub_id (Shopee filters on the server side; summary aggregates the filtered rows)
 curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026&sub_id=16MAY26FBSPCAD'
@@ -139,6 +141,7 @@ curl 'https://clickreport.wwoom.com/?id=15130770000&time=25/05/2026&sub_id=16MAY
 # Raw mode — inspect Shopee rows verbatim, one page at a time
 curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=yesterday&raw=1&page_size=5'
 curl 'http://127.0.0.1:8810/click-report?id=15142270000&time=2026-05-25&mode=raw&page_num=2'
+curl 'http://127.0.0.1:8810/click-report?id=15130770000&time=2026-06-09&raw=complete'
 ```
 
 **Summary response shape — `breakdown_mode: "complete"`** (small days where Shopee returns every row):

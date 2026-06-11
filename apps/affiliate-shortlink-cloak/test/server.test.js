@@ -1033,6 +1033,29 @@ test('loginHtmlPage status JS calls /api/credentials (GET status + DELETE for fo
   assert.match(html, /ลบ credential นี้/, 'must label the forget button in Thai');
 });
 
+test('loginHtmlPage saved credential rows include per-account Re-auth control', () => {
+  const html = server.loginHtmlPage({});
+  assert.match(html, /reauth\.type="button"/, 'Re-auth must be an accessible button');
+  assert.match(html, /reauth\.className="reauth"/, 'Re-auth must have its own class');
+  assert.match(html, /reauth\.textContent="Re-auth บัญชีนี้"/, 'Re-auth button label must be clear');
+  assert.match(html, /function buildReauthUrl\(platform,account\)/, 'must build a dedicated Re-auth URL');
+  assert.match(
+    html,
+    /"\/login\?json=1&platform="\+encodeURIComponent\(platform\|\|""\)\+"&account="\+encodeURIComponent\(account\|\|""\)\+"&autofill=1"/,
+    'Re-auth URL must target the exact platform/account login flow',
+  );
+  assert.match(
+    html,
+    /fetch\(buildReauthUrl\(it\.platform,it\.account\|\|""\),\{method:"GET"\}\)/,
+    'Re-auth must call /login with GET, not credential DELETE',
+  );
+  assert.match(
+    html,
+    /actions\.appendChild\(reauth\);actions\.appendChild\(del\);/,
+    'Re-auth should be rendered next to Delete per saved credential row',
+  );
+});
+
 test('loginHtmlPage embeds Thai status copy for configured + none cases and never echoes password in output', () => {
   const html = server.loginHtmlPage({});
   assert.match(html, /มี credential ใน macOS Keychain แล้ว/, 'configured Thai copy');

@@ -129,6 +129,84 @@ test('Graph comment min spacing defaults to 60s and accepts bounded env override
     assert.equal(resolveGraphCommentMinSpacingSeconds('bad'), 60)
 })
 
+test('Facebook comment resolver prefers comment token pool without changing sync resolver priority', () => {
+    const syncSource = indexFunctionSource(
+        'async function resolveFacebookSyncToken',
+        '// Resolve the Graph API token used by Facebook Page comment read/write flows.',
+    )
+    assert.ok(
+        syncSource.indexOf('...normalizePostTokenPool(poolEntry?.post_tokens || [])') <
+        syncSource.indexOf('...normalizeCommentTokenPool(poolEntry?.comment_tokens || [])'),
+        'non-comment sync resolver must still prefer post_tokens before comment_tokens',
+    )
+
+    const commentResolverSource = indexFunctionSource(
+        'async function resolveFacebookCommentToken',
+        'async function ensureFacebookPageVideoCacheTables',
+    )
+    assert.ok(
+        commentResolverSource.indexOf('const commentCandidates = normalizeCommentTokenPool') <
+        commentResolverSource.indexOf('const postCandidates = normalizePostTokenPool'),
+        'comment resolver must prefer comment_tokens before post_tokens',
+    )
+    assert.match(commentResolverSource, /namespace_token_pool\.comment_tokens\[0\]/)
+    assert.match(commentResolverSource, /namespace_token_pool\.post_tokens\[0\]/)
+    assert.match(commentResolverSource, /pages\.access_token\.namespace_page/)
+    assert.match(commentResolverSource, /pages\.access_token\.legacy_page/)
+    assert.match(commentResolverSource, /dashboard_settings\.facebook_sync_token/)
+    assert.match(commentResolverSource, /buildFacebookTokenResolution/)
+})
+
+test('page-comment routes use comment resolver and expose only redacted token hints', () => {
+    const tokenDebugSource = indexFunctionSource(
+        'function facebookTokenDebugFields',
+        '// Resolve the Graph API token used by the dashboard',
+    )
+    assert.match(tokenDebugSource, /token_source/)
+    assert.match(tokenDebugSource, /token_hash_prefix/)
+    assert.doesNotMatch(tokenDebugSource, /return\s+\{[\s\S]*token\s*:/)
+
+    const registrySource = indexFunctionSource(
+        "app.get('/api/dashboard/page-comment-link-registry'",
+        '// ===========================================================================\n// SAFE FULL WORKFLOW',
+    )
+    assert.match(registrySource, /resolveFacebookCommentToken/)
+    assert.doesNotMatch(registrySource, /resolveFacebookSyncToken/)
+    assert.match(registrySource, /facebookTokenDebugFields\(tokenResolution\)/)
+
+    const runSource = indexFunctionSource(
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/run'",
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify'",
+    )
+    assert.match(runSource, /resolveFacebookCommentToken/)
+    assert.doesNotMatch(runSource, /resolveFacebookSyncToken/)
+    assert.match(runSource, /facebookTokenDebugFields\(tokenResolution\)/)
+    assert.doesNotMatch(runSource, /token:\s*token/)
+    assert.doesNotMatch(runSource, /access_token:\s*token/)
+
+    const verifySource = indexFunctionSource(
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify'",
+        "app.get('/api/dashboard/page-comment-link-jobs/:job_id/history'",
+    )
+    assert.match(verifySource, /resolveFacebookCommentToken/)
+    assert.doesNotMatch(verifySource, /resolveFacebookSyncToken/)
+    assert.match(verifySource, /facebookTokenDebugFields\(tokenResolution\)/)
+    assert.doesNotMatch(verifySource, /token:\s*token/)
+    assert.doesNotMatch(verifySource, /access_token:\s*token/)
+
+    const backfillSource = indexFunctionSource(
+        "app.post('/api/dashboard/facebook-page-videos/backfill-from-facebook'",
+        "app.post('/api/dashboard/facebook-page-videos/backfill-shopee-links'",
+    )
+    assert.match(backfillSource, /const syncToken = await resolveFacebookSyncToken/)
+    assert.match(backfillSource, /const commentTokenResolution = await resolveFacebookCommentToken/)
+    assert.match(backfillSource, /const commentReadToken = commentTokenResolution\.token \|\| syncToken/)
+    assert.match(backfillSource, /\/comments\?fields=id,from,message,created_time&limit=10&access_token=\$\{encodeURIComponent\(commentReadToken\)\}/)
+    assert.match(backfillSource, /facebookTokenDebugFields\(commentTokenResolution\)/)
+    assert.doesNotMatch(backfillSource, /token:\s*token/)
+    assert.doesNotMatch(backfillSource, /access_token:\s*token/)
+})
+
 test('real page-comment run clamps writes to one item while dry-run can keep requested batch', () => {
     assert.equal(resolveRunCommentBatchLimit({ writeMode: true, batchSize: 50, requestedLimit: 50 }), 1)
     assert.equal(resolveRunCommentBatchLimit({ writeMode: true, batchSize: 5, requestedLimit: undefined }), 1)
@@ -358,7 +436,7 @@ test('job item canonical target: missing post_id blocks instead of falling back 
     assert.doesNotMatch(target.reason, /reel_id/)
 })
 
-test('buildTargetSubIds uses canonical post_id for sub2 when present', () => {
+test('buildTargetSubIds uses canonical post_id for sub2 and leaves sub4 empty', () => {
     const subs = buildTargetSubIds({
         requestedSub1: 'spring',
         pageId: '1008898512617594',
@@ -369,7 +447,7 @@ test('buildTargetSubIds uses canonical post_id for sub2 when present', () => {
     assert.equal(subs.sub1, 'spring')
     assert.equal(subs.sub2, '1284990567138972') // story tail of canonical post id
     assert.equal(subs.sub3, '1008898512617594')
-    assert.equal(subs.sub4, '98765')
+    assert.equal(subs.sub4, '')
     assert.equal(subs.sub2_source, 'canonical_post_id')
     assert.equal(subs.reason, '')
 })
@@ -511,30 +589,49 @@ test('page comment job item schema persists log_id and target_sub4 for preview t
     assert.match(PAGE_COMMENT_LINK_JOB_ITEMS_TABLE_SQL, /target_sub4 TEXT NOT NULL DEFAULT ''/)
 })
 
-test('dry-run customlink path includes fallback sub4 from log_id', () => {
+test('dry-run customlink path leaves sub4 empty while log id stays internal', () => {
     const targetSub4 = resolveEffectiveTargetSub4({ target_sub4: '', log_id: 25831 })
     const requestUrl = buildCustomlinkRequestUrl({
         productUrl: 'https://shopee.co.th/product/1/2',
         sub1: '1JUN26FBSPCAD',
         sub2: '1294666126171416',
         sub3: '1008898512617594',
-        sub4: targetSub4,
+        sub4: '',
     })
     const parsed = new URL(requestUrl)
-    assert.equal(parsed.searchParams.get('sub4'), '25831')
+    assert.equal(targetSub4, '25831')
+    assert.equal(parsed.searchParams.has('sub4'), false)
     assert.equal(buildExpectedUtmContent({
         sub1: '1JUN26FBSPCAD',
         sub2: '1294666126171416',
         sub3: '1008898512617594',
-        sub4: targetSub4,
-    }), '1JUN26FBSPCAD-1294666126171416-1008898512617594-25831-')
+        sub4: '',
+    }), '1JUN26FBSPCAD-1294666126171416-1008898512617594--')
+})
+
+test('persisted job rows do not rehydrate log_id into outbound target_sub4', () => {
+    const loadSource = indexFunctionSource(
+        'async function loadPageCommentLinkJobItems',
+        '// GET a job + its items (read-only).',
+    )
+    assert.doesNotMatch(loadSource, /resolveEffectiveTargetSub4\(row\)/)
+    assert.doesNotMatch(loadSource, /target_sub4:\s*targetSub4/)
+
+    const runSource = indexFunctionSource(
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/run'",
+        "app.post('/api/dashboard/page-comment-link-jobs/:job_id/verify'",
+    )
+    assert.match(runSource, /const targetSub4 = str\(row\.target_sub4\)/)
+    assert.doesNotMatch(runSource, /const targetSub4 = resolveEffectiveTargetSub4\(row\)/)
+    assert.match(runSource, /buildCustomlinkRequestUrl\(\{ productUrl, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: ''/)
+    assert.match(runSource, /verifyRewrittenShortlink\(expandedNewUrl, \{ sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '' \}\)/)
 })
 
 // ---------------------------------------------------------------------------
-// Durable per-page-story ledger id — guarantees a non-empty target_sub4/log_id
-// for EVERY rewrite item, including cache/manual/imported posts that have no
-// post_history.id. Regression guard for the 2026-05-16 batch that minted
-// utm_content with an empty slot 4 (`...-<post_id>-<page_id>--`).
+// Durable per-page-story ledger id — keeps an internal audit id/log_id for every
+// rewrite item, including cache/manual/imported posts that have no
+// post_history.id, while outbound Shopee/customlink tracking leaves sub4 empty
+// (`...-<post_id>-<page_id>--`).
 // ---------------------------------------------------------------------------
 
 test('page_post_link_ledger schema has an autoincrement id and durable metadata columns', () => {
@@ -560,7 +657,7 @@ test('resolveRewriteLogId prefers an existing durable id, else the ledger id, el
     assert.equal(resolveRewriteLogId({ existing: '', ledgerId: null }), '')
 })
 
-test('cache item without post_history id gets a ledger id and a populated target_sub4', async () => {
+test('cache item without post_history id gets a ledger id but generated tracking keeps sub4 empty', async () => {
     // In-memory ledger: a stable autoincrement id per (page_id, comment_target_id),
     // standing in for the D1 page_post_link_ledger autoincrement. No Facebook, no DB.
     const seen = new Map()
@@ -599,10 +696,9 @@ test('cache item without post_history id gets a ledger id and a populated target
         reelId: '1294666126171416',
         logId,
     })
-    assert.equal(subs.sub4, '1')
+    assert.equal(subs.sub4, '')
     const utm = buildExpectedUtmContent(subs)
-    assert.equal(utm, '1JUN26FBSPCAD-1234567890-1008898512617594-1-')
-    assert.ok(!utm.endsWith('--'), 'utm_content must never carry an empty slot 4')
+    assert.equal(utm, '1JUN26FBSPCAD-1234567890-1008898512617594--')
 
     // Idempotent: the same page-story target keeps the same ledger id (no churn).
     const again = await ensureRewriteLogId(raw, {
@@ -630,17 +726,17 @@ test('ensureRewriteLogId returns empty when no durable id and no stable target t
     assert.equal(await ensureRewriteLogId({}, { pageId: '1008898512617594', commentTargetId: 'P_1', store: null }), '')
 })
 
-test('real run refuses to mint when target_sub4 is empty and a comment target/id is known', () => {
+test('real run no longer refuses when target_sub4 is empty', () => {
     assert.equal(resolveRealRewriteRefusal({
         targetSub4: '', commentTargetId: '1008898512617594_1234567890', oldCommentId: '', commentId: '',
-    }), 'missing_target_sub4')
+    }), '')
     assert.equal(resolveRealRewriteRefusal({
         targetSub4: '', commentTargetId: '', oldCommentId: '', commentId: '1008898512617594_1234567890_9',
-    }), 'missing_target_sub4')
+    }), '')
     assert.equal(resolveRealRewriteRefusal({
         targetSub4: '', commentTargetId: '', oldCommentId: '1008898512617594_1234567890_9', commentId: '',
-    }), 'missing_target_sub4')
-    // A populated target_sub4 (post_history id OR ledger id) clears the refusal.
+    }), '')
+    // A populated target_sub4 remains allowed for backward compatibility.
     assert.equal(resolveRealRewriteRefusal({
         targetSub4: '25831', commentTargetId: '1008898512617594_1234567890', oldCommentId: '', commentId: '',
     }), '')
@@ -708,20 +804,20 @@ test('buildExpectedUtmContent renders sub4/log_id and leaves sub5 empty', () => 
     assert.equal(buildExpectedUtmContent({ sub1: 'a', sub2: 'b', sub3: 'c', sub4: 'log987' }), 'a-b-c-log987-')
 })
 
-test('verifyRewrittenShortlink confirms matching utm_content sub ids', () => {
-    const expected = { sub1: 'spring', sub2: 'post123', sub3: 'page456', sub4: 'log987' }
+test('verifyRewrittenShortlink confirms matching utm_content sub ids with empty sub4', () => {
+    const expected = { sub1: 'spring', sub2: 'post123', sub3: 'page456', sub4: '' }
     const ok = verifyRewrittenShortlink(
-        'https://shopee.co.th/product/1/2?utm_content=spring-post123-page456-log987-',
+        'https://shopee.co.th/product/1/2?utm_content=spring-post123-page456--',
         expected,
     )
     assert.equal(ok.ok, true)
-    assert.equal(ok.utm_content, 'spring-post123-page456-log987-')
-    assert.equal(ok.sub4, 'log987')
-    assert.equal(ok.expected_utm_content, 'spring-post123-page456-log987-')
+    assert.equal(ok.utm_content, 'spring-post123-page456--')
+    assert.equal(ok.sub4, '')
+    assert.equal(ok.expected_utm_content, 'spring-post123-page456--')
     assert.equal(ok.reason, '')
 
     const mismatch = verifyRewrittenShortlink(
-        'https://shopee.co.th/product/1/2?utm_content=spring-WRONG-page456-log987-',
+        'https://shopee.co.th/product/1/2?utm_content=spring-WRONG-page456--',
         expected,
     )
     assert.equal(mismatch.ok, false)
