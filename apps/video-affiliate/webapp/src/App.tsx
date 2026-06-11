@@ -4798,6 +4798,10 @@ function App({
   const dashboardRequestRef = useRef(0)
   const inboxRequestRef = useRef(0)
   const systemInboxRequestRef = useRef(0)
+  // Load-more offsets must track rows the server returned for the active view,
+  // not client-filtered visible rows — those can diverge and stall pagination.
+  const inboxViewFetchedCountRef = useRef(0)
+  const systemInboxViewFetchedCountRef = useRef(0)
   const globalOriginalFetchInFlightRef = useRef(false)
   const loadPagesRequestRef = useRef(0)
   const loadTeamRequestRef = useRef(0)
@@ -5828,7 +5832,7 @@ function App({
           ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
           : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
     )).length
-    const offset = reset || refreshTop ? 0 : currentInboxViewLength
+    const offset = reset || refreshTop ? 0 : inboxViewFetchedCountRef.current
     const shouldShowLoading = reset && currentInboxViewLength === 0
     if (shouldShowLoading) setInboxLoading(true)
     if (!reset && !refreshTop) setInboxLoadingMore(true)
@@ -5850,6 +5854,13 @@ function App({
       if (requestId !== inboxRequestRef.current) return
 
       const nextVideos = Array.isArray(data.videos) ? data.videos : []
+      if (reset) {
+        inboxViewFetchedCountRef.current = nextVideos.length
+      } else if (refreshTop) {
+        inboxViewFetchedCountRef.current = Math.max(inboxViewFetchedCountRef.current, nextVideos.length)
+      } else {
+        inboxViewFetchedCountRef.current = offset + nextVideos.length
+      }
       setInboxVideos((prev) => {
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
         return merged
@@ -5884,7 +5895,7 @@ function App({
           ? !String(video.processedAt || '').trim() && (!video.hasShopeeLink || !video.hasLazadaLink)
           : !String(video.processedAt || '').trim() && video.hasShopeeLink === true && video.hasLazadaLink === true
     )).length
-    const offset = reset || refreshTop ? 0 : currentSystemInboxViewLength
+    const offset = reset || refreshTop ? 0 : systemInboxViewFetchedCountRef.current
     const shouldShowLoading = reset && currentSystemInboxViewLength === 0
     if (shouldShowLoading) setSystemInboxLoading(true)
     if (!reset && !refreshTop) setSystemInboxLoadingMore(true)
@@ -5909,6 +5920,13 @@ function App({
       if (requestId !== systemInboxRequestRef.current) return
 
       const nextVideos = Array.isArray(data.videos) ? data.videos : []
+      if (reset) {
+        systemInboxViewFetchedCountRef.current = nextVideos.length
+      } else if (refreshTop) {
+        systemInboxViewFetchedCountRef.current = Math.max(systemInboxViewFetchedCountRef.current, nextVideos.length)
+      } else {
+        systemInboxViewFetchedCountRef.current = offset + nextVideos.length
+      }
       setSystemInboxVideos((prev) => {
         const merged = reset ? nextVideos : mergeInboxVideos(prev, nextVideos)
         return merged
@@ -8409,7 +8427,13 @@ function App({
             inboxUnprocessedTotalCount={Math.max(0, inboxTotalCount - inboxProcessedTotalCount - inboxMissingLinkTotalCount)}
             inboxMissingLinkTotalCount={inboxMissingLinkTotalCount}
             inboxView={inboxView}
-            onInboxViewChange={setInboxView}
+            onInboxViewChange={(view) => {
+              // New view → server offsets restart from 0; the inbox effect
+              // re-runs with reset: true right after this state change.
+              inboxViewFetchedCountRef.current = 0
+              systemInboxViewFetchedCountRef.current = 0
+              setInboxView(view)
+            }}
             inboxLoadingMore={inboxLoadingMore}
             inboxHasMore={inboxHasMore}
             loadMoreRef={inboxLoadMoreRef}
