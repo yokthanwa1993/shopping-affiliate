@@ -30091,6 +30091,8 @@ async function findExistingAffiliateComment(params: {
 }): Promise<{ id: string; targetId: string } | null> {
     const accessToken = String(params.accessToken || '').trim()
     if (!accessToken) return null
+    const pageId = String(params.pageId || '').trim()
+    if (!pageId) return null
 
     const hasStoryTarget = !!String(params.fbPostId || '').trim()
     const candidates: string[] = []
@@ -30109,13 +30111,17 @@ async function findExistingAffiliateComment(params: {
 
     for (const candidate of uniqueTokens(candidates)) {
         try {
-            const existingComments = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string }> }>(
+            const existingComments = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string; from?: { id?: string; name?: string } }> }>(
                 `${FB_GRAPH_V19}/${candidate}/comments`,
-                { access_token: accessToken, limit: '25' },
+                { access_token: accessToken, fields: 'id,message,from', limit: '25' },
             )
-            const match = isAffiliateCommentMatch(existingComments.data, {})
+            const pageAuthoredComments = (existingComments.data || []).filter((comment) => {
+                const fromId = String(comment?.from?.id || '').trim()
+                return fromId && fromId === pageId
+            })
+            const match = isAffiliateCommentMatch(pageAuthoredComments, {})
             if (match.matched) {
-                const matchedId = (existingComments.data || []).find((comment) =>
+                const matchedId = pageAuthoredComments.find((comment) =>
                     isAffiliateCommentMatch([comment], {}).matched,
                 )?.id || ''
                 if (matchedId) {
@@ -30138,20 +30144,26 @@ async function verifyAffiliateCommentOnTarget(params: {
     targetId: string
     commentId?: string
     accessToken: string
+    pageId?: string
     expectedMessage?: string
     logPrefix: string
 }): Promise<{ ok: boolean; matchedBy?: 'comment_id' | 'comment_id_suffix' | 'message'; error?: string }> {
     const targetId = String(params.targetId || '').trim()
     const accessToken = String(params.accessToken || '').trim()
-    if (!targetId || !accessToken) {
+    const pageId = String(params.pageId || '').trim()
+    if (!targetId || !accessToken || !pageId) {
         return { ok: false, error: 'verify_input_missing' }
     }
     try {
-        const data = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string }> }>(
+        const data = await facebookGraphRawGet<{ data?: Array<{ id?: string; message?: string; from?: { id?: string; name?: string } }> }>(
             `${FB_GRAPH_V19}/${targetId}/comments`,
-            { access_token: accessToken, limit: '25' },
+            { access_token: accessToken, fields: 'id,message,from', limit: '25' },
         )
-        const match = isAffiliateCommentMatch(data?.data, {
+        const pageAuthoredComments = (data?.data || []).filter((comment) => {
+            const fromId = String(comment?.from?.id || '').trim()
+            return fromId && fromId === pageId
+        })
+        const match = isAffiliateCommentMatch(pageAuthoredComments, {
             commentId: params.commentId,
             expectedMessage: params.expectedMessage,
         })
@@ -30320,6 +30332,7 @@ async function postShopeeCommentStrict(params: {
             targetId: tid,
             commentId: postedId,
             accessToken: commentToken,
+            pageId,
             expectedMessage: primaryMessage,
             logPrefix: params.logPrefix,
         })
@@ -30360,6 +30373,7 @@ async function postShopeeCommentStrict(params: {
                         targetId: tid,
                         commentId: followupId,
                         accessToken: commentToken,
+                        pageId,
                         expectedMessage: message,
                         logPrefix: params.logPrefix,
                     })

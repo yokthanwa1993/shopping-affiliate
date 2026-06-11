@@ -551,8 +551,21 @@ test('Shopee comment posting dedup and target selection are story-only', () => {
         '// Confirm the comment we just POSTed',
     )
     assert.match(dedupSource, /else\s*\{\s*return null\s*\}/)
+    assert.match(dedupSource, /fields:\s*'id,message,from'/)
+    assert.match(dedupSource, /comment\?\.from\?\.id/)
+    assert.match(dedupSource, /fromId && fromId === pageId/)
+    assert.match(dedupSource, /isAffiliateCommentMatch\(pageAuthoredComments/)
     assert.doesNotMatch(dedupSource, /resolveCommentTargetIdViaGraph\(\{/)
     assert.doesNotMatch(dedupSource, /buildCommentTargetCandidates\(/)
+
+    const verifySource = indexFunctionSource(
+        'async function verifyAffiliateCommentOnTarget',
+        'async function resolveCommentTargetIdViaGraph',
+    )
+    assert.match(verifySource, /fields:\s*'id,message,from'/)
+    assert.match(verifySource, /comment\?\.from\?\.id/)
+    assert.match(verifySource, /fromId && fromId === pageId/)
+    assert.match(verifySource, /isAffiliateCommentMatch\(pageAuthoredComments/)
 
     const strictSource = indexFunctionSource(
         'async function postShopeeCommentStrict',
