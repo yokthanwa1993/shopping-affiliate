@@ -191,6 +191,9 @@ const dashboardCacheKey = (namespaceId: string, date: string) => `dashboard_cach
 const systemInboxCacheKey = (botScope = getBotScopeFromLocation()) => scopedStorageKey(`inbox_system_cache:${CACHE_VERSION}`, botScope)
 const processingCacheKey = (namespaceId: string) => `processing_cache:${CACHE_VERSION}:${namespaceId}`
 const GALLERY_BATCH_SIZE = 24
+// Bounded timeout for inbox load-more page fetches so a stalled API surfaces a
+// retry affordance instead of an infinite bottom spinner.
+const INBOX_PAGE_FETCH_TIMEOUT_MS = 20_000
 const LOGS_REVEAL_BATCH_SIZE = 1
 const LOGS_REVEAL_INTERVAL_MS = 45
 const FORCE_SYSTEM_WIDE_GALLERY = false
@@ -4802,6 +4805,11 @@ function App({
   // not client-filtered visible rows — those can diverge and stall pagination.
   const inboxViewFetchedCountRef = useRef(0)
   const systemInboxViewFetchedCountRef = useRef(0)
+  // In-flight guards close the race where the IntersectionObserver and the
+  // scroll fallback both fire a load-more before React has committed the
+  // loadingMore=true state, which would otherwise issue duplicate page fetches.
+  const inboxLoadMoreInFlightRef = useRef(false)
+  const systemInboxLoadMoreInFlightRef = useRef(false)
   const globalOriginalFetchInFlightRef = useRef(false)
   const loadPagesRequestRef = useRef(0)
   const loadTeamRequestRef = useRef(0)
@@ -4825,6 +4833,10 @@ function App({
   )
   const [systemInboxLoadingMore, setSystemInboxLoadingMore] = useState(false)
   const [systemInboxHasMore, setSystemInboxHasMore] = useState(false)
+  // Load-more error flags drive a tap-to-retry affordance instead of a spinner
+  // that hangs forever when a page fetch stalls, times out, or returns non-OK.
+  const [inboxLoadMoreError, setInboxLoadMoreError] = useState(false)
+  const [systemInboxLoadMoreError, setSystemInboxLoadMoreError] = useState(false)
   const [galleryReadyTotalCount, setGalleryReadyTotalCount] = useState(videos.length)
   const [galleryUsedTotalCount, setGalleryUsedTotalCount] = useState(usedVideos.length)
   const [galleryUsedHasMore, setGalleryUsedHasMore] = useState(false)
@@ -5826,15 +5838,20 @@ function App({
 
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
+    const isLoadMore = !reset && !refreshTop
     const requestId = reset || refreshTop ? ++inboxRequestRef.current : inboxRequestRef.current
-    if (!reset && !refreshTop && (inboxLoadingMore || !inboxHasMore)) return
+    if (isLoadMore && (inboxLoadMoreInFlightRef.current || inboxLoadingMore || !inboxHasMore)) return
     if (refreshTop && inboxLoadingMore) return
 
     const currentInboxViewLength = inboxVideos.length
     const offset = reset || refreshTop ? 0 : inboxViewFetchedCountRef.current
     const shouldShowLoading = reset && currentInboxViewLength === 0
     if (shouldShowLoading) setInboxLoading(true)
-    if (!reset && !refreshTop) setInboxLoadingMore(true)
+    if (isLoadMore) {
+      inboxLoadMoreInFlightRef.current = true
+      setInboxLoadingMore(true)
+      setInboxLoadMoreError(false)
+    }
 
     try {
       const params = new URLSearchParams()
@@ -5842,12 +5859,17 @@ function App({
       params.set('limit', String(GALLERY_BATCH_SIZE))
       params.set('view', inboxView)
       if (offset === 0) params.set('_ts', String(Date.now()))
-      const resp = await apiFetch(`${WORKER_URL}/api/inbox?${params.toString()}`)
+      const url = `${WORKER_URL}/api/inbox?${params.toString()}`
+      // Bound the request so a stalled API cannot pin loadingMore=true forever.
+      const resp = isLoadMore ? await apiFetchWithTimeout(url, {}, INBOX_PAGE_FETCH_TIMEOUT_MS) : await apiFetch(url)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
-      if (!resp.ok) return
+      if (!resp.ok) {
+        if (isLoadMore) setInboxLoadMoreError(true)
+        return
+      }
 
       const data = await resp.json() as InboxPageResponse
       if (requestId !== inboxRequestRef.current) return
@@ -5868,13 +5890,18 @@ function App({
       setInboxProcessedTotalCount(Number(data.processed_total || 0))
       setInboxMissingLinkTotalCount(Number(data.missing_link_total || 0))
       setInboxHasMore(!!data.has_more && nextVideos.length > 0)
+      if (isLoadMore) setInboxLoadMoreError(false)
     } catch {
-      // Keep previous inbox snapshot on transient errors.
+      // Keep the loaded cards on transient failure; surface a retry affordance.
+      if (isLoadMore) setInboxLoadMoreError(true)
     } finally {
-      if (requestId === inboxRequestRef.current) {
-        if (shouldShowLoading) setInboxLoading(false)
-        if (!reset && !refreshTop) setInboxLoadingMore(false)
+      // Always release the load-more lock so the next attempt (auto or retry)
+      // can run, even if this request was aborted by the timeout.
+      if (isLoadMore) {
+        inboxLoadMoreInFlightRef.current = false
+        setInboxLoadingMore(false)
       }
+      if (shouldShowLoading && requestId === inboxRequestRef.current) setInboxLoading(false)
     }
   }
 
@@ -5883,15 +5910,20 @@ function App({
 
     const reset = !!options.reset
     const refreshTop = !!options.refreshTop
+    const isLoadMore = !reset && !refreshTop
     const requestId = reset || refreshTop ? ++systemInboxRequestRef.current : systemInboxRequestRef.current
-    if (!reset && !refreshTop && (systemInboxLoadingMore || !systemInboxHasMore)) return
+    if (isLoadMore && (systemInboxLoadMoreInFlightRef.current || systemInboxLoadingMore || !systemInboxHasMore)) return
     if (refreshTop && systemInboxLoadingMore) return
 
     const currentSystemInboxViewLength = systemInboxVideos.length
     const offset = reset || refreshTop ? 0 : systemInboxViewFetchedCountRef.current
     const shouldShowLoading = reset && currentSystemInboxViewLength === 0
     if (shouldShowLoading) setSystemInboxLoading(true)
-    if (!reset && !refreshTop) setSystemInboxLoadingMore(true)
+    if (isLoadMore) {
+      systemInboxLoadMoreInFlightRef.current = true
+      setSystemInboxLoadingMore(true)
+      setSystemInboxLoadMoreError(false)
+    }
 
     try {
       const params = new URLSearchParams()
@@ -5902,12 +5934,17 @@ function App({
         params.set('_ts', String(Date.now()))
         params.set('fresh', '1')
       }
-      const resp = await apiFetch(`${WORKER_URL}/api/inbox/system?${params.toString()}`)
+      const url = `${WORKER_URL}/api/inbox/system?${params.toString()}`
+      // Bound the request so a stalled API cannot pin loadingMore=true forever.
+      const resp = isLoadMore ? await apiFetchWithTimeout(url, {}, INBOX_PAGE_FETCH_TIMEOUT_MS) : await apiFetch(url)
       if (resp.status === 401) {
         await recoverSessionOrLogout()
         return
       }
-      if (!resp.ok) return
+      if (!resp.ok) {
+        if (isLoadMore) setSystemInboxLoadMoreError(true)
+        return
+      }
 
       const data = await resp.json() as InboxPageResponse
       if (requestId !== systemInboxRequestRef.current) return
@@ -5928,13 +5965,28 @@ function App({
       setSystemInboxProcessedTotalCount(Number(data.processed_total || 0))
       setSystemInboxMissingLinkTotalCount(Number(data.missing_link_total || 0))
       setSystemInboxHasMore(!!data.has_more && nextVideos.length > 0)
+      if (isLoadMore) setSystemInboxLoadMoreError(false)
     } catch {
-      // Keep previous inbox snapshot on transient errors.
+      // Keep the loaded cards on transient failure; surface a retry affordance.
+      if (isLoadMore) setSystemInboxLoadMoreError(true)
     } finally {
-      if (requestId === systemInboxRequestRef.current) {
-        if (shouldShowLoading) setSystemInboxLoading(false)
-        if (!reset && !refreshTop) setSystemInboxLoadingMore(false)
+      // Always release the load-more lock so the next attempt (auto or retry)
+      // can run, even if this request was aborted by the timeout.
+      if (isLoadMore) {
+        systemInboxLoadMoreInFlightRef.current = false
+        setSystemInboxLoadingMore(false)
       }
+      if (shouldShowLoading && requestId === systemInboxRequestRef.current) setSystemInboxLoading(false)
+    }
+  }
+
+  function retryInboxLoadMore() {
+    if (isSystemAdmin) {
+      setSystemInboxLoadMoreError(false)
+      void loadSystemInbox()
+    } else {
+      setInboxLoadMoreError(false)
+      void loadInboxSnapshot()
     }
   }
 
@@ -7960,7 +8012,7 @@ function App({
   }, [tab, isAllOriginalMode, galleryLoading, galleryHasMore, galleryLoadingMore, categoryFilter, videos.length, usedVideos.length])
 
   useEffect(() => {
-    if (tab !== 'inbox' || inboxLoading || !inboxHasMore || isSystemAdmin) return
+    if (tab !== 'inbox' || inboxLoading || !inboxHasMore || isSystemAdmin || inboxLoadMoreError) return
 
     const root = mainScrollRef.current
     const target = inboxLoadMoreRef.current
@@ -7978,10 +8030,10 @@ function App({
 
     observer.observe(target)
     return () => observer.disconnect()
-  }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length])
+  }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length, inboxLoadMoreError])
 
   useEffect(() => {
-    if (tab !== 'inbox' || inboxLoading || !inboxHasMore || isSystemAdmin) return
+    if (tab !== 'inbox' || inboxLoading || !inboxHasMore || isSystemAdmin || inboxLoadMoreError) return
 
     const root = mainScrollRef.current
     if (!root) return
@@ -8004,10 +8056,10 @@ function App({
       root.removeEventListener('scroll', maybeLoadMore)
       if (rafId) window.cancelAnimationFrame(rafId)
     }
-  }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length])
+  }, [tab, inboxLoading, inboxHasMore, inboxLoadingMore, isSystemAdmin, inboxVideos.length, inboxLoadMoreError])
 
   useEffect(() => {
-    if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin) return
+    if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin || systemInboxLoadMoreError) return
 
     const root = mainScrollRef.current
     const target = inboxLoadMoreRef.current
@@ -8025,10 +8077,10 @@ function App({
 
     observer.observe(target)
     return () => observer.disconnect()
-  }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
+  }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length, systemInboxLoadMoreError])
 
   useEffect(() => {
-    if (tab !== 'inbox' || inboxLoading || inboxLoadingMore || !inboxHasMore || isSystemAdmin) return
+    if (tab !== 'inbox' || inboxLoading || inboxLoadingMore || !inboxHasMore || isSystemAdmin || inboxLoadMoreError) return
 
     const root = mainScrollRef.current
     if (!root) return
@@ -8038,10 +8090,10 @@ function App({
       void loadInboxSnapshot()
     }, 120)
     return () => window.clearTimeout(timer)
-  }, [tab, inboxLoading, inboxLoadingMore, inboxHasMore, isSystemAdmin, inboxVideos.length])
+  }, [tab, inboxLoading, inboxLoadingMore, inboxHasMore, isSystemAdmin, inboxVideos.length, inboxLoadMoreError])
 
   useEffect(() => {
-    if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin) return
+    if (tab !== 'inbox' || systemInboxLoading || !systemInboxHasMore || !isSystemAdmin || systemInboxLoadMoreError) return
 
     const root = mainScrollRef.current
     if (!root) return
@@ -8064,10 +8116,10 @@ function App({
       root.removeEventListener('scroll', maybeLoadMore)
       if (rafId) window.cancelAnimationFrame(rafId)
     }
-  }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length])
+  }, [tab, systemInboxLoading, systemInboxHasMore, systemInboxLoadingMore, isSystemAdmin, systemInboxVideos.length, systemInboxLoadMoreError])
 
   useEffect(() => {
-    if (tab !== 'inbox' || systemInboxLoading || systemInboxLoadingMore || !systemInboxHasMore || !isSystemAdmin) return
+    if (tab !== 'inbox' || systemInboxLoading || systemInboxLoadingMore || !systemInboxHasMore || !isSystemAdmin || systemInboxLoadMoreError) return
 
     const root = mainScrollRef.current
     if (!root) return
@@ -8077,7 +8129,7 @@ function App({
       void loadSystemInbox()
     }, 120)
     return () => window.clearTimeout(timer)
-  }, [tab, systemInboxLoading, systemInboxLoadingMore, systemInboxHasMore, isSystemAdmin, systemInboxVideos.length])
+  }, [tab, systemInboxLoading, systemInboxLoadingMore, systemInboxHasMore, isSystemAdmin, systemInboxVideos.length, systemInboxLoadMoreError])
 
   const openMainLiff = () => {
     if (typeof window === 'undefined') return
@@ -8414,6 +8466,9 @@ function App({
             systemInboxMissingLinkTotalCount={systemInboxMissingLinkTotalCount}
             systemInboxLoadingMore={systemInboxLoadingMore}
             systemInboxHasMore={systemInboxHasMore}
+            systemInboxLoadMoreError={systemInboxLoadMoreError}
+            inboxLoadMoreError={inboxLoadMoreError}
+            onRetryLoadMore={retryInboxLoadMore}
             inboxLoading={inboxLoading}
             inboxVideos={inboxVideos}
             inboxProcessedTotalCount={inboxProcessedTotalCount}

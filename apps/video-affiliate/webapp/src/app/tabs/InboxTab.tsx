@@ -12,6 +12,9 @@ export function InboxTab({
   systemInboxMissingLinkTotalCount,
   systemInboxLoadingMore,
   systemInboxHasMore,
+  systemInboxLoadMoreError,
+  inboxLoadMoreError,
+  onRetryLoadMore,
   inboxLoading,
   inboxVideos,
   inboxProcessedTotalCount,
@@ -39,6 +42,9 @@ export function InboxTab({
   systemInboxMissingLinkTotalCount: number
   systemInboxLoadingMore: boolean
   systemInboxHasMore: boolean
+  systemInboxLoadMoreError: boolean
+  inboxLoadMoreError: boolean
+  onRetryLoadMore: () => void
   inboxLoading: boolean
   inboxVideos: InboxVideo[]
   inboxProcessedTotalCount: number
@@ -142,12 +148,22 @@ export function InboxTab({
               ))}
             </div>
             {systemInboxHasMore && (
-              <div ref={loadMoreRef} className={systemInboxLoadingMore ? 'py-5' : 'h-1'}>
-                {systemInboxLoadingMore && (
+              <div ref={loadMoreRef} className={systemInboxLoadingMore || systemInboxLoadMoreError ? 'py-5' : 'h-1'}>
+                {systemInboxLoadingMore ? (
                   <div className="flex items-center justify-center">
                     <div className="w-8 h-8 border-[3px] border-blue-200 border-t-blue-500 rounded-full animate-spin" />
                   </div>
-                )}
+                ) : systemInboxLoadMoreError ? (
+                  <div className="flex flex-col items-center justify-center gap-2">
+                    <p className="text-xs font-medium text-gray-400">โหลดคลิปเพิ่มไม่สำเร็จ</p>
+                    <button
+                      onClick={onRetryLoadMore}
+                      className="rounded-full bg-gray-900 px-5 py-2 text-sm font-bold text-white active:scale-95 transition-transform"
+                    >
+                      ลองอีกครั้ง
+                    </button>
+                  </div>
+                ) : null}
               </div>
             )}
             {!systemInboxHasMore && currentTotal > visibleSystemInboxVideos.length && (
@@ -227,12 +243,22 @@ export function InboxTab({
             ))}
           </div>
           {inboxHasMore && (
-            <div ref={loadMoreRef} className={inboxLoadingMore ? 'py-5' : 'h-1'}>
-              {inboxLoadingMore && (
+            <div ref={loadMoreRef} className={inboxLoadingMore || inboxLoadMoreError ? 'py-5' : 'h-1'}>
+              {inboxLoadingMore ? (
                 <div className="flex items-center justify-center">
                   <div className="w-8 h-8 border-[3px] border-blue-200 border-t-blue-500 rounded-full animate-spin" />
                 </div>
-              )}
+              ) : inboxLoadMoreError ? (
+                <div className="flex flex-col items-center justify-center gap-2">
+                  <p className="text-xs font-medium text-gray-400">โหลดคลิปเพิ่มไม่สำเร็จ</p>
+                  <button
+                    onClick={onRetryLoadMore}
+                    className="rounded-full bg-gray-900 px-5 py-2 text-sm font-bold text-white active:scale-95 transition-transform"
+                  >
+                    ลองอีกครั้ง
+                  </button>
+                </div>
+              ) : null}
             </div>
           )}
           {!inboxHasMore && currentTotal > visibleInboxVideos.length && (
