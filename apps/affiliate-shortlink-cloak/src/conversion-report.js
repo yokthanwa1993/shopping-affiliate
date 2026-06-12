@@ -367,8 +367,32 @@ function pickRowSubId(row) {
   return '';
 }
 
+function pickMicroBahtCommission(row) {
+  if (!row || typeof row !== 'object') return null;
+  const candidates = [
+    row.affiliate_net_commission,
+    row.affiliateNetCommission,
+    row.estimated_total_commission_with_mcn,
+    row.estimatedTotalCommissionWithMcn,
+    row.estimated_total_commission,
+    row.estimatedTotalCommission,
+  ];
+  for (const candidate of candidates) {
+    if (candidate == null || candidate === '') continue;
+    const value = pickNumber(candidate);
+    // Live Shopee conversion_report returns these net/estimated commission fields
+    // in 1/100000 THB units. Older test fixtures sometimes used baht-scale
+    // estimated fields beside explicit actual_commission; keep those legacy rows
+    // on the baht fallback below instead of turning 5 THB into 0.00005 THB.
+    if (Math.abs(value) >= 1000) return value / 100000;
+  }
+  return null;
+}
+
 function pickRowCommission(row) {
   if (!row || typeof row !== 'object') return 0;
+  const microBahtCommission = pickMicroBahtCommission(row);
+  if (microBahtCommission != null) return microBahtCommission;
   const candidates = [
     row.actual_commission,
     row.actualCommission,
@@ -384,18 +408,8 @@ function pickRowCommission(row) {
 }
 
 function pickRowEstimatedCommissionBaht(row) {
-  if (!row || typeof row !== 'object') return 0;
-  const candidates = [
-    row.estimated_total_commission,
-    row.estimatedTotalCommission,
-    row.estimated_total_commission_with_mcn,
-    row.estimatedTotalCommissionWithMcn,
-    row.affiliate_net_commission,
-    row.affiliateNetCommission,
-  ];
-  for (const candidate of candidates) {
-    if (candidate != null && candidate !== '') return pickNumber(candidate) / 100000;
-  }
+  const microBahtCommission = pickMicroBahtCommission(row);
+  if (microBahtCommission != null) return microBahtCommission;
   return pickRowCommission(row);
 }
 

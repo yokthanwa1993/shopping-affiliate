@@ -833,6 +833,54 @@ test('handleConversionReport complete-mode groups by utm_content (live row shape
   assert.equal(result.sub_ids.some((e) => e.sub_id === ''), false);
 });
 
+test('handleConversionReport summary uses live Shopee affiliate_net_commission as net THB', async (t) => {
+  const liveRow = (idx, utmContent, affiliateNetCommission, grossCommission) => ({
+    purchase_time: 1781197000 + idx,
+    checkout_id: 'LIVE-' + idx,
+    conversion_status: 1,
+    affiliate_net_commission: String(affiliateNetCommission),
+    estimated_total_commission_with_mcn: affiliateNetCommission,
+    estimated_total_commission: affiliateNetCommission,
+    gross_commission: grossCommission,
+    total_brand_commission: affiliateNetCommission - grossCommission,
+    mcn_management_fee_commission: '0',
+    utm_content: utmContent,
+    orders: [],
+    click_time: 1781196000 + idx,
+    click_id: 'CID-LIVE-' + idx,
+  });
+  stubBrowserForConversionReport(t, {
+    currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+    evaluateResult: {
+      status: 200,
+      parsed: true,
+      body: {
+        code: 0,
+        data: {
+          affiliate_id: 15130770000,
+          total_count: 2,
+          list: [
+            liveRow(1, '1JUN26FBSPCAD-1266171535687542-1008898512617594--', 5001500, 5000000),
+            liveRow(2, '20APR26FBSPCAD----', 153000, 153000),
+          ],
+        },
+      },
+    },
+  });
+
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '11/06/2026' },
+    { now: FROZEN_NOW },
+  );
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.breakdown_mode, 'complete');
+  assert.equal(result.sample_totals.commission, 51.55);
+  const first = result.sub_ids.find((e) => e.sub_id === '1JUN26FBSPCAD-1266171535687542-1008898512617594--');
+  assert.ok(first, 'first live sub id must be present');
+  assert.equal(first.commission, 50.02);
+});
+
 test('handleConversionReport complete-mode keeps empty-sub_id bucket only when row utm_content/sub_id are all blank', async (t) => {
   // Mix of populated utm_content + blank/missing rows. Blank rows form one
   // empty-string bucket (only valid in complete mode — discovery skips empties).
