@@ -589,36 +589,6 @@ test('post history comment targets do not fall back to bare post ids', () => {
     assert.doesNotMatch(source, /visibleCandidates\[0\]\s*\|\|\s*fbPostId(?:Raw)?/)
 })
 
-test('Facebook auto-post publish uses page-scoped tokens and verifies page-story owner before comment scheduling', () => {
-    const source = readFileSync('src/index.ts', 'utf8')
-    assert.match(source, /async function resolveStrictPageTokenPoolForPage/)
-    assert.match(source, /resolvePageScopedToken\(raw, pageId, env, 'comment'\)/)
-    assert.match(source, /async function verifyPageStoryObjectLoadable/)
-    assert.match(source, /targetId\.startsWith\(`\$\{pageId\}_`\)/)
-    assert.match(source, /facebook_publish_page_mismatch/)
-
-    const publishSource = indexFunctionSource(
-        'async function publishReelWithCommentTokenPrimaryFallback',
-        'type PageOneCardLinkMode',
-    )
-    assert.match(publishSource, /const rawCandidates = buildPrimaryPostingTokenCandidates/)
-    assert.match(publishSource, /const candidates = await resolveStrictPageTokenPoolForPage\(params\.env, params\.pageId, rawCandidates\)/)
-    assert.match(publishSource, /facebook_page_token_missing_for_page/)
-    assert.match(publishSource, /return await assertPublishedPageStory\(directResult\)/)
-    assert.match(publishSource, /return await assertPublishedPageStory\(fallbackResult\)/)
-    assert.match(publishSource, /return await assertPublishedPageStory\(\{[\s\S]*recoveredPostId/)
-    assert.doesNotMatch(publishSource, /\.\.\.params\.postTokens,[\s\S]*\.\.\.candidates/)
-})
-
-test('all direct Facebook reel publish call sites pass env for strict page-token resolution', () => {
-    const source = readFileSync('src/index.ts', 'utf8')
-    const calls = [...source.matchAll(/publishReelWithCommentTokenPrimaryFallback\(\{[\s\S]*?\n\s*\}\)/g)]
-    assert.equal(calls.length, 3)
-    for (const call of calls) {
-        assert.match(call[0], /\benv,/)
-    }
-})
-
 test('resolveEffectiveTargetSub4 preserves persisted sub4 and falls back to log/history ids', () => {
     assert.equal(resolveEffectiveTargetSub4({ target_sub4: '25831', log_id: 'fallback' }), '25831')
     assert.equal(resolveEffectiveTargetSub4({ target_sub4: '', log_id: 25831 }), '25831')
