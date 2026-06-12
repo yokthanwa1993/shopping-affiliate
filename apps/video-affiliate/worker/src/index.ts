@@ -29195,6 +29195,59 @@ async function resolveCommentPageTokenPoolForPage(
     return normalizeCommentTokenPool(resolved)
 }
 
+async function resolveStrictPageTokenPoolForPage(
+    env: Env,
+    pageIdRaw: string,
+    rawTokens: string[],
+): Promise<string[]> {
+    const pageId = String(pageIdRaw || '').trim()
+    if (!pageId) return []
+    const resolved = await Promise.all((rawTokens || []).map(async (token) => {
+        const raw = String(token || '').trim()
+        if (!raw) return ''
+        try {
+            const result = await resolvePageScopedToken(raw, pageId, env, 'comment')
+            return String(result.token || '').trim()
+        } catch {
+            return ''
+        }
+    }))
+    return normalizeCommentTokenPool(resolved)
+}
+
+async function verifyPageStoryObjectLoadable(params: {
+    pageId: string
+    postId: string
+    accessToken: string
+    logPrefix: string
+}): Promise<{ ok: boolean; targetId?: string; error?: string }> {
+    const pageId = String(params.pageId || '').trim()
+    const postId = String(params.postId || '').trim()
+    const accessToken = String(params.accessToken || '').trim()
+    if (!pageId || !postId || !accessToken) return { ok: false, error: 'page_story_object_missing' }
+    const targetId = postId.includes('_') ? postId : `${pageId}_${postId}`
+    if (!targetId.startsWith(`${pageId}_`)) {
+        return { ok: false, targetId, error: 'facebook_publish_page_mismatch' }
+    }
+    try {
+        const detail = await facebookGraphRawGet<{ id?: string }>(
+            `${FB_GRAPH_V19}/${targetId}`,
+            { fields: 'id', access_token: accessToken },
+        )
+        const id = String(detail?.id || '').trim()
+        if (id === targetId || id.endsWith(`_${postId}`)) {
+            return { ok: true, targetId }
+        }
+        console.warn(`[${params.logPrefix}] page-story verify returned unexpected id target=${targetId} id=${id || 'empty'}`)
+        return { ok: false, targetId, error: 'page_story_object_not_loadable' }
+    } catch (e) {
+        const parsed = parseFacebookErrorLike(e)
+        const err = String(parsed?.message || (e instanceof Error ? e.message : String(e)) || 'page_story_object_not_loadable')
+        console.warn(`[${params.logPrefix}] page-story verify failed target=${targetId}: ${err}`)
+        return { ok: false, targetId, error: 'page_story_object_not_loadable' }
+    }
+}
+
 async function hasPagesCommentTokenColumn(_db: D1Database): Promise<boolean> {
     // comment_token column has been removed - always return false
     return false
@@ -31578,6 +31631,7 @@ async function publishReelDirectWithTokenFallback(params: {
 }
 
 async function publishReelWithCommentTokenPrimaryFallback(params: {
+    env: Env
     pageId: string
     commentTokens: string[]
     postTokens: string[]
@@ -31587,13 +31641,31 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     description: string
     logPrefix: string
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
-    const candidates = buildPrimaryPostingTokenCandidates({
+    const rawCandidates = buildPrimaryPostingTokenCandidates({
         postTokens: params.postTokens,
         commentTokens: params.commentTokens,
     })
 
-    if (candidates.length === 0) {
+    if (rawCandidates.length === 0) {
         throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
+    }
+
+    const candidates = await resolveStrictPageTokenPoolForPage(params.env, params.pageId, rawCandidates)
+    if (candidates.length === 0) {
+        throw new FacebookRequestFailedError('facebook_page_token_missing_for_page', 0, 0)
+    }
+
+    const assertPublishedPageStory = async (result: { id: string; postId: string; permalinkUrl: string; postingToken: string }) => {
+        const verify = await verifyPageStoryObjectLoadable({
+            pageId: params.pageId,
+            postId: result.postId,
+            accessToken: result.postingToken,
+            logPrefix: params.logPrefix,
+        })
+        if (!verify.ok) {
+            throw new Error(`${verify.error || 'page_story_object_not_loadable'}: ${verify.targetId || `${params.pageId}_${result.postId || ''}`}`)
+        }
+        return result
     }
 
     // Look back 30 minutes when checking FB feed for "did we already publish this?".
@@ -31607,7 +31679,7 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     const overallNotBeforeIso = new Date(Date.now() - 30 * 60 * 1000).toISOString()
 
     try {
-        return await publishReelViaVideosEndpointWithTokenFallback({
+        const directResult = await publishReelViaVideosEndpointWithTokenFallback({
             pageId: params.pageId,
             accessTokens: candidates,
             videoBuffer: params.videoBuffer,
@@ -31616,12 +31688,10 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
             description: params.description,
             logPrefix: params.logPrefix,
         })
+        return await assertPublishedPageStory(directResult)
     } catch (directErr) {
         const directMessage = parseFacebookErrorLike(directErr)?.message || (directErr instanceof Error ? directErr.message : String(directErr))
-        const resumableCandidates = normalizePostTokenPool([
-            ...params.postTokens,
-            ...candidates,
-        ])
+        const resumableCandidates = candidates
         if (resumableCandidates.length === 0) {
             throw directErr
         }
@@ -31644,12 +31714,12 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
                 if (recovery.published && recovery.post_id) {
                     const recoveredPostId = String(recovery.post_id || '').trim()
                     console.log(`[${params.logPrefix}] /videos attempts already published as ${recoveredPostId} — skipping /video_reels fallback to prevent duplicate (token_tail=${deriveCommentTokenHint(token) || token.slice(-8)})`)
-                    return {
+                    return await assertPublishedPageStory({
                         id: recoveredPostId,
                         postId: recoveredPostId,
                         permalinkUrl: String(recovery.permalink_url || '').trim(),
                         postingToken: token,
-                    }
+                    })
                 }
             } catch {
                 // best-effort guard — fall through to /video_reels if recovery fails
@@ -31659,7 +31729,7 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         console.warn(`[${params.logPrefix}] direct /videos publish failed, falling back to 3-step /video_reels (${directMessage})`)
 
         try {
-            return await publishReelDirectWithTokenFallback({
+            const fallbackResult = await publishReelDirectWithTokenFallback({
                 pageId: params.pageId,
                 postTokens: resumableCandidates,
                 videoBuffer: params.videoBuffer,
@@ -31668,6 +31738,7 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
                 description: params.description,
                 logPrefix: `${params.logPrefix} /video_reels`,
             })
+            return await assertPublishedPageStory(fallbackResult)
         } catch (resumableErr) {
             const resumableMessage = parseFacebookErrorLike(resumableErr)?.message || (resumableErr instanceof Error ? resumableErr.message : String(resumableErr))
             throw new Error(`facebook_publish_all_paths_failed: direct=${directMessage} | video_reels=${resumableMessage}`)
@@ -34081,6 +34152,7 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
 
         postingTokenUsed = String(primaryPostingTokenCandidates[0] || '').trim()
         const reelResult = await publishReelWithCommentTokenPrimaryFallback({
+            env,
             pageId,
             commentTokens: commentTokenCandidates,
             postTokens: fallbackPostTokenCandidates,
@@ -35354,6 +35426,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 logPrefix: 'FORCE-POST ONECARD',
             })
             : await publishReelWithCommentTokenPrimaryFallback({
+                env,
                 pageId: page.id,
                 commentTokens: commentTokenCandidates,
                 postTokens: fallbackPostTokenCandidates,
@@ -37346,6 +37419,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     logPrefix: `CRON ${page.name} ONECARD`,
                 })
                 : await publishReelWithCommentTokenPrimaryFallback({
+                    env,
                     pageId: String(page.id || ''),
                     commentTokens: commentTokenCandidates,
                     postTokens: fallbackPostTokenCandidates,
