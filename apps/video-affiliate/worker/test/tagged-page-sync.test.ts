@@ -46,6 +46,52 @@ function getPagePostingOrderSettingsRouteSource(): string {
     return source.slice(start, end)
 }
 
+function getEnsurePagesOneCardColumnsSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function ensurePagesOneCardColumns')
+    assert.notEqual(start, -1, 'ensurePagesOneCardColumns must exist')
+
+    const end = source.indexOf('\nasync function publishVideoViaOneCard', start)
+    assert.notEqual(end, -1, 'ensurePagesOneCardColumns end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getNormalizePagePostingTokenSourceSource(): string {
+    // The normalizer + routing decisions now live in the standalone, unit-tested
+    // posting-token-source module (imported by index.ts).
+    const source = readFileSync('src/posting-token-source.ts', 'utf8')
+    const start = source.indexOf('export function normalizePagePostingTokenSource')
+    assert.notEqual(start, -1, 'normalizePagePostingTokenSource must exist')
+
+    const end = source.indexOf('\nexport function resolvePostingRoute', start)
+    assert.notEqual(end, -1, 'normalizePagePostingTokenSource end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getPagePutRouteSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf("app.put('/api/pages/:id'")
+    assert.notEqual(start, -1, 'PUT /api/pages/:id route must exist')
+
+    const end = source.indexOf("\napp.delete('/api/pages/:id'", start)
+    assert.notEqual(end, -1, 'PUT /api/pages/:id route end marker must exist')
+
+    return source.slice(start, end)
+}
+
+function getDashboardCreateAdRouteSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf("app.post('/api/dashboard/create-ad'")
+    assert.notEqual(start, -1, 'POST /api/dashboard/create-ad route must exist')
+
+    const end = source.indexOf("\napp.get('/api/dashboard/ad-links'", start)
+    assert.notEqual(end, -1, 'create-ad route end marker must exist')
+
+    return source.slice(start, end)
+}
+
 function getForcePostRouteSource(): string {
     const source = readFileSync('src/index.ts', 'utf8')
     const start = source.indexOf("app.post('/api/pages/:id/force-post'")
@@ -124,14 +170,14 @@ function getShortenShopeeLinkForNamespaceSource(): string {
 }
 
 function getPostingCommentShortlinkSubIdsSource(): string {
-    const source = readFileSync('src/index.ts', 'utf8')
-    const start = source.indexOf('function buildPostingCommentShortlinkSubIds')
+    // The pure post-id/page-id Sub ID derivation lives in shortlink-template.ts so it can
+    // be unit-tested without the Cloudflare runtime (see shortlink-template.test.ts).
+    const source = readFileSync('src/shortlink-template.ts', 'utf8')
+    const start = source.indexOf('export function buildPostingCommentShortlinkSubIds')
     assert.notEqual(start, -1, 'buildPostingCommentShortlinkSubIds must exist')
 
-    const end = source.indexOf('\nfunction isManagedShortlinkTransientFailure', start)
-    assert.notEqual(end, -1, 'buildPostingCommentShortlinkSubIds end marker must exist')
-
-    return source.slice(start, end)
+    // It is the last export in shortlink-template.ts, so read through end of file.
+    return source.slice(start)
 }
 
 function getPostingShopeeLinkResolverSource(): string {
@@ -237,6 +283,7 @@ test('facebook-page-videos GET route is read-only and never persists sync state'
     // page_name response is still derived via the sync/query fallback.
     assert.match(routeSource, /page_name:\s*String\(sync\?\.page_name \|\| pageName \|\| ''\)\.trim\(\)/)
 })
+
 
 test('tagged page metadata sync never deletes pages rows when rebuilding', () => {
     const functionSource = getSyncTaggedPagesFromProfileMetadataSource()
@@ -721,6 +768,325 @@ test('page posting order settings route rejects invalid posting_order values', (
     assert.match(routeSource, /allowed:\s*POSTING_ORDER_VALUES/)
 })
 
+test('runtime ensure idempotently adds the posting_token_source column', () => {
+    const ensureSource = getEnsurePagesOneCardColumnsSource()
+
+    assert.match(
+        ensureSource,
+        /ALTER TABLE pages ADD COLUMN posting_token_source TEXT DEFAULT 'stored_token'/,
+        'ensurePagesOneCardColumns must add posting_token_source so old DBs gain the column at runtime',
+    )
+    // ALTERs stay best-effort (idempotent) so re-running never throws on existing columns.
+    assert.match(ensureSource, /\.run\(\)\.catch\(\(\) => undefined\)/)
+})
+
+test('posting token source normalizer collapses to two modes (stored_token | cloak_browser)', () => {
+    const fnSource = getNormalizePagePostingTokenSourceSource()
+
+    assert.match(fnSource, /PagePostingTokenSource/)
+    // Legacy/internal DB values both collapse to the single CloakBrowser source.
+    assert.match(fnSource, /value === 'post-reels-token-cloak'/)
+    assert.match(fnSource, /value === 'post-reels-token-ads'/)
+    assert.match(fnSource, /value === 'cloak_browser'/)
+    assert.match(fnSource, /return 'cloak_browser'/)
+    // Everything invalid/missing falls back to the legacy default.
+    assert.match(fnSource, /return 'stored_token'/)
+})
+
+test('PUT /api/pages/:id persists posting_token_source independent of manual token edits', () => {
+    const routeSource = getPagePutRouteSource()
+
+    // The value is read from the request body and normalized before persistence.
+    assert.match(routeSource, /posting_token_source,/)
+    assert.match(routeSource, /normalizePagePostingTokenSource\(posting_token_source\)/)
+    // Persisted via its own UPDATE, gated only by `posting_token_source !== undefined`
+    // (NOT by token validation) so saving CloakBrowser never requires editing access_token.
+    assert.match(routeSource, /if \(posting_token_source !== undefined\) \{/)
+    assert.match(
+        routeSource,
+        /UPDATE pages SET posting_token_source = \?, updated_at = datetime\("now"\) WHERE id = \? AND bot_id = \?/,
+    )
+    // Selecting CloakBrowser is NOT admin-restricted (organic posting). The OneCard/create-ad
+    // route keeps its own admin guard (ads_publish_enabled + the create-ad runtime check), so
+    // the source-selection UPDATE must NOT carry an ads_publish_admin_only gate.
+    assert.ok(
+        !/normalizedPostingTokenSource ===[\s\S]*ads_publish_admin_only/.test(routeSource),
+        'selecting a posting source must not be admin-gated',
+    )
+    // The updated page is read back WITH posting_token_source so the UI restores the saved value.
+    assert.match(routeSource, /SELECT[\s\S]*posting_token_source[\s\S]*FROM pages WHERE id = \? AND bot_id = \?/)
+})
+
+test('runtime ensure idempotently adds the comment_token_source column (NULL default = follow posting source)', () => {
+    const ensureSource = getEnsurePagesOneCardColumnsSource()
+    // No DEFAULT — a NULL value is normalized at runtime to the page's effective posting
+    // source so existing pages keep their current comment behavior.
+    assert.match(
+        ensureSource,
+        /ALTER TABLE pages ADD COLUMN comment_token_source TEXT/,
+        'ensurePagesOneCardColumns must add comment_token_source so old DBs gain the column at runtime',
+    )
+})
+
+test('PUT /api/pages/:id persists comment_token_source independently of posting source and token edits', () => {
+    const routeSource = getPagePutRouteSource()
+
+    // Read from the body and normalized before persistence, independent of posting_token_source.
+    assert.match(routeSource, /comment_token_source,/)
+    assert.match(routeSource, /normalizePageCommentTokenSource\(comment_token_source\)/)
+    // Persisted via its own UPDATE, gated only by `comment_token_source !== undefined` (no
+    // token validation, no admin gate) so selecting a comment source never requires a token edit.
+    assert.match(routeSource, /if \(comment_token_source !== undefined\) \{/)
+    assert.match(
+        routeSource,
+        /UPDATE pages SET comment_token_source = \?, updated_at = datetime\("now"\) WHERE id = \? AND bot_id = \?/,
+    )
+    // Read back WITH comment_token_source so the UI restores the saved value.
+    assert.match(routeSource, /SELECT[\s\S]*comment_token_source[\s\S]*FROM pages WHERE id = \? AND bot_id = \?/)
+})
+
+test('sendPageCommentViaCloakBridge comments as the Page and fails closed (no stored-token fallback)', () => {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function sendPageCommentViaCloakBridge')
+    assert.notEqual(start, -1, 'sendPageCommentViaCloakBridge must exist')
+    const end = source.indexOf('\nasync function loadPostingThumbnailAsset', start)
+    const fn = source.slice(start, end > -1 ? end : start + 4000)
+
+    // Base URL from the Cloak FB bridge resolver, fails closed when unconfigured.
+    assert.match(fn, /resolveCloakFbBridgeBaseUrl\(params\.env\)/)
+    assert.match(fn, /throw new Error\('bridge_not_configured'\)/)
+    // Posts page_id/story_id/message to /page-comment — never a token.
+    assert.match(fn, /\$\{baseUrl\}\/page-comment`/)
+    assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message \}\)/)
+    // Nothing to comment → not_configured; any failure → 'failed' (never silent success).
+    assert.match(fn, /return \{ status: 'not_configured'/)
+    assert.match(fn, /status: 'failed'/)
+    // No stored/manual token anywhere in the bridge comment path.
+    assert.ok(!fn.includes('commentToken'), 'bridge comment must not use a stored comment token')
+})
+
+test('force-post routes CloakBrowser OneCard vs organic Reel without stored-token fallback', () => {
+    const routeSource = getForcePostRouteSource()
+
+    // SELECT reads the saved source back (posting + comment token sources).
+    assert.match(routeSource, /SELECT[\s\S]*posting_token_source, comment_token_source FROM pages WHERE id = \? AND bot_id = \?/)
+    // Effective decision is centralized in the tested resolvePostingRoute helper.
+    assert.match(routeSource, /normalizePagePostingTokenSource\(\(page as Record<string, unknown>\)\.posting_token_source\)/)
+    // The Video One Card flag selects OneCard/create-ad vs organic Reel for a CloakBrowser page.
+    assert.match(routeSource, /resolvePostingRoute\(\{ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag \}\)/)
+    assert.match(routeSource, /const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'/)
+    // Cloak organic branch routes to the session-cookie bridge, never the stored token.
+    assert.match(routeSource, /const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'/)
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*publishReelViaSessionBridge/)
+    // Cloak post hint/profile must NOT derive from a stored/manual token candidate.
+    assert.match(routeSource, /const initialPostTokenHint = pageCloakPostSelected \? 'cloak_session_bridge' : deriveCommentTokenHint/)
+    assert.match(routeSource, /resolvePostHistoryProfileByToken\(env, pageCloakPostSelected \? null :/)
+    // History post_token_hint stays the LEGACY persisted label ('cloak_session_bridge') on
+    // purpose — only the UI/source modes collapse to two (stored_token | cloak_browser).
+    // Renaming the stored hint would force a post_history data migration, so it is left as-is.
+    assert.match(routeSource, /post_token_hint='cloak_session_bridge'/)
+    // Cloak branch builds an affiliate comment and records its real status (no fake success).
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*buildAffiliateCommentMessage\(env\.DB, botId, cloakCommentShopeeLink\)/)
+    // Comment SOURCE is decoupled from posting route: the bridge only posts the comment when
+    // comment_token_source='cloak_browser'; otherwise the stored-token backlog handles it.
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*commentText: commentViaCloakBridge \? cloakCommentText : ''/)
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*if \(commentViaCloakBridge\) \{[\s\S]*cloakCommentStatus = !cloakCommentText[\s\S]*cloakResult\.commentId \? 'success' : 'failed'/)
+    // The stored-token override defers via comment_due_at (pending backlog).
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*cloakCommentStatus = 'pending'/)
+    // No facebook-token-cloak provider endpoints / env / port anywhere in the branch.
+    assert.ok(!routeSource.includes('/provider/post'), 'must not call the old /provider/post')
+    assert.ok(!routeSource.includes('FACEBOOK_TOKEN_CLOAK'), 'must not read FACEBOOK_TOKEN_CLOAK env')
+    assert.ok(!routeSource.includes('127.0.0.1:8820'), 'must not target port 8820')
+    // Admin-only guard still enforced on the ads branch.
+    assert.match(routeSource, /if \(pageAdsPublishEnabled\) \{[\s\S]*isNamespaceShortlinkAdminManaged/)
+    // OneCard/Ads must comment as the PAGE too (parity with organic Reels). create-ad runs
+    // with skip_comment so it never comments; this branch posts the single comment via the
+    // bridge /page-comment route (page token internal, never the user token).
+    assert.match(routeSource, /skip_comment: true/)
+    // ADS comment honors comment_token_source: bridge (cloak) vs deferred stored backlog.
+    assert.match(routeSource, /if \(!adsData\.commentPosted && adsCommentShopeeLink && !skipComment && storyId && commentViaCloakBridge\) \{/)
+    assert.match(routeSource, /if \(pageAdsPublishEnabled\) \{[\s\S]*sendPageCommentViaCloakBridge\(\{[\s\S]*pageId: String\(page\.id \|\| ''\),[\s\S]*storyId,[\s\S]*message: adsCommentText/)
+    // Stored-token override sets the deferred pending state instead of calling the bridge.
+    assert.match(routeSource, /if \(pageAdsPublishEnabled\) \{[\s\S]*adsCommentStatus = 'pending'/)
+    // After story_id exists the comment link is re-minted with sub2=post id / sub3=page id.
+    assert.match(routeSource, /adsCommentRemint = await remintOneCardCommentShortlink\(\{[\s\S]*storyId,[\s\S]*managedShopeeLink: normalizedShopeeLink,/)
+    assert.match(routeSource, /adsCommentShopeeLink = adsCommentRemint\.commentShopeeLink/)
+    // The post_history UPDATE binds the final comment status/id/error, token-free hint,
+    // deferred schedule, AND the re-minted link.
+    assert.match(routeSource, /comment_status=\?, comment_fb_id=\?, comment_error=\?, comment_token_hint=\?, comment_delay_seconds=\?, comment_due_at=\?, shopee_link=\?, error_message=NULL[\s\S]*\.bind\([\s\S]*adsCommentStatus,[\s\S]*adsCommentId,[\s\S]*adsCommentError,[\s\S]*adsCommentShopeeLink/)
+    // A failed comment must NOT fail the post.
+    assert.match(routeSource, /adsCommentStatus = 'failed'/)
+    // Response exposes comment_posted=true only when the (fallback) comment succeeded.
+    assert.match(routeSource, /comment_posted: adsCommentStatus === 'success'/)
+    // Source-aware log carries a token-free source hint.
+    assert.match(routeSource, /\[FORCE-POST\][\s\S]*posting_token_source=\$\{pagePostingTokenSource\}[\s\S]*source_hint=\$\{postingSourceHint\(pagePostingRoute\)\}/)
+})
+
+test('cron routes CloakBrowser OneCard vs organic Reel without stored-token fallback', () => {
+    const cronSource = getHandleScheduledSource()
+
+    // SELECT reads the saved source back for every candidate page (posting + comment).
+    assert.match(cronSource, /SELECT[\s\S]*ads_publish_enabled, posting_token_source, comment_token_source\s*\n\s*FROM pages/)
+    // Same centralized decision as force-post; never silently falls back to the stored token.
+    assert.match(cronSource, /normalizePagePostingTokenSource\(page\.posting_token_source\)/)
+    assert.match(cronSource, /resolvePostingRoute\(\{ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag \}\)/)
+    assert.match(cronSource, /const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'/)
+    assert.match(cronSource, /const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'/)
+    // Cloak organic branch uses the session-cookie bridge and fails closed.
+    assert.match(cronSource, /if \(pageCloakPostSelected\) \{[\s\S]*publishReelViaSessionBridge[\s\S]*cloak_post_failed/)
+    // Cloak post hint must NOT derive from a stored/manual token candidate.
+    assert.match(cronSource, /const initialPostTokenHint = pageCloakPostSelected \? 'cloak_session_bridge' : deriveCommentTokenHint/)
+    // Cloak branch builds an affiliate comment and records its real status.
+    assert.match(cronSource, /if \(pageCloakPostSelected\) \{[\s\S]*buildAffiliateCommentMessage\(env\.DB, botId, cloakCommentShopeeLink\)[\s\S]*cloakResult\.commentId \? 'success' : 'failed'/)
+    assert.ok(!cronSource.includes('/provider/post'), 'must not call the old /provider/post')
+    assert.ok(!cronSource.includes('FACEBOOK_TOKEN_CLOAK'), 'must not read FACEBOOK_TOKEN_CLOAK env')
+    // Admin-only runtime re-check preserved on the cron ads branch.
+    assert.match(cronSource, /if \(pageAdsPublishEnabled\) \{[\s\S]*isNamespaceShortlinkAdminManaged/)
+    // create-ad runs with skip_comment; cron posts the single re-minted comment itself.
+    assert.match(cronSource, /if \(pageAdsPublishEnabled\) \{[\s\S]*skip_comment: true/)
+    assert.match(cronSource, /cronAdsCommentRemint = await remintOneCardCommentShortlink\(\{[\s\S]*storyId,[\s\S]*managedShopeeLink: normalizedShopeeLink,/)
+    // ADS comment honors comment_token_source: cloak bridge vs deferred stored backlog.
+    assert.match(cronSource, /if \(commentViaCloakBridge\) \{[\s\S]*sendPageCommentViaCloakBridge\(\{[\s\S]*pageId: String\(page\.id \|\| ''\),[\s\S]*storyId,[\s\S]*message: cronAdsCommentText/)
+    assert.match(cronSource, /cronAdsCommentStatus = 'pending'/)
+    // post_history records the real comment status/id, token-free hint, schedule, and link.
+    assert.match(cronSource, /comment_status=\?, comment_fb_id=\?, comment_error=\?, comment_token_hint=\?, comment_delay_seconds=\?, comment_due_at=\?, shopee_link=\?, posted_at=\?, error_message=NULL[\s\S]*\.bind\([\s\S]*cronAdsCommentStatus,[\s\S]*cronAdsCommentId,[\s\S]*cronAdsCommentError,[\s\S]*cronAdsCommentShopeeLink/)
+})
+
+test('publishReelViaSessionBridge validates /token + /pages then posts /post via the Cloak FB bridge (no token leak, no 8820, fail-closed)', () => {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function publishReelViaSessionBridge')
+    assert.notEqual(start, -1, 'publishReelViaSessionBridge must exist')
+    const end = source.indexOf('\nasync function loadPostingThumbnailAsset', start)
+    const fn = source.slice(start, end > -1 ? end : start + 5000)
+
+    // Base URL comes from the Cloak FB bridge resolver (CLOAK_FB_BRIDGE_URL), with NO
+    // hardcoded default, and fails closed when unconfigured rather than hitting a dead tunnel.
+    assert.match(fn, /resolveCloakFbBridgeBaseUrl\(params\.env\)/)
+    assert.match(fn, /if \(!baseUrl\) throw new Error\('bridge_not_configured'\)/)
+    assert.ok(!fn.includes('video-onecard.wwoom.com'), 'must not target the retired video-onecard tunnel')
+    assert.ok(!fn.includes(':3847'), 'must not target the retired Electron port 3847')
+    assert.ok(!fn.includes('127.0.0.1:8820'), 'must not target port 8820')
+    assert.ok(!fn.includes('FACEBOOK_TOKEN_CLOAK'), 'must not read FACEBOOK_TOKEN_CLOAK env')
+    assert.ok(!fn.includes('/provider/'), 'must not call any /provider/* endpoint')
+    // Fail-closed validation: /token (boolean session check) then /pages authorization.
+    assert.match(fn, /\/token`[\s\S]*tokenData\.accessToken !== true[\s\S]*session_bridge_token_unavailable/)
+    assert.match(fn, /\/pages`[\s\S]*session_bridge_page_not_authorized/)
+    // Posts the organic Reel via the bridge /post route.
+    assert.match(fn, /\$\{baseUrl\}\/post`/)
+    // Comment is posted AS THE PAGE via the bridge /page-comment route (resolves the page
+    // token internally, fails closed, no session-user fallback). Worker sends only
+    // page_id/story_id/message — never a token.
+    assert.match(fn, /\$\{baseUrl\}\/page-comment`/)
+    assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message: commentText \}\)/)
+    // Must NOT comment via the /graph proxy (that path authors the comment as the
+    // logged-in user, not the Page — the bug this fix removes).
+    assert.ok(!/\/graph\?path=[^]*\/comments/.test(fn), 'organic Cloak comment must NOT use /graph?path=.../comments')
+    // Missing page-comment id → failed (never silently success), no user-token fallback.
+    assert.match(fn, /Missing page-comment id[\s\S]*commentStatus = 'failed'/)
+    // Returns the bridge source hint, not a stored token nor facebook-token-cloak.
+    assert.match(fn, /postingToken: 'cloak_session_bridge'/)
+})
+
+test('create-ad accepts an explicit pre-shortened comment link and skips its own shortener', () => {
+    const routeSource = getDashboardCreateAdRouteSource()
+
+    // Explicit field is read from the body and validated as http(s).
+    assert.match(routeSource, /comment_shortlink\?: string/)
+    assert.match(routeSource, /const explicitCommentShortlink = String\(body\.comment_shortlink \|\| ''\)\.trim\(\)/)
+    assert.match(routeSource, /const hasExplicitCommentShortlink = \/\^https\?:\\\/\\\/\/i\.test\(explicitCommentShortlink\)/)
+
+    // When present, shortLink is the explicit link and the legacy short.wwoom fetch
+    // is gated behind the else-if so it never double-shortens an already-short link.
+    assert.match(
+        routeSource,
+        /if \(hasExplicitCommentShortlink\) \{[\s\S]*shortLink = explicitCommentShortlink[\s\S]*\} else if \(shopeeLink\) \{/,
+    )
+    // The short.wwoom GET only lives inside the else-if (template) branch.
+    const explicitBranchIdx = routeSource.indexOf('shortLink = explicitCommentShortlink')
+    const fetchIdx = routeSource.indexOf('await fetch(shortlinkUrl,')
+    assert.ok(explicitBranchIdx > -1 && fetchIdx > -1, 'both branches must exist')
+    assert.ok(explicitBranchIdx < fetchIdx, 'explicit branch must precede (and short-circuit) the template fetch')
+
+    // A Shopee/product URL is still required for the CTA (shopee_link_not_found guard).
+    assert.match(routeSource, /if \(!shopeeLink\) \{[\s\S]*shopee_link_not_found/)
+
+    // skip_comment lets the OneCard auto route defer the comment so it can re-mint the
+    // link with sub2=post id / sub3=page id after story_id exists. The comment block is
+    // gated on !skipComment and the response advertises commentSkipped.
+    assert.match(routeSource, /skip_comment\?: boolean/)
+    assert.match(routeSource, /const skipComment = body\.skip_comment === true/)
+    assert.match(routeSource, /if \(cleanShortLink && placementTemplate !== 'instagram' && !skipComment\) \{/)
+    assert.match(routeSource, /commentSkipped: skipComment/)
+})
+
+test('create-ad uses the SAME Cloak FB bridge for every source — no provider branch, fail-closed when unconfigured', () => {
+    const routeSource = getDashboardCreateAdRouteSource()
+
+    // create-ad always targets the non-Electron Cloak FB bridge via baseUrl, resolved with
+    // no hardcoded default and failing closed (bridge_not_configured) when unset.
+    assert.match(routeSource, /const baseUrl = resolveCloakFbBridgeBaseUrl\(c\.env\)/)
+    assert.match(routeSource, /if \(!baseUrl\) return c\.json\(\{ ok: false, error: 'bridge_not_configured'/)
+    assert.match(routeSource, /callVideoOnecardCreateAd\(templateAdsetFromSettings\)/)
+    assert.match(routeSource, /await fetch\(`\$\{baseUrl\}\/create-ad`/)
+    // The old facebook-token-cloak provider dispatch is fully removed.
+    assert.ok(!routeSource.includes('/provider/create-ad'), 'must not call /provider/create-ad')
+    assert.ok(!routeSource.includes("=== 'cloak_provider'"), 'old cloak_provider create-ad branch must be gone')
+    assert.ok(!routeSource.includes('FACEBOOK_TOKEN_CLOAK'), 'must not read FACEBOOK_TOKEN_CLOAK env')
+    assert.ok(!routeSource.includes('127.0.0.1:8820'), 'must not target port 8820')
+    assert.ok(!routeSource.includes('video-onecard.wwoom.com'), 'must not target the retired video-onecard tunnel')
+    assert.ok(!routeSource.includes('cloak_create_ad_pending_browser_publish'), 'no stale pending stub state')
+})
+
+test('worker config/env never references the legacy facebook-token-cloak provider', () => {
+    const indexSrc = readFileSync('src/index.ts', 'utf8')
+    const pipelineSrc = readFileSync('src/pipeline.ts', 'utf8')
+    const wrangler = readFileSync('wrangler.jsonc', 'utf8')
+    for (const [name, src] of [['index.ts', indexSrc], ['pipeline.ts', pipelineSrc], ['wrangler.jsonc', wrangler]] as const) {
+        assert.ok(!/FACEBOOK_TOKEN_CLOAK_URL|FACEBOOK_TOKEN_CLOAK_ACCOUNT/.test(src), `${name} must not reference FACEBOOK_TOKEN_CLOAK_* env`)
+        assert.ok(!/['"`]https?:\/\/127\.0\.0\.1:8820/.test(src), `${name} must not point at the 8820 provider URL`)
+        assert.ok(!src.includes('/provider/post') && !src.includes('/provider/create-ad'), `${name} must not call /provider/* endpoints`)
+    }
+    // The active Env binding for the bridge is now CLOAK_FB_BRIDGE_URL (the non-Electron
+    // Cloak FB posting bridge). VIDEO_ONECARD_WORKER_URL remains only as a deprecated
+    // migration fallback and must NEVER default to the retired video-onecard tunnel.
+    assert.match(pipelineSrc, /CLOAK_FB_BRIDGE_URL\?: string/)
+    assert.match(wrangler, /"CLOAK_FB_BRIDGE_URL":\s*"[^"]*"/)
+    assert.ok(!/"VIDEO_ONECARD_WORKER_URL":\s*"https:\/\/video-onecard\.wwoom\.com"/.test(wrangler), 'wrangler must not point VIDEO_ONECARD_WORKER_URL at the retired tunnel')
+    assert.ok(!/"CLOAK_FB_BRIDGE_URL":\s*"[^"]*video-onecard\.wwoom\.com/.test(wrangler), 'CLOAK_FB_BRIDGE_URL must not point at the retired tunnel')
+})
+
+test('force-post ads branch passes the pre-shortened managed link as comment_shortlink', () => {
+    const routeSource = getForcePostRouteSource()
+
+    const callIdx = routeSource.indexOf("'force_ads_publish'")
+    assert.ok(callIdx > -1, 'force-post must call create-ad with force_ads_publish tag')
+    const callBlock = routeSource.slice(routeSource.lastIndexOf('/api/dashboard/create-ad', callIdx), callIdx)
+
+    // CTA uses the original Shopee URL (raw) with a managed-link fallback.
+    assert.match(callBlock, /shopee_url:\s*rawShopeeLink \|\| normalizedShopeeLink/)
+    // Comment shortlink is the already managed/shortened link so create-ad won't re-shorten.
+    assert.match(callBlock, /comment_shortlink:\s*normalizedShopeeLink/)
+    // Internal gallery id is uploaded by URL, NOT sent as a Facebook video id.
+    assert.match(callBlock, /video_url:\s*realVideoUrl/)
+    assert.match(callBlock, /source_video_id:\s*unpostedId/)
+    assert.doesNotMatch(callBlock, /\bvideo_id:\s*unpostedId/)
+})
+
+test('cron ads branch passes the pre-shortened managed link as comment_shortlink', () => {
+    const cronSource = getHandleScheduledSource()
+
+    const callIdx = cronSource.indexOf("'cron_ads_publish'")
+    assert.ok(callIdx > -1, 'cron must call create-ad with cron_ads_publish tag')
+    const callBlock = cronSource.slice(cronSource.lastIndexOf('/api/dashboard/create-ad', callIdx), callIdx)
+
+    assert.match(callBlock, /shopee_url:\s*rawShopeeLink \|\| normalizedShopeeLink/)
+    assert.match(callBlock, /comment_shortlink:\s*normalizedShopeeLink/)
+    // Internal gallery id is uploaded by URL, NOT sent as a Facebook video id.
+    assert.match(callBlock, /video_url:\s*realVideoUrl/)
+    assert.match(callBlock, /source_video_id:\s*unpostedId/)
+    assert.doesNotMatch(callBlock, /\bvideo_id:\s*unpostedId/)
+})
+
 test('force-post and cron use effective page posting order with source-aware logs', () => {
     const forceSource = getForcePostRouteSource()
     const cronSource = getHandleScheduledSource()
@@ -732,4 +1098,123 @@ test('force-post and cron use effective page posting order with source-aware log
     assert.match(cronSource, /resolveEffectivePagePostingOrder\(env\.DB,\s*botId,\s*String\(page\.id \|\| ''\)\)/)
     assert.match(cronSource, /posting_order=\$\{postingOrder\} source=\$\{postingOrderSource\}/)
     assert.doesNotMatch(cronSource, /getNamespacePostingOrderEntry\(env\.DB,\s*botId\)\)\.postingOrder/)
+})
+
+// Reads the runOneCardPostFirstAds helper source (module-level function in index.ts).
+function getPostFirstHelperSource(): string {
+    const source = readFileSync('src/index.ts', 'utf8')
+    const start = source.indexOf('async function runOneCardPostFirstAds(')
+    assert.notEqual(start, -1, 'runOneCardPostFirstAds must exist')
+    const end = source.indexOf('\nasync function isNamespaceAffiliateVerificationEnforced', start)
+    assert.notEqual(end, -1, 'runOneCardPostFirstAds end marker must exist')
+    return source.slice(start, end)
+}
+
+test('post-first ADS honors comment_token_source (bridge vs deferred stored), Page story target', () => {
+    const helper = getPostFirstHelperSource()
+
+    // Comment delivery is parameterized, decoupled from the ADS posting route.
+    assert.match(helper, /commentSource: PageCommentTokenSource/)
+    assert.match(helper, /hasCommentToken: boolean/)
+    // 'cloak_browser' → bridge /page-comment via the shared fail-closed helper, Page story id.
+    assert.match(helper, /params\.commentSource === 'cloak_browser'[\s\S]*sendPageCommentViaCloakBridge\(\{[\s\S]*storyId,[\s\S]*message: commentText/)
+    // 'stored_token' → deferred to the pending backlog (never silently uses the bridge).
+    assert.match(helper, /else if \(params\.hasCommentToken\) \{[\s\S]*commentStatus = 'pending'[\s\S]*commentDueAt = new Date\(/)
+    // Missing stored comment token fails per existing stored semantics.
+    assert.match(helper, /commentError = 'access_token_missing'/)
+    // The comment target is the Page story id — never the ad id or video id.
+    assert.ok(!/story_id: adId/.test(helper), 'comment must not target the ad id')
+    assert.ok(!/story_id: videoId/.test(helper), 'comment must not target the video id')
+})
+
+test('create-ad route forwards skip_ad to the bridge (post-first Phase A: publish post, no ad)', () => {
+    const routeSource = getDashboardCreateAdRouteSource()
+    assert.match(routeSource, /skip_ad\?: boolean/)
+    assert.match(routeSource, /const skipAd = body\.skip_ad === true/)
+    // Phase A bridge call includes skip_ad so the bridge stops after publishing the post.
+    assert.match(routeSource, /\.\.\.\(skipAd \? \{ skip_ad: true \} : \{\}\)/)
+    // Phase A must not forward any Worker redirect or pre-final visible CTA payload.
+    assert.doesNotMatch(routeSource, /cta_redirect_url/)
+    assert.doesNotMatch(routeSource, /onecard-cta/)
+})
+
+test('post-first OneCard is opt-in via ADS_POST_FIRST_ENABLED and runs A→mint→B(promote)→comment', () => {
+    const source = readFileSync('src/index.ts', 'utf8')
+    // Env gate, default off.
+    assert.match(source, /function oneCardPostFirstEnabled\(env: Env\): boolean \{[\s\S]*ADS_POST_FIRST_ENABLED/)
+
+    const helper = getPostFirstHelperSource()
+    // Phase A: create-ad with skip_ad + skip_comment (publish post only), with no visible CTA URL.
+    assert.match(helper, /\/api\/dashboard\/create-ad`[\s\S]*skip_ad: true,[\s\S]*skip_comment: true/)
+    assert.doesNotMatch(helper, /cta_redirect_url/)
+    assert.doesNotMatch(helper, /onecard-cta/)
+    assert.doesNotMatch(helper, /api\.pubilo\.com\/onecard-cta/)
+    // Mint the final link (sub2=post id, sub3=page id) AFTER the post id exists.
+    assert.match(helper, /remintOneCardCommentShortlink\(\{[\s\S]*storyId,[\s\S]*managedShopeeLink: params\.managedShopeeLink/)
+    // Fail closed before Phase B unless re-mint produced the direct final Shopee shortlink.
+    // The step name must not imply an organic page CTA change.
+    assert.match(helper, /if \(!remint\.reminted \|\| !isDirectShopeeShortlink\(finalLink\)\) \{[\s\S]*final_shortlink_mint/)
+    // Phase B: promote the ad with the FINAL link in the CTA, reusing the Phase A video.
+    assert.match(helper, /\$\{baseUrl\}\/promote`[\s\S]*video_id: videoId[\s\S]*final_cta_link: finalLink/)
+    // The visible-page CTA report is taken strictly from the bridge value (organic post
+    // unchanged → false), never inferred from the promoted-ad link.
+    assert.match(helper, /visiblePageCtaLink = String\(dataB\.visible_page_cta_link \|\| ''\)\.trim\(\)/)
+    assert.match(helper, /visiblePageCtaFinal = dataB\.visible_page_cta_final === true/)
+    assert.doesNotMatch(helper, /visible_page_cta_link \|\| dataB\.promoted_ad_cta_link/)
+    // Comment the SAME final link on the visible post, as the Page.
+    assert.match(helper, /\$\{baseUrl\}\/page-comment`[\s\S]*story_id: storyId, message: commentText/)
+    // CTA/comment parity flag is only true when the final link was actually re-minted.
+    assert.match(helper, /ctaParity: !!finalLink && remint\.reminted/)
+    // Never publishes a second page post — that is the bridge /promote contract; helper must
+    // not call /post or re-publish.
+    assert.doesNotMatch(helper, /\/post`/)
+})
+
+test('post-first Phase B success is gated on the promoted-ad CTA only, never the organic page CTA', () => {
+    const helper = getPostFirstHelperSource()
+    // Phase B success is proven by the PROMOTED AD creative CTA: final + direct Shopee shortlink.
+    assert.match(helper, /promotedAdCtaFinal: !!adId && !!finalLink && remint\.reminted/)
+    assert.match(helper, /!dataB\.promoted_ad_cta_final/)
+    assert.match(helper, /promotedCtaLink !== finalLink/)
+    assert.match(helper, /!isDirectShopeeShortlink\(promotedCtaLink\)/)
+    // It must NOT require any organic/visible page CTA change (the old wrong assumption).
+    assert.doesNotMatch(helper, /visibleCtaLink !== finalLink/)
+    assert.doesNotMatch(helper, /!isDirectShopeeShortlink\(visibleCtaLink\)/)
+    assert.doesNotMatch(helper, /!dataB\.visible_page_cta_final \|\|/)
+    // The visible-page report mirrors the bridge value (false) and only claims parity when the
+    // bridge itself confirmed a final visible CTA — which it does not for the promoted-ad flow.
+    assert.match(helper, /visiblePageCtaFinal,/)
+    assert.match(helper, /visiblePageCtaCommentParity: visiblePageCtaFinal && visiblePageCtaLink === finalLink/)
+
+    // The FORCE-POST response must report parity PER OBJECT and must not claim the visible page
+    // CTA equals the comment unless Phase B confirmed the final link. cta_comment_parity is back-compat ==
+    // the promoted ad only.
+    const forceSource = getForcePostRouteSource()
+    assert.match(forceSource, /cta_comment_parity: pf\.promotedAdCtaFinal/)
+    assert.match(forceSource, /promoted_ad_cta_comment_parity: pf\.promotedAdCtaFinal/)
+    assert.match(forceSource, /visible_page_cta_comment_parity: pf\.visiblePageCtaCommentParity/)
+    assert.match(forceSource, /visible_page_cta_final: pf\.visiblePageCtaFinal/)
+    assert.match(forceSource, /visible_page_cta_link: pf\.visiblePageCtaFinal \? \(pf\.visiblePageCtaLink \|\| pf\.ctaShortlink \|\| null\) : null/)
+    assert.doesNotMatch(forceSource, /visible_page_cta_redirect_url/)
+    assert.doesNotMatch(forceSource, /onecard-cta/)
+    // The visible page CTA parity must NEVER be wired to the promoted-ad flag (no overclaim).
+    assert.doesNotMatch(forceSource, /visible_page_cta_comment_parity: pf\.(ctaParity|promotedAdCtaFinal)/)
+})
+
+test('public onecard CTA redirect route is removed from production path', () => {
+    const source = readFileSync('src/index.ts', 'utf8')
+    assert.doesNotMatch(source, /app\.get\('\/onecard-cta\/:key'/)
+    assert.doesNotMatch(source, /onecard-cta/)
+    assert.doesNotMatch(source, /cta_redirect_url/)
+    assert.doesNotMatch(source, /onecard-cta-redirect/)
+})
+
+test('both ads branches gate post-first behind the env flag (default off keeps create-ad path)', () => {
+    const forceSource = getForcePostRouteSource()
+    const cronSource = getHandleScheduledSource()
+    for (const [label, src] of [['force-post', forceSource], ['cron', cronSource]] as const) {
+        assert.match(src, /if \(oneCardPostFirstEnabled\(env\)\) \{[\s\S]*runOneCardPostFirstAds\(\{/, `${label} must gate post-first behind the flag`)
+        // The single-shot create-ad path is still present (flag-off fallback).
+        assert.match(src, /cleanShortLink|comment_shortlink: normalizedShopeeLink/, `${label} keeps the create-ad fallback`)
+    }
 })

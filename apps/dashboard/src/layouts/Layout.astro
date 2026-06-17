@@ -1,7 +1,7 @@
 ---
 import '../styles/global.css'
 
-export type DashboardTab = 'dashboard' | 'gallery' | 'inbox' | 'processing' | 'page-posts' | 'running' | 'create' | 'queue' | 'history' | 'settings'
+export type DashboardTab = 'dashboard' | 'gallery' | 'inbox' | 'processing' | 'page-posts' | 'custom-link' | 'running' | 'create' | 'queue' | 'history' | 'settings'
 
 export interface Props {
   title: string
@@ -23,18 +23,19 @@ type NavItem = {
 // Sidebar items mirror the legacy Ads Manager dashboard ordering. Every route
 // here is wired to a working page in V3.
 const navItems: NavItem[] = [
-  { id: 'dashboard',  label: 'Dashboard',     href: '/',                 icon: 'layout',   enabled: true },
-  { id: 'gallery',    label: 'แกลลี่',         href: '/gallery',          icon: 'layers',   enabled: true },
-  { id: 'inbox',      label: 'คลังต้นฉบับ',     href: '/source-inventory', icon: 'inbox',    enabled: true },
-  { id: 'processing', label: 'Processing',    href: '/processing',       icon: 'cpu',      enabled: true },
-  { id: 'page-posts', label: 'โพสต์เพจ',       href: '/page-posts',       icon: 'facebook', enabled: true },
-  { id: 'running',    label: 'Campaigns',     href: '/campaigns',        icon: 'mega',     enabled: true },
-  { id: 'create',     label: 'Create Ads',    href: '/create-ads',       icon: 'users',    enabled: true },
-  { id: 'queue',      label: 'คิวสร้างแอด',     href: '/queue',            icon: 'clock',    enabled: true },
-  { id: 'history',    label: 'History',       href: '/history',          icon: 'msg',      enabled: true },
+  { id: 'dashboard',  label: 'Dashboard',     href: '/dashboard/',                  icon: 'layout',   enabled: true },
+  { id: 'gallery',    label: 'แกลลี่',         href: '/dashboard/gallery/',          icon: 'layers',   enabled: true },
+  { id: 'inbox',      label: 'คลังต้นฉบับ',     href: '/dashboard/source-inventory/', icon: 'inbox',    enabled: true },
+  { id: 'processing', label: 'Processing',    href: '/dashboard/processing/',       icon: 'cpu',      enabled: true },
+  { id: 'page-posts', label: 'โพสต์เพจ',       href: '/dashboard/page_posts/',       icon: 'facebook', enabled: true },
+  { id: 'custom-link', label: 'Custom Link',   href: '/dashboard/custom-link/',      icon: 'link',     enabled: true },
+  { id: 'running',    label: 'Campaigns',     href: '/dashboard/campaigns/',        icon: 'mega',     enabled: true },
+  { id: 'create',     label: 'Create Ads',    href: '/dashboard/create-ads/',       icon: 'users',    enabled: true },
+  { id: 'queue',      label: 'คิวสร้างแอด',     href: '/dashboard/queue/',            icon: 'clock',    enabled: true },
+  { id: 'history',    label: 'History',       href: '/dashboard/history/',          icon: 'msg',      enabled: true },
 ]
 
-const settingsItem: NavItem = { id: 'settings', label: 'Settings', href: '/settings', icon: 'cog', enabled: true }
+const settingsItem: NavItem = { id: 'settings', label: 'Settings', href: '/dashboard/settings/', icon: 'cog', enabled: true }
 ---
 
 <!doctype html>
@@ -54,7 +55,7 @@ const settingsItem: NavItem = { id: 'settings', label: 'Settings', href: '/setti
               Facebook-page card so the sidebar reflects who is signed in, not
               which page is being managed (pages live inside Ads Manager). */}
           <a
-            href="/settings"
+            href="/dashboard/settings/"
             class="flex w-full items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 text-left transition hover:bg-slate-100"
           >
             <span
@@ -108,6 +109,9 @@ const settingsItem: NavItem = { id: 'settings', label: 'Settings', href: '/setti
                       )}
                       {item.icon === 'facebook' && (
                         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/></svg>
+                      )}
+                      {item.icon === 'link' && (
+                        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
                       )}
                       {item.icon === 'mega' && (
                         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l18-5v12L3 13z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/></svg>

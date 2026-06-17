@@ -1,0 +1,13 @@
+tunnel: fa3c58f4-f45f-49a1-a49a-4fb7999d5a50
+credentials-file: /Users/yok-macmini/.cloudflared/fa3c58f4-f45f-49a1-a49a-4fb7999d5a50.json
+
+ingress:
+  # Facebook CloakBrowser posting bridge endpoints share the existing short.wwoom.com
+  # tunnel so the Worker has a durable URL without needing a new DNS record.
+  # All other paths continue to the shortlink service on 8810.
+  - hostname: short.wwoom.com
+    path: ^/(token|pages|post|page-comment|create-ad|promote|update-cta|publish-story)(/.*)?$
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    service: http://127.0.0.1:8810
+  - service: http_status:404

@@ -225,6 +225,89 @@ curl -X POST http://127.0.0.1:8820/token/export \
   -d '{"account":"CHEARB","target":"video-affiliate","dryRun":true}'
 ```
 
+## Worker posting bridge endpoints (CloakBrowser)
+
+This app also serves the Worker-compatible Facebook posting bridge contract that
+`apps/video-affiliate/worker` calls via `CLOAK_FB_BRIDGE_URL`. These drive the persistent
+logged-in CloakBrowser profile (`FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT`, default `content_paiya`)
+to resolve a user access token internally and call `graph.facebook.com`. They **never return
+or log raw tokens/cookies/fb_dtsg** — only booleans / ids / redacted evidence. They replace
+the retired Electron `apps/video-onecard` app (port 3847 / `video-onecard.wwoom.com`) — do
+not resurrect it.
+
+| Route | Method | Returns |
+|-------|--------|---------|
+| `/token` | GET | `{ ok, accessToken:<bool>, fbDtsg:<bool>, account }` — booleans only |
+| `/pages` | GET | `{ data: [{ id, name, category, hasToken }] }` — no page tokens |
+| `/post` | POST | organic One Card page video: `{ ok, story_id, video_id, post_url }` or step error |
+| `/page-comment` | POST | comments **as the Page** (`{ ok, id, author_expected:'page' }`); fail-closed `page_token_not_found` |
+| `/create-ad` | POST | OneCard/Ads: `{ ok, story_id, ad_id, adset_id, ... }` or step error. With `skip_ad` returns Phase A (`{ ok, phase:'post', story_id, video_id, thumbnail_url }`) — publishes a linkless page post and stops |
+| `/promote` | POST | Phase B paid ad from `video_data.video_id` + the final direct Shopee CTA: `{ ok, phase:'promote', ad_id, adset_id, campaign_id, campaign_name, daily_budget, start_time, end_time, promoted_ad_cta_link, ... }`. Does NOT touch the organic post CTA |
+| `/update-cta` | POST | update the **visible** Reel/page-post CTA to the final direct Shopee shortlink after `story_id` exists: POSTs `call_to_action` on `attachments.target.id`, reads back, returns `{ ok, cta_update_target_id, final_cta_link, visible_page_cta_link, visible_page_cta_final, permalink_url }`. Page-token only (fail-closed `page_token_not_found`); rejects Worker-redirect / non-`s.shopee.co.th` links |
+
+### Campaign selection + ad schedule/budget (`/create-ad`, `/promote`)
+
+Both ad-building routes share the same campaign resolution (precedence top→bottom):
+
+| Body field | Behavior |
+|------------|----------|
+| `campaign_id` | Use this exact campaign as-is. |
+| `new_campaign_name` | **Always force-create** a brand-new campaign with this exact name (CBO campaign budget; never reuses). Dashboard "new campaign" behavior — unchanged. |
+| `daily_campaign_name` (alias `reuse_campaign_name`) | **Reuse-or-create**: search the ad account for a non-deleted campaign with the *exact same name* **and** the template objective; reuse it if found, else create it once (no campaign-level/CBO budget, so the adset keeps its own budget). The Worker post-first flow sends the Bangkok-date daily name `DD/Mon/YYYY` (e.g. `15/Jun/2026`) here when no `campaign_id`/`new_campaign_name` override is given. |
+| _(none of the above)_ | Legacy `ADS_PUBLISH_<n>` prefix bin-packing (≤10 adsets/campaign, ≤10 campaigns per objective). |
+
+When the `daily_campaign_name` path is taken, the copied template adset gets a per-ad budget +
+24h run, applied in **separate, error-checked steps** (a combined budget+schedule+status POST
+returned Graph `code=100 subcode=1487057` live, and was silently ignored):
+
+1. POST `{ daily_budget }` **only** — default `10000` minor units = 100 THB (override
+   `adset_daily_budget`). `daily_budget` and `end_time` must NOT be sent in the same POST: Meta
+   rejects the pair (`code=100 subcode=1487793`), so budget is its own step. `daily_budget` (no
+   `lifetime_budget`) is the conflict-free budget for a copied template adset; the daily campaign
+   carries no CBO budget, so this is valid.
+2. POST `{ name, status: ACTIVE, end_time }` to rename + activate + schedule (the live-proven
+   single-POST shape). `end_time` is computed as the **copied adset's own `start_time` (read back
+   from Graph via `fields=start_time`) + `adset_run_hours` (24h)** — Meta requires
+   `end_time >= copied_start_time + run window`, and the copy assigns a `start_time` a few seconds
+   after the bridge's local clock, so an `end_time` based on local "now" lands just short and is
+   rejected `1487793`. It is sent as a **Bangkok offset ISO string** (e.g.
+   `2026-06-16T21:39:39+0700`; a bare unix value is also rejected `1487793`). If the readback
+   `start_time` is unavailable, it falls back to now + 24h + a 60s buffer. `start_time` is **never
+   sent** so the ad starts immediately — a now/past `start_time` is a known cause of `1487057`.
+   The **adset name is the post tail / sub2** (e.g.
+   `984538171215406`, the `story_id` tail) — never the hash, never `page_id_post_id`. The **ad
+   name is left as the system video code/hash** (set at ad creation from `source_video_id`) — the
+   ad is never renamed to sub2.
+3. Read the adset back (`fields=name,status,effective_status,daily_budget,start_time,end_time`)
+   and require `status === ACTIVE` **and** a present `end_time` (never claim the 24h schedule
+   applied if it is missing).
+
+Every step's response is checked: any Graph error, or a readback that is not `ACTIVE`, returns
+`ok:false` (step `adset_schedule` / `adset_activate`) and **deletes the orphan adset** — the
+route never reports success on a paused/half-built adset. On success, `campaign_name`,
+`daily_budget`, `start_time` (effective = now), and `end_time` are echoed back in the
+(token-free) response. The legacy `new_campaign_name`/prefix paths keep the activate-only adset
+behavior (campaign carries the budget) and do **not** set a per-adset budget or read back.
+
+Each route accepts an optional `account` (query for GET, body for POST) to override the
+default profile. Config (non-secret Facebook object ids, env-overridable):
+`FACEBOOK_TOKEN_CLOAK_POST_AD_ACCOUNT`, `FACEBOOK_TOKEN_CLOAK_AD_ACCOUNT`,
+`FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET`, `FACEBOOK_TOKEN_CLOAK_POLL_MS`.
+
+Default `FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET` is the current Ads Manager
+`TEMPLATE_SALES` adset `120248134990230263` (campaign
+`120248134990220263`). The retired pre-SALES template adset
+`120244361318490263` must not be used as a silent fallback.
+
+Run for the live `content_paiya` profile:
+
+```sh
+FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT=content_paiya \
+  npm --prefix apps/facebook-token-cloak start
+# listens on 127.0.0.1:8820 — expose via your cloudflared tunnel, then set the Worker's
+# CLOAK_FB_BRIDGE_URL to that public https URL (NOT video-onecard.wwoom.com, NOT :3847).
+```
+
 ## Verify
 
 ```sh

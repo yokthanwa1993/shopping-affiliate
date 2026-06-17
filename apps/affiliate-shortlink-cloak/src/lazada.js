@@ -11,7 +11,7 @@ const {
 } = require('./config');
 
 const LAZADA_JS = fs.readFileSync(
-  path.join(__dirname, '..', '..', 'affiliate-shortlink', 'lazada-shorten.js'),
+  path.join(__dirname, 'lazada-shorten.js'),
   'utf8',
 );
 

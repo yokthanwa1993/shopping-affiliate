@@ -652,8 +652,134 @@ async function handleDashboardIncomeForSpec(spec, page) {
   });
 }
 
+// Report/dashboard flows mirror the shortlink flow's auto re-auth: when Shopee
+// bounces the session to login (off the affiliate origin) or the protected
+// fetch returns a "not login" code, try to silently re-auth with the stored
+// Keychain credential before surfacing manual_login_required. The hook is
+// injected by the server (deps.onSessionExpired / deps.attemptReauth) so this
+// module never touches Keychain directly and stays backward compatible: with no
+// hook, behavior is exactly the legacy "return manual immediately".
+function getReauthHook(deps) {
+  if (!deps || typeof deps !== 'object') return null;
+  if (typeof deps.onSessionExpired === 'function') return deps.onSessionExpired;
+  if (typeof deps.attemptReauth === 'function') return deps.attemptReauth;
+  return null;
+}
+
+function isManualLoginResult(result) {
+  return !!(result && typeof result === 'object'
+    && (result.status === 'manual_login_required' || result.manualLoginRequired));
+}
+
+async function runReauthHook(hook, spec, reason) {
+  try {
+    const reauth = await hook({
+      platform: 'shopee',
+      account: spec.account,
+      accountInternal: spec.accountInternal,
+      displayAccount: spec.displayAccount,
+      id: spec.id,
+      reason,
+    });
+    return reauth || { ok: false, reason: 'auto_reauth_no_result' };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'auto_reauth_threw',
+      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+    };
+  }
+}
+
+// Attach a small, already-redacted diagnostic so callers can see that an auto
+// re-auth was tried and why it could not silently recover (captcha/otp/manual
+// blocker/keychain missing). Never surface password/cookies/tokens — the hook's
+// `reason` is redacted upstream and re-sanitized here.
+function annotateManualWithReauth(result, reauth) {
+  if (!reauth || typeof reauth !== 'object') return result;
+  const out = Object.assign({}, result, { autoReauthAttempted: true });
+  if (reauth.reason) out.autoReauthReason = sanitizeDetail(reauth.reason);
+  return out;
+}
+
+function manualLoginShape() {
+  return {
+    status: 'manual_login_required',
+    error: 'manual_login_required',
+    manualLoginRequired: true,
+    needsManual: true,
+    reason: 'shopee_login_required',
+    loginUi: '/login?platform=shopee',
+  };
+}
+
+// Acquire a Shopee page for `spec.account`, run `work(page)`, and on a login
+// classification (off-origin redirect OR a not-login fetch code) try the
+// injected re-auth hook once, then re-fetch a page for the same account and
+// retry the work exactly once. `baseShape()` supplies the per-caller envelope
+// merged into off-origin / browser-unavailable responses.
+async function runShopeeReportForSpec(spec, opts = {}) {
+  const browserDep = opts.browserDep || browser;
+  const hook = opts.hook || null;
+  const work = opts.work;
+  const makeBase = typeof opts.baseShape === 'function' ? opts.baseShape : () => ({});
+  let reauth = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let pageRecord;
+    try {
+      pageRecord = await browserDep.getPage('shopee', spec.account, { headless: true });
+    } catch (err) {
+      return Object.assign(makeBase(), {
+        status: 'error',
+        error: 'browser_unavailable',
+        reason: 'browser_unavailable',
+        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
+      });
+    }
+    const page = pageRecord && pageRecord.page;
+    if (!page) {
+      return Object.assign(makeBase(), {
+        status: 'error',
+        error: 'browser_unavailable',
+        reason: 'browser_unavailable',
+      });
+    }
+    if (typeof browserDep.ensureOnPlatformPage === 'function') {
+      try { await browserDep.ensureOnPlatformPage(page, 'shopee'); } catch {}
+    }
+    let currentUrl = '';
+    try { currentUrl = typeof page.url === 'function' ? String(page.url() || '') : ''; } catch { currentUrl = ''; }
+    const onAffiliateOrigin = typeof browserDep.isOnPlatformOrigin === 'function'
+      ? browserDep.isOnPlatformOrigin(currentUrl, 'shopee')
+      : /affiliate\.shopee\.co\.th/i.test(currentUrl);
+
+    if (isLoginRedirectUrl(currentUrl) || !onAffiliateOrigin) {
+      if (hook && attempt === 0) {
+        reauth = await runReauthHook(hook, spec, 'shopee_login_required');
+        if (reauth && reauth.ok) continue;
+      }
+      return annotateManualWithReauth(Object.assign(makeBase(), manualLoginShape()), reauth);
+    }
+
+    const result = await work(page);
+    if (isManualLoginResult(result)) {
+      if (hook && attempt === 0) {
+        reauth = await runReauthHook(hook, spec, result.reason || 'shopee_login_required');
+        if (reauth && reauth.ok) continue;
+      }
+      return annotateManualWithReauth(result, reauth);
+    }
+    return result;
+  }
+
+  // Reached only if the retry attempt is still login-gated.
+  return annotateManualWithReauth(Object.assign(makeBase(), manualLoginShape()), reauth);
+}
+
 async function handleDailyIncomeReport(query = {}, deps = {}) {
   const browserDep = deps.browser || browser;
+  const hook = getReauthHook(deps);
   const now = deps.now instanceof Date ? deps.now : new Date();
   const ids = parseDailyIncomeIds(query);
   const accounts = [];
@@ -666,47 +792,12 @@ async function handleDailyIncomeReport(query = {}, deps = {}) {
       page_num: 1,
     }), { now });
     if (!firstSpec) firstSpec = spec;
-    let pageRecord;
-    try {
-      pageRecord = await browserDep.getPage('shopee', spec.account, { headless: true });
-    } catch (err) {
-      accounts.push(Object.assign(baseResponseShape(spec), {
-        status: 'error',
-        error: 'browser_unavailable',
-        reason: 'browser_unavailable',
-        detail: sanitizeDetail(err && err.message ? err.message : String(err)),
-      }));
-      continue;
-    }
-    const page = pageRecord && pageRecord.page;
-    if (!page) {
-      accounts.push(Object.assign(baseResponseShape(spec), {
-        status: 'error',
-        error: 'browser_unavailable',
-        reason: 'browser_unavailable',
-      }));
-      continue;
-    }
-    if (typeof browserDep.ensureOnPlatformPage === 'function') {
-      try { await browserDep.ensureOnPlatformPage(page, 'shopee'); } catch {}
-    }
-    let currentUrl = '';
-    try { currentUrl = typeof page.url === 'function' ? String(page.url() || '') : ''; } catch { currentUrl = ''; }
-    const onAffiliateOrigin = typeof browserDep.isOnPlatformOrigin === 'function'
-      ? browserDep.isOnPlatformOrigin(currentUrl, 'shopee')
-      : /affiliate\.shopee\.co\.th/i.test(currentUrl);
-    if (isLoginRedirectUrl(currentUrl) || !onAffiliateOrigin) {
-      accounts.push(Object.assign(baseResponseShape(spec), {
-        status: 'manual_login_required',
-        error: 'manual_login_required',
-        manualLoginRequired: true,
-        needsManual: true,
-        reason: 'shopee_login_required',
-        loginUi: '/login?platform=shopee',
-      }));
-      continue;
-    }
-    accounts.push(await handleDashboardIncomeForSpec(spec, page));
+    accounts.push(await runShopeeReportForSpec(spec, {
+      browserDep,
+      hook,
+      baseShape: () => baseResponseShape(spec),
+      work: (page) => handleDashboardIncomeForSpec(spec, page),
+    }));
   }
 
   const okAccounts = accounts.filter((account) => account.status === 'ok');
@@ -1013,6 +1104,7 @@ async function handleConversionReportSummaryMode(spec, page) {
 
 async function handleConversionReport(query = {}, deps = {}) {
   const browserDep = deps.browser || browser;
+  const hook = getReauthHook(deps);
   const now = deps.now instanceof Date ? deps.now : new Date();
   const rawMode = isRawConversionReportMode(query);
 
@@ -1028,52 +1120,14 @@ async function handleConversionReport(query = {}, deps = {}) {
     ? Object.assign(baseResponseShape(spec), { mode: 'raw' })
     : summaryResponseShape(spec));
 
-  let pageRecord;
-  try {
-    pageRecord = await browserDep.getPage('shopee', spec.account, { headless: true });
-  } catch (err) {
-    return Object.assign(errorShape(), {
-      status: 'error',
-      error: 'browser_unavailable',
-      reason: 'browser_unavailable',
-      detail: sanitizeDetail(err && err.message ? err.message : String(err)),
-    });
-  }
-
-  const page = pageRecord && pageRecord.page;
-  if (!page) {
-    return Object.assign(errorShape(), {
-      status: 'error',
-      error: 'browser_unavailable',
-      reason: 'browser_unavailable',
-    });
-  }
-
-  if (typeof browserDep.ensureOnPlatformPage === 'function') {
-    try { await browserDep.ensureOnPlatformPage(page, 'shopee'); } catch {}
-  }
-
-  let currentUrl = '';
-  try { currentUrl = typeof page.url === 'function' ? String(page.url() || '') : ''; } catch { currentUrl = ''; }
-
-  const onAffiliateOrigin = typeof browserDep.isOnPlatformOrigin === 'function'
-    ? browserDep.isOnPlatformOrigin(currentUrl, 'shopee')
-    : /affiliate\.shopee\.co\.th/i.test(currentUrl);
-
-  if (isLoginRedirectUrl(currentUrl) || !onAffiliateOrigin) {
-    return Object.assign(errorShape(), {
-      status: 'manual_login_required',
-      error: 'manual_login_required',
-      manualLoginRequired: true,
-      needsManual: true,
-      reason: 'shopee_login_required',
-      loginUi: '/login?platform=shopee',
-    });
-  }
-
-  return rawMode
-    ? handleConversionReportRawMode(spec, page)
-    : handleConversionReportSummaryMode(spec, page);
+  return runShopeeReportForSpec(spec, {
+    browserDep,
+    hook,
+    baseShape: errorShape,
+    work: (page) => (rawMode
+      ? handleConversionReportRawMode(spec, page)
+      : handleConversionReportSummaryMode(spec, page)),
+  });
 }
 
 function isConversionReportHost(hostHeader) {

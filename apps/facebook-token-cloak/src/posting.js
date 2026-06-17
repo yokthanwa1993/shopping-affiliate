@@ -1,0 +1,1463 @@
+'use strict';
+// Worker-compatible Facebook posting bridge logic for facebook-token-cloak.
+//
+// This module ports the Graph API orchestration of the retired Electron
+// `apps/video-onecard/electron.js` (organic One Card /post, page comment, create-ad)
+// but uses PLAIN NODE fetch + the existing CloakBrowser/Playwright logged-in profile to
+// resolve a user access token internally. It NEVER imports/runs Electron, never binds
+// port 3847, and never targets video-onecard.wwoom.com.
+//
+// Token discipline: the user/page access tokens resolved here are used ONLY against
+// graph.facebook.com. They are never returned to callers, never logged. `/token` and
+// `/pages` callers receive booleans / id+name only.
+
+const { FACEBOOK_OAUTH_URL, extractAccessTokenFromUrl, sanitizePages } = require('./facebook');
+
+const GRAPH = 'https://graph.facebook.com';
+const GRAPH_V = 'v21.0';
+// Ads Manager page used by the in-page extractor fallback. A logged-in Ads Manager session
+// exposes window.__accessToken + DTSGInitData — the mechanism the retired Electron app used.
+const ADS_MANAGER_URL = 'https://adsmanager.facebook.com/adsmanager/manage/campaigns';
+
+function realSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Format a unix-seconds instant as a Graph-compatible Bangkok ISO 8601 string, e.g.
+// "2026-06-16T21:04:36+0700". Graph rejected adset schedules sent as a bare unix timestamp
+// (code=100 subcode=1487793 / 1487057); the live-proven accepted form is this offset ISO string.
+// Bangkok is UTC+7 with no DST, so shift the epoch by +7h and read the UTC parts.
+function toBangkokIso(epochSeconds) {
+  const d = new Date((Number(epochSeconds) + 7 * 3600) * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}+0700`;
+}
+
+// Runs INSIDE the logged-in browser page (via page.evaluate). Reads the live Ads Manager
+// access token and a *boolean* presence of fb_dtsg + a safe numeric user id. It deliberately
+// never returns the raw fb_dtsg value — only `fbDtsgPresent` — so no dtsg ever leaves the
+// page. Fully self-contained (no closure refs) so it serializes for page.evaluate.
+function inPageTokenExtractor() {
+  var out = { token: null, fbDtsgPresent: false, userId: null };
+  try { if (typeof window !== 'undefined' && window.__accessToken) out.token = String(window.__accessToken); } catch (e) {}
+  var html = '';
+  try { html = (typeof document !== 'undefined' && document.documentElement) ? document.documentElement.innerHTML : ''; } catch (e) {}
+  try {
+    if (typeof require === 'function') {
+      try { var d = require('DTSGInitData'); if (d && d.token) out.fbDtsgPresent = true; } catch (e) {}
+    }
+  } catch (e) {}
+  try {
+    if (!out.token && html) {
+      var m = html.match(/"accessToken":"(EAA[^"]+)"/) || html.match(/__accessToken"?\s*[:=]\s*"(EAA[^"]+)"/);
+      if (m) out.token = m[1];
+    }
+    if (!out.fbDtsgPresent && html) {
+      out.fbDtsgPresent = /DTSGInitData[\s\S]{0,80}"token":"[^"]+"/.test(html) || /name="fb_dtsg"\s+value="[^"]+"/.test(html);
+    }
+    if (!out.userId && html) {
+      var um = html.match(/"USER_ID":"(\d+)"/) || html.match(/"actorID":"(\d+)"/);
+      if (um && um[1] !== '0') out.userId = um[1];
+    }
+  } catch (e) {}
+  return out;
+}
+
+// Build a fetch-like Graph client (mirrors the minimal interface gJson() expects:
+// { ok, status, json() }) that carries the logged-in session cookies. The AdsManager
+// window.__accessToken is only accepted by Graph alongside those cookies; a plain Node fetch
+// with the same token fails (OAuthException code=1 Invalid request).
+//
+// Transport preference:
+//   1. context.request (Playwright APIRequestContext) — shares the context cookies and runs
+//      OUTSIDE the page, so it is NOT subject to page CORS/preflight. This is the reliable
+//      path (page.evaluate(fetch) can fail browser_graph_fetch_failed on Graph CORS), and it
+//      mirrors the retired Electron net.request({ useSessionCookies: true }).
+//   2. Fallback: in-page page.evaluate(fetch(url, { credentials: 'include' })).
+//
+// It only ever returns the Graph response body — never the token/cookies.
+function makeBrowserGraphFetch(target) {
+  const page = target && target.page ? target.page : (target && typeof target.evaluate === 'function' ? target : null);
+  const context = target && target.context ? target.context : (target && target.request ? target : null);
+  const browserGraphFetch = async function browserGraphFetch(url, init = {}) {
+    const method = (init && init.method) || 'GET';
+    const headers = (init && init.headers) || null;
+    const body = init && init.body != null ? init.body : null;
+
+    const apiRequest = context && context.request;
+    if (apiRequest && typeof apiRequest.fetch === 'function') {
+      try {
+        const opts = { method };
+        if (headers) opts.headers = headers;
+        if (body != null) opts.data = body;
+        const resp = await apiRequest.fetch(String(url), opts);
+        const status = typeof resp.status === 'function' ? resp.status() : resp.status;
+        const ok = typeof resp.ok === 'function' ? resp.ok() : resp.ok;
+        let text = '';
+        try { text = await resp.text(); } catch (e) { text = ''; }
+        return {
+          ok: !!ok,
+          status: status || 0,
+          json: async () => { try { return JSON.parse(text || '{}'); } catch { return {}; } }
+        };
+      } catch (e) {
+        return { ok: false, status: 0, json: async () => ({ error: { message: 'browser_graph_request_failed' } }) };
+      }
+    }
+
+    if (!page || typeof page.evaluate !== 'function') {
+      return { ok: false, status: 0, json: async () => ({ error: { message: 'browser_context_unavailable' } }) };
+    }
+    let result;
+    try {
+      result = await page.evaluate(async (args) => {
+        const opts = { method: args.method, credentials: 'include' };
+        if (args.headers) opts.headers = args.headers;
+        if (args.body != null) opts.body = args.body;
+        const resp = await fetch(args.url, opts);
+        let text = '';
+        try { text = await resp.text(); } catch (e) { text = ''; }
+        return { status: resp.status, ok: resp.ok, text: text };
+      }, { url: String(url), method: method, headers: headers, body: body });
+    } catch (e) {
+      return { ok: false, status: 0, json: async () => ({ error: { message: 'browser_graph_fetch_failed' } }) };
+    }
+    const payload = result || {};
+    return {
+      ok: !!payload.ok,
+      status: payload.status || 0,
+      json: async () => { try { return JSON.parse(payload.text || '{}'); } catch { return {}; } }
+    };
+  };
+
+  return browserGraphFetch;
+}
+
+// Close the browser context opened for a request's Graph work. Safe on any shape; swallows
+// errors. Call in a `finally` after all Graph calls complete so contexts never leak.
+async function closeSession(session) {
+  try {
+    if (session && session.context && typeof session.context.close === 'function') {
+      await session.context.close();
+    }
+  } catch {}
+}
+
+// Resolve a fresh user access token from the persistent CloakBrowser profile. Two paths:
+//   1. The Facebook OAuth dialog redirect (same mechanism as /token/refresh).
+//   2. FALLBACK — when OAuth yields no token (e.g. a deprecated/invalid client_id returns
+//      /oauth/error): reuse the SAME logged-in profile/page, navigate to Ads Manager, and
+//      read window.__accessToken + dtsg presence in-page (the retired Electron mechanism).
+// Returns the token plus the live browser context. The token is for internal Graph use only;
+// callers must never echo it back to clients. Raw fb_dtsg is never extracted (boolean only).
+async function resolveSessionToken({ browser, account, visible = false } = {}) {
+  if (!browser || typeof browser.openPage !== 'function') {
+    return { token: null, reason: 'browser_unavailable', fbDtsgPresent: false, userId: null };
+  }
+  let opened;
+  try {
+    opened = await browser.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible });
+  } catch (e) {
+    return { token: null, reason: (e && (e.code || e.message)) || 'browser_open_failed', fbDtsgPresent: false, userId: null };
+  }
+
+  let currentUrl = '';
+  try { currentUrl = opened.page.url(); } catch {}
+  let token = extractAccessTokenFromUrl(currentUrl);
+  let source = token ? 'oauth' : null;
+  let fbDtsgPresent = false;
+  let userId = null;
+
+  if (!token) {
+    const page = opened.page;
+    try {
+      if (page && typeof page.goto === 'function') {
+        await page.goto(ADS_MANAGER_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      }
+      if (page && typeof page.evaluate === 'function') {
+        const info = await page.evaluate(inPageTokenExtractor).catch(() => null);
+        if (info && typeof info === 'object') {
+          if (info.token) { token = String(info.token); source = 'adsmanager'; }
+          fbDtsgPresent = !!info.fbDtsgPresent;
+          if (info.userId) userId = String(info.userId);
+        }
+      }
+      try { currentUrl = page.url(); } catch {}
+    } catch {}
+  }
+
+  return {
+    token: token || null,
+    reason: token ? null : 'token_not_found',
+    source,
+    fbDtsgPresent,
+    userId,
+    currentUrl,
+    backend: opened.backend,
+    profileDir: opened.profileDir,
+    context: opened.context,
+    page: opened.page,
+    // Graph client bound to the logged-in session: prefers context.request (APIRequestContext,
+    // cookie-sharing, no page CORS), falls back to in-page fetch(credentials:'include').
+    graphFetch: makeBrowserGraphFetch({ page: opened.page, context: opened.context })
+  };
+}
+
+// Best-effort, token-free liveness probe: a logged-in Facebook session has a `c_user`
+// cookie. Used to report `fbDtsg` presence as a boolean without ever reading/returning the
+// fb_dtsg value itself. Returns false on any error.
+async function hasLoggedInSession(context) {
+  try {
+    if (!context || typeof context.cookies !== 'function') return false;
+    const cookies = await context.cookies('https://www.facebook.com');
+    return Array.isArray(cookies) && cookies.some((c) => c && c.name === 'c_user' && c.value);
+  } catch {
+    return false;
+  }
+}
+
+// Forward the bad-reused-campaign recovery diagnostics from a buildAdFromCreative result onto the
+// reshaped success responses of createAd/promoteOneCardPost (error responses pass adEntities through
+// verbatim, but success responses are rebuilt field-by-field and would otherwise drop these). Only
+// includes keys that are present, so non-recovery responses are unchanged. Never carries a token.
+function pickRecoveryDiag(adEntities = {}) {
+  const out = {};
+  for (const k of ['recovered_from_bad_reused_campaign', 'bad_reused_campaign_id', 'cleaned_bad_reused_campaign_id', 'bad_reused_campaign_cleanup_error', 'retry_campaign_id']) {
+    if (adEntities[k] !== undefined) out[k] = adEntities[k];
+  }
+  return out;
+}
+
+async function gJson(fetchImpl, url, opts) {
+  const res = await fetchImpl(url, opts);
+  let data = {};
+  try { data = await res.json(); } catch { data = {}; }
+  return { status: res.status, ok: res.ok, data: data || {} };
+}
+
+const crypto = require('crypto');
+
+// Ceiling for the locally-downloaded video buffer (the PRIMARY upload path). Current OneCard videos
+// are ~5–30MB; 200MB is a generous guard so a runaway/wrong URL can never load gigabytes into the
+// bridge process. Exceeding it makes the download throw, which routes to the file_url fallback
+// (see uploadAdVideoFromUrl) — Meta fetches the URL itself rather than the bridge buffering it.
+const MAX_DOWNLOAD_VIDEO_BYTES = 200 * 1024 * 1024;
+
+// Download a video URL into a Buffer for the multipart upload. The asset URL is a PUBLIC Worker
+// asset (no auth), so a plain fetch is used — NEVER the cookie-bearing Graph transport, and no
+// token is involved. Guards: an AbortController timeout and a hard byte ceiling (checked against
+// content-length up front AND the materialized buffer) so a wrong/huge URL fails closed instead of
+// exhausting memory. Returns { buffer, contentType }; throws a clear non-secret Error otherwise.
+async function downloadVideoToBuffer(videoUrl, { fetchImpl, maxBytes = MAX_DOWNLOAD_VIDEO_BYTES, timeoutMs = 120000 } = {}) {
+  const doFetch = fetchImpl || global.fetch;
+  if (typeof doFetch !== 'function') throw new Error('video_download_fetch_unavailable');
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller && timeoutMs > 0 ? setTimeout(() => { try { controller.abort(); } catch {} }, timeoutMs) : null;
+  try {
+    const resp = await doFetch(String(videoUrl), controller ? { signal: controller.signal } : {});
+    const status = typeof resp.status === 'number' ? resp.status : 0;
+    const ok = typeof resp.ok === 'boolean' ? resp.ok : (status >= 200 && status < 300);
+    if (!ok) throw new Error(`video_download_http_${status || 'error'}`);
+    const headerGet = resp.headers && typeof resp.headers.get === 'function' ? (k) => resp.headers.get(k) : () => null;
+    const declared = Number(headerGet('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new Error(`video_too_large_${declared}_bytes_max_${maxBytes}`);
+    }
+    const ab = await resp.arrayBuffer();
+    const buffer = Buffer.from(ab);
+    if (buffer.length === 0) throw new Error('video_download_empty');
+    if (buffer.length > maxBytes) throw new Error(`video_too_large_${buffer.length}_bytes_max_${maxBytes}`);
+    const ctRaw = String(headerGet('content-type') || '').split(';')[0].trim();
+    return { buffer, contentType: ctRaw || 'video/mp4' };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Build a multipart/form-data body (as a Buffer) carrying the video bytes under `source`, the field
+// Graph advideos expects for a direct file upload. Uses Node built-ins only; the boundary is random
+// so it can never collide with the binary payload. Returns { body, contentType }.
+function buildVideoMultipart({ buffer, filename = 'video.mp4', contentType = 'video/mp4', fieldName = 'source' }) {
+  const boundary = '----fbTokenCloak' + crypto.randomBytes(16).toString('hex');
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="${fieldName}"; filename="${filename}"\r\n` +
+    `Content-Type: ${contentType}\r\n\r\n`,
+    'utf8'
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+  return { body: Buffer.concat([head, buffer, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+// Upload a video to {adAccount}/advideos as a multipart file (the PRIMARY transport). access_token
+// stays in the URL query (never in the multipart body), so the token discipline is unchanged — the
+// body carries only the video bytes. Goes through the SAME Graph transport (fetchImpl) as every other
+// call so the logged-in session cookies are carried. Returns the parsed Graph response data.
+async function uploadAdVideoMultipart(fetchImpl, { adAccount, userToken, buffer, contentType = 'video/mp4', filename = 'video.mp4' }) {
+  const part = buildVideoMultipart({ buffer, filename, contentType });
+  const res = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/advideos?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': part.contentType },
+    body: part.body
+  });
+  return res.data || {};
+}
+
+// Upload a video to {adAccount}/advideos. PRIMARY path is a DIRECT multipart file upload: the bridge
+// downloads the video bytes itself, then POSTs them as multipart/form-data. This never depends on Meta
+// being able to fetch our (Worker public asset) URL — the live-incident failure mode where Graph
+// returns "Unable to fetch video file from URL." for a Cheiab/OneCard publish. The reliable path is
+// therefore Meta-fetch-free.
+//
+// FALLBACK — file_url: used ONLY when the LOCAL download cannot proceed (a download/fetch failure or
+// the byte-ceiling guard tripping). In that single case we let Meta fetch the URL itself as a last
+// resort so a transient bridge-side problem (or an oversized video) still has a chance to publish.
+// A Graph ERROR from the multipart upload (validation/permission/etc.) is returned AS-IS and never
+// triggers a file_url retry — so a real error is never hidden behind a fallback loop.
+//
+// Returns { data, uploadMode } where uploadMode is one of:
+//   'multipart'         — primary direct multipart upload (success, or a real Graph error returned as-is)
+//   'file_url_fallback' — the local download could not proceed; fell back to letting Meta fetch the URL
+// No token/secret is ever logged or returned.
+async function uploadAdVideoFromUrl(fetchImpl, {
+  adAccount,
+  userToken,
+  videoUrl,
+  download = downloadVideoToBuffer,
+  maxBytes = MAX_DOWNLOAD_VIDEO_BYTES,
+  downloadTimeoutMs = 120000
+} = {}) {
+  // PRIMARY: download the bytes and upload them directly as multipart so Meta never fetches our URL.
+  let dl;
+  try {
+    dl = await download(videoUrl, { maxBytes, timeoutMs: downloadTimeoutMs });
+  } catch (e) {
+    // The bridge could not download the file (network/fetch failure or the byte ceiling tripped).
+    // Last resort: let Meta fetch the file_url itself. The download reason is surfaced (non-secret)
+    // on any file_url error so the failure stays diagnosable.
+    const downloadReason = (e && e.message) || String(e);
+    const fb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/advideos?access_token=${encodeURIComponent(userToken)}&file_url=${encodeURIComponent(videoUrl)}`, { method: 'POST' });
+    const fbData = fb.data || {};
+    if (fbData.error) {
+      const err = fbData.error;
+      return {
+        data: { error: { message: `${err.message} (multipart_download_unavailable: ${downloadReason})`, code: err.code, error_subcode: err.error_subcode, fbtrace_id: err.fbtrace_id } },
+        uploadMode: 'file_url_fallback'
+      };
+    }
+    return { data: fbData, uploadMode: 'file_url_fallback' };
+  }
+  const data = await uploadAdVideoMultipart(fetchImpl, { adAccount, userToken, buffer: dl.buffer, contentType: dl.contentType });
+  return { data, uploadMode: 'multipart' };
+}
+
+// GET /pages — list the pages the session administers, id/name/category only. Page access
+// tokens are stripped (sanitizePages with includeToken=false). Shape: { data: [...] } to
+// match the Worker's `pagesData.data` authorization check.
+async function listPagesPublic(fetchImpl, userToken) {
+  const url = `${GRAPH}/me/accounts?fields=access_token,id,name,category&limit=200&access_token=${encodeURIComponent(userToken)}`;
+  const { data } = await gJson(fetchImpl, url);
+  if (data && data.error) {
+    return { data: [], error: (data.error && data.error.message) || 'me_accounts_failed' };
+  }
+  const pages = sanitizePages(data.data || [], false); // false => never includes access_token
+  return { data: pages, pagesCount: pages.length };
+}
+
+// Resolve the PAGE access token for a page_id via the session user token. Returns the page
+// token for INTERNAL Graph use only (never surfaced to clients) plus the page name. Fails
+// closed: `found:false` / empty pageToken when the session does not administer the page.
+async function resolvePageToken(fetchImpl, userToken, pageId) {
+  const url = `${GRAPH}/me/accounts?fields=access_token,id,name&limit=200&access_token=${encodeURIComponent(userToken)}`;
+  const { data } = await gJson(fetchImpl, url);
+  if (data && data.error) {
+    return { error: (data.error && data.error.message) || 'me_accounts_failed' };
+  }
+  const page = (data.data || []).find((pg) => String(pg.id) === String(pageId));
+  return {
+    found: !!page,
+    pageToken: page && page.access_token ? page.access_token : '',
+    pageName: page && page.name ? String(page.name) : ''
+  };
+}
+
+// POST /post — organic One Card page video post. Ports electron.js /post:
+// upload advideo → poll thumbnail → adcreative(object_story_spec) → poll story id →
+// publish to page (is_published). Returns { ok, story_id, video_id, post_url } or a
+// step-tagged error. Uses page token to publish (fails open to user token only for publish,
+// matching electron behavior). No token is ever returned.
+async function postOneCardVideo(fetchImpl, params = {}) {
+  const sleep = params.sleep || realSleep;
+  const userToken = params.userToken;
+  const adAccount = String(params.adAccount || '').trim();
+  const pageId = String(params.pageId || '').trim();
+  const videoUrl = String(params.videoUrl || '').trim();
+  const message = String(params.message || '');
+  const title = String(params.title || '');
+  const description = String(params.description || '');
+  const websiteUrl = String(params.websiteUrl || '').trim();
+  const cta = params.cta === 'NO_BUTTON' ? 'NO_BUTTON' : 'SHOP_NOW';
+  const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
+  const storyPolls = Number.isInteger(params.storyPolls) ? params.storyPolls : 20;
+  const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
+
+  if (!adAccount || !pageId || !videoUrl) {
+    return { ok: false, step: 'validate', error: 'Missing: ad_account, page_id, video_url' };
+  }
+
+  // 1. Upload video to the ad account. Direct multipart upload first (the bridge downloads the bytes
+  // so Meta never has to fetch our URL); file_url is only a fallback (see uploadAdVideoFromUrl).
+  const up = await uploadAdVideoFromUrl(fetchImpl, { adAccount, userToken, videoUrl, download: params.downloadVideo });
+  const v = up.data;
+  if (v.error) return { ok: false, step: 'upload_video', error: v.error.message, upload_mode: up.uploadMode };
+  const videoId = v.id;
+
+  // 2. Wait for a thumbnail.
+  let thumbUrl = null;
+  for (let i = 0; i < thumbPolls; i++) {
+    await sleep(pollMs);
+    const s = await gJson(fetchImpl, `${GRAPH}/${videoId}?access_token=${encodeURIComponent(userToken)}&fields=thumbnails`);
+    const sd = s.data;
+    if (sd.thumbnails && sd.thumbnails.data && sd.thumbnails.data.length >= 1) { thumbUrl = sd.thumbnails.data[0].uri; break; }
+  }
+  if (!thumbUrl) return { ok: false, step: 'thumbnails', error: 'Timeout' };
+
+  // 3. Create adcreative (dark post via object_story_spec).
+  const videoData = { video_id: videoId, image_url: thumbUrl, message: message || '' };
+  if (title) videoData.title = title;
+  if (description) videoData.link_description = description;
+  if (cta !== 'NO_BUTTON' && websiteUrl) videoData.call_to_action = { type: cta, value: { link: websiteUrl } };
+  const crBody = JSON.stringify({ object_story_spec: { page_id: pageId, video_data: videoData } });
+  const cr = await gJson(fetchImpl, `${GRAPH}/v16.0/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}&fields=effective_object_story_id,object_story_id`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: crBody
+  });
+  const c = cr.data;
+  if (c.error) return { ok: false, step: 'adcreative', error: c.error.message };
+
+  // 4. Poll for the story id.
+  let storyId = c.effective_object_story_id || c.object_story_id || null;
+  for (let i = 0; !storyId && i < storyPolls; i++) {
+    await sleep(pollMs);
+    const p4 = await gJson(fetchImpl, `${GRAPH}/${c.id}?access_token=${encodeURIComponent(userToken)}&fields=effective_object_story_id,object_story_id`);
+    const d4 = p4.data;
+    if (d4.error) return { ok: false, step: 'story_id', error: d4.error.message, adcreative_id: c.id };
+    if (d4.effective_object_story_id || d4.object_story_id) { storyId = d4.effective_object_story_id || d4.object_story_id; break; }
+  }
+  if (!storyId) return { ok: false, step: 'story_id', error: 'Timeout', adcreative_id: c.id, video_id: videoId };
+
+  // 5. Publish to the page feed using the PAGE token.
+  const pageTokenInfo = await resolvePageToken(fetchImpl, userToken, pageId);
+  const publishToken = pageTokenInfo.pageToken || userToken;
+  const pub = await gJson(fetchImpl, `${GRAPH}/v16.0/${storyId}?access_token=${encodeURIComponent(publishToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_published: true })
+  });
+  const pubR = pub.data;
+  if (pubR.error && pubR.error.code !== 1) return { ok: false, step: 'publish', error: pubR.error.message };
+
+  return { ok: true, story_id: storyId, video_id: videoId, post_url: `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}` };
+}
+
+// POST /page-comment — comment AS THE PAGE only. Resolves the page token internally and
+// fails closed (page_token_not_found) when the session does not administer the page —
+// NEVER falls back to the session user token (would author the comment as the user).
+async function pageComment(fetchImpl, params = {}) {
+  const userToken = params.userToken;
+  const pageId = String(params.pageId || '').trim();
+  const target = String(params.target || params.storyId || params.postId || '').trim();
+  const message = String(params.message || '').trim();
+  if (!pageId || !target || !message) {
+    return { ok: false, status: 400, step: 'validate', error: 'Missing: page_id, story_id (or post_id), message' };
+  }
+  if (!userToken) {
+    return { ok: false, status: 409, step: 'session', error: 'no_session' };
+  }
+  const info = await resolvePageToken(fetchImpl, userToken, pageId);
+  if (info.error) {
+    return { ok: false, status: 200, step: 'pages', error: info.error, page_id: pageId };
+  }
+  // Fail closed: no page token → do NOT comment as the user.
+  if (!info.pageToken) {
+    return { ok: false, status: 403, step: 'page_token', error: 'page_token_not_found', page_id: pageId };
+  }
+  const cm = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(target)}/comments`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, access_token: info.pageToken })
+  });
+  const data = cm.data;
+  if (data.error || !data.id) {
+    return { ok: false, status: 200, step: 'comment', error: (data.error && data.error.message) || 'comment_failed', page_id: pageId };
+  }
+  return { ok: true, status: 200, id: String(data.id), page_id: pageId, page_name: info.pageName, author_expected: 'page' };
+}
+
+// Publish a dark story (effective_object_story_id) to the page feed using the PAGE token.
+// Shared by createAd (step 8.5) and the post-first skip_ad early return. Fails soft:
+// returns { publishedToPage:false, publishError } rather than throwing, and never uses the
+// user token to publish (page token only, resolved internally).
+function isTransientPublishStoryError(error) {
+  const code = Number(error && error.code);
+  const message = String((error && error.message) || '').toLowerCase();
+  return code === 1 || message.includes('please reduce the amount of data');
+}
+
+async function publishStoryToPage(fetchImpl, { userToken, pageId, storyId }) {
+  try {
+    const info = await resolvePageToken(fetchImpl, userToken, pageId);
+    if (!info.pageToken) return { publishedToPage: false, publishError: 'page_token_not_found' };
+    const pub = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${storyId}?access_token=${encodeURIComponent(info.pageToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_published: true })
+    });
+    if (pub.data && pub.data.error) {
+      const publishError = String(pub.data.error.message || '').substring(0, 200);
+      if (isTransientPublishStoryError(pub.data.error)) {
+        return { publishedToPage: true, publishError, publishWarning: 'publish_story_transient_error_treated_as_success' };
+      }
+      return { publishedToPage: false, publishError };
+    }
+    return { publishedToPage: true, publishError: '' };
+  } catch (e) {
+    return { publishedToPage: false, publishError: (e && e.message) || String(e) };
+  }
+}
+
+// Template CAMPAIGN-level fields safe to MIRROR onto a freshly created campaign. Kept small and
+// known-creatable so Graph never rejects an immutable/invalid field (req: do not include fields
+// that would make Graph reject). Only fields actually present on the template are forwarded.
+const TEMPLATE_CAMPAIGN_MIRROR_FIELDS = ['smart_promotion_type'];
+// Template AD SET fields carrying the customer-lifecycle / customer-acquisition strategy
+// ("Reach new and existing customers" vs "Acquire new customers only"). Per Meta's Marketing API
+// this lives on the AD SET (existing_customer_budget_percentage), NOT the campaign — so a fresh
+// daily campaign cannot carry it; it must be re-applied to the COPIED adset. deep_copy:false copies
+// the adset shell but was live-observed to drop this strategy, so we re-apply it explicitly.
+const TEMPLATE_ADSET_LIFECYCLE_FIELDS = ['existing_customer_budget_percentage'];
+// Additional template adset fields READ for diagnostics only (not re-applied — they are not safely
+// settable via a plain adset POST). Surfaced under copied_template_settings for live verification.
+const TEMPLATE_ADSET_DIAGNOSTIC_FIELDS = ['targeting_optimization_types'];
+
+// Read the template's objective + the customer-lifecycle / campaign-level settings in ONE Graph
+// GET on the template adset (campaign{...} is an edge expansion). Returns safe defaults on any
+// failure so the ads flow still runs. The returned settings maps contain ONLY fields that are
+// present (non-null/non-empty) on the template, so callers can spread them unconditionally.
+async function readTemplateSettings(fetchImpl, { userToken, templateAdset }) {
+  const out = { objective: 'OUTCOME_ENGAGEMENT', campaignId: '', campaignSettings: {}, adsetSettings: {}, adsetDiagnostics: {} };
+  try {
+    const adsetFields = [...TEMPLATE_ADSET_LIFECYCLE_FIELDS, ...TEMPLATE_ADSET_DIAGNOSTIC_FIELDS].join(',');
+    const campaignFields = ['id', 'objective', ...TEMPLATE_CAMPAIGN_MIRROR_FIELDS].join(',');
+    const res = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${templateAdset}?fields=${adsetFields},campaign{${campaignFields}}&access_token=${encodeURIComponent(userToken)}`);
+    const d = (res && res.data) || {};
+    const camp = d.campaign || {};
+    if (camp.objective && typeof camp.objective === 'string') out.objective = camp.objective;
+    if (camp.id) out.campaignId = String(camp.id);
+    for (const f of TEMPLATE_CAMPAIGN_MIRROR_FIELDS) {
+      if (camp[f] !== undefined && camp[f] !== null && camp[f] !== '') out.campaignSettings[f] = camp[f];
+    }
+    for (const f of TEMPLATE_ADSET_LIFECYCLE_FIELDS) {
+      if (d[f] !== undefined && d[f] !== null && d[f] !== '') out.adsetSettings[f] = d[f];
+    }
+    for (const f of TEMPLATE_ADSET_DIAGNOSTIC_FIELDS) {
+      if (d[f] !== undefined && d[f] !== null && d[f] !== '') out.adsetDiagnostics[f] = d[f];
+    }
+  } catch {}
+  return out;
+}
+
+// Steps 5–8 of the ads flow: resolve/create a campaign, copy the template adset shell into
+// it, create the ad referencing `creativeId`, then rename + activate the adset/ad and clean
+// up deep_copy straggler ads. Shared by createAd and promoteOneCardPost so the two flows
+// cannot diverge. Returns { ok:true, campaign_id, adset_id, ad_id } or a step-tagged
+// { ok:false, ... } error (extraErrorFields are merged into the 'ad' error for caller context).
+//
+// Template parity: the new campaign mirrors the template campaign's safe lifecycle/strategy fields
+// (TEMPLATE_CAMPAIGN_MIRROR_FIELDS), and the COPIED adset re-applies the template's customer-
+// lifecycle strategy (TEMPLATE_ADSET_LIFECYCLE_FIELDS). Both are best-effort and reported under
+// `copied_template_settings` (+ `template_campaign_id`) so Hermes can live-verify.
+async function buildAdFromCreative(fetchImpl, params = {}) {
+  const sleep = params.sleep || realSleep;
+  const userToken = params.userToken;
+  const adAccount = String(params.adAccount || '').trim();
+  const templateAdset = String(params.templateAdset || '').trim();
+  const creativeId = params.creativeId;
+  const storyId = params.storyId;
+  const adName = params.adName;
+  const body = params.body || {};
+  const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
+  const extraErrorFields = params.extraErrorFields || {};
+  const now = Number.isFinite(params.now) ? params.now : Date.now();
+
+  // 5. Resolve / create the campaign.
+  const maxAdsetsPerCampaign = 10;
+  const maxCampaigns = 10;
+  const campaignPrefix = body.campaign_name || 'ADS_PUBLISH_';
+  // Daily campaign reuse: posts created on the same Bangkok calendar date share ONE campaign
+  // named e.g. "15/Jun/2026" (DD/Mon/YYYY). Reuse an existing same-name + same-objective campaign
+  // when present; otherwise create it once. DISTINCT from `new_campaign_name`, which ALWAYS
+  // force-creates a brand-new campaign (dashboard behavior — must not reuse). `campaign_id` (when
+  // explicit) still wins. `reuse_campaign_name` is an accepted alias for `daily_campaign_name`.
+  const dailyCampaignName = String(body.daily_campaign_name || body.reuse_campaign_name || '').trim();
+  let targetCampaignId = body.campaign_id || null;
+  let resolvedCampaignName = '';
+  // Apply the per-adset budget + 24h schedule (below) ONLY for the daily-campaign path. The daily
+  // campaign is created WITHOUT a campaign-level budget so the copied adset keeps its own
+  // daily_budget; the prefix/new_campaign_name campaigns carry a campaign budget (CBO) where an
+  // adset-level budget would be rejected, so they keep the legacy activate-only behavior.
+  let usedDailyCampaign = false;
+
+  // Read template objective + lifecycle/strategy settings once (campaign-level mirror fields +
+  // adset-level customer-lifecycle fields). campaignMirror is spread into every campaign we CREATE;
+  // it is empty when the template carries none of the allowlisted fields, so existing behavior is
+  // unchanged when there is nothing to mirror.
+  const templateSettings = await readTemplateSettings(fetchImpl, { userToken, templateAdset });
+  const templateObjective = templateSettings.objective;
+  const campaignMirror = templateSettings.campaignSettings || {};
+  // Did we CREATE a campaign and apply the campaign-level mirror (vs. reuse an existing campaign,
+  // where we cannot retro-apply campaign settings)? Tracked for the copied_template_settings report.
+  let campaignSettingsApplied = false;
+  let campaignReuse = null;
+  // Track a campaign CREATED by THIS request (daily / new_campaign_name / prefix paths). A downstream
+  // failure deletes this now-empty campaign so Ads Manager never keeps an orphan "ไม่มีโฆษณา" row
+  // (the live symptom: a 16/Jun/2026 campaign with no ads after a failed force-post). A REUSED
+  // existing campaign (campaignReuse set) is NEVER deleted — other live ads may share it.
+  let createdCampaignId = null;
+  // Set ONLY when this request REUSED an existing daily campaign (exact name + objective). A copy
+  // failure into such a campaign is the signature of a bad/orphan EMPTY daily campaign left by a
+  // prior failed run (live: code=100 subcode=1885272 "Invalid parameter"); the copy step does one
+  // safe recovery (delete-if-empty + recreate + retry) keyed on this id.
+  let reusedDailyCampaignId = null;
+
+  // Non-secret diagnostics merged into EVERY step-tagged error so the caller/history can show the
+  // exact bridge step + ids (never a token). Reads live values at call time.
+  const diag = () => ({
+    template_adset: templateAdset || undefined,
+    target_campaign: targetCampaignId || undefined,
+    campaign_id: targetCampaignId || undefined,
+    campaign_name: resolvedCampaignName || undefined,
+    daily_campaign_name: dailyCampaignName || undefined,
+    used_daily_campaign: usedDailyCampaign || undefined,
+    created_new_campaign: createdCampaignId ? true : undefined
+  });
+
+  // Quietly set status:'DELETED' on an adset OR campaign (both accept it). Returns '' on success or
+  // a short error string. Never throws, never logs/returns the token.
+  const deleteEntityQuiet = async (entityId) => {
+    if (!entityId) return '';
+    try {
+      const del = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${entityId}?access_token=${encodeURIComponent(userToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'DELETED' })
+      });
+      if (del.data && del.data.error) return String(del.data.error.message || 'delete_failed').substring(0, 200);
+      return '';
+    } catch (e) { return (e && e.message) || 'delete_exception'; }
+  };
+
+  // On a downstream failure: delete the copied adset (cascades to its ad) and, when THIS request
+  // CREATED the campaign, delete that now-empty campaign too. Returns cleanup diagnostics to merge
+  // into the error — cleaned_campaign_id on success, or orphan_campaign_id + campaign_cleanup_error
+  // when the campaign delete fails. A reused existing campaign is left untouched.
+  const failCleanup = async (adsetId) => {
+    if (adsetId) await deleteEntityQuiet(adsetId);
+    if (!createdCampaignId) return {};
+    const cErr = await deleteEntityQuiet(createdCampaignId);
+    if (cErr) return { orphan_campaign_id: createdCampaignId, campaign_cleanup_error: cErr };
+    return { cleaned_campaign_id: createdCampaignId };
+  };
+
+  if (body.new_campaign_name) {
+    targetCampaignId = '';
+    const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: String(body.new_campaign_name).trim(), objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], daily_budget: '100000', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
+    });
+    if (newCamp.data.error) return { ok: false, step: 'campaign', error: newCamp.data.error.message, fb_error_code: newCamp.data.error.code, fb_error_subcode: newCamp.data.error.error_subcode, fb_trace_id: newCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag() };
+    targetCampaignId = newCamp.data.id;
+    createdCampaignId = targetCampaignId;
+    resolvedCampaignName = String(body.new_campaign_name).trim();
+    campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
+  } else if (!targetCampaignId && dailyCampaignName) {
+    // Exact-name reuse within the ad account, scoped to the template objective. CONTAIN narrows
+    // the fetch; the exact `name ===` match guarantees we never reuse a different campaign.
+    const filtering = encodeURIComponent(JSON.stringify([{ field: 'name', operator: 'CONTAIN', value: dailyCampaignName }]));
+    const search = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}&fields=id,name,status,objective&limit=200&filtering=${filtering}`);
+    const match = ((search.data && search.data.data) || []).find((c) => c.status !== 'DELETED' && String(c.name) === dailyCampaignName && c.objective === templateObjective);
+    if (match) {
+      targetCampaignId = match.id;
+      resolvedCampaignName = String(match.name);
+      campaignReuse = 'reused_existing_campaign';
+      reusedDailyCampaignId = match.id;
+    } else {
+      // Create the daily campaign WITHOUT a campaign-level budget so the copied adset keeps its
+      // own daily_budget (template has daily_budget=10000); a campaign budget would force CBO and
+      // reject the adset-level budget set on activation. Mirror the template campaign's safe
+      // lifecycle/strategy fields (campaignMirror) so the daily campaign matches the template.
+      const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: dailyCampaignName, objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], ...campaignMirror })
+      });
+      if (newCamp.data.error) return { ok: false, step: 'campaign', error: newCamp.data.error.message, fb_error_code: newCamp.data.error.code, fb_error_subcode: newCamp.data.error.error_subcode, fb_trace_id: newCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag() };
+      targetCampaignId = newCamp.data.id;
+      createdCampaignId = targetCampaignId;
+      resolvedCampaignName = dailyCampaignName;
+      campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
+    }
+    usedDailyCampaign = true;
+  }
+
+  if (!targetCampaignId) {
+    const camps = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}&fields=id,name,status,objective&limit=50&filtering=[{"field":"name","operator":"CONTAIN","value":"${campaignPrefix}"}]`);
+    const activeCamps = ((camps.data && camps.data.data) || []).filter((c) => c.status !== 'DELETED' && c.objective === templateObjective);
+    for (const camp of activeCamps) {
+      const adsets = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${camp.id}/adsets?access_token=${encodeURIComponent(userToken)}&fields=id,status&limit=50`);
+      const count = ((adsets.data && adsets.data.data) || []).filter((a) => a.status !== 'DELETED').length;
+      if (count < maxAdsetsPerCampaign) { targetCampaignId = camp.id; resolvedCampaignName = String(camp.name || ''); campaignReuse = 'reused_existing_campaign'; break; }
+    }
+    if (!targetCampaignId) {
+      if (activeCamps.length >= maxCampaigns) return { ok: false, step: 'campaign', error: 'Max ' + maxCampaigns + ' campaigns reached for objective ' + templateObjective };
+      const newCampNum = activeCamps.length + 1;
+      const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: campaignPrefix + newCampNum, objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], daily_budget: '100000', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
+      });
+      if (newCamp.data.error) return { ok: false, step: 'campaign', error: newCamp.data.error.message, fb_error_code: newCamp.data.error.code, fb_error_subcode: newCamp.data.error.error_subcode, fb_trace_id: newCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag() };
+      targetCampaignId = newCamp.data.id;
+      createdCampaignId = targetCampaignId;
+      resolvedCampaignName = campaignPrefix + newCampNum;
+      campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
+    }
+  }
+
+  // 6. Copy the template adset shell into the campaign.
+  const copyTemplateAdset = (campaignId) => gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${templateAdset}/copies?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deep_copy: false, status_option: 'PAUSED', campaign_id: campaignId })
+  });
+  let copy = await copyTemplateAdset(targetCampaignId);
+  // Diagnostics describing a bad-reused-campaign recovery (empty), merged into the success and any
+  // subsequent error so Hermes can see what happened. Empty when no recovery was attempted.
+  let recoveryDiag = {};
+
+  // RECOVERY: a copy failure into a REUSED daily campaign is the signature of a bad/orphan EMPTY
+  // daily campaign left by a prior failed run (live: code=100 subcode=1885272 "Invalid parameter").
+  // Do ONE safe recovery: if that reused campaign has NO non-DELETED adsets, delete it (orphan
+  // cleanup), create a fresh duplicate daily campaign (same name/objective/mirror), and retry the
+  // copy once. A reused campaign that still has adsets is NEVER deleted.
+  if (copy.data.error && reusedDailyCampaignId && String(reusedDailyCampaignId) === String(targetCampaignId)) {
+    const firstError = copy.data.error || {};
+    const adsetsRes = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${reusedDailyCampaignId}/adsets?fields=id,status,effective_status&limit=50&access_token=${encodeURIComponent(userToken)}`);
+    const liveAdsets = ((adsetsRes.data && adsetsRes.data.data) || []).filter((a) => String((a && a.status) || '').toUpperCase() !== 'DELETED');
+    if (liveAdsets.length > 0) {
+      // Non-empty reused campaign — do NOT delete it. Return the original copy error.
+      return { ok: false, step: 'copy', error: firstError.message, fb_error_code: firstError.code, fb_error_subcode: firstError.error_subcode, fb_trace_id: firstError.fbtrace_id, ...diag(), reused_campaign_had_adsets: true };
+    }
+    // Empty reused campaign — safe orphan cleanup, then recreate fresh.
+    recoveryDiag = { recovered_from_bad_reused_campaign: true, bad_reused_campaign_id: reusedDailyCampaignId };
+    const badDelErr = await deleteEntityQuiet(reusedDailyCampaignId);
+    if (badDelErr) recoveryDiag.bad_reused_campaign_cleanup_error = badDelErr;
+    else recoveryDiag.cleaned_bad_reused_campaign_id = reusedDailyCampaignId;
+    // Create a fresh duplicate daily campaign (same name/objective/mirror, NO CBO budget so the
+    // copied adset keeps its own daily_budget).
+    const freshCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: dailyCampaignName, objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], ...campaignMirror })
+    });
+    if (freshCamp.data.error) {
+      return { ok: false, step: 'campaign', error: freshCamp.data.error.message, fb_error_code: freshCamp.data.error.code, fb_error_subcode: freshCamp.data.error.error_subcode, fb_trace_id: freshCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag(), ...recoveryDiag };
+    }
+    targetCampaignId = freshCamp.data.id;
+    createdCampaignId = targetCampaignId; // fresh campaign IS deletable on a later failure
+    campaignReuse = null;
+    reusedDailyCampaignId = null;
+    campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
+    recoveryDiag.retry_campaign_id = targetCampaignId;
+    // Retry the copy ONCE into the fresh campaign.
+    copy = await copyTemplateAdset(targetCampaignId);
+  }
+
+  if (copy.data.error) {
+    // The copy failed BEFORE any adset exists — only clean up a campaign we created this request
+    // (the fresh duplicate when recovery ran; nothing for a first-attempt reused campaign).
+    const cleanup = await failCleanup(null);
+    return { ok: false, step: 'copy', error: copy.data.error.message, fb_error_code: copy.data.error.code, fb_error_subcode: copy.data.error.error_subcode, fb_trace_id: copy.data.error.fbtrace_id, ...diag(), ...recoveryDiag, ...cleanup };
+  }
+  const newAdset = copy.data.copied_adset_id;
+
+  // 6.5. Re-apply the template's customer-lifecycle strategy to the COPIED adset. The strategy
+  // ("Reach new and existing customers" vs "Acquire new customers only") lives on the ad set
+  // (existing_customer_budget_percentage); deep_copy:false copies the adset shell but was live-
+  // observed to drop it, so re-apply it explicitly. Fail SOFT — the ad still runs without it; the
+  // outcome is recorded under copied_template_settings.adset for live verification (req: do not
+  // fail closed unless the setting is explicitly required).
+  let adsetLifecycle = { applied: false };
+  if (Object.keys(templateSettings.adsetSettings).length > 0) {
+    const life = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(templateSettings.adsetSettings)
+    });
+    if (life.data && life.data.error) {
+      adsetLifecycle = { applied: false, error: String(life.data.error.message || 'lifecycle_apply_failed').substring(0, 200), fields: { ...templateSettings.adsetSettings } };
+    } else {
+      adsetLifecycle = { applied: true, fields: { ...templateSettings.adsetSettings } };
+    }
+  }
+
+  // 7. Create the ad (retry transient errors).
+  let adData = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const adResp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/ads?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: adName, adset_id: newAdset, creative: { creative_id: creativeId }, status: 'PAUSED' })
+    });
+    adData = adResp.data;
+    if (!adData.error) break;
+    const retryable = adData.error.is_transient === true;
+    if (!retryable || attempt === 4) break;
+    await sleep(attempt * pollMs);
+  }
+  if (adData.error) {
+    const cleanup = await failCleanup(newAdset);
+    return { ok: false, step: 'ad', error: adData.error.message, fb_error_code: adData.error.code, fb_error_subcode: adData.error.error_subcode, fb_error_user_title: adData.error.error_user_title, fb_error_user_msg: adData.error.error_user_msg, fb_is_transient: adData.error.is_transient, fb_trace_id: adData.error.fbtrace_id, adset_id: newAdset, creative_id: creativeId, ...diag(), ...cleanup, ...extraErrorFields };
+  }
+  const newAd = adData.id;
+
+  // 8. Schedule/budget (daily-campaign path) → rename + activate → readback-confirm ACTIVE.
+  // The adset update response was previously IGNORED, which let a Graph error (live-observed:
+  // code=100 subcode=1487057 "Invalid parameter" on an invalid schedule) silently leave the adset
+  // PAUSED while this route reported success. The fix: (a) split the schedule/budget from the
+  // status change, (b) check EVERY response and fail closed (deleting the orphan adset), and
+  // (c) read the adset back and require status === 'ACTIVE' (a POST can "succeed" yet leave it
+  // PAUSED — also live-observed).
+  const adsetDailyBudget = Number.isInteger(body.adset_daily_budget) && body.adset_daily_budget > 0 ? body.adset_daily_budget : 10000;
+  const adsetRunHours = Number.isFinite(body.adset_run_hours) && body.adset_run_hours > 0 ? body.adset_run_hours : 24;
+  const runMs = Math.round(adsetRunHours * 3600 * 1000);
+  let scheduleReport = null;
+
+  // Daily/post-first ADSET name = the post tail / sub2 (e.g. "984538171215406") — never the hash
+  // and never page_id_post_id. Derived from the source post id (storyId) tail. The AD name is left
+  // untouched (it stays the system video code/hash set at creation). Legacy paths keep the full
+  // storyId adset name.
+  const storyIdStr = String(storyId || '');
+  const adsetName = (usedDailyCampaign && storyIdStr.includes('_'))
+    ? storyIdStr.split('_').slice(1).join('_')
+    : storyIdStr;
+
+  // Bangkok offset ISO schedule (daily path only). end_time is sent on the ACTIVATION POST, never
+  // alongside daily_budget — Meta rejects daily_budget + end_time in the same POST (live:
+  // code=100 subcode=1487793). start_time is NEVER sent (a now/past start_time is a known cause of
+  // subcode 1487057). Meta additionally requires end_time >= the COPIED adset's OWN start_time +
+  // the run window; the copy assigns a start_time a few seconds after our local `now`, so an
+  // end_time computed from `now` lands just short and is also rejected as 1487793. So we read the
+  // copied adset's start_time back and compute end_time = that start + adsetRunHours.
+  let startIso = '';
+  let endIso = '';
+  if (usedDailyCampaign) {
+    let baseStartMs = null;
+    try {
+      const sr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?fields=start_time&access_token=${encodeURIComponent(userToken)}`);
+      const rbStart = sr.data && sr.data.start_time ? String(sr.data.start_time) : '';
+      const parsed = rbStart ? Date.parse(rbStart) : NaN;
+      if (Number.isFinite(parsed)) { baseStartMs = parsed; startIso = rbStart; }
+    } catch {}
+    if (baseStartMs == null) {
+      // Fallback: no readable start_time. Anchor to now + a safety buffer so end_time is
+      // comfortably past the (unknown) actual copied start + run window.
+      baseStartMs = now;
+      startIso = toBangkokIso(Math.floor(now / 1000));
+      endIso = toBangkokIso(Math.floor((now + runMs + 60000) / 1000));
+    } else {
+      endIso = toBangkokIso(Math.floor((baseStartMs + runMs) / 1000));
+    }
+
+    // 8a. Per-ad daily budget ONLY (default 10000 minor units = 100 THB). Separate POST from the
+    // schedule/activation. daily_budget (no lifetime_budget) is the conflict-free budget for the
+    // copied template adset; the daily campaign carries no CBO budget, so this is valid.
+    const budget = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ daily_budget: String(adsetDailyBudget) })
+    });
+    if (budget.data && budget.data.error) {
+      const cleanup = await failCleanup(newAdset);
+      return { ok: false, step: 'adset_budget', error: budget.data.error.message, fb_error_code: budget.data.error.code, fb_error_subcode: budget.data.error.error_subcode, fb_trace_id: budget.data.error.fbtrace_id, adset_id: newAdset, daily_budget: adsetDailyBudget, start_time: startIso || undefined, end_time: endIso || undefined, ...diag(), ...cleanup, ...extraErrorFields };
+    }
+    scheduleReport = { daily_budget: adsetDailyBudget, start_time: startIso, end_time: endIso };
+  }
+
+  // 8b. Rename + activate the adset — fail closed on any Graph error (never ignore the response).
+  // Daily path: this single POST also carries the 24h end_time as an offset ISO string — the
+  // live-proven shape { name, status:'ACTIVE', end_time } (NO daily_budget here, NO start_time).
+  const adsetActBody = usedDailyCampaign
+    ? { name: adsetName, status: 'ACTIVE', end_time: endIso }
+    : { name: adsetName, status: 'ACTIVE' };
+  const adsetAct = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(adsetActBody)
+  });
+  if (adsetAct.data && adsetAct.data.error) {
+    const cleanup = await failCleanup(newAdset);
+    return { ok: false, step: 'adset_activate', error: adsetAct.data.error.message, fb_error_code: adsetAct.data.error.code, fb_error_subcode: adsetAct.data.error.error_subcode, fb_trace_id: adsetAct.data.error.fbtrace_id, adset_id: newAdset, ...(usedDailyCampaign ? { start_time: startIso || undefined, end_time: endIso } : {}), ...diag(), ...cleanup, ...extraErrorFields };
+  }
+
+  // 8c. Activate the ad — likewise fail closed on error.
+  const adAct = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAd}?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'ACTIVE' })
+  });
+  if (adAct.data && adAct.data.error) {
+    const cleanup = await failCleanup(newAdset);
+    return { ok: false, step: 'ad_activate', error: adAct.data.error.message, fb_error_code: adAct.data.error.code, fb_error_subcode: adAct.data.error.error_subcode, fb_trace_id: adAct.data.error.fbtrace_id, adset_id: newAdset, ad_id: newAd, ...diag(), ...cleanup, ...extraErrorFields };
+  }
+
+  // 8d. Readback (daily path): require the adset to actually be ACTIVE and to carry the schedule
+  // end_time. A POST can return success while the adset stays PAUSED (live-observed) — never
+  // report success on a paused adset, and never claim the 24h schedule applied if end_time is
+  // missing on read-back.
+  if (usedDailyCampaign) {
+    const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?fields=name,status,effective_status,daily_budget,start_time,end_time&access_token=${encodeURIComponent(userToken)}`);
+    const adsetStatus = String((rb.data && rb.data.status) || '').toUpperCase();
+    if (adsetStatus !== 'ACTIVE') {
+      const cleanup = await failCleanup(newAdset);
+      return { ok: false, step: 'adset_activate', error: 'adset_not_active_after_update', adset_status: adsetStatus || null, adset_effective_status: (rb.data && rb.data.effective_status) || null, adset_id: newAdset, ad_id: newAd, ...diag(), ...cleanup, ...extraErrorFields };
+    }
+    const rbEndTime = String((rb.data && rb.data.end_time) || '').trim();
+    if (!rbEndTime) {
+      const cleanup = await failCleanup(newAdset);
+      return { ok: false, step: 'adset_activate', error: 'adset_end_time_missing_after_update', adset_status: adsetStatus, adset_id: newAdset, ad_id: newAd, ...diag(), ...cleanup, ...extraErrorFields };
+    }
+  }
+
+  // 8.25. Cleanup deep_copy straggler ads.
+  try {
+    const adsList = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}/ads?fields=id&limit=50&access_token=${encodeURIComponent(userToken)}`);
+    const stragglers = ((adsList.data && adsList.data.data) || []).filter((a) => String(a.id) !== String(newAd));
+    for (const a of stragglers) {
+      await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${a.id}?access_token=${encodeURIComponent(userToken)}`, { method: 'DELETE' });
+    }
+  } catch {}
+
+  return {
+    ok: true,
+    campaign_id: targetCampaignId,
+    campaign_name: resolvedCampaignName || undefined,
+    adset_id: newAdset,
+    ad_id: newAd,
+    ...(scheduleReport ? { daily_budget: scheduleReport.daily_budget, start_time: scheduleReport.start_time, end_time: scheduleReport.end_time } : {}),
+    // Bad-reused-campaign recovery (empty orphan deleted + fresh duplicate created + copy retried).
+    // Empty when no recovery ran, so existing successful responses are unchanged.
+    ...recoveryDiag,
+    // Diagnostics so Hermes can live-verify template parity. template_campaign_id is the source
+    // template campaign; copied_template_settings reports what was mirrored at each level (campaign-
+    // level fields applied only when we CREATED the campaign; adset-level customer-lifecycle re-apply
+    // outcome). adset.diagnostics carries read-only template fields not safely re-applicable.
+    ...(templateSettings.campaignId ? { template_campaign_id: templateSettings.campaignId } : {}),
+    copied_template_settings: {
+      campaign: { applied: campaignSettingsApplied, fields: { ...campaignMirror }, ...(campaignReuse ? { reuse: campaignReuse } : {}) },
+      adset: { ...adsetLifecycle, diagnostics: { ...templateSettings.adsetDiagnostics } }
+    }
+  };
+}
+
+// Read the template adset's CTA type + Instagram actor/user ids from its first ad creative.
+// Returns safe defaults on any failure. Shared by createAd and promoteOneCardPost.
+async function readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset }) {
+  let ctaType = 'SHOP_NOW';
+  let instagramActorId = '';
+  let instagramUserId = '';
+  try {
+    const tplAds = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${templateAdset}/ads?fields=creative{id}&limit=1&access_token=${encodeURIComponent(userToken)}`);
+    const tplCreativeId = tplAds.data && tplAds.data.data && tplAds.data.data[0] && tplAds.data.data[0].creative && tplAds.data.data[0].creative.id;
+    if (tplCreativeId) {
+      const tplCr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${tplCreativeId}?fields=call_to_action_type,instagram_actor_id,object_story_spec&access_token=${encodeURIComponent(userToken)}`);
+      const d = tplCr.data;
+      if (d && d.call_to_action_type) ctaType = String(d.call_to_action_type).trim();
+      instagramActorId = String((d && (d.instagram_actor_id || (d.object_story_spec && d.object_story_spec.instagram_actor_id))) || '').trim();
+      instagramUserId = String((d && d.object_story_spec && d.object_story_spec.instagram_user_id) || '').trim();
+    }
+  } catch {}
+  return { ctaType, instagramActorId, instagramUserId };
+}
+
+// Resolve the attachment video id from a freshly posted page video. The verified legacy
+// /create-ad flow promotes a Page video by its video_id; when the caller only knows the
+// source post (story_id/post_id), read attachments{media_type,target{id,url}} and take the
+// attachment target id. Returns '' on any failure so callers fail closed.
+async function resolveVideoIdFromSourcePost(fetchImpl, { userToken, sourcePostId }) {
+  const postId = String(sourcePostId || '').trim();
+  if (!postId) return '';
+  try {
+    const res = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(postId)}?fields=attachments{media_type,target{id,url}}&access_token=${encodeURIComponent(userToken)}`);
+    const att = res.data && res.data.attachments && res.data.attachments.data;
+    const target = Array.isArray(att) && att[0] && att[0].target;
+    return target && target.id ? String(target.id).trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+// POST /create-ad — OneCard/Ads via Cloak. Faithful port of electron.js /create-ad Graph
+// orchestration (upload → thumbnail → creative → campaign/adset → ad → activate → publish
+// to page). Compatible with the Worker's existing create-ad payload + response fields.
+//
+// POST-FIRST SUPPORT: when body.skip_ad is set, this returns AFTER publishing the page post
+// (story_id + reusable video_id + thumbnail) and does NOT create a campaign/adset/ad. Phase A
+// publishes a VISIBLE OneCard post: the page video carries an INITIAL (temporary) Shopee CTA
+// (shortlink/shopee_url) so the post immediately shows the Shopee link card + the SHOP_NOW
+// button under the video — never an organic/linkless Reel. The final post-specific Shopee
+// shortlink needs the post id (sub2), so the Worker mints it after story_id and then calls
+// /update-cta to replace this initial CTA with the final link (and /promote builds the paid ad).
+// Phase A never bakes a Worker redirect (onecard-cta / api.pubilo.com) into the visible UI.
+async function createAd(fetchImpl, params = {}) {
+  const sleep = params.sleep || realSleep;
+  const userToken = params.userToken;
+  const body = params.body || {};
+  const pageId = body.page_id;
+  const videoUrl = String(body.video_url || '').trim();
+  const existingVideoId = String(body.video_id || '').trim();
+  const caption = body.caption || '';
+  const adAccount = String(body.ad_account || params.defaultAdAccount || '').trim();
+  const templateAdset = String(body.template_adset || params.defaultTemplateAdset || '').trim();
+  const shortlink = String(body.shortlink || '').trim();
+  const shopeeUrl = String(body.shopee_url || '').trim();
+  const thumbnailUrl = String(body.thumbnail_url || body.image_url || '').trim();
+  const skipPublishToPage = body.skip_publish_to_page === true || body.skip_publish_to_page === 'true';
+  const skipAd = body.skip_ad === true || body.skip_ad === 'true';
+  const requestedAdName = String(body.ad_name || body.source_video_id || '').trim();
+  const ctaLink = shortlink || shopeeUrl;
+  const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
+  const storyPolls = Number.isInteger(params.storyPolls) ? params.storyPolls : 50;
+  const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
+
+  if (!pageId || (!videoUrl && !existingVideoId)) {
+    return { ok: false, step: 'validate', error: 'Missing: page_id, video_url or video_id' };
+  }
+  if (!adAccount || !templateAdset) {
+    return { ok: false, step: 'config', error: 'Missing: ad_account / template_adset' };
+  }
+
+  // Read CTA type + IG actor from the template adset's first ad creative.
+  const { ctaType, instagramActorId, instagramUserId } = await readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset });
+
+  // 1. Upload video (or reuse existing video id).
+  let vid;
+  let uploadedForInstagram = false;
+  let resolvedVideoUrl = videoUrl;
+  if (skipPublishToPage && !resolvedVideoUrl && existingVideoId) {
+    try {
+      const src = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(existingVideoId)}?fields=source&access_token=${encodeURIComponent(userToken)}`);
+      if (src.data && src.data.source && /^https?:\/\//i.test(String(src.data.source))) resolvedVideoUrl = String(src.data.source).trim();
+    } catch {}
+  }
+  let uploadMode = null;
+  if (skipPublishToPage && resolvedVideoUrl) {
+    const uv = await uploadAdVideoFromUrl(fetchImpl, { adAccount, userToken, videoUrl: resolvedVideoUrl, download: params.downloadVideo });
+    vid = uv.data;
+    // upload_mode for this IG path reports both the 'instagram_advideo' intent and the transport
+    // used: multipart is now primary ('instagram_advideo_multipart'); only a download failure routes
+    // to the file_url fallback ('instagram_advideo_file_url_fallback').
+    uploadMode = uv.uploadMode === 'file_url_fallback' ? 'instagram_advideo_file_url_fallback' : 'instagram_advideo_multipart';
+    if (vid.error) return { ok: false, step: 'upload', error: vid.error.message, fb_error_code: vid.error.code, fb_error_subcode: vid.error.error_subcode, fb_trace_id: vid.error.fbtrace_id, upload_mode: uploadMode };
+    uploadedForInstagram = true;
+  } else if (existingVideoId) {
+    vid = { id: existingVideoId };
+  } else {
+    const uv = await uploadAdVideoFromUrl(fetchImpl, { adAccount, userToken, videoUrl: resolvedVideoUrl, download: params.downloadVideo });
+    vid = uv.data;
+    uploadMode = uv.uploadMode;
+    if (vid.error) return { ok: false, step: 'upload', error: vid.error.message, fb_error_code: vid.error.code, fb_error_subcode: vid.error.error_subcode, fb_trace_id: vid.error.fbtrace_id, upload_mode: uploadMode };
+  }
+
+  // 2. Wait for a thumbnail (or use the supplied one).
+  let thumb = /^https?:\/\//i.test(thumbnailUrl) ? thumbnailUrl : null;
+  if (!thumb) {
+    for (let i = 0; i < thumbPolls; i++) {
+      await sleep(pollMs);
+      const t = await gJson(fetchImpl, `${GRAPH}/${vid.id}?access_token=${encodeURIComponent(userToken)}&fields=thumbnails`);
+      const td = t.data;
+      if (td.error) return { ok: false, step: 'thumbnails', error: td.error.message || 'Graph thumbnails error', fb_error_code: td.error.code, fb_error_subcode: td.error.error_subcode, fb_trace_id: td.error.fbtrace_id, used_existing_video: !!existingVideoId && !uploadedForInstagram, uploaded_for_instagram: uploadedForInstagram };
+      if (td.thumbnails && td.thumbnails.data && td.thumbnails.data.length >= 1) { thumb = td.thumbnails.data[0].uri; break; }
+    }
+  }
+  if (!thumb) return { ok: false, step: 'thumbnails', error: 'Timeout (FB still processing)' };
+
+  // 3. Create the creative.
+  // POST-FIRST (skipAd) builds the VISIBLE OneCard page post. It DOES attach an INITIAL CTA so
+  // the post shows the Shopee link card + the SHOP_NOW button immediately — using the pre-final
+  // Shopee link (shortlink/shopee_url) the Worker provides before the post-specific shortlink is
+  // minted. /update-cta swaps in the final post-specific link once story_id exists. The visible
+  // CTA must NEVER carry a Worker redirect (onecard-cta / api.pubilo.com); strip it if present so
+  // the visible UI only ever shows a direct Shopee link.
+  let effectiveCtaLink = ctaLink;
+  if (/\/onecard-cta(?:\/|$)/i.test(effectiveCtaLink) || /^https?:\/\/api\.pubilo\.com(?:\/|$)/i.test(effectiveCtaLink)) {
+    effectiveCtaLink = '';
+  }
+  const hasCtaLink = !!effectiveCtaLink;
+  const isLikePageCta = ctaType === 'LIKE_PAGE' || (!hasCtaLink && !skipAd);
+  // Attach a CTA when there is a usable link, when the template itself is LIKE_PAGE, or for the
+  // full ad path. In skip_ad mode with no usable link, publish linkless rather than inject a
+  // LIKE_PAGE button that the OneCard flow never intended.
+  const attachCta = hasCtaLink || ctaType === 'LIKE_PAGE' || !skipAd;
+  const ctaSpec = isLikePageCta
+    ? { type: 'LIKE_PAGE', value: { page: pageId } }
+    : { type: ctaType, value: { link: effectiveCtaLink, link_format: 'VIDEO_LPP' } };
+  const videoData = { video_id: vid.id, message: caption, image_url: thumb };
+  if (attachCta) videoData.call_to_action = ctaSpec;
+  const crBody = {
+    name: String(caption).substring(0, 50),
+    ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+    object_story_spec: {
+      page_id: pageId,
+      ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+      video_data: videoData
+    }
+  };
+  const cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+  });
+  const crData = cr.data;
+  if (crData.error) return { ok: false, step: 'creative', error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: effectiveCtaLink || null, used_existing_video: !!existingVideoId && !uploadedForInstagram, uploaded_for_instagram: uploadedForInstagram };
+
+  // 4. Poll for the story id.
+  let storyId = null;
+  for (let i = 0; i < storyPolls; i++) {
+    await sleep(pollMs);
+    const cc = await gJson(fetchImpl, `${GRAPH}/${crData.id}?access_token=${encodeURIComponent(userToken)}&fields=effective_object_story_id`);
+    if (cc.data && cc.data.effective_object_story_id) { storyId = cc.data.effective_object_story_id; break; }
+  }
+  if (!storyId) return { ok: false, step: 'story_id', error: 'Timeout (FB still creating story)', creative_id: crData.id };
+  const adName = String(requestedAdName || existingVideoId || String(vid.id || '') || caption).substring(0, 255);
+
+  // PHASE A (post-first): publish the page post and STOP — no campaign/adset/ad. Return the
+  // ids the post-first caller needs to (a) mint the final link with this story/post id and
+  // (b) reuse this uploaded video in /promote without a second upload.
+  if (skipAd) {
+    let pa = { publishedToPage: false, publishError: 'skipped_by_placement_template' };
+    if (!skipPublishToPage) pa = await publishStoryToPage(fetchImpl, { userToken, pageId, storyId });
+    // The INITIAL visible CTA link actually baked onto the post (null when the post is linkless
+    // or carries a LIKE_PAGE CTA). It is the pre-final Shopee link; the post-specific final link
+    // is applied later by /update-cta — so visible_page_cta_final stays false here.
+    const visibleInitialCtaLink = (attachCta && !isLikePageCta) ? effectiveCtaLink : null;
+    return {
+      ok: true,
+      phase: 'post',
+      story_id: storyId,
+      video_id: vid.id,
+      creative_id: crData.id,
+      thumbnail_url: thumb,
+      cta_type: ctaType,
+      // Phase A publishes the visible OneCard post with an INITIAL (temporary) Shopee CTA. It is
+      // not the post-specific final link yet, so visible_page_cta_final remains false; the
+      // visible_page_cta_initial flag signals the post already shows a Shopee CTA card/button.
+      cta_link: visibleInitialCtaLink,
+      visible_page_cta_link: visibleInitialCtaLink,
+      visible_page_cta_initial: !!visibleInitialCtaLink,
+      visible_page_cta_final: false,
+      post_url: `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}`,
+      published_to_page: pa.publishedToPage,
+      publish_error: pa.publishError || undefined,
+      uploaded_for_instagram: uploadedForInstagram,
+      upload_mode: uploadMode || undefined
+    };
+  }
+
+  // 5–8. Resolve/create campaign, copy adset, create + activate the ad.
+  const adEntities = await buildAdFromCreative(fetchImpl, {
+    userToken, adAccount, templateAdset, creativeId: crData.id, storyId, adName, body, sleep, pollMs,
+    extraErrorFields: { uploaded_for_instagram: uploadedForInstagram }
+  });
+  if (!adEntities.ok) return adEntities;
+  const targetCampaignId = adEntities.campaign_id;
+  const newAdset = adEntities.adset_id;
+  const newAd = adEntities.ad_id;
+
+  // 8.5. Publish the dark post to the page feed via the PAGE token.
+  let publishedToPage = false;
+  let publishError = '';
+  if (skipPublishToPage) {
+    publishError = 'skipped_by_placement_template';
+  } else {
+    const pubRes = await publishStoryToPage(fetchImpl, { userToken, pageId, storyId });
+    publishedToPage = pubRes.publishedToPage;
+    publishError = pubRes.publishError;
+  }
+
+  return {
+    ok: true,
+    story_id: storyId,
+    campaign_id: targetCampaignId,
+    campaign_name: adEntities.campaign_name,
+    daily_budget: adEntities.daily_budget,
+    start_time: adEntities.start_time,
+    end_time: adEntities.end_time,
+    adset_id: newAdset,
+    ad_id: newAd,
+    video_id: vid.id,
+    creative_id: crData.id,
+    post_url: `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}`,
+    published_to_page: publishedToPage,
+    publish_error: publishError || undefined,
+    uploaded_for_instagram: uploadedForInstagram,
+    upload_mode: uploadMode || undefined,
+    template_campaign_id: adEntities.template_campaign_id,
+    copied_template_settings: adEntities.copied_template_settings,
+    ...pickRecoveryDiag(adEntities)
+  };
+}
+
+// POST /promote — PHASE B of the post-first One Card flow. Build a PAID ad creative for a
+// freshly posted Page video using the verified legacy /create-ad flow: a NEW dark-post
+// adcreative whose object_story_spec.video_data carries the video_id plus the FINAL Shopee
+// CTA link, then reuse buildAdFromCreative() to copy the template adset + create the paused
+// ad. This does NOT touch the organic page post CTA and does NOT build the creative from an
+// existing object_story_id (that path produced a preview with no Shopee/CTA — rejected).
+//
+// The promoted ad mints its OWN effective_object_story_id (ad_story_id), which is DISTINCT
+// from the source page post (story_id/post_id). The source post is used only for ad naming
+// and adset grouping; promote never publishes a second page post.
+//
+// Inputs (params.body): page_id, video_id (from Phase A; resolved from the source post
+// attachment when absent but story_id/post_id is present), final_cta_link (direct Shopee
+// shortlink), thumbnail_url (optional — polled from the video if absent), caption, story_id /
+// post_id (the source page post, for naming/reference), ad_account, template_adset, campaign
+// options.
+async function promoteOneCardPost(fetchImpl, params = {}) {
+  const sleep = params.sleep || realSleep;
+  const userToken = params.userToken;
+  const body = params.body || {};
+  const pageId = String(body.page_id || '').trim();
+  let videoId = String(body.video_id || '').trim();
+  const caption = body.caption || '';
+  const adAccount = String(body.ad_account || params.defaultAdAccount || '').trim();
+  const templateAdset = String(body.template_adset || params.defaultTemplateAdset || '').trim();
+  const finalCtaLink = String(body.final_cta_link || body.shortlink || '').trim();
+  const thumbnailUrl = String(body.thumbnail_url || body.image_url || '').trim();
+  // The source page post — used for ad naming/reference + adset grouping. Distinct from the
+  // ad creative's own dark story (ad_story_id).
+  const sourcePostId = String(body.story_id || body.post_id || '').trim();
+  const requestedAdName = String(body.ad_name || body.source_video_id || '').trim();
+  const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
+  const storyPolls = Number.isInteger(params.storyPolls) ? params.storyPolls : 50;
+  const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
+
+  if (!pageId) return { ok: false, step: 'validate', error: 'Missing: page_id' };
+  if (!videoId && !sourcePostId) return { ok: false, step: 'validate', error: 'Missing: video_id (or story_id to resolve it)' };
+  if (!finalCtaLink) return { ok: false, step: 'validate', error: 'Missing: final_cta_link' };
+  if (!/^https?:\/\//i.test(finalCtaLink)) return { ok: false, step: 'validate', error: 'final_cta_link must be an http(s) URL' };
+  if (/\/onecard-cta(?:\/|$)/i.test(finalCtaLink) || /^https?:\/\/api\.pubilo\.com(?:\/|$)/i.test(finalCtaLink)) {
+    return { ok: false, step: 'validate', error: 'final_cta_link_must_be_direct_shopee_link' };
+  }
+  if (!/^https:\/\/s\.shopee\.co\.th(?:\/|$)/i.test(finalCtaLink)) {
+    return { ok: false, step: 'validate', error: 'final_cta_link_must_be_direct_shopee_link' };
+  }
+  if (!adAccount || !templateAdset) return { ok: false, step: 'config', error: 'Missing: ad_account / template_adset' };
+
+  // Resolve the video id from the source post attachment when the caller did not supply it.
+  // Fail closed when no video_id can be resolved — promote cannot build the video creative.
+  if (!videoId && sourcePostId) {
+    videoId = await resolveVideoIdFromSourcePost(fetchImpl, { userToken, sourcePostId });
+  }
+  if (!videoId) {
+    return { ok: false, step: 'resolve_video', error: 'video_id_unresolved', source_post_id: sourcePostId || null };
+  }
+
+  const { ctaType, instagramActorId, instagramUserId } = await readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset });
+
+  // Promote MUST bake the FINAL link into the CTA — that is the whole point (ad CTA == comment
+  // link). A LIKE_PAGE template CTA has no destination link, so it would silently drop the
+  // final link. Fail closed BEFORE creating any creative/ad rather than ship a linkless ad.
+  if (ctaType === 'LIKE_PAGE') {
+    return { ok: false, step: 'creative', error: 'template_cta_type_does_not_support_final_link', cta_type: 'LIKE_PAGE', video_id: videoId };
+  }
+
+  // Thumbnail: reuse the supplied thumb when provided, else poll the video.
+  let thumb = /^https?:\/\//i.test(thumbnailUrl) ? thumbnailUrl : null;
+  if (!thumb) {
+    for (let i = 0; i < thumbPolls; i++) {
+      await sleep(pollMs);
+      const t = await gJson(fetchImpl, `${GRAPH}/${videoId}?access_token=${encodeURIComponent(userToken)}&fields=thumbnails`);
+      const td = t.data;
+      if (td.error) return { ok: false, step: 'thumbnails', error: td.error.message || 'Graph thumbnails error', fb_error_code: td.error.code, fb_error_subcode: td.error.error_subcode, fb_trace_id: td.error.fbtrace_id, video_id: videoId };
+      if (td.thumbnails && td.thumbnails.data && td.thumbnails.data.length >= 1) { thumb = td.thumbnails.data[0].uri; break; }
+    }
+  }
+  if (!thumb) return { ok: false, step: 'thumbnails', error: 'Timeout (FB still processing)', video_id: videoId };
+
+  // Build the NEW paid ad creative via video_data.video_id with the FINAL Shopee CTA link.
+  const ctaSpec = { type: ctaType, value: { link: finalCtaLink, link_format: 'VIDEO_LPP' } };
+  const crBody = {
+    name: String(caption).substring(0, 50),
+    ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+    object_story_spec: {
+      page_id: pageId,
+      ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+      video_data: { video_id: videoId, message: caption, image_url: thumb, call_to_action: ctaSpec }
+    }
+  };
+  const cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+  });
+  const crData = cr.data;
+  if (crData.error) return { ok: false, step: 'creative', error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: finalCtaLink, video_id: videoId };
+
+  // The ad creative mints its OWN dark story (we do NOT publish it — the visible post is the
+  // source page post). Poll the new story id (ad_story_id) for the adset name + reporting.
+  let adStoryId = null;
+  for (let i = 0; i < storyPolls; i++) {
+    await sleep(pollMs);
+    const cc = await gJson(fetchImpl, `${GRAPH}/${crData.id}?access_token=${encodeURIComponent(userToken)}&fields=effective_object_story_id`);
+    if (cc.data && cc.data.effective_object_story_id) { adStoryId = cc.data.effective_object_story_id; break; }
+  }
+  if (!adStoryId) return { ok: false, step: 'story_id', error: 'Timeout (FB still creating ad story)', creative_id: crData.id };
+  const adName = String(requestedAdName || sourcePostId || videoId || caption).substring(0, 255);
+
+  // Campaign / adset / ad / activate — the adset is named after the SOURCE page post (when
+  // known) so ads stay grouped with the visible post the comment lives on.
+  const adEntities = await buildAdFromCreative(fetchImpl, {
+    userToken, adAccount, templateAdset, creativeId: crData.id, storyId: sourcePostId || adStoryId, adName, body, sleep, pollMs
+  });
+  if (!adEntities.ok) return adEntities;
+
+  return {
+    ok: true,
+    phase: 'promote',
+    // The source page post (where the comment lives) — DISTINCT from the ad's own dark story.
+    source_post_id: sourcePostId || null,
+    ad_story_id: adStoryId,
+    campaign_id: adEntities.campaign_id,
+    campaign_name: adEntities.campaign_name,
+    daily_budget: adEntities.daily_budget,
+    start_time: adEntities.start_time,
+    end_time: adEntities.end_time,
+    adset_id: adEntities.adset_id,
+    ad_id: adEntities.ad_id,
+    creative_id: crData.id,
+    video_id: videoId,
+    cta_link: finalCtaLink,
+    // The PROMOTED AD creative carries the final link (ad CTA == comment link). This is the
+    // promoted-ad CTA report only: no Worker redirect and no pre-final link.
+    promoted_ad_cta_link: finalCtaLink,
+    promoted_ad_cta_final: true,
+    // Promote does NOT update the organic page post CTA — the only CTA it sets is on the new
+    // paid ad creative. Never claim a visible page CTA success here.
+    visible_page_cta_final: false,
+    published_to_page: false,
+    template_campaign_id: adEntities.template_campaign_id,
+    copied_template_settings: adEntities.copied_template_settings,
+    ...pickRecoveryDiag(adEntities)
+  };
+}
+
+// POST /update-cta — update the VISIBLE page post / Reel CTA to the final post-specific Shopee
+// shortlink after story_id exists. This is the step that changes what users actually see on the
+// Reel, and is DISTINCT from /promote (which only sets the PAID ad creative's CTA). Live-proven
+// mutation order (the reason this exists: editing the upload/ad video id "succeeds" but does NOT
+// change the visible post — only the attachment target id does):
+//   GET  /{story_id}?fields=call_to_action,permalink_url,attachments{target,type,url}
+//        → cta_update_target_id = attachments.data[0].target.id (the visible Reel/video object)
+//   POST /{cta_update_target_id}  call_to_action={ type, value:{ link, link_format:'VIDEO_LPP' } }
+//   GET  /{story_id}?fields=call_to_action,permalink_url,attachments{target}  (read back to verify)
+// Uses the PAGE token (a page post's CTA can only be edited with the page token); fails closed
+// (page_token_not_found) and NEVER uses the user token to mutate. The final link must be a direct
+// Shopee shortlink (never a Worker redirect / onecard-cta / api.pubilo.com URL) so the visible
+// Facebook UI never carries a redirect. No token is ever returned or logged.
+async function updateVisiblePostCta(fetchImpl, params = {}) {
+  const userToken = params.userToken;
+  const pageId = String(params.pageId || params.page_id || '').trim();
+  const storyId = String(params.storyId || params.story_id || params.postId || params.post_id || '').trim();
+  const finalCtaLink = String(params.finalCtaLink || params.final_cta_link || params.shortlink || '').trim();
+  const ctaType = (String(params.ctaType || params.cta_type || 'SHOP_NOW').trim() || 'SHOP_NOW');
+  // Conservative fallback target only when the visible post exposes no attachment target id.
+  const fallbackTargetId = String(params.reelId || params.reel_id || params.videoId || params.video_id || '').trim();
+
+  if (!pageId || !storyId) return { ok: false, step: 'validate', error: 'Missing: page_id, story_id' };
+  if (!finalCtaLink) return { ok: false, step: 'validate', error: 'Missing: final_cta_link' };
+  if (!/^https?:\/\//i.test(finalCtaLink)) return { ok: false, step: 'validate', error: 'final_cta_link must be an http(s) URL' };
+  if (/\/onecard-cta(?:\/|$)/i.test(finalCtaLink) || /^https?:\/\/api\.pubilo\.com(?:\/|$)/i.test(finalCtaLink)) {
+    return { ok: false, step: 'validate', error: 'final_cta_link_must_be_direct_shopee_link' };
+  }
+  if (!/^https:\/\/s\.shopee\.co\.th(?:\/|$)/i.test(finalCtaLink)) {
+    return { ok: false, step: 'validate', error: 'final_cta_link_must_be_direct_shopee_link' };
+  }
+  if (!userToken) return { ok: false, step: 'session', error: 'no_session' };
+
+  // Page post CTA edits require the PAGE token. Fail closed when the session does not administer
+  // the page — never fall back to the user token.
+  const info = await resolvePageToken(fetchImpl, userToken, pageId);
+  if (info.error) return { ok: false, status: 200, step: 'pages', error: info.error, page_id: pageId };
+  if (!info.pageToken) return { ok: false, status: 403, step: 'page_token', error: 'page_token_not_found', page_id: pageId };
+
+  // 1. Read the visible post to resolve the CTA update target (the attachment target id is the
+  //    visible Reel/video object). Updating the story id itself does not change the visible CTA.
+  let ctaUpdateTargetId = '';
+  let permalinkUrl = '';
+  try {
+    const pre = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(storyId)}?fields=call_to_action,permalink_url,attachments{target,type,url}&access_token=${encodeURIComponent(info.pageToken)}`);
+    if (pre.data && !pre.data.error) {
+      const att = pre.data.attachments && pre.data.attachments.data;
+      const target = Array.isArray(att) && att[0] && att[0].target;
+      if (target && target.id) ctaUpdateTargetId = String(target.id).trim();
+      if (pre.data.permalink_url) permalinkUrl = String(pre.data.permalink_url);
+    }
+  } catch {}
+  // Conservative fallback: the supplied reel/video id, then the story id itself.
+  if (!ctaUpdateTargetId) ctaUpdateTargetId = fallbackTargetId || storyId;
+
+  // 2. Apply the CTA on the visible target.
+  const ctaSpec = { type: ctaType, value: { link: finalCtaLink, link_format: 'VIDEO_LPP' } };
+  const upd = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(ctaUpdateTargetId)}?access_token=${encodeURIComponent(info.pageToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ call_to_action: ctaSpec })
+  });
+  if (upd.data && upd.data.error) {
+    return {
+      ok: false, step: 'update', error: String(upd.data.error.message || 'cta_update_failed').substring(0, 200),
+      fb_error_code: upd.data.error.code, fb_error_subcode: upd.data.error.error_subcode, fb_trace_id: upd.data.error.fbtrace_id,
+      page_id: pageId, story_id: storyId, cta_update_target_id: ctaUpdateTargetId, final_cta_link: finalCtaLink
+    };
+  }
+
+  // 3. Read back the visible post CTA to verify the change applied (a POST that "succeeds" but
+  //    leaves the visible CTA unchanged must be reported as visible_page_cta_final:false).
+  let confirmedCtaLink = '';
+  try {
+    const post = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(storyId)}?fields=call_to_action,permalink_url,attachments{target}&access_token=${encodeURIComponent(info.pageToken)}`);
+    if (post.data && !post.data.error) {
+      const cta = post.data.call_to_action;
+      const val = cta && cta.value;
+      confirmedCtaLink = String((val && (val.link || val.link_caption)) || '').trim();
+      if (!permalinkUrl && post.data.permalink_url) permalinkUrl = String(post.data.permalink_url);
+    }
+  } catch {}
+
+  const visiblePageCtaFinal = !!confirmedCtaLink && confirmedCtaLink === finalCtaLink;
+  return {
+    ok: true,
+    phase: 'update_cta',
+    page_id: pageId,
+    story_id: storyId,
+    cta_update_target_id: ctaUpdateTargetId,
+    final_cta_link: finalCtaLink,
+    // The verified visible CTA link read back from Graph (empty if the read-back did not echo it).
+    visible_page_cta_link: confirmedCtaLink,
+    // True only when the read-back confirms the visible post now carries the final link.
+    visible_page_cta_final: visiblePageCtaFinal,
+    permalink_url: permalinkUrl || undefined
+  };
+}
+
+module.exports = {
+  GRAPH,
+  GRAPH_V,
+  resolveSessionToken,
+  hasLoggedInSession,
+  closeSession,
+  makeBrowserGraphFetch,
+  listPagesPublic,
+  resolvePageToken,
+  publishStoryToPage,
+  buildAdFromCreative,
+  readTemplateSettings,
+  readTemplateCreativeMeta,
+  postOneCardVideo,
+  pageComment,
+  createAd,
+  promoteOneCardPost,
+  updateVisiblePostCta,
+  downloadVideoToBuffer,
+  buildVideoMultipart,
+  uploadAdVideoMultipart,
+  uploadAdVideoFromUrl,
+  MAX_DOWNLOAD_VIDEO_BYTES
+};

@@ -84,7 +84,18 @@
         "VERTEX_TTS_MODEL": "gemini-2.5-flash-preview-tts",
         "WEBAPP_URL": "https://app.pubilo.com",
         "WEBAPP_DESKTOP_URL": "https://app.pubilo.com",
-        "VIDEO_ONECARD_WORKER_URL": "https://video-onecard.wwoom.com",
+        // Non-Electron Cloak FB posting bridge (apps/facebook-token-cloak — the existing
+        // CloakBrowser logged-in Facebook session). Drives the organic Reel /post +
+        // /page-comment routes and the Ads/OneCard /create-ad route used by
+        // 'post-reels-token-cloak' /
+        // 'post-reels-token-ads' page sources. Set to the active facebook-token-cloak
+        // bridge tunnel; posting fails closed if this is empty or points to the retired
+        // Electron video-onecard tunnel.
+        "CLOAK_FB_BRIDGE_URL": "https://short.wwoom.com",
+        "ADS_POST_FIRST_ENABLED": "1",
+        // DEPRECATED — retired Electron video-onecard bridge (port 3847). Removed; kept
+        // empty only so the deprecated fallback never targets the dead tunnel.
+        "VIDEO_ONECARD_WORKER_URL": "",
         "BROWSERSAVING_WORKER_URL": "https://browsersaving-worker.yokthanwa1993-bc9.workers.dev",
         "BROWSERSAVING_API_URL": "https://browsersaving-api.lslly.com",
         "MERGE_SERVICE_URL": "http://merge-api.lslly.com"

@@ -188,6 +188,13 @@ export type Env = {
     CORS_ORIGIN: string
     WEBAPP_URL?: string
     WEBAPP_DESKTOP_URL?: string
+    // Non-Electron Cloak FB posting bridge (apps/cloak-fb-bridge — a CloakBrowser logged-in
+    // Facebook session). Drives the organic Reel /post + /page-comment routes and the
+    // Ads/OneCard /create-ad route; the page's posting_token_source selects which.
+    CLOAK_FB_BRIDGE_URL?: string
+    // DEPRECATED: the retired Electron video-onecard menu-bar bridge (port 3847 / tunnel
+    // video-onecard.wwoom.com) has been removed. Kept only as a migration fallback and is
+    // ignored when it still points at the retired bridge (see resolveCloakFbBridgeBaseUrl).
     VIDEO_ONECARD_WORKER_URL?: string
     BROWSERSAVING_WORKER_URL?: string
     BROWSERSAVING_API_URL?: string

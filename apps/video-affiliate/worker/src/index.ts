@@ -134,12 +134,34 @@ import { ADMIN_HTML } from './admin-page'
 import {
     MAX_SHORTLINK_URL_TEMPLATE_CHARS,
     MAX_SHORTLINK_SUB_ID_CHARS,
+    DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE,
     normalizeShortlinkUrlTemplate,
     normalizeShortlinkSubId,
     buildShortlinkRequestUrlFromTemplate,
+    buildShopeeShortlinkBaseUrl,
+    buildPostingCommentShortlinkSubIds,
 } from './shortlink-template'
 import { extractShopeeAffiliateIdFromLink } from './shopee-affiliate-id'
+import { buildCaptionLinkFirstDescription, resolvePublishCaption } from './caption-link'
 import { handleReportProxyRequest } from './report-proxy'
+import {
+    type DashboardSessionRow,
+    DASHBOARD_SESSION_HEADER_NAME,
+    DASHBOARD_SETUP_MODE_HEADER_NAME,
+    resolveDashboardSessionId,
+    dashboardSessionAuthorizes as dashboardSessionNamespaceAuthorizes,
+    dashboardSetupModeAuthorizes as dashboardSetupModeNamespaceAuthorizes,
+} from './dashboard-session'
+import {
+    type PostingRoute,
+    type PageCommentTokenSource,
+    normalizePagePostingTokenSource,
+    resolvePostingRoute,
+    postingSourceHint,
+    resolveCloakFbBridgeBaseUrl,
+    normalizePageCommentTokenSource,
+    defaultCommentSourceForRoute,
+} from './posting-token-source'
 import {
     PAGE_VIDEO_ASSET_WINNERS_INDEX_SQL,
     PAGE_VIDEO_ASSET_WINNERS_TABLE_SQL,
@@ -556,16 +578,96 @@ async function requireOwnerSession(c: Context<{ Bindings: Env, Variables: { botI
     return { ok: true as const }
 }
 
+// Resolve the dashboard passkey session against the shared D1
+// `dashboard_passkey_sessions` table. The session id comes from the proxy-injected
+// x-dashboard-session-id header (preferred — the cross-subdomain cookie does not
+// reliably survive the proxy hop) or, as a fallback, the pubilo_dashboard_session
+// cookie. Returns a live (unexpired) row with a namespace_id, or null. The table is
+// owned by the dashboard worker (apps/dashboard/src/server/auth.ts) on the SAME D1
+// binding; a missing table or any DB error degrades to null (treated as
+// unauthenticated) rather than throwing. No session value is ever logged.
+async function loadDashboardSession(c: Context<any>): Promise<DashboardSessionRow | null> {
+    const sessionId = resolveDashboardSessionId(
+        c.req.header(DASHBOARD_SESSION_HEADER_NAME),
+        c.req.header('cookie'),
+    )
+    if (!sessionId) return null
+    const row = await c.env.DB.prepare(
+        `SELECT session_id, user_id, namespace_id, expires_at
+           FROM dashboard_passkey_sessions
+          WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
+    ).bind(sessionId).first().catch(() => null) as DashboardSessionRow | null
+    if (!row?.namespace_id) return null
+    return row
+}
+
+// True when a live dashboard passkey session authorizes this request. The
+// namespace check is delegated to the pure decision in ./dashboard-session: the
+// request MUST carry a resolved botId (the dashboard sends it via x-bot-id) that
+// equals the session namespace_id. A blank botId never authorizes, so a dashboard
+// operator can only act inside their own namespace.
+async function dashboardSessionAuthorizes(c: Context<any>): Promise<boolean> {
+    const session = await loadDashboardSession(c)
+    return dashboardSessionNamespaceAuthorizes({
+        session,
+        requestBotId: c.get('botId'),
+    })
+}
+
+// Count registered dashboard passkey credentials for a namespace in the shared D1.
+// Returns null on any error (missing table / DB failure) so callers treat the
+// setup-mode signal as UNCONFIRMED and deny — the header is never trusted alone.
+async function loadDashboardCredentialCount(c: Context<any>, namespaceId: string): Promise<number | null> {
+    const row = await c.env.DB.prepare(
+        'SELECT COUNT(*) AS n FROM dashboard_passkey_credentials WHERE namespace_id = ?'
+    ).bind(namespaceId).first().catch(() => null) as { n?: number } | null
+    if (!row) return null
+    return Number(row.n ?? 0)
+}
+
+// Setup-mode (passkey bootstrap) authorization fallback. ONLY reached when there is
+// no dashboard session. Accepts the proxy-set x-dashboard-setup-mode:1 header, but
+// only after independently re-confirming via the shared D1 that the request's
+// namespace has 0 registered credentials. The header alone is never sufficient.
+// The DB is queried only when the header is actually present (cheap short-circuit).
+async function dashboardSetupModeAuthorizes(c: Context<any>): Promise<boolean> {
+    const setupModeHeader = c.req.header(DASHBOARD_SETUP_MODE_HEADER_NAME)
+    if (String(setupModeHeader || '').trim() !== '1') return false
+    const botId = String(c.get('botId') || '').trim()
+    if (!botId) return false
+    const credentialCount = await loadDashboardCredentialCount(c, botId)
+    return dashboardSetupModeNamespaceAuthorizes({
+        setupModeHeader,
+        requestBotId: botId,
+        credentialCount,
+    })
+}
+
 async function requireAuthSession(c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>) {
     const token = getSessionTokenFromRequest(c)
-    if (!token.startsWith('sess_')) {
-        return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
+    if (token.startsWith('sess_')) {
+        const user = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(token).first() as { email?: string } | null
+        if (!user?.email) {
+            return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
+        }
+        return { ok: true as const }
     }
-    const user = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(token).first() as { email?: string } | null
-    if (!user?.email) {
-        return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
+    // Dashboard passkey session bridge (pubilo_dashboard_session): the React
+    // dashboard never holds a raw `sess_` token, so authenticated operators reach
+    // these write routes via their passkey session cookie instead. Namespace is
+    // enforced (see dashboardSessionAuthorizes); a present-but-invalid `sess_`
+    // token above never falls through here.
+    if (await dashboardSessionAuthorizes(c)) {
+        return { ok: true as const }
     }
-    return { ok: true as const }
+    // Setup-mode fallback: during the passkey bootstrap window (namespace has 0
+    // registered credentials) the dashboard has no session to bridge, yet its UI is
+    // intentionally accessible. Authorize namespace-scoped writes, re-confirming the
+    // 0-credential state against D1 (header alone is never trusted).
+    if (await dashboardSetupModeAuthorizes(c)) {
+        return { ok: true as const }
+    }
+    return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
 }
 
 async function requireSystemAdminSession(c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>) {
@@ -1533,6 +1635,18 @@ app.put('/api/r2-upload/:key{.+}', async (c) => {
     } else if (authToken.startsWith('sess_')) {
         const user = await c.env.DB.prepare('SELECT email FROM users WHERE session_token = ?').bind(authToken).first().catch(() => null)
         if (user) authorized = true
+    }
+    // Dashboard passkey session bridge: the React dashboard uploads page avatars
+    // through /worker-api with its pubilo_dashboard_session cookie (no raw `sess_`
+    // token). Namespace is enforced against the resolved botId (x-bot-id), and the
+    // bucket below is already scoped to that botId.
+    if (!authorized && await dashboardSessionAuthorizes(c)) {
+        authorized = true
+    }
+    // Setup-mode fallback (passkey bootstrap window) — namespace-scoped, D1-confirmed
+    // 0-credential state; the x-dashboard-setup-mode header is never trusted alone.
+    if (!authorized && await dashboardSetupModeAuthorizes(c)) {
+        authorized = true
     }
     if (!authorized) {
         return c.json({ error: 'unauthorized' }, 401)
@@ -4339,6 +4453,71 @@ async function composeAvatarVideoForPosting(params: {
     throw new Error('avatar_compose_failed: merge_job_timeout')
 }
 
+async function prepareAvatarComposedPostingVideo(params: {
+    env: Env
+    db: D1Database
+    bucket: R2Bucket
+    namespaceId: string
+    pageId: string
+    videoId: string
+    baseVideoUrl: string
+    logPrefix: string
+}): Promise<{ videoUrl: string; avatarApplied: boolean; avatarVersion: string }> {
+    const baseVideoUrl = String(params.baseVideoUrl || '').trim()
+    const avatarSettings = await getPageAvatarSettings(params.db, params.pageId).catch(() => null)
+    if (!avatarSettings?.enabled || TEMP_DISABLE_AVATAR_COMPOSE_FOR_POSTING) {
+        return { videoUrl: baseVideoUrl, avatarApplied: false, avatarVersion: '' }
+    }
+    if (!avatarSettings.videoKey) throw new Error('avatar_compose_failed: avatar_video_key_missing')
+    const avatarHead = await params.bucket.head(avatarSettings.videoKey).catch(() => null)
+    if (!avatarHead) throw new Error('avatar_compose_failed: avatar_video_missing')
+    const avatarVideoUrl = buildAvatarObjectUrl(params.env, params.namespaceId, avatarSettings.videoKey)
+    if (!avatarVideoUrl) throw new Error('avatar_compose_failed: avatar_url_missing')
+    try {
+        const parsedAvatarUrl = new URL(avatarVideoUrl)
+        if (!['http:', 'https:'].includes(parsedAvatarUrl.protocol)) {
+            throw new Error('invalid_protocol')
+        }
+    } catch {
+        throw new Error('avatar_compose_failed: avatar_url_invalid')
+    }
+
+    const output = await composeAvatarVideoForPosting({
+        env: params.env,
+        baseVideoUrl,
+        avatarVideoUrl,
+        chromakeySimilarity: avatarSettings.chromakeySimilarity,
+        chromakeyBlend: avatarSettings.chromakeyBlend,
+    })
+    if (output.byteLength < 100000) throw new Error(`avatar_compose_failed: output_too_small_${output.byteLength}`)
+
+    const safeVideoId = String(params.videoId || 'posting').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80) || 'posting'
+    const composedVideoId = `${safeVideoId}_avatar_${Date.now()}`
+    const objectKey = `videos/${composedVideoId}.mp4`
+    await params.bucket.put(objectKey, output, {
+        httpMetadata: { contentType: 'video/mp4' },
+        customMetadata: {
+            source_video_id: String(params.videoId || ''),
+            page_id: String(params.pageId || ''),
+            avatar_version: avatarSettings.version || avatarSettings.updatedAt || 'v1',
+            purpose: 'facebook_posting_avatar_compose',
+        },
+    })
+    // Use the Worker gallery asset route instead of a raw r2.dev URL. This route is
+    // the same public, Range-capable path used by the normal Facebook posting flow;
+    // Meta's video uploader can fail to fetch the raw R2 URL immediately after put.
+    const videoUrl = buildWorkerGalleryAssetUrl(
+        String(params.env.WORKER_URL || '').trim(),
+        params.namespaceId,
+        composedVideoId,
+        'public',
+    ) || buildNamespaceObjectUrl(params.env.R2_PUBLIC_URL, params.namespaceId, objectKey)
+    if (!videoUrl) throw new Error('avatar_compose_failed: composed_url_missing')
+    const avatarVersion = avatarSettings.version || avatarSettings.updatedAt || 'v1'
+    console.log(`[${params.logPrefix}] avatar applied version=${avatarVersion} key=${objectKey} url_kind=${videoUrl.includes('/api/gallery/') ? 'worker_gallery' : 'r2_public'}`)
+    return { videoUrl, avatarApplied: true, avatarVersion }
+}
+
 function normalizeFacebookPageVideoCacheRow(pageId: string, raw: Record<string, unknown>): FacebookPageVideoCacheRow | null {
     const videoId = String(raw.id || raw.video_id || '').trim()
     if (!pageId || !videoId) return null
@@ -4651,6 +4830,20 @@ function isSameBangkokDate(a: string, b = new Date().toISOString()): boolean {
         day: '2-digit',
     })
     return formatter.format(new Date(first)) === formatter.format(new Date(second))
+}
+
+// Daily paid-ad campaign name for a Bangkok (UTC+7) calendar date, formatted DD/Mon/YYYY
+// (e.g. "15/Jun/2026"). Force-posts created on the same Bangkok day share ONE daily campaign
+// with this name; the bridge reuses the same-name + same-objective campaign or creates it once.
+function bangkokDailyCampaignName(now: Date = new Date()): string {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Bangkok',
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+    }).formatToParts(now)
+    const pick = (type: string) => parts.find((p) => p.type === type)?.value || ''
+    return `${pick('day')}/${pick('month')}/${pick('year')}`
 }
 
 // Extract a normalized views count from a /{video} or /?ids= record.
@@ -5378,6 +5571,9 @@ type DashboardGalleryPageResult = {
     inventoryTotal: number
     libraryTotal: number
     hasMore: boolean
+    // Raw gallery_index cursor for the deduped fast path: how many raw rows were
+    // consumed so the next page can resume past them. Only set on the fast path.
+    nextOffset?: number
 }
 
 const DASHBOARD_GALLERY_SELECT_COLUMNS = `
@@ -5761,9 +5957,14 @@ async function getDashboardGalleryPageFast(db: D1Database, params: {
     offset: number
     limit: number
     searchQuery: string
+    // When false, only the requested page rows are fetched and the (potentially
+    // full-table) COUNT(*) tallies are skipped — this is the fast first-paint
+    // path for the dashboard gallery, which no longer renders tab counts.
+    includeCounts?: boolean
 }): Promise<DashboardGalleryPageResult> {
     const namespaceId = String(params.namespaceId || '').trim()
     const view = params.view === 'used' ? 'used' : 'ready'
+    const includeCounts = params.includeCounts !== false
     const safeOffset = Math.max(0, Number(params.offset || 0))
     const safeLimit = Math.min(Math.max(Number(params.limit || 24), 1), 120)
     const postedClause = `(${DASHBOARD_GALLERY_POSTED_SQL})`
@@ -5780,7 +5981,7 @@ async function getDashboardGalleryPageFast(db: D1Database, params: {
         ensureNamespaceVideoStateColumns(db),
     ])
 
-    const rowsPromise = db.prepare(
+    const pageSql =
         `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
          ${DASHBOARD_GALLERY_FROM_JOIN}
          WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
@@ -5788,7 +5989,58 @@ async function getDashboardGalleryPageFast(db: D1Database, params: {
            ${searchWhere}
          ${orderBy}
          LIMIT ? OFFSET ?`
-    ).bind(...viewBinds, safeLimit, safeOffset).all() as Promise<{ results?: Array<Record<string, unknown>> }>
+
+    if (!includeCounts) {
+        // Fast path: dedupe by source fingerprint (fall back to namespace:id) so
+        // desktop matches the mobile LINE gallery, which groups by fingerprint.
+        // We scan raw gallery_index rows in chunks from the raw offset and keep
+        // the FIRST row of each fingerprint group — SQL already orders newest /
+        // desired-first, so the first occurrence is the canonical one. No COUNT(*)
+        // tallies and no full inventory hydration, so first paint stays fast.
+        const scanLimit = Math.min(Math.max(safeLimit * 4, safeLimit + 20), 500)
+        const MAX_CHUNKS = 3
+        const seen = new Set<string>()
+        const videos: Array<Record<string, unknown>> = []
+        let rawOffset = safeOffset
+        let lastChunkFull = false
+        for (let chunk = 0; chunk < MAX_CHUNKS && videos.length < safeLimit; chunk++) {
+            const chunkRes = await db.prepare(pageSql)
+                .bind(...viewBinds, scanLimit, rawOffset)
+                .all() as { results?: Array<Record<string, unknown>> }
+            const rows = chunkRes.results || []
+            lastChunkFull = rows.length >= scanLimit
+            for (const row of rows) {
+                rawOffset += 1
+                const mapped = mapDashboardGalleryRow(row, namespaceId)
+                const fingerprint = String(mapped.sourceFingerprint || '').trim()
+                const key = fingerprint ? `fp::${fingerprint}` : `id::${namespaceId}:${mapped.id}`
+                if (seen.has(key)) continue
+                seen.add(key)
+                videos.push(mapped)
+                if (videos.length >= safeLimit) break
+            }
+            if (!lastChunkFull) break
+        }
+        // Conservative "more pages exist": only stop once a chunk came back short
+        // AND we never filled the requested page from it. If we filled the page,
+        // assume more raw rows may remain so infinite scroll keeps going.
+        const hasMore = videos.length >= safeLimit || lastChunkFull
+        return {
+            videos,
+            total: 0,
+            overallTotal: 0,
+            readyTotal: 0,
+            usedTotal: 0,
+            inventoryTotal: 0,
+            libraryTotal: 0,
+            hasMore,
+            nextOffset: rawOffset,
+        }
+    }
+
+    const rowsPromise = db.prepare(pageSql)
+        .bind(...viewBinds, safeLimit, safeOffset)
+        .all() as Promise<{ results?: Array<Record<string, unknown>> }>
 
     const [rowsRes, viewTotalRow, readyTotalRow, usedTotalRow, libraryTotalRow] = await Promise.all([
         rowsPromise,
@@ -9558,26 +9810,94 @@ app.get('/api/dashboard/gallery', async (c) => {
     const viewRaw = String(c.req.query('view') || '').trim().toLowerCase()
     const view = viewRaw === 'used' ? 'used' : 'ready'
     const searchQuery = normalizeGallerySearchQuery(c.req.query('q'))
+    // Opt-out flag for the expensive count parity work. The dashboard gallery
+    // requests `include_counts=0` so the first page paints fast without waiting
+    // on the full namespace inventory (R2 fingerprint hydration + both-tab
+    // tallies). Other callers (Create Ads, etc.) omit the flag and keep the
+    // accurate, deduped counts.
+    const includeCountsRaw = String(c.req.query('include_counts') ?? '').trim().toLowerCase()
+    const includeCounts = !(includeCountsRaw === '0' || includeCountsRaw === 'false' || includeCountsRaw === 'no')
 
     try {
-        const page = await getDashboardGalleryPageFast(c.env.DB, {
-            namespaceId,
-            view,
-            offset,
-            limit,
-            searchQuery,
+        if (!includeCounts) {
+            // Fast first-paint path: a single LIMIT/OFFSET query straight off
+            // gallery_index, no inventory hydration and no COUNT(*) tallies.
+            const page = await getDashboardGalleryPageFast(c.env.DB, {
+                namespaceId,
+                view,
+                offset,
+                limit,
+                searchQuery,
+                includeCounts: false,
+            })
+            return c.json({
+                ok: true,
+                namespace_id: namespaceId,
+                videos: page.videos,
+                has_more: page.hasMore,
+                counts_included: false,
+                offset,
+                // Raw gallery_index cursor: the next page should resume here so the
+                // deduped scan doesn't re-yield rows already consumed this page.
+                next_offset: page.nextOffset ?? (offset + page.videos.length),
+                limit,
+                view,
+            }, 200, {
+                'Cache-Control': 'private, no-store',
+            })
+        }
+
+        // Use the same deduped namespace inventory the LINE mobile gallery reads
+        // (getNamespaceGalleryInventory → dedupeNamespaceInventoryVideos groups by
+        // source fingerprint). The previous fast path counted raw gallery_index
+        // rows and reported inflated ready/used totals that did not match mobile.
+        const inventory = await getNamespaceGalleryInventory(c.env, namespaceId)
+        const allVideos = inventory.videos
+        const readyVideos = allVideos.filter((video) => {
+            const row = video as Record<string, unknown>
+            return isNamespaceGalleryVideoDisplayReady(row) && !isNamespaceGalleryVideoPosted(row)
         })
+        // Newest-first, matching /api/gallery: surface videos manually moved back
+        // from the posted tab at the top, falling back to processed/created time.
+        const getReadySortMs = (video: Record<string, unknown>): number => {
+            const candidates = [
+                video.manualUnpostedAt,
+                video.manual_unposted_at,
+                video.processedAt,
+                video.processed_at,
+                video.updatedAt,
+                video.updated_at,
+                video.createdAt,
+                video.created_at,
+            ]
+            for (const candidate of candidates) {
+                const ts = new Date(String(candidate || '')).getTime()
+                if (Number.isFinite(ts) && ts > 0) return ts
+            }
+            return 0
+        }
+        readyVideos.sort((a, b) => getReadySortMs(b as Record<string, unknown>) - getReadySortMs(a as Record<string, unknown>))
+        const usedVideos = allVideos.filter((video) =>
+            isNamespaceGalleryVideoVisibleInUsedTab(video as Record<string, unknown>)
+        )
+        const sourceVideos = view === 'used'
+            ? sortUsedGalleryVideosNewestFirst(usedVideos as Array<Record<string, unknown>>)
+            : readyVideos
+        const searchedVideos = searchQuery
+            ? sourceVideos.filter((video) => matchesGallerySearchQuery(video as Record<string, unknown>, searchQuery))
+            : sourceVideos
+        const page = sliceGalleryPage(searchedVideos, offset, limit)
 
         return c.json({
             ok: true,
             namespace_id: namespaceId,
             videos: page.videos,
-            total: page.total,
-            overall_total: page.overallTotal,
-            ready_total: page.readyTotal,
-            used_total: page.usedTotal,
-            inventory_total: page.inventoryTotal,
-            library_total: page.libraryTotal,
+            total: searchedVideos.length,
+            overall_total: sourceVideos.length,
+            ready_total: readyVideos.length,
+            used_total: usedVideos.length,
+            inventory_total: allVideos.length,
+            library_total: inventory.sourceTotal,
             has_more: page.hasMore,
             offset,
             limit,
@@ -11005,6 +11325,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
         video_id?: string
         caption?: string
         shopee_url?: string
+        comment_shortlink?: string
         story_id?: string
         campaign_id?: string
         new_campaign_name?: string
@@ -11016,17 +11337,43 @@ app.post('/api/dashboard/create-ad', async (c) => {
         template_adset?: string
         ad_name?: string
         source_video_id?: string
+        skip_comment?: boolean
+        skip_ad?: boolean
+        skip_publish_to_page?: boolean
+        daily_campaign_name?: string
     }
     const pageId = String(body.page_id || '').trim()
     const videoUrl = String(body.video_url || '').trim()
     const videoId = String(body.video_id || '').trim()
     const caption = String(body.caption || '').trim()
     const shopeeUrl = String(body.shopee_url || '').trim()
+    // Optional explicit pre-shortened/managed comment link. The force-post / cron
+    // Ads/Token branch already resolves a managed shortlink via
+    // resolvePrePostingShortlinksForNamespace, so re-shortening it here double-shortens
+    // an already-short link and fails with shortlink_failed. When this is a valid
+    // http(s) URL we use it directly as the comment shortlink and skip our own fetch.
+    const explicitCommentShortlink = String(body.comment_shortlink || '').trim()
+    const hasExplicitCommentShortlink = /^https?:\/\//i.test(explicitCommentShortlink)
     const originalStoryId = String(body.story_id || '').trim()
     const lookupVideoId = videoId || (/^\d{8,}$/.test(originalStoryId) ? originalStoryId : '')
     const campaignId = String(body.campaign_id || '').trim()
     const newCampaignName = String(body.new_campaign_name || '').trim()
     const placementTemplate = String(body.placement_template || '').trim().toLowerCase()
+    // When true, create the ad + publish the page post and return story_id, but do
+    // NOT post the first comment here. The OneCard/Ads auto route (force-post/cron)
+    // sets this so it can re-mint the comment shortlink with sub2=post id / sub3=page
+    // id AFTER story_id exists, then post the single final comment itself. Without it,
+    // this route would comment with the pre-posting link (sub2/sub3 blank) and the
+    // caller would skip its corrected comment (no duplicate, but wrong link goes live).
+    const skipComment = body.skip_comment === true
+    // Post-first Phase A: forward skip_ad so the bridge publishes the page post and STOPS
+    // (returns story_id + reusable video_id + thumbnail) without creating a campaign/adset/ad.
+    const skipAd = body.skip_ad === true
+    // Post-first (ad-story-first): create the ad + story but HOLD the page-feed publish so the
+    // caller can finalize the visible CTA and publish the SAME story afterwards.
+    const skipPublishToPage = body.skip_publish_to_page === true
+    // Optional Bangkok-date daily campaign grouping (forwarded straight to the bridge buildAd path).
+    const dailyCampaignName = String(body.daily_campaign_name || '').trim()
     const templateAdsetOverride = String(body.template_adset || '').trim()
     const adName = resolveCreateAdVideoName({
         explicitName: body.ad_name,
@@ -11041,14 +11388,19 @@ app.post('/api/dashboard/create-ad', async (c) => {
     const overrideSub5 = String(body.sub_id5 || '').trim()
     if (!pageId || (!videoUrl && !videoId)) return c.json({ error: 'page_id and video_url or video_id required' }, 400)
 
-    const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+    // create-ad runs through the non-Electron Cloak FB posting bridge (apps/cloak-fb-bridge,
+    // CLOAK_FB_BRIDGE_URL) /create-ad route. The retired Electron video-onecard app is gone;
+    // fail closed with a precise `bridge_not_configured` error (not a vague invalid_response
+    // from a dead tunnel) when the bridge URL is unset.
+    const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
+    if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured', step: 'bridge_config' }, 503)
     try {
         // 1. Get settings + shortlink FIRST (need shortlink for caption). Read
         //    per-page so /chearb and /feed dashboards can hold different
         //    sub_ids / shortlink templates without leaking into each other.
         const settingsRow = await getPageSetting(c.env.DB, pageId, 'shortlink_url').catch(() => null)
         const subIdRow = await getPageSetting(c.env.DB, pageId, 'sub_id').catch(() => null)
-        const shortlinkUrlTemplate = String(settingsRow?.value || 'https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}').trim()
+        const shortlinkUrlTemplate = String(settingsRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
         const subId = String(subIdRow?.value || 'yok').trim()
 
         // 2. Find shopee link: first from facebook_page_video_cache, then post_history fallback
@@ -11056,7 +11408,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
         let thumbnailUrl = ''
 
         // Direct lookup from cache table. Keep the cached `picture` too: for already
-        // posted page videos it is a valid FB thumbnail URL, and lets video-onecard
+        // posted page videos it is a valid FB thumbnail URL, and lets the CloakBrowser bridge
         // avoid calling `/{video_id}?fields=thumbnails` during temporary FB blocks.
         let cacheRow: { shopee_link?: string; post_id?: string; picture?: string } | null = null
         if (lookupVideoId) {
@@ -11145,7 +11497,12 @@ app.post('/api/dashboard/create-ad', async (c) => {
         const sub5 = overrideSub5 || String(subId5Row?.value || '').trim()
 
         let shortLink = ''
-        if (shopeeLink) {
+        if (hasExplicitCommentShortlink) {
+            // Caller supplied an already-shortened managed link (force-post / cron
+            // Ads/Token path). Trust it verbatim and skip the legacy short.wwoom fetch
+            // so we never double-shorten. shopeeLink is still used for the CTA button.
+            shortLink = explicitCommentShortlink
+        } else if (shopeeLink) {
             // Replace all placeholders in template
             let shortlinkUrl = shortlinkUrlTemplate
                 .replace('{url}', encodeURIComponent(shopeeLink))
@@ -11171,24 +11528,29 @@ app.post('/api/dashboard/create-ad', async (c) => {
             return c.json({ ok: false, error: 'ย่อลิ้ง Shopee ไม่สำเร็จ', step: 'shortlink_failed', video_id: lookupVideoId || videoId, shopeeLink }, 400)
         }
 
-        // 4. Caption stays exactly what the operator typed/pulled — matches the
-        // cron post format (caption + hashtags only, NO shortlink prefix). The
-        // shortlink lives in the first comment + the ad's CTA button only, so
-        // the page-feed post reads naturally and matches every other cron post.
-        // Earlier we prepended "📌 พิกัด : <shortlink>\n" here, but operator
-        // wants page-post captions identical to cron's.
+        // 4. Caption: default to exactly what the operator typed/pulled (caption +
+        // hashtags only, NO shortlink prefix) — matching the cron post format. The
+        // shortlink otherwise lives in the first comment + the ad's CTA button only.
+        // EXCEPTION: when the page has caption_link_enabled=1 (UI toggle
+        // "ใส่ลิงก์ในแคปชั่น") the managed shortlink is prepended as the first caption
+        // line, so OneCard/Ads page posts honor the toggle just like organic Reels.
+        // buildCaptionLinkFirstDescription is idempotent, so a caller that already
+        // prepended the same link won't double it.
         const cleanShortLink = shortLink.replace(/\?lp=aff$/, '').replace(/&lp=aff$/, '')
-        const finalCaption = caption
+        const pageCaptionLinkRow = await getPageCaptionLinkEnabled(c.env.DB, pageId).catch(() => false)
+        const finalCaption = (pageCaptionLinkRow && cleanShortLink)
+            ? buildCaptionLinkFirstDescription(caption, cleanShortLink)
+            : caption
 
         // 4. Create ad with final caption.
         // CTA button (SHOP_NOW) → shopee_url (real Shopee link, like the template)
         // Caption + comment text → cleanShortLink (wwoom for affiliate tracking)
-        // Both are passed; video-onecard prefers shopee_url for the button destination.
+        // Both are passed; the CloakBrowser bridge prefers shopee_url for the button destination.
         //
         // IMPORTANT: forward template_adset + ad_account FROM DASHBOARD SETTINGS so the
         // operator's configured template (read from dashboard_settings.template_adset) is
-        // actually used. Before this fix, electron.js fell back to its hardcoded default
-        // (120244361318490263) whenever these weren't in the body — meaning changing the
+        // actually used. Before this fix, electron.js fell back to its retired pre-SALES
+        // hardcoded default whenever these weren't in the body — meaning changing the
         // template in Settings UI had NO effect on real ad creation. electron.js also
         // reads call_to_action_type dynamically from the template adset's first ad, so
         // whatever CTA the operator set in their new template (SHOP_NOW, LEARN_MORE,
@@ -11221,7 +11583,9 @@ app.post('/api/dashboard/create-ad', async (c) => {
                     ...(templateAdsetForAttempt ? { template_adset: templateAdsetForAttempt } : {}),
                     ...(adAccountFromSettings ? { ad_account: adAccountFromSettings } : {}),
                     ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
-                    ...(placementTemplate === 'instagram' ? { skip_publish_to_page: true } : {}),
+                    ...(placementTemplate === 'instagram' || skipPublishToPage ? { skip_publish_to_page: true } : {}),
+                    ...(skipAd ? { skip_ad: true } : {}),
+                    ...(dailyCampaignName ? { daily_campaign_name: dailyCampaignName } : {}),
                     // New campaign name must win over selected existing campaign.
                     // UI can keep an existing campaign highlighted while operator types
                     // a duplicate-name campaign; sending campaign_id here would merge the
@@ -11247,6 +11611,9 @@ app.post('/api/dashboard/create-ad', async (c) => {
             return { resp: onecardResp, data: parsed }
         }
 
+        // Cloak and Electron Ads sources share this SAME create-ad route — it already
+        // targets the CloakBrowser/session-cookie bridge via baseUrl. No
+        // separate provider branch; no stored/manual token is used by the bridge.
         let { resp, data } = await callVideoOnecardCreateAd(templateAdsetFromSettings)
         const isIgUnsupportedMedia = Number(data.fb_error_code || 0) === 100
             && Number(data.fb_error_subcode || 0) === 1443078
@@ -11272,7 +11639,7 @@ app.post('/api/dashboard/create-ad', async (c) => {
         let commentId = ''
         let commentError = ''
         let commentTargetId = ''
-        if (cleanShortLink && placementTemplate !== 'instagram') {
+        if (cleanShortLink && placementTemplate !== 'instagram' && !skipComment) {
             const storyId = String(data.story_id || '').trim()
             try {
                 let commentToken = ''
@@ -11357,6 +11724,9 @@ app.post('/api/dashboard/create-ad', async (c) => {
             commentId,
             commentTargetId,
             commentPosted: !!commentId,
+            // Tell the caller this route deliberately did not comment so it can post
+            // the re-minted (sub2/sub3) final comment without risking a duplicate.
+            commentSkipped: skipComment,
             ...(commentId ? {} : { commentError }),
         })
     } catch (e) {
@@ -11369,7 +11739,8 @@ app.get('/api/dashboard/ad-links', async (c) => {
     const pattern = String(c.req.query('pattern') || '^16MAY26FBSPCAD \\((\\d+)\\)$').trim()
     const limitRaw = Number(c.req.query('limit') || 20)
     const campaignLimit = Number.isFinite(limitRaw) ? Math.min(60, Math.max(1, Math.floor(limitRaw))) : 20
-    const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+    const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
+    if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
 
     const graph = async (path: string, fields: string, limit = 100) => {
         const resp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(path)}&fields=${encodeURIComponent(fields)}&limit=${encodeURIComponent(String(limit))}`)
@@ -11499,7 +11870,8 @@ app.get('/api/dashboard/ad-links', async (c) => {
 app.get('/api/dashboard/campaigns', async (c) => {
     const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
     const mode = String(c.req.query('mode') || '').trim().toLowerCase()
-    const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+    const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
+    if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
     try {
         // Pull more than the visible limit (60) so after we filter out paused
         // /archived/etc. we still have enough ACTIVE campaigns to show. Operator
@@ -16746,12 +17118,27 @@ async function handleLineTextMessage(params: {
         const xhsDownloadTimeoutMs = 45_000
         await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
-        // Keep the cover-picker in the original reply flow. Sending an early
-        // "กำลังดึงวิดีโอ" reply consumes the reply token and forces the cover
-        // carousel onto LINE push; if push/background delivery fails, the user
-        // sees no cover options. The legacy UX waits for XHS resolve/download
-        // and replies with the cover picker directly.
-        const followupReplyToken = replyToken
+        // Acknowledge immediately within the reply-token window. XHS
+        // resolve+download can take up to ~60s (resolve 15s + download 45s),
+        // far longer than the loading animation (20s) and long enough for the
+        // reply token to expire before any message is sent — which looks like
+        // the bot read the link and ignored it. Consume the reply token on a
+        // quick ack here, then deliver the cover picker (and any failure
+        // message) via push so there is never a stale/expired token in play.
+        await lineReplyOrPush({
+            replyToken,
+            channelAccessToken,
+            lineUserId,
+            messages: [
+                { type: 'text', text: 'รับลิงก์ XHS แล้ว 🎬 กำลังดึงวิดีโอ/เตรียมตัวเลือกปกให้นะ รอสักครู่...' },
+            ],
+        }).catch((e) => {
+            console.warn(`[LINE] XHS ack failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+        })
+
+        // Reply token is now consumed by the ack above. Force push for every
+        // follow-up message (cover picker or failure) by passing an empty token.
+        const followupReplyToken = ''
 
         const withTimeoutSignal = (timeoutMs: number) => {
             const controller = new AbortController()
@@ -17436,9 +17823,31 @@ app.post('/api/telegram/:token?', async (c) => {
         return c.text('ok')
     }
 
-    // Handle callbacks (del_email:, close_setting)
+    // Handle callbacks (del_email:, close_setting, intake_cancel)
     if (cb) {
         const action = cb.data as string
+        if (action === 'intake_cancel') {
+            // Cancel an in-flight XHS intake: write the per-chat cancel marker so
+            // a still-running materialize won't resurrect the intake, and delete
+            // any already-saved waiting state. This callback runs before the
+            // request-scoped bucket is set, so resolve the namespace bucket here.
+            const cbUser = await resolveTelegramWorkspaceSession(c.env.DB, String(chatId), currentBotId).catch(() => null)
+            const cbNamespaceId = String(cbUser?.namespace_id || '').trim()
+            if (cbNamespaceId) {
+                const cbBucket = new BotBucket(c.env.BUCKET, cbNamespaceId) as unknown as R2Bucket
+                await cbBucket.put(`_waiting_video_cancelled/${chatId}.json`, JSON.stringify({ cancelledAt: new Date().toISOString() }), {
+                    httpMetadata: { contentType: 'application/json' },
+                }).catch(() => { })
+                await cbBucket.delete(`_waiting_video/${chatId}.json`).catch(() => { })
+            }
+            await sendTelegram(token, 'editMessageText', {
+                chat_id: chatId,
+                message_id: cb.message.message_id,
+                text: '🚫 ยกเลิกการดึงวิดีโอ XHS แล้ว',
+            }).catch(() => null)
+            await sendTelegram(token, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => null)
+            return c.text('ok')
+        }
         if (action.startsWith('del_email:')) {
             const email = action.replace('del_email:', '')
             await c.env.DB.prepare('DELETE FROM email_namespaces WHERE email = ?').bind(email).run().catch(() => { })
@@ -17619,6 +18028,25 @@ app.post('/api/telegram/:token?', async (c) => {
         const clearWaitingVideoState = async () => {
             await c.get('bucket').delete(waitingVideoKey).catch(() => { })
         }
+        // Cancellation marker for an in-flight XHS intake. The slow part of an
+        // intake is materializeOriginalVideoAsset (XHS resolve + download); the
+        // user can press the inline "ยกเลิก" button while it runs. The cancel
+        // callback writes this marker (and deletes any saved waiting state);
+        // handleVideoInput re-checks it after materialize so a late finish does
+        // not resurrect the intake by saving waiting state / prompting links.
+        const intakeCancelledKey = `_waiting_video_cancelled/${chatId}.json`
+        const isIntakeCancelled = async (): Promise<boolean> => {
+            const obj = await c.get('bucket').head(intakeCancelledKey).catch(() => null)
+            return Boolean(obj)
+        }
+        const clearIntakeCancelled = async () => {
+            await c.get('bucket').delete(intakeCancelledKey).catch(() => { })
+        }
+        // Any reply that leaves a pending/failed intake (missing-link prompts,
+        // the "already waiting" block, invalid-link nags) carries this button so
+        // the user can always escape a stuck intake. It triggers the same
+        // intake_cancel callback that clears _waiting_video + the cancel marker.
+        const intakeCancelKeyboard = { inline_keyboard: [[{ text: '🚫 ยกเลิก/ล้างรายการ', callback_data: 'intake_cancel' }]] }
         const findExistingDuplicateInboxVideo = async (state: WaitingVideoState): Promise<
             | { kind: 'waiting'; item: WaitingVideoState }
             | { kind: 'inbox'; item: InboxVideoRecord }
@@ -17647,12 +18075,14 @@ app.post('/api/telegram/:token?', async (c) => {
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
                     text: 'ส่งลิงก์ Lazada มาเลย',
+                    reply_markup: intakeCancelKeyboard,
                 })
                 return
             }
             await sendTelegram(token, 'sendMessage', {
                 chat_id: chatId,
                 text: 'ส่งลิงก์ Shopee มาเลย',
+                reply_markup: intakeCancelKeyboard,
             })
         }
         const upsertInboxFromWaitingState = async (state: WaitingVideoState) => {
@@ -17784,6 +18214,15 @@ app.post('/api/telegram/:token?', async (c) => {
                 } catch (error) {
                     console.log(`[INBOX-ORIGINAL] materialize skipped video=${videoId}: ${error instanceof Error ? error.message : String(error)}`)
                 }
+                // The user may have pressed "ยกเลิก" while the (slow) materialize
+                // ran. Honor it here so we don't resurrect the intake by saving
+                // waiting state / prompting for links after a cancel.
+                if (await isIntakeCancelled()) {
+                    await clearIntakeCancelled()
+                    await clearWaitingVideoState()
+                    await c.get('bucket').put(dedupKey, 'processing')
+                    return
+                }
             }
 
             const waitingState = normalizeWaitingVideoState({
@@ -17847,6 +18286,7 @@ app.post('/api/telegram/:token?', async (c) => {
                 await sendTelegram(token, 'sendMessage', {
                     chat_id: chatId,
                     text: '❌ ยังมีวิดีโอที่รอลิงก์ค้างอยู่ 1 รายการ\nกรุณาส่งลิงก์ Shopee และ Lazada ของคลิปก่อนหน้าให้ครบก่อน',
+                    reply_markup: intakeCancelKeyboard,
                 })
                 await c.get('bucket').put(dedupKey, 'processing')
                 return
@@ -17876,6 +18316,9 @@ app.post('/api/telegram/:token?', async (c) => {
                 const videoUrl = `https://api.telegram.org/file/bot${token}/${fileInfo.result.file_path}`
                 const shopeeFromCaption = extractShopeeLink(msg.caption || '')
                 const lazadaFromCaption = extractLazadaLink(msg.caption || '')
+                // Fresh intake: drop any stale cancel marker so it can't abort
+                // this upload inside handleVideoInput's post-materialize check.
+                await clearIntakeCancelled()
                 await handleVideoInput(videoUrl, 'telegram_video', 'Telegram video', {
                     shopeeLink: shopeeFromCaption || undefined,
                     lazadaLink: lazadaFromCaption || undefined,
@@ -17888,6 +18331,17 @@ app.post('/api/telegram/:token?', async (c) => {
         const xhsMatch = text.match(/https?:\/\/(xhslink\.com|www\.xiaohongshu\.com)\S+/)
         if (xhsMatch) {
             const videoUrl = xhsMatch[0]
+            // Acknowledge immediately BEFORE the slow materialize (XHS resolve +
+            // download). Without this the chat just shows "typing" with no reply
+            // until materialize finishes — and on failure looks like silence.
+            // Clear any stale cancel marker so this fresh intake starts clean,
+            // and attach an inline cancel button users can press while it runs.
+            await clearIntakeCancelled()
+            await sendTelegram(token, 'sendMessage', {
+                chat_id: chatId,
+                text: '📥 รับลิงก์ XHS แล้ว กำลังดึงวิดีโอ/เตรียมข้อมูลให้นะ รอสักครู่...',
+                reply_markup: intakeCancelKeyboard,
+            }).catch(() => { })
             await handleVideoInput(videoUrl, 'xhs_url', videoUrl, {
                 shopeeLink: extractShopeeLink(text) || undefined,
                 lazadaLink: extractLazadaLink(text) || undefined,
@@ -17956,6 +18410,7 @@ app.post('/api/telegram/:token?', async (c) => {
                     text: missing === 'lazada'
                         ? '❌ ลิงก์ Lazada ไม่ถูกต้อง\n\nส่งลิงก์ที่ขึ้นต้นด้วย https://s.lazada.co.th/... หรือ https://www.lazada...'
                         : '❌ ลิงก์ Shopee ไม่ถูกต้อง\n\nส่งลิงก์ที่ขึ้นต้นด้วย https://s.shopee.co.th/... หรือ https://shopee.co.th/...',
+                    reply_markup: intakeCancelKeyboard,
                 })
             } else {
                 await sendTelegram(token, 'sendMessage', {
@@ -23878,7 +24333,14 @@ function extractShortlinkAccountFromBaseUrl(rawValue: string): string {
 function deriveAffiliateShortlinkBaseUrl(kind: 'shopee' | 'lazada', account: string): string {
     const normalizedAccount = normalizeShortlinkAccount(account)
     if (!normalizedAccount) return ''
-    const url = new URL(kind === 'lazada' ? DEFAULT_LAZADA_SHORTLINK_WORKER_URL : DEFAULT_SHOPEE_SHORTLINK_WORKER_URL)
+    // Shopee defaults route through the Cloak bridge, which rejects account=CHEARB
+    // (manual_login_required) but resolves the numeric customlink id form. Map the
+    // known admin account to id=15130770000. Lazada keeps the account= form because
+    // its bridge still authenticates per-account.
+    if (kind === 'shopee') {
+        return buildShopeeShortlinkBaseUrl(DEFAULT_SHOPEE_SHORTLINK_WORKER_URL, normalizedAccount)
+    }
+    const url = new URL(DEFAULT_LAZADA_SHORTLINK_WORKER_URL)
     url.searchParams.set('account', normalizedAccount)
     return url.toString()
 }
@@ -26582,6 +27044,67 @@ async function failStalePostingRows(db: D1Database, namespaceId: string, pageId:
     ).bind(normalizedNamespaceId, normalizedPageId, `-${Math.max(60, staleSeconds)} seconds`).run()
 }
 
+// Conservative threshold for treating a `status='posting'` row with no
+// fb_post_id as permanently stuck. Normal successful posting flips the row to
+// 'success' within seconds/minutes, so 5 minutes is safe and mirrors the
+// create-ad watchdog window used elsewhere.
+const STALE_POSTING_RECOVERY_THRESHOLD_MINUTES = 5
+
+// Recover post_history rows that are stuck in `status='posting'` with no
+// fb_post_id for longer than the threshold. Such rows are the result of a
+// posting attempt that died (e.g. merge-api boot, container restart) before it
+// could flip status, and they permanently block force-post / retry / cron via
+// the page-already-posting guards. We only touch rows that provably never
+// published (fb_post_id IS NULL/blank) so we never clobber a row that succeeded
+// but is still awaiting comment reconciliation. Returns the recovery count.
+async function recoverStalePostingAttemptsForPage(
+    db: D1Database,
+    params: {
+        namespaceId: string
+        pageId: string
+        thresholdMinutes?: number
+        reason?: string
+    }
+): Promise<number> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    if (!namespaceId || !pageId) return 0
+
+    const thresholdRaw = Number(params.thresholdMinutes)
+    const thresholdMinutes = Number.isFinite(thresholdRaw)
+        ? Math.max(1, Math.min(180, Math.floor(thresholdRaw)))
+        : STALE_POSTING_RECOVERY_THRESHOLD_MINUTES
+    const reason = String(params.reason || '').trim() || 'stale_posting_timeout_no_fb_post_id'
+
+    const result = await db.prepare(
+        `UPDATE post_history
+         SET status = 'failed',
+             error_message = ?,
+             comment_status = 'not_attempted'
+         WHERE bot_id = ?
+           AND page_id = ?
+           AND status = 'posting'
+           AND TRIM(COALESCE(fb_post_id, '')) = ''
+           AND datetime(posted_at) < datetime('now', ?)`
+    ).bind(reason, namespaceId, pageId, `-${thresholdMinutes} minutes`).run().catch(() => null)
+
+    const recovered = Number(result?.meta?.changes || 0)
+    if (recovered > 0) {
+        // Drop any stale page-scoped posting lock for the same namespace/page so
+        // the very next acquire can proceed. Scoped to old locks only — a fresh
+        // lock from a genuinely active concurrent post is left intact.
+        await db.prepare(
+            `DELETE FROM posting_locks
+             WHERE namespace_id = ?
+               AND page_id = ?
+               AND scope = 'page'
+               AND datetime(created_at) < datetime('now', ?)`
+        ).bind(namespaceId, pageId, `-${thresholdMinutes} minutes`).run().catch(() => { })
+        console.log(`[STALE-RECOVERY] namespace=${namespaceId} page=${pageId} recovered=${recovered} reason=${reason}`)
+    }
+    return recovered
+}
+
 async function ensureLinkSubmissionsTable(db: D1Database): Promise<void> {
     await db.prepare(
         `CREATE TABLE IF NOT EXISTS link_submissions (
@@ -26968,11 +27491,17 @@ async function facebookGraphDelete(
     }
 }
 
-function buildCaptionLinkFirstDescription(caption: string, shopeeLink: string): string {
-    const link = String(shopeeLink || '').trim()
-    const originalCaption = String(caption || '')
-    if (!link) return originalCaption
-    return originalCaption ? `${link}\n${originalCaption}` : link
+// Read the per-page "ใส่ลิงก์ในแคปชั่น" toggle (pages.caption_link_enabled) by FB page id.
+// Used by /api/dashboard/create-ad so OneCard/Ads page posts honor the same setting the
+// organic Reel path reads from the pages row. Returns false on any error (missing column,
+// page not found) so callers degrade to the caption-only behavior.
+async function getPageCaptionLinkEnabled(db: D1Database, pageId: string): Promise<boolean> {
+    const id = String(pageId || '').trim()
+    if (!id) return false
+    const row = await db.prepare(
+        'SELECT caption_link_enabled FROM pages WHERE id = ? LIMIT 1'
+    ).bind(id).first() as { caption_link_enabled?: number | null } | null
+    return Number(row?.caption_link_enabled || 0) === 1
 }
 
 type BrowserSavingTokenMode = 'post' | 'comment'
@@ -27664,41 +28193,6 @@ async function shortenShopeeLinkForNamespace(params: {
     return originalLink
 }
 
-type PostingCommentShortlinkSubIds = {
-    postSubId2: string
-    postSubId3: string
-    postSubId4: string
-}
-
-function normalizeFacebookPostSubIdForShortlink(value: string | null | undefined): string {
-    const raw = String(value || '').trim()
-    if (!raw) return ''
-    const tail = raw.includes('_') ? raw.split('_').pop() || '' : raw
-    return normalizeShortlinkSubId(tail)
-}
-
-function buildPostingCommentShortlinkSubIds(input: {
-    canonicalPostId?: string | null
-    fbVideoId?: string | null
-    reelId?: string | null
-    pageId?: string | null
-    historyId?: number | string | null
-    logPrefix: string
-}): PostingCommentShortlinkSubIds {
-    const canonicalPostId = normalizeFacebookPostSubIdForShortlink(input.canonicalPostId)
-    const postSubId2 = canonicalPostId
-    if (!postSubId2) {
-        console.log(`[${input.logPrefix}] Shopee comment shortlink sub2 missing: missing_page_story_object_id`)
-    }
-
-    const postSubId3 = normalizeShortlinkSubId(input.pageId || '')
-    // New outbound tracking policy: keep post_history/log ids internal only.
-    // Do not send them as Shopee/customlink sub4 for newly posted comments.
-    const postSubId4 = ''
-
-    return { postSubId2, postSubId3, postSubId4 }
-}
-
 function isManagedShortlinkTransientFailure(error: unknown): boolean {
     const normalized = String(error || '').toLowerCase()
     return normalized.includes('failed to fetch')
@@ -27937,6 +28431,432 @@ async function resolvePostingShopeeLinkForNamespace(params: {
         console.log(`[${params.logPrefix}] shortenShopeeLinkForNamespace failed; blocking admin posting instead of falling back to submitted link: ${msg}`)
         writeTrace({ utmSource: null, status: 'fallback', error: msg || 'admin_shopee_shortlink_failed' })
         return ''
+    }
+}
+
+type OneCardCommentShortlinkRemint = {
+    // Final Shopee shortlink to use for the ad's first comment. Always non-empty:
+    // re-minted with sub2/sub3 when possible, else the original managed link.
+    commentShopeeLink: string
+    // Sub ID 2 (Facebook post id tail) and Sub ID 3 (Facebook page id) that were
+    // injected into the re-minted link, exposed so Dev can verify utm_content.
+    sub2: string
+    sub3: string
+    // true when the link was successfully re-minted with sub2/sub3; false means
+    // we fell back to the pre-posting managed link (no post id / re-shorten failed).
+    reminted: boolean
+    error: string | null
+}
+
+function isDirectShopeeShortlink(link: string): boolean {
+    try {
+        const parsed = new URL(String(link || '').trim())
+        return parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 's.shopee.co.th' && parsed.pathname.replace(/\/+$/g, '') !== ''
+    } catch {
+        return false
+    }
+}
+
+// Re-mint the OneCard/Ads first-comment Shopee shortlink AFTER the page post's
+// story_id exists, so the comment link carries:
+//   sub2 = Facebook post id tail (story_id `pageId_postId` → `postId`)
+//   sub3 = Facebook page id
+// while sub1/campaign and sub4/sub5 defaults stay whatever the namespace settings
+// resolve to (resolvePostingShopeeLinkForNamespace preserves configured sub4/sub5
+// when no postSubId4 override is passed). OneCard CTA promotion requires a newly shortened
+// direct Shopee shortlink, not a fallback/original link.
+async function remintOneCardCommentShortlink(params: {
+    env: Env
+    namespaceId: string
+    pageId: string
+    storyId: string
+    fbVideoId?: string
+    // The pre-posting managed/shortened Shopee link. Used both as the unwrap input
+    // for re-shortening and as the fallback when re-minting cannot run.
+    managedShopeeLink: string
+    historyId?: number | null
+    logPrefix: string
+}): Promise<OneCardCommentShortlinkRemint> {
+    const fallback = String(params.managedShopeeLink || '').trim()
+    const subIds = buildPostingCommentShortlinkSubIds({
+        canonicalPostId: params.storyId,
+        fbVideoId: params.fbVideoId,
+        pageId: params.pageId,
+        historyId: params.historyId ?? null,
+        logPrefix: params.logPrefix,
+    })
+    if (!fallback || !subIds.postSubId2) {
+        return {
+            commentShopeeLink: fallback,
+            sub2: subIds.postSubId2,
+            sub3: subIds.postSubId3,
+            reminted: false,
+            error: !fallback ? 'no_managed_shopee_link' : 'missing_post_id_sub2',
+        }
+    }
+    try {
+        const trace: { utmSource?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
+        // Pass ONLY sub2/sub3 overrides. Deliberately omit postSubId4 so the namespace's
+        // configured sub4/sub5 defaults are preserved — passing postSubId4 (even '') would
+        // trip hasPostSubId4Override in shortenShopeeLinkForNamespace and blank both.
+        const reshortened = await resolvePostingShopeeLinkForNamespace({
+            env: params.env,
+            namespaceId: params.namespaceId,
+            pageId: params.pageId,
+            shopeeLink: fallback,
+            logPrefix: params.logPrefix,
+            postSubId2: subIds.postSubId2,
+            postSubId3: subIds.postSubId3,
+            trace,
+        })
+        if (reshortened && trace.status === 'shortened' && isDirectShopeeShortlink(reshortened)) {
+            return { commentShopeeLink: reshortened, sub2: subIds.postSubId2, sub3: subIds.postSubId3, reminted: true, error: null }
+        }
+        return {
+            commentShopeeLink: fallback,
+            sub2: subIds.postSubId2,
+            sub3: subIds.postSubId3,
+            reminted: false,
+            error: trace.error || 'final_shopee_shortlink_required',
+        }
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        console.log(`[${params.logPrefix}] OneCard comment re-mint failed; using pre-posting managed link: ${msg}`)
+        return { commentShopeeLink: fallback, sub2: subIds.postSubId2, sub3: subIds.postSubId3, reminted: false, error: msg }
+    }
+}
+
+// Post-first OneCard/Ads is opt-in via env ADS_POST_FIRST_ENABLED='1'. Default OFF so the
+// proven single-shot create-ad path is untouched in production; Dev/Thanwa flip it on a test
+// page to verify that the ad CTA == the final comment link (sub2=post id, sub3=page id).
+function oneCardPostFirstEnabled(env: Env): boolean {
+    return String((env as Record<string, unknown>).ADS_POST_FIRST_ENABLED || '').trim() === '1'
+}
+
+type OneCardPostFirstResult = {
+    ok: boolean
+    step?: string
+    error?: string
+    storyId: string
+    confirmedPostId: string
+    fbReelUrl: string
+    videoId: string
+    adId: string
+    ctaShortlink: string
+    ctaSub2: string
+    ctaSub3: string
+    // ctaParity == promoted-ad CTA equals the comment final link.
+    ctaParity: boolean
+    // The PROMOTED AD creative carries the final link (sub2=post id, sub3=page id).
+    promotedAdCtaFinal: boolean
+    // The organic page post / Reel CTA link confirmed by the bridge /update-cta read-back. Set
+    // when the visible Reel CTA was updated to the final post-specific link after story_id existed
+    // (distinct from /promote, which only sets the PAID ad creative CTA).
+    visiblePageCtaLink: string
+    // Mirrors the bridge /update-cta read-back parity: true only when the visible Reel CTA is
+    // confirmed to carry the final link. Paid CTA evidence is promotedAdCtaFinal + ctaShortlink.
+    visiblePageCtaFinal: boolean
+    // True only when the bridge-confirmed visible CTA link equals the final comment link.
+    visiblePageCtaCommentParity: boolean
+    // Outcome of the post-finalization visible Reel CTA update (bridge /update-cta). REQUIRED for
+    // the post-first OneCard flow: the overall run fails closed (ok:false) unless this confirms the
+    // visible post now carries the final post-specific link (visiblePageCtaFinal).
+    visibleCtaUpdateStatus: 'success' | 'failed' | 'not_attempted'
+    visibleCtaUpdateError: string | null
+    // 'pending' = comment_token_source='stored_token': deferred to the stored-token backlog
+    // processor instead of the bridge (caller persists commentDelaySeconds/commentDueAt).
+    commentStatus: 'success' | 'failed' | 'not_configured' | 'pending'
+    commentId: string | null
+    commentError: string | null
+    // Token-free comment hint + deferred schedule the caller writes to post_history.
+    commentTokenHint: string | null
+    commentDelaySeconds: number | null
+    commentDueAt: string | null
+}
+
+// Post-first OneCard/Ads orchestration (the architecture Thanwa requested):
+//   Phase A   publish the VISIBLE OneCard post (create-ad skip_ad+skip_comment) WITH an INITIAL
+//             (temporary) Shopee CTA so the post immediately shows the Shopee card + SHOP_NOW
+//             button → post id  (no ad yet)
+//   mint      final affiliate link with sub2=post id tail, sub3=page id
+//   Phase B   bridge /promote → build the PAID ad whose creative CTA carries that final direct
+//             Shopee link (reuses Phase A's uploaded video; no second post)
+//   Phase B.5 bridge /update-cta → swap the VISIBLE post CTA to the final post-specific link.
+//             REQUIRED for this flow: the run fails closed if the bridge does not confirm the
+//             visible CTA now carries the final link (Thanwa wants the VISIBLE post fixed, not
+//             merely the paid-ad CTA).
+//   comment   page-comment the SAME final link on the visible post
+// Result: visible post CTA == ad CTA == comment == final link. Never throws; returns ok:false
+// with a step on failure so the caller records history without crashing the run.
+async function runOneCardPostFirstAds(params: {
+    env: Env
+    pageId: string
+    namespaceId: string
+    caption: string
+    videoUrl: string
+    sourceVideoId: string
+    rawShopeeLink: string
+    managedShopeeLink: string
+    historyId: number | null
+    skipComment: boolean
+    // Comment delivery is chosen independently of the posting (ADS) route, same as the other
+    // branches: 'cloak_browser' → bridge /page-comment; 'stored_token' → deferred backlog.
+    commentSource: PageCommentTokenSource
+    hasCommentToken: boolean
+    storedCommentTokenHint: string | null
+    campaignId?: string
+    newCampaignName?: string
+    logPrefix: string
+}): Promise<OneCardPostFirstResult> {
+    const env = params.env
+    const pageId = params.pageId
+    const fail = (step: string, error: string, extra: Partial<OneCardPostFirstResult> = {}): OneCardPostFirstResult => ({
+        ok: false, step, error,
+        storyId: '', confirmedPostId: '', fbReelUrl: '', videoId: '', adId: '',
+        ctaShortlink: '', ctaSub2: '', ctaSub3: '', ctaParity: false,
+        promotedAdCtaFinal: false,
+        visiblePageCtaLink: '', visiblePageCtaFinal: false, visiblePageCtaCommentParity: false,
+        visibleCtaUpdateStatus: 'not_attempted', visibleCtaUpdateError: null,
+        commentStatus: 'not_configured', commentId: null, commentError: null,
+        commentTokenHint: null, commentDelaySeconds: null, commentDueAt: null,
+        ...extra,
+    })
+
+    const baseUrl = resolveCloakFbBridgeBaseUrl(env)
+    if (!baseUrl) return fail('bridge_config', 'bridge_not_configured')
+    const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+
+    // Daily campaign grouping: with no explicit campaign override, route the paid ad into the
+    // Bangkok-date daily campaign (DD/Mon/YYYY). The bridge reuses the same-name + same-objective
+    // campaign or creates it once, and runs each ad/adset for 24h at ~100 THB. An explicit
+    // campaignId/newCampaignName always takes precedence and suppresses the daily name. The ad is
+    // created in Phase A now (no /promote), so the daily name is sent with Phase A.
+    const dailyCampaignName = (!params.campaignId && !params.newCampaignName) ? bangkokDailyCampaignName() : ''
+
+    // PHASE A — create the AD STORY first (no page publish, no comment). create-ad runs the full
+    // ad path (creative → campaign/adset → ad) carrying an INITIAL Shopee CTA, but
+    // skip_publish_to_page holds the story OUT of the page feed. It returns the ad story_id +
+    // ad_id/adset_id + the reusable video_id. The SAME ad story is published to the page LATER
+    // (after the visible CTA is swapped to the final post-specific link) — there is no organic
+    // page post and no /promote step.
+    let phaseA: {
+        ok?: boolean; error?: string; step?: string; story_id?: string; video_id?: string; thumbnail_url?: string
+        ad_id?: string; adset_id?: string; creative_id?: string; campaign_id?: string; end_time?: string
+        // Non-secret bridge diagnostics surfaced on failure (never tokens).
+        fb_error_code?: number; fb_error_subcode?: number; fb_trace_id?: string
+        target_campaign?: string; daily_campaign_name?: string
+        orphan_campaign_id?: string; campaign_cleanup_error?: string; cleaned_campaign_id?: string
+    }
+    try {
+        const respA = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page_id: pageId,
+                video_url: params.videoUrl,
+                source_video_id: params.sourceVideoId,
+                // Ad name = the system video code/hash. The bridge keeps this as the AD name; only
+                // the ADSET name becomes the post tail/sub2 (daily-campaign path).
+                ad_name: params.sourceVideoId,
+                caption: params.caption,
+                shopee_url: params.rawShopeeLink || params.managedShopeeLink,
+                comment_shortlink: params.managedShopeeLink,
+                // Build the ad story but DO NOT publish to the page yet — publish happens after the
+                // visible CTA is finalized so the visible post carries the final post-specific link.
+                skip_publish_to_page: true,
+                skip_comment: true,
+                ...(dailyCampaignName ? { daily_campaign_name: dailyCampaignName } : {}),
+                ...(!params.newCampaignName && params.campaignId ? { campaign_id: params.campaignId } : {}),
+                ...(params.newCampaignName ? { new_campaign_name: params.newCampaignName } : {}),
+            }),
+        }, 300000, 'post_first_phase_a')
+        phaseA = await respA.json().catch(() => ({})) as typeof phaseA
+        if (!respA.ok || !phaseA?.ok || !phaseA.story_id) {
+            // Preserve the EXACT inner bridge step so history shows e.g.
+            // `ads_post_first_failed: phase_a_post:adset_activate:Invalid parameter` — not a bare
+            // `phase_a_post:Invalid parameter`. The bridge step (creative/campaign/copy/adset_budget/
+            // adset_activate/ad_activate/...) is the actionable signal.
+            const innerStep = String(phaseA?.step || '').trim()
+            const innerError = String(phaseA?.error || `phase_a_http_${respA.status}`)
+            const combinedError = innerStep ? `${innerStep}:${innerError}` : innerError
+            // Log NON-SECRET ids for diagnosis (never tokens/cookies). orphan_campaign_id flags a
+            // campaign the bridge could not clean up after the failure.
+            console.error(`${params.logPrefix} POST-FIRST PHASE A failed`, JSON.stringify({
+                step: innerStep || null,
+                campaign_id: phaseA?.campaign_id || phaseA?.target_campaign || null,
+                adset_id: phaseA?.adset_id || null,
+                ad_id: phaseA?.ad_id || null,
+                creative_id: phaseA?.creative_id || null,
+                fb_error_code: phaseA?.fb_error_code ?? null,
+                fb_error_subcode: phaseA?.fb_error_subcode ?? null,
+                fb_trace_id: phaseA?.fb_trace_id || null,
+                daily_campaign_name: phaseA?.daily_campaign_name || null,
+                orphan_campaign_id: phaseA?.orphan_campaign_id || null,
+                campaign_cleanup_error: phaseA?.campaign_cleanup_error || null,
+                cleaned_campaign_id: phaseA?.cleaned_campaign_id || null,
+                http_status: respA.status,
+            }))
+            return fail('phase_a_post', combinedError)
+        }
+    } catch (e) {
+        return fail('phase_a_post', e instanceof Error ? e.message : String(e))
+    }
+    const storyId = String(phaseA.story_id || '').trim()
+    const videoId = String(phaseA.video_id || '').trim()
+    const adId = String(phaseA.ad_id || '').trim()
+    const confirmedPostId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
+    const fbReelUrl = storyId ? `https://www.facebook.com/${storyId.replace('_', '/posts/')}` : ''
+    if (!videoId) return fail('phase_a_post', 'phase_a_missing_video_id', { storyId, confirmedPostId, fbReelUrl })
+    if (!adId) return fail('phase_a_post', 'phase_a_missing_ad_id', { storyId, confirmedPostId, fbReelUrl, videoId })
+
+    // MINT the final link (sub2=post id tail, sub3=page id). This is the link the ad CTA and
+    // the comment will SHARE.
+    const remint = await remintOneCardCommentShortlink({
+        env, namespaceId: params.namespaceId, pageId, storyId, fbVideoId: videoId,
+        managedShopeeLink: params.managedShopeeLink, historyId: params.historyId,
+        logPrefix: `${params.logPrefix} POST-FIRST-SHORTLINK`,
+    })
+    const finalLink = remint.commentShopeeLink
+    if (!remint.reminted || !isDirectShopeeShortlink(finalLink)) {
+        return fail('final_shortlink_mint', remint.error || 'final_shopee_shortlink_required', {
+            storyId, confirmedPostId, fbReelUrl, videoId, ctaShortlink: '', ctaSub2: remint.sub2, ctaSub3: remint.sub3,
+        })
+    }
+
+    // FINALIZE THE VISIBLE CTA — swap the visible post CTA to the final post-specific link on the
+    // ad story's attachment target. The ad story already exists (Phase A) but is NOT yet on the
+    // page feed; the CTA is finalized BEFORE publishing so the visible post goes live with the
+    // final link. REQUIRED: the run fails closed unless the bridge read-back confirms
+    // visible_page_cta_final (Thanwa wants the VISIBLE post fixed, not merely the paid-ad CTA).
+    let visiblePageCtaLink = ''
+    let visiblePageCtaFinal = false
+    let visibleCtaUpdateStatus: 'success' | 'failed' | 'not_attempted' = 'not_attempted'
+    let visibleCtaUpdateError: string | null = null
+    try {
+        const respCta = await fetchWithTimeout(`${baseUrl}/update-cta`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page_id: pageId,
+                story_id: storyId,
+                final_cta_link: finalLink,
+                ...(videoId ? { video_id: videoId } : {}),
+            }),
+        }, 60000, 'post_first_update_cta')
+        const dataCta = await respCta.json().catch(() => ({})) as {
+            ok?: boolean
+            error?: string
+            step?: string
+            cta_update_target_id?: string
+            final_cta_link?: string
+            visible_page_cta_link?: string
+            visible_page_cta_final?: boolean
+            permalink_url?: string
+        }
+        if (respCta.ok && dataCta?.ok && dataCta.visible_page_cta_final === true) {
+            visibleCtaUpdateStatus = 'success'
+            // Report the visible CTA strictly from the bridge read-back (verified parity only).
+            visiblePageCtaLink = String(dataCta.visible_page_cta_link || '').trim()
+            visiblePageCtaFinal = true
+        } else {
+            // Fail closed: do NOT publish a story whose visible CTA was not confirmed final.
+            visibleCtaUpdateStatus = 'failed'
+            visibleCtaUpdateError = String(dataCta?.step ? `${dataCta.step}:${dataCta.error || ''}` : (dataCta?.error || `update_cta_http_${respCta.status}`)).substring(0, 200)
+            return fail('update_cta', visibleCtaUpdateError, {
+                storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
+                visibleCtaUpdateStatus, visibleCtaUpdateError,
+            })
+        }
+    } catch (e) {
+        visibleCtaUpdateStatus = 'failed'
+        visibleCtaUpdateError = (e instanceof Error ? e.message : 'update_cta_failed').substring(0, 200)
+        return fail('update_cta', visibleCtaUpdateError, {
+            storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
+            visibleCtaUpdateStatus, visibleCtaUpdateError,
+        })
+    }
+
+    // PUBLISH THE SAME AD STORY — now that its visible CTA is final, push the ad story to the page
+    // feed via the bridge /publish-story (page token only, internal). REQUIRED: the run fails
+    // closed unless the bridge confirms published_to_page.
+    try {
+        const respPub = await fetchWithTimeout(`${baseUrl}/publish-story`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page_id: pageId, story_id: storyId }),
+        }, 60000, 'post_first_publish_story')
+        const dataPub = await respPub.json().catch(() => ({})) as { ok?: boolean; error?: string; step?: string; published_to_page?: boolean }
+        if (!respPub.ok || !dataPub?.ok || dataPub.published_to_page !== true) {
+            const pubErr = String(dataPub?.step ? `${dataPub.step}:${dataPub.error || ''}` : (dataPub?.error || `publish_story_http_${respPub.status}`)).substring(0, 200)
+            return fail('publish_story', pubErr, {
+                storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
+                visiblePageCtaLink, visiblePageCtaFinal, visibleCtaUpdateStatus,
+            })
+        }
+    } catch (e) {
+        return fail('publish_story', e instanceof Error ? e.message : String(e), {
+            storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
+            visiblePageCtaLink, visiblePageCtaFinal, visibleCtaUpdateStatus,
+        })
+    }
+
+    // COMMENT — same final link on the visible (Phase A) post, as the Page. Delivery honors
+    // comment_token_source exactly like the other branches: 'cloak_browser' comments via the
+    // bridge now; 'stored_token' defers to the stored-token backlog (the caller persists the
+    // pending state + schedule). The comment target is always the Page story id (never ad/video).
+    let commentStatus: 'success' | 'failed' | 'not_configured' | 'pending' = 'not_configured'
+    let commentId: string | null = null
+    let commentError: string | null = null
+    let commentTokenHint: string | null = params.commentSource === 'cloak_browser' ? 'cloak_session_bridge' : params.storedCommentTokenHint
+    let commentDelaySeconds: number | null = null
+    let commentDueAt: string | null = null
+    if (finalLink && !params.skipComment) {
+        if (params.commentSource === 'cloak_browser') {
+            const commentText = (await buildAffiliateCommentMessage(env.DB, params.namespaceId, finalLink).catch(() => '')) || finalLink
+            const bridged = await sendPageCommentViaCloakBridge({
+                env,
+                pageId,
+                storyId,
+                message: commentText,
+                logPrefix: `${params.logPrefix} POST-FIRST`,
+            })
+            commentStatus = bridged.status
+            commentId = bridged.id
+            commentError = bridged.error
+            commentTokenHint = 'cloak_session_bridge'
+        } else if (params.hasCommentToken) {
+            // Defer to the pending backlog processor (stored page token, Page story id).
+            commentStatus = 'pending'
+            commentDelaySeconds = getRandomCommentDelaySeconds()
+            commentDueAt = new Date(Date.now() + (commentDelaySeconds * 1000)).toISOString()
+            commentTokenHint = params.storedCommentTokenHint
+        } else {
+            commentStatus = 'failed'
+            commentError = 'access_token_missing'
+            commentTokenHint = params.storedCommentTokenHint
+        }
+    }
+
+    return {
+        ok: true,
+        storyId, confirmedPostId, fbReelUrl, videoId, adId,
+        ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
+        // Parity holds for the comment + visible post final link (re-minted with the post id).
+        // No Worker redirect is ever reported as visible CTA.
+        ctaParity: !!finalLink && remint.reminted,
+        // There is no separate /promote step now: the ad's creative carries the INITIAL Shopee
+        // link, while the FINAL post-specific link lives on the VISIBLE post (and comment). So the
+        // ad creative is NOT the final-link source — report false and use visiblePageCtaFinal.
+        promotedAdCtaFinal: false,
+        // The visible page CTA report reflects the bridge /update-cta read-back (verified parity);
+        // reaching this return means it was confirmed final before the story was published.
+        visiblePageCtaLink,
+        visiblePageCtaFinal,
+        visiblePageCtaCommentParity: visiblePageCtaFinal && visiblePageCtaLink === finalLink,
+        visibleCtaUpdateStatus,
+        visibleCtaUpdateError,
+        commentStatus, commentId, commentError,
+        commentTokenHint, commentDelaySeconds, commentDueAt,
     }
 }
 
@@ -30894,6 +31814,13 @@ function waitMs(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+// Fixed wait before an automatic Page comment that fires immediately after a post/story is
+// created. Hypothesis #2: Facebook may fail to auto-attach the Shopee product card when the
+// comment is posted too soon after publish. Applied only on paths that will actually attempt a
+// comment (message/link + story id present, comment not skipped). Comment failure stays
+// non-fatal to the post, exactly as before.
+const FACEBOOK_PAGE_COMMENT_DELAY_MS = 30_000
+
 function getRandomCommentDelaySeconds(): number {
     return Math.floor(Math.random() * 59) + 1
 }
@@ -31678,6 +32605,16 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
 type PageOneCardLinkMode = 'shopee' | 'lazada' | 'none'
 type PageOneCardCta = 'SHOP_NOW' | 'NO_BUTTON'
 
+// Per-page Facebook posting token source selector lives in ./posting-token-source
+// (normalizePagePostingTokenSource / resolvePostingRoute / resolveCloakFbBridgeBaseUrl).
+// Three side-by-side sources, none of which removes another:
+//   'stored_token'          = legacy manual / stored page token (default).
+//   'post-reels-token-cloak'= non-Electron Cloak FB posting bridge organic Reel
+//                             (apps/cloak-fb-bridge /post + /page-comment, CLOAK_FB_BRIDGE_URL).
+//   'post-reels-token-ads'  = Ads/OneCard via the same bridge /create-ad route. The old
+//                             Electron video-onecard app (port 3847) has been removed; this
+//                             fails closed (bridge_not_configured) until /create-ad ships.
+
 function normalizePageOneCardLinkMode(rawValue: unknown): PageOneCardLinkMode {
     const value = String(rawValue || '').trim().toLowerCase()
     if (value === 'lazada') return 'lazada'
@@ -31710,6 +32647,9 @@ async function ensurePagesOneCardColumns(db: D1Database): Promise<void> {
         `ALTER TABLE pages ADD COLUMN onecard_cta TEXT DEFAULT 'SHOP_NOW'`,
         `ALTER TABLE pages ADD COLUMN ads_publish_enabled INTEGER DEFAULT 0`,
         `ALTER TABLE pages ADD COLUMN caption_link_enabled INTEGER DEFAULT 0`,
+        `ALTER TABLE pages ADD COLUMN posting_token_source TEXT DEFAULT 'stored_token'`,
+        // Per-page comment token source (NULL → runtime follows the posting source).
+        `ALTER TABLE pages ADD COLUMN comment_token_source TEXT`,
     ]
     for (const sql of alterStatements) {
         await db.prepare(sql).run().catch(() => undefined)
@@ -31725,8 +32665,8 @@ async function publishVideoViaOneCard(params: {
     cta?: PageOneCardCta
     logPrefix: string
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
-    const baseUrl = String(params.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
-    if (!baseUrl) throw new Error('onecard_worker_url_missing')
+    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+    if (!baseUrl) throw new Error('bridge_not_configured')
 
     const payload: Record<string, unknown> = {
         page_id: params.pageId,
@@ -31764,6 +32704,183 @@ async function publishVideoViaOneCard(params: {
         postId,
         permalinkUrl: String(data.post_url || '').trim() || (postId ? `https://www.facebook.com/${params.pageId}/posts/${postId}` : ''),
         postingToken: 'onecard',
+    }
+}
+
+// Organic Reel force-post via the non-Electron Cloak FB posting bridge
+// (apps/cloak-fb-bridge, CLOAK_FB_BRIDGE_URL) — a CloakBrowser logged-in Facebook session,
+// NOT the retired Electron video-onecard menu-bar app (port 3847 / video-onecard.wwoom.com)
+// and NOT the legacy facebook-token-cloak app/port 8820. Fails closed (throws
+// `bridge_not_configured`) when no bridge URL is set, rather than hitting a dead tunnel.
+// Validates the bridge has a live logged-in session (/token) and administers the page
+// (/pages) before posting, then drives the bridge /post route. The bridge uses its own
+// session/page tokens internally; the Worker never sends, receives, or logs a raw token.
+// Fails closed (throws) on any validation/post failure — never falls back to a stored
+// or manual token.
+async function publishReelViaSessionBridge(params: {
+    env: Env
+    pageId: string
+    videoUrl: string
+    message: string
+    websiteUrl?: string
+    cta?: PageOneCardCta
+    commentText?: string
+    logPrefix: string
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string; commentId: string; commentStatus: string; commentError: string }> {
+    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+    if (!baseUrl) throw new Error('bridge_not_configured')
+    const pageId = String(params.pageId || '').trim()
+
+    // 1. Fail closed unless the bridge reports a live logged-in session. /token returns
+    //    only booleans (accessToken/fbDtsg presence) — never the values.
+    const tokenResp = await fetchWithTimeout(`${baseUrl}/token`, {}, 15000, 'bridge_token')
+    const tokenData = await tokenResp.json().catch(() => ({} as any)) as { ok?: boolean; accessToken?: boolean }
+    if (!tokenResp.ok || !tokenData?.ok || tokenData.accessToken !== true) {
+        throw new Error('session_bridge_token_unavailable')
+    }
+
+    // 2. Validate page authorization via /pages (me/accounts through the session). Only
+    //    the page id is read for the check; page access_token values are never logged.
+    const pagesResp = await fetchWithTimeout(`${baseUrl}/pages`, {}, 20000, 'bridge_pages')
+    const pagesData = await pagesResp.json().catch(() => ({} as any)) as { data?: Array<{ id?: string }>; error?: unknown }
+    if (!pagesResp.ok || (pagesData as any)?.error) {
+        throw new Error('session_bridge_pages_failed')
+    }
+    const authorized = Array.isArray(pagesData.data) && pagesData.data.some((p) => String(p?.id || '') === pageId)
+    if (!authorized) throw new Error('session_bridge_page_not_authorized')
+
+    // 3. Post the organic Reel via the bridge /post route.
+    const websiteUrl = String(params.websiteUrl || '').trim()
+    const cta = normalizePageOneCardCta(params.cta)
+    const postBody: Record<string, unknown> = {
+        page_id: pageId,
+        video_url: params.videoUrl,
+        message: String(params.message || '').trim(),
+    }
+    if (websiteUrl && cta !== 'NO_BUTTON') {
+        postBody.website_url = websiteUrl
+        postBody.cta = cta
+    }
+    const resp = await fetchWithTimeout(`${baseUrl}/post`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(postBody),
+    }, 180000, 'bridge_post')
+    const data = await resp.json().catch(() => ({} as any)) as {
+        ok?: boolean
+        step?: string
+        error?: string
+        video_id?: string
+        story_id?: string
+        post_url?: string
+    }
+    if (!resp.ok || !data?.ok) {
+        throw new Error(String(data?.step ? `${data.step}:${data.error || ''}` : (data?.error || `bridge_http_${resp.status}`)))
+    }
+
+    const storyId = String(data.story_id || '').trim()
+    const postId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
+
+    // 4. Affiliate comment as the PAGE via the bridge /page-comment route. The bridge
+    //    resolves the PAGE access token from /me/accounts internally and comments with it
+    //    only — it fails closed (page_token_not_found) and never falls back to the session
+    //    user token (the bug where comments showed the logged-in user as author). We send
+    //    only page_id/story_id/message; the Worker never handles a token. A failed comment
+    //    does not fail the post. NOTE: do NOT use the /graph proxy for comments — it posts
+    //    as the session user, not the Page.
+    const commentText = String(params.commentText || '').trim()
+    let commentId = ''
+    let commentStatus = commentText ? 'failed' : 'not_attempted'
+    let commentError = ''
+    if (commentText && storyId) {
+        try {
+            // Hypothesis #2: wait before commenting so Facebook attaches the product card.
+            await waitMs(FACEBOOK_PAGE_COMMENT_DELAY_MS)
+            const commentResp = await fetchWithTimeout(`${baseUrl}/page-comment`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ page_id: pageId, story_id: storyId, message: commentText }),
+            }, 30000, 'bridge_page_comment')
+            const commentData = await commentResp.json().catch(() => ({} as any)) as { ok?: boolean; id?: string; step?: string; error?: string }
+            if (commentResp.ok && commentData?.ok && commentData?.id) {
+                commentId = String(commentData.id)
+                commentStatus = 'success'
+            } else {
+                // Missing page-comment id → failed (never silently treated as success).
+                commentStatus = 'failed'
+                commentError = String(commentData?.step ? `${commentData.step}:${commentData.error || ''}` : (commentData?.error || `bridge_page_comment_http_${commentResp.status}`)).substring(0, 200)
+            }
+        } catch (e) {
+            commentStatus = 'failed'
+            commentError = e instanceof Error ? e.message.substring(0, 200) : 'bridge_page_comment_failed'
+        }
+    }
+
+    console.log(`[${params.logPrefix}] session_cookie_bridge post ok page=${pageId} story=${storyId || '(none)'} comment=${commentId ? 'yes' : commentStatus}`)
+    return {
+        id: String(data.video_id || '').trim(),
+        postId,
+        permalinkUrl: String(data.post_url || '').trim() || (postId ? `https://www.facebook.com/${pageId}/posts/${postId}` : ''),
+        postingToken: 'cloak_session_bridge',
+        commentId,
+        commentStatus,
+        commentError,
+    }
+}
+
+// Build the FULL page story id ("PAGEID_POSTID") the CloakBrowser bridge /page-comment
+// route expects, given a page id and a post id that may be either the bare post id or an
+// already-joined story id. Returns '' when either part is missing.
+function buildPageStoryId(pageId: string, postIdOrStoryId: string): string {
+    const page = String(pageId || '').trim()
+    const post = String(postIdOrStoryId || '').trim()
+    if (!post) return ''
+    if (post.includes('_')) return post
+    if (!page) return ''
+    return `${page}_${post}`
+}
+
+// Token-free affiliate comment as the PAGE via the CloakBrowser bridge /page-comment route
+// for an already-published Page story id. Used when comment_token_source='cloak_browser'
+// REGARDLESS of how the post itself was created (so even a stored-token post can comment
+// via the bridge). The bridge resolves the page token internally and fails closed
+// (page_token_not_found) — it never falls back to the session user token, and this helper
+// never falls back to a stored/manual token. The Worker sends only page_id/story_id/message
+// and never handles a token. Returns 'not_configured' when there is nothing to comment.
+async function sendPageCommentViaCloakBridge(params: {
+    env: Env
+    pageId: string
+    storyId: string
+    message: string
+    logPrefix: string
+}): Promise<{ status: 'success' | 'failed' | 'not_configured'; id: string | null; error: string | null }> {
+    const message = String(params.message || '').trim()
+    if (!message) return { status: 'not_configured', id: null, error: null }
+    const pageId = String(params.pageId || '').trim()
+    const storyId = buildPageStoryId(pageId, params.storyId)
+    if (!pageId || !storyId) return { status: 'failed', id: null, error: 'missing_page_story_object_id' }
+    try {
+        const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+        if (!baseUrl) throw new Error('bridge_not_configured')
+        // Hypothesis #2: wait before commenting so Facebook attaches the product card.
+        await waitMs(FACEBOOK_PAGE_COMMENT_DELAY_MS)
+        const resp = await fetchWithTimeout(`${baseUrl}/page-comment`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page_id: pageId, story_id: storyId, message }),
+        }, 30000, 'page_comment_bridge')
+        const data = await resp.json().catch(() => ({} as any)) as { ok?: boolean; id?: string; step?: string; error?: string }
+        if (resp.ok && data?.ok && data?.id) {
+            console.log(`[${params.logPrefix}] cloak bridge page-comment ok page=${pageId} story=${storyId}`)
+            return { status: 'success', id: String(data.id), error: null }
+        }
+        return {
+            status: 'failed',
+            id: null,
+            error: String(data?.step ? `${data.step}:${data.error || ''}` : (data?.error || `bridge_page_comment_http_${resp.status}`)).substring(0, 200),
+        }
+    } catch (e) {
+        return { status: 'failed', id: null, error: (e instanceof Error ? e.message : 'bridge_page_comment_failed').substring(0, 200) }
     }
 }
 
@@ -32029,7 +33146,7 @@ app.get('/api/pages', async (c) => {
         const botId = c.get('botId')
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
         c.header('Cache-Control', 'private, no-store')
         return c.json({ pages })
@@ -32055,7 +33172,7 @@ app.get('/api/admin/pages', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(requestedNamespaceId).all()).results || []) as any[])
         return c.json({ pages, namespace_id: requestedNamespaceId })
     } catch (e) {
@@ -32579,7 +33696,7 @@ app.get('/api/pages/:id', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
         if (!page) return c.json({ error: 'Page not found' }, 404)
         c.header('Cache-Control', 'private, no-store')
@@ -33076,7 +34193,7 @@ app.post('/api/pages', async (c) => {
         const onecardCta = normalizePageOneCardCta(onecard_cta)
         await ensurePagesOneCardColumns(c.env.DB)
         const existingInNamespace = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, botId).first()
         if (existingInNamespace) {
             return c.json({ success: true, id, updated: false, page: existingInNamespace })
@@ -33098,7 +34215,7 @@ app.post('/api/pages', async (c) => {
         ).bind(id, name, image_url, postToken, post_interval_minutes, botId, onecardEnabled, onecardLinkMode, onecardCta, captionLinkEnabled).run()
 
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, botId).first()
         return c.json({ success: true, id, page })
     } catch (e) {
@@ -33121,6 +34238,8 @@ app.put('/api/pages/:id', async (c) => {
             onecard_link_mode,
             onecard_cta,
             ads_publish_enabled,
+            posting_token_source,
+            comment_token_source,
             caption_link_enabled,
             base_post_hours,
             base_post_interval_minutes,
@@ -33131,7 +34250,7 @@ app.put('/api/pages/:id', async (c) => {
         // over a server-cleared post_hours='' — visible only by knowing PUT was hit and
         // with which payload. token redacted to a short tail to avoid leaking secrets.
         const tokenTail = access_token !== undefined ? String(access_token || '').trim().slice(-6) : '(unset)'
-        console.log(`[PAGES-PUT] page=${id} ns=${c.get('botId')} post_hours=${JSON.stringify(post_hours ?? null)} post_interval_minutes=${JSON.stringify(post_interval_minutes ?? null)} is_active=${JSON.stringify(is_active ?? null)} access_token_tail=${tokenTail} onecard_enabled=${JSON.stringify(onecard_enabled ?? null)} ads_publish_enabled=${JSON.stringify(ads_publish_enabled ?? null)} caption_link_enabled=${JSON.stringify(caption_link_enabled ?? null)}`)
+        console.log(`[PAGES-PUT] page=${id} ns=${c.get('botId')} post_hours=${JSON.stringify(post_hours ?? null)} post_interval_minutes=${JSON.stringify(post_interval_minutes ?? null)} is_active=${JSON.stringify(is_active ?? null)} access_token_tail=${tokenTail} onecard_enabled=${JSON.stringify(onecard_enabled ?? null)} ads_publish_enabled=${JSON.stringify(ads_publish_enabled ?? null)} posting_token_source=${JSON.stringify(posting_token_source ?? null)} comment_token_source=${JSON.stringify(comment_token_source ?? null)} caption_link_enabled=${JSON.stringify(caption_link_enabled ?? null)}`)
         // comment_token is now treated as access_token (unified token model)
         let normalizedPostHours = post_hours as string | undefined
         let normalizedInterval = post_interval_minutes as number | undefined
@@ -33390,13 +34509,43 @@ app.put('/api/pages/:id', async (c) => {
                 'UPDATE pages SET ads_publish_enabled = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(wantsEnabled ? 1 : 0, id, c.get('botId')).run()
         }
+
+        // posting_token_source — per-page Facebook posting token selector. Only two modes:
+        // 'stored_token' (manual token) and 'cloak_browser' (CloakBrowser session-cookie
+        // bridge). Legacy DB values ('post-reels-token-cloak'/'post-reels-token-ads')
+        // normalize to 'cloak_browser'. Persisted independently of manual access_token
+        // validation so that selecting CloakBrowser and saving does NOT require the operator
+        // to re-enter a page token (the bug where saving jumped back to Page/Token).
+        // Selecting CloakBrowser is NOT admin-restricted — it posts organically with the
+        // operator's own browser session. The OneCard/create-ad route keeps its own
+        // admin-namespace guard (ads_publish_enabled + the runtime check in create-ad).
+        if (posting_token_source !== undefined) {
+            const normalizedPostingTokenSource = normalizePagePostingTokenSource(posting_token_source)
+            await c.env.DB.prepare(
+                'UPDATE pages SET posting_token_source = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(normalizedPostingTokenSource, id, c.get('botId')).run()
+        }
+
+        // comment_token_source — per-page Facebook COMMENT token selector. Independent of
+        // posting_token_source and of any raw token validation: it only decides HOW the
+        // automatic affiliate comment is sent after a post ('stored_token' = stored page
+        // comment token over Graph; 'cloak_browser' = CloakBrowser bridge /page-comment).
+        // Legacy aliases collapse to 'cloak_browser'. Persisted as-is (no token gate). When
+        // the page never set it, runtime falls back to the effective posting source so
+        // existing pages are unaffected — hence we only write when the operator sends it.
+        if (comment_token_source !== undefined) {
+            const normalizedCommentTokenSource = normalizePageCommentTokenSource(comment_token_source)
+            await c.env.DB.prepare(
+                'UPDATE pages SET comment_token_source = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(normalizedCommentTokenSource, id, c.get('botId')).run()
+        }
         if (tokenUpdated) {
             const issueKey = `_alerts/comment_token/${c.get('botId')}/${id}.json`
             await c.env.BUCKET.delete(issueKey).catch(() => undefined)
         }
 
         const updatedPage = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
 
         return c.json({ success: true, resolved, resolved_details, page: updatedPage })
@@ -33813,6 +34962,13 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         pageName = String(sourceRow.page_name || pageId).trim()
         pageAccessToken = String(sourceRow.access_token || '').trim()
         selectedVideoId = String(sourceRow.video_id || '').trim()
+
+        // Recover stale posting rows first so a dead attempt does not block the retry.
+        await recoverStalePostingAttemptsForPage(env.DB, {
+            namespaceId: botId,
+            pageId,
+            reason: 'stale_posting_timeout_no_fb_post_id_retry',
+        }).catch(() => 0)
 
         const activePosting = await env.DB.prepare(
             `SELECT id
@@ -34982,10 +36138,17 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Get page info
         await ensurePagesOneCardColumns(env.DB)
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled FROM pages WHERE id = ? AND bot_id = ?'
-        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null; caption_link_enabled?: number | null } | null
+            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null; caption_link_enabled?: number | null; posting_token_source?: string | null; comment_token_source?: string | null } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
+        // Clear any posting attempt that died before flipping status so a stale
+        // row can't permanently return page_already_posting for this page.
+        await recoverStalePostingAttemptsForPage(env.DB, {
+            namespaceId: botId,
+            pageId: page.id,
+            reason: 'stale_posting_timeout_no_fb_post_id_force_post',
+        }).catch(() => 0)
         pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
             scope: 'page',
             namespaceId: botId,
@@ -35072,7 +36235,27 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const publicUrl = metaToString(meta, 'publicUrl')
         const rawLazadaLink = normalizeMetaLazadaLink(meta) || metaToString(meta, 'lazadaLink')
         const rawLazadaMemberId = String(metaToString(meta, 'lazadaMemberId') || metaToString(meta, 'lazada_member_id') || '').trim()
-        const pageAdsPublishEnabled = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        // Posting backend = explicit per-page token source selection. Electron Ads bridge
+        // ('post-reels-token-ads') and the legacy ads_publish_enabled flag both route
+        // through /api/dashboard/create-ad. CloakBrowser/session-cookie bridge
+        // (CloakBrowser) routes the organic Reel through the CloakBrowser
+        // bridge /post route (VIDEO_ONECARD_WORKER_URL) — never the stored token. Stored
+        // token remains the default legacy path.
+        const pagePostingTokenSource = normalizePagePostingTokenSource((page as Record<string, unknown>).posting_token_source)
+        const pageAdsPublishLegacyFlag = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
+        const pagePostingRoute: PostingRoute = resolvePostingRoute({ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag })
+        const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'
+        const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'
+        // Comment backend is chosen INDEPENDENTLY of the posting route. Missing/invalid
+        // comment_token_source falls back to the effective posting source so existing pages
+        // keep commenting exactly as before. 'cloak_browser' → CloakBrowser bridge
+        // /page-comment; 'stored_token' → stored page comment token (deferred pending path).
+        const pageCommentTokenSource: PageCommentTokenSource = normalizePageCommentTokenSource(
+            (page as Record<string, unknown>).comment_token_source,
+            defaultCommentSourceForRoute(pagePostingRoute),
+        )
+        const commentViaCloakBridge = pageCommentTokenSource === 'cloak_browser'
+        console.log(`[FORCE-POST] page=${String(page.id || '')} posting_token_source=${pagePostingTokenSource} route=${pagePostingRoute} source_hint=${postingSourceHint(pagePostingRoute)} comment_token_source=${pageCommentTokenSource} ads_publish_legacy_flag=${pageAdsPublishLegacyFlag} onecard=${pageOneCardEnabled} ads_publish=${pageAdsPublishEnabled} cloak=${pageCloakPostSelected}`)
 
         // Use title if available, otherwise generate caption from script
         const apiKeys = await resolveNamespaceGeminiApiKeys(env.DB, botId)
@@ -35110,8 +36293,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         await ensurePostHistoryTraceColumns(env.DB)
         commentTokenHint = deriveCommentTokenHint(pageCommentToken)
-        const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
-        const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
+        // Cloak source must never derive its post hint/profile from a stored/manual token.
+        const initialPostTokenHint = pageCloakPostSelected ? 'cloak_session_bridge' : deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, pageCloakPostSelected ? null : (primaryPostingTokenCandidates[0] || null))
         hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
         const initialCommentState = getInitialCommentTraceState(!!normalizedShopeeLink)
         initialCommentStatus = initialCommentState.status
@@ -35188,7 +36372,12 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }, 400)
         }
 
-        if (!pageAdsPublishEnabled) {
+        // The stored/manual comment-token preflight only applies when the comment will be
+        // sent with a STORED page token (comment_token_source='stored_token'). When comments
+        // go through the CloakBrowser bridge they are page-authored with no stored token, so
+        // skip the preflight regardless of posting route. (Comment success/failure is
+        // recorded from the bridge/backlog result in the branches below.)
+        if (!commentViaCloakBridge) {
             const affiliateCommentPreflight = validateAffiliateCommentPreflight({
                 shopeeLink: normalizedShopeeLink,
                 hasCommentToken,
@@ -35212,6 +36401,40 @@ app.post('/api/pages/:id/force-post', async (c) => {
 
         // Handle legacy publicUrl without namespace path
         const realVideoUrl = resolvePostingVideoDownloadUrl(env, selectedVideoNamespaceId, unpostedId, publicUrl)
+        let postingVideoUrl = realVideoUrl
+        let avatarApplied = false
+        let avatarVersion = ''
+
+        // Page-specific avatar must be applied before every Facebook posting route,
+        // including OneCard/Ads post-first. Those bridge routes accept only video_url,
+        // so compose first and publish the composed R2 URL instead of the raw source.
+        if (pageAdsPublishEnabled || pageCloakPostSelected || pageOneCardEnabled) {
+            const prepared = await prepareAvatarComposedPostingVideo({
+                env,
+                db: env.DB,
+                bucket: c.get('bucket'),
+                namespaceId: botId,
+                pageId: String(page.id || ''),
+                videoId: unpostedId,
+                baseVideoUrl: realVideoUrl,
+                logPrefix: 'FORCE-POST AVATAR',
+            })
+            postingVideoUrl = prepared.videoUrl
+            avatarApplied = prepared.avatarApplied
+            avatarVersion = prepared.avatarVersion
+        }
+
+        // caption_link_enabled: prepend the managed Shopee shortlink as the first caption
+        // line of the FB post. Applies to EVERY posting route (organic Reel, OneCard publish,
+        // and the CloakBrowser session bridge) — not just the plain organic path. The create-ad
+        // / Ads route prepends its own (post-specific) managed link inside /api/dashboard/create-ad
+        // instead, so the raw caption is forwarded there unchanged. Comment text, the CTA button
+        // link, shortlink reminting and token routing are all unaffected.
+        const publishDescription = resolvePublishCaption({
+            caption,
+            captionLinkEnabled: pageCaptionLinkEnabled,
+            shopeeLink: normalizedShopeeLink,
+        })
 
         // AUTO-ADS MODE (per-page toggle, admin-only).
         // Mirrors the cron branch: skip normal Reel post entirely, route through
@@ -35221,15 +36444,126 @@ app.post('/api/pages/:id/force-post', async (c) => {
             if (!namespaceIsAdminManaged) {
                 throw new Error('ads_publish_admin_only_runtime_check_failed')
             }
+
+            // POST-FIRST (opt-in): publish the page post → mint final link → promote the ad
+            // with that link in the CTA → comment the same link. Makes the live ad CTA equal
+            // the comment link (sub2=post id, sub3=page id). Default OFF (env gate).
+            if (oneCardPostFirstEnabled(env)) {
+                const pf = await runOneCardPostFirstAds({
+                    env,
+                    pageId: String(page.id || ''),
+                    namespaceId: botId,
+                    caption,
+                    videoUrl: postingVideoUrl,
+                    sourceVideoId: unpostedId,
+                    rawShopeeLink,
+                    managedShopeeLink: normalizedShopeeLink,
+                    historyId: forceHistoryId,
+                    skipComment,
+                    commentSource: pageCommentTokenSource,
+                    hasCommentToken,
+                    storedCommentTokenHint: deriveCommentTokenHint(pageCommentToken),
+                    logPrefix: 'FORCE-POST',
+                })
+                if (!pf.ok && !pf.storyId) {
+                    if (forceHistoryId) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET status='failed', error_message=?, comment_status='not_attempted' WHERE id=? AND status='posting'"
+                        ).bind(`ads_post_first_failed: ${pf.step || ''}:${pf.error || ''}`.substring(0, 240), forceHistoryId).run().catch(() => { })
+                    }
+                    throw new Error(String(pf.error || 'ads_post_first_failed'))
+                }
+                fbVideoId = String(pf.adId || pf.storyId || unpostedId)
+                postingTokenUsed = 'ads_publish'
+                const pfCommentStatus = pf.ok ? pf.commentStatus : (pf.commentStatus || 'not_configured')
+                if (forceHistoryId) {
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status=?, fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=? WHERE id=? AND status='posting'"
+                    ).bind(
+                        pf.ok ? 'success' : 'failed',
+                        pf.confirmedPostId || pf.storyId,
+                        pf.fbReelUrl,
+                        pfCommentStatus,
+                        pf.commentId,
+                        pf.commentError,
+                        pf.commentTokenHint,
+                        pf.commentDelaySeconds,
+                        pf.commentDueAt,
+                        pf.ctaShortlink || normalizedShopeeLink || null,
+                        pf.ok ? null : `ads_post_first_partial: ${pf.step || ''}:${pf.error || ''}`.substring(0, 240),
+                        forceHistoryId,
+                    ).run().catch(() => { })
+                }
+                await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+                await recordPagePostedVideoGuard(env.DB, {
+                    namespaceId: botId, pageId: page.id, videoId: unpostedId,
+                    sourceFingerprint: selectedSourceFingerprint, historyId: forceHistoryId, postedAt: attemptPostedAtIso,
+                }).catch(() => { })
+                await clearVideoShopeeLink(c.get('bucket'), unpostedId)
+                console.log(`[FORCE-POST] Page ${page.name}: POST-FIRST ADS ${pf.ok ? 'OK' : 'PARTIAL'} — story=${pf.storyId} ad_id=${pf.adId} comment=${pfCommentStatus} promoted_ad_cta_final=${pf.promotedAdCtaFinal} visible_cta_update=${pf.visibleCtaUpdateStatus}${pf.visibleCtaUpdateError ? `(${pf.visibleCtaUpdateError})` : ''} visible_page_cta_final=${pf.visiblePageCtaFinal} cta_sub2=${pf.ctaSub2} cta_sub3=${pf.ctaSub3}`)
+                return c.json({
+                    success: pf.ok,
+                    page: page.name,
+                    video_id: unpostedId,
+                    fb_video_id: fbVideoId,
+                    fb_post_id: pf.confirmedPostId || pf.storyId,
+                    fb_reel_url: pf.fbReelUrl,
+                    ads_publish: true,
+                    post_first: true,
+                    promote_ad_id: pf.adId || null,
+                    cta_shortlink: pf.ctaShortlink || null,
+                    // Reflects the PROMOTED AD CTA (where the final link lives); the organic page
+                    // post CTA is intentionally not modified, so this is not a "visible CTA" status.
+                    cta_update_status: pf.promotedAdCtaFinal ? 'promoted_ad_final_link' : (pf.ok ? 'promoted_ad_cta_unconfirmed' : `failed:${pf.step || ''}`),
+                    cta_sub2: pf.ctaSub2,
+                    cta_sub3: pf.ctaSub3,
+                    // CTA parity is reported PER OBJECT and never overclaimed:
+                    //  - promoted_ad_cta_comment_parity: the paid ad creative CTA == the final comment link.
+                    //  - visible_page_cta_comment_parity: true ONLY after Phase B confirms the final
+                    //    direct Shopee CTA link. Never report a Worker redirect as visible CTA.
+                    // cta_comment_parity is retained for back-compat and means the PROMOTED AD only.
+                    cta_comment_parity: pf.promotedAdCtaFinal,
+                    promoted_ad_cta_comment_parity: pf.promotedAdCtaFinal,
+                    promoted_ad_cta_link: pf.promotedAdCtaFinal ? (pf.ctaShortlink || null) : null,
+                    visible_page_cta_comment_parity: pf.visiblePageCtaCommentParity,
+                    visible_page_cta_final: pf.visiblePageCtaFinal,
+                    visible_page_cta_link: pf.visiblePageCtaFinal ? (pf.visiblePageCtaLink || pf.ctaShortlink || null) : null,
+                    // Outcome of the visible Reel CTA update (bridge /update-cta) after the final
+                    // sub2/sub3 link was minted. Best-effort; does not gate run success.
+                    visible_cta_update_status: pf.visibleCtaUpdateStatus,
+                    visible_cta_update_error: pf.visibleCtaUpdateError,
+                    comment_status: pfCommentStatus,
+                    comment_posted: pfCommentStatus === 'success',
+                    history_id: forceHistoryId,
+                    log_id: forceHistoryId,
+                    post_history_id: forceHistoryId,
+                }, pf.ok ? 200 : 502)
+            }
+
             const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
             const adsResp = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     page_id: String(page.id || ''),
-                    video_id: unpostedId,
+                    // unpostedId is an INTERNAL gallery/state id, not a Facebook video id.
+                    // Send the downloadable URL so the CloakBrowser bridge uploads the file instead of
+                    // doing a Graph GET on the internal id (which 500s "Object … does not
+                    // exist"). source_video_id keeps ads naming/history linked to the
+                    // internal system id.
+                    video_url: postingVideoUrl,
+                    source_video_id: unpostedId,
                     caption,
-                    shopee_url: normalizedShopeeLink,
+                    // CTA button → original Shopee product URL (falls back to the managed
+                    // link if no raw URL is available). Comment shortlink → the already
+                    // managed/shortened link so create-ad does NOT re-shorten it.
+                    shopee_url: rawShopeeLink || normalizedShopeeLink,
+                    comment_shortlink: normalizedShopeeLink,
+                    // Defer the first comment to this branch: after story_id exists we
+                    // re-mint the comment shortlink with sub2=post id / sub3=page id and
+                    // post the single final comment via /page-comment below. Without this
+                    // create-ad would comment with the pre-posting link (sub2/sub3 blank).
+                    skip_comment: true,
                 }),
             }, 300000, 'force_ads_publish')
             const adsData = await adsResp.json().catch(() => ({})) as {
@@ -35249,14 +36583,84 @@ app.post('/api/pages/:id/force-post', async (c) => {
             const fbReelUrl = storyId ? `https://www.facebook.com/${storyId.replace('_', '/posts/')}` : ''
             fbVideoId = String(adsData.ad_id || storyId || unpostedId)
             postingTokenUsed = 'ads_publish'
+
+            // OneCard/Ads must comment as the PAGE too — parity with organic Reels.
+            // create-ad ran with skip_comment, so it never commented (commentPosted is
+            // false). Re-mint the comment shortlink now that story_id exists so the live
+            // comment link carries sub2=post id tail / sub3=page id (sub1/campaign and
+            // sub4/sub5 defaults preserved), then post the single affiliate comment as the
+            // Page via the CloakBrowser bridge /page-comment route (the bridge resolves the
+            // page token internally, fails closed, never the user token). A failed comment
+            // never fails the post. NOTE: the ad CTA button is still built pre-story_id and
+            // does NOT carry sub2/sub3 — documented limitation (no safe post-story_id
+            // creative update wired into the bridge flow yet).
+            let adsCommentStatus = adsData.commentPosted ? 'success' : 'not_configured'
+            let adsCommentId: string | null = adsData.commentId || null
+            let adsCommentError: string | null = null
+            let adsCommentShopeeLink = normalizedShopeeLink
+            let adsCommentRemint: OneCardCommentShortlinkRemint | null = null
+            // Comment token-free hint + deferred schedule (only used by the stored path).
+            let adsCommentTokenHint: string | null = commentViaCloakBridge ? 'cloak_session_bridge' : deriveCommentTokenHint(pageCommentToken)
+            let adsCommentDelaySeconds: number | null = null
+            let adsCommentDueAt: string | null = null
+            if (!adsData.commentPosted && normalizedShopeeLink && !skipComment && storyId) {
+                adsCommentRemint = await remintOneCardCommentShortlink({
+                    env,
+                    namespaceId: botId,
+                    pageId: String(page.id || ''),
+                    storyId,
+                    fbVideoId,
+                    managedShopeeLink: normalizedShopeeLink,
+                    historyId: forceHistoryId,
+                    logPrefix: 'FORCE-POST ADS COMMENT-SHORTLINK',
+                })
+                adsCommentShopeeLink = adsCommentRemint.commentShopeeLink
+            }
+            if (!adsData.commentPosted && adsCommentShopeeLink && !skipComment && storyId && commentViaCloakBridge) {
+                // comment_token_source='cloak_browser' (default for an ADS page): comment as
+                // the Page via the bridge. Fails closed; never falls back to a stored token.
+                const adsCommentText = (await buildAffiliateCommentMessage(env.DB, botId, adsCommentShopeeLink).catch(() => '')) || adsCommentShopeeLink
+                const bridged = await sendPageCommentViaCloakBridge({
+                    env,
+                    pageId: String(page.id || ''),
+                    storyId,
+                    message: adsCommentText,
+                    logPrefix: 'FORCE-POST ADS',
+                })
+                adsCommentStatus = bridged.status
+                adsCommentId = bridged.id
+                adsCommentError = bridged.error
+                adsCommentTokenHint = 'cloak_session_bridge'
+            } else if (!adsData.commentPosted && adsCommentShopeeLink && !skipComment && storyId && !commentViaCloakBridge) {
+                // comment_token_source='stored_token': defer to the pending backlog processor
+                // which comments with the stored page token against the Page story id. Requires
+                // a stored comment token (else fail per existing stored semantics).
+                if (hasCommentToken) {
+                    adsCommentStatus = 'pending'
+                    adsCommentId = null
+                    adsCommentError = null
+                    adsCommentDelaySeconds = getRandomCommentDelaySeconds()
+                    adsCommentDueAt = new Date(Date.now() + (adsCommentDelaySeconds * 1000)).toISOString()
+                } else {
+                    adsCommentStatus = 'failed'
+                    adsCommentError = 'access_token_missing'
+                }
+                adsCommentTokenHint = deriveCommentTokenHint(pageCommentToken)
+            }
+
             if (forceHistoryId) {
                 await env.DB.prepare(
-                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, error_message=NULL WHERE id=? AND status='posting'"
+                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=NULL WHERE id=? AND status='posting'"
                 ).bind(
                     confirmedPostId || storyId,
                     fbReelUrl,
-                    adsData.commentPosted ? 'success' : 'not_configured',
-                    adsData.commentId || null,
+                    adsCommentStatus,
+                    adsCommentId,
+                    adsCommentError,
+                    adsCommentTokenHint,
+                    adsCommentDelaySeconds,
+                    adsCommentDueAt,
+                    adsCommentShopeeLink || normalizedShopeeLink || null,
                     forceHistoryId,
                 ).run().catch(() => { })
             }
@@ -35270,7 +36674,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 postedAt: attemptPostedAtIso,
             }).catch(() => { })
             await clearVideoShopeeLink(c.get('bucket'), unpostedId)
-            console.log(`[FORCE-POST] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${adsData.commentPosted ? 'yes' : 'no'}`)
+            console.log(`[FORCE-POST] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${adsCommentStatus} remint=${adsCommentRemint?.reminted ? `sub2=${adsCommentRemint.sub2} sub3=${adsCommentRemint.sub3}` : (adsCommentRemint?.error || 'n/a')}`)
             return c.json({
                 success: true,
                 page: page.name,
@@ -35279,7 +36683,113 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 fb_post_id: confirmedPostId || storyId,
                 fb_reel_url: fbReelUrl,
                 ads_publish: true,
-                comment_posted: !!adsData.commentPosted,
+                comment_status: adsCommentStatus,
+                comment_posted: adsCommentStatus === 'success',
+                // Final comment link + the sub ids it carries, for Dev verification.
+                // The ad CTA button still uses the pre-story_id link (no sub2/sub3) —
+                // documented limitation.
+                comment_shortlink: adsCommentShopeeLink || null,
+                comment_sub2: adsCommentRemint?.sub2 || '',
+                comment_sub3: adsCommentRemint?.sub3 || '',
+                comment_shortlink_reminted: !!adsCommentRemint?.reminted,
+                ...(adsCommentRemint?.error ? { comment_shortlink_remint_error: adsCommentRemint.error } : {}),
+                history_id: forceHistoryId,
+                log_id: forceHistoryId,
+                post_history_id: forceHistoryId,
+            })
+        }
+
+        // CLOAKBROWSER / SESSION-COOKIE BRIDGE ORGANIC POST (source = 'post-reels-token-cloak').
+        // Routes the organic Reel through the CloakBrowser session-cookie bridge /post
+        // route (NOT the stored token, NOT facebook-token-cloak). Fails closed
+        // (throw → history 'failed') rather than ever using the stored/manual token.
+        if (pageCloakPostSelected) {
+            // Comment when we have a managed shortlink and comments aren't skipped. The
+            // affiliate comment text is built the same way for both comment sources; only
+            // the DELIVERY differs (bridge /page-comment vs deferred stored-token backlog).
+            const cloakCommentShopeeLink = normalizedShopeeLink
+            const cloakCommentText = (cloakCommentShopeeLink && !skipComment)
+                ? await buildAffiliateCommentMessage(env.DB, botId, cloakCommentShopeeLink).catch(() => '')
+                : ''
+            const cloakOneCardWebsiteUrl = pageOneCardEnabled
+                ? pickOneCardWebsiteUrl({ linkMode: pageOneCardLinkMode, shopeeLink: normalizedShopeeLink, lazadaLink: normalizedLazadaLink })
+                : ''
+            const cloakResult = await publishReelViaSessionBridge({
+                env,
+                pageId: String(page.id || ''),
+                videoUrl: postingVideoUrl,
+                message: publishDescription,
+                websiteUrl: cloakOneCardWebsiteUrl,
+                cta: pageOneCardCta,
+                // Only let the bridge post the comment when comment_token_source='cloak_browser'.
+                // For stored-token comments we defer to the backlog (below) instead.
+                commentText: commentViaCloakBridge ? cloakCommentText : '',
+                logPrefix: 'FORCE-POST CLOAK-BRIDGE',
+            })
+            fbVideoId = cloakResult.id
+            postingTokenUsed = cloakResult.postingToken
+            const confirmedPostId = String(cloakResult.postId || '').trim() || fbVideoId
+            // Comment parity: success → success+comment_fb_id; attempted-but-failed →
+            // failed+sanitized error; nothing to post → not_configured. Never claim success.
+            let cloakCommentStatus: string
+            let cloakCommentFbId: string | null
+            let cloakCommentError: string | null
+            let cloakCommentTokenHint: string | null
+            let cloakCommentDelaySeconds: number | null = null
+            let cloakCommentDueAt: string | null = null
+            if (commentViaCloakBridge) {
+                cloakCommentStatus = !cloakCommentText
+                    ? 'not_configured'
+                    : (cloakResult.commentId ? 'success' : 'failed')
+                cloakCommentFbId = cloakResult.commentId || null
+                cloakCommentError = cloakCommentStatus === 'failed' ? (cloakResult.commentError || 'cloak_comment_failed') : null
+                cloakCommentTokenHint = 'cloak_session_bridge'
+            } else {
+                // comment_token_source='stored_token': defer to the pending backlog, which
+                // comments with the stored page token against the Page story id. Requires a
+                // stored comment token (else fail per existing stored semantics).
+                cloakCommentFbId = null
+                if (!cloakCommentText) {
+                    cloakCommentStatus = skipComment ? 'skipped' : 'not_configured'
+                    cloakCommentError = null
+                } else if (hasCommentToken) {
+                    cloakCommentStatus = 'pending'
+                    cloakCommentError = null
+                    cloakCommentDelaySeconds = getRandomCommentDelaySeconds()
+                    cloakCommentDueAt = new Date(Date.now() + (cloakCommentDelaySeconds * 1000)).toISOString()
+                } else {
+                    cloakCommentStatus = 'failed'
+                    cloakCommentError = 'access_token_missing'
+                }
+                cloakCommentTokenHint = deriveCommentTokenHint(pageCommentToken)
+            }
+            const fbReelUrl = String(cloakResult.permalinkUrl || '').trim()
+            if (forceHistoryId) {
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=NULL WHERE id=? AND status='posting'"
+                ).bind(confirmedPostId, fbReelUrl, cloakCommentStatus, cloakCommentFbId, cloakCommentError, cloakCommentTokenHint, cloakCommentDelaySeconds, cloakCommentDueAt, cloakCommentShopeeLink || normalizedShopeeLink || null, forceHistoryId).run().catch(() => { })
+            }
+            await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
+            await recordPagePostedVideoGuard(env.DB, {
+                namespaceId: botId,
+                pageId: page.id,
+                videoId: unpostedId,
+                sourceFingerprint: selectedSourceFingerprint,
+                historyId: forceHistoryId,
+                postedAt: attemptPostedAtIso,
+            }).catch(() => { })
+            await clearVideoShopeeLink(c.get('bucket'), unpostedId)
+            console.log(`[FORCE-POST] Page ${page.name}: CLOAK-BRIDGE POST OK — post=${confirmedPostId} comment=${cloakCommentStatus}`)
+            return c.json({
+                success: true,
+                page: page.name,
+                video_id: unpostedId,
+                fb_video_id: fbVideoId,
+                fb_post_id: confirmedPostId,
+                fb_reel_url: fbReelUrl,
+                posting_source: 'cloak',
+                comment_status: cloakCommentStatus,
+                comment_posted: cloakCommentStatus === 'success',
                 history_id: forceHistoryId,
                 log_id: forceHistoryId,
                 post_history_id: forceHistoryId,
@@ -35338,17 +36848,12 @@ app.post('/api/pages/:id/force-post', async (c) => {
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
         })
-        const captionLinkFirstEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
-        const publishDescription = captionLinkFirstEnabled
-            ? buildCaptionLinkFirstDescription(caption, normalizedShopeeLink)
-            : caption
-
         const reelResult = pageOneCardEnabled
             ? await publishVideoViaOneCard({
                 env,
                 pageId: page.id,
-                videoUrl: realVideoUrl,
-                message: caption,
+                videoUrl: postingVideoUrl,
+                message: publishDescription,
                 websiteUrl: oneCardWebsiteUrl,
                 cta: pageOneCardCta,
                 logPrefix: 'FORCE-POST ONECARD',
@@ -35370,7 +36875,10 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const confirmedCanonicalPostId = String(reelResult.postId || '').trim()
         const confirmedPostId = confirmedCanonicalPostId || fbVideoId
         let commentShopeeLink = normalizedShopeeLink
-        if (commentShopeeLink && !skipComment && hasCommentToken) {
+        // Re-shorten with the post id when we intend to comment — either via the stored
+        // token (needs hasCommentToken) or via the CloakBrowser bridge override.
+        const willComment = !!commentShopeeLink && !skipComment && (hasCommentToken || commentViaCloakBridge)
+        if (willComment) {
             try {
                 const commentSubIds = buildPostingCommentShortlinkSubIds({
                     canonicalPostId: confirmedCanonicalPostId,
@@ -35393,7 +36901,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
             }
         }
         const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
-        const scheduledCommentDelaySeconds = commentShopeeLink && !skipComment && hasCommentToken
+        // Only the stored-token path defers via comment_due_at; the bridge override comments
+        // immediately below, so it schedules no delay.
+        const scheduledCommentDelaySeconds = commentShopeeLink && !skipComment && hasCommentToken && !commentViaCloakBridge
             ? getRandomCommentDelaySeconds()
             : null
         const scheduledCommentDueAt = scheduledCommentDelaySeconds
@@ -35425,14 +36935,31 @@ app.post('/api/pages/:id/force-post', async (c) => {
         let commentTokenUsed = String(pageCommentToken || '').trim()
         let commentProfileId: string | null = null
         let commentProfileName: string | null = null
+        let commentTokenHintFinal = deriveCommentTokenHint(commentTokenUsed || pageCommentToken)
 
-        if (commentShopeeLink && !skipComment && hasCommentToken) {
-            commentStatus = 'pending'
-            commentError = null
-        } else if (skipComment) {
+        if (skipComment) {
             commentStatus = 'skipped'
             commentError = null
             console.log(`[FORCE-POST] Skipped comment for ${fbVideoId}`)
+        } else if (commentShopeeLink && commentViaCloakBridge) {
+            // comment_token_source='cloak_browser' on a stored-token POST: comment as the
+            // Page via the bridge immediately (fails closed, never a stored-token fallback).
+            const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
+            const bridged = await sendPageCommentViaCloakBridge({
+                env,
+                pageId,
+                storyId: buildPageStoryId(pageId, confirmedCanonicalPostId || confirmedPostId),
+                message: cloakOverrideText,
+                logPrefix: 'FORCE-POST STORED→CLOAK-COMMENT',
+            })
+            commentStatus = bridged.status
+            commentFbId = bridged.id
+            commentError = bridged.error
+            commentTokenHintFinal = 'cloak_session_bridge'
+        } else if (commentShopeeLink && hasCommentToken) {
+            // Stored-token comment deferred to the pending backlog processor.
+            commentStatus = 'pending'
+            commentError = null
         }
 
         // Update to success
@@ -35446,7 +36973,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 postingProfile.profileId,
                 postingProfile.profileName,
                 commentStatus,
-                deriveCommentTokenHint(commentTokenUsed || pageCommentToken),
+                commentTokenHintFinal,
                 commentProfileId,
                 commentProfileName,
                 commentError,
@@ -35798,7 +37325,8 @@ app.post('/api/pages/:id/promote-ad', async (c) => {
         const storyId = String(body.story_id || '').trim()
         if (!storyId) return c.json({ error: 'Missing story_id' }, 400)
 
-        const baseUrl = String(c.env.VIDEO_ONECARD_WORKER_URL || 'https://video-onecard.wwoom.com').trim().replace(/\/+$/, '')
+        const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
+        if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
         const resp = await fetchWithTimeout(baseUrl + '/promote', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -36616,7 +38144,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     // The API-side drift guard already ensures post_hours stays in sync with
     // interval-mode saves, so a NULL/empty post_hours genuinely means "off".
     const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta, caption_link_enabled, ads_publish_enabled
+        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta, caption_link_enabled, ads_publish_enabled, posting_token_source, comment_token_source
         FROM pages
         WHERE is_active = 1
           AND post_hours IS NOT NULL
@@ -36634,6 +38162,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             onecard_cta?: string | null
             caption_link_enabled?: number | null
             ads_publish_enabled?: number | null
+            posting_token_source?: string | null
+            comment_token_source?: string | null
         }>
     }
     // Keep scheduled handler logs compact. Dumping every candidate page on every
@@ -36696,6 +38226,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     reconciledNamespaces.add(botId)
                 }
                 failStalePostingRows(env.DB, botId, String(page.id || ''), 15 * 60).catch(() => { })
+                // Bounded stale-posting recovery: clear an attempt that died with
+                // no fb_post_id before the active-posting guards so cron is not
+                // permanently blocked for this page.
+                await recoverStalePostingAttemptsForPage(env.DB, {
+                    namespaceId: botId,
+                    pageId: String(page.id || ''),
+                    reason: 'stale_posting_timeout_no_fb_post_id_cron',
+                }).catch(() => 0)
 
                 // Universal min-gap guard — prevents back-to-back posts regardless of schedule mode.
                 // Catches bucket-boundary races (every:N) and stale last_post_at across cron ticks.
@@ -36979,10 +38517,29 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         const pageOneCardLinkMode = normalizePageOneCardLinkMode(page.onecard_link_mode)
         const pageOneCardCta = normalizePageOneCardCta(page.onecard_cta)
         const pageCaptionLinkEnabled = Number(page.caption_link_enabled || 0) === 1
-        const pageAdsPublishEnabled = Number(page.ads_publish_enabled || 0) === 1
+        // Posting backend mirrors the force-post path: explicit per-page token source
+        // selection wins. Electron Ads bridge ('post-reels-token-ads') and the legacy
+        // ads_publish_enabled flag route through /api/dashboard/create-ad; CloakBrowser/
+        // session-cookie bridge ('post-reels-token-cloak') routes the organic Reel through
+        // the CloakBrowser bridge /post route. Never silently fall back to the stored
+        // token when a non-stored source is explicitly selected.
+        const pagePostingTokenSource = normalizePagePostingTokenSource(page.posting_token_source)
+        const pageAdsPublishLegacyFlag = Number(page.ads_publish_enabled || 0) === 1
+        const pagePostingRoute: PostingRoute = resolvePostingRoute({ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag })
+        const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'
+        const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'
+        // Comment backend chosen independently of the posting route (see force-post).
+        const pageCommentTokenSource: PageCommentTokenSource = normalizePageCommentTokenSource(
+            page.comment_token_source,
+            defaultCommentSourceForRoute(pagePostingRoute),
+        )
+        const commentViaCloakBridge = pageCommentTokenSource === 'cloak_browser'
+        if (pageAdsPublishEnabled || pageCloakPostSelected || commentViaCloakBridge) {
+            console.log(`[CRON] page=${String(page.id || '')} posting_token_source=${pagePostingTokenSource} route=${pagePostingRoute} source_hint=${postingSourceHint(pagePostingRoute)} comment_token_source=${pageCommentTokenSource} ads_publish_legacy_flag=${pageAdsPublishLegacyFlag} ads_publish=${pageAdsPublishEnabled} cloak=${pageCloakPostSelected}`)
+        }
         const commentTemplateRequiresLazada = await namespaceCommentTemplateRequiresLazadaLink(env.DB, botId).catch(() => true)
         const oneCardRequiresLazada = pageOneCardEnabled && pageOneCardCta !== 'NO_BUTTON' && pageOneCardLinkMode === 'lazada'
-        const lazadaLinkRequiredForPosting = !!rawLazadaLink && !pageAdsPublishEnabled && (commentTemplateRequiresLazada || oneCardRequiresLazada)
+        const lazadaLinkRequiredForPosting = !!rawLazadaLink && !pageAdsPublishEnabled && !pageCloakPostSelected && (commentTemplateRequiresLazada || oneCardRequiresLazada)
         const lazadaShortlinkTrace: { utmSource?: string | null; memberId?: string | null; status?: 'disabled' | 'shortened' | 'fallback'; error?: string | null } = {}
         let normalizedLazadaLink = rawLazadaLink
         if (isAdminNamespace && rawLazadaLink && lazadaLinkRequiredForPosting) {
@@ -37071,8 +38628,26 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         if (!realVideoUrl) {
             throw new Error('Video public URL missing')
         }
+        let postingVideoUrl = realVideoUrl
+        let avatarAppliedForBridge = false
+        let avatarVersionForBridge = ''
+        if (pageAdsPublishEnabled || pageCloakPostSelected || pageOneCardEnabled) {
+            const prepared = await prepareAvatarComposedPostingVideo({
+                env,
+                db: env.DB,
+                bucket: botBucket,
+                namespaceId: botId,
+                pageId: String(page.id || ''),
+                videoId: unpostedId,
+                baseVideoUrl: realVideoUrl,
+                logPrefix: `CRON ${page.name} AVATAR`,
+            })
+            postingVideoUrl = prepared.videoUrl
+            avatarAppliedForBridge = prepared.avatarApplied
+            avatarVersionForBridge = prepared.avatarVersion
+        }
 
-        console.log(`[CRON] Page ${page.name}: posting video ${unpostedId} — caption: ${caption}`)
+        console.log(`[CRON] Page ${page.name}: posting video ${unpostedId}${avatarAppliedForBridge ? ` avatar=${avatarVersionForBridge}` : ''} — caption: ${caption}`)
 
         const tokenCandidates = await ensurePageTokenCandidates({
             env,
@@ -37095,8 +38670,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         })
         await ensurePostHistoryTraceColumns(env.DB)
         const commentTokenHint = deriveCommentTokenHint(commentTokenCandidates[0] || null)
-        const initialPostTokenHint = deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
-        const initialPostProfile = await resolvePostHistoryProfileByToken(env, primaryPostingTokenCandidates[0] || null)
+        // Cloak source must never derive its post hint/profile from a stored/manual token.
+        const initialPostTokenHint = pageCloakPostSelected ? 'cloak_session_bridge' : deriveCommentTokenHint(primaryPostingTokenCandidates[0] || null)
+        const initialPostProfile = await resolvePostHistoryProfileByToken(env, pageCloakPostSelected ? null : (primaryPostingTokenCandidates[0] || null))
         const hasCommentToken = commentTokenCandidates.length > 0 && !!String(pageCommentToken || '').trim()
         if (primaryPostingTokenCandidates.length === 0) {
             throw new Error('access_token_missing')
@@ -37162,7 +38738,12 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             continue
         }
 
-        if (!pageAdsPublishEnabled) {
+        // The stored/manual comment-token preflight only applies when the comment will be
+        // sent with a STORED page token (comment_token_source='stored_token'). When comments
+        // go through the CloakBrowser bridge they are page-authored with no stored token, so
+        // skip the preflight regardless of posting route. (Comment success/failure is
+        // recorded from the bridge/backlog result in the branches below.)
+        if (!commentViaCloakBridge) {
             const affiliateCommentPreflight = validateAffiliateCommentPreflight({
                 shopeeLink: normalizedShopeeLink,
                 hasCommentToken,
@@ -37192,6 +38773,16 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 ? 'onecard'
                 : String(primaryPostingTokenCandidates[0] || page.access_token || '').trim()
 
+        // caption_link_enabled: prepend the managed Shopee shortlink as the first caption
+        // line of the FB post, for every posting route (organic Reel, OneCard publish, and the
+        // CloakBrowser session bridge). The Ads/create-ad route prepends its own post-specific
+        // managed link inside /api/dashboard/create-ad, so the raw caption is forwarded there.
+        const publishDescription = resolvePublishCaption({
+            caption,
+            captionLinkEnabled: pageCaptionLinkEnabled,
+            shopeeLink: normalizedShopeeLink,
+        })
+
         // AUTO-ADS MODE (per-page toggle, admin-only enforced at PUT).
         // When enabled, skip the normal Reel post entirely and route through
         // /api/dashboard/create-ad which handles: re-shorten (admin-namespace already
@@ -37206,15 +38797,85 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 if (!namespaceIsAdminManaged) {
                     throw new Error('ads_publish_admin_only_runtime_check_failed')
                 }
+
+                // POST-FIRST (opt-in, same gate as force-post): page post → mint → promote
+                // with final link CTA → comment. Default OFF.
+                if (oneCardPostFirstEnabled(env)) {
+                    const pf = await runOneCardPostFirstAds({
+                        env,
+                        pageId: String(page.id || ''),
+                        namespaceId: botId,
+                        caption,
+                        videoUrl: postingVideoUrl,
+                        sourceVideoId: unpostedId,
+                        rawShopeeLink,
+                        managedShopeeLink: normalizedShopeeLink,
+                        historyId: cronHistoryId,
+                        skipComment: false,
+                        commentSource: pageCommentTokenSource,
+                        hasCommentToken,
+                        storedCommentTokenHint: deriveCommentTokenHint(pageCommentToken),
+                        logPrefix: `CRON ${page.name}`,
+                    })
+                    if (!pf.ok && !pf.storyId) {
+                        throw new Error(String(pf.error || 'ads_post_first_failed'))
+                    }
+                    if (cronHistoryId) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET status=?, fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=? WHERE id=? AND status='posting'"
+                        ).bind(
+                            pf.ok ? 'success' : 'failed',
+                            pf.confirmedPostId || pf.storyId,
+                            pf.fbReelUrl,
+                            pf.commentStatus,
+                            pf.commentId,
+                            pf.commentError,
+                            pf.commentTokenHint,
+                            pf.commentDelaySeconds,
+                            pf.commentDueAt,
+                            pf.ctaShortlink || normalizedShopeeLink || null,
+                            nowISO,
+                            pf.ok ? null : `ads_post_first_partial: ${pf.step || ''}:${pf.error || ''}`.substring(0, 240),
+                            cronHistoryId,
+                        ).run().catch(() => { })
+                    }
+                    await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
+                    markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, nowISO)
+                    await recordPagePostedVideoGuard(env.DB, {
+                        namespaceId: botId, pageId: page.id, videoId: unpostedId,
+                        sourceFingerprint, historyId: cronHistoryId, postedAt: nowISO,
+                    }).catch(() => { })
+                    if (pf.ok) cronStats.pagesPosted++; else cronStats.pagesFailed++
+                    console.log(`[CRON] Page ${page.name}: POST-FIRST ADS ${pf.ok ? 'OK' : 'PARTIAL'} — story=${pf.storyId} ad_id=${pf.adId} comment=${pf.commentStatus} promoted_ad_cta_final=${pf.promotedAdCtaFinal} visible_cta_update=${pf.visibleCtaUpdateStatus} visible_page_cta_final=${pf.visiblePageCtaFinal}`)
+                    await clearVideoShopeeLink(botBucket, unpostedId)
+                    await updateCronRuntimeState(env.DB, {
+                        runId, heartbeatAt: new Date().toISOString(),
+                        pagesVisited: cronStats.pagesVisited, pagesPosted: cronStats.pagesPosted, pagesFailed: cronStats.pagesFailed,
+                    }).catch(() => { })
+                    continue
+                }
+
                 const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
                 const adsResp = await fetchWithTimeout(`${workerUrl}/api/dashboard/create-ad`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         page_id: String(page.id || ''),
-                        video_id: unpostedId,
+                        // unpostedId is an INTERNAL gallery/state id, not a Facebook video
+                        // id. Send the downloadable URL so the CloakBrowser bridge uploads the file
+                        // instead of doing a Graph GET on the internal id (which 500s).
+                        // source_video_id keeps ads naming/history linked to the internal id.
+                        video_url: postingVideoUrl,
+                        source_video_id: unpostedId,
                         caption,
-                        shopee_url: normalizedShopeeLink,
+                        // CTA button → original Shopee product URL (falls back to the
+                        // managed link). Comment shortlink → the already managed/shortened
+                        // link so create-ad does NOT re-shorten it (double-shorten fails).
+                        shopee_url: rawShopeeLink || normalizedShopeeLink,
+                        comment_shortlink: normalizedShopeeLink,
+                        // Defer the comment so we can re-mint it with sub2=post id /
+                        // sub3=page id once story_id exists (see force-post branch).
+                        skip_comment: true,
                     }),
                 }, 300000, 'cron_ads_publish')
                 const adsData = await adsResp.json().catch(() => ({})) as {
@@ -37232,14 +38893,73 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 const storyId = String(adsData.story_id || '')
                 const confirmedPostId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
                 const fbReelUrl = storyId ? `https://www.facebook.com/${storyId.replace('_', '/posts/')}` : ''
+
+                // create-ad ran with skip_comment, so post the single affiliate comment
+                // here with the re-minted link (sub2=post id tail / sub3=page id) once
+                // story_id exists. Parity with the force-post ads branch. The ad CTA button
+                // remains the pre-story_id link (no sub2/sub3) — documented limitation.
+                let cronAdsCommentStatus = 'not_configured'
+                let cronAdsCommentId: string | null = null
+                let cronAdsCommentError: string | null = null
+                let cronAdsCommentShopeeLink = normalizedShopeeLink
+                let cronAdsCommentRemint: OneCardCommentShortlinkRemint | null = null
+                let cronAdsCommentTokenHint: string | null = commentViaCloakBridge ? 'cloak_session_bridge' : deriveCommentTokenHint(pageCommentToken)
+                let cronAdsCommentDelaySeconds: number | null = null
+                let cronAdsCommentDueAt: string | null = null
+                if (normalizedShopeeLink && storyId) {
+                    cronAdsCommentRemint = await remintOneCardCommentShortlink({
+                        env,
+                        namespaceId: botId,
+                        pageId: String(page.id || ''),
+                        storyId,
+                        fbVideoId: String(adsData.ad_id || storyId || unpostedId),
+                        managedShopeeLink: normalizedShopeeLink,
+                        historyId: cronHistoryId,
+                        logPrefix: `CRON ADS COMMENT-SHORTLINK ${page.name}`,
+                    })
+                    cronAdsCommentShopeeLink = cronAdsCommentRemint.commentShopeeLink
+                    if (commentViaCloakBridge) {
+                        // comment_token_source='cloak_browser' (default for an ADS page): comment
+                        // as the Page via the bridge. Fails closed; never a stored-token fallback.
+                        const cronAdsCommentText = (await buildAffiliateCommentMessage(env.DB, botId, cronAdsCommentShopeeLink).catch(() => '')) || cronAdsCommentShopeeLink
+                        const bridged = await sendPageCommentViaCloakBridge({
+                            env,
+                            pageId: String(page.id || ''),
+                            storyId,
+                            message: cronAdsCommentText,
+                            logPrefix: `CRON ADS ${page.name}`,
+                        })
+                        cronAdsCommentStatus = bridged.status
+                        cronAdsCommentId = bridged.id
+                        cronAdsCommentError = bridged.error
+                        cronAdsCommentTokenHint = 'cloak_session_bridge'
+                    } else if (hasCommentToken) {
+                        // comment_token_source='stored_token': defer to the pending backlog
+                        // processor (stored page token against the Page story id).
+                        cronAdsCommentStatus = 'pending'
+                        cronAdsCommentDelaySeconds = getRandomCommentDelaySeconds()
+                        cronAdsCommentDueAt = new Date(Date.now() + (cronAdsCommentDelaySeconds * 1000)).toISOString()
+                        cronAdsCommentTokenHint = deriveCommentTokenHint(pageCommentToken)
+                    } else {
+                        cronAdsCommentStatus = 'failed'
+                        cronAdsCommentError = 'access_token_missing'
+                        cronAdsCommentTokenHint = deriveCommentTokenHint(pageCommentToken)
+                    }
+                }
+
                 if (cronHistoryId) {
                     await env.DB.prepare(
-                        "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
+                        "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='ads_publish', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
                     ).bind(
                         confirmedPostId || storyId,
                         fbReelUrl,
-                        adsData.commentPosted ? 'success' : 'not_configured',
-                        adsData.commentId || null,
+                        cronAdsCommentStatus,
+                        cronAdsCommentId,
+                        cronAdsCommentError,
+                        cronAdsCommentTokenHint,
+                        cronAdsCommentDelaySeconds,
+                        cronAdsCommentDueAt,
+                        cronAdsCommentShopeeLink || normalizedShopeeLink || null,
                         nowISO,
                         cronHistoryId,
                     ).run().catch(() => { })
@@ -37255,7 +38975,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     postedAt: nowISO,
                 }).catch(() => { })
                 cronStats.pagesPosted++
-                console.log(`[CRON] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${adsData.commentPosted ? 'yes' : 'no'}`)
+                console.log(`[CRON] Page ${page.name}: ADS PUBLISH OK — story=${storyId} ad_id=${adsData.ad_id || ''} comment=${cronAdsCommentStatus} remint=${cronAdsCommentRemint?.reminted ? `sub2=${cronAdsCommentRemint.sub2} sub3=${cronAdsCommentRemint.sub3}` : (cronAdsCommentRemint?.error || 'n/a')}`)
                 await clearVideoShopeeLink(botBucket, unpostedId)
                 await updateCronRuntimeState(env.DB, {
                     runId,
@@ -37274,6 +38994,109 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 }
                 cronStats.pagesFailed++
                 console.error(`[CRON] Page ${page.name}: ADS PUBLISH FAILED — ${errMsg}`)
+                await releasePostingLock(env.DB, videoPostingLockKey).catch(() => { })
+                videoPostingLockKey = null
+                await botBucket.delete(dedupKey).catch(() => { })
+                await releaseCronScheduleLock(env.DB, dedupKey, botId).catch(() => { })
+                continue
+            }
+        }
+
+        // CLOAKBROWSER / SESSION-COOKIE BRIDGE ORGANIC POST (source = 'post-reels-token-cloak').
+        // Routes the organic Reel through the CloakBrowser session-cookie bridge /post
+        // route (NOT the stored token, NOT facebook-token-cloak). Fails closed (no
+        // stored-token fallback).
+        if (pageCloakPostSelected) {
+            try {
+                // Comment when a managed shortlink exists (cron is automatic); the bridge
+                // posts it via its /graph proxy (session token internal to the bridge).
+                const cloakCommentShopeeLink = normalizedShopeeLink
+                const cloakCommentText = cloakCommentShopeeLink
+                    ? await buildAffiliateCommentMessage(env.DB, botId, cloakCommentShopeeLink).catch(() => '')
+                    : ''
+                const cloakOneCardWebsiteUrl = pageOneCardEnabled
+                    ? pickOneCardWebsiteUrl({ linkMode: pageOneCardLinkMode, shopeeLink: normalizedShopeeLink, lazadaLink: normalizedLazadaLink })
+                    : ''
+                const cloakResult = await publishReelViaSessionBridge({
+                    env,
+                    pageId: String(page.id || ''),
+                    videoUrl: postingVideoUrl,
+                    message: publishDescription,
+                    websiteUrl: cloakOneCardWebsiteUrl,
+                    cta: pageOneCardCta,
+                    // Only let the bridge post the comment when comment_token_source=
+                    // 'cloak_browser'; otherwise defer to the stored-token backlog (below).
+                    commentText: commentViaCloakBridge ? cloakCommentText : '',
+                    logPrefix: `CRON CLOAK-BRIDGE ${page.name}`,
+                })
+                const confirmedPostId = String(cloakResult.postId || '').trim() || String(cloakResult.id || '').trim()
+                const fbReelUrl = String(cloakResult.permalinkUrl || '').trim()
+                let cloakCommentStatus: string
+                let cloakCommentFbId: string | null
+                let cloakCommentError: string | null
+                let cloakCommentTokenHint: string | null
+                let cloakCommentDelaySeconds: number | null = null
+                let cloakCommentDueAt: string | null = null
+                if (commentViaCloakBridge) {
+                    cloakCommentStatus = !cloakCommentText
+                        ? 'not_configured'
+                        : (cloakResult.commentId ? 'success' : 'failed')
+                    cloakCommentFbId = cloakResult.commentId || null
+                    cloakCommentError = cloakCommentStatus === 'failed' ? (cloakResult.commentError || 'cloak_comment_failed') : null
+                    cloakCommentTokenHint = 'cloak_session_bridge'
+                } else {
+                    // comment_token_source='stored_token': defer to the pending backlog
+                    // (stored page token against the Page story id).
+                    cloakCommentFbId = null
+                    if (!cloakCommentText) {
+                        cloakCommentStatus = 'not_configured'
+                        cloakCommentError = null
+                    } else if (hasCommentToken) {
+                        cloakCommentStatus = 'pending'
+                        cloakCommentError = null
+                        cloakCommentDelaySeconds = getRandomCommentDelaySeconds()
+                        cloakCommentDueAt = new Date(Date.now() + (cloakCommentDelaySeconds * 1000)).toISOString()
+                    } else {
+                        cloakCommentStatus = 'failed'
+                        cloakCommentError = 'access_token_missing'
+                    }
+                    cloakCommentTokenHint = deriveCommentTokenHint(pageCommentToken)
+                }
+                if (cronHistoryId) {
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
+                    ).bind(confirmedPostId, fbReelUrl, cloakCommentStatus, cloakCommentFbId, cloakCommentError, cloakCommentTokenHint, cloakCommentDelaySeconds, cloakCommentDueAt, cloakCommentShopeeLink || normalizedShopeeLink || null, nowISO, cronHistoryId).run().catch(() => { })
+                }
+                await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
+                markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, nowISO)
+                await recordPagePostedVideoGuard(env.DB, {
+                    namespaceId: botId,
+                    pageId: page.id,
+                    videoId: unpostedId,
+                    sourceFingerprint,
+                    historyId: cronHistoryId,
+                    postedAt: nowISO,
+                }).catch(() => { })
+                cronStats.pagesPosted++
+                console.log(`[CRON] Page ${page.name}: CLOAK-BRIDGE POST OK — post=${confirmedPostId} comment=${cloakCommentStatus}`)
+                await clearVideoShopeeLink(botBucket, unpostedId)
+                await updateCronRuntimeState(env.DB, {
+                    runId,
+                    heartbeatAt: new Date().toISOString(),
+                    pagesVisited: cronStats.pagesVisited,
+                    pagesPosted: cronStats.pagesPosted,
+                    pagesFailed: cronStats.pagesFailed,
+                }).catch(() => { })
+                continue
+            } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e)
+                if (cronHistoryId) {
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status='failed', error_message=?, comment_status='not_attempted' WHERE id=? AND status='posting'"
+                    ).bind(`cloak_post_failed: ${errMsg}`, cronHistoryId).run().catch(() => { })
+                }
+                cronStats.pagesFailed++
+                console.error(`[CRON] Page ${page.name}: CLOAK POST FAILED — ${errMsg}`)
                 await releasePostingLock(env.DB, videoPostingLockKey).catch(() => { })
                 videoPostingLockKey = null
                 await botBucket.delete(dedupKey).catch(() => { })
@@ -37330,17 +39153,12 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 shopeeLink: normalizedShopeeLink,
                 lazadaLink: normalizedLazadaLink,
             })
-            const captionLinkFirstEnabled = pageCaptionLinkEnabled && !pageOneCardEnabled && !pageAdsPublishEnabled && !!normalizedShopeeLink
-            const publishDescription = captionLinkFirstEnabled
-                ? buildCaptionLinkFirstDescription(caption, normalizedShopeeLink)
-                : caption
-
             const reelResult = pageOneCardEnabled
                 ? await publishVideoViaOneCard({
                     env,
                     pageId: String(page.id || ''),
-                    videoUrl: realVideoUrl,
-                    message: caption,
+                    videoUrl: postingVideoUrl,
+                    message: publishDescription,
                     websiteUrl: oneCardWebsiteUrl,
                     cta: pageOneCardCta,
                     logPrefix: `CRON ${page.name} ONECARD`,
@@ -37360,7 +39178,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             fbVideoId = reelResult.id
             const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
             const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
-            const scheduledCommentDelaySeconds = normalizedShopeeLink && hasCommentToken
+            // Only the stored-token path defers via comment_due_at; the bridge override
+            // comments immediately below, so it schedules no delay.
+            const scheduledCommentDelaySeconds = normalizedShopeeLink && hasCommentToken && !commentViaCloakBridge
                 ? getRandomCommentDelaySeconds()
                 : null
             const scheduledCommentDueAt = scheduledCommentDelaySeconds
@@ -37391,8 +39211,24 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             let commentTokenUsed = String(commentTokenCandidates[0] || '').trim()
             let commentProfileId: string | null = null
             let commentProfileName: string | null = null
+            let commentTokenHintFinal = deriveCommentTokenHint(commentTokenUsed)
 
-            if (normalizedShopeeLink && hasCommentToken) {
+            if (normalizedShopeeLink && commentViaCloakBridge) {
+                // comment_token_source='cloak_browser' on a stored-token POST: comment as the
+                // Page via the bridge immediately (fails closed, never a stored-token fallback).
+                const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, normalizedShopeeLink).catch(() => '')) || normalizedShopeeLink
+                const bridged = await sendPageCommentViaCloakBridge({
+                    env,
+                    pageId: String(page.id || ''),
+                    storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
+                    message: cloakOverrideText,
+                    logPrefix: `CRON STORED→CLOAK-COMMENT ${page.name}`,
+                })
+                commentStatus = bridged.status
+                commentFbId = bridged.id
+                commentError = bridged.error
+                commentTokenHintFinal = 'cloak_session_bridge'
+            } else if (normalizedShopeeLink && hasCommentToken) {
                 commentStatus = 'pending'
                 commentError = null
             }
@@ -37408,7 +39244,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     postingProfile.profileId,
                     postingProfile.profileName,
                     commentStatus,
-                    deriveCommentTokenHint(commentTokenUsed),
+                    commentTokenHintFinal,
                     commentProfileId,
                     commentProfileName,
                     commentError,

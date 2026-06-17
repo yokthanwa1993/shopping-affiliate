@@ -52,3 +52,7 @@ bun.lockb
 .wrangler/cache/
 *.zip
 *.mp4
+# Local Wrangler/Astro runtime state
+.wrangler/state/
+apps/**/.wrangler/
+apps/**/.astro/settings.json

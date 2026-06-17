@@ -575,10 +575,10 @@ test('Shopee comment posting dedup and target selection are story-only', () => {
     assert.doesNotMatch(strictSource, /comment_target_missing/)
     assert.doesNotMatch(strictSource, /reel fallback|fallback to reel/i)
 
-    const subSource = indexFunctionSource(
-        'function buildPostingCommentShortlinkSubIds',
-        'function isManagedShortlinkTransientFailure',
-    )
+    // buildPostingCommentShortlinkSubIds now lives in shortlink-template.ts (pure, unit-tested).
+    const subSource = readFileSync('src/shortlink-template.ts', 'utf8')
+        .slice(readFileSync('src/shortlink-template.ts', 'utf8').indexOf('export function buildPostingCommentShortlinkSubIds'))
+    assert.ok(subSource.length > 0, 'buildPostingCommentShortlinkSubIds must exist')
     assert.match(subSource, /Shopee comment shortlink sub2 missing: missing_page_story_object_id/)
     assert.doesNotMatch(subSource, /fb_video_id[\s\S]*reel_id[\s\S]*unavailable/)
     assert.doesNotMatch(subSource, /fallback/i)

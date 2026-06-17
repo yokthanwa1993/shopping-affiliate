@@ -1,0 +1,1 @@
+import{z as t,ad as c,aN as l,aL as o}from"./branches.I3mTiO-L.js";function a(e){throw new Error("https://svelte.dev/e/lifecycle_outside_component")}function u(e){t===null&&a(),c&&t.l!==null?i(t).m.push(e):l(()=>{const n=o(e);if(typeof n=="function")return n})}function f(e){t===null&&a(),u(()=>()=>o(e))}function i(e){var n=e.l;return n.u??={a:[],b:[],m:[]}}export{u as a,f as o};

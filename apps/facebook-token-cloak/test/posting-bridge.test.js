@@ -1,0 +1,1694 @@
+'use strict';
+
+// Fast Graph polling so /post + /create-ad happy paths don't wait real seconds.
+process.env.FACEBOOK_TOKEN_CLOAK_POLL_MS = '0';
+
+const { test, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+const http = require('http');
+const { createServer, DEFAULT_TEMPLATE_ADSET } = require('../src/server');
+
+const USER_TOKEN_SECRET = 'EAAB_USER_SECRET';
+const PAGE_TOKEN_SECRET = 'PAGE_SECRET_TOKEN';
+const LIVE_PAGE_ID = '107267395614980';
+
+test('bridge default template adset is the current SALES template, not retired pre-SALES template', () => {
+  assert.equal(DEFAULT_TEMPLATE_ADSET, '120248134990230263');
+  assert.notEqual(DEFAULT_TEMPLATE_ADSET, '120244361318490263');
+});
+
+function assertNoLeak(value) {
+  const payload = JSON.stringify(value);
+  for (const secret of [USER_TOKEN_SECRET, PAGE_TOKEN_SECRET]) {
+    assert.ok(!payload.includes(secret), `leaked secret ${secret}`);
+  }
+}
+
+// Graph response router — mirrors the live Graph happy path. Returns the parsed body object;
+// the mock browser wraps it as the in-page fetch result ({ status, ok, text }).
+function graphRoute(url, method, pages, opts = {}) {
+  const u = String(url);
+  const reqBody = String(opts.body || '');
+  // Adset BUDGET POST (daily-campaign path): { daily_budget } only (no end_time/status). Meta
+  // rejects daily_budget + end_time together (live subcode 1487793), so budget is its own POST.
+  // opts.adsetBudgetError simulates a Graph error on the budget POST.
+  if (method === 'POST' && /\/ADSET1\?/.test(u) && /daily_budget/.test(reqBody) && opts.adsetBudgetError) {
+    return { error: { message: 'Invalid parameter', code: 100, error_subcode: 1487793 } };
+  }
+  // Campaign CLEANUP delete (failure path): the bridge deletes a campaign it CREATED this request
+  // (or a bad empty reused campaign) when a step fails. opts.campaignDeleteError simulates Graph
+  // rejecting that delete: `true` → the fresh campaign CAMP1, or a campaign id string → that id.
+  if (method === 'POST' && /"status":"DELETED"/.test(reqBody) && opts.campaignDeleteError) {
+    const badId = opts.campaignDeleteError === true ? 'CAMP1' : String(opts.campaignDeleteError);
+    if (new RegExp(`/${badId}\\?`).test(u)) {
+      return { error: { message: 'Cannot delete campaign with active children', code: 100 } };
+    }
+  }
+  // Adset ACTIVATION POST (daily-campaign path): { name, status:'ACTIVE', end_time } — the
+  // live-proven shape. opts.adsetActivateError simulates a Graph error on activation.
+  if (method === 'POST' && /\/ADSET1\?/.test(u) && /"status":"ACTIVE"/.test(reqBody) && opts.adsetActivateError) {
+    return { error: { message: 'Invalid parameter', code: 100, error_subcode: 1487793 } };
+  }
+  // Adset CUSTOMER-LIFECYCLE re-apply POST (existing_customer_budget_percentage). Mirrors the
+  // template's customer-lifecycle strategy onto the copied adset. opts.adsetLifecycleError simulates
+  // Graph rejecting it (the bridge must fail SOFT and still create/activate the ad).
+  if (method === 'POST' && /\/ADSET1\?/.test(u) && /existing_customer_budget_percentage/.test(reqBody)) {
+    return opts.adsetLifecycleError ? { error: { message: 'Cannot apply lifecycle strategy', code: 100 } } : { success: true };
+  }
+  // Copied adset start_time readback (daily-campaign path): the bridge computes end_time as this
+  // start_time + 24h. Default simulates Meta assigning a start_time LATER than the bridge's local
+  // `now`. opts.copiedAdsetStartTimeMissing → no start_time (bridge falls back to now + buffer).
+  if (method === 'GET' && /fields=start_time&/.test(u)) {
+    return opts.copiedAdsetStartTimeMissing ? {} : { start_time: opts.copiedAdsetStartTime || '2026-06-15T21:39:39+0700' };
+  }
+  // Reused-campaign emptiness probe (bad-reused-campaign recovery): list non-DELETED adsets on the
+  // reused daily campaign. Must precede the adset readback route below (both carry effective_status).
+  // opts.reusedCampaignAdsets → simulate the reused campaign already having adsets (recovery must NOT
+  // delete it); default [] → empty (recovery deletes + recreates).
+  if (method === 'GET' && /\/adsets\?fields=id,status,effective_status/.test(u)) {
+    return { data: opts.reusedCampaignAdsets || [] };
+  }
+  // Adset status readback (daily-campaign path): the bridge requires status === 'ACTIVE' AND an
+  // end_time. opts.adsetReadbackPaused → stayed PAUSED; opts.adsetReadbackNoEndTime → ACTIVE but
+  // the schedule did not stick (no end_time).
+  if (method === 'GET' && /effective_status/.test(u)) {
+    if (opts.adsetReadbackPaused) return { status: 'PAUSED', effective_status: 'PAUSED', name: 'Adset copy' };
+    const base = { status: 'ACTIVE', effective_status: 'ACTIVE', name: 'Adset active', daily_budget: '10000' };
+    return opts.adsetReadbackNoEndTime ? base : { ...base, start_time: '2026-06-15T21:04:36+0700', end_time: '2026-06-16T21:04:36+0700' };
+  }
+  if (u.includes('/me/accounts')) return { data: pages };
+  // Source-post attachment lookup: the freshly posted page video's attachment target id.
+  // attachmentVideoId === '' simulates a post with no resolvable video (empty target id).
+  // CTA read-back on the visible post (GET …?fields=call_to_action…). Returns the link the post
+  // currently carries. opts.readbackCtaLink simulates the verified visible CTA after an update;
+  // opts.readbackCtaLink === null simulates a POST that "succeeded" but left the visible CTA
+  // unchanged (the live failure mode the read-back guards against).
+  if (/fields=call_to_action,permalink_url/.test(u) && method === 'GET') {
+    const vid = opts.attachmentVideoId === undefined ? '2061700814696950' : opts.attachmentVideoId;
+    const target = vid ? { id: vid, url: `https://www.facebook.com/reel/${vid}/` } : {};
+    const link = opts.readbackCtaLink;
+    const cta = link ? { type: 'SHOP_NOW', value: { link, link_format: 'VIDEO_LPP' } } : undefined;
+    return {
+      ...(cta ? { call_to_action: cta } : {}),
+      permalink_url: 'https://www.facebook.com/reel/2061700814696950/',
+      attachments: { data: [{ media_type: 'video', target }] }
+    };
+  }
+  if (/fields=attachments/.test(u) && method === 'GET') {
+    const vid = opts.attachmentVideoId === undefined ? 'RESOLVEDVID' : opts.attachmentVideoId;
+    const target = vid ? { id: vid, url: `https://www.facebook.com/watch/?v=${vid}` } : {};
+    return { attachments: { data: [{ media_type: 'video', target }] } };
+  }
+  if (/\/advideos\?/.test(u) && method === 'POST') return { id: 'VID123' };
+  if (/fields=thumbnails/.test(u)) return { thumbnails: { data: [{ id: 't1', uri: 'https://thumb/x.jpg' }] } };
+  if (/\/adcreatives/.test(u) && method === 'POST') return { id: 'CR1' };
+  if (/fields=effective_object_story_id/.test(u) && method === 'GET') return { effective_object_story_id: `${LIVE_PAGE_ID}_STORY9` };
+  if (/\/ads\?fields=creative/.test(u)) return { data: [{ creative: { id: 'TPLCR' } }] };
+  if (/TPLCR\?fields=call_to_action_type/.test(u)) return { call_to_action_type: opts.ctaType || 'SHOP_NOW' };
+  // Template settings read (objective + campaign-level mirror fields + adset-level customer-
+  // lifecycle fields) in ONE GET on the template adset. opts.* inject template values so the
+  // mirror/re-apply behavior can be exercised; absent → only objective is returned (default).
+  if (/fields=existing_customer_budget_percentage/.test(u) && method === 'GET') {
+    return {
+      ...(opts.templateExistingCustomerPct !== undefined ? { existing_customer_budget_percentage: opts.templateExistingCustomerPct } : {}),
+      ...(opts.templateTargetingOptTypes !== undefined ? { targeting_optimization_types: opts.templateTargetingOptTypes } : {}),
+      campaign: {
+        id: opts.templateCampaignId || 'TPLCAMP1',
+        objective: opts.templateObjective || 'OUTCOME_ENGAGEMENT',
+        ...(opts.templateSmartPromotionType !== undefined ? { smart_promotion_type: opts.templateSmartPromotionType } : {})
+      }
+    };
+  }
+  if (/campaign\{objective\}/.test(u)) return { campaign: { objective: 'OUTCOME_ENGAGEMENT' } };
+  // Campaign name search (daily-campaign reuse + legacy prefix lookup). opts.existingCampaigns
+  // simulates campaigns already on the ad account so exact-name reuse can be exercised.
+  if (/\/campaigns\?.*filtering/.test(u) && method === 'GET') return { data: opts.existingCampaigns || [] };
+  if (/\/campaigns\?/.test(u) && method === 'POST') return { id: 'CAMP1' };
+  // Adset COPY (template adset → campaign). opts.copyError simulates Graph rejecting EVERY copy.
+  // opts.copyErrorForCampaign simulates a bad/orphan REUSED daily campaign: the copy errors only
+  // when targeting that campaign id (live: code=100 subcode=1885272), and succeeds elsewhere (e.g.
+  // the fresh duplicate the recovery creates).
+  if (/\/copies/.test(u) && method === 'POST') {
+    if (opts.copyError) return { error: { message: 'Invalid parameter', code: 100, error_subcode: 1885272 } };
+    if (opts.copyErrorForCampaign) {
+      let cid = '';
+      try { cid = JSON.parse(reqBody || '{}').campaign_id || ''; } catch {}
+      if (String(cid) === String(opts.copyErrorForCampaign)) {
+        return { error: { message: 'Invalid parameter', code: 100, error_subcode: 1885272 } };
+      }
+    }
+    return { copied_adset_id: 'ADSET1' };
+  }
+  if (/\/ads\?fields=id/.test(u) && method === 'GET') return { data: [{ id: 'AD1' }] };
+  if (/\/ads\?/.test(u) && method === 'POST') return { id: 'AD1' };
+  if (/\/comments/.test(u) && method === 'POST') return { id: 'COMMENT1' };
+  return { success: true };
+}
+
+// Mock CloakBrowser.
+//   - Graph traffic preferentially goes through context.request.fetch (Playwright
+//     APIRequestContext — cookie-sharing, no page CORS). Recorded in `apiCalls`.
+//   - page.evaluate has TWO modes: token extraction (no { url }) and a Graph FALLBACK
+//     (with { url } — recorded in `evalGraphCalls`) used only when context.request is absent.
+// Pass opts.noApiRequest to omit context.request and force the page.evaluate fallback.
+function makeBrowser(opts = {}) {
+  const calls = [];
+  const apiCalls = [];
+  const evalGraphCalls = [];
+  let closes = 0;
+  const pages = opts.pages || [{ id: LIVE_PAGE_ID, name: 'คอนเทนต์ป้ายยา', category: 'Shop', access_token: PAGE_TOKEN_SECRET }];
+  const tokenInUrl = opts.oauthToken !== false && opts.url === undefined;
+  let url = opts.url || (tokenInUrl
+    ? `https://postcron.com/auth/login/facebook/callback#access_token=${USER_TOKEN_SECRET}`
+    : 'https://www.facebook.com/dialog/oauth/error?error=invalid_app_id');
+  const tokenExtract = opts.evalToken || { token: USER_TOKEN_SECRET, fbDtsgPresent: true, userId: '4242' };
+  const routeOpts = {
+    ctaType: opts.ctaType, attachmentVideoId: opts.attachmentVideoId, readbackCtaLink: opts.readbackCtaLink,
+    existingCampaigns: opts.existingCampaigns, adsetBudgetError: opts.adsetBudgetError, adsetActivateError: opts.adsetActivateError,
+    adsetReadbackPaused: opts.adsetReadbackPaused, adsetReadbackNoEndTime: opts.adsetReadbackNoEndTime,
+    copiedAdsetStartTime: opts.copiedAdsetStartTime, copiedAdsetStartTimeMissing: opts.copiedAdsetStartTimeMissing,
+    templateObjective: opts.templateObjective, templateCampaignId: opts.templateCampaignId,
+    templateSmartPromotionType: opts.templateSmartPromotionType, templateExistingCustomerPct: opts.templateExistingCustomerPct,
+    templateTargetingOptTypes: opts.templateTargetingOptTypes, adsetLifecycleError: opts.adsetLifecycleError,
+    campaignDeleteError: opts.campaignDeleteError, copyError: opts.copyError,
+    copyErrorForCampaign: opts.copyErrorForCampaign, reusedCampaignAdsets: opts.reusedCampaignAdsets
+  };
+
+  const apiRequest = opts.noApiRequest ? undefined : {
+    // Playwright APIResponse-like: status()/ok()/text() are methods.
+    fetch: async (reqUrl, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const reqBody = init.data != null ? String(init.data) : (init.body != null ? String(init.body) : '');
+      calls.push({ url: String(reqUrl), method, body: reqBody });
+      apiCalls.push({ url: String(reqUrl), method, body: reqBody });
+      const obj = graphRoute(reqUrl, method, pages, { ...routeOpts, body: reqBody });
+      const text = JSON.stringify(obj);
+      return { status: () => 200, ok: () => true, text: async () => text, json: async () => obj };
+    }
+  };
+
+  const browser = {
+    PROFILE_ROOT: '/tmp/profiles',
+    loadBrowserBackend: async () => ({ backend: 'mock-browser' }),
+    openPage: async () => ({
+      backend: 'mock-browser',
+      profileDir: '/tmp/profiles/content_paiya',
+      page: {
+        url: () => url,
+        textContent: async () => '',
+        goto: async (to) => { url = String(to); },
+        evaluate: async (fn, arg) => {
+          if (arg && arg.url) {
+            const method = (arg.method || 'GET').toUpperCase();
+            const reqBody = arg.body != null ? String(arg.body) : '';
+            calls.push({ url: String(arg.url), method, body: reqBody });
+            evalGraphCalls.push({ url: String(arg.url), method, body: reqBody });
+            return { status: 200, ok: true, text: JSON.stringify(graphRoute(arg.url, method, pages, { ...routeOpts, body: reqBody })) };
+          }
+          if (opts.onTokenEval) opts.onTokenEval();
+          return tokenExtract;
+        }
+      },
+      context: {
+        cookies: async () => (opts.loggedIn === false ? [] : [{ name: 'c_user', value: '4242' }]),
+        close: async () => { closes += 1; },
+        ...(apiRequest ? { request: apiRequest } : {})
+      }
+    })
+  };
+  browser.calls = calls;
+  browser.apiCalls = apiCalls;
+  browser.evalGraphCalls = evalGraphCalls;
+  browser.closeCount = () => closes;
+  return browser;
+}
+
+const NOT_LOGGED_IN = { url: 'https://www.facebook.com/login', evalToken: { token: null, fbDtsgPresent: false, userId: null }, loggedIn: false };
+
+let server;
+let lastBrowser;
+let lastNodeFetch;
+
+function listen(opts = {}) {
+  lastBrowser = opts.browser || makeBrowser();
+  // Node fetch must NOT be used for Graph (cookies required) — default to a spy that records
+  // any (unexpected) call so regressions can assert Graph never goes through Node fetch.
+  lastNodeFetch = opts.nodeFetch || (() => { lastNodeFetch.called = true; return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: { code: 1, message: 'Invalid request' } }) }); });
+  lastNodeFetch.called = false;
+  server = createServer({ browser: lastBrowser, fetch: lastNodeFetch });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+}
+
+function req(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const payload = body ? JSON.stringify(body) : '';
+    const r = http.request({
+      hostname: '127.0.0.1',
+      port: server.address().port,
+      path,
+      method,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: data ? JSON.parse(data) : {} }));
+    });
+    r.on('error', reject);
+    if (payload) r.write(payload);
+    r.end();
+  });
+}
+
+afterEach(async () => {
+  if (server) await new Promise((resolve) => server.close(resolve));
+  server = null;
+});
+
+test('GET /token returns booleans only (no raw token), accessToken=true when session has a token', async () => {
+  await listen();
+  const r = await req('GET', '/token');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.accessToken, true);
+  assert.equal(r.body.fbDtsg, true);
+  assert.equal(typeof r.body.accessToken, 'boolean');
+  assertNoLeak(r.body);
+});
+
+test('GET /token reports accessToken=false when the profile is not logged in', async () => {
+  await listen({ browser: makeBrowser(NOT_LOGGED_IN) });
+  const r = await req('GET', '/token');
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.accessToken, false);
+});
+
+test('GET /token falls back to the Ads Manager in-page extractor when OAuth has no token', async () => {
+  await listen({ browser: makeBrowser({ oauthToken: false }) });
+  const r = await req('GET', '/token');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.accessToken, true, 'token resolved via window.__accessToken fallback');
+  assert.equal(r.body.fbDtsg, true, 'fbDtsg presence from in-page extraction');
+  assertNoLeak(r.body);
+});
+
+test('GET /pages works via the Ads Manager fallback token (no token leak)', async () => {
+  await listen({ browser: makeBrowser({ oauthToken: false }) });
+  const r = await req('GET', '/pages');
+  assert.equal(r.status, 200);
+  assert.ok(r.body.data.map((p) => String(p.id)).includes(LIVE_PAGE_ID));
+  assertNoLeak(r.body);
+});
+
+test('Ads Manager fallback is skipped when OAuth already yields a token', async () => {
+  let evaluated = false;
+  await listen({ browser: makeBrowser({ onTokenEval: () => { evaluated = true; } }) });
+  const r = await req('GET', '/token');
+  assert.equal(r.body.accessToken, true);
+  assert.equal(evaluated, false, 'token-extract evaluate must not run when OAuth token exists');
+});
+
+test('GET /pages returns id/name only (no page access tokens) and includes the live page', async () => {
+  await listen();
+  const r = await req('GET', '/pages');
+  assert.equal(r.status, 200);
+  assert.ok(Array.isArray(r.body.data));
+  const ids = r.body.data.map((p) => String(p.id));
+  assert.ok(ids.includes(LIVE_PAGE_ID), 'must include page 107267395614980 when logged in');
+  for (const p of r.body.data) {
+    assert.equal(p.access_token, undefined, 'must not return page access_token');
+    assert.equal(p.hasToken, true, 'hasToken flag present without the token value');
+  }
+  assertNoLeak(r.body);
+});
+
+test('Graph runs through the logged-in browser page (credentials include), NOT Node fetch', async () => {
+  // Node fetch with the AdsManager token returns OAuthException code=1 live — so it must never
+  // be used. Pass a Node fetch that always errors; the browser-context Graph still succeeds.
+  await listen({ browser: makeBrowser({ oauthToken: false }) });
+  const r = await req('GET', '/pages');
+  assert.equal(r.status, 200);
+  assert.ok(r.body.data.map((p) => String(p.id)).includes(LIVE_PAGE_ID), 'page resolved via in-page fetch');
+  assert.equal(lastNodeFetch.called, false, 'Graph must NOT go through Node fetch');
+  assert.ok(lastBrowser.calls.some((c) => /\/me\/accounts/.test(c.url)), 'me/accounts fetched in-page');
+});
+
+test('Graph uses context.request.fetch (APIRequestContext) when present, NOT page.evaluate', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('GET', '/pages');
+  assert.equal(r.status, 200);
+  assert.ok(r.body.data.map((p) => String(p.id)).includes(LIVE_PAGE_ID));
+  assert.ok(browser.apiCalls.some((c) => /\/me\/accounts/.test(c.url)), 'me/accounts went through context.request.fetch');
+  assert.equal(browser.evalGraphCalls.length, 0, 'page.evaluate must NOT be used for Graph when context.request exists');
+});
+
+test('Graph falls back to page.evaluate(fetch) when context.request is unavailable', async () => {
+  const browser = makeBrowser({ noApiRequest: true });
+  await listen({ browser });
+  const r = await req('GET', '/pages');
+  assert.equal(r.status, 200);
+  assert.ok(r.body.data.map((p) => String(p.id)).includes(LIVE_PAGE_ID), 'page resolved via in-page fetch fallback');
+  assert.equal(browser.apiCalls.length, 0, 'no APIRequestContext available');
+  assert.ok(browser.evalGraphCalls.some((c) => /\/me\/accounts/.test(c.url)), 'fell back to page.evaluate for Graph');
+});
+
+test('POST /page-comment succeeds via context.request.fetch (the CORS-failing path is avoided)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/page-comment', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_STORY9`,
+    message: 'comment via api request'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.author_expected, 'page');
+  assert.ok(browser.apiCalls.some((c) => /\/comments/.test(c.url) && c.method === 'POST'), 'comment POSTed via context.request.fetch');
+  assert.equal(browser.evalGraphCalls.length, 0, 'no page.evaluate Graph for the comment');
+  assertNoLeak(r.body);
+});
+
+test('browser context is closed after the request completes (no context leak)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  await req('GET', '/pages');
+  assert.equal(browser.closeCount(), 1, 'context.close() called once after the request');
+});
+
+test('POST /post publishes an organic page video and returns story/post fields, no token leak', async () => {
+  await listen();
+  const r = await req('POST', '/post', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    message: 'hello',
+    website_url: 'https://s.shopee/x',
+    cta: 'SHOP_NOW'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.story_id, `${LIVE_PAGE_ID}_STORY9`);
+  assert.equal(r.body.video_id, 'VID123');
+  assert.ok(String(r.body.post_url).includes(LIVE_PAGE_ID));
+  assertNoLeak(r.body);
+});
+
+test('POST /post fails closed (validate) when page_id/video_url missing', async () => {
+  await listen();
+  const r = await req('POST', '/post', { page_id: LIVE_PAGE_ID });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /page-comment comments AS THE PAGE and returns author_expected=page, no token leak', async () => {
+  await listen();
+  const r = await req('POST', '/page-comment', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_STORY9`,
+    message: 'นี่คอมเมนต์'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.author_expected, 'page');
+  assert.ok(r.body.id);
+  assertNoLeak(r.body);
+});
+
+test('POST /page-comment FAILS CLOSED when the session does not administer the page (never comments as user)', async () => {
+  const browser = makeBrowser({ pages: [{ id: '999', name: 'Other', access_token: 'OTHER' }] });
+  await listen({ browser });
+  const r = await req('POST', '/page-comment', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_STORY9`,
+    message: 'should not post'
+  });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.error, 'page_token_not_found');
+  // Hard guarantee: no comment was ever POSTed to Graph /comments.
+  assert.ok(!browser.calls.some((c) => /\/comments/.test(c.url)), 'must not call /comments when page token is missing');
+});
+
+test('POST /page-comment fail-closed (no_session) when the profile is not logged in', async () => {
+  await listen({ browser: makeBrowser(NOT_LOGGED_IN) });
+  const r = await req('POST', '/page-comment', { page_id: LIVE_PAGE_ID, story_id: 'x_y', message: 'hi' });
+  assert.equal(r.status, 409);
+  assert.equal(r.body.error, 'no_session');
+});
+
+test('POST /create-ad runs the OneCard/ads orchestration and returns ids, no token leak', async () => {
+  await listen();
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'cap',
+    shortlink: 'https://s.wwoom/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.story_id, `${LIVE_PAGE_ID}_STORY9`);
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.adset_id, 'ADSET1');
+  assert.equal(r.body.published_to_page, true);
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad fails closed (validate) when page_id/video missing', async () => {
+  await listen();
+  const r = await req('POST', '/create-ad', { caption: 'x' });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+// VISIBLE-CTA-FIRST (current intent): skip_ad is a LEGACY path (the Worker main flow now uses
+// skip_publish_to_page + ad-story-first, see /publish-story). When it IS used, Phase A bakes the
+// INITIAL direct Shopee CTA so the visible post immediately shows the Shopee card + SHOP_NOW button.
+test('POST /create-ad with skip_ad bakes the INITIAL visible Shopee CTA (visible-CTA-first), never a Worker redirect', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const INITIAL_SHORTLINK = 'https://s.shopee.co.th/sub3only';
+  const SHOPEE = 'https://shopee.co.th/x';
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'cap',
+    shortlink: INITIAL_SHORTLINK,
+    shopee_url: SHOPEE,
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_ad: true
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'post', 'Phase A returns phase=post');
+  assert.equal(r.body.story_id, `${LIVE_PAGE_ID}_STORY9`);
+  assert.equal(r.body.video_id, 'VID123', 'returns the reusable uploaded video id');
+  assert.equal(r.body.thumbnail_url, 'https://thumb/x.jpg', 'returns the reusable thumbnail');
+  assert.equal(r.body.published_to_page, true, 'the visible page post is published');
+  assert.equal(r.body.ad_id, undefined, 'no ad is created in Phase A');
+  // VISIBLE-CTA-FIRST: Phase A bakes the INITIAL direct Shopee CTA. It must NEVER bake a Worker
+  // redirect into the visible UI.
+  const phaseACreative = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.ok(phaseACreative, 'a Phase A adcreative was created');
+  assert.ok(String(phaseACreative.body).includes('call_to_action'), 'Phase A bakes the initial visible CTA object');
+  assert.ok(String(phaseACreative.body).includes(INITIAL_SHORTLINK), 'visible post creative carries the initial direct Shopee link');
+  assert.ok(!String(phaseACreative.body).includes('onecard-cta'), 'Phase A must not contain the retired redirect path');
+  assert.ok(!String(phaseACreative.body).includes('api.pubilo.com'), 'Phase A CTA payload must not contain api.pubilo.com');
+  assert.ok(!String(phaseACreative.body).includes('cta_redirect_url'), 'Phase A must not forward cta_redirect_url');
+  assert.equal(r.body.cta_link, INITIAL_SHORTLINK, 'reports the initial visible CTA link');
+  assert.equal(r.body.visible_page_cta_link, INITIAL_SHORTLINK);
+  assert.equal(r.body.visible_page_cta_initial, true, 'Phase A shows an initial Shopee CTA card/button');
+  assert.equal(r.body.visible_page_cta_final, false, 'the post-specific final link is applied later by /update-cta');
+  // Hard guarantee: skip_ad must NOT create a campaign/adset/ad.
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'no campaign created');
+  assert.ok(!browser.calls.some((c) => /\/copies/.test(c.url)), 'no adset copied');
+  assert.ok(!browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'no ad created');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad with skip_ad strips a Worker redirect CTA and publishes linkless (never a redirect in the visible UI)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  // Only a Worker redirect is available (no direct Shopee link). The visible post must NEVER carry
+  // a redirect URL, so Phase A strips it and publishes a linkless video rather than baking it in.
+  const REDIRECT = 'https://api.pubilo.com/onecard-cta/oc_test123';
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'cap',
+    shortlink: REDIRECT,
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_ad: true
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  const phaseACreative = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.ok(phaseACreative, 'a Phase A adcreative was created');
+  assert.ok(!String(phaseACreative.body).includes('call_to_action'), 'strips the redirect → no CTA object (linkless)');
+  assert.ok(!String(phaseACreative.body).includes('onecard-cta'), 'must NOT bake the Worker redirect path');
+  assert.ok(!String(phaseACreative.body).includes('api.pubilo.com'), 'must NOT bake api.pubilo.com into the visible UI');
+  assert.equal(r.body.cta_link, null, 'no CTA link when only a Worker redirect was available');
+  assert.equal(r.body.visible_page_cta_link, null);
+  assert.equal(r.body.visible_page_cta_initial, false);
+  assert.equal(r.body.visible_page_cta_final, false);
+  assertNoLeak(r.body);
+});
+
+test('POST /promote builds a paid ad from video_data.video_id with the FINAL CTA — no organic post CTA update', async () => {
+  // The verified legacy flow: a NEW dark-post creative with object_story_spec.video_data
+  // carrying the video_id + SHOP_NOW CTA to the direct Shopee link, then copy template adset
+  // + create ad. The mock browser exposes NO updateExistingPostCta — promote must not need it.
+  const FINAL = 'https://s.shopee.co.th/80AJs9V61t';
+  const SOURCE_POST = `${LIVE_PAGE_ID}_984409834561573`;
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: SOURCE_POST,
+    final_cta_link: FINAL,
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'promote');
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.adset_id, 'ADSET1');
+  assert.equal(r.body.video_id, '1739988064022663', 'reuses the supplied video_id');
+  assert.equal(r.body.cta_link, FINAL);
+  assert.equal(r.body.promoted_ad_cta_link, FINAL, 'promoted ad CTA link is the final link');
+  assert.equal(r.body.promoted_ad_cta_final, true, 'the promoted ad CTA is final');
+  assert.equal(r.body.published_to_page, false, 'promote never publishes a second page post');
+  // The ad creative mints its OWN story (ad_story_id), DISTINCT from the source page post.
+  assert.equal(r.body.source_post_id, SOURCE_POST, 'reports the source page post id');
+  assert.equal(r.body.ad_story_id, `${LIVE_PAGE_ID}_STORY9`, 'reports the new ad dark-story id');
+  assert.notEqual(r.body.ad_story_id, r.body.source_post_id, 'ad_story_id is distinct from source_post_id');
+  // It does NOT update the organic page post CTA and never claims a visible page CTA success.
+  assert.equal(r.body.visible_page_cta_final, false, 'promote does not update the organic post CTA');
+  assert.equal(r.body.visible_page_cta_link, undefined, 'no visible page CTA link is reported');
+  assert.equal(r.body.visible_cta_update_status, undefined);
+  // The creative is built via video_data.video_id with the FINAL link in its call_to_action.
+  const creativePost = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.ok(creativePost, 'an adcreative was created');
+  const crBody = JSON.parse(creativePost.body);
+  assert.equal(crBody.object_story_spec.video_data.video_id, '1739988064022663', 'creative uses video_data.video_id');
+  assert.equal(crBody.object_story_spec.video_data.call_to_action.value.link, FINAL, 'creative CTA carries the FINAL link');
+  assert.equal(crBody.object_story_spec.video_data.call_to_action.value.link_format, 'VIDEO_LPP');
+  assert.ok(!('object_story_id' in crBody.object_story_spec), 'must NOT build the creative from an existing object_story_id');
+  // It uses the build/copy/ad path (template adset copy + ad create) and never publishes the ad story.
+  assert.ok(browser.calls.some((c) => /\/copies/.test(c.url) && c.method === 'POST'), 'copies the template adset');
+  assert.ok(browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'creates the ad');
+  assert.ok(!browser.calls.some((c) => /\/advideos/.test(c.url)), 'must not upload a second video');
+  assert.ok(!browser.calls.some((c) => /is_published/.test(String(c.body || ''))), 'must not publish the ad dark story');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote resolves video_id from the source post attachment when video_id is absent', async () => {
+  // No video_id supplied: promote reads attachments{media_type,target{id,url}} on the source
+  // post and promotes the attachment target video. Fails closed if none can be resolved.
+  const FINAL = 'https://s.shopee.co.th/80AJs9V61t';
+  const SOURCE_POST = `${LIVE_PAGE_ID}_984409834561573`;
+  const browser = makeBrowser({ attachmentVideoId: '1739988064022663' });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    story_id: SOURCE_POST,
+    final_cta_link: FINAL,
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.video_id, '1739988064022663', 'resolved the video_id from the source post attachment');
+  assert.ok(browser.calls.some((c) => /fields=attachments/.test(c.url)), 'queried the source post attachments');
+  const creativePost = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  const crBody = JSON.parse(creativePost.body);
+  assert.equal(crBody.object_story_spec.video_data.video_id, '1739988064022663');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote fails closed (resolve_video) when no video_id can be resolved from the source post', async () => {
+  // Source post has NO video attachment → no target id → fail closed before any creative/ad.
+  // attachmentVideoId:'' makes the attachment route return a target with an empty id.
+  const browser = makeBrowser({ attachmentVideoId: '' });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'resolve_video');
+  assert.equal(r.body.error, 'video_id_unresolved');
+  assert.ok(!browser.calls.some((c) => /\/adcreatives/.test(c.url) && c.method === 'POST'), 'must not create an adcreative');
+  assert.ok(!browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'must not create an ad');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote FAILS CLOSED when the template CTA is LIKE_PAGE (cannot bake the final link)', async () => {
+  const browser = makeBrowser({ ctaType: 'LIKE_PAGE' });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'VID123',
+    story_id: `${LIVE_PAGE_ID}_STORY9`,
+    final_cta_link: 'https://s.shopee.co.th/FINAL_sub2_sub3',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'creative');
+  assert.equal(r.body.error, 'template_cta_type_does_not_support_final_link');
+  assert.equal(r.body.cta_type, 'LIKE_PAGE');
+  // Hard guarantee: nothing is created — no adcreative, no campaign, no adset, no ad.
+  assert.ok(!browser.calls.some((c) => /\/adcreatives/.test(c.url) && c.method === 'POST'), 'must not create an adcreative');
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'must not create a campaign');
+  assert.ok(!browser.calls.some((c) => /\/copies/.test(c.url)), 'must not copy an adset');
+  assert.ok(!browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'must not create an ad');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote fails closed (validate) when video_id missing', async () => {
+  await listen();
+  const r = await req('POST', '/promote', { page_id: LIVE_PAGE_ID, final_cta_link: 'https://s.shopee.co.th/x' });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /promote fails closed (validate) when final_cta_link missing', async () => {
+  await listen();
+  const r = await req('POST', '/promote', { page_id: LIVE_PAGE_ID, video_id: 'VID123' });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /promote rejects a non-http final_cta_link (no fake/empty CTA)', async () => {
+  await listen();
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID, video_id: 'VID123', final_cta_link: 'notaurl', ad_account: 'act_test', template_adset: 'tpl_test'
+  });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /promote rejects Worker redirect URLs as final CTA payloads', async () => {
+  await listen();
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'VID123',
+    final_cta_link: 'https://api.pubilo.com/onecard-cta/oc_test123',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+  assert.equal(r.body.error, 'final_cta_link_must_be_direct_shopee_link');
+});
+
+test('POST /promote fails closed (no_session) when the profile is not logged in', async () => {
+  await listen({ browser: makeBrowser(NOT_LOGGED_IN) });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID, video_id: 'VID123', final_cta_link: 'https://s.shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'session');
+  assert.equal(r.body.error, 'no_session');
+});
+
+test('POST /update-cta updates the VISIBLE post CTA on attachments.target.id and verifies via read-back', async () => {
+  // Live-proven flow: read the visible post → POST call_to_action on attachments.target.id (the
+  // Reel video object, NOT the story id) → read back to confirm. readbackCtaLink === FINAL makes
+  // the read-back confirm the visible CTA changed.
+  const FINAL = 'https://s.shopee.co.th/3VhueVmOBA';
+  const SOURCE_POST = `${LIVE_PAGE_ID}_984495714552985`;
+  const TARGET_ID = '2061700814696950';
+  const browser = makeBrowser({ readbackCtaLink: FINAL });
+  await listen({ browser });
+  const r = await req('POST', '/update-cta', {
+    page_id: LIVE_PAGE_ID,
+    story_id: SOURCE_POST,
+    final_cta_link: FINAL,
+    video_id: 'VID123'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'update_cta');
+  assert.equal(r.body.cta_update_target_id, TARGET_ID, 'updates the attachment target id, not the story id');
+  assert.notEqual(r.body.cta_update_target_id, SOURCE_POST, 'must NOT update the story id directly');
+  assert.equal(r.body.final_cta_link, FINAL);
+  assert.equal(r.body.visible_page_cta_link, FINAL, 'read-back confirms the visible CTA link');
+  assert.equal(r.body.visible_page_cta_final, true, 'read-back parity proves the visible CTA changed');
+  assert.ok(String(r.body.permalink_url || '').includes('/reel/'), 'returns the reel permalink');
+  // The CTA POST targets the attachment id and carries the FINAL link with VIDEO_LPP.
+  const ctaPost = browser.calls.find((c) => c.method === 'POST' && new RegExp(`/${TARGET_ID}\\?`).test(c.url) && /call_to_action/.test(String(c.body || '')));
+  assert.ok(ctaPost, 'CTA POST sent to the attachment target id');
+  const ctaBody = JSON.parse(ctaPost.body);
+  assert.equal(ctaBody.call_to_action.type, 'SHOP_NOW');
+  assert.equal(ctaBody.call_to_action.value.link, FINAL, 'CTA POST carries the FINAL link');
+  assert.equal(ctaBody.call_to_action.value.link_format, 'VIDEO_LPP');
+  // Never POST the CTA to the bare story id.
+  assert.ok(!browser.calls.some((c) => c.method === 'POST' && new RegExp(`/${SOURCE_POST}\\?`).test(c.url) && /call_to_action/.test(String(c.body || ''))), 'must not update the story id');
+  assertNoLeak(r.body);
+});
+
+test('POST /update-cta reports visible_page_cta_final:false when the read-back shows the CTA unchanged', async () => {
+  // The live failure mode: the POST "succeeds" but the visible post CTA does not change. The
+  // read-back (no call_to_action link) must keep visible_page_cta_final:false — never overclaim.
+  const FINAL = 'https://s.shopee.co.th/3VhueVmOBA';
+  const browser = makeBrowser({ readbackCtaLink: null });
+  await listen({ browser });
+  const r = await req('POST', '/update-cta', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_984495714552985`,
+    final_cta_link: FINAL
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'the POST itself succeeded');
+  assert.equal(r.body.visible_page_cta_final, false, 'unchanged read-back must not claim a visible CTA');
+  assert.equal(r.body.visible_page_cta_link, '', 'no verified visible CTA link');
+  assertNoLeak(r.body);
+});
+
+test('POST /update-cta FAILS CLOSED (page_token_not_found) when the session does not administer the page', async () => {
+  const browser = makeBrowser({ pages: [{ id: '999', name: 'Other', access_token: 'OTHER' }] });
+  await listen({ browser });
+  const r = await req('POST', '/update-cta', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_984495714552985`,
+    final_cta_link: 'https://s.shopee.co.th/3VhueVmOBA'
+  });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.error, 'page_token_not_found');
+  // Hard guarantee: no CTA was ever POSTed without a page token.
+  assert.ok(!browser.calls.some((c) => /call_to_action/.test(String(c.body || ''))), 'must not POST a CTA when the page token is missing');
+});
+
+test('POST /update-cta rejects Worker redirect / non-direct-shopee links (no redirect in the visible UI)', async () => {
+  await listen();
+  for (const bad of ['https://api.pubilo.com/onecard-cta/oc_x', 'https://short.wwoom.com/abc', 'notaurl']) {
+    const r = await req('POST', '/update-cta', {
+      page_id: LIVE_PAGE_ID,
+      story_id: `${LIVE_PAGE_ID}_984495714552985`,
+      final_cta_link: bad
+    });
+    assert.equal(r.body.ok, false, `rejected ${bad}`);
+    assert.equal(r.body.step, 'validate');
+  }
+});
+
+test('POST /update-cta fails closed (validate) when page_id/story_id/final_cta_link missing', async () => {
+  await listen();
+  const r = await req('POST', '/update-cta', { page_id: LIVE_PAGE_ID });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /update-cta fails closed (no_session) when the profile is not logged in', async () => {
+  await listen({ browser: makeBrowser(NOT_LOGGED_IN) });
+  const r = await req('POST', '/update-cta', {
+    page_id: LIVE_PAGE_ID,
+    story_id: `${LIVE_PAGE_ID}_984495714552985`,
+    final_cta_link: 'https://s.shopee.co.th/3VhueVmOBA'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'session');
+  assert.equal(r.body.error, 'no_session');
+});
+
+test('POST /publish-story publishes the SAME ad story to the page and returns published_to_page (no token leak)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const STORY = `${LIVE_PAGE_ID}_STORY9`;
+  const r = await req('POST', '/publish-story', { page_id: LIVE_PAGE_ID, story_id: STORY });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'publish_story');
+  assert.equal(r.body.story_id, STORY);
+  assert.equal(r.body.published_to_page, true);
+  // Published via the PAGE token with is_published:true on the story id.
+  const pub = browser.calls.find((c) => c.method === 'POST' && new RegExp(`/${STORY}\\?`).test(c.url) && /is_published/.test(String(c.body || '')));
+  assert.ok(pub, 'is_published POSTed to the story id');
+  assertNoLeak(r.body);
+});
+
+test('POST /publish-story FAILS CLOSED (page_token_not_found) when the session does not administer the page', async () => {
+  const browser = makeBrowser({ pages: [{ id: '999', name: 'Other', access_token: 'OTHER' }] });
+  await listen({ browser });
+  const r = await req('POST', '/publish-story', { page_id: LIVE_PAGE_ID, story_id: `${LIVE_PAGE_ID}_STORY9` });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.published_to_page, false);
+  assert.equal(r.body.error, 'page_token_not_found');
+  // Hard guarantee: no is_published POST without the page token.
+  assert.ok(!browser.calls.some((c) => /is_published/.test(String(c.body || ''))), 'must not publish without a page token');
+});
+
+test('POST /publish-story fails closed (validate) when page_id/story_id missing', async () => {
+  await listen();
+  const r = await req('POST', '/publish-story', { page_id: LIVE_PAGE_ID });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /publish-story fails closed (no_session) when the profile is not logged in', async () => {
+  await listen({ browser: makeBrowser(NOT_LOGGED_IN) });
+  const r = await req('POST', '/publish-story', { page_id: LIVE_PAGE_ID, story_id: `${LIVE_PAGE_ID}_STORY9` });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'session');
+  assert.equal(r.body.error, 'no_session');
+});
+
+test('POST /promote with daily_campaign_name CREATES the daily campaign when none matches, with 10000 budget + 24h schedule', async () => {
+  const FINAL = 'https://s.shopee.co.th/80AJs9V61t';
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser(); // no existingCampaigns → must create the daily campaign
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: FINAL,
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    source_video_id: 'ea401f1e',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: DAILY
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMP1', 'created the daily campaign');
+  assert.equal(r.body.campaign_name, DAILY, 'returns the daily campaign name');
+  // A campaign POST was made carrying the EXACT daily name + the template objective, and NO
+  // campaign-level budget (so the per-adset daily_budget is accepted).
+  const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(campPost, 'a campaign was created');
+  const campBody = JSON.parse(campPost.body);
+  assert.equal(campBody.name, DAILY, 'campaign created with the exact daily name');
+  assert.equal(campBody.objective, 'OUTCOME_ENGAGEMENT', 'campaign uses the template objective');
+  assert.equal(campBody.daily_budget, undefined, 'daily campaign has NO campaign-level (CBO) budget');
+  // The copied adset gets the budget/schedule in a SEPARATE POST from the activation (the
+  // combined POST returned subcode 1487057 live). start_time is omitted (starts immediately).
+  // BUDGET POST is separate and carries ONLY daily_budget — Meta rejects daily_budget + end_time
+  // together (live subcode 1487793). No end_time, no start_time, no status here.
+  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
+  assert.ok(budgetPost, 'a separate budget POST was sent to the adset');
+  const budgetBody = JSON.parse(budgetPost.body);
+  assert.equal(budgetBody.daily_budget, '10000', 'adset daily_budget is 10000 (100 THB)');
+  assert.deepEqual(Object.keys(budgetBody).sort(), ['daily_budget'], 'budget POST carries ONLY daily_budget');
+  assert.equal(budgetBody.end_time, undefined, 'budget POST must NOT include end_time');
+  assert.equal(budgetBody.start_time, undefined, 'budget POST must NOT include start_time');
+  assert.equal(budgetBody.status, undefined, 'budget POST must NOT flip status');
+  // ACTIVATION POST is the live-proven shape: { name, status:'ACTIVE', end_time } (no daily_budget,
+  // no start_time). end_time is a Graph-compatible offset ISO string (e.g. 2026-06-16T21:04:36+0700).
+  const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  assert.ok(actPost, 'the adset was activated in a separate POST');
+  const actBody = JSON.parse(actPost.body);
+  assert.equal(actBody.status, 'ACTIVE', 'activation POST sets status ACTIVE');
+  assert.equal(typeof actBody.end_time, 'string', 'activation end_time is a string, not a number');
+  assert.match(actBody.end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'activation end_time is an offset ISO string');
+  // end_time = the COPIED adset's read-back start_time (2026-06-15T21:39:39+0700) + 24h — derived
+  // from Graph's start_time, NOT the bridge's local clock at copy time.
+  assert.equal(actBody.end_time, '2026-06-16T21:39:39+0700', 'end_time is exactly 24h after the copied adset start_time');
+  assert.equal(actBody.start_time, undefined, 'no start_time on the activation POST');
+  assert.equal(actBody.daily_budget, undefined, 'activation POST must NOT include daily_budget (rejected with end_time)');
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?fields=start_time&/.test(c.url) && c.method === 'GET'), 'read the copied adset start_time before scheduling');
+  // ADSET name = the post tail / sub2 only — never the hash, never page_id_post_id.
+  assert.equal(actBody.name, '984409834561573', 'adset name is the post tail/sub2');
+  assert.notEqual(actBody.name, `${LIVE_PAGE_ID}_984409834561573`, 'adset name must NOT be page_id_post_id');
+  // AD name stays the system video code/hash (NOT sub2) — the ad is created (and named) at /ads.
+  const adCreate = browser.calls.find((c) => /\/ads\?/.test(c.url) && c.method === 'POST');
+  assert.ok(adCreate, 'the ad was created');
+  assert.equal(JSON.parse(adCreate.body).name, 'ea401f1e', 'ad name is the system video code/hash');
+  assert.notEqual(JSON.parse(adCreate.body).name, '984409834561573', 'ad name must NOT be sub2');
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?fields=name,status,effective_status/.test(c.url) && c.method === 'GET'), 'adset status read back to confirm ACTIVE');
+  // Sanitized response carries the schedule/budget as offset ISO strings (24h window).
+  assert.equal(r.body.daily_budget, 10000);
+  assert.match(r.body.end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'response end_time is an offset ISO string');
+  assert.equal(new Date(r.body.end_time).getTime() - new Date(r.body.start_time).getTime(), 24 * 3600 * 1000, 'run window is 24h');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote with daily_campaign_name REUSES an existing exact-name + same-objective campaign (no new campaign)', async () => {
+  const FINAL = 'https://s.shopee.co.th/80AJs9V61t';
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    existingCampaigns: [
+      { id: 'CAMPOTHER', name: '14/Jun/2026', status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' },
+      { id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }
+    ]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: FINAL,
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: DAILY
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMPDAILY', 'reused the existing daily campaign');
+  assert.equal(r.body.campaign_name, DAILY);
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'must NOT create a campaign when one with the exact name + objective exists');
+  // Reuse still applies the per-adset 10000 budget + 24h schedule (response carries the window).
+  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
+  const budgetBody = JSON.parse(budgetPost.body);
+  assert.deepEqual(Object.keys(budgetBody).sort(), ['daily_budget'], 'budget POST carries ONLY daily_budget');
+  const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  const actBody = JSON.parse(actPost.body);
+  assert.match(actBody.end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'activation carries the offset ISO end_time');
+  assert.equal(actBody.start_time, undefined);
+  assert.equal(r.body.daily_budget, 10000);
+  assert.equal(new Date(r.body.end_time).getTime() - new Date(r.body.start_time).getTime(), 24 * 3600 * 1000);
+  assertNoLeak(r.body);
+});
+
+test('POST /promote does NOT reuse when the existing campaign objective differs from the template', async () => {
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_SALES' }]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: DAILY
+  });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMP1', 'created a fresh daily campaign (objective mismatch is not reused)');
+  assert.ok(browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'created a campaign because objective did not match');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote with new_campaign_name FORCE-CREATES even when a same-name campaign exists (no reuse, legacy behavior)', async () => {
+  const FORCED = '15/Jun/2026';
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: FORCED, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    new_campaign_name: FORCED
+  });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMP1', 'force-create returns the new campaign id, never the existing one');
+  const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(campPost, 'new_campaign_name always POSTs a fresh campaign');
+  assert.equal(JSON.parse(campPost.body).name, FORCED);
+  // Legacy new_campaign_name path keeps the activate-only adset behavior (campaign carries the
+  // budget) — it must NOT set a per-adset daily_budget that would conflict with campaign CBO, and
+  // must NOT send a separate schedule POST or read the adset back.
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))), 'new_campaign_name path must not set an adset daily_budget');
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?fields=name,status,effective_status/.test(c.url)), 'legacy path does not read the adset status back');
+  const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  assert.ok(actPost, 'adset still activated');
+  assert.equal(r.body.daily_budget, undefined, 'no schedule/budget reported on the legacy path');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote computes end_time as 24h after the COPIED adset start_time, not the local clock', async () => {
+  // Live blocker: end_time was computed from the bridge clock BEFORE the copy finished, landing a
+  // few seconds before the copied adset's own start_time + 24h → code=100 subcode=1487793. The
+  // copied adset start_time here is far from "now" to prove end_time tracks the readback, not now.
+  const COPIED_START = '2026-09-09T10:00:00+0700';
+  const EXPECTED_END = '2026-09-10T10:00:00+0700';
+  const browser = makeBrowser({ copiedAdsetStartTime: COPIED_START });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    source_video_id: 'ea401f1e',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: '15/Jun/2026'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  const actBody = JSON.parse(actPost.body);
+  assert.equal(actBody.end_time, EXPECTED_END, 'end_time = copied adset start_time + 24h');
+  assert.equal(actBody.start_time, undefined, 'still never send start_time on the POST');
+  // The budget POST is still budget-only.
+  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
+  assert.deepEqual(Object.keys(JSON.parse(budgetPost.body)).sort(), ['daily_budget']);
+  // Response reports the same start/end pair (exact 24h window).
+  assert.equal(r.body.start_time, COPIED_START);
+  assert.equal(r.body.end_time, EXPECTED_END);
+  assert.equal(new Date(r.body.end_time).getTime() - new Date(r.body.start_time).getTime(), 24 * 3600 * 1000);
+  assertNoLeak(r.body);
+});
+
+function promoteDaily(extra) {
+  return {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    source_video_id: 'ea401f1e',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: '15/Jun/2026',
+    ...extra
+  };
+}
+
+test('POST /promote FAILS CLOSED (ok:false) when the adset BUDGET update errors — never falsely reports success', async () => {
+  // The budget POST (daily_budget only) erroring must fail closed and delete the orphan adset —
+  // the old code ignored the response, leaving the adset PAUSED while the route reported success.
+  const browser = makeBrowser({ adsetBudgetError: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false, 'must not report success when the adset budget update errors');
+  assert.equal(r.body.step, 'adset_budget');
+  assert.equal(r.body.fb_error_subcode, 1487793, 'surfaces the Graph error subcode');
+  assert.equal(r.body.ad_id, undefined, 'no ad id is reported as a success');
+  // The orphan adset is deleted (status:DELETED) so a failed activation leaves nothing behind.
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'orphan adset deleted on failure');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote FAILS CLOSED (adset_activate) when the activation POST errors', async () => {
+  const browser = makeBrowser({ adsetActivateError: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'adset_activate');
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'orphan adset deleted on activation failure');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote FAILS CLOSED when the adset readback is ACTIVE but has NO end_time (schedule did not stick)', async () => {
+  const browser = makeBrowser({ adsetReadbackNoEndTime: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false, 'must not claim success when the 24h schedule is missing on readback');
+  assert.equal(r.body.step, 'adset_activate');
+  assert.equal(r.body.error, 'adset_end_time_missing_after_update');
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'orphan adset deleted');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote FAILS CLOSED when the adset readback stays PAUSED after a "successful" activation POST', async () => {
+  // Live blocker: POST {status:ACTIVE} returned success:true but the adset stayed PAUSED on
+  // readback. The bridge reads the adset back and must reject a non-ACTIVE adset.
+  const browser = makeBrowser({ adsetReadbackPaused: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: '15/Jun/2026'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false, 'must not report success when readback shows the adset is PAUSED');
+  assert.equal(r.body.step, 'adset_activate');
+  assert.equal(r.body.error, 'adset_not_active_after_update');
+  assert.equal(r.body.adset_status, 'PAUSED');
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'paused adset cleaned up');
+  assertNoLeak(r.body);
+});
+
+// ── Cleanup: a failed force-post must not leave an orphan empty campaign ──────────────────────
+// Live symptom: after a failed force-post on page เฉียบ, Ads Manager kept a 16/Jun/2026 campaign
+// with "ไม่มีโฆษณา" (no ads). When the bridge CREATES the daily campaign and a downstream step
+// fails, it must delete the copied adset AND the now-empty campaign it created. A REUSED existing
+// campaign must never be deleted (other live ads may share it).
+
+test('POST /promote downstream failure deletes the copied adset AND the newly-created daily campaign', async () => {
+  // No existingCampaigns → the bridge CREATES the daily campaign (CAMP1). The activation then errors
+  // → both the adset (ADSET1) and the created campaign (CAMP1) must be deleted.
+  const browser = makeBrowser({ adsetActivateError: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'adset_activate');
+  // The copied adset is deleted.
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'orphan adset deleted');
+  // The newly-created empty campaign is deleted too (no "ไม่มีโฆษณา" leftover).
+  assert.ok(browser.calls.some((c) => /\/CAMP1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'newly-created empty campaign deleted');
+  assert.equal(r.body.cleaned_campaign_id, 'CAMP1', 'reports the cleaned-up campaign id');
+  assert.equal(r.body.orphan_campaign_id, undefined, 'no orphan reported when cleanup succeeds');
+  // Diagnostics carry the exact bridge ids (never a token).
+  assert.equal(r.body.campaign_id, 'CAMP1');
+  assert.equal(r.body.daily_campaign_name, '15/Jun/2026');
+  assert.equal(r.body.template_adset, 'tpl_test');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote downstream failure does NOT delete a REUSED existing daily campaign', async () => {
+  // The daily campaign already exists (CAMPDAILY) → the bridge REUSES it. A downstream failure must
+  // delete only the copied adset, NEVER the shared existing campaign.
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    adsetActivateError: true,
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'adset_activate');
+  // The copied adset is still cleaned up.
+  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'orphan adset deleted');
+  // The reused campaign must NOT be deleted.
+  assert.ok(!browser.calls.some((c) => /\/CAMPDAILY\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'reused existing campaign must NOT be deleted');
+  assert.equal(r.body.cleaned_campaign_id, undefined, 'no campaign cleanup for a reused campaign');
+  assert.equal(r.body.orphan_campaign_id, undefined);
+  assert.equal(r.body.campaign_id, 'CAMPDAILY');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote reports orphan_campaign_id + campaign_cleanup_error when the campaign delete fails', async () => {
+  // The activation errors (created daily campaign) AND the campaign delete itself errors → the
+  // bridge surfaces orphan_campaign_id + campaign_cleanup_error so Hermes can clean it up manually.
+  const browser = makeBrowser({ adsetActivateError: true, campaignDeleteError: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'adset_activate');
+  assert.equal(r.body.orphan_campaign_id, 'CAMP1', 'reports the campaign that could not be deleted');
+  assert.ok(r.body.campaign_cleanup_error, 'records why the campaign cleanup failed');
+  assert.equal(r.body.cleaned_campaign_id, undefined, 'cleaned_campaign_id only on a successful delete');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote copy failure cleans up the newly-created campaign (no orphan before any adset)', async () => {
+  // The adset copy fails BEFORE any adset exists. The bridge must still delete the campaign it
+  // created this request (CAMP1) so no empty campaign is left behind.
+  const browser = makeBrowser({ copyError: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'copy');
+  // No adset was created, so only the created campaign needs cleanup.
+  assert.ok(browser.calls.some((c) => /\/CAMP1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'created campaign deleted after a copy failure');
+  assert.equal(r.body.cleaned_campaign_id, 'CAMP1');
+  assert.equal(r.body.template_adset, 'tpl_test');
+  assertNoLeak(r.body);
+});
+
+// ── Recovery: a bad/orphan EMPTY reused daily campaign must not get the flow stuck ────────────
+// Live symptom (history 28710): the bridge REUSED an existing 16/Jun/2026 daily campaign left
+// empty/bad by prior failed runs; copying the template adset into it returned code=100
+// subcode=1885272 "Invalid parameter". Because it was reused, prior cleanup left it in place and
+// every retry hit the same wall. The fix: on a copy failure into a REUSED daily campaign, if that
+// campaign has NO non-DELETED adsets, delete it and create a fresh duplicate, then retry once.
+
+test('POST /promote recovers from a bad EMPTY reused daily campaign: deletes it, recreates, retries copy, succeeds', async () => {
+  const DAILY = '15/Jun/2026';
+  // The reused campaign CAMPDAILY rejects the copy (subcode 1885272) and has NO adsets (default []).
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }],
+    copyErrorForCampaign: 'CAMPDAILY'
+    // reusedCampaignAdsets defaults to [] → empty → safe to delete + recreate
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'recovery retry succeeds so the whole flow succeeds');
+  // The bad reused campaign was probed for adsets, then deleted, and a fresh duplicate was created.
+  assert.ok(browser.calls.some((c) => /\/CAMPDAILY\/adsets\?fields=id,status,effective_status/.test(c.url) && c.method === 'GET'), 'probed the reused campaign for adsets');
+  assert.ok(browser.calls.some((c) => /\/CAMPDAILY\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'deleted the bad empty reused campaign');
+  const freshCampPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(freshCampPost, 'created a fresh duplicate daily campaign');
+  assert.equal(JSON.parse(freshCampPost.body).name, DAILY, 'fresh campaign keeps the same daily name');
+  assert.equal(JSON.parse(freshCampPost.body).objective, 'OUTCOME_ENGAGEMENT', 'fresh campaign keeps the template objective');
+  // The copy was attempted TWICE: into CAMPDAILY (failed), then into the fresh CAMP1 (succeeded).
+  const copyCalls = browser.calls.filter((c) => /\/copies/.test(c.url) && c.method === 'POST');
+  assert.equal(copyCalls.length, 2, 'copy retried exactly once');
+  assert.equal(JSON.parse(copyCalls[0].body).campaign_id, 'CAMPDAILY', 'first copy targeted the reused campaign');
+  assert.equal(JSON.parse(copyCalls[1].body).campaign_id, 'CAMP1', 'retry copy targeted the fresh campaign');
+  // Final entity lives in the fresh campaign; recovery diagnostics surfaced.
+  assert.equal(r.body.campaign_id, 'CAMP1', 'the ad is built in the fresh campaign');
+  assert.equal(r.body.recovered_from_bad_reused_campaign, true);
+  assert.equal(r.body.bad_reused_campaign_id, 'CAMPDAILY');
+  assert.equal(r.body.cleaned_bad_reused_campaign_id, 'CAMPDAILY');
+  assert.equal(r.body.retry_campaign_id, 'CAMP1');
+  // INVARIANTS intact: adset name = sub2, ad name = video hash, 24h schedule.
+  const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  assert.equal(JSON.parse(actPost.body).name, '984409834561573', 'adset name invariant: post tail/sub2');
+  assert.match(JSON.parse(actPost.body).end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, '24h offset ISO end_time');
+  const adCreate = browser.calls.find((c) => /\/ads\?/.test(c.url) && c.method === 'POST');
+  assert.equal(JSON.parse(adCreate.body).name, 'ea401f1e', 'ad name invariant: source video hash/code');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote does NOT delete a reused daily campaign that still has adsets; returns the copy error', async () => {
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }],
+    copyErrorForCampaign: 'CAMPDAILY',
+    reusedCampaignAdsets: [{ id: 'EXISTINGADSET', status: 'ACTIVE', effective_status: 'ACTIVE' }]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false, 'a non-empty reused campaign is not recovered — surfaces the copy error');
+  assert.equal(r.body.step, 'copy');
+  assert.equal(r.body.fb_error_subcode, 1885272, 'surfaces the original copy error subcode');
+  assert.equal(r.body.reused_campaign_had_adsets, true);
+  // Hard guarantee: the reused campaign was probed but NEVER deleted, and no fresh campaign created.
+  assert.ok(browser.calls.some((c) => /\/CAMPDAILY\/adsets\?fields=id,status,effective_status/.test(c.url)), 'probed the reused campaign');
+  assert.ok(!browser.calls.some((c) => /\/CAMPDAILY\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'must NOT delete a reused campaign that has adsets');
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'must NOT create a fresh campaign');
+  assert.equal(r.body.recovered_from_bad_reused_campaign, undefined);
+  assertNoLeak(r.body);
+});
+
+test('POST /promote recovery: when the retry copy ALSO fails, cleans up the fresh campaign + reports diagnostics', async () => {
+  const DAILY = '15/Jun/2026';
+  // copyError errors EVERY copy (both the reused campaign and the fresh duplicate). Recovery still
+  // deletes the empty reused campaign + creates the fresh one, but the retry copy fails → the fresh
+  // campaign must be cleaned up and the recovery diagnostics surfaced.
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }],
+    copyError: true
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'copy');
+  // The bad empty reused campaign was deleted and a fresh duplicate (CAMP1) was created + cleaned up.
+  assert.ok(browser.calls.some((c) => /\/CAMPDAILY\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'deleted the bad empty reused campaign');
+  assert.ok(browser.calls.some((c) => /\/CAMP1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'cleaned up the fresh campaign after the retry copy failed');
+  assert.equal(r.body.recovered_from_bad_reused_campaign, true);
+  assert.equal(r.body.bad_reused_campaign_id, 'CAMPDAILY');
+  assert.equal(r.body.cleaned_bad_reused_campaign_id, 'CAMPDAILY');
+  assert.equal(r.body.retry_campaign_id, 'CAMP1');
+  assert.equal(r.body.cleaned_campaign_id, 'CAMP1', 'fresh campaign cleaned via failCleanup');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote recovery: reports bad_reused_campaign_cleanup_error when the bad campaign delete fails', async () => {
+  const DAILY = '15/Jun/2026';
+  // The reused campaign is empty but its DELETE fails; recovery still proceeds to recreate + retry,
+  // and surfaces bad_reused_campaign_cleanup_error so Hermes can clean it up manually.
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }],
+    copyErrorForCampaign: 'CAMPDAILY',
+    campaignDeleteError: 'CAMPDAILY'
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'the retry into the fresh campaign still succeeds');
+  assert.equal(r.body.recovered_from_bad_reused_campaign, true);
+  assert.equal(r.body.bad_reused_campaign_id, 'CAMPDAILY');
+  assert.ok(r.body.bad_reused_campaign_cleanup_error, 'records why the bad campaign delete failed');
+  assert.equal(r.body.cleaned_bad_reused_campaign_id, undefined, 'cleaned id only on a successful delete');
+  assert.equal(r.body.retry_campaign_id, 'CAMP1');
+  assertNoLeak(r.body);
+});
+
+// ── Template parity: customer-lifecycle / campaign-level setup ───────────────────────────────
+// The live gap: the new ad/adset did NOT carry the template's customer-lifecycle strategy
+// ("รับคอนเวอร์ชั่นจากกลุ่มเป้าหมายทั้งหมด" / "Reach new and existing customers"). Per Meta's
+// Marketing API this strategy lives on the AD SET (existing_customer_budget_percentage); the
+// daily campaign is created fresh (dropping campaign-level mirror fields), and deep_copy:false was
+// observed to drop the adset strategy — so the bridge mirrors the template campaign's safe fields
+// onto the new daily campaign AND re-applies the template adset's customer-lifecycle strategy onto
+// the copied adset, reporting both under copied_template_settings for live verification.
+
+test('POST /create-ad mirrors the template campaign setting into the new daily campaign + reports diagnostics', async () => {
+  const browser = makeBrowser({ templateSmartPromotionType: 'SMART_PROMOTION', templateCampaignId: '120248134990220263' });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: '15/Jun/2026'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  // The template settings were read in ONE GET on the template adset (objective + campaign-level
+  // mirror fields + adset-level lifecycle fields).
+  assert.ok(browser.calls.some((c) => /fields=existing_customer_budget_percentage/.test(c.url) && /campaign\{id,objective,smart_promotion_type\}/.test(c.url) && c.method === 'GET'), 'template settings read in one GET');
+  // The new daily campaign POST carries the mirrored template campaign field — and still NO
+  // campaign-level (CBO) budget, so the per-adset daily_budget remains valid.
+  const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(campPost, 'a daily campaign was created');
+  const campBody = JSON.parse(campPost.body);
+  assert.equal(campBody.smart_promotion_type, 'SMART_PROMOTION', 'daily campaign mirrors the template campaign setting');
+  assert.equal(campBody.objective, 'OUTCOME_ENGAGEMENT', 'daily campaign keeps the template objective');
+  assert.equal(campBody.daily_budget, undefined, 'daily campaign still carries NO campaign-level budget');
+  // Diagnostics for Hermes live-verification.
+  assert.equal(r.body.template_campaign_id, '120248134990220263');
+  assert.equal(r.body.copied_template_settings.campaign.applied, true);
+  assert.equal(r.body.copied_template_settings.campaign.fields.smart_promotion_type, 'SMART_PROMOTION');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote re-applies the template adset customer-lifecycle strategy to the COPIED adset (invariants intact)', async () => {
+  // existing_customer_budget_percentage:0 = "Acquire new customers only" — re-applied to the copy.
+  const browser = makeBrowser({ templateExistingCustomerPct: 0 });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  // A dedicated POST re-applied the customer-lifecycle field to the copied adset (ADSET1).
+  const lifePost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /existing_customer_budget_percentage/.test(String(c.body || '')));
+  assert.ok(lifePost, 'customer-lifecycle re-applied to the copied adset');
+  const lifeBody = JSON.parse(lifePost.body);
+  assert.deepEqual(Object.keys(lifeBody), ['existing_customer_budget_percentage'], 'lifecycle POST carries ONLY the lifecycle field');
+  assert.equal(lifeBody.existing_customer_budget_percentage, 0, 're-applies the exact template percentage');
+  assert.equal(r.body.copied_template_settings.adset.applied, true);
+  assert.equal(r.body.copied_template_settings.adset.fields.existing_customer_budget_percentage, 0);
+  // INVARIANTS unchanged: budget POST budget-only, schedule offset-ISO end_time, adset name = sub2,
+  // ad name = source video hash/code.
+  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
+  assert.deepEqual(Object.keys(JSON.parse(budgetPost.body)).sort(), ['daily_budget'], 'budget POST still carries ONLY daily_budget');
+  const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  assert.match(JSON.parse(actPost.body).end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'activation end_time is an offset ISO string');
+  assert.equal(JSON.parse(actPost.body).name, '984409834561573', 'adset name invariant: post tail/sub2');
+  const adCreate = browser.calls.find((c) => /\/ads\?/.test(c.url) && c.method === 'POST');
+  assert.equal(JSON.parse(adCreate.body).name, 'ea401f1e', 'ad name invariant: source video hash/code');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote fails SOFT when the customer-lifecycle re-apply errors (ad still created, diagnostic records it)', async () => {
+  const browser = makeBrowser({ templateExistingCustomerPct: 50, adsetLifecycleError: true });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'a lifecycle re-apply failure must NOT fail the whole flow (not explicitly required)');
+  assert.equal(r.body.ad_id, 'AD1', 'the ad is still created');
+  assert.equal(r.body.copied_template_settings.adset.applied, false);
+  assert.ok(r.body.copied_template_settings.adset.error, 'records the lifecycle apply error for verification');
+  assert.equal(r.body.copied_template_settings.adset.fields.existing_customer_budget_percentage, 50);
+  assertNoLeak(r.body);
+});
+
+test('POST /promote does NOT mirror when the template carries no lifecycle/strategy fields (no extra POST, applied:false)', async () => {
+  const browser = makeBrowser(); // default template: no smart_promotion_type, no existing_customer_budget_percentage
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.body.ok, true);
+  const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.equal(JSON.parse(campPost.body).smart_promotion_type, undefined, 'no campaign mirror field when template has none');
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /existing_customer_budget_percentage/.test(String(c.body || ''))), 'no lifecycle re-apply POST when template carries none');
+  assert.equal(r.body.copied_template_settings.campaign.applied, false);
+  assert.equal(r.body.copied_template_settings.adset.applied, false);
+  assert.equal(r.body.template_campaign_id, 'TPLCAMP1', 'still reports the template campaign id for verification');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote reports campaign mirror applied:false + reuse when an existing daily campaign is reused', async () => {
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    templateSmartPromotionType: 'SMART_PROMOTION',
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', promoteDaily());
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMPDAILY', 'reused the existing daily campaign');
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'no campaign created on reuse → no campaign-level mirror possible');
+  assert.equal(r.body.copied_template_settings.campaign.applied, false, 'cannot mirror campaign settings onto a reused campaign');
+  assert.equal(r.body.copied_template_settings.campaign.reuse, 'reused_existing_campaign');
+  assertNoLeak(r.body);
+});
+
+test('endpoints exist (no 404) for the Worker contract surface', async () => {
+  await listen();
+  for (const [method, path] of [['GET', '/token'], ['GET', '/pages']]) {
+    const r = await req(method, path);
+    assert.notEqual(r.status, 404, `${method} ${path} must exist`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// advideos DIRECT multipart upload (the cheiab/OneCard incident: Meta returns
+// "Unable to fetch video file from URL" for Worker public asset URLs it cannot reach).
+// The bridge now downloads the video itself and uploads it as multipart/form-data as the
+// PRIMARY path, so Meta never has to fetch our URL. file_url is only a last-resort fallback
+// when the local download cannot proceed (download/fetch failure or the byte-ceiling guard).
+// ---------------------------------------------------------------------------
+const posting = require('../src/posting');
+const UPLOAD_TOKEN = 'EAAB_UPLOAD_SECRET';
+
+// A Graph transport mock that distinguishes the file_url advideos POST from the
+// multipart advideos POST and records every call (body/headers) for assertions.
+function makeUploadFetch(opts = {}) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    const method = (init.method || 'GET').toUpperCase();
+    const ct = (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || '';
+    const isMultipart = /multipart\/form-data/.test(String(ct));
+    calls.push({ url: u, method, isMultipart, body: init.body, contentType: String(ct) });
+    let obj = { success: true };
+    if (/\/advideos\?/.test(u) && method === 'POST') {
+      if (/[?&]file_url=/.test(u) && !isMultipart) {
+        obj = opts.fileUrlResponse || { id: 'VID_FILEURL' };
+      } else if (isMultipart) {
+        obj = opts.multipartResponse || { id: 'VID_MULTIPART' };
+      }
+    }
+    return { status: 200, ok: !obj.error, json: async () => obj };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+test('buildVideoMultipart: wraps bytes as a `source` file part with a matching boundary', () => {
+  const bytes = Buffer.from('FAKEMP4BYTES');
+  const part = posting.buildVideoMultipart({ buffer: bytes, filename: 'clip.mp4', contentType: 'video/mp4' });
+  const m = /boundary=(.+)$/.exec(part.contentType);
+  assert.ok(m, 'content-type carries a boundary');
+  const text = part.body.toString('utf8');
+  assert.ok(text.includes(`--${m[1]}`), 'body opens with the boundary');
+  assert.ok(text.includes('name="source"'), 'uses the Graph advideos file field `source`');
+  assert.ok(text.includes('filename="clip.mp4"'));
+  assert.ok(text.includes('FAKEMP4BYTES'), 'the video bytes are embedded');
+  assert.ok(text.trimEnd().endsWith(`--${m[1]}--`), 'body closes with the terminating boundary');
+});
+
+test('uploadAdVideoFromUrl (1): downloads + uploads multipart FIRST and never calls file_url', async () => {
+  const fetchImpl = makeUploadFetch({ multipartResponse: { id: 'VID_OK' } });
+  const downloadCalls = [];
+  const download = async (url, dlOpts) => { downloadCalls.push({ url, dlOpts }); return { buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' }; };
+  const out = await posting.uploadAdVideoFromUrl(fetchImpl, {
+    adAccount: 'act_1', userToken: UPLOAD_TOKEN, videoUrl: 'https://api.pubilo.com/asset.mp4', download
+  });
+  assert.equal(out.data.id, 'VID_OK', 'uploaded via the direct multipart path');
+  assert.equal(out.uploadMode, 'multipart');
+  assert.equal(downloadCalls.length, 1, 'downloaded the video once (primary path)');
+  assert.equal(downloadCalls[0].url, 'https://api.pubilo.com/asset.mp4');
+  assert.equal(fetchImpl.calls.length, 1, 'exactly one Graph upload call');
+  const multipartCall = fetchImpl.calls[0];
+  assert.ok(multipartCall.isMultipart, 'the single upload is multipart');
+  assert.ok(!fetchImpl.calls.some((c) => /file_url=/.test(c.url)), 'NEVER calls advideos with file_url on the primary path');
+  assert.ok(/access_token=/.test(multipartCall.url), 'token stays in the URL, not the multipart body');
+  assert.ok(!String(multipartCall.body.toString('utf8')).includes(UPLOAD_TOKEN), 'token never embedded in the multipart body');
+});
+
+test('uploadAdVideoFromUrl (2): a real Graph error from multipart is returned as-is and does NOT fall back to file_url', async () => {
+  // A validation/permission error from the multipart upload must surface unchanged — never masked by
+  // a file_url retry (guards against random fallback loops hiding real errors).
+  const fetchImpl = makeUploadFetch({
+    multipartResponse: { error: { message: 'Invalid parameter', code: 100, error_subcode: 1487390 } }
+  });
+  const download = async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' });
+  const out = await posting.uploadAdVideoFromUrl(fetchImpl, {
+    adAccount: 'act_1', userToken: UPLOAD_TOKEN, videoUrl: 'https://api.pubilo.com/asset.mp4', download
+  });
+  assert.ok(out.data.error, 'the Graph error is preserved');
+  assert.equal(out.data.error.message, 'Invalid parameter');
+  assert.equal(out.uploadMode, 'multipart', 'still reports the multipart transport (no fallback)');
+  assert.ok(!fetchImpl.calls.some((c) => /file_url=/.test(c.url)), 'must NOT retry via file_url after a real Graph error');
+  assert.equal(fetchImpl.calls.filter((c) => !c.isMultipart).length, 0, 'the only upload attempt was multipart');
+});
+
+test('uploadAdVideoFromUrl (3): download failure FALLS BACK to file_url and succeeds', async () => {
+  const fetchImpl = makeUploadFetch({ fileUrlResponse: { id: 'VID_VIA_FILEURL' } });
+  const download = async () => { throw new Error('video_download_http_503'); };
+  const out = await posting.uploadAdVideoFromUrl(fetchImpl, {
+    adAccount: 'act_1', userToken: UPLOAD_TOKEN, videoUrl: 'https://api.pubilo.com/asset.mp4', download
+  });
+  assert.equal(out.data.id, 'VID_VIA_FILEURL', 'recovered via the file_url fallback');
+  assert.equal(out.uploadMode, 'file_url_fallback');
+  assert.equal(fetchImpl.calls.length, 1, 'exactly one Graph upload call (the file_url fallback)');
+  assert.ok(/file_url=/.test(fetchImpl.calls[0].url), 'the fallback uses file_url');
+  assert.equal(fetchImpl.calls.filter((c) => c.isMultipart).length, 0, 'no multipart upload when the download failed');
+});
+
+test('uploadAdVideoFromUrl (4): download too-large + file_url ALSO fails surfaces a clear non-secret error', async () => {
+  const fetchImpl = makeUploadFetch({
+    fileUrlResponse: { error: { message: 'Unable to fetch video file from URL.', code: 100, error_subcode: 1363030, fbtrace_id: 'TRACE9' } }
+  });
+  const download = async () => { throw new Error('video_too_large_999999999_bytes_max_209715200'); };
+  const out = await posting.uploadAdVideoFromUrl(fetchImpl, {
+    adAccount: 'act_1', userToken: UPLOAD_TOKEN, videoUrl: 'https://api.pubilo.com/huge.mp4', download
+  });
+  assert.equal(out.uploadMode, 'file_url_fallback');
+  assert.ok(out.data.error, 'returns an error when both paths fail');
+  assert.ok(String(out.data.error.message).includes('multipart_download_unavailable'), 'explains the download could not proceed');
+  assert.ok(String(out.data.error.message).includes('video_too_large'), 'carries the download guard reason');
+  assert.ok(String(out.data.error.message).includes('Unable to fetch video file from URL'), 'carries the file_url error too');
+  assert.equal(out.data.error.fbtrace_id, 'TRACE9', 'preserves the file_url Graph trace id');
+  assert.ok(!String(JSON.stringify(out)).includes(UPLOAD_TOKEN), 'no token leak in the error');
+  assert.equal(fetchImpl.calls.filter((c) => c.isMultipart).length, 0, 'no multipart upload attempted when the download failed');
+});
+
+test('downloadVideoToBuffer: enforces the byte ceiling via content-length (fails closed)', async () => {
+  const fakeFetch = async () => ({
+    status: 200, ok: true,
+    headers: { get: (k) => (k.toLowerCase() === 'content-length' ? String(500 * 1024 * 1024) : 'video/mp4') },
+    arrayBuffer: async () => new ArrayBuffer(8)
+  });
+  await assert.rejects(
+    () => posting.downloadVideoToBuffer('https://api.pubilo.com/huge.mp4', { fetchImpl: fakeFetch, maxBytes: 200 * 1024 * 1024 }),
+    /video_too_large/
+  );
+});
+
+test('downloadVideoToBuffer: returns the buffer + content-type on a normal 200', async () => {
+  const payload = Buffer.from('SMALLMP4');
+  const fakeFetch = async () => ({
+    status: 200, ok: true,
+    headers: { get: (k) => (k.toLowerCase() === 'content-type' ? 'video/mp4; charset=binary' : null) },
+    arrayBuffer: async () => payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
+  });
+  const out = await posting.downloadVideoToBuffer('https://api.pubilo.com/ok.mp4', { fetchImpl: fakeFetch });
+  assert.equal(out.contentType, 'video/mp4', 'content-type is normalized (params stripped)');
+  assert.equal(out.buffer.toString('utf8'), 'SMALLMP4');
+});
+
+test('downloadVideoToBuffer: non-2xx download fails closed', async () => {
+  const fakeFetch = async () => ({ status: 404, ok: false, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) });
+  await assert.rejects(
+    () => posting.downloadVideoToBuffer('https://r2.dev/missing.mp4', { fetchImpl: fakeFetch }),
+    /video_download_http_404/
+  );
+});
+
+// Shared Graph mock for a full createAd run. `onAdvideos(isMultipart)` decides what the advideos
+// upload returns, so each test can drive the multipart-primary path or a file_url fallback. Records
+// every advideos call so tests can assert which transport was used.
+function makeCreateAdFetch(onAdvideos) {
+  const advideosCalls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    const method = (init.method || 'GET').toUpperCase();
+    const ct = (init.headers && (init.headers['Content-Type'] || init.headers['content-type'])) || '';
+    const isMultipart = /multipart\/form-data/.test(String(ct));
+    let obj = { success: true };
+    if (/\/advideos\?/.test(u) && method === 'POST') {
+      advideosCalls.push({ url: u, isMultipart });
+      obj = onAdvideos(isMultipart, u);
+    } else if (/me\/accounts/.test(u)) obj = { data: [{ id: '107267395614980', name: 'P', access_token: 'PAGE_TOK' }] };
+    else if (/fields=thumbnails/.test(u)) obj = { thumbnails: { data: [{ uri: 'https://thumb/x.jpg' }] } };
+    else if (/\/adcreatives/.test(u) && method === 'POST') obj = { id: 'CR1' };
+    else if (/fields=effective_object_story_id/.test(u)) obj = { effective_object_story_id: '107267395614980_STORY9' };
+    else if (/\/ads\?fields=creative/.test(u)) obj = { data: [{ creative: { id: 'TPLCR' } }] };
+    else if (/TPLCR\?fields=call_to_action_type/.test(u)) obj = { call_to_action_type: 'SHOP_NOW' };
+    else if (/fields=existing_customer_budget_percentage/.test(u)) obj = { campaign: { id: 'TPLCAMP', objective: 'OUTCOME_ENGAGEMENT' } };
+    else if (/\/campaigns\?.*filtering/.test(u) && method === 'GET') obj = { data: [] };
+    else if (/\/campaigns\?/.test(u) && method === 'POST') obj = { id: 'CAMP1' };
+    else if (/\/copies/.test(u) && method === 'POST') obj = { copied_adset_id: 'ADSET1' };
+    else if (/\/ads\?fields=id/.test(u) && method === 'GET') obj = { data: [{ id: 'AD1' }] };
+    else if (/\/ads\?/.test(u) && method === 'POST') obj = { id: 'AD1' };
+    return { status: 200, ok: !obj.error, json: async () => obj };
+  };
+  fetchImpl.advideosCalls = advideosCalls;
+  return fetchImpl;
+}
+
+test('createAd: video upload uses multipart FIRST and never calls advideos with file_url', async () => {
+  // The live-safe path — Meta never has to fetch our URL. The injected downloader supplies the bytes
+  // and the direct multipart upload succeeds; the success response carries upload_mode=multipart.
+  const fetchImpl = makeCreateAdFetch((isMultipart) => (isMultipart ? { id: 'VIDMULTI' } : { error: { message: 'Unable to fetch video file from URL.', code: 100 } }));
+  const download = async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' });
+  const result = await posting.createAd(fetchImpl, {
+    userToken: UPLOAD_TOKEN,
+    body: { page_id: '107267395614980', video_url: 'https://api.pubilo.com/asset.mp4', caption: 'cap', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test' },
+    pollMs: 0,
+    downloadVideo: download
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.video_id, 'VIDMULTI', 'used the multipart-uploaded video');
+  assert.equal(result.upload_mode, 'multipart', 'reports the primary multipart upload mode');
+  assert.equal(fetchImpl.advideosCalls.length, 1, 'exactly one advideos upload');
+  assert.ok(fetchImpl.advideosCalls[0].isMultipart, 'the upload was multipart');
+  assert.ok(!fetchImpl.advideosCalls.some((c) => /file_url=/.test(c.url)), 'NEVER calls advideos with file_url');
+  assert.ok(!JSON.stringify(result).includes(UPLOAD_TOKEN), 'no token leak');
+});
+
+test('createAd: skip_publish_to_page (Instagram) path maps upload_mode to the multipart-based mode', async () => {
+  const fetchImpl = makeCreateAdFetch((isMultipart) => (isMultipart ? { id: 'VIDIG' } : { error: { message: 'should not be called', code: 100 } }));
+  const download = async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' });
+  const result = await posting.createAd(fetchImpl, {
+    userToken: UPLOAD_TOKEN,
+    body: { page_id: '107267395614980', video_url: 'https://api.pubilo.com/asset.mp4', caption: 'cap', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test', skip_publish_to_page: true },
+    pollMs: 0,
+    downloadVideo: download
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.video_id, 'VIDIG', 'used the multipart-uploaded video on the IG path');
+  assert.equal(result.upload_mode, 'instagram_advideo_multipart', 'IG path reports the multipart-based mode');
+  assert.ok(fetchImpl.advideosCalls.length >= 1 && fetchImpl.advideosCalls.every((c) => c.isMultipart), 'every advideos upload was multipart');
+  assert.ok(!fetchImpl.advideosCalls.some((c) => /file_url=/.test(c.url)), 'IG path never calls advideos with file_url');
+  assert.ok(!JSON.stringify(result).includes(UPLOAD_TOKEN), 'no token leak');
+});
+
+test('createAd: download failure falls back to file_url and reports the fallback upload_mode', async () => {
+  // When the bridge cannot download, file_url is the last resort; the success response reports it.
+  const fetchImpl = makeCreateAdFetch((isMultipart) => (isMultipart ? { error: { message: 'should not be called', code: 100 } } : { id: 'VIDFILEURL' }));
+  const download = async () => { throw new Error('video_download_http_503'); };
+  const result = await posting.createAd(fetchImpl, {
+    userToken: UPLOAD_TOKEN,
+    body: { page_id: '107267395614980', video_url: 'https://api.pubilo.com/asset.mp4', caption: 'cap', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test' },
+    pollMs: 0,
+    downloadVideo: download
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.video_id, 'VIDFILEURL', 'used the file_url fallback video');
+  assert.equal(result.upload_mode, 'file_url_fallback', 'reports the fallback upload mode');
+  assert.equal(fetchImpl.advideosCalls.length, 1, 'one advideos upload (the file_url fallback)');
+  assert.ok(/file_url=/.test(fetchImpl.advideosCalls[0].url), 'the fallback used file_url');
+  assert.ok(!JSON.stringify(result).includes(UPLOAD_TOKEN), 'no token leak');
+});

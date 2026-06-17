@@ -2,8 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
     MAX_SHORTLINK_SUB_ID_CHARS,
+    DEFAULT_SHOPEE_CUSTOMLINK_ID,
+    DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE,
+    buildShopeeShortlinkBaseUrl,
     buildShortlinkRequestUrlFromTemplate,
     normalizeShortlinkSubId,
+    normalizeFacebookPostSubIdForShortlink,
+    buildPostingCommentShortlinkSubIds,
 } from '../src/shortlink-template.js'
 
 const SHOPEE_URL_TEMPLATE = 'https://customlink.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}&sub2={sub_id2}&sub3={sub_id3}&sub4={sub_id4}&sub5={sub_id5}'
@@ -23,6 +28,35 @@ test('normalizeShortlinkSubId trims whitespace and strips CR/LF/TAB', () => {
 test('normalizeShortlinkSubId slices to MAX_SHORTLINK_SUB_ID_CHARS', () => {
     const long = 'x'.repeat(MAX_SHORTLINK_SUB_ID_CHARS + 10)
     assert.equal(normalizeShortlinkSubId(long).length, MAX_SHORTLINK_SUB_ID_CHARS)
+})
+
+test('Shopee default shortlink template uses id=15130770000 and never account=CHEARB', () => {
+    assert.equal(DEFAULT_SHOPEE_CUSTOMLINK_ID, '15130770000')
+    assert.match(DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE, /[?&]id=15130770000(&|$)/)
+    assert.doesNotMatch(DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE, /account=/i)
+    assert.doesNotMatch(DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE, /CHEARB/i)
+    // The Cloak bridge mints from a built request, so the default template must
+    // produce an id-based request URL with the product url filled in.
+    const built = buildShortlinkRequestUrlFromTemplate(DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE, PRODUCT_URL, {
+        sub1: 's1', sub2: '', sub3: '', sub4: '', sub5: '',
+    })
+    assert.match(built, /[?&]id=15130770000(&|$)/)
+    assert.doesNotMatch(built, /account=/i)
+})
+
+test('buildShopeeShortlinkBaseUrl maps the admin CHEARB account to id=15130770000', () => {
+    const url = buildShopeeShortlinkBaseUrl('https://short.wwoom.com/', 'CHEARB')
+    assert.match(url, /[?&]id=15130770000(&|$)/)
+    assert.doesNotMatch(url, /account=/i)
+    // case-insensitive on the account name
+    assert.match(buildShopeeShortlinkBaseUrl('https://short.wwoom.com/', 'chearb'), /[?&]id=15130770000(&|$)/)
+})
+
+test('buildShopeeShortlinkBaseUrl keeps account= form for accounts without a known id', () => {
+    const url = buildShopeeShortlinkBaseUrl('https://short.wwoom.com/', 'SIAMNEWS')
+    assert.match(url, /[?&]account=SIAMNEWS(&|$)/)
+    assert.doesNotMatch(url, /[?&]id=/)
+    assert.equal(buildShopeeShortlinkBaseUrl('https://short.wwoom.com/', ''), '')
 })
 
 test('buildShortlinkRequestUrlFromTemplate fills sub_id2 with provided value', () => {
@@ -104,4 +138,62 @@ test('buildShortlinkRequestUrlFromTemplate fills sub_id3 with provided page id',
         sub5: '',
     })
     assert.match(url, new RegExp(`sub3=${pageId}`))
+})
+
+test('normalizeFacebookPostSubIdForShortlink takes the POST id tail from pageId_postId', () => {
+    // story_id is `pageId_postId` — sub2 must be the POST id, never the page id.
+    assert.equal(
+        normalizeFacebookPostSubIdForShortlink('1008898512617594_1277758961195466'),
+        '1277758961195466',
+    )
+})
+
+test('normalizeFacebookPostSubIdForShortlink returns a bare post id unchanged', () => {
+    assert.equal(normalizeFacebookPostSubIdForShortlink('1277758961195466'), '1277758961195466')
+})
+
+test('normalizeFacebookPostSubIdForShortlink returns empty for blank/missing input', () => {
+    assert.equal(normalizeFacebookPostSubIdForShortlink(''), '')
+    assert.equal(normalizeFacebookPostSubIdForShortlink(null), '')
+    assert.equal(normalizeFacebookPostSubIdForShortlink(undefined), '')
+    assert.equal(normalizeFacebookPostSubIdForShortlink('   '), '')
+})
+
+test('buildPostingCommentShortlinkSubIds sets sub2=post id tail and sub3=page id (the live-link bug)', () => {
+    // Reproduces the reported bug: live URL showed utm_content=<campaign>---- with
+    // sub2/sub3 blank. The fix derives sub2 from the post id tail and sub3 from the
+    // page id so the comment link carries both.
+    const pageId = '1008898512617594'
+    const storyId = `${pageId}_1277758961195466`
+    const subs = buildPostingCommentShortlinkSubIds({
+        canonicalPostId: storyId,
+        pageId,
+        logPrefix: 'TEST',
+    })
+    assert.equal(subs.postSubId2, '1277758961195466', 'sub2 must be the post id tail, not the page id')
+    assert.notEqual(subs.postSubId2, pageId, 'sub2 must never equal the page id')
+    assert.equal(subs.postSubId3, pageId, 'sub3 must be the page id')
+    assert.equal(subs.postSubId4, '', 'sub4 stays internal (empty)')
+})
+
+test('buildPostingCommentShortlinkSubIds accepts a bare post id for sub2', () => {
+    const subs = buildPostingCommentShortlinkSubIds({
+        canonicalPostId: '1277758961195466',
+        pageId: '1008898512617594',
+        logPrefix: 'TEST',
+    })
+    assert.equal(subs.postSubId2, '1277758961195466')
+    assert.equal(subs.postSubId3, '1008898512617594')
+})
+
+test('buildPostingCommentShortlinkSubIds leaves sub2 empty when no post id is known', () => {
+    // When story_id is missing the caller must fall back (no fake sub2). The OneCard
+    // re-mint helper treats an empty sub2 as "do not re-mint" and keeps the original link.
+    const subs = buildPostingCommentShortlinkSubIds({
+        canonicalPostId: '',
+        pageId: '1008898512617594',
+        logPrefix: 'TEST',
+    })
+    assert.equal(subs.postSubId2, '')
+    assert.equal(subs.postSubId3, '1008898512617594')
 })

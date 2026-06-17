@@ -1,0 +1,6 @@
+# React/Vite side-by-side dashboard preview — build artifacts & deps
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+.DS_Store

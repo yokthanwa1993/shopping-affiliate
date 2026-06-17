@@ -43,11 +43,20 @@
   let activePage = $state<PageOption>(defaultPage)
   let items = $state<PagePostItem[]>([])
   let loading = $state(true)
+  let loadingMore = $state(false)
   let syncing = $state(false)
   let error = $state('')
   let banner = $state('')
   let updatedAt = $state('')
   let copiedRef = $state('')
+  // Cache-first metadata surfaced from the worker so the operator can see how much
+  // of the page is in D1 and when it was last synced — without a huge blocking fetch.
+  let total = $state(0)
+  let lastSyncedAt = $state('')
+  let fullyScanned = $state(false)
+  // Incremental local pagination: pull more cached rows in small batches (offset)
+  // instead of one large min_views=0&limit=500 request that times out at 30s.
+  let hasMore = $derived(items.length < total)
 
   function isRecord(v: unknown): v is Record<string, unknown> {
     return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -95,28 +104,60 @@
     }
   }
 
+  type PageVideosResponse = {
+    items?: unknown[]
+    total?: number
+    sync?: { lastSyncedAt?: string; fullyScanned?: boolean }
+  }
+
+  async function fetchPage(page: PageOption, offset: number): Promise<PagePostItem[]> {
+    const params = new URLSearchParams({
+      page_id: page.id,
+      page_name: page.name,
+      min_views: String(GALLERY_MIN_VIEWS),
+      limit: String(GALLERY_READ_LIMIT),
+      offset: String(offset),
+    })
+    const data = await fetchJson<PageVideosResponse>(
+      `/api/dashboard/facebook-page-videos?${params.toString()}`,
+      { timeoutMs: 30000 },
+    )
+    total = safeNumber(data.total)
+    if (data.sync) {
+      lastSyncedAt = safeString(data.sync.lastSyncedAt)
+      fullyScanned = data.sync.fullyScanned === true
+    }
+    const list = Array.isArray(data.items) ? data.items : []
+    return list.map(normalize).filter((v): v is PagePostItem => v !== null)
+  }
+
   async function loadPosts(page: PageOption) {
     activePage = page
     loading = true
     error = ''
     try {
-      const params = new URLSearchParams({
-        page_id: page.id,
-        page_name: page.name,
-        min_views: String(GALLERY_MIN_VIEWS),
-        limit: String(GALLERY_READ_LIMIT),
-      })
-      const data = await fetchJson<{ items?: unknown[] }>(
-        `/api/dashboard/facebook-page-videos?${params.toString()}`,
-        { timeoutMs: 30000 },
-      )
-      const list = Array.isArray(data.items) ? data.items : []
-      items = list.map(normalize).filter((v): v is PagePostItem => v !== null)
+      items = await fetchPage(page, 0)
       updatedAt = new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })
     } catch (e) {
       error = e instanceof Error ? e.message : String(e)
     } finally {
       loading = false
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMore || loading || !hasMore) return
+    loadingMore = true
+    error = ''
+    try {
+      const next = await fetchPage(activePage, items.length)
+      // De-dupe defensively in case the cache shifted between requests.
+      const seen = new Set(items.map((it) => it.storyId || it.videoId))
+      items = [...items, ...next.filter((it) => !seen.has(it.storyId || it.videoId))]
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e)
+    } finally {
+      loadingMore = false
     }
   }
 
@@ -222,6 +263,11 @@
     return ''
   }
 
+  function downloadUrl(item: PagePostItem): string {
+    if (!item.systemVideoId) return ''
+    return `${WORKER_API_BASE}/api/gallery/${encodeURIComponent(item.systemVideoId)}/asset/public?namespace_id=${CHIEB_NAMESPACE_ID}`
+  }
+
   function handleThumbError(event: Event) {
     const img = event.currentTarget as HTMLImageElement | null
     if (!img) return
@@ -281,7 +327,13 @@
       {#if loading}
         กำลังโหลดโพสต์…
       {:else}
-        แสดง {items.length} คลิปจาก {activePage.name}
+        แสดง {items.length}{#if total > items.length} จาก {formatCompactViews(total)}{/if} คลิป (≥ 100K) · {activePage.name}
+        {#if lastSyncedAt}
+          <span class="ml-1 text-slate-400">· sync ล่าสุด {formatThaiDateTime(lastSyncedAt)}</span>
+        {/if}
+        {#if fullyScanned}
+          <span class="ml-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">sync ครบทั้งเพจ</span>
+        {/if}
       {/if}
     </div>
     <div class="flex flex-wrap items-center gap-2">
@@ -338,6 +390,7 @@
     <div class="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
       {#each items as item (item.storyId || item.videoId)}
         {@const ref = item.systemVideoId || (item.videoId ? `FB:${item.videoId}` : '')}
+        {@const systemDownloadUrl = downloadUrl(item)}
         <article class="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_4px_16px_rgba(15,23,42,0.04)] transition hover:shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
           <a
             href={item.postUrl}
@@ -397,10 +450,43 @@
             >
               สร้างแอด
             </a>
+            {#if systemDownloadUrl}
+              <a
+                href={systemDownloadUrl}
+                target="_blank"
+                rel="noreferrer"
+                download
+                class="block rounded-xl border border-slate-200 bg-white px-3 py-2 text-center text-xs font-semibold text-slate-700 hover:bg-slate-50 active:scale-95"
+              >
+                ดาวน์โหลดวีดีโอ
+              </a>
+            {:else}
+              <button
+                type="button"
+                disabled
+                class="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-100 px-3 py-2 text-center text-xs font-semibold text-slate-400"
+                title="ไม่มีวิดีโอระบบที่ match กับโพสต์นี้"
+              >
+                ดาวน์โหลดวีดีโอ
+              </button>
+            {/if}
           </div>
         </article>
       {/each}
     </div>
+
+    {#if hasMore}
+      <div class="flex justify-center pt-1">
+        <button
+          type="button"
+          onclick={() => void loadMore()}
+          disabled={loadingMore}
+          class="rounded-xl border border-slate-200 bg-white px-5 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {loadingMore ? 'กำลังโหลด…' : `โหลดเพิ่ม (${formatCompactViews(total - items.length)} คลิป)`}
+        </button>
+      </div>
+    {/if}
   {/if}
 
   <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">

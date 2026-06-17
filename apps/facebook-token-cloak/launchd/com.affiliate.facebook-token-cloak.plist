@@ -11,10 +11,8 @@
     <string>HOME=/Users/yok-macmini</string>
     <string>NODE_ENV=production</string>
     <string>PORT=8820</string>
-    <string>npm</string>
-    <string>--prefix</string>
-    <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/facebook-token-cloak</string>
-    <string>start</string>
+    <string>node</string>
+    <string>/Users/yok-macmini/Developer/shopping-affiliate/apps/facebook-token-cloak/bin/start.js</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -28,12 +26,20 @@
     <string>production</string>
     <key>PATH</key>
     <string>/Users/yok-macmini/.local/opt/node-v24.14.1-darwin-arm64/bin:/Users/yok-macmini/.local/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- CloakBrowser profile that drives the Worker posting bridge endpoints
+         (/token, /pages, /post, /page-comment, /create-ad). Not a secret. -->
+    <key>FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT</key>
+    <string>content_paiya</string>
+    <!-- Non-secret Ads Manager TEMPLATE_SALES adset id. Keep runtime explicit so the bridge never
+         falls back to the retired pre-SALES template adset. -->
+    <key>FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET</key>
+    <string>120248134990230263</string>
   </dict>
 
   <key>RunAtLoad</key>
-  <false/>
+  <true/>
   <key>KeepAlive</key>
-  <false/>
+  <true/>
 
   <key>StandardOutPath</key>
   <string>/Users/yok-macmini/Library/Logs/facebook-token-cloak.log</string>

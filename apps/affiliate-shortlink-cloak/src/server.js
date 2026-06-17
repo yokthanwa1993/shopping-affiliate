@@ -665,6 +665,20 @@ async function attemptReauthWithStoredCredential(platform, account, opts = {}) {
   return { ok: true, manualLoginRequired: false, reuseAuthenticatedContext: true };
 }
 
+// Conversion/daily-income report flows re-use the shortlink flow's stored-
+// credential re-auth: inject onSessionExpired so conversion-report.js can try a
+// headless auto re-auth before returning manual_login_required, then retry the
+// protected fetch once. attemptReauthWithStoredCredential stays untouched.
+function reportReauthDeps() {
+  return {
+    onSessionExpired: (info) => attemptReauthWithStoredCredential(
+      (info && info.platform) || 'shopee',
+      info && info.account,
+      { headless: true, forceNew: true },
+    ),
+  };
+}
+
 async function handleShorten(query, opts = {}) {
   const rawUrl = String(query.url || '').trim();
   if (!rawUrl) throw new Error('Missing required parameter: url');
@@ -2081,7 +2095,7 @@ function createServer() {
           return sendJson(res, 405, { error: 'Method not allowed (use GET)' });
         }
         try {
-          const payload = await conversionReport.handleDailyIncomeReport(query);
+          const payload = await conversionReport.handleDailyIncomeReport(query, reportReauthDeps());
           return sendJson(res, 200, payload);
         } catch (err) {
           if (err && err.publicPayload) {
@@ -2097,7 +2111,7 @@ function createServer() {
           return sendJson(res, 405, { error: 'Method not allowed (use GET)' });
         }
         try {
-          const payload = await conversionReport.handleConversionReport(query);
+          const payload = await conversionReport.handleConversionReport(query, reportReauthDeps());
           return sendJson(res, 200, payload);
         } catch (err) {
           if (err && err.publicPayload) {

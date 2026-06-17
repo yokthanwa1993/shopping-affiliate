@@ -40,11 +40,14 @@ AI agents must not wait for the user to say “อ่าน AGENTS.md”, “que
 3. `apps/dashboard/`
    - Dashboard web UI แยกสำหรับงานจัดการ/monitoring
 
-4. `apps/affiliate-shortlink/`
-   - ระบบ shortlink/affiliate link tooling เดิม
+4. `apps/affiliate-shortlink-cloak/`
+   - ระบบ Shopee/Lazada shortlink + report bridge ปัจจุบัน ใช้ CloakBrowser/Playwright บน port `8810`; legacy Electron `apps/affiliate-shortlink/` ถูกถอดออกแล้ว
 
-5. `apps/video-onecard/`
-   - ระบบ video/one-card helper เดิม
+5. `apps/cloak-fb-bridge/`
+   - **non-Electron CloakBrowser Facebook posting bridge** ปัจจุบันสำหรับ organic Reels/Page comment (`/token`, `/pages`, `/post`, `/page-comment`) ผ่าน Worker env `CLOAK_FB_BRIDGE_URL`. ใช้ persistent logged-in CloakBrowser session (ไม่มี stored/manual page token), port `8830` (127.0.0.1) ออกผ่าน cloudflared tunnel
+   - `post-reels-token-cloak` = organic Reel (ระบบที่คงไว้) ใช้ `/post` + `/page-comment` (comment เป็น Page, fail-closed)
+   - `post-reels-token-ads` = OneCard/Ads via Cloak ใช้ `/create-ad` ซึ่ง publish one-card video post ลง page feed (คืน `story_id`/`post_url` จริง) แล้ว Worker comment เองผ่าน `/graph` proxy (Electron paid-ad ถูกถอดออก; `video_id`-only reuse ยังไม่รองรับ → `create_ad_requires_video_url`)
+   - **REMOVED:** `apps/video-onecard/` (Electron menu-bar Ads app เดิม, port `3847`, tunnel `video-onecard.wwoom.com`, LaunchAgent `com.yok.video-onecard`) เลิกใช้แล้ว — ห้าม resurrect port 3847 / tunnel เดิม. Worker ไม่ default ไป `video-onecard.wwoom.com` อีก: ถ้า `CLOAK_FB_BRIDGE_URL` ว่าง จะ fail closed `bridge_not_configured`. `VIDEO_ONECARD_WORKER_URL` เหลือเป็น deprecated fallback เท่านั้น และถูก ignore ถ้าชี้กลับไป bridge เดิม
 
 ## Important boundaries
 
@@ -186,7 +189,7 @@ Obsidian note สำหรับโปรเจกต์นี้ควรอย
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **shopping-affiliate** (15370 symbols, 30433 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **shopping-affiliate** (15149 symbols, 30212 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 

@@ -755,8 +755,54 @@ interface FacebookPage {
   caption_link_enabled?: number
   onecard_link_mode?: 'shopee' | 'lazada' | 'none'
   onecard_cta?: 'SHOP_NOW' | 'NO_BUTTON'
+  // แหล่งโทเค้นที่ใช้โพสต์ — มีแค่ 2 โหมด: 'stored_token' คือ manual/stored token (default);
+  // 'cloak_browser' คือ CloakBrowser (ระบบ session-cookie browser ที่มาแทน Electron เดิม)
+  // โดย Video One Card toggle เป็นตัวเลือกว่าจะโพสต์ Reel ปกติหรือ OneCard.
+  // ค่าเก่าใน DB ('post-reels-token-ads'/'post-reels-token-cloak') ถูก normalize เป็น 'cloak_browser'.
+  posting_token_source?: PostingTokenSource
+  // โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ ('stored_token' = คอมเมนต์ด้วย
+  // Page token ที่กรอกเอง; 'cloak_browser' = คอมเมนต์ในนามเพจผ่าน CloakBrowser bridge)
+  // ถ้าไม่ได้ตั้งค่า runtime จะใช้ค่าเดียวกับโทเค้นที่ใช้โพสต์ เพื่อคงพฤติกรรมเดิม
+  comment_token_source?: CommentTokenSource
   last_post_at?: string
   updated_at?: string
+}
+
+type PostingTokenSource = 'stored_token' | 'cloak_browser'
+type CommentTokenSource = 'stored_token' | 'cloak_browser'
+
+function normalizePostingTokenSource(raw?: string | null): PostingTokenSource {
+  const value = String(raw || '').trim().toLowerCase()
+  // ค่า canonical + alias เก่าทุกตัว รวมเป็น CloakBrowser โหมดเดียว (ไม่มี provider ที่สาม)
+  if (
+    value === 'cloak_browser' ||
+    value === 'cloakbrowser' ||
+    value === 'cloak' ||
+    value === 'post-reels-token-cloak' ||
+    value === 'post-reels-token-ads'
+  ) {
+    return 'cloak_browser'
+  }
+  return 'stored_token'
+}
+
+// โทเค้นคอมเมนต์ใช้ค่าเดียวกับโทเค้นโพสต์ 2 โหมด แต่เลือกแยกได้ ถ้าค่าว่าง/ไม่ถูกต้อง
+// ให้ fallback ไปยังโทเค้นที่ใช้โพสต์ (parity กับ default ฝั่ง backend)
+function normalizeCommentTokenSource(raw: string | null | undefined, fallback: PostingTokenSource): CommentTokenSource {
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (
+    value === 'cloak_browser' ||
+    value === 'cloakbrowser' ||
+    value === 'cloak' ||
+    value === 'post-reels-token-cloak' ||
+    value === 'post-reels-token-ads'
+  ) {
+    return 'cloak_browser'
+  }
+  if (value === 'stored_token' || value === 'stored' || value === 'token' || value === 'page' || value === 'page_token') {
+    return 'stored_token'
+  }
+  return fallback
 }
 
 interface PageShortlinkSettingsForm {
@@ -2928,7 +2974,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [adsPublishEnabled, setAdsPublishEnabled] = useState(page.ads_publish_enabled === 1)
   const [captionLinkEnabled, setCaptionLinkEnabled] = useState(page.caption_link_enabled === 1)
   const [adsSubId, setAdsSubId] = useState('')
-  const [adsShortlinkUrl, setAdsShortlinkUrl] = useState('https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}')
+  const [adsShortlinkUrl, setAdsShortlinkUrl] = useState('https://short.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}')
   const [adsCommentTemplate, setAdsCommentTemplate] = useState('🔥 สนใจสั่งซื้อหรือดูราคา 👉 {shopee_link}')
   const [adsSaveStatus, setAdsSaveStatus] = useState<'saved' | 'error' | null>(null)
   const handleSaveAdsSettings = async () => { try { setAdsSaveStatus(null); setAdsSaveStatus('saved'); setTimeout(() => setAdsSaveStatus(null), 3000) } catch { setAdsSaveStatus('error') } }
@@ -2943,6 +2989,9 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     if (value === 'NO_BUTTON') return 'NO_BUTTON'
     return 'SHOP_NOW'
   })
+  const [postingTokenSource, setPostingTokenSource] = useState<PostingTokenSource>(() => normalizePostingTokenSource(page.posting_token_source))
+  const [commentTokenSource, setCommentTokenSource] = useState<CommentTokenSource>(() =>
+    normalizeCommentTokenSource(page.comment_token_source, normalizePostingTokenSource(page.posting_token_source)))
   const [accessToken, setAccessToken] = useState(page.access_token || '')
   const [saving, setSaving] = useState(false)
   const [forcingPost, setForcingPost] = useState(false)
@@ -3007,6 +3056,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
       if (value === 'NO_BUTTON') return 'NO_BUTTON'
       return 'SHOP_NOW'
     })
+    setPostingTokenSource(normalizePostingTokenSource(page.posting_token_source))
+    setCommentTokenSource(normalizeCommentTokenSource(page.comment_token_source, normalizePostingTokenSource(page.posting_token_source)))
     setAccessToken(page.access_token || '')
     setEditingToken(null)
     setEditingTokenValue('')
@@ -3020,6 +3071,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     page.caption_link_enabled,
     page.onecard_link_mode,
     page.onecard_cta,
+    page.posting_token_source,
+    page.comment_token_source,
     page.access_token,
   ])
 
@@ -3326,6 +3379,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         caption_link_enabled: captionLinkEnabled,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
+        posting_token_source: postingTokenSource,
+        comment_token_source: commentTokenSource,
       }
       if (accessTokenChanged) {
         payload.access_token = nextToken
@@ -3351,6 +3406,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         caption_link_enabled: captionLinkEnabled ? 1 : 0,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
+        posting_token_source: postingTokenSource,
+        comment_token_source: commentTokenSource,
         access_token: nextToken,
       }
 
@@ -3500,7 +3557,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="font-bold text-gray-900">Video One Card</p>
-              <p className="text-xs text-gray-400 mt-0.5">เปิดแล้วเพจนี้จะโพสต์ผ่าน Video One Card ส่วนเพจอื่นยังใช้แบบเดิม</p>
+              <p className="text-xs text-gray-400 mt-0.5">ตัวควบคุมหลัก: ปิด = โพสต์ Reel ปกติ, เปิด = โพสต์แบบ OneCard (สร้างแอด)</p>
             </div>
             <button
               onClick={() => setOneCardEnabled(!oneCardEnabled)}
@@ -3551,6 +3608,84 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           )}
         </div>
 
+        {/* โทเค้นสำหรับใช้โพสต์ — มีแค่ 2 โหมด: Page/Token (กรอกเอง) และ CloakBrowser */}
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+          <div className="min-w-0">
+            <p className="font-bold text-gray-900">โทเค้นสำหรับใช้โพสต์</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              เลือกว่าจะให้เพจนี้โพสต์ด้วยโทเค้นที่กรอกเอง หรือผ่าน CloakBrowser ที่ login อยู่บนเครื่อง Mac
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              { value: 'stored_token', label: 'Page/Token', hint: 'กรอก User/Page token เอง (legacy)' },
+              { value: 'cloak_browser', label: 'CloakBrowser', hint: 'ใช้ session ของ CloakBrowser โพสต์ให้' },
+            ] as { value: PostingTokenSource; label: string; hint: string }[]).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setPostingTokenSource(option.value)}
+                className={`min-h-[74px] rounded-xl border px-3 py-2 text-left transition-all ${postingTokenSource === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
+                aria-pressed={postingTokenSource === option.value}
+              >
+                <span className={`block text-sm font-bold ${postingTokenSource === option.value ? 'text-blue-700' : 'text-gray-700'}`}>{option.label}</span>
+                <span className="block text-[11px] text-gray-400 mt-1 leading-snug">{option.hint}</span>
+              </button>
+            ))}
+          </div>
+
+          {postingTokenSource === 'stored_token' ? (
+            <div className="rounded-xl border border-gray-100 bg-gray-50 p-3 flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-bold text-gray-900">Page/User Token</p>
+                <p className={`text-xs mt-1 font-mono break-all ${accessToken.trim() ? 'text-gray-500' : 'text-orange-600 font-bold'}`}>
+                  {renderTokenPreview(accessToken)}
+                </p>
+                <p className="text-[11px] text-gray-400 mt-2 leading-relaxed">
+                  วาง Facebook User Token หรือ Page Token ได้เลย ระบบจะดึง page token ผ่าน <code>me/accounts</code> ให้เองถ้าจำเป็น
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setEditingToken('access')
+                  setEditingTokenValue(accessToken)
+                }}
+                className="shrink-0 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-bold text-blue-600 active:scale-95"
+              >
+                แก้ไข
+              </button>
+            </div>
+          ) : null}
+        </div>
+
+        {/* โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ (Page/Token หรือ CloakBrowser) */}
+        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+          <div className="min-w-0">
+            <p className="font-bold text-gray-900">โทเค้นสำหรับใช้คอมเมนต์</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้นที่กรอกเอง หรือคอมเมนต์ในนามเพจผ่าน CloakBrowser (แยกอิสระจากโทเค้นที่ใช้โพสต์)
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {([
+              { value: 'stored_token', label: 'Page/Token', hint: 'คอมเมนต์ด้วย Page token ที่กรอกเอง' },
+              { value: 'cloak_browser', label: 'CloakBrowser', hint: 'คอมเมนต์ในนามเพจผ่าน session CloakBrowser' },
+            ] as { value: CommentTokenSource; label: string; hint: string }[]).map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => setCommentTokenSource(option.value)}
+                className={`min-h-[74px] rounded-xl border px-3 py-2 text-left transition-all ${commentTokenSource === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
+                aria-pressed={commentTokenSource === option.value}
+              >
+                <span className={`block text-sm font-bold ${commentTokenSource === option.value ? 'text-blue-700' : 'text-gray-700'}`}>{option.label}</span>
+                <span className="block text-[11px] text-gray-400 mt-1 leading-snug">{option.hint}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
@@ -3594,7 +3729,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
                     value={pageShortlinkUrlTemplate}
                     maxLength={pageShortlinkMaxTemplateChars}
                     onChange={(e) => { setPageShortlinkUrlTemplate(e.target.value); if (pageShortlinkMessage) setPageShortlinkMessage('') }}
-                    placeholder="https://short.wwoom.com/?account={account}&url={url}&sub1={sub_id}"
+                    placeholder="https://short.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}"
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                 </div>
@@ -3851,8 +3986,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
-                <p className="font-bold text-gray-900">ยิงแอดอัตโนมัติทุกโพสต์</p>
-                <p className="text-xs text-gray-400 mt-0.5">เปิดแล้วทุกครั้งที่ cron โพสต์เพจนี้ ระบบจะสร้างแอด + เผยแพร่ไปหน้าเพจ (แทนการโพสต์ Reel ปกติ) ตามเวลาที่ตั้งไว้ด้านบน</p>
+                <p className="font-bold text-gray-900">ใช้ Video One Card ตอนโพสต์อัตโนมัติ</p>
+                <p className="text-xs text-gray-400 mt-0.5">เปิดแล้ว cron จะโพสต์แบบ OneCard + ยิงแอด; ปิดแล้ว cron จะโพสต์ Reels ปกติ</p>
               </div>
               <button
                 type="button"
@@ -3862,11 +3997,6 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
                 <div className={`w-5 h-5 bg-white rounded-full absolute top-1 transition-all shadow-sm ${adsPublishEnabled ? 'right-1' : 'left-1'}`}></div>
               </button>
             </div>
-            {adsPublishEnabled && oneCardEnabled && (
-              <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-700">
-                ⚠️ เปิดพร้อม Video One Card จะยิงแอดแทน (Video One Card ถูกข้าม)
-              </div>
-            )}
           </div>
         )}
 
@@ -3882,29 +4012,6 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
               className={`shrink-0 px-4 py-2.5 rounded-xl text-sm font-bold transition-all ${forcingPost ? 'bg-gray-300 text-white' : 'bg-blue-600 text-white active:scale-95'}`}
             >
               {forcingPost ? 'กำลังโพสต์...' : 'โพสต์ตอนนี้'}
-            </button>
-          </div>
-        </div>
-
-        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-bold text-gray-900">Page/User Token</p>
-              <p className={`text-xs mt-1 font-mono break-all ${accessToken.trim() ? 'text-gray-500' : 'text-orange-600 font-bold'}`}>
-                {renderTokenPreview(accessToken)}
-              </p>
-              <p className="text-[11px] text-gray-400 mt-2">
-                วาง Facebook User Token หรือ Page Token ได้เลย ระบบจะดึง page token ผ่าน <code>me/accounts</code> ให้เองถ้าจำเป็น
-              </p>
-            </div>
-            <button
-              onClick={() => {
-                setEditingToken('access')
-                setEditingTokenValue(accessToken)
-              }}
-              className="shrink-0 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-bold text-blue-600 active:scale-95"
-            >
-              แก้ไข
             </button>
           </div>
         </div>
@@ -9678,7 +9785,7 @@ function App({
                       </div>
                       <div>
                         <label className="block text-xs font-bold text-gray-600 mb-1">Shortlink URL</label>
-                        <input type="text" placeholder="https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}" value={adsShortlinkUrl} onChange={(e) => setAdsShortlinkUrl(e.target.value)} className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                        <input type="text" placeholder="https://short.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}" value={adsShortlinkUrl} onChange={(e) => setAdsShortlinkUrl(e.target.value)} className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
                         <p className="text-xs text-gray-400 mt-1">{'{url}'} = ลิงก์ Shopee, {'{sub_id}'} = Sub ID</p>
                       </div>
                       <div>
@@ -9810,7 +9917,7 @@ function App({
                                 type="text"
                                 value={shortlinkUrlDraft}
                                 onChange={(e) => { setShortlinkUrlDraft(e.target.value); if (shortlinkMessage) setShortlinkMessage('') }}
-                                placeholder="https://short.wwoom.com/?account=CHEARB&url={url}&sub1={sub_id}"
+                                placeholder="https://short.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}"
                                 className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 text-xs outline-none focus:border-blue-400"
                               />
                               <div className="grid grid-cols-2 gap-2">

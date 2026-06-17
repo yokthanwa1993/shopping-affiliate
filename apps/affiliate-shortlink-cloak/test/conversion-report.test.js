@@ -407,6 +407,47 @@ function stubBrowserForConversionReport(t, opts = {}) {
   return { evaluates, getPageCalls };
 }
 
+// Sequenced stub: each getPage() call consumes the next state in `states`
+// (currentUrl + evaluateResult), letting a test model "attempt 0 is login-gated,
+// attempt 1 succeeds after auto re-auth". The final state repeats once exhausted.
+function stubBrowserSequence(t, states) {
+  const originalGetPage = browser.getPage;
+  const originalEnsureOnPlatformPage = browser.ensureOnPlatformPage;
+  const originalIsOnPlatformOrigin = browser.isOnPlatformOrigin;
+  const getPageCalls = [];
+  const evaluates = [];
+
+  t.after(() => {
+    browser.getPage = originalGetPage;
+    browser.ensureOnPlatformPage = originalEnsureOnPlatformPage;
+    browser.isOnPlatformOrigin = originalIsOnPlatformOrigin;
+  });
+
+  browser.getPage = async (platform, account, browserOpts) => {
+    const idx = getPageCalls.length;
+    const state = states[Math.min(idx, states.length - 1)] || {};
+    getPageCalls.push({ platform, account, opts: browserOpts });
+    return {
+      record: {},
+      page: {
+        url: () => state.currentUrl || 'https://affiliate.shopee.co.th/',
+        goto: async () => {},
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        evaluate: async (_fn, args) => {
+          evaluates.push({ idx, args });
+          if (typeof state.evaluateResult === 'function') return state.evaluateResult(args);
+          return state.evaluateResult;
+        },
+      },
+    };
+  };
+  browser.ensureOnPlatformPage = async () => {};
+  browser.isOnPlatformOrigin = (url) => /affiliate\.shopee\.co\.th/i.test(String(url || ''));
+
+  return { getPageCalls, evaluates };
+}
+
 function buildOrderRow(idx, subId, purchaseValue = 100, commission = 5) {
   return {
     purchase_time: 1748226000 + idx,
@@ -1401,6 +1442,186 @@ test('handleConversionReport reports conversion_report_fetch_failed on evaluate 
   assert.equal(result.status, 'error');
   assert.equal(result.reason, 'conversion_report_fetch_failed');
   assert.match(result.detail, /Failed to fetch/);
+});
+
+// ---------------------------------------------------------------------------
+// Auto re-auth before manual_login_required
+// ---------------------------------------------------------------------------
+
+test('handleConversionReport auto re-auths on off-origin redirect then retries successfully', async (t) => {
+  const stub = stubBrowserSequence(t, [
+    // attempt 0: bounced to buyer login -> off affiliate origin
+    {
+      currentUrl: 'https://shopee.co.th/buyer/login?next=https%3A%2F%2Faffiliate.shopee.co.th%2F',
+      evaluateResult: { status: 200, parsed: true, body: { code: 0, data: { total_count: 0, list: [] } } },
+    },
+    // attempt 1 (after successful re-auth): authenticated, real data
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: {
+        status: 200,
+        parsed: true,
+        body: { code: 0, data: { total_count: 1, list: [buildOrderRow(1, 'sub-a')] } },
+      },
+    },
+  ]);
+  const reauthCalls = [];
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '25/05/2026' },
+    {
+      now: FROZEN_NOW,
+      onSessionExpired: async (info) => { reauthCalls.push(info); return { ok: true, manualLoginRequired: false }; },
+    },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.mode, 'summary');
+  assert.equal(result.total_count, 1);
+  assert.equal(reauthCalls.length, 1);
+  assert.equal(reauthCalls[0].platform, 'shopee');
+  assert.equal(reauthCalls[0].account, 'affiliate_chearb.com');
+  assert.equal(stub.getPageCalls.length, 2);
+  // First fetch attempt should not have leaked since it was off-origin.
+  assert.equal(result.autoReauthAttempted, undefined);
+});
+
+test('handleConversionReport auto re-auths on Shopee code 30001 then retries the fetch', async (t) => {
+  const stub = stubBrowserSequence(t, [
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } },
+    },
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: {
+        status: 200,
+        parsed: true,
+        body: { code: 0, data: { total_count: 2, list: [buildOrderRow(1, 'sub-a'), buildOrderRow(2, 'sub-a')] } },
+      },
+    },
+  ]);
+  let reauthCount = 0;
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW, onSessionExpired: async () => { reauthCount += 1; return { ok: true }; } },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.total_count, 2);
+  assert.equal(reauthCount, 1);
+  assert.equal(stub.getPageCalls.length, 2);
+});
+
+test('handleConversionReport returns manual_login_required when auto re-auth hits a captcha blocker', async (t) => {
+  const stub = stubBrowserSequence(t, [
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } },
+    },
+  ]);
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '25/05/2026' },
+    {
+      now: FROZEN_NOW,
+      onSessionExpired: async () => ({ ok: false, manualLoginRequired: true, reason: 'captcha_required' }),
+    },
+  );
+  assert.equal(result.status, 'manual_login_required');
+  assert.equal(result.reason, 'shopee_login_required');
+  assert.equal(result.loginUi, '/login?platform=shopee');
+  assert.equal(result.autoReauthAttempted, true);
+  assert.equal(result.autoReauthReason, 'captcha_required');
+  // Only one fetch attempt because re-auth failed (no retry).
+  assert.equal(stub.getPageCalls.length, 1);
+  // No secret leakage.
+  const serialized = JSON.stringify(result);
+  assert.equal(/password|cookie|token|secret/i.test(serialized), false);
+});
+
+test('handleConversionReport surfaces keychain-missing diagnostic when auto re-auth has no credential', async (t) => {
+  stubBrowserSequence(t, [
+    {
+      currentUrl: 'https://shopee.co.th/buyer/login',
+      evaluateResult: { status: 200, parsed: true, body: { code: 0 } },
+    },
+  ]);
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '25/05/2026' },
+    {
+      now: FROZEN_NOW,
+      onSessionExpired: async () => ({ ok: false, manualLoginRequired: true, reason: 'keychain_credential_not_found' }),
+    },
+  );
+  assert.equal(result.status, 'manual_login_required');
+  assert.equal(result.autoReauthAttempted, true);
+  assert.equal(result.autoReauthReason, 'keychain_credential_not_found');
+});
+
+test('handleConversionReport without a re-auth hook keeps legacy manual_login_required (no retry)', async (t) => {
+  const stub = stubBrowserSequence(t, [
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } },
+    },
+  ]);
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW },
+  );
+  assert.equal(result.status, 'manual_login_required');
+  assert.equal(result.reason, 'shopee_login_required');
+  assert.equal(result.autoReauthAttempted, undefined);
+  assert.equal(stub.getPageCalls.length, 1);
+});
+
+test('handleConversionReport only retries once when re-auth succeeds but session is still gated', async (t) => {
+  const stub = stubBrowserSequence(t, [
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } },
+    },
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/report/conversion_report',
+      evaluateResult: { status: 200, parsed: true, body: { code: 30001, message: 'Not Login' } },
+    },
+  ]);
+  let reauthCount = 0;
+  const result = await conversionReport.handleConversionReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW, onSessionExpired: async () => { reauthCount += 1; return { ok: true }; } },
+  );
+  assert.equal(result.status, 'manual_login_required');
+  assert.equal(result.autoReauthAttempted, true);
+  assert.equal(reauthCount, 1);
+  // Exactly two fetch attempts (original + single retry), no infinite loop.
+  assert.equal(stub.getPageCalls.length, 2);
+});
+
+test('handleDailyIncomeReport auto re-auths per account before manual_login_required', async (t) => {
+  const stub = stubBrowserSequence(t, [
+    // attempt 0: off-origin login redirect
+    {
+      currentUrl: 'https://shopee.co.th/buyer/login',
+      evaluateResult: { status: 200, parsed: true, body: { code: 0, data: {} } },
+    },
+    // attempt 1: authenticated dashboard detail
+    {
+      currentUrl: 'https://affiliate.shopee.co.th/dashboard',
+      evaluateResult: {
+        status: 200,
+        parsed: true,
+        body: { code: 0, data: { cv_by_order_sum: 3, est_commission_sum: 500000, order_amount_sum: 100000000 } },
+      },
+    },
+  ]);
+  let reauthCount = 0;
+  const result = await conversionReport.handleDailyIncomeReport(
+    { id: '15130770000', time: '25/05/2026' },
+    { now: FROZEN_NOW, onSessionExpired: async () => { reauthCount += 1; return { ok: true }; } },
+  );
+  assert.equal(result.status, 'ok');
+  assert.equal(result.accounts[0].status, 'ok');
+  assert.equal(result.accounts[0].orders, 3);
+  assert.equal(reauthCount, 1);
+  assert.equal(stub.getPageCalls.length, 2);
 });
 
 // ---------------------------------------------------------------------------

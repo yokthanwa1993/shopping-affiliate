@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "astro dev --host 0.0.0.0 --port 4174",
-    "build": "astro build",
+    "build": "astro build && npm run build:next",
+    "build:astro": "astro build",
+    "build:next": "node scripts/build-dashboard-next.mjs",
     "check": "astro check",
     "preview": "astro preview",
     "deploy": "npm run build && wrangler deploy"
@@ -15,10 +17,13 @@
     "@simplewebauthn/browser": "^13.3.0",
     "@simplewebauthn/server": "^13.3.1",
     "astro": "^6.3.8",
-    "svelte": "^5.55.9"
+    "hono": "^4.4.3",
+    "svelte": "^5.55.9",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.9",
+    "@cloudflare/workers-types": "^4.20260613.1",
     "@tailwindcss/vite": "^4.3.0",
     "tailwindcss": "^4.3.0",
     "typescript": "~5.9.3",

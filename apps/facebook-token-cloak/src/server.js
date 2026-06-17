@@ -7,6 +7,7 @@ const browser = require('./browser');
 const accountSelectors = require('./account-selectors');
 const accountsRegistry = require('./accounts-registry');
 const ui = require('./ui');
+const posting = require('./posting');
 const {
   FACEBOOK_OAUTH_URL,
   extractAccessTokenFromUrl,
@@ -17,6 +18,37 @@ const {
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8820;
+
+// Worker posting bridge config (non-secret Facebook object ids, env-overridable). These drive
+// the persistent logged-in CloakBrowser profile so the Worker can call the bridge without ever
+// shipping a token. Defaults match the verified live `content_paiya` SALES template flow.
+//
+// Latest user-owned Ads Manager template (TEMPLATE_SALES):
+//   campaign_id 120248134990220263
+//   adset_id    120248134990230263
+// Do NOT silently fall back to the retired pre-SALES template adset 120244361318490263.
+const DEFAULT_TEMPLATE_ADSET = '120248134990230263';
+const POST_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT || 'content_paiya';
+const POST_AD_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_POST_AD_ACCOUNT || 'act_1148837732288721';
+const ADS_AD_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_AD_ACCOUNT || 'act_1030797047648459';
+const TEMPLATE_ADSET = process.env.FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET || DEFAULT_TEMPLATE_ADSET;
+// Graph polling interval; FACEBOOK_TOKEN_CLOAK_POLL_MS=0 makes tests resolve instantly.
+const POLL_MS = (() => {
+  const raw = process.env.FACEBOOK_TOKEN_CLOAK_POLL_MS;
+  if (raw == null || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) ? n : undefined;
+})();
+
+// Map a posting-result object to an HTTP status. `validate` failures are client errors (400);
+// every other shape carries an explicit `status` (page-comment) or defaults to 200 with ok:false
+// so the Worker can read the step/error without treating it as a transport failure.
+function postingStatus(result) {
+  if (result && result.ok) return 200;
+  if (result && typeof result.status === 'number') return result.status;
+  if (result && result.step === 'validate') return 400;
+  return 200;
+}
 
 function isLocalRequest(req) {
   const a = req.socket.remoteAddress;
@@ -539,6 +571,166 @@ function createHandler(deps = {}) {
         });
       }
 
+      // ── Worker posting bridge routes (CloakBrowser) ──────────────────────────────────────
+      // All resolve a fresh user token from the persistent logged-in profile, run their Graph
+      // work through the cookie-bound browser client, and ALWAYS close the context in `finally`.
+      // Raw tokens/cookies/fb_dtsg are never returned or logged.
+
+      if (req.method === 'GET' && url.pathname === '/token') {
+        const account = url.searchParams.get('account') || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          const accessToken = !!session.token;
+          let fbDtsg = !!session.fbDtsgPresent;
+          if (!fbDtsg && session.context) {
+            try { fbDtsg = await posting.hasLoggedInSession(session.context); } catch {}
+          }
+          return send(res, 200, { ok: true, accessToken, fbDtsg, account: sanitizeAccount(account).display });
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/pages') {
+        const account = url.searchParams.get('account') || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { data: [], error: 'no_session' });
+          const result = await posting.listPagesPublic(session.graphFetch, session.token);
+          return send(res, 200, result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/post') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          const result = await posting.postOneCardVideo(session.graphFetch, {
+            userToken: session.token,
+            adAccount: body.ad_account || POST_AD_ACCOUNT,
+            pageId: body.page_id,
+            videoUrl: body.video_url,
+            message: body.message,
+            title: body.title,
+            description: body.description,
+            websiteUrl: body.website_url,
+            cta: body.cta,
+            pollMs: POLL_MS
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/page-comment') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          const result = await posting.pageComment(session.graphFetch, {
+            userToken: session.token,
+            pageId: body.page_id,
+            target: body.target,
+            storyId: body.story_id,
+            postId: body.post_id,
+            message: body.message
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/create-ad') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          const result = await posting.createAd(session.graphFetch, {
+            userToken: session.token,
+            body,
+            defaultAdAccount: ADS_AD_ACCOUNT,
+            defaultTemplateAdset: TEMPLATE_ADSET,
+            pollMs: POLL_MS
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/promote') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          const result = await posting.promoteOneCardPost(session.graphFetch, {
+            userToken: session.token,
+            body,
+            defaultAdAccount: ADS_AD_ACCOUNT,
+            defaultTemplateAdset: TEMPLATE_ADSET,
+            pollMs: POLL_MS
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/publish-story') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const pageId = body.page_id;
+        const storyId = body.story_id;
+        if (!pageId || !storyId) return send(res, 400, { ok: false, step: 'validate', error: 'Missing: page_id, story_id' });
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          // Publish the SAME ad story to the page feed (page token only, resolved internally).
+          // ok:true ONLY when publishStoryToPage confirms publishedToPage. No tokens returned.
+          const pub = await posting.publishStoryToPage(session.graphFetch, { userToken: session.token, pageId, storyId });
+          const ok = pub.publishedToPage === true;
+          return send(res, 200, {
+            ok,
+            phase: 'publish_story',
+            story_id: String(storyId),
+            published_to_page: ok,
+            post_url: `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}`,
+            ...(ok ? {} : { step: 'publish', error: pub.publishError || 'publish_failed' })
+          });
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/update-cta') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          const result = await posting.updateVisiblePostCta(session.graphFetch, {
+            userToken: session.token,
+            pageId: body.page_id,
+            storyId: body.story_id || body.post_id,
+            finalCtaLink: body.final_cta_link || body.shortlink,
+            ctaType: body.cta_type,
+            reelId: body.reel_id,
+            videoId: body.video_id
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
       return sendError(res, 404, 'Not found');
     } catch (e) {
       return sendError(res, e.status || 500, e.status ? e.message : 'Internal server error');
@@ -556,4 +748,4 @@ function start(port = DEFAULT_PORT, host = DEFAULT_HOST) {
   return server;
 }
 
-module.exports = { createHandler, createServer, start, DEFAULT_PORT, DEFAULT_HOST };
+module.exports = { createHandler, createServer, start, DEFAULT_PORT, DEFAULT_HOST, DEFAULT_TEMPLATE_ADSET };

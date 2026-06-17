@@ -532,7 +532,8 @@ function startServer() {
         const existingVideoId = body.video_id || "";
         const caption = body.caption || "";
         const adAccount = body.ad_account || "act_1030797047648459";
-        const templateAdset = body.template_adset || "120244361318490263";
+        // Retired pre-SALES template 120244361318490263 must not be used as fallback.
+        const templateAdset = body.template_adset || "120248134990230263";
         const shortlink = String(body.shortlink || "").trim();
         const shopeeUrl = String(body.shopee_url || "").trim();
         const thumbnailUrl = String(body.thumbnail_url || body.image_url || "").trim();
@@ -1227,8 +1228,54 @@ function startServer() {
       } catch (e) { return res.end(JSON.stringify({ ok: false, error: e.message })); }
     }
 
+    // /page-comment — comment on a post/story as the PAGE (not the logged-in user).
+    // Resolves the PAGE access token from /me/accounts internally and posts the comment
+    // with that token only. Fails closed if the page token is missing — it NEVER falls
+    // back to the session user token (the bug that made comments appear authored by the
+    // logged-in user). The session/user/page tokens are used only against Graph and are
+    // never returned or logged.
+    if (p === "/page-comment" && req.method === "POST") {
+      try {
+        const pageId = String(params.page_id || "").trim();
+        const target = String(params.story_id || params.post_id || "").trim();
+        const message = String(params.message || "").trim();
+        if (!pageId || !target || !message) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ ok: false, step: "validate", error: "Missing: page_id, story_id (or post_id), message" }));
+        }
+        if (!accessToken) {
+          res.writeHead(409);
+          return res.end(JSON.stringify({ ok: false, step: "session", error: "no_session" }));
+        }
+        // Resolve the PAGE access token for page_id via the session user token.
+        const pagesRes = await elFetch(`https://graph.facebook.com/me/accounts?fields=access_token,id,name&limit=100&access_token=${encodeURIComponent(accessToken)}`);
+        const pagesData = pagesRes.json();
+        if (pagesData.error) {
+          return res.end(JSON.stringify({ ok: false, step: "pages", error: pagesData.error.message || "me_accounts_failed" }));
+        }
+        const page = (pagesData.data || []).find(pg => String(pg.id) === pageId);
+        const pageToken = page && page.access_token ? page.access_token : "";
+        const pageName = page && page.name ? String(page.name) : "";
+        // Fail closed: no page token → do NOT comment as the user.
+        if (!pageToken) {
+          res.writeHead(403);
+          return res.end(JSON.stringify({ ok: false, step: "page_token", error: "page_token_not_found", page_id: pageId }));
+        }
+        const commentRes = await elFetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(target)}/comments`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message, access_token: pageToken }),
+        });
+        const commentData = commentRes.json();
+        if (commentData.error || !commentData.id) {
+          return res.end(JSON.stringify({ ok: false, step: "comment", error: (commentData.error && commentData.error.message) || "comment_failed", page_id: pageId }));
+        }
+        return res.end(JSON.stringify({ ok: true, id: String(commentData.id), page_id: pageId, page_name: pageName, author_expected: "page" }));
+      } catch (e) { return res.end(JSON.stringify({ ok: false, step: "exception", error: e.message })); }
+    }
+
     res.writeHead(404);
-    res.end(JSON.stringify({ ok: false, error: "Use /token, /session, /pages, /post" }));
+    res.end(JSON.stringify({ ok: false, error: "Use /token, /session, /pages, /post, /page-comment" }));
   }).listen(LOCAL_PORT, () => safeLog(`API: http://localhost:${LOCAL_PORT}`));
 }
 

@@ -1,11 +1,10 @@
 # affiliate-shortlink-cloak
 
-Parallel CloakBrowser + Playwright bridge for Shopee / Lazada affiliate shortlinks. Runs alongside the existing Electron bridge at `apps/affiliate-shortlink/` — it does **not** modify or replace it.
+Current CloakBrowser + Playwright bridge for Shopee / Lazada affiliate shortlinks. This is the active `short.wwoom.com` / `customlink.wwoom.com` bridge after removing the legacy Electron `apps/affiliate-shortlink/` app.
 
 | Bridge | Port | Browser | Multi-account |
 |---|---|---|---|
-| Electron (legacy) | `8800` | Electron `BrowserWindow` (one partition per platform) | No |
-| Cloak (new) | `8810` | CloakBrowser / Playwright persistent context (one dir per account) | Yes |
+| Cloak (active) | `8810` | CloakBrowser / Playwright persistent context (one dir per account) | Yes |
 
 ## Install
 
@@ -328,7 +327,7 @@ The Electron bridge is in production behind launchd/pm2 on port 8800. This new b
 
 ## What is reused from the legacy bridge
 
-Pure-JS helpers were ported (copied) into this app — the legacy `apps/affiliate-shortlink/main.js` is **not** modified:
+Pure-JS helpers now live inside this app (the legacy `apps/affiliate-shortlink/` app has been removed):
 
 - URL normalization (`normalizeShopeeOriginalLink`, `normalizeLazadaOriginalLink`, `normalizeAffiliateId`)
 - Tracking-link resolution (`resolveOriginalLink`, `resolveTrackingLink`, etc.)

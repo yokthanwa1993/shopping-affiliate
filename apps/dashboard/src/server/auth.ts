@@ -1,3 +1,5 @@
+import { Hono, type Context } from 'hono'
+import { z } from 'zod'
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -336,6 +338,23 @@ function parseTransports(raw: string | null): AuthenticatorTransportFuture[] | u
   }
 }
 
+// ── Zod contracts ────────────────────────────────────────────────────────────
+// Formal request contracts for the passkey verify endpoints, mirroring the
+// customlink slice: the granular `invalid_request` checks below still produce the
+// exact error the clients branch on, and these schemas are the formal gate that
+// backs them. The `response` object is left as an open record because its shape
+// is owned by @simplewebauthn's RegistrationResponseJSON/AuthenticationResponseJSON
+// types, which the verify functions validate cryptographically anyway.
+export const registerVerifyRequestSchema = z.object({
+  challengeId: z.string().min(1),
+  response: z.record(z.string(), z.unknown()),
+})
+
+export const loginVerifyRequestSchema = z.object({
+  challengeId: z.string().min(1),
+  response: z.record(z.string(), z.unknown()),
+})
+
 export async function handleSessionMe(env: AuthEnv, req: Request): Promise<Response> {
   let setup = true
   try {
@@ -438,6 +457,12 @@ export async function handleRegisterVerify(env: AuthEnv, req: Request): Promise<
   if (!payload.challengeId || !payload.response) {
     return jsonResponse({ error: 'invalid_request' }, { status: 400 })
   }
+  // Formal contract gate (see registerVerifyRequestSchema). The check above
+  // already guarantees both fields are present; this rejects malformed shapes
+  // (e.g. a non-string challengeId) with the same stable error code.
+  if (!registerVerifyRequestSchema.safeParse(payload).success) {
+    return jsonResponse({ error: 'invalid_request' }, { status: 400 })
+  }
   const expectedChallenge = await consumeChallenge(env, payload.challengeId, 'registration')
   if (!expectedChallenge) {
     return jsonResponse({ error: 'challenge_expired' }, { status: 400 })
@@ -519,6 +544,11 @@ export async function handleLoginVerify(env: AuthEnv, req: Request): Promise<Res
     response?: AuthenticationResponseJSON
   }
   if (!payload.challengeId || !payload.response) {
+    return jsonResponse({ error: 'invalid_request' }, { status: 400 })
+  }
+  // Formal contract gate (see loginVerifyRequestSchema). Same stable error code
+  // as the presence check above; rejects malformed shapes before any DB work.
+  if (!loginVerifyRequestSchema.safeParse(payload).success) {
     return jsonResponse({ error: 'invalid_request' }, { status: 400 })
   }
   const expectedChallenge = await consumeChallenge(env, payload.challengeId, 'authentication')
@@ -603,3 +633,41 @@ export async function dispatchAuth(env: AuthEnv, req: Request): Promise<Response
   if (path === '/auth/logout' && req.method === 'POST') return handleLogout(env, req)
   return null
 }
+
+// ── Hono app: /auth/* routing ────────────────────────────────────────────────
+// Second route family migrated onto Hono (after the customlink shorten slice).
+// Same bridge shape: the raw fetch handler in worker.ts still owns host routing,
+// redirects, the shared auth gate and asset serving, and delegates every
+// /auth/* request here. Behavior is preserved 1:1 from dispatchAuth above:
+//   - ensureSchema runs before each matched route, with the identical 503
+//     `schema_unavailable` fallback (and, like before, does NOT run for an
+//     unknown /auth/* path — only for the six real routes).
+//   - method/path matching is identical; an unknown path or wrong method falls
+//     through to the same `not found` 404.
+//   - handler bodies are unchanged, so the passkey clients see no difference.
+// `dispatchAuth` is retained (unused by the worker now) as a one-line rollback.
+type AuthBindings = { Bindings: AuthEnv }
+
+function withSchema(
+  handler: (env: AuthEnv, req: Request) => Promise<Response>,
+): (c: Context<AuthBindings>) => Promise<Response> {
+  return async (c) => {
+    try {
+      await ensureSchema(c.env)
+    } catch (err) {
+      return jsonResponse({ error: 'schema_unavailable', detail: String(err) }, { status: 503 })
+    }
+    return handler(c.env, c.req.raw)
+  }
+}
+
+export const authApp = new Hono<AuthBindings>()
+
+authApp.get('/auth/session/me', withSchema(handleSessionMe))
+authApp.post('/auth/passkey/register/options', withSchema(handleRegisterOptions))
+authApp.post('/auth/passkey/register/verify', withSchema(handleRegisterVerify))
+authApp.post('/auth/passkey/login/options', withSchema(handleLoginOptions))
+authApp.post('/auth/passkey/login/verify', withSchema(handleLoginVerify))
+authApp.post('/auth/logout', withSchema(handleLogout))
+
+authApp.notFound(() => new Response('not found', { status: 404 }))
