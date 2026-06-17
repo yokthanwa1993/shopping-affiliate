@@ -1244,6 +1244,12 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   if (!adAccount || !templateAdset) return { ok: false, step: 'config', error: 'Missing: ad_account / template_adset' };
 
   // Resolve the video id from the source post attachment when the caller did not supply it.
+  // Some callers historically passed the full page story id (`<page_id>_<post_id>`) as
+  // `video_id`; that is not a Graph video object and fails `fields=thumbnails`. Treat it as
+  // missing so the bridge resolves the real attachment target from the source post instead.
+  if (videoId.includes('_') && sourcePostId) {
+    videoId = '';
+  }
   // Fail closed when no video_id can be resolved — promote cannot build the video creative.
   if (!videoId && sourcePostId) {
     videoId = await resolveVideoIdFromSourcePost(fetchImpl, { userToken, sourcePostId });

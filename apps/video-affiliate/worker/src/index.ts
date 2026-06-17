@@ -28661,8 +28661,9 @@ async function runOneCardPostFirstAds(params: {
                 caption: params.caption,
                 shopee_url: params.rawShopeeLink || params.managedShopeeLink,
                 comment_shortlink: params.managedShopeeLink,
-                // Build the ad story but DO NOT publish to the page yet — publish happens after the
-                // visible CTA is finalized so the visible post carries the final post-specific link.
+                // Build only the visible OneCard post story in Phase A. Do NOT continue into
+                // campaign/adset/ad creation here; Phase B promotes the finalized post later.
+                skip_ad: true,
                 skip_publish_to_page: true,
                 skip_comment: true,
                 ...(dailyCampaignName ? { daily_campaign_name: dailyCampaignName } : {}),
@@ -28703,11 +28704,10 @@ async function runOneCardPostFirstAds(params: {
     }
     const storyId = String(phaseA.story_id || '').trim()
     const videoId = String(phaseA.video_id || '').trim()
-    const adId = String(phaseA.ad_id || '').trim()
+    let adId = ''
     const confirmedPostId = storyId.includes('_') ? storyId.split('_').slice(1).join('_') : storyId
     const fbReelUrl = storyId ? `https://www.facebook.com/${storyId.replace('_', '/posts/')}` : ''
     if (!videoId) return fail('phase_a_post', 'phase_a_missing_video_id', { storyId, confirmedPostId, fbReelUrl })
-    if (!adId) return fail('phase_a_post', 'phase_a_missing_ad_id', { storyId, confirmedPostId, fbReelUrl, videoId })
 
     // MINT the final link (sub2=post id tail, sub3=page id). This is the link the ad CTA and
     // the comment will SHARE.
@@ -28723,81 +28723,71 @@ async function runOneCardPostFirstAds(params: {
         })
     }
 
-    // FINALIZE THE VISIBLE CTA — swap the visible post CTA to the final post-specific link on the
-    // ad story's attachment target. The ad story already exists (Phase A) but is NOT yet on the
-    // page feed; the CTA is finalized BEFORE publishing so the visible post goes live with the
-    // final link. REQUIRED: the run fails closed unless the bridge read-back confirms
-    // visible_page_cta_final (Thanwa wants the VISIBLE post fixed, not merely the paid-ad CTA).
+    // PHASE B — promote the visible Phase A post with the FINAL post-specific link in the paid ad CTA.
+    // The organic/visible post CTA is not inferred from this step; bridge /promote reports promoted-ad
+    // CTA evidence separately from visible_page_cta_*.
     let visiblePageCtaLink = ''
     let visiblePageCtaFinal = false
-    let visibleCtaUpdateStatus: 'success' | 'failed' | 'not_attempted' = 'not_attempted'
-    let visibleCtaUpdateError: string | null = null
+    const visibleCtaUpdateStatus: 'success' | 'failed' | 'not_attempted' = 'not_attempted'
+    const visibleCtaUpdateError: string | null = null
+    let promotedAdCtaFinal = false
     try {
-        const respCta = await fetchWithTimeout(`${baseUrl}/update-cta`, {
+        const respB = await fetchWithTimeout(`${baseUrl}/promote`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 page_id: pageId,
                 story_id: storyId,
+                video_id: videoId,
                 final_cta_link: finalLink,
-                ...(videoId ? { video_id: videoId } : {}),
+                thumbnail_url: String(phaseA.thumbnail_url || '').trim(),
+                caption: params.caption,
+                ad_name: params.sourceVideoId,
+                ...(dailyCampaignName ? { daily_campaign_name: dailyCampaignName } : {}),
+                ...(!params.newCampaignName && params.campaignId ? { campaign_id: params.campaignId } : {}),
+                ...(params.newCampaignName ? { new_campaign_name: params.newCampaignName } : {}),
             }),
-        }, 60000, 'post_first_update_cta')
-        const dataCta = await respCta.json().catch(() => ({})) as {
+        }, 300000, 'post_first_phase_b_promote')
+        const dataB = await respB.json().catch(() => ({})) as {
             ok?: boolean
             error?: string
             step?: string
-            cta_update_target_id?: string
-            final_cta_link?: string
+            ad_id?: string
+            promoted_ad_cta_link?: string
+            promoted_ad_cta_final?: boolean
             visible_page_cta_link?: string
             visible_page_cta_final?: boolean
-            permalink_url?: string
+            fb_error_code?: number
+            fb_error_subcode?: number
+            fb_trace_id?: string
         }
-        if (respCta.ok && dataCta?.ok && dataCta.visible_page_cta_final === true) {
-            visibleCtaUpdateStatus = 'success'
-            // Report the visible CTA strictly from the bridge read-back (verified parity only).
-            visiblePageCtaLink = String(dataCta.visible_page_cta_link || '').trim()
-            visiblePageCtaFinal = true
-        } else {
-            // Fail closed: do NOT publish a story whose visible CTA was not confirmed final.
-            visibleCtaUpdateStatus = 'failed'
-            visibleCtaUpdateError = String(dataCta?.step ? `${dataCta.step}:${dataCta.error || ''}` : (dataCta?.error || `update_cta_http_${respCta.status}`)).substring(0, 200)
-            return fail('update_cta', visibleCtaUpdateError, {
-                storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
-                visibleCtaUpdateStatus, visibleCtaUpdateError,
-            })
-        }
-    } catch (e) {
-        visibleCtaUpdateStatus = 'failed'
-        visibleCtaUpdateError = (e instanceof Error ? e.message : 'update_cta_failed').substring(0, 200)
-        return fail('update_cta', visibleCtaUpdateError, {
-            storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
-            visibleCtaUpdateStatus, visibleCtaUpdateError,
-        })
-    }
-
-    // PUBLISH THE SAME AD STORY — now that its visible CTA is final, push the ad story to the page
-    // feed via the bridge /publish-story (page token only, internal). REQUIRED: the run fails
-    // closed unless the bridge confirms published_to_page.
-    try {
-        const respPub = await fetchWithTimeout(`${baseUrl}/publish-story`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ page_id: pageId, story_id: storyId }),
-        }, 60000, 'post_first_publish_story')
-        const dataPub = await respPub.json().catch(() => ({})) as { ok?: boolean; error?: string; step?: string; published_to_page?: boolean }
-        if (!respPub.ok || !dataPub?.ok || dataPub.published_to_page !== true) {
-            const pubErr = String(dataPub?.step ? `${dataPub.step}:${dataPub.error || ''}` : (dataPub?.error || `publish_story_http_${respPub.status}`)).substring(0, 200)
-            return fail('publish_story', pubErr, {
-                storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
-                visiblePageCtaLink, visiblePageCtaFinal, visibleCtaUpdateStatus,
-            })
+        adId = String(dataB.ad_id || '').trim()
+        const promotedCtaLink = String(dataB.promoted_ad_cta_link || '').trim()
+        visiblePageCtaLink = String(dataB.visible_page_cta_link || '').trim()
+        visiblePageCtaFinal = dataB.visible_page_cta_final === true
+        promotedAdCtaFinal = !!adId && !!finalLink && remint.reminted
+            && dataB.promoted_ad_cta_final === true
+            && promotedCtaLink === finalLink
+            && isDirectShopeeShortlink(promotedCtaLink)
+        if (!respB.ok || !dataB?.ok || !dataB.promoted_ad_cta_final || promotedCtaLink !== finalLink || !isDirectShopeeShortlink(promotedCtaLink)) {
+            const promoteErr = String(dataB?.step ? `${dataB.step}:${dataB.error || ''}` : (dataB?.error || `promote_http_${respB.status}`)).substring(0, 200)
+            console.error(`${params.logPrefix} POST-FIRST PROMOTE failed; continuing visible post/comment`, JSON.stringify({
+                step: dataB?.step || null,
+                error: promoteErr,
+                ad_id: adId || null,
+                fb_error_code: dataB?.fb_error_code ?? null,
+                fb_error_subcode: dataB?.fb_error_subcode ?? null,
+                fb_trace_id: dataB?.fb_trace_id || null,
+            }))
+            promotedAdCtaFinal = false
+            adId = ''
         }
     } catch (e) {
-        return fail('publish_story', e instanceof Error ? e.message : String(e), {
-            storyId, confirmedPostId, fbReelUrl, videoId, adId, ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
-            visiblePageCtaLink, visiblePageCtaFinal, visibleCtaUpdateStatus,
-        })
+        console.error(`${params.logPrefix} POST-FIRST PROMOTE exception; continuing visible post/comment`, JSON.stringify({
+            error: e instanceof Error ? e.message : String(e),
+        }))
+        promotedAdCtaFinal = false
+        adId = ''
     }
 
     // COMMENT — same final link on the visible (Phase A) post, as the Page. Delivery honors
@@ -28841,15 +28831,11 @@ async function runOneCardPostFirstAds(params: {
         ok: true,
         storyId, confirmedPostId, fbReelUrl, videoId, adId,
         ctaShortlink: finalLink, ctaSub2: remint.sub2, ctaSub3: remint.sub3,
-        // Parity holds for the comment + visible post final link (re-minted with the post id).
-        // No Worker redirect is ever reported as visible CTA.
+        // Parity holds for the comment + promoted ad final CTA (re-minted with the post id).
         ctaParity: !!finalLink && remint.reminted,
-        // There is no separate /promote step now: the ad's creative carries the INITIAL Shopee
-        // link, while the FINAL post-specific link lives on the VISIBLE post (and comment). So the
-        // ad creative is NOT the final-link source — report false and use visiblePageCtaFinal.
-        promotedAdCtaFinal: false,
-        // The visible page CTA report reflects the bridge /update-cta read-back (verified parity);
-        // reaching this return means it was confirmed final before the story was published.
+        promotedAdCtaFinal: !!adId && !!finalLink && remint.reminted,
+        // The visible page CTA report mirrors bridge /promote's visible-page value. /promote does
+        // not update the organic page post CTA, so this should normally remain false/null.
         visiblePageCtaLink,
         visiblePageCtaFinal,
         visiblePageCtaCommentParity: visiblePageCtaFinal && visiblePageCtaLink === finalLink,
