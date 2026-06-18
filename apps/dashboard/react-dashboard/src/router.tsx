@@ -8,6 +8,7 @@ import { ProcessingPage } from '@/routes/processing'
 import { PagePostsPage } from '@/routes/page-posts'
 import { CustomLinkPage } from '@/routes/custom-link'
 import { CampaignsPage } from '@/routes/campaigns'
+import { CreatePostPage } from '@/routes/create-post'
 import { CreateAdsPage } from '@/routes/create-ads'
 import { QueuePage } from '@/routes/queue'
 import { HistoryPage } from '@/routes/history'
@@ -60,6 +61,7 @@ const pagePostsRoute = page('/page-posts', PagePostsPage)
 const pagePostsAliasRoute = page('/page_posts', PagePostsPage)
 const customLinkRoute = page('/custom-link', CustomLinkPage)
 const campaignsRoute = page('/campaigns', CampaignsPage)
+const createPostRoute = page('/create-post', CreatePostPage)
 const createAdsRoute = page('/create-ads', CreateAdsPage)
 const queueRoute = page('/queue', QueuePage)
 const historyRoute = page('/history', HistoryPage)
@@ -76,6 +78,7 @@ const routeTree = rootRoute.addChildren([
   pagePostsAliasRoute,
   customLinkRoute,
   campaignsRoute,
+  createPostRoute,
   createAdsRoute,
   queueRoute,
   historyRoute,

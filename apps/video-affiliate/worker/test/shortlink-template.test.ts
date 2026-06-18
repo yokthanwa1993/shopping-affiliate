@@ -186,6 +186,45 @@ test('buildPostingCommentShortlinkSubIds accepts a bare post id for sub2', () =>
     assert.equal(subs.postSubId3, '1008898512617594')
 })
 
+test('cron CloakBridge re-mint produces the expected utm_content tail shape (CHEARB live bug)', () => {
+    // Regression for the cron stored-token→CloakBridge comment path: it used to comment
+    // the pre-publish shortlink, whose request carried blank sub2/sub3, resolving to
+    // utm_content=16JUN26FBSPCAD---- (no post/page tail). After the fix the branch first
+    // re-mints with buildPostingCommentShortlinkSubIds(confirmedCanonicalPostId, pageId),
+    // so the minted request carries sub2=post id / sub3=page id and the resolved
+    // utm_content becomes <prefix>-<postId>-<pageId>--.
+    const pageId = '1008898512617594'
+    const fbPostId = '1305950258376336'
+    const storyId = `${pageId}_${fbPostId}`
+    const campaignPrefix = '16JUN26FBSPCAD'
+
+    const subs = buildPostingCommentShortlinkSubIds({
+        canonicalPostId: storyId,
+        pageId,
+        logPrefix: 'CRON STORED→CLOAK COMMENT-SHORTLINK',
+    })
+    // The re-mint request the cron branch now sends (mirrors shortenShopeeLinkForNamespace
+    // override resolution: sub2/sub3 come from the post-time overrides).
+    const mintRequest = buildShortlinkRequestUrlFromTemplate(SHOPEE_URL_TEMPLATE, PRODUCT_URL, {
+        sub1: campaignPrefix,
+        sub2: subs.postSubId2,
+        sub3: subs.postSubId3,
+        sub4: subs.postSubId4,
+        sub5: '',
+    })
+    assert.match(mintRequest, new RegExp(`sub2=${fbPostId}(&|$)`), 'minted request must carry the post id as sub2')
+    assert.match(mintRequest, new RegExp(`sub3=${pageId}(&|$)`), 'minted request must carry the page id as sub3')
+    assert.doesNotMatch(mintRequest, /sub2=&/, 'sub2 must not be blank after re-mint')
+    assert.doesNotMatch(mintRequest, /sub3=&/, 'sub3 must not be blank after re-mint')
+
+    // The customlink resolver concatenates the populated subs into the expected
+    // utm_content tail: <prefix>-<postId>-<pageId>-- (sub4 empty → trailing --).
+    const expectedUtmContent = `${campaignPrefix}-${subs.postSubId2}-${subs.postSubId3}--`
+    assert.equal(expectedUtmContent, `${campaignPrefix}-${fbPostId}-${pageId}--`)
+    // And it must NOT collapse to the blank-tail shape seen on the broken live links.
+    assert.notEqual(expectedUtmContent, `${campaignPrefix}----`)
+})
+
 test('buildPostingCommentShortlinkSubIds leaves sub2 empty when no post id is known', () => {
     // When story_id is missing the caller must fall back (no fake sub2). The OneCard
     // re-mint helper treats an empty sub2 as "do not re-mint" and keeps the original link.

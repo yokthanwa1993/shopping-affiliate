@@ -1,76 +1,108 @@
 import { useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { fetchGallery, galleryThumbSrc, type GalleryVideo } from '@/api/gallery'
-import { fetchPageVideos, type PageVideoItem } from '@/api/pagePosts'
-import { DEFAULT_PAGE_ID, DEFAULT_PAGE_NAME } from '@/api/client'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import { AlertTriangle, ArrowLeft, Check, Copy, ExternalLink, Info } from 'lucide-react'
+import { fetchGallery } from '@/api/gallery'
+import { fetchPageVideos } from '@/api/pagePosts'
+import { fetchSettingsPages, type SettingsPage } from '@/api/settings'
+import {
+  DASHBOARD_AD_CREATE_READY,
+  createAdOnly,
+  enqueueAdOnly,
+  defaultDailyCampaignName,
+  fetchAdHistory,
+  galleryToAdSource,
+  pagePostToAdSource,
+  type AdOnlyMode,
+  type AdSourceCandidate,
+  type CreateAdOnlyResult,
+  type EnqueueAdOnlyResult,
+} from '@/api/createAds'
+import { fetchAdOnlyInterval, setAdOnlyInterval } from '@/api/adQueue'
 import { formatCompactViews, formatThaiDateTime } from '@/lib/format'
+import { PagePicker, graphPageImageUrl } from '@/components/PagePicker'
+import { PageHealthCard } from '@/components/PageHealthCard'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 
-// Create Ads — full parity port of the Svelte CreateAdsPanel. Like the Svelte
-// panel, this page is read-only: it lists ready gallery clips and high-view page
-// posts, then lets the operator copy a System Video ID to drive ad creation in
-// the downstream tool. No ad-creation request is issued from here (the Svelte
-// panel never POSTed either — the actual enqueue happens from the Page Posts /
-// Gallery actions and the external Electron / Feed Ad extension). Reuses the
-// same read-only GET endpoints and Zod-typed clients as the rest of the app.
+// Create Ads — action-first, AD-ONLY, master-detail (mirrors Create Post).
+//
+// MASTER: no page is auto-selected; the operator first lands on a full-bleed,
+// scalable page list. DETAIL: tapping a page opens an ad-only settings screen
+// scoped to that page (health/defaults, pick an existing input, ad settings,
+// submit, ad-only history) with a back/"เปลี่ยนเพจ" affordance to the list.
+//
+// The AD-ONLY invariant is unchanged: the operator picks an EXISTING page
+// post/story or an existing video as the ad input. Creating an ad must never
+// publish a new post, so this page issues no post/publish request and calls no
+// mixed post+ad endpoint. Submit goes only through the dedicated ad-only Worker
+// endpoint (api/createAds.ts → POST /api/dashboard/create-ad-only) and the proof
+// panel/history read from dashboard_ad_history.
 
-type Candidate = {
-  source: 'gallery' | 'page-post'
-  refId: string
-  title: string
-  thumb: string
-  linkUrl: string
-  postedAt: string
-  views: number
+function SectionLabel({ step, title, hint }: { step: number; title: string; hint?: string }) {
+  return (
+    <div className="flex items-baseline gap-2">
+      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
+        {step}
+      </span>
+      <h2 className="text-base font-semibold tracking-tight">{title}</h2>
+      {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
+    </div>
+  )
 }
 
-function galleryToCandidate(video: GalleryVideo): Candidate | null {
-  if (!video.id) return null
-  return {
-    source: 'gallery',
-    refId: video.id,
-    title: video.title || video.id,
-    thumb: galleryThumbSrc(video),
-    linkUrl: video.publicUrl,
-    postedAt: video.postedAt || video.createdAt,
-    views: 0,
-  }
-}
-
-function pagePostToCandidate(item: PageVideoItem): Candidate | null {
-  const sys = (item.systemVideoId ?? '').trim()
-  const fb = (item.videoId ?? '').trim()
-  const refId = sys || (fb ? `FB:${fb}` : '')
-  if (!refId) return null
-  return {
-    source: 'page-post',
-    refId,
-    title: (item.videoTitle ?? '').trim() || refId,
-    thumb: (item.facebookThumb ?? item.videoThumb ?? '').trim(),
-    linkUrl: (item.postUrl ?? item.videoUrl ?? '').trim(),
-    postedAt: (item.postedAt ?? item.createdAt ?? '').trim(),
-    views: typeof item.views === 'number' ? item.views : 0,
-  }
+function CopyId({
+  label,
+  value,
+  copied,
+  onCopy,
+}: {
+  label: string
+  value: string
+  copied: boolean
+  onCopy: (value: string) => void
+}) {
+  if (!value) return null
+  return (
+    <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-2.5 py-1.5">
+      <div className="min-w-0 flex-1">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">{label}</p>
+        <p className="truncate font-mono text-xs font-bold">{value}</p>
+      </div>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className="h-7 shrink-0 gap-1 px-2 text-[10px]"
+        onClick={() => onCopy(value)}
+      >
+        {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+        {copied ? 'คัดลอกแล้ว' : 'คัดลอก'}
+      </Button>
+    </div>
+  )
 }
 
 function CandidateCard({
   item,
-  copied,
-  onCopy,
+  selected,
+  onSelect,
 }: {
-  item: Candidate
-  copied: boolean
-  onCopy: (value: string) => void
+  item: AdSourceCandidate
+  selected: boolean
+  onSelect: (item: AdSourceCandidate) => void
 }) {
   const [thumbFailed, setThumbFailed] = useState(false)
   return (
-    <article className="overflow-hidden rounded-xl border bg-card shadow-sm transition hover:shadow-md">
-      <a
-        href={item.linkUrl || undefined}
-        target={item.linkUrl ? '_blank' : undefined}
-        rel="noreferrer"
-        className="relative block aspect-[9/16] w-full overflow-hidden bg-muted"
-      >
+    <button
+      type="button"
+      onClick={() => onSelect(item)}
+      aria-pressed={selected}
+      className={`overflow-hidden rounded-xl border bg-card text-left shadow-sm transition hover:shadow-md ${
+        selected ? 'border-primary ring-2 ring-primary' : 'border-border'
+      }`}
+    >
+      <div className="relative aspect-[9/16] w-full overflow-hidden bg-muted">
         {item.thumb && !thumbFailed ? (
           <img
             src={item.thumb}
@@ -93,62 +125,292 @@ function CandidateCard({
           </span>
         ) : null}
         <span className="absolute left-2 top-2 rounded-full bg-background/90 px-2 py-0.5 text-[10px] font-bold text-foreground">
-          {item.source === 'gallery' ? 'แกลลี่' : 'โพสต์เพจ'}
+          {item.kind === 'gallery' ? 'แกลลี่' : 'โพสต์เพจ'}
         </span>
-      </a>
-      <div className="space-y-2 p-3">
+        {selected ? (
+          <span className="absolute bottom-2 right-2 flex h-6 w-6 items-center justify-center rounded-full bg-primary text-primary-foreground">
+            <Check className="h-3.5 w-3.5" />
+          </span>
+        ) : null}
+      </div>
+      <div className="space-y-1 p-2.5">
         <p className="line-clamp-2 text-xs font-medium">{item.title}</p>
-        <div className="rounded-lg border bg-muted/40 p-2">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">System Video ID</p>
-          <div className="mt-1 flex items-center gap-2">
-            <p className="min-w-0 flex-1 truncate text-xs font-bold">{item.refId}</p>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="h-7 shrink-0 px-2 text-[10px]"
-              onClick={() => onCopy(item.refId)}
-            >
-              {copied ? 'คัดลอกแล้ว' : 'คัดลอก'}
-            </Button>
-          </div>
-        </div>
+        {item.storyId ? (
+          <p className="truncate text-[10px] text-muted-foreground">story: {item.storyId}</p>
+        ) : null}
         {item.postedAt ? (
           <p className="text-[10px] text-muted-foreground">{formatThaiDateTime(item.postedAt)}</p>
         ) : null}
       </div>
-    </article>
+    </button>
   )
 }
 
 export function CreateAdsPage() {
-  const [view, setView] = useState<'gallery' | 'page-post'>('gallery')
-  const [copiedRef, setCopiedRef] = useState('')
+  // Master-detail: no page is auto-selected. The operator must pick a page from
+  // the scalable list first; only then does the ad-only detail screen come alive.
+  const [selectedId, setSelectedId] = useState<string>('')
 
+  const pagesQuery = useQuery({
+    queryKey: ['settings-pages'],
+    queryFn: ({ signal }) => fetchSettingsPages(signal),
+  })
+  const pages = pagesQuery.data ?? ([] as SettingsPage[])
+  const selectedPage = pages.find((p) => p.id === selectedId) ?? null
+
+  if (selectedPage) {
+    // DETAIL — ad-only settings scoped to the chosen page, with a back affordance
+    // to return to the page list. Keyed by page id so switching pages resets all
+    // per-page selection/ad-settings state cleanly.
+    return (
+      <div className="mx-auto w-full max-w-lg pb-12 lg:max-w-5xl xl:max-w-6xl">
+        <CreateAdsDetail
+          key={selectedPage.id}
+          page={selectedPage}
+          onBack={() => setSelectedId('')}
+        />
+      </div>
+    )
+  }
+
+  return (
+    // Master (no page selected) breaks out of the shell's p-5 to become
+    // full-bleed: the page-list card fills the whole content rect.
+    <div className="-m-5 flex min-h-full flex-col gap-4 p-4">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">สร้างแอด</h1>
+        <p className="text-sm text-muted-foreground">
+          เลือกเพจ แล้วสร้างแอด<strong>จากโพสต์ที่มีอยู่แล้ว</strong> — ไม่สร้างโพสต์ใหม่ในหน้านี้
+        </p>
+      </div>
+
+      {/* Separation guarantee — explicit, always visible on the master view. */}
+      <div className="flex items-start gap-2 rounded-xl border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+        <Info className="mt-0.5 h-4 w-4 shrink-0" />
+        <div>
+          <p className="font-semibold">หน้านี้สร้างแอดจากโพสต์/สตอรี/วิดีโอที่มีอยู่แล้วเท่านั้น</p>
+          <p className="text-sky-800">
+            ไม่เผยแพร่โพสต์ใหม่ — หากต้องการโพสต์ลงเพจ ให้ไปที่{' '}
+            <Link to="/create-post" className="font-semibold underline">
+              หน้าสร้างโพสต์
+            </Link>
+          </p>
+        </div>
+      </div>
+
+      {/* MASTER — page list first. No ad-only detail renders until a page is chosen. */}
+      <section className="flex min-h-0 flex-1 flex-col gap-3">
+        <p className="flex items-baseline gap-2 text-xs text-muted-foreground">
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
+            1
+          </span>
+          แตะเพจที่ต้องการเพื่อเปิดหน้าตั้งค่าแอดของเพจนั้น
+        </p>
+        <div className="min-h-0 flex-1">
+          <PagePicker
+            pages={pages}
+            selectedId={null}
+            onSelect={(p) => setSelectedId(p.id)}
+            loading={pagesQuery.isLoading}
+            error={pagesQuery.isError}
+            searchable
+            layout="table"
+            fill
+            title="เลือกเพจสำหรับสร้างแอด"
+            actionLabel="เปิดหน้าตั้งค่าแอด"
+          />
+        </div>
+      </section>
+    </div>
+  )
+}
+
+// Ad-only detail screen for a single selected page. All per-page ad state and the
+// createAdOnly mutation live here; the parent only owns page selection. Rendering
+// this only after a page is chosen keeps the page-scoped queries from firing on
+// the master list.
+function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => void }) {
+  const selectedId = page.id
+  const selectedPage = page
+  const [view, setView] = useState<'page-post' | 'gallery'>('page-post')
+  const [selectedInput, setSelectedInput] = useState<AdSourceCandidate | null>(null)
+  const [copiedRef, setCopiedRef] = useState('')
+  const [adResult, setAdResult] = useState<CreateAdOnlyResult | null>(null)
+  const [queueResult, setQueueResult] = useState<EnqueueAdOnlyResult | null>(null)
+
+  // Ad settings — operator-controlled lifecycle/budget/timing. Default to the safe PAUSED review
+  // mode; the operator must deliberately switch to the scheduled/active (spending) mode.
+  const [mode, setMode] = useState<AdOnlyMode>('paused')
+  const [campaignName, setCampaignName] = useState(() => defaultDailyCampaignName())
+  const [dailyBudgetThb, setDailyBudgetThb] = useState(100)
+  const [runHours, setRunHours] = useState(24)
+
+  // Existing high-view page posts for the SELECTED page (page-first).
+  const postsQuery = useQuery({
+    queryKey: ['create-ads', 'page-posts', selectedId],
+    queryFn: ({ signal }) =>
+      fetchPageVideos({ pageId: selectedId, minViews: 100000, limit: 48 }, signal),
+    enabled: !!selectedId,
+  })
+  // Gallery clips remain a valid ad input (existing video, not yet published).
   const galleryQuery = useQuery({
     queryKey: ['create-ads', 'gallery'],
     queryFn: ({ signal }) => fetchGallery('ready', signal),
   })
 
-  const postsQuery = useQuery({
-    queryKey: ['create-ads', 'page-posts'],
-    queryFn: ({ signal }) =>
-      fetchPageVideos({ pageId: DEFAULT_PAGE_ID, minViews: 100000, limit: 48 }, signal),
-  })
-
-  const galleryCandidates = useMemo(
-    () => (galleryQuery.data?.videos ?? []).map(galleryToCandidate).filter((c): c is Candidate => c !== null),
-    [galleryQuery.data],
-  )
   const postCandidates = useMemo(
-    () => (postsQuery.data?.items ?? []).map(pagePostToCandidate).filter((c): c is Candidate => c !== null),
+    () =>
+      (postsQuery.data?.items ?? [])
+        .map(pagePostToAdSource)
+        .filter((c): c is AdSourceCandidate => c !== null),
     [postsQuery.data],
   )
+  const galleryCandidates = useMemo(
+    () =>
+      (galleryQuery.data?.videos ?? [])
+        .map(galleryToAdSource)
+        .filter((c): c is AdSourceCandidate => c !== null),
+    [galleryQuery.data],
+  )
 
-  const active = view === 'gallery' ? galleryCandidates : postCandidates
-  const loading = view === 'gallery' ? galleryQuery.isLoading : postsQuery.isLoading
-  const error = view === 'gallery' ? galleryQuery.error : postsQuery.error
-  const refetching = galleryQuery.isFetching || postsQuery.isFetching
+  const active = view === 'page-post' ? postCandidates : galleryCandidates
+  const loading = view === 'page-post' ? postsQuery.isLoading : galleryQuery.isLoading
+  const error = view === 'page-post' ? postsQuery.error : galleryQuery.error
+  const refetching = postsQuery.isFetching || galleryQuery.isFetching
+
+  // An ad-only input is usable ONLY if it carries an existing story/post/FB-video id. A gallery
+  // clip with just a system video id has no published post to build an ad from, so the submit is
+  // disabled with that exact reason.
+  const adSourceReady = !!(
+    selectedInput && (selectedInput.storyId || selectedInput.postId || selectedInput.fbVideoId)
+  )
+  const adSourceReason = !selectedInput
+    ? 'ยังไม่ได้เลือกอินพุต'
+    : adSourceReady
+      ? ''
+      : 'อินพุตนี้ไม่มี Story ID / Post ID / Facebook Video ID — สร้างแอดจากของที่มีอยู่ไม่ได้ (วิดีโอแกลลี่ที่ยังไม่โพสต์ต้องไปโพสต์ก่อน)'
+
+  // Ad-only audit trail for the selected page — the proof panel.
+  const historyQuery = useQuery({
+    queryKey: ['ad-history', selectedId],
+    queryFn: ({ signal }) => fetchAdHistory({ pageId: selectedId, limit: 10 }, signal),
+    enabled: !!selectedId,
+  })
+
+  // Cadence ("สร้างทุก X นาที") — the operator-set interval the scheduler uses to drain the ad-only
+  // queue. Shared, global setting; editable here and on the คิวสร้างแอด page.
+  const intervalQuery = useQuery({
+    queryKey: ['ad-only-interval'],
+    queryFn: ({ signal }) => fetchAdOnlyInterval(signal),
+  })
+  const [intervalDraft, setIntervalDraft] = useState<number | null>(null)
+  const intervalMinutes = intervalDraft ?? intervalQuery.data ?? 20
+  const intervalMutation = useMutation({
+    mutationFn: (minutes: number) => setAdOnlyInterval(minutes),
+    onSuccess: (saved) => {
+      setIntervalDraft(saved)
+      void intervalQuery.refetch()
+    },
+  })
+
+  const adOnlyInput = (input: AdSourceCandidate) => ({
+    pageId: selectedId,
+    storyId: input.storyId,
+    postId: input.postId,
+    fbVideoId: input.fbVideoId,
+    systemVideoId: input.systemVideoId,
+    shopeeUrl: input.linkUrl,
+    adName: input.systemVideoId || input.refId,
+    mode,
+    dailyCampaignName: campaignName.trim(),
+    dailyBudgetThb,
+    runHours,
+  })
+
+  const createMutation = useMutation({
+    mutationFn: (input: AdSourceCandidate) => createAdOnly(adOnlyInput(input)),
+    onSuccess: (data) => {
+      setAdResult(data)
+      void historyQuery.refetch()
+    },
+    onError: (err) => {
+      setAdResult({ ok: false, error: err instanceof Error ? err.message : 'unknown_error' })
+    },
+  })
+
+  // Add-to-queue — same ad-only contract, but deferred to the cadence scheduler instead of creating
+  // now. The scheduler replays it through create-ad-only (never the page-publish/legacy lanes).
+  const enqueueMutation = useMutation({
+    mutationFn: (input: AdSourceCandidate) => enqueueAdOnly(adOnlyInput(input)),
+    onSuccess: (data) => setQueueResult(data),
+    onError: (err) => {
+      setQueueResult({ ok: false, error: err instanceof Error ? err.message : 'unknown_error' })
+    },
+  })
+
+  const trimmedCampaignName = campaignName.trim()
+  // The scheduled/active mode requires a campaign name (the date-named campaign carries the budget +
+  // schedule). PAUSED review needs none. settingsReason mirrors the worker's fail-closed rule.
+  const settingsReady = mode === 'paused' || !!trimmedCampaignName
+  const settingsReason = settingsReady ? '' : 'โหมดตั้งเวลา/ใช้งานจริงต้องระบุชื่อแคมเปญ (วันที่)'
+
+  function handleCreateAdOnly() {
+    if (!selectedInput || !adSourceReady || !settingsReady) return
+    const isActive = mode === 'active'
+    const sourceLines = [
+      selectedInput.storyId ? `story: ${selectedInput.storyId}` : '',
+      selectedInput.postId ? `post: ${selectedInput.postId}` : '',
+      selectedInput.fbVideoId ? `fb video: ${selectedInput.fbVideoId}` : '',
+    ].filter(Boolean)
+    // Honest, mode-aware confirmation. ACTIVE explicitly states the ad WILL spend; PAUSED states it
+    // will not. Shows page, source, campaign, budget and the run window.
+    const lines = [
+      isActive
+        ? '⚠️ สร้างแอด “ตั้งเวลา/ใช้งานจริง” — แอดนี้จะเริ่มใช้เงินทันทีเมื่อยืนยัน'
+        : 'สร้างแอดแบบ PAUSED (รีวิว) — ยังไม่ใช้เงิน ต้องไปเปิดใช้งานเองใน Ads Manager',
+      'สร้างจากโพสต์/วิดีโอที่มีอยู่ — ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์',
+      '',
+      `เพจ: ${selectedPage?.name || selectedId}`,
+      ...sourceLines,
+      `แคมเปญ: ${trimmedCampaignName || '(พาธ default ของ bridge)'}`,
+      ...(isActive
+        ? [
+            `งบต่อวัน: ${dailyBudgetThb} บาท`,
+            `ช่วงเวลา: เริ่มทันทีเมื่อยืนยัน • รัน ~${runHours} ชม.`,
+          ]
+        : []),
+      '',
+      isActive ? 'ยืนยันสร้างแอดและเริ่มใช้เงิน?' : 'ยืนยันสร้างแอด (PAUSED)?',
+    ]
+    if (!window.confirm(lines.join('\n'))) return
+    setAdResult(null)
+    setQueueResult(null)
+    createMutation.mutate(selectedInput)
+  }
+
+  function handleEnqueueAdOnly() {
+    if (!selectedInput || !adSourceReady || !settingsReady) return
+    const isActive = mode === 'active'
+    // Honest, mode-aware confirmation for the deferred (queued) path. ACTIVE is explicit that the ad
+    // WILL spend once the scheduler creates it; PAUSED stays non-spending.
+    const lines = [
+      `เพิ่มเข้าคิวสร้างแอด — ระบบจะสร้างให้อัตโนมัติ (ทุก ${intervalMinutes} นาที จะหยิบ 1 งาน)`,
+      isActive
+        ? '⚠️ โหมด “ตั้งเวลา/ใช้งานจริง” — เมื่อถึงคิวจะสร้างแอด ACTIVE และเริ่มใช้เงินทันที'
+        : 'โหมด PAUSED (รีวิว) — เมื่อถึงคิวจะสร้างแอดแบบยังไม่ใช้เงิน',
+      'สร้างจากโพสต์/วิดีโอที่มีอยู่ — ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์',
+      '',
+      `เพจ: ${selectedPage?.name || selectedId}`,
+      `แคมเปญ: ${trimmedCampaignName || '(พาธ default ของ bridge)'}`,
+      ...(isActive ? [`งบต่อวัน: ${dailyBudgetThb} บาท · รัน ~${runHours} ชม.`] : []),
+      '',
+      'ยืนยันเพิ่มเข้าคิว?',
+    ]
+    if (!window.confirm(lines.join('\n'))) return
+    setAdResult(null)
+    setQueueResult(null)
+    enqueueMutation.mutate(selectedInput)
+  }
 
   function copy(value: string) {
     if (!value) return
@@ -162,85 +424,478 @@ export function CreateAdsPage() {
   }
 
   return (
-    <div className="mx-auto max-w-6xl space-y-5">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">สร้างแอด</h1>
-        <p className="text-sm text-muted-foreground">
-          เลือกคลิปจากแกลลี่ที่ยังไม่โพสต์ หรือโพสต์เพจที่มียอดวิวสูง แล้วคัดลอกรหัส System Video ID
-          เพื่อนำไปสั่งสร้างแอด — ปลายทางเพจ {DEFAULT_PAGE_NAME}
-        </p>
-      </div>
-
-      <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
-          <Button
-            type="button"
-            size="sm"
-            variant={view === 'gallery' ? 'default' : 'ghost'}
-            onClick={() => setView('gallery')}
-          >
-            แกลลี่พร้อมโพสต์ ({galleryCandidates.length})
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant={view === 'page-post' ? 'default' : 'ghost'}
-            onClick={() => setView('page-post')}
-          >
-            โพสต์เพจยอดวิวสูง ({postCandidates.length})
-          </Button>
-        </div>
+    <div className="space-y-6">
+      {/* Detail header — back/"เปลี่ยนเพจ" affordance + page identity. Returns to
+          the master page list, mirroring the Create Post detail screen. */}
+      <div className="space-y-3">
         <Button
           type="button"
-          variant="outline"
+          variant="ghost"
           size="sm"
-          onClick={() => {
-            void galleryQuery.refetch()
-            void postsQuery.refetch()
-          }}
-          disabled={refetching}
+          onClick={onBack}
+          className="-ml-2 h-8 gap-1.5 px-2 text-muted-foreground"
         >
-          {refetching ? 'กำลังโหลด…' : 'รีเฟรช'}
+          <ArrowLeft className="h-4 w-4" />
+          เปลี่ยนเพจ
         </Button>
-      </div>
-
-      {error ? (
-        <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-          โหลดข้อมูลไม่สำเร็จ: {error instanceof Error ? error.message : 'unknown error'}
-          <div className="mt-1 text-xs text-muted-foreground">
-            หมายเหตุ: ต้องเข้าสู่ระบบแดชบอร์ดก่อนจึงจะดึงข้อมูลได้
+        <div className="flex items-center gap-3">
+          <img
+            src={selectedPage.iconUrl || graphPageImageUrl(selectedPage.id)}
+            alt={selectedPage.name || selectedPage.id}
+            loading="lazy"
+            className="h-12 w-12 shrink-0 rounded-full border bg-muted object-cover"
+          />
+          <div className="min-w-0">
+            <h1 className="truncate text-2xl font-semibold tracking-tight">
+              {selectedPage.name || selectedPage.id}
+            </h1>
+            <p className="truncate font-mono text-xs text-muted-foreground">{selectedPage.id}</p>
           </div>
         </div>
-      ) : null}
+      </div>
 
-      {loading && active.length === 0 ? (
-        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
-          {Array.from({ length: 10 }).map((_, i) => (
-            <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
-          ))}
+      {/* Separation guarantee — explicit, always visible on the detail screen. */}
+      <div className="flex items-start gap-2 rounded-xl border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+        <Info className="mt-0.5 h-4 w-4 shrink-0" />
+        <div>
+          <p className="font-semibold">หน้านี้สร้างแอดจากโพสต์/สตอรี/วิดีโอที่มีอยู่แล้วเท่านั้น</p>
+          <p className="text-sky-800">
+            ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์ — หากต้องการโพสต์ลงเพจ ให้ไปที่{' '}
+            <Link to="/create-post" className="font-semibold underline">
+              หน้าสร้างโพสต์
+            </Link>
+          </p>
         </div>
-      ) : active.length === 0 ? (
-        <p className="rounded-xl border border-dashed p-10 text-center text-sm text-muted-foreground">
-          {view === 'gallery'
-            ? 'ยังไม่มีคลิปในแกลลี่ที่พร้อมโพสต์ — ลองโหลดเพิ่มจากหน้าแกลลี่'
-            : 'ยังไม่มีโพสต์เพจที่มียอดวิวสูง — ลอง sync จากหน้าโพสต์เพจ'}
-        </p>
-      ) : (
-        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
-          {active.map((item) => (
-            <CandidateCard
-              key={item.refId}
-              item={item}
-              copied={copiedRef === item.refId}
-              onCopy={copy}
-            />
-          ))}
-        </div>
-      )}
+      </div>
 
-      <p className="text-xs text-muted-foreground">
-        คัดลอกรหัสจากบัตรแล้วใช้ในเครื่องมือสร้างแอด หรือกดสร้างแอดจากแท็บโพสต์เพจ/แกลลี่เพื่อเข้าคิวอัตโนมัติ
-      </p>
+      {/* Step 1 — ad-relevant page defaults. */}
+      <section className="space-y-3">
+        <SectionLabel step={1} title="ค่าตั้งต้นแอดของเพจ" hint="ข้อมูลอ้างอิง ไม่ใช่การสร้างแอด" />
+        <PageHealthCard pageId={selectedId} variant="ads" />
+      </section>
+
+      {/* Step 2 — pick an existing input. */}
+      <section className="space-y-3">
+        <SectionLabel step={2} title="เลือกอินพุตจากของที่มีอยู่" hint="โพสต์/สตอรี หรือวิดีโอเดิม" />
+            <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={view === 'page-post' ? 'default' : 'ghost'}
+                  onClick={() => setView('page-post')}
+                >
+                  โพสต์เพจที่มีอยู่ ({postCandidates.length})
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={view === 'gallery' ? 'default' : 'ghost'}
+                  onClick={() => setView('gallery')}
+                >
+                  วิดีโอแกลลี่ ({galleryCandidates.length})
+                </Button>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  void postsQuery.refetch()
+                  void galleryQuery.refetch()
+                }}
+                disabled={refetching}
+              >
+                {refetching ? 'กำลังโหลด…' : 'รีเฟรช'}
+              </Button>
+            </div>
+
+            {error ? (
+              <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+                โหลดข้อมูลไม่สำเร็จ: {error instanceof Error ? error.message : 'unknown error'}
+                <div className="mt-1 text-xs text-muted-foreground">
+                  หมายเหตุ: ต้องเข้าสู่ระบบแดชบอร์ดก่อนจึงจะดึงข้อมูลได้
+                </div>
+              </div>
+            ) : null}
+
+            {loading && active.length === 0 ? (
+              <div className="grid gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+                {Array.from({ length: 10 }).map((_, i) => (
+                  <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
+                ))}
+              </div>
+            ) : active.length === 0 ? (
+              <p className="rounded-xl border border-dashed p-10 text-center text-sm text-muted-foreground">
+                {view === 'page-post'
+                  ? 'ยังไม่มีโพสต์เพจที่มียอดวิวสูงสำหรับเพจนี้ — ลอง sync จากหน้าโพสต์เพจ'
+                  : 'ยังไม่มีวิดีโอในแกลลี่ที่พร้อมใช้ — ลองโหลดเพิ่มจากหน้าแกลลี่'}
+              </p>
+            ) : (
+              <div className="grid gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
+                {active.map((item) => (
+                  <CandidateCard
+                    key={item.refId}
+                    item={item}
+                    selected={selectedInput?.refId === item.refId}
+                    onSelect={(it) => {
+                      setSelectedInput(it)
+                      setAdResult(null)
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* Step 3 — selected input summary + ad-only action (pending). */}
+          <section className="space-y-3">
+            <SectionLabel step={3} title="สรุปอินพุตและสร้างแอด" hint="แอดจากโพสต์ที่มีอยู่แล้ว" />
+            {!selectedInput ? (
+              <p className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
+                ยังไม่ได้เลือกอินพุต — เลือกการ์ดด้านบนหนึ่งใบเพื่อใช้เป็นต้นทางของแอด
+              </p>
+            ) : (
+              <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <Badge variant="secondary">{selectedPage.name || selectedPage.id}</Badge>
+                  <Badge variant="outline">
+                    {selectedInput.kind === 'gallery' ? 'ต้นทาง: วิดีโอแกลลี่' : 'ต้นทาง: โพสต์เพจที่มีอยู่'}
+                  </Badge>
+                  <span className="min-w-0 truncate text-muted-foreground">{selectedInput.title}</span>
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <CopyId
+                    label="System Video ID"
+                    value={selectedInput.systemVideoId}
+                    copied={copiedRef === selectedInput.systemVideoId}
+                    onCopy={copy}
+                  />
+                  <CopyId
+                    label="Story ID (โพสต์ที่มีอยู่)"
+                    value={selectedInput.storyId}
+                    copied={copiedRef === selectedInput.storyId}
+                    onCopy={copy}
+                  />
+                  <CopyId
+                    label="Facebook Video ID"
+                    value={selectedInput.fbVideoId}
+                    copied={copiedRef === selectedInput.fbVideoId}
+                    onCopy={copy}
+                  />
+                  <CopyId
+                    label="Post ID"
+                    value={selectedInput.postId}
+                    copied={copiedRef === selectedInput.postId}
+                    onCopy={copy}
+                  />
+                </div>
+
+                {selectedInput.linkUrl ? (
+                  <a
+                    href={selectedInput.linkUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-xs font-semibold underline"
+                  >
+                    เปิดโพสต์/วิดีโอต้นทาง <ExternalLink className="h-3 w-3" />
+                  </a>
+                ) : null}
+
+                {/* Ad settings — operator-controlled lifecycle, campaign date/name, budget and run
+                    window. Default is the safe PAUSED review mode; the operator must deliberately
+                    switch to the scheduled/active (spending) mode. */}
+                <div className="space-y-3 rounded-xl border bg-muted/30 p-3">
+                  <div className="flex items-baseline gap-2">
+                    <h3 className="text-sm font-semibold">ตั้งค่าแอด</h3>
+                    <span className="text-xs text-muted-foreground">โหมด งบ และเวลา</span>
+                  </div>
+
+                  {/* Mode — explicit PAUSED (review) vs ACTIVE (spends). */}
+                  <div className="inline-flex items-center gap-1 rounded-lg bg-background p-1">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={mode === 'paused' ? 'default' : 'ghost'}
+                      onClick={() => setMode('paused')}
+                    >
+                      PAUSED (รีวิว)
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={mode === 'active' ? 'default' : 'ghost'}
+                      onClick={() => setMode('active')}
+                    >
+                      ตั้งเวลา/ใช้งานจริง
+                    </Button>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <label className="space-y-1">
+                      <span className="block text-xs font-medium text-muted-foreground">ชื่อแคมเปญ (วันที่)</span>
+                      <input
+                        type="text"
+                        value={campaignName}
+                        onChange={(e) => setCampaignName(e.target.value)}
+                        placeholder="18/Jun/2026"
+                        className="w-full rounded-lg border bg-background px-2.5 py-1.5 text-sm"
+                      />
+                    </label>
+                    <label className="space-y-1">
+                      <span className="block text-xs font-medium text-muted-foreground">งบต่อวัน (บาท)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100000}
+                        value={dailyBudgetThb}
+                        disabled={mode !== 'active'}
+                        onChange={(e) => setDailyBudgetThb(Math.max(1, Math.round(Number(e.target.value) || 0)))}
+                        className="w-full rounded-lg border bg-background px-2.5 py-1.5 text-sm disabled:opacity-50"
+                      />
+                    </label>
+                    <label className="space-y-1">
+                      <span className="block text-xs font-medium text-muted-foreground">รัน (ชั่วโมง)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={720}
+                        value={runHours}
+                        disabled={mode !== 'active'}
+                        onChange={(e) => setRunHours(Math.max(1, Math.round(Number(e.target.value) || 0)))}
+                        className="w-full rounded-lg border bg-background px-2.5 py-1.5 text-sm disabled:opacity-50"
+                      />
+                    </label>
+                  </div>
+
+                  {mode === 'active' ? (
+                    <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>
+                        โหมดนี้จะสร้างแอด <strong>ACTIVE</strong> และเริ่มใช้เงินทันที — เริ่มเมื่อยืนยัน, รัน ~{runHours} ชม.,
+                        งบ {dailyBudgetThb} บาท/วัน, แคมเปญ “{trimmedCampaignName || '—'}”
+                      </span>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      แอดจะถูกสร้างแบบ <strong>PAUSED</strong> (ยังไม่ใช้เงิน) — งบ/เวลาใช้เมื่อเปิดใช้งานเองใน Ads Manager
+                    </p>
+                  )}
+
+                  {/* Cadence — "สร้างทุก X นาที", like the old queue system. Used by the scheduler to
+                      drain the AD-ONLY queue (separate from page publish). */}
+                  <div className="flex flex-wrap items-end gap-2 border-t pt-3">
+                    <label className="space-y-1">
+                      <span className="block text-xs font-medium text-muted-foreground">รอบการสร้างจากคิว (สร้างทุก … นาที)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1440}
+                        value={intervalMinutes}
+                        onChange={(e) => setIntervalDraft(Math.max(1, Math.min(1440, Math.round(Number(e.target.value) || 0))))}
+                        className="w-28 rounded-lg border bg-background px-2.5 py-1.5 text-sm"
+                      />
+                    </label>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => intervalMutation.mutate(intervalMinutes)}
+                      disabled={intervalMutation.isPending}
+                    >
+                      {intervalMutation.isPending ? 'กำลังบันทึก…' : 'บันทึกรอบเวลา'}
+                    </Button>
+                    <span className="text-[11px] text-muted-foreground">
+                      ระบบจะหยิบงานในคิวมาสร้าง 1 งานทุกๆ {intervalMinutes} นาที — แยกจากการเผยแพร่หน้าเพจโดยสิ้นเชิง
+                    </span>
+                  </div>
+                </div>
+
+                {/* Ad-only action. Calls ONLY createAdOnly() (POST /api/dashboard/create-ad-only)
+                    — never the legacy mixed create-ad or the ad-queue endpoints. Disabled with the
+                    exact reason when the input lacks an existing story/post/FB-video id. */}
+                <div className="flex flex-wrap items-center gap-3 border-t pt-3">
+                  <Button
+                    type="button"
+                    onClick={handleCreateAdOnly}
+                    disabled={!adSourceReady || !settingsReady || createMutation.isPending || enqueueMutation.isPending}
+                    title={adSourceReason || settingsReason || 'สร้างแอดจากโพสต์ที่มีอยู่'}
+                  >
+                    {createMutation.isPending
+                      ? 'กำลังสร้างแอด…'
+                      : mode === 'active'
+                        ? 'สร้างเลย + เริ่มใช้เงิน'
+                        : 'สร้างเลย (PAUSED)'}
+                  </Button>
+                  {/* Defer to the cadence queue — same ad-only contract, created later by the
+                      scheduler (สร้างทุก X นาที). Never the page-publish/legacy lanes. */}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={handleEnqueueAdOnly}
+                    disabled={!adSourceReady || !settingsReady || createMutation.isPending || enqueueMutation.isPending}
+                    title={adSourceReason || settingsReason || `เพิ่มเข้าคิว — สร้างอัตโนมัติทุก ${intervalMinutes} นาที`}
+                  >
+                    {enqueueMutation.isPending ? 'กำลังเพิ่มเข้าคิว…' : `เพิ่มเข้าคิว (ทุก ${intervalMinutes} นาที)`}
+                  </Button>
+                  {adSourceReason ? (
+                    <span className="text-xs text-amber-700">{adSourceReason}</span>
+                  ) : settingsReason ? (
+                    <span className="text-xs text-amber-700">{settingsReason}</span>
+                  ) : !DASHBOARD_AD_CREATE_READY ? (
+                    <span className="text-xs text-muted-foreground">
+                      การสร้างแอดแบบแยกฝั่ง (ad-only) ยังไม่เปิดใช้งาน — กดเพื่อดูเหตุผลที่ชัดเจน
+                      หรือคัดลอก ID ไปสร้างแอดในเครื่องมือภายนอก
+                    </span>
+                  ) : mode === 'active' ? (
+                    <span className="text-xs text-amber-700">
+                      สร้างแอด <strong>ACTIVE</strong> จากโพสต์ที่มีอยู่ — <strong>เริ่มใช้เงินทันที</strong>
+                      ตามงบ/เวลาที่ตั้งไว้ ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      สร้างแอดจากโพสต์ที่มีอยู่ — แอดจะถูกสร้างแบบ <strong>PAUSED</strong> (ยังไม่ใช้เงิน)
+                      ไม่เผยแพร่โพสต์ใหม่ ต้องไปเปิดใช้งานเองใน Ads Manager
+                    </span>
+                  )}
+                </div>
+
+                {/* Result proof — the honest outcome of the ad-only call. */}
+                {adResult ? (
+                  <div
+                    className={`space-y-2 rounded-xl border px-4 py-3 text-sm ${
+                      adResult.ok
+                        ? 'border-emerald-300 bg-emerald-50 text-emerald-900'
+                        : 'border-amber-300 bg-amber-50 text-amber-900'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 font-semibold">
+                      {adResult.ok ? <Check className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+                      {adResult.ok
+                        ? `สร้างแอดสำเร็จ${adResult.ad_status ? ` (${adResult.ad_status})` : ''}`
+                        : `ยังสร้างแอดไม่ได้: ${adResult.error || 'unknown_error'}`}
+                    </div>
+                    {adResult.ok && (adResult.ad_status === 'PAUSED' || adResult.paused) ? (
+                      <p className="text-xs">แอดถูกสร้างแบบ PAUSED (ยังไม่ใช้เงิน) — เปิดใช้งานเองใน Ads Manager</p>
+                    ) : adResult.ok && adResult.ad_status === 'ACTIVE' ? (
+                      <p className="text-xs">
+                        แอด <strong>ACTIVE</strong> — กำลังใช้เงินตามงบ/เวลาที่ตั้งไว้
+                        {adResult.start_time ? ` • เริ่ม ${adResult.start_time}` : ''}
+                        {adResult.end_time ? ` • สิ้นสุด ${adResult.end_time}` : ''}
+                      </p>
+                    ) : null}
+                    {adResult.reason ? <p className="text-xs">{adResult.reason}</p> : null}
+                    {adResult.detail ? <p className="text-xs">{adResult.detail}</p> : null}
+                    {adResult.missing_bridge_fields && adResult.missing_bridge_fields.length > 0 ? (
+                      <div className="text-xs">
+                        <p className="font-semibold">สิ่งที่ bridge ยังขาด (ส่งให้ Hermes):</p>
+                        <ul className="ml-4 list-disc">
+                          {adResult.missing_bridge_fields.map((f, i) => (
+                            <li key={i} className="font-mono">{f}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                    {adResult.ad_id || adResult.adset_id || adResult.effective_object_story_id ? (
+                      <div className="grid gap-1 text-xs font-mono">
+                        {adResult.ad_id ? <span>ad_id: {adResult.ad_id}</span> : null}
+                        {adResult.adset_id ? <span>adset_id: {adResult.adset_id}</span> : null}
+                        {adResult.campaign_id ? (
+                          <span>campaign_id: {adResult.campaign_id}{adResult.campaign_status ? ` (${adResult.campaign_status})` : ''}</span>
+                        ) : null}
+                        {adResult.campaign_name ? <span>campaign: {adResult.campaign_name}</span> : null}
+                        {adResult.daily_budget ? <span>daily_budget: {adResult.daily_budget} (หน่วยย่อย)</span> : null}
+                        {adResult.effective_object_story_id ? (
+                          <span>effective_object_story_id: {adResult.effective_object_story_id}</span>
+                        ) : null}
+                        {adResult.click_link ? <span>click_link: {adResult.click_link}</span> : null}
+                      </div>
+                    ) : null}
+                    {typeof adResult.history_id === 'number' && adResult.history_id > 0 ? (
+                      <p className="text-[11px] text-muted-foreground">
+                        บันทึกในประวัติแอด #{adResult.history_id}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {/* Enqueue outcome — added to the cadence queue (or the reason it was refused). */}
+                {queueResult ? (
+                  <div
+                    className={`space-y-1 rounded-xl border px-4 py-3 text-sm ${
+                      queueResult.ok
+                        ? 'border-sky-300 bg-sky-50 text-sky-900'
+                        : 'border-amber-300 bg-amber-50 text-amber-900'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 font-semibold">
+                      {queueResult.ok ? <Check className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+                      {queueResult.ok
+                        ? `เพิ่มเข้าคิวแล้ว${queueResult.queue_id ? ` #${queueResult.queue_id}` : ''}`
+                        : `เพิ่มเข้าคิวไม่ได้: ${queueResult.error || 'unknown_error'}`}
+                    </div>
+                    {queueResult.ok ? (
+                      <p className="text-xs">
+                        โหมด {queueResult.mode === 'active' ? 'ACTIVE (ใช้เงิน)' : 'PAUSED (รีวิว)'}
+                        {typeof queueResult.queued_count === 'number' ? ` · ในคิว ${queueResult.queued_count} งาน` : ''}
+                        {queueResult.next_run_at ? ` · รันถัดไป ${formatThaiDateTime(queueResult.next_run_at)}` : ''}
+                        {' '}— <Link to="/queue" className="font-semibold underline">ดูคิวสร้างแอด</Link>
+                      </p>
+                    ) : queueResult.detail ? (
+                      <p className="text-xs">{queueResult.detail}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            )}
+
+            {/* Ad-only history proof panel — separate audit trail (dashboard_ad_history), never
+                post_history. */}
+            <div className="space-y-2 rounded-xl border bg-card p-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold">ประวัติการสร้างแอด (ad-only)</h3>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void historyQuery.refetch()}
+                  disabled={historyQuery.isFetching}
+                >
+                  {historyQuery.isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
+                </Button>
+              </div>
+              {historyQuery.isLoading ? (
+                <p className="text-xs text-muted-foreground">กำลังโหลดประวัติ…</p>
+              ) : (historyQuery.data ?? []).length === 0 ? (
+                <p className="text-xs text-muted-foreground">ยังไม่มีประวัติการสร้างแอดสำหรับเพจนี้</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {(historyQuery.data ?? []).map((h) => (
+                    <div
+                      key={h.id}
+                      className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border bg-muted/30 px-3 py-2 text-xs"
+                    >
+                      <Badge variant={h.status === 'created' ? 'default' : 'outline'}>{h.status}</Badge>
+                      {h.mode ? (
+                        <Badge variant={h.mode === 'active' ? 'destructive' : 'secondary'}>
+                          {h.mode === 'active' ? 'ACTIVE' : 'PAUSED'}
+                        </Badge>
+                      ) : null}
+                      <span className="text-muted-foreground">{formatThaiDateTime(h.completed_at || h.created_at)}</span>
+                      {h.campaign_name ? <span className="font-mono">camp: {h.campaign_name}</span> : null}
+                      {h.daily_budget ? <span className="font-mono">งบ: {h.daily_budget}</span> : null}
+                      {h.run_hours ? <span className="font-mono">{h.run_hours} ชม.</span> : null}
+                      {h.source_story_id ? <span className="font-mono">story: {h.source_story_id}</span> : null}
+                      {h.fb_video_id ? <span className="font-mono">fb: {h.fb_video_id}</span> : null}
+                      {h.ad_id ? <span className="font-mono">ad: {h.ad_id}</span> : null}
+                      {h.error_message ? <span className="text-amber-700">{h.error_message}</span> : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
     </div>
   )
 }

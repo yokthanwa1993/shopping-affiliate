@@ -490,31 +490,110 @@ async function pageComment(fetchImpl, params = {}) {
   return { ok: true, status: 200, id: String(data.id), page_id: pageId, page_name: info.pageName, author_expected: 'page' };
 }
 
+// Token-free readback that a story is ACTUALLY on the page feed: a published page post reports
+// is_published:true (and exposes a permalink_url). Used to CONFIRM a publish whose POST returned a
+// Graph error (a "transient" error like code 1 / "please reduce the amount of data" sometimes still
+// publishes, but must never be ASSUMED to have — that assumption is exactly how a post that never
+// appeared got recorded as a success). Returns { published, permalinkUrl }; published is false on
+// any error/ambiguity so we fail closed. The page token is used only against Graph, never returned.
+async function readbackStoryPublished(fetchImpl, { pageToken, storyId }) {
+  try {
+    const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(storyId)}?fields=is_published,permalink_url&access_token=${encodeURIComponent(pageToken)}`);
+    if (!rb || !rb.data || rb.data.error) return { published: false, permalinkUrl: '' };
+    const permalinkUrl = rb.data.permalink_url ? String(rb.data.permalink_url) : '';
+    return { published: rb.data.is_published === true, permalinkUrl };
+  } catch {
+    return { published: false, permalinkUrl: '' };
+  }
+}
+
+// Facebook returns misleading GENERIC messages for momentary backend hiccups on the page-publish
+// POST — most prominently code 1 / "Please reduce the amount of data you're asking for, then retry
+// your request" — and the SAME request commonly succeeds seconds later (the Worker classifies these
+// identically in isTransientFacebookPublishError, with live FAIL→SUCCESS-on-retry history). So an
+// errored publish is RETRIED (not abandoned) before we fail closed.
+function isRetryablePublishError(error) {
+  const code = Number(error && error.code);
+  const message = String((error && error.message) || '').toLowerCase();
+  if (
+    message.includes('please reduce the amount of data') ||
+    message.includes('please try again') ||
+    message.includes('temporarily unavailable') ||
+    message.includes('an unknown error occurred') ||
+    message.includes('service temporarily unavailable')
+  ) return true;
+  // Meta's generic OAuthException (code 1) on this publish endpoint is the live-observed transient
+  // shape; it is retryable (a HARD error like permission/code 200/190 is not, and fails closed).
+  return code === 1;
+}
+
 // Publish a dark story (effective_object_story_id) to the page feed using the PAGE token.
 // Shared by createAd (step 8.5) and the post-first skip_ad early return. Fails soft:
 // returns { publishedToPage:false, publishError } rather than throwing, and never uses the
 // user token to publish (page token only, resolved internally).
-function isTransientPublishStoryError(error) {
-  const code = Number(error && error.code);
-  const message = String((error && error.message) || '').toLowerCase();
-  return code === 1 || message.includes('please reduce the amount of data');
-}
-
-async function publishStoryToPage(fetchImpl, { userToken, pageId, storyId }) {
+//
+// A Graph ERROR on the publish POST is NEVER trusted as success on its own. Previously code 1 /
+// "please reduce the amount of data" was treated as published, which let the visible-post-missing
+// incident be recorded as a success. Now the publish is RETRIED on transient errors, and is only
+// reported as published when a token-free is_published readback CONFIRMS the post is actually on the
+// page feed; otherwise it fails closed with publishedToPage:false and an actionable publish_error.
+//
+// `pollMs` scales the retry backoff (0 in tests → no real waiting). `publishAttempts` is the total
+// number of publish POSTs to make (default 4: immediate + 3 retries).
+async function publishStoryToPage(fetchImpl, { userToken, pageId, storyId, sleep = realSleep, pollMs = 3000, publishAttempts = 4 } = {}) {
   try {
     const info = await resolvePageToken(fetchImpl, userToken, pageId);
     if (!info.pageToken) return { publishedToPage: false, publishError: 'page_token_not_found' };
-    const pub = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${storyId}?access_token=${encodeURIComponent(info.pageToken)}`, {
+    const pageToken = info.pageToken;
+    const baseDelay = Number.isFinite(pollMs) && pollMs >= 0 ? pollMs : 3000;
+    const totalAttempts = Number.isInteger(publishAttempts) && publishAttempts > 0 ? publishAttempts : 4;
+
+    const publishOnce = () => gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${storyId}?access_token=${encodeURIComponent(pageToken)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_published: true })
     });
-    if (pub.data && pub.data.error) {
-      const publishError = String(pub.data.error.message || '').substring(0, 200);
-      if (isTransientPublishStoryError(pub.data.error)) {
-        return { publishedToPage: true, publishError, publishWarning: 'publish_story_transient_error_treated_as_success' };
+
+    let lastPublishError = '';
+    let lastError = null;
+    let attemptsMade = 0;
+    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+      if (attempt > 1) await sleep(baseDelay * (attempt - 1)); // escalating backoff: 0, base, 2*base, ...
+      attemptsMade = attempt;
+      const pub = await publishOnce();
+      if (!(pub.data && pub.data.error)) {
+        return { publishedToPage: true, publishError: '', publishAttempts: attemptsMade };
       }
-      return { publishedToPage: false, publishError };
+      lastError = pub.data.error;
+      lastPublishError = String(pub.data.error.message || '').substring(0, 200);
+      // A transient error MAY have still published — confirm via readback before deciding.
+      const rb = await readbackStoryPublished(fetchImpl, { pageToken, storyId });
+      if (rb.published) {
+        return {
+          publishedToPage: true, publishError: lastPublishError, publishAttempts: attemptsMade,
+          publishWarning: 'publish_story_error_but_readback_confirmed_published',
+          ...(rb.permalinkUrl ? { permalink_url: rb.permalinkUrl } : {})
+        };
+      }
+      // A HARD (non-transient) error will not clear on retry — fail closed immediately.
+      if (!isRetryablePublishError(pub.data.error)) {
+        return { publishedToPage: false, publishError: lastPublishError, publishAttempts: attemptsMade };
+      }
     }
-    return { publishedToPage: true, publishError: '' };
+
+    // Retries exhausted. One last readback in case a late-arriving publish landed after the final POST.
+    const finalRb = await readbackStoryPublished(fetchImpl, { pageToken, storyId });
+    if (finalRb.published) {
+      return {
+        publishedToPage: true, publishError: lastPublishError, publishAttempts: attemptsMade,
+        publishWarning: 'publish_story_error_but_readback_confirmed_published',
+        ...(finalRb.permalinkUrl ? { permalink_url: finalRb.permalinkUrl } : {})
+      };
+    }
+    return {
+      publishedToPage: false,
+      publishError: lastPublishError || (lastError && String(lastError.message || '')) || 'publish_failed',
+      publishAttempts: attemptsMade,
+      publishExhaustedRetries: true
+    };
   } catch (e) {
     return { publishedToPage: false, publishError: (e && e.message) || String(e) };
   }
@@ -583,6 +662,17 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
   const extraErrorFields = params.extraErrorFields || {};
   const now = Number.isFinite(params.now) ? params.now : Date.now();
+  // Ad-only / non-spending path. When true, the copied adset (already created status_option:'PAUSED')
+  // and the ad (created status:'PAUSED') are LEFT paused: NO schedule/budget, NO activation, NO
+  // ACTIVE readback. Legacy callers never set this, so the ACTIVE path below is byte-for-byte
+  // unchanged and stays the default.
+  const paused = params.paused === true;
+  // A campaign NEWLY created by this request inherits the ad lifecycle: PAUSED for ad-only (so a
+  // brand-new campaign is never created ACTIVE), ACTIVE for the default path. A REUSED existing
+  // campaign keeps its own status — we never flip an existing campaign. createdCampaignStatus is the
+  // status we created a campaign WITH this request (null when we reused one), surfaced in the result.
+  const campaignCreateStatus = paused ? 'PAUSED' : 'ACTIVE';
+  let createdCampaignStatus = null;
 
   // 5. Resolve / create the campaign.
   const maxAdsetsPerCampaign = 10;
@@ -596,11 +686,19 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   const dailyCampaignName = String(body.daily_campaign_name || body.reuse_campaign_name || '').trim();
   let targetCampaignId = body.campaign_id || null;
   let resolvedCampaignName = '';
-  // Apply the per-adset budget + 24h schedule (below) ONLY for the daily-campaign path. The daily
-  // campaign is created WITHOUT a campaign-level budget so the copied adset keeps its own
-  // daily_budget; the prefix/new_campaign_name campaigns carry a campaign budget (CBO) where an
-  // adset-level budget would be rejected, so they keep the legacy activate-only behavior.
+  // Apply the 24h run-hours schedule (below) ONLY for the daily-campaign path. The daily campaign
+  // now carries a CAMPAIGN-level (CBO) daily_budget — matching the operator's updated Ads Manager
+  // template — so the copied adset must NOT get its own daily_budget (Meta rejects an adset budget
+  // under a CBO campaign). The prefix/new_campaign_name campaigns also carry a campaign budget and
+  // keep the legacy activate-only behavior.
   let usedDailyCampaign = false;
+  // Campaign-level (CBO) daily budget in Meta minor units (THB*100) for the daily-campaign path. The
+  // worker sends it as `campaign_daily_budget`; default 1_000_000 = 10,000 THB/day.
+  const campaignDailyBudget = Number.isInteger(body.campaign_daily_budget) && body.campaign_daily_budget > 0
+    ? body.campaign_daily_budget
+    : 1000000;
+  // The CBO budget actually applied to / read from the daily campaign (reported as campaign_budget).
+  let campaignBudgetMinor = null;
 
   // Read template objective + lifecycle/strategy settings once (campaign-level mirror fields +
   // adset-level customer-lifecycle fields). campaignMirror is spread into every campaign we CREATE;
@@ -665,38 +763,56 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     targetCampaignId = '';
     const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: String(body.new_campaign_name).trim(), objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], daily_budget: '100000', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
+      body: JSON.stringify({ name: String(body.new_campaign_name).trim(), objective: templateObjective, status: campaignCreateStatus, special_ad_categories: [], daily_budget: '100000', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
     });
     if (newCamp.data.error) return { ok: false, step: 'campaign', error: newCamp.data.error.message, fb_error_code: newCamp.data.error.code, fb_error_subcode: newCamp.data.error.error_subcode, fb_trace_id: newCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag() };
     targetCampaignId = newCamp.data.id;
     createdCampaignId = targetCampaignId;
+    createdCampaignStatus = campaignCreateStatus;
     resolvedCampaignName = String(body.new_campaign_name).trim();
     campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
   } else if (!targetCampaignId && dailyCampaignName) {
     // Exact-name reuse within the ad account, scoped to the template objective. CONTAIN narrows
     // the fetch; the exact `name ===` match guarantees we never reuse a different campaign.
     const filtering = encodeURIComponent(JSON.stringify([{ field: 'name', operator: 'CONTAIN', value: dailyCampaignName }]));
-    const search = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}&fields=id,name,status,objective&limit=200&filtering=${filtering}`);
+    const search = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}&fields=id,name,status,objective,daily_budget&limit=200&filtering=${filtering}`);
     const match = ((search.data && search.data.data) || []).find((c) => c.status !== 'DELETED' && String(c.name) === dailyCampaignName && c.objective === templateObjective);
     if (match) {
       targetCampaignId = match.id;
       resolvedCampaignName = String(match.name);
       campaignReuse = 'reused_existing_campaign';
       reusedDailyCampaignId = match.id;
+      // The date-named daily campaign carries the CBO budget shared by every adset created into it.
+      // Read its current daily_budget; ONLY when an explicit campaign_daily_budget was requested AND
+      // differs, update it (never overwrite a reused campaign's budget blindly). Reported as
+      // campaign_budget so history shows the live CBO budget.
+      const curBudget = Number(match.daily_budget);
+      campaignBudgetMinor = Number.isFinite(curBudget) && curBudget > 0 ? curBudget : null;
+      const wantBudget = Number.isInteger(body.campaign_daily_budget) && body.campaign_daily_budget > 0 ? body.campaign_daily_budget : null;
+      if (wantBudget && wantBudget !== campaignBudgetMinor) {
+        const upd = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${match.id}?access_token=${encodeURIComponent(userToken)}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ daily_budget: String(wantBudget) })
+        });
+        // Best-effort: a failed update leaves the existing CBO budget in place rather than blocking
+        // an otherwise-valid ad; campaign_budget then reports the read value.
+        if (!(upd.data && upd.data.error)) campaignBudgetMinor = wantBudget;
+      }
     } else {
-      // Create the daily campaign WITHOUT a campaign-level budget so the copied adset keeps its
-      // own daily_budget (template has daily_budget=10000); a campaign budget would force CBO and
-      // reject the adset-level budget set on activation. Mirror the template campaign's safe
+      // Create the daily campaign WITH the campaign-level (CBO) daily_budget + LOWEST_COST bid
+      // strategy, matching the operator's Ads Manager template. The copied adset therefore must NOT
+      // get its own daily_budget (see "8. schedule" below). Mirror the template campaign's safe
       // lifecycle/strategy fields (campaignMirror) so the daily campaign matches the template.
       const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: dailyCampaignName, objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], ...campaignMirror })
+        body: JSON.stringify({ name: dailyCampaignName, objective: templateObjective, status: campaignCreateStatus, special_ad_categories: [], daily_budget: String(campaignDailyBudget), bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
       });
       if (newCamp.data.error) return { ok: false, step: 'campaign', error: newCamp.data.error.message, fb_error_code: newCamp.data.error.code, fb_error_subcode: newCamp.data.error.error_subcode, fb_trace_id: newCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag() };
       targetCampaignId = newCamp.data.id;
       createdCampaignId = targetCampaignId;
+      createdCampaignStatus = campaignCreateStatus;
       resolvedCampaignName = dailyCampaignName;
       campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
+      campaignBudgetMinor = campaignDailyBudget;
     }
     usedDailyCampaign = true;
   }
@@ -714,11 +830,12 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
       const newCampNum = activeCamps.length + 1;
       const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: campaignPrefix + newCampNum, objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], daily_budget: '100000', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
+        body: JSON.stringify({ name: campaignPrefix + newCampNum, objective: templateObjective, status: campaignCreateStatus, special_ad_categories: [], daily_budget: '100000', bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
       });
       if (newCamp.data.error) return { ok: false, step: 'campaign', error: newCamp.data.error.message, fb_error_code: newCamp.data.error.code, fb_error_subcode: newCamp.data.error.error_subcode, fb_trace_id: newCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag() };
       targetCampaignId = newCamp.data.id;
       createdCampaignId = targetCampaignId;
+      createdCampaignStatus = campaignCreateStatus;
       resolvedCampaignName = campaignPrefix + newCampNum;
       campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
     }
@@ -752,20 +869,22 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     const badDelErr = await deleteEntityQuiet(reusedDailyCampaignId);
     if (badDelErr) recoveryDiag.bad_reused_campaign_cleanup_error = badDelErr;
     else recoveryDiag.cleaned_bad_reused_campaign_id = reusedDailyCampaignId;
-    // Create a fresh duplicate daily campaign (same name/objective/mirror, NO CBO budget so the
-    // copied adset keeps its own daily_budget).
+    // Create a fresh duplicate daily campaign (same name/objective/mirror) WITH the campaign-level
+    // (CBO) daily_budget + LOWEST_COST bid strategy, matching the daily-create path above.
     const freshCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: dailyCampaignName, objective: templateObjective, status: 'ACTIVE', special_ad_categories: [], ...campaignMirror })
+      body: JSON.stringify({ name: dailyCampaignName, objective: templateObjective, status: campaignCreateStatus, special_ad_categories: [], daily_budget: String(campaignDailyBudget), bid_strategy: 'LOWEST_COST_WITHOUT_CAP', ...campaignMirror })
     });
     if (freshCamp.data.error) {
       return { ok: false, step: 'campaign', error: freshCamp.data.error.message, fb_error_code: freshCamp.data.error.code, fb_error_subcode: freshCamp.data.error.error_subcode, fb_trace_id: freshCamp.data.error.fbtrace_id, attempted_objective: templateObjective, ...diag(), ...recoveryDiag };
     }
     targetCampaignId = freshCamp.data.id;
     createdCampaignId = targetCampaignId; // fresh campaign IS deletable on a later failure
+    createdCampaignStatus = campaignCreateStatus;
     campaignReuse = null;
     reusedDailyCampaignId = null;
     campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
+    campaignBudgetMinor = campaignDailyBudget;
     recoveryDiag.retry_campaign_id = targetCampaignId;
     // Retry the copy ONCE into the fresh campaign.
     copy = await copyTemplateAdset(targetCampaignId);
@@ -816,14 +935,14 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   }
   const newAd = adData.id;
 
-  // 8. Schedule/budget (daily-campaign path) → rename + activate → readback-confirm ACTIVE.
+  // 8. Schedule (daily-campaign path) → rename + activate → readback-confirm ACTIVE. The daily
+  // campaign carries the CAMPAIGN-level (CBO) budget, so NO per-adset daily_budget is set here.
   // The adset update response was previously IGNORED, which let a Graph error (live-observed:
   // code=100 subcode=1487057 "Invalid parameter" on an invalid schedule) silently leave the adset
-  // PAUSED while this route reported success. The fix: (a) split the schedule/budget from the
-  // status change, (b) check EVERY response and fail closed (deleting the orphan adset), and
+  // PAUSED while this route reported success. The fix: (a) keep the run-hours schedule on its own
+  // activation POST, (b) check EVERY response and fail closed (deleting the orphan adset), and
   // (c) read the adset back and require status === 'ACTIVE' (a POST can "succeed" yet leave it
   // PAUSED — also live-observed).
-  const adsetDailyBudget = Number.isInteger(body.adset_daily_budget) && body.adset_daily_budget > 0 ? body.adset_daily_budget : 10000;
   const adsetRunHours = Number.isFinite(body.adset_run_hours) && body.adset_run_hours > 0 ? body.adset_run_hours : 24;
   const runMs = Math.round(adsetRunHours * 3600 * 1000);
   let scheduleReport = null;
@@ -837,13 +956,57 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     ? storyIdStr.split('_').slice(1).join('_')
     : storyIdStr;
 
-  // Bangkok offset ISO schedule (daily path only). end_time is sent on the ACTIVATION POST, never
-  // alongside daily_budget — Meta rejects daily_budget + end_time in the same POST (live:
-  // code=100 subcode=1487793). start_time is NEVER sent (a now/past start_time is a known cause of
-  // subcode 1487057). Meta additionally requires end_time >= the COPIED adset's OWN start_time +
-  // the run window; the copy assigns a start_time a few seconds after our local `now`, so an
-  // end_time computed from `now` lands just short and is also rejected as 1487793. So we read the
-  // copied adset's start_time back and compute end_time = that start + adsetRunHours.
+  // PAUSED ad-only path — see `paused` above. The copied adset is already status_option:'PAUSED'
+  // and the ad was created status:'PAUSED'; leave both paused (a non-spending ad). Do a best-effort
+  // adset rename for naming parity (a NAME-only POST — never a status change), clean up the
+  // deep_copy straggler ads (same as the ACTIVE path), and return the known PAUSED statuses. No
+  // budget/schedule POST, no activation POST, no ACTIVE readback — so an ad-only call can never
+  // start spending.
+  if (paused) {
+    try {
+      await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?access_token=${encodeURIComponent(userToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: adsetName })
+      });
+    } catch {}
+    try {
+      const adsList = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}/ads?fields=id&limit=50&access_token=${encodeURIComponent(userToken)}`);
+      const stragglers = ((adsList.data && adsList.data.data) || []).filter((a) => String(a.id) !== String(newAd));
+      for (const a of stragglers) {
+        await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${a.id}?access_token=${encodeURIComponent(userToken)}`, { method: 'DELETE' });
+      }
+    } catch {}
+    return {
+      ok: true,
+      paused: true,
+      campaign_id: targetCampaignId,
+      campaign_name: resolvedCampaignName || undefined,
+      adset_id: newAdset,
+      ad_id: newAd,
+      // The copied adset and the ad are both left in their created PAUSED state (never activated).
+      adset_status: 'PAUSED',
+      ad_status: 'PAUSED',
+      // The daily campaign's CAMPAIGN-level (CBO) budget (minor units). On the paused/review path the
+      // campaign is PAUSED, so this budget never spends — it is reported for proof/parity only.
+      ...(campaignBudgetMinor != null ? { campaign_budget: campaignBudgetMinor } : {}),
+      // A campaign CREATED by this request was created PAUSED too (never ACTIVE). Omitted when we
+      // REUSED an existing campaign — we never flip an existing campaign's status, and its current
+      // status is not re-read here.
+      ...(createdCampaignStatus ? { campaign_status: createdCampaignStatus } : {}),
+      ...recoveryDiag,
+      ...(templateSettings.campaignId ? { template_campaign_id: templateSettings.campaignId } : {}),
+      copied_template_settings: {
+        campaign: { applied: campaignSettingsApplied, fields: { ...campaignMirror }, ...(campaignReuse ? { reuse: campaignReuse } : {}) },
+        adset: { ...adsetLifecycle, diagnostics: { ...templateSettings.adsetDiagnostics } }
+      }
+    };
+  }
+
+  // Bangkok offset ISO schedule (daily path only). end_time is sent on the ACTIVATION POST.
+  // start_time is NEVER sent (a now/past start_time is a known cause of subcode 1487057). Meta
+  // additionally requires end_time >= the COPIED adset's OWN start_time + the run window; the copy
+  // assigns a start_time a few seconds after our local `now`, so an end_time computed from `now`
+  // lands just short and is rejected as 1487793. So we read the copied adset's start_time back and
+  // compute end_time = that start + adsetRunHours.
   let startIso = '';
   let endIso = '';
   if (usedDailyCampaign) {
@@ -864,17 +1027,10 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
       endIso = toBangkokIso(Math.floor((baseStartMs + runMs) / 1000));
     }
 
-    // 8a. Per-ad daily budget ONLY (default 10000 minor units = 100 THB). Separate POST from the
-    // schedule/activation. daily_budget (no lifetime_budget) is the conflict-free budget for the
-    // copied template adset; the daily campaign carries no CBO budget, so this is valid.
-    const budget = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?access_token=${encodeURIComponent(userToken)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ daily_budget: String(adsetDailyBudget) })
-    });
-    if (budget.data && budget.data.error) {
-      const cleanup = await failCleanup(newAdset);
-      return { ok: false, step: 'adset_budget', error: budget.data.error.message, fb_error_code: budget.data.error.code, fb_error_subcode: budget.data.error.error_subcode, fb_trace_id: budget.data.error.fbtrace_id, adset_id: newAdset, daily_budget: adsetDailyBudget, start_time: startIso || undefined, end_time: endIso || undefined, ...diag(), ...cleanup, ...extraErrorFields };
-    }
-    scheduleReport = { daily_budget: adsetDailyBudget, start_time: startIso, end_time: endIso };
+    // 8a. NO per-adset daily_budget. The daily campaign carries the CAMPAIGN-level (CBO) budget, so
+    // setting an adset budget here would be rejected by Meta (and double-budget the ad). Only the
+    // run-hours schedule + activation are applied to the copied adset (8b below).
+    scheduleReport = { start_time: startIso, end_time: endIso };
   }
 
   // 8b. Rename + activate the adset — fail closed on any Graph error (never ignore the response).
@@ -933,7 +1089,16 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     campaign_name: resolvedCampaignName || undefined,
     adset_id: newAdset,
     ad_id: newAd,
-    ...(scheduleReport ? { daily_budget: scheduleReport.daily_budget, start_time: scheduleReport.start_time, end_time: scheduleReport.end_time } : {}),
+    // The default (non-paused) path activates the copied adset + ad to ACTIVE above (and the daily
+    // path read it back to confirm). Reported so callers can distinguish a live ad from a paused one.
+    adset_status: 'ACTIVE',
+    ad_status: 'ACTIVE',
+    // Surfaced when this request CREATED a campaign (ACTIVE on the default path). Omitted on reuse.
+    ...(createdCampaignStatus ? { campaign_status: createdCampaignStatus } : {}),
+    // The daily campaign's CAMPAIGN-level (CBO) budget (minor units) — the live spend budget shared
+    // by every adset in the date-named campaign. Replaces the old per-adset daily_budget report.
+    ...(campaignBudgetMinor != null ? { campaign_budget: campaignBudgetMinor } : {}),
+    ...(scheduleReport ? { start_time: scheduleReport.start_time, end_time: scheduleReport.end_time } : {}),
     // Bad-reused-campaign recovery (empty orphan deleted + fresh duplicate created + copy retried).
     // Empty when no recovery ran, so existing successful responses are unchanged.
     ...recoveryDiag,
@@ -1013,6 +1178,10 @@ async function createAd(fetchImpl, params = {}) {
   const thumbnailUrl = String(body.thumbnail_url || body.image_url || '').trim();
   const skipPublishToPage = body.skip_publish_to_page === true || body.skip_publish_to_page === 'true';
   const skipAd = body.skip_ad === true || body.skip_ad === 'true';
+  // Ad-only / non-spending mode: create the campaign/adset/ad but leave them PAUSED (never
+  // activate). Accept either `paused:true` or `status_option:'PAUSED'`. Default (unset) keeps the
+  // legacy ACTIVE behavior.
+  const paused = body.paused === true || body.paused === 'true' || String(body.status_option || '').toUpperCase() === 'PAUSED';
   const requestedAdName = String(body.ad_name || body.source_video_id || '').trim();
   const ctaLink = shortlink || shopeeUrl;
   const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
@@ -1124,7 +1293,27 @@ async function createAd(fetchImpl, params = {}) {
   // (b) reuse this uploaded video in /promote without a second upload.
   if (skipAd) {
     let pa = { publishedToPage: false, publishError: 'skipped_by_placement_template' };
-    if (!skipPublishToPage) pa = await publishStoryToPage(fetchImpl, { userToken, pageId, storyId });
+    if (!skipPublishToPage) pa = await publishStoryToPage(fetchImpl, { userToken, pageId, storyId, sleep, pollMs });
+    // Fail closed: when a page publish was ATTEMPTED (not skip_publish_to_page) but NOT confirmed,
+    // never return ok:true. ok:true here let the Worker record a visible-post success for a post
+    // that is not actually on the page feed (the live incident). skip_publish_to_page is the only
+    // intentional non-publish path; it stays ok:true with published_to_page:false (truthful) and
+    // callers must not record it as a visible page post. No token is ever included.
+    if (!skipPublishToPage && !pa.publishedToPage) {
+      return {
+        ok: false,
+        phase: 'post',
+        step: 'publish',
+        error: pa.publishError || 'publish_to_page_failed',
+        publish_error: pa.publishError || 'publish_to_page_failed',
+        published_to_page: false,
+        story_id: storyId,
+        video_id: vid.id,
+        creative_id: crData.id,
+        uploaded_for_instagram: uploadedForInstagram,
+        upload_mode: uploadMode || undefined
+      };
+    }
     // The INITIAL visible CTA link actually baked onto the post (null when the post is linkless
     // or carries a LIKE_PAGE CTA). It is the pre-final Shopee link; the post-specific final link
     // is applied later by /update-cta — so visible_page_cta_final stays false here.
@@ -1154,7 +1343,7 @@ async function createAd(fetchImpl, params = {}) {
 
   // 5–8. Resolve/create campaign, copy adset, create + activate the ad.
   const adEntities = await buildAdFromCreative(fetchImpl, {
-    userToken, adAccount, templateAdset, creativeId: crData.id, storyId, adName, body, sleep, pollMs,
+    userToken, adAccount, templateAdset, creativeId: crData.id, storyId, adName, body, sleep, pollMs, paused,
     extraErrorFields: { uploaded_for_instagram: uploadedForInstagram }
   });
   if (!adEntities.ok) return adEntities;
@@ -1168,9 +1357,31 @@ async function createAd(fetchImpl, params = {}) {
   if (skipPublishToPage) {
     publishError = 'skipped_by_placement_template';
   } else {
-    const pubRes = await publishStoryToPage(fetchImpl, { userToken, pageId, storyId });
+    const pubRes = await publishStoryToPage(fetchImpl, { userToken, pageId, storyId, sleep, pollMs });
     publishedToPage = pubRes.publishedToPage;
     publishError = pubRes.publishError;
+  }
+
+  // Fail closed: the full create-ad contract publishes the page post (unless skip_publish_to_page
+  // is set). When a publish was attempted but NOT confirmed, do NOT return ok:true — that let the
+  // Worker record a success for a post the page feed never showed. The ad entities already exist
+  // and their ids are surfaced for diagnosis; only the visible-page publish failed. No token leaks.
+  if (!skipPublishToPage && !publishedToPage) {
+    return {
+      ok: false,
+      step: 'publish',
+      error: publishError || 'publish_to_page_failed',
+      publish_error: publishError || 'publish_to_page_failed',
+      published_to_page: false,
+      story_id: storyId,
+      campaign_id: targetCampaignId,
+      adset_id: newAdset,
+      ad_id: newAd,
+      video_id: vid.id,
+      creative_id: crData.id,
+      uploaded_for_instagram: uploadedForInstagram,
+      upload_mode: uploadMode || undefined
+    };
   }
 
   return {
@@ -1178,11 +1389,18 @@ async function createAd(fetchImpl, params = {}) {
     story_id: storyId,
     campaign_id: targetCampaignId,
     campaign_name: adEntities.campaign_name,
-    daily_budget: adEntities.daily_budget,
+    // CAMPAIGN-level (CBO) daily budget in minor units (daily path). Replaces the old adset budget.
+    campaign_budget: adEntities.campaign_budget,
     start_time: adEntities.start_time,
     end_time: adEntities.end_time,
     adset_id: newAdset,
     ad_id: newAd,
+    // Surface the real adset/ad lifecycle status (PAUSED for ad-only, ACTIVE for the default path)
+    // so callers/history can tell a non-spending ad from a live one.
+    adset_status: adEntities.adset_status,
+    ad_status: adEntities.ad_status,
+    ...(adEntities.campaign_status ? { campaign_status: adEntities.campaign_status } : {}),
+    ...(paused ? { paused: true } : {}),
     video_id: vid.id,
     creative_id: crData.id,
     post_url: `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}`,
@@ -1227,6 +1445,9 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   // ad creative's own dark story (ad_story_id).
   const sourcePostId = String(body.story_id || body.post_id || '').trim();
   const requestedAdName = String(body.ad_name || body.source_video_id || '').trim();
+  // Ad-only / non-spending mode (same flag contract as createAd): build the paid ad but leave the
+  // campaign/adset/ad PAUSED. Default (unset) keeps the legacy ACTIVE behavior.
+  const paused = body.paused === true || body.paused === 'true' || String(body.status_option || '').toUpperCase() === 'PAUSED';
   const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
   const storyPolls = Number.isInteger(params.storyPolls) ? params.storyPolls : 50;
   const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
@@ -1312,7 +1533,7 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   // Campaign / adset / ad / activate — the adset is named after the SOURCE page post (when
   // known) so ads stay grouped with the visible post the comment lives on.
   const adEntities = await buildAdFromCreative(fetchImpl, {
-    userToken, adAccount, templateAdset, creativeId: crData.id, storyId: sourcePostId || adStoryId, adName, body, sleep, pollMs
+    userToken, adAccount, templateAdset, creativeId: crData.id, storyId: sourcePostId || adStoryId, adName, body, sleep, pollMs, paused
   });
   if (!adEntities.ok) return adEntities;
 
@@ -1324,11 +1545,17 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
     ad_story_id: adStoryId,
     campaign_id: adEntities.campaign_id,
     campaign_name: adEntities.campaign_name,
-    daily_budget: adEntities.daily_budget,
+    // CAMPAIGN-level (CBO) daily budget in minor units (daily path). Replaces the old adset budget.
+    campaign_budget: adEntities.campaign_budget,
     start_time: adEntities.start_time,
     end_time: adEntities.end_time,
     adset_id: adEntities.adset_id,
     ad_id: adEntities.ad_id,
+    // PAUSED for ad-only, ACTIVE for the default path (lets callers/history flag a non-spending ad).
+    adset_status: adEntities.adset_status,
+    ad_status: adEntities.ad_status,
+    ...(adEntities.campaign_status ? { campaign_status: adEntities.campaign_status } : {}),
+    ...(paused ? { paused: true } : {}),
     creative_id: crData.id,
     video_id: videoId,
     cta_link: finalCtaLink,

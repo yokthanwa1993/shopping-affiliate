@@ -1020,16 +1020,28 @@ const IS_SYSTEM_ADMIN = true
 // shortlink, posting-order and avatar settings and writes them via the same
 // worker endpoints the LINE app uses. The raw posting access token is never
 // rendered: only presence is shown, and the edit modal is write-only.
-function PageDetailView({
+//
+// `mode` controls whether ad/OneCard surfaces are exposed:
+//   - 'full'     (settings) — every block, including Video One Card and Auto-Ads.
+//   - 'postOnly' (Create Post) — normal Page/Reels posting only. The Video One
+//     Card card (and its link-mode / CTA controls) and the Auto-Ads toggle are
+//     hidden, and on save oneCardEnabled / adsPublishEnabled are FORCED false so
+//     this screen can never enable ad behavior. Ad config lives elsewhere.
+export type PageDetailMode = 'full' | 'postOnly'
+
+export function PageDetailView({
   page,
   onBack,
   canEdit,
+  mode = 'full',
 }: {
   page: SettingsPage
   onBack: () => void
   canEdit: boolean
+  mode?: PageDetailMode
 }) {
   const pageId = page.id
+  const postOnly = mode === 'postOnly'
 
   // ---- Core page state ---------------------------------------------------
   const [coreLoading, setCoreLoading] = useState(true)
@@ -1269,6 +1281,12 @@ function PageDetailView({
       const normalizedInterval = normalizeInterval(intervalMinutes)
       const schedulePostHours = scheduleMode === 'interval' ? `every:${normalizedInterval}` : postHoursString
 
+      // Post-only mode (Create Post) can NEVER enable ad/OneCard behavior:
+      // force both flags off regardless of any stale loaded value. The
+      // OneCard link-mode / CTA stay at their harmless loaded defaults.
+      const effectiveOneCardEnabled = postOnly ? false : oneCardEnabled
+      const effectiveAdsPublishEnabled = postOnly ? false : adsPublishEnabled
+
       await savePageCore(pageId, {
         postHours: schedulePostHours,
         postIntervalMinutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
@@ -1276,8 +1294,8 @@ function PageDetailView({
         basePostHours,
         basePostIntervalMinutes: baseInterval,
         baseIsActive,
-        oneCardEnabled,
-        adsPublishEnabled,
+        oneCardEnabled: effectiveOneCardEnabled,
+        adsPublishEnabled: effectiveAdsPublishEnabled,
         captionLinkEnabled,
         oneCardLinkMode,
         oneCardCta,
@@ -1413,7 +1431,8 @@ function PageDetailView({
               </div>
             </DetailCard>
 
-            {/* Video One Card */}
+            {/* Video One Card — ad surface; hidden in post-only mode. */}
+            {!postOnly ? (
             <DetailCard className="space-y-4">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
@@ -1467,6 +1486,7 @@ function PageDetailView({
                 </>
               ) : null}
             </DetailCard>
+            ) : null}
 
             {/* โทเค้นสำหรับใช้โพสต์ — two canonical modes (Page/Token + CloakBrowser) */}
             <DetailCard className="space-y-3">
@@ -1522,7 +1542,15 @@ function PageDetailView({
                 </div>
               ) : (
                 <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-700">
-                  CloakBrowser: ตอนโพสต์ระบบจะใช้ session ของ CloakBrowser ที่ login Facebook อยู่บนเครื่อง Mac โพสต์ให้ — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. ถ้า <strong>Video One Card ปิด</strong> จะโพสต์ Reel ปกติ + คอมเมนต์ในนามเพจ; ถ้า <strong>Video One Card เปิด</strong> จะโพสต์แบบ OneCard (สร้างแอด) ให้แทน. ถ้า session/login ใช้ไม่ได้จะหยุดโพสต์ ไม่ fallback ไป token เก่า (ระบบ manual ยังใช้ได้ตามปกติ)
+                  {postOnly ? (
+                    <>
+                      CloakBrowser: ตอนโพสต์ระบบจะใช้ session ของ CloakBrowser ที่ login Facebook อยู่บนเครื่อง Mac โพสต์ให้ — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. จะโพสต์ Reel ปกติลงเพจ + คอมเมนต์ในนามเพจ. ถ้า session/login ใช้ไม่ได้จะหยุดโพสต์ ไม่ fallback ไป token เก่า (ระบบ manual ยังใช้ได้ตามปกติ)
+                    </>
+                  ) : (
+                    <>
+                      CloakBrowser: ตอนโพสต์ระบบจะใช้ session ของ CloakBrowser ที่ login Facebook อยู่บนเครื่อง Mac โพสต์ให้ — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. ถ้า <strong>Video One Card ปิด</strong> จะโพสต์ Reel ปกติ + คอมเมนต์ในนามเพจ; ถ้า <strong>Video One Card เปิด</strong> จะโพสต์แบบ OneCard (สร้างแอด) ให้แทน. ถ้า session/login ใช้ไม่ได้จะหยุดโพสต์ ไม่ fallback ไป token เก่า (ระบบ manual ยังใช้ได้ตามปกติ)
+                    </>
+                  )}
                 </div>
               )}
             </DetailCard>
@@ -1841,8 +1869,8 @@ function PageDetailView({
               ) : null}
             </DetailCard>
 
-            {/* Auto-Ads (admin namespace) */}
-            {IS_SYSTEM_ADMIN ? (
+            {/* Auto-Ads (admin namespace) — ad surface; hidden in post-only mode. */}
+            {IS_SYSTEM_ADMIN && !postOnly ? (
               <DetailCard className="space-y-3">
                 <div className="flex items-center justify-between gap-3">
                   <div className="min-w-0">

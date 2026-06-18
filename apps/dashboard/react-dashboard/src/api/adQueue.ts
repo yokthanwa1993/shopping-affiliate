@@ -69,3 +69,110 @@ export async function fetchAdQueue(signal?: AbortSignal): Promise<AdQueueResult>
     intervalMinutes: safeNumber(data.interval_minutes) || 20,
   }
 }
+
+// ---------------------------------------------------------------------------
+// AD-ONLY QUEUE (separate lane from the legacy ad-queue above).
+//
+// GET /api/dashboard/ad-only-queue/list and its run-next/cancel/interval actions. Each queued row is
+// replayed through POST /api/dashboard/create-ad-only — never the legacy create-ad — so it never
+// publishes a Page post / comments / writes post_history. The cadence ("สร้างทุก X นาที") is the
+// operator-set interval served alongside the list and editable via the interval endpoint.
+// ---------------------------------------------------------------------------
+
+export interface AdOnlyQueueItem {
+  id: number
+  createdAt: string
+  pageId: string
+  mode: string
+  dailyCampaignName: string
+  dailyBudgetThb: string
+  runHours: string
+  storyId: string
+  postId: string
+  fbVideoId: string
+  systemVideoId: string
+  status: AdQueueStatus
+  attemptedAt: string
+  completedAt: string
+  errorMessage: string
+  resultAdId: string
+  resultAdsetId: string
+  resultCampaignId: string
+}
+
+export interface AdOnlyQueueResult {
+  items: AdOnlyQueueItem[]
+  counts: Record<string, number>
+  lastRunAt: string
+  nextRunAt: string
+  intervalMinutes: number
+}
+
+function normalizeAdOnly(raw: unknown): AdOnlyQueueItem | null {
+  if (!isRecord(raw)) return null
+  return {
+    id: safeNumber(raw.id),
+    createdAt: safeString(raw.created_at ?? raw.createdAt),
+    pageId: safeString(raw.page_id ?? raw.pageId),
+    mode: safeString(raw.mode) || 'paused',
+    dailyCampaignName: safeString(raw.daily_campaign_name ?? raw.dailyCampaignName),
+    dailyBudgetThb: safeString(raw.daily_budget_thb ?? raw.dailyBudgetThb),
+    runHours: safeString(raw.run_hours ?? raw.runHours),
+    storyId: safeString(raw.story_id ?? raw.storyId),
+    postId: safeString(raw.post_id ?? raw.postId),
+    fbVideoId: safeString(raw.fb_video_id ?? raw.fbVideoId),
+    systemVideoId: safeString(raw.system_video_id ?? raw.systemVideoId),
+    status: safeString(raw.status) || 'queued',
+    attemptedAt: safeString(raw.attempted_at ?? raw.attemptedAt),
+    completedAt: safeString(raw.completed_at ?? raw.completedAt),
+    errorMessage: safeString(raw.error_message ?? raw.errorMessage),
+    resultAdId: safeString(raw.result_ad_id ?? raw.resultAdId),
+    resultAdsetId: safeString(raw.result_adset_id ?? raw.resultAdsetId),
+    resultCampaignId: safeString(raw.result_campaign_id ?? raw.resultCampaignId),
+  }
+}
+
+export async function fetchAdOnlyQueue(signal?: AbortSignal): Promise<AdOnlyQueueResult> {
+  const data = await workerFetchJson<Record<string, unknown>>(
+    '/api/dashboard/ad-only-queue/list?limit=100',
+    { signal, timeoutMs: 15_000 },
+  )
+  if (!data.ok) throw new Error('worker คืน ok=false')
+  const items = Array.isArray(data.items)
+    ? data.items.map(normalizeAdOnly).filter((i): i is AdOnlyQueueItem => i !== null)
+    : []
+  return {
+    items,
+    counts: isRecord(data.counts) ? (data.counts as Record<string, number>) : {},
+    lastRunAt: safeString(data.last_run_at),
+    nextRunAt: safeString(data.next_run_at),
+    intervalMinutes: safeNumber(data.interval_minutes) || 20,
+  }
+}
+
+// Process the oldest queued ad-only item immediately (bypasses the interval gate).
+export async function runNextAdOnlyQueue(): Promise<{ ok: boolean; skipped?: boolean; reason?: string; error?: string }> {
+  return workerFetchJson('/api/dashboard/ad-only-queue/run-next', { method: 'POST', timeoutMs: 120_000 })
+}
+
+// Cancel a still-queued ad-only item.
+export async function cancelAdOnlyQueueItem(id: number): Promise<{ ok: boolean }> {
+  return workerFetchJson(`/api/dashboard/ad-only-queue/${id}`, { method: 'DELETE', timeoutMs: 15_000 })
+}
+
+// Read/set the cadence ("สร้างทุก X นาที"). The worker clamps 1–1440.
+export async function fetchAdOnlyInterval(signal?: AbortSignal): Promise<number> {
+  const data = await workerFetchJson<{ ok?: boolean; interval_minutes?: number }>(
+    '/api/dashboard/ad-only-queue/interval',
+    { signal, timeoutMs: 15_000 },
+  )
+  return safeNumber(data.interval_minutes) || 20
+}
+
+export async function setAdOnlyInterval(minutes: number): Promise<number> {
+  const data = await workerFetchJson<{ ok?: boolean; interval_minutes?: number }>(
+    '/api/dashboard/ad-only-queue/interval',
+    { method: 'PUT', timeoutMs: 15_000, body: { interval_minutes: minutes } },
+  )
+  return safeNumber(data.interval_minutes) || minutes
+}

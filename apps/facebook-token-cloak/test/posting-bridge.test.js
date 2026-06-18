@@ -29,10 +29,10 @@ function assertNoLeak(value) {
 function graphRoute(url, method, pages, opts = {}) {
   const u = String(url);
   const reqBody = String(opts.body || '');
-  // Adset BUDGET POST (daily-campaign path): { daily_budget } only (no end_time/status). Meta
-  // rejects daily_budget + end_time together (live subcode 1487793), so budget is its own POST.
-  // opts.adsetBudgetError simulates a Graph error on the budget POST.
-  if (method === 'POST' && /\/ADSET1\?/.test(u) && /daily_budget/.test(reqBody) && opts.adsetBudgetError) {
+  // CAMPAIGN-level (CBO) budget update POST on a REUSED daily campaign: { daily_budget } only, sent
+  // to the campaign id (NOT an adset). opts.campaignBudgetError simulates a Graph error on it — the
+  // bridge treats this update as best-effort and must NOT fail the whole flow.
+  if (method === 'POST' && /\/CAMP(DAILY|1)\?/.test(u) && /daily_budget/.test(reqBody) && !/"status"/.test(reqBody) && opts.campaignBudgetError) {
     return { error: { message: 'Invalid parameter', code: 100, error_subcode: 1487793 } };
   }
   // Campaign CLEANUP delete (failure path): the bridge deletes a campaign it CREATED this request
@@ -75,6 +75,30 @@ function graphRoute(url, method, pages, opts = {}) {
     if (opts.adsetReadbackPaused) return { status: 'PAUSED', effective_status: 'PAUSED', name: 'Adset copy' };
     const base = { status: 'ACTIVE', effective_status: 'ACTIVE', name: 'Adset active', daily_budget: '10000' };
     return opts.adsetReadbackNoEndTime ? base : { ...base, start_time: '2026-06-15T21:04:36+0700', end_time: '2026-06-16T21:04:36+0700' };
+  }
+  // PAGE-PUBLISH POST (is_published:true on the story id, via the PAGE token). opts.publishError
+  // simulates a Graph error on the publish — default the transient code 1 / "please reduce the
+  // amount of data" shape that USED to be trusted as success. opts.publishFailTimes makes only the
+  // FIRST N publish POSTs error (then a retry succeeds), exercising the bounded-retry recovery; a
+  // shared opts._publishState counter survives the per-request routeOpts shallow-copy.
+  if (method === 'POST' && /is_published/.test(reqBody)) {
+    if (opts.publishError || opts.publishFailTimes != null) {
+      const st = opts._publishState || { count: 0 };
+      st.count += 1;
+      const failTimes = opts.publishFailTimes != null ? opts.publishFailTimes : Infinity;
+      if (st.count <= failTimes) {
+        return { error: { message: opts.publishErrorMessage || 'please reduce the amount of data', code: opts.publishErrorCode != null ? opts.publishErrorCode : 1 } };
+      }
+    }
+    return { success: true };
+  }
+  // is_published READBACK (token-free confirm that an errored publish actually landed on the feed).
+  // opts.publishReadbackPublished === true → confirmed published; otherwise NOT published.
+  if (method === 'GET' && /fields=is_published\b/.test(u)) {
+    return {
+      is_published: opts.publishReadbackPublished === true,
+      ...(opts.publishReadbackPermalink ? { permalink_url: opts.publishReadbackPermalink } : {})
+    };
   }
   if (u.includes('/me/accounts')) return { data: pages };
   // Source-post attachment lookup: the freshly posted page video's attachment target id.
@@ -164,14 +188,19 @@ function makeBrowser(opts = {}) {
   const tokenExtract = opts.evalToken || { token: USER_TOKEN_SECRET, fbDtsgPresent: true, userId: '4242' };
   const routeOpts = {
     ctaType: opts.ctaType, attachmentVideoId: opts.attachmentVideoId, readbackCtaLink: opts.readbackCtaLink,
-    existingCampaigns: opts.existingCampaigns, adsetBudgetError: opts.adsetBudgetError, adsetActivateError: opts.adsetActivateError,
+    existingCampaigns: opts.existingCampaigns, campaignBudgetError: opts.campaignBudgetError, adsetActivateError: opts.adsetActivateError,
     adsetReadbackPaused: opts.adsetReadbackPaused, adsetReadbackNoEndTime: opts.adsetReadbackNoEndTime,
     copiedAdsetStartTime: opts.copiedAdsetStartTime, copiedAdsetStartTimeMissing: opts.copiedAdsetStartTimeMissing,
     templateObjective: opts.templateObjective, templateCampaignId: opts.templateCampaignId,
     templateSmartPromotionType: opts.templateSmartPromotionType, templateExistingCustomerPct: opts.templateExistingCustomerPct,
     templateTargetingOptTypes: opts.templateTargetingOptTypes, adsetLifecycleError: opts.adsetLifecycleError,
     campaignDeleteError: opts.campaignDeleteError, copyError: opts.copyError,
-    copyErrorForCampaign: opts.copyErrorForCampaign, reusedCampaignAdsets: opts.reusedCampaignAdsets
+    copyErrorForCampaign: opts.copyErrorForCampaign, reusedCampaignAdsets: opts.reusedCampaignAdsets,
+    publishError: opts.publishError, publishErrorCode: opts.publishErrorCode,
+    publishErrorMessage: opts.publishErrorMessage, publishReadbackPublished: opts.publishReadbackPublished,
+    publishFailTimes: opts.publishFailTimes, publishReadbackPermalink: opts.publishReadbackPermalink,
+    // Shared mutable counter so publishFailTimes survives the per-request `{ ...routeOpts }` copy.
+    _publishState: { count: 0 }
   };
 
   const apiRequest = opts.noApiRequest ? undefined : {
@@ -463,6 +492,204 @@ test('POST /create-ad fails closed (validate) when page_id/video missing', async
   assert.equal(r.status, 400);
   assert.equal(r.body.ok, false);
   assert.equal(r.body.step, 'validate');
+});
+
+// PAUSED / ACTIVE contract — the ad-only flow must be able to create a NON-SPENDING ad. The default
+// (no paused flag) MUST stay the legacy ACTIVE path; an explicit paused/status_option:'PAUSED'
+// leaves the adset + ad PAUSED and never issues an activation POST.
+test('POST /create-ad DEFAULT (no paused flag) ACTIVATES the adset + ad to ACTIVE (legacy behavior unchanged)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.adset_status, 'ACTIVE', 'default path reports adset ACTIVE');
+  assert.equal(r.body.ad_status, 'ACTIVE', 'default path reports ad ACTIVE');
+  assert.equal(r.body.paused, undefined, 'default response carries no paused flag');
+  // The ad-activation POST { status:'ACTIVE' } on the ad id IS issued in the default path.
+  assert.ok(
+    browser.calls.some((c) => /\/AD1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'default path activates the ad to ACTIVE'
+  );
+  assert.ok(
+    browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'default path activates the adset to ACTIVE'
+  );
+  // A NEW campaign is created (prefix branch) — and on the default path it is created ACTIVE.
+  const campCreate = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(campCreate, 'a new campaign was created');
+  assert.ok(/"status":"ACTIVE"/.test(String(campCreate.body || '')), 'default path creates the campaign ACTIVE');
+  assert.equal(r.body.campaign_status, 'ACTIVE', 'default reports campaign_status ACTIVE');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad with paused:true creates a PAUSED ad and NEVER issues an ACTIVE activation', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    paused: true
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.adset_id, 'ADSET1');
+  assert.equal(r.body.paused, true, 'response flags the paused ad-only mode');
+  assert.equal(r.body.adset_status, 'PAUSED', 'adset is left PAUSED');
+  assert.equal(r.body.ad_status, 'PAUSED', 'ad is left PAUSED');
+  assert.equal(r.body.published_to_page, false, 'ad-only never publishes a page post');
+  // The ad CREATE POST carries status:'PAUSED'.
+  const adCreate = browser.calls.find((c) => /\/ads\?/.test(c.url) && c.method === 'POST');
+  assert.ok(adCreate, 'an ad was created');
+  assert.ok(/"status":"PAUSED"/.test(String(adCreate.body || '')), 'ad is created PAUSED');
+  // HARD GUARANTEE: no activation POST on the adset or the ad, and no daily-budget POST.
+  assert.ok(
+    !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'paused path must NOT activate the adset'
+  );
+  assert.ok(
+    !browser.calls.some((c) => /\/AD1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'paused path must NOT activate the ad'
+  );
+  assert.ok(
+    !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))),
+    'paused path applies no budget (non-spending)'
+  );
+  // A NEW campaign is created (prefix branch) and MUST be created PAUSED — never ACTIVE.
+  const campCreate = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(campCreate, 'a new campaign was created');
+  assert.ok(/"status":"PAUSED"/.test(String(campCreate.body || '')), 'paused path creates the new campaign PAUSED');
+  assert.ok(!/"status":"ACTIVE"/.test(String(campCreate.body || '')), 'paused path must NOT create the campaign ACTIVE');
+  assert.equal(r.body.campaign_status, 'PAUSED', 'reports campaign_status PAUSED for the newly-created campaign');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad with paused:true + new_campaign_name creates the NEW campaign PAUSED (never ACTIVE)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    paused: true,
+    new_campaign_name: 'AD ONLY TEST CAMPAIGN'
+  });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_status, 'PAUSED');
+  // The new_campaign_name branch POST must carry the campaign name AND status:'PAUSED'.
+  const campCreate = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.ok(campCreate, 'a new campaign was created via the new_campaign_name branch');
+  assert.ok(/AD ONLY TEST CAMPAIGN/.test(String(campCreate.body || '')), 'new campaign carries the requested name');
+  assert.ok(/"status":"PAUSED"/.test(String(campCreate.body || '')), 'new_campaign_name branch creates PAUSED under paused:true');
+  assert.ok(!/"status":"ACTIVE"/.test(String(campCreate.body || '')), 'new_campaign_name branch must NOT create ACTIVE under paused:true');
+  assertNoLeak(r.body);
+});
+
+// AD-ONLY SCHEDULED/ACTIVE path (Dashboard Create Ads): build a LIVE, SPENDING ad from an EXISTING
+// video using the date-named daily-campaign path — per-adset budget + run-hours schedule +
+// activation — while skip_publish_to_page guarantees NO Page publish and NO comment. This is the
+// exact shape the worker /api/dashboard/create-ad-only sends in 'active' mode (no paused flag).
+test('POST /create-ad scheduled (daily_campaign_name + budget + skip_publish) ACTIVATES + schedules but never publishes/comments', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    skip_comment: true,
+    daily_campaign_name: '18/Jun/2026',
+    campaign_daily_budget: 1000000,
+    adset_run_hours: 24
+    // NO paused flag — this is the live/spending path.
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.adset_id, 'ADSET1');
+  assert.equal(r.body.adset_status, 'ACTIVE', 'scheduled path activates the adset');
+  assert.equal(r.body.ad_status, 'ACTIVE', 'scheduled path activates the ad');
+  assert.equal(r.body.paused, undefined, 'scheduled path carries no paused flag');
+  assert.equal(r.body.campaign_name, '18/Jun/2026', 'uses the date-named daily campaign');
+  assert.equal(r.body.campaign_budget, 1000000, 'reports the CAMPAIGN-level (CBO) daily budget');
+  assert.ok(r.body.end_time, 'a run-window end_time is scheduled');
+  // INVARIANT: never publishes a Page post and never comments, even on the active path.
+  assert.equal(r.body.published_to_page, false, 'ad-only scheduled mode never publishes a page post');
+  assert.ok(
+    !browser.calls.some((c) => /is_published/.test(String(c.body || ''))),
+    'no Page-publish POST (is_published) is ever issued'
+  );
+  assert.ok(
+    !browser.calls.some((c) => /\/comments/.test(c.url) && c.method === 'POST'),
+    'no Page comment POST is ever issued'
+  );
+  // The daily campaign is created WITH the campaign-level (CBO) budget; the adset gets NO budget.
+  const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.equal(JSON.parse(campPost.body).daily_budget, '1000000', 'daily campaign carries the CBO budget');
+  assert.equal(JSON.parse(campPost.body).bid_strategy, 'LOWEST_COST_WITHOUT_CAP', 'daily campaign uses LOWEST_COST CBO bid strategy');
+  assert.ok(
+    !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))),
+    'active daily path must NOT set a per-adset daily_budget under a CBO campaign'
+  );
+  // The activation POST { status:'ACTIVE' } still runs (schedule lives on it).
+  assert.ok(
+    browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'scheduled path activates the adset'
+  );
+  assertNoLeak(r.body);
+});
+
+test('POST /promote with paused:true builds a PAUSED ad and NEVER activates', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    final_cta_link: 'https://s.shopee.co.th/x',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    paused: true
+  });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.paused, true);
+  assert.equal(r.body.adset_status, 'PAUSED');
+  assert.equal(r.body.ad_status, 'PAUSED');
+  assert.equal(r.body.published_to_page, false, 'promote never publishes a page post');
+  assert.ok(
+    !browser.calls.some((c) => /\/AD1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'paused promote must NOT activate the ad'
+  );
+  assert.ok(
+    !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
+    'paused promote must NOT activate the adset'
+  );
+  assertNoLeak(r.body);
 });
 
 // VISIBLE-CTA-FIRST (current intent): skip_ad is a LEGACY path (the Worker main flow now uses
@@ -863,7 +1090,7 @@ test('POST /publish-story fails closed (no_session) when the profile is not logg
   assert.equal(r.body.error, 'no_session');
 });
 
-test('POST /promote with daily_campaign_name CREATES the daily campaign when none matches, with 10000 budget + 24h schedule', async () => {
+test('POST /promote with daily_campaign_name CREATES the daily campaign with a CAMPAIGN-level (CBO) budget + 24h schedule (no adset budget)', async () => {
   const FINAL = 'https://s.shopee.co.th/80AJs9V61t';
   const DAILY = '15/Jun/2026';
   const browser = makeBrowser(); // no existingCampaigns → must create the daily campaign
@@ -884,26 +1111,21 @@ test('POST /promote with daily_campaign_name CREATES the daily campaign when non
   assert.equal(r.body.ok, true);
   assert.equal(r.body.campaign_id, 'CAMP1', 'created the daily campaign');
   assert.equal(r.body.campaign_name, DAILY, 'returns the daily campaign name');
-  // A campaign POST was made carrying the EXACT daily name + the template objective, and NO
-  // campaign-level budget (so the per-adset daily_budget is accepted).
+  // A campaign POST was made carrying the EXACT daily name + the template objective + the
+  // CAMPAIGN-level (CBO) daily_budget + LOWEST_COST bid strategy (operator's Ads Manager template).
   const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
   assert.ok(campPost, 'a campaign was created');
   const campBody = JSON.parse(campPost.body);
   assert.equal(campBody.name, DAILY, 'campaign created with the exact daily name');
   assert.equal(campBody.objective, 'OUTCOME_ENGAGEMENT', 'campaign uses the template objective');
-  assert.equal(campBody.daily_budget, undefined, 'daily campaign has NO campaign-level (CBO) budget');
-  // The copied adset gets the budget/schedule in a SEPARATE POST from the activation (the
-  // combined POST returned subcode 1487057 live). start_time is omitted (starts immediately).
-  // BUDGET POST is separate and carries ONLY daily_budget — Meta rejects daily_budget + end_time
-  // together (live subcode 1487793). No end_time, no start_time, no status here.
-  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
-  assert.ok(budgetPost, 'a separate budget POST was sent to the adset');
-  const budgetBody = JSON.parse(budgetPost.body);
-  assert.equal(budgetBody.daily_budget, '10000', 'adset daily_budget is 10000 (100 THB)');
-  assert.deepEqual(Object.keys(budgetBody).sort(), ['daily_budget'], 'budget POST carries ONLY daily_budget');
-  assert.equal(budgetBody.end_time, undefined, 'budget POST must NOT include end_time');
-  assert.equal(budgetBody.start_time, undefined, 'budget POST must NOT include start_time');
-  assert.equal(budgetBody.status, undefined, 'budget POST must NOT flip status');
+  assert.equal(campBody.daily_budget, '1000000', 'daily campaign carries the CBO budget (default 10,000 THB/day)');
+  assert.equal(campBody.bid_strategy, 'LOWEST_COST_WITHOUT_CAP', 'daily campaign uses LOWEST_COST CBO bid strategy');
+  // The copied adset must NOT get its own daily_budget — Meta rejects an adset budget under a CBO
+  // campaign. There is no adset budget POST at all on the daily path now.
+  assert.ok(
+    !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))),
+    'daily path must NOT POST a per-adset daily_budget'
+  );
   // ACTIVATION POST is the live-proven shape: { name, status:'ACTIVE', end_time } (no daily_budget,
   // no start_time). end_time is a Graph-compatible offset ISO string (e.g. 2026-06-16T21:04:36+0700).
   const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
@@ -927,8 +1149,9 @@ test('POST /promote with daily_campaign_name CREATES the daily campaign when non
   assert.equal(JSON.parse(adCreate.body).name, 'ea401f1e', 'ad name is the system video code/hash');
   assert.notEqual(JSON.parse(adCreate.body).name, '984409834561573', 'ad name must NOT be sub2');
   assert.ok(browser.calls.some((c) => /\/ADSET1\?fields=name,status,effective_status/.test(c.url) && c.method === 'GET'), 'adset status read back to confirm ACTIVE');
-  // Sanitized response carries the schedule/budget as offset ISO strings (24h window).
-  assert.equal(r.body.daily_budget, 10000);
+  // Sanitized response carries the CBO campaign budget + the schedule as offset ISO strings.
+  assert.equal(r.body.campaign_budget, 1000000, 'response reports the campaign CBO budget');
+  assert.equal(r.body.daily_budget, undefined, 'no per-adset daily_budget is reported');
   assert.match(r.body.end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'response end_time is an offset ISO string');
   assert.equal(new Date(r.body.end_time).getTime() - new Date(r.body.start_time).getTime(), 24 * 3600 * 1000, 'run window is 24h');
   assertNoLeak(r.body);
@@ -939,8 +1162,8 @@ test('POST /promote with daily_campaign_name REUSES an existing exact-name + sam
   const DAILY = '15/Jun/2026';
   const browser = makeBrowser({
     existingCampaigns: [
-      { id: 'CAMPOTHER', name: '14/Jun/2026', status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' },
-      { id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT' }
+      { id: 'CAMPOTHER', name: '14/Jun/2026', status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT', daily_budget: '1000000' },
+      { id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT', daily_budget: '1000000' }
     ]
   });
   await listen({ browser });
@@ -960,16 +1183,74 @@ test('POST /promote with daily_campaign_name REUSES an existing exact-name + sam
   assert.equal(r.body.campaign_id, 'CAMPDAILY', 'reused the existing daily campaign');
   assert.equal(r.body.campaign_name, DAILY);
   assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'must NOT create a campaign when one with the exact name + objective exists');
-  // Reuse still applies the per-adset 10000 budget + 24h schedule (response carries the window).
-  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
-  const budgetBody = JSON.parse(budgetPost.body);
-  assert.deepEqual(Object.keys(budgetBody).sort(), ['daily_budget'], 'budget POST carries ONLY daily_budget');
+  // Reuse keeps the campaign's existing CBO budget and applies only the 24h schedule. NO per-adset
+  // daily_budget POST, and NO blind campaign-budget overwrite (no campaign_daily_budget requested).
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))), 'reuse must NOT set a per-adset daily_budget');
+  assert.ok(!browser.calls.some((c) => /\/CAMPDAILY\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))), 'reuse must NOT overwrite the campaign budget when none requested');
   const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
   const actBody = JSON.parse(actPost.body);
   assert.match(actBody.end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'activation carries the offset ISO end_time');
   assert.equal(actBody.start_time, undefined);
-  assert.equal(r.body.daily_budget, 10000);
+  assert.equal(r.body.campaign_budget, 1000000, 'reports the reused campaign CBO budget');
   assert.equal(new Date(r.body.end_time).getTime() - new Date(r.body.start_time).getTime(), 24 * 3600 * 1000);
+  assertNoLeak(r.body);
+});
+
+test('POST /promote REUSE updates the campaign CBO budget ONLY when an explicit campaign_daily_budget differs', async () => {
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT', daily_budget: '1000000' }]
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: DAILY,
+    campaign_daily_budget: 2000000 // differs from the current 1,000,000 → safe update
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMPDAILY', 'still reuses the campaign (no new campaign)');
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'no new campaign created');
+  // A campaign-level budget update POST was issued to the reused campaign id (NOT an adset).
+  const campUpdate = browser.calls.find((c) => /\/CAMPDAILY\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
+  assert.ok(campUpdate, 'reuse updates the campaign budget when an explicit budget differs');
+  assert.equal(JSON.parse(campUpdate.body).daily_budget, '2000000', 'updates to the requested CBO budget');
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))), 'still no per-adset daily_budget');
+  assert.equal(r.body.campaign_budget, 2000000, 'reports the updated CBO budget');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote REUSE budget update is best-effort — a failed update does NOT fail the ad', async () => {
+  const DAILY = '15/Jun/2026';
+  const browser = makeBrowser({
+    existingCampaigns: [{ id: 'CAMPDAILY', name: DAILY, status: 'ACTIVE', objective: 'OUTCOME_ENGAGEMENT', daily_budget: '1000000' }],
+    campaignBudgetError: true
+  });
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    video_id: '1739988064022663',
+    story_id: `${LIVE_PAGE_ID}_984409834561573`,
+    final_cta_link: 'https://s.shopee.co.th/80AJs9V61t',
+    thumbnail_url: 'https://thumb/x.jpg',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    daily_campaign_name: DAILY,
+    campaign_daily_budget: 2000000
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'a failed CBO budget update must NOT fail the whole flow');
+  assert.equal(r.body.ad_id, 'AD1');
+  // The update was attempted but errored → campaign_budget falls back to the read value.
+  assert.equal(r.body.campaign_budget, 1000000, 'reports the existing CBO budget when the update fails');
   assertNoLeak(r.body);
 });
 
@@ -1055,9 +1336,8 @@ test('POST /promote computes end_time as 24h after the COPIED adset start_time, 
   const actBody = JSON.parse(actPost.body);
   assert.equal(actBody.end_time, EXPECTED_END, 'end_time = copied adset start_time + 24h');
   assert.equal(actBody.start_time, undefined, 'still never send start_time on the POST');
-  // The budget POST is still budget-only.
-  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
-  assert.deepEqual(Object.keys(JSON.parse(budgetPost.body)).sort(), ['daily_budget']);
+  // No per-adset daily_budget POST on the daily (CBO) path.
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))), 'no per-adset daily_budget POST');
   // Response reports the same start/end pair (exact 24h window).
   assert.equal(r.body.start_time, COPIED_START);
   assert.equal(r.body.end_time, EXPECTED_END);
@@ -1081,19 +1361,23 @@ function promoteDaily(extra) {
   };
 }
 
-test('POST /promote FAILS CLOSED (ok:false) when the adset BUDGET update errors — never falsely reports success', async () => {
-  // The budget POST (daily_budget only) erroring must fail closed and delete the orphan adset —
-  // the old code ignored the response, leaving the adset PAUSED while the route reported success.
-  const browser = makeBrowser({ adsetBudgetError: true });
+test('POST /promote daily path puts the budget on the CAMPAIGN (CBO) and never on the copied adset', async () => {
+  // Regression guard for the CBO migration: the active daily path must set NO per-adset daily_budget
+  // (Meta rejects an adset budget under a CBO campaign) and instead carry it on the created campaign.
+  const browser = makeBrowser(); // no existingCampaigns → creates the daily campaign
   await listen({ browser });
   const r = await req('POST', '/promote', promoteDaily());
   assert.equal(r.status, 200);
-  assert.equal(r.body.ok, false, 'must not report success when the adset budget update errors');
-  assert.equal(r.body.step, 'adset_budget');
-  assert.equal(r.body.fb_error_subcode, 1487793, 'surfaces the Graph error subcode');
-  assert.equal(r.body.ad_id, undefined, 'no ad id is reported as a success');
-  // The orphan adset is deleted (status:DELETED) so a failed activation leaves nothing behind.
-  assert.ok(browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"DELETED"/.test(String(c.body || ''))), 'orphan adset deleted on failure');
+  assert.equal(r.body.ok, true);
+  // The created campaign carries the CBO daily_budget (default 10,000 THB/day = 1,000,000 minor).
+  const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
+  assert.equal(JSON.parse(campPost.body).daily_budget, '1000000', 'CBO budget set on the campaign');
+  // HARD INVARIANT: no POST to the adset ever carries a daily_budget.
+  assert.ok(
+    !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))),
+    'never sets a per-adset daily_budget on the daily CBO path'
+  );
+  assert.equal(r.body.campaign_budget, 1000000);
   assertNoLeak(r.body);
 });
 
@@ -1367,14 +1651,15 @@ test('POST /create-ad mirrors the template campaign setting into the new daily c
   // The template settings were read in ONE GET on the template adset (objective + campaign-level
   // mirror fields + adset-level lifecycle fields).
   assert.ok(browser.calls.some((c) => /fields=existing_customer_budget_percentage/.test(c.url) && /campaign\{id,objective,smart_promotion_type\}/.test(c.url) && c.method === 'GET'), 'template settings read in one GET');
-  // The new daily campaign POST carries the mirrored template campaign field — and still NO
-  // campaign-level (CBO) budget, so the per-adset daily_budget remains valid.
+  // The new daily campaign POST carries the mirrored template campaign field AND the CAMPAIGN-level
+  // (CBO) budget + bid strategy (the operator's Ads Manager template).
   const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
   assert.ok(campPost, 'a daily campaign was created');
   const campBody = JSON.parse(campPost.body);
   assert.equal(campBody.smart_promotion_type, 'SMART_PROMOTION', 'daily campaign mirrors the template campaign setting');
   assert.equal(campBody.objective, 'OUTCOME_ENGAGEMENT', 'daily campaign keeps the template objective');
-  assert.equal(campBody.daily_budget, undefined, 'daily campaign still carries NO campaign-level budget');
+  assert.equal(campBody.daily_budget, '1000000', 'daily campaign carries the CBO budget');
+  assert.equal(campBody.bid_strategy, 'LOWEST_COST_WITHOUT_CAP', 'daily campaign uses the CBO bid strategy');
   // Diagnostics for Hermes live-verification.
   assert.equal(r.body.template_campaign_id, '120248134990220263');
   assert.equal(r.body.copied_template_settings.campaign.applied, true);
@@ -1397,10 +1682,9 @@ test('POST /promote re-applies the template adset customer-lifecycle strategy to
   assert.equal(lifeBody.existing_customer_budget_percentage, 0, 're-applies the exact template percentage');
   assert.equal(r.body.copied_template_settings.adset.applied, true);
   assert.equal(r.body.copied_template_settings.adset.fields.existing_customer_budget_percentage, 0);
-  // INVARIANTS unchanged: budget POST budget-only, schedule offset-ISO end_time, adset name = sub2,
-  // ad name = source video hash/code.
-  const budgetPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || '')));
-  assert.deepEqual(Object.keys(JSON.parse(budgetPost.body)).sort(), ['daily_budget'], 'budget POST still carries ONLY daily_budget');
+  // INVARIANTS unchanged: NO per-adset budget POST (CBO is on the campaign), schedule offset-ISO
+  // end_time, adset name = sub2, ad name = source video hash/code.
+  assert.ok(!browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))), 'no per-adset daily_budget POST');
   const actPost = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
   assert.match(JSON.parse(actPost.body).end_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$/, 'activation end_time is an offset ISO string');
   assert.equal(JSON.parse(actPost.body).name, '984409834561573', 'adset name invariant: post tail/sub2');
@@ -1691,4 +1975,239 @@ test('createAd: download failure falls back to file_url and reports the fallback
   assert.equal(fetchImpl.advideosCalls.length, 1, 'one advideos upload (the file_url fallback)');
   assert.ok(/file_url=/.test(fetchImpl.advideosCalls[0].url), 'the fallback used file_url');
   assert.ok(!JSON.stringify(result).includes(UPLOAD_TOKEN), 'no token leak');
+});
+
+// ---------------------------------------------------------------------------
+// FALSE-SUCCESS PAGE-PUBLISH GUARDS
+// Regression for the live incident: a page post recorded as success while the Facebook feed
+// never showed it. publishStoryToPage used to treat a transient Graph publish error (code 1 /
+// "please reduce the amount of data") as published; createAd then returned ok:true and the
+// Worker recorded a visible-post success for a post that does not exist on the page feed.
+// ---------------------------------------------------------------------------
+
+const PUBLISH_PAGE_TOKEN = 'PUBLISH_PAGE_SECRET';
+
+// Graph fetch mock for the direct posting.* unit tests with controllable PAGE-PUBLISH behavior.
+//   opts.publishError → every is_published POST returns a Graph error (default code 1 transient shape)
+//   opts.publishFailTimes → only the FIRST N publish POSTs error, then a retry succeeds
+//   opts.publishErrorCode / publishErrorMessage → override the simulated error
+//   opts.readbackPublished → the token-free is_published readback reports the post actually landed
+//   opts.readbackPermalink → the readback also returns a permalink_url
+function makePublishAwareFetch(opts = {}) {
+  const calls = [];
+  let publishPostCount = 0;
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    const method = (init.method || 'GET').toUpperCase();
+    const body = init && init.body != null ? String(init.body) : '';
+    calls.push({ url: u, method, body });
+    let obj = { success: true };
+    if (method === 'POST' && /is_published/.test(body)) {
+      publishPostCount += 1;
+      const failTimes = opts.publishFailTimes != null ? opts.publishFailTimes : (opts.publishError ? Infinity : 0);
+      obj = publishPostCount <= failTimes
+        ? { error: { message: opts.publishErrorMessage || 'please reduce the amount of data', code: opts.publishErrorCode != null ? opts.publishErrorCode : 1 } }
+        : { success: true };
+    } else if (method === 'GET' && /fields=is_published\b/.test(u)) {
+      obj = { is_published: opts.readbackPublished === true, ...(opts.readbackPermalink ? { permalink_url: opts.readbackPermalink } : {}) };
+    } else if (/\/advideos\?/.test(u) && method === 'POST') obj = { id: 'VID123' };
+    else if (/me\/accounts/.test(u)) obj = { data: [{ id: '107267395614980', name: 'P', access_token: PUBLISH_PAGE_TOKEN }] };
+    else if (/fields=thumbnails/.test(u)) obj = { thumbnails: { data: [{ uri: 'https://thumb/x.jpg' }] } };
+    else if (/\/adcreatives/.test(u) && method === 'POST') obj = { id: 'CR1' };
+    else if (/fields=effective_object_story_id/.test(u)) obj = { effective_object_story_id: '107267395614980_STORY9' };
+    else if (/\/ads\?fields=creative/.test(u)) obj = { data: [{ creative: { id: 'TPLCR' } }] };
+    else if (/TPLCR\?fields=call_to_action_type/.test(u)) obj = { call_to_action_type: 'SHOP_NOW' };
+    else if (/fields=existing_customer_budget_percentage/.test(u)) obj = { campaign: { id: 'TPLCAMP', objective: 'OUTCOME_ENGAGEMENT' } };
+    else if (/\/campaigns\?.*filtering/.test(u) && method === 'GET') obj = { data: [] };
+    else if (/\/campaigns\?/.test(u) && method === 'POST') obj = { id: 'CAMP1' };
+    else if (/\/copies/.test(u) && method === 'POST') obj = { copied_adset_id: 'ADSET1' };
+    else if (/\/ads\?fields=id/.test(u) && method === 'GET') obj = { data: [{ id: 'AD1' }] };
+    else if (/\/ads\?/.test(u) && method === 'POST') obj = { id: 'AD1' };
+    return { status: 200, ok: !obj.error, json: async () => obj };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+test('publishStoryToPage: a transient publish error that never clears FAILS CLOSED after exhausting retries', async () => {
+  const fetchImpl = makePublishAwareFetch({ publishError: true, readbackPublished: false });
+  const res = await posting.publishStoryToPage(fetchImpl, {
+    userToken: USER_TOKEN_SECRET, pageId: '107267395614980', storyId: '107267395614980_STORY9', pollMs: 0
+  });
+  assert.equal(res.publishedToPage, false, 'errored publish without a confirming readback is NOT published');
+  assert.ok(res.publishError, 'carries the publish error for diagnosis');
+  assert.equal(res.publishExhaustedRetries, true, 'flags that bounded retries were exhausted');
+  // It RETRIED the publish (default 4 attempts) instead of giving up after one.
+  const publishPosts = fetchImpl.calls.filter((c) => c.method === 'POST' && /is_published/.test(c.body));
+  assert.equal(publishPosts.length, 4, 'made the full set of publish attempts');
+  // It must actually READ BACK is_published before deciding — never assume.
+  assert.ok(fetchImpl.calls.some((c) => c.method === 'GET' && /fields=is_published/.test(c.url)), 'performed the is_published readback');
+  assert.ok(!JSON.stringify(res).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('publishStoryToPage: a transient publish error RECOVERS on retry (the live remedy for "reduce the amount of data")', async () => {
+  // The first two publish POSTs return the transient code 1 error; the third succeeds — exactly the
+  // FAIL→SUCCESS-on-retry shape the Worker documents for this message.
+  const fetchImpl = makePublishAwareFetch({ publishFailTimes: 2, readbackPublished: false });
+  const res = await posting.publishStoryToPage(fetchImpl, {
+    userToken: USER_TOKEN_SECRET, pageId: '107267395614980', storyId: '107267395614980_STORY9', pollMs: 0
+  });
+  assert.equal(res.publishedToPage, true, 'a retry that succeeds publishes the visible post');
+  assert.equal(res.publishAttempts, 3, 'succeeded on the third attempt');
+  assert.ok(!JSON.stringify(res).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('publishStoryToPage: a transient publish error becomes success when a between-retry readback confirms is_published', async () => {
+  const fetchImpl = makePublishAwareFetch({ publishError: true, readbackPublished: true, readbackPermalink: 'https://www.facebook.com/reel/123/' });
+  const res = await posting.publishStoryToPage(fetchImpl, {
+    userToken: USER_TOKEN_SECRET, pageId: '107267395614980', storyId: '107267395614980_STORY9', pollMs: 0
+  });
+  assert.equal(res.publishedToPage, true, 'readback-confirmed publish is reported as published');
+  assert.equal(res.publishWarning, 'publish_story_error_but_readback_confirmed_published');
+  assert.equal(res.permalink_url, 'https://www.facebook.com/reel/123/', 'surfaces the confirmed permalink');
+  // The readback confirmed it on the FIRST errored attempt — no need to exhaust retries.
+  assert.equal(res.publishAttempts, 1);
+  assert.ok(!JSON.stringify(res).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('publishStoryToPage: a HARD (non-transient) publish error does NOT retry and fails closed immediately', async () => {
+  // A permission error (code 200) will not clear on retry — fail closed after a single attempt.
+  const fetchImpl = makePublishAwareFetch({ publishError: true, publishErrorCode: 200, publishErrorMessage: 'Permissions error', readbackPublished: false });
+  const res = await posting.publishStoryToPage(fetchImpl, {
+    userToken: USER_TOKEN_SECRET, pageId: '107267395614980', storyId: '107267395614980_STORY9', pollMs: 0
+  });
+  assert.equal(res.publishedToPage, false);
+  assert.equal(res.publishAttempts, 1, 'a hard error is not retried');
+  assert.notEqual(res.publishExhaustedRetries, true, 'did not loop through retries for a hard error');
+  const publishPosts = fetchImpl.calls.filter((c) => c.method === 'POST' && /is_published/.test(c.body));
+  assert.equal(publishPosts.length, 1, 'exactly one publish attempt for a hard error');
+  assert.ok(!JSON.stringify(res).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('createAd skip_ad: FAILS CLOSED (step=publish) when publishStoryToPage fails and the readback does not confirm', async () => {
+  const fetchImpl = makePublishAwareFetch({ publishError: true, readbackPublished: false });
+  const result = await posting.createAd(fetchImpl, {
+    userToken: USER_TOKEN_SECRET,
+    body: { page_id: '107267395614980', video_url: 'https://cdn/x.mp4', caption: 'cap', shortlink: 'https://s.shopee.co.th/x', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test', skip_ad: true },
+    pollMs: 0,
+    downloadVideo: async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' })
+  });
+  assert.equal(result.ok, false, 'must NOT report success when the page publish was not confirmed');
+  assert.equal(result.step, 'publish');
+  assert.equal(result.published_to_page, false);
+  assert.ok(result.publish_error, 'surfaces publish_error for history');
+  assert.equal(result.story_id, '107267395614980_STORY9', 'still surfaces the story id for diagnosis');
+  // Hard guarantee: no campaign/adset/ad created in skip_ad mode even on failure.
+  assert.ok(!fetchImpl.calls.some((c) => /\/copies/.test(c.url)), 'no adset copied');
+  assert.ok(!JSON.stringify(result).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('createAd skip_ad: SUCCESS when the page publish is confirmed', async () => {
+  const fetchImpl = makePublishAwareFetch({ publishError: false });
+  const result = await posting.createAd(fetchImpl, {
+    userToken: USER_TOKEN_SECRET,
+    body: { page_id: '107267395614980', video_url: 'https://cdn/x.mp4', caption: 'cap', shortlink: 'https://s.shopee.co.th/x', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test', skip_ad: true },
+    pollMs: 0,
+    downloadVideo: async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' })
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, 'post');
+  assert.equal(result.published_to_page, true);
+  assert.ok(!JSON.stringify(result).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('createAd full: FAILS CLOSED (step=publish) when publishStoryToPage fails for the visible page post', async () => {
+  const fetchImpl = makePublishAwareFetch({ publishError: true, readbackPublished: false });
+  const result = await posting.createAd(fetchImpl, {
+    userToken: USER_TOKEN_SECRET,
+    body: { page_id: '107267395614980', video_url: 'https://cdn/x.mp4', caption: 'cap', shortlink: 'https://s.shopee.co.th/x', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test' },
+    pollMs: 0,
+    downloadVideo: async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' })
+  });
+  assert.equal(result.ok, false, 'a full create-ad must not claim success when the page publish failed');
+  assert.equal(result.step, 'publish');
+  assert.equal(result.published_to_page, false);
+  assert.ok(result.publish_error, 'surfaces publish_error');
+  // The ad entities were created before the publish step — their ids are surfaced for diagnosis.
+  assert.equal(result.ad_id, 'AD1');
+  assert.equal(result.adset_id, 'ADSET1');
+  assert.ok(!JSON.stringify(result).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('createAd full with skip_publish_to_page: TRUTHFUL ok:true but published_to_page:false (no visible publish attempted)', async () => {
+  const fetchImpl = makePublishAwareFetch({ publishError: true, readbackPublished: false });
+  const result = await posting.createAd(fetchImpl, {
+    userToken: USER_TOKEN_SECRET,
+    body: { page_id: '107267395614980', video_url: 'https://cdn/x.mp4', caption: 'cap', shortlink: 'https://s.shopee.co.th/x', shopee_url: 'https://shopee.co.th/x', ad_account: 'act_test', template_adset: 'tpl_test', skip_publish_to_page: true },
+    pollMs: 0,
+    downloadVideo: async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' })
+  });
+  assert.equal(result.ok, true, 'skip_publish_to_page is an intentional non-publish path');
+  assert.equal(result.published_to_page, false, 'never claims a visible page post when publish was skipped');
+  // It never attempts the is_published POST/readback when the publish is intentionally skipped.
+  assert.ok(!fetchImpl.calls.some((c) => c.method === 'POST' && /is_published/.test(c.body)), 'no publish POST when skipped');
+  assert.ok(!JSON.stringify(result).includes(PUBLISH_PAGE_TOKEN), 'no page token leak');
+});
+
+test('POST /publish-story FAILS CLOSED when the publish errors transiently and the readback does not confirm (no false success)', async () => {
+  const browser = makeBrowser({ publishError: true, publishReadbackPublished: false });
+  await listen({ browser });
+  const STORY = `${LIVE_PAGE_ID}_STORY9`;
+  const r = await req('POST', '/publish-story', { page_id: LIVE_PAGE_ID, story_id: STORY });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false, 'a transient publish error is NOT a success');
+  assert.equal(r.body.published_to_page, false);
+  assert.equal(r.body.step, 'publish');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad FAILS CLOSED (ok:false, step=publish) when the page publish is not confirmed — Worker must record failure, not success', async () => {
+  const browser = makeBrowser({ publishError: true, publishReadbackPublished: false });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.body.ok, false, 'create-ad must not return ok:true when the visible publish failed');
+  assert.equal(r.body.step, 'publish');
+  assert.equal(r.body.published_to_page, false);
+  assertNoLeak(r.body);
+});
+
+test('POST /publish-story RECOVERS a transient "reduce the amount of data" publish via retry and reports success', async () => {
+  // The first two publish POSTs return the transient code 1 error; the retry succeeds — the real
+  // remedy for the live CHEARB incident where a single publish attempt failed transiently.
+  const browser = makeBrowser({ publishFailTimes: 2, publishReadbackPublished: false });
+  await listen({ browser });
+  const STORY = `${LIVE_PAGE_ID}_STORY9`;
+  const r = await req('POST', '/publish-story', { page_id: LIVE_PAGE_ID, story_id: STORY });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'a transient publish that clears on retry is a real success');
+  assert.equal(r.body.published_to_page, true);
+  // It retried the is_published POST rather than failing on the first transient error.
+  const publishPosts = browser.calls.filter((c) => c.method === 'POST' && /is_published/.test(String(c.body || '')));
+  assert.ok(publishPosts.length >= 3, 'retried the publish until it succeeded');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad RECOVERS a transient page publish via retry and returns ok:true with published_to_page', async () => {
+  const browser = makeBrowser({ publishFailTimes: 1, publishReadbackPublished: false });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.body.ok, true, 'create-ad succeeds once the transient publish clears on retry');
+  assert.equal(r.body.published_to_page, true);
+  assertNoLeak(r.body);
 });

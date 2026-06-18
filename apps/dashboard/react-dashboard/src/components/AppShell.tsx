@@ -13,6 +13,7 @@ import {
   Megaphone,
   MessageSquare,
   PackageOpen,
+  PenSquare,
   Settings,
   Users,
 } from 'lucide-react'
@@ -33,13 +34,14 @@ type NavItem = {
 // the live dashboard.
 const NAV: readonly NavItem[] = [
   { to: '/', label: 'ภาพรวม', sublabel: 'Overview', icon: LayoutDashboard, exact: true },
-  { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Layers, exact: false },
   { to: '/source-inventory', label: 'คลังต้นฉบับ', sublabel: 'Source Inventory', icon: PackageOpen, exact: false },
   { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Cpu, exact: false },
+  { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Layers, exact: false },
+  { to: '/create-post', label: 'สร้างโพสต์', sublabel: 'Create Post', icon: PenSquare, exact: false },
+  { to: '/create-ads', label: 'สร้างแอด', sublabel: 'Create Ads', icon: Users, exact: false },
   { to: '/page-posts', label: 'โพสต์เพจ', sublabel: 'Page Posts', icon: Facebook, exact: false },
   { to: '/custom-link', label: 'คัสตอมลิงก์', sublabel: 'Custom Link', icon: Link2, exact: false },
   { to: '/campaigns', label: 'แคมเปญ', sublabel: 'Campaigns', icon: Megaphone, exact: false },
-  { to: '/create-ads', label: 'สร้างแอด', sublabel: 'Create Ads', icon: Users, exact: false },
   { to: '/queue', label: 'คิวสร้างแอด', sublabel: 'Queue', icon: Clock, exact: false },
   { to: '/history', label: 'ประวัติ', sublabel: 'History', icon: MessageSquare, exact: false },
 ] as const

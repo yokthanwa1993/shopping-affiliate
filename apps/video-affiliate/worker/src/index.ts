@@ -143,6 +143,20 @@ import {
 } from './shortlink-template'
 import { extractShopeeAffiliateIdFromLink } from './shopee-affiliate-id'
 import { buildCaptionLinkFirstDescription, resolvePublishCaption } from './caption-link'
+import {
+    type AdHistoryRecord,
+    validateAdOnlyInput,
+    resolveAdOnlySchedule,
+    buildAdOnlyUnsupportedResult,
+    buildAdHistoryRecord,
+    AD_ONLY_BRIDGE_SUPPORTS_PAUSED,
+    type AdOnlyQueueRow,
+    buildAdOnlyCreateBody,
+    clampAdOnlyIntervalMinutes,
+    isAdOnlyQueueDue,
+    nextAdOnlyRunAtMs,
+    DEFAULT_AD_ONLY_INTERVAL_MINUTES,
+} from './ad-only-contract'
 import { handleReportProxyRequest } from './report-proxy'
 import {
     type DashboardSessionRow,
@@ -11734,6 +11748,586 @@ app.post('/api/dashboard/create-ad', async (c) => {
     }
 })
 
+// =====================================================================
+// AD-ONLY contract — POST /api/dashboard/create-ad-only + GET /api/dashboard/ad-history.
+//
+// Build a Meta ad FROM an existing page post/story/video. This is DELIBERATELY separate from:
+//   - POST /api/pages/:id/force-post   (Page Post flow → post_history, cron — NEVER touched here)
+//   - POST /api/dashboard/create-ad    (legacy hybrid post+ad — NEVER called from here)
+// so ad creation can never have a page-publish side effect. It NEVER writes post_history; every
+// attempt is recorded in its OWN audit table dashboard_ad_history.
+// =====================================================================
+async function ensureAdHistoryTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS dashboard_ad_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            page_id TEXT NOT NULL,
+            source_story_id TEXT NOT NULL DEFAULT '',
+            source_post_id TEXT NOT NULL DEFAULT '',
+            fb_video_id TEXT NOT NULL DEFAULT '',
+            system_video_id TEXT NOT NULL DEFAULT '',
+            campaign_id TEXT NOT NULL DEFAULT '',
+            campaign_name TEXT NOT NULL DEFAULT '',
+            adset_id TEXT NOT NULL DEFAULT '',
+            ad_id TEXT NOT NULL DEFAULT '',
+            creative_id TEXT NOT NULL DEFAULT '',
+            effective_object_story_id TEXT NOT NULL DEFAULT '',
+            click_link TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            truncated_result_json TEXT NOT NULL DEFAULT ''
+        )`
+    ).run()
+    // Safe ALTER ADD COLUMN pattern (SQLite has no IF NOT EXISTS for columns) — matches
+    // ensureAdQueueTable. Swallow the duplicate-column error on re-run so future columns can be
+    // added without a destructive migration.
+    await db.prepare(
+        `ALTER TABLE dashboard_ad_history ADD COLUMN completed_at TEXT NOT NULL DEFAULT ''`
+    ).run().catch(() => undefined)
+    // Operator scheduling/budget audit columns (backward-compatible, additive). mode/run_hours are
+    // worker-side intent; daily_budget (minor units) / start_time / end_time are echoed from the
+    // bridge on the active/scheduled path. Each ALTER swallows the duplicate-column error on re-run.
+    for (const col of [
+        `ALTER TABLE dashboard_ad_history ADD COLUMN mode TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN daily_budget TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN run_hours TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN start_time TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN end_time TEXT NOT NULL DEFAULT ''`,
+    ]) {
+        await db.prepare(col).run().catch(() => undefined)
+    }
+    await db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_dashboard_ad_history_page ON dashboard_ad_history(page_id, id)`
+    ).run()
+    await db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_dashboard_ad_history_status ON dashboard_ad_history(status, id)`
+    ).run()
+}
+
+async function insertAdHistoryRow(db: D1Database, rec: AdHistoryRecord, completed: boolean): Promise<number> {
+    const res = await db.prepare(
+        `INSERT INTO dashboard_ad_history
+           (completed_at, status, page_id, source_story_id, source_post_id, fb_video_id, system_video_id,
+            campaign_id, campaign_name, adset_id, ad_id, creative_id, effective_object_story_id,
+            click_link, error_message, truncated_result_json,
+            mode, daily_budget, run_hours, start_time, end_time)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+        completed ? new Date().toISOString() : '',
+        rec.status, rec.page_id, rec.source_story_id, rec.source_post_id, rec.fb_video_id, rec.system_video_id,
+        rec.campaign_id, rec.campaign_name, rec.adset_id, rec.ad_id, rec.creative_id, rec.effective_object_story_id,
+        rec.click_link, rec.error_message, rec.truncated_result_json,
+        rec.mode, rec.daily_budget, rec.run_hours, rec.start_time, rec.end_time,
+    ).run()
+    return (res as unknown as { meta?: { last_row_id?: number } }).meta?.last_row_id || 0
+}
+
+app.post('/api/dashboard/create-ad-only', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    await ensureAdHistoryTable(c.env.DB)
+    const validation = validateAdOnlyInput(body)
+
+    // 1. Fail closed on invalid / would-publish-a-new-post input. Record the rejection (no ad).
+    if (!validation.ok) {
+        const rec = buildAdHistoryRecord({ status: 'rejected', validation, errorMessage: validation.error })
+        const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
+        // 200 ok:false (ad-queue convention) so the React client — which throws on non-2xx and
+        // discards the body — can still read the precise reason/detail.
+        return c.json({ ok: false, error: validation.error, detail: validation.detail, history_id: historyId }, 200)
+    }
+
+    // 1b. Resolve the operator scheduling/budget. 'paused' (default) → non-spending review ad;
+    // 'active'/'scheduled' → a LIVE, SPENDING ad via the date-named daily-campaign path (per-adset
+    // budget + run-hours schedule + activation). Fails CLOSED — an active request with no campaign
+    // name is rejected rather than silently creating an unscheduled, mis-budgeted ad.
+    const schedule = resolveAdOnlySchedule(body)
+    if (!schedule.ok) {
+        const rec = buildAdHistoryRecord({ status: 'rejected', validation, errorMessage: schedule.error, schedule })
+        const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
+        return c.json({ ok: false, error: schedule.error, detail: schedule.detail, history_id: historyId }, 200)
+    }
+
+    // 2. Bridge-capability gate. The CloakBrowser FB bridge now supports a PAUSED ad-only path
+    // (buildAdFromCreative leaves the copied adset + ad PAUSED — no activation, no ACTIVE readback).
+    // If that path is ever disabled again, fail closed WITHOUT creating an ad rather than silently
+    // produce a live, spending ad. The attempt is recorded as 'unsupported' so the dashboard shows a
+    // precise, honest proof panel.
+    if (!AD_ONLY_BRIDGE_SUPPORTS_PAUSED) {
+        const unsupported = buildAdOnlyUnsupportedResult(validation)
+        const rec = buildAdHistoryRecord({ status: 'unsupported', validation, errorMessage: unsupported.error, schedule })
+        const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
+        return c.json({ ...unsupported, history_id: historyId }, 200)
+    }
+
+    // 3. Build the PAUSED ad-only ad via the CloakBrowser FB bridge /create-ad route. We call the
+    // bridge DIRECTLY (never the legacy worker create-ad endpoint) with skip_publish_to_page=true,
+    // skip_comment=true and paused/status_option=PAUSED — so it creates a NON-SPENDING ad from the
+    // existing video and never publishes a page post nor comments. post_history is never touched.
+    const recordAdOnlyFailure = async (error: string, result?: Record<string, unknown> | null, clickLink?: string) => {
+        const rec = buildAdHistoryRecord({ status: 'failed', validation, errorMessage: error, result: result ?? null, clickLink, schedule })
+        const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
+        return c.json({ ok: false, error, history_id: historyId, ...(result || {}) }, 200)
+    }
+
+    const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
+    if (!baseUrl) return recordAdOnlyFailure('bridge_not_configured')
+
+    // template_adset + ad_account from per-page settings — required to copy the template adset.
+    const placementTemplate = String((body.placement_template as string) || '').trim().toLowerCase()
+    const templateSettingKey = placementTemplate === 'facebook'
+        ? 'template_adset_facebook'
+        : (placementTemplate === 'instagram' ? 'template_adset_instagram' : 'template_adset')
+    const templateAdsetRow = await getPageSetting(c.env.DB, validation.pageId, templateSettingKey).catch(() => null)
+    const fallbackTemplateAdsetRow = templateSettingKey === 'template_adset'
+        ? null
+        : await getPageSetting(c.env.DB, validation.pageId, 'template_adset').catch(() => null)
+    const adAccountRow = await getPageSetting(c.env.DB, validation.pageId, 'ad_account').catch(() => null)
+    const templateAdset = String(templateAdsetRow?.value || fallbackTemplateAdsetRow?.value || '').trim()
+    const adAccount = String(adAccountRow?.value || '').trim()
+    if (!templateAdset || !adAccount) return recordAdOnlyFailure('config_missing_template_or_ad_account')
+
+    // Resolve the existing FB video id: prefer the supplied fb_video_id; else resolve it from the
+    // source story/post attachment via the bridge /graph proxy (mirrors the bridge's own
+    // resolveVideoIdFromSourcePost). Ad-only never uploads a new video.
+    let effectiveVideoId = validation.fbVideoId
+    if (!effectiveVideoId) {
+        const sourcePostId = validation.sourceStoryId || validation.sourcePostId
+        if (sourcePostId) {
+            try {
+                const gResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(sourcePostId)}&fields=${encodeURIComponent('attachments{media_type,target{id}}')}`)
+                const gData = await gResp.json().catch(() => ({})) as { attachments?: { data?: Array<{ target?: { id?: string } }> } }
+                effectiveVideoId = String(gData.attachments?.data?.[0]?.target?.id || '').trim()
+            } catch { /* fall through to the unresolved error */ }
+        }
+    }
+    if (!effectiveVideoId) return recordAdOnlyFailure('fb_video_id_unresolved')
+
+    // Resolve a Shopee click link for the ad CTA (click tracking). Best-effort, in order: an explicit
+    // shopee link in the request, the page-video cache, then gallery/namespace state by system video
+    // id. Then shorten via the page shortlink template. click_link falls back to the raw Shopee link.
+    const namespaceRow = await c.env.DB.prepare('SELECT bot_id FROM pages WHERE id = ? LIMIT 1')
+        .bind(validation.pageId).first().catch(() => null) as { bot_id?: string } | null
+    const namespaceId = String(namespaceRow?.bot_id || '').trim()
+    let shopeeLink = ''
+    const inputShopee = String((body.shopee_url as string) || (body.original_link as string) || '').trim()
+    if (/^https?:\/\/(?:[^\s]+\.)?shopee\.[^\s]+/i.test(inputShopee)) shopeeLink = inputShopee
+    if (!shopeeLink && effectiveVideoId) {
+        const cacheRow = await c.env.DB.prepare('SELECT shopee_link FROM facebook_page_video_cache WHERE page_id = ? AND video_id = ? LIMIT 1')
+            .bind(validation.pageId, effectiveVideoId).first().catch(() => null) as { shopee_link?: string } | null
+        if (cacheRow?.shopee_link) shopeeLink = String(cacheRow.shopee_link).trim()
+    }
+    if (!shopeeLink && namespaceId && validation.systemVideoId) {
+        const gi = await c.env.DB.prepare(
+            `SELECT COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), NULLIF(TRIM(gi.shopee_original_link), '')) AS original_link
+             FROM gallery_index gi
+             LEFT JOIN namespace_video_state nvs ON nvs.namespace_id = gi.namespace_id AND nvs.video_id = gi.video_id
+             WHERE gi.namespace_id = ? AND gi.video_id = ? LIMIT 1`
+        ).bind(namespaceId, validation.systemVideoId).first().catch(() => null) as { original_link?: string } | null
+        if (gi?.original_link) shopeeLink = String(gi.original_link).trim()
+    }
+
+    let clickLink = ''
+    if (shopeeLink) {
+        const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
+        const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
+        const sub2Row = await getPageSetting(c.env.DB, validation.pageId, 'sub_id2').catch(() => null)
+        const sub3Row = await getPageSetting(c.env.DB, validation.pageId, 'sub_id3').catch(() => null)
+        const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
+        const shortlinkUrl = tmpl
+            .replace('{url}', encodeURIComponent(shopeeLink))
+            .replace('{sub_id}', encodeURIComponent(String(subRow?.value || 'yok').trim()))
+            .replace('{sub_id2}', encodeURIComponent(String(sub2Row?.value || '').trim()))
+            .replace('{sub_id3}', encodeURIComponent(String(sub3Row?.value || '').trim()))
+            .replace('{sub_id4}', '')
+            .replace('{sub_id5}', '')
+        try {
+            const slResp = await fetch(shortlinkUrl, { method: 'GET' })
+            if (slResp.ok) {
+                const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+                clickLink = String(slData.shortLink || slData.short_link || '').trim()
+            }
+        } catch { /* shortener best-effort; fall back to the raw Shopee link below */ }
+        if (!clickLink) clickLink = shopeeLink
+    }
+
+    // 4. Call the bridge. Ad-only invariants hold for BOTH modes: never publish a new page post,
+    // never comment. The lifecycle differs by operator-selected mode:
+    //   - 'paused' (review): paused/status_option=PAUSED → the bridge leaves the adset + ad PAUSED
+    //     (no budget/schedule/activation) — a NON-SPENDING ad.
+    //   - 'active' (scheduled): NO paused flag; instead daily_campaign_name (date-named campaign) +
+    //     campaign_daily_budget (minor units, CAMPAIGN-level CBO) + adset_run_hours → the bridge
+    //     creates/updates the date-named campaign with the CBO daily budget, copies a budget-free
+    //     adset under it, applies the run-hours schedule and activates the adset + ad — a LIVE,
+    //     SPENDING ad. The skip_publish_to_page guarantee still prevents any Page publish/comment.
+    const caption = String((body.caption as string) || '').trim()
+    const adName = String((body.ad_name as string) || validation.systemVideoId || '').trim()
+    const lifecycleFields = schedule.mode === 'active'
+        ? {
+            daily_campaign_name: schedule.dailyCampaignName,
+            campaign_daily_budget: schedule.dailyBudgetMinor,
+            adset_run_hours: schedule.runHours,
+        }
+        : {
+            paused: true as const,
+            status_option: 'PAUSED' as const,
+            // Keep the old daily-campaign naming/grouping even for review-safe PAUSED ads.
+            // This preserves the operator-selected date (e.g. 18/Jun/2026) in Ads Manager
+            // without sending budget/schedule/activation fields that could start spend.
+            ...(schedule.dailyCampaignName ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
+        }
+    let bridgeResult: Record<string, unknown>
+    try {
+        const bridgeResp = await fetch(`${baseUrl}/create-ad`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page_id: validation.pageId,
+                video_id: effectiveVideoId,
+                caption,
+                ...(adName ? { ad_name: adName, source_video_id: adName } : {}),
+                ...(clickLink ? { shortlink: clickLink } : {}),
+                ...(shopeeLink ? { shopee_url: shopeeLink } : {}),
+                template_adset: templateAdset,
+                ad_account: adAccount,
+                // Ad-only invariants — never publish a new page post, never comment (both modes).
+                skip_publish_to_page: true,
+                skip_comment: true,
+                ...lifecycleFields,
+            }),
+        })
+        const text = await bridgeResp.text()
+        bridgeResult = text ? JSON.parse(text) as Record<string, unknown> : {}
+    } catch (e) {
+        return recordAdOnlyFailure(e instanceof Error ? e.message : String(e), null, clickLink)
+    }
+
+    if (!bridgeResult.ok || !bridgeResult.ad_id) {
+        const step = String(bridgeResult.step || '').trim()
+        const err = String(bridgeResult.error || 'bridge_create_ad_failed').trim()
+        return recordAdOnlyFailure(step ? `[${step}] ${err}` : err, bridgeResult, clickLink)
+    }
+
+    // 5. Success — record the created ids (status=created). The bridge create-ad path returns the
+    // dark creative's effective_object_story_id as `story_id`.
+    const successRec = buildAdHistoryRecord({ status: 'created', validation, result: bridgeResult, clickLink, schedule })
+    const historyId = await insertAdHistoryRow(c.env.DB, successRec, true).catch(() => 0)
+    return c.json({ ok: true, history_id: historyId, mode: schedule.mode, ...bridgeResult, click_link: clickLink }, 200)
+})
+
+app.get('/api/dashboard/ad-history', async (c) => {
+    await ensureAdHistoryTable(c.env.DB)
+    const limitRaw = Number(c.req.query('limit') || 50)
+    const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.floor(limitRaw))) : 50
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const status = String(c.req.query('status') || '').trim()
+    const clauses: string[] = []
+    const binds: unknown[] = []
+    if (pageId) { clauses.push('page_id = ?'); binds.push(pageId) }
+    if (status) { clauses.push('status = ?'); binds.push(status) }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const rows = await c.env.DB.prepare(
+        `SELECT * FROM dashboard_ad_history ${where} ORDER BY id DESC LIMIT ?`
+    ).bind(...binds, limit).all() as { results?: Array<Record<string, unknown>> }
+    return c.json({ ok: true, items: rows.results || [] }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// =====================================================================
+// AD-ONLY QUEUE / SCHEDULER — restores the "old queue cadence" UX (สร้างทุก X นาที) but on the
+// AD-ONLY lane ONLY. Every queued row is replayed through POST /api/dashboard/create-ad-only — never
+// the legacy /api/dashboard/create-ad — so the hard invariants of the ad-only lane are preserved:
+//   • NEVER publishes a new Page post   • NEVER comments   • NEVER writes post_history
+// It has its OWN table (dashboard_ad_only_queue) so it can never be picked up by the legacy ad-queue
+// processor, and the Page-post/auto-post lanes are completely untouched.
+//
+// Cadence: the scheduled handler processes AT MOST ONE queued row per interval (operator-set, stored
+// as a dashboard setting; clamped 1–1440 min, default 20). Default mode is the safe, non-spending
+// 'paused' review ad — an 'active' (spending) row is only ever created when the operator deliberately
+// queued one with a campaign date (the create-ad-only endpoint fails closed otherwise).
+// =====================================================================
+const AD_ONLY_QUEUE_LAST_RUN_KEY = 'ad_only_queue_last_run_at'
+const AD_ONLY_QUEUE_INTERVAL_KEY = 'ad_only_queue_interval_minutes'
+
+async function ensureAdOnlyQueueTable(db: D1Database): Promise<void> {
+    await db.prepare(
+        `CREATE TABLE IF NOT EXISTS dashboard_ad_only_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            page_id TEXT NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'paused',
+            daily_campaign_name TEXT NOT NULL DEFAULT '',
+            daily_budget_thb TEXT NOT NULL DEFAULT '',
+            run_hours TEXT NOT NULL DEFAULT '',
+            story_id TEXT NOT NULL DEFAULT '',
+            post_id TEXT NOT NULL DEFAULT '',
+            fb_video_id TEXT NOT NULL DEFAULT '',
+            system_video_id TEXT NOT NULL DEFAULT '',
+            shopee_url TEXT NOT NULL DEFAULT '',
+            caption TEXT NOT NULL DEFAULT '',
+            ad_name TEXT NOT NULL DEFAULT '',
+            placement_template TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'queued',
+            attempted_at TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            result_history_id TEXT NOT NULL DEFAULT '',
+            result_ad_id TEXT NOT NULL DEFAULT '',
+            result_adset_id TEXT NOT NULL DEFAULT '',
+            result_campaign_id TEXT NOT NULL DEFAULT '',
+            result_story_id TEXT NOT NULL DEFAULT ''
+        )`
+    ).run()
+    await db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_dashboard_ad_only_queue_status ON dashboard_ad_only_queue(status, id)`
+    ).run()
+}
+
+// Resolve the operator-set cadence (minutes). Stored globally in dashboard_settings; clamped/defaulted
+// by clampAdOnlyIntervalMinutes so a missing/garbage value never makes the gate fire every tick.
+async function getAdOnlyIntervalMinutes(db: D1Database): Promise<number> {
+    const row = await getDashboardSetting(db, AD_ONLY_QUEUE_INTERVAL_KEY).catch(() => null)
+    if (row && String(row.value || '').trim()) return clampAdOnlyIntervalMinutes(row.value)
+    return DEFAULT_AD_ONLY_INTERVAL_MINUTES
+}
+
+app.post('/api/dashboard/ad-only-queue/enqueue', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    await ensureAdOnlyQueueTable(c.env.DB)
+    // Validate with the SAME rules the create-ad-only endpoint enforces, so a row can never be queued
+    // that would be rejected at run time (and so a video_url-only / page-publish request is refused
+    // here too). resolveAdOnlySchedule enforces the active-mode campaign-name requirement.
+    const validation = validateAdOnlyInput(body)
+    if (!validation.ok) return c.json({ ok: false, error: validation.error, detail: validation.detail }, 200)
+    const schedule = resolveAdOnlySchedule(body)
+    if (!schedule.ok) return c.json({ ok: false, error: schedule.error, detail: schedule.detail }, 200)
+
+    const insert = await c.env.DB.prepare(
+        `INSERT INTO dashboard_ad_only_queue
+           (page_id, mode, daily_campaign_name, daily_budget_thb, run_hours,
+            story_id, post_id, fb_video_id, system_video_id, shopee_url, caption, ad_name, placement_template)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+        validation.pageId,
+        schedule.mode,
+        schedule.dailyCampaignName,
+        schedule.mode === 'active' ? String(schedule.dailyBudgetThb) : '',
+        schedule.mode === 'active' ? String(schedule.runHours) : '',
+        validation.sourceStoryId,
+        validation.sourcePostId,
+        validation.fbVideoId,
+        validation.systemVideoId,
+        String((body.shopee_url as string) || (body.original_link as string) || '').trim(),
+        String((body.caption as string) || '').trim(),
+        String((body.ad_name as string) || validation.systemVideoId || '').trim(),
+        String((body.placement_template as string) || '').trim(),
+    ).run()
+    const queueId = (insert as unknown as { meta?: { last_row_id?: number } }).meta?.last_row_id || 0
+    const queuedCount = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM dashboard_ad_only_queue WHERE status = 'queued'`
+    ).first() as { n?: number } | null
+    const interval = await getAdOnlyIntervalMinutes(c.env.DB)
+    const lastRun = await getDashboardSetting(c.env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY).catch(() => null)
+    const nextRunMs = nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now())
+    return c.json({
+        ok: true,
+        queue_id: queueId,
+        mode: schedule.mode,
+        queued_count: Number(queuedCount?.n || 0),
+        interval_minutes: interval,
+        next_run_at: new Date(nextRunMs).toISOString(),
+    }, 200)
+})
+
+app.get('/api/dashboard/ad-only-queue/list', async (c) => {
+    await ensureAdOnlyQueueTable(c.env.DB)
+    const limitRaw = Number(c.req.query('limit') || 100)
+    const limit = Number.isFinite(limitRaw) ? Math.min(500, Math.max(1, Math.floor(limitRaw))) : 100
+    const status = String(c.req.query('status') || '').trim()
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const clauses: string[] = []
+    const binds: unknown[] = []
+    if (status) { clauses.push('status = ?'); binds.push(status) }
+    if (pageId) { clauses.push('page_id = ?'); binds.push(pageId) }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const rows = await c.env.DB.prepare(
+        `SELECT * FROM dashboard_ad_only_queue ${where} ORDER BY id DESC LIMIT ?`
+    ).bind(...binds, limit).all() as { results?: Array<Record<string, unknown>> }
+    const counts = await c.env.DB.prepare(
+        `SELECT status, COUNT(*) AS n FROM dashboard_ad_only_queue GROUP BY status`
+    ).all() as { results?: Array<{ status: string; n: number }> }
+    const countsByStatus: Record<string, number> = {}
+    for (const r of (counts.results || [])) countsByStatus[String(r.status)] = Number(r.n)
+    const interval = await getAdOnlyIntervalMinutes(c.env.DB)
+    const lastRun = await getDashboardSetting(c.env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY).catch(() => null)
+    const nextRunMs = nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now())
+    return c.json({
+        ok: true,
+        items: rows.results || [],
+        counts: countsByStatus,
+        last_run_at: lastRun?.value || '',
+        next_run_at: new Date(nextRunMs).toISOString(),
+        interval_minutes: interval,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Operator cadence control — "สร้างทุก X นาที". GET reads, PUT sets (clamped 1–1440).
+app.get('/api/dashboard/ad-only-queue/interval', async (c) => {
+    const interval = await getAdOnlyIntervalMinutes(c.env.DB)
+    return c.json({ ok: true, interval_minutes: interval }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.put('/api/dashboard/ad-only-queue/interval', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { interval_minutes?: number | string }
+    const interval = clampAdOnlyIntervalMinutes(body.interval_minutes)
+    await setDashboardSetting(c.env.DB, AD_ONLY_QUEUE_INTERVAL_KEY, String(interval))
+    return c.json({ ok: true, interval_minutes: interval }, 200)
+})
+
+app.delete('/api/dashboard/ad-only-queue/:id', async (c) => {
+    await ensureAdOnlyQueueTable(c.env.DB)
+    const id = Number(c.req.param('id') || 0)
+    if (!id) return c.json({ ok: false, error: 'id required' }, 400)
+    await c.env.DB.prepare(
+        `UPDATE dashboard_ad_only_queue SET status = 'cancelled', completed_at = datetime('now')
+         WHERE id = ? AND status = 'queued'`
+    ).bind(id).run()
+    return c.json({ ok: true, id })
+})
+
+// Process the oldest queued ad-only item. Replays it through POST /api/dashboard/create-ad-only via
+// internal fetch (the SAME pattern as the legacy processNextAdQueueItem, but targeting the ad-only
+// endpoint — buildAdOnlyCreateBody guarantees the body never carries a page-publish field). Records
+// the resulting ad/history ids back on the row. Runs from cron and from the manual "run now" button.
+async function processNextAdOnlyQueueItem(env: Env): Promise<{
+    ok: boolean
+    skipped?: boolean
+    reason?: string
+    queue_id?: number
+    result?: unknown
+    error?: string
+}> {
+    await ensureAdOnlyQueueTable(env.DB)
+    const row = await env.DB.prepare(
+        `SELECT * FROM dashboard_ad_only_queue WHERE status = 'queued' ORDER BY id ASC LIMIT 1`
+    ).first() as Record<string, unknown> | null
+    if (!row) return { ok: true, skipped: true, reason: 'queue_empty' }
+
+    const queueId = Number(row.id)
+    const nowIso = new Date().toISOString()
+    const claim = await env.DB.prepare(
+        `UPDATE dashboard_ad_only_queue SET status = 'processing', attempted_at = ? WHERE id = ? AND status = 'queued'`
+    ).bind(nowIso, queueId).run()
+    const claimed = (claim as unknown as { meta?: { changes?: number } }).meta?.changes || 0
+    if (!claimed) return { ok: true, skipped: true, reason: 'claim_lost', queue_id: queueId }
+
+    try {
+        const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+        // buildAdOnlyCreateBody maps the queued row to the create-ad-only contract, preserving the
+        // operator-set campaign date/name, mode, budget and run-hours.
+        const reqBody = buildAdOnlyCreateBody(row as AdOnlyQueueRow)
+        const resp = await fetch(`${workerUrl}/api/dashboard/create-ad-only`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reqBody),
+        })
+        const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+        // create-ad-only returns HTTP 200 ok:false for validation/bridge failures, so gate on data.ok.
+        if (!resp.ok || !data.ok) {
+            const errorMsg = String(data.error || `http_${resp.status}`).trim()
+            const detail = String(data.detail || '').trim()
+            const combined = detail ? `${errorMsg} — ${detail}` : errorMsg
+            await env.DB.prepare(
+                `UPDATE dashboard_ad_only_queue SET status = 'failed', completed_at = datetime('now'),
+                   error_message = ?, result_history_id = ? WHERE id = ?`
+            ).bind(combined.substring(0, 500), String(data.history_id || ''), queueId).run()
+            return { ok: false, queue_id: queueId, error: combined }
+        }
+        await env.DB.prepare(
+            `UPDATE dashboard_ad_only_queue
+             SET status = 'done', completed_at = datetime('now'), error_message = '',
+                 result_history_id = ?, result_ad_id = ?, result_adset_id = ?,
+                 result_campaign_id = ?, result_story_id = ?
+             WHERE id = ?`
+        ).bind(
+            String(data.history_id || ''),
+            String(data.ad_id || ''),
+            String(data.adset_id || ''),
+            String(data.campaign_id || ''),
+            String(data.effective_object_story_id || data.story_id || ''),
+            queueId,
+        ).run()
+        return { ok: true, queue_id: queueId, result: data }
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        await env.DB.prepare(
+            `UPDATE dashboard_ad_only_queue SET status = 'failed', completed_at = datetime('now'), error_message = ? WHERE id = ?`
+        ).bind(msg.substring(0, 500), queueId).run()
+        return { ok: false, queue_id: queueId, error: msg }
+    }
+}
+
+async function recoverStuckAdOnlyQueueProcessing(env: Env, thresholdMs = 2 * 60 * 1000): Promise<{ recovered: number }> {
+    await ensureAdOnlyQueueTable(env.DB)
+    const cutoffIso = new Date(Date.now() - thresholdMs).toISOString()
+    const stuck = await env.DB.prepare(
+        `SELECT id FROM dashboard_ad_only_queue
+         WHERE status = 'processing' AND attempted_at < ? AND COALESCE(result_ad_id, '') = ''`
+    ).bind(cutoffIso).all() as { results?: Array<{ id: number }> }
+    const ids = (stuck.results || []).map((r) => Number(r.id)).filter(Boolean)
+    for (const id of ids) {
+        await env.DB.prepare(
+            `UPDATE dashboard_ad_only_queue
+             SET status = 'queued', error_message = 'recovered_from_aborted_processing', completed_at = ''
+             WHERE id = ? AND status = 'processing' AND COALESCE(result_ad_id, '') = ''`
+        ).bind(id).run()
+    }
+    if (ids.length) console.warn(`[AD-ONLY-QUEUE] recovered stuck processing items: ${ids.join(',')}`)
+    return { recovered: ids.length }
+}
+
+// Manual "run now" — process the oldest queued ad-only item immediately, bypassing the interval gate.
+// The actual create-ad call can take longer than browser/tool HTTP timeouts, so return quickly and let
+// waitUntil finish the work. This prevents a client abort from leaving the row stuck in processing.
+app.post('/api/dashboard/ad-only-queue/run-next', async (c) => {
+    const recovery = await recoverStuckAdOnlyQueueProcessing(c.env)
+    c.executionCtx.waitUntil(
+        processNextAdOnlyQueueItem(c.env).then((result) => {
+            console.log(`[AD-ONLY-QUEUE] manual run-next queue_id=${result.queue_id ?? ''} ok=${result.ok} ${result.error ? `error=${result.error}` : ''}`)
+        }).catch((error) => {
+            console.error(`[AD-ONLY-QUEUE] manual run-next failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    )
+    return c.json({ ok: true, accepted: true, recovered: recovery.recovered }, 202, { 'Cache-Control': 'no-store' })
+})
+
+// Cron entrypoint — process AT MOST ONE queued ad-only item, gated by the operator-set interval. Sets
+// last_run BEFORE processing so a slow create-ad-only call can't be double-claimed by the next
+// every-minute cron tick. Never throws (cron must not be derailed by an ad-only failure).
+async function maybeProcessAdOnlyQueueOnSchedule(env: Env): Promise<{ ran: boolean; reason?: string }> {
+    try {
+        await ensureAdOnlyQueueTable(env.DB)
+        await recoverStuckAdOnlyQueueProcessing(env)
+        const interval = await getAdOnlyIntervalMinutes(env.DB)
+        const lastRun = await getDashboardSetting(env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY).catch(() => null)
+        if (!isAdOnlyQueueDue(String(lastRun?.value || ''), interval, Date.now())) {
+            return { ran: false, reason: 'interval_not_elapsed' }
+        }
+        const pending = await env.DB.prepare(
+            `SELECT id FROM dashboard_ad_only_queue WHERE status = 'queued' ORDER BY id ASC LIMIT 1`
+        ).first() as { id?: number } | null
+        if (!pending) return { ran: false, reason: 'queue_empty' }
+        // Claim the cadence slot first (set last_run), then process exactly one item.
+        await setDashboardSetting(env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY, new Date().toISOString()).catch(() => null)
+        const result = await processNextAdOnlyQueueItem(env)
+        console.log(`[AD-ONLY-QUEUE] processed queue_id=${result.queue_id ?? ''} ok=${result.ok} ${result.error ? `error=${result.error}` : ''}`)
+        return { ran: true }
+    } catch (e) {
+        console.error(`[AD-ONLY-QUEUE] ${e instanceof Error ? e.message : String(e)}`)
+        return { ran: false, reason: 'error' }
+    }
+}
+
 app.get('/api/dashboard/ad-links', async (c) => {
     const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
     const pattern = String(c.req.query('pattern') || '^16MAY26FBSPCAD \\((\\d+)\\)$').trim()
@@ -13847,6 +14441,12 @@ type LineWaitingVideoState = {
     coverTextStyle?: CoverTextStyleSettings
     coverTextPositionOptions?: LineCoverTextPositionOption[]
 }
+type LineCurrentVideoIntakeState = {
+    videoId: string
+    createdAt?: string
+    sourceType?: string
+    sourceLabel?: string
+}
 
 type LineAffiliateLinkKind = 'shopee' | 'lazada'
 
@@ -15183,6 +15783,64 @@ function normalizeLineWaitingVideoState(input: Partial<LineWaitingVideoState> | 
     }
 }
 
+function normalizeLineCurrentVideoIntakeState(input: Partial<LineCurrentVideoIntakeState> | null | undefined): LineCurrentVideoIntakeState | null {
+    const videoId = String(input?.videoId || '').trim()
+    if (!videoId) return null
+    return {
+        videoId,
+        createdAt: String(input?.createdAt || '').trim() || new Date().toISOString(),
+        sourceType: String(input?.sourceType || '').trim(),
+        sourceLabel: String(input?.sourceLabel || '').trim().slice(0, 2048),
+    }
+}
+
+async function getLineCurrentVideoIntake(bucket: R2Bucket, lineUserId: string): Promise<LineCurrentVideoIntakeState | null> {
+    const userId = String(lineUserId || '').trim()
+    if (!userId) return null
+    const key = `_waiting_video_current/${userId}.json`
+    const obj = await bucket.get(key).catch(() => null)
+    if (!obj) return null
+    const raw = await obj.json().catch(() => null) as Partial<LineCurrentVideoIntakeState> | null
+    const state = normalizeLineCurrentVideoIntakeState(raw)
+    if (!state) {
+        await bucket.delete(key).catch(() => { })
+        return null
+    }
+    return state
+}
+
+async function putLineCurrentVideoIntake(bucket: R2Bucket, lineUserId: string, input: Partial<LineCurrentVideoIntakeState>): Promise<LineCurrentVideoIntakeState> {
+    const userId = String(lineUserId || '').trim()
+    const state = normalizeLineCurrentVideoIntakeState(input)
+    if (!userId || !state) throw new Error('invalid_line_current_video_intake')
+    await bucket.put(`_waiting_video_current/${userId}.json`, JSON.stringify(state), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+    return state
+}
+
+async function clearLineCurrentVideoIntake(bucket: R2Bucket, lineUserId: string): Promise<void> {
+    const userId = String(lineUserId || '').trim()
+    if (!userId) return
+    await bucket.delete(`_waiting_video_current/${userId}.json`).catch(() => { })
+}
+
+async function clearLineCurrentVideoIntakeIfMatches(bucket: R2Bucket, lineUserId: string, videoId: string): Promise<void> {
+    const userId = String(lineUserId || '').trim()
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!userId || !normalizedVideoId) return
+    const current = await getLineCurrentVideoIntake(bucket, userId).catch(() => null)
+    if (current?.videoId !== normalizedVideoId) return
+    await clearLineCurrentVideoIntake(bucket, userId)
+}
+
+async function isLineCurrentVideoIntake(bucket: R2Bucket, lineUserId: string, videoId: string): Promise<boolean> {
+    const normalizedVideoId = String(videoId || '').trim()
+    if (!String(lineUserId || '').trim() || !normalizedVideoId) return false
+    const current = await getLineCurrentVideoIntake(bucket, lineUserId)
+    return current?.videoId === normalizedVideoId
+}
+
 async function getLineWaitingVideoState(bucket: R2Bucket, lineUserId: string): Promise<LineWaitingVideoState | null> {
     const waitingObj = await bucket.get(`_waiting_video/${lineUserId}.json`)
     if (!waitingObj) return null
@@ -15190,6 +15848,10 @@ async function getLineWaitingVideoState(bucket: R2Bucket, lineUserId: string): P
     const state = normalizeLineWaitingVideoState(raw)
     if (!state) {
         await bucket.delete(`_waiting_video/${lineUserId}.json`).catch(() => { })
+        return null
+    }
+    const currentIntake = await getLineCurrentVideoIntake(bucket, lineUserId).catch(() => null)
+    if (currentIntake?.videoId && state.id !== currentIntake.videoId) {
         return null
     }
     return state
@@ -15472,6 +16134,10 @@ async function promptLineCoverOptions(params: {
         coverTextPositionOptions: [],
     })
 
+    // Do NOT swallow the send failure here. Callers (XHS intake, video upload,
+    // cover commands) wrap this in try/catch and send a user-visible fallback
+    // when the cover picker can't be delivered. Swallowing it would leave the
+    // user stuck on the ack with no follow-up and no error.
     await lineReplyOrPush({
         replyToken: params.replyToken,
         channelAccessToken: params.channelAccessToken,
@@ -15484,7 +16150,7 @@ async function promptLineCoverOptions(params: {
                 coverOptions: nextWaitingState.coverOptions || generatedOptions,
             }),
         ],
-    }).catch(() => { })
+    })
 }
 
 async function promptLineCoverTextPositionOptions(params: {
@@ -15865,6 +16531,7 @@ async function finalizeLineWaitingVideoAndStartProcessing(params: {
 
     await clearLineWaitingVideoState(params.bucket, params.lineUserId)
     await clearLineWaitingVideoCancelled(params.bucket, params.lineUserId)
+    await clearLineCurrentVideoIntakeIfMatches(params.bucket, params.lineUserId, waitingState.id)
 
     const hasLinks = !!String(inboxRecord.shopeeLink || '').trim() || !!String(inboxRecord.lazadaLink || '').trim()
     const jobStatus = startResult.outcome === 'started'
@@ -16539,6 +17206,7 @@ async function handleLineEvent(event: any, env: Env, channelAccessToken: string,
         await handleLineVideoMessage({
             env,
             bucket,
+            executionCtx,
             namespaceId,
             channelAccessToken,
             replyToken,
@@ -16576,26 +17244,51 @@ async function handleLineEvent(event: any, env: Env, channelAccessToken: string,
 async function handleLineVideoMessage(params: {
     env: Env
     bucket: R2Bucket
+    executionCtx?: ExecutionContext
     namespaceId: string
     channelAccessToken: string
     replyToken: string
     lineUserId: string
     messageId: string
 }) {
-    const { env, bucket, namespaceId, channelAccessToken, replyToken, lineUserId, messageId } = params
+    const { env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, messageId } = params
     const videoId = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
     await clearLineWaitingVideoCancelled(bucket, lineUserId)
 
-    try {
+    // Direct LINE video uploads can be large; pulling the bytes from LINE +
+    // storing to R2 + building the cover picker can exceed the reply-token
+    // lifetime, leaving the user staring at a read-but-silent bot. Ack inside
+    // the reply window first (consuming the token), then do the slow work via
+    // executionCtx.waitUntil so the webhook returns immediately. The cover
+    // picker and any error are delivered by push (followupReplyToken === ''),
+    // mirroring the XHS branch. Inline fallback when there is no executionCtx.
+    await lineReplyOrPush({
+        replyToken,
+        channelAccessToken,
+        lineUserId,
+        messages: [
+            { type: 'text', text: 'รับวิดีโอแล้ว 🎬 กำลังเตรียมตัวเลือกปกให้นะ รอสักครู่...' },
+        ],
+    }).catch((e) => {
+        console.warn(`[LINE] video ack failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+    })
+    const followupReplyToken = ''
+
+    const followupPromise = (async () => {
         // Download video content from LINE
         const contentResp = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
             headers: { 'Authorization': `Bearer ${channelAccessToken}` },
         })
         if (!contentResp.ok) {
             console.error(`[LINE] Failed to download video content: HTTP ${contentResp.status}`)
-            await lineReply(replyToken, channelAccessToken, [
-                { type: 'text', text: 'ไม่สามารถดาวน์โหลดวิดีโอได้ กรุณาลองใหม่อีกครั้ง' },
-            ])
+            await lineReplyOrPush({
+                replyToken: followupReplyToken,
+                channelAccessToken,
+                lineUserId,
+                messages: [
+                    { type: 'text', text: 'ไม่สามารถดาวน์โหลดวิดีโอได้ กรุณาลองใหม่อีกครั้ง' },
+                ],
+            }).catch(() => { })
             return
         }
 
@@ -16629,17 +17322,28 @@ async function handleLineVideoMessage(params: {
             bucket,
             namespaceId,
             channelAccessToken,
-            replyToken,
+            replyToken: followupReplyToken,
             lineUserId,
             waitingState,
             forceRefresh: true,
         })
-    } catch (e) {
+    })().catch(async (e) => {
         console.error('[LINE] Video handling error:', e instanceof Error ? e.message : String(e))
-        await lineReply(replyToken, channelAccessToken, [
-            { type: 'text', text: 'เกิดข้อผิดพลาดในการรับวิดีโอ กรุณาลองใหม่อีกครั้ง' },
-        ]).catch(() => {})
+        await lineReplyOrPush({
+            replyToken: followupReplyToken,
+            channelAccessToken,
+            lineUserId,
+            messages: [
+                { type: 'text', text: 'เกิดข้อผิดพลาดในการรับวิดีโอ กรุณาลองใหม่อีกครั้ง' },
+            ],
+        }).catch(() => { })
+    })
+
+    if (executionCtx) {
+        executionCtx.waitUntil(followupPromise)
+        return
     }
+    await followupPromise
 }
 
 async function ackAndStartLineWaitingVideoFinalization(params: {
@@ -16717,8 +17421,21 @@ async function handleLineTextMessage(params: {
     const waitingState = await getLineWaitingVideoState(bucket, lineUserId)
 
     if (isLineCancelCommand(text)) {
+        const currentIntake = await getLineCurrentVideoIntake(bucket, lineUserId).catch(() => null)
         if (waitingState) {
             await markLineWaitingVideoCancelled(bucket, lineUserId, waitingState.id)
+            if (!currentIntake || currentIntake.videoId === waitingState.id) {
+                await clearLineCurrentVideoIntake(bucket, lineUserId)
+            }
+            await clearLineWaitingVideoState(bucket, lineUserId)
+            await lineReply(replyToken, channelAccessToken, [
+                { type: 'text', text: 'ยกเลิกงานที่ค้างไว้แล้ว ส่งวิดีโอหรือลิงก์ใหม่ได้เลย' },
+            ]).catch(() => { })
+            return
+        }
+        if (currentIntake) {
+            await markLineWaitingVideoCancelled(bucket, lineUserId, currentIntake.videoId)
+            await clearLineCurrentVideoIntake(bucket, lineUserId)
             await clearLineWaitingVideoState(bucket, lineUserId)
             await lineReply(replyToken, channelAccessToken, [
                 { type: 'text', text: 'ยกเลิกงานที่ค้างไว้แล้ว ส่งวิดีโอหรือลิงก์ใหม่ได้เลย' },
@@ -17115,167 +17832,193 @@ async function handleLineTextMessage(params: {
         const xhsUrl = xhsMatch[0]
         const videoId = crypto.randomUUID().slice(0, 8)
         const xhsResolveTimeoutMs = 15_000
-        const xhsDownloadTimeoutMs = 45_000
-        await clearLineWaitingVideoCancelled(bucket, lineUserId)
-
-        // Acknowledge immediately within the reply-token window. XHS
-        // resolve+download can take up to ~60s (resolve 15s + download 45s),
-        // far longer than the loading animation (20s) and long enough for the
-        // reply token to expire before any message is sent — which looks like
-        // the bot read the link and ignored it. Consume the reply token on a
-        // quick ack here, then deliver the cover picker (and any failure
-        // message) via push so there is never a stale/expired token in play.
-        await lineReplyOrPush({
-            replyToken,
-            channelAccessToken,
-            lineUserId,
-            messages: [
-                { type: 'text', text: 'รับลิงก์ XHS แล้ว 🎬 กำลังดึงวิดีโอ/เตรียมตัวเลือกปกให้นะ รอสักครู่...' },
-            ],
-        }).catch((e) => {
-            console.warn(`[LINE] XHS ack failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+        // XHS full downloads can be large (50MB+ over slow upstreams) and the
+        // old 45s budget aborted real videos mid-stream — the dominant cause of
+        // "sometimes works, sometimes not". Allow up to 120s, still bounded by
+        // the AbortController below so a stalled upstream can never hang forever.
+        const xhsDownloadTimeoutMs = 120_000
+        await putLineCurrentVideoIntake(bucket, lineUserId, {
+            videoId,
+            createdAt: new Date().toISOString(),
+            sourceType: 'xhs_url',
+            sourceLabel: xhsUrl,
         })
 
-        // Reply token is now consumed by the ack above. Force push for every
-        // follow-up message (cover picker or failure) by passing an empty token.
-        const followupReplyToken = ''
+        // Keep LINE's legacy cover-picker-first UX: do not consume the reply
+        // token with an intermediate acknowledgement. The cover picker (or an
+        // explicit failure message) must be the first visible response.
+        const followupReplyToken = replyToken
 
-        const withTimeoutSignal = (timeoutMs: number) => {
-            const controller = new AbortController()
-            const timeoutId = setTimeout(() => controller.abort(`xhs_timeout_${timeoutMs}ms`), timeoutMs)
-            return { controller, timeoutId }
-        }
+        // The XHS resolve + full video download + R2 store + cover-picker
+        // prompt can run well past a minute for large videos. Return the
+        // webhook now (executionCtx.waitUntil) so LINE never gives up / retries
+        // the event while we work; the follow-up cover picker and any failure
+        // message are pushed (followupReplyToken === ''). In test / non-worker
+        // contexts (no executionCtx) we fall back to awaiting inline.
+        const followupPromise = (async () => {
+            const isCurrentXhsIntake = () => isLineCurrentVideoIntake(bucket, lineUserId, videoId)
+            const withTimeoutSignal = (timeoutMs: number) => {
+                const controller = new AbortController()
+                const timeoutId = setTimeout(() => controller.abort(`xhs_timeout_${timeoutMs}ms`), timeoutMs)
+                return { controller, timeoutId }
+            }
 
-        // Resolve XHS URL to direct video URL via merge service
-        let resolvedVideoUrl = xhsUrl
-        let resolverFailureReason: 'no_video' | 'request_failed' | null = null
-        try {
-            const { controller, timeoutId } = withTimeoutSignal(xhsResolveTimeoutMs)
-            let resolveResp: Response
+            // Resolve XHS URL to direct video URL via merge service
+            let resolvedVideoUrl = xhsUrl
+            let resolverFailureReason: 'no_video' | 'request_failed' | null = null
             try {
-                resolveResp = await fetchMergeService(env, '/xhs/resolve', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: xhsUrl }),
-                    signal: controller.signal,
-                })
-            } finally {
-                clearTimeout(timeoutId)
-            }
-            if (resolveResp.ok) {
-                const resolveData = await resolveResp.json() as { video_url?: string }
-                if (resolveData?.video_url) {
-                    resolvedVideoUrl = resolveData.video_url
-                } else {
-                    resolverFailureReason = 'no_video'
-                }
-            } else if (resolveResp.status === 404) {
-                resolverFailureReason = 'no_video'
-            } else {
-                resolverFailureReason = 'request_failed'
-            }
-        } catch (e) {
-            console.warn(`[LINE] XHS resolve failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
-            resolverFailureReason = 'request_failed'
-        }
-
-        // Download video and store in R2
-        let r2VideoUrl = xhsUrl
-        let originalStored = false
-        let downloadFailed = false
-        try {
-            if (resolvedVideoUrl !== xhsUrl) {
-                const { controller, timeoutId } = withTimeoutSignal(xhsDownloadTimeoutMs)
-                let videoResp: Response
+                const { controller, timeoutId } = withTimeoutSignal(xhsResolveTimeoutMs)
+                let resolveResp: Response
                 try {
-                    videoResp = await fetch(resolvedVideoUrl, {
-                        headers: { 'Referer': 'https://www.xiaohongshu.com/' },
+                    resolveResp = await fetchMergeService(env, '/xhs/resolve', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: xhsUrl }),
                         signal: controller.signal,
                     })
                 } finally {
                     clearTimeout(timeoutId)
                 }
-                if (videoResp.ok && videoResp.body) {
-                    const videoBuffer = await videoResp.arrayBuffer()
-                    assertDownloadedVideoResponse(videoResp, videoBuffer, resolvedVideoUrl)
-                    r2VideoUrl = await storeOriginalVideoBuffer({
-                        bucket,
-                        env,
-                        namespaceId,
-                        videoId,
-                        videoBuffer,
-                        contentType: 'video/mp4',
-                    })
-                    await backfillOriginalThumbnail(env, namespaceId, videoId).catch(() => { })
-                    originalStored = true
+                if (resolveResp.ok) {
+                    const resolveData = await resolveResp.json() as { video_url?: string }
+                    if (resolveData?.video_url) {
+                        resolvedVideoUrl = resolveData.video_url
+                    } else {
+                        resolverFailureReason = 'no_video'
+                    }
+                } else if (resolveResp.status === 404) {
+                    resolverFailureReason = 'no_video'
                 } else {
-                    downloadFailed = true
+                    resolverFailureReason = 'request_failed'
                 }
+            } catch (e) {
+                console.warn(`[LINE] XHS resolve failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+                resolverFailureReason = 'request_failed'
             }
-        } catch (e) {
-            console.warn(`[LINE] XHS download failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
-            downloadFailed = true
-        }
 
-        if (!originalStored) {
-            // Make sure we don't leave behind a stale waiting state or
-            // cancel marker that would confuse the next message.
-            await clearLineWaitingVideoState(bucket, lineUserId).catch(() => { })
-            await clearLineWaitingVideoCancelled(bucket, lineUserId).catch(() => { })
+            // Download video and store in R2
+            let r2VideoUrl = xhsUrl
+            let originalStored = false
+            let downloadFailed = false
+            try {
+                if (resolvedVideoUrl !== xhsUrl) {
+                    if (!(await isCurrentXhsIntake())) return
+                    const { controller, timeoutId } = withTimeoutSignal(xhsDownloadTimeoutMs)
+                    let videoResp: Response
+                    try {
+                        videoResp = await fetch(resolvedVideoUrl, {
+                            headers: { 'Referer': 'https://www.xiaohongshu.com/' },
+                            signal: controller.signal,
+                        })
+                    } finally {
+                        clearTimeout(timeoutId)
+                    }
+                    if (videoResp.ok && videoResp.body) {
+                        const videoBuffer = await videoResp.arrayBuffer()
+                        assertDownloadedVideoResponse(videoResp, videoBuffer, resolvedVideoUrl)
+                        if (!(await isCurrentXhsIntake())) return
+                        r2VideoUrl = await storeOriginalVideoBuffer({
+                            bucket,
+                            env,
+                            namespaceId,
+                            videoId,
+                            videoBuffer,
+                            contentType: 'video/mp4',
+                        })
+                        await backfillOriginalThumbnail(env, namespaceId, videoId).catch(() => { })
+                        originalStored = true
+                    } else {
+                        downloadFailed = true
+                    }
+                }
+            } catch (e) {
+                console.warn(`[LINE] XHS download failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+                downloadFailed = true
+            }
 
-            const failureText = resolverFailureReason === 'no_video'
-                ? 'ลิงก์ XHS นี้อาจไม่ใช่โพสต์วิดีโอ ลองส่งลิงก์ที่เป็นวิดีโอใหม่อีกครั้ง'
-                : downloadFailed || resolverFailureReason === 'request_failed'
-                    ? 'โหลดวิดีโอจาก XHS ไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
-                    : 'รับลิงก์ XHS แล้ว แต่ดึงวิดีโอไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
+            if (!originalStored) {
+                // Superseded/cancelled background work exits silently. The
+                // newer/current request owns all user-visible follow-ups.
+                if (!(await isCurrentXhsIntake())) return
 
+                const failureText = resolverFailureReason === 'no_video'
+                    ? 'ลิงก์ XHS นี้อาจไม่ใช่โพสต์วิดีโอ ลองส่งลิงก์ที่เป็นวิดีโอใหม่อีกครั้ง'
+                    : downloadFailed || resolverFailureReason === 'request_failed'
+                        ? 'โหลดวิดีโอจาก XHS ไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
+                        : 'รับลิงก์ XHS แล้ว แต่ดึงวิดีโอไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง'
+
+                await lineReplyOrPush({
+                    replyToken: followupReplyToken,
+                    channelAccessToken,
+                    lineUserId,
+                    messages: [
+                        { type: 'text', text: failureText },
+                    ],
+                }).catch(() => { })
+                await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
+                return
+            }
+
+            const createdAt = new Date().toISOString()
+
+            try {
+                if (!(await isCurrentXhsIntake())) return
+                const waitingState = await putLineWaitingVideoState(bucket, lineUserId, {
+                    id: videoId,
+                    videoUrl: r2VideoUrl,
+                    createdAt,
+                    sourceType: 'xhs_url',
+                    sourceLabel: xhsUrl,
+                    shopeeLink: shopeeLink || '',
+                    lazadaLink: lazadaLink || '',
+                    awaitingStep: 'cover',
+                    coverCompleted: false,
+                })
+
+                if (!(await isCurrentXhsIntake())) return
+                await promptLineCoverOptions({
+                    env,
+                    bucket,
+                    namespaceId,
+                    channelAccessToken,
+                    replyToken: followupReplyToken,
+                    lineUserId,
+                    waitingState,
+                    forceRefresh: true,
+                })
+            } catch (e) {
+                if (!(await isCurrentXhsIntake())) return
+                console.warn(`[LINE] XHS cover prompt failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+                await lineReplyOrPush({
+                    replyToken: followupReplyToken,
+                    channelAccessToken,
+                    lineUserId,
+                    messages: [
+                        { type: 'text', text: 'รับลิงก์ XHS แล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองใหม่' },
+                    ],
+                }).catch(() => { })
+            }
+        })().catch(async (error) => {
+            // Last-resort guard: only the active request may surface an error;
+            // stale/superseded background work exits silently.
+            if (!(await isLineCurrentVideoIntake(bucket, lineUserId, videoId))) return
+            console.warn(`[LINE] XHS follow-up crashed userId=${lineUserId}: ${error instanceof Error ? error.message : String(error)}`)
             await lineReplyOrPush({
                 replyToken: followupReplyToken,
                 channelAccessToken,
                 lineUserId,
                 messages: [
-                    { type: 'text', text: failureText },
+                    { type: 'text', text: 'โหลดวิดีโอจาก XHS ไม่สำเร็จ ลองส่งลิงก์ใหม่อีกครั้ง' },
                 ],
             }).catch(() => { })
+            await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
+        })
+
+        if (executionCtx) {
+            executionCtx.waitUntil(followupPromise)
             return
         }
-
-        const createdAt = new Date().toISOString()
-
-        try {
-            const waitingState = await putLineWaitingVideoState(bucket, lineUserId, {
-                id: videoId,
-                videoUrl: r2VideoUrl,
-                createdAt,
-                sourceType: 'xhs_url',
-                sourceLabel: xhsUrl,
-                shopeeLink: shopeeLink || '',
-                lazadaLink: lazadaLink || '',
-                awaitingStep: 'cover',
-                coverCompleted: false,
-            })
-
-            await promptLineCoverOptions({
-                env,
-                bucket,
-                namespaceId,
-                channelAccessToken,
-                replyToken: followupReplyToken,
-                lineUserId,
-                waitingState,
-                forceRefresh: true,
-            })
-        } catch (e) {
-            console.warn(`[LINE] XHS cover prompt failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
-            await lineReplyOrPush({
-                replyToken: followupReplyToken,
-                channelAccessToken,
-                lineUserId,
-                messages: [
-                    { type: 'text', text: 'รับลิงก์ XHS แล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองใหม่' },
-                ],
-            }).catch(() => { })
-        }
+        await followupPromise
         return
     }
 
@@ -28633,12 +29376,12 @@ async function runOneCardPostFirstAds(params: {
     // created in Phase A now (no /promote), so the daily name is sent with Phase A.
     const dailyCampaignName = (!params.campaignId && !params.newCampaignName) ? bangkokDailyCampaignName() : ''
 
-    // PHASE A — create the AD STORY first (no page publish, no comment). create-ad runs the full
-    // ad path (creative → campaign/adset → ad) carrying an INITIAL Shopee CTA, but
-    // skip_publish_to_page holds the story OUT of the page feed. It returns the ad story_id +
-    // ad_id/adset_id + the reusable video_id. The SAME ad story is published to the page LATER
-    // (after the visible CTA is swapped to the final post-specific link) — there is no organic
-    // page post and no /promote step.
+    // PHASE A — publish the VISIBLE page post (skip_ad: no campaign/adset/ad here). create-ad
+    // builds the OneCard creative carrying an INITIAL Shopee CTA and PUBLISHES it to the page feed,
+    // returning the story_id + the reusable video_id/thumbnail. The publish is NOT skipped: the
+    // bridge fails closed (ok:false, step:'publish') when the page publish is not confirmed, so a
+    // post the feed never showed is recorded as failed rather than a false success. The post-
+    // specific final link is applied to the comment + the promoted ad (Phase B) below.
     let phaseA: {
         ok?: boolean; error?: string; step?: string; story_id?: string; video_id?: string; thumbnail_url?: string
         ad_id?: string; adset_id?: string; creative_id?: string; campaign_id?: string; end_time?: string
@@ -28661,10 +29404,11 @@ async function runOneCardPostFirstAds(params: {
                 caption: params.caption,
                 shopee_url: params.rawShopeeLink || params.managedShopeeLink,
                 comment_shortlink: params.managedShopeeLink,
-                // Build only the visible OneCard post story in Phase A. Do NOT continue into
-                // campaign/adset/ad creation here; Phase B promotes the finalized post later.
+                // Build + PUBLISH only the visible OneCard post story in Phase A. Do NOT continue
+                // into campaign/adset/ad creation here; Phase B promotes the finalized post later.
+                // skip_publish_to_page is intentionally NOT set: the page post must actually publish
+                // (and fail closed if it does not) instead of being held out of the feed forever.
                 skip_ad: true,
-                skip_publish_to_page: true,
                 skip_comment: true,
                 ...(dailyCampaignName ? { daily_campaign_name: dailyCampaignName } : {}),
                 ...(!params.newCampaignName && params.campaignId ? { campaign_id: params.campaignId } : {}),
@@ -36690,16 +37434,13 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // route (NOT the stored token, NOT facebook-token-cloak). Fails closed
         // (throw → history 'failed') rather than ever using the stored/manual token.
         if (pageCloakPostSelected) {
-            // Comment when we have a managed shortlink and comments aren't skipped. The
-            // affiliate comment text is built the same way for both comment sources; only
-            // the DELIVERY differs (bridge /page-comment vs deferred stored-token backlog).
-            const cloakCommentShopeeLink = normalizedShopeeLink
-            const cloakCommentText = (cloakCommentShopeeLink && !skipComment)
-                ? await buildAffiliateCommentMessage(env.DB, botId, cloakCommentShopeeLink).catch(() => '')
-                : ''
             const cloakOneCardWebsiteUrl = pageOneCardEnabled
                 ? pickOneCardWebsiteUrl({ linkMode: pageOneCardLinkMode, shopeeLink: normalizedShopeeLink, lazadaLink: normalizedLazadaLink })
                 : ''
+            // Publish FIRST with no inline comment. The bridge would otherwise comment the
+            // pre-publish shortlink (blank sub2/sub3 → utm_content=...FBSPCAD----). When
+            // comment_token_source='cloak_browser' we re-mint the shortlink with the post id
+            // below, then comment via the bridge; stored-token defers to the backlog.
             const cloakResult = await publishReelViaSessionBridge({
                 env,
                 pageId: String(page.id || ''),
@@ -36707,14 +37448,14 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 message: publishDescription,
                 websiteUrl: cloakOneCardWebsiteUrl,
                 cta: pageOneCardCta,
-                // Only let the bridge post the comment when comment_token_source='cloak_browser'.
-                // For stored-token comments we defer to the backlog (below) instead.
-                commentText: commentViaCloakBridge ? cloakCommentText : '',
+                commentText: '',
                 logPrefix: 'FORCE-POST CLOAK-BRIDGE',
             })
             fbVideoId = cloakResult.id
             postingTokenUsed = cloakResult.postingToken
-            const confirmedPostId = String(cloakResult.postId || '').trim() || fbVideoId
+            const confirmedCanonicalPostId = String(cloakResult.postId || '').trim()
+            const confirmedPostId = confirmedCanonicalPostId || fbVideoId
+            const cloakCommentEligible = !!normalizedShopeeLink && !skipComment
             // Comment parity: success → success+comment_fb_id; attempted-but-failed →
             // failed+sanitized error; nothing to post → not_configured. Never claim success.
             let cloakCommentStatus: string
@@ -36723,17 +37464,59 @@ app.post('/api/pages/:id/force-post', async (c) => {
             let cloakCommentTokenHint: string | null
             let cloakCommentDelaySeconds: number | null = null
             let cloakCommentDueAt: string | null = null
+            let cloakCommentShopeeLink = normalizedShopeeLink
             if (commentViaCloakBridge) {
-                cloakCommentStatus = !cloakCommentText
-                    ? 'not_configured'
-                    : (cloakResult.commentId ? 'success' : 'failed')
-                cloakCommentFbId = cloakResult.commentId || null
-                cloakCommentError = cloakCommentStatus === 'failed' ? (cloakResult.commentError || 'cloak_comment_failed') : null
-                cloakCommentTokenHint = 'cloak_session_bridge'
+                if (!cloakCommentEligible) {
+                    cloakCommentStatus = 'not_configured'
+                    cloakCommentFbId = null
+                    cloakCommentError = null
+                    cloakCommentTokenHint = 'cloak_session_bridge'
+                } else {
+                    // Re-shorten with the post id FIRST so the commented link carries
+                    // sub2=post id / sub3=page id, then comment as the Page via the bridge
+                    // (fails closed). Mirrors the stored→cloak branch.
+                    let commentShopeeLink = normalizedShopeeLink
+                    try {
+                        const commentSubIds = buildPostingCommentShortlinkSubIds({
+                            canonicalPostId: confirmedCanonicalPostId,
+                            fbVideoId,
+                            pageId: page.id,
+                            historyId: forceHistoryId,
+                            logPrefix: 'FORCE-POST CLOAK COMMENT-SHORTLINK',
+                        })
+                        const reshortened = await resolvePostingShopeeLinkForNamespace({
+                            env,
+                            namespaceId: botId,
+                            pageId: page.id,
+                            shopeeLink: normalizedShopeeLink,
+                            logPrefix: 'FORCE-POST CLOAK COMMENT-SHORTLINK',
+                            ...commentSubIds,
+                        })
+                        if (reshortened) commentShopeeLink = reshortened
+                    } catch (reshortenErr) {
+                        console.log(`[FORCE-POST CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                    }
+                    cloakCommentShopeeLink = commentShopeeLink
+                    const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
+                    const bridged = await sendPageCommentViaCloakBridge({
+                        env,
+                        pageId: String(page.id || ''),
+                        storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
+                        message: cloakOverrideText,
+                        logPrefix: 'FORCE-POST CLOAK-COMMENT',
+                    })
+                    cloakCommentStatus = bridged.status
+                    cloakCommentFbId = bridged.id
+                    cloakCommentError = bridged.error
+                    cloakCommentTokenHint = 'cloak_session_bridge'
+                }
             } else {
                 // comment_token_source='stored_token': defer to the pending backlog, which
-                // comments with the stored page token against the Page story id. Requires a
-                // stored comment token (else fail per existing stored semantics).
+                // comments with the stored page token against the Page story id (and re-mints
+                // the shortlink itself). Requires a stored comment token (else fail).
+                const cloakCommentText = cloakCommentEligible
+                    ? await buildAffiliateCommentMessage(env.DB, botId, normalizedShopeeLink).catch(() => '')
+                    : ''
                 cloakCommentFbId = null
                 if (!cloakCommentText) {
                     cloakCommentStatus = skipComment ? 'skipped' : 'not_configured'
@@ -38994,15 +39777,14 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         // stored-token fallback).
         if (pageCloakPostSelected) {
             try {
-                // Comment when a managed shortlink exists (cron is automatic); the bridge
-                // posts it via its /graph proxy (session token internal to the bridge).
-                const cloakCommentShopeeLink = normalizedShopeeLink
-                const cloakCommentText = cloakCommentShopeeLink
-                    ? await buildAffiliateCommentMessage(env.DB, botId, cloakCommentShopeeLink).catch(() => '')
-                    : ''
+                // Cron is automatic, so comment whenever a managed shortlink exists.
                 const cloakOneCardWebsiteUrl = pageOneCardEnabled
                     ? pickOneCardWebsiteUrl({ linkMode: pageOneCardLinkMode, shopeeLink: normalizedShopeeLink, lazadaLink: normalizedLazadaLink })
                     : ''
+                // Publish FIRST with no inline comment. The bridge would otherwise comment the
+                // pre-publish shortlink (blank sub2/sub3 → utm_content=...FBSPCAD----). When
+                // comment_token_source='cloak_browser' we re-mint the shortlink with the post id
+                // below, then comment via the bridge; stored-token defers to the backlog.
                 const cloakResult = await publishReelViaSessionBridge({
                     env,
                     pageId: String(page.id || ''),
@@ -39010,12 +39792,11 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     message: publishDescription,
                     websiteUrl: cloakOneCardWebsiteUrl,
                     cta: pageOneCardCta,
-                    // Only let the bridge post the comment when comment_token_source=
-                    // 'cloak_browser'; otherwise defer to the stored-token backlog (below).
-                    commentText: commentViaCloakBridge ? cloakCommentText : '',
+                    commentText: '',
                     logPrefix: `CRON CLOAK-BRIDGE ${page.name}`,
                 })
-                const confirmedPostId = String(cloakResult.postId || '').trim() || String(cloakResult.id || '').trim()
+                const confirmedCanonicalPostId = String(cloakResult.postId || '').trim()
+                const confirmedPostId = confirmedCanonicalPostId || String(cloakResult.id || '').trim()
                 const fbReelUrl = String(cloakResult.permalinkUrl || '').trim()
                 let cloakCommentStatus: string
                 let cloakCommentFbId: string | null
@@ -39023,16 +39804,59 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 let cloakCommentTokenHint: string | null
                 let cloakCommentDelaySeconds: number | null = null
                 let cloakCommentDueAt: string | null = null
+                let cloakCommentShopeeLink = normalizedShopeeLink
                 if (commentViaCloakBridge) {
-                    cloakCommentStatus = !cloakCommentText
-                        ? 'not_configured'
-                        : (cloakResult.commentId ? 'success' : 'failed')
-                    cloakCommentFbId = cloakResult.commentId || null
-                    cloakCommentError = cloakCommentStatus === 'failed' ? (cloakResult.commentError || 'cloak_comment_failed') : null
-                    cloakCommentTokenHint = 'cloak_session_bridge'
+                    if (!normalizedShopeeLink) {
+                        cloakCommentStatus = 'not_configured'
+                        cloakCommentFbId = null
+                        cloakCommentError = null
+                        cloakCommentTokenHint = 'cloak_session_bridge'
+                    } else {
+                        // Re-shorten with the post id FIRST so the commented link carries
+                        // sub2=post id / sub3=page id, then comment as the Page via the bridge
+                        // (fails closed). Mirrors the stored→cloak branch below.
+                        let commentShopeeLink = normalizedShopeeLink
+                        try {
+                            const commentSubIds = buildPostingCommentShortlinkSubIds({
+                                canonicalPostId: confirmedCanonicalPostId,
+                                fbVideoId: String(cloakResult.id || '').trim(),
+                                pageId: page.id,
+                                historyId: cronHistoryId,
+                                logPrefix: `CRON ${page.name} CLOAK COMMENT-SHORTLINK`,
+                            })
+                            const reshortened = await resolvePostingShopeeLinkForNamespace({
+                                env,
+                                namespaceId: botId,
+                                pageId: page.id,
+                                shopeeLink: normalizedShopeeLink,
+                                logPrefix: `CRON ${page.name} CLOAK COMMENT-SHORTLINK`,
+                                ...commentSubIds,
+                            })
+                            if (reshortened) commentShopeeLink = reshortened
+                        } catch (reshortenErr) {
+                            console.log(`[CRON ${page.name} CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                        }
+                        cloakCommentShopeeLink = commentShopeeLink
+                        const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
+                        const bridged = await sendPageCommentViaCloakBridge({
+                            env,
+                            pageId: String(page.id || ''),
+                            storyId: buildPageStoryId(String(page.id || ''), confirmedPostId),
+                            message: cloakOverrideText,
+                            logPrefix: `CRON CLOAK-COMMENT ${page.name}`,
+                        })
+                        cloakCommentStatus = bridged.status
+                        cloakCommentFbId = bridged.id
+                        cloakCommentError = bridged.error
+                        cloakCommentTokenHint = 'cloak_session_bridge'
+                    }
                 } else {
                     // comment_token_source='stored_token': defer to the pending backlog
-                    // (stored page token against the Page story id).
+                    // (stored page token against the Page story id). The backlog re-mints the
+                    // shortlink with the post id itself.
+                    const cloakCommentText = normalizedShopeeLink
+                        ? await buildAffiliateCommentMessage(env.DB, botId, normalizedShopeeLink).catch(() => '')
+                        : ''
                     cloakCommentFbId = null
                     if (!cloakCommentText) {
                         cloakCommentStatus = 'not_configured'
@@ -39162,7 +39986,8 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id
-            const confirmedPostId = String(reelResult.postId || '').trim() || fbVideoId
+            const confirmedCanonicalPostId = String(reelResult.postId || '').trim()
+            const confirmedPostId = confirmedCanonicalPostId || fbVideoId
             const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
             // Only the stored-token path defers via comment_due_at; the bridge override
             // comments immediately below, so it schedules no delay.
@@ -39202,7 +40027,32 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             if (normalizedShopeeLink && commentViaCloakBridge) {
                 // comment_token_source='cloak_browser' on a stored-token POST: comment as the
                 // Page via the bridge immediately (fails closed, never a stored-token fallback).
-                const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, normalizedShopeeLink).catch(() => '')) || normalizedShopeeLink
+                // Re-shorten with the post id FIRST so the commented link carries
+                // sub2=post id / sub3=page id — mirrors the force-post bridge branch. Without
+                // this the bridge commented the pre-publish shortlink (blank sub2/sub3). The
+                // stored-token pending path re-mints in processPendingCommentBacklog instead.
+                let commentShopeeLink = normalizedShopeeLink
+                try {
+                    const commentSubIds = buildPostingCommentShortlinkSubIds({
+                        canonicalPostId: confirmedCanonicalPostId,
+                        fbVideoId,
+                        pageId: page.id,
+                        historyId: cronHistoryId,
+                        logPrefix: `CRON ${page.name} STORED→CLOAK COMMENT-SHORTLINK`,
+                    })
+                    const reshortened = await resolvePostingShopeeLinkForNamespace({
+                        env,
+                        namespaceId: botId,
+                        pageId: page.id,
+                        shopeeLink: normalizedShopeeLink,
+                        logPrefix: `CRON ${page.name} STORED→CLOAK COMMENT-SHORTLINK`,
+                        ...commentSubIds,
+                    })
+                    if (reshortened) commentShopeeLink = reshortened
+                } catch (reshortenErr) {
+                    console.log(`[CRON ${page.name} STORED→CLOAK COMMENT-SHORTLINK] re-shorten with post id failed; falling back to preflight link: ${reshortenErr instanceof Error ? reshortenErr.message : String(reshortenErr)}`)
+                }
+                const cloakOverrideText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
                 const bridged = await sendPageCommentViaCloakBridge({
                     env,
                     pageId: String(page.id || ''),
@@ -39712,5 +40562,11 @@ export default {
                 console.error(`[CRON-COMMENTS] ${error instanceof Error ? error.message : String(error)}`)
             })),
         })
+        // Ad-only queue cadence — process at most ONE queued ad-only item per operator-set interval.
+        // Runs in waitUntil so it never blocks (or is blocked by) the posting loop, and is wrapped to
+        // swallow its own errors so an ad-only failure can never derail the every-minute cron.
+        _ctx.waitUntil(maybeProcessAdOnlyQueueOnSchedule(env).catch((error) => {
+            console.error(`[AD-ONLY-QUEUE] ${error instanceof Error ? error.message : String(error)}`)
+        }))
     },
 }

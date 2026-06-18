@@ -695,7 +695,7 @@ function createHandler(deps = {}) {
           if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
           // Publish the SAME ad story to the page feed (page token only, resolved internally).
           // ok:true ONLY when publishStoryToPage confirms publishedToPage. No tokens returned.
-          const pub = await posting.publishStoryToPage(session.graphFetch, { userToken: session.token, pageId, storyId });
+          const pub = await posting.publishStoryToPage(session.graphFetch, { userToken: session.token, pageId, storyId, pollMs: POLL_MS });
           const ok = pub.publishedToPage === true;
           return send(res, 200, {
             ok,
