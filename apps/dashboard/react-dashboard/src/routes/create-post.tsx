@@ -6,15 +6,17 @@ import { fetchSettingsPages, type SettingsPage } from '@/api/settings'
 import { PagePicker } from '@/components/PagePicker'
 import { PageDetailView } from '@/routes/settings'
 
-// Create Post — POST-ONLY console.
+// Create Post — token-source console.
 //
-// The operator picks a page from the master list, then lands on a Mini App-like
-// Page settings/detail screen scoped to NORMAL Facebook Page/Reels posting.
-// That detail is the shared PageDetailView rendered in `mode="postOnly"`: the
-// Video One Card and Auto-Ads surfaces are hidden, and on save oneCardEnabled /
-// adsPublishEnabled are forced false — so this screen can never enable ad
-// behavior. Campaign / Ad Set / paid-ad configuration lives entirely on Create
-// Ads; the post-only ad-config surfaces will move there later.
+// The operator picks a page from the master list, then lands on a compact
+// detail screen scoped to ONE decision per page: which token source to use for
+// posting and which for commenting. That detail is the shared PageDetailView
+// rendered in `mode="tokenSourcesOnly"`: only the two source selectors
+// (โทเค้นสำหรับโพสต์ / โทเค้นสำหรับคอมเมนต์) + Save are shown, and on save ONLY
+// postingTokenSource / commentTokenSource are persisted (every other core field
+// is written back from its loaded base value). All full per-page setup —
+// schedule, Shortlink, posting order, Avatar, Video One Card, etc. — lives in
+// Settings > Pages.
 
 export function CreatePostPage() {
   // Master-detail: no page is auto-selected. The operator must pick a page from
@@ -37,7 +39,7 @@ export function CreatePostPage() {
         <PageDetailView
           page={selectedPage}
           canEdit
-          mode="postOnly"
+          mode="tokenSourcesOnly"
           onBack={() => setSelectedId('')}
         />
       </div>

@@ -1013,6 +1013,20 @@ function DetailCard({ children, className }: { children: ReactNode; className?: 
 // the admin-only Auto-Ads block (mirrors the LINE `isSystemAdmin` gate) renders.
 const IS_SYSTEM_ADMIN = true
 
+// User-facing token-source labels. The stored DB values stay 'stored_token' /
+// 'cloak_browser' for worker compatibility; only the displayed names changed:
+//   stored_token  → "Facebook Lite"
+//   cloak_browser → "Power Editor"
+const POSTING_TOKEN_SOURCE_OPTIONS: { value: PostingTokenSource; label: string; hint: string }[] = [
+  { value: 'stored_token', label: 'Facebook Lite', hint: 'ใช้ token ที่บันทึกไว้ของเพจนี้' },
+  { value: 'cloak_browser', label: 'Power Editor', hint: 'ใช้ session Power Editor บนเครื่อง Mac' },
+]
+
+const COMMENT_TOKEN_SOURCE_OPTIONS: { value: CommentTokenSource; label: string; hint: string }[] = [
+  { value: 'stored_token', label: 'Facebook Lite', hint: 'คอมเมนต์ด้วย token ที่บันทึกไว้ของเพจนี้' },
+  { value: 'cloak_browser', label: 'Power Editor', hint: 'คอมเมนต์ในนามเพจผ่าน session Power Editor' },
+]
+
 // In-page Page detail/settings screen, opened by tapping a card in the Pages
 // grid. Full port of the LINE Mini App PageDetail (apps/video-affiliate): every
 // block, Thai label and interaction is mirrored so the team can manage a page
@@ -1021,13 +1035,20 @@ const IS_SYSTEM_ADMIN = true
 // worker endpoints the LINE app uses. The raw posting access token is never
 // rendered: only presence is shown, and the edit modal is write-only.
 //
-// `mode` controls whether ad/OneCard surfaces are exposed:
+// `mode` controls which blocks are exposed:
 //   - 'full'     (settings) — every block, including Video One Card and Auto-Ads.
-//   - 'postOnly' (Create Post) — normal Page/Reels posting only. The Video One
-//     Card card (and its link-mode / CTA controls) and the Auto-Ads toggle are
-//     hidden, and on save oneCardEnabled / adsPublishEnabled are FORCED false so
-//     this screen can never enable ad behavior. Ad config lives elsewhere.
-export type PageDetailMode = 'full' | 'postOnly'
+//   - 'postOnly' — normal Page/Reels posting only (no ad/OneCard surfaces). On
+//     save oneCardEnabled / adsPublishEnabled are FORCED false. (Legacy mode;
+//     retained for compatibility — Create Post now uses 'tokenSourcesOnly'.)
+//   - 'tokenSourcesOnly' (Create Post) — the lightest detail: header/avatar +
+//     the two token-source selectors (โทเค้นสำหรับโพสต์ / โทเค้นสำหรับคอมเมนต์)
+//     + Save. Every other per-page block (Auto Post, caption link, Video One
+//     Card, Shortlink, posting order, Avatar, Focus post, Schedule, Auto-Ads) is
+//     hidden — that setup belongs in Settings > Pages. On save ONLY
+//     postingTokenSource / commentTokenSource are persisted; all other core
+//     fields are written back from their loaded base values so nothing else
+//     changes, and no newToken is sent.
+export type PageDetailMode = 'full' | 'postOnly' | 'tokenSourcesOnly'
 
 export function PageDetailView({
   page,
@@ -1042,6 +1063,11 @@ export function PageDetailView({
 }) {
   const pageId = page.id
   const postOnly = mode === 'postOnly'
+  // Create Post's token-source-only detail: just the two selectors + Save.
+  const tokenOnly = mode === 'tokenSourcesOnly'
+  // Both light modes collapse the token cards to selectors + a Settings hint
+  // (no write-only token edit box, no long explanatory paragraphs).
+  const compactToken = postOnly || tokenOnly
 
   // ---- Core page state ---------------------------------------------------
   const [coreLoading, setCoreLoading] = useState(true)
@@ -1278,6 +1304,33 @@ export function PageDetailView({
     setPostingOrderMessage('')
     setAvatarMessage('')
     try {
+      // Token-source-only mode (Create Post): persist ONLY the two token
+      // sources. Every other core field is written back from its loaded base
+      // value so this screen can never change schedule/OneCard/ads/caption, and
+      // no newToken is sent. Per-page shortlink/posting-order/avatar saves are
+      // skipped entirely.
+      if (tokenOnly) {
+        await savePageCore(pageId, {
+          postHours: basePostHours,
+          postIntervalMinutes: baseInterval ?? undefined,
+          isActive: baseIsActive === 1,
+          basePostHours,
+          basePostIntervalMinutes: baseInterval,
+          baseIsActive,
+          oneCardEnabled,
+          adsPublishEnabled,
+          captionLinkEnabled,
+          oneCardLinkMode,
+          oneCardCta,
+          postingTokenSource,
+          commentTokenSource,
+          newToken: '',
+        })
+        setSaveStatus('saved')
+        window.setTimeout(() => setSaveStatus((s) => (s === 'saved' ? null : s)), 3000)
+        return
+      }
+
       const normalizedInterval = normalizeInterval(intervalMinutes)
       const schedulePostHours = scheduleMode === 'interval' ? `every:${normalizedInterval}` : postHoursString
 
@@ -1414,6 +1467,11 @@ export function PageDetailView({
           </div>
         ) : (
           <>
+            {/* In tokenSourcesOnly mode (Create Post) every block except the two
+                token-source selectors + Save is hidden — full per-page setup
+                lives in Settings > Pages. */}
+            {!tokenOnly ? (
+            <>
             {/* Auto Post */}
             <DetailCard className="flex items-center justify-between">
               <p className="font-bold text-foreground">Auto Post</p>
@@ -1487,20 +1545,21 @@ export function PageDetailView({
               ) : null}
             </DetailCard>
             ) : null}
+            </>
+            ) : null}
 
-            {/* โทเค้นสำหรับใช้โพสต์ — two canonical modes (Page/Token + CloakBrowser) */}
+            {/* โทเค้นสำหรับโพสต์ — Facebook Lite (stored_token) vs Power Editor (cloak_browser).
+                postOnly (Create Post): selectors only — token setup lives in Settings.
+                full (Settings): selectors + write-only Facebook Lite token edit / Power Editor note. */}
             <DetailCard className="space-y-3">
               <div className="min-w-0">
-                <p className="font-bold text-foreground">โทเค้นสำหรับใช้โพสต์</p>
+                <p className="font-bold text-foreground">โทเค้นสำหรับโพสต์</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  เลือกว่าจะให้เพจนี้โพสต์ด้วยโทเค้นที่กรอกเอง หรือผ่าน CloakBrowser ที่ login อยู่บนเครื่อง Mac
+                  เลือกแหล่งที่ใช้โพสต์ของเพจนี้ — Facebook Lite (token ที่บันทึกไว้) หรือ Power Editor (session บนเครื่อง Mac)
                 </p>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                {([
-                  { value: 'stored_token', label: 'Page/Token', hint: 'กรอก User/Page token เอง (legacy)' },
-                  { value: 'cloak_browser', label: 'CloakBrowser', hint: 'ใช้ session ของ CloakBrowser โพสต์ให้' },
-                ] as { value: PostingTokenSource; label: string; hint: string }[]).map((option) => (
+                {POSTING_TOKEN_SOURCE_OPTIONS.map((option) => (
                   <button
                     key={option.value}
                     type="button"
@@ -1515,10 +1574,19 @@ export function PageDetailView({
                 ))}
               </div>
 
-              {postingTokenSource === 'stored_token' ? (
+              {compactToken ? (
+                // Light modes stay compact: no token storage UI here. Point the
+                // operator to Settings for the Facebook Lite token itself.
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  ตั้งค่า token ของ Facebook Lite ได้ที่{' '}
+                  <Link to="/settings" className="font-semibold text-blue-600 underline">
+                    Settings › Pages
+                  </Link>
+                </p>
+              ) : postingTokenSource === 'stored_token' ? (
                 <div className="flex items-start justify-between gap-3 rounded-xl border bg-muted/50 p-3">
                   <div className="min-w-0 flex-1">
-                    <p className="text-sm font-bold text-foreground">Page/User Token</p>
+                    <p className="text-sm font-bold text-foreground">Facebook Lite token</p>
                     <p className={`mt-1 text-xs font-bold ${newToken.trim() ? 'text-blue-600' : tokenPresent ? 'text-emerald-600' : 'text-orange-600'}`}>
                       {newToken.trim() ? 'จะบันทึกโทเค้นใหม่เมื่อกด Save' : tokenPresent ? '🔒 มีโทเค้นบันทึกไว้ (ค่าไม่แสดง)' : 'ยังไม่มีโทเค้น'}
                     </p>
@@ -1542,32 +1610,21 @@ export function PageDetailView({
                 </div>
               ) : (
                 <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-700">
-                  {postOnly ? (
-                    <>
-                      CloakBrowser: ตอนโพสต์ระบบจะใช้ session ของ CloakBrowser ที่ login Facebook อยู่บนเครื่อง Mac โพสต์ให้ — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. จะโพสต์ Reel ปกติลงเพจ + คอมเมนต์ในนามเพจ. ถ้า session/login ใช้ไม่ได้จะหยุดโพสต์ ไม่ fallback ไป token เก่า (ระบบ manual ยังใช้ได้ตามปกติ)
-                    </>
-                  ) : (
-                    <>
-                      CloakBrowser: ตอนโพสต์ระบบจะใช้ session ของ CloakBrowser ที่ login Facebook อยู่บนเครื่อง Mac โพสต์ให้ — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. ถ้า <strong>Video One Card ปิด</strong> จะโพสต์ Reel ปกติ + คอมเมนต์ในนามเพจ; ถ้า <strong>Video One Card เปิด</strong> จะโพสต์แบบ OneCard (สร้างแอด) ให้แทน. ถ้า session/login ใช้ไม่ได้จะหยุดโพสต์ ไม่ fallback ไป token เก่า (ระบบ manual ยังใช้ได้ตามปกติ)
-                    </>
-                  )}
+                  Power Editor: ตอนโพสต์ระบบจะใช้ session ของ Power Editor ที่ login Facebook อยู่บนเครื่อง Mac โพสต์ให้ — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. ถ้า <strong>Video One Card ปิด</strong> จะโพสต์ Reel ปกติ + คอมเมนต์ในนามเพจ; ถ้า <strong>Video One Card เปิด</strong> จะโพสต์แบบ OneCard (สร้างแอด) ให้แทน. ถ้า session/login ใช้ไม่ได้จะหยุดโพสต์ ไม่ fallback ไป token เก่า (ระบบ manual ยังใช้ได้ตามปกติ)
                 </div>
               )}
             </DetailCard>
 
-            {/* โทเค้นสำหรับใช้คอมเมนต์ — chosen independently of the posting source */}
+            {/* โทเค้นสำหรับคอมเมนต์ — chosen independently of the posting source */}
             <DetailCard className="space-y-3">
               <div className="min-w-0">
-                <p className="font-bold text-foreground">โทเค้นสำหรับใช้คอมเมนต์</p>
+                <p className="font-bold text-foreground">โทเค้นสำหรับคอมเมนต์</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้นที่กรอกเอง หรือคอมเมนต์ในนามเพจผ่าน CloakBrowser (แยกอิสระจากโทเค้นที่ใช้โพสต์)
+                  เลือกแหล่งที่ใช้คอมเมนต์หลังโพสต์ — Facebook Lite หรือ Power Editor (แยกอิสระจากโทเค้นที่ใช้โพสต์)
                 </p>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                {([
-                  { value: 'stored_token', label: 'Page/Token', hint: 'คอมเมนต์ด้วย Page token ที่กรอกเอง' },
-                  { value: 'cloak_browser', label: 'CloakBrowser', hint: 'คอมเมนต์ในนามเพจผ่าน session CloakBrowser' },
-                ] as { value: CommentTokenSource; label: string; hint: string }[]).map((option) => (
+                {COMMENT_TOKEN_SOURCE_OPTIONS.map((option) => (
                   <button
                     key={option.value}
                     type="button"
@@ -1581,17 +1638,21 @@ export function PageDetailView({
                   </button>
                 ))}
               </div>
-              {commentTokenSource === 'stored_token' ? (
+              {compactToken ? null : commentTokenSource === 'stored_token' ? (
                 <div className="rounded-xl border bg-muted/50 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-                  Page/Token: คอมเมนต์ด้วย Page token ที่บันทึกไว้ (ช่อง <strong>โทเค้นสำหรับใช้โพสต์</strong>) — ต้องมีโทเค้น ถ้าไม่มีคอมเมนต์จะไม่สำเร็จ ระบบจะ<strong>ไม่</strong>สลับไปใช้ CloakBrowser ให้เอง
+                  Facebook Lite: คอมเมนต์ด้วย token ที่บันทึกไว้ (ช่อง <strong>โทเค้นสำหรับโพสต์</strong>) — ต้องมีโทเค้น ถ้าไม่มีคอมเมนต์จะไม่สำเร็จ ระบบจะ<strong>ไม่</strong>สลับไปใช้ Power Editor ให้เอง
                 </div>
               ) : (
                 <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-700">
-                  CloakBrowser: คอมเมนต์ในนามเพจผ่าน session CloakBrowser ที่ login อยู่บนเครื่อง Mac — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. ถ้า bridge/session ใช้ไม่ได้คอมเมนต์จะไม่สำเร็จ ระบบจะ<strong>ไม่</strong> fallback ไป token เก่า (โพสต์ยังสำเร็จตามปกติ)
+                  Power Editor: คอมเมนต์ในนามเพจผ่าน session Power Editor ที่ login อยู่บนเครื่อง Mac — <strong>ไม่เก็บ token ใดๆ ในระบบ</strong>. ถ้า bridge/session ใช้ไม่ได้คอมเมนต์จะไม่สำเร็จ ระบบจะ<strong>ไม่</strong> fallback ไป token เก่า (โพสต์ยังสำเร็จตามปกติ)
                 </div>
               )}
             </DetailCard>
 
+            {/* Remaining per-page blocks (Shortlink, posting order, Avatar,
+                Auto-Ads, Focus post, Schedule) — hidden in tokenSourcesOnly. */}
+            {!tokenOnly ? (
+            <>
             {/* Shortlink เฉพาะเพจนี้ */}
             <DetailCard className="space-y-3">
               <div className="flex items-center justify-between gap-3">
@@ -1966,6 +2027,8 @@ export function PageDetailView({
                 </>
               )}
             </DetailCard>
+            </>
+            ) : null}
 
             {/* Big Save button */}
             <div className="space-y-2 pt-1">
@@ -1989,7 +2052,7 @@ export function PageDetailView({
       {editingToken ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-6" onClick={() => setEditingToken(false)}>
           <div className="w-full max-w-md space-y-4 rounded-2xl bg-card p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
-            <h3 className="text-center text-base font-bold text-foreground">Access Token (โพสต์)</h3>
+            <h3 className="text-center text-base font-bold text-foreground">Facebook Lite token (โพสต์)</h3>
             <textarea
               value={editingTokenValue}
               onChange={(e) => setEditingTokenValue(e.target.value)}
