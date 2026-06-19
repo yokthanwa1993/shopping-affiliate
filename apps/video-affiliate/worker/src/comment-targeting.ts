@@ -30,6 +30,17 @@ function isLikelyFullStoryId(value: string): boolean {
     return /^\d+_\d+$/.test(trimmed)
 }
 
+// True when the raw input is a Facebook /posts/<id> permalink. A /posts/<id> URL
+// points at the page-story/post tail, NOT a reel/video object, so its extracted id
+// must never be treated as a bare reel alias of fb_post_id. (Live bug: page Cheab
+// stored fb_reel_url=/<page>/posts/<post_tail> with fb_post_id=<post_tail>, which
+// the bare-reel-alias guard wrongly suppressed, producing missing_page_story_object_id.)
+function inputIsPostStoryPermalink(raw: string): boolean {
+    const clean = String(raw || '').trim()
+    if (!clean) return false
+    return /\/posts\/(\d+)/i.test(clean)
+}
+
 export function extractIdFromCommentTargetInput(raw: string | null | undefined): string {
     const clean = String(raw || '').trim()
     if (!clean) return ''
@@ -54,9 +65,14 @@ export function buildVisibleCommentTargetCandidates(input: VisibleCommentTargetI
     const fbPostIdRaw = String(input.fbPostId || '').trim()
     const reelInputRaw = String(input.fbReelUrlOrId || '').trim()
     const reelOrStoryId = extractIdFromCommentTargetInput(reelInputRaw)
+    // A /posts/<id> permalink is a page-story tail, not a reel — so even when its id
+    // equals fb_post_id, fb_post_id is a genuine post tail and must compose the full
+    // page-story target rather than being suppressed as a bare reel alias.
+    const reelInputIsPostStory = inputIsPostStoryPermalink(reelInputRaw)
     const postIdIsBareReelId = !!(
         fbPostIdRaw
         && reelOrStoryId
+        && !reelInputIsPostStory
         && !isLikelyFullStoryId(fbPostIdRaw)
         && !isLikelyFullStoryId(reelOrStoryId)
         && fbPostIdRaw === reelOrStoryId

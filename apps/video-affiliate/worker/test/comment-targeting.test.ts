@@ -83,6 +83,35 @@ test('empty input produces empty list', () => {
     assert.deepEqual(buildVisibleCommentTargetCandidates({}), [])
 })
 
+test('bare fb_post_id + /posts/<same id> permalink composes the full page-story target', () => {
+    // Live bug: page Cheab 1008898512617594 posts fine but comment failed with
+    // missing_page_story_object_id. fb_post_id is the post tail and fb_reel_url is a
+    // /posts/<same tail> permalink — a page-story URL, NOT a reel — so the bare-reel
+    // alias guard must NOT suppress it. The full page-story target must be returned.
+    const candidates = buildVisibleCommentTargetCandidates({
+        pageId: '1008898512617594',
+        fbPostId: '1306964481608247',
+        fbReelUrlOrId: 'https://www.facebook.com/1008898512617594/posts/1306964481608247',
+    })
+
+    assert.deepEqual(candidates, ['1008898512617594_1306964481608247'])
+    assert.notDeepEqual(candidates, [])
+    assert.ok(!candidates.includes('1306964481608247'), 'bare post tail must not be a Graph comment target')
+})
+
+test('bare fb_post_id + /reel/<same id> permalink still returns [] (reel alias guard preserved)', () => {
+    // Invariant: when the permalink is a genuine /reel/ URL whose id equals fb_post_id,
+    // fb_post_id is a bare reel alias and must not be page-prefixed into a comment target.
+    const candidates = buildVisibleCommentTargetCandidates({
+        pageId: '1008898512617594',
+        fbPostId: '1306964481608247',
+        fbReelUrlOrId: 'https://www.facebook.com/reel/1306964481608247/',
+    })
+
+    assert.deepEqual(candidates, [])
+    assert.ok(!candidates.includes('1008898512617594_1306964481608247'), 'reel alias must not compose a page-story target')
+})
+
 test('posting candidates: fbPostId keeps write path story-only even when initial target is a bare reel id', () => {
     const candidates = buildPostingCommentTargetCandidates({
         pageId: '1008898512617594',
