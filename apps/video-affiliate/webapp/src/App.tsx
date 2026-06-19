@@ -755,13 +755,13 @@ interface FacebookPage {
   caption_link_enabled?: number
   onecard_link_mode?: 'shopee' | 'lazada' | 'none'
   onecard_cta?: 'SHOP_NOW' | 'NO_BUTTON'
-  // แหล่งโทเค้นที่ใช้โพสต์ — มีแค่ 2 โหมด: 'stored_token' คือ manual/stored token (default);
-  // 'cloak_browser' คือ CloakBrowser (ระบบ session-cookie browser ที่มาแทน Electron เดิม)
+  // แหล่งโทเค้นที่ใช้โพสต์ — มีแค่ 2 โหมด: 'stored_token' (แสดงผลเป็น "Facebook Lite") คือ manual/stored token (default);
+  // 'cloak_browser' (แสดงผลเป็น "Power Editor") คือระบบ session-cookie browser ที่มาแทน Electron เดิม
   // โดย Video One Card toggle เป็นตัวเลือกว่าจะโพสต์ Reel ปกติหรือ OneCard.
   // ค่าเก่าใน DB ('post-reels-token-ads'/'post-reels-token-cloak') ถูก normalize เป็น 'cloak_browser'.
   posting_token_source?: PostingTokenSource
-  // โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ ('stored_token' = คอมเมนต์ด้วย
-  // Page token ที่กรอกเอง; 'cloak_browser' = คอมเมนต์ในนามเพจผ่าน CloakBrowser bridge)
+  // โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ ('stored_token'/"Facebook Lite" = คอมเมนต์ด้วย
+  // Page token ที่กรอกเอง; 'cloak_browser'/"Power Editor" = คอมเมนต์ในนามเพจผ่าน Power Editor bridge)
   // ถ้าไม่ได้ตั้งค่า runtime จะใช้ค่าเดียวกับโทเค้นที่ใช้โพสต์ เพื่อคงพฤติกรรมเดิม
   comment_token_source?: CommentTokenSource
   last_post_at?: string
@@ -3608,18 +3608,18 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           )}
         </div>
 
-        {/* โทเค้นสำหรับใช้โพสต์ — มีแค่ 2 โหมด: Page/Token (กรอกเอง) และ CloakBrowser */}
+        {/* โทเค้นสำหรับใช้โพสต์ — มีแค่ 2 โหมด: Facebook Lite (กรอกเอง) และ Power Editor */}
         <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
           <div className="min-w-0">
             <p className="font-bold text-gray-900">โทเค้นสำหรับใช้โพสต์</p>
             <p className="text-xs text-gray-400 mt-0.5">
-              เลือกว่าจะให้เพจนี้โพสต์ด้วยโทเค้นที่กรอกเอง หรือผ่าน CloakBrowser ที่ login อยู่บนเครื่อง Mac
+              เลือกว่าจะให้เพจนี้โพสต์ด้วยโทเค้นที่กรอกเอง (Facebook Lite) หรือผ่าน Power Editor ที่ login อยู่บนเครื่อง Mac
             </p>
           </div>
           <div className="grid grid-cols-2 gap-2">
             {([
-              { value: 'stored_token', label: 'Page/Token', hint: 'กรอก User/Page token เอง (legacy)' },
-              { value: 'cloak_browser', label: 'CloakBrowser', hint: 'ใช้ session ของ CloakBrowser โพสต์ให้' },
+              { value: 'stored_token', label: 'Facebook Lite', hint: 'กรอก User/Page token เอง (legacy)' },
+              { value: 'cloak_browser', label: 'Power Editor', hint: 'ใช้ session ของ Power Editor โพสต์ให้' },
             ] as { value: PostingTokenSource; label: string; hint: string }[]).map((option) => (
               <button
                 key={option.value}
@@ -3659,18 +3659,18 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           ) : null}
         </div>
 
-        {/* โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ (Page/Token หรือ CloakBrowser) */}
+        {/* โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ (Facebook Lite หรือ Power Editor) */}
         <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
           <div className="min-w-0">
             <p className="font-bold text-gray-900">โทเค้นสำหรับใช้คอมเมนต์</p>
             <p className="text-xs text-gray-400 mt-0.5">
-              เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้นที่กรอกเอง หรือคอมเมนต์ในนามเพจผ่าน CloakBrowser (แยกอิสระจากโทเค้นที่ใช้โพสต์)
+              เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้นที่กรอกเอง (Facebook Lite) หรือคอมเมนต์ในนามเพจผ่าน Power Editor (แยกอิสระจากโทเค้นที่ใช้โพสต์)
             </p>
           </div>
           <div className="grid grid-cols-2 gap-2">
             {([
-              { value: 'stored_token', label: 'Page/Token', hint: 'คอมเมนต์ด้วย Page token ที่กรอกเอง' },
-              { value: 'cloak_browser', label: 'CloakBrowser', hint: 'คอมเมนต์ในนามเพจผ่าน session CloakBrowser' },
+              { value: 'stored_token', label: 'Facebook Lite', hint: 'คอมเมนต์ด้วย Page token ที่กรอกเอง' },
+              { value: 'cloak_browser', label: 'Power Editor', hint: 'คอมเมนต์ในนามเพจผ่าน session Power Editor' },
             ] as { value: CommentTokenSource; label: string; hint: string }[]).map((option) => (
               <button
                 key={option.value}
