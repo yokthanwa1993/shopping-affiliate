@@ -1994,44 +1994,6 @@ async function getLatestSuccessfulPostHistoryRow(db: D1Database, params: {
     }
 }
 
-async function getLatestSuccessfulNamespacePostHistoryRow(db: D1Database, params: {
-    namespaceId: string
-    videoId: string
-    sourceFingerprint?: string
-}): Promise<{ id: number | null; pageId: string | null; postedAt: string | null } | null> {
-    const namespaceId = String(params.namespaceId || '').trim()
-    const videoId = String(params.videoId || '').trim()
-    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
-    if (!namespaceId || (!videoId && !sourceFingerprint)) return null
-
-    const row = await db.prepare(
-        `SELECT ph.id, ph.page_id, ph.posted_at
-         FROM post_history ph
-         LEFT JOIN namespace_video_state nvs
-           ON nvs.namespace_id = ph.bot_id
-          AND nvs.video_id = ph.video_id
-         WHERE ph.bot_id = ?
-           AND ph.status = 'success'
-           AND (
-               (? <> '' AND ph.video_id = ?)
-               OR (? <> '' AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) = ?)
-           )
-         ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
-         LIMIT 1`
-    ).bind(namespaceId, videoId, videoId, sourceFingerprint, sourceFingerprint).first() as {
-        id?: number
-        page_id?: string | null
-        posted_at?: string | null
-    } | null
-
-    if (!row) return null
-    return {
-        id: typeof row.id === 'number' ? row.id : null,
-        pageId: String(row.page_id || '').trim() || null,
-        postedAt: String(row.posted_at || '').trim() || null,
-    }
-}
-
 async function ensurePagePostedVideoGuardsTable(db: D1Database): Promise<void> {
     await db.prepare(
         `CREATE TABLE IF NOT EXISTS page_posted_video_guards (
@@ -2194,40 +2156,6 @@ async function recordPagePostedVideoGuard(db: D1Database, params: {
     }
 }
 
-async function getFreshNamespacePostedState(db: D1Database, params: {
-    namespaceId: string
-    videoId: string
-    sourceFingerprint?: string
-}): Promise<{ videoId: string; postedAt: string } | null> {
-    const namespaceId = String(params.namespaceId || '').trim()
-    const videoId = String(params.videoId || '').trim()
-    const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(params.sourceFingerprint)
-    if (!namespaceId || (!videoId && !sourceFingerprint)) return null
-
-    const row = await db.prepare(
-        `SELECT video_id, posted_at
-         FROM namespace_video_state
-         WHERE namespace_id = ?
-           AND TRIM(COALESCE(posted_at, '')) <> ''
-           AND (
-               (? <> '' AND video_id = ?)
-               OR (? <> '' AND TRIM(COALESCE(source_fingerprint, '')) = ?)
-           )
-         ORDER BY datetime(updated_at) DESC, datetime(posted_at) DESC
-         LIMIT 1`
-    ).bind(namespaceId, videoId, videoId, sourceFingerprint, sourceFingerprint).first().catch(() => null) as {
-        video_id?: string | null
-        posted_at?: string | null
-    } | null
-
-    const postedAt = String(row?.posted_at || '').trim()
-    if (!postedAt) return null
-    return {
-        videoId: String(row?.video_id || '').trim(),
-        postedAt,
-    }
-}
-
 async function claimGalleryVideoForPosting(params: {
     db: D1Database
     namespaceId: string
@@ -2248,140 +2176,24 @@ async function claimGalleryVideoForPosting(params: {
             video?.sourceFingerprint || video?.source_fingerprint,
         )
 
-        // Cached-state guard: if the in-memory video object already has postedAt set
-        // (e.g., from markCachedNamespaceVideoPosted in the same cron tick), skip.
-        // This guards against stale `videos[]` arrays leaking already-posted entries.
-        if (isNamespaceGalleryVideoPosted(video)) {
-            continue
-        }
-
-        // Fresh DB-state guard: the cron tick can hold a stale gallery array while
-        // an admin bulk-marks/reconciles videos as posted. Re-read state per candidate
-        // at claim time so videos manually moved to "posted" (even with no FB history
-        // row) can never be picked again.
-        const freshPostedState = await getFreshNamespacePostedState(params.db, {
-            namespaceId,
-            videoId,
-            sourceFingerprint,
-        })
-        if (freshPostedState) {
-            console.log(`[CLAIM-STATE-DEDUP] Skip ${videoId} ns=${namespaceId} — state already posted at ${freshPostedState.postedAt} (state_video=${freshPostedState.videoId || videoId})`)
-            continue
-        }
-
-        // SAFETY NET (bulletproof): namespace-level dedup directly against
-        // post_history. Matches by EXACT video_id OR by source_fingerprint so a
-        // freshly-uploaded duplicate of previously-posted content (different
-        // video_id, same etag) is also blocked. Catches any bypass of
-        // ensure*VideoNeverPosted — e.g., if state.posted_at was reset,
-        // race condition, or stale guard table. Rule: if this exact video_id OR
-        // its source_fingerprint was ever successfully posted (or is currently
-        // being posted) anywhere in the same namespace, it is NEVER eligible
-        // for re-posting.
-        const existingNamespacePost = await params.db.prepare(
-            `SELECT ph.id, ph.page_id, ph.video_id AS matched_video_id, ph.posted_at
-             FROM post_history ph
-             LEFT JOIN namespace_video_state nvs
-               ON nvs.namespace_id = ph.bot_id
-              AND nvs.video_id = ph.video_id
-             WHERE ph.bot_id = ?
-               AND ph.status IN ('success', 'posting')
-               AND (
-                   ph.video_id = ?
-                   OR (
-                       ? <> ''
-                       AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs.source_fingerprint) = ?
-                   )
-               )
-             ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
-             LIMIT 1`
-        ).bind(namespaceId, videoId, sourceFingerprint, sourceFingerprint).first().catch(() => null) as { id?: number; page_id?: string; matched_video_id?: string; posted_at?: string } | null
-        if (existingNamespacePost) {
-            const postedAt = String(existingNamespacePost.posted_at || '').trim() || new Date().toISOString()
-            const seenPageId = String(existingNamespacePost.page_id || '').trim()
-            const matchedVideoId = String(existingNamespacePost.matched_video_id || '').trim()
-            const matchKind = matchedVideoId && matchedVideoId !== videoId ? 'fingerprint' : 'video_id'
-
-            // 2026-05-04: Suppress the heal-back-to-posted step when the operator
-            // has manually unposted this video AFTER the last successful post.
-            // Previous behaviour: cron tick re-marked state.posted_at = postedAt
-            // (from post_history) → UI flipped video back from "ยังไม่โพสต์" to
-            // "โพสต์แล้ว" within minutes WITHOUT actually posting to FB.
-            // Operator complaint: "โพสต์ ต้องถูกโพสต์จริงๆสิ ถึงจะย้ายไป โพสต์แล้ว"
-            //
-            // If the operator manually moved this video back to "ยังไม่โพสต์"
-            // after its last successful post, treat that as explicit repost intent.
-            // Older behavior left the card visible in the unposted tab but still
-            // skipped it at claim time, which made the UI say there were no usable
-            // videos even though the operator had just clicked repost.
-            let manualUnpostedAtMs = 0
-            try {
-                const muRow = await params.db.prepare(
-                    `SELECT manual_unposted_at FROM namespace_video_state
-                     WHERE namespace_id = ? AND video_id = ?`
-                ).bind(namespaceId, videoId).first() as { manual_unposted_at?: string | null } | null
-                const raw = String(muRow?.manual_unposted_at || '').trim()
-                if (raw) {
-                    const ms = Date.parse(raw)
-                    if (Number.isFinite(ms)) manualUnpostedAtMs = ms
-                }
-            } catch { /* fall through */ }
-            const postedAtMs = Date.parse(postedAt)
-            const operatorReverted = manualUnpostedAtMs > 0
-                && Number.isFinite(postedAtMs)
-                && postedAtMs <= manualUnpostedAtMs
-
-            // 2026-05-04 (v3 fix): NEVER write posted_at back on dedup match.
-            // Earlier behaviour was to "heal" state by calling markNamespaceVideoPosted
-            // with the matched post_history's posted_at. This caused user-facing
-            // confusion: a freshly-uploaded video with the same source_fingerprint
-            // as an old post would suddenly appear in "โพสต์แล้ว" with a stale
-            // April timestamp, even though no FB post was ever made for THIS
-            // video. The dedup `continue` below is enough to prevent re-posting
-            // — and recordPagePostedVideoGuard (seeded right after) gives the
-            // next cron tick a fast O(1) skip without re-running the expensive
-            // post_history query. If manual_unposted_at is newer than the history,
-            // the operator explicitly requested a repost, so we allow the candidate
-            // through while keeping old history from auto-healing state.posted_at.
-            if (operatorReverted) {
-                console.log(`[CLAIM-DEDUP] Allow manual repost ${videoId} ns=${namespaceId} — previous ${matchKind} history_id=${existingNamespacePost.id ?? '?'} posted_at=${postedAt} manual_unposted_at=${new Date(manualUnpostedAtMs).toISOString()}`)
-            } else {
-                const matchAction = 'fingerprint/video_id match (skip heal — state stays honest)'
-                console.log(`[CLAIM-DEDUP] Skip ${videoId} ns=${namespaceId} — match=${matchKind} (sibling=${matchedVideoId || '?'}) already posted to page=${seenPageId || '?'} at ${postedAt} (history_id=${existingNamespacePost.id ?? '?'}) — ${matchAction}`)
-
-                if (seenPageId) {
-                    await recordPagePostedVideoGuard(params.db, {
-                        namespaceId,
-                        pageId: seenPageId,
-                        videoId,
-                        sourceFingerprint,
-                        historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
-                        postedAt,
-                    }).catch(() => { })
-                }
-                // Also seed a guard for the CURRENT page so the next race can't re-post here either.
-                await recordPagePostedVideoGuard(params.db, {
-                    namespaceId,
-                    pageId,
-                    videoId,
-                    sourceFingerprint,
-                    historyId: typeof existingNamespacePost.id === 'number' ? existingNamespacePost.id : null,
-                    postedAt,
-                }).catch(() => { })
-                continue
-            }
-        }
-
-        const namespaceDuplicateCheck = await ensureNamespaceVideoNeverPosted({
-            db: params.db,
-            namespaceId,
-            videoId,
-            sourceFingerprint,
-        })
-        if (namespaceDuplicateCheck.ok === false) {
-            continue
-        }
-
+        // 2026-06-21 (multi-page starvation fix): eligibility is PER PAGE, not
+        // namespace-wide. The candidate list handed in here is already filtered by
+        // the page-aware pool (countFastGalleryPostingCandidates /
+        // listFastGalleryPostingCandidatePage + PAGE_SCOPED_ALREADY_POSTED_SQL):
+        // it excludes only videos THIS page already posted (page-scoped
+        // post_history success + page_posted_video_guards, honouring
+        // manual_unposted_at) plus admin "mark all as posted" rows (posted_at set
+        // with no real post_history). A video posted by a SIBLING page therefore
+        // stays in this list and must remain claimable here.
+        //
+        // So we deliberately do NOT re-apply the namespace-wide posted_at guards
+        // (isNamespaceGalleryVideoPosted / getFreshNamespacePostedState) that used
+        // to live here — namespace_video_state.posted_at is set the moment ANY page
+        // posts a video, so re-checking it would re-starve every sibling page. The
+        // authoritative per-page block below (ensurePageVideoNeverPosted: page-scoped
+        // post_history + page guards, both respecting manual_unposted_at) plus the
+        // video-scoped posting lock are the only gates the claim path needs. We also
+        // never seed a page guard for this page off a sibling's row.
         const duplicateCheck = await ensurePageVideoNeverPosted({
             db: params.db,
             namespaceId,
@@ -2404,61 +2216,6 @@ async function claimGalleryVideoForPosting(params: {
     }
 
     return null
-}
-
-async function ensureNamespaceVideoNeverPosted(params: {
-    db: D1Database
-    namespaceId: string
-    videoId: string
-    sourceFingerprint?: string
-}): Promise<{ ok: true } | { ok: false; postedAt: string | null; historyId: number | null }> {
-    const latestHistory = await getLatestSuccessfulNamespacePostHistoryRow(params.db, params)
-    if (!latestHistory) return { ok: true }
-
-    const postedAt = String(latestHistory.postedAt || '').trim()
-
-    // 2026-05-04: Same heal-suppression as claimGalleryVideoForPosting (above).
-    // If operator manually unposted via the orange refresh button after the last
-    // successful post, do NOT write state.posted_at back and do NOT block the
-    // repost attempt. Page-level guards are still checked separately below.
-    let manualUnpostedAtMs = 0
-    try {
-        const muRow = await params.db.prepare(
-            `SELECT manual_unposted_at FROM namespace_video_state
-             WHERE namespace_id = ? AND video_id = ?`
-        ).bind(params.namespaceId, params.videoId).first() as { manual_unposted_at?: string | null } | null
-        const raw = String(muRow?.manual_unposted_at || '').trim()
-        if (raw) {
-            const ms = Date.parse(raw)
-            if (Number.isFinite(ms)) manualUnpostedAtMs = ms
-        }
-    } catch { /* fall through to default heal */ }
-    const postedAtMs = postedAt ? Date.parse(postedAt) : NaN
-    const operatorReverted = manualUnpostedAtMs > 0
-        && Number.isFinite(postedAtMs)
-        && postedAtMs <= manualUnpostedAtMs
-
-    // If manual_unposted_at is newer than the latest successful namespace
-    // history row, the operator clicked repost/reset after that Facebook post.
-    // Treat it as explicit repost intent: keep old history from healing
-    // state.posted_at, but do not block the newly requested post attempt.
-    if (operatorReverted) {
-        console.log(`[NS-NEVER-POSTED] Allow manual repost ${params.videoId} ns=${params.namespaceId}. post_history.posted_at=${postedAt} manual_unposted_at=${new Date(manualUnpostedAtMs).toISOString()}.`)
-        return { ok: true }
-    }
-
-    // 2026-05-04 (v3): Same as claimGalleryVideoForPosting — NEVER write
-    // state.posted_at back on dedup match. Just block re-posting via ok:false.
-    // Operator wants UI to reflect actual FB state; auto-healing posted_at from
-    // a sibling post_history row was surfacing fake "posted at 2026-04-25"
-    // timestamps for videos uploaded today that share a source_fingerprint with
-    // an old post.
-    console.log(`[NS-NEVER-POSTED] Skip ${params.videoId} ns=${params.namespaceId} — sibling history match (skip heal — state stays honest). post_history.posted_at=${postedAt} manual_unposted_at=-.`)
-    return {
-        ok: false,
-        postedAt: postedAt || null,
-        historyId: latestHistory.id ?? null,
-    }
 }
 
 async function ensurePageVideoNeverPosted(params: {
@@ -5663,6 +5420,96 @@ const DASHBOARD_GALLERY_POSTED_SQL = `
     )
 `
 
+// 2026-06-21 (multi-page starvation fix): page-aware "already posted by THIS
+// page" exclusion for the POSTING claim pool only — never used by the dashboard
+// ready/used views. DASHBOARD_GALLERY_POSTED_SQL keys on the namespace-wide
+// nvs.posted_at, so the moment ANY page posts a video it disappears from every
+// sibling page's candidate pool (the starvation the Dev Lead reported). This
+// predicate instead excludes a candidate only when the TARGET page itself has
+// already posted it — a page-scoped successful post_history row OR a
+// page_posted_video_guards row, matched by exact video_id OR source_fingerprint,
+// and honouring a newer manual_unposted_at (operator repost intent). It mirrors
+// the authoritative per-page ensurePageVideoNeverPosted check that still runs at
+// claim time. The candidate's own nvs.posted_at is intentionally NOT consulted,
+// so a video posted by page A stays eligible for page B.
+// Bind order per use: (namespaceId, pageId, namespaceId, pageId, namespaceId) —
+// see pageScopedAlreadyPostedBinds().
+const PAGE_SCOPED_ALREADY_POSTED_SQL = `
+    (
+        EXISTS (
+            SELECT 1
+            FROM post_history ph
+            LEFT JOIN namespace_video_state nvs2
+              ON nvs2.namespace_id = ph.bot_id
+             AND nvs2.video_id = ph.video_id
+            WHERE ph.bot_id = ?
+              AND ph.page_id = ?
+              AND ph.status = 'success'
+              AND (
+                  ph.video_id = gi.video_id
+                  OR (
+                      TRIM(COALESCE(nvs.source_fingerprint, '')) <> ''
+                      AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs2.source_fingerprint) = nvs.source_fingerprint
+                  )
+              )
+              AND NOT (
+                  TRIM(COALESCE(nvs.manual_unposted_at, '')) <> ''
+                  AND strftime('%s', ph.posted_at) IS NOT NULL
+                  AND strftime('%s', nvs.manual_unposted_at) IS NOT NULL
+                  AND CAST(strftime('%s', ph.posted_at) AS INTEGER) <= CAST(strftime('%s', nvs.manual_unposted_at) AS INTEGER)
+              )
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM page_posted_video_guards g
+            WHERE g.bot_id = ?
+              AND g.page_id = ?
+              AND (
+                  g.video_id = gi.video_id
+                  OR (
+                      TRIM(COALESCE(nvs.source_fingerprint, '')) <> ''
+                      AND TRIM(COALESCE(g.source_fingerprint, '')) = nvs.source_fingerprint
+                  )
+              )
+              AND NOT (
+                  TRIM(COALESCE(nvs.manual_unposted_at, '')) <> ''
+                  AND strftime('%s', g.created_at) IS NOT NULL
+                  AND strftime('%s', nvs.manual_unposted_at) IS NOT NULL
+                  AND CAST(strftime('%s', g.created_at) AS INTEGER) <= CAST(strftime('%s', nvs.manual_unposted_at) AS INTEGER)
+              )
+        )
+        OR (
+            -- Admin "mark all as posted" override: namespace_video_state.posted_at
+            -- was set WITHOUT any real post_history success row for this video. That
+            -- is an explicit operator signal to keep the video out of the auto-post
+            -- queue for EVERY page, so it must still be excluded namespace-wide. A
+            -- real page post always leaves a post_history row, so this branch never
+            -- fires for "page A actually posted it" — that case is handled per-page
+            -- above and stays claimable for siblings. A later manual_unposted_at
+            -- clears posted_at, which naturally re-opens the video.
+            TRIM(COALESCE(nvs.posted_at, '')) <> ''
+            AND NOT (
+                strftime('%s', nvs.posted_at) IS NOT NULL
+                AND strftime('%s', gi.processed_at) IS NOT NULL
+                AND CAST(strftime('%s', nvs.posted_at) AS INTEGER) < CAST(strftime('%s', gi.processed_at) AS INTEGER)
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM post_history ph2
+                WHERE ph2.bot_id = ?
+                  AND ph2.status = 'success'
+                  AND ph2.video_id = gi.video_id
+            )
+        )
+    )
+`
+
+function pageScopedAlreadyPostedBinds(namespaceId: string, pageId: string): string[] {
+    const ns = String(namespaceId || '').trim()
+    const page = String(pageId || '').trim()
+    return [ns, page, ns, page, ns]
+}
+
 function buildDashboardGallerySearchWhere(searchQuery: string, binds: Array<string | number>): string {
     const normalizedSearch = normalizeGallerySearchQuery(searchQuery)
     if (!normalizedSearch) return ''
@@ -5780,19 +5627,20 @@ async function hydrateFastPostingCandidateSourceFingerprint(params: {
     }).catch(() => { })
 }
 
-async function countFastGalleryPostingCandidates(db: D1Database, namespaceId: string): Promise<number> {
+async function countFastGalleryPostingCandidates(db: D1Database, namespaceId: string, pageId: string): Promise<number> {
     const row = await db.prepare(
         `SELECT COUNT(*) AS total
          ${DASHBOARD_GALLERY_FROM_JOIN}
          WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
-           AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})`
-    ).bind(namespaceId).first() as { total?: number } | null
+           AND NOT ${PAGE_SCOPED_ALREADY_POSTED_SQL}`
+    ).bind(namespaceId, ...pageScopedAlreadyPostedBinds(namespaceId, pageId)).first() as { total?: number } | null
     return Math.max(0, Number(row?.total || 0))
 }
 
 async function listFastGalleryPostingCandidatePage(params: {
     db: D1Database
     namespaceId: string
+    pageId: string
     postingOrder: NamespacePostingOrder
     limit: number
     offset: number
@@ -5801,10 +5649,10 @@ async function listFastGalleryPostingCandidatePage(params: {
         `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
          ${DASHBOARD_GALLERY_FROM_JOIN}
          WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
-           AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})
+           AND NOT ${PAGE_SCOPED_ALREADY_POSTED_SQL}
          ${buildFastGalleryPostingOrderBy(params.postingOrder)}
          LIMIT ? OFFSET ?`
-    ).bind(params.namespaceId, params.limit, params.offset).all() as { results?: Array<Record<string, unknown>> }
+    ).bind(params.namespaceId, ...pageScopedAlreadyPostedBinds(params.namespaceId, params.pageId), params.limit, params.offset).all() as { results?: Array<Record<string, unknown>> }
 
     return (rows.results || []).map((row) => ({
         ...mapDashboardGalleryRow(row, params.namespaceId),
@@ -5851,6 +5699,9 @@ async function claimFastGalleryVideoForPosting(params: {
     await Promise.all([
         ensureGalleryIndexTable(params.env.DB),
         ensureNamespaceVideoStateColumns(params.env.DB),
+        // The page-aware candidate pool predicate references page_posted_video_guards;
+        // make sure the table exists so the EXISTS subquery never errors on a fresh DB.
+        ensurePagePostedVideoGuardsTable(params.env.DB),
     ])
 
     const skipFailedTodayVideoIds = new Set<string>()
@@ -5871,7 +5722,7 @@ async function claimFastGalleryVideoForPosting(params: {
         }
     }
 
-    stats.candidateTotal = await countFastGalleryPostingCandidates(params.env.DB, namespaceId)
+    stats.candidateTotal = await countFastGalleryPostingCandidates(params.env.DB, namespaceId, pageId)
     if (stats.candidateTotal <= 0) return finish(null)
 
     const candidateBucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
@@ -5890,6 +5741,7 @@ async function claimFastGalleryVideoForPosting(params: {
         const page = await listFastGalleryPostingCandidatePage({
             db: params.env.DB,
             namespaceId,
+            pageId,
             postingOrder: params.postingOrder,
             limit: pageSize,
             offset,
