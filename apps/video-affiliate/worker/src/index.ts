@@ -14072,6 +14072,102 @@ app.post('/admin/api/comments/retry', async (c) => {
     }
 })
 
+// Targeted maintenance: recover a SINGLE failed post_history row whose Reel FB
+// actually published but whose publish confirmation was lost (fb_post_id stayed
+// null, e.g. cloak_post_failed: browser_graph_request_failed). Same engine as the
+// cron backstop (attemptFailedRowFeedRecovery) but with no freshness gate and a
+// wider, operator-tunable time window so a historical row can be repaired on demand.
+// dry_run defaults TRUE (preview only); pass dry_run:false to write. On a real write
+// it flips the row to success + comment_status='pending' so the existing pending-
+// comment backlog posts the Shopee link. Never returns or logs raw tokens.
+app.post('/admin/api/post-history/:id/recover-from-feed', async (c) => {
+    try {
+        const botId = String(c.get('botId') || '').trim()
+        if (!botId) return c.json({ ok: false, error: 'missing_namespace' }, 400)
+
+        const historyId = Number(c.req.param('id'))
+        if (!Number.isFinite(historyId) || historyId <= 0) return c.json({ ok: false, error: 'invalid_history_id' }, 400)
+
+        const body = await c.req.json().catch(() => ({})) as {
+            dry_run?: boolean
+            ahead_minutes?: number
+            behind_minutes?: number
+        }
+        const isExplicitFalse = (v: unknown): boolean => {
+            const s = String(v ?? '').trim().toLowerCase()
+            return v === false || s === 'false' || s === '0' || s === 'no' || s === 'off'
+        }
+        // dry_run defaults TRUE; only an explicit false enables the write.
+        const dryRunRaw = body.dry_run !== undefined ? body.dry_run : c.req.query('dry_run')
+        const dryRun = !isExplicitFalse(dryRunRaw)
+        const aheadMinutes = Math.min(720, Math.max(1, Math.floor(Number(body.ahead_minutes ?? c.req.query('ahead_minutes') ?? 60))))
+        const behindMinutes = Math.min(720, Math.max(1, Math.floor(Number(body.behind_minutes ?? c.req.query('behind_minutes') ?? 10))))
+
+        await ensurePostHistoryTraceColumns(c.env.DB)
+        const row = await c.env.DB.prepare(
+            `SELECT ph.id, ph.bot_id, ph.page_id, ph.video_id, ph.posted_at, ph.shopee_link, ph.status,
+                    ph.fb_post_id, p.name AS page_name, p.access_token
+             FROM post_history ph
+             JOIN pages p ON p.id = ph.page_id AND p.bot_id = ph.bot_id
+             WHERE ph.id = ? AND ph.bot_id = ?
+             LIMIT 1`
+        ).bind(historyId, botId).first() as {
+            id: number
+            bot_id: string
+            page_id: string
+            video_id: string
+            posted_at: string
+            shopee_link?: string | null
+            status?: string
+            fb_post_id?: string | null
+            page_name?: string | null
+            access_token?: string | null
+        } | null
+
+        if (!row) return c.json({ ok: false, error: 'history_row_not_found' }, 404)
+        if (String(row.status || '').trim() !== 'failed') {
+            return c.json({ ok: false, error: 'row_not_failed', status: row.status }, 409)
+        }
+        if (String(row.fb_post_id || '').trim()) {
+            return c.json({ ok: false, error: 'row_already_has_fb_post_id', fb_post_id: row.fb_post_id }, 409)
+        }
+
+        const result = await attemptFailedRowFeedRecovery({
+            env: c.env,
+            row: {
+                id: row.id,
+                bot_id: String(row.bot_id || ''),
+                page_id: String(row.page_id || ''),
+                video_id: String(row.video_id || ''),
+                posted_at: String(row.posted_at || ''),
+                shopee_link: row.shopee_link,
+                page_name: row.page_name,
+                access_token: row.access_token,
+            },
+            aheadMs: aheadMinutes * 60 * 1000,
+            behindMs: behindMinutes * 60 * 1000,
+            freshnessGuardMs: 0,
+            dryRun,
+            logPrefix: 'ADMIN-RECOVER-FAILED',
+        })
+
+        return c.json({
+            ok: true,
+            history_id: historyId,
+            dry_run: dryRun,
+            recovered: result.recovered,
+            reason: result.reason,
+            candidates_scanned: result.candidates_scanned,
+            fb_post_id: result.fb_post_id || null,
+            fb_reel_url: result.fb_reel_url || null,
+            comment_status: result.comment_status || null,
+            caption_matched: result.caption_matched ?? null,
+        })
+    } catch (e) {
+        return c.json({ ok: false, error: 'recover_from_feed_failed', details: e instanceof Error ? e.message : String(e) }, 500)
+    }
+})
+
 app.get('/admin/api/data', async (c) => {
     return c.json(await buildAdminDataPayload(c.env))
 })
@@ -33627,28 +33723,33 @@ async function reconcilePostingHistoryRows(params: {
  */
 async function recoverFailedHistoryRowsFromFeed(params: {
     env: Env
-    botId: string
     logPrefix: string
 }): Promise<void> {
-    const { env, botId, logPrefix } = params
-    const recoveryWindowMinutes = 45
+    const { env, logPrefix } = params
+    // since/until-bounded /posts scans find the post regardless of how many newer
+    // posts exist, so this window just bounds how far back the batch reaches; 180
+    // minutes covers a row that sat failed across a few cron ticks.
+    const recoveryWindowMinutes = 180
     try {
+        await ensurePostHistoryTraceColumns(env.DB)
+        // Namespace-agnostic scan (every bot_id) so the cron backstop covers all
+        // namespaces in one pass, mirroring processPendingCommentBacklog. Per-row
+        // bot_id drives the namespace token pool inside attemptFailedRowFeedRecovery.
         const { results } = await env.DB.prepare(
-            `SELECT ph.id, ph.page_id, ph.video_id, ph.posted_at, ph.shopee_link, ph.lazada_link,
+            `SELECT ph.id, ph.bot_id, ph.page_id, ph.video_id, ph.posted_at, ph.shopee_link, ph.lazada_link,
                     p.name AS page_name, p.access_token
              FROM post_history ph
-             JOIN pages p ON p.id = ph.page_id
+             JOIN pages p ON p.id = ph.page_id AND p.bot_id = ph.bot_id
              WHERE ph.status = 'failed'
                AND (ph.fb_post_id IS NULL OR TRIM(ph.fb_post_id) = '')
                AND ph.comment_status = 'not_attempted'
-               AND ph.bot_id = ?
-               AND p.bot_id = ?
                AND datetime(ph.posted_at) >= datetime('now', ?)
              ORDER BY ph.posted_at DESC
-             LIMIT 10`
-        ).bind(botId, botId, `-${recoveryWindowMinutes} minutes`).all() as {
+             LIMIT 20`
+        ).bind(`-${recoveryWindowMinutes} minutes`).all() as {
             results: Array<{
                 id: number
+                bot_id: string
                 page_id: string
                 video_id: string
                 posted_at: string
@@ -33661,58 +33762,26 @@ async function recoverFailedHistoryRowsFromFeed(params: {
 
         for (const row of results || []) {
             try {
-                const pageAccessToken = String(row.access_token || '').trim()
-                if (!pageAccessToken) continue
-
-                const postedAtMs = Date.parse(String(row.posted_at || ''))
-                // skip fresh failures — FB feed needs time to index
-                if (!Number.isFinite(postedAtMs) || Date.now() - postedAtMs < 60000) continue
-
-                const feedRecovered = await recoverPublishedReelFromRecentFeed({
-                    accessToken: pageAccessToken,
-                    pageId: String(row.page_id || ''),
-                    expectedCaption: '', // no caption stored in DB; fall back to time-window match only
-                    notBeforeIso: row.posted_at,
-                    logPrefix: `${logPrefix} RECOVER-FAILED ${row.page_name || row.page_id}`,
-                }).catch(() => ({ published: false } as { published: boolean; post_id?: string; permalink_url?: string }))
-
-                if (!feedRecovered.published || !feedRecovered.post_id) continue
-
-                const recoveredPostId = String(feedRecovered.post_id || '').trim()
-                const recoveredReelUrl = String(feedRecovered.permalink_url || '').trim() || `https://www.facebook.com/reel/${recoveredPostId}`
-
-                // Guard: make sure this fb_post_id is not already claimed by another history row for the same page.
-                const claimedByOther = await env.DB.prepare(
-                    `SELECT id FROM post_history
-                     WHERE fb_post_id = ? AND page_id = ? AND id <> ?
-                     LIMIT 1`
-                ).bind(recoveredPostId, String(row.page_id || ''), row.id).first<{ id?: number }>().catch(() => null)
-                if (claimedByOther?.id) {
-                    console.log(`[${logPrefix}] RECOVER-FAILED skip row ${row.id}: fb_post_id ${recoveredPostId} already claimed by row ${claimedByOther.id}`)
-                    continue
-                }
-
-                const hasShopee = !!String(row.shopee_link || '').trim()
-                const nextCommentStatus = hasShopee ? 'pending' : 'not_configured'
-
-                const update = await env.DB.prepare(
-                    `UPDATE post_history
-                     SET status = 'success',
-                         fb_post_id = ?,
-                         fb_reel_url = ?,
-                         error_message = NULL,
-                         comment_status = CASE WHEN comment_status = 'not_attempted' THEN ? ELSE comment_status END,
-                         comment_error = NULL,
-                         comment_due_at = NULL
-                     WHERE id = ?
-                       AND status = 'failed'
-                       AND (fb_post_id IS NULL OR TRIM(fb_post_id) = '')`
-                ).bind(recoveredPostId, recoveredReelUrl, nextCommentStatus, row.id).run().catch(() => null)
-
-                if (Number(update?.meta?.changes || 0) > 0) {
-                    console.log(`[${logPrefix}] RECOVER-FAILED row ${row.id} recovered: fb_post_id=${recoveredPostId}, comment=${nextCommentStatus}`)
-                    await markNamespaceVideoPosted(env.DB, botId, String(row.video_id || ''), new Date().toISOString()).catch(() => { })
-                }
+                await attemptFailedRowFeedRecovery({
+                    env,
+                    row: {
+                        id: row.id,
+                        bot_id: String(row.bot_id || ''),
+                        page_id: String(row.page_id || ''),
+                        video_id: String(row.video_id || ''),
+                        posted_at: String(row.posted_at || ''),
+                        shopee_link: row.shopee_link,
+                        page_name: row.page_name,
+                        access_token: row.access_token,
+                    },
+                    // Tight window for the unattended batch: the post is published within
+                    // minutes of the attempt. 60s freshness gate gives FB time to index.
+                    aheadMs: 15 * 60 * 1000,
+                    behindMs: 2 * 60 * 1000,
+                    freshnessGuardMs: 60 * 1000,
+                    dryRun: false,
+                    logPrefix,
+                })
             } catch (rowErr) {
                 console.error(`[${logPrefix}] RECOVER-FAILED row ${row.id} failed: ${rowErr instanceof Error ? rowErr.message : String(rowErr)}`)
             }
@@ -33955,6 +34024,329 @@ async function recoverPublishedReelFromRecentFeed(params: {
     return { published: false }
 }
 
+// Resolves the actor id that a Facebook token actually belongs to. A page's
+// public canonical actor id (new-page-experience / "profile-plus") can differ
+// from the numeric page_id we store and post to (e.g. stored 1008898512617594
+// vs public 100068841215950). When recovering a post from the feed we must scan
+// BOTH ids, because either one may be the id Graph exposes the feed under for a
+// given token. Never logs or returns the raw token. Returns '' on any error.
+async function resolveFacebookTokenActorId(accessToken: string): Promise<string> {
+    const token = String(accessToken || '').trim()
+    if (!token) return ''
+    try {
+        const me = await facebookGraphRawGet<{ id?: string }>(
+            `${FB_GRAPH_V19}/me`,
+            { fields: 'id', access_token: token },
+        )
+        return String(me?.id || '').trim()
+    } catch {
+        return ''
+    }
+}
+
+// A published video/page-story candidate harvested from a page's recent posts.
+// storyId is the BARE story tail (e.g. 1307742981530397) — the proven fb_post_id
+// format (see post_history success rows) that buildVisibleCommentTargetCandidates
+// composes into the visible page-story comment target <page_id>_<storyId>.
+type RecoveryStoryCandidate = {
+    storyId: string
+    fullStoryId: string
+    reelId: string
+    permalink: string
+    createdMs: number
+    message: string
+}
+
+function postHasVideoAttachment(item: Record<string, unknown>): boolean {
+    const attachments = item?.attachments as { data?: Array<Record<string, unknown>> } | undefined
+    const atts = Array.isArray(attachments?.data) ? attachments!.data! : []
+    return atts.some((att) => String((att as Record<string, unknown>)?.media_type || '').toLowerCase() === 'video')
+}
+
+// Lists a page's recent VIDEO/Reel posts inside a time window, newest first.
+// Uses /{feedId}/posts (the same reliable edge the gallery sync uses — /feed can
+// silently omit Reels) and merges /{feedId}/feed as a secondary source. Bounds the
+// query server-side with since/until so it finds the post even when many newer
+// posts exist. Returns the page-story tail as the recovery id, never the bare reel
+// object id (comments on the reel object do not appear on the visible page story).
+async function listRecentPagePostsForRecovery(params: {
+    accessToken: string
+    feedId: string
+    windowStartMs: number
+    windowEndMs: number
+    logPrefix: string
+}): Promise<RecoveryStoryCandidate[]> {
+    const out: RecoveryStoryCandidate[] = []
+    const seen = new Set<string>()
+    const since = Math.floor(params.windowStartMs / 1000)
+    const until = Math.ceil(params.windowEndMs / 1000)
+    const ingest = (items: Array<Record<string, unknown>> | undefined) => {
+        for (const item of items || []) {
+            const createdTime = String(item?.created_time || '').trim()
+            const createdMs = createdTime ? Date.parse(createdTime) : Number.NaN
+            if (!Number.isFinite(createdMs)) continue
+            if (createdMs < params.windowStartMs || createdMs > params.windowEndMs) continue
+            const permalink = normalizeFacebookPermalink(String(item?.permalink_url || ''))
+            const isVideoPost = /\/reel\/|\/videos\//i.test(permalink) || postHasVideoAttachment(item)
+            if (!isVideoPost) continue
+            const fullStoryId = String(item?.id || '').trim()
+            const storyId = fullStoryId.includes('_') ? String(fullStoryId.split('_').pop() || '').trim() : fullStoryId
+            if (!storyId) continue
+            const key = fullStoryId || permalink || storyId
+            if (seen.has(key)) continue
+            seen.add(key)
+            out.push({
+                storyId,
+                fullStoryId,
+                reelId: extractReelIdFromPermalink(permalink),
+                permalink,
+                createdMs,
+                message: String(item?.message || '').trim(),
+            })
+        }
+    }
+    const fields = 'id,message,permalink_url,created_time,attachments{media_type,target{id}}'
+    for (const edge of ['posts', 'feed']) {
+        try {
+            const resp = await facebookGraphRawGet<{ data?: Array<Record<string, unknown>> }>(
+                `${FB_GRAPH_V19}/${params.feedId}/${edge}`,
+                { fields, limit: '25', since: String(since), until: String(until), access_token: params.accessToken },
+            )
+            ingest(Array.isArray(resp?.data) ? resp.data : [])
+        } catch (e) {
+            console.log(`[${params.logPrefix}] ${edge} scan failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+    return out.sort((a, b) => b.createdMs - a.createdMs)
+}
+
+// Canonical-owner-tolerant, multi-token candidate harvest. Tries every candidate
+// token and, for each, lists posts under BOTH the stored page_id and the token's
+// own actor id so a public canonical-owner mismatch (stored 1008898512617594 vs
+// public 100068841215950) can never hide an already-published post. Tokens are
+// never logged. Deduped by story id, newest first.
+async function collectRecoveryStoryCandidates(params: {
+    tokens: string[]
+    storedPageId: string
+    windowStartMs: number
+    windowEndMs: number
+    logPrefix: string
+}): Promise<RecoveryStoryCandidate[]> {
+    const storedPageId = String(params.storedPageId || '').trim()
+    const scanned = new Set<string>()
+    const byStory = new Map<string, RecoveryStoryCandidate>()
+    for (const rawToken of params.tokens) {
+        const token = String(rawToken || '').trim()
+        if (!token) continue
+        const actorId = await resolveFacebookTokenActorId(token).catch(() => '')
+        const feedIds = [storedPageId, actorId].filter((id) => !!id)
+        for (const feedId of feedIds) {
+            const dedupeKey = `${token}::${feedId}`
+            if (scanned.has(dedupeKey)) continue
+            scanned.add(dedupeKey)
+            const found = await listRecentPagePostsForRecovery({
+                accessToken: token,
+                feedId,
+                windowStartMs: params.windowStartMs,
+                windowEndMs: params.windowEndMs,
+                logPrefix: `${params.logPrefix} feed=${feedId}`,
+            }).catch(() => [] as RecoveryStoryCandidate[])
+            for (const candidate of found) {
+                const key = candidate.fullStoryId || candidate.storyId
+                if (!byStory.has(key)) byStory.set(key, candidate)
+            }
+        }
+    }
+    return Array.from(byStory.values()).sort((a, b) => b.createdMs - a.createdMs)
+}
+
+// Shared core that recovers ONE failed post_history row whose publish confirmation
+// was lost (FB actually published, fb_post_id stayed null). Harvests the page's
+// recent video posts in a time window around the attempt, picks the matching
+// page-story (caption match preferred, else newest unclaimed in window), and — when
+// not a dry run — flips the row to success + comment_status='pending' so the
+// pending-comment backlog posts the Shopee link. Used by BOTH the cron backstop and
+// the targeted maintenance endpoint. Never logs or returns raw tokens.
+async function attemptFailedRowFeedRecovery(params: {
+    env: Env
+    row: {
+        id: number
+        bot_id: string
+        page_id: string
+        video_id: string
+        posted_at: string
+        shopee_link?: string | null
+        page_name?: string | null
+        access_token?: string | null
+    }
+    aheadMs: number
+    behindMs: number
+    freshnessGuardMs: number
+    dryRun: boolean
+    // Optional write-confirmation guard. When set (non-empty) on a write, the row is
+    // updated ONLY if the matched story tail exactly equals this value; otherwise the
+    // call returns reason 'expected_fb_post_id_mismatch' WITHOUT writing. Lets a
+    // namespace-scoped caller confirm the exact id (from a prior dry run) before any
+    // public caller can pin a wrong story id.
+    expectedFbPostId?: string
+    logPrefix: string
+}): Promise<{
+    recovered: boolean
+    reason: string
+    candidates_scanned: number
+    fb_post_id?: string
+    fb_reel_url?: string
+    comment_status?: string
+    caption_matched?: boolean
+}> {
+    const { env, row } = params
+    const botId = String(row.bot_id || '').trim()
+    const pageId = String(row.page_id || '').trim()
+    if (!botId || !pageId) return { recovered: false, reason: 'missing_namespace_or_page', candidates_scanned: 0 }
+
+    const postedAtMs = Date.parse(String(row.posted_at || ''))
+    if (!Number.isFinite(postedAtMs)) return { recovered: false, reason: 'invalid_posted_at', candidates_scanned: 0 }
+    // Freshness gate (batch only): give FB time to index before we claim a post.
+    if (params.freshnessGuardMs > 0 && Date.now() - postedAtMs < params.freshnessGuardMs) {
+        return { recovered: false, reason: 'too_fresh', candidates_scanned: 0 }
+    }
+
+    // Namespace token pool (post + dedicated comment tokens), plus the sync token the
+    // gallery reader uses, so a CloakBrowser-bridge post with no stored post token is
+    // still recoverable via the comment/sync token's feed read access.
+    const tokenCandidates = await ensurePageTokenCandidates({
+        env,
+        db: env.DB,
+        namespaceId: botId,
+        pageId,
+        pageName: String(row.page_name || ''),
+        primaryToken: String(row.access_token || ''),
+        logPrefix: `${params.logPrefix} ${row.id}`,
+    })
+    const syncToken = await resolveFacebookSyncToken(env.DB, pageId, botId).catch(() => '')
+    const feedTokens = uniqueTokens([
+        ...tokenCandidates.postTokens,
+        ...tokenCandidates.commentTokens,
+        syncToken,
+        String(row.access_token || '').trim(),
+    ])
+    if (feedTokens.length === 0) return { recovered: false, reason: 'no_feed_token', candidates_scanned: 0 }
+
+    // Reconstruct the stored caption as a SOFT match signal. It is unreliable when the
+    // posted message was AI-generated (buildPostingCaptionFromMeta), so a mismatch must
+    // NOT veto recovery — it only ranks candidates.
+    let expectedCaption = ''
+    try {
+        const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
+        const metaObj = await bucket.get(`videos/${String(row.video_id || '')}.json`)
+        if (metaObj) {
+            const meta = await metaObj.json() as Record<string, unknown>
+            expectedCaption = buildExpectedCaptionFromMeta(meta)
+        }
+    } catch { /* caption is optional */ }
+
+    const candidates = await collectRecoveryStoryCandidates({
+        tokens: feedTokens,
+        storedPageId: pageId,
+        windowStartMs: postedAtMs - params.behindMs,
+        windowEndMs: postedAtMs + params.aheadMs,
+        logPrefix: `${params.logPrefix} RECOVER-FAILED ${row.page_name || pageId}`,
+    })
+    if (candidates.length === 0) return { recovered: false, reason: 'no_published_post_found', candidates_scanned: 0 }
+
+    // Skip story ids already claimed by another history row for this page (compare
+    // both bare-tail and full forms so a sibling success row can't be re-claimed).
+    const claimedRows = await env.DB.prepare(
+        `SELECT fb_post_id FROM post_history
+         WHERE page_id = ? AND id <> ? AND TRIM(COALESCE(fb_post_id, '')) <> ''`
+    ).bind(pageId, row.id).all().catch(() => ({ results: [] as Array<{ fb_post_id?: string }> }))
+    const claimed = new Set<string>()
+    for (const r of (claimedRows.results || []) as Array<{ fb_post_id?: string }>) {
+        const v = String(r.fb_post_id || '').trim()
+        if (!v) continue
+        claimed.add(v)
+        if (v.includes('_')) claimed.add(String(v.split('_').pop() || '').trim())
+    }
+    const isClaimed = (c: RecoveryStoryCandidate) => claimed.has(c.storyId) || claimed.has(c.fullStoryId)
+
+    const expectedNorm = normalizeCaptionForMatch(expectedCaption)
+    const captionMatches = (message: string): boolean => {
+        if (!expectedNorm) return false
+        const messageNorm = normalizeCaptionForMatch(message)
+        if (!messageNorm) return false
+        return messageNorm === expectedNorm
+            || messageNorm.startsWith(expectedNorm)
+            || expectedNorm.startsWith(messageNorm)
+    }
+
+    const unclaimed = candidates.filter((c) => !isClaimed(c))
+    const chosen = unclaimed.find((c) => captionMatches(c.message)) || unclaimed[0]
+    if (!chosen) return { recovered: false, reason: 'all_candidates_claimed', candidates_scanned: candidates.length }
+
+    const captionMatched = captionMatches(chosen.message)
+    const recoveredPostId = chosen.storyId
+    const recoveredReelUrl = chosen.permalink || `https://www.facebook.com/${pageId}/posts/${recoveredPostId}`
+    const hasShopee = !!String(row.shopee_link || '').trim()
+    const nextCommentStatus = hasShopee ? 'pending' : 'not_configured'
+
+    if (params.dryRun) {
+        return {
+            recovered: true,
+            reason: 'dry_run_match',
+            candidates_scanned: candidates.length,
+            fb_post_id: recoveredPostId,
+            fb_reel_url: recoveredReelUrl,
+            comment_status: nextCommentStatus,
+            caption_matched: captionMatched,
+        }
+    }
+
+    // Write-confirmation guard: a caller can require the matched story tail to equal a
+    // value it confirmed from a prior dry run. Surfaces the matched id so the caller
+    // can see what would have been written, but does NOT write on mismatch.
+    const expectedFbPostId = String(params.expectedFbPostId || '').trim()
+    if (expectedFbPostId && expectedFbPostId !== recoveredPostId) {
+        return {
+            recovered: false,
+            reason: 'expected_fb_post_id_mismatch',
+            candidates_scanned: candidates.length,
+            fb_post_id: recoveredPostId,
+            fb_reel_url: recoveredReelUrl,
+            comment_status: nextCommentStatus,
+            caption_matched: captionMatched,
+        }
+    }
+
+    const update = await env.DB.prepare(
+        `UPDATE post_history
+         SET status = 'success',
+             fb_post_id = ?,
+             fb_reel_url = ?,
+             error_message = NULL,
+             comment_status = CASE WHEN comment_status = 'not_attempted' THEN ? ELSE comment_status END,
+             comment_error = NULL,
+             comment_due_at = NULL
+         WHERE id = ?
+           AND status = 'failed'
+           AND (fb_post_id IS NULL OR TRIM(fb_post_id) = '')`
+    ).bind(recoveredPostId, recoveredReelUrl, nextCommentStatus, row.id).run().catch(() => null)
+
+    if (Number(update?.meta?.changes || 0) === 0) {
+        return { recovered: false, reason: 'row_already_updated', candidates_scanned: candidates.length }
+    }
+
+    console.log(`[${params.logPrefix}] RECOVER-FAILED row ${row.id} recovered: fb_post_id=${recoveredPostId}, comment=${nextCommentStatus}, caption_matched=${captionMatched}`)
+    await markNamespaceVideoPosted(env.DB, botId, String(row.video_id || ''), new Date().toISOString()).catch(() => { })
+    return {
+        recovered: true,
+        reason: 'recovered',
+        candidates_scanned: candidates.length,
+        fb_post_id: recoveredPostId,
+        fb_reel_url: recoveredReelUrl,
+        comment_status: nextCommentStatus,
+        caption_matched: captionMatched,
+    }
+}
 async function finishReelPublishWithRetry(params: {
     accessToken: string
     pageId: string
@@ -36850,6 +37242,133 @@ app.delete('/api/post-history/:id', async (c) => {
         return c.json({ success: true })
     } catch {
         return c.json({ error: 'Failed to delete' }, 500)
+    }
+})
+
+// Namespace-scoped maintenance: recover a SINGLE failed post_history row whose Reel
+// FB actually published but whose publish confirmation was lost (fb_post_id stayed
+// null, e.g. cloak_post_failed: browser_graph_request_failed). Same engine as the
+// cron backstop and the admin route (attemptFailedRowFeedRecovery), reachable with
+// normal history (x-bot-id) auth — UNLIKE the /admin/* variant which needs the admin
+// token. It does NOT repost (unlike retry-post): it only matches the already-published
+// page-story and flips the row to success + comment_status='pending' so the existing
+// pending-comment backlog posts the Shopee link.
+//
+// Safety: dry_run defaults TRUE (preview only). A write (dry_run:false) REQUIRES
+// body.expected_fb_post_id to exactly equal the matched story tail, so a public caller
+// can never pin an arbitrary/wrong story id — they must first read the matched id from
+// a dry run and echo it back. Refuses rows that are not failed, already have an
+// fb_post_id, or whose comment was already attempted. Returns redacted metadata only.
+app.post('/api/post-history/:id/recover-from-feed', async (c) => {
+    try {
+        const botId = String(c.get('botId') || '').trim()
+        if (!botId) return c.json({ ok: false, error: 'missing_namespace' }, 400)
+
+        const historyId = Number(c.req.param('id'))
+        if (!Number.isFinite(historyId) || historyId <= 0) return c.json({ ok: false, error: 'invalid_history_id' }, 400)
+
+        const body = await c.req.json().catch(() => ({})) as {
+            dry_run?: boolean
+            expected_fb_post_id?: string
+            ahead_minutes?: number
+            behind_minutes?: number
+        }
+        const isExplicitFalse = (v: unknown): boolean => {
+            const s = String(v ?? '').trim().toLowerCase()
+            return v === false || s === 'false' || s === '0' || s === 'no' || s === 'off'
+        }
+        // dry_run defaults TRUE; only an explicit false enables the write.
+        const dryRunRaw = body.dry_run !== undefined ? body.dry_run : c.req.query('dry_run')
+        const dryRun = !isExplicitFalse(dryRunRaw)
+        const expectedFbPostId = String(body.expected_fb_post_id ?? c.req.query('expected_fb_post_id') ?? '').trim()
+        const aheadMinutes = Math.min(720, Math.max(1, Math.floor(Number(body.ahead_minutes ?? c.req.query('ahead_minutes') ?? 60))))
+        const behindMinutes = Math.min(720, Math.max(1, Math.floor(Number(body.behind_minutes ?? c.req.query('behind_minutes') ?? 10))))
+
+        // Writes must echo back the exact matched id from a prior dry run.
+        if (!dryRun && !expectedFbPostId) {
+            return c.json({ ok: false, error: 'expected_fb_post_id_required' }, 400)
+        }
+
+        await ensurePostHistoryTraceColumns(c.env.DB)
+        const row = await c.env.DB.prepare(
+            `SELECT ph.id, ph.bot_id, ph.page_id, ph.video_id, ph.posted_at, ph.shopee_link, ph.status,
+                    ph.fb_post_id, ph.comment_status, p.name AS page_name, p.access_token
+             FROM post_history ph
+             JOIN pages p ON p.id = ph.page_id AND p.bot_id = ph.bot_id
+             WHERE ph.id = ? AND ph.bot_id = ?
+             LIMIT 1`
+        ).bind(historyId, botId).first() as {
+            id: number
+            bot_id: string
+            page_id: string
+            video_id: string
+            posted_at: string
+            shopee_link?: string | null
+            status?: string
+            fb_post_id?: string | null
+            comment_status?: string | null
+            page_name?: string | null
+            access_token?: string | null
+        } | null
+
+        if (!row) return c.json({ ok: false, error: 'history_row_not_found' }, 404)
+        if (String(row.status || '').trim() !== 'failed') {
+            return c.json({ ok: false, error: 'row_not_failed', status: row.status }, 409)
+        }
+        if (String(row.fb_post_id || '').trim()) {
+            return c.json({ ok: false, error: 'row_already_has_fb_post_id' }, 409)
+        }
+        const commentStatus = String(row.comment_status || '').trim()
+        if (commentStatus && commentStatus !== 'not_attempted') {
+            return c.json({ ok: false, error: 'comment_already_attempted', comment_status: commentStatus }, 409)
+        }
+
+        const result = await attemptFailedRowFeedRecovery({
+            env: c.env,
+            row: {
+                id: row.id,
+                bot_id: String(row.bot_id || ''),
+                page_id: String(row.page_id || ''),
+                video_id: String(row.video_id || ''),
+                posted_at: String(row.posted_at || ''),
+                shopee_link: row.shopee_link,
+                page_name: row.page_name,
+                access_token: row.access_token,
+            },
+            aheadMs: aheadMinutes * 60 * 1000,
+            behindMs: behindMinutes * 60 * 1000,
+            freshnessGuardMs: 0,
+            dryRun,
+            expectedFbPostId,
+            logPrefix: 'NS-RECOVER-FAILED',
+        })
+
+        // Confirmation mismatch on a write: report the matched id, do not write.
+        if (result.reason === 'expected_fb_post_id_mismatch') {
+            return c.json({
+                ok: false,
+                error: 'expected_fb_post_id_mismatch',
+                history_id: historyId,
+                expected_fb_post_id: expectedFbPostId,
+                matched_fb_post_id: result.fb_post_id || null,
+                candidates_scanned: result.candidates_scanned,
+            }, 409)
+        }
+
+        return c.json({
+            ok: true,
+            history_id: historyId,
+            dry_run: dryRun,
+            recovered: result.recovered,
+            reason: result.reason,
+            candidates_scanned: result.candidates_scanned,
+            fb_post_id: result.fb_post_id || null,
+            fb_reel_url: result.fb_reel_url || null,
+            comment_status: result.comment_status || null,
+            caption_matched: result.caption_matched ?? null,
+        })
+    } catch (e) {
+        return c.json({ ok: false, error: 'recover_from_feed_failed', details: e instanceof Error ? e.message : String(e) }, 500)
     }
 })
 
@@ -41812,6 +42331,15 @@ export default {
                 console.error(`[CRON-COMMENTS] ${error instanceof Error ? error.message : String(error)}`)
             })),
         })
+        // Recover rows that FB actually published but whose publish confirmation failed
+        // (e.g. cloak_post_failed: browser_graph_request_failed leaves fb_post_id null).
+        // Scans the page feed via the namespace token pool, tolerant of public canonical
+        // page-owner id mismatches, then flips the row to success + comment_status='pending'
+        // so the comment backlog above posts the Shopee link on the next tick. Own waitUntil
+        // so it never blocks (or is blocked by) posting, and swallows its own errors.
+        _ctx.waitUntil(recoverFailedHistoryRowsFromFeed({ env, logPrefix: 'CRON' }).catch((error) => {
+            console.error(`[CRON-RECOVER-FAILED] ${error instanceof Error ? error.message : String(error)}`)
+        }))
         // Ad-only queue cadence — process at most ONE queued ad-only item per operator-set interval.
         // Runs in waitUntil so it never blocks (or is blocked by) the posting loop, and is wrapped to
         // swallow its own errors so an ad-only failure can never derail the every-minute cron.
