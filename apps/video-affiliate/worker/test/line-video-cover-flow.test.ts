@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import test from 'node:test'
+
+const requireFromWorker = createRequire(`${process.cwd()}/package.json`)
+const ts = requireFromWorker('typescript') as typeof import('typescript')
 
 function getSource(): string {
     return readFileSync('src/index.ts', 'utf8')
@@ -36,27 +40,264 @@ function getLineWebhookSource(): string {
     )
 }
 
-test('direct LINE video upload still acks within the reply window', () => {
+type HarnessSend = {
+    replyToken: string
+    messages: Array<Record<string, unknown>>
+}
+
+function makeLineVideoHandlerHarness(options: {
+    coverPickerSendFails?: boolean
+    firstTextFollowupFails?: boolean
+} = {}) {
+    const compiled = ts.transpileModule(getVideoHandlerSource(), {
+        compilerOptions: {
+            target: ts.ScriptTarget.ES2022,
+            module: ts.ModuleKind.CommonJS,
+            esModuleInterop: true,
+        },
+    }).outputText
+
+    const lineUserId = 'line-user-1'
+    const values = new Map<string, string>()
+    const sends: HarnessSend[] = []
+    const ackPushes: Array<{ lineUserId: string; messages: Array<Record<string, unknown>> }> = []
+    const prompts: unknown[] = []
+    const currentWrites: unknown[] = []
+    const clearedCurrent: string[] = []
+    let textFollowupFailuresRemaining = options.firstTextFollowupFails ? 1 : 0
+
+    const bucket = {
+        async get(key: string) {
+            const value = values.get(key)
+            if (value == null) return null
+            return {
+                async json() {
+                    return JSON.parse(value)
+                },
+            }
+        },
+        async put(key: string, value: unknown) {
+            values.set(key, typeof value === 'string' ? value : JSON.stringify(value))
+            return null
+        },
+        async delete(keyOrKeys: string | string[]) {
+            for (const key of Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys]) {
+                values.delete(key)
+            }
+        },
+    }
+
+    values.set(`_waiting_video_cancelled/${lineUserId}.json`, JSON.stringify({
+        videoId: 'oldvideo',
+        cancelledAt: '2026-06-20T10:00:00.000Z',
+    }))
+
+    const getLineCurrentVideoIntake = async (_bucket: typeof bucket, userId: string) => {
+        const obj = await _bucket.get(`_waiting_video_current/${userId}.json`)
+        return obj ? obj.json() : null
+    }
+    const putLineCurrentVideoIntake = async (_bucket: typeof bucket, userId: string, input: Record<string, unknown>) => {
+        currentWrites.push(input)
+        await _bucket.put(`_waiting_video_current/${userId}.json`, JSON.stringify(input))
+        return input
+    }
+    const clearLineCurrentVideoIntake = async (_bucket: typeof bucket, userId: string) => {
+        await _bucket.delete(`_waiting_video_current/${userId}.json`)
+    }
+    const clearLineCurrentVideoIntakeIfMatches = async (_bucket: typeof bucket, userId: string, videoId: string) => {
+        const current = await getLineCurrentVideoIntake(_bucket, userId)
+        if (String(current?.videoId || '') !== videoId) return
+        clearedCurrent.push(videoId)
+        await clearLineCurrentVideoIntake(_bucket, userId)
+    }
+    const isLineCurrentVideoIntake = async (_bucket: typeof bucket, userId: string, videoId: string) => {
+        const current = await getLineCurrentVideoIntake(_bucket, userId)
+        return String(current?.videoId || '') === videoId
+    }
+    const putLineWaitingVideoState = async (_bucket: typeof bucket, userId: string, input: Record<string, unknown>) => {
+        await _bucket.put(`_waiting_video/${userId}.json`, JSON.stringify(input))
+        return input
+    }
+    const lineReplyOrPush = async (params: {
+        replyToken: string
+        messages: Array<Record<string, unknown>>
+    }) => {
+        sends.push({
+            replyToken: params.replyToken,
+            messages: params.messages,
+        })
+        const firstMessage = params.messages[0] || {}
+        if (options.coverPickerSendFails && firstMessage.type === 'flex') {
+            throw new Error('line_cover_picker_send_failed')
+        }
+        if (
+            textFollowupFailuresRemaining > 0
+            && firstMessage.type === 'text'
+            && /โหลดตัวเลือกปก|เกิดข้อผิดพลาด/.test(String(firstMessage.text || ''))
+        ) {
+            textFollowupFailuresRemaining--
+            throw new Error('transient_line_text_followup_failed')
+        }
+    }
+    const linePushMessage = async (_channelAccessToken: string, pushedLineUserId: string, messages: Array<Record<string, unknown>>) => {
+        ackPushes.push({ lineUserId: pushedLineUserId, messages })
+        return { ok: true }
+    }
+    const promptLineCoverOptions = async (params: {
+        replyToken: string
+        channelAccessToken: string
+        lineUserId: string
+    }) => {
+        prompts.push(params)
+        await lineReplyOrPush({
+            replyToken: params.replyToken,
+            messages: [{ type: 'flex', altText: 'เลือกปก' }],
+        })
+    }
+
+    const factory = new Function(
+        'crypto',
+        'fetch',
+        'putLineCurrentVideoIntake',
+        'getLineCurrentVideoIntake',
+        'clearLineCurrentVideoIntake',
+        'clearLineCurrentVideoIntakeIfMatches',
+        'isLineCurrentVideoIntake',
+        'linePushMessage',
+        'lineReplyOrPush',
+        'assertDownloadedVideoResponse',
+        'storeOriginalVideoBuffer',
+        'backfillOriginalThumbnail',
+        'putLineWaitingVideoState',
+        'promptLineCoverOptions',
+        'LINE_CANCEL_QUICK_REPLY_ITEM',
+        `${compiled}
+return handleLineVideoMessage`,
+    )
+
+    const handler = factory(
+        { randomUUID: () => 'freshvid-0000-4000-8000-000000000000' },
+        async () => new Response('video-bytes', { headers: { 'content-type': 'video/mp4' } }),
+        putLineCurrentVideoIntake,
+        getLineCurrentVideoIntake,
+        clearLineCurrentVideoIntake,
+        clearLineCurrentVideoIntakeIfMatches,
+        isLineCurrentVideoIntake,
+        linePushMessage,
+        lineReplyOrPush,
+        () => { },
+        async () => 'https://worker.example/videos/freshvid_line_original.mp4',
+        async () => ({ generated: true, thumbnailUrl: 'https://worker.example/thumb.webp' }),
+        putLineWaitingVideoState,
+        promptLineCoverOptions,
+        { type: 'action', action: { type: 'message', label: 'ยกเลิกงาน', text: 'ยกเลิกงาน' } },
+    ) as (params: Record<string, unknown>) => Promise<void>
+
+    return {
+        handler,
+        bucket,
+        lineUserId,
+        values,
+        sends,
+        ackPushes,
+        prompts,
+        currentWrites,
+        clearedCurrent,
+    }
+}
+
+test('direct LINE video upload still sends a quick ack without consuming reply token', () => {
     const handler = getVideoHandlerSource()
     assert.match(
         handler,
         /รับวิดีโอแล้ว 🎬 กำลังเตรียมตัวเลือกปกให้นะ รอสักครู่\.\.\./,
         'video upload must ack before slow download/store work',
     )
+    assert.match(
+        handler,
+        /linePushMessage\(channelAccessToken, lineUserId/,
+        'video ack must be a best-effort push so the reply token remains available for the cover picker',
+    )
 })
 
-test('direct LINE video follow-ups are push-only after the ack', () => {
+test('direct LINE video follow-ups preserve the original reply token after ack push', () => {
     const handler = getVideoHandlerSource()
     assert.match(
         handler,
-        /const followupReplyToken = ''/,
-        'video follow-ups must be push-only (empty reply token) because the ack consumes the reply token',
+        /const followupReplyToken = replyToken/,
+        'video follow-ups must use the original reply token first because the ack no longer consumes it',
     )
     assert.match(
         handler,
         /replyToken: followupReplyToken/,
-        'cover picker and failure paths must deliver via followupReplyToken (push)',
+        'cover picker and failure paths must deliver via followupReplyToken with push fallback',
     )
+})
+
+test('behavior: direct video after cancel supersedes old state and reaches cover picker', async () => {
+    const harness = makeLineVideoHandlerHarness()
+
+    await harness.handler({
+        env: {},
+        bucket: harness.bucket,
+        namespaceId: 'namespace-1',
+        channelAccessToken: 'line-token',
+        replyToken: 'reply-token-new-video',
+        lineUserId: harness.lineUserId,
+        messageId: 'line-message-1',
+    })
+
+    assert.equal(harness.ackPushes.length, 1, 'fresh direct video should send a best-effort ack push')
+    assert.match(
+        String(harness.ackPushes[0].messages[0]?.text || ''),
+        /รับวิดีโอแล้ว/,
+        'ack push should be the quick video acknowledgement',
+    )
+    assert.equal(harness.prompts.length, 1, 'fresh direct video must attempt the cover picker')
+
+    const coverSend = harness.sends.find((send) => send.messages.some((message) => message.type === 'flex'))
+    assert.ok(coverSend, 'cover picker send must be attempted after the ack')
+    assert.equal(
+        coverSend.replyToken,
+        'reply-token-new-video',
+        'cover picker must keep the fresh video reply token instead of becoming push-only',
+    )
+
+    const current = JSON.parse(harness.values.get(`_waiting_video_current/${harness.lineUserId}.json`) || '{}')
+    assert.equal(current.videoId, 'freshvid', 'fresh video must become the current intake')
+    const oldCancel = JSON.parse(harness.values.get(`_waiting_video_cancelled/${harness.lineUserId}.json`) || '{}')
+    assert.equal(oldCancel.videoId, 'oldvideo', 'old cancel marker must not classify the fresh video as cancelled')
+})
+
+test('behavior: direct video cover send failure retries visible error instead of ending at ack-only', async () => {
+    const harness = makeLineVideoHandlerHarness({
+        coverPickerSendFails: true,
+        firstTextFollowupFails: true,
+    })
+
+    await harness.handler({
+        env: {},
+        bucket: harness.bucket,
+        namespaceId: 'namespace-1',
+        channelAccessToken: 'line-token',
+        replyToken: 'reply-token-new-video',
+        lineUserId: harness.lineUserId,
+        messageId: 'line-message-1',
+    })
+
+    assert.equal(harness.ackPushes.length, 1, 'ack should still be attempted once')
+    assert.equal(harness.prompts.length, 1, 'cover picker should be attempted before fallback')
+
+    const textFollowups = harness.sends.filter((send) => send.messages.some((message) => message.type === 'text'))
+    assert.ok(
+        textFollowups.some((send) => /รับวิดีโอแล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ/.test(String(send.messages[0]?.text || ''))),
+        'cover-prompt catch should attempt the specific visible fallback',
+    )
+    assert.ok(
+        textFollowups.some((send) => /เกิดข้อผิดพลาดในการรับวิดีโอ/.test(String(send.messages[0]?.text || ''))),
+        'if that fallback send fails, the outer catch must retry a visible error instead of returning after the ack',
+    )
+    assert.deepEqual(harness.clearedCurrent, ['freshvid'], 'terminal failure must clear only the matching fresh intake')
 })
 
 test('video branch establishes current-intake marker before slow download/store', () => {
@@ -99,7 +340,7 @@ test('video follow-up verifies current intake before writing waiting state and p
     )
 })
 
-test('video cover-prompt failure sends a visible push-only fallback, not silence', () => {
+test('video cover-prompt failure sends a visible follow-up fallback, not silence', () => {
     const handler = getVideoHandlerSource()
 
     const promptIndex = handler.indexOf('await promptLineCoverOptions({')
@@ -114,7 +355,7 @@ test('video cover-prompt failure sends a visible push-only fallback, not silence
 
     const catchBlock = handler.slice(catchIndex, fallbackIndex)
     assert.match(catchBlock, /lineReplyOrPush\(/, 'fallback must be sent via lineReplyOrPush')
-    assert.match(catchBlock, /replyToken: followupReplyToken/, 'fallback must use followupReplyToken (push-only)')
+    assert.match(catchBlock, /replyToken: followupReplyToken/, 'fallback must use followupReplyToken with push fallback')
 })
 
 test('video download failure surfaces a visible error and clears the matching marker', () => {

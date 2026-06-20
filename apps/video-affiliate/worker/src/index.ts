@@ -18434,10 +18434,12 @@ async function handleLineVideoMessage(params: {
 
     // Direct LINE video uploads can be large; pulling the bytes from LINE +
     // storing to R2 + building the cover picker can exceed the reply-token
-    // lifetime, leaving the user staring at a read-but-silent bot. Ack inside
-    // the reply window first (consuming the token), then do the slow work in
-    // followupPromise. The cover picker and any error are delivered by push
-    // (followupReplyToken === ''), mirroring the XHS branch.
+    // lifetime, leaving the user staring at a read-but-silent bot. Send the
+    // quick ack as a best-effort push so we do NOT consume the reply token; the
+    // cover picker/error can still use the original reply token first and fall
+    // back to push if LINE has expired it. This mirrors the XHS branch's
+    // cover-picker-first token policy while still giving a quick visible ack
+    // when push delivery is available.
     //
     // The LINE webhook runs this whole handler inside ITS executionCtx.waitUntil
     // and deliberately passes no executionCtx down, so followupPromise is
@@ -18446,17 +18448,17 @@ async function handleLineVideoMessage(params: {
     // here would double-detach and could be dropped before the follow-up runs.
     // The executionCtx branch is retained only for a hypothetical top-level
     // caller that is NOT already inside a waitUntil.
-    await lineReplyOrPush({
-        replyToken,
-        channelAccessToken,
-        lineUserId,
-        messages: [
-            { type: 'text', text: 'รับวิดีโอแล้ว 🎬 กำลังเตรียมตัวเลือกปกให้นะ รอสักครู่...' },
-        ],
-    }).catch((e) => {
-        console.warn(`[LINE] video ack failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
-    })
-    const followupReplyToken = ''
+    const ackPushResult = await linePushMessage(channelAccessToken, lineUserId, [
+        {
+            type: 'text',
+            text: 'รับวิดีโอแล้ว 🎬 กำลังเตรียมตัวเลือกปกให้นะ รอสักครู่...',
+            quickReply: { items: [LINE_CANCEL_QUICK_REPLY_ITEM] },
+        },
+    ]).catch((e) => ({ ok: false, error: e instanceof Error ? e.message : String(e) }))
+    if (!ackPushResult.ok) {
+        console.warn(`[LINE] video ack push failed userId=${lineUserId}: ${ackPushResult.error || 'unknown_error'}`)
+    }
+    const followupReplyToken = replyToken
 
     const followupPromise = (async () => {
         // Only the active (current) request may surface user-visible follow-ups.
@@ -18478,7 +18480,7 @@ async function handleLineVideoMessage(params: {
                 messages: [
                     { type: 'text', text: 'ไม่สามารถดาวน์โหลดวิดีโอได้ กรุณาลองใหม่อีกครั้ง' },
                 ],
-            }).catch(() => { })
+            })
             await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
             return
         }
@@ -18535,7 +18537,7 @@ async function handleLineVideoMessage(params: {
                 messages: [
                     { type: 'text', text: 'รับวิดีโอแล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองส่งวิดีโอใหม่อีกครั้ง' },
                 ],
-            }).catch(() => { })
+            })
             await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
         }
     })().catch(async (e) => {
@@ -19173,7 +19175,7 @@ async function handleLineTextMessage(params: {
                     messages: [
                         { type: 'text', text: failureText },
                     ],
-                }).catch(() => { })
+                })
                 await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
                 return
             }
@@ -19215,7 +19217,7 @@ async function handleLineTextMessage(params: {
                     messages: [
                         { type: 'text', text: 'รับลิงก์ XHS แล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองใหม่' },
                     ],
-                }).catch(() => { })
+                })
             }
         })().catch(async (error) => {
             // Last-resort guard: only the active request may surface an error;
