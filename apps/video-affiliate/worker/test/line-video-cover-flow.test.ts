@@ -25,6 +25,17 @@ function getVideoHandlerSource(): string {
     )
 }
 
+// Isolate the LINE webhook handler body so we can assert it does NOT re-detach
+// event processing by passing its own executionCtx down into handleLineEvent.
+function getLineWebhookSource(): string {
+    return sliceBetween(
+        getSource(),
+        "app.post('/api/line/webhook', async (c) => {",
+        "app.post('/api/line/liff-login'",
+        'LINE webhook handler',
+    )
+}
+
 test('direct LINE video upload still acks within the reply window', () => {
     const handler = getVideoHandlerSource()
     assert.match(
@@ -210,4 +221,69 @@ test('both LINE intake sources supersede older work via the current-intake marke
         /currentIntake\?\.videoId && state\.id !== currentIntake\.videoId/,
         'shared waiting-state read must keep filtering superseded state for both sources',
     )
+})
+
+// --- double-detach regression guards ---------------------------------------
+// The live "ack then silence" failure was a double-detach: the webhook ran the
+// event loop inside its own executionCtx.waitUntil AND passed that executionCtx
+// down, so the direct-video handler registered a SECOND, nested waitUntil for
+// the slow follow-up and returned early. The nested promise was not reliably
+// awaited, so neither the cover picker nor its fallback ran. These tests lock in
+// that the webhook keeps a single outer waitUntil and lets the handler await its
+// follow-up inline.
+
+test('LINE webhook still backgrounds event processing in one outer waitUntil', () => {
+    const webhook = getLineWebhookSource()
+    assert.match(
+        webhook,
+        /c\.executionCtx\.waitUntil\(\(async \(\) => \{/,
+        'webhook must run the event loop inside executionCtx.waitUntil so it can return 200 immediately while the worker stays alive',
+    )
+    assert.match(
+        webhook,
+        /return c\.json\(\{ ok: true \}\)/,
+        'webhook must still return 200 immediately after scheduling the background loop',
+    )
+})
+
+test('LINE webhook does NOT pass its own executionCtx into handleLineEvent (no double-detach)', () => {
+    const webhook = getLineWebhookSource()
+    assert.match(
+        webhook,
+        /await handleLineEvent\(event, c\.env, channelAccessToken\)/,
+        'webhook must call handleLineEvent WITHOUT executionCtx so the handler awaits its follow-up inside the outer waitUntil',
+    )
+    assert.doesNotMatch(
+        webhook,
+        /handleLineEvent\([^)]*c\.executionCtx[^)]*\)/,
+        'webhook must NOT pass c.executionCtx down: that re-detaches the follow-up and the cover picker/fallback can be dropped before it runs',
+    )
+})
+
+test('direct-video handler self-detaches only when a top-level executionCtx is provided', () => {
+    const handler = getVideoHandlerSource()
+
+    const branchIndex = handler.indexOf('if (executionCtx) {')
+    assert.notEqual(branchIndex, -1, 'handler must keep an executionCtx guard for hypothetical top-level callers')
+
+    const nestedWaitUntilIndex = handler.indexOf('executionCtx.waitUntil(followupPromise)', branchIndex)
+    assert.notEqual(nestedWaitUntilIndex, -1, 'self-detach must use executionCtx.waitUntil(followupPromise)')
+    assert.ok(
+        nestedWaitUntilIndex > branchIndex && nestedWaitUntilIndex < branchIndex + 120,
+        'the nested waitUntil must live INSIDE the executionCtx guard, not run unconditionally',
+    )
+
+    const inlineAwaitIndex = handler.indexOf('await followupPromise', nestedWaitUntilIndex)
+    assert.notEqual(inlineAwaitIndex, -1, 'handler must await followupPromise inline as the fallback when no executionCtx is given')
+    assert.ok(
+        inlineAwaitIndex > nestedWaitUntilIndex,
+        'inline await must follow the guarded self-detach so the webhook (no executionCtx) path awaits within the outer waitUntil',
+    )
+
+    // followupPromise must never be left dangling: it is either handed to a
+    // top-level executionCtx.waitUntil OR awaited inline — exactly once each.
+    const detachCount = (handler.match(/executionCtx\.waitUntil\(followupPromise\)/g) || []).length
+    const inlineCount = (handler.match(/await followupPromise/g) || []).length
+    assert.equal(detachCount, 1, 'handler must self-detach the follow-up in exactly one place (guarded)')
+    assert.equal(inlineCount, 1, 'handler must await the follow-up inline in exactly one place (fallback)')
 })

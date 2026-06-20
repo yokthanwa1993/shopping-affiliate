@@ -17821,11 +17821,23 @@ app.post('/api/line/webhook', async (c) => {
     }
     const events = parsed.events || []
 
-    // Process events in background to return 200 immediately
+    // Process events in background to return 200 immediately. This whole event
+    // loop already runs inside the outer executionCtx.waitUntil, which keeps the
+    // worker alive until every handler settles.
+    //
+    // Intentionally DO NOT pass c.executionCtx into handleLineEvent. If we did,
+    // the direct-video / XHS handlers would register a SECOND, nested
+    // executionCtx.waitUntil for their slow follow-up and then return early.
+    // That nested promise is registered from inside an already-detached
+    // waitUntil and is not reliably awaited: the outer promise settles, the
+    // request is torn down, and the cover picker AND its fallback silently never
+    // run — the live "ack then silence" failure. With executionCtx omitted, the
+    // handlers await their follow-up inline, so this single outer waitUntil owns
+    // the full lifetime. The HTTP 200 is still returned synchronously below.
     c.executionCtx.waitUntil((async () => {
         for (const event of events) {
             try {
-                await handleLineEvent(event, c.env, channelAccessToken, c.executionCtx)
+                await handleLineEvent(event, c.env, channelAccessToken)
             } catch (e) {
                 console.error('[LINE] Event handler error:', e instanceof Error ? e.message : String(e))
             }
@@ -18423,10 +18435,17 @@ async function handleLineVideoMessage(params: {
     // Direct LINE video uploads can be large; pulling the bytes from LINE +
     // storing to R2 + building the cover picker can exceed the reply-token
     // lifetime, leaving the user staring at a read-but-silent bot. Ack inside
-    // the reply window first (consuming the token), then do the slow work via
-    // executionCtx.waitUntil so the webhook returns immediately. The cover
-    // picker and any error are delivered by push (followupReplyToken === ''),
-    // mirroring the XHS branch. Inline fallback when there is no executionCtx.
+    // the reply window first (consuming the token), then do the slow work in
+    // followupPromise. The cover picker and any error are delivered by push
+    // (followupReplyToken === ''), mirroring the XHS branch.
+    //
+    // The LINE webhook runs this whole handler inside ITS executionCtx.waitUntil
+    // and deliberately passes no executionCtx down, so followupPromise is
+    // awaited inline below and that outer waitUntil keeps the worker alive until
+    // the picker/fallback is actually delivered. A nested executionCtx.waitUntil
+    // here would double-detach and could be dropped before the follow-up runs.
+    // The executionCtx branch is retained only for a hypothetical top-level
+    // caller that is NOT already inside a waitUntil.
     await lineReplyOrPush({
         replyToken,
         channelAccessToken,
@@ -18535,6 +18554,10 @@ async function handleLineVideoMessage(params: {
         await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
     })
 
+    // Only self-detach when a TOP-LEVEL caller supplies executionCtx. The LINE
+    // webhook intentionally passes none (it already wraps us in waitUntil), so
+    // we fall through and await inline, letting that outer waitUntil own the
+    // lifetime instead of double-detaching the follow-up.
     if (executionCtx) {
         executionCtx.waitUntil(followupPromise)
         return
