@@ -7,7 +7,7 @@
 
 import { BotBucket } from './utils/botBucket'
 
-const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-05.avatar-loop-overlay.01'
+const EXPECTED_PIPELINE_ENGINE_VERSION = '2026-06-20.ffmpeg-flip-fallback.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${EXPECTED_PIPELINE_ENGINE_VERSION}`
 const VOICE_PROMPT_KEY = 'voice_script_prompt_v1'
 const VOICE_PROFILE_KEY = 'voice_profile_v2'

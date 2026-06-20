@@ -305,7 +305,7 @@ const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
 const MAX_COMMENT_TEMPLATE_CHARS = 4000
 const VOICE_PREVIEW_TTS_MODELS = ['gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'] as const
-const MERGE_CONTAINER_ENGINE_VERSION = '2026-05-26.01'
+const MERGE_CONTAINER_ENGINE_VERSION = '2026-06-20.ffmpeg-flip-fallback.01'
 const MERGE_CONTAINER_INSTANCE_NAME = `merge-worker-${MERGE_CONTAINER_ENGINE_VERSION}`
 
 // Call the merge service. When env.MERGE_SERVICE_URL is set, route to the external

@@ -35,6 +35,13 @@ const GEMINI_STRICT_FPS: u32 = 15;
 const GEMINI_STRICT_MIN_VIDEO_BITRATE_KBPS: u32 = 40;
 const GEMINI_STRICT_MAX_VIDEO_BITRATE_KBPS: u32 = 360;
 const SUBTITLE_BURN_TIMEOUT_SECS: u64 = 300;
+// Fast bounded budgets for the cosmetic horizontal-flip preprocessing step. The
+// primary flip re-encodes (ultrafast/high-CRF) so even long LINE videos finish
+// well inside the budget; if it still times out or fails we fall back to a
+// near-instant stream-copy remux (no flip) so the job is never terminal-failed
+// solely because the cosmetic mirror exceeded its budget.
+const FLIP_PRIMARY_TIMEOUT_SECS: u64 = 150;
+const FLIP_FALLBACK_TIMEOUT_SECS: u64 = 60;
 const VERTEX_TTS_DEFAULT_ENDPOINT: &str = "https://aiplatform.googleapis.com";
 const VERTEX_TTS_DEFAULT_LOCATION: &str = "global";
 const VERTEX_TTS_DEFAULT_MODEL: &str = "gemini-2.5-flash-preview-tts";
@@ -414,12 +421,45 @@ fn build_flip_processing_input_ffmpeg_args(input_str: &str, output_str: &str) ->
     push_ffmpeg_args(&mut args, &["-y", "-i", input_str]);
     push_ffmpeg_args(&mut args, &["-vf", "hflip,format=yuv420p"]);
     push_ffmpeg_args(&mut args, &["-c:v", "libx264"]);
-    push_ffmpeg_args(&mut args, &["-preset", "fast", "-crf", "20"]);
+    // Speed/reliability over CRF quality for this intermediate input: ultrafast +
+    // high CRF keeps the encode bounded for long/large LINE videos. zerolatency
+    // disables lookahead so ffmpeg spends less time before producing frames.
+    push_ffmpeg_args(&mut args, &["-preset", "ultrafast", "-crf", "28"]);
+    push_ffmpeg_args(&mut args, &["-tune", "zerolatency"]);
     push_ffmpeg_args(&mut args, &["-pix_fmt", "yuv420p"]);
     push_ffmpeg_args(&mut args, &["-c:a", "aac", "-b:a", "128k"]);
     push_ffmpeg_args(&mut args, &["-movflags", "+faststart"]);
     args.push(output_str.to_string());
     args
+}
+
+/// Fallback when the cosmetic flip cannot finish in budget: stream-copy remux
+/// (no re-encode, no flip) so the job continues with the original/normalized
+/// input instead of terminal-failing on a cosmetic mirror.
+fn build_flip_fallback_remux_ffmpeg_args(input_str: &str, output_str: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    push_ffmpeg_args(&mut args, &["-y", "-i", input_str]);
+    push_ffmpeg_args(&mut args, &["-c", "copy"]);
+    push_ffmpeg_args(&mut args, &["-movflags", "+faststart"]);
+    args.push(output_str.to_string());
+    args
+}
+
+async fn run_flip_ffmpeg_step(
+    args: &[String],
+    timeout_secs: u64,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        Command::new("ffmpeg").args(args).output(),
+    )
+    .await
+    .map_err(|_| format!("FFmpeg {} timed out (>{}s)", label, timeout_secs))??;
+    if let Some(reason) = ffmpeg_nonzero_status_reason(&output) {
+        return Err(format!("FFmpeg {} failed: {}", label, reason).into());
+    }
+    Ok(())
 }
 
 async fn create_flipped_processing_input(
@@ -432,17 +472,28 @@ async fn create_flipped_processing_input(
     let output_str = output_path
         .to_str()
         .ok_or("processing_video_path_invalid_for_flip")?;
-    let args = build_flip_processing_input_ffmpeg_args(input_str, output_str);
-    let output = tokio::time::timeout(
-        Duration::from_secs(180),
-        Command::new("ffmpeg").args(&args).output(),
-    )
-    .await
-    .map_err(|_| "FFmpeg flip timed out (>180s)")??;
-    if let Some(reason) = ffmpeg_nonzero_status_reason(&output) {
-        return Err(format!("FFmpeg flip failed: {}", reason).into());
+
+    // Primary: fast bounded horizontal flip.
+    let flip_args = build_flip_processing_input_ffmpeg_args(input_str, output_str);
+    match run_flip_ffmpeg_step(&flip_args, FLIP_PRIMARY_TIMEOUT_SECS, "flip").await {
+        Ok(()) => return Ok(()),
+        Err(flip_err) => {
+            eprintln!(
+                "[PIPELINE] flip preprocessing failed ({}); falling back to no-flip stream-copy remux",
+                flip_err
+            );
+        }
     }
-    Ok(())
+
+    // Fallback: skip the cosmetic flip and remux the original so the job still
+    // completes. Surfaces the remux error if even the copy path fails (truly
+    // terminal — the source itself is unusable, not just the cosmetic flip).
+    let remux_args = build_flip_fallback_remux_ffmpeg_args(input_str, output_str);
+    run_flip_ffmpeg_step(&remux_args, FLIP_FALLBACK_TIMEOUT_SECS, "flip-fallback-remux")
+        .await
+        .map_err(|remux_err| {
+            format!("FFmpeg flip fallback remux failed: {}", remux_err).into()
+        })
 }
 
 fn build_gemini_transcode_ffmpeg_args(
@@ -2153,7 +2204,8 @@ mod tests {
         GeminiPreflightError, GeminiTranscodeProfile, VERTEX_GEMINI_AUDIO_SRT_TIMEOUT_SECS,
         VERTEX_GENERATION_INLINE_MAX_BYTES, build_avatar_compose_ffmpeg_args,
         build_avatar_compose_filter_complex, build_final_merge_ffmpeg_args,
-        build_flip_processing_input_ffmpeg_args, build_gemini_inline_video_part,
+        build_flip_fallback_remux_ffmpeg_args, build_flip_processing_input_ffmpeg_args,
+        build_gemini_inline_video_part,
         build_gemini_transcode_ffmpeg_args, build_gemini_transcode_filter,
         build_srt_from_lines_with_timing, build_tts_payload, convert_to_ass,
         extract_speech_srt_time_span, extract_srt_payload, ffmpeg_nonzero_status_reason,
@@ -2223,9 +2275,36 @@ mod tests {
         assert_eq!(value_after("-i"), Some("/tmp/video.mp4"));
         assert_eq!(value_after("-vf"), Some("hflip,format=yuv420p"));
         assert_eq!(value_after("-c:v"), Some("libx264"));
+        // Fast bounded transcode: ultrafast preset + high CRF over quality so
+        // long/large LINE videos finish well inside FLIP_PRIMARY_TIMEOUT_SECS.
+        assert_eq!(value_after("-preset"), Some("ultrafast"));
+        assert_eq!(value_after("-crf"), Some("28"));
+        assert_eq!(value_after("-tune"), Some("zerolatency"));
         assert_eq!(value_after("-pix_fmt"), Some("yuv420p"));
         assert_eq!(value_after("-c:a"), Some("aac"));
         assert_eq!(value_after("-b:a"), Some("128k"));
+        assert_eq!(value_after("-movflags"), Some("+faststart"));
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/processing.mp4"));
+    }
+
+    #[test]
+    fn flip_fallback_remux_streams_copy_without_flip() {
+        let args =
+            build_flip_fallback_remux_ffmpeg_args("/tmp/video.mp4", "/tmp/processing.mp4");
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+        };
+
+        assert_eq!(value_after("-i"), Some("/tmp/video.mp4"));
+        // Fallback must NOT re-encode (no libx264) and must NOT flip (no -vf),
+        // so it stays near-instant and never re-hits the encode timeout.
+        assert_eq!(value_after("-c"), Some("copy"));
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+        assert!(!args.iter().any(|arg| arg == "libx264"));
+        assert!(!args.iter().any(|arg| arg == "hflip,format=yuv420p"));
         assert_eq!(value_after("-movflags"), Some("+faststart"));
         assert_eq!(args.last().map(String::as_str), Some("/tmp/processing.mp4"));
     }
