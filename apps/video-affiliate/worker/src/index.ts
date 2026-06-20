@@ -18416,13 +18416,13 @@ async function handleLineVideoMessage(params: {
     const videoId = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
 
     // A fresh direct video upload supersedes any older in-flight LINE intake.
-    // Write the current-intake marker BEFORE the ack + slow download/store so
+    // Write the current-intake marker BEFORE the slow download/store so
     // (a) stale XHS/video background work stops short of pushing an abandoned
     // clip's cover picker, and (b) every later waiting-state read (cover picker,
     // postback selection) resolves to THIS video instead of being filtered out
     // by a leftover marker that points at a different videoId. Without this the
-    // bot can ack ("รับวิดีโอแล้ว…") and then silently lose the picker. Mirrors
-    // the XHS branch invariants. Do NOT clear the user-level cancel marker here:
+    // bot can silently lose the picker. Mirrors the XHS branch invariants. Do
+    // NOT clear the user-level cancel marker here:
     // it is videoId-scoped, and clearing it could un-cancel an older in-flight
     // job; the current-intake marker alone supersedes older work.
     await putLineCurrentVideoIntake(bucket, lineUserId, {
@@ -18432,14 +18432,11 @@ async function handleLineVideoMessage(params: {
         sourceLabel: 'LINE video',
     })
 
-    // Direct LINE video uploads can be large; pulling the bytes from LINE +
-    // storing to R2 + building the cover picker can exceed the reply-token
-    // lifetime, leaving the user staring at a read-but-silent bot. Send the
-    // quick ack as a best-effort push so we do NOT consume the reply token; the
-    // cover picker/error can still use the original reply token first and fall
-    // back to push if LINE has expired it. This mirrors the XHS branch's
-    // cover-picker-first token policy while still giving a quick visible ack
-    // when push delivery is available.
+    // Keep LINE's legacy cover-picker-first UX, identical to the XHS branch: do
+    // NOT consume the reply token (or push) with an intermediate "รับวิดีโอแล้ว…"
+    // acknowledgement. The cover picker (or an explicit failure message) must be
+    // the first visible response. The picker/error use the original reply token
+    // first and fall back to push if LINE has expired it.
     //
     // The LINE webhook runs this whole handler inside ITS executionCtx.waitUntil
     // and deliberately passes no executionCtx down, so followupPromise is
@@ -18448,16 +18445,6 @@ async function handleLineVideoMessage(params: {
     // here would double-detach and could be dropped before the follow-up runs.
     // The executionCtx branch is retained only for a hypothetical top-level
     // caller that is NOT already inside a waitUntil.
-    const ackPushResult = await linePushMessage(channelAccessToken, lineUserId, [
-        {
-            type: 'text',
-            text: 'รับวิดีโอแล้ว 🎬 กำลังเตรียมตัวเลือกปกให้นะ รอสักครู่...',
-            quickReply: { items: [LINE_CANCEL_QUICK_REPLY_ITEM] },
-        },
-    ]).catch((e) => ({ ok: false, error: e instanceof Error ? e.message : String(e) }))
-    if (!ackPushResult.ok) {
-        console.warn(`[LINE] video ack push failed userId=${lineUserId}: ${ackPushResult.error || 'unknown_error'}`)
-    }
     const followupReplyToken = replyToken
 
     const followupPromise = (async () => {

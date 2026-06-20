@@ -206,26 +206,26 @@ return handleLineVideoMessage`,
     }
 }
 
-test('direct LINE video upload still sends a quick ack without consuming reply token', () => {
+test('direct LINE video upload does NOT send a visible ack bubble before the cover picker', () => {
     const handler = getVideoHandlerSource()
-    assert.match(
+    assert.doesNotMatch(
         handler,
         /รับวิดีโอแล้ว 🎬 กำลังเตรียมตัวเลือกปกให้นะ รอสักครู่\.\.\./,
-        'video upload must ack before slow download/store work',
+        'direct video must NOT push a "รับวิดีโอแล้ว…" ack before the cover picker — the picker/error is the first visible response (matches XHS/link UX)',
     )
-    assert.match(
+    assert.doesNotMatch(
         handler,
         /linePushMessage\(channelAccessToken, lineUserId/,
-        'video ack must be a best-effort push so the reply token remains available for the cover picker',
+        'direct video must not pre-ack via linePushMessage; the cover picker must be the first meaningful bot response',
     )
 })
 
-test('direct LINE video follow-ups preserve the original reply token after ack push', () => {
+test('direct LINE video follow-ups use the original reply token first with push fallback', () => {
     const handler = getVideoHandlerSource()
     assert.match(
         handler,
         /const followupReplyToken = replyToken/,
-        'video follow-ups must use the original reply token first because the ack no longer consumes it',
+        'video follow-ups must use the original reply token first (cover-picker-first, no consuming ack)',
     )
     assert.match(
         handler,
@@ -247,20 +247,19 @@ test('behavior: direct video after cancel supersedes old state and reaches cover
         messageId: 'line-message-1',
     })
 
-    assert.equal(harness.ackPushes.length, 1, 'fresh direct video should send a best-effort ack push')
-    assert.match(
-        String(harness.ackPushes[0].messages[0]?.text || ''),
-        /รับวิดีโอแล้ว/,
-        'ack push should be the quick video acknowledgement',
+    assert.equal(harness.ackPushes.length, 0, 'fresh direct video must NOT push any visible ack before the cover picker')
+    assert.ok(
+        !harness.sends.some((send) => send.messages.some((message) => /รับวิดีโอแล้ว 🎬/.test(String(message.text || '')))),
+        'no "รับวิดีโอแล้ว 🎬" ack bubble may be delivered before the cover picker',
     )
-    assert.equal(harness.prompts.length, 1, 'fresh direct video must attempt the cover picker')
+    assert.equal(harness.prompts.length, 1, 'fresh direct video must attempt the cover picker as the first response')
 
     const coverSend = harness.sends.find((send) => send.messages.some((message) => message.type === 'flex'))
-    assert.ok(coverSend, 'cover picker send must be attempted after the ack')
+    assert.ok(coverSend, 'cover picker send must be the first meaningful response')
     assert.equal(
         coverSend.replyToken,
         'reply-token-new-video',
-        'cover picker must keep the fresh video reply token instead of becoming push-only',
+        'cover picker must use the fresh video reply token first instead of becoming push-only',
     )
 
     const current = JSON.parse(harness.values.get(`_waiting_video_current/${harness.lineUserId}.json`) || '{}')
@@ -285,7 +284,7 @@ test('behavior: direct video cover send failure retries visible error instead of
         messageId: 'line-message-1',
     })
 
-    assert.equal(harness.ackPushes.length, 1, 'ack should still be attempted once')
+    assert.equal(harness.ackPushes.length, 0, 'no ack push is attempted; the cover picker is the first response')
     assert.equal(harness.prompts.length, 1, 'cover picker should be attempted before fallback')
 
     const textFollowups = harness.sends.filter((send) => send.messages.some((message) => message.type === 'text'))
