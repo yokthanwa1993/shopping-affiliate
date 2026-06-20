@@ -5,6 +5,9 @@ import {
     resolveAdOnlySchedule,
     buildAdOnlyUnsupportedResult,
     buildAdHistoryRecord,
+    buildAdOnlyShortlinkRequestUrl,
+    buildPaidAdCtaRepairBody,
+    summarizePaidAdCtaRepair,
     truncateResultJson,
     AD_ONLY_BRIDGE_SUPPORTS_PAUSED,
     AD_ONLY_MISSING_BRIDGE_FIELDS,
@@ -12,6 +15,12 @@ import {
     DEFAULT_RUN_HOURS,
     MAX_RUN_HOURS,
 } from '../src/ad-only-contract.js'
+import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
+import {
+    renderCommentTemplatesForPosting,
+    DEFAULT_COMMENT_TEMPLATE_TEXT,
+    COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
+} from '../src/comment-template.js'
 
 test('validate fails closed when page_id is missing', () => {
     const v = validateAdOnlyInput({ story_id: '123_456' })
@@ -163,6 +172,180 @@ test('ad-history record for the unsupported path carries status + error, no resu
     assert.equal(rec.error_message, 'ad_only_bridge_paused_unsupported')
     assert.equal(rec.truncated_result_json, '')
     assert.equal(rec.ad_id, '')
+})
+
+// Active ad-only finalization: after the bridge returns the dark-post story_id, the worker re-mints
+// the CTA/comment shortlink so it carries sub2 = post id tail and sub3 = page id. These two helpers
+// are the single source of truth for that derivation + request-url build, so assert them together.
+test('active ad-only re-mint derives sub2 = bridge story-id tail and sub3 = page id', () => {
+    const bridgeStoryId = '111_222' // bridge effective_object_story_id = PAGEID_POSTID
+    const pageId = '111'
+    const subs = buildPostingCommentShortlinkSubIds({ canonicalPostId: bridgeStoryId, pageId, logPrefix: 'AD-ONLY ACTIVE' })
+    assert.equal(subs.postSubId2, '222') // post id tail, NEVER the page id
+    assert.equal(subs.postSubId3, '111') // page id
+
+    const url = buildAdOnlyShortlinkRequestUrl({
+        template: 'https://short.wwoom.com/?id=X&url={url}&sub1={sub_id}&sub2={sub_id2}&sub3={sub_id3}',
+        shopeeLink: 'https://shopee.co.th/product',
+        sub1: 'yok',
+        sub2: subs.postSubId2,
+        sub3: subs.postSubId3,
+    })
+    assert.ok(url.includes('sub2=222'), url)
+    assert.ok(url.includes('sub3=111'), url)
+    assert.ok(url.includes('sub1=yok'), url)
+    assert.ok(url.includes(`url=${encodeURIComponent('https://shopee.co.th/product')}`), url)
+})
+
+test('buildAdOnlyShortlinkRequestUrl url-encodes subs, blanks sub4/sub5, tolerates missing placeholders', () => {
+    const url = buildAdOnlyShortlinkRequestUrl({
+        template: '{url}|{sub_id}|{sub_id2}|{sub_id3}|{sub_id4}|{sub_id5}',
+        shopeeLink: 'https://shopee.co.th/x',
+        sub1: 'a b',
+        sub2: 'b',
+        sub3: 'c',
+    })
+    // sub4/sub5 emptied; sub1 url-encoded; sub2/sub3 carried verbatim.
+    assert.equal(url, `${encodeURIComponent('https://shopee.co.th/x')}|a%20b|b|c||`)
+    // A template without the sub2/sub3 placeholders simply carries no sub2/sub3 (no throw).
+    const noPlaceholders = buildAdOnlyShortlinkRequestUrl({
+        template: 'https://short.wwoom.com/?id=X&url={url}&sub1={sub_id}',
+        shopeeLink: 'https://shopee.co.th/x',
+        sub1: 'yok',
+        sub2: '222',
+        sub3: '111',
+    })
+    assert.ok(!noPlaceholders.includes('222'))
+    assert.ok(noPlaceholders.includes('sub1=yok'))
+})
+
+// Active ad-only finalization posts the Page comment through the SAME template renderer normal page
+// posts use (buildAffiliateCommentMessage → renderCommentTemplatesForPosting), substituting the SAME
+// finalLink the CTA carries into {{shopee_link}}. The comment must be the template style — NOT a bare
+// link — and must contain the final shortlink. These assert the exact rendering that path relies on.
+test('active ad-only comment renders the namespace template with the final shortlink, not a bare link', () => {
+    const finalLink = 'https://s.shopee.co.th/8KnFV0t8sa'
+    const customSlot = `🛍️ ช้อปเลย Shopee : ${COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER}`
+    const rendered = renderCommentTemplatesForPosting({
+        slots: [customSlot, '', ''],
+        shopeeLink: finalLink,
+        lazadaLink: '',
+        fallbackTemplate: DEFAULT_COMMENT_TEMPLATE_TEXT,
+    })
+    const message = rendered[0] || ''
+    assert.ok(message.includes(finalLink), 'comment substitutes the final shortlink into {{shopee_link}}')
+    assert.notEqual(message.trim(), finalLink, 'comment is the template style, not a bare link')
+    assert.ok(message.includes('Shopee :'), 'comment carries the page-post template label, not just a URL')
+})
+
+test('active ad-only comment falls back to the DEFAULT template when the namespace has no custom slots', () => {
+    const finalLink = 'https://s.shopee.co.th/8KnFV0t8sa'
+    const rendered = renderCommentTemplatesForPosting({
+        slots: ['', '', ''],
+        shopeeLink: finalLink,
+        lazadaLink: '', // ad-only has no Lazada link → the Lazada line is dropped from the default
+        fallbackTemplate: DEFAULT_COMMENT_TEMPLATE_TEXT,
+    })
+    const message = rendered[0] || ''
+    assert.ok(message.length > 0, 'a normal fallback render always yields a non-empty message')
+    assert.ok(message.includes(finalLink), 'default template still substitutes the final shortlink')
+    assert.notEqual(message.trim(), finalLink, 'default fallback is not a bare link')
+    assert.ok(!/lazada/i.test(message) || /https?:\/\//i.test(message), 'empty Lazada line is dropped')
+})
+
+// PAID AD CTA REPAIR — the active ad-only finalization fixes the PAID ad creative's CTA in Ads
+// Manager (the live bug: ads showed the placeholder utm_content=…AD---- link). The repair must carry
+// the SAME finalLink the visible CTA + Page comment use, and must NEVER record success unless the
+// bridge read-back confirmed it.
+test('paid CTA repair body carries the SAME final link the visible CTA + comment use, plus the ad/creative/video ids', () => {
+    const finalLink = 'https://s.shopee.co.th/8KnFV0t8sa'
+    // The comment renders the SAME finalLink — assert both reference one identical link.
+    const rendered = renderCommentTemplatesForPosting({
+        slots: [`🛍️ Shopee : ${COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER}`, '', ''],
+        shopeeLink: finalLink,
+        lazadaLink: '',
+        fallbackTemplate: DEFAULT_COMMENT_TEMPLATE_TEXT,
+    })
+    const body = buildPaidAdCtaRepairBody({
+        pageId: '111',
+        adId: 'AD9',
+        finalLink,
+        creativeId: 'OLDCR',
+        videoId: 'VID9',
+        caption: 'cap',
+        adAccount: 'act_test',
+        templateAdset: 'tpl_test',
+        sourceStoryId: '111_222',
+        adName: 'ad-9',
+    })
+    assert.equal(body.final_cta_link, finalLink, 'paid CTA repair carries the post-specific final link')
+    assert.ok((rendered[0] || '').includes(finalLink), 'the Page comment renders the SAME final link')
+    assert.ok((rendered[0] || '').includes(String(body.final_cta_link)), 'paid CTA and the comment share ONE final link')
+    assert.equal(body.ad_id, 'AD9')
+    assert.equal(body.creative_id, 'OLDCR')
+    assert.equal(body.video_id, 'VID9')
+    assert.equal(body.page_id, '111')
+    assert.equal(body.ad_account, 'act_test')
+    assert.equal(body.template_adset, 'tpl_test')
+    assert.equal(body.source_story_id, '111_222')
+})
+
+test('paid CTA repair body omits empty optional fields so the bridge applies its own backfill', () => {
+    const body = buildPaidAdCtaRepairBody({ pageId: '111', adId: 'AD9', finalLink: 'https://s.shopee.co.th/x' })
+    assert.equal(body.page_id, '111')
+    assert.equal(body.ad_id, 'AD9')
+    assert.equal(body.final_cta_link, 'https://s.shopee.co.th/x')
+    assert.ok(!('creative_id' in body), 'no empty creative_id is sent')
+    assert.ok(!('video_id' in body), 'no empty video_id is sent')
+    assert.ok(!('caption' in body), 'no empty caption is sent')
+})
+
+test('summarize paid CTA repair records paid_ad_cta_final=true ONLY when the bridge confirmed it', () => {
+    const ok = summarizePaidAdCtaRepair({
+        ok: true,
+        paid_ad_cta_final: true,
+        paid_ad_cta_link: 'https://s.shopee.co.th/FINAL',
+        new_creative_id: 'CR2',
+        old_creative_id: 'CR1',
+    }, true)
+    assert.equal(ok.paid_cta_update_status, 'success')
+    assert.equal(ok.paid_ad_cta_final, true)
+    assert.equal(ok.paid_ad_cta_link, 'https://s.shopee.co.th/FINAL')
+    assert.equal(ok.paid_new_creative_id, 'CR2')
+    assert.equal(ok.paid_old_creative_id, 'CR1')
+})
+
+test('summarize paid CTA repair NEVER claims success on an unconfirmed read-back or an http/error response', () => {
+    // ok:true but read-back did NOT confirm → failed, not success.
+    const unconfirmed = summarizePaidAdCtaRepair({ ok: true, paid_ad_cta_final: false, new_creative_id: 'CR2' }, true)
+    assert.equal(unconfirmed.paid_cta_update_status, 'failed')
+    assert.notEqual(unconfirmed.paid_ad_cta_final, true)
+    // A bridge step error is surfaced as the recorded reason.
+    const errored = summarizePaidAdCtaRepair({ ok: false, step: 'update_ad', error: 'ad_creative_update_failed' }, true)
+    assert.equal(errored.paid_cta_update_status, 'failed')
+    assert.equal(errored.paid_cta_update_error, 'update_ad:ad_creative_update_failed')
+    // A non-2xx HTTP response is also a failure even if the body looks ok.
+    const http = summarizePaidAdCtaRepair({ ok: true, paid_ad_cta_final: true }, false)
+    assert.equal(http.paid_cta_update_status, 'failed')
+})
+
+test('ad-history record reflects the repaired paid creative + carries paid_ad_cta_final in the audit json', () => {
+    const v = validateAdOnlyInput({ page_id: '111', story_id: '111_222' })
+    // After a confirmed repair the worker syncs creative_id to the NEW creative and merges the summary.
+    const bridgeResult = {
+        ad_id: 'AD9',
+        creative_id: 'CR2', // synced to the new creative after repair
+        story_id: '111_222',
+        paid_ad_cta_final: true,
+        paid_ad_cta_link: 'https://s.shopee.co.th/FINAL',
+        paid_new_creative_id: 'CR2',
+        paid_old_creative_id: 'CR1',
+        visible_page_cta_final: true,
+    }
+    const rec = buildAdHistoryRecord({ status: 'created', validation: v, result: bridgeResult, clickLink: 'https://s.shopee.co.th/FINAL', schedule: { mode: 'active', runHours: 24 } })
+    assert.equal(rec.creative_id, 'CR2', 'audit row reflects the repaired (new) creative id')
+    assert.ok(rec.truncated_result_json.includes('"paid_ad_cta_final":true'), 'audit json records the confirmed paid CTA')
+    assert.equal(rec.click_link, 'https://s.shopee.co.th/FINAL')
 })
 
 test('truncateResultJson bounds long payloads and never throws on cycles', () => {

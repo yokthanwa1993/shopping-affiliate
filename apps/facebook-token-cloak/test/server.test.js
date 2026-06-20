@@ -289,7 +289,7 @@ test('/login can autodiscover apple-passwords provider without exposing credenti
 
   const r = await req('GET', '/login?account=CHEARB&credentialProvider=apple-passwords&visible=1&autofill=1&submit=1');
   assert.equal(r.status, 200);
-  assert.equal(r.body.state, 'login_opened');
+  assert.equal(r.body.state, 'login_submitted');
   assert.equal(r.body.credentialProvider, 'apple-passwords');
   assert.equal(r.body.autofilled, true);
   assert.equal(r.body.submitted, true);
@@ -334,7 +334,7 @@ test('/login uses stored selector for apple-passwords without exposing credentia
 
   const r = await req('GET', '/login?account=CHEARB&provider=apple-passwords&visible=1&autofill=1&submit=1');
   assert.equal(r.status, 200);
-  assert.equal(r.body.state, 'login_opened');
+  assert.equal(r.body.state, 'login_submitted');
   assert.equal(r.body.selectorPresent, true);
   assert.equal(r.body.usernameHintPresent, true);
   assert.equal(r.body.selectedDomain, 'facebook.com');
@@ -441,7 +441,7 @@ test('/login explicit apple-passwords query overrides stored selector without le
     '/login?account=CHEARB&credentialProvider=apple-passwords&domain=www.facebook.com&username=fb-two%40example.com&visible=1&autofill=1&submit=1'
   );
   assert.equal(r.status, 200);
-  assert.equal(r.body.state, 'login_opened');
+  assert.equal(r.body.state, 'login_submitted');
   assert.equal(r.body.selectorPresent, true);
   assert.equal(r.body.usernameHintPresent, true);
   assert.equal(r.body.selectedDomain, 'www.facebook.com');
@@ -487,7 +487,7 @@ test('/login explicit domain and username override still wins for apple-password
     '/login?account=CHEARB&credentialProvider=apple-passwords&domain=www.facebook.com&username=fb-two%40example.com&visible=1&autofill=1&submit=1'
   );
   assert.equal(r.status, 200);
-  assert.equal(r.body.state, 'login_opened');
+  assert.equal(r.body.state, 'login_submitted');
   assert.equal(r.body.autofilled, true);
   assert.equal(r.body.submitted, true);
   assert.deepEqual(seen.credential.username, 'fb-two@example.com');

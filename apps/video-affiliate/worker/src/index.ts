@@ -63,6 +63,7 @@ import {
     normalizeRegistryLimit,
     normalizeRegistryOffset,
     parseAffiliateId,
+    parseGraphCtaObject,
     parseTrackingSubIds,
     pickPrimaryAffiliateUrl,
     replaceShortlinkInMessage,
@@ -149,6 +150,7 @@ import {
     resolveAdOnlySchedule,
     buildAdOnlyUnsupportedResult,
     buildAdHistoryRecord,
+    buildAdOnlyShortlinkRequestUrl,
     AD_ONLY_BRIDGE_SUPPORTS_PAUSED,
     type AdOnlyQueueRow,
     buildAdOnlyCreateBody,
@@ -156,6 +158,18 @@ import {
     isAdOnlyQueueDue,
     nextAdOnlyRunAtMs,
     DEFAULT_AD_ONLY_INTERVAL_MINUTES,
+    type AdOnlyAutoCandidate,
+    type AdOnlyHistoryIdRow,
+    AD_ONLY_AUTO_MIN_VIEWS,
+    buildAdOnlyUsedIdSetForBangkokDate,
+    rankAdOnlyAutoCandidatesRandom,
+    makeSeededRng,
+    buildAdOnlyAutoPickBody,
+    type AdOnlyFailureRow,
+    AD_ONLY_AUTO_MAX_ATTEMPTS,
+    buildAdOnlySkippedPageSet,
+    buildPaidAdCtaRepairBody,
+    summarizePaidAdCtaRepair,
 } from './ad-only-contract'
 import { handleReportProxyRequest } from './report-proxy'
 import {
@@ -175,6 +189,7 @@ import {
     resolveCloakFbBridgeBaseUrl,
     normalizePageCommentTokenSource,
     defaultCommentSourceForRoute,
+    restrictCloakToAdminNamespace,
 } from './posting-token-source'
 import {
     PAGE_VIDEO_ASSET_WINNERS_INDEX_SQL,
@@ -9712,6 +9727,700 @@ app.get('/api/dashboard/page-comment-link-jobs/:job_id/history', async (c) => {
     }, 200, { 'Cache-Control': 'no-store' })
 })
 
+// ===========================================================================
+// SAFE ONE-POST CTA + COMMENT CAMPAIGN REWRITE — check → preview → run.
+//
+// Migrates a single Facebook Page post's Shopee campaign (sub1) on BOTH the
+// page-owned comment link AND the post/Reel CTA/button link. Built on the same
+// pure helpers + Graph/customlink I/O as the page-comment-link workflow above,
+// and obeys the same invariants:
+//   - Comment read/write/verify uses the FULL page-story object <page_id>_<post_id>
+//     only; bare Reel/video ids are metadata. (resolveCanonicalCommentTarget)
+//   - The CTA Graph UPDATE targets the bare post/video id tail; the CTA readback /
+//     verify reads the full page-story object (handoff-verified pattern).
+//   - Comment action is EDIT-only (allow_create_new defaults false; never create a
+//     duplicate, never delete). dry_run defaults true; batch is one post.
+//   - Outbound Shopee/customlink tracking leaves sub4 blank (2026-06-10 policy);
+//     an internal log_id/effective_target_sub4 is still allocated for audit.
+//   - Mint + verify the new shortlink (affiliate id + utm subs) BEFORE any
+//     Facebook write; stop on Graph block/rate/spam codes (368/4/17/32/613/...).
+//   - Never returns tokens/cookies/secrets — only token_source / token_hash_prefix.
+// ===========================================================================
+
+const PAGE_POST_LINK_SUB4_POLICY =
+    'outbound Shopee/customlink sub4 intentionally blank (2026-06-10 policy): utm_content=<sub1>-<sub2>-<sub3>--; ' +
+    'internal log_id/effective_target_sub4 is kept for audit only and never lands in the link.'
+
+type PagePostLinkSurface = 'comment' | 'cta'
+
+function normalizePagePostLinkSurfaces(raw: unknown): PagePostLinkSurface[] {
+    const fallback: PagePostLinkSurface[] = ['comment', 'cta']
+    if (!Array.isArray(raw)) return fallback
+    const out: PagePostLinkSurface[] = []
+    for (const value of raw) {
+        const s = String(value || '').trim().toLowerCase()
+        if ((s === 'comment' || s === 'cta') && !out.includes(s as PagePostLinkSurface)) out.push(s as PagePostLinkSurface)
+    }
+    return out.length ? out : fallback
+}
+
+// Read the CTA/button on a post via the FULL page-story object. GET-only; never
+// returns the token. parseGraphCtaObject normalises the {type,value:{link}} shape.
+async function readPagePostStoryCta(pageStoryObjectId: string, token: string): Promise<{
+    ok: boolean; present: boolean; type: string; title: string; url: string; error: string
+}> {
+    const target = str(pageStoryObjectId)
+    if (!target || !token) return { ok: false, present: false, type: '', title: '', url: '', error: 'missing_target_or_token' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8000)
+    try {
+        const resp = await fetch(
+            `https://graph.facebook.com/v21.0/${encodeURIComponent(target)}?fields=call_to_action,permalink_url&access_token=${encodeURIComponent(token)}`,
+            { method: 'GET', signal: controller.signal },
+        )
+        const body = await readMetaGraphJson(resp)
+        if (!resp.ok) return { ok: false, present: false, type: '', title: '', url: '', error: sanitizeMetaGraphError((body as Record<string, unknown>).error || body) }
+        const cta = parseGraphCtaObject((body as Record<string, unknown>).call_to_action)
+        return { ok: true, present: !!cta, type: cta?.type || '', title: cta?.title || '', url: cta?.url || '', error: '' }
+    } catch (e) {
+        return { ok: false, present: false, type: '', title: '', url: '', error: sanitizeMetaGraphError(e) }
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+// Update the post/Reel CTA link. POST targets the BARE post/video id tail (the
+// handoff-verified write target); the caller verifies via the full page-story
+// object. Returns the raw Graph payload so the caller can detect stop signals.
+async function updatePagePostStoryCta(bareId: string, ctaType: string, link: string, token: string): Promise<{ ok: boolean; data: Record<string, unknown> }> {
+    const form = new URLSearchParams()
+    form.set('call_to_action', JSON.stringify({ type: ctaType, value: { link } }))
+    form.set('access_token', token)
+    try {
+        const resp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(bareId)}`, {
+            method: 'POST', body: form, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        })
+        const data = await readMetaGraphJson(resp)
+        return { ok: resp.ok && !data.error, data }
+    } catch (e) {
+        return { ok: false, data: { error: { message: sanitizeMetaGraphError(e) } } }
+    }
+}
+
+type PagePostLinkParsedLink = {
+    shortlink: string
+    expanded_url: string
+    utm_content: string
+    sub1: string
+    sub2: string
+    sub3: string
+    sub4: string
+    sub5: string
+    affiliate_id: string
+}
+
+function emptyPagePostLinkParsedLink(): PagePostLinkParsedLink {
+    return { shortlink: '', expanded_url: '', utm_content: '', sub1: '', sub2: '', sub3: '', sub4: '', sub5: '', affiliate_id: '' }
+}
+
+// Expand + parse a single shortlink into sub ids + affiliate id. Bounded; never throws.
+async function describePagePostLink(shortlink: string): Promise<PagePostLinkParsedLink> {
+    const link = str(shortlink)
+    if (!link) return emptyPagePostLinkParsedLink()
+    let expanded = ''
+    if (isShortlinkCandidate(link)) {
+        const r = await expandShortlinkFinalUrl(link)
+        expanded = r.finalUrl
+    }
+    const subs = parseTrackingSubIds(expanded || link)
+    return {
+        shortlink: link,
+        expanded_url: expanded,
+        utm_content: subs.utm_content,
+        sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: subs.sub4, sub5: subs.sub5,
+        affiliate_id: parseAffiliateId(expanded || link),
+    }
+}
+
+type PagePostLinkRewriteContext = {
+    ok: boolean
+    error: string
+    page_id: string
+    page_id_source: 'explicit' | 'old_shortlink_sub3' | ''
+    post_id: string
+    post_tail: string
+    page_story_object_id: string
+    tokenResolution: FacebookTokenResolution
+    token: string
+    has_token: boolean
+    comment_fetch: 'ok' | 'failed' | 'missing_token' | 'cooldown' | 'graph_blocked'
+    guard: GraphCommentGuardCheck | null
+    comment: {
+        id: string; from_id: string; from_name: string; message: string
+        matched_by: 'old_shortlink' | 'affiliate_link' | ''
+        link: PagePostLinkParsedLink
+    } | null
+    cta: {
+        read_ok: boolean; present: boolean; type: string; title: string; error: string
+        link: PagePostLinkParsedLink
+    }
+    input_old_shortlink: PagePostLinkParsedLink
+    product_url: string
+}
+
+// READ-ONLY preflight shared by check / preview / run. Resolves page_id (explicit
+// → old shortlink sub3), builds the canonical page-story object, reads the
+// page-owned comment + CTA from that story object only, and parses both old links.
+// Never writes to Facebook. Never returns the raw token to callers' responses
+// (the route spreads facebookTokenDebugFields() — never tokenResolution.token).
+async function resolvePagePostLinkRewriteContext(
+    db: D1Database,
+    env: Env,
+    input: { pageId?: string; postId?: string; url?: string; oldShortlink?: string },
+): Promise<PagePostLinkRewriteContext> {
+    const base: PagePostLinkRewriteContext = {
+        ok: false, error: '', page_id: '', page_id_source: '', post_id: '', post_tail: '',
+        page_story_object_id: '', tokenResolution: emptyFacebookTokenResolution(), token: '', has_token: false,
+        comment_fetch: 'missing_token', guard: null, comment: null,
+        cta: { read_ok: false, present: false, type: '', title: '', error: '', link: emptyPagePostLinkParsedLink() },
+        input_old_shortlink: emptyPagePostLinkParsedLink(), product_url: '',
+    }
+
+    // 1) Expand the supplied old shortlink first — it feeds both page_id derivation
+    //    (sub3) and the product URL.
+    const oldShortlink = str(input.oldShortlink)
+    const oldParsed = await describePagePostLink(oldShortlink)
+    base.input_old_shortlink = oldParsed
+
+    // 2) Resolve page_id: explicit first, else the old shortlink's sub3.
+    const explicitPage = str(input.pageId)
+    const pageId = explicitPage || str(oldParsed.sub3)
+    base.page_id = pageId
+    base.page_id_source = explicitPage ? 'explicit' : (oldParsed.sub3 ? 'old_shortlink_sub3' : '')
+    if (!pageId) return { ...base, error: 'page_id_required' }
+
+    // 3) Build the canonical page-story object <page_id>_<post_id>. Comment + CTA
+    //    reads/writes/verify all key off this; a bare reel id is never a target.
+    const postId = str(input.postId)
+    base.post_id = postId
+    if (!postId) return { ...base, error: 'post_id_required' }
+    const canonical = resolveCanonicalCommentTarget({ pageId, postId })
+    base.page_story_object_id = canonical.target
+    base.post_tail = canonical.postTail
+    if (!canonical.target) return { ...base, error: canonical.reason || 'missing_page_story_object_id' }
+
+    // 4) Token (redacted metadata only — never echoed).
+    const tokenResolution = await resolveFacebookCommentToken(db, pageId, DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).catch(() => emptyFacebookTokenResolution())
+    base.tokenResolution = tokenResolution
+    base.token = tokenResolution.token
+    base.has_token = tokenResolution.token.length > 0
+
+    // 5) Read comments — page-story object ONLY (never the bare reel/video object).
+    let comments: PageCommentLinkLiveComment[] = []
+    if (base.has_token) {
+        const guard = await checkGraphCommentGuard(db, env, pageId, GRAPH_COMMENT_FEATURE_REGISTRY)
+        if (!guard.allowed) { base.comment_fetch = guard.status; base.guard = guard }
+        else {
+            const res = await fetchPageCommentsLive(canonical.target, base.token)
+            await recordGraphCommentOperation(db, pageId, GRAPH_COMMENT_FEATURE_REGISTRY)
+            if (res.ok) { base.comment_fetch = 'ok'; comments = res.comments }
+            else {
+                const sig = detectGraphStopSignal(res.error)
+                if (sig.stop) { const blocked = await blockGraphCommentGuard(db, pageId, GRAPH_COMMENT_FEATURE_REGISTRY, sig.reason); base.comment_fetch = blocked.status; base.guard = blocked }
+                else base.comment_fetch = 'failed'
+            }
+        }
+    }
+
+    // 6) Find the existing Page-owned comment carrying the old link. Prefer an
+    //    exact old_shortlink match; otherwise any affiliate link.
+    const pageOwned = comments.filter((cm) => cm.fromId && cm.fromId === pageId)
+    let chosen: { cm: PageCommentLinkLiveComment; matchedBy: 'old_shortlink' | 'affiliate_link' } | null = null
+    if (oldShortlink) {
+        const exact = pageOwned.find((cm) => String(cm.message || '').includes(oldShortlink))
+        if (exact) chosen = { cm: exact, matchedBy: 'old_shortlink' }
+    }
+    if (!chosen) {
+        const affiliate = pageOwned.find((cm) => PAGE_COMMENT_LINK_AFFILIATE_HOST_PATTERN.test(String(cm.message || '')))
+        if (affiliate) chosen = { cm: affiliate, matchedBy: 'affiliate_link' }
+    }
+    let commentExpandedProductSource = ''
+    if (chosen) {
+        const message = String(chosen.cm.message || '')
+        const urls = extractUrlsFromText(message)
+        const commentShortlink = (oldShortlink && urls.includes(oldShortlink)) ? oldShortlink : (pickPrimaryAffiliateUrl(urls) || oldShortlink)
+        const link = await describePagePostLink(commentShortlink)
+        commentExpandedProductSource = link.expanded_url || link.shortlink
+        base.comment = {
+            id: str(chosen.cm.id), from_id: str(chosen.cm.fromId), from_name: str(chosen.cm.fromName),
+            message, matched_by: chosen.matchedBy, link,
+        }
+    }
+
+    // 7) Read the CTA from the page-story object and parse its link.
+    if (base.has_token) {
+        const ctaRead = await readPagePostStoryCta(canonical.target, base.token)
+        const ctaLink = ctaRead.present ? await describePagePostLink(ctaRead.url) : emptyPagePostLinkParsedLink()
+        base.cta = { read_ok: ctaRead.ok, present: ctaRead.present, type: ctaRead.type, title: ctaRead.title, error: ctaRead.error, link: ctaLink }
+    }
+
+    // 8) Product URL: prefer the comment's expanded link, else CTA, else the input.
+    const productSource = commentExpandedProductSource
+        || base.cta.link.expanded_url || base.cta.link.shortlink
+        || oldParsed.expanded_url || oldParsed.shortlink
+    base.product_url = canonicalizeProductUrl(productSource)
+
+    base.ok = true
+    return base
+}
+
+// 1) READ-ONLY check — resolve the post, read the existing Page comment + CTA,
+//    and report both old links/subs. No writes, no minting.
+app.post('/api/dashboard/page-post-link-rewrite/check', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const ctx = await resolvePagePostLinkRewriteContext(c.env.DB, c.env, {
+        pageId: str(body.page_id), postId: str(body.post_id), url: str(body.url), oldShortlink: str(body.old_shortlink),
+    })
+    if (!ctx.ok) {
+        return c.json({
+            ok: false, mode: 'check', error: ctx.error,
+            page_id: ctx.page_id, page_id_source: ctx.page_id_source, post_id: ctx.post_id,
+            page_story_object_id: ctx.page_story_object_id,
+            ...facebookTokenDebugFields(ctx.tokenResolution),
+            ...(ctx.guard ? graphGuardResponseFields(ctx.guard) : {}),
+        }, 400, { 'Cache-Control': 'no-store' })
+    }
+    const comment = ctx.comment
+    const cta = ctx.cta
+    return c.json({
+        ok: true, mode: 'check', read_only: true,
+        page_id: ctx.page_id, page_id_source: ctx.page_id_source,
+        post_id: ctx.post_id, post_tail: ctx.post_tail,
+        page_story_object_id: ctx.page_story_object_id,
+        token_available: ctx.has_token,
+        ...facebookTokenDebugFields(ctx.tokenResolution),
+        comment_fetch: ctx.comment_fetch,
+        comment_found: !!comment,
+        comment_matched_by: comment?.matched_by || '',
+        comment_id: comment?.id || '',
+        comment_from_id: comment?.from_id || '',
+        comment_from_name: comment?.from_name || '',
+        old_comment_message: comment?.message || '',
+        old_comment_shortlink: comment?.link.shortlink || '',
+        old_comment_expanded_url: comment?.link.expanded_url || '',
+        old_comment_affiliate_id: comment?.link.affiliate_id || '',
+        old_comment_utm_content: comment?.link.utm_content || '',
+        old_comment_sub1: comment?.link.sub1 || '',
+        old_comment_sub2: comment?.link.sub2 || '',
+        old_comment_sub3: comment?.link.sub3 || '',
+        old_comment_sub4: comment?.link.sub4 || '',
+        old_comment_sub5: comment?.link.sub5 || '',
+        cta_present: cta.present,
+        cta_read_ok: cta.read_ok,
+        cta_read_error: cta.error || '',
+        cta_type: cta.type || '',
+        cta_title: cta.title || '',
+        old_cta_link: cta.link.shortlink || '',
+        old_cta_expanded_url: cta.link.expanded_url || '',
+        old_cta_affiliate_id: cta.link.affiliate_id || '',
+        old_cta_utm_content: cta.link.utm_content || '',
+        old_cta_sub1: cta.link.sub1 || '',
+        old_cta_sub2: cta.link.sub2 || '',
+        old_cta_sub3: cta.link.sub3 || '',
+        old_cta_sub4: cta.link.sub4 || '',
+        old_cta_sub5: cta.link.sub5 || '',
+        // Old shortlink as supplied in the request (expanded for evidence).
+        input_old_shortlink: ctx.input_old_shortlink.shortlink || '',
+        input_old_shortlink_expanded_url: ctx.input_old_shortlink.expanded_url || '',
+        input_old_shortlink_sub1: ctx.input_old_shortlink.sub1 || '',
+        input_old_shortlink_affiliate_id: ctx.input_old_shortlink.affiliate_id || '',
+        product_url: ctx.product_url,
+        ...(ctx.guard ? graphGuardResponseFields(ctx.guard) : {}),
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Build the planned target subs + minted/planned customlink request for the
+// one-post rewrite. sub4 stays blank outbound; a ledger id backs effective_target_sub4.
+async function buildPagePostLinkPlan(
+    db: D1Database,
+    ctx: PagePostLinkRewriteContext,
+    opts: { requestedSub1: string; customlinkId: string },
+    auditedAt: string,
+) {
+    const requestedSub1 = str(opts.requestedSub1)
+    const customlinkId = resolveTargetAffiliateId(opts.customlinkId)
+    // Internal, non-empty audit id (never lands in the outbound link's sub4).
+    const ledgerStore = createPagePostLedgerStore(db, auditedAt)
+    const ledgerId = await ledgerStore.resolveId({
+        pageId: ctx.page_id,
+        commentTargetId: ctx.page_story_object_id,
+        postId: ctx.post_tail,
+        commentId: ctx.comment?.id || '',
+        oldShortlink: ctx.comment?.link.shortlink || ctx.input_old_shortlink.shortlink || '',
+        oldUtmContent: ctx.comment?.link.utm_content || '',
+        oldAffiliateId: ctx.comment?.link.affiliate_id || '',
+        source: 'page_post_link_rewrite',
+    }).catch(() => 0)
+    const logId = ledgerId > 0 ? String(ledgerId) : ''
+    // sub2 = canonical post tail, sub3 = resolved page id, sub4 = '' (outbound policy).
+    const subs = buildTargetSubIds({ requestedSub1, pageId: ctx.page_id, canonicalPostId: ctx.page_story_object_id, logId })
+    const customlinkRequestUrl = ctx.product_url
+        ? buildCustomlinkRequestUrl({ productUrl: ctx.product_url, sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: '', id: customlinkId })
+        : ''
+    return {
+        requestedSub1, customlinkId, logId, subs,
+        expectedUtmContent: buildExpectedUtmContent({ sub1: subs.sub1, sub2: subs.sub2, sub3: subs.sub3, sub4: '' }),
+        customlinkRequestUrl,
+    }
+}
+
+// 2) PREVIEW — read-only against Facebook. Mints a planned shortlink via
+//    customlink.wwoom.com (a non-Facebook side effect) and reports the planned
+//    target subs + actions. Comment action is edit; CTA action is update.
+app.post('/api/dashboard/page-post-link-rewrite/preview', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const requestedSub1 = str(body.target_sub1) || str(body.sub1)
+    const customlinkId = resolveTargetAffiliateId(str(body.customlink_id) || CUSTOMLINK_DEFAULT_ID)
+    const surfaces = normalizePagePostLinkSurfaces(body.surfaces)
+    const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
+    if (!requestedSub1) return c.json({ ok: false, mode: 'preview', error: 'target_sub1_required' }, 400)
+
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const auditedAt = new Date().toISOString()
+    const ctx = await resolvePagePostLinkRewriteContext(c.env.DB, c.env, {
+        pageId: str(body.page_id), postId: str(body.post_id), url: str(body.url), oldShortlink: str(body.old_shortlink),
+    })
+    if (!ctx.ok) {
+        return c.json({
+            ok: false, mode: 'preview', error: ctx.error,
+            page_id: ctx.page_id, post_id: ctx.post_id, page_story_object_id: ctx.page_story_object_id,
+            ...facebookTokenDebugFields(ctx.tokenResolution),
+            ...(ctx.guard ? graphGuardResponseFields(ctx.guard) : {}),
+        }, 400, { 'Cache-Control': 'no-store' })
+    }
+
+    const plan = await buildPagePostLinkPlan(c.env.DB, ctx, { requestedSub1, customlinkId }, auditedAt)
+
+    // Mint a planned shortlink (real customlink call — no Facebook write) so the
+    // operator sees the exact link/subs a run would post.
+    let plannedShortlink = ''
+    let plannedExpandedUrl = ''
+    let plannedShortlinkOk = false
+    let plannedShortlinkError = ''
+    let plannedVerify: ReturnType<typeof verifyRewrittenShortlink> | null = null
+    let plannedAffiliateVerify: ReturnType<typeof verifyAffiliateId> | null = null
+    if (plan.customlinkRequestUrl) {
+        const minted = await mintCustomlinkShortlink(plan.customlinkRequestUrl)
+        plannedShortlinkOk = minted.ok
+        plannedShortlinkError = minted.error
+        if (minted.ok) {
+            plannedShortlink = minted.shortLink
+            const expanded = await expandShortlinkFinalUrl(plannedShortlink)
+            plannedExpandedUrl = expanded.finalUrl || plannedShortlink
+            plannedVerify = verifyRewrittenShortlink(plannedExpandedUrl, { sub1: plan.subs.sub1, sub2: plan.subs.sub2, sub3: plan.subs.sub3, sub4: '' })
+            plannedAffiliateVerify = verifyAffiliateId(plannedExpandedUrl, plan.customlinkId)
+        }
+    } else {
+        plannedShortlinkError = 'no_product_url'
+    }
+
+    return c.json({
+        ok: true, mode: 'preview', read_only: true,
+        dry_run: true,
+        allow_create_new: allowCreateNew,
+        page_id: ctx.page_id, page_id_source: ctx.page_id_source,
+        post_id: ctx.post_id, post_tail: ctx.post_tail,
+        page_story_object_id: ctx.page_story_object_id,
+        token_available: ctx.has_token,
+        ...facebookTokenDebugFields(ctx.tokenResolution),
+        surfaces,
+        comment_action: 'edit',
+        cta_action: 'update',
+        comment_found: !!ctx.comment,
+        comment_id: ctx.comment?.id || '',
+        cta_present: ctx.cta.present,
+        cta_type: ctx.cta.type || '',
+        product_url: ctx.product_url,
+        customlink_id: plan.customlinkId,
+        target_sub1: plan.subs.sub1,
+        target_sub2: plan.subs.sub2,
+        target_sub3: plan.subs.sub3,
+        // Outbound tracking leaves sub4 blank; internal ids are exposed separately.
+        target_sub4: '',
+        log_id: plan.logId,
+        effective_target_sub4: plan.logId,
+        sub4_policy: PAGE_POST_LINK_SUB4_POLICY,
+        expected_utm_content: plan.expectedUtmContent,
+        customlink_request_url: plan.customlinkRequestUrl,
+        planned_new_shortlink: plannedShortlink,
+        planned_new_expanded_url: plannedExpandedUrl,
+        planned_shortlink_ok: plannedShortlinkOk,
+        planned_shortlink_error: plannedShortlinkError || '',
+        planned_shortlink_verify: plannedVerify ? { ok: plannedVerify.ok, reason: plannedVerify.reason, utm_content: plannedVerify.utm_content } : null,
+        planned_affiliate_verify: plannedAffiliateVerify
+            ? { status: plannedAffiliateVerify.affiliate_verify_status, new_affiliate_id: plannedAffiliateVerify.new_affiliate_id, match: plannedAffiliateVerify.affiliate_id_match }
+            : null,
+        old_comment_shortlink: ctx.comment?.link.shortlink || '',
+        old_comment_sub1: ctx.comment?.link.sub1 || '',
+        old_cta_link: ctx.cta.link.shortlink || '',
+        old_cta_sub1: ctx.cta.link.sub1 || '',
+        ...(ctx.guard ? graphGuardResponseFields(ctx.guard) : {}),
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// 3) RUN — default safe (dry_run true). batch is one post. When dry_run is
+//    explicitly false: mint+verify the new shortlink, EDIT the existing Page
+//    comment (never create/delete), UPDATE the CTA on the bare post tail, then
+//    verify both against the full page-story object. Stops on Graph block codes.
+app.post('/api/dashboard/page-post-link-rewrite/run', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const requestedSub1 = str(body.target_sub1) || str(body.sub1)
+    const customlinkId = resolveTargetAffiliateId(str(body.customlink_id) || CUSTOMLINK_DEFAULT_ID)
+    const surfaces = normalizePagePostLinkSurfaces(body.surfaces)
+    const allowCreateNew = normalizeJobBool(body.allow_create_new, false)
+    // Fixed one-post batch for this canary flow.
+    const batchSize = 1
+    // dry_run defaults TRUE; only an explicit false performs writes.
+    const writeMode = normalizeJobBool(body.dry_run, true) === false
+    if (!requestedSub1) return c.json({ ok: false, mode: 'run', error: 'target_sub1_required' }, 400)
+
+    await ensurePageCommentLinkWorkflowTables(c.env.DB)
+    const auditedAt = new Date().toISOString()
+    const ctx = await resolvePagePostLinkRewriteContext(c.env.DB, c.env, {
+        pageId: str(body.page_id), postId: str(body.post_id), url: str(body.url), oldShortlink: str(body.old_shortlink),
+    })
+    if (!ctx.ok) {
+        return c.json({
+            ok: false, mode: 'run', error: ctx.error,
+            page_id: ctx.page_id, post_id: ctx.post_id, page_story_object_id: ctx.page_story_object_id,
+            ...facebookTokenDebugFields(ctx.tokenResolution),
+            ...(ctx.guard ? graphGuardResponseFields(ctx.guard) : {}),
+        }, 400, { 'Cache-Control': 'no-store' })
+    }
+
+    const plan = await buildPagePostLinkPlan(c.env.DB, ctx, { requestedSub1, customlinkId }, auditedAt)
+    const targetSub1 = plan.subs.sub1
+    const targetSub2 = plan.subs.sub2
+    const targetSub3 = plan.subs.sub3
+    const doComment = surfaces.includes('comment')
+    const doCta = surfaces.includes('cta')
+
+    // Guard the page-story target the same way the comment workflow does.
+    const pageStoryBlockReason = resolvePageStoryRewriteBlockReason({
+        commentTargetId: ctx.page_story_object_id,
+        pageStoryObjectId: ctx.page_story_object_id,
+        postId: ctx.post_tail,
+        canonicalPostId: ctx.page_story_object_id,
+        targetSub2, targetSub3,
+    })
+
+    // ---- DRY RUN (default): describe what WOULD happen; no minting, no writes. ----
+    if (!writeMode || !ctx.has_token || pageStoryBlockReason) {
+        return c.json({
+            ok: true, mode: 'run_dry',
+            dry_run: true, write_mode: false,
+            batch_size: batchSize, allow_create_new: allowCreateNew,
+            token_available: ctx.has_token,
+            ...facebookTokenDebugFields(ctx.tokenResolution),
+            page_id: ctx.page_id, post_id: ctx.post_id, post_tail: ctx.post_tail,
+            page_story_object_id: ctx.page_story_object_id,
+            surfaces,
+            page_story_block_reason: pageStoryBlockReason || '',
+            would_edit_comment: doComment && !!ctx.comment && ctx.comment.from_id === ctx.page_id,
+            would_update_cta: doCta,
+            comment_action: 'edit', cta_action: 'update',
+            comment_id: ctx.comment?.id || '',
+            comment_found: !!ctx.comment,
+            comment_is_page_owned: !!ctx.comment && ctx.comment.from_id === ctx.page_id,
+            cta_present: ctx.cta.present, cta_type: ctx.cta.type || '',
+            product_url: ctx.product_url,
+            customlink_id: plan.customlinkId,
+            target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: '',
+            log_id: plan.logId, effective_target_sub4: plan.logId, sub4_policy: PAGE_POST_LINK_SUB4_POLICY,
+            expected_utm_content: plan.expectedUtmContent,
+            customlink_request_url: plan.customlinkRequestUrl,
+            ...(ctx.guard ? graphGuardResponseFields(ctx.guard) : {}),
+        }, 200, { 'Cache-Control': 'no-store' })
+    }
+
+    // ---- REAL WRITE PATH (dry_run:false) ----------------------------------------
+    const token = ctx.token
+    const evidence: Record<string, unknown> = {
+        ok: false, mode: 'run_write', dry_run: false, write_mode: true,
+        batch_size: batchSize, allow_create_new: allowCreateNew,
+        token_available: true,
+        ...facebookTokenDebugFields(ctx.tokenResolution),
+        page_id: ctx.page_id, post_id: ctx.post_id, post_tail: ctx.post_tail,
+        page_story_object_id: ctx.page_story_object_id,
+        surfaces,
+        customlink_id: plan.customlinkId,
+        target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: '',
+        log_id: plan.logId, effective_target_sub4: plan.logId, sub4_policy: PAGE_POST_LINK_SUB4_POLICY,
+        expected_utm_content: plan.expectedUtmContent,
+    }
+
+    const fail = (reason: string, extra: Record<string, unknown> = {}) =>
+        c.json({ ...evidence, ok: false, status: 'failed', stopped_reason: reason, reason, ...extra }, 200, { 'Cache-Control': 'no-store' })
+
+    // Run guard (rate/cooldown) before any write.
+    const runGuard = await checkGraphCommentGuard(c.env.DB, c.env, ctx.page_id, GRAPH_COMMENT_FEATURE_REWRITE)
+    if (!runGuard.allowed) {
+        return c.json({ ...evidence, ok: true, status: runGuard.status, stopped_reason: runGuard.reason, ...graphGuardResponseFields(runGuard) }, 200, { 'Cache-Control': 'no-store' })
+    }
+
+    // 1) Mint + verify the new shortlink BEFORE any Facebook write.
+    if (!ctx.product_url) return fail('no_product_url')
+    const requestUrl = buildCustomlinkRequestUrl({ productUrl: ctx.product_url, sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '', id: plan.customlinkId })
+    const minted = await mintCustomlinkShortlink(requestUrl)
+    if (!minted.ok) return fail('shortlink_failed', { error: minted.error })
+    const newShortlink = minted.shortLink
+    const expanded = await expandShortlinkFinalUrl(newShortlink)
+    const expandedNewUrl = expanded.finalUrl || newShortlink
+    const verifyLink = verifyRewrittenShortlink(expandedNewUrl, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '' })
+    const affiliateVerify = verifyAffiliateId(expandedNewUrl, plan.customlinkId)
+    evidence.new_shortlink = newShortlink
+    evidence.new_expanded_url = expanded.finalUrl
+    evidence.new_utm_content = verifyLink.utm_content
+    evidence.new_affiliate_id = affiliateVerify.new_affiliate_id
+    if (!verifyLink.ok) return fail(`shortlink_verify_${verifyLink.reason}`)
+    if (affiliateVerify.affiliate_verify_status !== 'verified') return fail(`shortlink_verify_affiliate_${affiliateVerify.affiliate_verify_status}`)
+
+    // 2) EDIT the existing Page-owned comment (never create, never delete).
+    let commentEdited = false
+    let commentNewMessage = ''
+    let commentWriteError = ''
+    if (doComment) {
+        const comment = ctx.comment
+        if (!comment) return fail('comment_missing')
+        if (comment.from_id !== ctx.page_id) return fail('non_page_comment')
+        const oldCommentLink = comment.link.shortlink
+        if (!oldCommentLink || !String(comment.message).includes(oldCommentLink)) return fail('old_comment_link_not_present')
+        const rewrite = replaceShortlinkInMessage(comment.message, oldCommentLink, newShortlink)
+        commentNewMessage = rewrite.message
+        const form = new URLSearchParams()
+        form.set('message', commentNewMessage)
+        form.set('access_token', token)
+        let editData: Record<string, unknown> = {}
+        let editOk = false
+        try {
+            const resp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(comment.id)}`, {
+                method: 'POST', body: form, headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            })
+            editData = await readMetaGraphJson(resp)
+            editOk = resp.ok && !editData.error
+        } catch (e) {
+            editData = { error: { message: sanitizeMetaGraphError(e) } }
+        }
+        await recordGraphCommentOperation(c.env.DB, ctx.page_id, GRAPH_COMMENT_FEATURE_REWRITE)
+        if (!editOk) {
+            const sig = detectGraphStopSignal((editData as Record<string, unknown>).error)
+            commentWriteError = sanitizeMetaGraphError((editData as Record<string, unknown>).error)
+            if (sig.stop) {
+                const blocked = await blockGraphCommentGuard(c.env.DB, ctx.page_id, GRAPH_COMMENT_FEATURE_REWRITE, sig.reason)
+                return c.json({ ...evidence, ok: false, status: blocked.status, stopped_reason: `stop_${sig.reason}`, reason: `stop_${sig.reason}`, error: commentWriteError, ...graphGuardResponseFields(blocked) }, 200, { 'Cache-Control': 'no-store' })
+            }
+            return fail('comment_edit_failed', { error: commentWriteError })
+        }
+        commentEdited = true
+    }
+
+    // 3) UPDATE the CTA — Graph write targets the BARE post/video id tail.
+    let ctaUpdated = false
+    let ctaWriteError = ''
+    const ctaType = ctx.cta.type || 'SHOP_NOW'
+    if (doCta) {
+        const ctaWrite = await updatePagePostStoryCta(ctx.post_tail, ctaType, newShortlink, token)
+        await recordGraphCommentOperation(c.env.DB, ctx.page_id, GRAPH_COMMENT_FEATURE_REWRITE)
+        if (!ctaWrite.ok) {
+            const sig = detectGraphStopSignal((ctaWrite.data as Record<string, unknown>).error)
+            ctaWriteError = sanitizeMetaGraphError((ctaWrite.data as Record<string, unknown>).error)
+            if (sig.stop) {
+                const blocked = await blockGraphCommentGuard(c.env.DB, ctx.page_id, GRAPH_COMMENT_FEATURE_REWRITE, sig.reason)
+                return c.json({ ...evidence, ok: false, status: blocked.status, stopped_reason: `stop_${sig.reason}`, reason: `stop_${sig.reason}`, error: ctaWriteError, comment_edited: commentEdited, ...graphGuardResponseFields(blocked) }, 200, { 'Cache-Control': 'no-store' })
+            }
+            return fail('cta_update_failed', { error: ctaWriteError, comment_edited: commentEdited })
+        }
+        ctaUpdated = true
+    }
+
+    // 4) VERIFY after write — read back the FULL page-story object only.
+    let commentVerified = !doComment
+    let oldLinkGone = !doComment
+    let newLinkPresent = !doComment
+    if (doComment) {
+        const live = await fetchPageCommentsLive(ctx.page_story_object_id, token)
+        await recordGraphCommentOperation(c.env.DB, ctx.page_id, GRAPH_COMMENT_FEATURE_REWRITE)
+        const sameComment = live.ok ? live.comments.find((cm) => str(cm.id) === str(ctx.comment?.id)) : undefined
+        const message = String(sameComment?.message || '')
+        const oldCommentLink = ctx.comment?.link.shortlink || ''
+        oldLinkGone = !!sameComment && !!oldCommentLink && !message.includes(oldCommentLink)
+        newLinkPresent = !!sameComment && message.includes(newShortlink)
+        commentVerified = !!sameComment && oldLinkGone && newLinkPresent
+    }
+
+    let ctaVerified = !doCta
+    let ctaFinalLink = ''
+    let ctaFinalExpandedUrl = ''
+    let ctaFinalLinkVerify: ReturnType<typeof verifyRewrittenShortlink> | null = null
+    let ctaFinalAffiliateVerify: ReturnType<typeof verifyAffiliateId> | null = null
+    if (doCta) {
+        const ctaReadback = await readPagePostStoryCta(ctx.page_story_object_id, token)
+        ctaFinalLink = ctaReadback.url
+        const linkMatches = !!ctaReadback.url && (ctaReadback.url === newShortlink || ctaReadback.url.includes(newShortlink))
+        if (ctaReadback.url) {
+            const ctaExpanded = await describePagePostLink(ctaReadback.url)
+            ctaFinalExpandedUrl = ctaExpanded.expanded_url
+            ctaFinalLinkVerify = verifyRewrittenShortlink(ctaExpanded.expanded_url || ctaReadback.url, { sub1: targetSub1, sub2: targetSub2, sub3: targetSub3, sub4: '' })
+            ctaFinalAffiliateVerify = verifyAffiliateId(ctaExpanded.expanded_url || ctaReadback.url, plan.customlinkId)
+        }
+        ctaVerified = ctaReadback.ok && (linkMatches || (!!ctaFinalLinkVerify?.ok && ctaFinalAffiliateVerify?.affiliate_verify_status === 'verified'))
+    }
+
+    const overallOk = commentVerified && ctaVerified
+    const status: JobItemStatus = overallOk ? 'done' : 'verify_failed'
+
+    // Best-effort durable ledger bookkeeping (our own table; never breaks the run).
+    await updatePagePostLedgerByTarget(c.env.DB, ctx.page_id, ctx.page_story_object_id, {
+        new_shortlink: newShortlink, new_utm_content: verifyLink.utm_content, new_affiliate_id: affiliateVerify.new_affiliate_id,
+        target_sub1: targetSub1, target_sub2: targetSub2, target_sub3: targetSub3, target_sub4: '',
+        status, last_rewrite_at: auditedAt, last_verified_at: new Date().toISOString(),
+    })
+
+    return c.json({
+        ...evidence,
+        ok: overallOk,
+        status,
+        stopped_reason: null,
+        comment_action: doComment ? 'edit' : 'skip',
+        cta_action: doCta ? 'update' : 'skip',
+        comment_edited: commentEdited,
+        comment_id: ctx.comment?.id || '',
+        comment_from_id: ctx.comment?.from_id || '',
+        comment_new_message: commentNewMessage,
+        comment_write_error: commentWriteError || '',
+        comment_verified: commentVerified,
+        old_comment_link_gone: oldLinkGone,
+        new_comment_link_present: newLinkPresent,
+        old_comment_shortlink: ctx.comment?.link.shortlink || '',
+        cta_updated: ctaUpdated,
+        cta_type: ctaType,
+        cta_write_error: ctaWriteError || '',
+        cta_verified: ctaVerified,
+        cta_final_link: ctaFinalLink,
+        cta_final_expanded_url: ctaFinalExpandedUrl,
+        cta_final_link_ok: ctaFinalLinkVerify ? ctaFinalLinkVerify.ok : null,
+        cta_final_affiliate_status: ctaFinalAffiliateVerify ? ctaFinalAffiliateVerify.affiliate_verify_status : null,
+        old_cta_link: ctx.cta.link.shortlink || '',
+        new_shortlink: newShortlink,
+        new_expanded_url: expanded.finalUrl,
+        new_utm_content: verifyLink.utm_content,
+        new_affiliate_id: affiliateVerify.new_affiliate_id,
+        affiliate_verify_status: affiliateVerify.affiliate_verify_status,
+        affiliate_id_match: affiliateVerify.affiliate_id_match ? 1 : 0,
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
 app.get('/api/dashboard/page-video-asset-winners', async (c) => {
     const namespaceId = String(c.req.query('namespace_id') || c.req.query('bot_id') || DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID).trim()
     const pageId = String(c.req.query('page_id') || DASHBOARD_FACEBOOK_GALLERY_PAGE_ID).trim()
@@ -11795,6 +12504,16 @@ async function ensureAdHistoryTable(db: D1Database): Promise<void> {
         `ALTER TABLE dashboard_ad_history ADD COLUMN run_hours TEXT NOT NULL DEFAULT ''`,
         `ALTER TABLE dashboard_ad_history ADD COLUMN start_time TEXT NOT NULL DEFAULT ''`,
         `ALTER TABLE dashboard_ad_history ADD COLUMN end_time TEXT NOT NULL DEFAULT ''`,
+        // Auto-pause audit columns (additive). After a system-created ACTIVE ad-only campaign's run
+        // window ends (end_time <= now), the cron turns it OFF via the bridge /pause-ad-only route —
+        // status=PAUSED only, NEVER deleted. auto_paused_at is set ONLY on a confirmed pause so a
+        // failed attempt is retried on the next cron; *_status_after hold the Graph read-back.
+        `ALTER TABLE dashboard_ad_history ADD COLUMN auto_paused_at TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN auto_pause_status TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN auto_pause_error TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN campaign_status_after TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN adset_status_after TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN ad_status_after TEXT NOT NULL DEFAULT ''`,
     ]) {
         await db.prepare(col).run().catch(() => undefined)
     }
@@ -11952,15 +12671,19 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         if (!clickLink) clickLink = shopeeLink
     }
 
-    // 4. Call the bridge. Ad-only invariants hold for BOTH modes: never publish a new page post,
-    // never comment. The lifecycle differs by operator-selected mode:
+    // 4. Call the bridge. Ad-only NEVER publishes a new Page post (skip_publish_to_page) and the
+    // bridge create-ad call NEVER comments (skip_comment) — so there is no post_history side effect
+    // in either mode. Page commenting differs by mode and is done by the WORKER below, not the
+    // bridge create-ad path:
     //   - 'paused' (review): paused/status_option=PAUSED → the bridge leaves the adset + ad PAUSED
-    //     (no budget/schedule/activation) — a NON-SPENDING ad.
+    //     (no budget/schedule/activation) — a NON-SPENDING ad. NO CTA update and NO Page comment.
     //   - 'active' (scheduled): NO paused flag; instead daily_campaign_name (date-named campaign) +
     //     campaign_daily_budget (minor units, CAMPAIGN-level CBO) + adset_run_hours → the bridge
     //     creates/updates the date-named campaign with the CBO daily budget, copies a budget-free
     //     adset under it, applies the run-hours schedule and activates the adset + ad — a LIVE,
-    //     SPENDING ad. The skip_publish_to_page guarantee still prevents any Page publish/comment.
+    //     SPENDING ad. AFTER the bridge returns story_id, the worker re-mints the shortlink with
+    //     sub2=post id tail / sub3=page id, sets the VISIBLE ad-post CTA (bridge /update-cta) and
+    //     posts EXACTLY ONE Page comment with that final link (bridge /page-comment) — see step 5.
     const caption = String((body.caption as string) || '').trim()
     const adName = String((body.ad_name as string) || validation.systemVideoId || '').trim()
     const lifecycleFields = schedule.mode === 'active'
@@ -11991,7 +12714,9 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                 ...(shopeeLink ? { shopee_url: shopeeLink } : {}),
                 template_adset: templateAdset,
                 ad_account: adAccount,
-                // Ad-only invariants — never publish a new page post, never comment (both modes).
+                // Ad-only invariant — never publish a new Page post. The bridge create-ad call itself
+                // never comments (skip_comment); the SINGLE active-mode Page comment is posted by the
+                // worker below via /page-comment, so there is exactly one comment and no double-post.
                 skip_publish_to_page: true,
                 skip_comment: true,
                 ...lifecycleFields,
@@ -12009,8 +12734,159 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         return recordAdOnlyFailure(step ? `[${step}] ${err}` : err, bridgeResult, clickLink)
     }
 
-    // 5. Success — record the created ids (status=created). The bridge create-ad path returns the
-    // dark creative's effective_object_story_id as `story_id`.
+    // 5. Active-mode finalization — the bridge create-ad path returns the dark creative's
+    // effective_object_story_id as `story_id`. ONLY for the spending 'active' path (the paused/review
+    // path stays non-spending and is never touched here), re-mint the CTA/comment shortlink so it
+    // carries sub2 = post id tail (from the returned story_id) and sub3 = page id, then:
+    //   • set the VISIBLE ad-post CTA to that final link (bridge /update-cta, SHOP_NOW), and
+    //   • post EXACTLY ONE Page comment with the same final link on the FULL story id (/page-comment).
+    // All of this is best-effort: a failure is recorded on bridgeResult but never fails the created ad.
+    if (schedule.mode === 'active' && shopeeLink) {
+        const bridgeStoryId = String(bridgeResult.story_id || bridgeResult.effective_object_story_id || bridgeResult.ad_story_id || '').trim()
+        if (bridgeStoryId) {
+            // Derive sub2 = post id tail, sub3 = page id from the bridge-returned story_id.
+            const commentSubIds = buildPostingCommentShortlinkSubIds({
+                canonicalPostId: bridgeStoryId,
+                fbVideoId: effectiveVideoId,
+                pageId: validation.pageId,
+                historyId: null,
+                logPrefix: `AD-ONLY ACTIVE ${validation.pageId}`,
+            })
+            // Re-mint through the SAME page shortlink template / short.wwoom flow used for the initial
+            // clickLink, but with sub2/sub3 from the returned story_id (sub1 stays the page setting).
+            const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
+            const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
+            const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
+            const finalShortlinkUrl = buildAdOnlyShortlinkRequestUrl({
+                template: tmpl,
+                shopeeLink,
+                sub1: String(subRow?.value || 'yok').trim(),
+                sub2: commentSubIds.postSubId2,
+                sub3: commentSubIds.postSubId3,
+            })
+            let finalLink = ''
+            try {
+                const slResp = await fetch(finalShortlinkUrl, { method: 'GET' })
+                if (slResp.ok) {
+                    const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+                    finalLink = String(slData.shortLink || slData.short_link || '').trim()
+                }
+            } catch { /* shortener best-effort; without a final link we skip CTA/comment below */ }
+
+            if (finalLink) {
+                // The final link becomes the ad's recorded click link + the comment shortlink.
+                clickLink = finalLink
+                bridgeResult.click_link = finalLink
+                bridgeResult.comment_shortlink = finalLink
+                bridgeResult.cta_sub2 = commentSubIds.postSubId2
+                bridgeResult.cta_sub3 = commentSubIds.postSubId3
+
+                // a. Swap the VISIBLE ad-post CTA to the final post-specific link.
+                try {
+                    const ctaResp = await fetch(`${baseUrl}/update-cta`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ page_id: validation.pageId, story_id: bridgeStoryId, final_cta_link: finalLink, cta_type: 'SHOP_NOW' }),
+                    })
+                    const ctaData = await ctaResp.json().catch(() => ({})) as Record<string, unknown>
+                    if (ctaResp.ok && ctaData.ok) {
+                        bridgeResult.cta_update_status = 'success'
+                        bridgeResult.visible_page_cta_link = String(ctaData.visible_page_cta_link || finalLink)
+                        bridgeResult.visible_page_cta_final = ctaData.visible_page_cta_final === true
+                    } else {
+                        bridgeResult.cta_update_status = 'failed'
+                        bridgeResult.cta_update_error = String(ctaData.step ? `${ctaData.step}:${ctaData.error || ''}` : (ctaData.error || `update_cta_http_${ctaResp.status}`)).slice(0, 200)
+                    }
+                } catch (e) {
+                    bridgeResult.cta_update_status = 'failed'
+                    bridgeResult.cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                }
+
+                // a.2 Repair the PAID ad creative's CTA (Ads Manager). The paid ad was created in
+                // step 3 BEFORE this final post-specific shortlink existed, so its creative still
+                // carries the placeholder link (sub2/sub3 unset — the live incident where all ads
+                // showed utm_content=…AD----). /update-cta above only fixes the VISIBLE post; Graph
+                // cannot edit a creative's link inline, so the bridge creates a NEW creative with the
+                // SAME finalLink and re-points the ad at it. Best-effort: recorded on bridgeResult,
+                // never fails the created ad. The result NEVER claims success unless the bridge
+                // read-back confirms paid_ad_cta_final.
+                const repairAdId = String(bridgeResult.ad_id || '').trim()
+                if (repairAdId) {
+                    try {
+                        const repairBody = buildPaidAdCtaRepairBody({
+                            pageId: validation.pageId,
+                            adId: repairAdId,
+                            finalLink,
+                            creativeId: String(bridgeResult.creative_id || ''),
+                            videoId: effectiveVideoId,
+                            caption,
+                            adAccount,
+                            templateAdset,
+                            sourceStoryId: bridgeStoryId,
+                            adName,
+                            thumbnailUrl: String(bridgeResult.thumbnail_url || ''),
+                        })
+                        const repairResp = await fetch(`${baseUrl}/repair-ad-cta`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(repairBody),
+                        })
+                        const repairData = await repairResp.json().catch(() => ({})) as Record<string, unknown>
+                        const summary = summarizePaidAdCtaRepair(repairData, repairResp.ok)
+                        Object.assign(bridgeResult, summary)
+                        // On a CONFIRMED paid-CTA repair the ad now points at the NEW creative — keep
+                        // the recorded creative_id in sync so the audit row reflects the live creative.
+                        if (summary.paid_cta_update_status === 'success' && summary.paid_new_creative_id) {
+                            bridgeResult.creative_id = summary.paid_new_creative_id
+                        }
+                    } catch (e) {
+                        bridgeResult.paid_cta_update_status = 'failed'
+                        bridgeResult.paid_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                    }
+                }
+
+                // b. Post EXACTLY ONE Page comment on the FULL story id, rendered through the SAME
+                // namespace comment-template system normal page posts use (buildAffiliateCommentMessage)
+                // — NOT a bare link. {{shopee_link}} is substituted with the SAME finalLink the CTA
+                // uses, so CTA and comment carry one identical post-specific shortlink. The namespace
+                // lookup failing falls back to DEFAULT_COMMENT_TEMPLATE_TEXT via
+                // renderCommentTemplatesForPosting (inside buildAffiliateCommentMessage), so a normal
+                // run always yields a message. Ad-only has no Lazada link, so the Lazada slot/line is
+                // dropped by the renderer. Comment failure is recorded but never fails the created ad.
+                const commentMessage = await buildAffiliateCommentMessage(c.env.DB, namespaceId, finalLink).catch(() => '')
+                // Audit: store a safe, truncated preview of the rendered comment (never a raw token).
+                bridgeResult.comment_message = commentMessage.slice(0, 500)
+                if (!commentMessage) {
+                    // Render produced nothing (e.g. empty namespace + empty default) — skip explicitly.
+                    bridgeResult.comment_status = 'skipped_no_message'
+                    bridgeResult.comment_error = 'comment_template_rendered_empty'
+                } else {
+                    try {
+                        const fullStoryId = buildPageStoryId(validation.pageId, bridgeStoryId)
+                        const commentResp = await fetch(`${baseUrl}/page-comment`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            // Also pass comment_message so the bridge audit/fallback never bare-links.
+                            body: JSON.stringify({ page_id: validation.pageId, story_id: fullStoryId, message: commentMessage, comment_message: commentMessage }),
+                        })
+                        const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
+                        if (commentResp.ok && commentData.ok && commentData.id) {
+                            bridgeResult.comment_status = 'success'
+                            bridgeResult.comment_fb_id = String(commentData.id)
+                        } else {
+                            bridgeResult.comment_status = 'failed'
+                            bridgeResult.comment_error = String(commentData.step ? `${commentData.step}:${commentData.error || ''}` : (commentData.error || `page_comment_http_${commentResp.status}`)).slice(0, 200)
+                        }
+                    } catch (e) {
+                        bridgeResult.comment_status = 'failed'
+                        bridgeResult.comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Success — record the created ids (status=created).
     const successRec = buildAdHistoryRecord({ status: 'created', validation, result: bridgeResult, clickLink, schedule })
     const historyId = await insertAdHistoryRow(c.env.DB, successRec, true).catch(() => 0)
     return c.json({ ok: true, history_id: historyId, mode: schedule.mode, ...bridgeResult, click_link: clickLink }, 200)
@@ -12301,9 +13177,169 @@ app.post('/api/dashboard/ad-only-queue/run-next', async (c) => {
     return c.json({ ok: true, accepted: true, recovered: recovery.recovered }, 202, { 'Cache-Control': 'no-store' })
 })
 
-// Cron entrypoint — process AT MOST ONE queued ad-only item, gated by the operator-set interval. Sets
-// last_run BEFORE processing so a slow create-ad-only call can't be double-claimed by the next
-// every-minute cron tick. Never throws (cron must not be derailed by an ad-only failure).
+// =====================================================================
+// AD-ONLY AUTO-PICK — when the manual queue is EMPTY the scheduler must still create one ad per
+// interval automatically. It selects ONE eligible cached page video (views ≥ 100k, has a Shopee link,
+// not already in dashboard_ad_history) and replays it through the SAME create-ad-only contract as the
+// queue path — NEVER the legacy create-ad and NEVER a page publish. The auto path always builds a
+// LIVE, SPENDING ad (mode active, Bangkok date-named daily campaign, 10,000 THB/day CBO budget, 24h),
+// matching the force-post CBO-campaign requirement. The eligibility/dedup/selection/body math lives in
+// ad-only-contract.ts (unit-tested); this function only does the D1 reads + the internal POST.
+// =====================================================================
+
+// How many configured pages to scan per auto-pick tick, and how many cached videos to pull per page.
+// Bounded so a cron tick stays cheap even with many pages / large caches.
+const AD_ONLY_AUTO_MAX_PAGES = 50
+const AD_ONLY_AUTO_VIDEOS_PER_PAGE = 100
+
+// How many recent failed dashboard_ad_history rows to scan when building the per-page cooldown set.
+// Bounded so the read stays cheap; the cooldown window (time) does the real filtering.
+const AD_ONLY_AUTO_FAILURE_SCAN_LIMIT = 500
+
+// Resolve a RANKED LIST of auto-pick candidates across all configured pages (highest views first),
+// NOT just one. A page qualifies only when it has the ad_account + template_adset that create-ad-only
+// requires (honoring the global fallback) AND is not on a fatal-failure cooldown (a page that recently
+// failed with a permission/config error is temporarily skipped so it can't keep eating cadence slots).
+// Dedup is per-page (ids are page-scoped) via dashboard_ad_history; each page contributes its single
+// best fresh candidate, then the list is ranked cross-page. The scheduler walks this list and falls
+// through to the next page when one create fails. Returns [] when nothing eligible/fresh exists.
+async function autoPickAdOnlyCandidates(env: Env): Promise<AdOnlyAutoCandidate[]> {
+    // Pages that actually have an eligible cached video (≥ min views + a Shopee link). DISTINCT keeps
+    // the per-page settings/history reads bounded to pages that could possibly produce a candidate.
+    const pageRows = await env.DB.prepare(
+        `SELECT DISTINCT page_id FROM facebook_page_video_cache
+         WHERE views >= ? AND TRIM(COALESCE(shopee_link, '')) != ''
+         ORDER BY page_id LIMIT ?`
+    ).bind(AD_ONLY_AUTO_MIN_VIEWS, AD_ONLY_AUTO_MAX_PAGES).all().catch(() => ({ results: [] as Array<{ page_id?: string }> })) as { results?: Array<{ page_id?: string }> }
+    const pageIds = (pageRows.results || []).map((r) => String(r.page_id || '').trim()).filter(Boolean)
+    if (!pageIds.length) return []
+
+    // Temporary per-page cooldown: pages whose recent ad-only create failed with a permission/config
+    // error are skipped this tick. Time-bounded (AD_ONLY_PAGE_COOLDOWN_MS) so a fixed page recovers
+    // automatically — never a permanent ban.
+    const failureRows = await env.DB.prepare(
+        `SELECT page_id, status, error_message, truncated_result_json, created_at
+         FROM dashboard_ad_history
+         WHERE status IN ('failed', 'error', 'unsupported')
+         ORDER BY id DESC LIMIT ?`
+    ).bind(AD_ONLY_AUTO_FAILURE_SCAN_LIMIT).all().catch(() => ({ results: [] as AdOnlyFailureRow[] })) as { results?: AdOnlyFailureRow[] }
+    const skippedPages = buildAdOnlySkippedPageSet(failureRows.results || [], Date.now())
+    if (skippedPages.size) console.log(`[AD-ONLY-AUTO] cooldown skip pages=${Array.from(skippedPages).join(',')}`)
+
+    // ONE rng per tick (seeded from the wall clock) drives the randomized per-page + cross-page picks,
+    // so the cadence draws RANDOMLY across the eligible cached pool instead of always promoting the
+    // highest-view clip. Daily no-repeat is enforced separately via the Bangkok-day-scoped used set.
+    const nowMs = Date.now()
+    const rng = makeSeededRng(nowMs)
+
+    const perPageBest: AdOnlyAutoCandidate[] = []
+    for (const pageId of pageIds) {
+        if (skippedPages.has(pageId)) continue
+        // create-ad-only fails closed without these; skip the page rather than queue a doomed run.
+        const adAccountRow = await getPageSetting(env.DB, pageId, 'ad_account').catch(() => null)
+        const templateRow = await getPageSetting(env.DB, pageId, 'template_adset').catch(() => null)
+        if (!String(adAccountRow?.value || '').trim() || !String(templateRow?.value || '').trim()) continue
+
+        const videos = await listFacebookPageVideoCache(env.DB, {
+            pageId,
+            minViews: AD_ONLY_AUTO_MIN_VIEWS,
+            limit: AD_ONLY_AUTO_VIDEOS_PER_PAGE,
+            order: 'newest',
+        }).catch(() => [] as FacebookPageVideoCacheRow[])
+        if (!videos.length) continue
+
+        // Dedup is scoped to the CURRENT Bangkok day only: rows are pulled newest-first (created_at
+        // included) and buildAdOnlyUsedIdSetForBangkokDate keeps only today's, so a clip promoted on a
+        // previous Bangkok day is eligible again today and the no-repeat window resets at midnight (UTC+7).
+        const historyRows = await env.DB.prepare(
+            `SELECT source_story_id, source_post_id, fb_video_id, system_video_id, effective_object_story_id, created_at
+             FROM dashboard_ad_history WHERE page_id = ? ORDER BY id DESC LIMIT 5000`
+        ).bind(pageId).all().catch(() => ({ results: [] as AdOnlyHistoryIdRow[] })) as { results?: AdOnlyHistoryIdRow[] }
+        const used = buildAdOnlyUsedIdSetForBangkokDate(historyRows.results || [], nowMs)
+
+        const candidates: AdOnlyAutoCandidate[] = videos.map((v) => ({
+            pageId,
+            videoId: String(v.video_id || '').trim(),
+            postId: String(v.post_id || '').trim(),
+            shopeeLink: String(v.shopee_link || '').trim(),
+            views: Number(v.views || 0),
+            createdTime: String(v.created_time || '').trim(),
+            adName: String(v.title || '').trim() || String(v.video_id || '').trim(),
+        }))
+        // Per page take ONE random fresh candidate (not the highest-view one) — a page's other clips
+        // share the same page-level config, so the cross-page list is the right granularity for fall-through.
+        const ranked = rankAdOnlyAutoCandidatesRandom(candidates, used, rng)
+        if (ranked.length) perPageBest.push(ranked[0])
+    }
+
+    // Final cross-page ordering is also RANDOM (used set already applied per page, so pass empty), so the
+    // scheduler does not always favour the same page's highest-view clip first.
+    return rankAdOnlyAutoCandidatesRandom(perPageBest, new Set<string>(), rng)
+}
+
+// Issue ONE create-ad-only call for a candidate via the SAME internal endpoint the queue uses
+// (buildAdOnlyAutoPickBody guarantees an active-mode body with the Bangkok daily campaign + 10k THB +
+// 24h and NO page-publish field). create-ad-only returns HTTP 200 ok:false for validation/bridge
+// failures, so success is gated on data.ok, not just resp.ok.
+async function createOneAutoPickedAdOnly(env: Env, candidate: AdOnlyAutoCandidate): Promise<{ ok: boolean; error?: string; result?: unknown }> {
+    const reqBody = buildAdOnlyAutoPickBody({ candidate, dailyCampaignName: bangkokDailyCampaignName() })
+    try {
+        const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+        const resp = await fetch(`${workerUrl}/api/dashboard/create-ad-only`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reqBody),
+        })
+        const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+        if (!resp.ok || !data.ok) {
+            const errorMsg = String(data.error || `http_${resp.status}`).trim()
+            return { ok: false, error: errorMsg, result: data }
+        }
+        return { ok: true, result: data }
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+}
+
+// Auto-pick and create one ad per tick, but RESILIENT to a bad page/candidate: walk the ranked
+// cross-page candidate list and try the next one when a create fails, up to AD_ONLY_AUTO_MAX_ATTEMPTS
+// bounded attempts, returning on the FIRST success. So one page that 500s on permissions/config no
+// longer wastes the whole cadence slot — a healthy page's clip still gets promoted in the same tick.
+// On total failure the reason carries the attempted count, the failed pages and the last error.
+async function processAutoPickedAdOnlyCreate(env: Env): Promise<{ ok: boolean; reason?: string; error?: string; result?: unknown; attempted?: number; failedPages?: string[] }> {
+    const candidates = await autoPickAdOnlyCandidates(env)
+    if (!candidates.length) return { ok: true, reason: 'no_eligible_candidate' }
+
+    const maxAttempts = Math.min(AD_ONLY_AUTO_MAX_ATTEMPTS, candidates.length)
+    const failedPages: string[] = []
+    let lastError = ''
+    let lastResult: unknown
+    for (let i = 0; i < maxAttempts; i++) {
+        const candidate = candidates[i]
+        const res = await createOneAutoPickedAdOnly(env, candidate)
+        if (res.ok) {
+            return { ok: true, result: res.result, attempted: i + 1 }
+        }
+        failedPages.push(candidate.pageId)
+        lastError = res.error || 'unknown'
+        lastResult = res.result
+        console.warn(`[AD-ONLY-AUTO] attempt ${i + 1}/${maxAttempts} page=${candidate.pageId} video=${candidate.videoId} failed: ${lastError}`)
+    }
+    return {
+        ok: false,
+        error: lastError,
+        result: lastResult,
+        attempted: maxAttempts,
+        failedPages,
+        reason: `all_attempts_failed attempted=${maxAttempts} failed_pages=${failedPages.join(',')} last_error=${lastError}`.slice(0, 300),
+    }
+}
+
+// Cron entrypoint — process AT MOST ONE ad-only item per interval. A queued manual row always wins
+// (oldest first); when the queue is EMPTY, auto-pick exactly one eligible cached page video and create
+// through the SAME create-ad-only contract — so an ad is created every cadence even with no manual
+// rows. Sets last_run BEFORE processing so a slow create-ad-only call can't be double-claimed by the
+// next every-minute cron tick. Never throws (cron must not be derailed by an ad-only failure).
 async function maybeProcessAdOnlyQueueOnSchedule(env: Env): Promise<{ ran: boolean; reason?: string }> {
     try {
         await ensureAdOnlyQueueTable(env.DB)
@@ -12316,15 +13352,128 @@ async function maybeProcessAdOnlyQueueOnSchedule(env: Env): Promise<{ ran: boole
         const pending = await env.DB.prepare(
             `SELECT id FROM dashboard_ad_only_queue WHERE status = 'queued' ORDER BY id ASC LIMIT 1`
         ).first() as { id?: number } | null
-        if (!pending) return { ran: false, reason: 'queue_empty' }
-        // Claim the cadence slot first (set last_run), then process exactly one item.
+        // Claim the cadence slot first (set last_run) in BOTH branches, then do exactly one unit of
+        // work — a manual queue row when present, else an auto-picked candidate.
         await setDashboardSetting(env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY, new Date().toISOString()).catch(() => null)
-        const result = await processNextAdOnlyQueueItem(env)
-        console.log(`[AD-ONLY-QUEUE] processed queue_id=${result.queue_id ?? ''} ok=${result.ok} ${result.error ? `error=${result.error}` : ''}`)
-        return { ran: true }
+        if (pending) {
+            const result = await processNextAdOnlyQueueItem(env)
+            console.log(`[AD-ONLY-QUEUE] processed queue_id=${result.queue_id ?? ''} ok=${result.ok} ${result.error ? `error=${result.error}` : ''}`)
+            return { ran: true }
+        }
+        // Empty queue → auto-pick eligible clips and create through create-ad-only, trying the next
+        // ranked candidate when one fails so a single bad page can't waste the slot.
+        const auto = await processAutoPickedAdOnlyCreate(env)
+        console.log(`[AD-ONLY-AUTO] ok=${auto.ok}${auto.attempted ? ` attempted=${auto.attempted}` : ''}${auto.failedPages?.length ? ` failed_pages=${auto.failedPages.join(',')}` : ''} ${auto.reason ? `reason=${auto.reason}` : ''} ${auto.error ? `error=${auto.error}` : ''}`)
+        return { ran: auto.reason !== 'no_eligible_candidate', reason: auto.reason }
     } catch (e) {
         console.error(`[AD-ONLY-QUEUE] ${e instanceof Error ? e.message : String(e)}`)
         return { ran: false, reason: 'error' }
+    }
+}
+
+// =====================================================================
+// Auto-pause FINISHED ad-only campaigns — turn OFF, never delete.
+// ---------------------------------------------------------------------
+// After a system-created ACTIVE ad-only ad's scheduled run window ends (end_time <= now), this turns
+// the campaign + adset (and the ad, when known) OFF via the bridge /pause-ad-only route. It ONLY ever
+// requests status=PAUSED — it NEVER deletes a campaign/adset/ad and NEVER sets status='DELETED'. The
+// operator contract is close/off, never destroy. Runs from the cron in waitUntil so it can never
+// block (or be blocked by) posting or the ad-only queue, and swallows its own errors. A row's
+// auto_paused_at is set ONLY on a confirmed pause, so a transient bridge/Graph failure is simply
+// retried on the next cron tick (bounded batch, cheapest-first by id).
+const AUTO_PAUSE_AD_ONLY_BATCH = 15
+
+async function autoPauseCompletedAdOnlyCampaigns(
+    env: Env,
+    opts?: { limit?: number }
+): Promise<{ scanned: number; paused: number; failed: number; reason?: string }> {
+    try {
+        await ensureAdHistoryTable(env.DB)
+        const baseUrl = resolveCloakFbBridgeBaseUrl(env)
+        if (!baseUrl) return { scanned: 0, paused: 0, failed: 0, reason: 'bridge_not_configured' }
+
+        const limit = Math.min(25, Math.max(1, Math.floor(opts?.limit ?? AUTO_PAUSE_AD_ONLY_BATCH)))
+        // Only created (success) ad-only rows whose scheduled run window has ended and that carry a
+        // pausable id are eligible — rejected/unsupported/failed rows never created live objects.
+        // datetime(end_time) <= datetime('now') is the "finished" gate; auto_paused_at = '' makes
+        // each row a one-shot (and lets a failed attempt re-qualify next tick).
+        const rows = await env.DB.prepare(
+            `SELECT id, campaign_id, adset_id, ad_id
+               FROM dashboard_ad_history
+              WHERE auto_paused_at = ''
+                AND end_time != ''
+                AND datetime(end_time) <= datetime('now')
+                AND status IN ('created', 'success')
+                AND (campaign_id != '' OR adset_id != '')
+              ORDER BY id ASC
+              LIMIT ?`
+        ).bind(limit).all()
+
+        const list = (rows?.results || []) as Array<{ id: number; campaign_id: string; adset_id: string; ad_id: string }>
+        let paused = 0
+        let failed = 0
+
+        for (const row of list) {
+            const campaignId = String(row.campaign_id || '').trim()
+            const adsetId = String(row.adset_id || '').trim()
+            const adId = String(row.ad_id || '').trim()
+            try {
+                const resp = await fetch(`${baseUrl}/pause-ad-only`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        ...(campaignId ? { campaign_id: campaignId } : {}),
+                        ...(adsetId ? { adset_id: adsetId } : {}),
+                        ...(adId ? { ad_id: adId } : {}),
+                    }),
+                })
+                const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+                const campaign = (data.campaign || {}) as Record<string, unknown>
+                const adset = (data.adset || {}) as Record<string, unknown>
+                const ad = (data.ad || {}) as Record<string, unknown>
+                if (resp.ok && data.ok) {
+                    // Confirmed off — stamp auto_paused_at so this row is never paused again, and
+                    // record the Graph read-back status for the audit/proof panel.
+                    await env.DB.prepare(
+                        `UPDATE dashboard_ad_history
+                            SET auto_paused_at = datetime('now'),
+                                auto_pause_status = 'success',
+                                auto_pause_error = '',
+                                campaign_status_after = ?,
+                                adset_status_after = ?,
+                                ad_status_after = ?
+                          WHERE id = ?`
+                    ).bind(
+                        String(campaign.effective_status || campaign.status || ''),
+                        String(adset.effective_status || adset.status || ''),
+                        String(ad.effective_status || ad.status || ''),
+                        row.id
+                    ).run().catch(() => undefined)
+                    paused += 1
+                } else {
+                    // Leave auto_paused_at empty so the next cron tick retries this row.
+                    const err = String(data.error || data.step || `pause_http_${resp.status}`).slice(0, 200)
+                    await env.DB.prepare(
+                        `UPDATE dashboard_ad_history
+                            SET auto_pause_status = 'failed', auto_pause_error = ?
+                          WHERE id = ?`
+                    ).bind(err, row.id).run().catch(() => undefined)
+                    failed += 1
+                }
+            } catch (e) {
+                const err = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                await env.DB.prepare(
+                    `UPDATE dashboard_ad_history
+                        SET auto_pause_status = 'failed', auto_pause_error = ?
+                      WHERE id = ?`
+                ).bind(err, row.id).run().catch(() => undefined)
+                failed += 1
+            }
+        }
+        return { scanned: list.length, paused, failed }
+    } catch (e) {
+        console.error(`[AD-ONLY-AUTOPAUSE] ${e instanceof Error ? e.message : String(e)}`)
+        return { scanned: 0, paused: 0, failed: 0, reason: 'error' }
     }
 }
 
@@ -17253,7 +18402,23 @@ async function handleLineVideoMessage(params: {
 }) {
     const { env, bucket, executionCtx, namespaceId, channelAccessToken, replyToken, lineUserId, messageId } = params
     const videoId = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
-    await clearLineWaitingVideoCancelled(bucket, lineUserId)
+
+    // A fresh direct video upload supersedes any older in-flight LINE intake.
+    // Write the current-intake marker BEFORE the ack + slow download/store so
+    // (a) stale XHS/video background work stops short of pushing an abandoned
+    // clip's cover picker, and (b) every later waiting-state read (cover picker,
+    // postback selection) resolves to THIS video instead of being filtered out
+    // by a leftover marker that points at a different videoId. Without this the
+    // bot can ack ("รับวิดีโอแล้ว…") and then silently lose the picker. Mirrors
+    // the XHS branch invariants. Do NOT clear the user-level cancel marker here:
+    // it is videoId-scoped, and clearing it could un-cancel an older in-flight
+    // job; the current-intake marker alone supersedes older work.
+    await putLineCurrentVideoIntake(bucket, lineUserId, {
+        videoId,
+        createdAt: new Date().toISOString(),
+        sourceType: 'line_video',
+        sourceLabel: 'LINE video',
+    })
 
     // Direct LINE video uploads can be large; pulling the bytes from LINE +
     // storing to R2 + building the cover picker can exceed the reply-token
@@ -17275,11 +18440,17 @@ async function handleLineVideoMessage(params: {
     const followupReplyToken = ''
 
     const followupPromise = (async () => {
+        // Only the active (current) request may surface user-visible follow-ups.
+        // A newer clip/link or a cancel command flips this guard, so superseded
+        // background work exits silently instead of pushing stale covers.
+        const isCurrentVideoIntake = () => isLineCurrentVideoIntake(bucket, lineUserId, videoId)
+
         // Download video content from LINE
         const contentResp = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
             headers: { 'Authorization': `Bearer ${channelAccessToken}` },
         })
         if (!contentResp.ok) {
+            if (!(await isCurrentVideoIntake())) return
             console.error(`[LINE] Failed to download video content: HTTP ${contentResp.status}`)
             await lineReplyOrPush({
                 replyToken: followupReplyToken,
@@ -17289,6 +18460,7 @@ async function handleLineVideoMessage(params: {
                     { type: 'text', text: 'ไม่สามารถดาวน์โหลดวิดีโอได้ กรุณาลองใหม่อีกครั้ง' },
                 ],
             }).catch(() => { })
+            await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
             return
         }
 
@@ -17296,6 +18468,7 @@ async function handleLineVideoMessage(params: {
         assertDownloadedVideoResponse(contentResp, videoBuffer, `line-message:${messageId}`)
         console.log(`[LINE] Video downloaded: ${(videoBuffer.byteLength / 1024 / 1024).toFixed(1)}MB userId=${lineUserId}`)
 
+        if (!(await isCurrentVideoIntake())) return
         const originalVideoUrl = await storeOriginalVideoBuffer({
             bucket,
             env,
@@ -17307,27 +18480,49 @@ async function handleLineVideoMessage(params: {
         await backfillOriginalThumbnail(env, namespaceId, videoId).catch(() => { })
 
         const createdAt = new Date().toISOString()
-        const waitingState = await putLineWaitingVideoState(bucket, lineUserId, {
-            id: videoId,
-            videoUrl: originalVideoUrl,
-            createdAt,
-            sourceType: 'line_video',
-            sourceLabel: 'LINE video',
-            awaitingStep: 'cover',
-            coverCompleted: false,
-        })
 
-        await promptLineCoverOptions({
-            env,
-            bucket,
-            namespaceId,
-            channelAccessToken,
-            replyToken: followupReplyToken,
-            lineUserId,
-            waitingState,
-            forceRefresh: true,
-        })
+        try {
+            // Only write waiting state / prompt the picker if this intake is
+            // still current — otherwise we would resurrect an abandoned clip.
+            if (!(await isCurrentVideoIntake())) return
+            const waitingState = await putLineWaitingVideoState(bucket, lineUserId, {
+                id: videoId,
+                videoUrl: originalVideoUrl,
+                createdAt,
+                sourceType: 'line_video',
+                sourceLabel: 'LINE video',
+                awaitingStep: 'cover',
+                coverCompleted: false,
+            })
+
+            if (!(await isCurrentVideoIntake())) return
+            await promptLineCoverOptions({
+                env,
+                bucket,
+                namespaceId,
+                channelAccessToken,
+                replyToken: followupReplyToken,
+                lineUserId,
+                waitingState,
+                forceRefresh: true,
+            })
+        } catch (e) {
+            if (!(await isCurrentVideoIntake())) return
+            console.warn(`[LINE] video cover prompt failed userId=${lineUserId}: ${e instanceof Error ? e.message : String(e)}`)
+            await lineReplyOrPush({
+                replyToken: followupReplyToken,
+                channelAccessToken,
+                lineUserId,
+                messages: [
+                    { type: 'text', text: 'รับวิดีโอแล้ว แต่โหลดตัวเลือกปกไม่สำเร็จ ลองส่งวิดีโอใหม่อีกครั้ง' },
+                ],
+            }).catch(() => { })
+            await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
+        }
     })().catch(async (e) => {
+        // Last-resort guard: only the active request may surface an error;
+        // stale/superseded background work exits silently.
+        if (!(await isLineCurrentVideoIntake(bucket, lineUserId, videoId))) return
         console.error('[LINE] Video handling error:', e instanceof Error ? e.message : String(e))
         await lineReplyOrPush({
             replyToken: followupReplyToken,
@@ -17337,6 +18532,7 @@ async function handleLineVideoMessage(params: {
                 { type: 'text', text: 'เกิดข้อผิดพลาดในการรับวิดีโอ กรุณาลองใหม่อีกครั้ง' },
             ],
         }).catch(() => { })
+        await clearLineCurrentVideoIntakeIfMatches(bucket, lineUserId, videoId)
     })
 
     if (executionCtx) {
@@ -35249,8 +36445,18 @@ app.put('/api/pages/:id', async (c) => {
         // Selecting CloakBrowser is NOT admin-restricted — it posts organically with the
         // operator's own browser session. The OneCard/create-ad route keeps its own
         // admin-namespace guard (ads_publish_enabled + the runtime check in create-ad).
+        // Power Editor / CloakBrowser is admin-owned only (restrictCloakToAdminNamespace). For
+        // a non-admin (member/team) namespace we persist 'stored_token' even when the client
+        // sends 'cloak_browser' or a legacy alias, so a member page can never be silently
+        // routed to the session bridge it has no access to. Resolved once for both selectors.
+        const namespaceIsAdminOwned = posting_token_source !== undefined || comment_token_source !== undefined
+            ? await isNamespaceShortlinkAdminManaged(c.env.DB, String(c.get('botId') || '')).catch(() => false)
+            : false
         if (posting_token_source !== undefined) {
-            const normalizedPostingTokenSource = normalizePagePostingTokenSource(posting_token_source)
+            const normalizedPostingTokenSource = restrictCloakToAdminNamespace(
+                normalizePagePostingTokenSource(posting_token_source),
+                namespaceIsAdminOwned,
+            )
             await c.env.DB.prepare(
                 'UPDATE pages SET posting_token_source = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(normalizedPostingTokenSource, id, c.get('botId')).run()
@@ -35264,7 +36470,10 @@ app.put('/api/pages/:id', async (c) => {
         // the page never set it, runtime falls back to the effective posting source so
         // existing pages are unaffected — hence we only write when the operator sends it.
         if (comment_token_source !== undefined) {
-            const normalizedCommentTokenSource = normalizePageCommentTokenSource(comment_token_source)
+            const normalizedCommentTokenSource = restrictCloakToAdminNamespace(
+                normalizePageCommentTokenSource(comment_token_source),
+                namespaceIsAdminOwned,
+            )
             await c.env.DB.prepare(
                 'UPDATE pages SET comment_token_source = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(normalizedCommentTokenSource, id, c.get('botId')).run()
@@ -36971,18 +38180,35 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // (CloakBrowser) routes the organic Reel through the CloakBrowser
         // bridge /post route (VIDEO_ONECARD_WORKER_URL) — never the stored token. Stored
         // token remains the default legacy path.
-        const pagePostingTokenSource = normalizePagePostingTokenSource((page as Record<string, unknown>).posting_token_source)
+        // Power Editor / CloakBrowser is admin-owned only: a non-admin namespace can never
+        // reach the session bridge, so we collapse its posting/comment source to stored_token
+        // here (restrictCloakToAdminNamespace) BEFORE resolving the route. This keeps a
+        // member/manual-token page (e.g. ข่าวสด) on publishReelWithCommentTokenPrimaryFallback
+        // instead of publishReelViaSessionBridge.
+        const namespaceIsAdminOwned = await isNamespaceShortlinkAdminManaged(env.DB, String(botId || '')).catch(() => false)
+        const pagePostingTokenSource = restrictCloakToAdminNamespace(
+            normalizePagePostingTokenSource((page as Record<string, unknown>).posting_token_source),
+            namespaceIsAdminOwned,
+        )
         const pageAdsPublishLegacyFlag = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
-        const pagePostingRoute: PostingRoute = resolvePostingRoute({ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag })
+        // The legacy ads_publish_enabled flag promotes even a stored_token source to the
+        // CloakBrowser OneCard/create-ad bridge route — also admin-owned only. Gate it on
+        // namespace ownership so a non-admin page with a stale ads_publish_enabled=1 can never
+        // be promoted onto the bridge it has no access to.
+        const pagePostingRoute: PostingRoute = resolvePostingRoute({ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag && namespaceIsAdminOwned })
         const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'
         const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'
         // Comment backend is chosen INDEPENDENTLY of the posting route. Missing/invalid
         // comment_token_source falls back to the effective posting source so existing pages
         // keep commenting exactly as before. 'cloak_browser' → CloakBrowser bridge
         // /page-comment; 'stored_token' → stored page comment token (deferred pending path).
-        const pageCommentTokenSource: PageCommentTokenSource = normalizePageCommentTokenSource(
-            (page as Record<string, unknown>).comment_token_source,
-            defaultCommentSourceForRoute(pagePostingRoute),
+        // Non-admin namespaces are likewise pinned to stored_token (admin-owned bridge only).
+        const pageCommentTokenSource: PageCommentTokenSource = restrictCloakToAdminNamespace(
+            normalizePageCommentTokenSource(
+                (page as Record<string, unknown>).comment_token_source,
+                defaultCommentSourceForRoute(pagePostingRoute),
+            ),
+            namespaceIsAdminOwned,
         )
         const commentViaCloakBridge = pageCommentTokenSource === 'cloak_browser'
         console.log(`[FORCE-POST] page=${String(page.id || '')} posting_token_source=${pagePostingTokenSource} route=${pagePostingRoute} source_hint=${postingSourceHint(pagePostingRoute)} comment_token_source=${pageCommentTokenSource} ads_publish_legacy_flag=${pageAdsPublishLegacyFlag} onecard=${pageOneCardEnabled} ads_publish=${pageAdsPublishEnabled} cloak=${pageCloakPostSelected}`)
@@ -39292,15 +40518,27 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
         // session-cookie bridge ('post-reels-token-cloak') routes the organic Reel through
         // the CloakBrowser bridge /post route. Never silently fall back to the stored
         // token when a non-stored source is explicitly selected.
-        const pagePostingTokenSource = normalizePagePostingTokenSource(page.posting_token_source)
+        // Power Editor / CloakBrowser is admin-owned only — mirror the force-post guard so the
+        // scheduled auto-post path also pins non-admin namespaces to stored_token and never
+        // hands a member page to the session bridge (restrictCloakToAdminNamespace).
+        const namespaceIsAdminOwned = await isNamespaceShortlinkAdminManaged(env.DB, String(botId || '')).catch(() => false)
+        const pagePostingTokenSource = restrictCloakToAdminNamespace(
+            normalizePagePostingTokenSource(page.posting_token_source),
+            namespaceIsAdminOwned,
+        )
         const pageAdsPublishLegacyFlag = Number(page.ads_publish_enabled || 0) === 1
-        const pagePostingRoute: PostingRoute = resolvePostingRoute({ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag })
+        // Gate the legacy ads_publish_enabled → OneCard/create-ad bridge promotion on namespace
+        // ownership (mirror of the force-post guard): the bridge route is admin-owned only.
+        const pagePostingRoute: PostingRoute = resolvePostingRoute({ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag && namespaceIsAdminOwned })
         const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'
         const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'
         // Comment backend chosen independently of the posting route (see force-post).
-        const pageCommentTokenSource: PageCommentTokenSource = normalizePageCommentTokenSource(
-            page.comment_token_source,
-            defaultCommentSourceForRoute(pagePostingRoute),
+        const pageCommentTokenSource: PageCommentTokenSource = restrictCloakToAdminNamespace(
+            normalizePageCommentTokenSource(
+                page.comment_token_source,
+                defaultCommentSourceForRoute(pagePostingRoute),
+            ),
+            namespaceIsAdminOwned,
         )
         const commentViaCloakBridge = pageCommentTokenSource === 'cloak_browser'
         if (pageAdsPublishEnabled || pageCloakPostSelected || commentViaCloakBridge) {
@@ -40567,6 +41805,12 @@ export default {
         // swallow its own errors so an ad-only failure can never derail the every-minute cron.
         _ctx.waitUntil(maybeProcessAdOnlyQueueOnSchedule(env).catch((error) => {
             console.error(`[AD-ONLY-QUEUE] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        // Turn OFF (status=PAUSED, NEVER delete) system-created ad-only campaigns whose scheduled run
+        // window has ended. Runs in its OWN waitUntil so it never blocks (or is blocked by) posting or
+        // the ad-only queue, and swallows its own errors so a pause failure can't derail the cron.
+        _ctx.waitUntil(autoPauseCompletedAdOnlyCampaigns(env).catch((error) => {
+            console.error(`[AD-ONLY-AUTOPAUSE] ${error instanceof Error ? error.message : String(error)}`)
         }))
     },
 }

@@ -355,6 +355,459 @@ export function buildAdOnlyCreateBody(row: AdOnlyQueueRow | null | undefined): R
     return body
 }
 
+// =====================================================================
+// AD-ONLY AUTO-PICK — pure, network-free helpers for the "create an ad EVERY interval even when the
+// manual queue is empty" cadence. When dashboard_ad_only_queue has no queued row, the scheduler
+// auto-selects ONE eligible cached page video and replays it through the SAME create-ad-only contract
+// (NEVER the legacy create-ad / page-publish). These helpers hold the candidate eligibility, the
+// dedup-against-history math, the highest-views selection and the create-ad-only body shaping so the
+// whole auto-pick decision is unit-testable without D1/cron/the bridge.
+// =====================================================================
+
+// Minimum lifetime views a cached page video must have to be auto-picked. Matches the operator rule
+// "only promote clips with real reach". A candidate below this is skipped.
+export const AD_ONLY_AUTO_MIN_VIEWS = 100_000
+
+// A cached page video reduced to the fields the auto-picker needs (a projection of
+// facebook_page_video_cache). videoId is the existing FB video id (the ad source); postId is the
+// PAGEID_POSTID page story when known. shopeeLink/views gate eligibility; createdTime breaks ties.
+export interface AdOnlyAutoCandidate {
+    pageId: string
+    videoId: string
+    postId?: string
+    shopeeLink?: string
+    views?: number | string
+    createdTime?: string
+    /** Optional human label forwarded as ad_name (defaults to the video id). */
+    adName?: string
+}
+
+// One dashboard_ad_history row's id columns, used to dedup an auto-pick against already-promoted
+// clips. All fields optional/string the way D1 returns them.
+export interface AdOnlyHistoryIdRow {
+    source_story_id?: string
+    source_post_id?: string
+    fb_video_id?: string
+    system_video_id?: string
+    effective_object_story_id?: string
+    /** Attempt timestamp (ISO/SQLite datetime). Used to scope auto-pick dedup to the current Bangkok
+     * day; absent on the all-time manual flow, which ignores it. */
+    created_at?: string
+}
+
+// The tail after the last underscore of a PAGEID_POSTID id (e.g. "111_222" → "222"). An id with no
+// underscore returns itself; empty-safe.
+export function adOnlyIdTail(id: unknown): string {
+    const s = str(id)
+    if (!s) return ''
+    const i = s.lastIndexOf('_')
+    return i >= 0 ? s.slice(i + 1) : s
+}
+
+// Build the set of ids already represented in dashboard_ad_history. Each row contributes its
+// source_story_id, source_post_id, fb_video_id, system_video_id and effective_object_story_id —
+// each added BOTH raw and as its underscore tail — so a candidate's video id, post id or post-id
+// tail can be matched regardless of which id column recorded the original promotion. Empty values
+// are skipped, so an all-empty history row never poisons the set.
+export function buildAdOnlyUsedIdSet(rows: ReadonlyArray<AdOnlyHistoryIdRow> | null | undefined): Set<string> {
+    const used = new Set<string>()
+    const add = (v: unknown) => {
+        const s = str(v)
+        if (!s) return
+        used.add(s)
+        const tail = adOnlyIdTail(s)
+        if (tail) used.add(tail)
+    }
+    for (const r of rows || []) {
+        if (!r) continue
+        add(r.source_story_id)
+        add(r.source_post_id)
+        add(r.fb_video_id)
+        add(r.system_video_id)
+        add(r.effective_object_story_id)
+    }
+    return used
+}
+
+// Bangkok (UTC+7) calendar-date key "YYYY-MM-DD" for an ISO string / epoch-ms / Date. Empty or
+// unparseable input returns ''. The auto scheduler keys daily no-repeat off this so a clip promoted on
+// a PREVIOUS Bangkok day no longer blocks it today, and the duplicate set resets at the Bangkok day
+// boundary. Pure (Intl only, no Date.now()).
+export function bangkokDateKey(value: string | number | Date | null | undefined): string {
+    let d: Date
+    if (value instanceof Date) {
+        d = value
+    } else if (typeof value === 'number') {
+        if (!Number.isFinite(value)) return ''
+        d = new Date(value)
+    } else {
+        const s = str(value)
+        if (!s) return ''
+        const ms = Date.parse(s)
+        if (!Number.isFinite(ms)) return ''
+        d = new Date(ms)
+    }
+    if (Number.isNaN(d.getTime())) return ''
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Bangkok',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).format(d)
+}
+
+// Keep only the history rows whose created_at falls on the SAME Bangkok day as nowMs. Rows from a
+// previous Bangkok day are dropped (so they no longer block today's pick). A row with NO parseable
+// created_at is KEPT (fail safe: dedup against an undated row rather than risk a same-day repeat). Pure
+// — the caller passes nowMs.
+export function filterAdOnlyHistoryRowsForBangkokDate(
+    rows: ReadonlyArray<AdOnlyHistoryIdRow> | null | undefined,
+    nowMs: number,
+): AdOnlyHistoryIdRow[] {
+    const todayKey = bangkokDateKey(nowMs)
+    return (rows || []).filter((r) => {
+        if (!r) return false
+        const created = str(r.created_at)
+        if (!created) return true
+        const key = bangkokDateKey(created)
+        if (!key) return true
+        return key === todayKey
+    })
+}
+
+// Used-id set scoped to the CURRENT Bangkok day: only history rows created today (Asia/Bangkok)
+// contribute, so a clip promoted on a previous Bangkok day is eligible again today and the no-repeat
+// window resets at the day boundary. The all-time buildAdOnlyUsedIdSet is unchanged for the manual
+// create-ad-only flow. Pure — the caller passes nowMs.
+export function buildAdOnlyUsedIdSetForBangkokDate(
+    rows: ReadonlyArray<AdOnlyHistoryIdRow> | null | undefined,
+    nowMs: number,
+): Set<string> {
+    return buildAdOnlyUsedIdSet(filterAdOnlyHistoryRowsForBangkokDate(rows, nowMs))
+}
+
+// True when this candidate has already been promoted — its video id, post id, or post-id tail is in
+// the used set built from dashboard_ad_history. Fail safe: when in doubt about a match the candidate
+// is treated as fresh ONLY if none of its ids appear.
+export function isAdOnlyCandidateUsed(candidate: AdOnlyAutoCandidate | null | undefined, used: Set<string>): boolean {
+    const c = candidate
+    if (!c) return false
+    const keys = [str(c.videoId), str(c.postId), adOnlyIdTail(c.postId)]
+    return keys.some((k) => k.length > 0 && used.has(k))
+}
+
+const toViews = (v: unknown): number => {
+    const n = typeof v === 'number' ? v : Number(String(v ?? '').trim())
+    return Number.isFinite(n) ? n : 0
+}
+
+// Eligibility for auto-pick: must reference an existing FB video, carry a Shopee link, and clear the
+// minimum-views bar. A candidate without a shopee link OR below minViews is NOT eligible.
+export function isAdOnlyCandidateEligible(
+    candidate: AdOnlyAutoCandidate | null | undefined,
+    minViews: number = AD_ONLY_AUTO_MIN_VIEWS,
+): boolean {
+    const c = candidate
+    if (!c) return false
+    if (!str(c.videoId) && !str(c.postId)) return false
+    if (!str(c.shopeeLink)) return false
+    return toViews(c.views) >= minViews
+}
+
+// Deterministic candidate ordering: highest views first, then newest created_time, then a stable id
+// order so a tie never depends on input order. Shared by the ranked-list and single-pick selectors.
+function compareAdOnlyAutoCandidates(a: AdOnlyAutoCandidate, b: AdOnlyAutoCandidate): number {
+    const dv = toViews(b.views) - toViews(a.views)
+    if (dv !== 0) return dv
+    const dc = str(b.createdTime).localeCompare(str(a.createdTime))
+    if (dc !== 0) return dc
+    return str(a.videoId).localeCompare(str(b.videoId))
+}
+
+// Rank ALL eligible+fresh auto-pick candidates (highest views first) instead of just one. The scheduler
+// uses this so a single failing page/candidate can't waste the cadence slot: it walks the ranked list
+// and tries the next candidate when one fails. `used` excludes already-promoted clips (per
+// dashboard_ad_history). Returns [] when nothing qualifies. Pure — input order never affects the result.
+export function rankAdOnlyAutoCandidates(
+    candidates: ReadonlyArray<AdOnlyAutoCandidate> | null | undefined,
+    used: Set<string>,
+    minViews: number = AD_ONLY_AUTO_MIN_VIEWS,
+): AdOnlyAutoCandidate[] {
+    const eligible = (candidates || []).filter(
+        (c) => isAdOnlyCandidateEligible(c, minViews) && !isAdOnlyCandidateUsed(c, used),
+    )
+    eligible.sort(compareAdOnlyAutoCandidates)
+    return eligible
+}
+
+// Deterministic, well-distributed seeded PRNG (mulberry32). Returns a function yielding floats in
+// [0, 1). Used to make the auto-pick shuffle reproducible in tests (inject a fixed seed) while the
+// scheduler seeds it from the wall clock per tick for real randomness. A zero/NaN seed is coerced to 1
+// so the generator never degenerates.
+export function makeSeededRng(seed: number): () => number {
+    let a = (Number.isFinite(seed) ? seed : 0) >>> 0
+    if (a === 0) a = 1
+    return () => {
+        a |= 0
+        a = (a + 0x6d2b79f5) | 0
+        let t = Math.imul(a ^ (a >>> 15), 1 | a)
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+}
+
+// Fisher–Yates shuffle returning a NEW array (never mutates the input). rng defaults to Math.random;
+// pass a seeded rng for deterministic tests.
+export function shuffleWithRng<T>(items: ReadonlyArray<T>, rng: () => number = Math.random): T[] {
+    const arr = items.slice()
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1))
+        const tmp = arr[i]
+        arr[i] = arr[j]
+        arr[j] = tmp
+    }
+    return arr
+}
+
+// RANDOMIZED auto-pick ranking for the scheduler. Applies the SAME eligibility + same-day dedup gates
+// as rankAdOnlyAutoCandidates, but instead of sorting by highest views it SHUFFLES the eligible+fresh
+// pool, so the cadence does not always promote the highest-view clip — it draws randomly across the
+// eligible cached pool. Pass a seeded rng for deterministic tests; the scheduler seeds from the wall
+// clock. Returns [] when nothing qualifies. Order of the input never biases the result.
+export function rankAdOnlyAutoCandidatesRandom(
+    candidates: ReadonlyArray<AdOnlyAutoCandidate> | null | undefined,
+    used: Set<string>,
+    rng: () => number = Math.random,
+    minViews: number = AD_ONLY_AUTO_MIN_VIEWS,
+): AdOnlyAutoCandidate[] {
+    const eligible = (candidates || []).filter(
+        (c) => isAdOnlyCandidateEligible(c, minViews) && !isAdOnlyCandidateUsed(c, used),
+    )
+    return shuffleWithRng(eligible, rng)
+}
+
+// Pick the SINGLE best auto-pick candidate: eligible (shopee link + views ≥ minViews) AND not already
+// in dashboard_ad_history. Ties broken by highest views, then newest created_time, then a stable id
+// order so selection is deterministic. Returns null when nothing qualifies (queue stays idle that
+// interval rather than promoting a low-quality / duplicate clip).
+export function selectAdOnlyAutoCandidate(
+    candidates: ReadonlyArray<AdOnlyAutoCandidate> | null | undefined,
+    used: Set<string>,
+    minViews: number = AD_ONLY_AUTO_MIN_VIEWS,
+): AdOnlyAutoCandidate | null {
+    const ranked = rankAdOnlyAutoCandidates(candidates, used, minViews)
+    return ranked.length ? ranked[0] : null
+}
+
+// =====================================================================
+// AD-ONLY AUTO-PICK FAILURE COOLDOWN — a page whose recent ad-only create failed with a permission/
+// config error will keep failing until an operator fixes it, so the auto scheduler must stop spending
+// cadence slots on it. These helpers classify a fatal error and build the temporary per-page skip set
+// from recent dashboard_ad_history failures. The skip is TIME-BOUNDED (never a permanent ban): once the
+// cooldown elapses the page is retried, so a later config fix re-enables it automatically.
+// =====================================================================
+
+// Error substrings that mark a create failure as fatal/config — retrying the same page immediately is
+// pointless until an operator intervenes. Matched case-insensitively against error_message AND the
+// truncated bridge result. Covers the live permission/config failures plus the worker's own fail-closed
+// codes. Kept narrow on purpose: a transient/unknown error does NOT cool a page down (it stays retryable).
+export const AD_ONLY_FATAL_ERROR_SUBSTRINGS: string[] = [
+    'Application does not have permission',
+    'Object with ID',
+    'missing permissions',
+    'config_missing_template_or_ad_account',
+    'bridge_not_configured',
+    'fb_video_id_unresolved',
+]
+
+// True when a failure message/result matches a fatal/config substring (case-insensitive). Empty-safe.
+export function isAdOnlyFatalError(message: unknown): boolean {
+    const s = str(message).toLowerCase()
+    if (!s) return false
+    return AD_ONLY_FATAL_ERROR_SUBSTRINGS.some((sub) => s.includes(sub.toLowerCase()))
+}
+
+// How long a page stays on cooldown after a fatal create failure. Bounded so the ban is temporary — a
+// config fix re-enables the page on the next tick after this window. 6h ≈ 18 cadence slots at 20-min.
+export const AD_ONLY_PAGE_COOLDOWN_MS = 6 * 60 * 60 * 1000
+
+// How many ranked candidates the scheduler attempts in ONE tick before giving up. Bounds the work per
+// cron tick while still letting it fall through past a few bad pages/candidates to a good one.
+export const AD_ONLY_AUTO_MAX_ATTEMPTS = 4
+
+// One recent dashboard_ad_history failure row, reduced to the fields the cooldown needs. All optional/
+// string the way D1 returns them. created_at is the attempt timestamp (ISO/SQLite datetime).
+export interface AdOnlyFailureRow {
+    page_id?: string
+    status?: string
+    error_message?: string
+    truncated_result_json?: string
+    created_at?: string
+}
+
+// Build the set of page ids to TEMPORARILY skip this tick. A page is cooled down when it has a failed
+// history row whose error matches a fatal/config substring AND the failure is newer than nowMs -
+// cooldownMs. Non-failed rows, non-fatal errors and failures older than the window never add a page. A
+// row with no parseable timestamp is treated as recent (fail safe: skip a known-bad page rather than
+// immediately retry it). Pure + deterministic — the caller passes nowMs.
+export function buildAdOnlySkippedPageSet(
+    rows: ReadonlyArray<AdOnlyFailureRow> | null | undefined,
+    nowMs: number,
+    cooldownMs: number = AD_ONLY_PAGE_COOLDOWN_MS,
+): Set<string> {
+    const skipped = new Set<string>()
+    for (const r of rows || []) {
+        if (!r) continue
+        const pageId = str(r.page_id)
+        if (!pageId) continue
+        // Only failures cool a page down; a 'created'/'pending' row never does.
+        const status = str(r.status).toLowerCase()
+        if (status && status !== 'failed' && status !== 'error' && status !== 'unsupported') continue
+        if (!isAdOnlyFatalError(`${str(r.error_message)} ${str(r.truncated_result_json)}`)) continue
+        const ts = Date.parse(str(r.created_at))
+        if (Number.isFinite(ts) && nowMs - ts > cooldownMs) continue
+        skipped.add(pageId)
+    }
+    return skipped
+}
+
+// Map an auto-picked candidate to the EXACT POST /api/dashboard/create-ad-only request body. The auto
+// scheduler always creates a LIVE, SPENDING ad, so it defaults to mode 'active' with the Bangkok
+// date-named daily campaign, the 10,000 THB/day CBO budget and a 24h run window — the same contract
+// requirement already implemented for the force-post CBO campaign. Like buildAdOnlyCreateBody it emits
+// NOTHING that could publish a page post (no video_url): it builds the ad from the existing FB video /
+// page story only. The create-ad-only endpoint re-validates and writes the dashboard_ad_history audit.
+export function buildAdOnlyAutoPickBody(input: {
+    candidate: AdOnlyAutoCandidate
+    dailyCampaignName: string
+    dailyBudgetThb?: number
+    runHours?: number
+}): Record<string, unknown> {
+    const c = input.candidate
+    const budget = Number.isFinite(Number(input.dailyBudgetThb)) && Number(input.dailyBudgetThb) > 0
+        ? Math.round(Number(input.dailyBudgetThb))
+        : DEFAULT_DAILY_BUDGET_THB
+    const hours = Number.isFinite(Number(input.runHours)) && Number(input.runHours) > 0
+        ? Math.round(Number(input.runHours))
+        : DEFAULT_RUN_HOURS
+    const body: Record<string, unknown> = {
+        page_id: str(c.pageId),
+        fb_video_id: str(c.videoId),
+        post_id: str(c.postId),
+        shopee_url: str(c.shopeeLink),
+        ad_name: str(c.adName) || str(c.videoId),
+        mode: 'active' as AdOnlyMode,
+        daily_campaign_name: str(input.dailyCampaignName),
+        daily_budget_thb: budget,
+        run_hours: hours,
+    }
+    return body
+}
+
+// Build the Shopee shortlink REQUEST url (page shortlink template / short.wwoom flow) for an
+// AD-ONLY re-mint. Mirrors the create-ad-only initial mint, but lets the caller inject sub2/sub3
+// derived from the bridge-returned story_id (sub2 = post id tail, sub3 = page id) instead of the
+// page-settings defaults (which can be blank before the ad's story exists). sub4/sub5 are emptied —
+// outbound tracking keeps internal ids out of the link. Templates without a {sub_id2}/{sub_id3}
+// placeholder simply carry no sub2/sub3 (same behaviour as the initial mint). Pure: no network.
+export function buildAdOnlyShortlinkRequestUrl(input: {
+    template: string
+    shopeeLink: string
+    sub1: string
+    sub2: string
+    sub3: string
+}): string {
+    const enc = (v: string): string => encodeURIComponent(str(v))
+    return str(input.template)
+        .replace('{url}', encodeURIComponent(str(input.shopeeLink)))
+        .replace('{sub_id}', enc(input.sub1))
+        .replace('{sub_id2}', enc(input.sub2))
+        .replace('{sub_id3}', enc(input.sub3))
+        .replace('{sub_id4}', '')
+        .replace('{sub_id5}', '')
+}
+
+// =====================================================================
+// PAID AD CTA REPAIR — pure helpers for the active ad-only finalization step that fixes the PAID ad
+// creative's CTA in Ads Manager. The paid ad is created BEFORE the final post-specific shortlink is
+// minted, so its creative carries a placeholder link (sub2/sub3 unset). After the worker mints the
+// final shortlink it calls the bridge POST /repair-ad-cta to re-point the ad at a NEW creative whose
+// CTA is the SAME finalLink the visible CTA + Page comment use. These keep that request-body build +
+// response-mapping unit-testable without the bridge/network.
+// =====================================================================
+
+// Build the POST /repair-ad-cta request body. `finalLink` is the single post-specific Shopee link
+// shared by the visible CTA, the Page comment AND this paid-ad CTA. Omits empty optional fields so
+// the bridge applies its own backfill (it reads the old creative for video/image/message).
+export function buildPaidAdCtaRepairBody(input: {
+    pageId: string
+    adId: string
+    finalLink: string
+    creativeId?: string
+    videoId?: string
+    caption?: string
+    adAccount?: string
+    templateAdset?: string
+    sourceStoryId?: string
+    adName?: string
+    thumbnailUrl?: string
+}): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+        page_id: str(input.pageId),
+        ad_id: str(input.adId),
+        final_cta_link: str(input.finalLink),
+    }
+    const creativeId = str(input.creativeId); if (creativeId) body.creative_id = creativeId
+    const videoId = str(input.videoId); if (videoId) body.video_id = videoId
+    const caption = str(input.caption); if (caption) body.caption = caption
+    const adAccount = str(input.adAccount); if (adAccount) body.ad_account = adAccount
+    const templateAdset = str(input.templateAdset); if (templateAdset) body.template_adset = templateAdset
+    const sourceStoryId = str(input.sourceStoryId); if (sourceStoryId) body.source_story_id = sourceStoryId
+    const adName = str(input.adName); if (adName) body.ad_name = adName
+    const thumbnailUrl = str(input.thumbnailUrl); if (thumbnailUrl) body.thumbnail_url = thumbnailUrl
+    return body
+}
+
+// The audit fields merged onto bridgeResult after a /repair-ad-cta call.
+export interface PaidAdCtaRepairSummary {
+    paid_cta_update_status: 'success' | 'failed'
+    paid_ad_cta_link?: string
+    paid_ad_cta_final?: boolean
+    paid_new_creative_id?: string
+    paid_old_creative_id?: string
+    paid_cta_update_error?: string
+}
+
+// Map a /repair-ad-cta bridge response into the bridgeResult audit fields. NEVER claims success
+// unless the bridge returned ok AND a read-back-confirmed paid_ad_cta_final. Pure.
+export function summarizePaidAdCtaRepair(
+    data: Record<string, unknown> | null | undefined,
+    httpOk: boolean,
+): PaidAdCtaRepairSummary {
+    const d = data || {}
+    const newCreativeId = str(d.new_creative_id)
+    const oldCreativeId = str(d.old_creative_id)
+    if (httpOk && d.ok === true && d.paid_ad_cta_final === true) {
+        const summary: PaidAdCtaRepairSummary = {
+            paid_cta_update_status: 'success',
+            paid_ad_cta_link: str(d.paid_ad_cta_link) || str(d.final_cta_link),
+            paid_ad_cta_final: true,
+        }
+        if (newCreativeId) summary.paid_new_creative_id = newCreativeId
+        if (oldCreativeId) summary.paid_old_creative_id = oldCreativeId
+        return summary
+    }
+    const errBase = str(d.step) ? `${str(d.step)}:${str(d.error)}` : (str(d.error) || 'repair_ad_cta_failed')
+    const summary: PaidAdCtaRepairSummary = {
+        paid_cta_update_status: 'failed',
+        paid_ad_cta_final: d.paid_ad_cta_final === true,
+        paid_cta_update_error: errBase.slice(0, 200),
+    }
+    if (newCreativeId) summary.paid_new_creative_id = newCreativeId
+    if (oldCreativeId) summary.paid_old_creative_id = oldCreativeId
+    return summary
+}
+
 const MAX_RESULT_JSON = 4000
 
 // Truncate a raw bridge/result object to a bounded JSON string for the audit row. Never throws.

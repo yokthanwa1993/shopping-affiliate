@@ -6,7 +6,7 @@ ingress:
   # tunnel so the Worker has a durable URL without needing a new DNS record.
   # All other paths continue to the shortlink service on 8810.
   - hostname: short.wwoom.com
-    path: ^/(token|pages|post|page-comment|create-ad|promote|update-cta|publish-story)(/.*)?$
+    path: ^/(token|pages|post|page-comment|create-ad|promote|update-cta|repair-ad-cta|pause-ad-only|publish-story)(/.*)?$
     service: http://127.0.0.1:8820
   - hostname: short.wwoom.com
     service: http://127.0.0.1:8810

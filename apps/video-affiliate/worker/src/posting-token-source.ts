@@ -68,6 +68,22 @@ export function postingSourceHint(route: PostingRoute): PostingSourceHint {
     return 'stored_token'
 }
 
+// Power Editor / CloakBrowser is ADMIN-OWNED ONLY. The session-cookie bridge only knows the
+// admin operator's own logged-in Pages, so a member/team (non-admin) namespace can never post
+// or comment through it — attempting to does NOT degrade gracefully, it hard-fails
+// `session_bridge_page_not_authorized`. This guard collapses ANY non-stored source down to
+// 'stored_token' for non-admin namespaces, regardless of whether the value came from a stale
+// legacy DB alias or a client save payload. It is the single chokepoint that keeps member
+// pages (e.g. ข่าวสด) on their own manually stored Facebook Lite/Page token. Admin namespaces
+// pass through unchanged, so explicit Power Editor selections keep working exactly as before.
+export function restrictCloakToAdminNamespace(
+    source: PagePostingTokenSource,
+    isAdminNamespace: boolean,
+): PagePostingTokenSource {
+    if (isAdminNamespace) return source
+    return 'stored_token'
+}
+
 // ---- Per-page Facebook COMMENT token source -------------------------------
 // Independent, per-page selector for HOW the automatic affiliate comment is sent
 // AFTER a post. Same two canonical values as the posting source, but decoupled so an

@@ -32,9 +32,9 @@ test('LaunchAgent plist pins label, command, paths, and opt-in startup', () => {
   assert.match(plist, /<string>HOME=\/Users\/yok-macmini<\/string>/);
   assert.match(plist, /<string>NODE_ENV=production<\/string>/);
   assert.match(plist, /<string>PORT=8820<\/string>/);
-  assert.match(plist, /<string>npm<\/string>[\s\S]*<string>--prefix<\/string>[\s\S]*<string>\/Users\/yok-macmini\/Developer\/shopping-affiliate\/apps\/facebook-token-cloak<\/string>[\s\S]*<string>start<\/string>/);
-  assert.match(plist, /<key>RunAtLoad<\/key>\s*<false\/>/);
-  assert.match(plist, /<key>KeepAlive<\/key>\s*<false\/>/);
+  assert.match(plist, /<string>node<\/string>[\s\S]*<string>\/Users\/yok-macmini\/Developer\/shopping-affiliate\/apps\/facebook-token-cloak\/bin\/start\.js<\/string>/);
+  assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
+  assert.match(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
   assert.doesNotMatch(plist, /<string>\/bin\/(?:ba)?sh<\/string>/);
 });
 

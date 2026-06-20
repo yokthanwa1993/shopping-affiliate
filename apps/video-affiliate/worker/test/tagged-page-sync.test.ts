@@ -873,7 +873,9 @@ test('force-post routes CloakBrowser OneCard vs organic Reel without stored-toke
     // Effective decision is centralized in the tested resolvePostingRoute helper.
     assert.match(routeSource, /normalizePagePostingTokenSource\(\(page as Record<string, unknown>\)\.posting_token_source\)/)
     // The Video One Card flag selects OneCard/create-ad vs organic Reel for a CloakBrowser page.
-    assert.match(routeSource, /resolvePostingRoute\(\{ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag \}\)/)
+    // The legacy ads_publish_enabled bridge promotion is admin-owned only, so it is gated on
+    // namespace ownership (&& namespaceIsAdminOwned) alongside the source admin guard.
+    assert.match(routeSource, /resolvePostingRoute\(\{ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag && namespaceIsAdminOwned \}\)/)
     assert.match(routeSource, /const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'/)
     // Cloak organic branch routes to the session-cookie bridge, never the stored token.
     assert.match(routeSource, /const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'/)
@@ -885,12 +887,15 @@ test('force-post routes CloakBrowser OneCard vs organic Reel without stored-toke
     // purpose — only the UI/source modes collapse to two (stored_token | cloak_browser).
     // Renaming the stored hint would force a post_history data migration, so it is left as-is.
     assert.match(routeSource, /post_token_hint='cloak_session_bridge'/)
-    // Cloak branch builds an affiliate comment and records its real status (no fake success).
-    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*buildAffiliateCommentMessage\(env\.DB, botId, cloakCommentShopeeLink\)/)
+    // Cloak comment re-mints the link with the post id (sub2=post id / sub3=page id), builds the
+    // affiliate comment from that re-minted link, and posts it AS THE PAGE via the shared fail-closed
+    // bridge helper — the comment status comes from the bridge result (never a fake success).
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*buildAffiliateCommentMessage\(env\.DB, botId, commentShopeeLink\)[\s\S]*sendPageCommentViaCloakBridge\(\{[\s\S]*message: cloakOverrideText/)
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*cloakCommentStatus = bridged\.status/)
     // Comment SOURCE is decoupled from posting route: the bridge only posts the comment when
-    // comment_token_source='cloak_browser'; otherwise the stored-token backlog handles it.
-    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*commentText: commentViaCloakBridge \? cloakCommentText : ''/)
-    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*if \(commentViaCloakBridge\) \{[\s\S]*cloakCommentStatus = !cloakCommentText[\s\S]*cloakResult\.commentId \? 'success' : 'failed'/)
+    // comment_token_source='cloak_browser' (commentViaCloakBridge); otherwise the stored-token
+    // backlog handles it.
+    assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*if \(commentViaCloakBridge\) \{/)
     // The stored-token override defers via comment_due_at (pending backlog).
     assert.match(routeSource, /if \(pageCloakPostSelected\) \{[\s\S]*cloakCommentStatus = 'pending'/)
     // No facebook-token-cloak provider endpoints / env / port anywhere in the branch.
@@ -929,15 +934,17 @@ test('cron routes CloakBrowser OneCard vs organic Reel without stored-token fall
     assert.match(cronSource, /SELECT[\s\S]*ads_publish_enabled, posting_token_source, comment_token_source\s*\n\s*FROM pages/)
     // Same centralized decision as force-post; never silently falls back to the stored token.
     assert.match(cronSource, /normalizePagePostingTokenSource\(page\.posting_token_source\)/)
-    assert.match(cronSource, /resolvePostingRoute\(\{ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag \}\)/)
+    // Mirror of the force-post guard: legacy ads_publish_enabled promotion is admin-gated.
+    assert.match(cronSource, /resolvePostingRoute\(\{ source: pagePostingTokenSource, oneCardEnabled: pageOneCardEnabled, adsPublishLegacyFlag: pageAdsPublishLegacyFlag && namespaceIsAdminOwned \}\)/)
     assert.match(cronSource, /const pageAdsPublishEnabled = pagePostingRoute === 'cloak_onecard_bridge'/)
     assert.match(cronSource, /const pageCloakPostSelected = pagePostingRoute === 'cloak_organic_reel'/)
     // Cloak organic branch uses the session-cookie bridge and fails closed.
     assert.match(cronSource, /if \(pageCloakPostSelected\) \{[\s\S]*publishReelViaSessionBridge[\s\S]*cloak_post_failed/)
     // Cloak post hint must NOT derive from a stored/manual token candidate.
     assert.match(cronSource, /const initialPostTokenHint = pageCloakPostSelected \? 'cloak_session_bridge' : deriveCommentTokenHint/)
-    // Cloak branch builds an affiliate comment and records its real status.
-    assert.match(cronSource, /if \(pageCloakPostSelected\) \{[\s\S]*buildAffiliateCommentMessage\(env\.DB, botId, cloakCommentShopeeLink\)[\s\S]*cloakResult\.commentId \? 'success' : 'failed'/)
+    // Cloak branch re-mints the link with the post id, builds an affiliate comment from it, and
+    // posts AS THE PAGE via the shared fail-closed bridge helper (status from the bridge result).
+    assert.match(cronSource, /if \(pageCloakPostSelected\) \{[\s\S]*buildAffiliateCommentMessage\(env\.DB, botId, commentShopeeLink\)[\s\S]*sendPageCommentViaCloakBridge\(\{[\s\S]*message: cloakOverrideText[\s\S]*cloakCommentStatus = bridged\.status/)
     assert.ok(!cronSource.includes('/provider/post'), 'must not call the old /provider/post')
     assert.ok(!cronSource.includes('FACEBOOK_TOKEN_CLOAK'), 'must not read FACEBOOK_TOKEN_CLOAK env')
     // Admin-only runtime re-check preserved on the cron ads branch.
@@ -1066,8 +1073,9 @@ test('force-post ads branch passes the pre-shortened managed link as comment_sho
     assert.match(callBlock, /shopee_url:\s*rawShopeeLink \|\| normalizedShopeeLink/)
     // Comment shortlink is the already managed/shortened link so create-ad won't re-shorten.
     assert.match(callBlock, /comment_shortlink:\s*normalizedShopeeLink/)
-    // Internal gallery id is uploaded by URL, NOT sent as a Facebook video id.
-    assert.match(callBlock, /video_url:\s*realVideoUrl/)
+    // Internal gallery id is uploaded by URL (the avatar-composed posting URL derived from
+    // realVideoUrl), NOT sent as a Facebook video id.
+    assert.match(callBlock, /video_url:\s*postingVideoUrl/)
     assert.match(callBlock, /source_video_id:\s*unpostedId/)
     assert.doesNotMatch(callBlock, /\bvideo_id:\s*unpostedId/)
 })
@@ -1081,8 +1089,9 @@ test('cron ads branch passes the pre-shortened managed link as comment_shortlink
 
     assert.match(callBlock, /shopee_url:\s*rawShopeeLink \|\| normalizedShopeeLink/)
     assert.match(callBlock, /comment_shortlink:\s*normalizedShopeeLink/)
-    // Internal gallery id is uploaded by URL, NOT sent as a Facebook video id.
-    assert.match(callBlock, /video_url:\s*realVideoUrl/)
+    // Internal gallery id is uploaded by URL (the avatar-composed posting URL derived from
+    // realVideoUrl), NOT sent as a Facebook video id.
+    assert.match(callBlock, /video_url:\s*postingVideoUrl/)
     assert.match(callBlock, /source_video_id:\s*unpostedId/)
     assert.doesNotMatch(callBlock, /\bvideo_id:\s*unpostedId/)
 })
@@ -1161,8 +1170,9 @@ test('post-first OneCard is opt-in via ADS_POST_FIRST_ENABLED and runs A→mint�
     assert.match(helper, /visiblePageCtaLink = String\(dataB\.visible_page_cta_link \|\| ''\)\.trim\(\)/)
     assert.match(helper, /visiblePageCtaFinal = dataB\.visible_page_cta_final === true/)
     assert.doesNotMatch(helper, /visible_page_cta_link \|\| dataB\.promoted_ad_cta_link/)
-    // Comment the SAME final link on the visible post, as the Page.
-    assert.match(helper, /\$\{baseUrl\}\/page-comment`[\s\S]*story_id: storyId, message: commentText/)
+    // Comment the SAME final link on the visible post, as the Page, via the shared fail-closed
+    // bridge helper targeting the Page story id.
+    assert.match(helper, /sendPageCommentViaCloakBridge\(\{[\s\S]*storyId,[\s\S]*message: commentText/)
     // CTA/comment parity flag is only true when the final link was actually re-minted.
     assert.match(helper, /ctaParity: !!finalLink && remint\.reminted/)
     // Never publishes a second page post — that is the bridge /promote contract; helper must

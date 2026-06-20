@@ -196,6 +196,24 @@ export function parseAffiliateId(url: string): string {
     return extractShopeeAffiliateIdFromLink(url)
 }
 
+export type ParsedCtaObject = { type: string; title: string; url: string }
+
+// Pure: normalise a Facebook Graph `call_to_action` object into {type,title,url}.
+// CTA buttons come back shaped { type, value: { link|url|title } } (the page-story
+// / post form) or with a flat title/link; this returns null when no usable
+// type/title/url is present. Network-free so the one-post CTA rewrite can parse a
+// read-back CTA without pulling in the Worker runtime. Never reads tokens.
+export function parseGraphCtaObject(cta: unknown): ParsedCtaObject | null {
+    if (!cta || typeof cta !== 'object') return null
+    const obj = cta as Record<string, unknown>
+    const value = (obj.value && typeof obj.value === 'object') ? obj.value as Record<string, unknown> : undefined
+    const type = String(obj.type || '').trim()
+    const title = String(value?.title || obj.title || '').trim()
+    const url = String(value?.link || value?.url || obj.link || obj.url || '').trim()
+    if (!type && !title && !url) return null
+    return { type, title, url }
+}
+
 // Resolve the affiliate id the rewrite SHOULD mint with. Defaults to the CHEARB
 // customlink account id; an operator override is honoured ONLY when it normalises
 // to a valid numeric id (an_ stripped, digits-only, length-capped). Anything

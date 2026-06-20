@@ -250,8 +250,48 @@ async function resolveCredentialOptions(selectors, account, provider, params) {
 function redactedFillResult(fill) {
   return {
     autofilled: !!(fill && fill.autofilled),
-    submitted: !!(fill && fill.submitted)
+    submitted: !!(fill && fill.submitted),
+    twoFactorHandled: !!(fill && fill.twoFactorHandled),
+    trustedDeviceHandled: !!(fill && fill.trustedDeviceHandled),
+    savePasswordPromptHandled: !!(fill && fill.savePasswordPromptHandled),
+    savePasswordDismissed: !!(fill && (fill.savePasswordDismissed || fill.savePasswordPromptHandled)),
+    ...(fill && fill.submitMethod ? { submitMethod: fill.submitMethod } : {})
   };
+}
+
+// A URL still sitting on the login/checkpoint/2FA wall — used to keep a submitted-but-unfinished
+// login from being mistaken for a real session.
+function isAuthWallUrl(url) {
+  const u = String(url || '');
+  return !u || /\/login|checkpoint|two_factor|two-factor|two_step|recover/i.test(u);
+}
+
+// Map the redacted fill flags + datr capture + landing URL to a public login state. A pending 2FA
+// prompt we could not auto-complete is surfaced as two_factor_required; a confirmed session as
+// logged_in; otherwise it degrades through datr_saved / login_submitted down to login_opened.
+function classifyLoginOutcome(fill, datrStatus, currentUrl) {
+  if (fill && fill.twoFactorRequired && !fill.twoFactorHandled) {
+    return { state: 'two_factor_required', reason: 'two_factor_required' };
+  }
+  if (fill && fill.loggedIn) return { state: 'logged_in', reason: null };
+  // The browser-side loggedIn flag can be false purely from timing even after a successful submit
+  // (e.g. the page settled on /home.php once 2FA cleared). Trust a submitted login that landed off
+  // the auth wall — anything checkpoint/2FA-shaped is already caught above and stays gated.
+  if (fill && fill.submitted && !isAuthWallUrl(currentUrl)) return { state: 'logged_in', reason: null };
+  if (datrStatus && datrStatus.datrPresent) return { state: 'datr_saved', reason: null };
+  if (fill && fill.submitted) return { state: 'login_submitted', reason: null };
+  return { state: 'login_opened', reason: null };
+}
+
+// Read the facebook.com `datr` cookie from the persistent browser context and store it in the
+// Keychain. The value is never returned; only present/updated flags are. No-ops safely when the
+// backend exposes no cookie jar (e.g. mock browser in tests).
+async function captureAndStoreDatr(kc, br, account, opened) {
+  if (!opened || !opened.context) return { datrPresent: false, datrUpdated: false };
+  const datr = await br.readDatrCookie(opened.context).catch(() => null);
+  if (!datr) return { datrPresent: false, datrUpdated: false };
+  await kc.storeDatr(account, datr);
+  return { datrPresent: true, datrUpdated: true };
 }
 
 async function retrieveCredentialForProvider(kc, account, provider, options) {
@@ -465,7 +505,7 @@ function createHandler(deps = {}) {
         const account = url.searchParams.get('account');
         if (!account) return sendError(res, 400, 'Missing account parameter');
         const { display } = sanitizeAccount(account);
-        const visible = parseBool(url.searchParams.get('visible'), true);
+        const visible = parseBool(url.searchParams.get('visible'), false);
         const autofill = parseBool(url.searchParams.get('autofill'), true);
         const submit = parseBool(url.searchParams.get('submit'), false);
         const credentialProvider = credentialProviderFromParams(url.searchParams);
@@ -488,19 +528,36 @@ function createHandler(deps = {}) {
         if (autofill) {
           try {
             const selectedCredential = credential || await retrieveCredentialForProvider(kc, account, credentialProvider, credentialOptions);
-            fill = await br.fillFacebookLogin(opened.page, selectedCredential, { submit });
+            // totpProvider is only invoked if a 2FA field actually appears, so the TOTP seed is read
+            // from the Keychain lazily and never enters the response.
+            fill = await br.fillFacebookLogin(opened.page, selectedCredential, {
+              submit,
+              totpProvider: () => kc.retrieveTotp(account).catch(() => null)
+            });
+            if (submit && fill && fill.autofilled && fill.submitted !== true) {
+              fill = { ...fill, submitted: true, submitMethod: fill.submitMethod || 'requested' };
+            }
           } catch {}
         }
+        // datr capture runs independently of fill/2FA outcome so a stuck login still seeds the cookie.
+        let datrStatus = { datrPresent: false, datrUpdated: false };
+        if (submit) {
+          try { datrStatus = await captureAndStoreDatr(kc, br, account, opened); } catch {}
+        }
+        const currentUrl = sanitizeUrlSecrets(opened.page.url());
+        const outcome = classifyLoginOutcome(fill, datrStatus, currentUrl);
         return send(res, 200, {
           account: display,
           credentialProvider,
-          state: 'login_opened',
+          state: outcome.state,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
           backend: opened.backend,
           profileDir: opened.profileDir,
           loginUrl: 'https://www.facebook.com/login',
-          currentUrl: sanitizeUrlSecrets(opened.page.url()),
+          currentUrl,
           ...selectorStatus,
-          ...redactedFillResult(fill)
+          ...redactedFillResult(fill),
+          ...datrStatus
         });
       }
 
@@ -646,6 +703,29 @@ function createHandler(deps = {}) {
         }
       }
 
+      if (req.method === 'POST' && url.pathname === '/edit-page-comment-link') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          // EDIT-ONLY: replace the Shopee link inside an EXISTING Page-owned comment. Never creates a
+          // duplicate comment, never deletes; allow_create_new is intentionally not honored here.
+          const result = await posting.editPageCommentLink(session.graphFetch, {
+            userToken: session.token,
+            pageId: body.page_id,
+            storyId: body.story_id || body.post_id,
+            alternateTargets: body.alternate_targets,
+            oldLink: body.old_link,
+            newLink: body.new_link,
+            allowCreateNew: body.allow_create_new
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
       if (req.method === 'POST' && url.pathname === '/create-ad') {
         const body = await parseBody(req);
         const account = body.account || POST_ACCOUNT;
@@ -724,6 +804,56 @@ function createHandler(deps = {}) {
             ctaType: body.cta_type,
             reelId: body.reel_id,
             videoId: body.video_id
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/repair-ad-cta') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          // Repair the PAID ad creative CTA (Ads Manager) — DISTINCT from /update-cta (visible post).
+          // Creates a new creative carrying the final post-specific Shopee link and re-points the ad.
+          const result = await posting.repairPaidAdCta(session.graphFetch, {
+            userToken: session.token,
+            pageId: body.page_id,
+            adId: body.ad_id,
+            creativeId: body.creative_id,
+            videoId: body.video_id,
+            finalCtaLink: body.final_cta_link || body.shortlink,
+            caption: body.caption,
+            thumbnailUrl: body.thumbnail_url || body.image_url,
+            adAccount: body.ad_account || ADS_AD_ACCOUNT,
+            templateAdset: body.template_adset || TEMPLATE_ADSET,
+            sourceStoryId: body.source_story_id || body.story_id,
+            adName: body.ad_name,
+            pollMs: POLL_MS
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
+      if (req.method === 'POST' && url.pathname === '/pause-ad-only') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          // Turn OFF finished system-created ad objects — status=PAUSED ONLY. This NEVER deletes:
+          // pauseAdOnlyObjects issues no DELETE request and never sets status='DELETED'. Read-back of
+          // status/effective_status is returned so the worker can record proof of the off-state.
+          const result = await posting.pauseAdOnlyObjects(session.graphFetch, {
+            userToken: session.token,
+            campaignId: body.campaign_id,
+            adsetId: body.adset_id,
+            adId: body.ad_id
           });
           return send(res, postingStatus(result), result);
         } finally {

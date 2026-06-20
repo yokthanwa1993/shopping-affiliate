@@ -29,6 +29,12 @@ function assertNoLeak(value) {
 function graphRoute(url, method, pages, opts = {}) {
   const u = String(url);
   const reqBody = String(opts.body || '');
+  // pause-ad-only: status read-back after a { status: 'PAUSED' } write. Must precede the daily-
+  // campaign adset readback below (which matches the broader /effective_status/). The pause readback
+  // requests EXACTLY fields=status,effective_status; echo PAUSED so auto-pause can confirm the off-state.
+  if (method === 'GET' && /\?fields=status,effective_status&/.test(u)) {
+    return { status: 'PAUSED', effective_status: 'PAUSED' };
+  }
   // CAMPAIGN-level (CBO) budget update POST on a REUSED daily campaign: { daily_budget } only, sent
   // to the campaign id (NOT an adset). opts.campaignBudgetError simulates a Graph error on it — the
   // bridge treats this update as best-effort and must NOT fail the whole flow.
@@ -100,6 +106,19 @@ function graphRoute(url, method, pages, opts = {}) {
       ...(opts.publishReadbackPermalink ? { permalink_url: opts.publishReadbackPermalink } : {})
     };
   }
+  // repair-ad-cta: read the OLD paid creative's object_story_spec (backfill video/image/message +
+  // the placeholder link the live bug left). Keyed on the creative id the test supplies (OLDCR).
+  if (method === 'GET' && /\/OLDCR\?fields=object_story_spec/.test(u)) {
+    return { object_story_spec: { page_id: LIVE_PAGE_ID, video_data: { video_id: 'EXISTINGVID', image_url: 'https://thumb/old.jpg', message: 'cap', call_to_action: { type: 'SHOP_NOW', value: { link: 'https://s.shopee.co.th/PLACEHOLDER----' } } } } };
+  }
+  // repair-ad-cta: ad creative READBACK after the ad is re-pointed at the new creative. Echoes the
+  // link baked into the most recently created adcreative (captured below) so paid_ad_cta_final is a
+  // real confirmation; opts.repairReadbackCtaLink/CreativeId override it to exercise a failed confirm.
+  if (method === 'GET' && /\/AD1\?fields=creative/.test(u)) {
+    const link = opts.repairReadbackCtaLink !== undefined ? opts.repairReadbackCtaLink : ((opts._repairState && opts._repairState.lastCreativeLink) || '');
+    const cid = opts.repairReadbackCreativeId !== undefined ? opts.repairReadbackCreativeId : 'CR1';
+    return { creative: { id: cid, ...(link ? { object_story_spec: { video_data: { call_to_action: { type: 'SHOP_NOW', value: { link } } } } } : {}) } };
+  }
   if (u.includes('/me/accounts')) return { data: pages };
   // Source-post attachment lookup: the freshly posted page video's attachment target id.
   // attachmentVideoId === '' simulates a post with no resolvable video (empty target id).
@@ -125,7 +144,17 @@ function graphRoute(url, method, pages, opts = {}) {
   }
   if (/\/advideos\?/.test(u) && method === 'POST') return { id: 'VID123' };
   if (/fields=thumbnails/.test(u)) return { thumbnails: { data: [{ id: 't1', uri: 'https://thumb/x.jpg' }] } };
-  if (/\/adcreatives/.test(u) && method === 'POST') return { id: 'CR1' };
+  if (/\/adcreatives/.test(u) && method === 'POST') {
+    // Capture the CTA link baked into the created creative so the repair-ad-cta readback echoes it.
+    if (opts._repairState) {
+      try {
+        const spec = JSON.parse(reqBody || '{}').object_story_spec;
+        const link = spec && spec.video_data && spec.video_data.call_to_action && spec.video_data.call_to_action.value && spec.video_data.call_to_action.value.link;
+        if (link) opts._repairState.lastCreativeLink = String(link);
+      } catch {}
+    }
+    return { id: 'CR1' };
+  }
   if (/fields=effective_object_story_id/.test(u) && method === 'GET') return { effective_object_story_id: `${LIVE_PAGE_ID}_STORY9` };
   if (/\/ads\?fields=creative/.test(u)) return { data: [{ creative: { id: 'TPLCR' } }] };
   if (/TPLCR\?fields=call_to_action_type/.test(u)) return { call_to_action_type: opts.ctaType || 'SHOP_NOW' };
@@ -165,6 +194,36 @@ function graphRoute(url, method, pages, opts = {}) {
   }
   if (/\/ads\?fields=id/.test(u) && method === 'GET') return { data: [{ id: 'AD1' }] };
   if (/\/ads\?/.test(u) && method === 'POST') return { id: 'AD1' };
+  // edit-page-comment-link: READ comments on a target (GET /{target}/comments?fields=id,message,from…).
+  // opts.commentsByTarget maps a target id → array of comment objects; a target absent from the map
+  // (or no map) returns an empty list so the helper falls through to the next read candidate.
+  if (method === 'GET' && /\/comments\?fields=id,message,from/.test(u)) {
+    const map = opts.commentsByTarget || {};
+    let list = [];
+    for (const key of Object.keys(map)) {
+      if (u.includes(`/${encodeURIComponent(key)}/comments`)) { list = map[key]; break; }
+    }
+    return { data: list };
+  }
+  // edit-page-comment-link: the EDIT itself — official Graph edit POST /{comment_id} { message }. The
+  // URL ends with the comment id (no query). Records the edited message so the readback echoes it.
+  if (method === 'POST' && /\/COMMENT[^/?]*$/.test(u) && /"message"/.test(reqBody)) {
+    if (opts._editState) { try { opts._editState.editedMessage = JSON.parse(reqBody || '{}').message; } catch {} }
+    if (opts.commentEditError) return { error: { message: 'Edit failed', code: 100 } };
+    return { id: opts.editCommentId || 'COMMENTOLD', success: true };
+  }
+  // edit-page-comment-link: direct READBACK of the same comment id (GET /{comment_id}?fields=id,
+  // message,from,permalink_url). Echoes the edited message + a from.id (default the live page).
+  if (method === 'GET' && /\/COMMENT[^/?]*\?fields=id,message,from,permalink_url/.test(u)) {
+    const edited = (opts._editState && opts._editState.editedMessage) || '';
+    const fromId = opts.readbackFromId !== undefined ? opts.readbackFromId : LIVE_PAGE_ID;
+    return {
+      id: opts.editCommentId || 'COMMENTOLD',
+      message: edited,
+      from: { id: fromId, name: 'Page' },
+      permalink_url: 'https://www.facebook.com/comment/COMMENTOLD'
+    };
+  }
   if (/\/comments/.test(u) && method === 'POST') return { id: 'COMMENT1' };
   return { success: true };
 }
@@ -199,8 +258,17 @@ function makeBrowser(opts = {}) {
     publishError: opts.publishError, publishErrorCode: opts.publishErrorCode,
     publishErrorMessage: opts.publishErrorMessage, publishReadbackPublished: opts.publishReadbackPublished,
     publishFailTimes: opts.publishFailTimes, publishReadbackPermalink: opts.publishReadbackPermalink,
+    repairReadbackCtaLink: opts.repairReadbackCtaLink, repairReadbackCreativeId: opts.repairReadbackCreativeId,
+    // edit-page-comment-link routing: which comments each target exposes + edit/readback overrides.
+    commentsByTarget: opts.commentsByTarget, commentEditError: opts.commentEditError,
+    editCommentId: opts.editCommentId, readbackFromId: opts.readbackFromId,
     // Shared mutable counter so publishFailTimes survives the per-request `{ ...routeOpts }` copy.
-    _publishState: { count: 0 }
+    _publishState: { count: 0 },
+    // Shared mutable state so the edit-page-comment-link readback echoes the just-edited message.
+    _editState: { editedMessage: '' },
+    // Shared mutable state so the repair-ad-cta readback can echo the link of the creative just
+    // created (survives the per-request `{ ...routeOpts }` shallow copy, like _publishState).
+    _repairState: { lastCreativeLink: '' }
   };
 
   const apiRequest = opts.noApiRequest ? undefined : {
@@ -466,6 +534,128 @@ test('POST /page-comment fail-closed (no_session) when the profile is not logged
   assert.equal(r.body.error, 'no_session');
 });
 
+// ---------------------------------------------------------------------------
+// POST /edit-page-comment-link — EDIT (never create) the Shopee link inside an EXISTING Page-owned
+// comment. Discovery order is strict (full story first, alternate_targets only on no match); the
+// matched comment must be authored by the page; allow_create_new is never honored; nothing is ever
+// created or deleted.
+// ---------------------------------------------------------------------------
+const ECL_STORY = `${LIVE_PAGE_ID}_768749526323172`;
+const ECL_OLD = 'https://s.shopee.co.th/5q5l46qSw4';
+const ECL_NEW = 'https://s.shopee.co.th/8pjWjs1coO';
+const eclComment = (overrides = {}) => ({
+  id: 'COMMENTOLD',
+  from: { id: LIVE_PAGE_ID, name: 'คอนเทนต์ป้ายยา' },
+  message: `📌 พิกัดอยู่ตรงนี้เลย 👇\n🧡 Shopee : ${ECL_OLD}`,
+  created_time: '2026-06-18T10:00:00+0700',
+  permalink_url: 'https://www.facebook.com/comment/COMMENTOLD',
+  ...overrides
+});
+
+test('POST /edit-page-comment-link finds the Page comment ON THE STORY and edits the SAME comment, verifies readback, never creates', async () => {
+  const browser = makeBrowser({ commentsByTarget: { [ECL_STORY]: [eclComment()] } });
+  await listen({ browser });
+  const r = await req('POST', '/edit-page-comment-link', {
+    page_id: LIVE_PAGE_ID,
+    story_id: ECL_STORY,
+    alternate_targets: ['1664564174693233', '768749526323172'],
+    old_link: ECL_OLD,
+    new_link: ECL_NEW,
+    allow_create_new: false
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'edit_page_comment_link');
+  assert.equal(r.body.comment_id, 'COMMENTOLD');
+  assert.equal(r.body.target_used, ECL_STORY, 'edited the comment found on the full story target');
+  assert.equal(r.body.old_link_gone, true);
+  assert.equal(r.body.new_link_present, true);
+  assert.equal(r.body.author_page_verified, true);
+  assert.ok(r.body.final_message_first_line.includes('พิกัด'), 'returns first line only');
+  // The edit POST targets the SAME comment id (no query) and carries the replaced message.
+  const editPost = browser.calls.find((c) => /\/COMMENTOLD$/.test(c.url) && c.method === 'POST');
+  assert.ok(editPost, 'an edit POST to /{comment_id} was issued');
+  const sent = JSON.parse(editPost.body);
+  assert.ok(sent.message.includes(ECL_NEW) && !sent.message.includes(ECL_OLD), 'edited message swaps old→new link');
+  // HARD GUARANTEE: never POST to /{target}/comments (that would CREATE a duplicate).
+  assert.ok(!browser.calls.some((c) => /\/comments(\?|$)/.test(c.url) && c.method === 'POST'), 'must NOT create a comment');
+  assertNoLeak(r.body);
+});
+
+test('POST /edit-page-comment-link falls back to an alternate READ target ONLY after the story has no match', async () => {
+  const ALT = '1664564174693233';
+  const browser = makeBrowser({ commentsByTarget: { [ALT]: [eclComment()] } }); // story target → empty
+  await listen({ browser });
+  const r = await req('POST', '/edit-page-comment-link', {
+    page_id: LIVE_PAGE_ID,
+    story_id: ECL_STORY,
+    alternate_targets: [ALT, '768749526323172'],
+    old_link: ECL_OLD,
+    new_link: ECL_NEW,
+    allow_create_new: false
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.target_used, ALT, 'used the alternate read target after the story had no match');
+  // Order: the FULL story comments are read BEFORE any alternate target.
+  const storyReadIdx = browser.calls.findIndex((c) => c.method === 'GET' && c.url.includes(`/${ECL_STORY}/comments`));
+  const altReadIdx = browser.calls.findIndex((c) => c.method === 'GET' && c.url.includes(`/${ALT}/comments`));
+  assert.ok(storyReadIdx >= 0 && altReadIdx >= 0, 'both targets were read');
+  assert.ok(storyReadIdx < altReadIdx, 'the full story is read before the alternate target');
+  assert.ok(!browser.calls.some((c) => /\/comments(\?|$)/.test(c.url) && c.method === 'POST'), 'must NOT create a comment');
+  assertNoLeak(r.body);
+});
+
+test('POST /edit-page-comment-link rejects missing new_link and rejects allow_create_new:true WITHOUT creating/editing', async () => {
+  // (a) missing new_link → validate.
+  let browser = makeBrowser({ commentsByTarget: { [ECL_STORY]: [eclComment()] } });
+  await listen({ browser });
+  let r = await req('POST', '/edit-page-comment-link', { page_id: LIVE_PAGE_ID, story_id: ECL_STORY, old_link: ECL_OLD });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+  assert.ok(!browser.calls.some((c) => c.method === 'POST'), 'no Graph write on validation failure');
+  await new Promise((resolve) => server.close(resolve));
+  server = null;
+
+  // (b) allow_create_new:true → never supported here; must not create or edit anything.
+  browser = makeBrowser({ commentsByTarget: { [ECL_STORY]: [eclComment()] } });
+  await listen({ browser });
+  r = await req('POST', '/edit-page-comment-link', {
+    page_id: LIVE_PAGE_ID, story_id: ECL_STORY, old_link: ECL_OLD, new_link: ECL_NEW, allow_create_new: true
+  });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.error, 'create_new_not_supported');
+  assert.ok(!browser.calls.some((c) => /\/comments(\?|$)/.test(c.url) && c.method === 'POST'), 'must NOT create a comment');
+  assert.ok(!browser.calls.some((c) => /\/COMMENTOLD$/.test(c.url) && c.method === 'POST'), 'must NOT edit a comment');
+  assertNoLeak(r.body);
+});
+
+test('POST /edit-page-comment-link is non-ok and edits NOTHING when the matching comment is not authored by the page', async () => {
+  // The only comment carrying the old link is authored by a USER (from.id != page_id).
+  const browser = makeBrowser({
+    commentsByTarget: { [ECL_STORY]: [eclComment({ id: 'USERCOMMENT', from: { id: '999', name: 'Someone' } })] }
+  });
+  await listen({ browser });
+  const r = await req('POST', '/edit-page-comment-link', {
+    page_id: LIVE_PAGE_ID, story_id: ECL_STORY, old_link: ECL_OLD, new_link: ECL_NEW, allow_create_new: false
+  });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.error, 'matching_comment_not_found', 'a non-page-authored comment is never matched/edited');
+  assert.ok(!browser.calls.some((c) => c.method === 'POST'), 'no edit/create POST when no page-owned comment matches');
+  assertNoLeak(r.body);
+});
+
+test('POST /edit-page-comment-link response never leaks USER_TOKEN_SECRET or PAGE_TOKEN_SECRET', async () => {
+  const browser = makeBrowser({ commentsByTarget: { [ECL_STORY]: [eclComment()] } });
+  await listen({ browser });
+  const r = await req('POST', '/edit-page-comment-link', {
+    page_id: LIVE_PAGE_ID, story_id: ECL_STORY, old_link: ECL_OLD, new_link: ECL_NEW, allow_create_new: false
+  });
+  assert.equal(r.body.ok, true);
+  assertNoLeak(r.body);
+});
+
 test('POST /create-ad runs the OneCard/ads orchestration and returns ids, no token leak', async () => {
   await listen();
   const r = await req('POST', '/create-ad', {
@@ -570,6 +760,12 @@ test('POST /create-ad with paused:true creates a PAUSED ad and NEVER issues an A
     !browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /daily_budget/.test(String(c.body || ''))),
     'paused path applies no budget (non-spending)'
   );
+  // The paused/review path NEVER comments (the affiliate-link comment is only for the active path).
+  assert.ok(
+    !browser.calls.some((c) => /\/comments/.test(c.url) && c.method === 'POST'),
+    'paused path must NOT post a Page comment'
+  );
+  assert.equal(r.body.comment_status, undefined, 'paused result carries no comment_status');
   // A NEW campaign is created (prefix branch) and MUST be created PAUSED — never ACTIVE.
   const campCreate = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
   assert.ok(campCreate, 'a new campaign was created');
@@ -607,9 +803,11 @@ test('POST /create-ad with paused:true + new_campaign_name creates the NEW campa
 
 // AD-ONLY SCHEDULED/ACTIVE path (Dashboard Create Ads): build a LIVE, SPENDING ad from an EXISTING
 // video using the date-named daily-campaign path — per-adset budget + run-hours schedule +
-// activation — while skip_publish_to_page guarantees NO Page publish and NO comment. This is the
-// exact shape the worker /api/dashboard/create-ad-only sends in 'active' mode (no paused flag).
-test('POST /create-ad scheduled (daily_campaign_name + budget + skip_publish) ACTIVATES + schedules but never publishes/comments', async () => {
+// activation — while skip_publish_to_page guarantees NO Page publish. On the ACTIVE path the bridge
+// drops exactly ONE Page comment carrying the Shopee link (the affiliate link still has to surface
+// under the dark story). This is the exact shape the worker /api/dashboard/create-ad-only sends in
+// 'active' mode (no paused flag).
+test('POST /create-ad scheduled (daily_campaign_name + budget + skip_publish) ACTIVATES + schedules, never publishes, comments ONCE', async () => {
   const browser = makeBrowser();
   await listen({ browser });
   const r = await req('POST', '/create-ad', {
@@ -621,7 +819,6 @@ test('POST /create-ad scheduled (daily_campaign_name + budget + skip_publish) AC
     ad_account: 'act_test',
     template_adset: 'tpl_test',
     skip_publish_to_page: true,
-    skip_comment: true,
     daily_campaign_name: '18/Jun/2026',
     campaign_daily_budget: 1000000,
     adset_run_hours: 24
@@ -637,16 +834,25 @@ test('POST /create-ad scheduled (daily_campaign_name + budget + skip_publish) AC
   assert.equal(r.body.campaign_name, '18/Jun/2026', 'uses the date-named daily campaign');
   assert.equal(r.body.campaign_budget, 1000000, 'reports the CAMPAIGN-level (CBO) daily budget');
   assert.ok(r.body.end_time, 'a run-window end_time is scheduled');
-  // INVARIANT: never publishes a Page post and never comments, even on the active path.
+  // INVARIANT: never publishes a Page post, even on the active path.
   assert.equal(r.body.published_to_page, false, 'ad-only scheduled mode never publishes a page post');
   assert.ok(
     !browser.calls.some((c) => /is_published/.test(String(c.body || ''))),
     'no Page-publish POST (is_published) is ever issued'
   );
-  assert.ok(
-    !browser.calls.some((c) => /\/comments/.test(c.url) && c.method === 'POST'),
-    'no Page comment POST is ever issued'
-  );
+  // The active ad-only path drops EXACTLY ONE Page comment carrying the Shopee link, targeting the
+  // FULL story id; the result surfaces the comment outcome for the Worker/history.
+  const commentPosts = browser.calls.filter((c) => /\/comments/.test(c.url) && c.method === 'POST');
+  assert.equal(commentPosts.length, 1, 'exactly one Page comment POST is issued on the active ad-only path');
+  assert.ok(commentPosts[0].url.includes(`${LIVE_PAGE_ID}_STORY9/comments`), 'comment targets the FULL story id');
+  assert.ok(String(commentPosts[0].body).includes('https://s.shopee.co.th/x'), 'comment carries the Shopee link');
+  assert.equal(r.body.comment_status, 'commented', 'result reports the comment landed');
+  assert.equal(r.body.comment_fb_id, 'COMMENT1', 'result carries the comment fb id');
+  // The adset is activated under the date-named daily campaign with the TAIL-ONLY name (story tail),
+  // never the full page_id_post_id.
+  const adsetActivate = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  assert.ok(adsetActivate, 'the adset activation POST was issued');
+  assert.equal(JSON.parse(adsetActivate.body).name, 'STORY9', 'adset activation name is the story tail only');
   // The daily campaign is created WITH the campaign-level (CBO) budget; the adset gets NO budget.
   const campPost = browser.calls.find((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST');
   assert.equal(JSON.parse(campPost.body).daily_budget, '1000000', 'daily campaign carries the CBO budget');
@@ -660,6 +866,77 @@ test('POST /create-ad scheduled (daily_campaign_name + budget + skip_publish) AC
     browser.calls.some((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || ''))),
     'scheduled path activates the adset'
   );
+  assertNoLeak(r.body);
+});
+
+// When the worker supplies an explicit rendered comment template (comment_message), the active
+// ad-only path must comment with THAT template text — never a bare shortlink. This is the defensive
+// guard so the bridge never forces a bare-link comment when the caller already rendered one.
+test('POST /create-ad active ad-only honors an explicit comment_message over the bare shortlink', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const rendered = '📌 พิกัดอยู่ตรงนี้เลย 👇\n🧡 Shopee : https://s.shopee.co.th/FINAL';
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    daily_campaign_name: '19/Jun/2026',
+    campaign_daily_budget: 1000000,
+    adset_run_hours: 24,
+    comment_message: rendered
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  const commentPosts = browser.calls.filter((c) => /\/comments/.test(c.url) && c.method === 'POST');
+  assert.equal(commentPosts.length, 1, 'exactly one Page comment POST is issued');
+  const sentMessage = JSON.parse(commentPosts[0].body).message;
+  assert.equal(sentMessage, rendered, 'comment posts the rendered template, not the bare shortlink');
+  assert.ok(sentMessage.includes('Shopee :'), 'comment carries the template style, not a bare link');
+  assert.equal(r.body.comment_status, 'commented');
+  assertNoLeak(r.body);
+});
+
+// AD-ONLY ACTIVE path with an EXPLICIT campaign_id (usedDailyCampaign stays false). Without the
+// ad-only signal the adset would be named with the FULL page_id_post_id; the bridge must still use
+// the TAIL-only name here (driven by skip_publish_to_page / campaign_daily_budget / adset_run_hours /
+// force_adset_name_tail) and still drop the single affiliate-link comment.
+test('POST /create-ad active ad-only with explicit campaign_id names the adset TAIL-only and comments ONCE', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    campaign_id: 'CAMPEXPLICIT',
+    adset_run_hours: 24
+    // explicit campaign_id → NOT the daily-campaign path (usedDailyCampaign=false), still active.
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign_id, 'CAMPEXPLICIT', 'reuses the explicit campaign id');
+  assert.equal(r.body.adset_id, 'ADSET1');
+  assert.equal(r.body.ad_status, 'ACTIVE');
+  // No campaign is created when an explicit campaign_id is supplied.
+  assert.ok(!browser.calls.some((c) => /\/campaigns\?/.test(c.url) && c.method === 'POST'), 'no campaign created for explicit campaign_id');
+  // The adset activation carries the TAIL-only name (STORY9), never the full page_id_post_id.
+  const adsetActivate = browser.calls.find((c) => /\/ADSET1\?/.test(c.url) && c.method === 'POST' && /"status":"ACTIVE"/.test(String(c.body || '')));
+  assert.ok(adsetActivate, 'the adset activation POST was issued');
+  assert.equal(JSON.parse(adsetActivate.body).name, 'STORY9', 'explicit campaign_id ad-only path names the adset TAIL-only');
+  // Still drops exactly one affiliate-link Page comment.
+  const commentPosts = browser.calls.filter((c) => /\/comments/.test(c.url) && c.method === 'POST');
+  assert.equal(commentPosts.length, 1, 'exactly one Page comment POST is issued');
+  assert.equal(r.body.comment_status, 'commented');
+  assert.equal(r.body.published_to_page, false, 'never publishes a page post');
   assertNoLeak(r.body);
 });
 
@@ -2210,4 +2487,200 @@ test('POST /create-ad RECOVERS a transient page publish via retry and returns ok
   assert.equal(r.body.ok, true, 'create-ad succeeds once the transient publish clears on retry');
   assert.equal(r.body.published_to_page, true);
   assertNoLeak(r.body);
+});
+
+// =====================================================================
+// PAID AD CTA REPAIR (/repair-ad-cta) — the urgent production fix. The ad-only ACTIVE flow creates
+// the paid ad BEFORE the final post-specific shortlink exists, so the paid creative carries a
+// placeholder link (sub2/sub3 unset — Ads Manager previews showed utm_content=…AD----). This repairs
+// the PAID ad creative (NOT just the visible post /update-cta): a NEW creative carrying the final
+// link, the existing ad re-pointed at it, and a read-back confirmation.
+// =====================================================================
+test('POST /repair-ad-cta builds a NEW creative with the final link, re-points the ad, confirms paid_ad_cta_final', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const FINAL = 'https://s.shopee.co.th/FINALCTA';
+  const r = await req('POST', '/repair-ad-cta', {
+    page_id: LIVE_PAGE_ID,
+    ad_id: 'AD1',
+    creative_id: 'OLDCR',
+    video_id: 'EXISTINGVID',
+    final_cta_link: FINAL,
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    story_id: `${LIVE_PAGE_ID}_STORY9`
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'repair_ad_cta');
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.old_creative_id, 'OLDCR');
+  assert.equal(r.body.new_creative_id, 'CR1');
+  assert.equal(r.body.paid_ad_cta_link, FINAL, 'read-back confirms the paid CTA carries the final link');
+  assert.equal(r.body.paid_ad_cta_final, true);
+  // A NEW adcreative carrying the final link in the video_data CTA was POSTed.
+  const crPost = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.ok(crPost, 'a new adcreative was created');
+  assert.ok(String(crPost.body).includes(FINAL), 'new creative bakes the final link into the CTA');
+  assert.ok(/call_to_action/.test(String(crPost.body)), 'new creative carries a CTA object');
+  assert.ok(/video_data/.test(String(crPost.body)), 'new creative uses object_story_spec.video_data');
+  // The existing ad is re-pointed at the new creative (Graph cannot edit a live creative inline).
+  const adRepoint = browser.calls.find((c) => /\/AD1\?/.test(c.url) && c.method === 'POST' && /creative_id/.test(String(c.body || '')));
+  assert.ok(adRepoint, 'the ad is re-pointed at the new creative');
+  assert.ok(String(adRepoint.body).includes('CR1'), 're-point references the new creative id');
+  assertNoLeak(r.body);
+});
+
+test('POST /repair-ad-cta backfills video/image/message from the OLD creative when not supplied', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const FINAL = 'https://s.shopee.co.th/BACKFILL';
+  const r = await req('POST', '/repair-ad-cta', {
+    page_id: LIVE_PAGE_ID,
+    ad_id: 'AD1',
+    creative_id: 'OLDCR', // video_id / caption / thumbnail intentionally omitted — read off OLDCR
+    final_cta_link: FINAL,
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.video_id, 'EXISTINGVID', 'video id backfilled from the old creative spec');
+  assert.equal(r.body.paid_ad_cta_final, true);
+  const crPost = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.ok(String(crPost.body).includes('EXISTINGVID'), 'new creative reuses the old video id');
+  assert.ok(String(crPost.body).includes('https://thumb/old.jpg'), 'new creative reuses the old thumbnail');
+  // The old placeholder link is surfaced for diagnostics but never re-used as the CTA.
+  assert.equal(r.body.old_paid_ad_cta_link, 'https://s.shopee.co.th/PLACEHOLDER----');
+  assert.ok(String(crPost.body).includes(FINAL), 'new creative uses the FINAL link, not the placeholder');
+  assertNoLeak(r.body);
+});
+
+test('POST /repair-ad-cta does NOT claim paid_ad_cta_final when the read-back creative does not match', async () => {
+  // The re-point "succeeds" but the ad still reports the OLD creative on read-back — fail closed.
+  const browser = makeBrowser({ repairReadbackCreativeId: 'OLDCR', repairReadbackCtaLink: 'https://s.shopee.co.th/PLACEHOLDER----' });
+  await listen({ browser });
+  const r = await req('POST', '/repair-ad-cta', {
+    page_id: LIVE_PAGE_ID,
+    ad_id: 'AD1',
+    creative_id: 'OLDCR',
+    video_id: 'EXISTINGVID',
+    final_cta_link: 'https://s.shopee.co.th/FINALCTA',
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true, 'the call still completes (creative made + ad re-pointed)');
+  assert.equal(r.body.paid_ad_cta_final, false, 'read-back did not confirm the new creative → fail closed');
+  assertNoLeak(r.body);
+});
+
+test('POST /repair-ad-cta REJECTS a non-Shopee / redirect final link and never touches the ad creative', async () => {
+  for (const bad of ['https://api.pubilo.com/onecard-cta/abc', 'https://example.com/x']) {
+    const browser = makeBrowser();
+    await listen({ browser });
+    const r = await req('POST', '/repair-ad-cta', {
+      page_id: LIVE_PAGE_ID,
+      ad_id: 'AD1',
+      creative_id: 'OLDCR',
+      video_id: 'EXISTINGVID',
+      final_cta_link: bad,
+      ad_account: 'act_test',
+      template_adset: 'tpl_test'
+    });
+    assert.equal(r.body.ok, false, `rejects ${bad}`);
+    assert.equal(r.body.error, 'final_cta_link_must_be_direct_shopee_link');
+    // HARD GUARANTEE: no creative was created and the ad was never re-pointed.
+    assert.ok(!browser.calls.some((c) => /\/adcreatives/.test(c.url) && c.method === 'POST'), 'no creative created on a rejected link');
+    assert.ok(!browser.calls.some((c) => /\/AD1\?/.test(c.url) && c.method === 'POST' && /creative_id/.test(String(c.body || ''))), 'ad never re-pointed on a rejected link');
+    assertNoLeak(r.body);
+    await new Promise((resolve) => server.close(resolve));
+    server = null;
+  }
+});
+
+test('POST /repair-ad-cta fails closed (validate) when ad_id is missing', async () => {
+  await listen();
+  const r = await req('POST', '/repair-ad-cta', {
+    page_id: LIVE_PAGE_ID,
+    final_cta_link: 'https://s.shopee.co.th/x',
+    ad_account: 'act_test'
+  });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+// =====================================================================
+// AD-ONLY AUTO-PAUSE (/pause-ad-only) — turn OFF a finished campaign/adset/ad. The HARD invariant:
+// status=PAUSED ONLY, never a DELETE request and never status='DELETED'. Close/off, never destroy.
+// =====================================================================
+test('POST /pause-ad-only sets status=PAUSED on campaign+adset+ad and reads back the off-state', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/pause-ad-only', {
+    campaign_id: 'CAMPX',
+    adset_id: 'ADSETX',
+    ad_id: 'ADX'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'pause_ad_only');
+  assert.equal(r.body.campaign_id, 'CAMPX');
+  assert.equal(r.body.adset_id, 'ADSETX');
+  assert.equal(r.body.ad_id, 'ADX');
+  assert.equal(r.body.campaign.ok, true);
+  assert.equal(r.body.campaign.effective_status, 'PAUSED');
+  assert.equal(r.body.adset.effective_status, 'PAUSED');
+  assert.equal(r.body.ad.effective_status, 'PAUSED');
+  // Each object got a { status: 'PAUSED' } POST.
+  for (const id of ['CAMPX', 'ADSETX', 'ADX']) {
+    const pausePost = browser.calls.find((c) => new RegExp(`/${id}\\?`).test(c.url) && c.method === 'POST' && /"status":"PAUSED"/.test(String(c.body || '')));
+    assert.ok(pausePost, `${id} received a status=PAUSED POST`);
+  }
+  // HARD GUARANTEE: never a DELETE request, never status='DELETED'.
+  assert.ok(!browser.calls.some((c) => String(c.method).toUpperCase() === 'DELETE'), 'no DELETE request issued');
+  assert.ok(!browser.calls.some((c) => /"status":"DELETED"/.test(String(c.body || ''))), 'never sets status=DELETED');
+  assertNoLeak(r.body);
+});
+
+test('POST /pause-ad-only works with only a campaign_id (ad_id optional)', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/pause-ad-only', { campaign_id: 'CAMPONLY' });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.campaign.effective_status, 'PAUSED');
+  assert.equal(r.body.adset, undefined, 'no adset pause attempted when none supplied');
+  assert.equal(r.body.ad, undefined, 'no ad pause attempted when none supplied');
+  assert.ok(!browser.calls.some((c) => String(c.method).toUpperCase() === 'DELETE'), 'no DELETE request issued');
+  assertNoLeak(r.body);
+});
+
+test('POST /pause-ad-only fails closed (validate) when neither campaign_id nor adset_id supplied', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/pause-ad-only', { ad_id: 'ADX' });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+  // Nothing was touched on Graph.
+  assert.ok(!browser.calls.some((c) => c.method === 'POST' && /"status"/.test(String(c.body || ''))), 'no status write on a rejected request');
+  assertNoLeak(r.body);
+});
+
+// SOURCE INVARIANT — the pause helper must be provably DELETE-free.
+test('pauseAdOnlyObjects source contains status=PAUSED and NEVER DELETE/DELETED', () => {
+  const { readFileSync } = require('fs');
+  const { resolve } = require('path');
+  const src = readFileSync(resolve(__dirname, '../src/posting.js'), 'utf8');
+  const fnStart = src.indexOf('async function pauseAdOnlyObjects');
+  assert.ok(fnStart >= 0, 'pauseAdOnlyObjects exists');
+  const fnEnd = src.indexOf('\nmodule.exports', fnStart);
+  const fn = src.slice(fnStart, fnEnd > fnStart ? fnEnd : undefined);
+  assert.ok(/status:\s*'PAUSED'/.test(fn), 'pause helper writes status=PAUSED');
+  // Strip line/block comments so the doc-comment's literal mention of DELETED (documenting the
+  // guarantee) does not satisfy the invariant — only EXECUTABLE code is checked.
+  const code = fn.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/status:\s*'DELETED'/.test(code), 'pause helper never writes status=DELETED');
+  assert.ok(!/method:\s*'DELETE'/.test(code), 'pause helper never issues a DELETE method');
 });

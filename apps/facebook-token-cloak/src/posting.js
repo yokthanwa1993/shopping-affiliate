@@ -490,6 +490,147 @@ async function pageComment(fetchImpl, params = {}) {
   return { ok: true, status: 200, id: String(data.id), page_id: pageId, page_name: info.pageName, author_expected: 'page' };
 }
 
+// POST /edit-page-comment-link — EDIT (never create) the Shopee link inside an EXISTING Page-owned
+// comment. The ad-only flow re-mints the post-specific shortlink AFTER the Page comment is dropped,
+// so the live comment can still carry the OLD campaign link while the visible CTA was already
+// repaired by /update-cta. This edits the SAME comment in place using the official Graph edit
+// (POST /{comment_id} { message }), so no duplicate comment is ever created and nothing is deleted.
+//
+// Discovery order is strict: read comments on the FULL Page story first; only if NO matching
+// Page-owned comment is found there do we read the alternate_targets (e.g. the visible Reel target)
+// as additional READ candidates. A comment is only ever EDITED on the id that was actually read back
+// from one of those reads — we never POST to /{target}/comments (that would CREATE).
+//
+// Fails closed: the matched comment must be authored by the page (from.id == page_id); a comment
+// from any other author is never edited. allow_create_new is accepted but intentionally NOT honored
+// here — when true the call returns ok:false / create_new_not_supported and creates nothing. The
+// page token is used only against Graph and is never returned/logged.
+async function editPageCommentLink(fetchImpl, params = {}) {
+  const userToken = params.userToken;
+  const pageId = String(params.pageId || params.page_id || '').trim();
+  const storyId = String(params.storyId || params.story_id || params.postId || params.post_id || '').trim();
+  const oldLink = String(params.oldLink || params.old_link || '').trim();
+  const newLink = String(params.newLink || params.new_link || '').trim();
+  const allowCreateNew = params.allowCreateNew === true || params.allow_create_new === true;
+  // Alternate READ candidates (visible Reel target / bare post id). Never written to unless the
+  // matching comment id was actually read back from that candidate.
+  const altRaw = Array.isArray(params.alternateTargets) ? params.alternateTargets
+    : (Array.isArray(params.alternate_targets) ? params.alternate_targets : []);
+  const alternateTargets = altRaw.map((t) => String(t || '').trim()).filter(Boolean);
+
+  // Validation: required ids/links, http(s) links only.
+  if (!pageId || !storyId) return { ok: false, step: 'validate', error: 'Missing: page_id, story_id' };
+  if (!oldLink || !newLink) return { ok: false, step: 'validate', error: 'Missing: old_link, new_link' };
+  if (!/^https?:\/\//i.test(oldLink) || !/^https?:\/\//i.test(newLink)) {
+    return { ok: false, step: 'validate', error: 'old_link/new_link must be http(s) URLs' };
+  }
+  // This endpoint is EDIT-ONLY. allow_create_new is never honored here — fail closed and create
+  // nothing rather than silently creating a duplicate comment.
+  if (allowCreateNew) {
+    return { ok: false, status: 400, step: 'validate', error: 'create_new_not_supported', page_id: pageId, story_id: storyId };
+  }
+  if (!userToken) return { ok: false, status: 409, step: 'session', error: 'no_session' };
+
+  // Editing a Page-owned comment requires the PAGE token. Fail closed when the session does not
+  // administer the page — never fall back to the user token.
+  const info = await resolvePageToken(fetchImpl, userToken, pageId);
+  if (info.error) return { ok: false, status: 200, step: 'pages', error: info.error, page_id: pageId };
+  if (!info.pageToken) return { ok: false, status: 403, step: 'page_token', error: 'page_token_not_found', page_id: pageId };
+  const pageToken = info.pageToken;
+
+  // READ comments on one target and return the first Page-owned comment whose message carries the
+  // old link. READ ONLY — a GET on /{target}/comments. Returns { match } or {} (never throws).
+  const readMatchOnTarget = async (target) => {
+    try {
+      const r = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(target)}/comments?fields=id,message,from,created_time,permalink_url&limit=200&access_token=${encodeURIComponent(pageToken)}`);
+      if (!r.data || r.data.error) return {};
+      const list = Array.isArray(r.data.data) ? r.data.data : [];
+      const match = list.find((c) => c
+        && c.from && String(c.from.id) === String(pageId)
+        && typeof c.message === 'string' && c.message.includes(oldLink));
+      return match ? { match } : {};
+    } catch {
+      return {};
+    }
+  };
+
+  // 1. Read the FULL story first; only fall back to alternate_targets if it yields no match.
+  let matched = null;
+  let targetUsed = '';
+  const storyRead = await readMatchOnTarget(storyId);
+  if (storyRead.match) { matched = storyRead.match; targetUsed = storyId; }
+  if (!matched) {
+    for (const alt of alternateTargets) {
+      if (String(alt) === String(storyId)) continue; // already read
+      const altRead = await readMatchOnTarget(alt);
+      if (altRead.match) { matched = altRead.match; targetUsed = alt; break; }
+    }
+  }
+
+  if (!matched || !matched.id) {
+    return { ok: false, status: 200, step: 'find_comment', error: 'matching_comment_not_found', page_id: pageId, story_id: storyId };
+  }
+  // Defense in depth: never edit a comment that is not authored by the page.
+  if (!matched.from || String(matched.from.id) !== String(pageId)) {
+    return { ok: false, status: 403, step: 'author_check', error: 'comment_not_authored_by_page', page_id: pageId, story_id: storyId, comment_id: String(matched.id) };
+  }
+
+  const commentId = String(matched.id);
+  const originalMessage = typeof matched.message === 'string' ? matched.message : '';
+  // Replace EVERY occurrence of the old link with the new link, in place (the rest of the comment
+  // text — emoji, label, sub ids — is preserved verbatim).
+  const replacedMessage = originalMessage.split(oldLink).join(newLink);
+
+  // 2. EDIT the same comment id (official Graph edit — POST /{comment_id} { message }). This never
+  //    creates a new comment. The access_token rides in the JSON body, matching pageComment.
+  const upd = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(commentId)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: replacedMessage, access_token: pageToken })
+  });
+  if (upd.data && upd.data.error) {
+    return {
+      ok: false, status: 200, step: 'edit', error: String(upd.data.error.message || 'comment_edit_failed').substring(0, 200),
+      fb_error_code: upd.data.error.code, fb_error_subcode: upd.data.error.error_subcode, fb_trace_id: upd.data.error.fbtrace_id,
+      page_id: pageId, story_id: storyId, comment_id: commentId, target_used: targetUsed
+    };
+  }
+
+  // 3. Verify via a DIRECT readback of the SAME comment id: the new link is present, the old link is
+  //    gone, and the comment is still authored by the page.
+  let confirmedMessage = '';
+  let authorPageVerified = false;
+  let permalinkUrl = matched.permalink_url ? String(matched.permalink_url) : '';
+  try {
+    const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(commentId)}?fields=id,message,from,permalink_url&access_token=${encodeURIComponent(pageToken)}`);
+    if (rb.data && !rb.data.error) {
+      confirmedMessage = typeof rb.data.message === 'string' ? rb.data.message : '';
+      authorPageVerified = !!(rb.data.from && String(rb.data.from.id) === String(pageId));
+      if (rb.data.permalink_url) permalinkUrl = String(rb.data.permalink_url);
+    }
+  } catch {}
+
+  const newLinkPresent = confirmedMessage.includes(newLink);
+  const oldLinkGone = !confirmedMessage.includes(oldLink);
+  const verified = newLinkPresent && oldLinkGone && authorPageVerified;
+  const firstLine = confirmedMessage.split('\n')[0] || '';
+
+  return {
+    ok: verified,
+    status: 200,
+    phase: 'edit_page_comment_link',
+    page_id: pageId,
+    story_id: storyId,
+    target_used: targetUsed,
+    comment_id: commentId,
+    old_link_gone: oldLinkGone,
+    new_link_present: newLinkPresent,
+    author_page_verified: authorPageVerified,
+    final_message_first_line: firstLine,
+    ...(permalinkUrl ? { permalink_url: permalinkUrl } : {}),
+    ...(verified ? {} : { step: 'verify', error: 'comment_edit_unverified' })
+  };
+}
+
 // Token-free readback that a story is ACTUALLY on the page feed: a published page post reports
 // is_published:true (and exposes a permalink_url). Used to CONFIRM a publish whose POST returned a
 // Graph error (a "transient" error like code 1 / "please reduce the amount of data" sometimes still
@@ -951,8 +1092,18 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   // and never page_id_post_id. Derived from the source post id (storyId) tail. The AD name is left
   // untouched (it stays the system video code/hash set at creation). Legacy paths keep the full
   // storyId adset name.
+  //
+  // Ad-only paths can pass an EXPLICIT campaign_id (so usedDailyCampaign stays false) yet still want
+  // the tail-only adset name — without this they would get the full page_id_post_id name. Detect the
+  // ad-only flow (skip_publish_to_page / a campaign_daily_budget / an adset_run_hours / an explicit
+  // force_adset_name_tail) and apply the same tail-only naming. Legacy (non-ad-only) callers without
+  // a daily campaign are unchanged and keep the full storyId.
   const storyIdStr = String(storyId || '');
-  const adsetName = (usedDailyCampaign && storyIdStr.includes('_'))
+  const adOnlyTailSignal = body.skip_publish_to_page === true || body.skip_publish_to_page === 'true'
+    || body.campaign_daily_budget != null
+    || body.adset_run_hours != null
+    || body.force_adset_name_tail === true || body.force_adset_name_tail === 'true';
+  const adsetName = ((usedDailyCampaign || adOnlyTailSignal) && storyIdStr.includes('_'))
     ? storyIdStr.split('_').slice(1).join('_')
     : storyIdStr;
 
@@ -1177,6 +1328,7 @@ async function createAd(fetchImpl, params = {}) {
   const shopeeUrl = String(body.shopee_url || '').trim();
   const thumbnailUrl = String(body.thumbnail_url || body.image_url || '').trim();
   const skipPublishToPage = body.skip_publish_to_page === true || body.skip_publish_to_page === 'true';
+  const skipComment = body.skip_comment === true || body.skip_comment === 'true';
   const skipAd = body.skip_ad === true || body.skip_ad === 'true';
   // Ad-only / non-spending mode: create the campaign/adset/ad but leave them PAUSED (never
   // activate). Accept either `paused:true` or `status_option:'PAUSED'`. Default (unset) keeps the
@@ -1384,6 +1536,38 @@ async function createAd(fetchImpl, params = {}) {
     };
   }
 
+  // Active ad-only path (skip_publish_to_page, NOT paused): no Page post is published, so drop ONE
+  // Page comment carrying the Shopee link instead — the spending ad still needs the affiliate link
+  // surfaced under the (dark) story. Targets the FULL storyId. Never runs on the paused/review path
+  // and never on the normal publish path (which already publishes a visible post). Honors skip_comment
+  // and fails SOFT: a comment failure is reported (comment_error) but never fails the ad.
+  let commentStatus;
+  let commentFbId;
+  let commentError;
+  if (skipPublishToPage && !paused && !skipComment) {
+    // Prefer an explicit rendered comment template (comment_message/comment_text) when the caller
+    // supplies one, so this path never forces a bare-link comment. Only fall back to the raw
+    // shortlink/shopee fields when no rendered message was provided.
+    const commentMessage = String(body.comment_message || body.comment_text || body.comment_shortlink || body.final_cta_link || body.shortlink || body.shopee_url || '').trim();
+    if (commentMessage) {
+      try {
+        const cm = await pageComment(fetchImpl, { userToken, pageId, target: storyId, message: commentMessage });
+        if (cm && cm.ok && cm.id) {
+          commentStatus = 'commented';
+          commentFbId = String(cm.id);
+        } else {
+          commentStatus = 'comment_failed';
+          commentError = (cm && cm.error) || 'comment_failed';
+        }
+      } catch (e) {
+        commentStatus = 'comment_failed';
+        commentError = (e && e.message) || String(e);
+      }
+    } else {
+      commentStatus = 'comment_skipped_no_link';
+    }
+  }
+
   return {
     ok: true,
     story_id: storyId,
@@ -1406,6 +1590,11 @@ async function createAd(fetchImpl, params = {}) {
     post_url: `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}`,
     published_to_page: publishedToPage,
     publish_error: publishError || undefined,
+    // Active ad-only comment outcome (only set on the skip_publish_to_page + non-paused path). Lets
+    // the Worker/history record whether the affiliate-link comment landed (and its fb id) or failed.
+    ...(commentStatus ? { comment_status: commentStatus } : {}),
+    ...(commentFbId ? { comment_fb_id: commentFbId } : {}),
+    ...(commentError ? { comment_error: commentError } : {}),
     uploaded_for_instagram: uploadedForInstagram,
     upload_mode: uploadMode || undefined,
     template_campaign_id: adEntities.template_campaign_id,
@@ -1670,6 +1859,223 @@ async function updateVisiblePostCta(fetchImpl, params = {}) {
   };
 }
 
+// POST /repair-ad-cta — repair the PAID ad creative's CTA link in Ads Manager. DISTINCT from
+// /update-cta (which edits the VISIBLE page post / Reel CTA) and /promote (which builds a brand-new
+// paid ad from scratch). The ad-only ACTIVE flow creates the paid ad BEFORE the final post-specific
+// shortlink is minted, so the paid creative carries a PLACEHOLDER link (sub2/sub3 unset — the live
+// incident where Ads Manager previews showed utm_content=…AD----). Graph does NOT allow editing an
+// existing adcreative's destination link inline, so this:
+//   1. reads the OLD creative (object_story_spec) to backfill video_id / image_url / message so the
+//      new creative is identical except for the CTA link,
+//   2. creates a NEW adcreative whose object_story_spec.video_data.call_to_action.value.link is the
+//      FINAL direct Shopee link,
+//   3. re-points the existing ad at the new creative (POST /{ad_id} { creative:{ creative_id } }),
+//   4. reads back the ad's creative to CONFIRM the paid CTA now carries the final link.
+// Uses the user (ad-account) token for ad-account writes; no page token is needed. The final link
+// MUST be a direct https://s.shopee.co.th/… link (never a Worker redirect / onecard-cta /
+// api.pubilo.com). No token is ever returned or logged.
+async function repairPaidAdCta(fetchImpl, params = {}) {
+  const sleep = params.sleep || realSleep;
+  const userToken = params.userToken;
+  const pageId = String(params.pageId || params.page_id || '').trim();
+  const adId = String(params.adId || params.ad_id || '').trim();
+  let oldCreativeId = String(params.creativeId || params.creative_id || '').trim();
+  let videoId = String(params.videoId || params.video_id || '').trim();
+  const finalCtaLink = String(params.finalCtaLink || params.final_cta_link || params.shortlink || '').trim();
+  let caption = params.caption != null ? String(params.caption) : '';
+  let thumbnailUrl = String(params.thumbnailUrl || params.thumbnail_url || params.image_url || '').trim();
+  const adAccount = String(params.adAccount || params.ad_account || params.defaultAdAccount || '').trim();
+  const templateAdset = String(params.templateAdset || params.template_adset || params.defaultTemplateAdset || '').trim();
+  const sourceStoryId = String(params.sourceStoryId || params.source_story_id || params.storyId || params.story_id || '').trim();
+  const requestedAdName = String(params.adName || params.ad_name || '').trim();
+  const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
+  const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
+
+  if (!pageId || !adId) return { ok: false, step: 'validate', error: 'Missing: page_id, ad_id' };
+  if (!finalCtaLink) return { ok: false, step: 'validate', error: 'Missing: final_cta_link' };
+  if (!/^https?:\/\//i.test(finalCtaLink)) return { ok: false, step: 'validate', error: 'final_cta_link must be an http(s) URL' };
+  // The paid CTA must point at a DIRECT Shopee shortlink — never a Worker redirect (the whole point
+  // of the repair is to surface the real sub2/sub3-bearing Shopee link in the paid ad preview).
+  if (/\/onecard-cta(?:\/|$)/i.test(finalCtaLink) || /^https?:\/\/api\.pubilo\.com(?:\/|$)/i.test(finalCtaLink)) {
+    return { ok: false, step: 'validate', error: 'final_cta_link_must_be_direct_shopee_link' };
+  }
+  if (!/^https:\/\/s\.shopee\.co\.th(?:\/|$)/i.test(finalCtaLink)) {
+    return { ok: false, step: 'validate', error: 'final_cta_link_must_be_direct_shopee_link' };
+  }
+  if (!userToken) return { ok: false, step: 'session', error: 'no_session' };
+  if (!adAccount) return { ok: false, step: 'config', error: 'Missing: ad_account' };
+
+  // Resolve the OLD creative id off the ad when the caller did not supply it (defensive).
+  if (!oldCreativeId) {
+    try {
+      const adCr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(adId)}?fields=creative{id}&access_token=${encodeURIComponent(userToken)}`);
+      const cid = adCr.data && adCr.data.creative && adCr.data.creative.id;
+      if (cid) oldCreativeId = String(cid).trim();
+    } catch {}
+  }
+
+  // Read the OLD creative's object_story_spec to backfill the video/image/message so the NEW creative
+  // is identical except for the CTA link. Best-effort; the caller-supplied fields win when present.
+  let oldPaidCtaLink = '';
+  if (oldCreativeId) {
+    try {
+      const old = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(oldCreativeId)}?fields=object_story_spec,call_to_action_type&access_token=${encodeURIComponent(userToken)}`);
+      const spec = old.data && old.data.object_story_spec;
+      const vd = spec && spec.video_data;
+      if (vd) {
+        if (!videoId && vd.video_id) videoId = String(vd.video_id).trim();
+        if (!thumbnailUrl && vd.image_url) thumbnailUrl = String(vd.image_url).trim();
+        if (!caption && vd.message != null) caption = String(vd.message);
+        const oldLink = vd.call_to_action && vd.call_to_action.value && vd.call_to_action.value.link;
+        if (oldLink) oldPaidCtaLink = String(oldLink).trim();
+      }
+    } catch {}
+  }
+
+  // Resolve the video id from the source post attachment when it is still unknown.
+  if (!videoId && sourceStoryId) {
+    videoId = await resolveVideoIdFromSourcePost(fetchImpl, { userToken, sourcePostId: sourceStoryId });
+  }
+  if (!videoId) return { ok: false, step: 'resolve_video', error: 'video_id_unresolved', ad_id: adId, old_creative_id: oldCreativeId || null };
+
+  // CTA type + IG actor from the template adset's first creative (mirror create-ad/promote shape).
+  const { ctaType, instagramActorId, instagramUserId } = await readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset });
+  // A LIKE_PAGE template CTA has no destination link, so it cannot carry the final link — fail closed
+  // before creating any creative rather than ship a linkless paid ad.
+  if (ctaType === 'LIKE_PAGE') {
+    return { ok: false, step: 'creative', error: 'template_cta_type_does_not_support_final_link', cta_type: 'LIKE_PAGE', ad_id: adId, video_id: videoId };
+  }
+
+  // Thumbnail: reuse the backfilled/supplied image, else poll the video.
+  let thumb = /^https?:\/\//i.test(thumbnailUrl) ? thumbnailUrl : null;
+  if (!thumb) {
+    for (let i = 0; i < thumbPolls; i++) {
+      await sleep(pollMs);
+      const t = await gJson(fetchImpl, `${GRAPH}/${videoId}?access_token=${encodeURIComponent(userToken)}&fields=thumbnails`);
+      const td = t.data;
+      if (td.error) return { ok: false, step: 'thumbnails', error: td.error.message || 'Graph thumbnails error', fb_error_code: td.error.code, fb_error_subcode: td.error.error_subcode, fb_trace_id: td.error.fbtrace_id, ad_id: adId, video_id: videoId };
+      if (td.thumbnails && td.thumbnails.data && td.thumbnails.data.length >= 1) { thumb = td.thumbnails.data[0].uri; break; }
+    }
+  }
+  if (!thumb) return { ok: false, step: 'thumbnails', error: 'Timeout (FB still processing)', ad_id: adId, video_id: videoId };
+
+  // 1. Create a NEW paid ad creative with the FINAL Shopee CTA link baked into video_data.
+  const ctaSpec = { type: ctaType, value: { link: finalCtaLink, link_format: 'VIDEO_LPP' } };
+  const crBody = {
+    name: String(caption || requestedAdName || 'ad').substring(0, 50),
+    ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+    object_story_spec: {
+      page_id: pageId,
+      ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+      video_data: { video_id: videoId, message: caption, image_url: thumb, call_to_action: ctaSpec }
+    }
+  };
+  const cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+  });
+  const crData = cr.data;
+  if (crData.error) return { ok: false, step: 'creative', error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, ad_id: adId, video_id: videoId, old_creative_id: oldCreativeId || null };
+  const newCreativeId = String(crData.id || '').trim();
+  if (!newCreativeId) return { ok: false, step: 'creative', error: 'new_creative_id_missing', ad_id: adId, old_creative_id: oldCreativeId || null };
+
+  // 2. Re-point the existing ad at the new creative (Graph cannot edit a live creative's link inline).
+  const upd = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(adId)}?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ creative: { creative_id: newCreativeId } })
+  });
+  if (upd.data && upd.data.error) {
+    return {
+      ok: false, step: 'update_ad', error: String(upd.data.error.message || 'ad_creative_update_failed').substring(0, 200),
+      fb_error_code: upd.data.error.code, fb_error_subcode: upd.data.error.error_subcode, fb_trace_id: upd.data.error.fbtrace_id,
+      ad_id: adId, old_creative_id: oldCreativeId || null, new_creative_id: newCreativeId, final_cta_link: finalCtaLink
+    };
+  }
+
+  // 3. Read back the ad's creative to CONFIRM the paid CTA now carries the final link. A POST that
+  // "succeeds" but leaves the old creative in place must be reported as paid_ad_cta_final:false.
+  let confirmedCreativeId = '';
+  let confirmedCtaLink = '';
+  try {
+    const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(adId)}?fields=creative{id,object_story_spec}&access_token=${encodeURIComponent(userToken)}`);
+    const creative = rb.data && rb.data.creative;
+    if (creative) {
+      if (creative.id) confirmedCreativeId = String(creative.id).trim();
+      const vd = creative.object_story_spec && creative.object_story_spec.video_data;
+      const link = vd && vd.call_to_action && vd.call_to_action.value && vd.call_to_action.value.link;
+      if (link) confirmedCtaLink = String(link).trim();
+    }
+  } catch {}
+
+  const paidAdCtaFinal = !!confirmedCreativeId && confirmedCreativeId === newCreativeId && confirmedCtaLink === finalCtaLink;
+  return {
+    ok: true,
+    phase: 'repair_ad_cta',
+    page_id: pageId,
+    ad_id: adId,
+    old_creative_id: oldCreativeId || null,
+    new_creative_id: newCreativeId,
+    video_id: videoId,
+    final_cta_link: finalCtaLink,
+    // The verified paid ad CTA link read back from Graph (empty if the read-back did not echo it).
+    paid_ad_cta_link: confirmedCtaLink,
+    // True only when the read-back confirms the ad now points at the NEW creative carrying the link.
+    paid_ad_cta_final: paidAdCtaFinal,
+    ...(oldPaidCtaLink ? { old_paid_ad_cta_link: oldPaidCtaLink } : {})
+  };
+}
+
+// POST /pause-ad-only — turn OFF (status=PAUSED) one or more FINISHED system-created ad objects
+// (campaign / adset / ad). DISTINCT from every other ad route: it makes NO new objects and CHANGES
+// NOTHING except the run state. The operator contract is close/off, NEVER destroy:
+//   • the ONLY write this performs is `status: 'PAUSED'`,
+//   • it NEVER issues a DELETE request and NEVER sets status='DELETED',
+//   • each object is read back (status + effective_status) so the caller can PROVE it is paused.
+// Uses the user (ad-account) token for ad-object writes; no page token is needed. At least one of
+// campaign_id / adset_id is required; ad_id is optional. No token is ever returned or logged.
+async function pauseAdOnlyObjects(fetchImpl, params = {}) {
+  const userToken = params.userToken;
+  const campaignId = String(params.campaignId || params.campaign_id || '').trim();
+  const adsetId = String(params.adsetId || params.adset_id || '').trim();
+  const adId = String(params.adId || params.ad_id || '').trim();
+
+  if (!campaignId && !adsetId) return { ok: false, step: 'validate', error: 'Missing: campaign_id or adset_id' };
+  if (!userToken) return { ok: false, step: 'session', error: 'no_session' };
+
+  // Pause ONE ad object by id. The request body is EXACTLY { status: 'PAUSED' } — never DELETED,
+  // never a DELETE method — then a read-back of status/effective_status confirms the off-state.
+  const pauseOne = async (objectId) => {
+    const upd = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(objectId)}?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'PAUSED' })
+    });
+    if (upd.data && upd.data.error) {
+      return {
+        ok: false,
+        error: String(upd.data.error.message || 'pause_failed').substring(0, 200),
+        fb_error_code: upd.data.error.code, fb_error_subcode: upd.data.error.error_subcode, fb_trace_id: upd.data.error.fbtrace_id
+      };
+    }
+    let status = '';
+    let effectiveStatus = '';
+    try {
+      const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(objectId)}?fields=status,effective_status&access_token=${encodeURIComponent(userToken)}`);
+      if (rb.data && !rb.data.error) {
+        status = String(rb.data.status || '').trim();
+        effectiveStatus = String(rb.data.effective_status || '').trim();
+      }
+    } catch {}
+    return { ok: true, status, effective_status: effectiveStatus };
+  };
+
+  const result = { ok: true, phase: 'pause_ad_only' };
+  if (campaignId) { result.campaign_id = campaignId; result.campaign = await pauseOne(campaignId); }
+  if (adsetId) { result.adset_id = adsetId; result.adset = await pauseOne(adsetId); }
+  if (adId) { result.ad_id = adId; result.ad = await pauseOne(adId); }
+
+  // Overall ok only when every attempted object paused without a Graph error.
+  result.ok = [result.campaign, result.adset, result.ad].filter(Boolean).every((r) => r && r.ok);
+  return result;
+}
+
 module.exports = {
   GRAPH,
   GRAPH_V,
@@ -1685,9 +2091,12 @@ module.exports = {
   readTemplateCreativeMeta,
   postOneCardVideo,
   pageComment,
+  editPageCommentLink,
   createAd,
   promoteOneCardPost,
   updateVisiblePostCta,
+  repairPaidAdCta,
+  pauseAdOnlyObjects,
   downloadVideoToBuffer,
   buildVideoMultipart,
   uploadAdVideoMultipart,
