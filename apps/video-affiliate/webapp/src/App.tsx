@@ -805,6 +805,22 @@ function normalizeCommentTokenSource(raw: string | null | undefined, fallback: P
   return fallback
 }
 
+// Member/non-admin namespaces ห้ามเลือก provider เอง — บังคับใช้ stored_token (Token ที่ผู้ใช้กรอกเอง) เสมอ
+// Power Editor / CloakBrowser เป็น flow ของ admin/operator เท่านั้น (กันค่าเก่าใน DB ที่ค้างเป็น cloak_browser)
+function resolvePostingTokenSourceForRole(raw: string | null | undefined, isSystemAdmin: boolean): PostingTokenSource {
+  if (!isSystemAdmin) return 'stored_token'
+  return normalizePostingTokenSource(raw)
+}
+
+function resolveCommentTokenSourceForRole(
+  raw: string | null | undefined,
+  fallback: PostingTokenSource,
+  isSystemAdmin: boolean,
+): CommentTokenSource {
+  if (!isSystemAdmin) return 'stored_token'
+  return normalizeCommentTokenSource(raw, fallback)
+}
+
 interface PageShortlinkSettingsForm {
   override_enabled: boolean
   account: string
@@ -2989,9 +3005,10 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     if (value === 'NO_BUTTON') return 'NO_BUTTON'
     return 'SHOP_NOW'
   })
-  const [postingTokenSource, setPostingTokenSource] = useState<PostingTokenSource>(() => normalizePostingTokenSource(page.posting_token_source))
+  const [postingTokenSource, setPostingTokenSource] = useState<PostingTokenSource>(() =>
+    resolvePostingTokenSourceForRole(page.posting_token_source, isSystemAdmin))
   const [commentTokenSource, setCommentTokenSource] = useState<CommentTokenSource>(() =>
-    normalizeCommentTokenSource(page.comment_token_source, normalizePostingTokenSource(page.posting_token_source)))
+    resolveCommentTokenSourceForRole(page.comment_token_source, resolvePostingTokenSourceForRole(page.posting_token_source, isSystemAdmin), isSystemAdmin))
   const [accessToken, setAccessToken] = useState(page.access_token || '')
   const [saving, setSaving] = useState(false)
   const [forcingPost, setForcingPost] = useState(false)
@@ -3056,8 +3073,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
       if (value === 'NO_BUTTON') return 'NO_BUTTON'
       return 'SHOP_NOW'
     })
-    setPostingTokenSource(normalizePostingTokenSource(page.posting_token_source))
-    setCommentTokenSource(normalizeCommentTokenSource(page.comment_token_source, normalizePostingTokenSource(page.posting_token_source)))
+    setPostingTokenSource(resolvePostingTokenSourceForRole(page.posting_token_source, isSystemAdmin))
+    setCommentTokenSource(resolveCommentTokenSourceForRole(page.comment_token_source, resolvePostingTokenSourceForRole(page.posting_token_source, isSystemAdmin), isSystemAdmin))
     setAccessToken(page.access_token || '')
     setEditingToken(null)
     setEditingTokenValue('')
@@ -3074,6 +3091,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     page.posting_token_source,
     page.comment_token_source,
     page.access_token,
+    isSystemAdmin,
   ])
 
   useEffect(() => {
@@ -3367,6 +3385,9 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         : postHoursString
       const nextToken = accessToken.trim()
       const accessTokenChanged = nextToken !== String(page.access_token || '').trim()
+      // Member/non-admin: บังคับ stored_token เสมอ (กันค่าเก่าใน state/DB ที่ค้างเป็น cloak_browser)
+      const effectivePostingTokenSource = resolvePostingTokenSourceForRole(postingTokenSource, isSystemAdmin)
+      const effectiveCommentTokenSource = resolveCommentTokenSourceForRole(commentTokenSource, effectivePostingTokenSource, isSystemAdmin)
       const payload: Record<string, unknown> = {
         post_hours: schedulePostHours,
         post_interval_minutes: scheduleMode === 'interval' ? normalizedInterval : undefined,
@@ -3379,8 +3400,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         caption_link_enabled: captionLinkEnabled,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
-        posting_token_source: postingTokenSource,
-        comment_token_source: commentTokenSource,
+        posting_token_source: effectivePostingTokenSource,
+        comment_token_source: effectiveCommentTokenSource,
       }
       if (accessTokenChanged) {
         payload.access_token = nextToken
@@ -3406,8 +3427,8 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
         caption_link_enabled: captionLinkEnabled ? 1 : 0,
         onecard_link_mode: oneCardLinkMode,
         onecard_cta: oneCardCta,
-        posting_token_source: postingTokenSource,
-        comment_token_source: commentTokenSource,
+        posting_token_source: effectivePostingTokenSource,
+        comment_token_source: effectiveCommentTokenSource,
         access_token: nextToken,
       }
 
@@ -3608,31 +3629,36 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           )}
         </div>
 
-        {/* โทเค้นสำหรับใช้โพสต์ — มีแค่ 2 โหมด: Facebook Lite (กรอกเอง) และ Power Editor */}
+        {/* โทเค้นสำหรับใช้โพสต์/คอมเมนต์ — admin เลือก Facebook Lite vs Power Editor ได้,
+            ส่วน member ใช้ Token ที่กรอกเองอย่างเดียว (ไม่มีตัวเลือก provider) */}
         <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
           <div className="min-w-0">
             <p className="font-bold text-gray-900">โทเค้นสำหรับใช้โพสต์</p>
             <p className="text-xs text-gray-400 mt-0.5">
-              เลือกว่าจะให้เพจนี้โพสต์ด้วยโทเค้นที่กรอกเอง (Facebook Lite) หรือผ่าน Power Editor ที่ login อยู่บนเครื่อง Mac
+              {isSystemAdmin
+                ? 'เลือกว่าจะให้เพจนี้โพสต์ด้วยโทเค้นที่กรอกเอง (Facebook Lite) หรือผ่าน Power Editor ที่ login อยู่บนเครื่อง Mac'
+                : 'เพจนี้โพสต์และคอมเมนต์ด้วย Token ที่คุณกรอกเองเท่านั้น'}
             </p>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { value: 'stored_token', label: 'Facebook Lite', hint: 'กรอก User/Page token เอง (legacy)' },
-              { value: 'cloak_browser', label: 'Power Editor', hint: 'ใช้ session ของ Power Editor โพสต์ให้' },
-            ] as { value: PostingTokenSource; label: string; hint: string }[]).map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => setPostingTokenSource(option.value)}
-                className={`min-h-[74px] rounded-xl border px-3 py-2 text-left transition-all ${postingTokenSource === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
-                aria-pressed={postingTokenSource === option.value}
-              >
-                <span className={`block text-sm font-bold ${postingTokenSource === option.value ? 'text-blue-700' : 'text-gray-700'}`}>{option.label}</span>
-                <span className="block text-[11px] text-gray-400 mt-1 leading-snug">{option.hint}</span>
-              </button>
-            ))}
-          </div>
+          {isSystemAdmin ? (
+            <div className="grid grid-cols-2 gap-2">
+              {([
+                { value: 'stored_token', label: 'Facebook Lite', hint: 'กรอก User/Page token เอง (legacy)' },
+                { value: 'cloak_browser', label: 'Power Editor', hint: 'ใช้ session ของ Power Editor โพสต์ให้' },
+              ] as { value: PostingTokenSource; label: string; hint: string }[]).map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setPostingTokenSource(option.value)}
+                  className={`min-h-[74px] rounded-xl border px-3 py-2 text-left transition-all ${postingTokenSource === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
+                  aria-pressed={postingTokenSource === option.value}
+                >
+                  <span className={`block text-sm font-bold ${postingTokenSource === option.value ? 'text-blue-700' : 'text-gray-700'}`}>{option.label}</span>
+                  <span className="block text-[11px] text-gray-400 mt-1 leading-snug">{option.hint}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
 
           {postingTokenSource === 'stored_token' ? (
             <div className="rounded-xl border border-gray-100 bg-gray-50 p-3 flex items-start justify-between gap-3">
@@ -3659,32 +3685,35 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
           ) : null}
         </div>
 
-        {/* โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ (Facebook Lite หรือ Power Editor) */}
-        <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
-          <div className="min-w-0">
-            <p className="font-bold text-gray-900">โทเค้นสำหรับใช้คอมเมนต์</p>
-            <p className="text-xs text-gray-400 mt-0.5">
-              เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้นที่กรอกเอง (Facebook Lite) หรือคอมเมนต์ในนามเพจผ่าน Power Editor (แยกอิสระจากโทเค้นที่ใช้โพสต์)
-            </p>
+        {/* โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ (Facebook Lite หรือ Power Editor)
+            แสดงเฉพาะ admin/operator; member คอมเมนต์ด้วย Token ที่กรอกเองเสมอ */}
+        {isSystemAdmin ? (
+          <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
+            <div className="min-w-0">
+              <p className="font-bold text-gray-900">โทเค้นสำหรับใช้คอมเมนต์</p>
+              <p className="text-xs text-gray-400 mt-0.5">
+                เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้นที่กรอกเอง (Facebook Lite) หรือคอมเมนต์ในนามเพจผ่าน Power Editor (แยกอิสระจากโทเค้นที่ใช้โพสต์)
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {([
+                { value: 'stored_token', label: 'Facebook Lite', hint: 'คอมเมนต์ด้วย Page token ที่กรอกเอง' },
+                { value: 'cloak_browser', label: 'Power Editor', hint: 'คอมเมนต์ในนามเพจผ่าน session Power Editor' },
+              ] as { value: CommentTokenSource; label: string; hint: string }[]).map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setCommentTokenSource(option.value)}
+                  className={`min-h-[74px] rounded-xl border px-3 py-2 text-left transition-all ${commentTokenSource === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
+                  aria-pressed={commentTokenSource === option.value}
+                >
+                  <span className={`block text-sm font-bold ${commentTokenSource === option.value ? 'text-blue-700' : 'text-gray-700'}`}>{option.label}</span>
+                  <span className="block text-[11px] text-gray-400 mt-1 leading-snug">{option.hint}</span>
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { value: 'stored_token', label: 'Facebook Lite', hint: 'คอมเมนต์ด้วย Page token ที่กรอกเอง' },
-              { value: 'cloak_browser', label: 'Power Editor', hint: 'คอมเมนต์ในนามเพจผ่าน session Power Editor' },
-            ] as { value: CommentTokenSource; label: string; hint: string }[]).map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                onClick={() => setCommentTokenSource(option.value)}
-                className={`min-h-[74px] rounded-xl border px-3 py-2 text-left transition-all ${commentTokenSource === option.value ? 'border-blue-500 bg-blue-50' : 'border-gray-200 bg-gray-50'}`}
-                aria-pressed={commentTokenSource === option.value}
-              >
-                <span className={`block text-sm font-bold ${commentTokenSource === option.value ? 'text-blue-700' : 'text-gray-700'}`}>{option.label}</span>
-                <span className="block text-[11px] text-gray-400 mt-1 leading-snug">{option.hint}</span>
-              </button>
-            ))}
-          </div>
-        </div>
+        ) : null}
 
         <div className="bg-white border border-gray-100 rounded-2xl p-4 mb-3 space-y-3">
           <div className="flex items-center justify-between gap-3">
