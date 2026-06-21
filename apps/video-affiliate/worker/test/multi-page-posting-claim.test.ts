@@ -81,6 +81,15 @@ function getHistoryCheckSource(): string {
     )
 }
 
+function getSourceFingerprintHistoryCheckSource(): string {
+    return sliceBetween(
+        getSource(),
+        'async function getLatestSuccessfulNamespacePostHistoryForSourceFingerprint',
+        '\nfunction isSuccessfulNamespaceSourceHistoryStaleForManualUnpost',
+        'getLatestSuccessfulNamespacePostHistoryForSourceFingerprint'
+    )
+}
+
 function getClaimFastSource(): string {
     return sliceBetween(
         getSource(),
@@ -284,6 +293,81 @@ test('claimFastGalleryVideoForPosting treats seen fresh rows as no-fallback even
         'scan pass must report exhaustion separately from whether rows existed'
     )
     assert.ok(guardIdx !== -1 && guardIdx < fallbackIdx, 'fresh-row no-fallback guard must run before fallback scan')
+})
+
+test('namespace-unposted primary pass hydrates source_fingerprint before claim eligibility', () => {
+    const body = getClaimFastSource()
+    const hydrateIdx = body.indexOf('await hydrateFastPostingCandidateSourceFingerprint({')
+    const sourceFingerprintIdx = body.indexOf('const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint', hydrateIdx)
+    const sourceHistoryIdx = body.indexOf('getLatestSuccessfulNamespacePostHistoryForSourceFingerprint', sourceFingerprintIdx)
+    const claimIdx = body.indexOf('const picked = await claimGalleryVideoForPosting({', sourceHistoryIdx)
+
+    assert.notEqual(hydrateIdx, -1, 'primary scan must hydrate candidate source_fingerprint')
+    assert.ok(sourceFingerprintIdx > hydrateIdx, 'candidate source_fingerprint must be read after hydration')
+    assert.ok(sourceHistoryIdx > sourceFingerprintIdx, 'source history eligibility must use the hydrated fingerprint')
+    assert.ok(claimIdx > sourceHistoryIdx, 'source history eligibility must run before claimGalleryVideoForPosting')
+    assert.match(
+        body,
+        /if \(mode === 'namespace_unposted' && sourceFingerprint\)/,
+        'source-fingerprint history guard must apply to the namespace_unposted primary pass'
+    )
+})
+
+test('namespace-unposted primary pass blocks successful duplicate sources before selecting raw rows', () => {
+    const historyBody = getSourceFingerprintHistoryCheckSource()
+    const claimBody = getClaimFastSource()
+    const sourceHistoryIdx = claimBody.indexOf('getLatestSuccessfulNamespacePostHistoryForSourceFingerprint')
+    const skipIdx = claimBody.indexOf('!isSuccessfulNamespaceSourceHistoryStaleForManualUnpost', sourceHistoryIdx)
+    const claimIdx = claimBody.indexOf('const picked = await claimGalleryVideoForPosting({', sourceHistoryIdx)
+
+    assert.match(historyBody, /FROM post_history ph/, 'source guard must read post_history')
+    assert.match(historyBody, /ph\.bot_id = \?/, 'source guard must be namespace-scoped')
+    assert.match(historyBody, /ph\.status = 'success'/, 'source guard must require successful history')
+    assert.match(historyBody, /ph\.source_fingerprint/, 'source guard must use post_history source_fingerprint')
+    assert.match(historyBody, /nvs\.source_fingerprint/, 'source guard must hydrate older history rows through namespace_video_state')
+    assert.doesNotMatch(
+        historyBody,
+        /AND\s+ph\.video_id\s*=\s*\?/,
+        'source guard must not only check exact video_id'
+    )
+    assert.doesNotMatch(historyBody, /ph\.page_id = \?/, 'source guard must not be page-scoped')
+    assert.ok(skipIdx > sourceHistoryIdx && skipIdx < claimIdx, 'duplicate source skip must happen before claim selection')
+})
+
+test('page reuse fallback remains exact-video namespace success after the primary pass', () => {
+    const claimBody = getClaimFastSource()
+    const primaryIdx = claimBody.indexOf("scanCandidateMode('namespace_unposted')")
+    const fallbackIdx = claimBody.indexOf("scanCandidateMode('page_reuse_fallback')")
+    const fallbackBlock = sliceBetween(
+        claimBody,
+        "if (mode === 'page_reuse_fallback') {",
+        '\n                await hydrateFastPostingCandidateSourceFingerprint',
+        'page_reuse_fallback block'
+    )
+
+    assert.ok(primaryIdx !== -1 && fallbackIdx !== -1 && primaryIdx < fallbackIdx, 'fallback scan must stay after the primary scan')
+    assert.match(
+        fallbackBlock,
+        /hasSuccessfulNamespacePostHistoryForVideo/,
+        'fallback must still require real namespace success for the exact video_id'
+    )
+    assert.doesNotMatch(
+        fallbackBlock,
+        /getLatestSuccessfulNamespacePostHistoryForSourceFingerprint/,
+        'source-fingerprint duplicate guard must not replace the fallback exact-video success check'
+    )
+})
+
+test('source-fingerprint duplicate guard stays bounded and avoids page-aware hot SQL', () => {
+    const listBody = getListCandidatesSource()
+    const claimBody = getClaimFastSource()
+    const historyBody = getSourceFingerprintHistoryCheckSource()
+
+    assert.doesNotMatch(listBody, /SELECT\s+COUNT\(\*\)/i, 'candidate lister must not run COUNT(*)')
+    assert.doesNotMatch(claimBody, /SELECT\s+COUNT\(\*\)/i, 'claimFast must not reintroduce COUNT(*)')
+    assert.doesNotMatch(historyBody, /COUNT\(\*\)/i, 'source guard must not count history rows')
+    assert.match(historyBody, /LIMIT 1/, 'source guard must use a bounded existence lookup')
+    assert.doesNotMatch(historyBody, /page_id\s*=\s*\?/, 'source guard must not add a page-aware subquery')
 })
 
 test('random posting order uses bounded random page windows without COUNT', () => {

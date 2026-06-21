@@ -5570,6 +5570,55 @@ async function hasSuccessfulNamespacePostHistoryForVideo(db: D1Database, namespa
     return !!row
 }
 
+type SuccessfulNamespaceSourceHistoryRow = {
+    id: number | null
+    postedAt: string | null
+}
+
+async function getLatestSuccessfulNamespacePostHistoryForSourceFingerprint(
+    db: D1Database,
+    namespaceId: string,
+    sourceFingerprint: string,
+): Promise<SuccessfulNamespaceSourceHistoryRow | null> {
+    const ns = String(namespaceId || '').trim()
+    const fingerprint = normalizeNamespaceVideoSourceFingerprint(sourceFingerprint)
+    if (!ns || !fingerprint) return null
+
+    const row = await db.prepare(
+        `SELECT ph.id, ph.posted_at
+         FROM post_history ph
+         LEFT JOIN namespace_video_state nvs
+           ON nvs.namespace_id = ph.bot_id
+          AND nvs.video_id = ph.video_id
+         WHERE ph.bot_id = ?
+           AND ph.status = 'success'
+           AND lower(COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), NULLIF(TRIM(nvs.source_fingerprint), ''))) = ?
+         ORDER BY datetime(ph.posted_at) DESC, ph.id DESC
+         LIMIT 1`
+    ).bind(ns, fingerprint).first().catch(() => null) as {
+        id?: number
+        posted_at?: string | null
+    } | null
+
+    if (!row) return null
+    return {
+        id: typeof row.id === 'number' ? row.id : null,
+        postedAt: String(row.posted_at || '').trim() || null,
+    }
+}
+
+function isSuccessfulNamespaceSourceHistoryStaleForManualUnpost(
+    history: SuccessfulNamespaceSourceHistoryRow | null,
+    manualUnpostedAt: string,
+): boolean {
+    if (!history) return false
+    const manualUnpostedAtMs = Date.parse(String(manualUnpostedAt || '').trim())
+    const postedAtMs = Date.parse(String(history.postedAt || '').trim())
+    return Number.isFinite(manualUnpostedAtMs)
+        && Number.isFinite(postedAtMs)
+        && postedAtMs <= manualUnpostedAtMs
+}
+
 async function listFastGalleryPostingCandidatePage(params: {
     db: D1Database
     namespaceId: string
@@ -5674,6 +5723,7 @@ async function claimFastGalleryVideoForPosting(params: {
         const pageIndexes = buildFastGalleryPostingPageIndexes(maxPages, params.postingOrder)
         let exhaustedAfterPageIndex: number | null = null
         let candidateRows = 0
+        const successfulSourceHistoryByFingerprint = new Map<string, SuccessfulNamespaceSourceHistoryRow | null>()
 
         for (const pageIndex of pageIndexes) {
             if (exhaustedAfterPageIndex !== null && pageIndex > exhaustedAfterPageIndex) continue
@@ -5730,6 +5780,27 @@ async function claimFastGalleryVideoForPosting(params: {
                     bucket: candidateBucket,
                     video: candidate,
                 })
+                const sourceFingerprint = normalizeNamespaceVideoSourceFingerprint(
+                    candidate.sourceFingerprint || candidate.source_fingerprint,
+                )
+                if (mode === 'namespace_unposted' && sourceFingerprint) {
+                    let successfulSourceHistory = successfulSourceHistoryByFingerprint.get(sourceFingerprint)
+                    if (!successfulSourceHistoryByFingerprint.has(sourceFingerprint)) {
+                        successfulSourceHistory = await getLatestSuccessfulNamespacePostHistoryForSourceFingerprint(
+                            params.env.DB,
+                            namespaceId,
+                            sourceFingerprint,
+                        )
+                        successfulSourceHistoryByFingerprint.set(sourceFingerprint, successfulSourceHistory)
+                    }
+                    const manualUnpostedAt = String(candidate.manualUnpostedAt || candidate.manual_unposted_at || '').trim()
+                    if (
+                        successfulSourceHistory
+                        && !isSuccessfulNamespaceSourceHistoryStaleForManualUnpost(successfulSourceHistory, manualUnpostedAt)
+                    ) {
+                        continue
+                    }
+                }
 
                 const picked = await claimGalleryVideoForPosting({
                     db: params.env.DB,
