@@ -258,11 +258,32 @@ test('claimFastGalleryVideoForPosting scans namespace-fresh before reuse fallbac
     assert.ok(primaryIdx < fallbackIdx, 'namespace_unposted pass must run before page_reuse_fallback')
     assert.match(
         body,
-        /if \(!namespaceFreshScan\.exhausted\) return finish\(null\)/,
-        'claimFast must not fall back to reused clips unless the namespace-fresh pass was exhausted'
+        /if \(!namespaceFreshScan\.exhausted \|\| namespaceFreshScan\.candidateRows > 0\) return finish\(null\)/,
+        'claimFast must not fall back to reused clips unless the namespace-fresh pass was exhausted and empty'
     )
     assert.match(body, /gallery_index_namespace_unposted/, 'stats/log source must expose namespace-unposted mode')
     assert.match(body, /gallery_index_page_reuse_fallback/, 'stats/log source must expose fallback reuse mode')
+})
+
+test('claimFastGalleryVideoForPosting treats seen fresh rows as no-fallback even when none claim', () => {
+    const source = getSource()
+    const body = getClaimFastSource()
+    const guardIdx = body.indexOf('namespaceFreshScan.candidateRows > 0')
+    const fallbackIdx = body.indexOf("scanCandidateMode('page_reuse_fallback')")
+
+    assert.match(
+        source,
+        /type FastGalleryPostingScanResult = \{[\s\S]*candidateRows: number[\s\S]*\}/,
+        'scan result must carry how many rows the active pass fetched'
+    )
+    assert.match(body, /let candidateRows = 0/, 'scan pass must initialize candidateRows')
+    assert.match(body, /candidateRows \+= page\.length/, 'scan pass must count fetched fresh rows')
+    assert.match(
+        body,
+        /return \{ picked: null, exhausted: exhaustedAfterPageIndex !== null, candidateRows \}/,
+        'scan pass must report exhaustion separately from whether rows existed'
+    )
+    assert.ok(guardIdx !== -1 && guardIdx < fallbackIdx, 'fresh-row no-fallback guard must run before fallback scan')
 })
 
 test('random posting order uses bounded random page windows without COUNT', () => {
@@ -274,6 +295,11 @@ test('random posting order uses bounded random page windows without COUNT', () =
         claimBody,
         /const pageIndexes = buildFastGalleryPostingPageIndexes\(maxPages, params\.postingOrder\)/,
         'claimFast must use bounded page indexes instead of COUNT-derived random offsets'
+    )
+    assert.match(
+        claimBody,
+        /if \(!namespaceFreshScan\.exhausted \|\| namespaceFreshScan\.candidateRows > 0\) return finish\(null\)/,
+        'bounded random scans must return no pick when they lack proof of an empty fresh pool'
     )
 })
 

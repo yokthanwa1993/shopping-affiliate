@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
     validateAdOnlyInput,
     resolveAdOnlySchedule,
@@ -21,6 +22,43 @@ import {
     DEFAULT_COMMENT_TEMPLATE_TEXT,
     COMMENT_TEMPLATE_SHOPEE_PLACEHOLDER,
 } from '../src/comment-template.js'
+
+function getIndexSource(): string {
+    return readFileSync('src/index.ts', 'utf8')
+}
+
+function sliceIndexSource(startMarker: string, endMarker: string, label: string): string {
+    const source = getIndexSource()
+    const start = source.indexOf(startMarker)
+    assert.notEqual(start, -1, `${label} start marker must exist`)
+    const end = source.indexOf(endMarker, start + startMarker.length)
+    assert.notEqual(end, -1, `${label} end marker must exist`)
+    return source.slice(start, end)
+}
+
+function getCreateAdOnlyRouteSource(): string {
+    return sliceIndexSource(
+        "app.post('/api/dashboard/create-ad-only'",
+        "\napp.get('/api/dashboard/ad-history'",
+        'POST /api/dashboard/create-ad-only'
+    )
+}
+
+function getAdHistoryRouteSource(): string {
+    return sliceIndexSource(
+        "app.get('/api/dashboard/ad-history'",
+        '\n// =====================================================================\n// AD-ONLY QUEUE',
+        'GET /api/dashboard/ad-history'
+    )
+}
+
+function getAdHistoryNormalizerSource(): string {
+    return sliceIndexSource(
+        'function normalizeDashboardAdHistoryRow',
+        "\napp.post('/api/dashboard/create-ad-only'",
+        'normalizeDashboardAdHistoryRow'
+    )
+}
 
 test('validate fails closed when page_id is missing', () => {
     const v = validateAdOnlyInput({ story_id: '123_456' })
@@ -251,6 +289,63 @@ test('active ad-only comment falls back to the DEFAULT template when the namespa
     assert.ok(message.includes(finalLink), 'default template still substitutes the final shortlink')
     assert.notEqual(message.trim(), finalLink, 'default fallback is not a bare link')
     assert.ok(!/lazada/i.test(message) || /https?:\/\//i.test(message), 'empty Lazada line is dropped')
+})
+
+test('active create-ad-only records explicit comment evidence or a skipped/failed reason', () => {
+    const routeSource = getCreateAdOnlyRouteSource()
+    const activeIdx = routeSource.indexOf("if (schedule.mode === 'active')")
+    const pageCommentIdx = routeSource.indexOf("`${baseUrl}/page-comment`")
+    const successIdx = routeSource.indexOf('// 6. Success')
+
+    assert.ok(activeIdx >= 0, 'create-ad-only must have an active-only finalization block')
+    assert.ok(pageCommentIdx > activeIdx && pageCommentIdx < successIdx, 'Page comment write must only happen inside active finalization')
+    assert.match(routeSource, /skip_comment: true/, 'bridge /create-ad must not also comment')
+    assert.match(routeSource, /bridgeResult\.comment_status = 'skipped_no_shopee_link'/)
+    assert.match(routeSource, /bridgeResult\.comment_error = 'shopee_link_missing'/)
+    assert.match(routeSource, /bridgeResult\.comment_status = 'failed'[\s\S]*bridgeResult\.comment_error = 'story_id_missing'/)
+    assert.match(routeSource, /bridgeResult\.comment_status = 'failed'[\s\S]*bridgeResult\.comment_error = 'final_shortlink_unresolved'/)
+    assert.match(routeSource, /bridgeResult\.comment_target_story_id = fullStoryId/)
+    assert.match(routeSource, /bridgeResult\.comment_target_post_id = commentSubIds\.postSubId2/)
+    assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: fullStoryId, message: commentMessage, comment_message: commentMessage \}\)/)
+})
+
+test('ad-history expands safe comment and CTA proof fields from truncated_result_json', () => {
+    const source = getIndexSource()
+    const routeSource = getAdHistoryRouteSource()
+    const normalizerSource = getAdHistoryNormalizerSource()
+
+    for (const key of [
+        'comment_status',
+        'comment_fb_id',
+        'comment_message',
+        'comment_shortlink',
+        'comment_target_story_id',
+        'comment_target_post_id',
+        'published_to_page',
+        'publish_error',
+        'visible_page_cta_final',
+        'visible_page_cta_link',
+        'paid_ad_cta_final',
+        'paid_ad_cta_link',
+    ]) {
+        assert.match(source, new RegExp(`'${key}'`), `safe field list must include ${key}`)
+    }
+    assert.match(routeSource, /\.map\(normalizeDashboardAdHistoryRow\)/)
+    assert.match(normalizerSource, /parseDashboardAdHistoryResultJson\(row\.truncated_result_json\)/)
+    assert.match(normalizerSource, /for \(const key of AD_HISTORY_RESULT_SAFE_FIELDS\)/)
+    assert.match(normalizerSource, /buildPageStoryId\(pageId, storyId\)/)
+    assert.match(normalizerSource, /item\.comment_target_story_id = fullStoryId/)
+    assert.match(normalizerSource, /item\.comment_target_post_id = adHistoryStoryTail\(fullStoryId\)/)
+})
+
+test('created ad-history audit json prioritizes comment proof fields before long bridge payloads', () => {
+    const routeSource = getCreateAdOnlyRouteSource()
+    const successResultIdx = routeSource.indexOf('const successResult = prioritizeDashboardAdHistoryResultFields(bridgeResult)')
+    const buildRecordIdx = routeSource.indexOf("buildAdHistoryRecord({ status: 'created'")
+
+    assert.ok(successResultIdx >= 0 && successResultIdx < buildRecordIdx, 'success audit result must be reordered before storage')
+    assert.match(routeSource, /result: successResult/)
+    assert.match(routeSource, /\.\.\.successResult/)
 })
 
 // PAID AD CTA REPAIR — the active ad-only finalization fixes the PAID ad creative's CTA in Ads

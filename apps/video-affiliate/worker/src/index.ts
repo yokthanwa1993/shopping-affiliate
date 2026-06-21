@@ -5488,6 +5488,7 @@ type FastGalleryPostingClaimResult = {
 type FastGalleryPostingScanResult = {
     picked: FastGalleryPostingClaimResult | null
     exhausted: boolean
+    candidateRows: number
 }
 
 type FastGalleryPostingClaimOutcome = {
@@ -5672,6 +5673,7 @@ async function claimFastGalleryVideoForPosting(params: {
         const seenVideoIds = new Set<string>()
         const pageIndexes = buildFastGalleryPostingPageIndexes(maxPages, params.postingOrder)
         let exhaustedAfterPageIndex: number | null = null
+        let candidateRows = 0
 
         for (const pageIndex of pageIndexes) {
             if (exhaustedAfterPageIndex !== null && pageIndex > exhaustedAfterPageIndex) continue
@@ -5687,6 +5689,7 @@ async function claimFastGalleryVideoForPosting(params: {
             })
             stats.pages += 1
             stats.candidateTotal += page.length
+            candidateRows += page.length
             if (page.length === 0) {
                 exhaustedAfterPageIndex = exhaustedAfterPageIndex === null
                     ? pageIndex
@@ -5735,17 +5738,21 @@ async function claimFastGalleryVideoForPosting(params: {
                     videos: [candidate],
                     postingOrder: params.postingOrder,
                 })
-                if (picked) return { picked, exhausted: false }
+                if (picked) return { picked, exhausted: false, candidateRows }
             }
 
             if (params.postingOrder !== 'random' && page.length < pageSize) break
         }
-        return { picked: null, exhausted: exhaustedAfterPageIndex !== null }
+        return { picked: null, exhausted: exhaustedAfterPageIndex !== null, candidateRows }
     }
 
     const namespaceFreshScan = await scanCandidateMode('namespace_unposted')
     if (namespaceFreshScan.picked) return finish(namespaceFreshScan.picked)
-    if (!namespaceFreshScan.exhausted) return finish(null)
+    // Reuse is safe only when the fresh namespace pool is proven empty. If the
+    // fresh pass saw rows but could not claim them (video lock, same-page guard,
+    // failed-today skip, or any bounded-window uncertainty), stop this tick
+    // instead of posting an older namespace-used clip.
+    if (!namespaceFreshScan.exhausted || namespaceFreshScan.candidateRows > 0) return finish(null)
 
     const fallbackScan = await scanCandidateMode('page_reuse_fallback')
     if (fallbackScan.picked) return finish(fallbackScan.picked)
@@ -12360,6 +12367,141 @@ async function insertAdHistoryRow(db: D1Database, rec: AdHistoryRecord, complete
     return (res as unknown as { meta?: { last_row_id?: number } }).meta?.last_row_id || 0
 }
 
+const AD_HISTORY_RESULT_SAFE_FIELDS = [
+    'comment_status',
+    'comment_fb_id',
+    'comment_message',
+    'comment_shortlink',
+    'comment_target_story_id',
+    'comment_target_post_id',
+    'comment_error',
+    'published_to_page',
+    'publish_error',
+    'visible_page_cta_final',
+    'visible_page_cta_link',
+    'visible_page_cta_initial',
+    'cta_update_status',
+    'cta_update_error',
+    'cta_sub2',
+    'cta_sub3',
+    'paid_ad_cta_final',
+    'paid_ad_cta_link',
+    'paid_cta_update_status',
+    'paid_cta_update_error',
+    'paid_new_creative_id',
+    'paid_old_creative_id',
+    'story_id',
+    'ad_story_id',
+    'effective_object_story_id',
+    'post_url',
+    'campaign_budget',
+    'daily_budget',
+    'start_time',
+    'end_time',
+    'campaign_status',
+    'adset_status',
+    'ad_status',
+] as const
+
+function adHistoryStoryTail(storyId: unknown): string {
+    const s = String(storyId || '').trim()
+    if (!s) return ''
+    const idx = s.lastIndexOf('_')
+    return idx >= 0 ? s.slice(idx + 1) : s
+}
+
+function escapeRegexLiteral(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function parseDashboardAdHistoryResultJson(raw: unknown): Record<string, unknown> {
+    const text = String(raw || '').trim()
+    if (!text) return {}
+    try {
+        const parsed = JSON.parse(text) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    } catch { /* truncated_result_json can be clipped; fall back to safe field extraction below */ }
+
+    const out: Record<string, unknown> = {}
+    for (const key of AD_HISTORY_RESULT_SAFE_FIELDS) {
+        const escapedKey = escapeRegexLiteral(key)
+        const stringMatch = text.match(new RegExp(`"${escapedKey}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`))
+        if (stringMatch) {
+            try {
+                out[key] = JSON.parse(`"${stringMatch[1]}"`)
+            } catch {
+                out[key] = stringMatch[1]
+            }
+            continue
+        }
+        const boolMatch = text.match(new RegExp(`"${escapedKey}"\\s*:\\s*(true|false)`))
+        if (boolMatch) {
+            out[key] = boolMatch[1] === 'true'
+            continue
+        }
+        const numberMatch = text.match(new RegExp(`"${escapedKey}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`))
+        if (numberMatch) out[key] = Number(numberMatch[1])
+    }
+    return out
+}
+
+function sanitizeDashboardAdHistoryField(value: unknown): unknown {
+    if (typeof value === 'boolean' || typeof value === 'number') return value
+    const s = String(value ?? '').trim()
+    return s.length > 1000 ? s.slice(0, 1000) : s
+}
+
+function prioritizeDashboardAdHistoryResultFields(result: Record<string, unknown>): Record<string, unknown> {
+    const ordered: Record<string, unknown> = {}
+    for (const key of AD_HISTORY_RESULT_SAFE_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(result, key)) ordered[key] = result[key]
+    }
+    for (const [key, value] of Object.entries(result)) {
+        if (!Object.prototype.hasOwnProperty.call(ordered, key)) ordered[key] = value
+    }
+    return ordered
+}
+
+function normalizeDashboardAdHistoryRow(row: Record<string, unknown>): Record<string, unknown> {
+    const result = parseDashboardAdHistoryResultJson(row.truncated_result_json)
+    const item: Record<string, unknown> = { ...row }
+    for (const key of AD_HISTORY_RESULT_SAFE_FIELDS) {
+        if (!Object.prototype.hasOwnProperty.call(result, key)) continue
+        const value = result[key]
+        if (value === null || value === undefined) continue
+        if (typeof value === 'string' && !value.trim()) continue
+        item[key] = sanitizeDashboardAdHistoryField(value)
+    }
+
+    const hasCommentEvidence = !!String(
+        item.comment_status
+        || item.comment_fb_id
+        || item.comment_shortlink
+        || item.comment_message
+        || ''
+    ).trim() || String(item.mode || '').trim().toLowerCase() === 'active'
+    if (!hasCommentEvidence) return item
+
+    const pageId = String(item.page_id || '').trim()
+    const storyId = String(
+        item.comment_target_story_id
+        || result.comment_target_story_id
+        || result.story_id
+        || result.effective_object_story_id
+        || result.ad_story_id
+        || item.effective_object_story_id
+        || ''
+    ).trim()
+    const fullStoryId = buildPageStoryId(pageId, storyId)
+    if (fullStoryId && !String(item.comment_target_story_id || '').trim()) {
+        item.comment_target_story_id = fullStoryId
+    }
+    if (fullStoryId && !String(item.comment_target_post_id || '').trim()) {
+        item.comment_target_post_id = adHistoryStoryTail(fullStoryId)
+    }
+    return item
+}
+
 app.post('/api/dashboard/create-ad-only', async (c) => {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
     await ensureAdHistoryTable(c.env.DB)
@@ -12558,9 +12700,15 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     //   • set the VISIBLE ad-post CTA to that final link (bridge /update-cta, SHOP_NOW), and
     //   • post EXACTLY ONE Page comment with the same final link on the FULL story id (/page-comment).
     // All of this is best-effort: a failure is recorded on bridgeResult but never fails the created ad.
-    if (schedule.mode === 'active' && shopeeLink) {
+    if (schedule.mode === 'active') {
         const bridgeStoryId = String(bridgeResult.story_id || bridgeResult.effective_object_story_id || bridgeResult.ad_story_id || '').trim()
-        if (bridgeStoryId) {
+        if (!shopeeLink) {
+            bridgeResult.comment_status = 'skipped_no_shopee_link'
+            bridgeResult.comment_error = 'shopee_link_missing'
+        } else if (!bridgeStoryId) {
+            bridgeResult.comment_status = 'failed'
+            bridgeResult.comment_error = 'story_id_missing'
+        } else {
             // Derive sub2 = post id tail, sub3 = page id from the bridge-returned story_id.
             const commentSubIds = buildPostingCommentShortlinkSubIds({
                 canonicalPostId: bridgeStoryId,
@@ -12569,6 +12717,9 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                 historyId: null,
                 logPrefix: `AD-ONLY ACTIVE ${validation.pageId}`,
             })
+            const fullStoryId = buildPageStoryId(validation.pageId, bridgeStoryId)
+            bridgeResult.comment_target_story_id = fullStoryId
+            bridgeResult.comment_target_post_id = commentSubIds.postSubId2
             // Re-mint through the SAME page shortlink template / short.wwoom flow used for the initial
             // clickLink, but with sub2/sub3 from the returned story_id (sub1 stays the page setting).
             const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
@@ -12679,7 +12830,6 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                     bridgeResult.comment_error = 'comment_template_rendered_empty'
                 } else {
                     try {
-                        const fullStoryId = buildPageStoryId(validation.pageId, bridgeStoryId)
                         const commentResp = await fetch(`${baseUrl}/page-comment`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
@@ -12699,14 +12849,18 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                         bridgeResult.comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
                     }
                 }
+            } else {
+                bridgeResult.comment_status = 'failed'
+                bridgeResult.comment_error = 'final_shortlink_unresolved'
             }
         }
     }
 
     // 6. Success — record the created ids (status=created).
-    const successRec = buildAdHistoryRecord({ status: 'created', validation, result: bridgeResult, clickLink, schedule })
+    const successResult = prioritizeDashboardAdHistoryResultFields(bridgeResult)
+    const successRec = buildAdHistoryRecord({ status: 'created', validation, result: successResult, clickLink, schedule })
     const historyId = await insertAdHistoryRow(c.env.DB, successRec, true).catch(() => 0)
-    return c.json({ ok: true, history_id: historyId, mode: schedule.mode, ...bridgeResult, click_link: clickLink }, 200)
+    return c.json({ ok: true, history_id: historyId, mode: schedule.mode, ...successResult, click_link: clickLink }, 200)
 })
 
 app.get('/api/dashboard/ad-history', async (c) => {
@@ -12723,7 +12877,8 @@ app.get('/api/dashboard/ad-history', async (c) => {
     const rows = await c.env.DB.prepare(
         `SELECT * FROM dashboard_ad_history ${where} ORDER BY id DESC LIMIT ?`
     ).bind(...binds, limit).all() as { results?: Array<Record<string, unknown>> }
-    return c.json({ ok: true, items: rows.results || [] }, 200, { 'Cache-Control': 'no-store' })
+    const items = (rows.results || []).map(normalizeDashboardAdHistoryRow)
+    return c.json({ ok: true, items }, 200, { 'Cache-Control': 'no-store' })
 })
 
 // =====================================================================
