@@ -47,7 +47,7 @@ function getCreateAdOnlyRouteSource(): string {
 function getAdHistoryRouteSource(): string {
     return sliceIndexSource(
         "app.get('/api/dashboard/ad-history'",
-        '\n// =====================================================================\n// AD-ONLY QUEUE',
+        '\n// =====================================================================\n// CREATE ADS QUEUE',
         'GET /api/dashboard/ad-history'
     )
 }
@@ -66,21 +66,32 @@ test('validate fails closed when page_id is missing', () => {
     assert.equal(v.error, 'page_id_required')
 })
 
-test('validate rejects a video_url-only request (would publish a new post)', () => {
+test('validate accepts an already-resolved video_url publish source', () => {
     const v = validateAdOnlyInput({ page_id: 'P', video_url: 'https://cdn/x.mp4' })
-    assert.equal(v.ok, false)
-    assert.equal(v.error, 'ad_only_no_new_post')
+    assert.equal(v.ok, true)
+    assert.equal(v.videoUrl, 'https://cdn/x.mp4')
+    assert.equal(v.hasSystemVideoSource, true)
 })
 
-test('validate rejects system_video_id alone — audit metadata is not an ad source', () => {
+test('validate accepts system_video_id alone as publishable system content', () => {
     const v = validateAdOnlyInput({ page_id: 'P', system_video_id: 'sys-1' })
-    assert.equal(v.ok, false)
-    assert.equal(v.error, 'ad_source_required')
+    assert.equal(v.ok, true)
     assert.equal(v.systemVideoId, 'sys-1')
     assert.equal(v.hasAdSource, false)
+    assert.equal(v.hasSystemVideoSource, true)
 })
 
-test('validate accepts an existing story_id and carries the parsed source ids', () => {
+test('validate rejects old source-signal ids without system video content', () => {
+    const v = validateAdOnlyInput({ page_id: 'P', story_id: '123_456', fb_video_id: 'fb-1' })
+    assert.equal(v.ok, false)
+    assert.equal(v.error, 'system_video_source_required')
+    assert.equal(v.sourceStoryId, '123_456')
+    assert.equal(v.fbVideoId, 'fb-1')
+    assert.equal(v.hasAdSource, true)
+    assert.equal(v.hasSystemVideoSource, false)
+})
+
+test('validate accepts an old story_id signal with a system video publish source', () => {
     const v = validateAdOnlyInput({ page_id: 'P', story_id: '123_456', system_video_id: 'sys-1' })
     assert.equal(v.ok, true)
     assert.equal(v.sourceStoryId, '123_456')
@@ -89,14 +100,14 @@ test('validate accepts an existing story_id and carries the parsed source ids', 
 })
 
 test('validate accepts fb_video_id and the generic video_id alias', () => {
-    assert.equal(validateAdOnlyInput({ page_id: 'P', fb_video_id: 'v1' }).ok, true)
-    const v = validateAdOnlyInput({ page_id: 'P', video_id: 'v2' })
+    assert.equal(validateAdOnlyInput({ page_id: 'P', fb_video_id: 'v1', system_video_id: 'sys-1' }).ok, true)
+    const v = validateAdOnlyInput({ page_id: 'P', video_id: 'v2', system_video_id: 'sys-2' })
     assert.equal(v.ok, true)
     assert.equal(v.fbVideoId, 'v2')
 })
 
 test('validate accepts post_id as an ad source', () => {
-    const v = validateAdOnlyInput({ page_id: 'P', post_id: 'P_789' })
+    const v = validateAdOnlyInput({ page_id: 'P', post_id: 'P_789', system_video_id: 'sys-1' })
     assert.equal(v.ok, true)
     assert.equal(v.sourcePostId, 'P_789')
 })
@@ -143,7 +154,7 @@ test('schedule accepts the minor-units daily_budget alias (converted back to who
 })
 
 test('ad-history record carries mode + run_hours intent and echoes bridge budget/schedule', () => {
-    const v = validateAdOnlyInput({ page_id: 'P', story_id: '1_2' })
+    const v = validateAdOnlyInput({ page_id: 'P', story_id: '1_2', system_video_id: 'sys-1' })
     const rec = buildAdHistoryRecord({
         status: 'created',
         validation: v,
@@ -158,7 +169,7 @@ test('ad-history record carries mode + run_hours intent and echoes bridge budget
 })
 
 test('ad-history record leaves schedule fields empty for the paused/review path', () => {
-    const v = validateAdOnlyInput({ page_id: 'P', story_id: '1_2' })
+    const v = validateAdOnlyInput({ page_id: 'P', story_id: '1_2', system_video_id: 'sys-1' })
     const rec = buildAdHistoryRecord({ status: 'created', validation: v, result: { ad_id: 'AD1', adset_status: 'PAUSED' }, schedule: { mode: 'paused', runHours: 24 } })
     assert.equal(rec.mode, 'paused')
     assert.equal(rec.daily_budget, '')
@@ -173,7 +184,7 @@ test('bridge paused gate is ON — ad-only creates non-spending PAUSED ads via t
 })
 
 test('unsupported result is structured, stable, and echoes the validated source', () => {
-    const v = validateAdOnlyInput({ page_id: 'P', story_id: '123_456', fb_video_id: 'v9' })
+    const v = validateAdOnlyInput({ page_id: 'P', story_id: '123_456', fb_video_id: 'v9', system_video_id: 'sys-1' })
     const r = buildAdOnlyUnsupportedResult(v)
     assert.equal(r.ok, false)
     assert.equal(r.error, 'ad_only_bridge_paused_unsupported')
@@ -204,7 +215,7 @@ test('ad-history record maps validation + bridge result fields', () => {
 })
 
 test('ad-history record for the unsupported path carries status + error, no result json', () => {
-    const v = validateAdOnlyInput({ page_id: 'P', post_id: 'P_1' })
+    const v = validateAdOnlyInput({ page_id: 'P', post_id: 'P_1', system_video_id: 'sys-1' })
     const rec = buildAdHistoryRecord({ status: 'unsupported', validation: v, errorMessage: 'ad_only_bridge_paused_unsupported' })
     assert.equal(rec.status, 'unsupported')
     assert.equal(rec.error_message, 'ad_only_bridge_paused_unsupported')
@@ -291,14 +302,15 @@ test('active ad-only comment falls back to the DEFAULT template when the namespa
     assert.ok(!/lazada/i.test(message) || /https?:\/\//i.test(message), 'empty Lazada line is dropped')
 })
 
-test('active create-ad-only records explicit comment evidence or a skipped/failed reason', () => {
+test('create-ad-only records new-story comment evidence or a skipped/failed reason', () => {
     const routeSource = getCreateAdOnlyRouteSource()
-    const activeIdx = routeSource.indexOf("if (schedule.mode === 'active')")
+    const finalizationIdx = routeSource.indexOf('// 5. New-story finalization')
     const pageCommentIdx = routeSource.indexOf("`${baseUrl}/page-comment`")
     const successIdx = routeSource.indexOf('// 6. Success')
 
-    assert.ok(activeIdx >= 0, 'create-ad-only must have an active-only finalization block')
-    assert.ok(pageCommentIdx > activeIdx && pageCommentIdx < successIdx, 'Page comment write must only happen inside active finalization')
+    assert.ok(finalizationIdx >= 0, 'create-ad-only must have a new-story finalization block')
+    assert.ok(pageCommentIdx > finalizationIdx && pageCommentIdx < successIdx, 'Page comment write must target the new-story finalization block')
+    assert.doesNotMatch(routeSource, /if \(schedule\.mode === 'active'\)[\s\S]*`\$\{baseUrl\}\/page-comment`/)
     assert.match(routeSource, /skip_comment: true/, 'bridge /create-ad must not also comment')
     assert.match(routeSource, /bridgeResult\.comment_status = 'skipped_no_shopee_link'/)
     assert.match(routeSource, /bridgeResult\.comment_error = 'shopee_link_missing'/)
@@ -307,22 +319,30 @@ test('active create-ad-only records explicit comment evidence or a skipped/faile
     assert.match(routeSource, /bridgeResult\.comment_target_story_id = fullStoryId/)
     assert.match(routeSource, /bridgeResult\.comment_target_post_id = commentSubIds\.postSubId2/)
     assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: targetStoryId, message: commentMessage, comment_message: commentMessage \}\)/)
-    assert.match(routeSource, /const sourceCommentTargetRaw = validation\.sourcePostId \|\| validation\.fbVideoId/)
-    assert.match(routeSource, /sourceCommentTargetStoryId && sourceCommentTargetStoryId !== fullStoryId/)
 })
 
-test('active create-ad-only records source-surface comment proof without overwriting created-story proof', () => {
+test('create-ad-only bridge body publishes a new system-video post and does not skip page publish', () => {
     const routeSource = getCreateAdOnlyRouteSource()
 
-    assert.match(routeSource, /bridgeResult\.comment_status = createdComment\.status/)
-    assert.match(routeSource, /bridgeResult\.comment_fb_id = createdComment\.id/)
-    assert.match(routeSource, /bridgeResult\.source_comment_target_story_id = sourceCommentTargetStoryId/)
-    assert.match(routeSource, /bridgeResult\.source_comment_shortlink = finalLink/)
-    assert.match(routeSource, /bridgeResult\.source_comment_message = commentMessage\.slice\(0, 500\)/)
-    assert.match(routeSource, /bridgeResult\.source_comment_status = sourceComment\.status/)
-    assert.match(routeSource, /bridgeResult\.source_comment_fb_id = sourceComment\.id/)
-    assert.match(routeSource, /bridgeResult\.source_comment_error = sourceComment\.error/)
-    assert.match(routeSource, /bridgeResult\.source_comment_error = \(e instanceof Error \? e\.message : String\(e\)\)\.slice\(0, 200\)/)
+    assert.match(routeSource, /video_url: publishVideoUrl/)
+    assert.match(routeSource, /source_video_id: validation\.systemVideoId/)
+    assert.match(routeSource, /skip_comment: true/)
+    assert.doesNotMatch(routeSource, /skip_publish_to_page:\s*true/)
+    assert.match(routeSource, /resolveGalleryVideoForRepost/)
+    assert.match(routeSource, /system_video_unresolved/)
+})
+
+test('create-ad-only records new-story proof separately from old source signal ids', () => {
+    const routeSource = getCreateAdOnlyRouteSource()
+
+    assert.match(routeSource, /source_signal_story_id: validation\.sourceStoryId/)
+    assert.match(routeSource, /source_signal_post_id: validation\.sourcePostId/)
+    assert.match(routeSource, /source_signal_fb_video_id: validation\.fbVideoId/)
+    assert.match(routeSource, /source_signal_system_video_id: validation\.systemVideoId/)
+    assert.match(routeSource, /new_story_id: newStoryIdForProof/)
+    assert.match(routeSource, /new_post_id: newPostIdForProof/)
+    assert.doesNotMatch(routeSource, /sourceCommentTargetRaw/)
+    assert.doesNotMatch(routeSource, /source_comment_target_story_id = sourceCommentTargetStoryId/)
 })
 
 test('ad-history expands safe comment and CTA proof fields from truncated_result_json', () => {
@@ -331,6 +351,13 @@ test('ad-history expands safe comment and CTA proof fields from truncated_result
     const normalizerSource = getAdHistoryNormalizerSource()
 
     for (const key of [
+        'source_signal_story_id',
+        'source_signal_post_id',
+        'source_signal_fb_video_id',
+        'source_signal_system_video_id',
+        'new_story_id',
+        'new_post_id',
+        'new_fb_video_id',
         'comment_status',
         'comment_fb_id',
         'comment_message',
@@ -447,7 +474,7 @@ test('summarize paid CTA repair NEVER claims success on an unconfirmed read-back
 })
 
 test('ad-history record reflects the repaired paid creative + carries paid_ad_cta_final in the audit json', () => {
-    const v = validateAdOnlyInput({ page_id: '111', story_id: '111_222' })
+    const v = validateAdOnlyInput({ page_id: '111', story_id: '111_222', system_video_id: 'sys-1' })
     // After a confirmed repair the worker syncs creative_id to the NEW creative and merges the summary.
     const bridgeResult = {
         ad_id: 'AD9',
@@ -463,6 +490,14 @@ test('ad-history record reflects the repaired paid creative + carries paid_ad_ct
     assert.equal(rec.creative_id, 'CR2', 'audit row reflects the repaired (new) creative id')
     assert.ok(rec.truncated_result_json.includes('"paid_ad_cta_final":true'), 'audit json records the confirmed paid CTA')
     assert.equal(rec.click_link, 'https://s.shopee.co.th/FINAL')
+})
+
+test('Create Ads UI wording says old post is a signal and no longer claims no new post/comment', () => {
+    const ui = readFileSync('../../dashboard/react-dashboard/src/routes/create-ads.tsx', 'utf8')
+    assert.match(ui, /โพสต์เก่าคือต้นแบบ\/สัญญาณ/)
+    assert.match(ui, /สร้างโพสต์เพจใหม่/)
+    assert.doesNotMatch(ui, /ไม่เผยแพร่โพสต์ใหม่/)
+    assert.doesNotMatch(ui, /ไม่คอมเมนต์/)
 })
 
 test('truncateResultJson bounds long payloads and never throws on cycles', () => {

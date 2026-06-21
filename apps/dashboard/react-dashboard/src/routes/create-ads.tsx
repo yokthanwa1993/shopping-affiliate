@@ -25,19 +25,18 @@ import { PageHealthCard } from '@/components/PageHealthCard'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 
-// Create Ads — action-first, AD-ONLY, master-detail (mirrors Create Post).
+// Create Ads — action-first, signal-to-new-post, master-detail (mirrors Create Post).
 //
 // MASTER: no page is auto-selected; the operator first lands on a full-bleed,
-// scalable page list. DETAIL: tapping a page opens an ad-only settings screen
-// scoped to that page (health/defaults, pick an existing input, ad settings,
-// submit, ad-only history) with a back/"เปลี่ยนเพจ" affordance to the list.
+// scalable page list. DETAIL: tapping a page opens Create Ads settings scoped to
+// that page (health/defaults, pick a high-performing source signal, ad settings,
+// submit, history) with a back/"เปลี่ยนเพจ" affordance to the list.
 //
-// The AD-ONLY invariant is unchanged: the operator picks an EXISTING page
-// post/story or an existing video as the ad input. Creating an ad must never
-// publish a new post, so this page issues no post/publish request and calls no
-// mixed post+ad endpoint. Submit goes only through the dedicated ad-only Worker
-// endpoint (api/createAds.ts → POST /api/dashboard/create-ad-only) and the proof
-// panel/history read from dashboard_ad_history.
+// The selected old Page post/video is a source signal only. The Worker resolves
+// its system video id, creates a NEW Page post/story with the same system content,
+// then creates/promotes the ad from that new story. Submit goes only through the
+// dedicated Worker endpoint (api/createAds.ts → POST /api/dashboard/create-ad-only)
+// and the proof panel/history read from dashboard_ad_history.
 
 function SectionLabel({ step, title, hint }: { step: number; title: string; hint?: string }) {
   return (
@@ -148,7 +147,7 @@ function CandidateCard({
 
 export function CreateAdsPage() {
   // Master-detail: no page is auto-selected. The operator must pick a page from
-  // the scalable list first; only then does the ad-only detail screen come alive.
+  // the scalable list first; only then does the Create Ads detail screen come alive.
   const [selectedId, setSelectedId] = useState<string>('')
 
   const pagesQuery = useQuery({
@@ -159,7 +158,7 @@ export function CreateAdsPage() {
   const selectedPage = pages.find((p) => p.id === selectedId) ?? null
 
   if (selectedPage) {
-    // DETAIL — ad-only settings scoped to the chosen page, with a back affordance
+    // DETAIL — Create Ads settings scoped to the chosen page, with a back affordance
     // to return to the page list. Keyed by page id so switching pages resets all
     // per-page selection/ad-settings state cleanly.
     return (
@@ -180,7 +179,7 @@ export function CreateAdsPage() {
       <div className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">สร้างแอด</h1>
         <p className="text-sm text-muted-foreground">
-          เลือกเพจ แล้วสร้างแอด<strong>จากโพสต์ที่มีอยู่แล้ว</strong> — ไม่สร้างโพสต์ใหม่ในหน้านี้
+          เลือกเพจ แล้วใช้โพสต์ยอดดีเป็นสัญญาณเพื่อสร้างโพสต์ใหม่และแอดใหม่
         </p>
       </div>
 
@@ -188,17 +187,14 @@ export function CreateAdsPage() {
       <div className="flex items-start gap-2 rounded-xl border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
         <Info className="mt-0.5 h-4 w-4 shrink-0" />
         <div>
-          <p className="font-semibold">หน้านี้สร้างแอดจากโพสต์/สตอรี/วิดีโอที่มีอยู่แล้วเท่านั้น</p>
+          <p className="font-semibold">โพสต์เก่าเป็นต้นแบบ/สัญญาณ ไม่ใช่พื้นผิวแอดจริง</p>
           <p className="text-sky-800">
-            ไม่เผยแพร่โพสต์ใหม่ — หากต้องการโพสต์ลงเพจ ให้ไปที่{' '}
-            <Link to="/create-post" className="font-semibold underline">
-              หน้าสร้างโพสต์
-            </Link>
+            ระบบจะสร้างโพสต์เพจใหม่ด้วยวิดีโอ/คอนเทนต์เดียวกันจากระบบ แล้วสร้างแอดจากโพสต์ใหม่นั้น
           </p>
         </div>
       </div>
 
-      {/* MASTER — page list first. No ad-only detail renders until a page is chosen. */}
+      {/* MASTER — page list first. No Create Ads detail renders until a page is chosen. */}
       <section className="flex min-h-0 flex-1 flex-col gap-3">
         <p className="flex items-baseline gap-2 text-xs text-muted-foreground">
           <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
@@ -225,7 +221,7 @@ export function CreateAdsPage() {
   )
 }
 
-// Ad-only detail screen for a single selected page. All per-page ad state and the
+// Create Ads detail screen for a single selected page. All per-page ad state and the
 // createAdOnly mutation live here; the parent only owns page selection. Rendering
 // this only after a page is chosen keeps the page-scoped queries from firing on
 // the master list.
@@ -245,14 +241,14 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
   const [dailyBudgetThb, setDailyBudgetThb] = useState(100)
   const [runHours, setRunHours] = useState(24)
 
-  // Existing high-view page posts for the SELECTED page (page-first).
+  // Existing high-view page posts for the SELECTED page. These are source signals only.
   const postsQuery = useQuery({
     queryKey: ['create-ads', 'page-posts', selectedId],
     queryFn: ({ signal }) =>
       fetchPageVideos({ pageId: selectedId, minViews: 100000, limit: 48 }, signal),
     enabled: !!selectedId,
   })
-  // Gallery clips remain a valid ad input (existing video, not yet published).
+  // Gallery clips are valid because they already carry a system video id to publish as a new post.
   const galleryQuery = useQuery({
     queryKey: ['create-ads', 'gallery'],
     queryFn: ({ signal }) => fetchGallery('ready', signal),
@@ -278,26 +274,23 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
   const error = view === 'page-post' ? postsQuery.error : galleryQuery.error
   const refetching = postsQuery.isFetching || galleryQuery.isFetching
 
-  // An ad-only input is usable ONLY if it carries an existing story/post/FB-video id. A gallery
-  // clip with just a system video id has no published post to build an ad from, so the submit is
-  // disabled with that exact reason.
-  const adSourceReady = !!(
-    selectedInput && (selectedInput.storyId || selectedInput.postId || selectedInput.fbVideoId)
-  )
+  // Create Ads requires a system video id so the Worker can publish a NEW Page post from our own
+  // content. Old story/post/FB-video ids are kept as source-signal proof only.
+  const adSourceReady = !!(selectedInput && selectedInput.systemVideoId)
   const adSourceReason = !selectedInput
     ? 'ยังไม่ได้เลือกอินพุต'
     : adSourceReady
       ? ''
-      : 'อินพุตนี้ไม่มี Story ID / Post ID / Facebook Video ID — สร้างแอดจากของที่มีอยู่ไม่ได้ (วิดีโอแกลลี่ที่ยังไม่โพสต์ต้องไปโพสต์ก่อน)'
+      : 'อินพุตนี้ไม่มี System Video ID — ระบบจึงสร้างโพสต์ใหม่จากวิดีโอในระบบไม่ได้'
 
-  // Ad-only audit trail for the selected page — the proof panel.
+  // Create Ads audit trail for the selected page — the proof panel.
   const historyQuery = useQuery({
     queryKey: ['ad-history', selectedId],
     queryFn: ({ signal }) => fetchAdHistory({ pageId: selectedId, limit: 10 }, signal),
     enabled: !!selectedId,
   })
 
-  // Cadence ("สร้างทุก X นาที") — the operator-set interval the scheduler uses to drain the ad-only
+  // Cadence ("สร้างทุก X นาที") — the operator-set interval the scheduler uses to drain the Create Ads
   // queue. Shared, global setting; editable here and on the คิวสร้างแอด page.
   const intervalQuery = useQuery({
     queryKey: ['ad-only-interval'],
@@ -319,7 +312,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
     postId: input.postId,
     fbVideoId: input.fbVideoId,
     systemVideoId: input.systemVideoId,
-    shopeeUrl: input.linkUrl,
+    shopeeUrl: input.shopeeUrl,
+    caption: input.title,
     adName: input.systemVideoId || input.refId,
     mode,
     dailyCampaignName: campaignName.trim(),
@@ -338,8 +332,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
     },
   })
 
-  // Add-to-queue — same ad-only contract, but deferred to the cadence scheduler instead of creating
-  // now. The scheduler replays it through create-ad-only (never the page-publish/legacy lanes).
+  // Add-to-queue — same Create Ads contract, but deferred to the cadence scheduler instead of creating
+  // now. The scheduler replays it through create-ad-only.
   const enqueueMutation = useMutation({
     mutationFn: (input: AdSourceCandidate) => enqueueAdOnly(adOnlyInput(input)),
     onSuccess: (data) => setQueueResult(data),
@@ -358,9 +352,10 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
     if (!selectedInput || !adSourceReady || !settingsReady) return
     const isActive = mode === 'active'
     const sourceLines = [
-      selectedInput.storyId ? `story: ${selectedInput.storyId}` : '',
-      selectedInput.postId ? `post: ${selectedInput.postId}` : '',
-      selectedInput.fbVideoId ? `fb video: ${selectedInput.fbVideoId}` : '',
+      selectedInput.systemVideoId ? `system video: ${selectedInput.systemVideoId}` : '',
+      selectedInput.storyId ? `source story: ${selectedInput.storyId}` : '',
+      selectedInput.postId ? `source post: ${selectedInput.postId}` : '',
+      selectedInput.fbVideoId ? `source fb video: ${selectedInput.fbVideoId}` : '',
     ].filter(Boolean)
     // Honest, mode-aware confirmation. ACTIVE explicitly states the ad WILL spend; PAUSED states it
     // will not. Shows page, source, campaign, budget and the run window.
@@ -368,7 +363,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
       isActive
         ? '⚠️ สร้างแอด “ตั้งเวลา/ใช้งานจริง” — แอดนี้จะเริ่มใช้เงินทันทีเมื่อยืนยัน'
         : 'สร้างแอดแบบ PAUSED (รีวิว) — ยังไม่ใช้เงิน ต้องไปเปิดใช้งานเองใน Ads Manager',
-      'สร้างจากโพสต์/วิดีโอที่มีอยู่ — ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์',
+      'โพสต์เก่าเป็นสัญญาณเท่านั้น — ระบบจะสร้างโพสต์เพจใหม่จากวิดีโอในระบบ แล้วสร้างแอดจากโพสต์ใหม่นั้น',
       '',
       `เพจ: ${selectedPage?.name || selectedId}`,
       ...sourceLines,
@@ -398,7 +393,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
       isActive
         ? '⚠️ โหมด “ตั้งเวลา/ใช้งานจริง” — เมื่อถึงคิวจะสร้างแอด ACTIVE และเริ่มใช้เงินทันที'
         : 'โหมด PAUSED (รีวิว) — เมื่อถึงคิวจะสร้างแอดแบบยังไม่ใช้เงิน',
-      'สร้างจากโพสต์/วิดีโอที่มีอยู่ — ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์',
+      'ระบบจะสร้างโพสต์เพจใหม่จากวิดีโอในระบบ แล้วสร้างแอดจากโพสต์ใหม่นั้น',
       '',
       `เพจ: ${selectedPage?.name || selectedId}`,
       `แคมเปญ: ${trimmedCampaignName || '(พาธ default ของ bridge)'}`,
@@ -454,16 +449,13 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
         </div>
       </div>
 
-      {/* Separation guarantee — explicit, always visible on the detail screen. */}
+      {/* Contract guarantee — explicit, always visible on the detail screen. */}
       <div className="flex items-start gap-2 rounded-xl border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
         <Info className="mt-0.5 h-4 w-4 shrink-0" />
         <div>
-          <p className="font-semibold">หน้านี้สร้างแอดจากโพสต์/สตอรี/วิดีโอที่มีอยู่แล้วเท่านั้น</p>
+          <p className="font-semibold">โพสต์เก่าคือต้นแบบ/สัญญาณสำหรับเลือกคอนเทนต์ยอดดี</p>
           <p className="text-sky-800">
-            ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์ — หากต้องการโพสต์ลงเพจ ให้ไปที่{' '}
-            <Link to="/create-post" className="font-semibold underline">
-              หน้าสร้างโพสต์
-            </Link>
+            เมื่อสร้างแอด ระบบจะเผยแพร่โพสต์เพจใหม่ด้วยวิดีโอเดียวกันจากระบบ แล้วใช้โพสต์ใหม่นั้นเป็นพื้นผิวแอด
           </p>
         </div>
       </div>
@@ -474,9 +466,9 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
         <PageHealthCard pageId={selectedId} variant="ads" />
       </section>
 
-      {/* Step 2 — pick an existing input. */}
+      {/* Step 2 — pick a high-performing source signal. */}
       <section className="space-y-3">
-        <SectionLabel step={2} title="เลือกอินพุตจากของที่มีอยู่" hint="โพสต์/สตอรี หรือวิดีโอเดิม" />
+        <SectionLabel step={2} title="เลือกต้นแบบ/สัญญาณยอดดี" hint="โพสต์เก่าหรือวิดีโอระบบ" />
             <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
                 <Button
@@ -485,7 +477,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                   variant={view === 'page-post' ? 'default' : 'ghost'}
                   onClick={() => setView('page-post')}
                 >
-                  โพสต์เพจที่มีอยู่ ({postCandidates.length})
+                  โพสต์เพจยอดดี ({postCandidates.length})
                 </Button>
                 <Button
                   type="button"
@@ -493,7 +485,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                   variant={view === 'gallery' ? 'default' : 'ghost'}
                   onClick={() => setView('gallery')}
                 >
-                  วิดีโอแกลลี่ ({galleryCandidates.length})
+                  วิดีโอในระบบ ({galleryCandidates.length})
                 </Button>
               </div>
               <Button
@@ -528,8 +520,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
             ) : active.length === 0 ? (
               <p className="rounded-xl border border-dashed p-10 text-center text-sm text-muted-foreground">
                 {view === 'page-post'
-                  ? 'ยังไม่มีโพสต์เพจที่มียอดวิวสูงสำหรับเพจนี้ — ลอง sync จากหน้าโพสต์เพจ'
-                  : 'ยังไม่มีวิดีโอในแกลลี่ที่พร้อมใช้ — ลองโหลดเพิ่มจากหน้าแกลลี่'}
+                  ? 'ยังไม่มีโพสต์เพจยอดดีสำหรับเพจนี้ — ลอง sync จากหน้าโพสต์เพจ'
+                  : 'ยังไม่มีวิดีโอในระบบที่พร้อมใช้ — ลองโหลดเพิ่มจากหน้าแกลลี่'}
               </p>
             ) : (
               <div className="grid gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
@@ -548,19 +540,19 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
             )}
           </section>
 
-          {/* Step 3 — selected input summary + ad-only action (pending). */}
+          {/* Step 3 — selected signal summary + create action. */}
           <section className="space-y-3">
-            <SectionLabel step={3} title="สรุปอินพุตและสร้างแอด" hint="แอดจากโพสต์ที่มีอยู่แล้ว" />
+            <SectionLabel step={3} title="สรุปต้นแบบและสร้างแอด" hint="สร้างโพสต์ใหม่ก่อนสร้างแอด" />
             {!selectedInput ? (
               <p className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
-                ยังไม่ได้เลือกอินพุต — เลือกการ์ดด้านบนหนึ่งใบเพื่อใช้เป็นต้นทางของแอด
+                ยังไม่ได้เลือกต้นแบบ — เลือกการ์ดด้านบนหนึ่งใบเพื่อใช้เป็นสัญญาณคอนเทนต์
               </p>
             ) : (
               <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm">
                 <div className="flex flex-wrap items-center gap-2 text-sm">
                   <Badge variant="secondary">{selectedPage.name || selectedPage.id}</Badge>
                   <Badge variant="outline">
-                    {selectedInput.kind === 'gallery' ? 'ต้นทาง: วิดีโอแกลลี่' : 'ต้นทาง: โพสต์เพจที่มีอยู่'}
+                    {selectedInput.kind === 'gallery' ? 'สัญญาณ: วิดีโอในระบบ' : 'สัญญาณ: โพสต์เพจยอดดี'}
                   </Badge>
                   <span className="min-w-0 truncate text-muted-foreground">{selectedInput.title}</span>
                 </div>
@@ -573,7 +565,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                     onCopy={copy}
                   />
                   <CopyId
-                    label="Story ID (โพสต์ที่มีอยู่)"
+                    label="Source Story ID"
                     value={selectedInput.storyId}
                     copied={copiedRef === selectedInput.storyId}
                     onCopy={copy}
@@ -599,7 +591,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                     rel="noreferrer"
                     className="inline-flex items-center gap-1 text-xs font-semibold underline"
                   >
-                    เปิดโพสต์/วิดีโอต้นทาง <ExternalLink className="h-3 w-3" />
+                    เปิดต้นแบบ/สัญญาณ <ExternalLink className="h-3 w-3" />
                   </a>
                 ) : null}
 
@@ -684,7 +676,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                   )}
 
                   {/* Cadence — "สร้างทุก X นาที", like the old queue system. Used by the scheduler to
-                      drain the AD-ONLY queue (separate from page publish). */}
+                      drain the Create Ads queue. */}
                   <div className="flex flex-wrap items-end gap-2 border-t pt-3">
                     <label className="space-y-1">
                       <span className="block text-xs font-medium text-muted-foreground">รอบการสร้างจากคิว (สร้างทุก … นาที)</span>
@@ -712,15 +704,15 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                   </div>
                 </div>
 
-                {/* Ad-only action. Calls ONLY createAdOnly() (POST /api/dashboard/create-ad-only)
+                {/* Create action. Calls ONLY createAdOnly() (POST /api/dashboard/create-ad-only)
                     — never the legacy mixed create-ad or the ad-queue endpoints. Disabled with the
-                    exact reason when the input lacks an existing story/post/FB-video id. */}
+                    exact reason when the input lacks a system video id. */}
                 <div className="flex flex-wrap items-center gap-3 border-t pt-3">
                   <Button
                     type="button"
                     onClick={handleCreateAdOnly}
                     disabled={!adSourceReady || !settingsReady || createMutation.isPending || enqueueMutation.isPending}
-                    title={adSourceReason || settingsReason || 'สร้างแอดจากโพสต์ที่มีอยู่'}
+                    title={adSourceReason || settingsReason || 'สร้างโพสต์ใหม่และแอดใหม่จากวิดีโอในระบบ'}
                   >
                     {createMutation.isPending
                       ? 'กำลังสร้างแอด…'
@@ -728,8 +720,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                         ? 'สร้างเลย + เริ่มใช้เงิน'
                         : 'สร้างเลย (PAUSED)'}
                   </Button>
-                  {/* Defer to the cadence queue — same ad-only contract, created later by the
-                      scheduler (สร้างทุก X นาที). Never the page-publish/legacy lanes. */}
+                  {/* Defer to the cadence queue — same Create Ads contract, created later by the
+                      scheduler (สร้างทุก X นาที). */}
                   <Button
                     type="button"
                     variant="outline"
@@ -745,23 +737,23 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                     <span className="text-xs text-amber-700">{settingsReason}</span>
                   ) : !DASHBOARD_AD_CREATE_READY ? (
                     <span className="text-xs text-muted-foreground">
-                      การสร้างแอดแบบแยกฝั่ง (ad-only) ยังไม่เปิดใช้งาน — กดเพื่อดูเหตุผลที่ชัดเจน
+                      การสร้างแอดแบบแยกฝั่งยังไม่เปิดใช้งาน — กดเพื่อดูเหตุผลที่ชัดเจน
                       หรือคัดลอก ID ไปสร้างแอดในเครื่องมือภายนอก
                     </span>
                   ) : mode === 'active' ? (
                     <span className="text-xs text-amber-700">
-                      สร้างแอด <strong>ACTIVE</strong> จากโพสต์ที่มีอยู่ — <strong>เริ่มใช้เงินทันที</strong>
-                      ตามงบ/เวลาที่ตั้งไว้ ไม่เผยแพร่โพสต์ใหม่ ไม่คอมเมนต์
+                      สร้างโพสต์ใหม่และแอด <strong>ACTIVE</strong> — <strong>เริ่มใช้เงินทันที</strong>
+                      ตามงบ/เวลาที่ตั้งไว้ หลังระบบสร้างโพสต์เพจใหม่
                     </span>
                   ) : (
                     <span className="text-xs text-muted-foreground">
-                      สร้างแอดจากโพสต์ที่มีอยู่ — แอดจะถูกสร้างแบบ <strong>PAUSED</strong> (ยังไม่ใช้เงิน)
-                      ไม่เผยแพร่โพสต์ใหม่ ต้องไปเปิดใช้งานเองใน Ads Manager
+                      ระบบจะสร้างโพสต์เพจใหม่ แล้วสร้างแอดแบบ <strong>PAUSED</strong> (ยังไม่ใช้เงิน)
+                      ต้องไปเปิดใช้งานเองใน Ads Manager
                     </span>
                   )}
                 </div>
 
-                {/* Result proof — the honest outcome of the ad-only call. */}
+                {/* Result proof — the honest outcome of the Create Ads call. */}
                 {adResult ? (
                   <div
                     className={`space-y-2 rounded-xl border px-4 py-3 text-sm ${
@@ -806,9 +798,12 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                         ) : null}
                         {adResult.campaign_name ? <span>campaign: {adResult.campaign_name}</span> : null}
                         {adResult.daily_budget ? <span>daily_budget: {adResult.daily_budget} (หน่วยย่อย)</span> : null}
+                        {adResult.new_story_id ? <span>new_story_id: {adResult.new_story_id}</span> : null}
+                        {adResult.new_post_id ? <span>new_post_id: {adResult.new_post_id}</span> : null}
                         {adResult.effective_object_story_id ? (
                           <span>effective_object_story_id: {adResult.effective_object_story_id}</span>
                         ) : null}
+                        {adResult.source_signal_system_video_id ? <span>source_signal_system_video_id: {adResult.source_signal_system_video_id}</span> : null}
                         {adResult.click_link ? <span>click_link: {adResult.click_link}</span> : null}
                       </div>
                     ) : null}
@@ -850,11 +845,11 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
               </div>
             )}
 
-            {/* Ad-only history proof panel — separate audit trail (dashboard_ad_history), never
+            {/* Create Ads history proof panel — separate audit trail (dashboard_ad_history), never
                 post_history. */}
             <div className="space-y-2 rounded-xl border bg-card p-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold">ประวัติการสร้างแอด (ad-only)</h3>
+                <h3 className="text-sm font-semibold">ประวัติการสร้างแอด</h3>
                 <Button
                   type="button"
                   variant="outline"
@@ -886,8 +881,9 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                       {h.campaign_name ? <span className="font-mono">camp: {h.campaign_name}</span> : null}
                       {h.daily_budget ? <span className="font-mono">งบ: {h.daily_budget}</span> : null}
                       {h.run_hours ? <span className="font-mono">{h.run_hours} ชม.</span> : null}
-                      {h.source_story_id ? <span className="font-mono">story: {h.source_story_id}</span> : null}
+                      {h.source_story_id ? <span className="font-mono">source: {h.source_story_id}</span> : null}
                       {h.fb_video_id ? <span className="font-mono">fb: {h.fb_video_id}</span> : null}
+                      {h.effective_object_story_id ? <span className="font-mono">new: {h.effective_object_story_id}</span> : null}
                       {h.ad_id ? <span className="font-mono">ad: {h.ad_id}</span> : null}
                       {h.error_message ? <span className="text-amber-700">{h.error_message}</span> : null}
                     </div>

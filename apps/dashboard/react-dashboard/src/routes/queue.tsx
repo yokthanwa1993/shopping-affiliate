@@ -33,9 +33,10 @@ function statusVariant(status: AdQueueStatus): 'success' | 'destructive' | 'seco
   return 'outline'
 }
 
-// AD-ONLY queue — the cadence lane that replays each row through create-ad-only (never page publish /
-// legacy create-ad). Shows interval, next run, campaign date, source id, mode and the ad result, with
-// run-now / cancel / interval controls.
+// Create Ads queue — the cadence lane that replays each row through create-ad-only. Each row uses the
+// old source ids as signals, resolves the system video, publishes a new Page post, then creates the ad.
+// Shows interval, next run, campaign date, source id, mode and the ad result, with run-now / cancel /
+// interval controls.
 function AdOnlyQueueSection() {
   const qc = useQueryClient()
   const query = useQuery({
@@ -68,7 +69,7 @@ function AdOnlyQueueSection() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">คิวสร้างแอด (แยกจากการเผยแพร่หน้าเพจ) — {items.length} งาน</CardTitle>
+        <CardTitle className="text-base">คิวสร้างแอดจากต้นแบบ/สัญญาณ — {items.length} งาน</CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
         {/* Cadence + run controls. */}
@@ -219,7 +220,7 @@ export function QueuePage() {
         <h1 className="text-2xl font-semibold tracking-tight">คิวสร้างแอด</h1>
         <p className="text-sm text-muted-foreground">
           คิวงานสร้างโฆษณาอัตโนมัติ — ระบบหยิบงานในคิวมาสร้างทีละงานตามรอบเวลาที่ตั้งไว้
-          <strong> สร้างเฉพาะแอด ไม่เผยแพร่โพสต์ลงหน้าเพจ</strong>
+          <strong> โดยสร้างโพสต์เพจใหม่ก่อน แล้วจึงสร้างแอดจากโพสต์ใหม่นั้น</strong>
         </p>
       </div>
 

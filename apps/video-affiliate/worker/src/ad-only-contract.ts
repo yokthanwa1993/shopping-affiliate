@@ -1,26 +1,30 @@
-// AD-ONLY contract — pure, network-free helpers for POST /api/dashboard/create-ad-only.
+// Create Ads contract — pure, network-free helpers for POST /api/dashboard/create-ad-only.
 //
-// The ad-only endpoint builds a Meta ad FROM something that ALREADY exists (an existing page
-// post/story, or an existing Facebook/system video) and must NEVER publish a new Page post.
+// The endpoint name is kept for compatibility, but the main Create Ads flow is signal-to-new-post:
+// an old high-performing Page post/video is only the source signal. The worker resolves the matching
+// internal system video/content, publishes a NEW Page post/story, then creates/promotes the ad from
+// that newly-created story. It must fail closed when the internal system video/content cannot be
+// resolved; it must never silently boost/reuse the old Page post/video as the ad surface.
 // It is deliberately separate from:
 //   - the Page Post flow  (POST /api/pages/:id/force-post → post_history, cron — UNTOUCHED)
 //   - the legacy hybrid   (POST /api/dashboard/create-ad → mixed post+ad — UNTOUCHED)
-// so that ad creation can never have a page-publish side effect and has its own audit trail
-// (dashboard_ad_history). This module holds the input validation, the bridge-capability gate,
-// and the audit-row shaping so all of it is unit-testable without a live Graph / bridge.
+// and has its own audit trail (dashboard_ad_history). This module holds input validation, the
+// bridge-capability gate, queue shaping, and audit-row shaping so all of it is unit-testable without
+// a live Graph / bridge.
 
 export interface AdOnlyInputBody {
     page_id?: string
-    // Ad source — at least one of these existing-post/video ids is REQUIRED. system_video_id is
-    // audit-only and is NEVER, on its own, treated as permission to publish a new Page post.
+    // Source signal ids from the old high-performing Page surface. These are kept for proof/dedup only;
+    // they are NOT the ad surface. The ad surface must come from system_video_id or an already-resolved
+    // internal video_url.
     story_id?: string
     post_id?: string
     fb_video_id?: string
     video_id?: string
     system_video_id?: string
     source_video_id?: string
-    // Explicitly NOT supported in ad-only for this phase — a video_url-only flow would require
-    // uploading + publishing a new post. Presence is rejected (fail closed).
+    // Optional already-resolved internal system video URL. The dashboard normally sends system_video_id
+    // and the worker resolves this itself; internal callers/tests may pass video_url directly.
     video_url?: string
     // Optional ad metadata forwarded to existing helpers when a real ad path is enabled.
     shopee_url?: string
@@ -33,7 +37,7 @@ export interface AdOnlyInputBody {
     new_campaign_name?: string
     daily_campaign_name?: string
     comment_shortlink?: string
-    // Operator-set scheduling/budget for the ad-only run. `mode` selects the lifecycle:
+    // Operator-set scheduling/budget for the Create Ads run. `mode` selects the lifecycle:
     //   'paused' (default) — non-spending review ad (current behavior).
     //   'active'/'scheduled' — a LIVE, SPENDING ad: the bridge applies the daily-campaign budget +
     //     run-hours schedule and activates the adset + ad.
@@ -59,17 +63,21 @@ export interface AdOnlyValidation {
     sourcePostId: string
     fbVideoId: string
     systemVideoId: string
-    /** True when at least one real ad source (story/post/fb video) was supplied. */
+    /** Already-resolved internal video URL, when supplied by a trusted/internal caller. */
+    videoUrl: string
+    /** True when at least one old Page surface id was supplied as the high-performing signal. */
     hasAdSource: boolean
+    /** True when the request carries a system video id or resolved video URL that can publish a new post. */
+    hasSystemVideoSource: boolean
 }
 
 const str = (v: unknown): string => String(v ?? '').trim()
 
-// Validate ad-only input and fail CLOSED. Rules:
+// Validate Create Ads input and fail CLOSED. Rules:
 //   1. page_id is required.
-//   2. video_url is rejected — ad-only never uploads/publishes a new post in this phase.
-//   3. At least one of story_id / post_id / fb_video_id is required. A system_video_id alone is
-//      audit metadata, NOT an existing-post/video reference, so it cannot authorize ad creation.
+//   2. The publishable source is system_video_id/source_video_id or an already-resolved video_url.
+//   3. story_id / post_id / fb_video_id are source-signal/audit ids only. They never authorize reuse
+//      of the old Page surface as the ad surface.
 export function validateAdOnlyInput(body: AdOnlyInputBody | null | undefined): AdOnlyValidation {
     const b = body || {}
     const pageId = str(b.page_id)
@@ -80,34 +88,25 @@ export function validateAdOnlyInput(body: AdOnlyInputBody | null | undefined): A
     const systemVideoId = str(b.system_video_id) || str(b.source_video_id)
     const videoUrl = str(b.video_url)
     const hasAdSource = !!(sourceStoryId || sourcePostId || fbVideoId)
+    const hasSystemVideoSource = !!(systemVideoId || videoUrl)
 
-    const base = { pageId, sourceStoryId, sourcePostId, fbVideoId, systemVideoId, hasAdSource }
+    const base = { pageId, sourceStoryId, sourcePostId, fbVideoId, systemVideoId, videoUrl, hasAdSource, hasSystemVideoSource }
 
     if (!pageId) {
-        return { ok: false, error: 'page_id_required', detail: 'page_id is required for ad-only', ...base }
+        return { ok: false, error: 'page_id_required', detail: 'page_id is required for Create Ads', ...base }
     }
-    // Fail closed: a video_url-only request would force a brand-new upload/publish. Ad-only must
-    // build from an existing post/video, so reject any video_url here.
-    if (videoUrl) {
+    if (!hasSystemVideoSource) {
         return {
             ok: false,
-            error: 'ad_only_no_new_post',
-            detail: 'video_url is not allowed in ad-only — provide an existing story_id/post_id/fb_video_id instead',
-            ...base,
-        }
-    }
-    if (!hasAdSource) {
-        return {
-            ok: false,
-            error: 'ad_source_required',
-            detail: 'at least one of story_id, post_id or fb_video_id is required (system_video_id alone is audit-only and never authorizes publishing)',
+            error: 'system_video_source_required',
+            detail: 'system_video_id or resolved internal video_url is required; old story/post/Facebook video ids are signal/audit only and will not be reused as the ad surface',
             ...base,
         }
     }
     return { ok: true, ...base }
 }
 
-// Operator scheduling/budget for an ad-only run. 'paused' creates a non-spending review ad (no
+// Operator scheduling/budget for a Create Ads run. 'paused' creates a non-spending review ad (no
 // budget/schedule/activation). 'active' creates a LIVE, SPENDING ad via the bridge daily-campaign
 // path (date-named campaign + per-adset daily budget + run-hours schedule + activation).
 export type AdOnlyMode = 'paused' | 'active'
@@ -265,13 +264,13 @@ export interface AdHistoryRecord {
 }
 
 // =====================================================================
-// AD-ONLY QUEUE / SCHEDULER — pure, network-free helpers.
+// CREATE ADS QUEUE / SCHEDULER — pure, network-free helpers.
 //
-// Restores the "old queue cadence" UX (สร้างทุก X นาที) but on the AD-ONLY lane ONLY: a queued
-// row is replayed through POST /api/dashboard/create-ad-only (NEVER the legacy /api/dashboard/
-// create-ad), so it can never publish a Page post, never comment, never write post_history. The
-// scheduler picks at most ONE queued row per interval. This block holds the interval math and the
-// queue-row → create-ad-only request-body mapping so all of it is unit-testable without D1/cron.
+// Restores the "old queue cadence" UX (สร้างทุก X นาที) on the Create Ads lane: a queued row is
+// replayed through POST /api/dashboard/create-ad-only, which resolves the system video, publishes a
+// new Page post/story, and creates/promotes the ad from that new story. The scheduler picks at most
+// ONE queued row per interval. This block holds the interval math and the queue-row → create-ad-only
+// request-body mapping so all of it is unit-testable without D1/cron.
 // =====================================================================
 
 // The endpoint the queue processor MUST target. Exported so tests can assert the processor builds a
@@ -327,9 +326,8 @@ export interface AdOnlyQueueRow {
 
 // Map a queued row to the EXACT POST /api/dashboard/create-ad-only request body. This is the single
 // source of truth for replaying a queued item: it preserves the operator-set campaign date/name,
-// mode, budget and run-hours, and forwards the existing-post/video source ids. It deliberately emits
-// NOTHING that could publish a page post (no video_url) — the create-ad-only endpoint enforces that
-// too. Empty budget/run-hours are omitted so the endpoint applies its safe defaults.
+// mode, budget and run-hours, and forwards the old source-signal ids plus system_video_id. Empty
+// budget/run-hours are omitted so the endpoint applies its safe defaults.
 export function buildAdOnlyCreateBody(row: AdOnlyQueueRow | null | undefined): Record<string, unknown> {
     const r = row || {}
     const rawMode = str(r.mode).toLowerCase()
@@ -356,12 +354,11 @@ export function buildAdOnlyCreateBody(row: AdOnlyQueueRow | null | undefined): R
 }
 
 // =====================================================================
-// AD-ONLY AUTO-PICK — pure, network-free helpers for the "create an ad EVERY interval even when the
-// manual queue is empty" cadence. When dashboard_ad_only_queue has no queued row, the scheduler
-// auto-selects ONE eligible cached page video and replays it through the SAME create-ad-only contract
-// (NEVER the legacy create-ad / page-publish). These helpers hold the candidate eligibility, the
-// dedup-against-history math, the highest-views selection and the create-ad-only body shaping so the
-// whole auto-pick decision is unit-testable without D1/cron/the bridge.
+// CREATE ADS AUTO-PICK — pure, network-free helpers for the "create an ad EVERY interval even when
+// the manual queue is empty" cadence. When dashboard_ad_only_queue has no queued row, the scheduler
+// auto-selects ONE eligible cached page-video signal and replays it through the SAME create-ad-only
+// contract. These helpers hold candidate eligibility, dedup-against-history math, ranking and body
+// shaping so the whole auto-pick decision is unit-testable without D1/cron/the bridge.
 // =====================================================================
 
 // Minimum lifetime views a cached page video must have to be auto-picked. Matches the operator rule
@@ -369,8 +366,9 @@ export function buildAdOnlyCreateBody(row: AdOnlyQueueRow | null | undefined): R
 export const AD_ONLY_AUTO_MIN_VIEWS = 100_000
 
 // A cached page video reduced to the fields the auto-picker needs (a projection of
-// facebook_page_video_cache). videoId is the existing FB video id (the ad source); postId is the
-// PAGEID_POSTID page story when known. shopeeLink/views gate eligibility; createdTime breaks ties.
+// facebook_page_video_cache). videoId/postId are old Page source-signal ids only. systemVideoId is
+// the internal content that will be published as the NEW Page post. shopeeLink/views gate eligibility;
+// createdTime breaks ties.
 export interface AdOnlyAutoCandidate {
     pageId: string
     videoId: string
@@ -378,7 +376,9 @@ export interface AdOnlyAutoCandidate {
     shopeeLink?: string
     views?: number | string
     createdTime?: string
-    /** Optional human label forwarded as ad_name (defaults to the video id). */
+    /** Internal system video id that will be resolved to the NEW post's video_url. Required to create. */
+    systemVideoId?: string
+    /** Optional human label forwarded as ad_name (defaults to the system/video id). */
     adName?: string
 }
 
@@ -501,8 +501,9 @@ const toViews = (v: unknown): number => {
     return Number.isFinite(n) ? n : 0
 }
 
-// Eligibility for auto-pick: must reference an existing FB video, carry a Shopee link, and clear the
-// minimum-views bar. A candidate without a shopee link OR below minViews is NOT eligible.
+// Eligibility for auto-pick: must carry an old source signal, a Shopee link, and clear the
+// minimum-views bar. The create-ad-only endpoint still fails closed if that source cannot be resolved
+// to publishable internal system content.
 export function isAdOnlyCandidateEligible(
     candidate: AdOnlyAutoCandidate | null | undefined,
     minViews: number = AD_ONLY_AUTO_MIN_VIEWS,
@@ -618,6 +619,9 @@ export const AD_ONLY_FATAL_ERROR_SUBSTRINGS: string[] = [
     'config_missing_template_or_ad_account',
     'bridge_not_configured',
     'fb_video_id_unresolved',
+    'system_video_source_required',
+    'system_video_unresolved',
+    'system_video_url_unresolved',
 ]
 
 // True when a failure message/result matches a fatal/config substring (case-insensitive). Empty-safe.
@@ -674,9 +678,9 @@ export function buildAdOnlySkippedPageSet(
 // Map an auto-picked candidate to the EXACT POST /api/dashboard/create-ad-only request body. The auto
 // scheduler always creates a LIVE, SPENDING ad, so it defaults to mode 'active' with the Bangkok
 // date-named daily campaign, the 10,000 THB/day CBO budget and a 24h run window — the same contract
-// requirement already implemented for the force-post CBO campaign. Like buildAdOnlyCreateBody it emits
-// NOTHING that could publish a page post (no video_url): it builds the ad from the existing FB video /
-// page story only. The create-ad-only endpoint re-validates and writes the dashboard_ad_history audit.
+// requirement already implemented for the force-post CBO campaign. It forwards source-signal ids and
+// system_video_id; the endpoint re-validates, resolves the system video URL, publishes the new Page
+// post/story, and writes the dashboard_ad_history audit.
 export function buildAdOnlyAutoPickBody(input: {
     candidate: AdOnlyAutoCandidate
     dailyCampaignName: string
@@ -694,8 +698,9 @@ export function buildAdOnlyAutoPickBody(input: {
         page_id: str(c.pageId),
         fb_video_id: str(c.videoId),
         post_id: str(c.postId),
+        system_video_id: str(c.systemVideoId),
         shopee_url: str(c.shopeeLink),
-        ad_name: str(c.adName) || str(c.videoId),
+        ad_name: str(c.adName) || str(c.systemVideoId) || str(c.videoId),
         mode: 'active' as AdOnlyMode,
         daily_campaign_name: str(input.dailyCampaignName),
         daily_budget_thb: budget,

@@ -6,17 +6,15 @@ import {
   type PageVideoItem,
 } from '@/api/pagePosts'
 
-// AD-ONLY contract for the dashboard. The mental model here is deliberately the
-// inverse of Create Post: an ad is built FROM something that already exists — an
-// existing page post/story, or an existing system/Facebook video — and creating
-// an ad must never publish a new post.
+// Create Ads contract for the dashboard. The old high-view Page post/video is a
+// source signal only: the worker resolves the matching internal system video,
+// publishes a NEW Page post/story with that content, then creates/promotes the ad
+// from the new story.
 //
-// The dedicated ad-only flow is wired end-to-end: POST /api/dashboard/create-ad-only builds an ad
-// FROM an existing post/story/video through the CloakBrowser FB bridge in PAUSED mode
-// (skip_publish_to_page + skip_comment + paused) — it creates a NON-SPENDING ad, never publishes a
-// new Page post, never writes post_history, and records every attempt in dashboard_ad_history. It
-// does NOT call the legacy mixed create-ad / ad-queue flows. The bridge keeps its default ACTIVE
-// behavior for every other caller; only this ad-only path sends the paused flag.
+// The endpoint name remains POST /api/dashboard/create-ad-only for compatibility, but this main path
+// no longer means "reuse an existing post without publishing." PAUSED creates a non-spending ad;
+// ACTIVE starts spend. Both paths require system_video_id or a resolved internal video_url so the
+// worker never silently boosts the old Page post/video directly.
 //
 // READY=true means the submit action really creates the (paused) ad and shows the created ids +
 // effective_object_story_id + click link in the proof panel. The created ad is PAUSED, so an
@@ -33,12 +31,19 @@ export interface CreateAdOnlyResult {
   reason?: string
   missing_bridge_fields?: string[]
   history_id?: number
-  // Echoed source ids + (on a future real success) the created ad ids.
+  // Echoed old source-signal ids + resulting new story/ad ids.
   page_id?: string
   source_story_id?: string
   source_post_id?: string
   fb_video_id?: string
   system_video_id?: string
+  source_signal_story_id?: string
+  source_signal_post_id?: string
+  source_signal_fb_video_id?: string
+  source_signal_system_video_id?: string
+  new_story_id?: string
+  new_post_id?: string
+  new_fb_video_id?: string
   campaign_id?: string
   campaign_name?: string
   adset_id?: string
@@ -82,10 +87,10 @@ export interface CreateAdOnlyInput {
   runHours?: number
 }
 
-// AD-ONLY mutating call. This is the ONLY ad-creation request the Create Ads console makes. It
-// hits POST /api/dashboard/create-ad-only — never /api/dashboard/create-ad and never the ad-queue
-// legacy endpoints. The worker fails closed (no Page post, no post_history) and records the
-// attempt in dashboard_ad_history.
+// Create Ads mutating call. This is the ONLY ad-creation request the Create Ads console makes. It
+// hits POST /api/dashboard/create-ad-only — never the mixed create-ad endpoint and never the legacy
+// ad-queue endpoints. The worker fails closed if it cannot resolve the internal system video/content
+// and records every attempt in dashboard_ad_history.
 export async function createAdOnly(input: CreateAdOnlyInput): Promise<CreateAdOnlyResult> {
   return workerFetchJson<CreateAdOnlyResult>('/api/dashboard/create-ad-only', {
     method: 'POST',
@@ -109,9 +114,9 @@ export async function createAdOnly(input: CreateAdOnlyInput): Promise<CreateAdOn
   })
 }
 
-// Result of POST /api/dashboard/ad-only-queue/enqueue — add the same ad-only input to the cadence
+// Result of POST /api/dashboard/ad-only-queue/enqueue — add the same Create Ads input to the cadence
 // queue instead of creating it immediately. The scheduler later replays it through
-// /api/dashboard/create-ad-only (never the legacy create-ad), so all ad-only invariants still hold.
+// /api/dashboard/create-ad-only, so the same signal-to-new-post contract still holds.
 export interface EnqueueAdOnlyResult {
   ok: boolean
   error?: string
@@ -123,9 +128,8 @@ export interface EnqueueAdOnlyResult {
   next_run_at?: string
 }
 
-// AD-ONLY ENQUEUE. Adds an ad-only request to the cadence queue. Same body/contract as createAdOnly,
-// so a queued row can never be one that would be rejected at run time. Never touches the page-publish
-// or legacy ad-queue lanes.
+// CREATE ADS ENQUEUE. Adds a Create Ads request to the cadence queue. Same body/contract as
+// createAdOnly, so a queued row can never be one that would be rejected at run time.
 export async function enqueueAdOnly(input: CreateAdOnlyInput): Promise<EnqueueAdOnlyResult> {
   return workerFetchJson<EnqueueAdOnlyResult>('/api/dashboard/ad-only-queue/enqueue', {
     method: 'POST',
@@ -188,7 +192,7 @@ export interface AdHistoryItem {
   end_time?: string
 }
 
-// Read the ad-only audit trail (GET /api/dashboard/ad-history). Used for the proof panel.
+// Read the Create Ads audit trail (GET /api/dashboard/ad-history). Used for the proof panel.
 export async function fetchAdHistory(
   params: { pageId?: string; status?: string; limit?: number } = {},
   signal?: AbortSignal,
@@ -206,9 +210,9 @@ export async function fetchAdHistory(
 
 export type AdSourceKind = 'gallery' | 'page-post'
 
-// A candidate that can serve as the INPUT to an ad. For an existing page post
-// the meaningful ad inputs are its story/post id and its Facebook/system video
-// id; gallery clips carry only a system video id (no published story yet).
+// A candidate that can serve as the source signal for an ad. Existing page posts provide old
+// story/post/Facebook ids for proof; both page-post and gallery candidates must carry systemVideoId
+// so the worker can publish a new Page post from our own content.
 export interface AdSourceCandidate {
   kind: AdSourceKind
   /** Stable key for selection + the headline copyable id (System Video ID). */
@@ -216,6 +220,7 @@ export interface AdSourceCandidate {
   title: string
   thumb: string
   linkUrl: string
+  shopeeUrl: string
   postedAt: string
   views: number
   // Ad input ids — present where the source exposes them. Empty string when n/a.
@@ -233,6 +238,7 @@ export function galleryToAdSource(video: GalleryVideo): AdSourceCandidate | null
     title: video.title || video.id,
     thumb: galleryThumbSrc(video),
     linkUrl: video.publicUrl,
+    shopeeUrl: video.shopeeLink,
     postedAt: video.postedAt || video.createdAt,
     views: 0,
     storyId: '',
@@ -261,6 +267,7 @@ export function pagePostToAdSource(item: PageVideoItem): AdSourceCandidate | nul
       systemVideoThumbUrl(item) ||
       '',
     linkUrl: (item.postUrl ?? '').trim() || externalVideoUrl(item) || '',
+    shopeeUrl: (item.shopeeLink ?? '').trim(),
     postedAt: (item.postedAt ?? item.createdAt ?? '').trim(),
     views: typeof item.views === 'number' ? item.views : 0,
     storyId: story,

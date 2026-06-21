@@ -12373,13 +12373,15 @@ app.post('/api/dashboard/create-ad', async (c) => {
 })
 
 // =====================================================================
-// AD-ONLY contract — POST /api/dashboard/create-ad-only + GET /api/dashboard/ad-history.
+// Create Ads contract — POST /api/dashboard/create-ad-only + GET /api/dashboard/ad-history.
 //
-// Build a Meta ad FROM an existing page post/story/video. This is DELIBERATELY separate from:
+// The endpoint name is kept for compatibility. The product contract is:
+// old high-performing Page post/video = source signal only → resolve the matching system video/content
+// → publish a NEW Page post/story → create/promote the ad from THAT new story. This is deliberately
+// separate from:
 //   - POST /api/pages/:id/force-post   (Page Post flow → post_history, cron — NEVER touched here)
-//   - POST /api/dashboard/create-ad    (legacy hybrid post+ad — NEVER called from here)
-// so ad creation can never have a page-publish side effect. It NEVER writes post_history; every
-// attempt is recorded in its OWN audit table dashboard_ad_history.
+//   - POST /api/dashboard/create-ad    (legacy mixed helper — not called by this endpoint)
+// It NEVER writes post_history; every attempt is recorded in its OWN audit table dashboard_ad_history.
 // =====================================================================
 async function ensureAdHistoryTable(db: D1Database): Promise<void> {
     await db.prepare(
@@ -12459,6 +12461,15 @@ async function insertAdHistoryRow(db: D1Database, rec: AdHistoryRecord, complete
 }
 
 const AD_HISTORY_RESULT_SAFE_FIELDS = [
+    'source_signal_story_id',
+    'source_signal_post_id',
+    'source_signal_fb_video_id',
+    'source_signal_system_video_id',
+    'new_story_id',
+    'new_post_id',
+    'new_fb_video_id',
+    'resolved_system_video_id',
+    'resolved_system_video_namespace_id',
     'comment_status',
     'comment_fb_id',
     'comment_message',
@@ -12604,7 +12615,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     await ensureAdHistoryTable(c.env.DB)
     const validation = validateAdOnlyInput(body)
 
-    // 1. Fail closed on invalid / would-publish-a-new-post input. Record the rejection (no ad).
+    // 1. Fail closed on invalid input. Record the rejection (no ad/post).
     if (!validation.ok) {
         const rec = buildAdHistoryRecord({ status: 'rejected', validation, errorMessage: validation.error })
         const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
@@ -12636,10 +12647,10 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         return c.json({ ...unsupported, history_id: historyId }, 200)
     }
 
-    // 3. Build the PAUSED ad-only ad via the CloakBrowser FB bridge /create-ad route. We call the
-    // bridge DIRECTLY (never the legacy worker create-ad endpoint) with skip_publish_to_page=true,
-    // skip_comment=true and paused/status_option=PAUSED — so it creates a NON-SPENDING ad from the
-    // existing video and never publishes a page post nor comments. post_history is never touched.
+    // 3. Build the Create Ads result via the CloakBrowser FB bridge /create-ad route. We call the
+    // bridge DIRECTLY with a resolved internal system video_url. The old Page post/video ids are source
+    // signals only; they are recorded for proof/dedup but are never sent as the ad surface. The bridge
+    // create-ad call never comments (skip_comment); any comment below targets the NEW story only.
     const recordAdOnlyFailure = async (error: string, result?: Record<string, unknown> | null, clickLink?: string) => {
         const rec = buildAdHistoryRecord({ status: 'failed', validation, errorMessage: error, result: result ?? null, clickLink, schedule })
         const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
@@ -12663,36 +12674,56 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     const adAccount = String(adAccountRow?.value || '').trim()
     if (!templateAdset || !adAccount) return recordAdOnlyFailure('config_missing_template_or_ad_account')
 
-    // Resolve the existing FB video id: prefer the supplied fb_video_id; else resolve it from the
-    // source story/post attachment via the bridge /graph proxy (mirrors the bridge's own
-    // resolveVideoIdFromSourcePost). Ad-only never uploads a new video.
-    let effectiveVideoId = validation.fbVideoId
-    if (!effectiveVideoId) {
-        const sourcePostId = validation.sourceStoryId || validation.sourcePostId
-        if (sourcePostId) {
-            try {
-                const gResp = await fetch(`${baseUrl}/graph?path=${encodeURIComponent(sourcePostId)}&fields=${encodeURIComponent('attachments{media_type,target{id}}')}`)
-                const gData = await gResp.json().catch(() => ({})) as { attachments?: { data?: Array<{ target?: { id?: string } }> } }
-                effectiveVideoId = String(gData.attachments?.data?.[0]?.target?.id || '').trim()
-            } catch { /* fall through to the unresolved error */ }
-        }
-    }
-    if (!effectiveVideoId) return recordAdOnlyFailure('fb_video_id_unresolved')
-
-    // Resolve a Shopee click link for the ad CTA (click tracking). Best-effort, in order: an explicit
-    // shopee link in the request, the page-video cache, then gallery/namespace state by system video
-    // id. Then shorten via the page shortlink template. click_link falls back to the raw Shopee link.
+    // Resolve the namespace + internal system video URL that will be uploaded/published as the NEW Page
+    // post. If the source signal has no system video mapping, fail closed instead of boosting/reusing
+    // the old Facebook post/video.
     const namespaceRow = await c.env.DB.prepare('SELECT bot_id FROM pages WHERE id = ? LIMIT 1')
         .bind(validation.pageId).first().catch(() => null) as { bot_id?: string } | null
     const namespaceId = String(namespaceRow?.bot_id || '').trim()
+    if (!namespaceId) return recordAdOnlyFailure('page_namespace_unresolved')
+
+    let resolvedSystemVideoNamespaceId = namespaceId
+    let publishVideoUrl = validation.videoUrl
+    let sourceMeta: Record<string, unknown> = {}
+    let systemShopeeLink = ''
+    let thumbnailUrl = ''
+    if (validation.systemVideoId) {
+        const videoRef = await resolveGalleryVideoForRepost({
+            env: c.env,
+            fallbackNamespaceId: namespaceId,
+            videoId: validation.systemVideoId,
+        }).catch(() => null)
+        if (videoRef) {
+            resolvedSystemVideoNamespaceId = String(videoRef.sourceNamespaceId || namespaceId).trim() || namespaceId
+            const sourceBucket = new BotBucket(c.env.BUCKET, resolvedSystemVideoNamespaceId) as unknown as R2Bucket
+            sourceMeta = await loadLatestVideoMetaForPosting(sourceBucket, validation.systemVideoId, videoRef.meta).catch(() => videoRef.meta)
+            systemShopeeLink = videoRef.shopeeLink || normalizeMetaShopeeLink(sourceMeta) || ''
+            const publicUrl = metaToString(sourceMeta, 'publicUrl') || metaToString(sourceMeta, 'public_url')
+            if (!publishVideoUrl) {
+                publishVideoUrl = resolvePostingVideoDownloadUrl(c.env, resolvedSystemVideoNamespaceId, validation.systemVideoId, publicUrl)
+            }
+            thumbnailUrl = metaToString(sourceMeta, 'thumbnailUrl')
+                || metaToString(sourceMeta, 'thumbnail_url')
+                || getVideoThumbnailUrlForNamespace(c.env.R2_PUBLIC_URL, resolvedSystemVideoNamespaceId, validation.systemVideoId)
+        } else if (!publishVideoUrl) {
+            return recordAdOnlyFailure('system_video_unresolved', {
+                source_signal_story_id: validation.sourceStoryId,
+                source_signal_post_id: validation.sourcePostId,
+                source_signal_fb_video_id: validation.fbVideoId,
+                source_signal_system_video_id: validation.systemVideoId,
+                resolved_system_video_id: validation.systemVideoId,
+            })
+        }
+    }
+    if (!publishVideoUrl) return recordAdOnlyFailure('system_video_url_unresolved')
+
+    // Resolve a Shopee click link for the ad CTA/comment tracking. Best-effort, in order: explicit
+    // request link, resolved system-video metadata, then gallery/namespace state by system video id.
+    // Then shorten via the page shortlink template. click_link falls back to the raw Shopee link.
     let shopeeLink = ''
     const inputShopee = String((body.shopee_url as string) || (body.original_link as string) || '').trim()
-    if (/^https?:\/\/(?:[^\s]+\.)?shopee\.[^\s]+/i.test(inputShopee)) shopeeLink = inputShopee
-    if (!shopeeLink && effectiveVideoId) {
-        const cacheRow = await c.env.DB.prepare('SELECT shopee_link FROM facebook_page_video_cache WHERE page_id = ? AND video_id = ? LIMIT 1')
-            .bind(validation.pageId, effectiveVideoId).first().catch(() => null) as { shopee_link?: string } | null
-        if (cacheRow?.shopee_link) shopeeLink = String(cacheRow.shopee_link).trim()
-    }
+    shopeeLink = pickFirstShopeeUrl(inputShopee) || ''
+    if (!shopeeLink) shopeeLink = systemShopeeLink
     if (!shopeeLink && namespaceId && validation.systemVideoId) {
         const gi = await c.env.DB.prepare(
             `SELECT COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), NULLIF(TRIM(gi.shopee_original_link), '')) AS original_link
@@ -12727,20 +12758,23 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         if (!clickLink) clickLink = shopeeLink
     }
 
-    // 4. Call the bridge. Ad-only NEVER publishes a new Page post (skip_publish_to_page) and the
-    // bridge create-ad call NEVER comments (skip_comment) — so there is no post_history side effect
-    // in either mode. Page commenting differs by mode and is done by the WORKER below, not the
-    // bridge create-ad path:
+    // 4. Call the bridge. This main Create Ads path MUST publish a NEW Page post/story and then create
+    // the ad from that new story. Therefore skip_publish_to_page is intentionally not sent. The bridge
+    // create-ad call never comments (skip_comment); Page commenting is done by the WORKER below, not
+    // the bridge create-ad path:
     //   - 'paused' (review): paused/status_option=PAUSED → the bridge leaves the adset + ad PAUSED
-    //     (no budget/schedule/activation) — a NON-SPENDING ad. NO CTA update and NO Page comment.
+    //     (no budget/schedule/activation) — a NON-SPENDING ad.
     //   - 'active' (scheduled): NO paused flag; instead daily_campaign_name (date-named campaign) +
     //     campaign_daily_budget (minor units, CAMPAIGN-level CBO) + adset_run_hours → the bridge
     //     creates/updates the date-named campaign with the CBO daily budget, copies a budget-free
     //     adset under it, applies the run-hours schedule and activates the adset + ad — a LIVE,
-    //     SPENDING ad. AFTER the bridge returns story_id, the worker re-mints the shortlink with
-    //     sub2=post id tail / sub3=page id, sets the VISIBLE ad-post CTA (bridge /update-cta) and
-    //     posts EXACTLY ONE Page comment with that final link (bridge /page-comment) — see step 5.
+    //     SPENDING ad.
+    // AFTER the bridge returns story_id, the worker re-mints the shortlink with sub2=post id tail /
+    // sub3=page id, sets the VISIBLE ad-post CTA (bridge /update-cta), repairs the paid creative CTA,
+    // and posts EXACTLY ONE Page comment with that final link (bridge /page-comment) — see step 5.
     const caption = String((body.caption as string) || '').trim()
+        || buildExpectedCaptionFromMeta(sourceMeta)
+        || validation.systemVideoId
     const adName = String((body.ad_name as string) || validation.systemVideoId || '').trim()
     const lifecycleFields = schedule.mode === 'active'
         ? {
@@ -12763,17 +12797,17 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 page_id: validation.pageId,
-                video_id: effectiveVideoId,
+                video_url: publishVideoUrl,
                 caption,
-                ...(adName ? { ad_name: adName, source_video_id: adName } : {}),
+                ...(adName ? { ad_name: adName } : {}),
+                ...(validation.systemVideoId ? { source_video_id: validation.systemVideoId } : {}),
                 ...(clickLink ? { shortlink: clickLink } : {}),
                 ...(shopeeLink ? { shopee_url: shopeeLink } : {}),
+                ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
                 template_adset: templateAdset,
                 ad_account: adAccount,
-                // Ad-only invariant — never publish a new Page post. The bridge create-ad call itself
-                // never comments (skip_comment); the SINGLE active-mode Page comment is posted by the
-                // worker below via /page-comment, so there is exactly one comment and no double-post.
-                skip_publish_to_page: true,
+                // The old Page source is only a signal; no skip_publish_to_page flag is sent here.
+                // The bridge must publish/create a NEW Page story from video_url, then create the ad.
                 skip_comment: true,
                 ...lifecycleFields,
             }),
@@ -12784,200 +12818,195 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         return recordAdOnlyFailure(e instanceof Error ? e.message : String(e), null, clickLink)
     }
 
+    const bridgeStoryIdForProof = String(bridgeResult.story_id || bridgeResult.effective_object_story_id || bridgeResult.ad_story_id || '').trim()
+    const newStoryIdForProof = buildPageStoryId(validation.pageId, bridgeStoryIdForProof)
+    const newPostIdForProof = adHistoryStoryTail(newStoryIdForProof || bridgeStoryIdForProof)
+    const newFbVideoId = String(bridgeResult.video_id || bridgeResult.fb_video_id || bridgeResult.advideo_id || '').trim()
+    Object.assign(bridgeResult, {
+        source_signal_story_id: validation.sourceStoryId,
+        source_signal_post_id: validation.sourcePostId,
+        source_signal_fb_video_id: validation.fbVideoId,
+        source_signal_system_video_id: validation.systemVideoId,
+        resolved_system_video_id: validation.systemVideoId,
+        resolved_system_video_namespace_id: resolvedSystemVideoNamespaceId,
+        ...(newStoryIdForProof ? { new_story_id: newStoryIdForProof } : {}),
+        ...(newPostIdForProof ? { new_post_id: newPostIdForProof } : {}),
+        ...(newFbVideoId ? { new_fb_video_id: newFbVideoId } : {}),
+        ...(newStoryIdForProof ? { effective_object_story_id: newStoryIdForProof, published_to_page: bridgeResult.published_to_page ?? true } : {}),
+    })
+
     if (!bridgeResult.ok || !bridgeResult.ad_id) {
         const step = String(bridgeResult.step || '').trim()
         const err = String(bridgeResult.error || 'bridge_create_ad_failed').trim()
         return recordAdOnlyFailure(step ? `[${step}] ${err}` : err, bridgeResult, clickLink)
     }
 
-    // 5. Active-mode finalization — the bridge create-ad path returns the dark creative's
-    // effective_object_story_id as `story_id`. ONLY for the spending 'active' path (the paused/review
-    // path stays non-spending and is never touched here), re-mint the CTA/comment shortlink so it
-    // carries sub2 = post id tail (from the returned story_id) and sub3 = page id, then:
+    // 5. New-story finalization — the bridge create-ad path returns the newly published story id.
+    // Re-mint the CTA/comment shortlink so it carries sub2 = post id tail (from the returned story_id)
+    // and sub3 = page id, then:
     //   • set the VISIBLE ad-post CTA to that final link (bridge /update-cta, SHOP_NOW), and
     //   • post EXACTLY ONE Page comment with the same final link on the FULL story id (/page-comment).
-    // All of this is best-effort: a failure is recorded on bridgeResult but never fails the created ad.
-    if (schedule.mode === 'active') {
-        const bridgeStoryId = String(bridgeResult.story_id || bridgeResult.effective_object_story_id || bridgeResult.ad_story_id || '').trim()
-        if (!shopeeLink) {
-            bridgeResult.comment_status = 'skipped_no_shopee_link'
-            bridgeResult.comment_error = 'shopee_link_missing'
-        } else if (!bridgeStoryId) {
-            bridgeResult.comment_status = 'failed'
-            bridgeResult.comment_error = 'story_id_missing'
-        } else {
-            // Derive sub2 = post id tail, sub3 = page id from the bridge-returned story_id.
-            const commentSubIds = buildPostingCommentShortlinkSubIds({
-                canonicalPostId: bridgeStoryId,
-                fbVideoId: effectiveVideoId,
-                pageId: validation.pageId,
-                historyId: null,
-                logPrefix: `AD-ONLY ACTIVE ${validation.pageId}`,
-            })
-            const fullStoryId = buildPageStoryId(validation.pageId, bridgeStoryId)
-            bridgeResult.comment_target_story_id = fullStoryId
-            bridgeResult.comment_target_post_id = commentSubIds.postSubId2
-            // Re-mint through the SAME page shortlink template / short.wwoom flow used for the initial
-            // clickLink, but with sub2/sub3 from the returned story_id (sub1 stays the page setting).
-            const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
-            const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
-            const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
-            const finalShortlinkUrl = buildAdOnlyShortlinkRequestUrl({
-                template: tmpl,
-                shopeeLink,
-                sub1: String(subRow?.value || 'yok').trim(),
-                sub2: commentSubIds.postSubId2,
-                sub3: commentSubIds.postSubId3,
-            })
-            let finalLink = ''
+    // All of this is best-effort: a failure is recorded on bridgeResult but never fails the created ad
+    // or changes PAUSED into ACTIVE.
+    const bridgeStoryId = String(bridgeResult.story_id || bridgeResult.effective_object_story_id || bridgeResult.ad_story_id || '').trim()
+    if (!shopeeLink) {
+        bridgeResult.comment_status = 'skipped_no_shopee_link'
+        bridgeResult.comment_error = 'shopee_link_missing'
+    } else if (!bridgeStoryId) {
+        bridgeResult.comment_status = 'failed'
+        bridgeResult.comment_error = 'story_id_missing'
+    } else {
+        // Derive sub2 = post id tail, sub3 = page id from the bridge-returned story_id.
+        const commentSubIds = buildPostingCommentShortlinkSubIds({
+            canonicalPostId: bridgeStoryId,
+            fbVideoId: newFbVideoId,
+            pageId: validation.pageId,
+            historyId: null,
+            logPrefix: `CREATE ADS ${validation.pageId}`,
+        })
+        const fullStoryId = buildPageStoryId(validation.pageId, bridgeStoryId)
+        bridgeResult.comment_target_story_id = fullStoryId
+        bridgeResult.comment_target_post_id = commentSubIds.postSubId2
+        // Re-mint through the SAME page shortlink template / short.wwoom flow used for the initial
+        // clickLink, but with sub2/sub3 from the returned story_id (sub1 stays the page setting).
+        const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
+        const subRow = await getPageSetting(c.env.DB, validation.pageId, 'sub_id').catch(() => null)
+        const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
+        const finalShortlinkUrl = buildAdOnlyShortlinkRequestUrl({
+            template: tmpl,
+            shopeeLink,
+            sub1: String(subRow?.value || 'yok').trim(),
+            sub2: commentSubIds.postSubId2,
+            sub3: commentSubIds.postSubId3,
+        })
+        let finalLink = ''
+        try {
+            const slResp = await fetch(finalShortlinkUrl, { method: 'GET' })
+            if (slResp.ok) {
+                const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+                finalLink = String(slData.shortLink || slData.short_link || '').trim()
+            }
+        } catch { /* shortener best-effort; without a final link we skip CTA/comment below */ }
+
+        if (finalLink) {
+            // The final link becomes the ad's recorded click link + the comment shortlink.
+            clickLink = finalLink
+            bridgeResult.click_link = finalLink
+            bridgeResult.comment_shortlink = finalLink
+            bridgeResult.cta_sub2 = commentSubIds.postSubId2
+            bridgeResult.cta_sub3 = commentSubIds.postSubId3
+
+            // a. Swap the VISIBLE ad-post CTA to the final post-specific link.
             try {
-                const slResp = await fetch(finalShortlinkUrl, { method: 'GET' })
-                if (slResp.ok) {
-                    const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
-                    finalLink = String(slData.shortLink || slData.short_link || '').trim()
+                const ctaResp = await fetch(`${baseUrl}/update-cta`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ page_id: validation.pageId, story_id: bridgeStoryId, final_cta_link: finalLink, cta_type: 'SHOP_NOW' }),
+                })
+                const ctaData = await ctaResp.json().catch(() => ({})) as Record<string, unknown>
+                if (ctaResp.ok && ctaData.ok) {
+                    bridgeResult.cta_update_status = 'success'
+                    bridgeResult.visible_page_cta_link = String(ctaData.visible_page_cta_link || finalLink)
+                    bridgeResult.visible_page_cta_final = ctaData.visible_page_cta_final === true
+                } else {
+                    bridgeResult.cta_update_status = 'failed'
+                    bridgeResult.cta_update_error = String(ctaData.step ? `${ctaData.step}:${ctaData.error || ''}` : (ctaData.error || `update_cta_http_${ctaResp.status}`)).slice(0, 200)
                 }
-            } catch { /* shortener best-effort; without a final link we skip CTA/comment below */ }
+            } catch (e) {
+                bridgeResult.cta_update_status = 'failed'
+                bridgeResult.cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+            }
 
-            if (finalLink) {
-                // The final link becomes the ad's recorded click link + the comment shortlink.
-                clickLink = finalLink
-                bridgeResult.click_link = finalLink
-                bridgeResult.comment_shortlink = finalLink
-                bridgeResult.cta_sub2 = commentSubIds.postSubId2
-                bridgeResult.cta_sub3 = commentSubIds.postSubId3
-
-                // a. Swap the VISIBLE ad-post CTA to the final post-specific link.
+            // a.2 Repair the PAID ad creative's CTA (Ads Manager). The paid ad was created in step 3
+            // BEFORE this final post-specific shortlink existed, so its creative still carries the
+            // placeholder link (sub2/sub3 unset — the live incident where all ads showed
+            // utm_content=…AD----). /update-cta above only fixes the VISIBLE post; Graph cannot edit a
+            // creative's link inline, so the bridge creates a NEW creative with the SAME finalLink and
+            // re-points the ad at it. Best-effort: recorded on bridgeResult, never fails the created
+            // ad. The result NEVER claims success unless the bridge read-back confirms
+            // paid_ad_cta_final.
+            const repairAdId = String(bridgeResult.ad_id || '').trim()
+            if (repairAdId) {
                 try {
-                    const ctaResp = await fetch(`${baseUrl}/update-cta`, {
+                    const repairBody = buildPaidAdCtaRepairBody({
+                        pageId: validation.pageId,
+                        adId: repairAdId,
+                        finalLink,
+                        creativeId: String(bridgeResult.creative_id || ''),
+                        videoId: newFbVideoId,
+                        caption,
+                        adAccount,
+                        templateAdset,
+                        sourceStoryId: bridgeStoryId,
+                        adName,
+                        thumbnailUrl: String(bridgeResult.thumbnail_url || ''),
+                    })
+                    const repairResp = await fetch(`${baseUrl}/repair-ad-cta`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ page_id: validation.pageId, story_id: bridgeStoryId, final_cta_link: finalLink, cta_type: 'SHOP_NOW' }),
+                        body: JSON.stringify(repairBody),
                     })
-                    const ctaData = await ctaResp.json().catch(() => ({})) as Record<string, unknown>
-                    if (ctaResp.ok && ctaData.ok) {
-                        bridgeResult.cta_update_status = 'success'
-                        bridgeResult.visible_page_cta_link = String(ctaData.visible_page_cta_link || finalLink)
-                        bridgeResult.visible_page_cta_final = ctaData.visible_page_cta_final === true
-                    } else {
-                        bridgeResult.cta_update_status = 'failed'
-                        bridgeResult.cta_update_error = String(ctaData.step ? `${ctaData.step}:${ctaData.error || ''}` : (ctaData.error || `update_cta_http_${ctaResp.status}`)).slice(0, 200)
+                    const repairData = await repairResp.json().catch(() => ({})) as Record<string, unknown>
+                    const summary = summarizePaidAdCtaRepair(repairData, repairResp.ok)
+                    Object.assign(bridgeResult, summary)
+                    // On a CONFIRMED paid-CTA repair the ad now points at the NEW creative — keep
+                    // the recorded creative_id in sync so the audit row reflects the live creative.
+                    if (summary.paid_cta_update_status === 'success' && summary.paid_new_creative_id) {
+                        bridgeResult.creative_id = summary.paid_new_creative_id
                     }
                 } catch (e) {
-                    bridgeResult.cta_update_status = 'failed'
-                    bridgeResult.cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                    bridgeResult.paid_cta_update_status = 'failed'
+                    bridgeResult.paid_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
                 }
-
-                // a.2 Repair the PAID ad creative's CTA (Ads Manager). The paid ad was created in
-                // step 3 BEFORE this final post-specific shortlink existed, so its creative still
-                // carries the placeholder link (sub2/sub3 unset — the live incident where all ads
-                // showed utm_content=…AD----). /update-cta above only fixes the VISIBLE post; Graph
-                // cannot edit a creative's link inline, so the bridge creates a NEW creative with the
-                // SAME finalLink and re-points the ad at it. Best-effort: recorded on bridgeResult,
-                // never fails the created ad. The result NEVER claims success unless the bridge
-                // read-back confirms paid_ad_cta_final.
-                const repairAdId = String(bridgeResult.ad_id || '').trim()
-                if (repairAdId) {
-                    try {
-                        const repairBody = buildPaidAdCtaRepairBody({
-                            pageId: validation.pageId,
-                            adId: repairAdId,
-                            finalLink,
-                            creativeId: String(bridgeResult.creative_id || ''),
-                            videoId: effectiveVideoId,
-                            caption,
-                            adAccount,
-                            templateAdset,
-                            sourceStoryId: bridgeStoryId,
-                            adName,
-                            thumbnailUrl: String(bridgeResult.thumbnail_url || ''),
-                        })
-                        const repairResp = await fetch(`${baseUrl}/repair-ad-cta`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(repairBody),
-                        })
-                        const repairData = await repairResp.json().catch(() => ({})) as Record<string, unknown>
-                        const summary = summarizePaidAdCtaRepair(repairData, repairResp.ok)
-                        Object.assign(bridgeResult, summary)
-                        // On a CONFIRMED paid-CTA repair the ad now points at the NEW creative — keep
-                        // the recorded creative_id in sync so the audit row reflects the live creative.
-                        if (summary.paid_cta_update_status === 'success' && summary.paid_new_creative_id) {
-                            bridgeResult.creative_id = summary.paid_new_creative_id
-                        }
-                    } catch (e) {
-                        bridgeResult.paid_cta_update_status = 'failed'
-                        bridgeResult.paid_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
-                    }
-                }
-
-                // b. Post EXACTLY ONE Page comment on the FULL story id, rendered through the SAME
-                // namespace comment-template system normal page posts use (buildAffiliateCommentMessage)
-                // — NOT a bare link. {{shopee_link}} is substituted with the SAME finalLink the CTA
-                // uses, so CTA and comment carry one identical post-specific shortlink. The namespace
-                // lookup failing falls back to DEFAULT_COMMENT_TEMPLATE_TEXT via
-                // renderCommentTemplatesForPosting (inside buildAffiliateCommentMessage), so a normal
-                // run always yields a message. Ad-only has no Lazada link, so the Lazada slot/line is
-                // dropped by the renderer. Comment failure is recorded but never fails the created ad.
-                const commentMessage = await buildAffiliateCommentMessage(c.env.DB, namespaceId, finalLink).catch(() => '')
-                // Audit: store a safe, truncated preview of the rendered comment (never a raw token).
-                bridgeResult.comment_message = commentMessage.slice(0, 500)
-                if (!commentMessage) {
-                    // Render produced nothing (e.g. empty namespace + empty default) — skip explicitly.
-                    bridgeResult.comment_status = 'skipped_no_message'
-                    bridgeResult.comment_error = 'comment_template_rendered_empty'
-                } else {
-                    const postPageComment = async (targetStoryId: string): Promise<{ status: 'success' | 'failed'; id: string; error: string }> => {
-                        const commentResp = await fetch(`${baseUrl}/page-comment`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            // Also pass comment_message so the bridge audit/fallback never bare-links.
-                            body: JSON.stringify({ page_id: validation.pageId, story_id: targetStoryId, message: commentMessage, comment_message: commentMessage }),
-                        })
-                        const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
-                        if (commentResp.ok && commentData.ok && commentData.id) {
-                            return { status: 'success', id: String(commentData.id), error: '' }
-                        }
-                        const error = String(commentData.step ? `${commentData.step}:${commentData.error || ''}` : (commentData.error || `page_comment_http_${commentResp.status}`)).slice(0, 200)
-                        return { status: 'failed', id: '', error }
-                    }
-
-                    try {
-                        const createdComment = await postPageComment(fullStoryId)
-                        bridgeResult.comment_status = createdComment.status
-                        if (createdComment.status === 'success') {
-                            bridgeResult.comment_fb_id = createdComment.id
-                        } else {
-                            bridgeResult.comment_error = createdComment.error
-                        }
-                    } catch (e) {
-                        bridgeResult.comment_status = 'failed'
-                        bridgeResult.comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
-                    }
-
-                    const sourceCommentTargetRaw = validation.sourcePostId || validation.fbVideoId
-                    const sourceCommentTargetStoryId = buildPageStoryId(validation.pageId, sourceCommentTargetRaw)
-                    if (sourceCommentTargetStoryId && sourceCommentTargetStoryId !== fullStoryId) {
-                        bridgeResult.source_comment_target_story_id = sourceCommentTargetStoryId
-                        bridgeResult.source_comment_shortlink = finalLink
-                        bridgeResult.source_comment_message = commentMessage.slice(0, 500)
-                        try {
-                            const sourceComment = await postPageComment(sourceCommentTargetStoryId)
-                            bridgeResult.source_comment_status = sourceComment.status
-                            if (sourceComment.status === 'success') {
-                                bridgeResult.source_comment_fb_id = sourceComment.id
-                            } else {
-                                bridgeResult.source_comment_error = sourceComment.error
-                            }
-                        } catch (e) {
-                            bridgeResult.source_comment_status = 'failed'
-                            bridgeResult.source_comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
-                        }
-                    }
-                }
-            } else {
-                bridgeResult.comment_status = 'failed'
-                bridgeResult.comment_error = 'final_shortlink_unresolved'
             }
+
+            // b. Post EXACTLY ONE Page comment on the FULL story id, rendered through the SAME
+            // namespace comment-template system normal page posts use (buildAffiliateCommentMessage)
+            // — NOT a bare link. {{shopee_link}} is substituted with the SAME finalLink the CTA uses,
+            // so CTA and comment carry one identical post-specific shortlink. The namespace lookup
+            // failing falls back to DEFAULT_COMMENT_TEMPLATE_TEXT via renderCommentTemplatesForPosting
+            // (inside buildAffiliateCommentMessage), so a normal run always yields a message. Ad-only
+            // has no Lazada link, so the Lazada slot/line is dropped by the renderer. Comment failure
+            // is recorded but never fails the created ad.
+            const commentMessage = await buildAffiliateCommentMessage(c.env.DB, namespaceId, finalLink).catch(() => '')
+            // Audit: store a safe, truncated preview of the rendered comment (never a raw token).
+            bridgeResult.comment_message = commentMessage.slice(0, 500)
+            if (!commentMessage) {
+                // Render produced nothing (e.g. empty namespace + empty default) — skip explicitly.
+                bridgeResult.comment_status = 'skipped_no_message'
+                bridgeResult.comment_error = 'comment_template_rendered_empty'
+            } else {
+                const postPageComment = async (targetStoryId: string): Promise<{ status: 'success' | 'failed'; id: string; error: string }> => {
+                    const commentResp = await fetch(`${baseUrl}/page-comment`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        // Also pass comment_message so the bridge audit/fallback never bare-links.
+                        body: JSON.stringify({ page_id: validation.pageId, story_id: targetStoryId, message: commentMessage, comment_message: commentMessage }),
+                    })
+                    const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
+                    if (commentResp.ok && commentData.ok && commentData.id) {
+                        return { status: 'success', id: String(commentData.id), error: '' }
+                    }
+                    const error = String(commentData.step ? `${commentData.step}:${commentData.error || ''}` : (commentData.error || `page_comment_http_${commentResp.status}`)).slice(0, 200)
+                    return { status: 'failed', id: '', error }
+                }
+
+                try {
+                    const createdComment = await postPageComment(fullStoryId)
+                    bridgeResult.comment_status = createdComment.status
+                    if (createdComment.status === 'success') {
+                        bridgeResult.comment_fb_id = createdComment.id
+                    } else {
+                        bridgeResult.comment_error = createdComment.error
+                    }
+                } catch (e) {
+                    bridgeResult.comment_status = 'failed'
+                    bridgeResult.comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                }
+            }
+        } else {
+            bridgeResult.comment_status = 'failed'
+            bridgeResult.comment_error = 'final_shortlink_unresolved'
         }
     }
 
@@ -13007,12 +13036,11 @@ app.get('/api/dashboard/ad-history', async (c) => {
 })
 
 // =====================================================================
-// AD-ONLY QUEUE / SCHEDULER — restores the "old queue cadence" UX (สร้างทุก X นาที) but on the
-// AD-ONLY lane ONLY. Every queued row is replayed through POST /api/dashboard/create-ad-only — never
-// the legacy /api/dashboard/create-ad — so the hard invariants of the ad-only lane are preserved:
-//   • NEVER publishes a new Page post   • NEVER comments   • NEVER writes post_history
-// It has its OWN table (dashboard_ad_only_queue) so it can never be picked up by the legacy ad-queue
-// processor, and the Page-post/auto-post lanes are completely untouched.
+// CREATE ADS QUEUE / SCHEDULER — restores the "old queue cadence" UX (สร้างทุก X นาที) on the
+// Create Ads lane. Every queued row is replayed through POST /api/dashboard/create-ad-only: source
+// signal ids are proof only, the worker resolves system_video_id, publishes a NEW Page post/story,
+// then creates/promotes the ad from that new story. It NEVER writes post_history. It has its OWN table
+// (dashboard_ad_only_queue) so it can never be picked up by the legacy ad-queue processor.
 //
 // Cadence: the scheduled handler processes AT MOST ONE queued row per interval (operator-set, stored
 // as a dashboard setting; clamped 1–1440 min, default 20). Default mode is the safe, non-spending
@@ -13068,8 +13096,8 @@ app.post('/api/dashboard/ad-only-queue/enqueue', async (c) => {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
     await ensureAdOnlyQueueTable(c.env.DB)
     // Validate with the SAME rules the create-ad-only endpoint enforces, so a row can never be queued
-    // that would be rejected at run time (and so a video_url-only / page-publish request is refused
-    // here too). resolveAdOnlySchedule enforces the active-mode campaign-name requirement.
+    // that would be rejected at run time. resolveAdOnlySchedule enforces the active-mode campaign-name
+    // requirement.
     const validation = validateAdOnlyInput(body)
     if (!validation.ok) return c.json({ ok: false, error: validation.error, detail: validation.detail }, 200)
     const schedule = resolveAdOnlySchedule(body)
@@ -13354,15 +13382,60 @@ async function autoPickAdOnlyCandidates(env: Env): Promise<AdOnlyAutoCandidate[]
         ).bind(pageId).all().catch(() => ({ results: [] as AdOnlyHistoryIdRow[] })) as { results?: AdOnlyHistoryIdRow[] }
         const used = buildAdOnlyUsedIdSetForBangkokDate(historyRows.results || [], nowMs)
 
-        const candidates: AdOnlyAutoCandidate[] = videos.map((v) => ({
-            pageId,
-            videoId: String(v.video_id || '').trim(),
-            postId: String(v.post_id || '').trim(),
-            shopeeLink: String(v.shopee_link || '').trim(),
-            views: Number(v.views || 0),
-            createdTime: String(v.created_time || '').trim(),
-            adName: String(v.title || '').trim() || String(v.video_id || '').trim(),
-        }))
+        const candidates: AdOnlyAutoCandidate[] = []
+        for (const v of videos) {
+            const fbVideoId = String(v.video_id || '').trim()
+            const postId = String(v.post_id || '').trim()
+            const shopeeLink = String(v.shopee_link || '').trim()
+            let systemVideoId = ''
+            try {
+                const row = await env.DB.prepare(
+                    `SELECT video_id
+                     FROM post_history
+                     WHERE bot_id = ?
+                       AND page_id = ?
+                       AND TRIM(COALESCE(video_id, '')) <> ''
+                       AND (
+                           fb_post_id = ?
+                           OR fb_post_id = ?
+                           OR fb_reel_url LIKE ?
+                           OR fb_reel_url LIKE ?
+                       )
+                     ORDER BY datetime(posted_at) DESC LIMIT 1`
+                ).bind(
+                    DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID,
+                    pageId,
+                    postId,
+                    postId ? `${pageId}_${postId}` : '',
+                    fbVideoId ? `%${fbVideoId}%` : '',
+                    fbVideoId ? `%/reel/${fbVideoId}%` : '',
+                ).first() as { video_id?: string } | null
+                systemVideoId = String(row?.video_id || '').trim()
+            } catch { /* leave unresolved; eligibility will fail closed */ }
+            if (!systemVideoId && shopeeLink) {
+                try {
+                    const row = await env.DB.prepare(
+                        `SELECT video_id
+                         FROM namespace_video_state
+                         WHERE namespace_id = ?
+                           AND TRIM(COALESCE(video_id, '')) <> ''
+                           AND (shopee_original_link = ? OR shopee_link = ?)
+                         ORDER BY datetime(updated_at) DESC LIMIT 1`
+                    ).bind(DASHBOARD_FACEBOOK_GALLERY_NAMESPACE_ID, shopeeLink, shopeeLink).first() as { video_id?: string } | null
+                    systemVideoId = String(row?.video_id || '').trim()
+                } catch { /* leave unresolved; eligibility will fail closed */ }
+            }
+            candidates.push({
+                pageId,
+                videoId: fbVideoId,
+                postId,
+                systemVideoId,
+                shopeeLink,
+                views: Number(v.views || 0),
+                createdTime: String(v.created_time || '').trim(),
+                adName: String(v.title || '').trim() || systemVideoId || fbVideoId,
+            })
+        }
         // Per page take ONE random fresh candidate (not the highest-view one) — a page's other clips
         // share the same page-level config, so the cross-page list is the right granularity for fall-through.
         const ranked = rankAdOnlyAutoCandidatesRandom(candidates, used, rng)
@@ -13376,7 +13449,7 @@ async function autoPickAdOnlyCandidates(env: Env): Promise<AdOnlyAutoCandidate[]
 
 // Issue ONE create-ad-only call for a candidate via the SAME internal endpoint the queue uses
 // (buildAdOnlyAutoPickBody guarantees an active-mode body with the Bangkok daily campaign + 10k THB +
-// 24h and NO page-publish field). create-ad-only returns HTTP 200 ok:false for validation/bridge
+// 24h plus source-signal/system-video ids). create-ad-only returns HTTP 200 ok:false for validation/bridge
 // failures, so success is gated on data.ok, not just resp.ok.
 async function createOneAutoPickedAdOnly(env: Env, candidate: AdOnlyAutoCandidate): Promise<{ ok: boolean; error?: string; result?: unknown }> {
     const reqBody = buildAdOnlyAutoPickBody({ candidate, dailyCampaignName: bangkokDailyCampaignName() })
