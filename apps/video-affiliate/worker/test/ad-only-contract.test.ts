@@ -314,20 +314,28 @@ test('create-ad-only records new-story comment evidence or a skipped/failed reas
     assert.match(routeSource, /skip_comment: true/, 'bridge /create-ad must not also comment')
     assert.match(routeSource, /bridgeResult\.comment_status = 'skipped_no_shopee_link'/)
     assert.match(routeSource, /bridgeResult\.comment_error = 'shopee_link_missing'/)
-    assert.match(routeSource, /bridgeResult\.comment_status = 'failed'[\s\S]*bridgeResult\.comment_error = 'story_id_missing'/)
+    assert.match(routeSource, /visible_cta_update_failed/, 'must fail before promote when visible CTA is not final')
     assert.match(routeSource, /bridgeResult\.comment_status = 'failed'[\s\S]*bridgeResult\.comment_error = 'final_shortlink_unresolved'/)
     assert.match(routeSource, /bridgeResult\.comment_target_story_id = fullStoryId/)
     assert.match(routeSource, /bridgeResult\.comment_target_post_id = commentSubIds\.postSubId2/)
     assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: targetStoryId, message: commentMessage, comment_message: commentMessage \}\)/)
 })
 
-test('create-ad-only bridge body publishes a new system-video post and does not skip page publish', () => {
+test('create-ad-only bridge bodies publish a new system-video post, then promote that same story', () => {
     const routeSource = getCreateAdOnlyRouteSource()
 
     assert.match(routeSource, /video_url: publishVideoUrl/)
     assert.match(routeSource, /source_video_id: validation\.systemVideoId/)
+    assert.match(routeSource, /skip_ad: true/)
+    assert.match(routeSource, /publish_as_page_video: true/)
     assert.match(routeSource, /skip_comment: true/)
+    assert.match(routeSource, /`\$\{baseUrl\}\/promote`/)
+    assert.match(routeSource, /story_id: fullStoryId/)
+    assert.match(routeSource, /post_id: fullStoryId/)
+    assert.match(routeSource, /final_cta_link: finalLink/)
+    assert.match(routeSource, /use_object_story_id: true/)
     assert.doesNotMatch(routeSource, /skip_publish_to_page:\s*true/)
+    assert.doesNotMatch(routeSource, /`\$\{baseUrl\}\/repair-ad-cta`/)
     assert.match(routeSource, /resolveGalleryVideoForRepost/)
     assert.match(routeSource, /system_video_unresolved/)
 })
@@ -341,8 +349,40 @@ test('create-ad-only records new-story proof separately from old source signal i
     assert.match(routeSource, /source_signal_system_video_id: validation\.systemVideoId/)
     assert.match(routeSource, /new_story_id: newStoryIdForProof/)
     assert.match(routeSource, /new_post_id: newPostIdForProof/)
+    assert.match(routeSource, /new_story_id: fullStoryId/)
+    assert.match(routeSource, /final_shortlink: finalLink/)
+    assert.match(routeSource, /sub1: finalSub1/)
+    assert.match(routeSource, /cta_sub1: finalSub1/)
+    assert.match(routeSource, /cta_sub2: commentSubIds\.postSubId2/)
+    assert.match(routeSource, /cta_sub3: commentSubIds\.postSubId3/)
     assert.doesNotMatch(routeSource, /sourceCommentTargetRaw/)
     assert.doesNotMatch(routeSource, /source_comment_target_story_id = sourceCommentTargetStoryId/)
+})
+
+test('ad-only queue preflights old source signals to a system video before creating history', () => {
+    const source = getIndexSource()
+    const queueSource = sliceIndexSource(
+        'async function processNextAdOnlyQueueItem',
+        '\nasync function recoverStuckAdOnlyQueueProcessing',
+        'processNextAdOnlyQueueItem'
+    )
+    const autoPickSource = sliceIndexSource(
+        'async function autoPickAdOnlyCandidates',
+        '\n// Issue ONE create-ad-only call',
+        'autoPickAdOnlyCandidates'
+    )
+
+    assert.match(source, /async function resolveAdOnlySystemVideoIdFromSignal/)
+    assert.match(queueSource, /resolveAdOnlySystemVideoIdFromSignal\(env/)
+    assert.match(queueSource, /system_video_unmapped_preflight/)
+    assert.match(queueSource, /system_video_source_required_preflight/)
+    assert.ok(
+        queueSource.indexOf('system_video_unmapped_preflight') < queueSource.indexOf("fetch(`${workerUrl}/api/dashboard/create-ad-only`"),
+        'unmapped queued rows must fail before the internal create-ad-only fetch'
+    )
+    assert.match(autoPickSource, /resolveAdOnlySystemVideoIdFromSignal\(env/)
+    assert.match(autoPickSource, /reason=system_video_unmapped_preflight/)
+    assert.match(autoPickSource, /continue/)
 })
 
 test('ad-history expands safe comment and CTA proof fields from truncated_result_json', () => {
@@ -374,8 +414,15 @@ test('ad-history expands safe comment and CTA proof fields from truncated_result
         'publish_error',
         'visible_page_cta_final',
         'visible_page_cta_link',
+        'sub1',
+        'cta_sub1',
+        'cta_sub2',
+        'cta_sub3',
+        'final_shortlink',
         'paid_ad_cta_final',
         'paid_ad_cta_link',
+        'promote_mode',
+        'promote_uses_object_story_id',
     ]) {
         assert.match(source, new RegExp(`'${key}'`), `safe field list must include ${key}`)
     }

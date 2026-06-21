@@ -277,8 +277,20 @@ async function downloadVideoToBuffer(videoUrl, { fetchImpl, maxBytes = MAX_DOWNL
 // Build a multipart/form-data body (as a Buffer) carrying the video bytes under `source`, the field
 // Graph advideos expects for a direct file upload. Uses Node built-ins only; the boundary is random
 // so it can never collide with the binary payload. Returns { body, contentType }.
-function buildVideoMultipart({ buffer, filename = 'video.mp4', contentType = 'video/mp4', fieldName = 'source' }) {
+function buildVideoMultipart({ buffer, filename = 'video.mp4', contentType = 'video/mp4', fieldName = 'source', fields = {} }) {
   const boundary = '----fbTokenCloak' + crypto.randomBytes(16).toString('hex');
+  const fieldParts = [];
+  for (const [name, value] of Object.entries(fields || {})) {
+    const cleanName = String(name || '').replace(/"/g, '');
+    if (!cleanName) continue;
+    const cleanValue = String(value == null ? '' : value);
+    fieldParts.push(Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="${cleanName}"\r\n\r\n` +
+      `${cleanValue}\r\n`,
+      'utf8'
+    ));
+  }
   const head = Buffer.from(
     `--${boundary}\r\n` +
     `Content-Disposition: form-data; name="${fieldName}"; filename="${filename}"\r\n` +
@@ -286,7 +298,7 @@ function buildVideoMultipart({ buffer, filename = 'video.mp4', contentType = 'vi
     'utf8'
   );
   const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
-  return { body: Buffer.concat([head, buffer, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
+  return { body: Buffer.concat([...fieldParts, head, buffer, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
 }
 
 // Upload a video to {adAccount}/advideos as a multipart file (the PRIMARY transport). access_token
@@ -349,6 +361,137 @@ async function uploadAdVideoFromUrl(fetchImpl, {
   }
   const data = await uploadAdVideoMultipart(fetchImpl, { adAccount, userToken, buffer: dl.buffer, contentType: dl.contentType });
   return { data, uploadMode: 'multipart' };
+}
+
+// Publish a NEW Page video post directly through the Page video endpoint, not through an adcreative.
+// This is the Create Ads Phase A path: old high-view posts are signals only; the bridge first creates
+// a fresh Page story from the system video, then the Worker mints the final post-specific shortlink
+// and calls /promote with use_object_story_id so the paid ad sponsors this same story. No token is
+// returned or logged.
+async function publishPageVideoPost(fetchImpl, params = {}) {
+  const userToken = params.userToken;
+  const pageId = String(params.pageId || params.page_id || '').trim();
+  const videoUrl = String(params.videoUrl || params.video_url || '').trim();
+  const caption = String(params.caption || params.message || '').trim();
+  const title = String(params.title || params.adName || params.ad_name || '').trim().slice(0, 120);
+  const sleep = params.sleep || realSleep;
+  const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
+  const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 40;
+
+  if (!userToken) return { ok: false, phase: 'post', step: 'session', error: 'no_session' };
+  if (!pageId || !videoUrl) return { ok: false, phase: 'post', step: 'validate', error: 'Missing: page_id, video_url' };
+
+  const pageTokenInfo = await resolvePageToken(fetchImpl, userToken, pageId);
+  if (!pageTokenInfo.pageToken) {
+    return { ok: false, phase: 'post', step: 'page_token', error: pageTokenInfo.error || 'page_token_not_found', page_id: pageId };
+  }
+  const pageToken = pageTokenInfo.pageToken;
+
+  let uploadMode = 'page_video_multipart';
+  let upData = {};
+  try {
+    const dl = await (params.downloadVideo || downloadVideoToBuffer)(videoUrl, {
+      maxBytes: MAX_DOWNLOAD_VIDEO_BYTES,
+      timeoutMs: 120000
+    });
+    const part = buildVideoMultipart({
+      buffer: dl.buffer,
+      filename: 'page-video.mp4',
+      contentType: dl.contentType,
+      fieldName: 'source',
+      fields: {
+        published: 'true',
+        description: caption,
+        ...(title ? { title } : {})
+      }
+    });
+    const up = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${pageId}/videos?access_token=${encodeURIComponent(pageToken)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': part.contentType },
+      body: part.body
+    });
+    upData = up.data || {};
+  } catch (e) {
+    uploadMode = 'page_video_file_url_fallback';
+    const downloadReason = (e && e.message) || String(e);
+    const up = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${pageId}/videos?access_token=${encodeURIComponent(pageToken)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_url: videoUrl,
+        published: true,
+        description: caption,
+        ...(title ? { title } : {})
+      })
+    });
+    upData = up.data || {};
+    if (upData.error && upData.error.message) {
+      upData = {
+        error: {
+          message: `${upData.error.message} (multipart_download_unavailable: ${downloadReason})`,
+          code: upData.error.code,
+          error_subcode: upData.error.error_subcode,
+          fbtrace_id: upData.error.fbtrace_id
+        }
+      };
+    }
+  }
+
+  if (upData.error) {
+    return {
+      ok: false,
+      phase: 'post',
+      step: 'publish_video',
+      error: upData.error.message || 'page_video_publish_failed',
+      fb_error_code: upData.error.code,
+      fb_error_subcode: upData.error.error_subcode,
+      fb_trace_id: upData.error.fbtrace_id,
+      upload_mode: uploadMode
+    };
+  }
+
+  const videoId = String(upData.id || upData.video_id || '').trim();
+  if (!videoId) {
+    return { ok: false, phase: 'post', step: 'publish_video', error: 'page_video_id_missing', upload_mode: uploadMode };
+  }
+
+  let storyId = String(upData.post_id || upData.postId || upData.story_id || '').trim();
+  let postUrl = '';
+  let thumb = '';
+  let storyIdSource = storyId ? 'upload_response' : '';
+  for (let i = 0; i < Math.max(1, thumbPolls); i++) {
+    if (i > 0) await sleep(pollMs);
+    try {
+      const read = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(videoId)}?fields=post_id,permalink_url,thumbnails&access_token=${encodeURIComponent(pageToken)}`);
+      const d = read.data || {};
+      if (!storyId && d.post_id) {
+        storyId = String(d.post_id).trim();
+        storyIdSource = 'video_readback';
+      }
+      if (!postUrl) postUrl = String(d.permalink_url || '').trim();
+      const thumbs = d.thumbnails && d.thumbnails.data;
+      if (!thumb && Array.isArray(thumbs) && thumbs[0] && thumbs[0].uri) thumb = String(thumbs[0].uri).trim();
+      if (storyId) break;
+    } catch {}
+  }
+
+  if (!storyId) {
+    storyId = `${pageId}_${videoId}`;
+    storyIdSource = 'page_video_id_fallback';
+  }
+  if (!postUrl) postUrl = `https://www.facebook.com/${String(storyId).replace('_', '/posts/')}`;
+
+  return {
+    ok: true,
+    phase: 'post',
+    story_id: storyId,
+    video_id: videoId,
+    post_url: postUrl,
+    thumbnail_url: thumb || undefined,
+    published_to_page: true,
+    upload_mode: uploadMode,
+    story_id_source: storyIdSource
+  };
 }
 
 // GET /pages — list the pages the session administers, id/name/category only. Page access
@@ -1347,6 +1490,19 @@ async function createAd(fetchImpl, params = {}) {
     return { ok: false, step: 'config', error: 'Missing: ad_account / template_adset' };
   }
 
+  if (skipAd && (body.publish_as_page_video === true || body.publish_as_page_video === 'true')) {
+    return await publishPageVideoPost(fetchImpl, {
+      userToken,
+      pageId,
+      videoUrl,
+      caption,
+      title: requestedAdName,
+      sleep,
+      pollMs,
+      downloadVideo: params.downloadVideo
+    });
+  }
+
   // Read CTA type + IG actor from the template adset's first ad creative.
   const { ctaType, instagramActorId, instagramUserId } = await readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset });
 
@@ -1637,6 +1793,10 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   // Ad-only / non-spending mode (same flag contract as createAd): build the paid ad but leave the
   // campaign/adset/ad PAUSED. Default (unset) keeps the legacy ACTIVE behavior.
   const paused = body.paused === true || body.paused === 'true' || String(body.status_option || '').toUpperCase() === 'PAUSED';
+  // Create Ads post-new-then-promote mode: the Worker already published and finalized the NEW Page
+  // story, so the paid ad should sponsor that exact story via object_story_id instead of minting a
+  // second video_data dark story.
+  const useObjectStoryId = body.use_object_story_id === true || body.use_object_story_id === 'true';
   const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 60;
   const storyPolls = Number.isInteger(params.storyPolls) ? params.storyPolls : 50;
   const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
@@ -1653,6 +1813,82 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   }
   if (!adAccount || !templateAdset) return { ok: false, step: 'config', error: 'Missing: ad_account / template_adset' };
 
+  const { ctaType, instagramActorId, instagramUserId } = await readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset });
+
+  if (useObjectStoryId) {
+    if (!sourcePostId) return { ok: false, step: 'validate', error: 'Missing: story_id for object_story_id promote' };
+    const crBody = {
+      name: String(caption || sourcePostId).substring(0, 50),
+      ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+      object_story_id: sourcePostId
+    };
+    const cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+    });
+    const crData = cr.data || {};
+    if (crData.error) {
+      return {
+        ok: false,
+        step: 'creative',
+        error: crData.error.message,
+        fb_error_code: crData.error.code,
+        fb_error_subcode: crData.error.error_subcode,
+        fb_trace_id: crData.error.fbtrace_id,
+        object_story_id: sourcePostId,
+        cta_link: finalCtaLink,
+        video_id: videoId || undefined,
+        promote_uses_object_story_id: true
+      };
+    }
+    const creativeId = String(crData.id || '').trim();
+    if (!creativeId) return { ok: false, step: 'creative', error: 'creative_id_missing', object_story_id: sourcePostId };
+    const adName = String(requestedAdName || sourcePostId || videoId || caption).substring(0, 255);
+    const adEntities = await buildAdFromCreative(fetchImpl, {
+      userToken,
+      adAccount,
+      templateAdset,
+      creativeId,
+      storyId: sourcePostId,
+      adName,
+      body: { ...body, force_adset_name_tail: true },
+      sleep,
+      pollMs,
+      paused
+    });
+    if (!adEntities.ok) return adEntities;
+    return {
+      ok: true,
+      phase: 'promote',
+      promote_mode: 'object_story_id',
+      promote_uses_object_story_id: true,
+      source_post_id: sourcePostId,
+      story_id: sourcePostId,
+      effective_object_story_id: sourcePostId,
+      ad_story_id: sourcePostId,
+      campaign_id: adEntities.campaign_id,
+      campaign_name: adEntities.campaign_name,
+      campaign_budget: adEntities.campaign_budget,
+      start_time: adEntities.start_time,
+      end_time: adEntities.end_time,
+      adset_id: adEntities.adset_id,
+      ad_id: adEntities.ad_id,
+      adset_status: adEntities.adset_status,
+      ad_status: adEntities.ad_status,
+      ...(adEntities.campaign_status ? { campaign_status: adEntities.campaign_status } : {}),
+      ...(paused ? { paused: true } : {}),
+      creative_id: creativeId,
+      video_id: videoId || undefined,
+      cta_link: finalCtaLink,
+      promoted_ad_cta_link: finalCtaLink,
+      promoted_ad_cta_final: true,
+      visible_page_cta_final: true,
+      published_to_page: true,
+      template_campaign_id: adEntities.template_campaign_id,
+      copied_template_settings: adEntities.copied_template_settings,
+      ...pickRecoveryDiag(adEntities)
+    };
+  }
+
   // Resolve the video id from the source post attachment when the caller did not supply it.
   // Some callers historically passed the full page story id (`<page_id>_<post_id>`) as
   // `video_id`; that is not a Graph video object and fails `fields=thumbnails`. Treat it as
@@ -1667,8 +1903,6 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   if (!videoId) {
     return { ok: false, step: 'resolve_video', error: 'video_id_unresolved', source_post_id: sourcePostId || null };
   }
-
-  const { ctaType, instagramActorId, instagramUserId } = await readTemplateCreativeMeta(fetchImpl, { userToken, templateAdset });
 
   // Promote MUST bake the FINAL link into the CTA — that is the whole point (ad CTA == comment
   // link). A LIKE_PAGE template CTA has no destination link, so it would silently drop the
@@ -2089,6 +2323,7 @@ module.exports = {
   buildAdFromCreative,
   readTemplateSettings,
   readTemplateCreativeMeta,
+  publishPageVideoPost,
   postOneCardVideo,
   pageComment,
   editPageCommentLink,

@@ -317,6 +317,7 @@ function createHandler(deps = {}) {
   const selectors = deps.accountSelectors || accountSelectors;
   const registry = deps.accountsRegistry || accountsRegistry;
   const fetchImpl = deps.fetch || global.fetch;
+  const downloadVideo = deps.downloadVideo;
   return async function handleRequest(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
@@ -676,6 +677,7 @@ function createHandler(deps = {}) {
             description: body.description,
             websiteUrl: body.website_url,
             cta: body.cta,
+            downloadVideo,
             pollMs: POLL_MS
           });
           return send(res, postingStatus(result), result);
@@ -737,6 +739,7 @@ function createHandler(deps = {}) {
             body,
             defaultAdAccount: ADS_AD_ACCOUNT,
             defaultTemplateAdset: TEMPLATE_ADSET,
+            downloadVideo,
             pollMs: POLL_MS
           });
           return send(res, postingStatus(result), result);
@@ -756,6 +759,7 @@ function createHandler(deps = {}) {
             body,
             defaultAdAccount: ADS_AD_ACCOUNT,
             defaultTemplateAdset: TEMPLATE_ADSET,
+            downloadVideo,
             pollMs: POLL_MS
           });
           return send(res, postingStatus(result), result);

@@ -142,6 +142,16 @@ function graphRoute(url, method, pages, opts = {}) {
     const target = vid ? { id: vid, url: `https://www.facebook.com/watch/?v=${vid}` } : {};
     return { attachments: { data: [{ media_type: 'video', target }] } };
   }
+  if (new RegExp(`/${LIVE_PAGE_ID}/videos\\?`).test(u) && method === 'POST') {
+    return { id: 'PAGEVID1', post_id: `${LIVE_PAGE_ID}_NEWPOST1` };
+  }
+  if (/\/PAGEVID1\?fields=post_id,permalink_url,thumbnails/.test(u) && method === 'GET') {
+    return {
+      post_id: `${LIVE_PAGE_ID}_NEWPOST1`,
+      permalink_url: `https://www.facebook.com/${LIVE_PAGE_ID}/posts/NEWPOST1`,
+      thumbnails: { data: [{ uri: 'https://thumb/page.jpg' }] }
+    };
+  }
   if (/\/advideos\?/.test(u) && method === 'POST') return { id: 'VID123' };
   if (/fields=thumbnails/.test(u)) return { thumbnails: { data: [{ id: 't1', uri: 'https://thumb/x.jpg' }] } };
   if (/\/adcreatives/.test(u) && method === 'POST') {
@@ -332,7 +342,7 @@ function listen(opts = {}) {
   // any (unexpected) call so regressions can assert Graph never goes through Node fetch.
   lastNodeFetch = opts.nodeFetch || (() => { lastNodeFetch.called = true; return Promise.resolve({ ok: false, status: 400, json: async () => ({ error: { code: 1, message: 'Invalid request' } }) }); });
   lastNodeFetch.called = false;
-  server = createServer({ browser: lastBrowser, fetch: lastNodeFetch });
+  server = createServer({ browser: lastBrowser, fetch: lastNodeFetch, downloadVideo: opts.downloadVideo });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 }
 
@@ -673,6 +683,38 @@ test('POST /create-ad runs the OneCard/ads orchestration and returns ids, no tok
   assert.equal(r.body.ad_id, 'AD1');
   assert.equal(r.body.adset_id, 'ADSET1');
   assert.equal(r.body.published_to_page, true);
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad with publish_as_page_video publishes a NEW Page video post and creates no ad', async () => {
+  const browser = makeBrowser();
+  await listen({
+    browser,
+    downloadVideo: async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' })
+  });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_url: 'https://cdn/example.mp4',
+    caption: 'new page story',
+    ad_name: 'new-page-story',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_ad: true,
+    publish_as_page_video: true,
+    skip_comment: true
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'post');
+  assert.equal(r.body.story_id, `${LIVE_PAGE_ID}_NEWPOST1`);
+  assert.equal(r.body.video_id, 'PAGEVID1');
+  assert.equal(r.body.published_to_page, true);
+  assert.equal(r.body.upload_mode, 'page_video_multipart');
+  assert.ok(String(r.body.post_url).includes('/posts/NEWPOST1'));
+  assert.ok(browser.calls.some((c) => new RegExp(`/${LIVE_PAGE_ID}/videos\\?`).test(c.url) && c.method === 'POST'), 'publishes through /{page_id}/videos');
+  assert.ok(!browser.calls.some((c) => /\/adcreatives/.test(c.url)), 'Phase A must not create an adcreative');
+  assert.ok(!browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'Phase A must not create an ad');
+  assert.ok(!browser.calls.some((c) => /\/advideos/.test(c.url)), 'Phase A does not use ad-account advideos');
   assertNoLeak(r.body);
 });
 
@@ -1093,6 +1135,49 @@ test('POST /promote builds a paid ad from video_data.video_id with the FINAL CTA
   assert.ok(browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'creates the ad');
   assert.ok(!browser.calls.some((c) => /\/advideos/.test(c.url)), 'must not upload a second video');
   assert.ok(!browser.calls.some((c) => /is_published/.test(String(c.body || ''))), 'must not publish the ad dark story');
+  assertNoLeak(r.body);
+});
+
+test('POST /promote with use_object_story_id sponsors the same NEW Page story', async () => {
+  const FINAL = 'https://s.shopee.co.th/80AJs9V61t';
+  const NEW_STORY = `${LIVE_PAGE_ID}_NEWPOST1`;
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/promote', {
+    page_id: LIVE_PAGE_ID,
+    story_id: NEW_STORY,
+    post_id: NEW_STORY,
+    video_id: 'PAGEVID1',
+    final_cta_link: FINAL,
+    caption: 'cap',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    use_object_story_id: true,
+    skip_comment: true
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'promote');
+  assert.equal(r.body.promote_mode, 'object_story_id');
+  assert.equal(r.body.promote_uses_object_story_id, true);
+  assert.equal(r.body.story_id, NEW_STORY);
+  assert.equal(r.body.effective_object_story_id, NEW_STORY);
+  assert.equal(r.body.ad_story_id, NEW_STORY);
+  assert.equal(r.body.ad_id, 'AD1');
+  assert.equal(r.body.published_to_page, true);
+  assert.equal(r.body.promoted_ad_cta_link, FINAL);
+  assert.equal(r.body.promoted_ad_cta_final, true);
+  assert.equal(r.body.visible_page_cta_final, true);
+
+  const creativePost = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.ok(creativePost, 'an adcreative was created');
+  const crBody = JSON.parse(creativePost.body);
+  assert.equal(crBody.object_story_id, NEW_STORY, 'creative sponsors the same new Page story');
+  assert.ok(!('object_story_spec' in crBody), 'must not create a second video_data dark story');
+  assert.ok(!String(creativePost.body).includes('video_data'), 'creative body has no video_data');
+  assert.ok(browser.calls.some((c) => /\/copies/.test(c.url) && c.method === 'POST'), 'copies the template adset');
+  assert.ok(browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'creates the ad');
+  assert.ok(!browser.calls.some((c) => /\/advideos/.test(c.url)), 'must not upload another video');
   assertNoLeak(r.body);
 });
 
