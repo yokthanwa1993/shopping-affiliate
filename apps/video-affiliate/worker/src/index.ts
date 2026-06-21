@@ -2176,15 +2176,14 @@ async function claimGalleryVideoForPosting(params: {
             video?.sourceFingerprint || video?.source_fingerprint,
         )
 
-        // 2026-06-21 (multi-page starvation fix): eligibility is PER PAGE, not
-        // namespace-wide. The candidate list handed in here is already filtered by
-        // the page-aware pool (countFastGalleryPostingCandidates /
-        // listFastGalleryPostingCandidatePage + PAGE_SCOPED_ALREADY_POSTED_SQL):
-        // it excludes only videos THIS page already posted (page-scoped
-        // post_history success + page_posted_video_guards, honouring
-        // manual_unposted_at) plus admin "mark all as posted" rows (posted_at set
-        // with no real post_history). A video posted by a SIBLING page therefore
-        // stays in this list and must remain claimable here.
+        // 2026-06-21 (multi-page starvation fix): final eligibility is PER PAGE,
+        // not namespace-wide. The fast selector intentionally avoids page-aware
+        // subqueries because they were expensive enough to trip D1 CPU limits in
+        // production; it only separates namespace-unposted primary rows from the
+        // namespace-posted fallback. This guard remains the authoritative same-page
+        // block (page-scoped post_history + page_posted_video_guards, honouring
+        // manual_unposted_at). A video posted by a SIBLING page therefore stays
+        // claimable here during the explicit fallback pass.
         //
         // So we deliberately do NOT re-apply the namespace-wide posted_at guards
         // (isNamespaceGalleryVideoPosted / getFreshNamespacePostedState) that used
@@ -5420,96 +5419,6 @@ const DASHBOARD_GALLERY_POSTED_SQL = `
     )
 `
 
-// 2026-06-21 (multi-page starvation fix): page-aware "already posted by THIS
-// page" exclusion for the POSTING claim pool only — never used by the dashboard
-// ready/used views. DASHBOARD_GALLERY_POSTED_SQL keys on the namespace-wide
-// nvs.posted_at, so the moment ANY page posts a video it disappears from every
-// sibling page's candidate pool (the starvation the Dev Lead reported). This
-// predicate instead excludes a candidate only when the TARGET page itself has
-// already posted it — a page-scoped successful post_history row OR a
-// page_posted_video_guards row, matched by exact video_id OR source_fingerprint,
-// and honouring a newer manual_unposted_at (operator repost intent). It mirrors
-// the authoritative per-page ensurePageVideoNeverPosted check that still runs at
-// claim time. The candidate's own nvs.posted_at is intentionally NOT consulted,
-// so a video posted by page A stays eligible for page B.
-// Bind order per use: (namespaceId, pageId, namespaceId, pageId, namespaceId) —
-// see pageScopedAlreadyPostedBinds().
-const PAGE_SCOPED_ALREADY_POSTED_SQL = `
-    (
-        EXISTS (
-            SELECT 1
-            FROM post_history ph
-            LEFT JOIN namespace_video_state nvs2
-              ON nvs2.namespace_id = ph.bot_id
-             AND nvs2.video_id = ph.video_id
-            WHERE ph.bot_id = ?
-              AND ph.page_id = ?
-              AND ph.status = 'success'
-              AND (
-                  ph.video_id = gi.video_id
-                  OR (
-                      TRIM(COALESCE(nvs.source_fingerprint, '')) <> ''
-                      AND COALESCE(NULLIF(TRIM(ph.source_fingerprint), ''), nvs2.source_fingerprint) = nvs.source_fingerprint
-                  )
-              )
-              AND NOT (
-                  TRIM(COALESCE(nvs.manual_unposted_at, '')) <> ''
-                  AND strftime('%s', ph.posted_at) IS NOT NULL
-                  AND strftime('%s', nvs.manual_unposted_at) IS NOT NULL
-                  AND CAST(strftime('%s', ph.posted_at) AS INTEGER) <= CAST(strftime('%s', nvs.manual_unposted_at) AS INTEGER)
-              )
-        )
-        OR EXISTS (
-            SELECT 1
-            FROM page_posted_video_guards g
-            WHERE g.bot_id = ?
-              AND g.page_id = ?
-              AND (
-                  g.video_id = gi.video_id
-                  OR (
-                      TRIM(COALESCE(nvs.source_fingerprint, '')) <> ''
-                      AND TRIM(COALESCE(g.source_fingerprint, '')) = nvs.source_fingerprint
-                  )
-              )
-              AND NOT (
-                  TRIM(COALESCE(nvs.manual_unposted_at, '')) <> ''
-                  AND strftime('%s', g.created_at) IS NOT NULL
-                  AND strftime('%s', nvs.manual_unposted_at) IS NOT NULL
-                  AND CAST(strftime('%s', g.created_at) AS INTEGER) <= CAST(strftime('%s', nvs.manual_unposted_at) AS INTEGER)
-              )
-        )
-        OR (
-            -- Admin "mark all as posted" override: namespace_video_state.posted_at
-            -- was set WITHOUT any real post_history success row for this video. That
-            -- is an explicit operator signal to keep the video out of the auto-post
-            -- queue for EVERY page, so it must still be excluded namespace-wide. A
-            -- real page post always leaves a post_history row, so this branch never
-            -- fires for "page A actually posted it" — that case is handled per-page
-            -- above and stays claimable for siblings. A later manual_unposted_at
-            -- clears posted_at, which naturally re-opens the video.
-            TRIM(COALESCE(nvs.posted_at, '')) <> ''
-            AND NOT (
-                strftime('%s', nvs.posted_at) IS NOT NULL
-                AND strftime('%s', gi.processed_at) IS NOT NULL
-                AND CAST(strftime('%s', nvs.posted_at) AS INTEGER) < CAST(strftime('%s', gi.processed_at) AS INTEGER)
-            )
-            AND NOT EXISTS (
-                SELECT 1
-                FROM post_history ph2
-                WHERE ph2.bot_id = ?
-                  AND ph2.status = 'success'
-                  AND ph2.video_id = gi.video_id
-            )
-        )
-    )
-`
-
-function pageScopedAlreadyPostedBinds(namespaceId: string, pageId: string): string[] {
-    const ns = String(namespaceId || '').trim()
-    const page = String(pageId || '').trim()
-    return [ns, page, ns, page, ns]
-}
-
 function buildDashboardGallerySearchWhere(searchQuery: string, binds: Array<string | number>): string {
     const normalizedSearch = normalizeGallerySearchQuery(searchQuery)
     if (!normalizedSearch) return ''
@@ -5563,7 +5472,7 @@ function mapDashboardGalleryRow(row: Record<string, unknown>, namespaceId: strin
 }
 
 type FastGalleryPostingClaimStats = {
-    source: 'gallery_index'
+    source: 'gallery_index_namespace_unposted' | 'gallery_index_page_reuse_fallback'
     candidateTotal: number
     scanned: number
     pages: number
@@ -5576,6 +5485,11 @@ type FastGalleryPostingClaimResult = {
     videoLockKey: string
 }
 
+type FastGalleryPostingScanResult = {
+    picked: FastGalleryPostingClaimResult | null
+    exhausted: boolean
+}
+
 type FastGalleryPostingClaimOutcome = {
     picked: FastGalleryPostingClaimResult | null
     stats: FastGalleryPostingClaimStats
@@ -5583,6 +5497,7 @@ type FastGalleryPostingClaimOutcome = {
 
 const FAST_GALLERY_POSTING_PAGE_SIZE = 24
 const FAST_GALLERY_POSTING_MAX_PAGES = 15
+type FastGalleryPostingCandidateMode = 'namespace_unposted' | 'page_reuse_fallback'
 
 function buildFastGalleryPostingOrderBy(postingOrder: NamespacePostingOrder): string {
     const sortExpr = `COALESCE(NULLIF(TRIM(gi.processed_at), ''), NULLIF(TRIM(gi.updated_at), ''), NULLIF(TRIM(gi.created_at), ''))`
@@ -5590,6 +5505,18 @@ function buildFastGalleryPostingOrderBy(postingOrder: NamespacePostingOrder): st
         return `ORDER BY ${sortExpr} DESC, gi.video_id DESC`
     }
     return `ORDER BY ${sortExpr} ASC, gi.video_id ASC`
+}
+
+function buildFastGalleryPostingPageIndexes(maxPages: number, postingOrder: NamespacePostingOrder): number[] {
+    const pages = Array.from({ length: Math.max(0, maxPages) }, (_, index) => index)
+    if (postingOrder !== 'random') return pages
+    for (let index = pages.length - 1; index > 0; index -= 1) {
+        const swapIndex = Math.floor(Math.random() * (index + 1))
+        const current = pages[index]
+        pages[index] = pages[swapIndex]
+        pages[swapIndex] = current
+    }
+    return pages
 }
 
 async function hydrateFastPostingCandidateSourceFingerprint(params: {
@@ -5627,32 +5554,40 @@ async function hydrateFastPostingCandidateSourceFingerprint(params: {
     }).catch(() => { })
 }
 
-async function countFastGalleryPostingCandidates(db: D1Database, namespaceId: string, pageId: string): Promise<number> {
+async function hasSuccessfulNamespacePostHistoryForVideo(db: D1Database, namespaceId: string, videoId: string): Promise<boolean> {
+    const ns = String(namespaceId || '').trim()
+    const id = String(videoId || '').trim()
+    if (!ns || !id) return false
     const row = await db.prepare(
-        `SELECT COUNT(*) AS total
-         ${DASHBOARD_GALLERY_FROM_JOIN}
-         WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
-           AND NOT ${PAGE_SCOPED_ALREADY_POSTED_SQL}`
-    ).bind(namespaceId, ...pageScopedAlreadyPostedBinds(namespaceId, pageId)).first() as { total?: number } | null
-    return Math.max(0, Number(row?.total || 0))
+        `SELECT 1 AS ok
+         FROM post_history
+         WHERE bot_id = ?
+           AND status = 'success'
+           AND video_id = ?
+         LIMIT 1`
+    ).bind(ns, id).first().catch(() => null) as { ok?: number } | null
+    return !!row
 }
 
 async function listFastGalleryPostingCandidatePage(params: {
     db: D1Database
     namespaceId: string
-    pageId: string
     postingOrder: NamespacePostingOrder
+    mode: FastGalleryPostingCandidateMode
     limit: number
     offset: number
 }): Promise<Array<Record<string, unknown>>> {
+    const namespacePostedClause = params.mode === 'namespace_unposted'
+        ? `AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})`
+        : `AND (${DASHBOARD_GALLERY_POSTED_SQL})`
     const rows = await params.db.prepare(
         `SELECT ${DASHBOARD_GALLERY_SELECT_COLUMNS}
          ${DASHBOARD_GALLERY_FROM_JOIN}
          WHERE ${DASHBOARD_GALLERY_DISPLAY_WHERE}
-           AND NOT ${PAGE_SCOPED_ALREADY_POSTED_SQL}
+           ${namespacePostedClause}
          ${buildFastGalleryPostingOrderBy(params.postingOrder)}
          LIMIT ? OFFSET ?`
-    ).bind(params.namespaceId, ...pageScopedAlreadyPostedBinds(params.namespaceId, params.pageId), params.limit, params.offset).all() as { results?: Array<Record<string, unknown>> }
+    ).bind(params.namespaceId, params.limit, params.offset).all() as { results?: Array<Record<string, unknown>> }
 
     return (rows.results || []).map((row) => ({
         ...mapDashboardGalleryRow(row, params.namespaceId),
@@ -5681,7 +5616,7 @@ async function claimFastGalleryVideoForPosting(params: {
     const pageSize = Math.min(Math.max(Math.floor(Number(params.pageSize || FAST_GALLERY_POSTING_PAGE_SIZE)), 1), 100)
     const maxPages = Math.min(Math.max(Math.floor(Number(params.maxPages || FAST_GALLERY_POSTING_MAX_PAGES)), 1), 50)
     const stats: FastGalleryPostingClaimStats = {
-        source: 'gallery_index',
+        source: 'gallery_index_namespace_unposted',
         candidateTotal: 0,
         scanned: 0,
         pages: 0,
@@ -5699,8 +5634,7 @@ async function claimFastGalleryVideoForPosting(params: {
     await Promise.all([
         ensureGalleryIndexTable(params.env.DB),
         ensureNamespaceVideoStateColumns(params.env.DB),
-        // The page-aware candidate pool predicate references page_posted_video_guards;
-        // make sure the table exists so the EXISTS subquery never errors on a fresh DB.
+        // The claim-level same-page duplicate guard reads page_posted_video_guards.
         ensurePagePostedVideoGuardsTable(params.env.DB),
     ])
 
@@ -5722,68 +5656,99 @@ async function claimFastGalleryVideoForPosting(params: {
         }
     }
 
-    stats.candidateTotal = await countFastGalleryPostingCandidates(params.env.DB, namespaceId, pageId)
-    if (stats.candidateTotal <= 0) return finish(null)
-
     const candidateBucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
-    const seenVideoIds = new Set<string>()
-    const sequentialPages = Math.ceil(stats.candidateTotal / pageSize)
-    const pagesToScan = params.postingOrder === 'random'
-        ? maxPages
-        : Math.min(maxPages, sequentialPages)
 
-    for (let pageIndex = 0; pageIndex < pagesToScan; pageIndex += 1) {
-        const maxOffset = Math.max(0, stats.candidateTotal - pageSize)
-        const offset = params.postingOrder === 'random'
-            ? Math.floor(Math.random() * (maxOffset + 1))
-            : pageIndex * pageSize
+    const scanCandidateMode = async (mode: FastGalleryPostingCandidateMode): Promise<FastGalleryPostingScanResult> => {
+        stats.source = mode === 'namespace_unposted'
+            ? 'gallery_index_namespace_unposted'
+            : 'gallery_index_page_reuse_fallback'
+        // Do not run COUNT(*) here: production D1 can hit CPU limits on large
+        // gallery namespaces before a post even starts. candidateTotal is the
+        // bounded window fetched for the active pass, not a full table count.
+        stats.candidateTotal = 0
+        stats.scanned = 0
+        stats.pages = 0
 
-        const page = await listFastGalleryPostingCandidatePage({
-            db: params.env.DB,
-            namespaceId,
-            pageId,
-            postingOrder: params.postingOrder,
-            limit: pageSize,
-            offset,
-        })
-        stats.pages += 1
-        if (page.length === 0) {
-            if (params.postingOrder !== 'random') break
-            continue
-        }
+        const seenVideoIds = new Set<string>()
+        const pageIndexes = buildFastGalleryPostingPageIndexes(maxPages, params.postingOrder)
+        let exhaustedAfterPageIndex: number | null = null
 
-        const orderedPage = orderGalleryVideosForPosting(page, params.postingOrder)
-        for (const candidate of orderedPage) {
-            const videoId = String(candidate.id || '').trim()
-            if (!videoId || seenVideoIds.has(videoId)) continue
-            seenVideoIds.add(videoId)
-            stats.scanned += 1
+        for (const pageIndex of pageIndexes) {
+            if (exhaustedAfterPageIndex !== null && pageIndex > exhaustedAfterPageIndex) continue
+            const offset = pageIndex * pageSize
 
-            if (skipFailedTodayVideoIds.has(videoId)) {
-                console.log(`[CRON-FAIL-DEDUP] Skip ${videoId} ns=${namespaceId} page=${pageId} — failed cron row already exists for ${skipDate}`)
-                continue
-            }
-
-            await hydrateFastPostingCandidateSourceFingerprint({
-                env: params.env,
-                namespaceId,
-                bucket: candidateBucket,
-                video: candidate,
-            })
-
-            const picked = await claimGalleryVideoForPosting({
+            const page = await listFastGalleryPostingCandidatePage({
                 db: params.env.DB,
                 namespaceId,
-                pageId,
-                videos: [candidate],
                 postingOrder: params.postingOrder,
+                mode,
+                limit: pageSize,
+                offset,
             })
-            if (picked) return finish(picked)
-        }
+            stats.pages += 1
+            stats.candidateTotal += page.length
+            if (page.length === 0) {
+                exhaustedAfterPageIndex = exhaustedAfterPageIndex === null
+                    ? pageIndex
+                    : Math.min(exhaustedAfterPageIndex, pageIndex)
+                if (params.postingOrder !== 'random') break
+                continue
+            }
+            if (page.length < pageSize) {
+                exhaustedAfterPageIndex = exhaustedAfterPageIndex === null
+                    ? pageIndex
+                    : Math.min(exhaustedAfterPageIndex, pageIndex)
+            }
 
-        if (params.postingOrder !== 'random' && page.length < pageSize) break
-        if (seenVideoIds.size >= stats.candidateTotal) break
+            const orderedPage = orderGalleryVideosForPosting(page, params.postingOrder)
+            for (const candidate of orderedPage) {
+                const videoId = String(candidate.id || '').trim()
+                if (!videoId || seenVideoIds.has(videoId)) continue
+                seenVideoIds.add(videoId)
+                stats.scanned += 1
+
+                if (skipFailedTodayVideoIds.has(videoId)) {
+                    console.log(`[CRON-FAIL-DEDUP] Skip ${videoId} ns=${namespaceId} page=${pageId} — failed cron row already exists for ${skipDate}`)
+                    continue
+                }
+
+                if (mode === 'page_reuse_fallback') {
+                    const hasRealNamespacePost = await hasSuccessfulNamespacePostHistoryForVideo(
+                        params.env.DB,
+                        namespaceId,
+                        videoId,
+                    )
+                    if (!hasRealNamespacePost) continue
+                }
+
+                await hydrateFastPostingCandidateSourceFingerprint({
+                    env: params.env,
+                    namespaceId,
+                    bucket: candidateBucket,
+                    video: candidate,
+                })
+
+                const picked = await claimGalleryVideoForPosting({
+                    db: params.env.DB,
+                    namespaceId,
+                    pageId,
+                    videos: [candidate],
+                    postingOrder: params.postingOrder,
+                })
+                if (picked) return { picked, exhausted: false }
+            }
+
+            if (params.postingOrder !== 'random' && page.length < pageSize) break
+        }
+        return { picked: null, exhausted: exhaustedAfterPageIndex !== null }
     }
+
+    const namespaceFreshScan = await scanCandidateMode('namespace_unposted')
+    if (namespaceFreshScan.picked) return finish(namespaceFreshScan.picked)
+    if (!namespaceFreshScan.exhausted) return finish(null)
+
+    const fallbackScan = await scanCandidateMode('page_reuse_fallback')
+    if (fallbackScan.picked) return finish(fallbackScan.picked)
 
     return finish(null)
 }

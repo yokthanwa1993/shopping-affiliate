@@ -2,14 +2,14 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-// Regression coverage for the namespace 1779705687536764750 multi-page posting
-// starvation: pages in one namespace share ONE gallery. The claim path used to
-// dedup against post_history (and namespace_video_state) namespace-wide, so once
-// the primary page posted a video, every sibling page saw it (or any freshly
-// uploaded duplicate sharing its source_fingerprint) as "already posted" and
-// got "No unposted gallery video left" even though their per-page history was
-// empty. Per-page dedup must come from ensurePageVideoNeverPosted (page-scoped
-// post_history + page guards), never from a namespace-wide block.
+// Regression coverage for the namespace 1779705687536764750 posting selector.
+// Contract after the 2026-06-21 incident:
+//   1) normal cron/force-post must pick namespace-unposted videos first, so it
+//      does not keep reusing clips another page already posted;
+//   2) page-aware reuse is allowed only as an explicit fallback when there are
+//      truly no namespace-unposted candidates, preserving the prior starvation
+//      fix without making reused clips the default;
+//   3) same-page duplicate prevention remains strict.
 //
 // These are source-level assertions (the worker's D1 helpers are not exported
 // and there is no D1 mock in this suite), matching the established pattern in
@@ -54,30 +54,30 @@ function getPageScopedHistoryRowSource(): string {
     )
 }
 
-function getPageScopedAlreadyPostedSql(): string {
-    return sliceBetween(
-        getSource(),
-        'const PAGE_SCOPED_ALREADY_POSTED_SQL = `',
-        '\n`',
-        'PAGE_SCOPED_ALREADY_POSTED_SQL'
-    )
-}
-
-function getCountCandidatesSource(): string {
-    return sliceBetween(
-        getSource(),
-        'async function countFastGalleryPostingCandidates',
-        '\nasync function listFastGalleryPostingCandidatePage',
-        'countFastGalleryPostingCandidates'
-    )
-}
-
 function getListCandidatesSource(): string {
     return sliceBetween(
         getSource(),
         'async function listFastGalleryPostingCandidatePage',
         '\nasync function claimFastGalleryVideoForPosting',
         'listFastGalleryPostingCandidatePage'
+    )
+}
+
+function getPageIndexesSource(): string {
+    return sliceBetween(
+        getSource(),
+        'function buildFastGalleryPostingPageIndexes',
+        '\nasync function hydrateFastPostingCandidateSourceFingerprint',
+        'buildFastGalleryPostingPageIndexes'
+    )
+}
+
+function getHistoryCheckSource(): string {
+    return sliceBetween(
+        getSource(),
+        'async function hasSuccessfulNamespacePostHistoryForVideo',
+        '\nasync function listFastGalleryPostingCandidatePage',
+        'hasSuccessfulNamespacePostHistoryForVideo'
     )
 }
 
@@ -194,97 +194,110 @@ test('dead namespace-wide dedup helpers are fully removed', () => {
     )
 })
 
-// --- Page-aware candidate pool (the second half of the starvation fix) ---------
+// --- Two-pass posting candidate pool -----------------------------------------
 //
-// Before: force-post/cron candidate pool used `AND NOT (DASHBOARD_GALLERY_POSTED_SQL)`,
-// which keys on the namespace-wide nvs.posted_at. The instant page A posted a
-// video, markNamespaceVideoPosted set nvs.posted_at and the exact video_id
-// vanished from EVERY sibling page's pool BEFORE the page-scoped claim checks ran
-// — so empty sibling pages got "No unposted gallery video left" even with ready
-// videos. The pool is now page-aware: it excludes a candidate only if the TARGET
-// page already posted it, never just because a sibling did.
+// Normal cron/force-post must choose namespace-fresh videos first. Page-aware
+// reuse remains only as an explicit fallback so sibling pages are not starved
+// when there are no fresh candidates left.
 
-test('posting candidate pool no longer filters on the namespace-wide posted_at flag', () => {
-    const countBody = getCountCandidatesSource()
+test('posting candidate pool has a namespace-unposted primary mode before posted fallback', () => {
     const listBody = getListCandidatesSource()
-    for (const [label, body] of [['count', countBody], ['list', listBody]] as const) {
-        assert.ok(
-            !body.includes('DASHBOARD_GALLERY_POSTED_SQL'),
-            `${label} candidate query must NOT use the namespace-wide DASHBOARD_GALLERY_POSTED_SQL`
-        )
-        assert.ok(
-            body.includes('PAGE_SCOPED_ALREADY_POSTED_SQL'),
-            `${label} candidate query must use the page-aware PAGE_SCOPED_ALREADY_POSTED_SQL`
-        )
-    }
+    assert.ok(
+        listBody.includes("mode === 'namespace_unposted'"),
+        'candidate query must branch on namespace_unposted mode'
+    )
+    assert.ok(
+        listBody.includes('AND NOT (${DASHBOARD_GALLERY_POSTED_SQL})'),
+        'primary candidate query must require namespace-unposted rows'
+    )
+    assert.ok(
+        listBody.includes('AND (${DASHBOARD_GALLERY_POSTED_SQL})'),
+        'fallback candidate query must be restricted to namespace-posted rows'
+    )
 })
 
-test('posting candidate pool functions are page-aware (accept and bind pageId)', () => {
-    const countBody = getCountCandidatesSource()
+test('posting selector avoids page-aware SQL subqueries in the hot path', () => {
+    const source = getSource()
     const listBody = getListCandidatesSource()
-    assert.match(countBody, /countFastGalleryPostingCandidates\(db: D1Database, namespaceId: string, pageId: string\)/, 'count must accept pageId')
-    assert.match(listBody, /pageId: string/, 'list params must include pageId')
-    assert.ok(countBody.includes('pageScopedAlreadyPostedBinds(namespaceId, pageId)'), 'count must bind the page-scoped predicate')
-    assert.ok(listBody.includes('pageScopedAlreadyPostedBinds(params.namespaceId, params.pageId)'), 'list must bind the page-scoped predicate')
+    assert.ok(!source.includes('countFastGalleryPostingCandidates'), 'runtime selector must not keep the dead COUNT helper')
+    assert.ok(!source.includes('PAGE_SCOPED_ALREADY_POSTED_SQL'), 'runtime selector must not use expensive page-aware subquery predicate')
+    assert.ok(!source.includes('pageScopedAlreadyPostedBinds'), 'runtime selector must not bind page-aware subqueries')
+    assert.match(listBody, /mode: FastGalleryPostingCandidateMode/, 'list params must include selection mode')
+    assert.match(
+        listBody,
+        /\.bind\(params\.namespaceId,\s*params\.limit,\s*params\.offset\)/,
+        'list query bind order must only be namespaceId, limit, offset'
+    )
 })
 
-test('claimFastGalleryVideoForPosting threads pageId into the candidate pool', () => {
+test('claimFastGalleryVideoForPosting keeps strict same-page guard outside the selector', () => {
     const body = getClaimFastSource()
     assert.ok(
-        body.includes('countFastGalleryPostingCandidates(params.env.DB, namespaceId, pageId)'),
-        'claimFast must pass pageId to the candidate counter'
+        !body.includes('countFastGalleryPostingCandidates('),
+        'claimFast must NOT run COUNT(*) before selecting; production D1 can exceed CPU'
     )
-    // The list call inside the scan loop must pass pageId too.
     const listCall = sliceBetween(body, 'listFastGalleryPostingCandidatePage({', '})', 'list call')
-    assert.match(listCall, /\bpageId\b/, 'claimFast must pass pageId to the candidate lister')
-    // The page_posted_video_guards table referenced by the predicate must be ensured.
+    assert.match(listCall, /\bmode\b/, 'claimFast must pass mode to the candidate lister')
     assert.ok(
         body.includes('ensurePagePostedVideoGuardsTable('),
-        'claimFast must ensure the page_posted_video_guards table exists before querying it'
+        'claimFast must ensure the page_posted_video_guards table exists before claim-level duplicate checks'
+    )
+    assert.match(
+        body,
+        /claimGalleryVideoForPosting\(\{[\s\S]*pageId,[\s\S]*videos: \[candidate\]/,
+        'claimFast must pass pageId into the strict same-page claim guard'
     )
 })
 
-test('page-aware predicate excludes only by THIS page (post_history + guards), keyed by page_id', () => {
-    const sql = getPageScopedAlreadyPostedSql()
-    // Page-scoped successful post_history.
-    assert.match(sql, /FROM post_history ph\b/, 'predicate must check post_history')
-    assert.match(sql, /ph\.page_id = \?/, 'post_history branch must be page-scoped')
-    assert.match(sql, /ph\.status = 'success'/, 'post_history branch must only count successful posts')
-    // Page-scoped guards.
-    assert.match(sql, /FROM page_posted_video_guards g\b/, 'predicate must check page guards')
-    assert.match(sql, /g\.page_id = \?/, 'guard branch must be page-scoped')
-    // Both page-posted branches match by exact video_id OR source_fingerprint.
-    assert.match(sql, /ph\.video_id = gi\.video_id/, 'post_history branch must match exact video_id')
-    assert.match(sql, /g\.video_id = gi\.video_id/, 'guard branch must match exact video_id')
-    assert.match(sql, /source_fingerprint/, 'predicate must also dedup by source_fingerprint within the page')
+test('claimFastGalleryVideoForPosting scans namespace-fresh before reuse fallback and only falls back after exhaustion', () => {
+    const body = getClaimFastSource()
+    const primaryIdx = body.indexOf("scanCandidateMode('namespace_unposted')")
+    const fallbackIdx = body.indexOf("scanCandidateMode('page_reuse_fallback')")
+    assert.notEqual(primaryIdx, -1, 'claimFast must run namespace_unposted primary pass')
+    assert.notEqual(fallbackIdx, -1, 'claimFast must keep a page_reuse_fallback pass')
+    assert.ok(primaryIdx < fallbackIdx, 'namespace_unposted pass must run before page_reuse_fallback')
+    assert.match(
+        body,
+        /if \(!namespaceFreshScan\.exhausted\) return finish\(null\)/,
+        'claimFast must not fall back to reused clips unless the namespace-fresh pass was exhausted'
+    )
+    assert.match(body, /gallery_index_namespace_unposted/, 'stats/log source must expose namespace-unposted mode')
+    assert.match(body, /gallery_index_page_reuse_fallback/, 'stats/log source must expose fallback reuse mode')
 })
 
-test('page-aware predicate honors manual_unposted_at (repost intent re-opens the video)', () => {
-    const sql = getPageScopedAlreadyPostedSql()
-    assert.match(sql, /nvs\.manual_unposted_at/, 'predicate must consult manual_unposted_at')
-    // A post/guard older than the manual unpost must NOT exclude (allow repost).
+test('random posting order uses bounded random page windows without COUNT', () => {
+    const pageIndexBody = getPageIndexesSource()
+    const claimBody = getClaimFastSource()
+    assert.match(pageIndexBody, /postingOrder !== 'random'/, 'non-random order must keep sequential pages')
+    assert.match(pageIndexBody, /Math\.random\(\)/, 'random order must shuffle bounded page windows')
     assert.match(
-        sql,
-        /CAST\(strftime\('%s', ph\.posted_at\) AS INTEGER\) <= CAST\(strftime\('%s', nvs\.manual_unposted_at\) AS INTEGER\)/,
-        'post_history exclusion must be skipped when posted_at <= manual_unposted_at'
-    )
-    assert.match(
-        sql,
-        /CAST\(strftime\('%s', g\.created_at\) AS INTEGER\) <= CAST\(strftime\('%s', nvs\.manual_unposted_at\) AS INTEGER\)/,
-        'guard exclusion must be skipped when guard created_at <= manual_unposted_at'
+        claimBody,
+        /const pageIndexes = buildFastGalleryPostingPageIndexes\(maxPages, params\.postingOrder\)/,
+        'claimFast must use bounded page indexes instead of COUNT-derived random offsets'
     )
 })
 
-test('page-aware predicate preserves the admin "mark all as posted" override', () => {
-    const sql = getPageScopedAlreadyPostedSql()
-    // The admin override branch keeps a video out for EVERY page only when
-    // posted_at is set AND there is NO real post_history success row for it. A
-    // genuine page-A post always has a post_history row, so that branch never
-    // fires for "page A posted it" — keeping it claimable for siblings.
-    assert.match(sql, /TRIM\(COALESCE\(nvs\.posted_at, ''\)\) <> ''/, 'admin-override branch must check posted_at')
+test('reuse fallback requires a real namespace success history row', () => {
+    const historyBody = getHistoryCheckSource()
+    const claimBody = getClaimFastSource()
+    assert.match(historyBody, /FROM post_history/, 'fallback history check must read post_history')
+    assert.match(historyBody, /status = 'success'/, 'fallback history check must require success')
     assert.match(
-        sql,
-        /NOT EXISTS \(\s*SELECT 1\s*FROM post_history ph2\s*WHERE ph2\.bot_id = \?\s*AND ph2\.status = 'success'\s*AND ph2\.video_id = gi\.video_id\s*\)/,
-        'admin-override branch must only fire when NO real post_history success row exists'
+        historyBody,
+        /video_id = \?/,
+        'fallback history check must key on exact video_id'
     )
+    assert.match(
+        claimBody,
+        /mode === 'page_reuse_fallback'[\s\S]*hasSuccessfulNamespacePostHistoryForVideo/,
+        'fallback must skip namespace-posted rows that have no real success history'
+    )
+})
+
+test('claimFastGalleryVideoForPosting reports candidateTotal as fetched bounded-window rows', () => {
+    const body = getClaimFastSource()
+    assert.match(body, /stats\.candidateTotal = 0/, 'each pass must reset candidateTotal')
+    assert.match(body, /stats\.candidateTotal \+= page\.length/, 'candidateTotal must count fetched bounded-window rows')
+    assert.match(body, /stats\.scanned = 0/, 'each pass must reset scanned count')
+    assert.match(body, /stats\.pages = 0/, 'each pass must reset page count')
 })
