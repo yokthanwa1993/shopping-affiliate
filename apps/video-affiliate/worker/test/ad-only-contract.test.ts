@@ -306,7 +306,23 @@ test('active create-ad-only records explicit comment evidence or a skipped/faile
     assert.match(routeSource, /bridgeResult\.comment_status = 'failed'[\s\S]*bridgeResult\.comment_error = 'final_shortlink_unresolved'/)
     assert.match(routeSource, /bridgeResult\.comment_target_story_id = fullStoryId/)
     assert.match(routeSource, /bridgeResult\.comment_target_post_id = commentSubIds\.postSubId2/)
-    assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: fullStoryId, message: commentMessage, comment_message: commentMessage \}\)/)
+    assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: targetStoryId, message: commentMessage, comment_message: commentMessage \}\)/)
+    assert.match(routeSource, /const sourceCommentTargetRaw = validation\.sourcePostId \|\| validation\.fbVideoId/)
+    assert.match(routeSource, /sourceCommentTargetStoryId && sourceCommentTargetStoryId !== fullStoryId/)
+})
+
+test('active create-ad-only records source-surface comment proof without overwriting created-story proof', () => {
+    const routeSource = getCreateAdOnlyRouteSource()
+
+    assert.match(routeSource, /bridgeResult\.comment_status = createdComment\.status/)
+    assert.match(routeSource, /bridgeResult\.comment_fb_id = createdComment\.id/)
+    assert.match(routeSource, /bridgeResult\.source_comment_target_story_id = sourceCommentTargetStoryId/)
+    assert.match(routeSource, /bridgeResult\.source_comment_shortlink = finalLink/)
+    assert.match(routeSource, /bridgeResult\.source_comment_message = commentMessage\.slice\(0, 500\)/)
+    assert.match(routeSource, /bridgeResult\.source_comment_status = sourceComment\.status/)
+    assert.match(routeSource, /bridgeResult\.source_comment_fb_id = sourceComment\.id/)
+    assert.match(routeSource, /bridgeResult\.source_comment_error = sourceComment\.error/)
+    assert.match(routeSource, /bridgeResult\.source_comment_error = \(e instanceof Error \? e\.message : String\(e\)\)\.slice\(0, 200\)/)
 })
 
 test('ad-history expands safe comment and CTA proof fields from truncated_result_json', () => {
@@ -321,6 +337,12 @@ test('ad-history expands safe comment and CTA proof fields from truncated_result
         'comment_shortlink',
         'comment_target_story_id',
         'comment_target_post_id',
+        'source_comment_status',
+        'source_comment_fb_id',
+        'source_comment_message',
+        'source_comment_shortlink',
+        'source_comment_target_story_id',
+        'source_comment_error',
         'published_to_page',
         'publish_error',
         'visible_page_cta_final',

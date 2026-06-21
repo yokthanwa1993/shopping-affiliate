@@ -12466,6 +12466,12 @@ const AD_HISTORY_RESULT_SAFE_FIELDS = [
     'comment_target_story_id',
     'comment_target_post_id',
     'comment_error',
+    'source_comment_status',
+    'source_comment_fb_id',
+    'source_comment_message',
+    'source_comment_shortlink',
+    'source_comment_target_story_id',
+    'source_comment_error',
     'published_to_page',
     'publish_error',
     'visible_page_cta_final',
@@ -12920,24 +12926,52 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                     bridgeResult.comment_status = 'skipped_no_message'
                     bridgeResult.comment_error = 'comment_template_rendered_empty'
                 } else {
-                    try {
+                    const postPageComment = async (targetStoryId: string): Promise<{ status: 'success' | 'failed'; id: string; error: string }> => {
                         const commentResp = await fetch(`${baseUrl}/page-comment`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             // Also pass comment_message so the bridge audit/fallback never bare-links.
-                            body: JSON.stringify({ page_id: validation.pageId, story_id: fullStoryId, message: commentMessage, comment_message: commentMessage }),
+                            body: JSON.stringify({ page_id: validation.pageId, story_id: targetStoryId, message: commentMessage, comment_message: commentMessage }),
                         })
                         const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
                         if (commentResp.ok && commentData.ok && commentData.id) {
-                            bridgeResult.comment_status = 'success'
-                            bridgeResult.comment_fb_id = String(commentData.id)
+                            return { status: 'success', id: String(commentData.id), error: '' }
+                        }
+                        const error = String(commentData.step ? `${commentData.step}:${commentData.error || ''}` : (commentData.error || `page_comment_http_${commentResp.status}`)).slice(0, 200)
+                        return { status: 'failed', id: '', error }
+                    }
+
+                    try {
+                        const createdComment = await postPageComment(fullStoryId)
+                        bridgeResult.comment_status = createdComment.status
+                        if (createdComment.status === 'success') {
+                            bridgeResult.comment_fb_id = createdComment.id
                         } else {
-                            bridgeResult.comment_status = 'failed'
-                            bridgeResult.comment_error = String(commentData.step ? `${commentData.step}:${commentData.error || ''}` : (commentData.error || `page_comment_http_${commentResp.status}`)).slice(0, 200)
+                            bridgeResult.comment_error = createdComment.error
                         }
                     } catch (e) {
                         bridgeResult.comment_status = 'failed'
                         bridgeResult.comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                    }
+
+                    const sourceCommentTargetRaw = validation.sourcePostId || validation.fbVideoId
+                    const sourceCommentTargetStoryId = buildPageStoryId(validation.pageId, sourceCommentTargetRaw)
+                    if (sourceCommentTargetStoryId && sourceCommentTargetStoryId !== fullStoryId) {
+                        bridgeResult.source_comment_target_story_id = sourceCommentTargetStoryId
+                        bridgeResult.source_comment_shortlink = finalLink
+                        bridgeResult.source_comment_message = commentMessage.slice(0, 500)
+                        try {
+                            const sourceComment = await postPageComment(sourceCommentTargetStoryId)
+                            bridgeResult.source_comment_status = sourceComment.status
+                            if (sourceComment.status === 'success') {
+                                bridgeResult.source_comment_fb_id = sourceComment.id
+                            } else {
+                                bridgeResult.source_comment_error = sourceComment.error
+                            }
+                        } catch (e) {
+                            bridgeResult.source_comment_status = 'failed'
+                            bridgeResult.source_comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                        }
                     }
                 }
             } else {
