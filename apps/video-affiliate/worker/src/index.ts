@@ -5472,7 +5472,7 @@ function mapDashboardGalleryRow(row: Record<string, unknown>, namespaceId: strin
 }
 
 type FastGalleryPostingClaimStats = {
-    source: 'gallery_index_namespace_unposted' | 'gallery_index_page_reuse_fallback'
+    source: 'gallery_ready_namespace_unposted' | 'gallery_index_namespace_unposted' | 'gallery_index_page_reuse_fallback'
     candidateTotal: number
     scanned: number
     pages: number
@@ -5708,9 +5708,27 @@ async function claimFastGalleryVideoForPosting(params: {
 
     const candidateBucket = new BotBucket(params.env.BUCKET, namespaceId) as unknown as R2Bucket
 
+    const loadVisibleReadyPostingCandidates = async (): Promise<Array<Record<string, unknown>>> => {
+        const inventory = await getNamespaceGalleryInventory(params.env, namespaceId)
+        const readyVideos = (inventory.videos || [])
+            .filter((video) => isNamespaceGalleryVideoDisplayReady(video as Record<string, unknown>))
+            .filter((video) => !isNamespaceGalleryVideoPosted(video as Record<string, unknown>))
+            .map((video) => ({
+                ...(video as Record<string, unknown>),
+                sourceNamespaceId: String((video as Record<string, unknown>).sourceNamespaceId || (video as Record<string, unknown>).source_namespace_id || namespaceId).trim() || namespaceId,
+                source_namespace_id: String((video as Record<string, unknown>).sourceNamespaceId || (video as Record<string, unknown>).source_namespace_id || namespaceId).trim() || namespaceId,
+            }))
+        return orderGalleryVideosForPosting(readyVideos, params.postingOrder)
+    }
+
+    const visibleReadyPostingCandidates = await loadVisibleReadyPostingCandidates().catch((error) => {
+        console.log(`[GALLERY-READY] Failed to load visible ready inventory ns=${namespaceId}: ${error instanceof Error ? error.message : String(error)}`)
+        return [] as Array<Record<string, unknown>>
+    })
+
     const scanCandidateMode = async (mode: FastGalleryPostingCandidateMode): Promise<FastGalleryPostingScanResult> => {
         stats.source = mode === 'namespace_unposted'
-            ? 'gallery_index_namespace_unposted'
+            ? 'gallery_ready_namespace_unposted'
             : 'gallery_index_page_reuse_fallback'
         // Do not run COUNT(*) here: production D1 can hit CPU limits on large
         // gallery namespaces before a post even starts. candidateTotal is the
@@ -5729,14 +5747,16 @@ async function claimFastGalleryVideoForPosting(params: {
             if (exhaustedAfterPageIndex !== null && pageIndex > exhaustedAfterPageIndex) continue
             const offset = pageIndex * pageSize
 
-            const page = await listFastGalleryPostingCandidatePage({
-                db: params.env.DB,
-                namespaceId,
-                postingOrder: params.postingOrder,
-                mode,
-                limit: pageSize,
-                offset,
-            })
+            const page = mode === 'namespace_unposted'
+                ? visibleReadyPostingCandidates.slice(offset, offset + pageSize)
+                : await listFastGalleryPostingCandidatePage({
+                    db: params.env.DB,
+                    namespaceId,
+                    postingOrder: params.postingOrder,
+                    mode,
+                    limit: pageSize,
+                    offset,
+                })
             stats.pages += 1
             stats.candidateTotal += page.length
             candidateRows += page.length

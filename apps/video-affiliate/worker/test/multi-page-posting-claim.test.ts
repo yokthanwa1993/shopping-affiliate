@@ -274,6 +274,35 @@ test('claimFastGalleryVideoForPosting scans namespace-fresh before reuse fallbac
     assert.match(body, /gallery_index_page_reuse_fallback/, 'stats/log source must expose fallback reuse mode')
 })
 
+test('claimFastGalleryVideoForPosting uses visible ready inventory for the primary pass', () => {
+    const body = getClaimFastSource()
+    const loadIdx = body.indexOf('const loadVisibleReadyPostingCandidates')
+    const inventoryIdx = body.indexOf('getNamespaceGalleryInventory(params.env, namespaceId)', loadIdx)
+    const readyFilterIdx = body.indexOf('isNamespaceGalleryVideoDisplayReady', inventoryIdx)
+    const unpostedFilterIdx = body.indexOf('!isNamespaceGalleryVideoPosted', readyFilterIdx)
+    const orderIdx = body.indexOf('orderGalleryVideosForPosting(readyVideos, params.postingOrder)', unpostedFilterIdx)
+    const scanIdx = body.indexOf("scanCandidateMode('namespace_unposted')")
+
+    assert.notEqual(loadIdx, -1, 'claimFast must define the visible-ready inventory loader')
+    assert.ok(inventoryIdx > loadIdx, 'primary pool must load the same namespace inventory as Gallery')
+    assert.ok(readyFilterIdx > inventoryIdx, 'primary pool must use Gallery display-ready semantics')
+    assert.ok(unpostedFilterIdx > readyFilterIdx, 'primary pool must exclude Gallery posted items')
+    assert.ok(orderIdx > unpostedFilterIdx, 'primary pool must apply the configured posting order to visible-ready items')
+    assert.ok(scanIdx > orderIdx, 'visible-ready candidates must be prepared before the primary scan')
+    assert.match(body, /gallery_ready_namespace_unposted/, 'stats/log source must distinguish visible-ready primary mode')
+})
+
+test('namespace-unposted scan slices visible ready candidates instead of raw gallery_index SQL', () => {
+    const body = getClaimFastSource()
+    const primarySliceIdx = body.indexOf("mode === 'namespace_unposted'\n                ? visibleReadyPostingCandidates.slice(offset, offset + pageSize)")
+    const rawSqlIdx = body.indexOf('await listFastGalleryPostingCandidatePage({', primarySliceIdx)
+    const fallbackIdx = body.indexOf("scanCandidateMode('page_reuse_fallback')")
+
+    assert.notEqual(primarySliceIdx, -1, 'namespace_unposted scan must page through visibleReadyPostingCandidates')
+    assert.ok(rawSqlIdx > primarySliceIdx, 'raw SQL candidate lister must be only the fallback branch')
+    assert.ok(fallbackIdx > primarySliceIdx, 'reuse fallback must remain after visible-ready primary scan')
+})
+
 test('claimFastGalleryVideoForPosting treats seen fresh rows as no-fallback even when none claim', () => {
     const source = getSource()
     const body = getClaimFastSource()
