@@ -718,7 +718,7 @@ test('POST /create-ad with publish_as_page_video publishes a NEW Page video post
     page_id: LIVE_PAGE_ID,
     video_url: 'https://cdn/example.mp4',
     caption: 'new page story',
-    ad_name: 'new-page-story',
+    ad_name: '1de9be59',
     ad_account: 'act_test',
     template_adset: 'tpl_test',
     skip_ad: true,
@@ -733,7 +733,9 @@ test('POST /create-ad with publish_as_page_video publishes a NEW Page video post
   assert.equal(r.body.published_to_page, true);
   assert.equal(r.body.upload_mode, 'page_video_multipart');
   assert.ok(String(r.body.post_url).includes('/posts/NEWPOST1'));
-  assert.ok(browser.calls.some((c) => new RegExp(`/${LIVE_PAGE_ID}/videos\\?`).test(c.url) && c.method === 'POST'), 'publishes through /{page_id}/videos');
+  const publishCall = browser.calls.find((c) => new RegExp(`/${LIVE_PAGE_ID}/videos\\?`).test(c.url) && c.method === 'POST');
+  assert.ok(publishCall, 'publishes through /{page_id}/videos');
+  assert.ok(!String(publishCall.body || '').includes('1de9be59'), 'internal video code must not be used as public card title');
   assert.ok(!browser.calls.some((c) => /\/adcreatives/.test(c.url)), 'Phase A must not create an adcreative');
   assert.ok(!browser.calls.some((c) => /\/ads\?/.test(c.url) && c.method === 'POST'), 'Phase A must not create an ad');
   assert.ok(!browser.calls.some((c) => /\/advideos/.test(c.url)), 'Phase A does not use ad-account advideos');

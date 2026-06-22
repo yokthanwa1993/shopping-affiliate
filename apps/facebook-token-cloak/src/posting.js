@@ -228,6 +228,20 @@ function pickRecoveryDiag(adEntities = {}) {
   return out;
 }
 
+function normalizeGraphId(id) {
+  return String(id == null ? '' : id).trim().replace(/^act_/, '');
+}
+
+function looksLikeInternalVideoCode(value) {
+  const text = String(value == null ? '' : value).trim();
+  return /^[a-f0-9]{8,12}$/i.test(text) || (/^[A-Z0-9_-]{6,16}$/i.test(text) && /\d/.test(text) && !/\s/.test(text));
+}
+
+function sanitizePublicCardTitle(value) {
+  const text = String(value == null ? '' : value).trim().slice(0, 120);
+  return looksLikeInternalVideoCode(text) ? '' : text;
+}
+
 async function gJson(fetchImpl, url, opts) {
   const res = await fetchImpl(url, opts);
   let data = {};
@@ -420,7 +434,7 @@ async function publishPageVideoPost(fetchImpl, params = {}) {
   const pageId = String(params.pageId || params.page_id || '').trim();
   const videoUrl = String(params.videoUrl || params.video_url || '').trim();
   const caption = String(params.caption || params.message || '').trim();
-  const title = String(params.title || params.adName || params.ad_name || '').trim().slice(0, 120);
+  const title = sanitizePublicCardTitle(params.title || params.adName || params.ad_name || '');
   const sleep = params.sleep || realSleep;
   const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
   const thumbPolls = Number.isInteger(params.thumbPolls) ? params.thumbPolls : 40;
