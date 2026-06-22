@@ -315,9 +315,9 @@ test('create-ad-only records ad-story comment evidence or a skipped/failed reaso
     assert.match(routeSource, /paid_cta_update_failed/, 'must repair the paid ad CTA instead of editing a visible page post CTA')
     assert.doesNotMatch(routeSource, /visible_cta_update_failed/)
     assert.match(routeSource, /bridgeResult\.comment_status = 'failed'[\s\S]*bridgeResult\.comment_error = 'final_shortlink_unresolved'/)
-    assert.match(routeSource, /bridgeResult\.comment_target_story_id = adStoryIdForProof/)
-    assert.match(routeSource, /bridgeResult\.comment_target_post_id = commentSubIds\.postSubId2/)
-    assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: adStoryIdForProof, message: commentMessage, comment_message: commentMessage \}\)/)
+    assert.match(routeSource, /bridgeResult\.comment_target_story_id = repairedStoryIdForProof/)
+    assert.match(routeSource, /bridgeResult\.comment_target_post_id = commentPostIdForProof/)
+    assert.match(routeSource, /body: JSON\.stringify\(\{ page_id: validation\.pageId, story_id: commentStoryIdForProof, message: commentMessage, comment_message: commentMessage \}\)/)
 })
 
 test('create-ad-only bridge body creates an ads-only dark story and never publishes a visible Page post', () => {
@@ -331,7 +331,7 @@ test('create-ad-only bridge body creates an ads-only dark story and never publis
     assert.doesNotMatch(routeSource, /skip_ad: true/)
     assert.doesNotMatch(routeSource, /publish_as_page_video: true/)
     assert.doesNotMatch(routeSource, /`\$\{baseUrl\}\/promote`/)
-    assert.doesNotMatch(routeSource, /`\$\{baseUrl\}\/update-cta`/)
+    assert.match(routeSource, /`\$\{baseUrl\}\/update-cta`/, 'when Meta repairs to a new dark story, update that story CTA before commenting')
     assert.match(routeSource, /resolveGalleryVideoForRepost/)
     assert.match(routeSource, /system_video_unresolved/)
 })

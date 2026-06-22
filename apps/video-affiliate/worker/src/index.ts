@@ -12657,7 +12657,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     const recordAdOnlyFailure = async (error: string, result?: Record<string, unknown> | null, clickLink?: string) => {
         const rec = buildAdHistoryRecord({ status: 'failed', validation, errorMessage: error, result: result ?? null, clickLink, schedule })
         const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
-        return c.json({ ok: false, error, history_id: historyId, ...(result || {}) }, 200)
+        return c.json({ ...(result || {}), ok: false, error, history_id: historyId }, 200)
     }
 
     const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
@@ -12950,12 +12950,68 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         paid_cta_update_status: repairResult.paid_ad_cta_final === true ? 'success' : 'unconfirmed',
         ...(repairResult.error ? { paid_cta_update_error: repairResult.error } : {}),
     }
+    const repairedStoryRaw = String(repairResult.effective_object_story_id || repairResult.ad_story_id || repairResult.story_id || '').trim()
+    let repairedStoryIdForProof = buildPageStoryId(validation.pageId, repairedStoryRaw)
+    let commentStoryIdForProof = repairedStoryIdForProof || adStoryIdForProof
+    let commentPostIdForProof = adHistoryStoryTail(commentStoryIdForProof)
+    if (repairedStoryIdForProof) {
+        bridgeResult.paid_ad_story_id = repairedStoryIdForProof
+        bridgeResult.story_id = repairedStoryIdForProof
+        bridgeResult.ad_story_id = repairedStoryIdForProof
+        bridgeResult.effective_object_story_id = repairedStoryIdForProof
+        bridgeResult.comment_target_story_id = repairedStoryIdForProof
+        bridgeResult.comment_target_post_id = commentPostIdForProof
+    }
     if (!repairResult.ok || repairResult.paid_ad_cta_final !== true) {
         const step = String(repairResult.step || '').trim()
         const err = String(repairResult.error || 'paid_ad_cta_not_final').trim()
         bridgeResult.paid_cta_update_status = 'failed'
         bridgeResult.paid_cta_update_error = step ? `${step}:${err}`.slice(0, 200) : err.slice(0, 200)
         return recordAdOnlyFailure('paid_cta_update_failed', bridgeResult, finalLink)
+    }
+
+    if (repairedStoryIdForProof && repairedStoryIdForProof !== adStoryIdForProof) {
+        const storyFinalShortlinkUrl = buildAdOnlyShortlinkRequestUrl({
+            template: tmpl,
+            shopeeLink,
+            sub1: finalSub1,
+            sub2: commentPostIdForProof,
+            sub3: validation.pageId,
+        })
+        let storyFinalLink = ''
+        try {
+            const slResp = await fetch(storyFinalShortlinkUrl, { method: 'GET' })
+            if (slResp.ok) {
+                const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+                storyFinalLink = String(slData.shortLink || slData.short_link || '').trim()
+            }
+        } catch { /* fail closed below */ }
+        if (!storyFinalLink) return recordAdOnlyFailure('final_shortlink_unresolved_after_repair_story', bridgeResult, finalLink)
+        finalLink = storyFinalLink
+        clickLink = finalLink
+        bridgeResult.click_link = finalLink
+        bridgeResult.comment_shortlink = finalLink
+        bridgeResult.final_shortlink = finalLink
+        bridgeResult.cta_sub2 = commentPostIdForProof
+        bridgeResult.cta_sub3 = validation.pageId
+        try {
+            const storyCtaResp = await fetch(`${baseUrl}/update-cta`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ page_id: validation.pageId, story_id: repairedStoryIdForProof, final_cta_link: finalLink, shortlink: finalLink, cta_type: 'SHOP_NOW' }),
+            })
+            const storyCta = await storyCtaResp.json().catch(() => ({})) as Record<string, unknown>
+            bridgeResult.story_cta_update_status = storyCtaResp.ok && storyCta.ok ? 'success' : 'failed'
+            bridgeResult.story_cta_link = finalLink
+            if (!storyCtaResp.ok || !storyCta.ok) {
+                bridgeResult.story_cta_update_error = String(storyCta.step ? `${storyCta.step}:${storyCta.error || ''}` : (storyCta.error || `story_cta_http_${storyCtaResp.status}`)).slice(0, 200)
+                return recordAdOnlyFailure('story_cta_update_failed', bridgeResult, finalLink)
+            }
+        } catch (e) {
+            bridgeResult.story_cta_update_status = 'failed'
+            bridgeResult.story_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+            return recordAdOnlyFailure('story_cta_update_failed', bridgeResult, finalLink)
+        }
     }
 
     const commentMessage = await buildAffiliateCommentMessage(c.env.DB, namespaceId, finalLink).catch(() => '')
@@ -12968,7 +13024,7 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
             const commentResp = await fetch(`${baseUrl}/page-comment`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ page_id: validation.pageId, story_id: adStoryIdForProof, message: commentMessage, comment_message: commentMessage }),
+                body: JSON.stringify({ page_id: validation.pageId, story_id: commentStoryIdForProof, message: commentMessage, comment_message: commentMessage }),
             })
             const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
             if (commentResp.ok && commentData.ok && commentData.id) {

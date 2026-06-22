@@ -117,7 +117,7 @@ function graphRoute(url, method, pages, opts = {}) {
   if (method === 'GET' && /\/AD1\?fields=creative/.test(u)) {
     const link = opts.repairReadbackCtaLink !== undefined ? opts.repairReadbackCtaLink : ((opts._repairState && opts._repairState.lastCreativeLink) || '');
     const cid = opts.repairReadbackCreativeId !== undefined ? opts.repairReadbackCreativeId : 'CR1';
-    return { creative: { id: cid, ...(link ? { object_story_spec: { video_data: { call_to_action: { type: 'SHOP_NOW', value: { link } } } } } : {}) } };
+    return { creative: { id: cid, effective_object_story_id: `${LIVE_PAGE_ID}_REPAIRED_STORY`, object_story_spec: { video_data: { call_to_action: { type: 'SHOP_NOW', value: { link } } } } } };
   }
   if (u.includes('/me/accounts')) return { data: pages };
   // Source-post attachment lookup: the freshly posted page video's attachment target id.
@@ -2746,6 +2746,8 @@ test('POST /repair-ad-cta builds a NEW creative with the final link, re-points t
   assert.equal(r.body.old_creative_id, 'OLDCR');
   assert.equal(r.body.new_creative_id, 'CR1');
   assert.equal(r.body.paid_ad_cta_link, FINAL, 'read-back confirms the paid CTA carries the final link');
+  assert.equal(r.body.effective_object_story_id, `${LIVE_PAGE_ID}_REPAIRED_STORY`, 'repair returns the ad creative story currently used by the paid ad');
+  assert.equal(r.body.story_id, `${LIVE_PAGE_ID}_REPAIRED_STORY`);
   assert.equal(r.body.paid_ad_cta_final, true);
   // A NEW adcreative carrying the final link in the video_data CTA was POSTed.
   const crPost = browser.calls.find((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');

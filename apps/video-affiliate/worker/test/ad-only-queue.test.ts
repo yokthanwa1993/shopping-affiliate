@@ -118,6 +118,15 @@ test('clampAdOnlyIntervalMinutes defaults garbage / non-positive and clamps out-
     assert.equal(clampAdOnlyIntervalMinutes(0.4), MIN_AD_ONLY_INTERVAL_MINUTES)
 })
 
+test('create-ad-only comments on repaired paid-ad story when repair returns a new effective story id', () => {
+    const src = readFileSync(resolve(process.cwd(), 'src/index.ts'), 'utf8')
+    const repairIdx = src.indexOf('const repairedStoryRaw = String(repairResult.effective_object_story_id')
+    assert.ok(repairIdx > 0, 'create-ad-only reads the repaired paid-ad effective story id')
+    const commentIdx = src.indexOf('story_id: commentStoryIdForProof', repairIdx)
+    assert.ok(commentIdx > repairIdx, 'page-comment targets the repaired paid-ad story, not the pre-repair story')
+    assert.match(src.slice(repairIdx, commentIdx + 400), /bridgeResult\.comment_target_story_id = repairedStoryIdForProof/)
+})
+
 // =====================================================================
 // AD-ONLY AUTO-PICK — when the manual queue is empty, the scheduler auto-selects ONE eligible cached
 // page video and replays it through the SAME create-ad-only contract (never legacy/page-publish).

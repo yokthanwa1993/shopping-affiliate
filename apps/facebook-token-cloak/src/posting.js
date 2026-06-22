@@ -2361,18 +2361,30 @@ async function repairPaidAdCta(fetchImpl, params = {}) {
 
   // 3. Read back the ad's creative to CONFIRM the paid CTA now carries the final link. A POST that
   // "succeeds" but leaves the old creative in place must be reported as paid_ad_cta_final:false.
+  // Meta can mint/settle the effective_object_story_id asynchronously immediately after the ad is
+  // re-pointed, so poll a few times and return the latest story id the paid ad actually uses.
   let confirmedCreativeId = '';
+  let confirmedStoryId = '';
   let confirmedCtaLink = '';
-  try {
-    const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(adId)}?fields=creative{id,object_story_spec}&access_token=${encodeURIComponent(userToken)}`);
-    const creative = rb.data && rb.data.creative;
-    if (creative) {
-      if (creative.id) confirmedCreativeId = String(creative.id).trim();
-      const vd = creative.object_story_spec && creative.object_story_spec.video_data;
-      const link = vd && vd.call_to_action && vd.call_to_action.value && vd.call_to_action.value.link;
-      if (link) confirmedCtaLink = String(link).trim();
-    }
-  } catch {}
+  for (let i = 0; i < 10; i++) {
+    try {
+      if (i > 0) await sleep(2000);
+      const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(adId)}?fields=creative{id,effective_object_story_id,object_story_spec}&access_token=${encodeURIComponent(userToken)}`);
+      const creative = rb.data && rb.data.creative;
+      if (creative) {
+        if (creative.id) confirmedCreativeId = String(creative.id).trim();
+        if (creative.effective_object_story_id) confirmedStoryId = String(creative.effective_object_story_id).trim();
+        const vd = creative.object_story_spec && creative.object_story_spec.video_data;
+        const link = vd && vd.call_to_action && vd.call_to_action.value && vd.call_to_action.value.link;
+        if (link) confirmedCtaLink = String(link).trim();
+      }
+      if (confirmedCreativeId === newCreativeId && confirmedCtaLink === finalCtaLink && confirmedStoryId) {
+        // One extra settle read catches the live-observed case where the first read has the right CTA
+        // but an older effective story id.
+        if (i >= 1) break;
+      }
+    } catch {}
+  }
 
   const paidAdCtaFinal = !!confirmedCreativeId && confirmedCreativeId === newCreativeId && confirmedCtaLink === finalCtaLink;
   return {
@@ -2384,6 +2396,7 @@ async function repairPaidAdCta(fetchImpl, params = {}) {
     new_creative_id: newCreativeId,
     video_id: videoId,
     final_cta_link: finalCtaLink,
+    ...(confirmedStoryId ? { effective_object_story_id: confirmedStoryId, ad_story_id: confirmedStoryId, story_id: confirmedStoryId } : {}),
     // The verified paid ad CTA link read back from Graph (empty if the read-back did not echo it).
     paid_ad_cta_link: confirmedCtaLink,
     // True only when the read-back confirms the ad now points at the NEW creative carrying the link.
