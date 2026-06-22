@@ -263,8 +263,15 @@ async function downloadVideoToBuffer(videoUrl, { fetchImpl, maxBytes = MAX_DOWNL
     if (Number.isFinite(declared) && declared > maxBytes) {
       throw new Error(`video_too_large_${declared}_bytes_max_${maxBytes}`);
     }
-    const ab = await resp.arrayBuffer();
-    const buffer = Buffer.from(ab);
+    let buffer;
+    if (typeof resp.arrayBuffer === 'function') {
+      const ab = await resp.arrayBuffer();
+      buffer = Buffer.from(ab);
+    } else if (typeof resp.body === 'function') {
+      buffer = Buffer.from(await resp.body());
+    } else {
+      throw new Error('video_download_body_unavailable');
+    }
     if (buffer.length === 0) throw new Error('video_download_empty');
     if (buffer.length > maxBytes) throw new Error(`video_too_large_${buffer.length}_bytes_max_${maxBytes}`);
     const ctRaw = String(headerGet('content-type') || '').split(';')[0].trim();
@@ -361,6 +368,46 @@ async function uploadAdVideoFromUrl(fetchImpl, {
   }
   const data = await uploadAdVideoMultipart(fetchImpl, { adAccount, userToken, buffer: dl.buffer, contentType: dl.contentType });
   return { data, uploadMode: 'multipart' };
+}
+
+async function uploadAdImageFromUrl(fetchImpl, {
+  adAccount,
+  userToken,
+  imageUrl,
+  download = downloadVideoToBuffer,
+  maxBytes = 10 * 1024 * 1024,
+  downloadTimeoutMs = 60000,
+  fetchForDownload = null
+} = {}) {
+  if (!imageUrl) return { data: { error: { message: 'image_url_missing' } }, uploadMode: 'missing' };
+  let dl;
+  try {
+    dl = await download(imageUrl, { maxBytes, timeoutMs: downloadTimeoutMs, ...(fetchForDownload ? { fetchImpl: fetchForDownload } : {}) });
+  } catch (e) {
+    return { data: { error: { message: `image_download_failed: ${(e && e.message) || String(e)}` } }, uploadMode: 'download_failed' };
+  }
+  const part = buildVideoMultipart({
+    buffer: dl.buffer,
+    filename: 'thumbnail.jpg',
+    contentType: dl.contentType || 'image/jpeg',
+    fieldName: 'filename'
+  });
+  const res = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adimages?access_token=${encodeURIComponent(userToken)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': part.contentType },
+    body: part.body
+  });
+  return { data: res.data || {}, uploadMode: 'multipart' };
+}
+
+function firstAdImageHash(data) {
+  const images = data && data.images;
+  if (!images || typeof images !== 'object') return '';
+  for (const item of Object.values(images)) {
+    const hash = item && item.hash ? String(item.hash) : '';
+    if (hash) return hash;
+  }
+  return '';
 }
 
 // Publish a NEW Page video post directly through the Page video endpoint, not through an adcreative.
@@ -1568,23 +1615,89 @@ async function createAd(fetchImpl, params = {}) {
   const ctaSpec = isLikePageCta
     ? { type: 'LIKE_PAGE', value: { page: pageId } }
     : { type: ctaType, value: { link: effectiveCtaLink, link_format: 'VIDEO_LPP' } };
+  let uploadedImageHash = '';
+  let creativeImageUploadMode = '';
+  let creativeImageUploadError = '';
   const videoData = { video_id: vid.id, message: caption, image_url: thumb };
   if (attachCta) videoData.call_to_action = ctaSpec;
-  const crBody = {
-    name: String(caption).substring(0, 50),
-    ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
-    object_story_spec: {
-      page_id: pageId,
-      ...(instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
-      ...(instagramUserId ? { instagram_user_id: instagramUserId } : {}),
-      video_data: videoData
+  const buildCreativeBody = (includeInstagram = true, includeLinkFormat = true, includeCta = true, includeImage = true, imageHash = '') => {
+    const spec = { ...ctaSpec };
+    if (!includeLinkFormat && spec && spec.value) delete spec.value.link_format;
+    const localVideoData = { ...videoData };
+    if (imageHash) {
+      delete localVideoData.image_url;
+      localVideoData.image_hash = imageHash;
     }
+    if (!includeImage) delete localVideoData.image_url;
+    if (!includeCta) delete localVideoData.call_to_action;
+    if (localVideoData.call_to_action && !includeLinkFormat) localVideoData.call_to_action = spec;
+    const storySpec = {
+      page_id: pageId,
+      ...(includeInstagram && instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+      ...(includeInstagram && instagramUserId ? { instagram_user_id: instagramUserId } : {}),
+      video_data: localVideoData
+    };
+    return {
+      name: String(caption).substring(0, 50),
+      ...(includeInstagram && instagramActorId ? { instagram_actor_id: instagramActorId } : {}),
+      object_story_spec: storySpec
+    };
   };
-  const cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+  let crBody = buildCreativeBody(true, true);
+  let creativeRetryWithoutInstagram = false;
+  let creativeRetryWithoutLinkFormat = false;
+  let creativeRetryWithoutCta = false;
+  let creativeRetryWithoutImage = false;
+  let cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
   });
-  const crData = cr.data;
-  if (crData.error) return { ok: false, step: 'creative', error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: effectiveCtaLink || null, used_existing_video: !!existingVideoId && !uploadedForInstagram, uploaded_for_instagram: uploadedForInstagram };
+  let crData = cr.data;
+  if (crData.error && skipPublishToPage && (instagramActorId || instagramUserId)) {
+    creativeRetryWithoutInstagram = true;
+    crBody = buildCreativeBody(false, true);
+    cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+    });
+    crData = cr.data;
+  }
+  if (crData.error && skipPublishToPage && effectiveCtaLink) {
+    creativeRetryWithoutLinkFormat = true;
+    crBody = buildCreativeBody(false, false, true);
+    cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+    });
+    crData = cr.data;
+  }
+  if (crData.error && skipPublishToPage && attachCta) {
+    creativeRetryWithoutCta = true;
+    crBody = buildCreativeBody(false, false, false, true);
+    cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+    });
+    crData = cr.data;
+  }
+  if (crData.error && skipPublishToPage && thumb) {
+    const img = await uploadAdImageFromUrl(fetchImpl, { adAccount, userToken, imageUrl: thumb, download: params.downloadImage || params.downloadVideo });
+    creativeImageUploadMode = img.uploadMode || '';
+    creativeImageUploadError = img.data && img.data.error && img.data.error.message ? String(img.data.error.message).slice(0, 200) : '';
+    uploadedImageHash = firstAdImageHash(img.data);
+    if (uploadedImageHash) {
+      crBody = buildCreativeBody(false, false, false, true, uploadedImageHash);
+      cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+      });
+      crData = cr.data;
+    }
+  }
+  if (crData.error && skipPublishToPage && thumb) {
+    creativeRetryWithoutImage = true;
+    crBody = buildCreativeBody(false, false, false, false);
+    cr = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/adcreatives?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(crBody)
+    });
+    crData = cr.data;
+  }
+  if (crData.error) return { ok: false, step: 'creative', error: crData.error.message, fb_error_code: crData.error.code, fb_error_subcode: crData.error.error_subcode, fb_trace_id: crData.error.fbtrace_id, cta_type: ctaType, cta_link: effectiveCtaLink || null, used_existing_video: !!existingVideoId && !uploadedForInstagram, uploaded_for_instagram: uploadedForInstagram, creative_retry_without_instagram: creativeRetryWithoutInstagram, creative_retry_without_link_format: creativeRetryWithoutLinkFormat, creative_retry_without_cta: creativeRetryWithoutCta, creative_retry_without_image: creativeRetryWithoutImage, creative_image_upload_mode: creativeImageUploadMode, creative_image_upload_error: creativeImageUploadError, creative_uploaded_image_hash: !!uploadedImageHash };
 
   // 4. Poll for the story id.
   let storyId = null;
@@ -1752,6 +1865,13 @@ async function createAd(fetchImpl, params = {}) {
     ...(commentFbId ? { comment_fb_id: commentFbId } : {}),
     ...(commentError ? { comment_error: commentError } : {}),
     uploaded_for_instagram: uploadedForInstagram,
+    creative_retry_without_instagram: creativeRetryWithoutInstagram,
+    creative_retry_without_link_format: creativeRetryWithoutLinkFormat,
+    creative_retry_without_cta: creativeRetryWithoutCta,
+    creative_retry_without_image: creativeRetryWithoutImage,
+    creative_image_upload_mode: creativeImageUploadMode || undefined,
+    creative_image_upload_error: creativeImageUploadError || undefined,
+    creative_uploaded_image_hash: !!uploadedImageHash,
     upload_mode: uploadMode || undefined,
     template_campaign_id: adEntities.template_campaign_id,
     copied_template_settings: adEntities.copied_template_settings,

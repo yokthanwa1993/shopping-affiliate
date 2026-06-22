@@ -155,6 +155,18 @@ function graphRoute(url, method, pages, opts = {}) {
   if (/\/advideos\?/.test(u) && method === 'POST') return { id: 'VID123' };
   if (/fields=thumbnails/.test(u)) return { thumbnails: { data: [{ id: 't1', uri: 'https://thumb/x.jpg' }] } };
   if (/\/adcreatives/.test(u) && method === 'POST') {
+    if (opts.creativeErrorWithInstagram && /instagram_(actor|user)_id/.test(String(reqBody || ''))) {
+      return { error: { message: 'Invalid parameter', code: 100, error_subcode: 3858258, fbtrace_id: 'TRACE_IG' } };
+    }
+    if (opts.creativeErrorWithLinkFormat && /"link_format":"VIDEO_LPP"/.test(String(reqBody || ''))) {
+      return { error: { message: 'Invalid parameter', code: 100, error_subcode: 3858258, fbtrace_id: 'TRACE_LF' } };
+    }
+    if (opts.creativeErrorWithCta && /"call_to_action"/.test(String(reqBody || ''))) {
+      return { error: { message: 'Invalid parameter', code: 100, error_subcode: 3858258, fbtrace_id: 'TRACE_CTA' } };
+    }
+    if (opts.creativeErrorWithImage && /"image_url"/.test(String(reqBody || ''))) {
+      return { error: { message: 'Invalid parameter', code: 100, error_subcode: 3858258, fbtrace_id: 'TRACE_IMG' } };
+    }
     // Capture the CTA link baked into the created creative so the repair-ad-cta readback echoes it.
     if (opts._repairState) {
       try {
@@ -167,7 +179,11 @@ function graphRoute(url, method, pages, opts = {}) {
   }
   if (/fields=effective_object_story_id/.test(u) && method === 'GET') return { effective_object_story_id: `${LIVE_PAGE_ID}_STORY9` };
   if (/\/ads\?fields=creative/.test(u)) return { data: [{ creative: { id: 'TPLCR' } }] };
-  if (/TPLCR\?fields=call_to_action_type/.test(u)) return { call_to_action_type: opts.ctaType || 'SHOP_NOW' };
+  if (/TPLCR\?fields=call_to_action_type/.test(u)) return {
+    call_to_action_type: opts.ctaType || 'SHOP_NOW',
+    ...(opts.templateInstagramActorId ? { instagram_actor_id: opts.templateInstagramActorId } : {}),
+    ...(opts.templateInstagramUserId ? { object_story_spec: { instagram_user_id: opts.templateInstagramUserId } } : {})
+  };
   // Template settings read (objective + campaign-level mirror fields + adset-level customer-
   // lifecycle fields) in ONE GET on the template adset. opts.* inject template values so the
   // mirror/re-apply behavior can be exercised; absent → only objective is returned (default).
@@ -265,6 +281,12 @@ function makeBrowser(opts = {}) {
     templateTargetingOptTypes: opts.templateTargetingOptTypes, adsetLifecycleError: opts.adsetLifecycleError,
     campaignDeleteError: opts.campaignDeleteError, copyError: opts.copyError,
     copyErrorForCampaign: opts.copyErrorForCampaign, reusedCampaignAdsets: opts.reusedCampaignAdsets,
+    creativeErrorWithInstagram: opts.creativeErrorWithInstagram,
+    creativeErrorWithLinkFormat: opts.creativeErrorWithLinkFormat,
+    creativeErrorWithCta: opts.creativeErrorWithCta,
+    creativeErrorWithImage: opts.creativeErrorWithImage,
+    templateInstagramActorId: opts.templateInstagramActorId,
+    templateInstagramUserId: opts.templateInstagramUserId,
     publishError: opts.publishError, publishErrorCode: opts.publishErrorCode,
     publishErrorMessage: opts.publishErrorMessage, publishReadbackPublished: opts.publishReadbackPublished,
     publishFailTimes: opts.publishFailTimes, publishReadbackPermalink: opts.publishReadbackPermalink,
@@ -940,6 +962,125 @@ test('POST /create-ad active ad-only honors an explicit comment_message over the
   assert.equal(sentMessage, rendered, 'comment posts the rendered template, not the bare shortlink');
   assert.ok(sentMessage.includes('Shopee :'), 'comment carries the template style, not a bare link');
   assert.equal(r.body.comment_status, 'commented');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad scheduled skip_publish retries creative without Instagram ids when Meta rejects IG fields', async () => {
+  const browser = makeBrowser({
+    creativeErrorWithInstagram: true,
+    templateInstagramActorId: 'IG_ACTOR_1',
+    templateInstagramUserId: 'IG_USER_1'
+  });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    daily_campaign_name: '22/Jun/2026',
+    campaign_daily_budget: 1000000,
+    adset_run_hours: 24
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.creative_retry_without_instagram, true);
+  const creativeCalls = browser.calls.filter((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.equal(creativeCalls.length, 2, 'first creative with IG ids fails, retry without IG ids succeeds');
+  assert.ok(/instagram_(actor|user)_id/.test(String(creativeCalls[0].body || '')), 'first attempt includes template IG ids');
+  assert.ok(!/instagram_(actor|user)_id/.test(String(creativeCalls[1].body || '')), 'retry strips IG ids');
+  assert.equal(r.body.published_to_page, false);
+  assert.equal(r.body.ad_id, 'AD1');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad scheduled skip_publish retries creative without link_format when Meta rejects VIDEO_LPP', async () => {
+  const browser = makeBrowser({ creativeErrorWithLinkFormat: true });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    daily_campaign_name: '22/Jun/2026',
+    campaign_daily_budget: 1000000,
+    adset_run_hours: 24
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.creative_retry_without_link_format, true);
+  const creativeCalls = browser.calls.filter((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.equal(creativeCalls.length, 2, 'first creative with VIDEO_LPP fails, retry without link_format succeeds');
+  assert.ok(String(creativeCalls[0].body || '').includes('"link_format":"VIDEO_LPP"'));
+  assert.ok(!String(creativeCalls[1].body || '').includes('"link_format"'));
+  assert.equal(r.body.published_to_page, false);
+  assert.equal(r.body.ad_id, 'AD1');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad scheduled skip_publish can create linkless first then rely on paid CTA repair', async () => {
+  const browser = makeBrowser({ creativeErrorWithCta: true });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    daily_campaign_name: '22/Jun/2026',
+    campaign_daily_budget: 1000000,
+    adset_run_hours: 24
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.creative_retry_without_cta, true);
+  const creativeCalls = browser.calls.filter((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.equal(creativeCalls.length, 3, 'full creative fails, no-link_format retry fails, no-CTA retry succeeds');
+  assert.ok(String(creativeCalls[0].body || '').includes('"call_to_action"'));
+  assert.ok(String(creativeCalls[1].body || '').includes('"call_to_action"'));
+  assert.ok(!String(creativeCalls[2].body || '').includes('"call_to_action"'));
+  assert.equal(r.body.published_to_page, false);
+  assert.equal(r.body.ad_id, 'AD1');
+  assertNoLeak(r.body);
+});
+
+test('POST /create-ad scheduled skip_publish can retry without thumbnail image_url', async () => {
+  const browser = makeBrowser({ creativeErrorWithImage: true });
+  await listen({ browser });
+  const r = await req('POST', '/create-ad', {
+    page_id: LIVE_PAGE_ID,
+    video_id: 'EXISTINGVID',
+    caption: 'cap',
+    shortlink: 'https://s.shopee.co.th/x',
+    shopee_url: 'https://shopee.co.th/x',
+    ad_account: 'act_test',
+    template_adset: 'tpl_test',
+    skip_publish_to_page: true,
+    daily_campaign_name: '22/Jun/2026',
+    campaign_daily_budget: 1000000,
+    adset_run_hours: 24
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.creative_retry_without_image, true);
+  const creativeCalls = browser.calls.filter((c) => /\/adcreatives/.test(c.url) && c.method === 'POST');
+  assert.equal(creativeCalls.length, 4, 'full/no-link/no-CTA attempts fail with image_url, final no-image retry succeeds');
+  assert.ok(String(creativeCalls[0].body || '').includes('"image_url"'));
+  assert.ok(String(creativeCalls[1].body || '').includes('"image_url"'));
+  assert.ok(String(creativeCalls[2].body || '').includes('"image_url"'));
+  assert.ok(!String(creativeCalls[3].body || '').includes('"image_url"'));
+  assert.equal(r.body.published_to_page, false);
+  assert.equal(r.body.ad_id, 'AD1');
   assertNoLeak(r.body);
 });
 

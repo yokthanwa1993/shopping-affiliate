@@ -314,6 +314,20 @@ test('cooldown set: the window is bounded (temporary), never a permanent ban', (
     assert.ok(AD_ONLY_PAGE_COOLDOWN_MS > 0)
 })
 
+test('cooldown set: legacy visible-publish failures do not block the restored ads-only flow', () => {
+    const now = Date.parse('2026-06-22T09:05:00.000Z')
+    const recent = new Date(now - 10 * 60 * 1000).toISOString()
+    const skipped = buildAdOnlySkippedPageSet(
+        [
+            { page_id: 'P-old', status: 'failed', error_message: 'missing permissions', created_at: recent, published_to_page: true },
+            { page_id: 'P-new', status: 'failed', error_message: 'missing permissions', created_at: recent, published_to_page: false },
+        ],
+        now,
+    )
+    assert.equal(skipped.has('P-old'), false)
+    assert.equal(skipped.has('P-new'), true)
+})
+
 test('bounded attempts constant is a small positive number (loops a few candidates, not unbounded)', () => {
     assert.ok(AD_ONLY_AUTO_MAX_ATTEMPTS >= 3 && AD_ONLY_AUTO_MAX_ATTEMPTS <= 10)
 })
@@ -345,7 +359,7 @@ test('autoPickAdOnlyCandidates scopes dedup to the Bangkok day and picks randoml
     // Used set is the Bangkok-day-scoped variant, not the all-time one.
     assert.match(indexSrc, /buildAdOnlyUsedIdSetForBangkokDate\(historyRows\.results \|\| \[\], nowMs\)/)
     // The history read pulls created_at (needed to scope by day) and newest-first.
-    assert.match(indexSrc, /effective_object_story_id, created_at\s*\n\s*FROM dashboard_ad_history WHERE page_id = \? ORDER BY id DESC LIMIT 5000/)
+    assert.match(indexSrc, /effective_object_story_id, created_at, status\s*\n\s*FROM dashboard_ad_history WHERE page_id = \? ORDER BY id DESC LIMIT 5000/)
     // Selection is randomized (per-page and cross-page), driven by one seeded rng per tick.
     assert.match(indexSrc, /const rng = makeSeededRng\(nowMs\)/)
     assert.match(indexSrc, /rankAdOnlyAutoCandidatesRandom\(candidates, used, rng\)/)
@@ -426,6 +440,15 @@ test('same Bangkok day: a history row from TODAY excludes its candidate (no same
         nowMs,
     )
     assert.equal(isAdOnlyCandidateUsed(candidate(), used), true)
+})
+
+test('same Bangkok day: failed rows do NOT exclude a candidate because no ad was created', () => {
+    const nowMs = Date.parse('2026-06-19T05:00:00.000Z')
+    const used = buildAdOnlyUsedIdSetForBangkokDate(
+        [{ fb_video_id: 'v-368352', created_at: '2026-06-19T02:00:00.000Z', status: 'failed' }],
+        nowMs,
+    )
+    assert.equal(isAdOnlyCandidateUsed(candidate(), used), false)
 })
 
 test('Bangkok day boundary: a row whose UTC date is yesterday but Bangkok date is TODAY still excludes', () => {

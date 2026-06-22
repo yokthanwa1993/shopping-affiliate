@@ -1,10 +1,11 @@
 // Create Ads contract — pure, network-free helpers for POST /api/dashboard/create-ad-only.
 //
-// The endpoint name is kept for compatibility, but the main Create Ads flow is signal-to-new-post:
+// The endpoint name is kept for compatibility, but the main Create Ads flow is signal-to-dark-ad:
 // an old high-performing Page post/video is only the source signal. The worker resolves the matching
-// internal system video/content, publishes a NEW Page post/story, then creates/promotes the ad from
-// that newly-created story. It must fail closed when the internal system video/content cannot be
-// resolved; it must never silently boost/reuse the old Page post/video as the ad surface.
+// internal system video/content, creates a PAID ad/dark story, repairs the paid ad CTA, and comments on
+// that ad story. It must fail closed when the internal system video/content cannot be resolved; it must
+// never silently boost/reuse the old Page post/video as the ad surface and must never publish a new
+// visible Page post in this lane.
 // It is deliberately separate from:
 //   - the Page Post flow  (POST /api/pages/:id/force-post → post_history, cron — UNTOUCHED)
 //   - the legacy hybrid   (POST /api/dashboard/create-ad → mixed post+ad — UNTOUCHED)
@@ -267,8 +268,8 @@ export interface AdHistoryRecord {
 // CREATE ADS QUEUE / SCHEDULER — pure, network-free helpers.
 //
 // Restores the "old queue cadence" UX (สร้างทุก X นาที) on the Create Ads lane: a queued row is
-// replayed through POST /api/dashboard/create-ad-only, which resolves the system video, publishes a
-// new Page post/story, and creates/promotes the ad from that new story. The scheduler picks at most
+// replayed through POST /api/dashboard/create-ad-only, which resolves the system video, creates an
+// ads-only dark story, repairs the paid ad CTA, and comments on that ad story. The scheduler picks at most
 // ONE queued row per interval. This block holds the interval math and the queue-row → create-ad-only
 // request-body mapping so all of it is unit-testable without D1/cron.
 // =====================================================================
@@ -393,6 +394,8 @@ export interface AdOnlyHistoryIdRow {
     /** Attempt timestamp (ISO/SQLite datetime). Used to scope auto-pick dedup to the current Bangkok
      * day; absent on the all-time manual flow, which ignores it. */
     created_at?: string
+    /** Lifecycle status. Auto-pick dedup ignores failed/error/unsupported rows because no ad was created. */
+    status?: string
 }
 
 // The tail after the last underscore of a PAGEID_POSTID id (e.g. "111_222" → "222"). An id with no
@@ -467,6 +470,10 @@ export function filterAdOnlyHistoryRowsForBangkokDate(
     const todayKey = bangkokDateKey(nowMs)
     return (rows || []).filter((r) => {
         if (!r) return false
+        // Failed/unsupported attempts never created a usable ad, so they must not consume the
+        // same-day no-repeat slot. Retry pacing is handled separately by the fatal-error cooldown.
+        const status = str(r.status).toLowerCase()
+        if (status === 'failed' || status === 'error' || status === 'unsupported') return false
         const created = str(r.created_at)
         if (!created) return true
         const key = bangkokDateKey(created)
@@ -647,6 +654,9 @@ export interface AdOnlyFailureRow {
     error_message?: string
     truncated_result_json?: string
     created_at?: string
+    // Legacy pre-fix attempts published a visible Page post before failing later in creative/CTA.
+    // Those rows must not keep the page on cooldown after the ads-only/dark-story flow is restored.
+    published_to_page?: boolean | number | string | null
 }
 
 // Build the set of page ids to TEMPORARILY skip this tick. A page is cooled down when it has a failed
@@ -667,6 +677,8 @@ export function buildAdOnlySkippedPageSet(
         // Only failures cool a page down; a 'created'/'pending' row never does.
         const status = str(r.status).toLowerCase()
         if (status && status !== 'failed' && status !== 'error' && status !== 'unsupported') continue
+        const legacyVisiblePublish = r.published_to_page === true || r.published_to_page === 1 || str(r.published_to_page).toLowerCase() === 'true'
+        if (legacyVisiblePublish) continue
         if (!isAdOnlyFatalError(`${str(r.error_message)} ${str(r.truncated_result_json)}`)) continue
         const ts = Date.parse(str(r.created_at))
         if (Number.isFinite(ts) && nowMs - ts > cooldownMs) continue
@@ -679,8 +691,8 @@ export function buildAdOnlySkippedPageSet(
 // scheduler always creates a LIVE, SPENDING ad, so it defaults to mode 'active' with the Bangkok
 // date-named daily campaign, the 10,000 THB/day CBO budget and a 24h run window — the same contract
 // requirement already implemented for the force-post CBO campaign. It forwards source-signal ids and
-// system_video_id; the endpoint re-validates, resolves the system video URL, publishes the new Page
-// post/story, and writes the dashboard_ad_history audit.
+// system_video_id; the endpoint re-validates, resolves the system video URL, creates an ads-only
+// dark story, repairs the paid ad CTA, comments on that ad story, and writes the dashboard_ad_history audit.
 export function buildAdOnlyAutoPickBody(input: {
     candidate: AdOnlyAutoCandidate
     dailyCampaignName: string
