@@ -153,6 +153,19 @@ test('schedule accepts the minor-units daily_budget alias (converted back to who
     assert.equal(s.dailyBudgetMinor, 30000)
 })
 
+test('create-ad-only initial creative shortlink never uses empty settings sub2/sub3', () => {
+    const route = getCreateAdOnlyRouteSource()
+    assert.match(route, /const initialSub2 = String\(/)
+    assert.match(route, /validation\.sourceStoryId/)
+    assert.match(route, /validation\.sourcePostId/)
+    assert.match(route, /validation\.fbVideoId/)
+    assert.match(route, /validation\.systemVideoId/)
+    assert.match(route, /const initialSub3 = String\(validation\.pageId/)
+    assert.match(route, /sub2: initialSub2/)
+    assert.match(route, /sub3: initialSub3/)
+    assert.doesNotMatch(route, /\.replace\('\{sub_id2\}', encodeURIComponent\(String\(sub2Row\?\.value \|\| ''\)/)
+})
+
 test('ad-history record carries mode + run_hours intent and echoes bridge budget/schedule', () => {
     const v = validateAdOnlyInput({ page_id: 'P', story_id: '1_2', system_video_id: 'sys-1' })
     const rec = buildAdHistoryRecord({

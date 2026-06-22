@@ -12748,13 +12748,28 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         const sub2Row = await getPageSetting(c.env.DB, validation.pageId, 'sub_id2').catch(() => null)
         const sub3Row = await getPageSetting(c.env.DB, validation.pageId, 'sub_id3').catch(() => null)
         const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
-        const shortlinkUrl = tmpl
-            .replace('{url}', encodeURIComponent(shopeeLink))
-            .replace('{sub_id}', encodeURIComponent(String(subRow?.value || 'yok').trim()))
-            .replace('{sub_id2}', encodeURIComponent(String(sub2Row?.value || '').trim()))
-            .replace('{sub_id3}', encodeURIComponent(String(sub3Row?.value || '').trim()))
-            .replace('{sub_id4}', '')
-            .replace('{sub_id5}', '')
+        const initialSub1 = String(subRow?.value || 'yok').trim()
+        // The first CTA is baked into Meta's ad creative before the dark story id exists. Never let
+        // it fall back to empty settings (`sub1----`): use the known source signal as sub2 and the
+        // page id as sub3. After the dark story is created, this route remints the final story-specific
+        // link and writes it to the story CTA/comment. This keeps Ads UI/creative clicks trackable even
+        // before/if the story CTA readback is used.
+        const initialSub2 = String(
+            validation.sourceStoryId
+            || validation.sourcePostId
+            || validation.fbVideoId
+            || validation.systemVideoId
+            || sub2Row?.value
+            || ''
+        ).trim()
+        const initialSub3 = String(validation.pageId || sub3Row?.value || '').trim()
+        const shortlinkUrl = buildAdOnlyShortlinkRequestUrl({
+            template: tmpl,
+            shopeeLink,
+            sub1: initialSub1,
+            sub2: initialSub2,
+            sub3: initialSub3,
+        })
         try {
             const slResp = await fetch(shortlinkUrl, { method: 'GET' })
             if (slResp.ok) {
