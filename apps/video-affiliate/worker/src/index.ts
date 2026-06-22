@@ -12897,31 +12897,47 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     bridgeResult.comment_shortlink = finalLink
     bridgeResult.final_shortlink = finalLink
 
+    const repairPayload = {
+        page_id: validation.pageId,
+        ad_id: bridgeResult.ad_id,
+        creative_id: bridgeResult.creative_id,
+        video_id: adFbVideoId,
+        final_cta_link: finalLink,
+        shortlink: finalLink,
+        caption,
+        ...(String(bridgeResult.thumbnail_url || thumbnailUrl || '').trim() ? { thumbnail_url: String(bridgeResult.thumbnail_url || thumbnailUrl || '').trim() } : {}),
+        template_adset: templateAdset,
+        ad_account: adAccount,
+        source_story_id: adStoryIdForProof,
+        ...(adName ? { ad_name: adName } : {}),
+    }
     let repairResult: Record<string, unknown> = {}
-    try {
-        const repairResp = await fetch(`${baseUrl}/repair-ad-cta`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                page_id: validation.pageId,
-                ad_id: bridgeResult.ad_id,
-                creative_id: bridgeResult.creative_id,
-                video_id: adFbVideoId,
-                final_cta_link: finalLink,
-                shortlink: finalLink,
-                caption,
-                ...(String(bridgeResult.thumbnail_url || thumbnailUrl || '').trim() ? { thumbnail_url: String(bridgeResult.thumbnail_url || thumbnailUrl || '').trim() } : {}),
-                template_adset: templateAdset,
-                ad_account: adAccount,
-                source_story_id: adStoryIdForProof,
-                ...(adName ? { ad_name: adName } : {}),
-            }),
-        })
-        const text = await repairResp.text()
-        repairResult = text ? JSON.parse(text) as Record<string, unknown> : {}
-    } catch (e) {
+    let repairTransportError = ''
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            const repairResp = await fetch(`${baseUrl}/repair-ad-cta`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(repairPayload),
+            })
+            const text = await repairResp.text()
+            repairResult = text ? JSON.parse(text) as Record<string, unknown> : {}
+            repairResult.paid_cta_repair_attempts = attempt
+            if (repairResp.ok && repairResult.ok && repairResult.paid_ad_cta_final === true) break
+            const err = String(repairResult.error || '').toLowerCase()
+            const step = String(repairResult.step || '').toLowerCase()
+            const transient = err.includes('unexpected error') || err.includes('retry') || step === 'update_ad'
+            if (!transient || attempt === 3) break
+            await new Promise((resolve) => setTimeout(resolve, attempt * 1500))
+        } catch (e) {
+            repairTransportError = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+            if (attempt === 3) break
+            await new Promise((resolve) => setTimeout(resolve, attempt * 1500))
+        }
+    }
+    if (repairTransportError && !repairResult.ok) {
         bridgeResult.paid_cta_update_status = 'failed'
-        bridgeResult.paid_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+        bridgeResult.paid_cta_update_error = repairTransportError
         return recordAdOnlyFailure('paid_cta_update_failed', bridgeResult, finalLink)
     }
 
