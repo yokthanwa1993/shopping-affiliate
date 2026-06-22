@@ -6,6 +6,7 @@ import {
   runNextAdOnlyQueue,
   cancelAdOnlyQueueItem,
   setAdOnlyInterval,
+  setAdOnlySchedulerEnabled,
   type AdQueueStatus,
 } from '@/api/adQueue'
 import { formatThaiDateTime } from '@/lib/format'
@@ -47,6 +48,7 @@ function AdOnlyQueueSection() {
   const items = data?.items ?? []
   const [intervalDraft, setIntervalDraft] = useState<number | null>(null)
   const intervalMinutes = intervalDraft ?? data?.intervalMinutes ?? 20
+  const schedulerEnabled = data?.schedulerEnabled !== false
 
   const intervalMutation = useMutation({
     mutationFn: (minutes: number) => setAdOnlyInterval(minutes),
@@ -54,6 +56,10 @@ function AdOnlyQueueSection() {
       setIntervalDraft(saved)
       void query.refetch()
     },
+  })
+  const schedulerMutation = useMutation({
+    mutationFn: (enabled: boolean) => setAdOnlySchedulerEnabled(enabled),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['ad-only-queue'] }),
   })
   const runNextMutation = useMutation({
     mutationFn: () => runNextAdOnlyQueue(),
@@ -75,6 +81,23 @@ function AdOnlyQueueSection() {
         {/* Cadence + run controls. */}
         <div className="flex flex-wrap items-end justify-between gap-3 rounded-xl border bg-card p-3">
           <div className="flex flex-wrap items-end gap-2 text-xs text-muted-foreground">
+            <div className={`rounded-lg border px-3 py-2 text-xs ${schedulerEnabled ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-amber-300 bg-amber-50 text-amber-900'}`}>
+              <div className="font-semibold">Cron สร้างแอด: {schedulerEnabled ? 'เปิดอยู่' : 'หยุดอยู่'}</div>
+              <div>{schedulerEnabled ? 'ระบบจะ auto-pick สร้างแอดตามรอบเวลา' : 'ไม่สร้างแอดตามวัน/auto-pick จนกว่าจะเปิดใหม่'}</div>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant={schedulerEnabled ? 'destructive' : 'default'}
+              onClick={() => schedulerMutation.mutate(!schedulerEnabled)}
+              disabled={schedulerMutation.isPending}
+            >
+              {schedulerMutation.isPending
+                ? 'กำลังบันทึก…'
+                : schedulerEnabled
+                  ? 'หยุด Cron สร้างแอด'
+                  : 'เปิด Cron สร้างแอด'}
+            </Button>
             <label className="space-y-1">
               <span className="block font-medium">สร้างทุก … นาที</span>
               <input
@@ -105,8 +128,8 @@ function AdOnlyQueueSection() {
               type="button"
               size="sm"
               onClick={() => runNextMutation.mutate()}
-              disabled={runNextMutation.isPending || queuedCount === 0}
-              title={queuedCount === 0 ? 'ไม่มีงานในคิว' : 'สร้างงานถัดไปทันที (ข้ามรอบเวลา)'}
+              disabled={runNextMutation.isPending || queuedCount === 0 || !schedulerEnabled}
+              title={!schedulerEnabled ? 'Cron สร้างแอดถูกหยุดอยู่' : queuedCount === 0 ? 'ไม่มีงานในคิว' : 'สร้างงานถัดไปทันที (ข้ามรอบเวลา)'}
             >
               {runNextMutation.isPending ? 'กำลังสร้าง…' : 'สร้างงานถัดไปทันที'}
             </Button>

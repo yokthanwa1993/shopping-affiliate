@@ -13010,6 +13010,7 @@ app.get('/api/dashboard/ad-history', async (c) => {
 // =====================================================================
 const AD_ONLY_QUEUE_LAST_RUN_KEY = 'ad_only_queue_last_run_at'
 const AD_ONLY_QUEUE_INTERVAL_KEY = 'ad_only_queue_interval_minutes'
+const AD_ONLY_QUEUE_ENABLED_KEY = 'ad_only_queue_enabled'
 
 async function ensureAdOnlyQueueTable(db: D1Database): Promise<void> {
     await db.prepare(
@@ -13051,6 +13052,12 @@ async function getAdOnlyIntervalMinutes(db: D1Database): Promise<number> {
     const row = await getDashboardSetting(db, AD_ONLY_QUEUE_INTERVAL_KEY).catch(() => null)
     if (row && String(row.value || '').trim()) return clampAdOnlyIntervalMinutes(row.value)
     return DEFAULT_AD_ONLY_INTERVAL_MINUTES
+}
+
+async function isAdOnlyQueueSchedulerEnabled(db: D1Database): Promise<boolean> {
+    const row = await getDashboardSetting(db, AD_ONLY_QUEUE_ENABLED_KEY).catch(() => null)
+    const raw = String(row?.value ?? '1').trim().toLowerCase()
+    return !['0', 'false', 'off', 'no', 'disabled'].includes(raw)
 }
 
 async function resolveAdOnlySystemVideoIdFromSignal(
@@ -13179,15 +13186,17 @@ app.get('/api/dashboard/ad-only-queue/list', async (c) => {
     const countsByStatus: Record<string, number> = {}
     for (const r of (counts.results || [])) countsByStatus[String(r.status)] = Number(r.n)
     const interval = await getAdOnlyIntervalMinutes(c.env.DB)
+    const schedulerEnabled = await isAdOnlyQueueSchedulerEnabled(c.env.DB)
     const lastRun = await getDashboardSetting(c.env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY).catch(() => null)
-    const nextRunMs = nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now())
+    const nextRunMs = schedulerEnabled ? nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now()) : 0
     return c.json({
         ok: true,
         items: rows.results || [],
         counts: countsByStatus,
         last_run_at: lastRun?.value || '',
-        next_run_at: new Date(nextRunMs).toISOString(),
+        next_run_at: nextRunMs ? new Date(nextRunMs).toISOString() : '',
         interval_minutes: interval,
+        scheduler_enabled: schedulerEnabled,
     }, 200, { 'Cache-Control': 'no-store' })
 })
 
@@ -13202,6 +13211,19 @@ app.put('/api/dashboard/ad-only-queue/interval', async (c) => {
     const interval = clampAdOnlyIntervalMinutes(body.interval_minutes)
     await setDashboardSetting(c.env.DB, AD_ONLY_QUEUE_INTERVAL_KEY, String(interval))
     return c.json({ ok: true, interval_minutes: interval }, 200)
+})
+
+app.get('/api/dashboard/ad-only-queue/enabled', async (c) => {
+    const enabled = await isAdOnlyQueueSchedulerEnabled(c.env.DB)
+    return c.json({ ok: true, scheduler_enabled: enabled }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.put('/api/dashboard/ad-only-queue/enabled', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { scheduler_enabled?: boolean | string | number }
+    const raw = body.scheduler_enabled
+    const enabled = raw === true || raw === 1 || String(raw).trim().toLowerCase() === 'true' || String(raw).trim() === '1'
+    await setDashboardSetting(c.env.DB, AD_ONLY_QUEUE_ENABLED_KEY, enabled ? '1' : '0')
+    return c.json({ ok: true, scheduler_enabled: enabled }, 200, { 'Cache-Control': 'no-store' })
 })
 
 app.delete('/api/dashboard/ad-only-queue/:id', async (c) => {
@@ -13524,6 +13546,8 @@ async function maybeProcessAdOnlyQueueOnSchedule(env: Env): Promise<{ ran: boole
     try {
         await ensureAdOnlyQueueTable(env.DB)
         await recoverStuckAdOnlyQueueProcessing(env)
+        const enabled = await isAdOnlyQueueSchedulerEnabled(env.DB)
+        if (!enabled) return { ran: false, reason: 'scheduler_disabled' }
         const interval = await getAdOnlyIntervalMinutes(env.DB)
         const lastRun = await getDashboardSetting(env.DB, AD_ONLY_QUEUE_LAST_RUN_KEY).catch(() => null)
         if (!isAdOnlyQueueDue(String(lastRun?.value || ''), interval, Date.now())) {

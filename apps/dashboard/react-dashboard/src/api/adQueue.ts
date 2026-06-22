@@ -106,6 +106,7 @@ export interface AdOnlyQueueResult {
   lastRunAt: string
   nextRunAt: string
   intervalMinutes: number
+  schedulerEnabled: boolean
 }
 
 function normalizeAdOnly(raw: unknown): AdOnlyQueueItem | null {
@@ -147,6 +148,7 @@ export async function fetchAdOnlyQueue(signal?: AbortSignal): Promise<AdOnlyQueu
     lastRunAt: safeString(data.last_run_at),
     nextRunAt: safeString(data.next_run_at),
     intervalMinutes: safeNumber(data.interval_minutes) || 20,
+    schedulerEnabled: data.scheduler_enabled !== false,
   }
 }
 
@@ -175,4 +177,12 @@ export async function setAdOnlyInterval(minutes: number): Promise<number> {
     { method: 'PUT', timeoutMs: 15_000, body: { interval_minutes: minutes } },
   )
   return safeNumber(data.interval_minutes) || minutes
+}
+
+export async function setAdOnlySchedulerEnabled(enabled: boolean): Promise<boolean> {
+  const data = await workerFetchJson<{ ok?: boolean; scheduler_enabled?: boolean }>(
+    '/api/dashboard/ad-only-queue/enabled',
+    { method: 'PUT', timeoutMs: 15_000, body: { scheduler_enabled: enabled } },
+  )
+  return data.scheduler_enabled === true
 }
