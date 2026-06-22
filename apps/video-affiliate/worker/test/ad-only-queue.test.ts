@@ -118,13 +118,17 @@ test('clampAdOnlyIntervalMinutes defaults garbage / non-positive and clamps out-
     assert.equal(clampAdOnlyIntervalMinutes(0.4), MIN_AD_ONLY_INTERVAL_MINUTES)
 })
 
-test('create-ad-only comments on repaired paid-ad story when repair returns a new effective story id', () => {
+test('create-ad-only keeps one dark story: update story CTA then comment same story without paid repair remint', () => {
     const src = readFileSync(resolve(process.cwd(), 'src/index.ts'), 'utf8')
-    const repairIdx = src.indexOf('const repairedStoryRaw = String(repairResult.effective_object_story_id')
-    assert.ok(repairIdx > 0, 'create-ad-only reads the repaired paid-ad effective story id')
-    const commentIdx = src.indexOf('story_id: commentStoryIdForProof', repairIdx)
-    assert.ok(commentIdx > repairIdx, 'page-comment targets the repaired paid-ad story, not the pre-repair story')
-    assert.match(src.slice(repairIdx, commentIdx + 400), /bridgeResult\.comment_target_story_id = repairedStoryIdForProof/)
+    const start = src.indexOf("app.post('/api/dashboard/create-ad-only'")
+    assert.ok(start > 0, 'create-ad-only route exists')
+    const end = src.indexOf("app.get('/api/dashboard/ad-history'", start)
+    const route = src.slice(start, end)
+    assert.doesNotMatch(route, /fetch\(`\$\{baseUrl\}\/repair-ad-cta`/, 'create-ad-only must not call repair-ad-cta because Meta mints duplicate ad posts')
+    const ctaIdx = route.indexOf('/update-cta')
+    const commentIdx = route.indexOf('/page-comment')
+    assert.ok(ctaIdx > 0 && commentIdx > ctaIdx, 'route updates the story CTA before commenting')
+    assert.match(route, /story_id: commentStoryIdForProof/, 'page-comment targets the same create-ad story')
 })
 
 // =====================================================================

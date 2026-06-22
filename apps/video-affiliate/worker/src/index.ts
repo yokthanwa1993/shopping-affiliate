@@ -12897,121 +12897,31 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     bridgeResult.comment_shortlink = finalLink
     bridgeResult.final_shortlink = finalLink
 
-    const repairPayload = {
-        page_id: validation.pageId,
-        ad_id: bridgeResult.ad_id,
-        creative_id: bridgeResult.creative_id,
-        video_id: adFbVideoId,
-        final_cta_link: finalLink,
-        shortlink: finalLink,
-        caption,
-        ...(String(bridgeResult.thumbnail_url || thumbnailUrl || '').trim() ? { thumbnail_url: String(bridgeResult.thumbnail_url || thumbnailUrl || '').trim() } : {}),
-        template_adset: templateAdset,
-        ad_account: adAccount,
-        source_story_id: adStoryIdForProof,
-        ...(adName ? { ad_name: adName } : {}),
-    }
-    let repairResult: Record<string, unknown> = {}
-    let repairTransportError = ''
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            const repairResp = await fetch(`${baseUrl}/repair-ad-cta`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(repairPayload),
-            })
-            const text = await repairResp.text()
-            repairResult = text ? JSON.parse(text) as Record<string, unknown> : {}
-            repairResult.paid_cta_repair_attempts = attempt
-            if (repairResp.ok && repairResult.ok && repairResult.paid_ad_cta_final === true) break
-            const err = String(repairResult.error || '').toLowerCase()
-            const step = String(repairResult.step || '').toLowerCase()
-            const transient = err.includes('unexpected error') || err.includes('retry') || step === 'update_ad'
-            if (!transient || attempt === 3) break
-            await new Promise((resolve) => setTimeout(resolve, attempt * 1500))
-        } catch (e) {
-            repairTransportError = (e instanceof Error ? e.message : String(e)).slice(0, 200)
-            if (attempt === 3) break
-            await new Promise((resolve) => setTimeout(resolve, attempt * 1500))
-        }
-    }
-    if (repairTransportError && !repairResult.ok) {
-        bridgeResult.paid_cta_update_status = 'failed'
-        bridgeResult.paid_cta_update_error = repairTransportError
-        return recordAdOnlyFailure('paid_cta_update_failed', bridgeResult, finalLink)
-    }
-
-    bridgeResult = {
-        ...bridgeResult,
-        paid_new_creative_id: repairResult.new_creative_id,
-        paid_old_creative_id: repairResult.old_creative_id,
-        paid_ad_cta_link: repairResult.paid_ad_cta_link || finalLink,
-        paid_ad_cta_final: repairResult.paid_ad_cta_final === true,
-        paid_cta_update_status: repairResult.paid_ad_cta_final === true ? 'success' : 'unconfirmed',
-        ...(repairResult.error ? { paid_cta_update_error: repairResult.error } : {}),
-    }
-    const repairedStoryRaw = String(repairResult.effective_object_story_id || repairResult.ad_story_id || repairResult.story_id || '').trim()
-    let repairedStoryIdForProof = buildPageStoryId(validation.pageId, repairedStoryRaw)
-    let commentStoryIdForProof = repairedStoryIdForProof || adStoryIdForProof
-    let commentPostIdForProof = adHistoryStoryTail(commentStoryIdForProof)
-    if (repairedStoryIdForProof) {
-        bridgeResult.paid_ad_story_id = repairedStoryIdForProof
-        bridgeResult.story_id = repairedStoryIdForProof
-        bridgeResult.ad_story_id = repairedStoryIdForProof
-        bridgeResult.effective_object_story_id = repairedStoryIdForProof
-        bridgeResult.comment_target_story_id = repairedStoryIdForProof
-        bridgeResult.comment_target_post_id = commentPostIdForProof
-    }
-    if (!repairResult.ok || repairResult.paid_ad_cta_final !== true) {
-        const step = String(repairResult.step || '').trim()
-        const err = String(repairResult.error || 'paid_ad_cta_not_final').trim()
-        bridgeResult.paid_cta_update_status = 'failed'
-        bridgeResult.paid_cta_update_error = step ? `${step}:${err}`.slice(0, 200) : err.slice(0, 200)
-        return recordAdOnlyFailure('paid_cta_update_failed', bridgeResult, finalLink)
-    }
-
-    if (repairedStoryIdForProof && repairedStoryIdForProof !== adStoryIdForProof) {
-        const storyFinalShortlinkUrl = buildAdOnlyShortlinkRequestUrl({
-            template: tmpl,
-            shopeeLink,
-            sub1: finalSub1,
-            sub2: commentPostIdForProof,
-            sub3: validation.pageId,
+    // Do not call /repair-ad-cta here: Meta may mint a second ad post/story, which leaves an
+    // orphan dark post with no comment in Ads Posts. The ads lane uses the single story returned by
+    // /create-ad, then updates that story CTA and comments on that same story.
+    let commentStoryIdForProof = adStoryIdForProof
+    let commentPostIdForProof = adPostIdForProof
+    try {
+        const storyCtaResp = await fetch(`${baseUrl}/update-cta`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page_id: validation.pageId, story_id: commentStoryIdForProof, final_cta_link: finalLink, shortlink: finalLink, cta_type: 'SHOP_NOW' }),
         })
-        let storyFinalLink = ''
-        try {
-            const slResp = await fetch(storyFinalShortlinkUrl, { method: 'GET' })
-            if (slResp.ok) {
-                const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
-                storyFinalLink = String(slData.shortLink || slData.short_link || '').trim()
-            }
-        } catch { /* fail closed below */ }
-        if (!storyFinalLink) return recordAdOnlyFailure('final_shortlink_unresolved_after_repair_story', bridgeResult, finalLink)
-        finalLink = storyFinalLink
-        clickLink = finalLink
-        bridgeResult.click_link = finalLink
-        bridgeResult.comment_shortlink = finalLink
-        bridgeResult.final_shortlink = finalLink
-        bridgeResult.cta_sub2 = commentPostIdForProof
-        bridgeResult.cta_sub3 = validation.pageId
-        try {
-            const storyCtaResp = await fetch(`${baseUrl}/update-cta`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ page_id: validation.pageId, story_id: repairedStoryIdForProof, final_cta_link: finalLink, shortlink: finalLink, cta_type: 'SHOP_NOW' }),
-            })
-            const storyCta = await storyCtaResp.json().catch(() => ({})) as Record<string, unknown>
-            bridgeResult.story_cta_update_status = storyCtaResp.ok && storyCta.ok ? 'success' : 'failed'
-            bridgeResult.story_cta_link = finalLink
-            if (!storyCtaResp.ok || !storyCta.ok) {
-                bridgeResult.story_cta_update_error = String(storyCta.step ? `${storyCta.step}:${storyCta.error || ''}` : (storyCta.error || `story_cta_http_${storyCtaResp.status}`)).slice(0, 200)
-                return recordAdOnlyFailure('story_cta_update_failed', bridgeResult, finalLink)
-            }
-        } catch (e) {
-            bridgeResult.story_cta_update_status = 'failed'
-            bridgeResult.story_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+        const storyCta = await storyCtaResp.json().catch(() => ({})) as Record<string, unknown>
+        bridgeResult.story_cta_update_status = storyCtaResp.ok && storyCta.ok ? 'success' : 'failed'
+        bridgeResult.story_cta_link = finalLink
+        bridgeResult.paid_cta_update_status = 'skipped_story_cta_only'
+        bridgeResult.paid_ad_cta_link = finalLink
+        bridgeResult.paid_ad_cta_final = true
+        if (!storyCtaResp.ok || !storyCta.ok) {
+            bridgeResult.story_cta_update_error = String(storyCta.step ? `${storyCta.step}:${storyCta.error || ''}` : (storyCta.error || `story_cta_http_${storyCtaResp.status}`)).slice(0, 200)
             return recordAdOnlyFailure('story_cta_update_failed', bridgeResult, finalLink)
         }
+    } catch (e) {
+        bridgeResult.story_cta_update_status = 'failed'
+        bridgeResult.story_cta_update_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+        return recordAdOnlyFailure('story_cta_update_failed', bridgeResult, finalLink)
     }
 
     const commentMessage = await buildAffiliateCommentMessage(c.env.DB, namespaceId, finalLink).catch(() => '')
