@@ -1,0 +1,4 @@
+'use strict';
+const test=require('node:test'); const assert=require('node:assert/strict'); const fs=require('fs/promises'); const path=require('path'); const os=require('os'); const registry=require('../src/registry');
+async function tmp(){return path.join(await fs.mkdtemp(path.join(os.tmpdir(),'vault-reg-')),'registry.json')}
+test('registry rejects secrets and writes mode 0600', async()=>{const p=await tmp(); await assert.rejects(()=>registry.upsert({provider:'shopee',account:'CHEARB',password:'x'},p),/Forbidden registry field/); const rec=await registry.upsert({provider:'shopee',account:'CHEARB',affiliateId:'15130770000',profileAlias:'CHEARB',username:'hint'},p); assert.equal(rec.profileAlias,'CHEARB'); assert.equal((await fs.stat(p)).mode & 0o777,0o600); const rows=await registry.list(p); assert.equal(rows.length,1); assert.equal(rows[0].affiliateId,'15130770000');});

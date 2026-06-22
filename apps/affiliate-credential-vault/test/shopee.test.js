@@ -1,0 +1,4 @@
+'use strict';
+const test=require('node:test'); const assert=require('node:assert/strict'); const {buildShopeeShortenUrl}=require('../src/shopee');
+test('shorten URL omits id by default when explicit alias exists',()=>{const u=new URL(buildShopeeShortenUrl({account:'CHEARB',affiliateId:'15130770000',productUrl:'https://shopee.co.th/x',sub1:'S'})); assert.equal(u.searchParams.get('account'),'CHEARB'); assert.equal(u.searchParams.get('id'),null); assert.equal(u.searchParams.get('sub1'),'S');});
+test('shorten URL includes id only opt-in or no alias',()=>{let u=new URL(buildShopeeShortenUrl({account:'CHEARB',affiliateId:'15130770000',productUrl:'https://shopee.co.th/x',includeAffiliateId:true})); assert.equal(u.searchParams.get('id'),'15130770000'); u=new URL(buildShopeeShortenUrl({affiliateId:'15130770000',productUrl:'https://shopee.co.th/x'})); assert.equal(u.searchParams.get('id'),'15130770000');});
