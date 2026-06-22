@@ -1,10 +1,16 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, Check, Copy, ExternalLink, Info } from 'lucide-react'
 import { fetchGallery } from '@/api/gallery'
 import { fetchPageVideos } from '@/api/pagePosts'
-import { fetchSettingsPages, type SettingsPage } from '@/api/settings'
+import {
+  EMPTY_FORM,
+  fetchPageSettings,
+  fetchSettingsPages,
+  savePageSettings,
+  type SettingsPage,
+} from '@/api/settings'
 import {
   DASHBOARD_AD_CREATE_READY,
   createAdOnly,
@@ -241,6 +247,50 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
   const [dailyBudgetThb, setDailyBudgetThb] = useState(100)
   const [runHours, setRunHours] = useState(24)
 
+  const pageSettingsQuery = useQuery({
+    queryKey: ['settings', selectedId],
+    queryFn: ({ signal }) => fetchPageSettings(selectedId, signal),
+    enabled: !!selectedId,
+  })
+  const [flowEnabled, setFlowEnabled] = useState(false)
+  const [flowKey, setFlowKey] = useState('legacy_cron')
+  const [sourceStrategy, setSourceStrategy] = useState('page_posts')
+  const [ctaStrategy, setCtaStrategy] = useState('source_then_story')
+  const [commentMode, setCommentMode] = useState('template')
+  const [draftAdAccount, setDraftAdAccount] = useState('')
+  const [draftTemplateAdset, setDraftTemplateAdset] = useState('')
+  const [draftSub1, setDraftSub1] = useState('')
+
+  useEffect(() => {
+    const form = pageSettingsQuery.data?.form
+    if (!form) return
+    setFlowEnabled(form.adFlowEnabled === '1' || form.adFlowEnabled === 'true')
+    setFlowKey(form.adFlowKey || 'legacy_cron')
+    setSourceStrategy(form.adFlowSourceStrategy || 'page_posts')
+    setCtaStrategy(form.adFlowCtaStrategy || 'source_then_story')
+    setCommentMode(form.adFlowCommentMode || 'template')
+    setDraftAdAccount(form.adAccount || '')
+    setDraftTemplateAdset(form.templateAdset || '')
+    setDraftSub1(form.subId || '')
+  }, [pageSettingsQuery.data])
+
+  const saveFlowMutation = useMutation({
+    mutationFn: () => savePageSettings(selectedId, {
+      ...(pageSettingsQuery.data?.form ?? EMPTY_FORM),
+      adAccount: draftAdAccount,
+      templateAdset: draftTemplateAdset,
+      subId: draftSub1,
+      adFlowEnabled: flowEnabled ? '1' : '0',
+      adFlowKey: flowKey,
+      adFlowSourceStrategy: sourceStrategy,
+      adFlowCtaStrategy: ctaStrategy,
+      adFlowCommentMode: commentMode,
+    }),
+    onSuccess: () => {
+      void pageSettingsQuery.refetch()
+    },
+  })
+
   // Existing high-view page posts for the SELECTED page. These are source signals only.
   const postsQuery = useQuery({
     queryKey: ['create-ads', 'page-posts', selectedId],
@@ -466,9 +516,137 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
         <PageHealthCard pageId={selectedId} variant="ads" />
       </section>
 
-      {/* Step 2 — pick a high-performing source signal. */}
+      {/* Step 2 — per-page flow settings. */}
       <section className="space-y-3">
-        <SectionLabel step={2} title="เลือกต้นแบบ/สัญญาณยอดดี" hint="โพสต์เก่าหรือวิดีโอระบบ" />
+        <SectionLabel step={2} title="ตั้งค่า Flow ของเพจนี้" hint="กัน flow ใหม่ไม่ให้ทับเพจเดิม" />
+        <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h3 className="text-sm font-semibold">เลือกวิธีสร้างแอดต่อเพจ</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                ค่าเหล่านี้ผูกกับ page_id นี้เท่านั้น — flow ใหม่ default ปิดไว้ก่อน จนกว่าจะเปิดเอง
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant={flowEnabled ? 'default' : 'outline'}
+              onClick={() => setFlowEnabled(!flowEnabled)}
+              className="shrink-0"
+            >
+              {flowEnabled ? 'เปิดใช้ flow นี้' : 'ปิดอยู่ / ไม่ให้ cron ใช้'}
+            </Button>
+          </div>
+
+          {pageSettingsQuery.isLoading ? (
+            <p className="text-xs text-muted-foreground">กำลังโหลดค่าตั้งต้นของเพจ…</p>
+          ) : pageSettingsQuery.isError ? (
+            <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              โหลด settings ไม่สำเร็จ — ยังไม่ควรเปิด flow ใหม่
+            </p>
+          ) : null}
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Flow/Preset</span>
+              <select
+                value={flowKey}
+                onChange={(e) => setFlowKey(e.target.value)}
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              >
+                <option value="legacy_cron">Legacy Cron เดิม</option>
+                <option value="focus_create_ad">Focus Create Ad</option>
+                <option value="new_flow_disabled">Flow ใหม่ (staging / ปิดไว้ก่อน)</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Source strategy</span>
+              <select
+                value={sourceStrategy}
+                onChange={(e) => setSourceStrategy(e.target.value)}
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              >
+                <option value="page_posts">โพสต์เพจยอดดีของเพจนี้</option>
+                <option value="gallery_ready">Gallery ready ของระบบ</option>
+                <option value="manual_only">Manual เท่านั้น ไม่ให้ cron เลือกเอง</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">CTA strategy</span>
+              <select
+                value={ctaStrategy}
+                onChange={(e) => setCtaStrategy(e.target.value)}
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              >
+                <option value="source_then_story">Creative=sub จาก source, Story/Comment=sub จาก dark story</option>
+                <option value="story_only_guarded">Story/Comment only (guarded)</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Comment</span>
+              <select
+                value={commentMode}
+                onChange={(e) => setCommentMode(e.target.value)}
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              >
+                <option value="template">ใช้ template ปกติ</option>
+                <option value="off">ปิด comment สำหรับ flow นี้</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Ad account</span>
+              <input
+                value={draftAdAccount}
+                onChange={(e) => setDraftAdAccount(e.target.value)}
+                placeholder="act_..."
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Template adset</span>
+              <input
+                value={draftTemplateAdset}
+                onChange={(e) => setDraftTemplateAdset(e.target.value)}
+                placeholder="120..."
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">sub1 / campaign sub</span>
+              <input
+                value={draftSub1}
+                onChange={(e) => setDraftSub1(e.target.value)}
+                placeholder="เช่น 16JUN26FBSPCAD"
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 border-t pt-3">
+            <Button
+              type="button"
+              onClick={() => saveFlowMutation.mutate()}
+              disabled={saveFlowMutation.isPending || pageSettingsQuery.isLoading}
+            >
+              {saveFlowMutation.isPending ? 'กำลังบันทึก…' : 'บันทึกค่า flow ของเพจนี้'}
+            </Button>
+            {saveFlowMutation.isSuccess ? (
+              <span className="text-xs font-medium text-emerald-700">บันทึกแล้ว</span>
+            ) : saveFlowMutation.isError ? (
+              <span className="text-xs font-medium text-amber-700">
+                บันทึกไม่ได้: {saveFlowMutation.error instanceof Error ? saveFlowMutation.error.message : 'unknown_error'}
+              </span>
+            ) : (
+              <span className="text-xs text-muted-foreground">
+                ค่า flow ใหม่ถูกเก็บแยกต่อเพจ — เฉียบจะไม่เปลี่ยนจนกว่าจะเปิด/บันทึกที่เพจเฉียบเอง
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Step 3 — pick a high-performing source signal. */}
+      <section className="space-y-3">
+        <SectionLabel step={3} title="เลือกต้นแบบ/สัญญาณยอดดี" hint="โพสต์เก่าหรือวิดีโอระบบ" />
             <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
                 <Button
@@ -540,9 +718,9 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
             )}
           </section>
 
-          {/* Step 3 — selected signal summary + create action. */}
+          {/* Step 4 — selected signal summary + create action. */}
           <section className="space-y-3">
-            <SectionLabel step={3} title="สรุปต้นแบบและสร้างแอด" hint="สร้างโพสต์ใหม่ก่อนสร้างแอด" />
+            <SectionLabel step={4} title="สรุปต้นแบบและสร้างแอด" hint="สร้างโพสต์ใหม่ก่อนสร้างแอด" />
             {!selectedInput ? (
               <p className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
                 ยังไม่ได้เลือกต้นแบบ — เลือกการ์ดด้านบนหนึ่งใบเพื่อใช้เป็นสัญญาณคอนเทนต์

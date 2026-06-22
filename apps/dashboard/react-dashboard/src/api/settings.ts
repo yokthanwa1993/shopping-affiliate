@@ -33,9 +33,15 @@ export const pageSettingsSchema = z.object({
   shortlinkProvider: z.enum(['api', 'extension']).default('api'),
   commentTemplate: z.string().max(4000).default(''),
   adAccount: z.string().max(120).default(''),
+  templateAdset: z.string().max(120).default(''),
   campaignPrefix: z.string().max(120).default(''),
   adsPerRound: z.string().max(20).default(''),
   autoCreateTime: z.string().max(20).default(''),
+  adFlowEnabled: z.string().max(10).default('0'),
+  adFlowKey: z.string().max(80).default('legacy_cron'),
+  adFlowSourceStrategy: z.string().max(80).default('page_posts'),
+  adFlowCtaStrategy: z.string().max(80).default('source_then_story'),
+  adFlowCommentMode: z.string().max(80).default('template'),
 })
 
 export type PageSettingsForm = z.infer<typeof pageSettingsSchema>
@@ -57,9 +63,15 @@ export const EMPTY_FORM: PageSettingsForm = {
   shortlinkProvider: 'api',
   commentTemplate: '',
   adAccount: '',
+  templateAdset: '',
   campaignPrefix: '',
   adsPerRound: '',
   autoCreateTime: '',
+  adFlowEnabled: '0',
+  adFlowKey: 'legacy_cron',
+  adFlowSourceStrategy: 'page_posts',
+  adFlowCtaStrategy: 'source_then_story',
+  adFlowCommentMode: 'template',
 }
 
 export const FALLBACK_PAGES: SettingsPage[] = [
@@ -109,9 +121,15 @@ export async function fetchPageSettings(
       shortlinkProvider: provider,
       commentTemplate: String(data.comment_template || ''),
       adAccount: String(data.ad_account || ''),
+      templateAdset: String(data.template_adset || ''),
       campaignPrefix: String(data.campaign_prefix || ''),
       adsPerRound: String(data.ads_per_round || ''),
       autoCreateTime: String(data.auto_create_time || ''),
+      adFlowEnabled: String(data.ad_flow_enabled || '0'),
+      adFlowKey: String(data.ad_flow_key || 'legacy_cron'),
+      adFlowSourceStrategy: String(data.ad_flow_source_strategy || 'page_posts'),
+      adFlowCtaStrategy: String(data.ad_flow_cta_strategy || 'source_then_story'),
+      adFlowCommentMode: String(data.ad_flow_comment_mode || 'template'),
     },
     // Presence only — the raw token string is intentionally dropped here.
     tokenPresent: !!data.facebook_sync_token || !!data.facebookSyncToken || !!data.facebookSyncTokenUpdatedAt,
@@ -135,9 +153,15 @@ export async function savePageSettings(
     shortlink_provider: form.shortlinkProvider,
     comment_template: form.commentTemplate,
     ad_account: form.adAccount,
+    template_adset: form.templateAdset,
     campaign_prefix: form.campaignPrefix,
     ads_per_round: form.adsPerRound,
     auto_create_time: form.autoCreateTime,
+    ad_flow_enabled: form.adFlowEnabled,
+    ad_flow_key: form.adFlowKey,
+    ad_flow_source_strategy: form.adFlowSourceStrategy,
+    ad_flow_cta_strategy: form.adFlowCtaStrategy,
+    ad_flow_comment_mode: form.adFlowCommentMode,
   }
   // Only write the token when the operator typed a new one. Omitting the field
   // leaves any existing token untouched (and never echoes it back to the UI).

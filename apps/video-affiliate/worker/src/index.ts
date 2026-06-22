@@ -10556,6 +10556,10 @@ const DASHBOARD_SETTING_KEYS = [
     'shortlink_url', 'comment_template', 'default_page', 'ad_account', 'template_adset',
     'template_adset_facebook', 'template_adset_instagram',
     'campaign_prefix', 'ads_per_round', 'auto_create_time',
+    // Per-page Create Ads flow controls. These are UI/ops settings first: cron/focus code must opt in
+    // by page_id + flow_key, so new flows can be staged side-by-side without taking over Chearb.
+    'ad_flow_enabled', 'ad_flow_key', 'ad_flow_source_strategy', 'ad_flow_cta_strategy',
+    'ad_flow_comment_mode',
     // Per-page choice for how the create-ad pipeline shortens Shopee URLs:
     //   'api'        → call short.wwoom.com (default; same as the Electron flow)
     //   'extension'  → call affiliate.shopee.co.th GraphQL via the Feed Ad
@@ -10568,7 +10572,9 @@ const DASHBOARD_SETTING_ALIASES: Record<string, string> = {
     facebookSyncToken: 'facebook_sync_token', subId: 'sub_id', shortlinkUrl: 'shortlink_url',
     commentTemplate: 'comment_template', defaultPage: 'default_page', adAccount: 'ad_account',
     templateAdset: 'template_adset', templateAdsetFacebook: 'template_adset_facebook', templateAdsetInstagram: 'template_adset_instagram', campaignPrefix: 'campaign_prefix', adsPerRound: 'ads_per_round',
-    autoCreateTime: 'auto_create_time', shortlinkProvider: 'shortlink_provider',
+    autoCreateTime: 'auto_create_time', shortlinkProvider: 'shortlink_provider', adFlowEnabled: 'ad_flow_enabled',
+    adFlowKey: 'ad_flow_key', adFlowSourceStrategy: 'ad_flow_source_strategy', adFlowCtaStrategy: 'ad_flow_cta_strategy',
+    adFlowCommentMode: 'ad_flow_comment_mode',
 }
 
 app.get('/api/dashboard/settings', async (c) => {
