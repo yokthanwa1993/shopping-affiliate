@@ -81,6 +81,7 @@ const FIELD_EXCLUDE_REGEX = /captcha|recaptcha|hcaptcha|otp|one[-_\s]?time|verif
 const FILL_ACTION = 'fill-login-input';
 const CLICK_PASSWORD_LOGIN_ACTION = 'click-password-login';
 const CAPTURE_LOGIN_DIAGNOSTICS_ACTION = 'capture-login-diagnostics';
+const DETECT_VISIBLE_CREDENTIAL_LOGIN_FORM_ACTION = 'detect-visible-credential-login-form';
 const MAX_DIAGNOSTIC_FRAMES = 8;
 const MAX_DIAGNOSTIC_INPUTS_PER_FRAME = 24;
 const MAX_DIAGNOSTIC_SNIPPETS_PER_FRAME = 8;
@@ -530,6 +531,108 @@ async function detectManualBlocker(page) {
     } catch {}
   }
   return '';
+}
+
+function diagnosticHasVisibleCredentialLoginForm(diagnostic) {
+  const frames = Array.isArray(diagnostic && diagnostic.frames) ? diagnostic.frames : [];
+  for (const frame of frames) {
+    const inputs = Array.isArray(frame && frame.inputs) ? frame.inputs : [];
+    let hasUsername = false;
+    let hasPassword = false;
+    for (const input of inputs) {
+      if (!input || input.visible !== true || input.disabled === true || input.readOnly === true) continue;
+      if (input.candidate === 'username') hasUsername = true;
+      if (input.candidate === 'password') hasPassword = true;
+      if (hasUsername && hasPassword) return true;
+    }
+  }
+  return false;
+}
+
+async function hasVisibleCredentialLoginForm(page) {
+  const targets = fillTargets(page);
+  for (const target of targets) {
+    if (typeof target.evaluate !== 'function') continue;
+    try {
+      const ok = await target.evaluate(({ action, expectedAction }) => {
+        if (action !== expectedAction) return false;
+
+        const usernameRe = /login|log[-_\s]?in|username|user|email|e-?mail|phone|mobile|tel|account|identifier|loginKey|หมายเลข|โทรศัพท์|ผู้ใช้|ชื่อผู้ใช้|อีเมล|อีเมล์/i;
+        const passwordRe = /password|passwd|current-password|รหัสผ่าน/i;
+        const excludeRe = /captcha|recaptcha|hcaptcha|otp|one[-_\s]?time|verification|verify|verifycode|2fa|mfa|code|search|query|coupon|voucher|pin|รหัสยืนยัน|ยืนยัน|ค้นหา/i;
+
+        function queryAllDeep(selector) {
+          const out = [];
+          const seen = new Set();
+          const roots = [document];
+          for (let i = 0; i < roots.length; i++) {
+            const root = roots[i];
+            if (!root || typeof root.querySelectorAll !== 'function') continue;
+            let matches = [];
+            try { matches = Array.from(root.querySelectorAll(selector)); } catch { matches = []; }
+            for (const el of matches) {
+              if (seen.has(el)) continue;
+              seen.add(el);
+              out.push(el);
+            }
+            let all = [];
+            try { all = Array.from(root.querySelectorAll('*')); } catch { all = []; }
+            for (const el of all) {
+              if (el && el.shadowRoot && !seen.has(el.shadowRoot)) {
+                seen.add(el.shadowRoot);
+                roots.push(el.shadowRoot);
+              }
+            }
+          }
+          return out;
+        }
+
+        function isVisible(el) {
+          if (!el || !(el instanceof Element)) return false;
+          const style = window.getComputedStyle(el);
+          if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return false;
+          const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+          const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+          if (vw && rect.right < -20) return false;
+          if (vh && rect.bottom < -20) return false;
+          if (vw && rect.left > vw + 200) return false;
+          if (vh && rect.top > vh + 400) return false;
+          return true;
+        }
+
+        function marker(el) {
+          const attrs = [
+            'type', 'name', 'id', 'autocomplete', 'placeholder', 'aria-label',
+            'inputmode', 'class', 'role', 'title', 'contenteditable', 'data-testid', 'data-test',
+          ];
+          return attrs.map((name) => {
+            try { return el.getAttribute(name) || ''; } catch { return ''; }
+          }).join(' ');
+        }
+
+        const inputs = queryAllDeep('input,textarea,[contenteditable=""],[contenteditable="true"],[contenteditable="plaintext-only"],[role="textbox"]');
+        let hasUsername = false;
+        let hasPassword = false;
+        for (const el of inputs) {
+          if (!isVisible(el) || el.disabled || el.readOnly) continue;
+          const text = marker(el);
+          if (excludeRe.test(text)) continue;
+          const type = String(el.getAttribute('type') || '').toLowerCase();
+          if (type === 'password' || passwordRe.test(text)) hasPassword = true;
+          else if (usernameRe.test(text)) hasUsername = true;
+          if (hasUsername && hasPassword) return true;
+        }
+        return false;
+      }, {
+        action: DETECT_VISIBLE_CREDENTIAL_LOGIN_FORM_ACTION,
+        expectedAction: DETECT_VISIBLE_CREDENTIAL_LOGIN_FORM_ACTION,
+      });
+      if (ok) return true;
+    } catch {}
+  }
+  return false;
 }
 
 function fillTargets(page) {
@@ -1005,9 +1108,12 @@ async function attemptLogin(page, platform, username, password, opts = {}) {
   }
 
   const preBlocker = await detectManualBlocker(page);
+  const hasVisibleForm = await hasVisibleCredentialLoginForm(page);
   if (preBlocker) {
     const diagnostic = await captureLoginDiagnostics(page, platform, preBlocker, [username, password]);
-    return { filled: false, submitted: false, needsManual: true, reason: preBlocker, diagnostic };
+    if (!hasVisibleForm && !diagnosticHasVisibleCredentialLoginForm(diagnostic)) {
+      return { filled: false, submitted: false, needsManual: true, reason: preBlocker, diagnostic };
+    }
   }
 
   await clickPasswordLoginIfPresent(page, { maxAttempts: 4 }).catch(() => {});

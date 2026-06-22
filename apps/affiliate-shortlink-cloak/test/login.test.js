@@ -64,6 +64,12 @@ function makeTarget(name, events, options = {}, state = {}) {
         const resultByKind = opts.resultByKind || {};
         return resultByKind[arg.kind] || `dom:${name}:${arg.kind}`;
       }
+      if (arg && arg.action === 'detect-visible-credential-login-form') {
+        const inputs = Array.isArray(opts.diagnostic && opts.diagnostic.inputs) ? opts.diagnostic.inputs : [];
+        const hasUsername = inputs.some((input) => input && input.visible && input.candidate === 'username');
+        const hasPassword = inputs.some((input) => input && input.visible && input.candidate === 'password');
+        return hasUsername && hasPassword;
+      }
       return '';
     },
   };
@@ -72,6 +78,7 @@ function makeTarget(name, events, options = {}, state = {}) {
 function makePage({
   url = 'https://affiliate.shopee.co.th/login',
   content = '<html><body>login form</body></html>',
+  contentAfterSubmit,
   frameContent,
   pageTarget = {},
   frameTarget,
@@ -79,6 +86,7 @@ function makePage({
 } = {}) {
   const events = [];
   const state = {};
+  let currentContent = content;
   const main = makeTarget('main', events, {}, state);
   const iframe = makeTarget('iframe', events, frameTarget || {
     domKinds: frameDomKinds,
@@ -87,7 +95,7 @@ function makePage({
   const page = {
     ...makeTarget('page', events, pageTarget, state),
     url: () => url,
-    content: async () => content,
+    content: async () => currentContent,
     mainFrame: () => main,
     frames: () => [main, iframe],
     waitForLoadState: async () => {},
@@ -95,6 +103,9 @@ function makePage({
     keyboard: {
       press: async (key) => {
         events.push({ target: 'page', kind: `key:${key}` });
+        if (key === 'Enter' && contentAfterSubmit !== undefined) {
+          currentContent = contentAfterSubmit;
+        }
       },
     },
   };
@@ -318,4 +329,89 @@ test('attemptLogin preserves manual_login_required when OTP/CAPTCHA marker is in
   assert.equal(result.needsManual, true);
   assert.equal(result.reason, 'captcha_or_otp_detected');
   assert.equal(events.length, 0, 'manual blocker in frame should stop autofill attempts');
+});
+
+test('attemptLogin ignores hidden captcha markers when visible credential login form is present', async () => {
+  const username = 'stored-user@example.com';
+  const password = 'stored-password';
+  const { page, events } = makePage({
+    url: 'https://shopee.co.th/buyer/login?next=https%3A%2F%2Faffiliate.shopee.co.th%2F',
+    content: '<html><body><!-- hidden captcha marker --><input name="loginKey" placeholder="Phone number / Username / Email"><input name="password" type="password"><button>LOG IN</button></body></html>',
+    contentAfterSubmit: '<html><body>redirecting to affiliate dashboard</body></html>',
+    pageTarget: {
+      domKinds: new Set(['text', 'password']),
+      diagnostic: {
+        title: 'Shopee Login',
+        inputCount: 2,
+        inputs: [
+          {
+            index: 0,
+            tag: 'input',
+            type: 'text',
+            name: 'loginKey',
+            placeholder: 'Phone number / Username / Email',
+            visible: true,
+            candidate: 'username',
+          },
+          {
+            index: 1,
+            tag: 'input',
+            type: 'password',
+            name: 'password',
+            placeholder: 'Password',
+            visible: true,
+            candidate: 'password',
+          },
+        ],
+        textSnippets: ['LOG IN'],
+        blockerMarkers: [],
+      },
+    },
+  });
+
+  const result = await attemptLogin(page, 'shopee', username, password);
+  const serialized = JSON.stringify(result);
+
+  assert.equal(result.filled, true);
+  assert.equal(result.submitted, true);
+  assert.equal(result.needsManual, false);
+  assert.equal(result.reason, '');
+  assert.equal(serialized.includes(username), false, 'username must not leak');
+  assert.equal(serialized.includes(password), false, 'password must not leak');
+  assert.ok(events.some((event) => event.kind === 'text'), 'username should be filled');
+  assert.ok(events.some((event) => event.kind === 'password'), 'password should be filled');
+});
+
+test('attemptLogin still blocks visible OTP/CAPTCHA page without credential fields', async () => {
+  const { page, events } = makePage({
+    content: '<html><body>Please enter the OTP code sent to your phone</body></html>',
+    pageTarget: {
+      diagnostic: {
+        title: 'OTP Verification',
+        inputCount: 1,
+        inputs: [
+          {
+            index: 0,
+            tag: 'input',
+            type: 'text',
+            name: 'otp',
+            placeholder: 'OTP code',
+            visible: true,
+            candidate: 'generic_text',
+            excluded: 'excluded_by_login_field_filter',
+          },
+        ],
+        textSnippets: ['OTP verification required'],
+        blockerMarkers: ['otp_or_2fa'],
+      },
+    },
+  });
+
+  const result = await attemptLogin(page, 'shopee', 'stored-user', 'stored-password');
+
+  assert.equal(result.filled, false);
+  assert.equal(result.submitted, false);
+  assert.equal(result.needsManual, true);
+  assert.equal(result.reason, 'captcha_or_otp_detected');
+  assert.equal(events.length, 0, 'manual blocker should stop autofill attempts');
 });
