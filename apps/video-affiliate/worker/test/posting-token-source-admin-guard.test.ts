@@ -171,3 +171,32 @@ test('wiring: cron auto-post path applies the same admin guard before routing', 
         'cron must gate the legacy ads_publish_enabled bridge promotion on namespaceIsAdminOwned',
     )
 })
+
+test('wiring: retry-failed-comments route is authenticated, namespace-scoped, dry_run-default, helper-gated', () => {
+    const src = indexSrc()
+    const routeIdx = src.indexOf("app.post('/api/pages/:id/retry-failed-comments'")
+    assert.notEqual(routeIdx, -1, 'retry-failed-comments POST route must be registered')
+    // Region from the route start to the next route registration.
+    const nextRouteIdx = src.indexOf('app.get(\'/api/pages/:id/stats\'', routeIdx)
+    assert.notEqual(nextRouteIdx, -1, 'route region boundary (stats route) must exist')
+    const region = src.slice(routeIdx, nextRouteIdx)
+
+    // Same dashboard-session auth surface as the other write routes — never an admin endpoint.
+    assert.ok(/requireAuthSession\(c\)/.test(region), 'must gate on requireAuthSession (dashboard session)')
+    assert.ok(!/adminAuthMiddleware|requireSystemAdminSession/.test(region), 'must NOT be an admin endpoint')
+    // Namespace derived from session context + page ownership enforced.
+    assert.ok(/const namespaceId = String\(c\.get\('botId'\)/.test(region), 'namespace must come from c.get(botId)')
+    assert.ok(/FROM pages WHERE id = \? AND bot_id = \?/.test(region), 'must scope the page to the current namespace')
+    // dry_run defaults true: only an explicit false writes.
+    assert.ok(/const dryRun = !\(dryRunRaw === false/.test(region), 'dry_run must default true (explicit false to write)')
+    // Eligibility is gated by BOTH shared helpers, not ad-hoc string checks.
+    assert.ok(/isCloakBridgeCommentFallbackEligible\(/.test(region), 'must filter on isCloakBridgeCommentFallbackEligible')
+    assert.ok(/isStoredCommentTokenAuthFailure\(/.test(region), 'must filter on isStoredCommentTokenAuthFailure')
+    // Selection criteria + bounded limit.
+    assert.ok(/status = 'success'/.test(region) && /comment_status = 'failed'/.test(region), 'must select success+failed-comment rows')
+    assert.ok(/TRIM\(COALESCE\(fb_post_id, ''\)\) <> ''/.test(region), 'must require a present fb_post_id')
+    assert.ok(/Math\.min\(10, Math\.max\(1, limit\)\)/.test(region), 'limit must be clamped to <= 10')
+    // Write mode re-queues to pending and processes the backlog once.
+    assert.ok(/comment_status='pending', comment_error=NULL/.test(region), 'write mode must re-queue to pending and clear the error')
+    assert.ok(/processPendingCommentBacklog\(c\.env\)/.test(region), 'write mode must run the backlog once for immediate repair')
+})

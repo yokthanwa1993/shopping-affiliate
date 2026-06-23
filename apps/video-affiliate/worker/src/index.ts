@@ -188,6 +188,8 @@ import {
     normalizePageCommentTokenSource,
     defaultCommentSourceForRoute,
     restrictCloakToAdminNamespace,
+    isCloakBridgeCommentFallbackEligible,
+    isStoredCommentTokenAuthFailure,
 } from './posting-token-source'
 import {
     PAGE_VIDEO_ASSET_WINNERS_INDEX_SQL,
@@ -35418,6 +35420,30 @@ async function sendPageCommentViaCloakBridge(params: {
     }
 }
 
+// Fallback path for a stored/Facebook Lite pending comment whose token is missing/invalid:
+// re-post the SAME affiliate comment as the Page through the CloakBrowser /page-comment
+// bridge, using the already re-minted shortlink so sub-id attribution is preserved. The
+// bridge owns its own session/page token internally — the Worker never sends or logs a raw
+// token. Caller must have confirmed eligibility (isCloakBridgeCommentFallbackEligible) first.
+async function sendStoredCommentBridgeFallback(params: {
+    env: Env
+    namespaceId: string
+    pageId: string
+    storyId: string
+    shortShopeeLink: string
+    logPrefix: string
+}): Promise<{ ok: boolean; id: string | null; error: string | null }> {
+    const message = (await buildAffiliateCommentMessage(params.env.DB, params.namespaceId, params.shortShopeeLink).catch(() => '')) || params.shortShopeeLink
+    const bridged = await sendPageCommentViaCloakBridge({
+        env: params.env,
+        pageId: params.pageId,
+        storyId: params.storyId,
+        message,
+        logPrefix: params.logPrefix,
+    })
+    return { ok: bridged.status === 'success' && !!bridged.id, id: bridged.id, error: bridged.error }
+}
+
 async function loadPostingThumbnailAsset(params: {
     env: Env
     namespaceId: string
@@ -38211,6 +38237,144 @@ app.get('/api/pages/:id/history', async (c) => {
     }
 })
 
+// Authenticated maintenance endpoint: re-queue already-failed affiliate comments so the
+// stored→CloakBrowser bridge fallback (processPendingCommentBacklog) can repair them, without
+// a manual D1 remote write. Same dashboard-session auth + namespace scoping as the page
+// settings/history routes — NOT an admin endpoint. Only rows that the backlog fallback could
+// actually fix are touched: post went out via the admin-owned bridge (post_token_hint eligible)
+// and the comment failed on a token auth/availability error. dry_run defaults true.
+app.post('/api/pages/:id/retry-failed-comments', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = String(c.get('botId') || '').trim()
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+    if (!namespaceId) return c.json({ error: 'Unauthorized' }, 401)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+
+    const body = await c.req.json().catch(() => ({})) as { dry_run?: unknown; dryRun?: unknown; limit?: unknown }
+    // dry_run defaults TRUE — only an explicit false (body or query) performs the write.
+    const dryRunRaw = body.dry_run ?? body.dryRun ?? c.req.query('dry_run')
+    const dryRun = !(dryRunRaw === false || String(dryRunRaw ?? '').trim().toLowerCase() === 'false')
+
+    const limitRaw = body.limit ?? c.req.query('limit')
+    let limit = Math.floor(Number(limitRaw))
+    if (!Number.isFinite(limit) || limit <= 0) limit = 10
+    limit = Math.min(10, Math.max(1, limit))
+
+    try {
+        // Coarse SQL cut (index-friendly), precise eligibility re-checked in JS via the shared
+        // helpers so the route and the backlog processor agree on what is repairable.
+        const SCAN_CAP = 100
+        const scan = await c.env.DB.prepare(
+            `SELECT id, video_id, fb_post_id, post_token_hint, comment_error, comment_token_hint, posted_at
+             FROM post_history
+             WHERE page_id = ?
+               AND bot_id = ?
+               AND status = 'success'
+               AND comment_status = 'failed'
+               AND TRIM(COALESCE(fb_post_id, '')) <> ''
+             ORDER BY datetime(posted_at) DESC, id DESC
+             LIMIT ?`
+        ).bind(pageId, namespaceId, SCAN_CAP).all() as {
+            results?: Array<{
+                id?: number
+                video_id?: string
+                fb_post_id?: string
+                post_token_hint?: string
+                comment_error?: string
+                comment_token_hint?: string
+                posted_at?: string
+            }>
+        }
+
+        const eligible = (scan.results || []).filter((r) =>
+            isCloakBridgeCommentFallbackEligible(r.post_token_hint) &&
+            isStoredCommentTokenAuthFailure(r.comment_error)
+        ).slice(0, limit)
+
+        // Safe, token-free projection. comment_error is the already-sanitized stored string
+        // (a Graph auth/session message, never a token); truncate defensively anyway.
+        const candidates = eligible.map((r) => ({
+            id: Number(r.id || 0),
+            video_id: String(r.video_id || ''),
+            fb_post_id: String(r.fb_post_id || ''),
+            post_token_hint: String(r.post_token_hint || ''),
+            comment_token_hint: String(r.comment_token_hint || ''),
+            posted_at: String(r.posted_at || ''),
+            comment_error: String(r.comment_error || '').substring(0, 200),
+        }))
+        const candidateIds = candidates.map((r) => r.id).filter((id) => id > 0)
+
+        if (dryRun || candidateIds.length === 0) {
+            return c.json({
+                page_id: pageId,
+                namespace_id: namespaceId,
+                dry_run: true,
+                limit,
+                before: { eligible_failed_comments: candidateIds.length },
+                candidate_ids: candidateIds,
+                candidates,
+            })
+        }
+
+        // Write mode: re-queue each candidate to 'pending' (idempotent, still namespace +
+        // page + state guarded) so the bridge-fallback backlog can repair it now.
+        let reset = 0
+        for (const id of candidateIds) {
+            const res = await c.env.DB.prepare(
+                `UPDATE post_history
+                 SET comment_status='pending', comment_error=NULL, comment_fb_id=NULL, comment_due_at=datetime('now')
+                 WHERE id = ?
+                   AND page_id = ?
+                   AND bot_id = ?
+                   AND status='success'
+                   AND comment_status='failed'`
+            ).bind(id, pageId, namespaceId).run().catch(() => null)
+            reset += Number(res?.meta?.changes || 0)
+        }
+
+        // Process the backlog once so the operator sees immediate repair results.
+        await processPendingCommentBacklog(c.env).catch((error) => {
+            console.error(`[RETRY-FAILED-COMMENTS] backlog run failed page=${pageId}:`, error)
+        })
+
+        // After-state for exactly the re-queued ids.
+        const placeholders = candidateIds.map(() => '?').join(',')
+        const after = await c.env.DB.prepare(
+            `SELECT comment_status, COUNT(*) AS n
+             FROM post_history
+             WHERE id IN (${placeholders}) AND page_id = ? AND bot_id = ?
+             GROUP BY comment_status`
+        ).bind(...candidateIds, pageId, namespaceId).all() as {
+            results?: Array<{ comment_status?: string; n?: number }>
+        }
+        const afterCounts: Record<string, number> = {}
+        for (const row of after.results || []) {
+            afterCounts[String(row.comment_status || 'unknown')] = Number(row.n || 0)
+        }
+
+        return c.json({
+            page_id: pageId,
+            namespace_id: namespaceId,
+            dry_run: false,
+            limit,
+            before: { eligible_failed_comments: candidateIds.length },
+            reset_count: reset,
+            after: afterCounts,
+            candidate_ids: candidateIds,
+            candidates,
+        })
+    } catch (e) {
+        return c.json({ error: 'retry_failed_comments_failed', details: String(e instanceof Error ? e.message : e).substring(0, 200) }, 500)
+    }
+})
+
 app.get('/api/pages/:id/stats', async (c) => {
     const pageId = c.req.param('id')
     try {
@@ -40440,6 +40604,7 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 ph.shopee_link,
                 ph.lazada_link,
                 ph.status,
+                ph.post_token_hint,
                 p.name AS page_name,
                 p.access_token
          FROM post_history ph
@@ -40463,6 +40628,7 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
             shopee_link?: string
             lazada_link?: string
             status?: string
+            post_token_hint?: string
             page_name?: string
             access_token?: string
         }>
@@ -40537,13 +40703,9 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
             const commentTokenHint = deriveCommentTokenHint(commentToken)
             const commentProfile = await resolvePostHistoryProfileByToken(env, commentToken)
 
-            if (!commentToken) {
-                await env.DB.prepare(
-                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
-                ).bind('access_token_missing', commentTokenHint, historyId).run().catch(() => { })
-                continue
-            }
-
+            // Resolve the shopee shortlink up front (before the missing-token check): the
+            // CloakBrowser bridge fallback below reuses this SAME re-minted shortlink, and a
+            // row that can't produce a link can't comment by any route anyway.
             const bucket = new BotBucket(env.BUCKET, botId) as unknown as R2Bucket
             const shopeeLink = await resolveShopeeLinkForRetry({
                 db: env.DB,
@@ -40588,6 +40750,45 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 preferred: String(row.lazada_link || '').trim(),
             })
 
+            // Bridge-fallback eligibility: only when the ORIGINAL post itself went out through
+            // the admin-owned CloakBrowser/Power Editor bridge (post_token_hint proves the
+            // bridge already has authorized access to this Page) AND the namespace is admin
+            // managed. The DB lookup is short-circuited so a plain stored-token post never
+            // pays for it. This is what lets page เฉียบ (post via Power Editor, comment via
+            // Facebook Lite) still get a Page comment when its stored token is invalidated.
+            const bridgeFallbackEligible =
+                isCloakBridgeCommentFallbackEligible(row.post_token_hint) &&
+                await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
+
+            if (!commentToken) {
+                // Missing/expired stored Facebook Lite token. If the page can still comment as
+                // the Page via the bridge, do that instead of leaving a posted-but-no-comment row.
+                if (bridgeFallbackEligible) {
+                    const bridged = await sendStoredCommentBridgeFallback({
+                        env,
+                        namespaceId: botId,
+                        pageId,
+                        storyId: targetId,
+                        shortShopeeLink,
+                        logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+                    })
+                    if (bridged.ok) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET status='success', comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=?, comment_profile_id=NULL, comment_profile_name=NULL WHERE id=?"
+                        ).bind(bridged.id || null, 'stored_token_missing_fallback_cloak_session_bridge', historyId).run().catch(() => { })
+                        continue
+                    }
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
+                    ).bind(`access_token_missing; cloak_fallback_failed:${bridged.error || 'bridge_failed'}`.substring(0, 200), commentTokenHint, historyId).run().catch(() => { })
+                    continue
+                }
+                await env.DB.prepare(
+                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
+                ).bind('access_token_missing', commentTokenHint, historyId).run().catch(() => { })
+                continue
+            }
+
             const commentResult = await postShopeeCommentWithFallback({
                 env,
                 namespaceId: botId,
@@ -40618,6 +40819,35 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 const usedToken = String(commentResult.commentToken || commentToken || '').trim()
                 const usedTokenHint = deriveCommentTokenHint(usedToken)
                 const usedProfile = await resolvePostHistoryProfileByToken(env, usedToken)
+                // Stored/Facebook Lite token comment failed. If it failed because the token is
+                // invalid/expired/missing AND the page is bridge-eligible, post the comment as
+                // the Page through the CloakBrowser bridge so we don't leave it uncommented.
+                if (bridgeFallbackEligible && isStoredCommentTokenAuthFailure(commentResult.error)) {
+                    const bridged = await sendStoredCommentBridgeFallback({
+                        env,
+                        namespaceId: botId,
+                        pageId,
+                        storyId: targetId,
+                        shortShopeeLink,
+                        logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+                    })
+                    if (bridged.ok) {
+                        await env.DB.prepare(
+                            "UPDATE post_history SET status='success', comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=?, comment_profile_id=NULL, comment_profile_name=NULL WHERE id=?"
+                        ).bind(bridged.id || null, 'stored_token_failed_fallback_cloak_session_bridge', historyId).run().catch(() => { })
+                        continue
+                    }
+                    await env.DB.prepare(
+                        "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
+                    ).bind(
+                        `${commentResult.error || 'comment_failed'}; cloak_fallback_failed:${bridged.error || 'bridge_failed'}`.substring(0, 200),
+                        usedTokenHint,
+                        usedProfile.profileId,
+                        usedProfile.profileName,
+                        historyId,
+                    ).run().catch(() => { })
+                    continue
+                }
                 await env.DB.prepare(
                     "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=?, comment_profile_id=?, comment_profile_name=? WHERE id=?"
                 ).bind(

@@ -9,6 +9,8 @@ import {
     isRetiredElectronBridge,
     normalizePageCommentTokenSource,
     defaultCommentSourceForRoute,
+    isCloakBridgeCommentFallbackEligible,
+    isStoredCommentTokenAuthFailure,
 } from '../src/posting-token-source'
 
 test('normalize: only two modes — stored_token and cloak_browser', () => {
@@ -124,6 +126,37 @@ test('comment source default mirrors the resolved posting route', () => {
     assert.equal(defaultCommentSourceForRoute('stored_token'), 'stored_token')
     assert.equal(defaultCommentSourceForRoute('cloak_organic_reel'), 'cloak_browser')
     assert.equal(defaultCommentSourceForRoute('cloak_onecard_bridge'), 'cloak_browser')
+})
+
+test('bridge-comment fallback eligibility: only session-bridge / ads-publish posts qualify', () => {
+    // The original post went out through the admin-owned CloakBrowser bridge → eligible.
+    assert.equal(isCloakBridgeCommentFallbackEligible('cloak_session_bridge'), true)
+    assert.equal(isCloakBridgeCommentFallbackEligible('ads_publish'), true)
+    // case-insensitive + trimmed
+    assert.equal(isCloakBridgeCommentFallbackEligible('  CLOAK_SESSION_BRIDGE '), true)
+    // A stored/manual-token post never proves bridge access → not eligible.
+    assert.equal(isCloakBridgeCommentFallbackEligible('stored_token'), false)
+    assert.equal(isCloakBridgeCommentFallbackEligible('EAAD6V...ZDZD'), false)
+    assert.equal(isCloakBridgeCommentFallbackEligible(undefined), false)
+    assert.equal(isCloakBridgeCommentFallbackEligible(null), false)
+    assert.equal(isCloakBridgeCommentFallbackEligible(''), false)
+})
+
+test('stored-comment token failure classifier: auth/session/missing errors trigger fallback', () => {
+    // The exact production signature from page เฉียบ row 32995.
+    assert.equal(isStoredCommentTokenAuthFailure('Error validating access token: The session has been invalidated...'), true)
+    assert.equal(isStoredCommentTokenAuthFailure('access_token_missing'), true)
+    assert.equal(isStoredCommentTokenAuthFailure('OAuthException: ...'), true)
+    assert.equal(isStoredCommentTokenAuthFailure('{"error":{"code":190,"message":"..."}}'), true)
+    assert.equal(isStoredCommentTokenAuthFailure('code: 190 invalid'), true)
+    assert.equal(isStoredCommentTokenAuthFailure('access token has expired'), true)
+    assert.equal(isStoredCommentTokenAuthFailure('Malformed access token'), true)
+    // Unrelated failures must NOT silently route to the bridge — operator keeps seeing them.
+    assert.equal(isStoredCommentTokenAuthFailure('missing_page_story_object_id'), false)
+    assert.equal(isStoredCommentTokenAuthFailure('shopee_shortlink_failed'), false)
+    assert.equal(isStoredCommentTokenAuthFailure('rate limit reached, code 4'), false)
+    assert.equal(isStoredCommentTokenAuthFailure(''), false)
+    assert.equal(isStoredCommentTokenAuthFailure(undefined), false)
 })
 
 test('module exposes only the two-mode source type (no third provider)', () => {

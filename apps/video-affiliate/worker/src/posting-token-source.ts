@@ -135,6 +135,43 @@ export function defaultCommentSourceForRoute(route: PostingRoute): PageCommentTo
     return route === 'stored_token' ? 'stored_token' : 'cloak_browser'
 }
 
+// ---- Stored/Facebook Lite comment → CloakBrowser bridge fallback ----------
+// A page can post via the CloakBrowser/Power Editor session bridge yet comment with a
+// stored Facebook Lite token (comment_token_source='stored_token'). When that stored token
+// is missing or invalidated, the deferred pending-comment backlog would otherwise leave a
+// "posted but no comment" row. These two pure predicates gate a narrow fallback: re-post the
+// SAME affiliate comment as the Page through the bridge /page-comment route — but ONLY when
+// the original post already went out through that admin-owned bridge.
+
+// Eligibility: the original post's `post_token_hint` proves the CloakBrowser bridge already
+// has authorized access to this Page. 'cloak_session_bridge' = organic Reel via /post;
+// 'ads_publish' = OneCard/create-ad via the same bridge. Any other hint (e.g. a stored-token
+// organic post) is NOT eligible — the bridge has no proven access to that Page, so we never
+// silently route a member/manual page onto the admin-owned bridge.
+export function isCloakBridgeCommentFallbackEligible(postTokenHint: unknown): boolean {
+    const hint = String(postTokenHint ?? '').trim().toLowerCase()
+    return hint === 'cloak_session_bridge' || hint === 'ads_publish'
+}
+
+// Classify a stored/Facebook Lite comment failure as a token auth/availability problem that
+// warrants the bridge fallback: a missing token, or a Graph API auth error (OAuthException /
+// code 190 / invalidated session / expired-or-malformed access token). Operates only on the
+// already-sanitized, redacted error strings the worker stores — never a raw token value.
+// Returns false for unrelated failures (e.g. a transient bridge/target error) so the operator's
+// stored-token selection still surfaces those errors instead of masking them with a fallback.
+export function isStoredCommentTokenAuthFailure(error: unknown): boolean {
+    const msg = String(error ?? '').toLowerCase()
+    if (!msg) return false
+    return (
+        msg.includes('access_token_missing') ||
+        msg.includes('session has been invalidated') ||
+        msg.includes('error validating access token') ||
+        msg.includes('oauthexception') ||
+        /(^|[^0-9])(?:code["']?\s*[:=]\s*)190(\D|$)/.test(msg) ||
+        (msg.includes('access token') && (msg.includes('invalid') || msg.includes('expire') || msg.includes('malformed')))
+    )
+}
+
 // Env subset the CloakBrowser Facebook posting bridge base URL is resolved from.
 export interface CloakFbBridgeEnv {
     // Primary: the non-Electron CloakBrowser Facebook posting bridge.
