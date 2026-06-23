@@ -160,3 +160,100 @@ test('BrowserSaving redaction: reason strips token-like substrings and caps leng
     assert.ok(/EAA\[A-Za-z0-9\]\{6,\}/.test(fn) || fn.includes('EAA'), 'must redact EAA… token-like substrings')
     assert.ok(fn.includes('.slice(0, 120)'), 'must cap the reason length')
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-success immediate comment drain (no longer cron-only).
+// A successful page post that leaves comment_status='pending' must trigger a
+// TARGETED drain of just-that-row shortly after the post is persisted, instead
+// of waiting minutes for the next cron scan. Cron stays the fallback. These
+// tests read the worker source (index.ts cannot be imported under node:test).
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('processPendingCommentBacklog accepts options (historyId/ignoreDueAt/limit)', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function processPendingCommentBacklog')
+    assert.notEqual(start, -1, 'processPendingCommentBacklog must exist')
+    const sig = src.slice(start, src.indexOf('Promise<void>', start))
+    assert.ok(/options\s*:\s*\{[^}]*historyId\?[^}]*ignoreDueAt\?[^}]*limit\?/.test(sig.replace(/\n/g, ' ')),
+        'must accept an options object with historyId/ignoreDueAt/limit')
+
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // Targeting a specific row pins LIMIT 1 and bypasses the due_at gate.
+    assert.ok(fn.includes('const targetHistoryId = Number(options.historyId || 0)'), 'must read options.historyId')
+    assert.ok(/ignoreDueAt\s*=\s*!!options\.ignoreDueAt \|\| targetHistoryId > 0/.test(fn),
+        'a concrete historyId must imply ignoreDueAt')
+    assert.ok(fn.includes('ph.id = ?'), 'must filter by ph.id when targeting a row')
+    // The due_at gate is only applied when NOT ignoring it (general cron scan).
+    assert.ok(/if \(!ignoreDueAt\)/.test(fn), 'due_at predicate must be conditional on !ignoreDueAt')
+    assert.ok(fn.includes("ph.comment_due_at IS NULL OR datetime(ph.comment_due_at) <= datetime('now')"),
+        'general scan must still respect comment_due_at')
+})
+
+test('general backlog scan prioritizes fresh posts, not oldest-first only', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function processPendingCommentBacklog')
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // The old unconditional "ORDER BY ... posted_at ASC, ph.id ASC" for the general scan must be
+    // gone — that let months-old backlog (LIMIT 20) starve fresh deploy-boundary posts.
+    assert.ok(!/ORDER BY datetime\(ph\.posted_at\) ASC, ph\.id ASC\b/.test(fn),
+        'general scan must NOT order purely oldest-first anymore')
+    // Recent-priority CASE puts last-6h posts first, then newest-first.
+    assert.ok(/CASE WHEN datetime\(ph\.posted_at\) >= datetime\('now', '-6 hours'\) THEN 0 ELSE 1 END ASC/.test(fn),
+        'general scan must put recently-posted rows first via a CASE bucket')
+    assert.ok(/datetime\(ph\.posted_at\) DESC/.test(fn), 'general scan must then order newest-first')
+    // The targeted (single-row) path is unaffected — ordering is moot there.
+    assert.ok(/targetHistoryId > 0\s*\?\s*'datetime\(ph\.posted_at\) ASC, ph\.id ASC'/.test(fn),
+        'targeted historyId path keeps a stable single-row order')
+})
+
+test('runPendingCommentBacklogSoon waits the fixed delay then targets the row ignoring due_at', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('function runPendingCommentBacklogSoon')
+    assert.notEqual(start, -1, 'runPendingCommentBacklogSoon helper must exist')
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // Bounded fixed delay (FB attachment readiness), never the random 1-59s + cron-only path.
+    assert.ok(fn.includes('await waitMs(FACEBOOK_PAGE_COMMENT_DELAY_MS)'), 'must use the fixed bounded delay')
+    assert.ok(!/getRandomCommentDelay/.test(fn), 'must NOT use the random comment delay')
+    // Targeted drain of the exact row, ignoring due_at, limit 1.
+    assert.ok(/processPendingCommentBacklog\(env,\s*\{[\s\S]*historyId:\s*targetHistoryId[\s\S]*ignoreDueAt:\s*true[\s\S]*limit:\s*1/.test(fn),
+        'must call processPendingCommentBacklog with { historyId, ignoreDueAt: true, limit: 1 }')
+    // Runs via waitUntil when an ExecutionContext is available (non-blocking), errors swallowed.
+    assert.ok(fn.includes('enqueueBackgroundTask(ctx'), 'must dispatch via the background task helper (waitUntil-aware)')
+    assert.ok(/\.catch\(/.test(fn), 'targeted drain errors must be caught/sanitized (comment failure non-fatal)')
+})
+
+test('every post-success pending path triggers the targeted drain', () => {
+    const src = readVideoAffiliateIndex()
+    // Force-post (regular reel, ads post-first, ads publish, cloak bridge), retry-post, and the
+    // matching cron branches each call runPendingCommentBacklogSoon when they leave pending.
+    const calls = (src.match(/runPendingCommentBacklogSoon\(/g) || []).length
+    assert.ok(calls >= 7, `expected the targeted drain to be wired at every pending post-success site (found ${calls})`)
+    // HTTP routes pass the request ExecutionContext; cron passes the scheduled ctx.
+    assert.ok(src.includes("runPendingCommentBacklogSoon(env, retryHistoryId, 'RETRY-POST IMMEDIATE-COMMENT', c.executionCtx)"),
+        'retry-post must trigger the targeted drain')
+    assert.ok(src.includes("runPendingCommentBacklogSoon(env, forceHistoryId, 'FORCE-POST IMMEDIATE-COMMENT', c.executionCtx)"),
+        'force-post regular reel must trigger the targeted drain')
+    assert.ok(/runPendingCommentBacklogSoon\(env, Number\(cronHistoryId \|\| 0\), `CRON [^`]*IMMEDIATE-COMMENT`, ctx\)/.test(src),
+        'cron post-success branches must trigger the targeted drain with the scheduled ctx')
+})
+
+test('generic cron comment drain still runs without ignoreDueAt (cron stays the fallback)', () => {
+    const src = readVideoAffiliateIndex()
+    // The scheduled handler drains the general backlog with NO options → due_at is respected.
+    assert.ok(/runComments:\s*\(\)\s*=>\s*_ctx\.waitUntil\(processPendingCommentBacklog\(env\)\.catch/.test(src),
+        'the every-minute cron must call processPendingCommentBacklog(env) with no options')
+})
+
+test('stuck comment_status=processing rows are reset by the general cron scan', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function processPendingCommentBacklog')
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // Backstop only runs for the general scan (no concrete historyId) so an in-flight targeted
+    // drain is never disturbed, and only resets rows with no FRESH comment-job lock.
+    assert.ok(/if \(targetHistoryId <= 0\)/.test(fn), 'backstop must be gated to the general cron scan')
+    assert.ok(fn.includes("comment_status='processing'"), 'backstop must target stuck processing rows')
+    assert.ok(/SET comment_status='pending'/.test(fn), 'backstop must reset stuck rows to pending')
+    assert.ok(fn.includes("'video::' || post_history.bot_id || '::comment:' || post_history.id"),
+        'backstop must key off the comment-job posting lock')
+    assert.ok(/datetime\('now', '-15 minutes'\)/.test(fn), 'backstop must only reset rows with no fresh (<15m) lock')
+})

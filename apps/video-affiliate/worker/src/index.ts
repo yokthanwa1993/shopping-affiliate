@@ -38282,6 +38282,9 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             commentShopeeLink || normalizedShopeeLink || null,
             retryHistoryId,
         ).run()
+        if (commentStatus === 'pending') {
+            runPendingCommentBacklogSoon(env, retryHistoryId, 'RETRY-POST IMMEDIATE-COMMENT', c.executionCtx)
+        }
         await markNamespaceVideoPosted(env.DB, botId, selectedVideoId, new Date().toISOString())
         await recordPagePostedVideoGuard(env.DB, {
             namespaceId: botId,
@@ -39681,6 +39684,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                         forceHistoryId,
                     ).run().catch(() => { })
                 }
+                if (pf.ok && pfCommentStatus === 'pending') {
+                    runPendingCommentBacklogSoon(env, forceHistoryId, 'FORCE-POST POST-FIRST IMMEDIATE-COMMENT', c.executionCtx)
+                }
                 await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
                 await recordPagePostedVideoGuard(env.DB, {
                     namespaceId: botId, pageId: page.id, videoId: unpostedId,
@@ -39851,6 +39857,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                     forceHistoryId,
                 ).run().catch(() => { })
             }
+            if (adsCommentStatus === 'pending') {
+                runPendingCommentBacklogSoon(env, forceHistoryId, 'FORCE-POST ADS IMMEDIATE-COMMENT', c.executionCtx)
+            }
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
             await recordPagePostedVideoGuard(env.DB, {
                 namespaceId: botId,
@@ -39994,6 +40003,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 await env.DB.prepare(
                     "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, error_message=NULL WHERE id=? AND status='posting'"
                 ).bind(confirmedPostId, fbReelUrl, cloakCommentStatus, cloakCommentFbId, cloakCommentError, cloakCommentTokenHint, cloakCommentDelaySeconds, cloakCommentDueAt, cloakCommentShopeeLink || normalizedShopeeLink || null, forceHistoryId).run().catch(() => { })
+            }
+            if (cloakCommentStatus === 'pending') {
+                runPendingCommentBacklogSoon(env, forceHistoryId, 'FORCE-POST CLOAK IMMEDIATE-COMMENT', c.executionCtx)
             }
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
             await recordPagePostedVideoGuard(env.DB, {
@@ -40207,6 +40219,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 commentShopeeLink || normalizedShopeeLink || null,
                 forceHistoryId,
             ).run()
+        }
+        if (commentStatus === 'pending') {
+            runPendingCommentBacklogSoon(env, forceHistoryId, 'FORCE-POST IMMEDIATE-COMMENT', c.executionCtx)
         }
         await markNamespaceVideoPosted(env.DB, botId, unpostedId, new Date().toISOString())
         await recordPagePostedVideoGuard(env.DB, {
@@ -40917,7 +40932,10 @@ function enqueueBackgroundTask(
     }
 }
 
-async function processPendingCommentBacklog(env: Env): Promise<void> {
+async function processPendingCommentBacklog(
+    env: Env,
+    options: { historyId?: number; ignoreDueAt?: boolean; limit?: number } = {},
+): Promise<void> {
     const pendingList = await env.BUCKET.list({ prefix: '_pending_comments/' })
 
     for (const obj of pendingList.objects) {
@@ -40926,6 +40944,63 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
     }
 
     await ensurePostHistoryTraceColumns(env.DB)
+
+    // Targeted drain (post-success path): when a concrete historyId is given, process ONLY
+    // that just-created row, ignoring comment_due_at so it never has to wait for the next
+    // cron scan. The general cron scan keeps respecting comment_due_at and its 20-row cap.
+    const targetHistoryId = Number(options.historyId || 0)
+    const ignoreDueAt = !!options.ignoreDueAt || targetHistoryId > 0
+    const scanLimit = targetHistoryId > 0
+        ? 1
+        : Math.max(1, Math.min(100, Number(options.limit || 20)))
+
+    // Backstop (general cron scan only): recover rows stranded in comment_status='processing'
+    // — a targeted drain that crashed after the claim but before writing a terminal state.
+    // Reset them to 'pending' so the scan below retries them, but ONLY when no fresh
+    // (<15 min) comment-job posting lock is held for that row, so a drain currently in flight
+    // is never disturbed. Failure-tolerant: a backstop error must not block the scan.
+    if (targetHistoryId <= 0) {
+        try {
+            await ensurePostingLocksTable(env.DB)
+            await env.DB.prepare(
+                `UPDATE post_history
+                 SET comment_status='pending', comment_error=NULL
+                 WHERE comment_status='processing'
+                   AND NOT EXISTS (
+                        SELECT 1 FROM posting_locks pl
+                        WHERE pl.lock_key = 'video::' || post_history.bot_id || '::comment:' || post_history.id
+                          AND datetime(pl.created_at) > datetime('now', '-15 minutes')
+                   )`
+            ).run()
+        } catch (error) {
+            console.error(`[CRON-COMMENTS] stuck-processing backstop failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+    }
+
+    const whereClauses = [
+        "ph.comment_status = 'pending'",
+        "TRIM(COALESCE(ph.fb_post_id, '')) <> ''",
+    ]
+    const whereBindings: unknown[] = []
+    if (targetHistoryId > 0) {
+        whereClauses.push('ph.id = ?')
+        whereBindings.push(targetHistoryId)
+    }
+    if (!ignoreDueAt) {
+        whereClauses.push("(ph.comment_due_at IS NULL OR datetime(ph.comment_due_at) <= datetime('now'))")
+    }
+
+    // Order: a targeted drain has a single row, so ordering is moot. The general cron fallback
+    // must NOT be oldest-first only — that lets a months-old backlog (LIMIT 20) starve fresh
+    // posts created at a deploy boundary whose targeted drain missed/failed. Prioritize rows
+    // posted in the last 6 hours, then newest-first, so a fresh stuck post is always serviced
+    // ahead of stale backlog while old rows still drain over subsequent ticks.
+    const orderBy = targetHistoryId > 0
+        ? 'datetime(ph.posted_at) ASC, ph.id ASC'
+        : `CASE WHEN datetime(ph.posted_at) >= datetime('now', '-6 hours') THEN 0 ELSE 1 END ASC,
+                  datetime(ph.posted_at) DESC,
+                  ph.id DESC`
+
     const pendingRows = await env.DB.prepare(
         `SELECT ph.id,
                 ph.bot_id,
@@ -40941,15 +41016,10 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 p.access_token
          FROM post_history ph
          JOIN pages p ON p.id = ph.page_id
-         WHERE ph.comment_status = 'pending'
-           AND TRIM(COALESCE(ph.fb_post_id, '')) <> ''
-           AND (
-                ph.comment_due_at IS NULL
-                OR datetime(ph.comment_due_at) <= datetime('now')
-           )
-         ORDER BY datetime(ph.posted_at) ASC, ph.id ASC
-         LIMIT 20`
-    ).all() as {
+         WHERE ${whereClauses.join('\n           AND ')}
+         ORDER BY ${orderBy}
+         LIMIT ${scanLimit}`
+    ).bind(...whereBindings).all() as {
         results?: Array<{
             id?: number
             bot_id?: string
@@ -41286,6 +41356,34 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
             await releasePostingLock(env.DB, commentJobLockKey).catch(() => { })
         }
     }
+}
+
+// Post-success comment trigger: after a route/cron post persists comment_status='pending'
+// for a concrete post_history row, drain THAT row shortly after instead of waiting for the
+// next cron scan. The short fixed delay reuses FACEBOOK_PAGE_COMMENT_DELAY_MS so the page
+// post/product card is attached and commentable. Comment failure stays non-fatal (the post
+// already succeeded), errors are swallowed/sanitized, and cron remains the fallback.
+//
+// When an ExecutionContext is available (HTTP routes, cron) the drain runs in waitUntil so it
+// never blocks the response; otherwise it runs detached. Either way it never throws.
+function runPendingCommentBacklogSoon(
+    env: Env,
+    historyId: number,
+    logPrefix: string,
+    ctx?: ExecutionContext,
+): void {
+    const targetHistoryId = Number(historyId || 0)
+    if (targetHistoryId <= 0) return
+    enqueueBackgroundTask(ctx, logPrefix, async () => {
+        await waitMs(FACEBOOK_PAGE_COMMENT_DELAY_MS)
+        await processPendingCommentBacklog(env, {
+            historyId: targetHistoryId,
+            ignoreDueAt: true,
+            limit: 1,
+        }).catch((error) => {
+            console.error(`[${logPrefix}] targeted comment drain failed for history ${targetHistoryId}: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    })
 }
 
 async function ensureCronRuntimeStateTable(db: D1Database): Promise<void> {
@@ -42223,6 +42321,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                             cronHistoryId,
                         ).run().catch(() => { })
                     }
+                    if (pf.ok && pf.commentStatus === 'pending') {
+                        runPendingCommentBacklogSoon(env, Number(cronHistoryId || 0), `CRON ${page.name} POST-FIRST IMMEDIATE-COMMENT`, ctx)
+                    }
                     await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
                     markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, nowISO)
                     await recordPagePostedVideoGuard(env.DB, {
@@ -42347,6 +42448,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                         nowISO,
                         cronHistoryId,
                     ).run().catch(() => { })
+                }
+                if (cronAdsCommentStatus === 'pending') {
+                    runPendingCommentBacklogSoon(env, Number(cronHistoryId || 0), `CRON ${page.name} ADS IMMEDIATE-COMMENT`, ctx)
                 }
                 await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
                 markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, nowISO)
@@ -42491,6 +42595,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     await env.DB.prepare(
                         "UPDATE post_history SET status='success', fb_post_id=?, fb_reel_url=?, post_token_hint='cloak_session_bridge', comment_status=?, comment_fb_id=?, comment_error=?, comment_token_hint=?, comment_delay_seconds=?, comment_due_at=?, shopee_link=?, posted_at=?, error_message=NULL WHERE id=? AND status='posting'"
                     ).bind(confirmedPostId, fbReelUrl, cloakCommentStatus, cloakCommentFbId, cloakCommentError, cloakCommentTokenHint, cloakCommentDelaySeconds, cloakCommentDueAt, cloakCommentShopeeLink || normalizedShopeeLink || null, nowISO, cronHistoryId).run().catch(() => { })
+                }
+                if (cloakCommentStatus === 'pending') {
+                    runPendingCommentBacklogSoon(env, Number(cronHistoryId || 0), `CRON ${page.name} CLOAK IMMEDIATE-COMMENT`, ctx)
                 }
                 await markNamespaceVideoPosted(env.DB, botId, unpostedId, nowISO)
                 markCachedNamespaceVideoPosted(galleryVideosByNamespace, botId, unpostedId, nowISO)
@@ -42702,6 +42809,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     commentFbId,
                     cronHistoryId,
                 ).run()
+            }
+            if (commentStatus === 'pending') {
+                runPendingCommentBacklogSoon(env, Number(cronHistoryId || 0), `CRON ${page.name} IMMEDIATE-COMMENT`, ctx)
             }
             const postedAtIso = new Date().toISOString()
             await markNamespaceVideoPosted(env.DB, botId, unpostedId, postedAtIso)
