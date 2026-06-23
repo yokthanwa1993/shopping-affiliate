@@ -181,33 +181,9 @@ export function CreateAdsPage() {
   return (
     // Master (no page selected) breaks out of the shell's p-5 to become
     // full-bleed: the page-list card fills the whole content rect.
-    <div className="-m-5 flex min-h-full flex-col gap-4 p-4">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">สร้างแอด</h1>
-        <p className="text-sm text-muted-foreground">
-          เลือกเพจ แล้วใช้โพสต์ยอดดีเป็นสัญญาณเพื่อสร้างโพสต์ใหม่และแอดใหม่
-        </p>
-      </div>
-
-      {/* Separation guarantee — explicit, always visible on the master view. */}
-      <div className="flex items-start gap-2 rounded-xl border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
-        <Info className="mt-0.5 h-4 w-4 shrink-0" />
-        <div>
-          <p className="font-semibold">โพสต์เก่าเป็นต้นแบบ/สัญญาณ ไม่ใช่พื้นผิวแอดจริง</p>
-          <p className="text-sky-800">
-            ระบบจะสร้างโพสต์เพจใหม่ด้วยวิดีโอ/คอนเทนต์เดียวกันจากระบบ แล้วสร้างแอดจากโพสต์ใหม่นั้น
-          </p>
-        </div>
-      </div>
-
+    <div className="-m-5 flex min-h-full flex-col p-4">
       {/* MASTER — page list first. No Create Ads detail renders until a page is chosen. */}
-      <section className="flex min-h-0 flex-1 flex-col gap-3">
-        <p className="flex items-baseline gap-2 text-xs text-muted-foreground">
-          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
-            1
-          </span>
-          แตะเพจที่ต้องการเพื่อเปิดหน้าตั้งค่าแอดของเพจนั้น
-        </p>
+      <section className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0 flex-1">
           <PagePicker
             pages={pages}
