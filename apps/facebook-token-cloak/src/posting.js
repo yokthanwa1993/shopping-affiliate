@@ -555,16 +555,16 @@ async function publishPageVideoPost(fetchImpl, params = {}) {
   };
 }
 
-// GET /pages — list the pages the session administers, id/name/category only. Page access
-// tokens are stripped (sanitizePages with includeToken=false). Shape: { data: [...] } to
-// match the Worker's `pagesData.data` authorization check.
-async function listPagesPublic(fetchImpl, userToken) {
+// GET /pages — list the pages the session administers, id/name/category only by default.
+// Page access tokens are stripped unless an explicitly local-only caller asks for includeToken.
+// Shape: { data: [...] } to match the Worker's `pagesData.data` authorization check.
+async function listPagesPublic(fetchImpl, userToken, includeToken = false) {
   const url = `${GRAPH}/me/accounts?fields=access_token,id,name,category&limit=200&access_token=${encodeURIComponent(userToken)}`;
   const { data } = await gJson(fetchImpl, url);
   if (data && data.error) {
     return { data: [], error: (data.error && data.error.message) || 'me_accounts_failed' };
   }
-  const pages = sanitizePages(data.data || [], false); // false => never includes access_token
+  const pages = sanitizePages(data.data || [], !!includeToken);
   return { data: pages, pagesCount: pages.length };
 }
 

@@ -190,6 +190,11 @@ import {
     restrictCloakToAdminNamespace,
     isCloakBridgeCommentFallbackEligible,
     isStoredCommentTokenAuthFailure,
+    shouldAttemptFacebookLiteRefresh,
+    buildFacebookLiteRefreshRequestBody,
+    parseFacebookLiteRefreshResponse,
+    type FacebookLiteRefreshOutcome,
+    type FacebookLiteRefreshRequestBody,
 } from './posting-token-source'
 import {
     PAGE_VIDEO_ASSET_WINNERS_INDEX_SQL,
@@ -1391,7 +1396,12 @@ app.post('/api/pages/tag-sync', async (c) => {
 })
 
 app.post('/api/pages/profile-sync', async (c) => {
-    return c.json({ error: 'direct_page_management_only' }, 410)
+    // Direct/client page management stays disabled (410). ONLY the secret-authed
+    // server-to-server BrowserSaving push is honored: this is how a freshly re-minted
+    // Facebook Lite token reaches the namespace token pool, which is the root fix for the
+    // permanent "token expired" state (a stored token is never terminal because stored
+    // credentials can always mint a new one). The push originates from BrowserSaving's
+    // /api/fb-lite/refresh-comment-token route. The legacy owner-session branch is removed.
     let body: any = {}
     try {
         body = await c.req.json()
@@ -1401,19 +1411,15 @@ app.post('/api/pages/profile-sync', async (c) => {
 
     const configuredSecret = String(c.env.TAG_SYNC_PUSH_SECRET || '').trim()
     const providedSecret = String(c.req.header('x-tag-sync-secret') || '').trim()
+    if (!configuredSecret || providedSecret !== configuredSecret) {
+        return c.json({ error: 'direct_page_management_only' }, 410)
+    }
 
-    let namespaceId = ''
-    if (configuredSecret && providedSecret === configuredSecret) {
-        namespaceId = String(body?.namespace_id || body?.namespaceId || c.req.header('x-bot-id') || '').trim()
-        const email = String(body?.email || '').trim().toLowerCase()
-        if (!namespaceId && email) {
-            const namespaces = await resolveNamespacesForTagSync(c.env.DB, { email })
-            namespaceId = String(namespaces[0] || '').trim()
-        }
-    } else {
-        const owner = await requireOwnerSession(c)
-        if (!owner.ok) return owner.response
-        namespaceId = String(c.get('botId') || '').trim()
+    let namespaceId = String(body?.namespace_id || body?.namespaceId || c.req.header('x-bot-id') || '').trim()
+    const email = String(body?.email || '').trim().toLowerCase()
+    if (!namespaceId && email) {
+        const namespaces = await resolveNamespacesForTagSync(c.env.DB, { email })
+        namespaceId = String(namespaces[0] || '').trim()
     }
 
     const pageId = String(body?.page_id || body?.pageId || '').trim()
@@ -28937,6 +28943,248 @@ async function refreshPagePostTokensFromBrowserSaving(params: {
     }
 }
 
+// Resolve the BrowserSaving profile ids that can re-mint a fresh Facebook Lite token for a
+// page. Prefer the operator-linked profiles (pages_linked_tagged_profiles_v1); fall back to
+// the tag-derived profiles scoped to the page. Returns a short, de-duplicated id list.
+// Token-free — only profile ids leave this function.
+async function resolveFacebookLiteRefreshProfileIdsForPage(params: {
+    env: Env
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    pageName: string
+}): Promise<string[]> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    if (!namespaceId || !pageId) return []
+
+    const ids: string[] = []
+    let linkedProfiles: NamespacePageLinkedTaggedProfiles = {}
+    try {
+        linkedProfiles = await getNamespaceLinkedTaggedProfiles(params.db, namespaceId)
+        if (hasLinkedTaggedProfilesEntryForPage(linkedProfiles, pageId)) {
+            for (const id of getLinkedTaggedProfileIdsForPage(linkedProfiles, pageId)) {
+                const v = String(id || '').trim()
+                if (v) ids.push(v)
+            }
+        }
+    } catch { /* fall through to tag-derived resolution */ }
+
+    if (ids.length === 0) {
+        try {
+            const profiles = await fetchBrowserSavingProfilesForNamespace(params.env, params.db, namespaceId)
+            const hiddenProfiles = await getNamespaceHiddenTaggedProfiles(params.db, namespaceId)
+            const scoped = filterProfilesForTaggedPage({
+                profiles,
+                pageId,
+                pageName: String(params.pageName || '').trim(),
+                hiddenProfiles,
+                linkedProfiles,
+            })
+            for (const profile of scoped) {
+                const v = String(profile.id || '').trim()
+                if (v) ids.push(v)
+            }
+        } catch { /* no profiles resolvable for this page */ }
+    }
+
+    return uniqueTokens(ids)
+}
+
+// The namespace operator email(s) — used to scope BrowserSaving's server-side auto-discovery
+// to this tenant's stored Account Manager profiles. Empty when unknown (BrowserSaving then
+// searches all credentialed profiles, bounded; page ownership is itself the authority).
+async function resolveNamespaceOwnerEmails(db: D1Database, namespaceId: string): Promise<string[]> {
+    const ns = String(namespaceId || '').trim()
+    if (!ns) return []
+    try {
+        const rows = await db.prepare(
+            "SELECT DISTINCT lower(trim(email)) AS email FROM users WHERE namespace_id = ? AND TRIM(COALESCE(email,'')) <> ''"
+        ).bind(ns).all() as { results?: Array<{ email?: string }> }
+        return uniqueTokens((rows.results || [])
+            .map((r) => String(r?.email || '').trim().toLowerCase())
+            .filter((e) => e.includes('@')))
+    } catch {
+        return []
+    }
+}
+
+// POST helper to BrowserSaving's FB Lite refresh route; tries each base, parses the token-free
+// outcome. Returns null only when every base threw (transport error).
+async function postFacebookLiteRefresh(
+    env: Env,
+    bases: string[],
+    requestBody: FacebookLiteRefreshRequestBody,
+    onTransportError: (reason: string) => void,
+): Promise<FacebookLiteRefreshOutcome | null> {
+    const body = JSON.stringify(requestBody)
+    let outcome: FacebookLiteRefreshOutcome | null = null
+    for (const base of bases) {
+        try {
+            const response = await fetchFromBrowserSavingBase(env, base, '/api/fb-lite/refresh-comment-token', {
+                method: 'POST',
+                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                body,
+            })
+            const data = await response.json().catch(() => ({}))
+            outcome = parseFacebookLiteRefreshResponse(response.ok, data)
+            // Stop probing other bases on success or any definite (non-5xx) answer.
+            if (outcome.ok || response.status < 500) break
+        } catch (e) {
+            onTransportError(e instanceof Error ? e.message : String(e))
+        }
+    }
+    return outcome
+}
+
+// On-demand Facebook Lite (FB GET Token) refresh for a page's stored comment token. NO manual
+// linking/tagging is required: BrowserSaving re-mints a fresh page token from the stored
+// Account Manager credentials (uid/password/TOTP/datr) and pushes it into this namespace's
+// token pool via profile-sync. We try operator-LINKED profiles first (optimization), then ask
+// BrowserSaving to AUTO-DISCOVER the profile that owns/admins the page (page_id only, scoped by
+// the namespace owner email). On return the pool holds the fresh token, so the caller re-reads
+// it (resolveFacebookCommentToken) and retries. Best-effort: any failure returns
+// refreshed:false and the caller keeps its bridge-fallback / fail behavior. Token-free — the
+// Worker never logs a token; BrowserSaving returns only booleans + redacted hints + ids.
+async function refreshFacebookLiteCommentTokenForPage(params: {
+    env: Env
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    pageName: string
+    candidateProfileIds?: string[]
+    candidateLoginIds?: string[]
+    logPrefix: string
+}): Promise<{ refreshed: boolean; synced: boolean; profileCount: number; reason: string }> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    if (!namespaceId || !pageId) {
+        return { refreshed: false, synced: false, profileCount: 0, reason: 'invalid_namespace_or_page' }
+    }
+
+    const bases = buildBrowserSavingProfileBaseUrls(params.env)
+    if (bases.length === 0) {
+        return { refreshed: false, synced: false, profileCount: 0, reason: 'browsersaving_not_configured' }
+    }
+
+    const explicitCandidateIds = normalizeHiddenTaggedProfileIds(params.candidateProfileIds || [])
+    const explicitCandidateLoginIds = uniqueTokens((params.candidateLoginIds || []).map((v) => String(v || '').trim()).filter(Boolean))
+    const linkedIds = normalizeHiddenTaggedProfileIds([
+        ...explicitCandidateIds,
+        ...await resolveFacebookLiteRefreshProfileIdsForPage({
+            env: params.env,
+            db: params.db,
+            namespaceId,
+            pageId,
+            pageName: params.pageName,
+        }),
+    ])
+    const ownerEmails = await resolveNamespaceOwnerEmails(params.db, namespaceId)
+
+    let refreshed = false
+    let synced = false
+    let lastReason = 'refresh_failed'
+    const onTransportError = (reason: string) => { lastReason = reason }
+
+    const applyOutcome = (outcome: FacebookLiteRefreshOutcome | null): boolean => {
+        if (outcome?.refreshed) {
+            refreshed = true
+            lastReason = outcome.reason
+            if (outcome.synced) { synced = true; return true }
+        } else if (outcome) {
+            lastReason = outcome.reason
+        }
+        return false
+    }
+
+    // 1) Operator-linked profiles first (fast path when a page is explicitly linked).
+    for (const profileId of linkedIds) {
+        const outcome = await postFacebookLiteRefresh(
+            params.env, bases,
+            buildFacebookLiteRefreshRequestBody({ profileId, pageId, pageName: params.pageName, namespaceId, ownerEmails, candidateLoginIds: explicitCandidateLoginIds }),
+            onTransportError,
+        )
+        if (applyOutcome(outcome)) break // one synced profile is enough
+    }
+
+    // 2) Auto-discover by page when no linked profile synchronized a fresh token. This is the
+    // key behavior: a credentialed Account Manager profile that owns the page is found and used
+    // even though it was never manually linked/tagged ("no_linked_profile" is NOT terminal).
+    if (!synced) {
+        const outcome = await postFacebookLiteRefresh(
+            params.env, bases,
+            buildFacebookLiteRefreshRequestBody({ pageId, pageName: params.pageName, namespaceId, ownerEmails, candidateProfileIds: linkedIds, candidateLoginIds: explicitCandidateLoginIds }),
+            onTransportError,
+        )
+        applyOutcome(outcome)
+    }
+
+    console.log(`[${params.logPrefix}] fb-lite refresh ns=${namespaceId} page=${pageId} linked=${linkedIds.length} owners=${ownerEmails.length} refreshed=${refreshed} synced=${synced} reason=${lastReason}`)
+    return { refreshed, synced, profileCount: linkedIds.length, reason: lastReason }
+}
+
+// Read-only probe (no mint) for the dry-run maintenance path: ask BrowserSaving whether a
+// stored Account Manager profile owns/admins the page and could be refreshed. Token-free.
+async function probeFacebookLiteProfilesForPage(params: {
+    env: Env
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    pageName: string
+    candidateProfileIds?: string[]
+    candidateLoginIds?: string[]
+}): Promise<{ ok: boolean; wouldRefresh: boolean; profileFound: boolean; credentialedCount: number; linkedCount: number; reason: string }> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    const pageId = String(params.pageId || '').trim()
+    const explicitCandidateIds = normalizeHiddenTaggedProfileIds(params.candidateProfileIds || [])
+    const explicitCandidateLoginIds = uniqueTokens((params.candidateLoginIds || []).map((v) => String(v || '').trim()).filter(Boolean))
+    const linkedIds = normalizeHiddenTaggedProfileIds([
+        ...explicitCandidateIds,
+        ...await resolveFacebookLiteRefreshProfileIdsForPage({
+            env: params.env,
+            db: params.db,
+            namespaceId,
+            pageId,
+            pageName: params.pageName,
+        }),
+    ])
+    const ownerEmails = await resolveNamespaceOwnerEmails(params.db, namespaceId)
+    const bases = buildBrowserSavingProfileBaseUrls(params.env)
+    if (bases.length === 0) {
+        return { ok: false, wouldRefresh: linkedIds.length > 0, profileFound: false, credentialedCount: 0, linkedCount: linkedIds.length, reason: 'browsersaving_not_configured' }
+    }
+    const body = JSON.stringify({
+        page_id: pageId,
+        namespace_id: namespaceId,
+        page_name: params.pageName,
+        owner_emails: ownerEmails,
+        candidate_profile_ids: linkedIds,
+        candidate_login_ids: explicitCandidateLoginIds,
+    })
+    for (const base of bases) {
+        try {
+            const response = await fetchFromBrowserSavingBase(params.env, base, '/api/fb-lite/profiles-for-page', {
+                method: 'POST',
+                headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+                body,
+            })
+            const data = await response.json().catch(() => ({})) as Record<string, unknown>
+            if (response.ok && data?.ok === true) {
+                return {
+                    ok: true,
+                    wouldRefresh: data.would_refresh === true,
+                    profileFound: data.profile_found === true,
+                    credentialedCount: Number(data.credentialed_count || 0),
+                    linkedCount: linkedIds.length,
+                    reason: String(data.via || (data.profile_found ? 'owner_found' : '')).slice(0, 120),
+                }
+            }
+            if (response.status < 500) break
+        } catch { /* try next base */ }
+    }
+    return { ok: false, wouldRefresh: linkedIds.length > 0, profileFound: false, credentialedCount: 0, linkedCount: linkedIds.length, reason: 'probe_failed' }
+}
+
 async function initReelUploadWithPostingTokenAutoRecover(params: {
     env: Env
     db: D1Database
@@ -29864,6 +30112,8 @@ function buildBrowserSavingProfileBaseUrls(env: Env): string[] {
         hasBrowserSavingServiceBinding(env) ? BROWSERSAVING_SERVICE_BASE : '',
         DEFAULT_BROWSERSAVING_WORKER_URL,
         String(env.BROWSERSAVING_WORKER_URL || '').trim(),
+        String(env.BROWSERSAVING_API_URL || '').trim(),
+        DEFAULT_BROWSERSAVING_API_URL,
     ]
 
     const out: string[] = []
@@ -38243,6 +38493,88 @@ app.get('/api/pages/:id/history', async (c) => {
 // settings/history routes — NOT an admin endpoint. Only rows that the backlog fallback could
 // actually fix are touched: post went out via the admin-owned bridge (post_token_hint eligible)
 // and the comment failed on a token auth/availability error. dry_run defaults true.
+// Manual/maintenance trigger for the Facebook Lite (FB GET Token) refresh. Authenticated +
+// namespace-scoped + dry-run-safe (dry_run defaults TRUE). Re-mints a fresh page comment
+// token from the page's stored BrowserSaving credentials and syncs it into the namespace
+// pool. Returns ONLY booleans + counts + a redacted reason hint — never a token. Use this to
+// repair a page stuck behind an invalidated Facebook Lite token without waiting for the cron.
+app.post('/api/pages/:id/refresh-comment-token', async (c) => {
+    const ownerCheck = await requireAuthSession(c)
+    if (!ownerCheck.ok) return ownerCheck.response
+
+    const pageId = String(c.req.param('id') || '').trim()
+    const namespaceId = String(c.get('botId') || '').trim()
+    if (!pageId) return c.json({ error: 'Page ID is required' }, 400)
+    if (!namespaceId) return c.json({ error: 'Unauthorized' }, 401)
+
+    const page = await c.env.DB.prepare(
+        'SELECT id, name FROM pages WHERE id = ? AND bot_id = ?'
+    ).bind(pageId, namespaceId).first() as { id?: string; name?: string } | null
+    if (!page?.id) return c.json({ error: 'Page not found' }, 404)
+    const pageName = String(page.name || '').trim()
+
+    const body = await c.req.json().catch(() => ({})) as { dry_run?: unknown; dryRun?: unknown; candidate_login_ids?: unknown; candidateLoginIds?: unknown }
+    // dry_run defaults TRUE — only an explicit false performs the live refresh + sync.
+    const dryRunRaw = body.dry_run ?? body.dryRun ?? c.req.query('dry_run')
+    const dryRun = !(dryRunRaw === false || String(dryRunRaw ?? '').trim().toLowerCase() === 'false')
+    const rawCandidateLogins = body.candidate_login_ids ?? body.candidateLoginIds
+    const candidateLoginIds = Array.isArray(rawCandidateLogins)
+        ? rawCandidateLogins.map((v) => String(v || '').trim()).filter(Boolean)
+        : String(rawCandidateLogins || '').split(',').map((v) => v.trim()).filter(Boolean)
+
+    try {
+        if (dryRun) {
+            // No mint: ask BrowserSaving whether a stored Account Manager profile owns/admins
+            // the page (auto-discovery), so a missing manual link is NOT reported as terminal.
+            const probe = await probeFacebookLiteProfilesForPage({
+                env: c.env,
+                db: c.env.DB,
+                namespaceId,
+                pageId,
+                pageName,
+                candidateLoginIds,
+            })
+            return c.json({
+                ok: true,
+                dry_run: true,
+                page_id: pageId,
+                would_refresh: probe.wouldRefresh,
+                profile_found: probe.profileFound,
+                linked_profile_count: probe.linkedCount,
+                credentialed_count: probe.credentialedCount,
+                reason: probe.reason || (probe.wouldRefresh ? 'refresh_available' : 'no_credentialed_profile'),
+            })
+        }
+
+        const result = await refreshFacebookLiteCommentTokenForPage({
+            env: c.env,
+            db: c.env.DB,
+            namespaceId,
+            pageId,
+            pageName,
+            candidateLoginIds,
+            logPrefix: `MANUAL-REFRESH ${pageName || pageId}`,
+        })
+        return c.json({
+            ok: result.refreshed,
+            dry_run: false,
+            page_id: pageId,
+            refreshed: result.refreshed,
+            synced: result.synced,
+            profile_count: result.profileCount,
+            reason: String(result.reason || '').slice(0, 120),
+        }, result.refreshed ? 200 : 502)
+    } catch (e) {
+        return c.json({
+            ok: false,
+            dry_run: dryRun,
+            page_id: pageId,
+            error: 'fb_lite_refresh_failed',
+            reason: (e instanceof Error ? e.message : String(e)).slice(0, 120),
+        }, 500)
+    }
+})
+
 app.post('/api/pages/:id/retry-failed-comments', async (c) => {
     const ownerCheck = await requireAuthSession(c)
     if (!ownerCheck.ok) return ownerCheck.response
@@ -40690,7 +41022,7 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
         }
 
         try {
-            const tokenCandidates = await ensurePageTokenCandidates({
+            let tokenCandidates = await ensurePageTokenCandidates({
                 env,
                 db: env.DB,
                 namespaceId: botId,
@@ -40699,9 +41031,9 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 primaryToken: String(row.access_token || ''),
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
             })
-            const commentToken = String(tokenCandidates.commentTokens[0] || '').trim()
-            const commentTokenHint = deriveCommentTokenHint(commentToken)
-            const commentProfile = await resolvePostHistoryProfileByToken(env, commentToken)
+            let commentToken = String(tokenCandidates.commentTokens[0] || '').trim()
+            let commentTokenHint = deriveCommentTokenHint(commentToken)
+            let commentProfile = await resolvePostHistoryProfileByToken(env, commentToken)
 
             // Resolve the shopee shortlink up front (before the missing-token check): the
             // CloakBrowser bridge fallback below reuses this SAME re-minted shortlink, and a
@@ -40760,36 +41092,94 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 isCloakBridgeCommentFallbackEligible(row.post_token_hint) &&
                 await isNamespaceShortlinkAdminManaged(env.DB, botId).catch(() => false)
 
+            // Root fix for the "permanent token expired" state on Facebook Lite pages: this
+            // backlog IS the stored_token comment path, so a missing or auth-rejected
+            // (190 / invalidated session) stored token is never terminal — stored credentials
+            // can always re-mint a fresh page token. Try BrowserSaving's FB GET Token refresh
+            // ONCE, reload the fresh token from the namespace pool, and let the caller retry
+            // before falling back to the admin bridge / failing. Returns true only when a
+            // usable comment token now exists.
+            let fbLiteRefreshAttempted = false
+            const reloadCommentTokenViaFacebookLiteRefresh = async (
+                trigger: 'missing' | 'auth_failure',
+                error?: unknown,
+            ): Promise<boolean> => {
+                if (fbLiteRefreshAttempted) return false
+                if (!shouldAttemptFacebookLiteRefresh({
+                    commentSource: 'stored_token',
+                    tokenMissing: trigger === 'missing',
+                    error,
+                })) return false
+                fbLiteRefreshAttempted = true
+                const refreshOutcome = await refreshFacebookLiteCommentTokenForPage({
+                    env,
+                    db: env.DB,
+                    namespaceId: botId,
+                    pageId,
+                    pageName,
+                    logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+                }).catch((e) => ({
+                    refreshed: false,
+                    synced: false,
+                    profileCount: 0,
+                    reason: e instanceof Error ? e.message : String(e),
+                }))
+                if (!refreshOutcome.refreshed) return false
+                // BrowserSaving pushed the fresh page token into the namespace pool; read it
+                // back (resolveFacebookCommentToken prefers pool comment/post tokens, then
+                // pages.access_token) and put it at the head of the candidate list.
+                const refreshedResolution = await resolveFacebookCommentToken(env.DB, pageId, botId).catch(() => null)
+                const refreshedToken = String(refreshedResolution?.token || '').trim()
+                if (!refreshedToken) return false
+                tokenCandidates = {
+                    ...tokenCandidates,
+                    commentTokens: normalizeCommentTokenPool([
+                        refreshedToken,
+                        ...(tokenCandidates.commentTokens || []),
+                    ]),
+                }
+                commentToken = String(tokenCandidates.commentTokens[0] || '').trim()
+                commentTokenHint = deriveCommentTokenHint(commentToken)
+                commentProfile = await resolvePostHistoryProfileByToken(env, commentToken)
+                return !!commentToken
+            }
+
             if (!commentToken) {
-                // Missing/expired stored Facebook Lite token. If the page can still comment as
-                // the Page via the bridge, do that instead of leaving a posted-but-no-comment row.
-                if (bridgeFallbackEligible) {
-                    const bridged = await sendStoredCommentBridgeFallback({
-                        env,
-                        namespaceId: botId,
-                        pageId,
-                        storyId: targetId,
-                        shortShopeeLink,
-                        logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
-                    })
-                    if (bridged.ok) {
+                // Re-mint a fresh Facebook Lite token before any fallback. On success the loop
+                // falls through to the normal comment attempt below with the fresh token.
+                const recovered = await reloadCommentTokenViaFacebookLiteRefresh('missing')
+                if (!recovered) {
+                    // Missing/expired stored Facebook Lite token and refresh unavailable. If the
+                    // page can still comment as the Page via the bridge, do that instead of
+                    // leaving a posted-but-no-comment row.
+                    if (bridgeFallbackEligible) {
+                        const bridged = await sendStoredCommentBridgeFallback({
+                            env,
+                            namespaceId: botId,
+                            pageId,
+                            storyId: targetId,
+                            shortShopeeLink,
+                            logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
+                        })
+                        if (bridged.ok) {
+                            await env.DB.prepare(
+                                "UPDATE post_history SET status='success', comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=?, comment_profile_id=NULL, comment_profile_name=NULL WHERE id=?"
+                            ).bind(bridged.id || null, 'stored_token_missing_fallback_cloak_session_bridge', historyId).run().catch(() => { })
+                            continue
+                        }
                         await env.DB.prepare(
-                            "UPDATE post_history SET status='success', comment_status='success', comment_error=NULL, comment_fb_id=?, comment_token_hint=?, comment_profile_id=NULL, comment_profile_name=NULL WHERE id=?"
-                        ).bind(bridged.id || null, 'stored_token_missing_fallback_cloak_session_bridge', historyId).run().catch(() => { })
+                            "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
+                        ).bind(`access_token_missing; cloak_fallback_failed:${bridged.error || 'bridge_failed'}`.substring(0, 200), commentTokenHint, historyId).run().catch(() => { })
                         continue
                     }
                     await env.DB.prepare(
                         "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
-                    ).bind(`access_token_missing; cloak_fallback_failed:${bridged.error || 'bridge_failed'}`.substring(0, 200), commentTokenHint, historyId).run().catch(() => { })
+                    ).bind('access_token_missing', commentTokenHint, historyId).run().catch(() => { })
                     continue
                 }
-                await env.DB.prepare(
-                    "UPDATE post_history SET status='success', comment_status='failed', comment_error=?, comment_token_hint=? WHERE id=?"
-                ).bind('access_token_missing', commentTokenHint, historyId).run().catch(() => { })
-                continue
             }
 
-            const commentResult = await postShopeeCommentWithFallback({
+            let commentResult = await postShopeeCommentWithFallback({
                 env,
                 namespaceId: botId,
                 fbVideoId: targetId,
@@ -40801,6 +41191,28 @@ async function processPendingCommentBacklog(env: Env): Promise<void> {
                 pageId,
                 logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId}`,
             })
+
+            // The stored Facebook Lite token was rejected with an auth error (190 / invalidated
+            // session). Re-mint a fresh token from stored credentials ONCE and retry before
+            // falling back to the admin bridge / failing — a Facebook Lite token is never
+            // permanently expired while its credentials are stored.
+            if (!commentResult.ok && isStoredCommentTokenAuthFailure(commentResult.error)) {
+                const recovered = await reloadCommentTokenViaFacebookLiteRefresh('auth_failure', commentResult.error)
+                if (recovered) {
+                    commentResult = await postShopeeCommentWithFallback({
+                        env,
+                        namespaceId: botId,
+                        fbVideoId: targetId,
+                        fbPostId: fbPostIdRaw,
+                        fbReelUrlOrId: fbReelUrlRaw,
+                        shopeeLink: shortShopeeLink,
+                        lazadaLink,
+                        commentTokens: tokenCandidates.commentTokens,
+                        pageId,
+                        logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId} (fb-lite-refreshed)`,
+                    })
+                }
+            }
 
             if (commentResult.ok) {
                 const usedToken = String(commentResult.commentToken || commentToken || '').trim()

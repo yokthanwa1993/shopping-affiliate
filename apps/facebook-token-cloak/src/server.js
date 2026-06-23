@@ -563,12 +563,14 @@ function createHandler(deps = {}) {
       }
 
       if (req.method === 'POST' && url.pathname === '/token/refresh') {
-        const { account, visible = false, includeToken = false } = await parseBody(req);
+        const { account, visible = false, includeToken = false, oauthUrl = '' } = await parseBody(req);
         if (!account) return sendError(res, 400, 'Missing account');
+        const selectedOauthUrl = String(oauthUrl || '').trim();
+        if (selectedOauthUrl && !isLocalRequest(req)) return sendError(res, 403, 'oauthUrl override is only allowed for local requests');
         const { display } = sanitizeAccount(account);
         let opened;
         try {
-          opened = await br.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible });
+          opened = await br.openPage(account, selectedOauthUrl || FACEBOOK_OAUTH_URL, { visible: !!visible });
         } catch (e) {
           return send(res, 200, buildNoTokenRefreshResponse(display, e.code || e.message || 'browser_open_failed'));
         }
@@ -651,10 +653,12 @@ function createHandler(deps = {}) {
 
       if (req.method === 'GET' && url.pathname === '/pages') {
         const account = url.searchParams.get('account') || POST_ACCOUNT;
+        const includeToken = ['1', 'true', 'yes'].includes(String(url.searchParams.get('includeToken') || '').trim().toLowerCase());
+        if (includeToken && !isLocalRequest(req)) return sendError(res, 403, 'includeToken is only allowed for local requests');
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
           if (!session.token) return send(res, 200, { data: [], error: 'no_session' });
-          const result = await posting.listPagesPublic(session.graphFetch, session.token);
+          const result = await posting.listPagesPublic(session.graphFetch, session.token, includeToken && isLocalRequest(req));
           return send(res, 200, result);
         } finally {
           await posting.closeSession(session);
@@ -688,21 +692,48 @@ function createHandler(deps = {}) {
 
       if (req.method === 'POST' && url.pathname === '/page-comment') {
         const body = await parseBody(req);
-        const account = body.account || POST_ACCOUNT;
-        const session = await posting.resolveSessionToken({ browser: br, account });
-        try {
-          const result = await posting.pageComment(session.graphFetch, {
-            userToken: session.token,
-            pageId: body.page_id,
-            target: body.target,
-            storyId: body.story_id,
-            postId: body.post_id,
-            message: body.message
-          });
-          return send(res, postingStatus(result), result);
-        } finally {
-          await posting.closeSession(session);
+        const explicitAccount = body.account ? String(body.account).trim() : '';
+        const pageId = String(body.page_id || '').trim();
+        const tried = new Set();
+        const tryCommentWithAccount = async (account) => {
+          const key = sanitizeAccount(account).key;
+          if (!key || tried.has(key)) return null;
+          tried.add(key);
+          const session = await posting.resolveSessionToken({ browser: br, account });
+          try {
+            const result = await posting.pageComment(session.graphFetch, {
+              userToken: session.token,
+              pageId: body.page_id,
+              target: body.target,
+              storyId: body.story_id,
+              postId: body.post_id,
+              message: body.message
+            });
+            return result;
+          } finally {
+            await posting.closeSession(session);
+          }
+        };
+
+        let result = await tryCommentWithAccount(explicitAccount || POST_ACCOUNT);
+        const shouldAutoDiscoverAccount = pageId && (!explicitAccount) && result && result.step === 'page_token' && result.error === 'page_token_not_found';
+        if (shouldAutoDiscoverAccount) {
+          const accounts = await listAccountStatuses(kc, selectors, registry).catch(() => []);
+          for (const entry of accounts) {
+            const candidate = entry && (entry.account || entry.key);
+            if (!candidate) continue;
+            const candidateResult = await tryCommentWithAccount(candidate).catch((e) => ({ ok: false, status: 200, step: 'session', error: e && (e.code || e.message) || 'account_probe_failed' }));
+            if (!candidateResult) continue;
+            if (candidateResult.ok) { result = candidateResult; break; }
+            // Keep scanning accounts that simply do not own/admin this page. Stop on
+            // real comment/session errors from an account that did resolve beyond page ownership.
+            if (!(candidateResult.step === 'page_token' && candidateResult.error === 'page_token_not_found')) {
+              result = candidateResult;
+              break;
+            }
+          }
         }
+        return send(res, postingStatus(result), result || { ok: false, status: 409, step: 'session', error: 'no_session' });
       }
 
       if (req.method === 'POST' && url.pathname === '/edit-page-comment-link') {

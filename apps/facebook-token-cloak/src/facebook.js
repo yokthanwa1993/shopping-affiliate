@@ -1,5 +1,8 @@
 'use strict';
-const FACEBOOK_OAUTH_URL='https://www.facebook.com/v18.0/dialog/oauth?client_id=350172498359498&redirect_uri=https%3A%2F%2Fpostcron.com%2Fauth%2Flogin%2Ffacebook%2Fcallback&scope=pages_manage_posts%2Cpages_read_engagement%2Cpages_show_list%2Cpublic_profile&response_type=token';
+// Historical Postcron OAuth is retired. Keep the export name for compatibility with
+// older call sites/tests, but open a first-party logged-in Facebook surface so the
+// bridge can use the session-derived token extractor instead of any third-party app id.
+const FACEBOOK_OAUTH_URL='https://adsmanager.facebook.com/adsmanager/manage/campaigns';
 const GRAPH_PAGES_URL='https://graph.facebook.com/v19.0/me/accounts?fields=id,name,category,access_token&limit=200';
 function extractAccessTokenFromUrl(url){ if(!url||typeof url!=='string') return null; const m=url.match(/[#&]access_token=([^&#\s]+)/); if(m) return decodeURIComponent(m[1]); try{return new URL(url).searchParams.get('access_token')}catch{const q=url.match(/[?&]access_token=([^&#\s]+)/); return q?decodeURIComponent(q[1]):null;} }
 function sanitizePages(pages, includeToken=false){ if(!Array.isArray(pages)) return []; return pages.map(p=>{const out={id:p&&p.id!=null?String(p.id):undefined,name:p&&p.name!=null?String(p.name):undefined,category:p&&p.category!=null?String(p.category):undefined,hasToken:!!(p&&p.access_token)}; if(includeToken&&p&&p.access_token) out.access_token=String(p.access_token); return out;}); }

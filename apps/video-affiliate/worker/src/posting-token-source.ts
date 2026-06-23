@@ -172,6 +172,156 @@ export function isStoredCommentTokenAuthFailure(error: unknown): boolean {
     )
 }
 
+// ---- Facebook Lite (FB GET Token) on-demand refresh ----------------------
+// The product builds a password-backed FB GET Token / Facebook Lite system: every
+// stored profile keeps its uid/password/TOTP/datr in BrowserSaving, so a fresh page
+// token can ALWAYS be re-minted from those credentials. There must therefore be no
+// permanent "token expired" state for a Facebook Lite (stored_token) page — when the
+// stored token is missing or rejected by Graph with an auth error (190 / invalidated
+// session), the worker re-mints a fresh token through the BrowserSaving
+// token-facebook-lite pipeline and retries ONCE before falling back / failing.
+//
+// These pure predicates and shapers keep the refresh routing + redaction decisions
+// testable and token-free. The CloakBrowser/Power Editor comment path is intentionally
+// excluded: those comments are delivered by the bridge's own logged-in session and never
+// use a stored Facebook Lite token, so refreshing one would be meaningless.
+
+// Should we attempt an FB Lite refresh for a stored-token comment? Only for the
+// 'stored_token' comment source, and only when the token is missing OR the failure is an
+// auth/availability problem (see isStoredCommentTokenAuthFailure). Any other failure
+// (transient bridge/target error, rate limit, etc.) is surfaced unchanged — refreshing
+// the token would not help and would mask the real error.
+export function shouldAttemptFacebookLiteRefresh(params: {
+    commentSource: PageCommentTokenSource
+    tokenMissing?: boolean
+    error?: unknown
+}): boolean {
+    if (params.commentSource !== 'stored_token') return false
+    if (params.tokenMissing) return true
+    return isStoredCommentTokenAuthFailure(params.error)
+}
+
+// Body the Worker POSTs to the BrowserSaving secret-authed refresh route. profile_id is
+// OPTIONAL: when omitted, BrowserSaving auto-discovers the stored Account Manager profile
+// that owns/admins page_id (no manual linking required). page_id / namespace_id route the
+// resolved token back to the right namespace page; owner_emails scope the auto-discovery to
+// the namespace's operator(s). dry_run asks BrowserSaving to report what it WOULD refresh
+// without minting/pushing. Never carries a token value.
+export interface FacebookLiteRefreshRequestBody {
+    profile_id?: string
+    page_id?: string
+    page_name?: string
+    namespace_id?: string
+    owner_emails?: string[]
+    candidate_profile_ids?: string[]
+    candidate_login_ids?: string[]
+    dry_run?: boolean
+}
+
+export function buildFacebookLiteRefreshRequestBody(params: {
+    profileId?: string
+    pageId?: string
+    pageName?: string
+    namespaceId?: string
+    ownerEmails?: string[]
+    candidateProfileIds?: string[]
+    candidateLoginIds?: string[]
+    dryRun?: boolean
+}): FacebookLiteRefreshRequestBody {
+    const body: FacebookLiteRefreshRequestBody = {}
+    const profileId = String(params.profileId ?? '').trim()
+    const pageId = String(params.pageId ?? '').trim()
+    const namespaceId = String(params.namespaceId ?? '').trim()
+    const pageName = String(params.pageName ?? '').trim()
+    const ownerEmails = Array.from(new Set(
+        (params.ownerEmails ?? []).map((e) => String(e ?? '').trim().toLowerCase()).filter(Boolean),
+    ))
+    const candidateProfileIds = Array.from(new Set(
+        (params.candidateProfileIds ?? []).map((id) => String(id ?? '').trim()).filter(Boolean),
+    ))
+    const candidateLoginIds = Array.from(new Set(
+        (params.candidateLoginIds ?? []).map((id) => String(id ?? '').trim()).filter(Boolean),
+    ))
+    if (profileId) body.profile_id = profileId
+    if (pageId) body.page_id = pageId
+    if (pageName) body.page_name = pageName
+    if (namespaceId) body.namespace_id = namespaceId
+    if (ownerEmails.length) body.owner_emails = ownerEmails
+    if (candidateProfileIds.length) body.candidate_profile_ids = candidateProfileIds
+    if (candidateLoginIds.length) body.candidate_login_ids = candidateLoginIds
+    if (params.dryRun) body.dry_run = true
+    return body
+}
+
+// Token-free outcome of a refresh attempt — what the Worker keeps after calling the
+// BrowserSaving route. `refreshed` = a fresh token was minted; `synced` = it was pushed
+// back into video-affiliate's namespace pool (so the retry can read it). `reason` is a
+// short redacted hint for logs, never a token.
+export interface FacebookLiteRefreshOutcome {
+    ok: boolean
+    refreshed: boolean
+    synced: boolean
+    pageId: string
+    reason: string
+}
+
+// Parse the BrowserSaving refresh route's JSON response into a token-free outcome. The
+// route returns only booleans/redacted hints, but parse defensively in case of partial
+// payloads. Any token-like field is ignored entirely.
+export function parseFacebookLiteRefreshResponse(httpOk: boolean, data: unknown): FacebookLiteRefreshOutcome {
+    const payload = (data && typeof data === 'object') ? data as Record<string, unknown> : {}
+    const ok = httpOk && payload.ok === true
+    const refreshed = ok && payload.refreshed === true
+    const synced = refreshed && (payload.synced === true || payload.video_affiliate_sync === true)
+    const pageId = String(payload.page_id ?? '').trim()
+    const reasonRaw = String(payload.reason ?? payload.error ?? '').trim()
+    return {
+        ok,
+        refreshed,
+        synced,
+        pageId,
+        reason: reasonRaw ? reasonRaw.slice(0, 120) : (ok ? 'refreshed' : 'refresh_failed'),
+    }
+}
+
+// Server-side (BrowserSaving) shaper: collapse an internal refresh result down to the
+// token-free response body the route returns. NEVER include a token, cookie, password or
+// raw error containing one — only booleans + already-redacted short hints.
+export interface FacebookLiteRefreshResponseBody {
+    ok: boolean
+    refreshed: boolean
+    synced: boolean
+    dry_run: boolean
+    profile_present: boolean
+    has_credentials: boolean
+    page_id: string | null
+    reason: string
+}
+
+export function redactFacebookLiteRefreshResult(params: {
+    ok: boolean
+    refreshed?: boolean
+    synced?: boolean
+    dryRun?: boolean
+    profilePresent?: boolean
+    hasCredentials?: boolean
+    pageId?: string | null
+    reason?: string
+}): FacebookLiteRefreshResponseBody {
+    const reasonRaw = String(params.reason ?? '').trim()
+    const pageId = String(params.pageId ?? '').trim()
+    return {
+        ok: params.ok === true,
+        refreshed: params.refreshed === true,
+        synced: params.synced === true,
+        dry_run: params.dryRun === true,
+        profile_present: params.profilePresent === true,
+        has_credentials: params.hasCredentials === true,
+        page_id: pageId || null,
+        reason: reasonRaw ? reasonRaw.slice(0, 120) : (params.ok ? 'ok' : 'failed'),
+    }
+}
+
 // Env subset the CloakBrowser Facebook posting bridge base URL is resolved from.
 export interface CloakFbBridgeEnv {
     // Primary: the non-Electron CloakBrowser Facebook posting bridge.

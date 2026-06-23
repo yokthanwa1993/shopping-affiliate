@@ -614,21 +614,27 @@ async function pushVideoAffiliatePageSync(c: any, input: {
     pageAvatarUrl?: string;
     accessToken: string;
     commentToken?: string;
+    // Explicit target namespace. Provided by the secret-authed server-to-server refresh
+    // route (which has no user session, so getAuthEmail() would be empty). When set, it is
+    // used directly and the authEmail → workspace resolution is skipped. Trusted because the
+    // only caller that sets it is the secret-authed FB Lite refresh route.
+    namespaceId?: string;
 }): Promise<{ namespaceId: string }> {
     const pageId = String(input.pageId || '').trim();
     const accessToken = normalizeToken(input.accessToken);
     const commentToken = normalizeToken(input.commentToken);
     if (!pageId || !accessToken) throw new Error('video_affiliate_page_sync_missing_required_fields');
 
-    const authEmail = getAuthEmail(c);
-    if (!authEmail) throw new Error('video_affiliate_auth_email_missing');
-
-    let namespaceId = '';
-    try {
-        const workspace = await resolveVideoAffiliateWorkspaceByEmail(c, authEmail);
-        if (workspace.namespaceId) namespaceId = workspace.namespaceId;
-    } catch (err) {
-        console.log(`[VIDEO-AFFILIATE] namespace resolve failed for ${authEmail}: ${String(err)}`);
+    let namespaceId = String(input.namespaceId || '').trim();
+    if (!namespaceId) {
+        const authEmail = getAuthEmail(c);
+        if (!authEmail) throw new Error('video_affiliate_auth_email_missing');
+        try {
+            const workspace = await resolveVideoAffiliateWorkspaceByEmail(c, authEmail);
+            if (workspace.namespaceId) namespaceId = workspace.namespaceId;
+        } catch (err) {
+            console.log(`[VIDEO-AFFILIATE] namespace resolve failed for ${authEmail}: ${String(err)}`);
+        }
     }
     if (!namespaceId) throw new Error('video_affiliate_namespace_not_found');
 
@@ -2147,6 +2153,8 @@ async function persistCommentTokenAndResolvedPage(c: any, input: {
     profileName: string;
     commentToken: string;
     resolvedPage: { pageToken: string; pageId: string; pageName: string; pageAvatarUrl: string };
+    // Explicit target namespace for the server-to-server refresh path (no user session).
+    namespaceId?: string;
 }) {
     const resolvedCommentToken = normalizeToken(input.resolvedPage.pageToken);
     if (!resolvedCommentToken) throw new Error('resolved_comment_page_token_empty');
@@ -2170,6 +2178,7 @@ async function persistCommentTokenAndResolvedPage(c: any, input: {
             pageAvatarUrl: input.resolvedPage.pageAvatarUrl,
             accessToken: resolvedCommentToken,
             commentToken: resolvedCommentToken,
+            namespaceId: input.namespaceId,
         });
         videoAffiliateSync = { ok: true, namespace_id: synced.namespaceId };
     } catch (syncErr) {
@@ -2597,6 +2606,376 @@ app.post('/api/token/:profileId/resolve', async (c) => {
             profileId,
             profile: profile.name,
         }, 400);
+    }
+});
+
+// Strip any token-like substring out of a free-text reason hint so the refresh route can
+// never leak a token/cookie value through an error message it bubbles up.
+function redactFbLiteReason(raw: unknown): string {
+    let s = String(raw ?? '').trim();
+    if (!s) return '';
+    s = s.replace(/EAA[A-Za-z0-9]{6,}/g, '[REDACTED]');
+    s = s.replace(/\b[A-Za-z0-9_-]{40,}\b/g, '[REDACTED]');
+    return s.slice(0, 120);
+}
+
+// Token-free response body for the FB Lite refresh route. ONLY booleans + redacted hints +
+// non-secret ids (page_id / profile_id are not secrets; tokens/cookies/passwords never are).
+function buildFbLiteRefreshResponse(fields: {
+    ok: boolean;
+    refreshed?: boolean;
+    synced?: boolean;
+    dryRun?: boolean;
+    profilePresent?: boolean;
+    hasCredentials?: boolean;
+    pageId?: string | null;
+    profileId?: string | null;
+    via?: string;
+    reason?: string;
+}) {
+    const pageId = String(fields.pageId ?? '').trim();
+    const profileId = String(fields.profileId ?? '').trim();
+    const reason = redactFbLiteReason(fields.reason);
+    return {
+        ok: fields.ok === true,
+        refreshed: fields.refreshed === true,
+        synced: fields.synced === true,
+        dry_run: fields.dryRun === true,
+        profile_present: fields.profilePresent === true,
+        has_credentials: fields.hasCredentials === true,
+        page_id: pageId || null,
+        profile_id: profileId || null,
+        via: String(fields.via || '').trim() || null,
+        reason: reason || (fields.ok ? 'ok' : 'failed'),
+    };
+}
+
+// List the Facebook Page ids a token can administer (me/accounts). Read-only, token-free
+// result (only page ids leave this function). Returns an empty set on any error so a dead
+// stored token simply yields "no pages" rather than throwing.
+async function listFacebookPageIdsForToken(tokenRaw: string): Promise<Set<string>> {
+    const token = normalizeToken(tokenRaw);
+    const out = new Set<string>();
+    if (!token) return out;
+    try {
+        const url = `https://graph.facebook.com/v21.0/me/accounts?fields=id&limit=200&access_token=${encodeURIComponent(token)}`;
+        const r = await fetch(url);
+        const d = await r.json().catch(() => ({} as any));
+        if (!r.ok) return out;
+        const arr = Array.isArray(d?.data) ? d.data : [];
+        for (const it of arr) {
+            const id = String(it?.id || '').trim();
+            if (id) out.add(id);
+        }
+    } catch { /* dead/blocked token → no pages */ }
+    return out;
+}
+
+// Auto-discover the stored Account Manager profile that owns/admins a page WITHOUT requiring
+// any manual linking/tagging. Searches credentialed profiles (uid/username + password
+// present), optionally scoped by owner_email / candidate ids for multi-tenant safety.
+//   Pass 1 (cheap): probe each profile's STORED token via me/accounts.
+//   Pass 2 (mint):  only when allowMint, re-mint a fresh FB Lite token and probe — this is
+//                   the path that works in the exact failure case (stored token invalidated).
+// Returns the matching profile id + (when minted) the fresh user token to reuse, plus
+// token-free counts for reporting. Never returns a stored token value.
+async function discoverFbLiteProfileForPage(c: any, pageId: string, opts: {
+    ownerEmails?: string[];
+    candidateIds?: string[];
+    candidateLoginIds?: string[];
+    allowMint?: boolean;
+    maxProbe?: number;
+    maxMint?: number;
+    pageName?: string;
+}): Promise<{
+    found: boolean;
+    profileId: string;
+    userToken: string | null;
+    profile: any | null;
+    credentialedCount: number;
+    probed: number;
+    via: string;
+}> {
+    const pid = String(pageId || '').trim();
+    const base = { found: false, profileId: '', userToken: null as string | null, profile: null as any, credentialedCount: 0, probed: 0, via: '' };
+    if (!pid) return base;
+
+    const ownerEmails = (opts.ownerEmails || []).map((e) => String(e || '').trim().toLowerCase()).filter(Boolean);
+    const candidateIds = (opts.candidateIds || []).map((s) => String(s || '').trim()).filter(Boolean);
+    const candidateLoginIds = (opts.candidateLoginIds || []).map((s) => String(s || '').trim()).filter(Boolean);
+    const targetPageName = String(opts.pageName || '').trim().toLowerCase();
+    const scoreCandidate = (p: any): number => {
+        const pageName = String(p?.page_name || '').trim().toLowerCase();
+        const name = String(p?.name || '').trim().toLowerCase();
+        const avatar = String(p?.page_avatar_url || '').trim();
+        if (targetPageName && (pageName === targetPageName || name === targetPageName)) return 0;
+        if (avatar && avatar.includes(pid)) return 1;
+        if (targetPageName && (pageName.includes(targetPageName) || targetPageName.includes(pageName))) return 2;
+        return 10;
+    };
+    const maxProbe = Math.max(1, Math.min(100, opts.maxProbe ?? 60));
+    const maxMint = Math.max(0, Math.min(25, opts.maxMint ?? 12));
+
+    // Fetch credentialed candidate profiles. Prefer owner-scoped (the tenant's own profiles),
+    // but if that yields nothing fall back to an unscoped credentialed search — page ownership
+    // is itself the authority (a profile can only mint a token that admins a page it actually
+    // controls), so this keeps "creds exist → never terminal" true even on an owner_email
+    // mismatch between the two systems. candidate_profile_ids, when provided, always applies.
+    const queryCandidates = async (useOwnerScope: boolean): Promise<any[]> => {
+        const where = [
+            'deleted_at IS NULL',
+            "TRIM(COALESCE(password,'')) <> ''",
+            "TRIM(COALESCE(uid,'') || COALESCE(username,'')) <> ''",
+        ];
+        const binds: any[] = [];
+        if (useOwnerScope && ownerEmails.length) {
+            where.push(`lower(trim(coalesce(owner_email,''))) IN (${ownerEmails.map(() => '?').join(',')})`);
+            binds.push(...ownerEmails);
+        }
+        if (candidateIds.length) {
+            where.push(`id IN (${candidateIds.map(() => '?').join(',')})`);
+            binds.push(...candidateIds);
+        }
+        if (candidateLoginIds.length) {
+            where.push(`(uid IN (${candidateLoginIds.map(() => '?').join(',')}) OR username IN (${candidateLoginIds.map(() => '?').join(',')}))`);
+            binds.push(...candidateLoginIds, ...candidateLoginIds);
+        }
+        const rows = await c.env.DB.prepare(
+            `SELECT id, name, owner_email, uid, username, password, totp_secret, datr, page_name, page_avatar_url, access_token, facebook_token
+             FROM profiles
+             WHERE ${where.join(' AND ')}
+             ORDER BY (CASE WHEN TRIM(COALESCE(access_token,'')) <> '' THEN 0 ELSE 1 END), created_at DESC`
+        ).bind(...binds).all().catch(() => ({ results: [] as any[] }));
+        return ((rows?.results || []) as any[]);
+    };
+
+    let candidateRows = await queryCandidates(true);
+    if (candidateRows.length === 0 && ownerEmails.length) {
+        candidateRows = await queryCandidates(false);
+    }
+    candidateRows = candidateRows.slice().sort((a, b) => scoreCandidate(a) - scoreCandidate(b));
+    const candidates = candidateRows.slice(0, maxProbe);
+    const credentialedCount = candidates.length;
+    let probed = 0;
+
+    // Pass 1: cheap stored-token check.
+    for (const p of candidates) {
+        const stored = normalizeToken(p.access_token) || normalizeToken(p.facebook_token);
+        if (!stored) continue;
+        probed += 1;
+        const ids = await listFacebookPageIdsForToken(stored);
+        if (ids.has(pid)) {
+            return { found: true, profileId: String(p.id || ''), userToken: null, profile: p, credentialedCount, probed, via: 'stored_token' };
+        }
+    }
+
+    // Pass 2: mint fresh and check (authoritative — works when the stored token is dead).
+    if (opts.allowMint) {
+        let minted = 0;
+        for (const p of candidates) {
+            if (minted >= maxMint) break;
+            minted += 1;
+            probed += 1;
+            const fetched = await fetchFreshCommentToken(c, String(p.id || ''));
+            if (!fetched.ok) continue;
+            const ids = await listFacebookPageIdsForToken(fetched.userToken);
+            if (ids.has(pid)) {
+                return { found: true, profileId: String(p.id || ''), userToken: fetched.userToken, profile: fetched.profile, credentialedCount, probed, via: 'minted' };
+            }
+        }
+    }
+
+    return { ...base, credentialedCount, probed };
+}
+
+function parseFbLiteOwnerEmails(body: any): string[] {
+    const raw = body?.owner_emails ?? body?.ownerEmails ?? body?.owner_email ?? body?.ownerEmail;
+    const out: string[] = [];
+    const push = (v: unknown) => { const e = normalizeEmail(String(v || '')); if (e) out.push(e); };
+    if (Array.isArray(raw)) raw.forEach(push);
+    else if (typeof raw === 'string') raw.split(',').forEach(push);
+    return Array.from(new Set(out));
+}
+
+function parseFbLiteCandidateIds(body: any): string[] {
+    const raw = body?.candidate_profile_ids ?? body?.candidateProfileIds;
+    const out: string[] = [];
+    const push = (v: unknown) => { const s = String(v || '').trim(); if (s) out.push(s); };
+    if (Array.isArray(raw)) raw.forEach(push);
+    else if (typeof raw === 'string') raw.split(',').forEach(push);
+    return Array.from(new Set(out));
+}
+
+function parseFbLiteCandidateLoginIds(body: any): string[] {
+    const raw = body?.candidate_login_ids ?? body?.candidateLoginIds ?? body?.candidate_uids ?? body?.candidateUids;
+    const out: string[] = [];
+    const push = (v: unknown) => { const s = String(v || '').trim(); if (s) out.push(s); };
+    if (Array.isArray(raw)) raw.forEach(push);
+    else if (typeof raw === 'string') raw.split(',').forEach(push);
+    return Array.from(new Set(out));
+}
+
+// POST /api/fb-lite/profiles-for-page
+// Secret-authed read-only discovery: report whether a stored Account Manager profile
+// (uid/password/2FA/datr present) owns/admins the page, WITHOUT minting (allowMint=false).
+// Returns only booleans / counts / ids — never a token. Used by the dry-run maintenance
+// path so an operator can confirm auto-refresh will work before triggering it.
+app.post('/api/fb-lite/profiles-for-page', async (c) => {
+    if (!verifyVideoAffiliateProvisionSecret(c)) {
+        return c.json({ ok: false, page_id: null, profile_found: false, reason: 'unauthorized' }, 401);
+    }
+    const body = await c.req.json().catch(() => ({} as any));
+    const pageId = String(body?.page_id || body?.pageId || '').trim();
+    if (!pageId) {
+        return c.json({ ok: false, page_id: null, profile_found: false, reason: 'page_id_required' }, 400);
+    }
+    const discovery = await discoverFbLiteProfileForPage(c, pageId, {
+        ownerEmails: parseFbLiteOwnerEmails(body),
+        candidateIds: parseFbLiteCandidateIds(body),
+        candidateLoginIds: parseFbLiteCandidateLoginIds(body),
+        pageName: String(body?.page_name || body?.pageName || '').trim(),
+        allowMint: false,
+    });
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        profile_found: discovery.found,
+        // would_refresh: a credentialed profile exists that can mint+match even if its stored
+        // token is currently dead (the live path mints to confirm).
+        would_refresh: discovery.found || discovery.credentialedCount > 0,
+        profile_id: discovery.found ? discovery.profileId : null,
+        credentialed_count: discovery.credentialedCount,
+        probed: discovery.probed,
+        via: discovery.via || null,
+    });
+});
+
+// POST /api/fb-lite/refresh-comment-token
+// Secret-authed service route (video-affiliate Worker → BrowserSaving) that re-mints a
+// fresh Facebook Lite page comment token from the profile's STORED credentials
+// (uid/password/TOTP/datr) and pushes it back into video-affiliate via profile-sync. This
+// is the root fix that removes the permanent "token expired" state for Facebook Lite pages:
+// stored credentials can always mint a new token, so a stale DB token is never terminal.
+// profile_id is OPTIONAL — when omitted, the page owner is auto-discovered from stored
+// Account Manager credentials (no manual linking/tagging required). Returns ONLY booleans +
+// redacted hints + non-secret ids — never a token, cookie or password.
+app.post('/api/fb-lite/refresh-comment-token', async (c) => {
+    if (!verifyVideoAffiliateProvisionSecret(c)) {
+        return c.json(buildFbLiteRefreshResponse({ ok: false, reason: 'unauthorized' }), 401);
+    }
+
+    const body = await c.req.json().catch(() => ({} as any));
+    let profileId = String(body?.profile_id || body?.profileId || '').trim();
+    const pageIdHint = String(body?.page_id || body?.pageId || '').trim();
+    const namespaceIdHint = String(body?.namespace_id || body?.namespaceId || '').trim();
+    const ownerEmails = parseFbLiteOwnerEmails(body);
+    const candidateIds = parseFbLiteCandidateIds(body);
+    const candidateLoginIds = parseFbLiteCandidateLoginIds(body);
+    const dryRun = body?.dry_run === true || body?.dryRun === true;
+
+    if (!profileId && !pageIdHint) {
+        return c.json(buildFbLiteRefreshResponse({ ok: false, reason: 'profile_id_or_page_id_required' }), 400);
+    }
+
+    // Auto-discovery path: no profile_id, find the stored profile that owns the page.
+    let mintedUserToken: string | null = null;
+    let discoveredProfile: any = null;
+    let via = '';
+    if (!profileId) {
+        // Dry-run reports without minting; live mints to confirm + reuse the fresh token.
+        const discovery = await discoverFbLiteProfileForPage(c, pageIdHint, {
+            ownerEmails,
+            candidateIds,
+            candidateLoginIds,
+            pageName: String(body?.page_name || body?.pageName || '').trim(),
+            allowMint: !dryRun,
+        });
+        if (dryRun) {
+            const ok = discovery.found || discovery.credentialedCount > 0;
+            return c.json(buildFbLiteRefreshResponse({
+                ok,
+                dryRun: true,
+                profilePresent: discovery.credentialedCount > 0,
+                hasCredentials: discovery.credentialedCount > 0,
+                pageId: pageIdHint,
+                profileId: discovery.found ? discovery.profileId : '',
+                via: discovery.via,
+                reason: discovery.found ? 'dry_run_owner_found' : (discovery.credentialedCount > 0 ? 'dry_run_credentialed_candidates' : 'no_credentialed_profile'),
+            }), 200);
+        }
+        if (!discovery.found) {
+            return c.json(buildFbLiteRefreshResponse({
+                ok: false,
+                pageId: pageIdHint,
+                reason: discovery.credentialedCount > 0 ? 'no_profile_owns_page' : 'no_credentialed_profile',
+            }), 502);
+        }
+        profileId = discovery.profileId;
+        mintedUserToken = discovery.userToken;
+        discoveredProfile = discovery.profile;
+        via = discovery.via;
+    }
+
+    const profile = discoveredProfile || await loadProfileForCommentToken(c, profileId);
+    const profilePresent = !!profile;
+    const loginId = profilePresent ? String(profile!.uid || profile!.username || '').trim() : '';
+    const hasCredentials = !!(loginId && profile?.password);
+
+    if (!profilePresent) {
+        return c.json(buildFbLiteRefreshResponse({ ok: false, profilePresent: false, hasCredentials: false, pageId: pageIdHint, profileId, reason: 'profile_not_found' }), 404);
+    }
+
+    if (dryRun) {
+        return c.json(buildFbLiteRefreshResponse({
+            ok: hasCredentials,
+            dryRun: true,
+            profilePresent,
+            hasCredentials,
+            pageId: pageIdHint,
+            profileId,
+            reason: hasCredentials ? 'dry_run_credentials_present' : 'dry_run_credentials_missing',
+        }), 200);
+    }
+
+    if (!hasCredentials) {
+        return c.json(buildFbLiteRefreshResponse({ ok: false, profilePresent, hasCredentials: false, pageId: pageIdHint, profileId, reason: 'missing_credentials' }), 400);
+    }
+
+    // Reuse a token already minted during discovery; otherwise mint fresh now.
+    let userToken = mintedUserToken;
+    let profileForResolve: any = profile;
+    if (!userToken) {
+        const fetched = await fetchFreshCommentToken(c, profileId);
+        if (!fetched.ok) {
+            const reason = stringifyUnknown((fetched.body as any)?.error) || 'fb_lite_token_failed';
+            return c.json(buildFbLiteRefreshResponse({ ok: false, profilePresent, hasCredentials, pageId: pageIdHint, profileId, reason }), fetched.status >= 500 ? 502 : 400);
+        }
+        userToken = fetched.userToken;
+        profileForResolve = fetched.profile;
+    }
+
+    try {
+        const resolvedPage = await resolveProfilePageToken(userToken, profileForResolve);
+        const sync = await persistCommentTokenAndResolvedPage(c, {
+            profileId,
+            profileName: String(profileForResolve?.name || profile?.name || ''),
+            commentToken: userToken,
+            resolvedPage,
+            namespaceId: namespaceIdHint,
+        });
+        return c.json(buildFbLiteRefreshResponse({
+            ok: true,
+            refreshed: true,
+            synced: !!sync?.ok,
+            profilePresent,
+            hasCredentials,
+            pageId: resolvedPage.pageId || pageIdHint,
+            profileId,
+            via: via || 'profile_id',
+            reason: sync?.ok ? 'refreshed_and_synced' : `refreshed_sync_failed:${sync?.error || 'unknown'}`,
+        }), 200);
+    } catch (err) {
+        return c.json(buildFbLiteRefreshResponse({ ok: false, refreshed: false, profilePresent, hasCredentials, pageId: pageIdHint, profileId, reason: `page_resolve_failed:${String(err)}` }), 400);
     }
 });
 

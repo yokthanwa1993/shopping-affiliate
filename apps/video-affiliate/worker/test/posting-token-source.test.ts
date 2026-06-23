@@ -11,6 +11,10 @@ import {
     defaultCommentSourceForRoute,
     isCloakBridgeCommentFallbackEligible,
     isStoredCommentTokenAuthFailure,
+    shouldAttemptFacebookLiteRefresh,
+    buildFacebookLiteRefreshRequestBody,
+    parseFacebookLiteRefreshResponse,
+    redactFacebookLiteRefreshResult,
 } from '../src/posting-token-source'
 
 test('normalize: only two modes — stored_token and cloak_browser', () => {
@@ -157,6 +161,94 @@ test('stored-comment token failure classifier: auth/session/missing errors trigg
     assert.equal(isStoredCommentTokenAuthFailure('rate limit reached, code 4'), false)
     assert.equal(isStoredCommentTokenAuthFailure(''), false)
     assert.equal(isStoredCommentTokenAuthFailure(undefined), false)
+})
+
+test('fb-lite refresh gate: only stored_token + missing/auth-failure triggers a refresh', () => {
+    // Missing stored token → refresh (a Facebook Lite token is never permanently expired).
+    assert.equal(shouldAttemptFacebookLiteRefresh({ commentSource: 'stored_token', tokenMissing: true }), true)
+    // Graph auth error (190 / invalidated session) → refresh + retry.
+    assert.equal(shouldAttemptFacebookLiteRefresh({
+        commentSource: 'stored_token',
+        error: 'Error validating access token: The session has been invalidated...',
+    }), true)
+    assert.equal(shouldAttemptFacebookLiteRefresh({
+        commentSource: 'stored_token',
+        error: '{"error":{"code":190,"message":"..."}}',
+    }), true)
+    // Present token + unrelated failure → do NOT refresh (refreshing would mask the real error).
+    assert.equal(shouldAttemptFacebookLiteRefresh({ commentSource: 'stored_token', error: 'rate limit reached, code 4' }), false)
+    assert.equal(shouldAttemptFacebookLiteRefresh({ commentSource: 'stored_token' }), false)
+    // CloakBrowser/Power Editor comments never use a stored token → never refreshed.
+    assert.equal(shouldAttemptFacebookLiteRefresh({ commentSource: 'cloak_browser', tokenMissing: true }), false)
+    assert.equal(shouldAttemptFacebookLiteRefresh({
+        commentSource: 'cloak_browser',
+        error: 'OAuthException: ...',
+    }), false)
+})
+
+test('fb-lite refresh request body: profile_id required, hints optional, dry_run only when true', () => {
+    assert.deepEqual(
+        buildFacebookLiteRefreshRequestBody({ profileId: ' p1 ', pageId: ' 100 ', namespaceId: ' ns ' }),
+        { profile_id: 'p1', page_id: '100', namespace_id: 'ns' },
+    )
+    // Empty hints are omitted entirely.
+    assert.deepEqual(buildFacebookLiteRefreshRequestBody({ profileId: 'p1' }), { profile_id: 'p1' })
+    assert.deepEqual(
+        buildFacebookLiteRefreshRequestBody({ profileId: 'p1', pageId: '', namespaceId: '   ' }),
+        { profile_id: 'p1' },
+    )
+    // dry_run only set when explicitly true.
+    assert.deepEqual(
+        buildFacebookLiteRefreshRequestBody({ profileId: 'p1', dryRun: true }),
+        { profile_id: 'p1', dry_run: true },
+    )
+    assert.equal('dry_run' in buildFacebookLiteRefreshRequestBody({ profileId: 'p1', dryRun: false }), false)
+})
+
+test('fb-lite refresh request body: profile_id is OPTIONAL (page-only auto-discovery) + owner scoping', () => {
+    // No profile_id → page-only auto-discovery request; profile_id is omitted entirely.
+    const discover = buildFacebookLiteRefreshRequestBody({ pageId: '100', namespaceId: 'ns', ownerEmails: ['A@x.com', 'a@x.com', '  b@y.com '] })
+    assert.equal('profile_id' in discover, false)
+    assert.deepEqual(discover, { page_id: '100', namespace_id: 'ns', owner_emails: ['a@x.com', 'b@y.com'] })
+    // Empty owner list is omitted.
+    assert.equal('owner_emails' in buildFacebookLiteRefreshRequestBody({ pageId: '100', ownerEmails: ['', '   '] }), false)
+    // Fully empty input → empty body (no profile_id stub).
+    assert.deepEqual(buildFacebookLiteRefreshRequestBody({}), {})
+})
+
+test('fb-lite refresh response parse: token-free outcome, requires ok+refreshed', () => {
+    const good = parseFacebookLiteRefreshResponse(true, { ok: true, refreshed: true, synced: true, page_id: '100', reason: 'refreshed_and_synced' })
+    assert.deepEqual(good, { ok: true, refreshed: true, synced: true, pageId: '100', reason: 'refreshed_and_synced' })
+    // refreshed but sync failed → synced:false (caller must not assume the pool is fresh).
+    assert.equal(parseFacebookLiteRefreshResponse(true, { ok: true, refreshed: true, synced: false }).synced, false)
+    // HTTP failure forces ok/refreshed/synced false regardless of body.
+    const httpFail = parseFacebookLiteRefreshResponse(false, { ok: true, refreshed: true, synced: true })
+    assert.equal(httpFail.ok, false)
+    assert.equal(httpFail.refreshed, false)
+    assert.equal(httpFail.synced, false)
+    // ok:false body → not refreshed; reason falls back to error/redacted hint.
+    const failed = parseFacebookLiteRefreshResponse(true, { ok: false, error: 'missing_credentials' })
+    assert.equal(failed.refreshed, false)
+    assert.equal(failed.reason, 'missing_credentials')
+    // Garbage payloads never throw.
+    assert.equal(parseFacebookLiteRefreshResponse(true, null).ok, false)
+    assert.equal(parseFacebookLiteRefreshResponse(true, undefined).refreshed, false)
+})
+
+test('fb-lite refresh response shaper (server side): only booleans + redacted hints, never a token', () => {
+    const dry = redactFacebookLiteRefreshResult({ ok: true, dryRun: true, profilePresent: true, hasCredentials: true, pageId: '100', reason: 'dry_run_credentials_present' })
+    assert.deepEqual(dry, {
+        ok: true, refreshed: false, synced: false, dry_run: true,
+        profile_present: true, has_credentials: true, page_id: '100', reason: 'dry_run_credentials_present',
+    })
+    // No token-bearing fields are ever emitted.
+    const keys = Object.keys(redactFacebookLiteRefreshResult({ ok: true, refreshed: true, synced: true }))
+    assert.deepEqual(keys.sort(), ['dry_run', 'has_credentials', 'ok', 'page_id', 'profile_present', 'reason', 'refreshed', 'synced'])
+    // reason is capped so a leaked error string can't smuggle a long token through.
+    const long = redactFacebookLiteRefreshResult({ ok: false, reason: 'x'.repeat(500) })
+    assert.ok(long.reason.length <= 120)
+    // Empty pageId normalizes to null.
+    assert.equal(redactFacebookLiteRefreshResult({ ok: false, pageId: '   ' }).page_id, null)
 })
 
 test('module exposes only the two-mode source type (no third provider)', () => {
