@@ -106,6 +106,13 @@ function hasValue(v) {
   return v != null && String(v).trim() !== '';
 }
 
+function sanitizePublicReason(value, fallback = 'request_failed') {
+  const text = sanitizeUrlSecrets(String(value || fallback)).slice(0, 500);
+  return text
+    .replace(/\bEAA[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .replace(/\b(fb_dtsg|datr|cookie|cookies|password)\b\s*[:=]?\s*[^,\s;)]+/ig, '$1=[REDACTED]');
+}
+
 async function safeKeychainStatus(kc, account) {
   try {
     return await kc.getStatus(account);
@@ -684,13 +691,13 @@ function createHandler(deps = {}) {
             } catch (e) {
               return {
                 status: 'graph_pages_failed', page_found: false, hasToken: false, pageToken: '', pageName: '',
-                reason: (e && (e.reason || e.code || e.message)) || 'graph_pages_failed'
+                reason: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed')
               };
             }
             if (pagesResult && pagesResult.error) {
               return {
                 status: 'graph_pages_failed', page_found: false, hasToken: false, pageToken: '', pageName: '',
-                reason: pagesResult.error
+                reason: sanitizePublicReason(pagesResult.error, 'graph_pages_failed')
               };
             }
             const match = (pagesResult.data || []).find((p) => String(p && p.id) === pid);
@@ -781,7 +788,7 @@ function createHandler(deps = {}) {
             ok: false, synced: false, status: 'worker_unreachable',
             account: effectiveAccount, namespace_id: ns, page_id: pid,
             page_found: true, hasToken: true,
-            reason: (e && (e.code || e.message)) || 'worker_unreachable'
+            reason: sanitizePublicReason((e && (e.code || e.message)) || 'worker_unreachable', 'worker_unreachable')
           });
         }
 

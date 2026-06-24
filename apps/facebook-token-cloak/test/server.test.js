@@ -584,6 +584,23 @@ function callHandler(deps, { method, path, body, remoteAddress }) {
   }));
 }
 
+async function captureConsole(fn) {
+  const lines = [];
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  const capture = (...args) => { lines.push(args.map((arg) => String(arg)).join(' ')); };
+  console.log = capture;
+  console.warn = capture;
+  console.error = capture;
+  try {
+    const value = await fn();
+    return { value, lines };
+  } finally {
+    console.log = original.log;
+    console.warn = original.warn;
+    console.error = original.error;
+  }
+}
+
 // A CloakBrowser mock whose session resolves the page list through `session.graphFetch` — the
 // same cookie-bound client GET /pages uses — instead of a bare server fetch. `pagesByAccount`
 // maps an account/alias to the me/accounts rows that account's logged-in session administers;
@@ -591,8 +608,10 @@ function callHandler(deps, { method, path, body, remoteAddress }) {
 // and no Ads Manager token), exercising the no_session / default-account fallback paths. The
 // graphFetch path runs over `context.request.fetch` (Playwright APIRequestContext shape), which
 // is what `makeBrowserGraphFetch` prefers in production.
-function exportBrowser({ pagesByAccount = {}, noSessionAccounts = [] } = {}) {
+function exportBrowser({ pagesByAccount = {}, noSessionAccounts = [], graphErrorsByAccount = {} } = {}) {
+  const graphCalls = [];
   return {
+    graphCalls,
     PROFILE_ROOT: '/tmp/profiles',
     loadBrowserBackend: async () => ({ backend: 'mock-browser' }),
     openPage: async (account) => {
@@ -618,7 +637,11 @@ function exportBrowser({ pagesByAccount = {}, noSessionAccounts = [] } = {}) {
           request: {
             fetch: async (url) => {
               const u = String(url);
-              const payload = u.includes('/me/accounts') ? { data: pages } : {};
+              graphCalls.push({ account, url: u });
+              const error = graphErrorsByAccount[account];
+              const payload = u.includes('/me/accounts') && error
+                ? { error: { message: String(error) } }
+                : (u.includes('/me/accounts') ? { data: pages } : {});
               return { status: 200, ok: true, text: async () => JSON.stringify(payload) };
             }
           }
@@ -673,14 +696,19 @@ test('/token/export live export returns sync_secret_missing when no secret confi
 test('/token/export live export resolves the page via session.graphFetch (same as /pages) and stays token-free', async () => {
   const SECRET = 'unit-test-bridge-secret';
   let captured = null;
+  let r;
+  const mockBrowser = exportBrowser({
+    pagesByAccount: {
+      '100090320823561': [
+        { id: '999', name: 'Other', access_token: 'OTHERPAGESECRET' },
+        { id: '1008898512617594', name: 'เฉียบ', access_token: 'PAGESECRET' }
+      ]
+    }
+  });
   // The injected fetch deliberately does NOT serve /me/accounts — if the exporter still resolved
   // the page it must have come from session.graphFetch (the /pages semantics), not a bare fetch.
   await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
-    browser: exportBrowser({
-      pagesByAccount: {
-        '100090320823561': [{ id: '1008898512617594', name: 'เฉียบ', access_token: 'PAGESECRET' }]
-      }
-    }),
+    browser: mockBrowser,
     fetch: async (url, opts) => {
       if (String(url).includes('/me/accounts')) {
         throw new Error('me/accounts must be resolved via session.graphFetch, not the bare fetch');
@@ -692,12 +720,15 @@ test('/token/export live export resolves the page via session.graphFetch (same a
       return { ok: true, status: 200, json: async () => ({}) };
     }
   }, async (request) => {
-    const r = await request('POST', '/token/export', {
-      account: '100090320823561',
-      namespaceId: '1774858894802785816',
-      pageId: '1008898512617594',
-      dryRun: false
+    const capturedConsole = await captureConsole(async () => {
+      r = await request('POST', '/token/export', {
+        account: '100090320823561',
+        namespaceId: '1774858894802785816',
+        pageId: '1008898512617594',
+        dryRun: false
+      });
     });
+    const logs = capturedConsole.lines;
     // Response is token-free and reports a successful sync.
     assert.equal(r.body.ok, true);
     assert.equal(r.body.synced, true);
@@ -707,7 +738,16 @@ test('/token/export live export resolves the page via session.graphFetch (same a
     assert.equal(r.body.profile_sync_success, true);
     assert.equal('access_token' in r.body, false);
     assert.equal('token' in r.body, false);
-    assertNoLeak(r.body, ['PAGESECRET', 'SESSION_100090320823561', SECRET]);
+    assertNoLeak({ body: r.body, logs }, ['PAGESECRET', 'OTHERPAGESECRET', 'SESSION_100090320823561', SECRET, 'fb_dtsg', 'datr=']);
+    assert.ok(
+      mockBrowser.graphCalls.some((call) =>
+        call.account === '100090320823561' &&
+        /\/me\/accounts/.test(call.url) &&
+        /fields=access_token,id,name,category/.test(call.url) &&
+        /access_token=SESSION_100090320823561/.test(call.url)
+      ),
+      'export must call session.graphFetch /me/accounts with the user token'
+    );
 
     // The push carried the secret header + the page-scoped token in the body only.
     assert.ok(captured, 'profile-sync must be called');
@@ -716,6 +756,7 @@ test('/token/export live export resolves the page via session.graphFetch (same a
     assert.equal(captured.body.page_id, '1008898512617594');
     assert.equal(captured.body.access_token, 'PAGESECRET');
     assert.equal(captured.body.comment_token, 'PAGESECRET');
+    assert.notEqual(captured.body.access_token, 'OTHERPAGESECRET', 'must choose the token for the matching page id');
   }));
 });
 
@@ -786,14 +827,15 @@ test('/token/export returns no_session when neither the alias nor the default ac
 test('/token/export returns page_not_found when no administered session lists the page', async () => {
   const SECRET = 'unit-test-bridge-secret';
   let pushCalled = false;
+  const mockBrowser = exportBrowser({
+    pagesByAccount: {
+      CHEARB: [{ id: '999', name: 'Other', access_token: 'X' }],
+      content_paiya: [{ id: '888', name: 'Other2', access_token: 'Y' }]
+    }
+  });
   // Both the alias and the default account have sessions, but neither administers the requested page.
   await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
-    browser: exportBrowser({
-      pagesByAccount: {
-        CHEARB: [{ id: '999', name: 'Other', access_token: 'X' }],
-        content_paiya: [{ id: '888', name: 'Other2', access_token: 'Y' }]
-      }
-    }),
+    browser: mockBrowser,
     fetch: async (url) => {
       if (String(url).includes('/api/pages/profile-sync')) pushCalled = true;
       return { ok: true, status: 200, json: async () => ({}) };
@@ -806,6 +848,9 @@ test('/token/export returns page_not_found when no administered session lists th
     assert.equal(r.body.ok, false);
     assert.equal(r.body.page_found, false);
     assert.equal(pushCalled, false);
+    assert.ok(mockBrowser.graphCalls.some((call) => call.account === 'CHEARB' && /\/me\/accounts/.test(call.url)));
+    assert.ok(mockBrowser.graphCalls.some((call) => call.account === 'content_paiya' && /\/me\/accounts/.test(call.url)));
+    assertNoLeak(r.body, ['SESSION_CHEARB', 'SESSION_content_paiya', 'X', 'Y', SECRET]);
   }));
 });
 
@@ -832,5 +877,52 @@ test('/token/export returns page_token_unavailable when the page is administered
     assert.equal(r.body.page_found, true);
     assert.equal(r.body.hasToken, false);
     assert.equal(pushCalled, false);
+    assert.equal('access_token' in r.body, false);
+    assert.equal('token' in r.body, false);
+    assertNoLeak(r.body, ['SESSION_CHEARB', 'SESSION_content_paiya', SECRET]);
+  }));
+});
+
+test('/token/export sanitizes graph failure reasons and console output', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const leakyReason = 'graph failed access_token=EAAB_USER_SECRET fb_dtsg=FB_DTSG_SECRET datr=DATR_SECRET cookie=c_user=123 password=PW_SECRET';
+  let pushCalled = false;
+  let r;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    browser: exportBrowser({
+      graphErrorsByAccount: {
+        CHEARB: leakyReason,
+        content_paiya: leakyReason
+      }
+    }),
+    fetch: async (url) => {
+      if (String(url).includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const captured = await captureConsole(async () => {
+      r = await request('POST', '/token/export', {
+        account: 'CHEARB',
+        namespaceId: 'NS',
+        pageId: '1008898512617594',
+        dryRun: false
+      });
+    });
+    assert.equal(r.body.status, 'graph_pages_failed');
+    assert.equal(r.body.ok, false);
+    assert.equal(pushCalled, false);
+    assert.match(r.body.reason, /access_token=\[REDACTED\]/);
+    assert.match(r.body.reason, /fb_dtsg=\[REDACTED\]/);
+    assert.match(r.body.reason, /datr=\[REDACTED\]/);
+    assert.match(r.body.reason, /cookie=\[REDACTED\]/);
+    assert.match(r.body.reason, /password=\[REDACTED\]/);
+    assertNoLeak({ body: r.body, logs: captured.lines }, [
+      'EAAB_USER_SECRET',
+      'FB_DTSG_SECRET',
+      'DATR_SECRET',
+      'c_user=123',
+      'PW_SECRET',
+      SECRET
+    ]);
   }));
 });

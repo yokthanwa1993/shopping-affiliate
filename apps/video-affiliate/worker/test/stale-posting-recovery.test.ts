@@ -63,13 +63,27 @@ test('recoverStalePostingAttemptsForPage helper exists with safe invariants', ()
     assert.match(body, /datetime\(created_at\) < datetime\('now', \?\)/, 'lock cleanup must be age-bounded')
 })
 
-test('default recovery threshold is the conservative 5-minute constant', () => {
+test('default recovery threshold gives Facebook Lite /video_reels enough processing headroom', () => {
     const source = getSource()
     assert.match(
         source,
-        /const STALE_POSTING_RECOVERY_THRESHOLD_MINUTES = 5\b/,
-        'STALE_POSTING_RECOVERY_THRESHOLD_MINUTES must be 5'
+        /const STALE_POSTING_RECOVERY_THRESHOLD_MINUTES = 15\b/,
+        'STALE_POSTING_RECOVERY_THRESHOLD_MINUTES must be 15'
     )
+})
+
+test('Facebook Lite /video_reels upload is timeout-bounded, not a raw fetch that can leave posting rows stuck', () => {
+    const source = getSource()
+    const body = sliceBetween(
+        source,
+        'async function publishReelDirectWithTokenFallback',
+        '\nasync function publishReelWithCommentTokenPrimaryFallback',
+        'publishReelDirectWithTokenFallback'
+    )
+
+    assert.match(body, /fetchWithTimeout\(uploadUrl,/, 'video_reels upload must use fetchWithTimeout')
+    assert.match(body, /facebook_reel_upload/, 'timeout label must identify the Facebook reel upload step')
+    assert.doesNotMatch(body, /await fetch\(uploadUrl,/, 'video_reels upload must not use raw fetch')
 })
 
 test('force-post recovers stale posting rows before acquiring the page lock', () => {

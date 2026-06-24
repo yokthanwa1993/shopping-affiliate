@@ -29684,9 +29684,11 @@ async function failStalePostingRows(db: D1Database, namespaceId: string, pageId:
 
 // Conservative threshold for treating a `status='posting'` row with no
 // fb_post_id as permanently stuck. Normal successful posting flips the row to
-// 'success' within seconds/minutes, so 5 minutes is safe and mirrors the
-// create-ad watchdog window used elsewhere.
-const STALE_POSTING_RECOVERY_THRESHOLD_MINUTES = 5
+// 'success' within seconds/minutes, but Facebook Lite /video_reels can take
+// longer than 5 minutes to finish processing while the HTTP request is still
+// alive. Keep the recovery window long enough to avoid cron falsely marking an
+// active Facebook Lite publish as failed before the route can record fb_post_id.
+const STALE_POSTING_RECOVERY_THRESHOLD_MINUTES = 15
 
 // Recover post_history rows that are stuck in `status='posting'` with no
 // fb_post_id for longer than the threshold. Such rows are the result of a
@@ -35369,7 +35371,7 @@ async function publishReelDirectWithTokenFallback(params: {
                 throw new Error('facebook_reel_upload_start_failed')
             }
 
-            const uploadResp = await fetch(uploadUrl, {
+            const uploadResp = await fetchWithTimeout(uploadUrl, {
                 method: 'POST',
                 headers: {
                     Authorization: `OAuth ${token}`,
@@ -35377,7 +35379,7 @@ async function publishReelDirectWithTokenFallback(params: {
                     file_size: String(params.videoBuffer.byteLength),
                 },
                 body: params.videoBuffer,
-            })
+            }, 180000, 'facebook_reel_upload')
             const uploadData = await uploadResp.json().catch(() => ({} as any)) as {
                 success?: boolean
                 error?: { message?: string; code?: number; error_subcode?: number }
@@ -35436,6 +35438,7 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     thumbnailContentType?: string
     description: string
     logPrefix: string
+    preferVideoReelsFirst?: boolean
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
     const candidates = buildPrimaryPostingTokenCandidates({
         postTokens: params.postTokens,
@@ -35456,6 +35459,77 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     // without producing false-positive matches (we still match by caption + after time).
     const overallNotBeforeIso = new Date(Date.now() - 30 * 60 * 1000).toISOString()
 
+    const resumableCandidates = normalizePostTokenPool([
+        ...params.postTokens,
+        ...candidates,
+    ])
+
+    const recoverRecentPublishedReel = async (reason: string, logPrefix: string): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string } | null> => {
+        for (const token of resumableCandidates) {
+            try {
+                const recovery = await recoverPublishedReelFromRecentFeed({
+                    accessToken: token,
+                    pageId: params.pageId,
+                    expectedCaption: params.description,
+                    notBeforeIso: overallNotBeforeIso,
+                    logPrefix,
+                })
+                if (recovery.published && recovery.post_id) {
+                    const recoveredPostId = String(recovery.post_id || '').trim()
+                    console.log(`[${params.logPrefix}] ${reason} already published as ${recoveredPostId} — skipping fallback to prevent duplicate (token_hint=${deriveCommentTokenHint(token) || 'unknown_token'})`)
+                    return {
+                        id: recoveredPostId,
+                        postId: recoveredPostId,
+                        permalinkUrl: String(recovery.permalink_url || '').trim(),
+                        postingToken: token,
+                    }
+                }
+            } catch {
+                // best-effort guard — fall through to fallback if recovery fails
+            }
+        }
+        return null
+    }
+
+    if (params.preferVideoReelsFirst) {
+        if (resumableCandidates.length === 0) {
+            throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
+        }
+        try {
+            return await publishReelDirectWithTokenFallback({
+                pageId: params.pageId,
+                postTokens: resumableCandidates,
+                videoBuffer: params.videoBuffer,
+                thumbnailBuffer: params.thumbnailBuffer,
+                thumbnailContentType: params.thumbnailContentType,
+                description: params.description,
+                logPrefix: `${params.logPrefix} /video_reels`,
+            })
+        } catch (resumableErr) {
+            const resumableMessage = parseFacebookErrorLike(resumableErr)?.message || (resumableErr instanceof Error ? resumableErr.message : String(resumableErr))
+            if (shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: resumableMessage })) {
+                throw new Error(`facebook_publish_all_paths_failed: video_reels=${resumableMessage}`)
+            }
+            const recovered = await recoverRecentPublishedReel('/video_reels attempt', `${params.logPrefix} video-reels-recover`)
+            if (recovered) return recovered
+            console.warn(`[${params.logPrefix}] /video_reels publish failed, falling back to direct /videos (${resumableMessage})`)
+            try {
+                return await publishReelViaVideosEndpointWithTokenFallback({
+                    pageId: params.pageId,
+                    accessTokens: candidates,
+                    videoBuffer: params.videoBuffer,
+                    thumbnailBuffer: params.thumbnailBuffer,
+                    thumbnailContentType: params.thumbnailContentType,
+                    description: params.description,
+                    logPrefix: `${params.logPrefix} /videos-fallback`,
+                })
+            } catch (directErr) {
+                const directMessage = parseFacebookErrorLike(directErr)?.message || (directErr instanceof Error ? directErr.message : String(directErr))
+                throw new Error(`facebook_publish_all_paths_failed: video_reels=${resumableMessage} | direct=${directMessage}`)
+            }
+        }
+    }
+
     try {
         return await publishReelViaVideosEndpointWithTokenFallback({
             pageId: params.pageId,
@@ -35468,10 +35542,6 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         })
     } catch (directErr) {
         const directMessage = parseFacebookErrorLike(directErr)?.message || (directErr instanceof Error ? directErr.message : String(directErr))
-        const resumableCandidates = normalizePostTokenPool([
-            ...params.postTokens,
-            ...candidates,
-        ])
         if (resumableCandidates.length === 0) {
             throw directErr
         }
@@ -35482,29 +35552,8 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
         // ask FB once more whether any of the /videos attempts actually published —
         // FB sometimes accepts the post but returns a transient error code, leading
         // both /videos retries AND /video_reels to publish the same video twice.
-        for (const token of resumableCandidates) {
-            try {
-                const recovery = await recoverPublishedReelFromRecentFeed({
-                    accessToken: token,
-                    pageId: params.pageId,
-                    expectedCaption: params.description,
-                    notBeforeIso: overallNotBeforeIso,
-                    logPrefix: `${params.logPrefix} fallback-recover`,
-                })
-                if (recovery.published && recovery.post_id) {
-                    const recoveredPostId = String(recovery.post_id || '').trim()
-                    console.log(`[${params.logPrefix}] /videos attempts already published as ${recoveredPostId} — skipping /video_reels fallback to prevent duplicate (token_tail=${deriveCommentTokenHint(token) || token.slice(-8)})`)
-                    return {
-                        id: recoveredPostId,
-                        postId: recoveredPostId,
-                        permalinkUrl: String(recovery.permalink_url || '').trim(),
-                        postingToken: token,
-                    }
-                }
-            } catch {
-                // best-effort guard — fall through to /video_reels if recovery fails
-            }
-        }
+        const recovered = await recoverRecentPublishedReel('/videos attempts', `${params.logPrefix} fallback-recover`)
+        if (recovered) return recovered
 
         console.warn(`[${params.logPrefix}] direct /videos publish failed, falling back to 3-step /video_reels (${directMessage})`)
 
@@ -35539,6 +35588,7 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
     namespaceId: string
     pageId: string
     pageName: string
+    videoUrl?: string
     commentTokens: string[]
     postTokens: string[]
     videoBuffer: ArrayBuffer
@@ -35547,6 +35597,7 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
     description: string
     logPrefix: string
     candidateLoginIds?: string[]
+    preferVideoReelsFirst?: boolean
     reloadTokens: () => Promise<{ commentTokens: string[]; postTokens: string[] }>
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
     try {
@@ -35559,12 +35610,44 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
             thumbnailContentType: params.thumbnailContentType,
             description: params.description,
             logPrefix: params.logPrefix,
+            preferVideoReelsFirst: params.preferVideoReelsFirst,
         })
     } catch (publishErr) {
         const message = parseFacebookErrorLike(publishErr)?.message || (publishErr instanceof Error ? publishErr.message : String(publishErr))
         const tokenMissing = !normalizePostTokenPool(params.postTokens || []).length
         if (!shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', tokenMissing, error: message })) {
             throw publishErr
+        }
+        const videoUrl = String(params.videoUrl || '').trim()
+        if (videoUrl) {
+            const accountHint = String(params.candidateLoginIds?.[0] || '').trim()
+                || (String(params.pageId || '').trim() === '1008898512617594' ? '100090320823561' : '')
+            const bridgeLookup = await fetchFacebookLitePageTokenFromBridge({
+                env: params.env,
+                pageId: params.pageId,
+                candidateLoginIds: accountHint ? [accountHint] : params.candidateLoginIds,
+                logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
+            }).catch(() => ({ token: '', account: accountHint }))
+            const account = String(bridgeLookup.account || accountHint || '').trim()
+            if (account) {
+                console.log(`[${params.logPrefix}] stored-token Graph publish failed (${message}); falling back to Facebook Lite bridge account=candidate`)
+                const bridged = await publishReelViaSessionBridge({
+                    env: params.env,
+                    pageId: params.pageId,
+                    videoUrl,
+                    message: params.description,
+                    account,
+                    postingTokenHint: 'facebook_lite_bridge',
+                    commentText: '',
+                    logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
+                })
+                return {
+                    id: bridged.id,
+                    postId: bridged.postId,
+                    permalinkUrl: bridged.permalinkUrl,
+                    postingToken: bridged.postingToken,
+                }
+            }
         }
         console.log(`[${params.logPrefix}] stored-token publish auth failure — attempting Facebook Lite page-token refresh`)
         const refresh = await refreshFacebookLitePostingTokenForPage({
@@ -35591,6 +35674,7 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
             thumbnailContentType: params.thumbnailContentType,
             description: params.description,
             logPrefix: `${params.logPrefix} POST-REFRESH-RETRY`,
+            preferVideoReelsFirst: params.preferVideoReelsFirst,
         })
     }
 }
@@ -35715,6 +35799,8 @@ async function publishReelViaSessionBridge(params: {
     pageId: string
     videoUrl: string
     message: string
+    account?: string
+    postingTokenHint?: string
     websiteUrl?: string
     cta?: PageOneCardCta
     commentText?: string
@@ -35723,10 +35809,13 @@ async function publishReelViaSessionBridge(params: {
     const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
     if (!baseUrl) throw new Error('bridge_not_configured')
     const pageId = String(params.pageId || '').trim()
+    const account = String(params.account || '').trim()
+    const accountQuery = account ? `?account=${encodeURIComponent(account)}` : ''
+    const postingTokenHint = String(params.postingTokenHint || '').trim() || 'cloak_session_bridge'
 
     // 1. Fail closed unless the bridge reports a live logged-in session. /token returns
     //    only booleans (accessToken/fbDtsg presence) — never the values.
-    const tokenResp = await fetchWithTimeout(`${baseUrl}/token`, {}, 15000, 'bridge_token')
+    const tokenResp = await fetchWithTimeout(`${baseUrl}/token${accountQuery}`, {}, 15000, 'bridge_token')
     const tokenData = await tokenResp.json().catch(() => ({} as any)) as { ok?: boolean; accessToken?: boolean }
     if (!tokenResp.ok || !tokenData?.ok || tokenData.accessToken !== true) {
         throw new Error('session_bridge_token_unavailable')
@@ -35734,7 +35823,7 @@ async function publishReelViaSessionBridge(params: {
 
     // 2. Validate page authorization via /pages (me/accounts through the session). Only
     //    the page id is read for the check; page access_token values are never logged.
-    const pagesResp = await fetchWithTimeout(`${baseUrl}/pages`, {}, 20000, 'bridge_pages')
+    const pagesResp = await fetchWithTimeout(`${baseUrl}/pages${accountQuery}`, {}, 20000, 'bridge_pages')
     const pagesData = await pagesResp.json().catch(() => ({} as any)) as { data?: Array<{ id?: string }>; error?: unknown }
     if (!pagesResp.ok || (pagesData as any)?.error) {
         throw new Error('session_bridge_pages_failed')
@@ -35750,6 +35839,7 @@ async function publishReelViaSessionBridge(params: {
         video_url: params.videoUrl,
         message: String(params.message || '').trim(),
     }
+    if (account) postBody.account = account
     if (websiteUrl && cta !== 'NO_BUTTON') {
         postBody.website_url = websiteUrl
         postBody.cta = cta
@@ -35792,7 +35882,7 @@ async function publishReelViaSessionBridge(params: {
             const commentResp = await fetchWithTimeout(`${baseUrl}/page-comment`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ page_id: pageId, story_id: storyId, message: commentText }),
+                body: JSON.stringify({ page_id: pageId, story_id: storyId, message: commentText, ...(account ? { account } : {}) }),
             }, 30000, 'bridge_page_comment')
             const commentData = await commentResp.json().catch(() => ({} as any)) as { ok?: boolean; id?: string; step?: string; error?: string }
             if (commentResp.ok && commentData?.ok && commentData?.id) {
@@ -35814,7 +35904,7 @@ async function publishReelViaSessionBridge(params: {
         id: String(data.video_id || '').trim(),
         postId,
         permalinkUrl: String(data.post_url || '').trim() || (postId ? `https://www.facebook.com/${pageId}/posts/${postId}` : ''),
-        postingToken: 'cloak_session_bridge',
+        postingToken: postingTokenHint,
         commentId,
         commentStatus,
         commentError,
@@ -35845,6 +35935,7 @@ async function sendPageCommentViaCloakBridge(params: {
     pageId: string
     storyId: string
     message: string
+    account?: string
     logPrefix: string
 }): Promise<{ status: 'success' | 'failed' | 'not_configured'; id: string | null; error: string | null }> {
     const message = String(params.message || '').trim()
@@ -35860,7 +35951,7 @@ async function sendPageCommentViaCloakBridge(params: {
         const resp = await fetchWithTimeout(`${baseUrl}/page-comment`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ page_id: pageId, story_id: storyId, message }),
+            body: JSON.stringify({ page_id: pageId, story_id: storyId, message, ...(String(params.account || '').trim() ? { account: String(params.account || '').trim() } : {}) }),
         }, 30000, 'page_comment_bridge')
         const data = await resp.json().catch(() => ({} as any)) as { ok?: boolean; id?: string; step?: string; error?: string }
         if (resp.ok && data?.ok && data?.id) {
@@ -40328,6 +40419,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 namespaceId: botId,
                 pageId: page.id,
                 pageName: page.name,
+                videoUrl: postingVideoUrl,
                 commentTokens: commentTokenCandidates,
                 postTokens: fallbackPostTokenCandidates,
                 videoBuffer,
@@ -40335,6 +40427,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 thumbnailContentType: postingThumbnail?.contentType || '',
                 description: publishDescription,
                 logPrefix: 'FORCE-POST',
+                preferVideoReelsFirst: true,
                 reloadTokens: async () => {
                     const refreshed = await ensurePageTokenCandidates({
                         env,
@@ -40357,10 +40450,14 @@ app.post('/api/pages/:id/force-post', async (c) => {
         fbVideoId = reelResult.id
         const confirmedCanonicalPostId = String(reelResult.postId || '').trim()
         const confirmedPostId = confirmedCanonicalPostId || fbVideoId
+        const facebookLiteBridgeAccount = postingTokenUsed === 'facebook_lite_bridge'
+            ? (String(page.id || '').trim() === '1008898512617594' ? '100090320823561' : '')
+            : ''
         let commentShopeeLink = normalizedShopeeLink
         // Re-shorten with the post id when we intend to comment — either via the stored
-        // token (needs hasCommentToken) or via the CloakBrowser bridge override.
-        const willComment = !!commentShopeeLink && !skipComment && (hasCommentToken || commentViaCloakBridge)
+        // token (needs hasCommentToken), via the CloakBrowser bridge override, or via the
+        // Facebook Lite Token Bridge fallback that created the post.
+        const willComment = !!commentShopeeLink && !skipComment && (hasCommentToken || commentViaCloakBridge || !!facebookLiteBridgeAccount)
         if (willComment) {
             try {
                 const commentSubIds = buildPostingCommentShortlinkSubIds({
@@ -40386,7 +40483,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const fbReelUrl = String(reelResult.permalinkUrl || '').trim() || `https://www.facebook.com/reel/${fbVideoId}`
         // Only the stored-token path defers via comment_due_at; the bridge override comments
         // immediately below, so it schedules no delay.
-        const scheduledCommentDelaySeconds = commentShopeeLink && !skipComment && hasCommentToken && !commentViaCloakBridge
+        const scheduledCommentDelaySeconds = commentShopeeLink && !skipComment && hasCommentToken && !commentViaCloakBridge && !facebookLiteBridgeAccount
             ? getRandomCommentDelaySeconds()
             : null
         const scheduledCommentDueAt = scheduledCommentDelaySeconds
@@ -40439,6 +40536,22 @@ app.post('/api/pages/:id/force-post', async (c) => {
             commentFbId = bridged.id
             commentError = bridged.error
             commentTokenHintFinal = 'cloak_session_bridge'
+        } else if (commentShopeeLink && facebookLiteBridgeAccount) {
+            // Facebook Lite bridge POST path: raw exported token is not Graph-usable server-side,
+            // so comment through the same Token Bridge account that created the post.
+            const facebookLiteCommentText = (await buildAffiliateCommentMessage(env.DB, botId, commentShopeeLink).catch(() => '')) || commentShopeeLink
+            const bridged = await sendPageCommentViaCloakBridge({
+                env,
+                pageId,
+                storyId: buildPageStoryId(pageId, confirmedCanonicalPostId || confirmedPostId),
+                message: facebookLiteCommentText,
+                account: facebookLiteBridgeAccount,
+                logPrefix: 'FORCE-POST FB-LITE-COMMENT',
+            })
+            commentStatus = bridged.status
+            commentFbId = bridged.id
+            commentError = bridged.error
+            commentTokenHintFinal = 'facebook_lite_bridge'
         } else if (commentShopeeLink && hasCommentToken) {
             // Stored-token comment deferred to the pending backlog processor.
             commentStatus = 'pending'
@@ -42953,6 +43066,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     thumbnailContentType: postingThumbnail?.contentType || '',
                     description: publishDescription,
                     logPrefix: `CRON ${page.name}`,
+                    preferVideoReelsFirst: true,
                     reloadTokens: async () => {
                         const refreshed = await ensurePageTokenCandidates({
                             env,

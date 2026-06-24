@@ -855,9 +855,10 @@ test('sendPageCommentViaCloakBridge comments as the Page and fails closed (no st
     // Base URL from the Cloak FB bridge resolver, fails closed when unconfigured.
     assert.match(fn, /resolveCloakFbBridgeBaseUrl\(params\.env\)/)
     assert.match(fn, /throw new Error\('bridge_not_configured'\)/)
-    // Posts page_id/story_id/message to /page-comment — never a token.
+    // Posts page_id/story_id/message to /page-comment — never a token. Optional account
+    // is allowed so Facebook Lite can select the correct Token Bridge session.
     assert.match(fn, /\$\{baseUrl\}\/page-comment`/)
-    assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message \}\)/)
+    assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message,[\s\S]*account/)
     // Nothing to comment → not_configured; any failure → 'failed' (never silent success).
     assert.match(fn, /return \{ status: 'not_configured'/)
     assert.match(fn, /status: 'failed'/)
@@ -976,22 +977,22 @@ test('publishReelViaSessionBridge validates /token + /pages then posts /post via
     assert.ok(!fn.includes('FACEBOOK_TOKEN_CLOAK'), 'must not read FACEBOOK_TOKEN_CLOAK env')
     assert.ok(!fn.includes('/provider/'), 'must not call any /provider/* endpoint')
     // Fail-closed validation: /token (boolean session check) then /pages authorization.
-    assert.match(fn, /\/token`[\s\S]*tokenData\.accessToken !== true[\s\S]*session_bridge_token_unavailable/)
-    assert.match(fn, /\/pages`[\s\S]*session_bridge_page_not_authorized/)
+    assert.match(fn, /\/token\$\{accountQuery\}`[\s\S]*tokenData\.accessToken !== true[\s\S]*session_bridge_token_unavailable/)
+    assert.match(fn, /\/pages\$\{accountQuery\}`[\s\S]*session_bridge_page_not_authorized/)
     // Posts the organic Reel via the bridge /post route.
     assert.match(fn, /\$\{baseUrl\}\/post`/)
     // Comment is posted AS THE PAGE via the bridge /page-comment route (resolves the page
     // token internally, fails closed, no session-user fallback). Worker sends only
-    // page_id/story_id/message — never a token.
+    // page_id/story_id/message (+ optional account selector) — never a token.
     assert.match(fn, /\$\{baseUrl\}\/page-comment`/)
-    assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message: commentText \}\)/)
+    assert.match(fn, /body: JSON\.stringify\(\{ page_id: pageId, story_id: storyId, message: commentText,[\s\S]*account/)
     // Must NOT comment via the /graph proxy (that path authors the comment as the
     // logged-in user, not the Page — the bug this fix removes).
     assert.ok(!/\/graph\?path=[^]*\/comments/.test(fn), 'organic Cloak comment must NOT use /graph?path=.../comments')
     // Missing page-comment id → failed (never silently success), no user-token fallback.
     assert.match(fn, /Missing page-comment id[\s\S]*commentStatus = 'failed'/)
-    // Returns the bridge source hint, not a stored token nor facebook-token-cloak.
-    assert.match(fn, /postingToken: 'cloak_session_bridge'/)
+    // Returns a token-free bridge source hint, not a stored token nor facebook-token-cloak.
+    assert.match(fn, /postingToken: postingTokenHint/)
 })
 
 test('create-ad accepts an explicit pre-shortened comment link and skips its own shortener', () => {
