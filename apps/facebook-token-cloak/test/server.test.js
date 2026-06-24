@@ -23,6 +23,16 @@ function assertNoLeak(value, secrets) {
   for (const secret of secrets) assert.ok(!payload.includes(secret), `leaked ${secret}`);
 }
 
+test('UI auto-check marks Facebook Lite ready from accessToken without requiring Power Editor fbDtsg', async () => {
+  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
+  assert.match(ui, /var tokenReady = !!\(probe && probe\.accessToken\)/);
+  assert.match(ui, /var sessionReady = !!\(probe && probe\.fbDtsg\)/);
+  assert.match(ui, /tokenPresent: tokenReady/);
+  assert.match(ui, /sessionPresent: sessionReady/);
+  assert.ok(!ui.includes('var ready = tokenReady && sessionReady'), 'Facebook Lite token status must not require Power Editor/session readiness');
+  assert.ok(!ui.includes('tokenPresent: ready'), 'UI must not gate Facebook Lite token status on combined readiness');
+})
+
 function browser(url = 'https://postcron.com/auth/login/facebook/callback#access_token=EAAB_USER_SECRET', seen) {
   return {
     PROFILE_ROOT: '/tmp/profiles',

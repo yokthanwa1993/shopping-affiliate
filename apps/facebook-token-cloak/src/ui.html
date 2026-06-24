@@ -467,9 +467,9 @@
     return badge(status.reason || status.status || "No token", "bad");
   }
 
-  // A stored account is worth probing for readiness on load when it has credentials or a saved
-  // browser session — i.e. the cases where Facebook Lite token / Power Editor bridge session can
-  // already be usable without re-login.
+  // A stored account is worth probing for Facebook Lite readiness on load when it has
+  // credentials or a saved browser session. This is only a status probe; it never reads or
+  // displays the raw token.
   function accountLooksCredentialed(account) {
     var browserSessionKey = "da" + "trPresent";
     return !!(account && (account.credentialPresent || account.passwordPresent || account[browserSessionKey]));
@@ -478,9 +478,9 @@
   // Background readiness hydration (fixes "Not checked" sticking until a manual Check token).
   // For every credentialed account without a known status, ask the SAFE GET /token?account=...
   // endpoint (returns booleans only: ok/accessToken/fbDtsg — never a raw token).
-  // tokenPresent = accessToken && fbDtsg marks BOTH the Facebook Lite token and
-  // the Power Editor bridge session as ready, so the row turns green on page load when the
-  // session is already usable. Runs sequentially to avoid spawning many browser sessions at once.
+  // Facebook Lite token readiness is accessToken=true. fbDtsg is only a separate browser-session
+  // signal and must NOT be required here, otherwise the UI falsely looks like Power Editor is
+  // needed before Facebook Lite can go green.
   async function hydrateTokenStatuses() {
     var pending = state.accounts.filter(function (account) {
       return account && account.account && accountLooksCredentialed(account) && !state.tokenStatusByAccount[account.account];
@@ -493,13 +493,11 @@
         var probe = await api("GET", "/token?account=" + encodeURIComponent(account));
         var tokenReady = !!(probe && probe.accessToken);
         var sessionReady = !!(probe && probe.fbDtsg);
-        var ready = tokenReady && sessionReady;
         state.tokenStatusByAccount[account] = {
-          status: ready ? "ready" : "incomplete",
-          tokenPresent: ready,
-          // Distinguish "session up but no page token" from "no logged-in session" so the
-          // operator can tell whether the bridge needs a re-login or the token is just missing.
-          reason: ready ? undefined : (tokenReady ? "session_not_ready" : (sessionReady ? "token_missing" : "not_logged_in"))
+          status: tokenReady ? "ready" : "incomplete",
+          tokenPresent: tokenReady,
+          sessionPresent: sessionReady,
+          reason: tokenReady ? undefined : (sessionReady ? "token_missing" : "not_logged_in")
         };
       } catch (error) {
         state.tokenStatusByAccount[account] = {
