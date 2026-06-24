@@ -168,6 +168,22 @@ import {
     type AdOnlyFailureRow,
     AD_ONLY_AUTO_MAX_ATTEMPTS,
     buildAdOnlySkippedPageSet,
+    type AdOnlyMode,
+    type AdOnlySchedule,
+    type AdOnlyValidation,
+    resolveAdOnlyLane,
+    resolveFollowLaneTemplateAdset,
+    resolveFollowLaneCampaignSub1,
+    buildFollowLaneShortlinkRequestUrl,
+    buildFollowLaneCreativeMessage,
+    buildFollowLaneCommentShortlinkRequestUrl,
+    buildFollowLaneCommentMessage,
+    buildFollowAutoPickBody,
+    FOLLOW_LANE_TEMPLATE_ADSET,
+    FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+    FOLLOW_LANE_CTA_TYPE,
+    FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY,
+    FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY,
 } from './ad-only-contract'
 import { handleReportProxyRequest } from './report-proxy'
 import {
@@ -196,6 +212,11 @@ import {
     parseFacebookLiteRefreshResponse,
     buildBridgeTokenPagesUrl,
     extractBridgeTokenPageAccessToken,
+    isFacebookLitePageToken,
+    isFacebookLitePostingPermissionError,
+    isPersistablePagePrimaryToken,
+    prioritizeSyncedPageTokenPools,
+    shouldFallbackToOrganicAfterOneCardFailure,
     type FacebookLiteRefreshOutcome,
     type FacebookLiteRefreshRequestBody,
 } from './posting-token-source'
@@ -1442,6 +1463,9 @@ app.post('/api/pages/profile-sync', async (c) => {
     const accessToken = String(body?.access_token || body?.accessToken || '').trim()
     const commentToken = String(body?.comment_token || body?.commentToken || '').trim()
     const profileId = String(body?.profile_id || body?.profileId || '').trim()
+    // Advisory source tag from the Token Bridge export (e.g. facebook_lite_bridge). Used only for
+    // logging/diagnostics — prioritization is driven by the token VALUE, not this hint.
+    const tokenSource = String(body?.token_source || body?.tokenSource || body?.post_token_hint || '').trim()
 
     if (!namespaceId) return c.json({ error: 'namespace_not_found' }, 400)
     if (!pageId) return c.json({ error: 'page_id_required' }, 400)
@@ -1459,6 +1483,7 @@ app.post('/api/pages/profile-sync', async (c) => {
             pageAvatarUrl,
             accessToken,
             commentToken,
+            tokenSource,
         })
 
         if (profileId && looksLikeBrowserSavingProfileId(profileId)) {
@@ -12540,6 +12565,20 @@ const AD_HISTORY_RESULT_SAFE_FIELDS = [
     'campaign_status',
     'adset_status',
     'ad_status',
+    // Follow/Page-like lane audit fields.
+    'lane',
+    'follow_cta_type',
+    'follow_shortlink',
+    'follow_campaign_sub1',
+    'follow_shortlink_sub2',
+    'follow_template_adset',
+    // Follow lane Page-comment proof (the final three-sub comment-tracking link posted on the ad story).
+    'follow_comment_status',
+    'follow_comment_id',
+    'follow_comment_error',
+    'follow_comment_shortlink',
+    'follow_comment_sub2',
+    'follow_comment_sub3',
 ] as const
 
 function adHistoryStoryTail(storyId: unknown): string {
@@ -12641,6 +12680,263 @@ function normalizeDashboardAdHistoryRow(row: Record<string, unknown>): Record<st
     return item
 }
 
+// Follow/Page-like lane handler. Reuses the SAME fail-closed input validation + schedule as the
+// click-link lane, but diverges on the ad surface: the Follow OUTCOME_ENGAGEMENT/PAGE_LIKES template,
+// a TWO-sub shortlink (sub1=campaign id, sub2=page id, NO sub3) baked into the creative MESSAGE (above
+// the video preview), and the template's LIKE_PAGE button — NO SHOP_NOW CTA, NO update-cta/repair on the
+// creative. After the dark/ad story id is known it re-mints a FINAL THREE-sub comment-tracking shortlink
+// (sub1=campaign id, sub2=page id, sub3=post/story tail) and posts the required Page comment on that
+// story (non-fatal). Writes its own dashboard_ad_history row tagged lane='follow'. Never publishes a
+// visible Page post (skip_publish_to_page).
+async function runFollowLaneCreateAdOnly(
+    c: Context<{ Bindings: Env, Variables: { botId: string; bucket: R2Bucket } }>,
+    body: Record<string, unknown>,
+    validation: AdOnlyValidation,
+    schedule: AdOnlySchedule,
+): Promise<Response> {
+    const logPrefix = `FOLLOW-AD ${validation.pageId}`
+    const recordFailure = async (error: string, result?: Record<string, unknown> | null, clickLink?: string) => {
+        const rec = buildAdHistoryRecord({ status: 'failed', validation, errorMessage: error, result: result ?? null, clickLink, schedule })
+        const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
+        return c.json({ ...(result || {}), ok: false, lane: 'follow', error, history_id: historyId }, 200)
+    }
+
+    const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
+    if (!baseUrl) return recordFailure('bridge_not_configured')
+
+    // Follow template adset: explicit body → per-page template_adset_follow → corrected default.
+    // ad_account is still required (the bridge copies the template adset under that ad account).
+    const followTemplateRow = await getPageSetting(c.env.DB, validation.pageId, FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY).catch(() => null)
+    const templateAdset = resolveFollowLaneTemplateAdset({ bodyValue: body.template_adset, settingValue: followTemplateRow?.value })
+    const adAccountRow = await getPageSetting(c.env.DB, validation.pageId, 'ad_account').catch(() => null)
+    const adAccount = String(adAccountRow?.value || '').trim()
+    if (!templateAdset || !adAccount) return recordFailure('config_missing_template_or_ad_account')
+
+    // Resolve the namespace + internal system video URL to publish as the dark/ad story. Fail closed
+    // (never boost/reuse the old Facebook post/video) — identical contract to the click-link lane.
+    const namespaceRow = await c.env.DB.prepare('SELECT bot_id FROM pages WHERE id = ? LIMIT 1')
+        .bind(validation.pageId).first().catch(() => null) as { bot_id?: string } | null
+    const namespaceId = String(namespaceRow?.bot_id || '').trim()
+    if (!namespaceId) return recordFailure('page_namespace_unresolved')
+
+    let resolvedNamespaceId = namespaceId
+    let publishVideoUrl = validation.videoUrl
+    let sourceMeta: Record<string, unknown> = {}
+    let systemShopeeLink = ''
+    let thumbnailUrl = ''
+    if (validation.systemVideoId) {
+        const videoRef = await resolveGalleryVideoForRepost({
+            env: c.env,
+            fallbackNamespaceId: namespaceId,
+            videoId: validation.systemVideoId,
+        }).catch(() => null)
+        if (videoRef) {
+            resolvedNamespaceId = String(videoRef.sourceNamespaceId || namespaceId).trim() || namespaceId
+            const sourceBucket = new BotBucket(c.env.BUCKET, resolvedNamespaceId) as unknown as R2Bucket
+            sourceMeta = await loadLatestVideoMetaForPosting(sourceBucket, validation.systemVideoId, videoRef.meta).catch(() => videoRef.meta)
+            systemShopeeLink = videoRef.shopeeLink || normalizeMetaShopeeLink(sourceMeta) || ''
+            const publicUrl = metaToString(sourceMeta, 'publicUrl') || metaToString(sourceMeta, 'public_url')
+            if (!publishVideoUrl) {
+                publishVideoUrl = resolvePostingVideoDownloadUrl(c.env, resolvedNamespaceId, validation.systemVideoId, publicUrl)
+            }
+            const explicitThumbnailUrl = String((body.thumbnail_url as string) || (body.image_url as string) || '').trim()
+            const galleryThumbUrl = buildWorkerGalleryAssetUrl(c.env.WORKER_URL, resolvedNamespaceId, validation.systemVideoId, 'thumb')
+            thumbnailUrl = explicitThumbnailUrl
+                || galleryThumbUrl
+                || metaToString(sourceMeta, 'thumbnailUrl')
+                || metaToString(sourceMeta, 'thumbnail_url')
+                || getVideoThumbnailUrlForNamespace(c.env.R2_PUBLIC_URL, resolvedNamespaceId, validation.systemVideoId)
+        } else if (!publishVideoUrl) {
+            return recordFailure('system_video_unresolved', {
+                source_signal_system_video_id: validation.systemVideoId,
+                resolved_system_video_id: validation.systemVideoId,
+            })
+        }
+    }
+    if (!publishVideoUrl) return recordFailure('system_video_url_unresolved')
+
+    // Resolve a Shopee link (best-effort, same order as the click-link lane): explicit request →
+    // resolved system-video metadata → gallery/namespace state by system video id.
+    let shopeeLink = pickFirstShopeeUrl(String((body.shopee_url as string) || (body.original_link as string) || '').trim()) || ''
+    if (!shopeeLink) shopeeLink = systemShopeeLink
+    if (!shopeeLink && namespaceId && validation.systemVideoId) {
+        const gi = await c.env.DB.prepare(
+            `SELECT COALESCE(NULLIF(TRIM(nvs.shopee_original_link), ''), NULLIF(TRIM(gi.shopee_original_link), '')) AS original_link
+             FROM gallery_index gi
+             LEFT JOIN namespace_video_state nvs ON nvs.namespace_id = gi.namespace_id AND nvs.video_id = gi.video_id
+             WHERE gi.namespace_id = ? AND gi.video_id = ? LIMIT 1`
+        ).bind(namespaceId, validation.systemVideoId).first().catch(() => null) as { original_link?: string } | null
+        if (gi?.original_link) shopeeLink = String(gi.original_link).trim()
+    }
+    if (!shopeeLink) {
+        return recordFailure('shopee_link_missing', {
+            source_signal_system_video_id: validation.systemVideoId,
+            resolved_system_video_id: validation.systemVideoId,
+            resolved_system_video_namespace_id: resolvedNamespaceId,
+            published_to_page: false,
+        })
+    }
+
+    // Mint the TWO-sub Follow shortlink: sub1 = campaign id (default 16JUN26FBSPCAD), sub2 = page id,
+    // NO sub3. The builder forces sub1=/sub2= as real query params (the default template only carries
+    // sub1=) and strips sub3=/sub4=/sub5=, so the page id can never land in a third sub.
+    const tmplRow = await getPageSetting(c.env.DB, validation.pageId, 'shortlink_url').catch(() => null)
+    const tmpl = String(tmplRow?.value || DEFAULT_SHOPEE_SHORTLINK_URL_TEMPLATE).trim()
+    const campaignSub1SettingRow = await getPageSetting(c.env.DB, validation.pageId, FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY).catch(() => null)
+    const campaignSub1 = resolveFollowLaneCampaignSub1(
+        (body.follow_campaign_sub1 as string) ?? (body.campaign_sub1 as string) ?? campaignSub1SettingRow?.value,
+    )
+    const followShortlinkUrl = buildFollowLaneShortlinkRequestUrl({ template: tmpl, shopeeLink, campaignSub1, pageId: validation.pageId })
+    let followLink = ''
+    try {
+        const slResp = await fetch(followShortlinkUrl, { method: 'GET' })
+        if (slResp.ok) {
+            const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+            followLink = String(slData.shortLink || slData.short_link || '').trim()
+        }
+    } catch { /* shortener best-effort; fall back to the raw Shopee link below */ }
+    if (!followLink) followLink = shopeeLink
+
+    // Caption: text + newline + shortlink baked into the creative MESSAGE (above the video preview).
+    const captionText = String((body.caption as string) || '').trim()
+        || buildExpectedCaptionFromMeta(sourceMeta)
+        || validation.systemVideoId
+    const creativeMessage = buildFollowLaneCreativeMessage({ caption: captionText, shortlink: followLink })
+    const adName = String((body.ad_name as string) || validation.systemVideoId || '').trim()
+
+    const lifecycleFields = schedule.mode === 'active'
+        ? {
+            daily_campaign_name: schedule.dailyCampaignName,
+            campaign_daily_budget: schedule.dailyBudgetMinor,
+            adset_run_hours: schedule.runHours,
+        }
+        : {
+            paused: true as const,
+            status_option: 'PAUSED' as const,
+            ...(schedule.dailyCampaignName ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
+        }
+
+    let bridgeResult: Record<string, unknown>
+    try {
+        const bridgeResp = await fetch(`${baseUrl}/create-ad`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page_id: validation.pageId,
+                video_url: publishVideoUrl,
+                // The Shopee link lives in the creative MESSAGE, NOT in a SHOP_NOW button — send the
+                // composed caption as the message. The LIKE_PAGE button comes from the template creative.
+                caption: creativeMessage,
+                ...(adName ? { ad_name: adName } : {}),
+                ...(validation.systemVideoId ? { source_video_id: validation.systemVideoId } : {}),
+                ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
+                template_adset: templateAdset,
+                ad_account: adAccount,
+                // Hint the Follow CTA; the bridge keeps LIKE_PAGE when the template creative is LIKE_PAGE.
+                call_to_action_type: FOLLOW_LANE_CTA_TYPE,
+                // HARD SEPARATION: dark/ad story only — never publish a visible Page post here.
+                skip_publish_to_page: true,
+                skip_comment: true,
+                ...lifecycleFields,
+            }),
+        })
+        const text = await bridgeResp.text()
+        bridgeResult = text ? JSON.parse(text) as Record<string, unknown> : {}
+    } catch (e) {
+        return recordFailure(e instanceof Error ? e.message : String(e), null, followLink)
+    }
+
+    const adStoryIdRaw = String(bridgeResult.story_id || bridgeResult.effective_object_story_id || bridgeResult.ad_story_id || '').trim()
+    const adStoryIdForProof = buildPageStoryId(validation.pageId, adStoryIdRaw)
+    const adFbVideoId = String(bridgeResult.video_id || bridgeResult.fb_video_id || bridgeResult.advideo_id || '').trim()
+    bridgeResult = {
+        ...bridgeResult,
+        lane: 'follow',
+        follow_cta_type: FOLLOW_LANE_CTA_TYPE,
+        follow_shortlink: followLink,
+        follow_campaign_sub1: campaignSub1,
+        follow_shortlink_sub2: validation.pageId,
+        follow_template_adset: templateAdset,
+        resolved_system_video_id: validation.systemVideoId,
+        resolved_system_video_namespace_id: resolvedNamespaceId,
+        ...(adStoryIdForProof ? { story_id: adStoryIdForProof, ad_story_id: adStoryIdForProof, effective_object_story_id: adStoryIdForProof } : {}),
+        ...(adFbVideoId ? { new_fb_video_id: adFbVideoId } : {}),
+        click_link: followLink,
+        comment_message: creativeMessage.slice(0, 500),
+        published_to_page: false,
+    }
+
+    // The Follow ad needs only an ad_id to be a real ad. Unlike the click-link lane it does NOT require
+    // a readable story id (PAUSED follow ads may not expose one) and the LIKE_PAGE creative CTA is never
+    // touched — but if the bridge DOES return a dark/ad story id we still post the required Page comment
+    // on that story (comment-tracking only; the ad stays PAUSED and keeps LIKE_PAGE).
+    if (!bridgeResult.ok || !bridgeResult.ad_id) {
+        const step = String(bridgeResult.step || '').trim()
+        const err = String(bridgeResult.error || 'bridge_create_ad_failed').trim()
+        console.warn(`[${logPrefix}] create-ad failed: ${step ? `[${step}] ` : ''}${err}`)
+        return recordFailure(step ? `[${step}] ${err}` : err, bridgeResult, followLink)
+    }
+
+    // Post the required Page comment on the ACTUAL ad story now that its id is known. The comment link is
+    // the FINAL THREE-sub tracking shortlink (sub1=campaign id, sub2=page id, sub3=post/story tail) — a
+    // re-mint distinct from the two-sub creative-message link. This NEVER changes the LIKE_PAGE CTA and
+    // never resurrects SHOP_NOW. Comment failure is NON-FATAL: the Follow ad is already created, so we
+    // only surface sanitized proof fields. With no readable story id (some PAUSED follow ads) we skip.
+    const commentPostTail = adHistoryStoryTail(adStoryIdForProof)
+    bridgeResult.comment_target_story_id = adStoryIdForProof
+    bridgeResult.follow_comment_sub2 = validation.pageId
+    bridgeResult.follow_comment_sub3 = commentPostTail
+    if (!adStoryIdForProof) {
+        bridgeResult.follow_comment_status = 'skipped_no_story_id'
+    } else {
+        const commentShortlinkUrl = buildFollowLaneCommentShortlinkRequestUrl({
+            template: tmpl,
+            shopeeLink,
+            campaignSub1,
+            pageId: validation.pageId,
+            postTail: commentPostTail,
+        })
+        let commentShortlink = ''
+        try {
+            const slResp = await fetch(commentShortlinkUrl, { method: 'GET' })
+            if (slResp.ok) {
+                const slData = await slResp.json().catch(() => ({})) as Record<string, unknown>
+                commentShortlink = String(slData.shortLink || slData.short_link || '').trim()
+            }
+        } catch { /* shortener best-effort; fall back to the raw Shopee link below */ }
+        if (!commentShortlink) commentShortlink = shopeeLink
+        bridgeResult.follow_comment_shortlink = commentShortlink
+
+        const commentMessage = buildFollowLaneCommentMessage(commentShortlink)
+        bridgeResult.comment_message = commentMessage.slice(0, 500)
+        try {
+            const commentResp = await fetch(`${baseUrl}/page-comment`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ page_id: validation.pageId, story_id: adStoryIdForProof, message: commentMessage, comment_message: commentMessage }),
+            })
+            const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
+            if (commentResp.ok && commentData.ok && commentData.id) {
+                bridgeResult.follow_comment_status = 'success'
+                bridgeResult.follow_comment_id = String(commentData.id)
+            } else {
+                bridgeResult.follow_comment_status = 'failed'
+                bridgeResult.follow_comment_error = String(commentData.step ? `${commentData.step}:${commentData.error || ''}` : (commentData.error || `page_comment_http_${commentResp.status}`)).slice(0, 200)
+                console.warn(`[${logPrefix}] page-comment failed: ${bridgeResult.follow_comment_error}`)
+            }
+        } catch (e) {
+            bridgeResult.follow_comment_status = 'failed'
+            bridgeResult.follow_comment_error = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+            console.warn(`[${logPrefix}] page-comment threw: ${bridgeResult.follow_comment_error}`)
+        }
+    }
+
+    const successResult = prioritizeDashboardAdHistoryResultFields(bridgeResult)
+    const successRec = buildAdHistoryRecord({ status: 'created', validation, result: successResult, clickLink: followLink, schedule })
+    const historyId = await insertAdHistoryRow(c.env.DB, successRec, true).catch(() => 0)
+    return c.json({ ok: true, lane: 'follow', history_id: historyId, mode: schedule.mode, ...successResult, click_link: followLink }, 200)
+}
+
 app.post('/api/dashboard/create-ad-only', async (c) => {
     const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
     await ensureAdHistoryTable(c.env.DB)
@@ -12676,6 +12972,14 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         const rec = buildAdHistoryRecord({ status: 'unsupported', validation, errorMessage: unsupported.error, schedule })
         const historyId = await insertAdHistoryRow(c.env.DB, rec, true).catch(() => 0)
         return c.json({ ...unsupported, history_id: historyId }, 200)
+    }
+
+    // 2c. Follow/Page-like lane — a SEPARATE ad-only lane built from the OUTCOME_ENGAGEMENT/PAGE_LIKES
+    // template. It bakes a TWO-sub shortlink (sub1=campaign id, sub2=page id, NO sub3) into the creative
+    // message and keeps the template's LIKE_PAGE CTA. Branch BEFORE the click-link/sales finalization so
+    // the original lane is byte-for-byte untouched. Default mode stays the safe non-spending 'paused'.
+    if (resolveAdOnlyLane(body) === 'follow') {
+        return await runFollowLaneCreateAdOnly(c, body, validation, schedule)
     }
 
     // 3. Build the Create Ads result via the CloakBrowser FB bridge /create-ad route. We call the
@@ -13593,6 +13897,181 @@ async function maybeProcessAdOnlyQueueOnSchedule(env: Env): Promise<{ ran: boole
         return { ran: auto.reason !== 'no_eligible_candidate', reason: auto.reason }
     } catch (e) {
         console.error(`[AD-ONLY-QUEUE] ${e instanceof Error ? e.message : String(e)}`)
+        return { ran: false, reason: 'error' }
+    }
+}
+
+// =====================================================================
+// FOLLOW / PAGE-LIKE LANE SCHEDULER — a SEPARATE cadence lane that creates one Follow/Page-like ad per
+// interval from the OUTCOME_ENGAGEMENT/PAGE_LIKES template, routed through the SAME create-ad-only
+// endpoint (lane='follow') so the two-sub shortlink + LIKE_PAGE creative live in one place. It has its
+// OWN operator settings (enabled/interval/mode) so it never disturbs the click-link/sales ad-only
+// scheduler. OPT-IN: disabled by default, and 'paused' (non-spending) by default — it only ever spends
+// when the operator explicitly enables it AND sets mode='active'. Reuses autoPickAdOnlyCandidates for
+// page/video eligibility + dedup + cooldown; the only difference is the create body (buildFollowAutoPickBody).
+// =====================================================================
+const FOLLOW_AD_SCHED_ENABLED_KEY = 'follow_ad_scheduler_enabled'
+const FOLLOW_AD_SCHED_INTERVAL_KEY = 'follow_ad_interval_minutes'
+const FOLLOW_AD_SCHED_LAST_RUN_KEY = 'follow_ad_last_run_at'
+const FOLLOW_AD_SCHED_MODE_KEY = 'follow_ad_mode'
+
+// Cadence (minutes), clamped/defaulted by the SAME helper as the ad-only queue (1–1440, default 20).
+async function getFollowAdIntervalMinutes(db: D1Database): Promise<number> {
+    const row = await getDashboardSetting(db, FOLLOW_AD_SCHED_INTERVAL_KEY).catch(() => null)
+    if (row && String(row.value || '').trim()) return clampAdOnlyIntervalMinutes(row.value)
+    return DEFAULT_AD_ONLY_INTERVAL_MINUTES
+}
+
+// Follow lane is OPT-IN: DISABLED by default so it never auto-spends without a deliberate operator action.
+async function isFollowAdSchedulerEnabled(db: D1Database): Promise<boolean> {
+    const row = await getDashboardSetting(db, FOLLOW_AD_SCHED_ENABLED_KEY).catch(() => null)
+    const raw = String(row?.value ?? '0').trim().toLowerCase()
+    return ['1', 'true', 'on', 'yes', 'enabled'].includes(raw)
+}
+
+// Follow lane mode: 'paused' (default, non-spending) unless the operator explicitly sets 'active'.
+async function getFollowAdMode(db: D1Database): Promise<AdOnlyMode> {
+    const row = await getDashboardSetting(db, FOLLOW_AD_SCHED_MODE_KEY).catch(() => null)
+    return String(row?.value || '').trim().toLowerCase() === 'active' ? 'active' : 'paused'
+}
+
+// Operator scheduler control + status for the Follow lane.
+app.get('/api/dashboard/follow-ad/status', async (c) => {
+    const enabled = await isFollowAdSchedulerEnabled(c.env.DB)
+    const interval = await getFollowAdIntervalMinutes(c.env.DB)
+    const mode = await getFollowAdMode(c.env.DB)
+    const lastRun = await getDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY).catch(() => null)
+    const nextRunMs = enabled ? nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now()) : 0
+    return c.json({
+        ok: true,
+        lane: 'follow',
+        scheduler_enabled: enabled,
+        interval_minutes: interval,
+        mode,
+        template_adset: FOLLOW_LANE_TEMPLATE_ADSET,
+        campaign_sub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        cta_type: FOLLOW_LANE_CTA_TYPE,
+        last_run_at: lastRun?.value || '',
+        next_run_at: nextRunMs ? new Date(nextRunMs).toISOString() : '',
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.get('/api/dashboard/follow-ad/enabled', async (c) => {
+    const enabled = await isFollowAdSchedulerEnabled(c.env.DB)
+    return c.json({ ok: true, scheduler_enabled: enabled }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.put('/api/dashboard/follow-ad/enabled', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { scheduler_enabled?: boolean | string | number }
+    const raw = body.scheduler_enabled
+    const enabled = raw === true || raw === 1 || String(raw).trim().toLowerCase() === 'true' || String(raw).trim() === '1'
+    await setDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_ENABLED_KEY, enabled ? '1' : '0')
+    return c.json({ ok: true, scheduler_enabled: enabled }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.get('/api/dashboard/follow-ad/interval', async (c) => {
+    const interval = await getFollowAdIntervalMinutes(c.env.DB)
+    return c.json({ ok: true, interval_minutes: interval }, 200, { 'Cache-Control': 'no-store' })
+})
+
+app.put('/api/dashboard/follow-ad/interval', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { interval_minutes?: number | string }
+    const interval = clampAdOnlyIntervalMinutes(body.interval_minutes)
+    await setDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_INTERVAL_KEY, String(interval))
+    return c.json({ ok: true, interval_minutes: interval }, 200)
+})
+
+app.put('/api/dashboard/follow-ad/mode', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { mode?: string }
+    const mode: AdOnlyMode = String(body.mode || '').trim().toLowerCase() === 'active' ? 'active' : 'paused'
+    await setDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_MODE_KEY, mode)
+    return c.json({ ok: true, mode }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Create ONE Follow ad this tick, resilient to a bad page/candidate: walk the ranked cross-page
+// candidate list (same eligibility/dedup/cooldown as the click-link auto-pick) and try the next page
+// when one fails, up to AD_ONLY_AUTO_MAX_ATTEMPTS. Each create routes through create-ad-only with a
+// lane='follow' body. create-ad-only returns HTTP 200 ok:false on failure, so success gates on data.ok.
+async function processOneFollowAd(env: Env): Promise<{ ok: boolean; reason?: string; error?: string; result?: unknown; attempted?: number; failedPages?: string[] }> {
+    const candidates = await autoPickAdOnlyCandidates(env)
+    if (!candidates.length) return { ok: true, reason: 'no_eligible_candidate' }
+
+    const mode = await getFollowAdMode(env.DB)
+    // Follow lane must always group each day's proof/live ads under the Bangkok date-named campaign,
+    // even in PAUSED review mode. PAUSED still never spends, but the Ads Manager campaign remains
+    // discoverable as e.g. 25/Jun/2026 instead of falling back to ADS_PUBLISH_*.
+    const dailyCampaignName = bangkokDailyCampaignName()
+    const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+    const maxAttempts = Math.min(AD_ONLY_AUTO_MAX_ATTEMPTS, candidates.length)
+    const failedPages: string[] = []
+    let lastError = ''
+    let lastResult: unknown
+    for (let i = 0; i < maxAttempts; i++) {
+        const candidate = candidates[i]
+        const reqBody = buildFollowAutoPickBody({
+            candidate,
+            mode,
+            dailyCampaignName,
+            templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
+            campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        })
+        try {
+            const resp = await fetch(`${workerUrl}/api/dashboard/create-ad-only`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(reqBody),
+            })
+            const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+            if (resp.ok && data.ok) return { ok: true, result: data, attempted: i + 1 }
+            lastError = String(data.error || `http_${resp.status}`).trim()
+            lastResult = data
+        } catch (e) {
+            lastError = e instanceof Error ? e.message : String(e)
+        }
+        failedPages.push(candidate.pageId)
+        console.warn(`[FOLLOW-AD] attempt ${i + 1}/${maxAttempts} page=${candidate.pageId} video=${candidate.videoId} failed: ${lastError}`)
+    }
+    return {
+        ok: false,
+        error: lastError,
+        result: lastResult,
+        attempted: maxAttempts,
+        failedPages,
+        reason: `all_attempts_failed attempted=${maxAttempts} failed_pages=${failedPages.join(',')} last_error=${lastError}`.slice(0, 300),
+    }
+}
+
+// Manual "run now" for the Follow lane — process immediately, bypassing the interval gate. The create
+// call can outrun browser/tool HTTP timeouts, so accept fast and finish in waitUntil.
+app.post('/api/dashboard/follow-ad/run-next', async (c) => {
+    c.executionCtx.waitUntil(
+        processOneFollowAd(c.env).then((result) => {
+            console.log(`[FOLLOW-AD] manual run-next ok=${result.ok}${result.attempted ? ` attempted=${result.attempted}` : ''} ${result.reason ? `reason=${result.reason}` : ''} ${result.error ? `error=${result.error}` : ''}`)
+        }).catch((error) => {
+            console.error(`[FOLLOW-AD] manual run-next failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    )
+    return c.json({ ok: true, accepted: true }, 202, { 'Cache-Control': 'no-store' })
+})
+
+// Cron entrypoint — create AT MOST ONE Follow ad per operator-set interval, ONLY when the Follow
+// scheduler is enabled. Claims the cadence slot (sets last_run) BEFORE creating so a slow create can't
+// be double-claimed by the next minute's tick. Never throws (cron must not be derailed).
+async function maybeProcessFollowAdOnSchedule(env: Env): Promise<{ ran: boolean; reason?: string }> {
+    try {
+        const enabled = await isFollowAdSchedulerEnabled(env.DB)
+        if (!enabled) return { ran: false, reason: 'scheduler_disabled' }
+        const interval = await getFollowAdIntervalMinutes(env.DB)
+        const lastRun = await getDashboardSetting(env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY).catch(() => null)
+        if (!isAdOnlyQueueDue(String(lastRun?.value || ''), interval, Date.now())) {
+            return { ran: false, reason: 'interval_not_elapsed' }
+        }
+        await setDashboardSetting(env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY, new Date().toISOString()).catch(() => null)
+        const res = await processOneFollowAd(env)
+        console.log(`[FOLLOW-AD] ok=${res.ok}${res.attempted ? ` attempted=${res.attempted}` : ''}${res.failedPages?.length ? ` failed_pages=${res.failedPages.join(',')}` : ''} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''}`)
+        return { ran: res.reason !== 'no_eligible_candidate', reason: res.reason }
+    } catch (e) {
+        console.error(`[FOLLOW-AD] ${e instanceof Error ? e.message : String(e)}`)
         return { ran: false, reason: 'error' }
     }
 }
@@ -28186,6 +28665,7 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     pageAvatarUrl?: string
     accessToken: string
     commentToken?: string
+    tokenSource?: string
 }): Promise<{ created: boolean; updated: boolean; moved: boolean }> {
     const namespaceId = String(params.namespaceId || '').trim()
     const pageId = String(params.pageId || '').trim()
@@ -28194,30 +28674,19 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
         `https://graph.facebook.com/${encodeURIComponent(pageId)}/picture?type=large`
     const accessToken = String(params.accessToken || '').trim()
     const commentToken = String(params.commentToken || '').trim()
+    const tokenSource = String(params.tokenSource || '').trim().toLowerCase()
 
     if (!namespaceId) throw new Error('namespace_not_found')
     if (!pageId) throw new Error('page_id_required')
     if (!accessToken) throw new Error('access_token_required')
 
-    // Prefer strict role slots from sync payloads.
-    // Some BrowserSaving sync paths may send the resolved EAAD6 token in access_token
-    // while comment_token still contains an intermediate raw token. Keep the direct
-    // video token in the comment pool so posting does not fall back to Postcron.
-    //
-    // Facebook Lite fresh PAGE tokens are EAAD6-prefixed. isPostRoleToken() historically treated
-    // EAAD6 as "comment role" and so DROPPED a freshly-synced Lite token from post_tokens —
-    // leaving the posting resolver on the old stale token (live row 33210 kept reusing
-    // EAAD6V…ZDZD even after a successful refresh). normalizePostTokenPool() already accepts any
-    // non-empty token because EAAD6 encodes the Facebook app id, not the token scope, so trust it:
-    // any non-empty synced token is a valid post token and must lead the pool.
-    const incomingPostToken = normalizePostTokenPool([accessToken])[0] || ''
-    const resolvedCommentToken = String(
-        normalizeDirectVideoTokenPool([
-            commentToken,
-            isCommentRoleToken(accessToken) ? accessToken : '',
-        ])[0] || ''
-    ).trim()
-
+    // The freshly-synced page token must lead BOTH pools and become the stored primary, so a
+    // facebook_lite_bridge export (or any newer access_token) immediately outranks a stale EAABsb
+    // already present. Facebook Lite page tokens are EAAD6V-prefixed; the legacy isPostRoleToken()
+    // gate excluded EAAD6 and so let a stale EAABsb stay primary (live row 33519 posted with a stale
+    // EAABsb after a successful EAAD6V export). prioritizeSyncedPageTokenPools() makes the fresh
+    // token authoritative and is independent of that gate. The comment_token (if any, else the
+    // access_token) seeds the comment pool so commenting uses the same fresh token.
     let created = false
     let updated = false
     let moved = false
@@ -28227,18 +28696,25 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     const existing = await env.DB.prepare(
         'SELECT id, access_token FROM pages WHERE id = ? AND bot_id = ?'
     ).bind(pageId, namespaceId).first() as { id?: string; access_token?: string | null } | null
-    const currentPrimaryToken = isPostRoleToken(String(existing?.access_token || '').trim())
-        ? String(existing?.access_token || '').trim()
-        : ''
-    const nextPostTokens = normalizePostTokenPool([
-        incomingPostToken,
-        ...(existingEntry.post_tokens || []),
-    ])
-    const nextCommentTokens = normalizeCommentTokenPool([
-        resolvedCommentToken,
-        ...(existingEntry.comment_tokens || []),
-    ])
-    const nextPrimaryToken = String(nextPostTokens[0] || currentPrimaryToken || '').trim()
+
+    const prioritized = prioritizeSyncedPageTokenPools({
+        incomingToken: accessToken,
+        incomingCommentToken: commentToken || (isCommentRoleToken(accessToken) ? accessToken : ''),
+        // Preserve the existing stored primary ONLY as a fallback when the incoming token is empty
+        // (it never is here — access_token is validated above). Keeping EAAD6V-eligible (any valid)
+        // tokens means a previously-synced Lite token is never blanked.
+        existingPrimaryToken: isPersistablePagePrimaryToken(existing?.access_token)
+            ? String(existing?.access_token || '').trim()
+            : '',
+        existingPostTokens: existingEntry.post_tokens || [],
+        existingCommentTokens: existingEntry.comment_tokens || [],
+    })
+    if (tokenSource) {
+        console.log(`[PAGE-PROFILE-SYNC] ns=${namespaceId} page=${pageId} token_source=${tokenSource} lite=${isFacebookLitePageToken(accessToken)} primary_is_incoming=${prioritized.primaryToken === accessToken}`)
+    }
+    const nextPostTokens = prioritized.postTokens
+    const nextCommentTokens = prioritized.commentTokens
+    const nextPrimaryToken = prioritized.primaryToken
 
     if (existing?.id) {
         await env.DB.prepare(
@@ -28251,10 +28727,10 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
         ).bind(pageId).first() as { bot_id?: string; access_token?: string | null } | null
 
         if (existingInOtherNamespace?.bot_id && String(existingInOtherNamespace.bot_id || '').trim() !== namespaceId) {
-            const existingOtherPrimaryToken = isPostRoleToken(String(existingInOtherNamespace.access_token || '').trim())
+            const existingOtherPrimaryToken = isPersistablePagePrimaryToken(existingInOtherNamespace.access_token)
                 ? String(existingInOtherNamespace.access_token || '').trim()
                 : ''
-            const movedPrimaryToken = String(nextPostTokens[0] || existingOtherPrimaryToken || '').trim()
+            const movedPrimaryToken = String(nextPrimaryToken || existingOtherPrimaryToken || '').trim()
             await env.DB.prepare(
                 'UPDATE pages SET bot_id = ?, access_token = ?, image_url = ?, name = ?, updated_at = datetime(\"now\") WHERE id = ?'
             ).bind(namespaceId, movedPrimaryToken, pageAvatarUrl, pageName, pageId).run()
@@ -28762,7 +29238,9 @@ async function rebuildTaggedPageProfileTokens(env: Env, namespaceId: string, pag
     const existingPage = await env.DB.prepare(
         'SELECT access_token FROM pages WHERE id = ? AND bot_id = ?'
     ).bind(pageId, namespaceId).first() as { access_token?: string | null } | null
-    const preservedPrimaryToken = isPostRoleToken(String(existingPage?.access_token || '').trim())
+    // Keep ANY existing stored page token (EAAB- or EAAD6V-prefixed) as the preserve fallback so a
+    // freshly-synced Facebook Lite (EAAD6V) primary is never blanked when the rebuild has no token.
+    const preservedPrimaryToken = isPersistablePagePrimaryToken(existingPage?.access_token)
         ? String(existingPage?.access_token || '').trim()
         : ''
     const rebuiltPrimaryToken = String(rebuiltPostTokens[0] || preservedPrimaryToken || '').trim()
@@ -33226,7 +33704,9 @@ async function autoSyncPagesForNamespace(
                     const pageId = page.id
                     desiredPageIds.add(pageId)
                     const existingRow = existingById.get(pageId)
-                    const existingAccessToken = isPostRoleToken(String(existingRow?.access_token || '').trim())
+                    // Preserve ANY stored page token (incl. a freshly-synced EAAD6V Facebook Lite token)
+                    // so page discovery never demotes it to a stale EAABsb just because it is EAAD6V.
+                    const existingAccessToken = isPersistablePagePrimaryToken(existingRow?.access_token)
                         ? String(existingRow?.access_token || '').trim()
                         : ''
 
@@ -33249,7 +33729,7 @@ async function autoSyncPagesForNamespace(
                             ...(existingPool[pageId]?.post_tokens || []),
                         ])
                         : normalizePostTokenPool(existingPool[pageId]?.post_tokens || [])
-                    const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
+                    const discoveredPrimaryToken = isPersistablePagePrimaryToken(page.access_token)
                         ? String(page.access_token || '').trim()
                         : ''
                     const primaryToken = String(postTokenPool[0] || existingAccessToken || discoveredPrimaryToken || '').trim()
@@ -33489,7 +33969,7 @@ async function autoSyncPagesForNamespace(
                 ...(existingEntry.comment_tokens || []),
             ],
         })
-        const discoveredPrimaryToken = isPostRoleToken(String(page.access_token || '').trim())
+        const discoveredPrimaryToken = isPersistablePagePrimaryToken(page.access_token)
             ? String(page.access_token || '').trim()
             : ''
         const primaryToken = String(postTokenPool[0] || discoveredPrimaryToken || '').trim()
@@ -35057,7 +35537,9 @@ async function initReelUploadWithPostingTokenFallback(params: {
     throw new Error(`all_post_tokens_failed: ${errors.join(' | ') || 'unknown_error'}`)
 }
 
-/** Single POST to /{pageId}/videos with is_reel=true (replaces 3-step resumable upload) */
+/** Single POST to /{pageId}/videos (multipart `source`). is_reel=true by default; pass isReel=false
+ *  for Facebook Lite (EAAD6V) page tokens — they reject the Reels API ((#10) Permission Denied) but
+ *  a PLAIN /videos upload works (Facebook auto-classifies short vertical video as a Reel). */
 async function publishReelDirect(params: {
     pageId: string
     accessToken: string
@@ -35066,6 +35548,7 @@ async function publishReelDirect(params: {
     thumbnailContentType?: string
     description: string
     logPrefix: string
+    isReel?: boolean
 }): Promise<{ id?: string; success?: boolean }> {
     const token = String(params.accessToken || '').trim()
     if (!token) throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
@@ -35088,7 +35571,10 @@ async function publishReelDirect(params: {
     }
     formData.append('description', params.description)
     formData.append('published', 'true')
-    formData.append('is_reel', 'true')
+    // is_reel routes through the Reels API, which a Facebook Lite (EAAD6V) page token cannot use
+    // ((#10) Permission Denied). Omit it for the Lite lane — FB still classifies the short vertical
+    // video as a Reel (readback permalink is /reel/<id>/), confirmed by direct token probe.
+    if (params.isReel !== false) formData.append('is_reel', 'true')
     formData.append('access_token', token)
 
     const url = `https://graph.facebook.com/v21.0/${params.pageId}/videos`
@@ -35192,6 +35678,7 @@ async function publishReelViaVideosEndpointWithTokenFallback(params: {
     thumbnailContentType?: string
     description: string
     logPrefix: string
+    isReel?: boolean
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
     const candidates = uniqueTokens((params.accessTokens || []).map((token) => String(token || '').trim()).filter(Boolean))
     if (candidates.length === 0) throw new FacebookRequestFailedError('facebook_access_token_missing', 0, 0)
@@ -35249,6 +35736,7 @@ async function publishReelViaVideosEndpointWithTokenFallback(params: {
                         thumbnailBuffer: params.thumbnailBuffer,
                         thumbnailContentType: params.thumbnailContentType,
                         description: params.description,
+                        isReel: params.isReel,
                         logPrefix: attempt === 0 ? params.logPrefix : `${params.logPrefix} retry#${attempt}`,
                     })
                     break
@@ -35582,6 +36070,57 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
 // Token /pages tunnel), reload the page's token pool, and retry the publish ONCE. Any non-auth
 // failure (transient FB error, video issue, etc.) is rethrown untouched so it is never masked.
 // Token-free: it logs only ids/booleans/redacted hints, never a raw token.
+// Publish a REAL organic Page video through the local Facebook Lite bridge's logged-in session
+// (bridge organic /post → classic /{page_id}/videos with the EAAD6V page token). This is the publish
+// method that WORKS for Facebook Lite tokens, which cannot use Worker-direct /video_reels (verified:
+// upload_phase=start returns "(#10) Permission Denied"). Fails closed with a DISTINCT, token-free
+// capability-blocker error so the operator/Hermes can see exactly which path was attempted.
+async function publishOrganicViaFacebookLiteBridge(params: {
+    env: Env
+    pageId: string
+    videoUrl: string
+    description: string
+    candidateLoginIds?: string[]
+    logPrefix: string
+    reason: string
+    graphMessage?: string
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
+    const videoUrl = String(params.videoUrl || '').trim()
+    const graphSuffix = params.graphMessage ? ` | graph=${params.graphMessage}` : ''
+    if (!videoUrl) {
+        throw new Error(`facebook_lite_publish_capability_blocked: no_video_url (${params.reason})${graphSuffix}`)
+    }
+    const accountHint = String(params.candidateLoginIds?.[0] || '').trim()
+        || (String(params.pageId || '').trim() === '1008898512617594' ? '100090320823561' : '')
+    const bridgeLookup = await fetchFacebookLitePageTokenFromBridge({
+        env: params.env,
+        pageId: params.pageId,
+        candidateLoginIds: accountHint ? [accountHint] : params.candidateLoginIds,
+        logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
+    }).catch(() => ({ token: '', account: accountHint }))
+    const account = String(bridgeLookup.account || accountHint || '').trim()
+    if (!account) {
+        throw new Error(`facebook_lite_publish_capability_blocked: no_bridge_account (${params.reason})${graphSuffix}`)
+    }
+    console.log(`[${params.logPrefix}] publishing via Facebook Lite bridge ORGANIC /post (account=candidate, reason=${params.reason})`)
+    try {
+        const bridged = await publishReelViaSessionBridge({
+            env: params.env,
+            pageId: params.pageId,
+            videoUrl,
+            message: params.description,
+            account,
+            postingTokenHint: 'facebook_lite_bridge',
+            commentText: '',
+            logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
+        })
+        return { id: bridged.id, postId: bridged.postId, permalinkUrl: bridged.permalinkUrl, postingToken: bridged.postingToken }
+    } catch (bridgeErr) {
+        const bridgeMsg = parseFacebookErrorLike(bridgeErr)?.message || (bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr))
+        throw new Error(`facebook_lite_bridge_organic_post_failed: ${bridgeMsg}${graphSuffix}`)
+    }
+}
+
 async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: {
     env: Env
     db: D1Database
@@ -35600,6 +36139,47 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
     preferVideoReelsFirst?: boolean
     reloadTokens: () => Promise<{ commentTokens: string[]; postTokens: string[] }>
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
+    // Facebook Lite (EAAD6V) page tokens are valid for page READ but reject the Reels API: Worker-
+    // direct /video_reels (and is_reel=true) return (#10) Permission Denied. The PLAIN /{page}/videos
+    // multipart `source` upload (is_reel OMITTED) WORKS with the same token — Facebook auto-classifies
+    // the short vertical video as a Reel (readback permalink /reel/<id>/), confirmed by direct probe.
+    // So for an EAAD6V token, publish Worker-direct via /videos (is_reel off) as PRIMARY, skipping
+    // /video_reels entirely. NO ad account / OneCard / Power Editor for this lane. The Facebook Lite
+    // bridge organic /post is a last-resort secondary (also /{page}/videos, via the bridge session).
+    const litePostTokens = normalizePostTokenPool(params.postTokens || [])
+    if (isFacebookLitePageToken(litePostTokens[0] || '')) {
+        console.log(`[${params.logPrefix}] Facebook Lite (EAAD6V) post token — publishing via direct /{page}/videos multipart (is_reel omitted), skipping /video_reels`)
+        try {
+            return await publishReelViaVideosEndpointWithTokenFallback({
+                pageId: params.pageId,
+                accessTokens: litePostTokens,
+                videoBuffer: params.videoBuffer,
+                thumbnailBuffer: params.thumbnailBuffer,
+                thumbnailContentType: params.thumbnailContentType,
+                description: params.description,
+                isReel: false,
+                logPrefix: `${params.logPrefix} FB-LITE-VIDEOS`,
+            })
+        } catch (liteDirectErr) {
+            const liteMsg = parseFacebookErrorLike(liteDirectErr)?.message || (liteDirectErr instanceof Error ? liteDirectErr.message : String(liteDirectErr))
+            // Secondary (still organic /{page}/videos, NEVER ad account): the local Facebook Lite
+            // bridge session. Surfaces a distinct capability blocker if even that cannot publish.
+            if (String(params.videoUrl || '').trim()) {
+                console.warn(`[${params.logPrefix}] EAAD6V direct /videos publish failed (${liteMsg}); trying Facebook Lite bridge organic /post`)
+                return await publishOrganicViaFacebookLiteBridge({
+                    env: params.env,
+                    pageId: params.pageId,
+                    videoUrl: String(params.videoUrl || ''),
+                    description: params.description,
+                    candidateLoginIds: params.candidateLoginIds,
+                    logPrefix: params.logPrefix,
+                    reason: 'eaad6_videos_direct_failed',
+                    graphMessage: liteMsg,
+                })
+            }
+            throw liteDirectErr
+        }
+    }
     try {
         return await publishReelWithCommentTokenPrimaryFallback({
             pageId: params.pageId,
@@ -35615,7 +36195,13 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
     } catch (publishErr) {
         const message = parseFacebookErrorLike(publishErr)?.message || (publishErr instanceof Error ? publishErr.message : String(publishErr))
         const tokenMissing = !normalizePostTokenPool(params.postTokens || []).length
-        if (!shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', tokenMissing, error: message })) {
+        const authFailure = shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', tokenMissing, error: message })
+        // (#10) Permission Denied: the stored EAAD6V page token cannot publish via the Worker Graph
+        // app/ad account, but the local Facebook Lite bridge's logged-in session CAN post the organic
+        // Page reel. Treat it like an auth failure so it reaches the bridge organic /post fallback
+        // below (token refresh would not help — it is a permission, not a 190/invalidated, error).
+        const permissionDenied = isFacebookLitePostingPermissionError(message)
+        if (!authFailure && !permissionDenied) {
             throw publishErr
         }
         const videoUrl = String(params.videoUrl || '').trim()
@@ -35630,24 +36216,38 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
             }).catch(() => ({ token: '', account: accountHint }))
             const account = String(bridgeLookup.account || accountHint || '').trim()
             if (account) {
-                console.log(`[${params.logPrefix}] stored-token Graph publish failed (${message}); falling back to Facebook Lite bridge account=candidate`)
-                const bridged = await publishReelViaSessionBridge({
-                    env: params.env,
-                    pageId: params.pageId,
-                    videoUrl,
-                    message: params.description,
-                    account,
-                    postingTokenHint: 'facebook_lite_bridge',
-                    commentText: '',
-                    logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
-                })
-                return {
-                    id: bridged.id,
-                    postId: bridged.postId,
-                    permalinkUrl: bridged.permalinkUrl,
-                    postingToken: bridged.postingToken,
+                console.log(`[${params.logPrefix}] stored-token Graph publish failed (${message}); attempting Facebook Lite bridge ORGANIC /post (account=candidate, reason=${permissionDenied ? 'permission_denied' : 'auth_failure'})`)
+                try {
+                    const bridged = await publishReelViaSessionBridge({
+                        env: params.env,
+                        pageId: params.pageId,
+                        videoUrl,
+                        message: params.description,
+                        account,
+                        postingTokenHint: 'facebook_lite_bridge',
+                        commentText: '',
+                        logPrefix: `${params.logPrefix} FB-LITE-BRIDGE`,
+                    })
+                    return {
+                        id: bridged.id,
+                        postId: bridged.postId,
+                        permalinkUrl: bridged.permalinkUrl,
+                        postingToken: bridged.postingToken,
+                    }
+                } catch (bridgeErr) {
+                    // Fail closed, but with a DISTINCT error so Hermes can see the bridge organic /post
+                    // path WAS attempted (and why it failed) instead of the original Graph (#10).
+                    const bridgeMsg = parseFacebookErrorLike(bridgeErr)?.message || (bridgeErr instanceof Error ? bridgeErr.message : String(bridgeErr))
+                    throw new Error(`facebook_lite_bridge_organic_post_failed: ${bridgeMsg} | graph=${message}`)
                 }
             }
+            // Permission denied with NO resolvable Facebook Lite bridge account → token refresh
+            // cannot help (not an auth error); surface distinctly rather than masking as auth.
+            if (permissionDenied && !authFailure) {
+                throw new Error(`facebook_lite_permission_denied_no_bridge_account: ${message}`)
+            }
+        } else if (permissionDenied && !authFailure) {
+            throw new Error(`facebook_lite_permission_denied_no_video_url: ${message}`)
         }
         console.log(`[${params.logPrefix}] stored-token publish auth failure — attempting Facebook Lite page-token refresh`)
         const refresh = await refreshFacebookLitePostingTokenForPage({
@@ -36814,6 +37414,31 @@ app.get('/api/pages/:id', async (c) => {
     }
 })
 
+// Returns the full latest system-managed (Facebook Lite) token for ONE page,
+// scoped to the authenticated namespace (same botId guard as GET /api/pages/:id).
+// Backs the page-settings "ดู token / คัดลอก" affordance: the operator fetches the
+// raw token only on explicit click (it is NOT shown automatically). Never logged.
+app.get('/api/pages/:id/managed-token', async (c) => {
+    const id = c.req.param('id')
+    try {
+        const row = await c.env.DB.prepare(
+            'SELECT access_token, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(id, c.get('botId')).first() as { access_token?: string | null; updated_at?: string | null } | null
+        if (!row) return c.json({ error: 'Page not found' }, 404)
+        const token = String(row.access_token || '').trim()
+        c.header('Cache-Control', 'private, no-store')
+        return c.json({
+            ok: true,
+            has_token: !!token,
+            token,
+            preview: token ? `${token.slice(0, 20)}...` : '',
+            updated_at: row.updated_at || null,
+        })
+    } catch (e) {
+        return c.json({ error: 'Failed to fetch managed token' }, 500)
+    }
+})
+
 app.get('/api/pages/:id/tag-profiles', async (c) => {
     return c.json({ error: 'direct_page_management_only' }, 410)
     const pageId = String(c.req.param('id') || '').trim()
@@ -37022,7 +37647,9 @@ app.get('/api/pages/:id/tag-profiles', async (c) => {
                 ])
                 : normalizeCommentTokenPool(existingEntry.comment_tokens || [])
 
-            const storedPostScoped = isPostRoleToken(storedAccessScoped) ? storedAccessScoped : ''
+            // Preserve a stored EAAD6V Facebook Lite token too (not only EAAB-prefixed) so it is
+            // never blanked when the rebuilt pool is empty.
+            const storedPostScoped = isPersistablePagePrimaryToken(storedAccessScoped) ? storedAccessScoped : ''
             const nextAccess = nextPostTokenPool[0] || storedPostScoped || ''
 
             if (
@@ -40403,47 +41030,73 @@ app.post('/api/pages/:id/force-post', async (c) => {
             shopeeLink: normalizedShopeeLink,
             lazadaLink: normalizedLazadaLink,
         })
-        const reelResult = pageOneCardEnabled
-            ? await publishVideoViaOneCard({
-                env,
-                pageId: page.id,
-                videoUrl: postingVideoUrl,
-                message: publishDescription,
-                websiteUrl: oneCardWebsiteUrl,
-                cta: pageOneCardCta,
-                logPrefix: 'FORCE-POST ONECARD',
-            })
-            : await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
-                env,
-                db: env.DB,
-                namespaceId: botId,
-                pageId: page.id,
-                pageName: page.name,
-                videoUrl: postingVideoUrl,
-                commentTokens: commentTokenCandidates,
-                postTokens: fallbackPostTokenCandidates,
-                videoBuffer,
-                thumbnailBuffer: postingThumbnail?.buffer || null,
-                thumbnailContentType: postingThumbnail?.contentType || '',
-                description: publishDescription,
-                logPrefix: 'FORCE-POST',
-                preferVideoReelsFirst: true,
-                reloadTokens: async () => {
-                    const refreshed = await ensurePageTokenCandidates({
-                        env,
-                        db: env.DB,
-                        namespaceId: botId,
-                        pageId: page.id,
-                        pageName: page.name,
-                        primaryToken: pageAccessToken,
-                        logPrefix: 'FORCE-POST RELOAD',
-                    })
-                    const post = refreshed.postTokens.length > 0
-                        ? refreshed.postTokens
-                        : normalizePostTokenPool([pageAccessToken])
-                    return { commentTokens: refreshed.commentTokens, postTokens: post }
-                },
-            })
+        // Real organic Page reel via the STORED Facebook Lite (EAAD6V) page token — Worker-direct
+        // Graph (/video_reels → /videos), with the Facebook Lite Token Bridge fallback baked into
+        // publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh. NEVER the ad account / Power
+        // Editor. Reused both as the default stored_token path and as the OneCard failure fallback.
+        const publishStoredFacebookLiteReel = () => publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
+            env,
+            db: env.DB,
+            namespaceId: botId,
+            pageId: page.id,
+            pageName: page.name,
+            videoUrl: postingVideoUrl,
+            commentTokens: commentTokenCandidates,
+            postTokens: fallbackPostTokenCandidates,
+            videoBuffer,
+            thumbnailBuffer: postingThumbnail?.buffer || null,
+            thumbnailContentType: postingThumbnail?.contentType || '',
+            description: publishDescription,
+            logPrefix: 'FORCE-POST',
+            preferVideoReelsFirst: true,
+            reloadTokens: async () => {
+                const refreshed = await ensurePageTokenCandidates({
+                    env,
+                    db: env.DB,
+                    namespaceId: botId,
+                    pageId: page.id,
+                    pageName: page.name,
+                    primaryToken: pageAccessToken,
+                    logPrefix: 'FORCE-POST RELOAD',
+                })
+                const post = refreshed.postTokens.length > 0
+                    ? refreshed.postTokens
+                    : normalizePostTokenPool([pageAccessToken])
+                return { commentTokens: refreshed.commentTokens, postTokens: post }
+            },
+        })
+
+        // A Facebook Lite (EAAD6V) stored token cannot use the ad account, so NEVER route it through
+        // OneCard/advideos/Power Editor — publish the organic Page reel directly (the bridge-free
+        // /{page}/videos lane). Non-Lite OneCard pages keep the OneCard path.
+        const useOneCardForThisPost = pageOneCardEnabled && !isFacebookLitePageToken(primaryPostingTokenCandidates[0] || '')
+        let reelResult: { id: string; postId: string; permalinkUrl: string; postingToken: string }
+        if (useOneCardForThisPost) {
+            try {
+                reelResult = await publishVideoViaOneCard({
+                    env,
+                    pageId: page.id,
+                    videoUrl: postingVideoUrl,
+                    message: publishDescription,
+                    websiteUrl: oneCardWebsiteUrl,
+                    cta: pageOneCardCta,
+                    logPrefix: 'FORCE-POST ONECARD',
+                })
+            } catch (oneCardErr) {
+                // OneCard runs through the cloak-fb-bridge ad-account/create-ad path (Power Editor).
+                // A stored Facebook Lite (EAAD6V) page token cannot drive the ad account, so an
+                // ad-permission failure (e.g. "(#10) Permission Denied") must NOT burn the row: when
+                // a stored page token exists, fall back to a REAL organic Page reel via that EAAD6V
+                // token. Pages with no stored token (pure admin/CloakBrowser OneCard) still fail closed.
+                const oneCardMsg = parseFacebookErrorLike(oneCardErr)?.message || (oneCardErr instanceof Error ? oneCardErr.message : String(oneCardErr))
+                const haveStoredPostToken = normalizePostTokenPool(fallbackPostTokenCandidates).length > 0
+                if (!shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken, error: oneCardMsg })) throw oneCardErr
+                console.warn(`[FORCE-POST] OneCard publish failed (${oneCardMsg}); falling back to stored Facebook Lite organic Page reel (EAAD6V), not Power Editor`)
+                reelResult = await publishStoredFacebookLiteReel()
+            }
+        } else {
+            reelResult = await publishStoredFacebookLiteReel()
+        }
         postingTokenUsed = reelResult.postingToken
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
 
@@ -43043,46 +43696,69 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 shopeeLink: normalizedShopeeLink,
                 lazadaLink: normalizedLazadaLink,
             })
-            const reelResult = pageOneCardEnabled
-                ? await publishVideoViaOneCard({
-                    env,
-                    pageId: String(page.id || ''),
-                    videoUrl: postingVideoUrl,
-                    message: publishDescription,
-                    websiteUrl: oneCardWebsiteUrl,
-                    cta: pageOneCardCta,
-                    logPrefix: `CRON ${page.name} ONECARD`,
-                })
-                : await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
-                    env,
-                    db: env.DB,
-                    namespaceId: botId,
-                    pageId: String(page.id || ''),
-                    pageName: String(page.name || ''),
-                    commentTokens: commentTokenCandidates,
-                    postTokens: fallbackPostTokenCandidates,
-                    videoBuffer,
-                    thumbnailBuffer: postingThumbnail?.buffer || null,
-                    thumbnailContentType: postingThumbnail?.contentType || '',
-                    description: publishDescription,
-                    logPrefix: `CRON ${page.name}`,
-                    preferVideoReelsFirst: true,
-                    reloadTokens: async () => {
-                        const refreshed = await ensurePageTokenCandidates({
-                            env,
-                            db: env.DB,
-                            namespaceId: botId,
-                            pageId: String(page.id || ''),
-                            pageName: String(page.name || ''),
-                            primaryToken: String(page.access_token || ''),
-                            logPrefix: `CRON ${page.name} RELOAD`,
-                        })
-                        const post = refreshed.postTokens.length > 0
-                            ? refreshed.postTokens
-                            : normalizePostTokenPool([String(page.access_token || '')])
-                        return { commentTokens: refreshed.commentTokens, postTokens: post }
-                    },
-                })
+            // Real organic Page reel via the STORED Facebook Lite (EAAD6V) token (Worker Graph +
+            // Facebook Lite bridge fallback) — never the ad account / Power Editor. Used as the
+            // default stored_token path AND as the OneCard ad-permission-failure fallback below.
+            const publishStoredFacebookLiteReel = () => publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
+                env,
+                db: env.DB,
+                namespaceId: botId,
+                pageId: String(page.id || ''),
+                pageName: String(page.name || ''),
+                commentTokens: commentTokenCandidates,
+                postTokens: fallbackPostTokenCandidates,
+                videoBuffer,
+                thumbnailBuffer: postingThumbnail?.buffer || null,
+                thumbnailContentType: postingThumbnail?.contentType || '',
+                description: publishDescription,
+                logPrefix: `CRON ${page.name}`,
+                preferVideoReelsFirst: true,
+                reloadTokens: async () => {
+                    const refreshed = await ensurePageTokenCandidates({
+                        env,
+                        db: env.DB,
+                        namespaceId: botId,
+                        pageId: String(page.id || ''),
+                        pageName: String(page.name || ''),
+                        primaryToken: String(page.access_token || ''),
+                        logPrefix: `CRON ${page.name} RELOAD`,
+                    })
+                    const post = refreshed.postTokens.length > 0
+                        ? refreshed.postTokens
+                        : normalizePostTokenPool([String(page.access_token || '')])
+                    return { commentTokens: refreshed.commentTokens, postTokens: post }
+                },
+            })
+
+            // Facebook Lite (EAAD6V) stored tokens never use the ad account / OneCard / Power Editor:
+            // publish the organic Page reel directly (/{page}/videos lane). Non-Lite OneCard unchanged.
+            const useOneCardForThisPost = pageOneCardEnabled && !isFacebookLitePageToken(primaryPostingTokenCandidates[0] || '')
+            let reelResult: { id: string; postId: string; permalinkUrl: string; postingToken: string }
+            if (useOneCardForThisPost) {
+                try {
+                    reelResult = await publishVideoViaOneCard({
+                        env,
+                        pageId: String(page.id || ''),
+                        videoUrl: postingVideoUrl,
+                        message: publishDescription,
+                        websiteUrl: oneCardWebsiteUrl,
+                        cta: pageOneCardCta,
+                        logPrefix: `CRON ${page.name} ONECARD`,
+                    })
+                } catch (oneCardErr) {
+                    // OneCard = cloak-fb-bridge ad-account/create-ad (Power Editor). A stored Facebook
+                    // Lite (EAAD6V) token cannot drive the ad account, so an ad-permission failure must
+                    // not burn the row: fall back to a REAL organic Page reel via EAAD6V when a stored
+                    // token exists (pure admin/CloakBrowser OneCard pages still fail closed).
+                    const oneCardMsg = parseFacebookErrorLike(oneCardErr)?.message || (oneCardErr instanceof Error ? oneCardErr.message : String(oneCardErr))
+                    const haveStoredPostToken = normalizePostTokenPool(fallbackPostTokenCandidates).length > 0
+                    if (!shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken, error: oneCardMsg })) throw oneCardErr
+                    console.warn(`[CRON ${page.name}] OneCard publish failed (${oneCardMsg}); falling back to stored Facebook Lite organic Page reel (EAAD6V), not Power Editor`)
+                    reelResult = await publishStoredFacebookLiteReel()
+                }
+            } else {
+                reelResult = await publishStoredFacebookLiteReel()
+            }
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
             fbVideoId = reelResult.id
@@ -43679,6 +44355,12 @@ export default {
         // swallow its own errors so an ad-only failure can never derail the every-minute cron.
         _ctx.waitUntil(maybeProcessAdOnlyQueueOnSchedule(env).catch((error) => {
             console.error(`[AD-ONLY-QUEUE] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        // Follow/Page-like lane cadence — OPT-IN, OFF by default. When the operator enables it, create
+        // at most ONE Follow ad per interval from the OUTCOME_ENGAGEMENT/PAGE_LIKES template (separate
+        // settings, separate last_run). Its own waitUntil + error swallow so it never derails the cron.
+        _ctx.waitUntil(maybeProcessFollowAdOnSchedule(env).catch((error) => {
+            console.error(`[FOLLOW-AD] ${error instanceof Error ? error.message : String(error)}`)
         }))
         // Turn OFF (status=PAUSED, NEVER delete) system-created ad-only campaigns whose scheduled run
         // window has ended. Runs in its OWN waitUntil so it never blocks (or is blocked by) posting or

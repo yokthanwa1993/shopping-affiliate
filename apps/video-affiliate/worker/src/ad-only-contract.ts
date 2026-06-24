@@ -839,6 +839,223 @@ export function truncateResultJson(result: unknown, max = MAX_RESULT_JSON): stri
     return s.slice(0, max - 1) + '…'
 }
 
+// =====================================================================
+// FOLLOW / PAGE-LIKE LANE — pure, network-free helpers for a SECOND ad-only lane.
+//
+// Built from the operator's corrected Ads Manager Follow/Page-like template (objective
+// OUTCOME_ENGAGEMENT, adset optimization_goal PAGE_LIKES, creative CTA LIKE_PAGE). It is deliberately
+// SEPARATE from the click-link/sales ad-only lane and never overwrites it:
+//   - the sales lane mints a post-specific THREE-sub shortlink (sub2 = post id tail, sub3 = page id)
+//     for a SHOP_NOW CTA AFTER the dark story exists;
+//   - the Follow lane bakes a TWO-sub shortlink (sub1 = campaign id, sub2 = page id, NO sub3) into the
+//     creative MESSAGE (above the video preview) and keeps the LIKE_PAGE button from the template.
+//
+// The previous manual attempt set sub2 = sub3 = page id (utm_content=page-page-page). The two-sub
+// builder below makes that impossible: sub3/sub4/sub5 are always emptied and the page id only ever
+// lands in sub2.
+// =====================================================================
+
+export type AdOnlyLane = 'sales' | 'follow'
+
+// The corrected Follow/Page-like template adset (OUTCOME_ENGAGEMENT / PAGE_LIKES / LIKE_PAGE). Used
+// when neither the request body nor the per-page `template_adset_follow` setting supplies one.
+export const FOLLOW_LANE_TEMPLATE_ADSET = '120248767074180263'
+
+// Default Follow shortlink campaign sub1 (the operator-confirmed campaign code). The Follow shortlink
+// carries EXACTLY two sub ids: sub1 = this campaign code, sub2 = page id.
+export const FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT = '16JUN26FBSPCAD'
+
+// The creative CTA the Follow lane relies on (supplied by the template creative; sent as a hint and
+// echoed for audit). The bridge already attaches a LIKE_PAGE button when the template creative's CTA
+// is LIKE_PAGE, so no bridge change is required.
+export const FOLLOW_LANE_CTA_TYPE = 'LIKE_PAGE'
+
+// Per-page setting key holding a page-specific Follow template adset override.
+export const FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY = 'template_adset_follow'
+
+// Per-page setting key holding a page-specific Follow campaign sub1 override.
+export const FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY = 'follow_campaign_sub1'
+
+// Resolve which ad-only lane a request targets. Defaults to 'sales' (the original click-link lane) so
+// every existing caller / queue row / auto-pick body is unchanged. 'follow' is selected only by an
+// explicit lane/objective hint (or a truthy `follow` flag). Empty/unknown → 'sales'.
+export function resolveAdOnlyLane(body: Record<string, unknown> | null | undefined): AdOnlyLane {
+    const b = body || {}
+    const raw = str(b.lane || b.ad_lane || b.ad_objective).toLowerCase()
+    if (['follow', 'page_like', 'page_likes', 'page-like', 'like_page', 'outcome_engagement', 'engagement'].includes(raw)) {
+        return 'follow'
+    }
+    if (b.follow === true || b.follow === 1 || str(b.follow).toLowerCase() === 'true' || str(b.follow) === '1') {
+        return 'follow'
+    }
+    return 'sales'
+}
+
+// Resolve the Follow lane template adset: explicit body value → per-page setting → the corrected
+// default. Always non-empty so the bridge copies the right OUTCOME_ENGAGEMENT/PAGE_LIKES template.
+export function resolveFollowLaneTemplateAdset(input: { bodyValue?: unknown; settingValue?: unknown }): string {
+    return str(input.bodyValue) || str(input.settingValue) || FOLLOW_LANE_TEMPLATE_ADSET
+}
+
+// Resolve the Follow lane shortlink campaign sub1 (sub1 = campaign id). Explicit value → the
+// operator-confirmed default. Never empty (an empty sub1 would drop campaign attribution).
+export function resolveFollowLaneCampaignSub1(value: unknown): string {
+    return str(value) || FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT
+}
+
+// Build the Follow lane Shopee shortlink REQUEST url. EXACTLY two sub ids are populated —
+// sub1 = campaign id, sub2 = page id — and sub3/sub4/sub5 are guaranteed absent so the page id can
+// NEVER be repeated into a third sub (the utm_content=page-page-page bug). Robust to ANY template:
+//   1. first fill any {placeholder} form (sales-style templates) and EMPTY {sub_id3..5};
+//   2. then enforce sub1=/sub2= as real query params and delete sub3=/sub4=/sub5= — because the
+//      default template (`...&sub1={sub_id}`) has NO {sub_id2} placeholder, so the page id (sub2)
+//      would otherwise never be sent.
+// Pure: no network.
+export function buildFollowLaneShortlinkRequestUrl(input: {
+    template: string
+    shopeeLink: string
+    campaignSub1: string
+    pageId: string
+}): string {
+    const campaignSub1 = resolveFollowLaneCampaignSub1(input.campaignSub1)
+    const pageId = str(input.pageId)
+    const filled = str(input.template)
+        .replace('{url}', encodeURIComponent(str(input.shopeeLink)))
+        .replace('{sub_id}', encodeURIComponent(campaignSub1))
+        .replace('{sub_id2}', encodeURIComponent(pageId))
+        .replace('{sub_id3}', '')
+        .replace('{sub_id4}', '')
+        .replace('{sub_id5}', '')
+    try {
+        const u = new URL(filled)
+        u.searchParams.set('sub1', campaignSub1)
+        u.searchParams.set('sub2', pageId)
+        u.searchParams.delete('sub3')
+        u.searchParams.delete('sub4')
+        u.searchParams.delete('sub5')
+        return u.toString()
+    } catch {
+        return filled
+    }
+}
+
+// Compose the Follow lane creative MESSAGE: caption text then the Shopee shortlink on its own line so
+// the link renders ABOVE the video preview in the dark/ad story. If the supplied caption already
+// contains the shortlink it is returned unchanged (never duplicate the link). Empty caption → just the
+// shortlink; empty shortlink → just the caption. Pure.
+export function buildFollowLaneCreativeMessage(input: { caption?: string; shortlink?: string }): string {
+    const caption = str(input.caption)
+    const shortlink = str(input.shortlink)
+    if (!shortlink) return caption
+    if (caption && caption.includes(shortlink)) return caption
+    if (!caption) return shortlink
+    return `${caption}\n${shortlink}`
+}
+
+// Build the Follow lane COMMENT shortlink REQUEST url. This is the FINAL, post-specific tracking link
+// that goes into the Page COMMENT posted on the actual dark/ad story AFTER its story id is known. It is
+// SEPARATE from the two-sub creative-message link: it carries EXACTLY three sub ids —
+//   sub1 = campaign id (default 16JUN26FBSPCAD), sub2 = page id, sub3 = post/story tail —
+// and sub4/sub5 are always emptied/deleted. Robust to ANY template (the default carries only `sub1=`,
+// so sub2/sub3 are enforced as real query params even when the template has no {sub_id2}/{sub_id3}
+// placeholder). An empty postTail simply drops sub3 (never repeats sub2). Pure: no network.
+export function buildFollowLaneCommentShortlinkRequestUrl(input: {
+    template: string
+    shopeeLink: string
+    campaignSub1: string
+    pageId: string
+    postTail: string
+}): string {
+    const campaignSub1 = resolveFollowLaneCampaignSub1(input.campaignSub1)
+    const pageId = str(input.pageId)
+    const postTail = str(input.postTail)
+    const filled = str(input.template)
+        .replace('{url}', encodeURIComponent(str(input.shopeeLink)))
+        .replace('{sub_id}', encodeURIComponent(campaignSub1))
+        .replace('{sub_id2}', encodeURIComponent(pageId))
+        .replace('{sub_id3}', encodeURIComponent(postTail))
+        .replace('{sub_id4}', '')
+        .replace('{sub_id5}', '')
+    try {
+        const u = new URL(filled)
+        u.searchParams.set('sub1', campaignSub1)
+        u.searchParams.set('sub2', pageId)
+        if (postTail) u.searchParams.set('sub3', postTail)
+        else u.searchParams.delete('sub3')
+        u.searchParams.delete('sub4')
+        u.searchParams.delete('sub5')
+        return u.toString()
+    } catch {
+        return filled
+    }
+}
+
+// The two standing CTA lines appended under the final shortlink in the Follow lane Page comment —
+// the normal Page comment style (link first, then these two lines).
+export const FOLLOW_LANE_COMMENT_BODY_LINES: readonly string[] = [
+    '📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้',
+    '🟠 สั่งผ่านลิงก์เพจเป็นพาร์ทเนอร์กับ Shopee ปลอดภัย 💯',
+]
+
+// Compose the Follow lane PAGE COMMENT message: the final three-sub comment-tracking shortlink on its
+// own first line, then the two standing CTA lines. Posted (as the Page) on the actual ad story after
+// its id is known. This link is comment-tracking ONLY — it is NOT the LIKE_PAGE creative CTA and NOT
+// the two-sub creative-message link. Empty shortlink → '' so the caller skips the comment. Pure.
+export function buildFollowLaneCommentMessage(finalShortlink: string): string {
+    const link = str(finalShortlink)
+    if (!link) return ''
+    return [link, ...FOLLOW_LANE_COMMENT_BODY_LINES].join('\n')
+}
+
+// Map an auto-picked candidate to the EXACT POST /api/dashboard/create-ad-only request body for the
+// FOLLOW lane. Defaults to the SAFE non-spending 'paused' mode (the Follow scheduler must never
+// silently spend); 'active' is used only when the operator explicitly opts in, in which case the
+// Bangkok date-named daily campaign carries the CAMPAIGN-level (CBO) budget + run-hours. `lane:'follow'`
+// routes the endpoint to the Follow branch (Follow template + two-sub shortlink + caption-embedded link
+// + LIKE_PAGE CTA). Source-signal/system-video ids are forwarded; the endpoint re-validates and resolves
+// the system video URL.
+export function buildFollowAutoPickBody(input: {
+    candidate: AdOnlyAutoCandidate
+    mode?: AdOnlyMode
+    dailyCampaignName?: string
+    dailyBudgetThb?: number
+    runHours?: number
+    templateAdset?: string
+    campaignSub1?: string
+}): Record<string, unknown> {
+    const c = input.candidate
+    const mode: AdOnlyMode = input.mode === 'active' ? 'active' : 'paused'
+    const body: Record<string, unknown> = {
+        lane: 'follow',
+        page_id: str(c.pageId),
+        fb_video_id: str(c.videoId),
+        post_id: str(c.postId),
+        system_video_id: str(c.systemVideoId),
+        shopee_url: str(c.shopeeLink),
+        ad_name: str(c.adName) || str(c.systemVideoId) || str(c.videoId),
+        mode,
+    }
+    const templateAdset = str(input.templateAdset)
+    if (templateAdset) body.template_adset = templateAdset
+    const campaignSub1 = str(input.campaignSub1)
+    if (campaignSub1) body.follow_campaign_sub1 = campaignSub1
+    // Always pass the Bangkok date-named campaign for the Follow lane, even when PAUSED, so proof ads
+    // are discoverable under e.g. 25/Jun/2026 instead of falling back to ADS_PUBLISH_*.
+    const dailyCampaignName = str(input.dailyCampaignName)
+    if (dailyCampaignName) body.daily_campaign_name = dailyCampaignName
+    if (mode === 'active') {
+        const budget = Number.isFinite(Number(input.dailyBudgetThb)) && Number(input.dailyBudgetThb) > 0
+            ? Math.round(Number(input.dailyBudgetThb))
+            : DEFAULT_DAILY_BUDGET_THB
+        const hours = Number.isFinite(Number(input.runHours)) && Number(input.runHours) > 0
+            ? Math.round(Number(input.runHours))
+            : DEFAULT_RUN_HOURS
+        body.daily_budget_thb = budget
+        body.run_hours = hours
+    }
+    return body
+}
+
 // Shape the audit row from a validation + an optional bridge result. Pure: the DB write lives in
 // the route. `status` is the lifecycle state ('unsupported' | 'failed' | 'created' | 'pending').
 export function buildAdHistoryRecord(params: {

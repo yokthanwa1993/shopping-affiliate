@@ -15,6 +15,18 @@ import {
     DEFAULT_DAILY_BUDGET_THB,
     DEFAULT_RUN_HOURS,
     MAX_RUN_HOURS,
+    resolveAdOnlyLane,
+    resolveFollowLaneTemplateAdset,
+    resolveFollowLaneCampaignSub1,
+    buildFollowLaneShortlinkRequestUrl,
+    buildFollowLaneCreativeMessage,
+    buildFollowLaneCommentShortlinkRequestUrl,
+    buildFollowLaneCommentMessage,
+    buildFollowAutoPickBody,
+    FOLLOW_LANE_TEMPLATE_ADSET,
+    FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+    FOLLOW_LANE_CTA_TYPE,
+    FOLLOW_LANE_COMMENT_BODY_LINES,
 } from '../src/ad-only-contract.js'
 import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
 import {
@@ -565,4 +577,269 @@ test('truncateResultJson bounds long payloads and never throws on cycles', () =>
     const cyc: Record<string, unknown> = {}
     cyc.self = cyc
     assert.doesNotThrow(() => truncateResultJson(cyc))
+})
+
+// =====================================================================
+// FOLLOW / PAGE-LIKE LANE
+// =====================================================================
+
+const DEFAULT_TEMPLATE = 'https://short.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}'
+const FOLLOW_PAGE_ID = '1008898512617594'
+const FOLLOW_SHOPEE = 'https://s.shopee.co.th/abc123'
+
+function getFollowLaneHandlerSource(): string {
+    return sliceIndexSource(
+        'async function runFollowLaneCreateAdOnly',
+        "\napp.post('/api/dashboard/create-ad-only'",
+        'runFollowLaneCreateAdOnly',
+    )
+}
+
+test('resolveAdOnlyLane defaults to sales and never breaks the click-link lane', () => {
+    assert.equal(resolveAdOnlyLane(undefined), 'sales')
+    assert.equal(resolveAdOnlyLane({}), 'sales')
+    assert.equal(resolveAdOnlyLane({ page_id: 'P', system_video_id: 'sys' }), 'sales')
+    assert.equal(resolveAdOnlyLane({ lane: 'sales' }), 'sales')
+})
+
+test('resolveAdOnlyLane selects follow for explicit lane/objective/flag hints', () => {
+    assert.equal(resolveAdOnlyLane({ lane: 'follow' }), 'follow')
+    assert.equal(resolveAdOnlyLane({ lane: 'page_like' }), 'follow')
+    assert.equal(resolveAdOnlyLane({ lane: 'PAGE_LIKES' }), 'follow')
+    assert.equal(resolveAdOnlyLane({ ad_objective: 'OUTCOME_ENGAGEMENT' }), 'follow')
+    assert.equal(resolveAdOnlyLane({ follow: true }), 'follow')
+    assert.equal(resolveAdOnlyLane({ follow: 'true' }), 'follow')
+    assert.equal(resolveAdOnlyLane({ follow: 1 }), 'follow')
+})
+
+test('resolveFollowLaneTemplateAdset prefers body, then setting, then the corrected default', () => {
+    assert.equal(FOLLOW_LANE_TEMPLATE_ADSET, '120248767074180263')
+    assert.equal(resolveFollowLaneTemplateAdset({ bodyValue: '999', settingValue: '888' }), '999')
+    assert.equal(resolveFollowLaneTemplateAdset({ settingValue: '888' }), '888')
+    assert.equal(resolveFollowLaneTemplateAdset({}), FOLLOW_LANE_TEMPLATE_ADSET)
+})
+
+test('resolveFollowLaneCampaignSub1 falls back to the operator-confirmed campaign code', () => {
+    assert.equal(FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT, '16JUN26FBSPCAD')
+    assert.equal(resolveFollowLaneCampaignSub1('CUSTOM'), 'CUSTOM')
+    assert.equal(resolveFollowLaneCampaignSub1(''), FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT)
+    assert.equal(resolveFollowLaneCampaignSub1(undefined), FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT)
+})
+
+test('Follow shortlink carries EXACTLY two subs: sub1=campaign, sub2=page id, NO sub3 (default template)', () => {
+    const url = buildFollowLaneShortlinkRequestUrl({
+        template: DEFAULT_TEMPLATE,
+        shopeeLink: FOLLOW_SHOPEE,
+        campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        pageId: FOLLOW_PAGE_ID,
+    })
+    const u = new URL(url)
+    // sub1 = campaign code, sub2 = page id — even though the default template has NO {sub_id2} slot.
+    assert.equal(u.searchParams.get('sub1'), '16JUN26FBSPCAD')
+    assert.equal(u.searchParams.get('sub2'), FOLLOW_PAGE_ID)
+    // NO sub3/sub4/sub5 — the page id is NEVER repeated into a third sub (the page-page-page bug).
+    assert.equal(u.searchParams.has('sub3'), false)
+    assert.equal(u.searchParams.has('sub4'), false)
+    assert.equal(u.searchParams.has('sub5'), false)
+    // The product url survives single-encoded.
+    assert.equal(u.searchParams.get('url'), FOLLOW_SHOPEE)
+    // The page id appears in exactly ONE sub slot (sub2), proving utm_content can't be page-page-page.
+    const subVals = ['sub1', 'sub2', 'sub3', 'sub4', 'sub5'].map((k) => u.searchParams.get(k)).filter(Boolean)
+    assert.deepEqual(subVals, ['16JUN26FBSPCAD', FOLLOW_PAGE_ID])
+    assert.equal(subVals.filter((v) => v === FOLLOW_PAGE_ID).length, 1)
+})
+
+test('Follow shortlink empties {sub_id3..5} placeholders when a sales-style template carries them', () => {
+    const tmpl = 'https://short.wwoom.com/?id=15130770000&url={url}&sub1={sub_id}&sub2={sub_id2}&sub3={sub_id3}'
+    const url = buildFollowLaneShortlinkRequestUrl({
+        template: tmpl,
+        shopeeLink: FOLLOW_SHOPEE,
+        campaignSub1: 'CAMP',
+        pageId: FOLLOW_PAGE_ID,
+    })
+    const u = new URL(url)
+    assert.equal(u.searchParams.get('sub1'), 'CAMP')
+    assert.equal(u.searchParams.get('sub2'), FOLLOW_PAGE_ID)
+    assert.equal(u.searchParams.has('sub3'), false)
+})
+
+test('Follow shortlink uses the default campaign sub1 when none supplied', () => {
+    const url = buildFollowLaneShortlinkRequestUrl({
+        template: DEFAULT_TEMPLATE, shopeeLink: FOLLOW_SHOPEE, campaignSub1: '', pageId: FOLLOW_PAGE_ID,
+    })
+    assert.equal(new URL(url).searchParams.get('sub1'), '16JUN26FBSPCAD')
+})
+
+test('Follow creative message puts caption text + shortlink (link above the video preview)', () => {
+    const msg = buildFollowLaneCreativeMessage({ caption: 'กดติดตามเพจ', shortlink: 'https://s.shopee.co.th/x' })
+    assert.equal(msg, 'กดติดตามเพจ\nhttps://s.shopee.co.th/x')
+    // The shortlink IS present in the creative message.
+    assert.ok(msg.includes('https://s.shopee.co.th/x'))
+})
+
+test('Follow creative message never duplicates a shortlink already in the caption', () => {
+    const caption = 'ดูเลย https://s.shopee.co.th/x ของดี'
+    const msg = buildFollowLaneCreativeMessage({ caption, shortlink: 'https://s.shopee.co.th/x' })
+    assert.equal(msg, caption)
+    assert.equal((msg.match(/https:\/\/s\.shopee\.co\.th\/x/g) || []).length, 1)
+})
+
+test('Follow creative message handles empty caption / empty shortlink', () => {
+    assert.equal(buildFollowLaneCreativeMessage({ caption: '', shortlink: 'https://x' }), 'https://x')
+    assert.equal(buildFollowLaneCreativeMessage({ caption: 'hi', shortlink: '' }), 'hi')
+})
+
+test('Follow COMMENT shortlink carries THREE subs: sub1=campaign, sub2=page id, sub3=post tail (default template)', () => {
+    const url = buildFollowLaneCommentShortlinkRequestUrl({
+        template: DEFAULT_TEMPLATE,
+        shopeeLink: FOLLOW_SHOPEE,
+        campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        pageId: FOLLOW_PAGE_ID,
+        postTail: '987654321',
+    })
+    const u = new URL(url)
+    // The comment-tracking link is THREE-sub even though the default template only carries `sub1=`.
+    assert.equal(u.searchParams.get('sub1'), '16JUN26FBSPCAD')
+    assert.equal(u.searchParams.get('sub2'), FOLLOW_PAGE_ID)
+    assert.equal(u.searchParams.get('sub3'), '987654321')
+    // Never a fourth/fifth sub.
+    assert.equal(u.searchParams.has('sub4'), false)
+    assert.equal(u.searchParams.has('sub5'), false)
+    assert.equal(u.searchParams.get('url'), FOLLOW_SHOPEE)
+})
+
+test('Follow COMMENT shortlink drops sub3 (never repeats sub2) when the post tail is empty', () => {
+    const url = buildFollowLaneCommentShortlinkRequestUrl({
+        template: DEFAULT_TEMPLATE,
+        shopeeLink: FOLLOW_SHOPEE,
+        campaignSub1: 'CAMP',
+        pageId: FOLLOW_PAGE_ID,
+        postTail: '',
+    })
+    const u = new URL(url)
+    assert.equal(u.searchParams.get('sub1'), 'CAMP')
+    assert.equal(u.searchParams.get('sub2'), FOLLOW_PAGE_ID)
+    assert.equal(u.searchParams.has('sub3'), false)
+    // The page id appears in exactly ONE sub slot — never the page-page-page bug.
+    const subVals = ['sub1', 'sub2', 'sub3'].map((k) => u.searchParams.get(k)).filter(Boolean)
+    assert.equal(subVals.filter((v) => v === FOLLOW_PAGE_ID).length, 1)
+})
+
+test('Follow COMMENT shortlink defaults sub1 to the operator campaign code when none supplied', () => {
+    const url = buildFollowLaneCommentShortlinkRequestUrl({
+        template: DEFAULT_TEMPLATE, shopeeLink: FOLLOW_SHOPEE, campaignSub1: '', pageId: FOLLOW_PAGE_ID, postTail: '55',
+    })
+    assert.equal(new URL(url).searchParams.get('sub1'), '16JUN26FBSPCAD')
+})
+
+test('Follow COMMENT message is the final shortlink then the exact two-line Page comment template', () => {
+    const msg = buildFollowLaneCommentMessage('https://s.shopee.co.th/final')
+    assert.equal(
+        msg,
+        'https://s.shopee.co.th/final\n📌 พิกัดอยู่ตรงนี้เลย กดเข้าไปดูเองได้\n🟠 สั่งผ่านลิงก์เพจเป็นพาร์ทเนอร์กับ Shopee ปลอดภัย 💯',
+    )
+    // The final shortlink is the FIRST line.
+    assert.equal(msg.split('\n')[0], 'https://s.shopee.co.th/final')
+    // The two standing CTA lines are exactly the exported constant.
+    assert.deepEqual(msg.split('\n').slice(1), [...FOLLOW_LANE_COMMENT_BODY_LINES])
+})
+
+test('Follow COMMENT message is empty when there is no shortlink (caller skips the comment)', () => {
+    assert.equal(buildFollowLaneCommentMessage(''), '')
+})
+
+test('Follow lane handler remints a three-sub COMMENT shortlink off the story tail and posts the Page comment', () => {
+    const src = getFollowLaneHandlerSource()
+    // Re-mints the FINAL three-sub comment shortlink (not the two-sub creative-message link) using the
+    // bridge-returned story tail as sub3.
+    assert.match(src, /buildFollowLaneCommentShortlinkRequestUrl\(/)
+    assert.match(src, /postTail: commentPostTail/)
+    assert.match(src, /commentPostTail = adHistoryStoryTail\(adStoryIdForProof\)/)
+    // Posts the exact-template Page comment on the actual ad story via the Page-comment bridge.
+    assert.match(src, /buildFollowLaneCommentMessage\(commentShortlink\)/)
+    assert.match(src, /\/page-comment/)
+    assert.match(src, /story_id: adStoryIdForProof/)
+    // Surfaces sanitized comment proof fields (no tokens).
+    assert.match(src, /follow_comment_status/)
+    assert.match(src, /follow_comment_id/)
+    assert.match(src, /follow_comment_error/)
+    assert.match(src, /follow_comment_shortlink/)
+    assert.match(src, /follow_comment_sub2 = validation\.pageId/)
+    assert.match(src, /follow_comment_sub3 = commentPostTail/)
+    assert.match(src, /comment_target_story_id = adStoryIdForProof/)
+    // Comment is comment-tracking ONLY: the Follow lane never calls the SHOP_NOW story CTA repair path.
+    assert.doesNotMatch(src, /\/update-cta/)
+    assert.doesNotMatch(src, /cta_type: 'SHOP_NOW'/)
+})
+
+test('buildFollowAutoPickBody defaults to non-spending paused with lane=follow but still uses the daily campaign', () => {
+    const body = buildFollowAutoPickBody({
+        candidate: { pageId: FOLLOW_PAGE_ID, videoId: 'fb-1', postId: `${FOLLOW_PAGE_ID}_77`, systemVideoId: 'sys-1', shopeeLink: FOLLOW_SHOPEE },
+        templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
+        campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        dailyCampaignName: '25/Jun/2026',
+    })
+    assert.equal(body.lane, 'follow')
+    assert.equal(body.mode, 'paused')
+    assert.equal(body.page_id, FOLLOW_PAGE_ID)
+    assert.equal(body.system_video_id, 'sys-1')
+    assert.equal(body.template_adset, '120248767074180263')
+    assert.equal(body.follow_campaign_sub1, '16JUN26FBSPCAD')
+    assert.equal(body.daily_campaign_name, '25/Jun/2026')
+    // paused never spends → no budget/run-hours fields.
+    assert.equal(body.daily_budget_thb, undefined)
+    assert.equal(body.run_hours, undefined)
+})
+
+test('buildFollowAutoPickBody active mode carries the Bangkok daily campaign + CBO budget + run hours', () => {
+    const body = buildFollowAutoPickBody({
+        candidate: { pageId: FOLLOW_PAGE_ID, videoId: 'fb-1', systemVideoId: 'sys-1', shopeeLink: FOLLOW_SHOPEE },
+        mode: 'active',
+        dailyCampaignName: '24/Jun/2026',
+        templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
+    })
+    assert.equal(body.lane, 'follow')
+    assert.equal(body.mode, 'active')
+    assert.equal(body.daily_campaign_name, '24/Jun/2026')
+    assert.equal(body.daily_budget_thb, DEFAULT_DAILY_BUDGET_THB)
+    assert.equal(body.run_hours, DEFAULT_RUN_HOURS)
+})
+
+test('create-ad-only route branches into the Follow lane via resolveAdOnlyLane', () => {
+    const route = getCreateAdOnlyRouteSource()
+    assert.match(route, /resolveAdOnlyLane\(body\)\s*===\s*'follow'/)
+    assert.match(route, /return await runFollowLaneCreateAdOnly\(c, body, validation, schedule\)/)
+})
+
+test('Follow lane handler uses the two-sub shortlink, caption-embedded link, Follow template and LIKE_PAGE CTA', () => {
+    const src = getFollowLaneHandlerSource()
+    // Two-sub shortlink builder (not the sales 3-sub buildAdOnlyShortlinkRequestUrl).
+    assert.match(src, /buildFollowLaneShortlinkRequestUrl\(/)
+    assert.match(src, /pageId: validation\.pageId/)
+    // Caption + shortlink composed into the creative message and sent as the bridge caption.
+    assert.match(src, /buildFollowLaneCreativeMessage\(/)
+    assert.match(src, /caption: creativeMessage/)
+    // Follow template adset (per-page override key) + LIKE_PAGE CTA hint.
+    assert.match(src, /FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY/)
+    assert.match(src, /resolveFollowLaneTemplateAdset\(/)
+    assert.match(src, /call_to_action_type: FOLLOW_LANE_CTA_TYPE/)
+    assert.equal(FOLLOW_LANE_CTA_TYPE, 'LIKE_PAGE')
+    // Hard separation: dark/ad story only, never a visible Page post.
+    assert.match(src, /skip_publish_to_page: true/)
+    // Records the lane on the audit row.
+    assert.match(src, /lane: 'follow'/)
+})
+
+test('Follow lane scheduler exposes scheduler_enabled + interval + run-next and is OPT-IN/paused-default', () => {
+    const source = getIndexSource()
+    assert.match(source, /app\.put\('\/api\/dashboard\/follow-ad\/enabled'/)
+    assert.match(source, /app\.get\('\/api\/dashboard\/follow-ad\/status'/)
+    assert.match(source, /app\.put\('\/api\/dashboard\/follow-ad\/interval'/)
+    assert.match(source, /app\.post\('\/api\/dashboard\/follow-ad\/run-next'/)
+    // Cron-wired alongside the click-link ad-only scheduler.
+    assert.match(source, /maybeProcessFollowAdOnSchedule\(env\)/)
+    // OPT-IN default off (settings default '0').
+    assert.match(source, /row\?\.value \?\? '0'/)
+    // Follow scheduler create body routes through the SAME create-ad-only endpoint with a follow body.
+    assert.match(source, /buildFollowAutoPickBody\(\{/)
 })
