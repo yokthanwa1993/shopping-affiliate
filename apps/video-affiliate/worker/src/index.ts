@@ -191,8 +191,11 @@ import {
     isCloakBridgeCommentFallbackEligible,
     isStoredCommentTokenAuthFailure,
     shouldAttemptFacebookLiteRefresh,
+    shouldAttemptFacebookLitePostingRefresh,
     buildFacebookLiteRefreshRequestBody,
     parseFacebookLiteRefreshResponse,
+    buildBridgeTokenPagesUrl,
+    extractBridgeTokenPageAccessToken,
     type FacebookLiteRefreshOutcome,
     type FacebookLiteRefreshRequestBody,
 } from './posting-token-source'
@@ -1409,9 +1412,20 @@ app.post('/api/pages/profile-sync', async (c) => {
         body = {}
     }
 
-    const configuredSecret = String(c.env.TAG_SYNC_PUSH_SECRET || '').trim()
+    // Accept EITHER the existing BrowserSaving tag-sync secret OR a dedicated Bridge Token sync
+    // secret. The Bridge Token (facebook-token-cloak) local exporter pushes freshly-resolved
+    // Facebook Lite page tokens through this same route; giving it its own secret means the Dev
+    // can provision it without rotating/breaking the existing BrowserSaving TAG_SYNC_PUSH_SECRET.
+    // Behavior is otherwise unchanged: if neither secret is configured, or the provided header
+    // matches neither, the route stays 410 (no direct/client page management).
+    const tagSyncSecret = String(c.env.TAG_SYNC_PUSH_SECRET || '').trim()
+    const bridgeTokenSecret = String((c.env as Env & { BRIDGE_TOKEN_SYNC_SECRET?: string }).BRIDGE_TOKEN_SYNC_SECRET || '').trim()
     const providedSecret = String(c.req.header('x-tag-sync-secret') || '').trim()
-    if (!configuredSecret || providedSecret !== configuredSecret) {
+    const secretAuthorized = !!providedSecret && (
+        (!!tagSyncSecret && providedSecret === tagSyncSecret) ||
+        (!!bridgeTokenSecret && providedSecret === bridgeTokenSecret)
+    )
+    if (!secretAuthorized) {
         return c.json({ error: 'direct_page_management_only' }, 410)
     }
 
@@ -28189,7 +28203,14 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     // Some BrowserSaving sync paths may send the resolved EAAD6 token in access_token
     // while comment_token still contains an intermediate raw token. Keep the direct
     // video token in the comment pool so posting does not fall back to Postcron.
-    const incomingPostToken = isPostRoleToken(accessToken) ? accessToken : ''
+    //
+    // Facebook Lite fresh PAGE tokens are EAAD6-prefixed. isPostRoleToken() historically treated
+    // EAAD6 as "comment role" and so DROPPED a freshly-synced Lite token from post_tokens —
+    // leaving the posting resolver on the old stale token (live row 33210 kept reusing
+    // EAAD6V…ZDZD even after a successful refresh). normalizePostTokenPool() already accepts any
+    // non-empty token because EAAD6 encodes the Facebook app id, not the token scope, so trust it:
+    // any non-empty synced token is a valid post token and must lead the pool.
+    const incomingPostToken = normalizePostTokenPool([accessToken])[0] || ''
     const resolvedCommentToken = String(
         normalizeDirectVideoTokenPool([
             commentToken,
@@ -28813,23 +28834,34 @@ async function ensurePageTokenCandidates(params: {
     primaryToken?: string | null
     logPrefix: string
 }): Promise<{ tokens: string[]; postTokens: string[]; commentTokens: string[] }> {
-    // Posting tokens: whatever the operator pastes in the page "Access Token (โพสต์)"
-    // field is used for posting only.
-    // Comment tokens: prefer the per-namespace dedicated comment token (LIFF settings →
-    // ตั้งค่า → คอมเม้น → "Access Token (คอมเม้น)"); falls back to primary post token
-    // if not set (legacy single-token behavior). If neither is set → empty pool.
-    const primary = String(params.primaryToken || '').trim()
+    // Posting tokens: use the per-page namespace token pool first-class, not only the
+    // legacy pages.access_token field. Token Bridge/Facebook Lite sync writes fresh
+    // page tokens into pages_token_pool_v1 (and pages.access_token); force-post must
+    // include that pool so a stale primary token cannot keep the page permanently
+    // broken after a successful /token/export sync.
+    // Comment tokens: still prefer the per-namespace dedicated comment token (LIFF
+    // settings → ตั้งค่า → คอมเม้น → "Access Token (คอมเม้น)"), then the pool/primary
+    // candidates for legacy single-token behavior.
+    const pooled = await getPageTokenCandidates({
+        db: params.db,
+        namespaceId: params.namespaceId,
+        pageId: params.pageId,
+        primaryToken: params.primaryToken,
+    })
     const dedicatedComment = await resolveNamespaceDedicatedCommentToken(params.db, params.namespaceId).catch(() => '')
-    const commentTokens = dedicatedComment ? [dedicatedComment] : (primary ? [primary] : [])
-    const postTokens = primary ? [primary] : []
+    const commentTokens = normalizeCommentTokenPool([
+        String(dedicatedComment || '').trim(),
+        ...pooled.commentTokens,
+    ])
+    const postTokens = normalizePostTokenPool(pooled.postTokens)
+    const tokens = uniqueTokens([
+        ...(postTokens.length > 0 ? postTokens : commentTokens),
+        ...commentTokens,
+    ])
     if (postTokens.length === 0 && commentTokens.length === 0) {
         return { tokens: [], postTokens: [], commentTokens: [] }
     }
-    return {
-        tokens: postTokens.length > 0 ? postTokens : commentTokens,
-        postTokens,
-        commentTokens,
-    }
+    return { tokens, postTokens, commentTokens }
 }
 
 function getFacebookErrorMessage(rawError: unknown): string {
@@ -29183,6 +29215,111 @@ async function probeFacebookLiteProfilesForPage(params: {
         } catch { /* try next base */ }
     }
     return { ok: false, wouldRefresh: linkedIds.length > 0, profileFound: false, credentialedCount: 0, linkedCount: linkedIds.length, reason: 'probe_failed' }
+}
+
+// Bridge Token (Facebook Lite / Power Editor) fallback page-token fetch. Pulls a fresh
+// page-scoped access token directly from the Bridge Token local tool's `/pages?...&includeToken=1`
+// route via the production tunnel (CLOAK_FB_BRIDGE_URL = https://short.wwoom.com). Used ONLY when
+// the BrowserSaving secret refresh route did not sync a fresh token (e.g. it returned "Not found").
+// Tries each candidate login id first, then the tool's default logged-in session (no account),
+// which lists every administered page. The returned token is held IN MEMORY by the caller and is
+// NEVER logged or returned to a client — only its presence is logged.
+async function fetchFacebookLitePageTokenFromBridge(params: {
+    env: Env
+    pageId: string
+    candidateLoginIds?: string[]
+    logPrefix: string
+}): Promise<{ token: string; account: string }> {
+    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+    const pageId = String(params.pageId || '').trim()
+    if (!baseUrl || !pageId) return { token: '', account: '' }
+    // Candidate login ids first (multi-account bridge), THEN the default session (''). The ''
+    // sentinel must be appended AFTER de-duping the non-empty candidates — uniqueTokens() drops
+    // blanks, so folding it into the dedupe would silently skip the default-session lookup, which
+    // is the live production path (no candidate ids are passed by force-post/retry/cron, and the
+    // tool's default session lists every administered page, e.g. CHEARB).
+    const accounts = [
+        ...uniqueTokens((params.candidateLoginIds || []).map((v) => String(v || '').trim())),
+        '',
+    ]
+    for (const account of accounts) {
+        const url = buildBridgeTokenPagesUrl({ baseUrl, account, includeToken: true })
+        if (!url) continue
+        try {
+            const resp = await fetchWithTimeout(url, {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+            }, 30000, 'bridge_token_pages')
+            const data = await resp.json().catch(() => ({}))
+            const lookup = extractBridgeTokenPageAccessToken(data, pageId)
+            if (lookup.found && lookup.accessToken) {
+                console.log(`[${params.logPrefix}] bridge token /pages lookup ok page=${pageId} account=${account ? 'candidate' : 'default'} token_present=true`)
+                return { token: lookup.accessToken, account }
+            }
+        } catch (e) {
+            console.warn(`[${params.logPrefix}] bridge token /pages lookup failed (${e instanceof Error ? e.message : String(e)})`)
+        }
+    }
+    return { token: '', account: '' }
+}
+
+// On-demand Facebook Lite (FB GET Token) refresh for a stored-token page's POSTING token. There is
+// no permanent "token expired" state for a Facebook Lite page: this re-mints a fresh page token and
+// syncs it into this namespace's pool so the caller can re-read it and retry publishing.
+//   1) Preferred — the BrowserSaving secret route re-mints from stored Account Manager credentials
+//      and pushes the fresh token back via profile-sync (token-free, auto-discovers by page_id).
+//   2) Fallback — if that route did NOT sync (unavailable / "Not found"), pull a fresh page token
+//      straight from the Bridge Token tool's /pages route and upsert it into the pool ourselves.
+// Best-effort and token-free in logs: the Worker never logs a raw token value.
+async function refreshFacebookLitePostingTokenForPage(params: {
+    env: Env
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    pageName: string
+    candidateLoginIds?: string[]
+    logPrefix: string
+}): Promise<{ refreshed: boolean; synced: boolean; via: string; reason: string }> {
+    // 1) BrowserSaving secret mint + profile-sync (the fresh page token lands in the post pool).
+    const bs = await refreshFacebookLiteCommentTokenForPage({
+        env: params.env,
+        db: params.db,
+        namespaceId: params.namespaceId,
+        pageId: params.pageId,
+        pageName: params.pageName,
+        candidateLoginIds: params.candidateLoginIds,
+        logPrefix: `${params.logPrefix} POST-REFRESH`,
+    }).catch((e) => ({ refreshed: false, synced: false, profileCount: 0, reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
+    if (bs.synced) {
+        return { refreshed: true, synced: true, via: 'browsersaving', reason: bs.reason }
+    }
+
+    // 2) Bridge Token /pages fallback when BrowserSaving did not sync a token.
+    const bridge = await fetchFacebookLitePageTokenFromBridge({
+        env: params.env,
+        pageId: params.pageId,
+        candidateLoginIds: params.candidateLoginIds,
+        logPrefix: `${params.logPrefix} BRIDGE-TOKEN`,
+    })
+    if (bridge.token) {
+        try {
+            await upsertNamespacePageFromProfileSync(params.env, {
+                namespaceId: params.namespaceId,
+                pageId: params.pageId,
+                pageName: params.pageName,
+                accessToken: bridge.token,
+                commentToken: bridge.token,
+            })
+            console.log(`[${params.logPrefix}] bridge token synced into pool page=${params.pageId} via=bridge_token_pages`)
+            return { refreshed: true, synced: true, via: 'bridge_token_pages', reason: 'bridge_token_synced' }
+        } catch (e) {
+            const reason = (e instanceof Error ? e.message : String(e)).slice(0, 120)
+            console.warn(`[${params.logPrefix}] bridge token sync into pool failed (${reason})`)
+            return { refreshed: true, synced: false, via: 'bridge_token_pages', reason }
+        }
+    }
+
+    return { refreshed: bs.refreshed, synced: false, via: 'none', reason: bs.reason }
 }
 
 async function initReelUploadWithPostingTokenAutoRecover(params: {
@@ -35388,6 +35525,76 @@ async function publishReelWithCommentTokenPrimaryFallback(params: {
     }
 }
 
+// Stored-token / Facebook Lite organic-Reel publish with on-demand token refresh + one retry.
+// Wraps publishReelWithCommentTokenPrimaryFallback: on the happy path nothing changes. Only when
+// the whole token-fallback chain fails with an auth/availability error (190 / invalidated session
+// / "error validating access token" / missing token — exactly the production "session has been
+// invalidated" failure) does it re-mint a fresh page token (BrowserSaving first, then the Bridge
+// Token /pages tunnel), reload the page's token pool, and retry the publish ONCE. Any non-auth
+// failure (transient FB error, video issue, etc.) is rethrown untouched so it is never masked.
+// Token-free: it logs only ids/booleans/redacted hints, never a raw token.
+async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: {
+    env: Env
+    db: D1Database
+    namespaceId: string
+    pageId: string
+    pageName: string
+    commentTokens: string[]
+    postTokens: string[]
+    videoBuffer: ArrayBuffer
+    thumbnailBuffer?: ArrayBuffer | null
+    thumbnailContentType?: string
+    description: string
+    logPrefix: string
+    candidateLoginIds?: string[]
+    reloadTokens: () => Promise<{ commentTokens: string[]; postTokens: string[] }>
+}): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
+    try {
+        return await publishReelWithCommentTokenPrimaryFallback({
+            pageId: params.pageId,
+            commentTokens: params.commentTokens,
+            postTokens: params.postTokens,
+            videoBuffer: params.videoBuffer,
+            thumbnailBuffer: params.thumbnailBuffer,
+            thumbnailContentType: params.thumbnailContentType,
+            description: params.description,
+            logPrefix: params.logPrefix,
+        })
+    } catch (publishErr) {
+        const message = parseFacebookErrorLike(publishErr)?.message || (publishErr instanceof Error ? publishErr.message : String(publishErr))
+        const tokenMissing = !normalizePostTokenPool(params.postTokens || []).length
+        if (!shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', tokenMissing, error: message })) {
+            throw publishErr
+        }
+        console.log(`[${params.logPrefix}] stored-token publish auth failure — attempting Facebook Lite page-token refresh`)
+        const refresh = await refreshFacebookLitePostingTokenForPage({
+            env: params.env,
+            db: params.db,
+            namespaceId: params.namespaceId,
+            pageId: params.pageId,
+            pageName: params.pageName,
+            candidateLoginIds: params.candidateLoginIds,
+            logPrefix: params.logPrefix,
+        }).catch((e) => ({ refreshed: false, synced: false, via: 'error', reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
+        if (!refresh.synced) {
+            console.warn(`[${params.logPrefix}] Facebook Lite refresh did not sync a fresh token (via=${refresh.via} reason=${refresh.reason}); surfacing original publish error`)
+            throw publishErr
+        }
+        const reloaded = await params.reloadTokens().catch(() => ({ commentTokens: params.commentTokens, postTokens: params.postTokens }))
+        console.log(`[${params.logPrefix}] retrying publish once with refreshed token (via=${refresh.via})`)
+        return await publishReelWithCommentTokenPrimaryFallback({
+            pageId: params.pageId,
+            commentTokens: reloaded.commentTokens,
+            postTokens: reloaded.postTokens,
+            videoBuffer: params.videoBuffer,
+            thumbnailBuffer: params.thumbnailBuffer,
+            thumbnailContentType: params.thumbnailContentType,
+            description: params.description,
+            logPrefix: `${params.logPrefix} POST-REFRESH-RETRY`,
+        })
+    }
+}
+
 type PageOneCardLinkMode = 'shopee' | 'lazada' | 'none'
 type PageOneCardCta = 'SHOP_NOW' | 'NO_BUTTON'
 
@@ -38186,8 +38393,12 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
         }).catch(() => null)
 
         postingTokenUsed = String(primaryPostingTokenCandidates[0] || '').trim()
-        const reelResult = await publishReelWithCommentTokenPrimaryFallback({
+        const reelResult = await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
+            env,
+            db: env.DB,
+            namespaceId: botId,
             pageId,
+            pageName,
             commentTokens: commentTokenCandidates,
             postTokens: fallbackPostTokenCandidates,
             videoBuffer,
@@ -38195,6 +38406,21 @@ app.post('/api/post-history/:id/retry-post', async (c) => {
             thumbnailContentType: postingThumbnail?.contentType || '',
             description: caption,
             logPrefix: 'RETRY-POST',
+            reloadTokens: async () => {
+                const refreshed = await ensurePageTokenCandidates({
+                    env,
+                    db: env.DB,
+                    namespaceId: botId,
+                    pageId,
+                    pageName,
+                    primaryToken: pageAccessToken,
+                    logPrefix: 'RETRY-POST RELOAD',
+                })
+                const post = refreshed.postTokens.length > 0
+                    ? refreshed.postTokens
+                    : normalizePostTokenPool([pageAccessToken])
+                return { commentTokens: refreshed.commentTokens, postTokens: post }
+            },
         })
         postingTokenUsed = reelResult.postingToken
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
@@ -40096,8 +40322,12 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 cta: pageOneCardCta,
                 logPrefix: 'FORCE-POST ONECARD',
             })
-            : await publishReelWithCommentTokenPrimaryFallback({
+            : await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
+                env,
+                db: env.DB,
+                namespaceId: botId,
                 pageId: page.id,
+                pageName: page.name,
                 commentTokens: commentTokenCandidates,
                 postTokens: fallbackPostTokenCandidates,
                 videoBuffer,
@@ -40105,6 +40335,21 @@ app.post('/api/pages/:id/force-post', async (c) => {
                 thumbnailContentType: postingThumbnail?.contentType || '',
                 description: publishDescription,
                 logPrefix: 'FORCE-POST',
+                reloadTokens: async () => {
+                    const refreshed = await ensurePageTokenCandidates({
+                        env,
+                        db: env.DB,
+                        namespaceId: botId,
+                        pageId: page.id,
+                        pageName: page.name,
+                        primaryToken: pageAccessToken,
+                        logPrefix: 'FORCE-POST RELOAD',
+                    })
+                    const post = refreshed.postTokens.length > 0
+                        ? refreshed.postTokens
+                        : normalizePostTokenPool([pageAccessToken])
+                    return { commentTokens: refreshed.commentTokens, postTokens: post }
+                },
             })
         postingTokenUsed = reelResult.postingToken
         const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)
@@ -42695,8 +42940,12 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     cta: pageOneCardCta,
                     logPrefix: `CRON ${page.name} ONECARD`,
                 })
-                : await publishReelWithCommentTokenPrimaryFallback({
+                : await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({
+                    env,
+                    db: env.DB,
+                    namespaceId: botId,
                     pageId: String(page.id || ''),
+                    pageName: String(page.name || ''),
                     commentTokens: commentTokenCandidates,
                     postTokens: fallbackPostTokenCandidates,
                     videoBuffer,
@@ -42704,6 +42953,21 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                     thumbnailContentType: postingThumbnail?.contentType || '',
                     description: publishDescription,
                     logPrefix: `CRON ${page.name}`,
+                    reloadTokens: async () => {
+                        const refreshed = await ensurePageTokenCandidates({
+                            env,
+                            db: env.DB,
+                            namespaceId: botId,
+                            pageId: String(page.id || ''),
+                            pageName: String(page.name || ''),
+                            primaryToken: String(page.access_token || ''),
+                            logPrefix: `CRON ${page.name} RELOAD`,
+                        })
+                        const post = refreshed.postTokens.length > 0
+                            ? refreshed.postTokens
+                            : normalizePostTokenPool([String(page.access_token || '')])
+                        return { commentTokens: refreshed.commentTokens, postTokens: post }
+                    },
                 })
             postingTokenUsed = reelResult.postingToken
             const postingProfile = await resolvePostHistoryProfileByToken(env, postingTokenUsed)

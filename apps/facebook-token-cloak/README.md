@@ -7,7 +7,7 @@ Side-by-side local Facebook token bridge for CloakBrowser + macOS Keychain.
 - Profile root: `~/.facebook-token-cloak/profiles`.
 - Keychain service prefix: `com.affiliate.facebook-token-cloak`.
 - No raw tokens/passwords/TOTP/cookies/datr are logged or returned by default.
-- `/token/export` is dry-run only; it does not write Cloudflare/D1.
+- `/token/export` is dry-run by default (no writes). A `dryRun:false` export is **local-only**: it resolves the page-scoped token from the logged-in session in memory and pushes it to the Worker `/api/pages/profile-sync` route (secret-authed); it never returns or logs the raw token.
 
 ## Run
 
@@ -217,13 +217,41 @@ curl -X POST http://127.0.0.1:8820/token/refresh \
 
 Default response returns only `tokenPresent`, redacted `tokenPrefix`, `pagesCount`, and sanitized `id/name/category/hasToken`. `includeToken=true` is localhost-only manual debug.
 
-Dry-run export:
+Dry-run export (default — previews what would be pushed, no writes):
 
 ```sh
 curl -X POST http://127.0.0.1:8820/token/export \
   -H 'Content-Type: application/json' \
   -d '{"account":"CHEARB","target":"video-affiliate","dryRun":true}'
 ```
+
+Live export (local-only — resolves the page token and pushes it into the Worker namespace token
+pool). Requires `namespaceId` + `pageId`, and a sync secret in the env:
+`BRIDGE_TOKEN_SYNC_SECRET` (preferred) or `TAG_SYNC_PUSH_SECRET` / `BROWSERSAVING_TAG_SYNC_SECRET`.
+The Worker URL defaults to `https://api.pubilo.com` and can be overridden with `workerUrl` or
+`VIDEO_AFFILIATE_WORKER_URL` / `WORKER_URL`. The response is token-free
+(`ok/synced/status/page_id/namespace_id/worker_status/profile_sync_success/page_found/hasToken/account`):
+
+```sh
+curl -X POST http://127.0.0.1:8820/token/export \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"100090320823561","namespaceId":"<ns>","pageId":"<page_id>","dryRun":false}'
+```
+
+The live exporter resolves the requested page through the **same cookie-bound `session.graphFetch`
+semantics as `GET /pages`** (the logged-in CloakBrowser / Ads Manager client), not a bare server
+fetch — a plain fetch with only the user token misses Ads-Manager-derived sessions, which is why
+`/pages` could see the page while the exporter returned `page_not_found`. If the requested
+`account` cannot resolve the page (no session, page not administered, or no page token), the
+exporter retries **once** with the default posting account (`FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT`,
+default `content_paiya`), whose session lists every administered page. The fallback is adopted only
+when it gets strictly further, and the token-free `account` field reports the **effective** account
+that produced the token. Unresolvable requests still return `no_session` / `page_not_found` /
+`page_token_unavailable` and never push.
+
+When no sync secret is configured a live export returns `{ ok:false, status:"sync_secret_missing" }`
+(it never prompts and never writes). The matching Worker route accepts either
+`BRIDGE_TOKEN_SYNC_SECRET` or `TAG_SYNC_PUSH_SECRET` as the `x-tag-sync-secret` header.
 
 ## Worker posting bridge endpoints (CloakBrowser)
 

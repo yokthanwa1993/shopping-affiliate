@@ -12,9 +12,12 @@ import {
     isCloakBridgeCommentFallbackEligible,
     isStoredCommentTokenAuthFailure,
     shouldAttemptFacebookLiteRefresh,
+    shouldAttemptFacebookLitePostingRefresh,
     buildFacebookLiteRefreshRequestBody,
     parseFacebookLiteRefreshResponse,
     redactFacebookLiteRefreshResult,
+    buildBridgeTokenPagesUrl,
+    extractBridgeTokenPageAccessToken,
 } from '../src/posting-token-source'
 
 test('normalize: only two modes — stored_token and cloak_browser', () => {
@@ -258,4 +261,62 @@ test('module exposes only the two-mode source type (no third provider)', () => {
     assert.ok(!/['"`]https:\/\/video-onecard\.wwoom\.com['"`]/.test(src), 'must not default to the retired video-onecard tunnel URL')
     // The source union must be exactly the two product modes.
     assert.ok(/'stored_token'/.test(src) && /'cloak_browser'/.test(src), 'both modes present')
+})
+
+// ---- Facebook Lite POSTING-token refresh predicate (publish-path twin) ---------------------
+
+test('posting refresh: only stored_token, only on auth failure / missing token', () => {
+    // The exact production failure must trigger a refresh.
+    const prodErr = 'facebook_publish_all_paths_failed: direct=all_direct_video_tokens_failed: EAAD6V…: Error validating access token: The session has been invalidated because the user changed their password | video_reels=all_post_tokens_failed: EAAD6V…: Error validating access token: The session has been invalidated'
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: prodErr }), true)
+    // code 190 / OAuthException variants.
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: 'OAuthException code 190' }), true)
+    // explicit missing-token markers.
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: 'facebook_access_token_missing' }), true)
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', tokenMissing: true }), true)
+    // A non-auth failure must NOT trigger a refresh (it would mask the real error).
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: 'Please reduce the amount of data' }), false)
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: 'Video too small (123 bytes)' }), false)
+    // CloakBrowser posting never refreshes a stored token.
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'cloak_browser', error: prodErr }), false)
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'cloak_browser', tokenMissing: true }), false)
+})
+
+// ---- Bridge Token /pages fallback URL + token extraction -----------------------------------
+
+test('bridge token /pages url: includes account + includeToken=1, omits empty account', () => {
+    const withAccount = buildBridgeTokenPagesUrl({ baseUrl: 'https://short.wwoom.com', account: '100090320823561', includeToken: true })
+    assert.ok(withAccount.startsWith('https://short.wwoom.com/pages?'), 'targets the bridge /pages route')
+    assert.ok(/account=100090320823561/.test(withAccount), 'carries the candidate login id as account=')
+    assert.ok(/includeToken=1/.test(withAccount), 'requests the raw token via includeToken=1')
+    // No account → default session, no account= param, still includeToken=1.
+    const defaultSession = buildBridgeTokenPagesUrl({ baseUrl: 'https://short.wwoom.com/', includeToken: true })
+    assert.equal(defaultSession, 'https://short.wwoom.com/pages?includeToken=1')
+    // Empty base → empty url (caller fails closed).
+    assert.equal(buildBridgeTokenPagesUrl({ baseUrl: '', includeToken: true }), '')
+})
+
+test('bridge token /pages: extracts the matching page access_token, ignores others', () => {
+    const data = {
+        data: [
+            { id: '999', name: 'other', hasToken: true, access_token: 'EAAotherZZZ' },
+            { id: '1008898512617594', name: 'เฉียบ', hasToken: true, access_token: 'EAAfreshpagetoken' },
+        ],
+    }
+    const hit = extractBridgeTokenPageAccessToken(data, '1008898512617594')
+    assert.equal(hit.found, true)
+    assert.equal(hit.hasToken, true)
+    assert.equal(hit.accessToken, 'EAAfreshpagetoken')
+    // Page absent → found:false, no token.
+    const miss = extractBridgeTokenPageAccessToken(data, '111')
+    assert.equal(miss.found, false)
+    assert.equal(miss.accessToken, '')
+    // hasToken flag with token withheld (non-local caller) → found but empty token.
+    const withheld = extractBridgeTokenPageAccessToken({ data: [{ id: '5', hasToken: true }] }, '5')
+    assert.equal(withheld.found, true)
+    assert.equal(withheld.hasToken, true)
+    assert.equal(withheld.accessToken, '')
+    // Garbage payloads never throw.
+    assert.equal(extractBridgeTokenPageAccessToken(null, '5').found, false)
+    assert.equal(extractBridgeTokenPageAccessToken({ data: 'nope' }, '5').found, false)
 })

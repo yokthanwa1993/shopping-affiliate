@@ -617,17 +617,186 @@ function createHandler(deps = {}) {
       }
 
       if (req.method === 'POST' && url.pathname === '/token/export') {
-        const { account, target = 'video-affiliate', namespaceId, dryRun = true } = await parseBody(req);
+        const exportBody = await parseBody(req);
+        const { account, target = 'video-affiliate', namespaceId, pageId, pageName, workerUrl, dryRun = true } = exportBody;
         if (!account) return sendError(res, 400, 'Missing account');
         const { display } = sanitizeAccount(account);
+        const wantDryRun = dryRun !== false;
+
+        // SAFE default: a dry run performs no Cloudflare/D1 writes and resolves no token. It only
+        // echoes back what a real export WOULD push, so the UI/Dev can preview without side effects.
+        if (wantDryRun) {
+          return send(res, 200, {
+            account: display,
+            target,
+            namespaceId: namespaceId || null,
+            pageId: pageId || null,
+            dryRun: true,
+            status: 'dry_run_only',
+            wouldUpdate: ['pages_token_pool_v1', 'pages.access_token'],
+            note: 'No Cloudflare/D1 writes performed by this endpoint.'
+          });
+        }
+
+        // ── Real local-only export ─────────────────────────────────────────────────────────
+        // Resolving a page token reads the logged-in CloakBrowser session, so a live export is
+        // gated to localhost. A remote caller can never trigger a token resolution/push.
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Live token export is local-only');
+
+        const ns = String(namespaceId || '').trim();
+        const pid = String(pageId || '').trim();
+        if (!ns || !pid) return sendError(res, 400, 'namespaceId and pageId are required for a live export');
+
+        // Dedicated Bridge Token sync secret first, then the existing BrowserSaving tag-sync
+        // secrets. Never echoed/logged; only its presence gates the push.
+        const syncSecret = String(
+          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
+          process.env.TAG_SYNC_PUSH_SECRET ||
+          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
+          ''
+        ).trim();
+        if (!syncSecret) {
+          return send(res, 200, {
+            ok: false,
+            synced: false,
+            status: 'sync_secret_missing',
+            account: display,
+            namespace_id: ns,
+            page_id: pid
+          });
+        }
+
+        // Resolve the requested page's token using the SAME cookie-bound session semantics as
+        // GET /pages: list me/accounts over `session.graphFetch` (the logged-in CloakBrowser /
+        // Ads Manager client), NOT a bare server fetch. A plain fetch with only the token misses
+        // Ads-Manager-derived sessions, which is why /pages saw the page but the old exporter did
+        // not. Each attempt owns its session and closes it; the page token never leaves this
+        // closure except in the secret-authed push body below.
+        const resolvePageForExport = async (acct) => {
+          const session = await posting.resolveSessionToken({ browser: br, account: acct });
+          try {
+            if (!session.token) {
+              return { status: 'no_session', page_found: false, hasToken: false, pageToken: '', pageName: '' };
+            }
+            let pagesResult;
+            try {
+              pagesResult = await posting.listPagesPublic(session.graphFetch, session.token, true);
+            } catch (e) {
+              return {
+                status: 'graph_pages_failed', page_found: false, hasToken: false, pageToken: '', pageName: '',
+                reason: (e && (e.reason || e.code || e.message)) || 'graph_pages_failed'
+              };
+            }
+            if (pagesResult && pagesResult.error) {
+              return {
+                status: 'graph_pages_failed', page_found: false, hasToken: false, pageToken: '', pageName: '',
+                reason: pagesResult.error
+              };
+            }
+            const match = (pagesResult.data || []).find((p) => String(p && p.id) === pid);
+            if (!match) {
+              return { status: 'page_not_found', page_found: false, hasToken: false, pageToken: '', pageName: '' };
+            }
+            const pageToken = match.access_token ? String(match.access_token) : '';
+            if (!pageToken) {
+              return { status: 'page_token_unavailable', page_found: true, hasToken: false, pageToken: '', pageName: String(match.name || '') };
+            }
+            return { status: 'ok', page_found: true, hasToken: true, pageToken, pageName: String(match.name || '') };
+          } finally {
+            await posting.closeSession(session);
+          }
+        };
+
+        // Rank how far an attempt got so a fallback can only ever IMPROVE the outcome.
+        const exportRank = (status) => {
+          switch (status) {
+            case 'ok': return 3;
+            case 'page_token_unavailable': return 2;
+            case 'page_not_found': return 1;
+            default: return 0; // no_session / graph_pages_failed
+          }
+        };
+
+        let resolved = await resolvePageForExport(account);
+        let effectiveAccount = display;
+
+        // SAFE fallback: only when the explicit account could not resolve a usable page token,
+        // retry once with the default configured posting account/session — it is proven to list
+        // every administered page. The default is tried only if it is a different account, and is
+        // adopted only when it gets strictly further than the explicit attempt. The response still
+        // never carries a token; it only names the effective account.
+        if (resolved.status !== 'ok' && String(account).trim() !== String(POST_ACCOUNT).trim()) {
+          const fb = await resolvePageForExport(POST_ACCOUNT);
+          if (exportRank(fb.status) > exportRank(resolved.status)) {
+            resolved = fb;
+            effectiveAccount = sanitizeAccount(POST_ACCOUNT).display;
+          }
+        }
+
+        if (resolved.status !== 'ok') {
+          return send(res, 200, {
+            ok: false, synced: false, status: resolved.status,
+            account: effectiveAccount, namespace_id: ns, page_id: pid,
+            page_found: resolved.page_found, hasToken: resolved.hasToken,
+            ...(resolved.reason ? { reason: resolved.reason } : {})
+          });
+        }
+
+        const pageToken = resolved.pageToken;
+        const resolvedPageName = String(pageName || resolved.pageName || '').trim();
+
+        // Push the page-scoped token into the Worker namespace token pool via the secret-authed
+        // server-to-server route. The token rides in the request body ONLY — it is never placed
+        // in our own response or logs.
+        const base = String(
+          workerUrl ||
+          process.env.VIDEO_AFFILIATE_WORKER_URL ||
+          process.env.WORKER_URL ||
+          'https://api.pubilo.com'
+        ).trim().replace(/\/+$/, '');
+        const syncUrl = `${base}/api/pages/profile-sync`;
+        const syncPayload = {
+          namespace_id: ns,
+          page_id: pid,
+          page_name: resolvedPageName,
+          access_token: pageToken,
+          comment_token: pageToken,
+          account: effectiveAccount
+        };
+
+        let workerStatus = 0;
+        let profileSyncSuccess = false;
+        try {
+          const resp = await fetchImpl(syncUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecret },
+            body: JSON.stringify(syncPayload)
+          });
+          workerStatus = Number(resp && resp.status) || 0;
+          let data = {};
+          try { data = await resp.json(); } catch {}
+          profileSyncSuccess = !!((resp && resp.ok !== false && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300))) && data && data.success === true);
+        } catch (e) {
+          return send(res, 200, {
+            ok: false, synced: false, status: 'worker_unreachable',
+            account: effectiveAccount, namespace_id: ns, page_id: pid,
+            page_found: true, hasToken: true,
+            reason: (e && (e.code || e.message)) || 'worker_unreachable'
+          });
+        }
+
         return send(res, 200, {
-          account: display,
+          ok: profileSyncSuccess,
+          synced: profileSyncSuccess,
+          status: profileSyncSuccess ? 'synced' : 'worker_rejected',
           target,
-          namespaceId: namespaceId || null,
-          dryRun: dryRun !== false,
-          status: 'dry_run_only',
-          wouldUpdate: ['dedicated_comment_token_v1', 'pages_token_pool_v1', 'pages.access_token'],
-          note: 'No Cloudflare/D1 writes performed by this endpoint.'
+          account: effectiveAccount,
+          namespace_id: ns,
+          page_id: pid,
+          page_found: true,
+          hasToken: true,
+          worker_status: workerStatus,
+          profile_sync_success: profileSyncSuccess
         });
       }
 

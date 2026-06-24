@@ -23,8 +23,8 @@ test('profile-sync receiver: secret-authed server push is honored, direct/client
     const body = src.slice(start, src.indexOf("app.post('/api/pages/profile-token-health'", start))
     // The push secret gate returns 410 ONLY for non-secret callers (client/direct management).
     assert.ok(
-        /if \(!configuredSecret \|\| providedSecret !== configuredSecret\) \{\s*return c\.json\(\{ error: 'direct_page_management_only' \}, 410\)/.test(body),
-        'profile-sync must 410 only when the push secret is missing/mismatched',
+        /if \(!secretAuthorized\) \{\s*return c\.json\(\{ error: 'direct_page_management_only' \}, 410\)/.test(body),
+        'profile-sync must 410 only when no configured secret authorizes the caller',
     )
     // The legacy unconditional 410 at the top of the handler must be gone.
     assert.ok(
@@ -33,6 +33,24 @@ test('profile-sync receiver: secret-authed server push is honored, direct/client
     )
     // It still upserts the freshly synced token into the namespace pool.
     assert.ok(body.includes('upsertNamespacePageFromProfileSync'), 'profile-sync must upsert into the token pool')
+})
+
+test('profile-sync accepts EITHER TAG_SYNC_PUSH_SECRET OR a dedicated BRIDGE_TOKEN_SYNC_SECRET', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf("app.post('/api/pages/profile-sync'")
+    assert.notEqual(start, -1, 'profile-sync route must exist')
+    const body = src.slice(start, src.indexOf("app.post('/api/pages/profile-token-health'", start))
+    // Both secrets are read; the existing BrowserSaving secret keeps working AND a Bridge Token
+    // exporter can be provisioned with its own secret without rotating the BrowserSaving one.
+    assert.ok(/const tagSyncSecret = String\(c\.env\.TAG_SYNC_PUSH_SECRET \|\| ''\)\.trim\(\)/.test(body),
+        'must still read TAG_SYNC_PUSH_SECRET')
+    assert.ok(/BRIDGE_TOKEN_SYNC_SECRET/.test(body), 'must also read BRIDGE_TOKEN_SYNC_SECRET')
+    // Authorization requires a non-empty provided secret matching one of the CONFIGURED secrets,
+    // so an unset secret can never accidentally authorize (no empty-string match).
+    assert.ok(/const secretAuthorized = !!providedSecret && \(/.test(body),
+        'authorization must require a non-empty provided secret')
+    assert.ok(/!!tagSyncSecret && providedSecret === tagSyncSecret/.test(body), 'tag-sync secret branch')
+    assert.ok(/!!bridgeTokenSecret && providedSecret === bridgeTokenSecret/.test(body), 'bridge-token secret branch')
 })
 
 test('refresh helper posts to the BrowserSaving secret route via the authenticated base fetch', () => {
@@ -256,4 +274,109 @@ test('stuck comment_status=processing rows are reset by the general cron scan', 
     assert.ok(fn.includes("'video::' || post_history.bot_id || '::comment:' || post_history.id"),
         'backstop must key off the comment-job posting lock')
     assert.ok(/datetime\('now', '-15 minutes'\)/.test(fn), 'backstop must only reset rows with no fresh (<15m) lock')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stored-token / Facebook Lite PUBLISH auto-refresh (the production root fix).
+// A force/retry/cron organic-Reel publish that fails with an auth-invalid stored
+// token (190 / "session has been invalidated") must re-mint a fresh page token —
+// BrowserSaving first, then the Bridge Token /pages tunnel — sync it into the pool,
+// and retry the publish ONCE. Token-free. (index.ts read as source; not importable.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('publish wrapper refreshes + retries once only on stored-token auth failure', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
+    assert.notEqual(start, -1, 'the stored-token publish+refresh wrapper must exist')
+    const fn = src.slice(start, src.indexOf('type PageOneCardLinkMode', start))
+    // Happy path delegates to the existing fallback chain.
+    assert.ok(fn.includes('await publishReelWithCommentTokenPrimaryFallback('), 'must call the existing publish fallback chain')
+    // Refresh is gated by the pure posting predicate (auth-failure / missing token only).
+    assert.ok(fn.includes('shouldAttemptFacebookLitePostingRefresh('), 'refresh must be gated by the posting predicate')
+    // Non-auth failures are rethrown untouched (never masked).
+    assert.ok(/throw publishErr/.test(fn), 'a non-auth failure must rethrow the original publish error')
+    // Re-mint + reload + single retry.
+    assert.ok(fn.includes('refreshFacebookLitePostingTokenForPage('), 'must call the posting-token refresh helper')
+    assert.ok(fn.includes('params.reloadTokens()'), 'must reload the fresh token pool before retrying')
+    assert.ok(fn.includes('POST-REFRESH-RETRY'), 'the retry must be a single labeled re-publish')
+    // Only retries when a fresh token actually synced.
+    assert.ok(/if \(!refresh\.synced\)/.test(fn), 'must only retry when a fresh token was synced')
+    // Token-free: never interpolate a token into a log line.
+    const logLines = fn.split('\n').filter((l) => /console\.(log|warn|error)/.test(l))
+    assert.ok(logLines.every((l) => !/token=\$\{|accessToken|\.token\}/.test(l)), 'wrapper logs must never interpolate a token value')
+})
+
+test('posting-token refresh prefers BrowserSaving, falls back to the Bridge Token /pages tunnel', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function refreshFacebookLitePostingTokenForPage')
+    assert.notEqual(start, -1, 'refreshFacebookLitePostingTokenForPage must exist')
+    const fn = src.slice(start, src.indexOf('async function initReelUploadWithPostingTokenAutoRecover', start))
+    // 1) BrowserSaving secret mint + profile-sync is tried first.
+    assert.ok(fn.includes('refreshFacebookLiteCommentTokenForPage('), 'must try the BrowserSaving secret refresh first')
+    assert.ok(/if \(bs\.synced\)/.test(fn), 'must short-circuit when BrowserSaving synced a fresh token')
+    assert.ok(fn.includes("via: 'browsersaving'"), 'BrowserSaving success path is labeled')
+    // 2) Bridge Token /pages fallback when BrowserSaving did not sync.
+    assert.ok(fn.includes('fetchFacebookLitePageTokenFromBridge('), 'must fall back to the Bridge Token /pages fetch')
+    assert.ok(fn.includes('upsertNamespacePageFromProfileSync('), 'must sync the bridge token into pages.access_token / pool')
+    assert.ok(fn.includes("via: 'bridge_token_pages'"), 'bridge fallback success path is labeled')
+})
+
+test('bridge token fetch uses /pages?account=...&includeToken=1 and never logs the token', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function fetchFacebookLitePageTokenFromBridge')
+    assert.notEqual(start, -1, 'fetchFacebookLitePageTokenFromBridge must exist')
+    const fn = src.slice(start, src.indexOf('async function refreshFacebookLitePostingTokenForPage', start))
+    // Resolves the Bridge Token base from env (CLOAK_FB_BRIDGE_URL = https://short.wwoom.com).
+    assert.ok(fn.includes('resolveCloakFbBridgeBaseUrl('), 'must resolve the bridge base from env (CLOAK_FB_BRIDGE_URL)')
+    // Hits the /pages route with includeToken and an optional account= candidate login id.
+    assert.ok(fn.includes('buildBridgeTokenPagesUrl('), 'must build the /pages lookup url')
+    assert.ok(/includeToken:\s*true/.test(fn), 'must request the raw token via includeToken=1')
+    assert.ok(fn.includes('candidateLoginIds'), 'must try candidate login ids as account= first')
+    // REGRESSION GUARD: the default-session sentinel ('') must be appended AFTER uniqueTokens —
+    // uniqueTokens() drops blanks, so folding '' into the dedupe silently skips the no-account
+    // default-session lookup, which is the LIVE production path (force-post/retry/cron pass no
+    // candidate ids; the tool's default session lists every administered page, e.g. CHEARB).
+    const flat = fn.replace(/\s+/g, ' ')
+    // The candidates must be SPREAD out of uniqueTokens (`...uniqueTokens(...)`) with '' as a
+    // sibling element — NOT `uniqueTokens([..., ''])`, which would drop the sentinel.
+    assert.ok(/\.\.\.\s*uniqueTokens\(/.test(fn), 'candidate ids must be spread out of uniqueTokens so the sentinel stays a sibling')
+    assert.ok(/\.\.\. ?uniqueTokens\(.+?\), ''/.test(flat), "default-session sentinel ('') must be appended after uniqueTokens, not deduped away")
+    assert.ok(fn.includes('extractBridgeTokenPageAccessToken('), 'must extract the matching page access_token')
+    // Token-free logging: only a presence flag is logged.
+    assert.ok(fn.includes('token_present=true'), 'logs token presence, not the value')
+    const logLines = fn.split('\n').filter((l) => /console\.(log|warn|error)/.test(l))
+    assert.ok(logLines.every((l) => !/\$\{[^}]*token[^}]*\}/i.test(l) || /token_present/.test(l)), 'must never interpolate a raw token into logs')
+})
+
+test('profile-sync upsert accepts an EAAD6 Facebook Lite token as the lead post token (not dropped)', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function upsertNamespacePageFromProfileSync')
+    assert.notEqual(start, -1, 'upsertNamespacePageFromProfileSync must exist')
+    const fn = src.slice(start, src.indexOf('function uniqueTokens', start))
+    // ROOT FIX: the old EAAD6-excluding gate must be gone. isPostRoleToken() treated EAAD6 as
+    // "comment role" and so DROPPED a freshly-synced Facebook Lite page token from post_tokens,
+    // leaving the posting resolver on the stale token (live row 33210 kept reusing EAAD6V…ZDZD
+    // even after a successful Bridge Token refresh).
+    assert.ok(!/const incomingPostToken = isPostRoleToken\(accessToken\)/.test(fn),
+        'incoming post token must NOT be gated behind isPostRoleToken (that drops EAAD6 Lite tokens)')
+    // Any non-empty synced token is now trusted as a post token via normalizePostTokenPool.
+    assert.ok(/const incomingPostToken = normalizePostTokenPool\(\[accessToken\]\)\[0\] \|\| ''/.test(fn),
+        'incoming post token must accept any non-empty synced token (EAAD6 encodes the app id, not the scope)')
+    // The fresh token is prepended ahead of the existing pool → it becomes post_tokens[0]…
+    assert.ok(/nextPostTokens = normalizePostTokenPool\(\[\s*incomingPostToken,/.test(fn),
+        'fresh token must be prepended to post_tokens (becomes post_tokens[0])')
+    // …and pages.access_token (the primary the posting resolver reads) follows post_tokens[0].
+    assert.ok(/const nextPrimaryToken = String\(nextPostTokens\[0\]/.test(fn),
+        'pages.access_token primary must follow post_tokens[0] so the resolver uses the fresh token')
+    assert.ok(/UPDATE pages SET access_token = \?/.test(fn),
+        'the fresh primary must be written back to pages.access_token')
+})
+
+test('all three stored-token publish sites use the auto-refresh wrapper', () => {
+    const src = readVideoAffiliateIndex()
+    const calls = (src.match(/await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh\(/g) || []).length
+    assert.ok(calls >= 3, `force/retry/cron stored-token publishes must use the refresh wrapper (found ${calls})`)
+    // Each call site supplies a reloadTokens closure that re-reads the fresh pool.
+    const reloadSites = (src.match(/reloadTokens: async \(\) => \{/g) || []).length
+    assert.ok(reloadSites >= 3, `each publish site must pass a reloadTokens closure (found ${reloadSites})`)
 })

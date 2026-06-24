@@ -2,11 +2,37 @@ tunnel: fa3c58f4-f45f-49a1-a49a-4fb7999d5a50
 credentials-file: /Users/yok-macmini/.cloudflared/fa3c58f4-f45f-49a1-a49a-4fb7999d5a50.json
 
 ingress:
-  # Facebook CloakBrowser posting bridge endpoints share the existing short.wwoom.com
-  # tunnel so the Worker has a durable URL without needing a new DNS record.
-  # All other paths continue to the shortlink service on 8810.
+  # Facebook Lite / Power Editor Bridge Token endpoints share short.wwoom.com,
+  # but must route to facebook-token-cloak on 8820. Keep normal shortlink traffic on 8810.
   - hostname: short.wwoom.com
-    path: ^/(token|pages|post|page-comment|create-ad|promote|update-cta|repair-ad-cta|pause-ad-only|publish-story)(/.*)?$
+    path: /token*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /pages*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /post*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /page-comment*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /create-ad*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /promote*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /update-cta*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /repair-ad-cta*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /pause-ad-only*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
+    path: /publish-story*
     service: http://127.0.0.1:8820
   - hostname: short.wwoom.com
     service: http://127.0.0.1:8810

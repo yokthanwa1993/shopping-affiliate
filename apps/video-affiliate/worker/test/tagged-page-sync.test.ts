@@ -299,7 +299,7 @@ test('tagged page metadata sync never deletes pages rows when rebuilding', () =>
 test('cron organic Reel path composes enabled page avatar before Facebook publish', () => {
     const functionSource = getHandleScheduledSource()
     const composeAt = functionSource.indexOf('videoBuffer = await composeAvatarVideoForPosting({')
-    const publishAt = functionSource.indexOf('publishReelWithCommentTokenPrimaryFallback({')
+    const publishAt = functionSource.indexOf('publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({')
     const errorCheckAt = functionSource.indexOf("const isAvatarComposeError = errorMsg.includes('avatar_compose_failed')")
     const recoveryGuardAt = functionSource.indexOf('if (!isAvatarComposeError) {', errorCheckAt)
 
@@ -348,7 +348,7 @@ test('force-post converts configured shortlinks before affiliate verification an
     const conversionAt = routeSource.indexOf('resolvePrePostingShortlinksForNamespace({')
     const insertAt = routeSource.indexOf('INSERT INTO post_history')
     const verifyAt = routeSource.indexOf('verifyAffiliateLinksForPosting({')
-    const publishAt = routeSource.indexOf('publishReelWithCommentTokenPrimaryFallback({')
+    const publishAt = routeSource.indexOf('publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({')
 
     assert.ok(conversionAt > -1, 'force-post must resolve pre-posting shortlinks')
     assert.ok(verifyAt > -1, 'force-post must verify affiliate links')
@@ -367,7 +367,7 @@ test('retry-post re-converts old history links before affiliate verification and
     const conversionAt = routeSource.indexOf('resolvePrePostingShortlinksForNamespace({')
     const insertAt = routeSource.indexOf('INSERT INTO post_history')
     const verifyAt = routeSource.indexOf('verifyAffiliateLinksForPosting({')
-    const publishAt = routeSource.indexOf('publishReelWithCommentTokenPrimaryFallback({')
+    const publishAt = routeSource.indexOf('publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh({')
 
     assert.ok(conversionAt > -1, 'retry-post must resolve pre-posting shortlinks')
     assert.ok(verifyAt > -1, 'retry-post must verify affiliate links')

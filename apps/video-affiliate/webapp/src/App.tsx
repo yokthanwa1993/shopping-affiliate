@@ -756,14 +756,14 @@ interface FacebookPage {
   onecard_link_mode?: 'shopee' | 'lazada' | 'none'
   onecard_cta?: 'SHOP_NOW' | 'NO_BUTTON'
   // แหล่งโทเค้นที่ใช้โพสต์ — มีแค่ 2 โหมด: 'stored_token' (แสดงผลเป็น "Facebook Lite") คือโทเค้น Facebook Lite
-  // ล่าสุดที่ระบบเก็บไว้ (default); เมื่อหมดอายุ/auth fail Worker จะรีเฟรชผ่าน FB Get Token / BrowserSaving
+  // ล่าสุดที่ระบบเก็บไว้ (default); เมื่อหมดอายุ/auth fail Worker จะรีเฟรชผ่าน Bridge Token
   // (/api/fb-lite/refresh-comment-token) แล้ว sync กลับเข้า pages.access_token ให้เอง — แก้ไขเองได้เฉพาะกรณีฉุกเฉิน
   // 'cloak_browser' (แสดงผลเป็น "Power Editor") คือระบบ session-cookie browser ที่มาแทน Electron เดิม
   // โดย Video One Card toggle เป็นตัวเลือกว่าจะโพสต์ Reel ปกติหรือ OneCard.
   // ค่าเก่าใน DB ('post-reels-token-ads'/'post-reels-token-cloak') ถูก normalize เป็น 'cloak_browser'.
   posting_token_source?: PostingTokenSource
   // โทเค้นสำหรับใช้คอมเมนต์ — เลือกแยกจากโทเค้นโพสต์ได้ ('stored_token'/"Facebook Lite" = คอมเมนต์ด้วย Page token
-  // จาก FB Get Token ที่ระบบรีเฟรชอัตโนมัติ; 'cloak_browser'/"Power Editor" = คอมเมนต์ในนามเพจผ่าน Power Editor bridge)
+  // จาก Bridge Token ที่ระบบรีเฟรชอัตโนมัติ; 'cloak_browser'/"Power Editor" = คอมเมนต์ในนามเพจผ่าน Power Editor bridge)
   // ถ้าไม่ได้ตั้งค่า runtime จะใช้ค่าเดียวกับโทเค้นที่ใช้โพสต์ เพื่อคงพฤติกรรมเดิม
   comment_token_source?: CommentTokenSource
   last_post_at?: string
@@ -807,7 +807,7 @@ function normalizeCommentTokenSource(raw: string | null | undefined, fallback: P
   return fallback
 }
 
-// Member/non-admin namespaces ห้ามเลือก provider เอง — บังคับใช้ stored_token (Facebook Lite ที่ระบบรีเฟรชจาก FB Get Token) เสมอ
+// Member/non-admin namespaces ห้ามเลือก provider เอง — บังคับใช้ stored_token (Facebook Lite ที่ระบบรีเฟรชจาก Bridge Token) เสมอ
 // Power Editor / CloakBrowser เป็น flow ของ admin/operator เท่านั้น (กันค่าเก่าใน DB ที่ค้างเป็น cloak_browser)
 function resolvePostingTokenSourceForRole(raw: string | null | undefined, isSystemAdmin: boolean): PostingTokenSource {
   if (!isSystemAdmin) return 'stored_token'
@@ -3012,7 +3012,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [commentTokenSource, setCommentTokenSource] = useState<CommentTokenSource>(() =>
     resolveCommentTokenSourceForRole(page.comment_token_source, resolvePostingTokenSourceForRole(page.posting_token_source, isSystemAdmin), isSystemAdmin))
   const [accessToken, setAccessToken] = useState(page.access_token || '')
-  // โหมดย่อยของ Facebook Lite (UI-only, ไม่ persist): 'auto' = ใช้โทเค้นที่ระบบดึง/รีเฟรชจาก FB Get Token (default);
+  // โหมดย่อยของ Facebook Lite (UI-only, ไม่ persist): 'auto' = ใช้โทเค้นที่ระบบดึง/รีเฟรชจาก Bridge Token (default);
   // 'manual' = override ด้วยการวางโทเค้นเอง (fallback ฉุกเฉิน). โหมดนี้คุมแค่ copy/affordance — Auto จะไม่แก้ access_token
   // เว้นแต่ผู้ใช้กดแก้ไขเอง (save ส่ง access_token เฉพาะตอน accessTokenChanged)
   const [fbLiteTokenMode, setFbLiteTokenMode] = useState<'auto' | 'manual'>('auto')
@@ -3642,14 +3642,14 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
             <p className="font-bold text-gray-900">โทเค้นสำหรับใช้โพสต์</p>
             <p className="text-xs text-gray-400 mt-0.5">
               {isSystemAdmin
-                ? 'Facebook Lite = ใช้โทเค้นที่ระบบดึง/รีเฟรชจาก FB Get Token บนเครื่อง (แก้ไขเองได้เมื่อจำเป็น) หรือเลือก Power Editor ที่ login อยู่บนเครื่อง Mac'
+                ? 'Facebook Lite = ใช้โทเค้นที่ Bridge Token ดึง/รีเฟรชจากเครื่องให้ (แก้ไขเองได้เมื่อจำเป็น) หรือเลือก Power Editor ที่ login อยู่บนเครื่อง Mac'
                 : 'เพจนี้โพสต์และคอมเมนต์ด้วยโทเค้น Facebook Lite ที่ระบบจัดการให้'}
             </p>
           </div>
           {isSystemAdmin ? (
             <div className="grid grid-cols-2 gap-2">
               {([
-                { value: 'stored_token', label: 'Facebook Lite', hint: 'ใช้โทเค้นจาก FB Get Token / รีเฟรชอัตโนมัติ' },
+                { value: 'stored_token', label: 'Facebook Lite', hint: 'ใช้โทเค้นจาก Bridge Token / รีเฟรชอัตโนมัติ' },
                 { value: 'cloak_browser', label: 'Power Editor', hint: 'ใช้ session ของ Power Editor โพสต์ให้' },
               ] as { value: PostingTokenSource; label: string; hint: string }[]).map((option) => (
                 <button
@@ -3668,10 +3668,10 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
 
           {postingTokenSource === 'stored_token' ? (
             <div className="space-y-2">
-              {/* โหมดย่อย Facebook Lite: Auto (ดึง/รีเฟรชจาก FB Get Token) vs Manual (วางเอง, fallback) */}
+              {/* โหมดย่อย Facebook Lite: Auto (ดึง/รีเฟรชจาก Bridge Token) vs Manual (วางเอง, fallback) */}
               <div className="grid grid-cols-2 gap-2">
                 {([
-                  { value: 'auto', label: 'Auto จาก FB Get Token', hint: 'ระบบดึง/รีเฟรชโทเค้นให้อัตโนมัติ (แนะนำ)' },
+                  { value: 'auto', label: 'Auto จาก Bridge Token', hint: 'ระบบดึง/รีเฟรชโทเค้นให้อัตโนมัติ (แนะนำ)' },
                   { value: 'manual', label: 'ใส่ Token เอง', hint: 'วาง Page/User token เอง — สำรองกรณีฉุกเฉิน' },
                 ] as { value: 'auto' | 'manual'; label: string; hint: string }[]).map((option) => (
                   <button
@@ -3700,7 +3700,7 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
                     </p>
                   )}
                   <p className="text-[11px] text-gray-400 mt-2 leading-relaxed">
-                    โทเค้นนี้มาจาก FB Get Token/BrowserSaving บนเครื่อง; ถ้าหมดอายุระบบจะดึงใหม่และ sync กลับมาให้เอง ไม่ต้องวางเอง
+                    โทเค้นนี้มาจาก Bridge Token บนเครื่อง; ถ้าหมดอายุระบบจะดึงใหม่และ sync กลับมาให้เอง ไม่ต้องวางเอง
                   </p>
                 </div>
               ) : (
@@ -3737,12 +3737,12 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
             <div className="min-w-0">
               <p className="font-bold text-gray-900">โทเค้นสำหรับใช้คอมเมนต์</p>
               <p className="text-xs text-gray-400 mt-0.5">
-                เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้น Facebook Lite จาก FB Get Token ที่ระบบรีเฟรชอัตโนมัติ หรือคอมเมนต์ในนามเพจผ่าน Power Editor (แยกอิสระจากโทเค้นที่ใช้โพสต์)
+                เลือกว่าหลังโพสต์แล้วจะคอมเมนต์ลิงก์ด้วยโทเค้น Facebook Lite จาก Bridge Token ที่ระบบรีเฟรชอัตโนมัติ หรือคอมเมนต์ในนามเพจผ่าน Power Editor (แยกอิสระจากโทเค้นที่ใช้โพสต์)
               </p>
             </div>
             <div className="grid grid-cols-2 gap-2">
               {([
-                { value: 'stored_token', label: 'Facebook Lite', hint: 'คอมเมนต์ด้วย Page token จาก FB Get Token / รีเฟรชอัตโนมัติ' },
+                { value: 'stored_token', label: 'Facebook Lite', hint: 'คอมเมนต์ด้วย Page token จาก Bridge Token / รีเฟรชอัตโนมัติ' },
                 { value: 'cloak_browser', label: 'Power Editor', hint: 'คอมเมนต์ในนามเพจผ่าน session Power Editor' },
               ] as { value: CommentTokenSource; label: string; hint: string }[]).map((option) => (
                 <button

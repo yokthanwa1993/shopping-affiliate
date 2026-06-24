@@ -201,6 +201,28 @@ export function shouldAttemptFacebookLiteRefresh(params: {
     return isStoredCommentTokenAuthFailure(params.error)
 }
 
+// Posting-side twin of shouldAttemptFacebookLiteRefresh. A stored-token / Facebook Lite
+// PUBLISH (organic Reel) that fails because the stored page token is missing or has been
+// rejected by Graph (190 / invalidated session / "error validating access token") is exactly
+// the case the FB GET Token / Bridge Token system can recover from by re-minting a fresh page
+// token and retrying. The publish-path errors are aggregate strings the fallback chain throws
+// (`all_direct_video_tokens_failed`, `all_post_tokens_failed`, `facebook_publish_all_paths_failed`,
+// `facebook_access_token_missing`); isStoredCommentTokenAuthFailure already matches the embedded
+// 190/invalidated/validating substrings, and access_token_missing is matched explicitly here.
+// Any other failure (transient FB 5xx, "reduce the amount of data", rate limit, video too small)
+// returns false so the original error surfaces unchanged instead of being masked by a refresh.
+export function shouldAttemptFacebookLitePostingRefresh(params: {
+    source: PagePostingTokenSource
+    tokenMissing?: boolean
+    error?: unknown
+}): boolean {
+    if (params.source !== 'stored_token') return false
+    if (params.tokenMissing) return true
+    const msg = String(params.error ?? '').toLowerCase()
+    if (msg.includes('access_token_missing')) return true
+    return isStoredCommentTokenAuthFailure(params.error)
+}
+
 // Body the Worker POSTs to the BrowserSaving secret-authed refresh route. profile_id is
 // OPTIONAL: when omitted, BrowserSaving auto-discovers the stored Account Manager profile
 // that owns/admins page_id (no manual linking required). page_id / namespace_id route the
@@ -353,4 +375,58 @@ export function resolveCloakFbBridgeBaseUrl(env: CloakFbBridgeEnv | null | undef
     const legacy = trim(env?.VIDEO_ONECARD_WORKER_URL)
     if (legacy && !isRetiredElectronBridge(legacy)) return legacy
     return ''
+}
+
+// ---- Bridge Token (Facebook Lite / Power Editor) /pages page-token fallback --------------
+// When the BrowserSaving secret refresh route is unavailable (e.g. returns "Not found"), the
+// Worker can still re-mint a stored-token page's posting token from the SAME Bridge Token local
+// tool that powers Facebook Lite / Power Editor — exposed in production at CLOAK_FB_BRIDGE_URL
+// (https://short.wwoom.com). The tool's `GET /pages?account=<login>&includeToken=1` route returns
+// the page-scoped access_token for every page the logged-in session administers. `includeToken=1`
+// is gated to local requests on the tool, but a cloudflared tunnel origin request arrives as
+// 127.0.0.1, so the tunnel returns the token (verified in production). The Worker reads that token
+// IN MEMORY ONLY — it is synced into the pool and used for the retry, never returned or logged.
+
+// Build the Bridge Token /pages lookup URL. `account` (a Facebook login/candidate id) is optional:
+// omitted → the tool uses its default logged-in session, which lists every administered page.
+export function buildBridgeTokenPagesUrl(params: {
+    baseUrl: string
+    account?: string
+    includeToken?: boolean
+}): string {
+    const base = String(params.baseUrl ?? '').trim().replace(/\/+$/, '')
+    if (!base) return ''
+    const qs = new URLSearchParams()
+    const account = String(params.account ?? '').trim()
+    if (account) qs.set('account', account)
+    if (params.includeToken) qs.set('includeToken', '1')
+    const query = qs.toString()
+    return query ? `${base}/pages?${query}` : `${base}/pages`
+}
+
+// Token-bearing result of a Bridge Token /pages lookup. `accessToken` is a RAW page token held in
+// memory only — callers must sync it into storage and never log/return it. `hasToken` reflects the
+// tool's own presence flag so a caller can distinguish "page found but token withheld" from "page
+// not administered".
+export interface BridgeTokenPageLookup {
+    found: boolean
+    hasToken: boolean
+    accessToken: string
+}
+
+// Extract the page-scoped access_token for `pageId` from a Bridge Token /pages response
+// (`{ data: [{ id, name, hasToken, access_token? }] }`). Returns the first matching row's token.
+export function extractBridgeTokenPageAccessToken(data: unknown, pageId: string): BridgeTokenPageLookup {
+    const wantId = String(pageId ?? '').trim()
+    const rows = (data && typeof data === 'object' && Array.isArray((data as { data?: unknown }).data))
+        ? (data as { data: unknown[] }).data
+        : []
+    for (const row of rows) {
+        if (!row || typeof row !== 'object') continue
+        const r = row as Record<string, unknown>
+        if (String(r.id ?? '').trim() !== wantId) continue
+        const token = String(r.access_token ?? '').trim()
+        return { found: true, hasToken: token.length > 0 || r.hasToken === true, accessToken: token }
+    }
+    return { found: false, hasToken: false, accessToken: '' }
 }
