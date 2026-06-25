@@ -127,6 +127,7 @@ test('GET / serves the simple account table/form console and never requests a ra
   assert.match(r.text, /id="totp-input"/);
   assert.match(r.text, /Save/);
   assert.match(r.text, /Login\/Get Token/);
+  assert.match(r.text, /Reveal token/);
   assert.match(r.text, /Delete/);
   const visibleMarkup = r.text.slice(0, r.text.indexOf('<script>'));
   assert.doesNotMatch(visibleMarkup, /provider-input/i);
@@ -146,7 +147,10 @@ test('GET / serves the simple account table/form console and never requests a ra
   assert.doesNotMatch(r.text, /refresh-button/);
   assert.doesNotMatch(r.text, /btn-export/);
   assert.doesNotMatch(r.text, /\/token\/export/);
-  assert.doesNotMatch(r.text, /includeToken/i, 'UI must not mention or request raw token output');
+  // Operator verification (explicit requirement): the UI MAY reveal the raw EAAD6V token, but ONLY
+  // via the local-only Facebook Lite reveal — the server returns the raw token for includeToken=1
+  // exclusively to a 127.0.0.1 caller (403 otherwise). No other raw-token surface exists.
+  assert.match(r.text, /facebook_lite=1&includeToken=1/, 'raw-token request is scoped to the local Facebook Lite reveal');
   assert.doesNotMatch(r.text, /datr/i);
   assert.doesNotMatch(r.text, /Convert token mode/);
   // Static page carries no secret literals.
@@ -163,7 +167,6 @@ test('GET / uses only the generic-keychain UI save/login path', async () => {
   assert.doesNotMatch(r.text, /provider=/i);
   assert.doesNotMatch(r.text, /domain|server|protocol/i);
   assert.doesNotMatch(r.text, /apple-passwords/i);
-  assert.doesNotMatch(r.text, /includeToken/i);
 });
 
 test('simple save/login/token path stays redacted and clears write-only fields in UI code', async () => {

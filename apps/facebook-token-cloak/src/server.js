@@ -8,6 +8,7 @@ const accountSelectors = require('./account-selectors');
 const accountsRegistry = require('./accounts-registry');
 const ui = require('./ui');
 const posting = require('./posting');
+const fbLiteTokenService = require('./fb-lite-token-service.cjs');
 const {
   FACEBOOK_OAUTH_URL,
   extractAccessTokenFromUrl,
@@ -44,10 +45,95 @@ const POLL_MS = (() => {
 // every other shape carries an explicit `status` (page-comment) or defaults to 200 with ok:false
 // so the Worker can read the step/error without treating it as a transport failure.
 function postingStatus(result) {
-  if (result && result.ok) return 200;
-  if (result && typeof result.status === 'number') return result.status;
-  if (result && result.step === 'validate') return 400;
+  if (!result || result.ok) return 200;
+  if (result.status) return result.status;
+  if (result.step === 'validate') return 400;
   return 200;
+}
+
+// Decide whether a request should mint a token through the Facebook Lite (EAAD6V) path instead
+// of the persistent CloakBrowser session. Triggers on an explicit flag (facebook_lite /
+// token_source=facebook_lite_bridge / …) OR a numeric account id (a Facebook Lite user id has no
+// CloakBrowser profile, so it can only be served by the Lite credential login).
+function wantsFacebookLiteBridge(account, body = {}) {
+  const flag = String(body.facebook_lite || body.facebookLite || body.token_source || body.source || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'facebook_lite', 'fb_lite', 'facebook_lite_bridge', 'facebook_lite_eaad6'].includes(flag)) return true;
+  return /^[0-9]{8,}$/.test(String(account || '').trim());
+}
+
+async function optionalSecret(fn) {
+  try { return await fn(); } catch { return null; }
+}
+
+// Mint a FRESH Facebook Lite (EAAD6V) USER token straight from the stored Keychain credentials
+// (username/password + optional TOTP + datr), via the FB Lite login → auth.getSessionforApp(FB_LITE)
+// conversion. This is the ONLY success proof for a Facebook Lite account — a CloakBrowser/Power
+// Editor session is never used to vouch for it. The raw token stays inside the returned object and
+// is only ever handed to Graph (`graphFetch`); callers surface `prefix` (e.g. "EAAD6V") as a hint.
+async function resolveFacebookLiteEAAD6Session(deps, account) {
+  const { kc, fbLite, fetchImpl } = deps;
+  const safe = sanitizeAccount(account).display;
+  let credential;
+  try {
+    credential = await kc.retrieveCredential(account);
+  } catch (e) {
+    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_credential_unavailable' };
+  }
+  if (!credential || !credential.username || !credential.password) {
+    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: 'fb_lite_credential_missing' };
+  }
+  const twofa = await optionalSecret(() => kc.retrieveTotp(account));
+  const datr = await optionalSecret(() => kc.retrieveDatr(account));
+  let result;
+  try {
+    result = await fbLite.facebookLogin({
+      identifier: String(credential.username || safe).trim(),
+      password: String(credential.password || ''),
+      twofa: twofa || null,
+      datr: datr || null,
+      target_app: 'FB_LITE',
+      timeout_seconds: 45
+    });
+  } catch (e) {
+    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_token_error' };
+  }
+  if (!result || result.success !== true) {
+    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: (result && (result.error_user_msg || result.error)) || 'fb_lite_token_login_failed' };
+  }
+  const token = String((result.converted_token && result.converted_token.access_token) || '').trim();
+  if (!token) return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: 'fb_lite_converted_token_missing' };
+  const prefix = fbLite.extractTokenPrefix(token);
+  // FB Lite (app 275254692598279) tokens are EAAD6V-style. Reject anything else so we fail closed
+  // rather than posting with a wrong-app token that the Worker would then cache as a bad EAAD6V.
+  if (!token.startsWith('EAAD6')) {
+    return { token: null, ok: false, source: 'facebook_lite_eaad6', reason: 'fb_lite_token_prefix_mismatch', prefix };
+  }
+  return { token, ok: true, source: 'facebook_lite_eaad6', prefix, account: safe, graphFetch: fetchImpl };
+}
+
+// Resolve the PAGE access token for `pageId` from a freshly minted Facebook Lite user token using
+// me/accounts semantics. The returned page token inherits the FB Lite app, so it is EAAD6V-style
+// too — exactly the token shape the Worker posts/comments with. Status ranks mirror the CloakBrowser
+// export path so a caller can compare/rank outcomes. No raw token is ever returned (pageToken stays
+// internal; only `prefix` is surfaced).
+async function resolveFacebookLitePageToken(deps, account, pageId) {
+  const lite = await resolveFacebookLiteEAAD6Session(deps, account);
+  const base = { source: 'facebook_lite_eaad6', prefix: lite.prefix || null, page_found: false, hasToken: false, pageToken: '', pageName: '' };
+  if (!lite.ok || !lite.token) {
+    return { ...base, status: 'fb_lite_token_not_ready', reason: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready') };
+  }
+  let info;
+  try {
+    info = await posting.resolvePageToken(lite.graphFetch, lite.token, pageId);
+  } catch (e) {
+    return { ...base, status: 'graph_pages_failed', reason: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed') };
+  }
+  if (info && info.error) {
+    return { ...base, status: 'graph_pages_failed', reason: sanitizePublicReason(info.error, 'graph_pages_failed') };
+  }
+  if (!info || !info.found) return { ...base, status: 'page_not_found' };
+  if (!info.pageToken) return { ...base, status: 'page_token_unavailable', page_found: true, pageName: String(info.pageName || '') };
+  return { ...base, status: 'ok', page_found: true, hasToken: true, pageToken: info.pageToken, pageName: String(info.pageName || '') };
 }
 
 function isLocalRequest(req) {
@@ -324,7 +410,10 @@ function createHandler(deps = {}) {
   const selectors = deps.accountSelectors || accountSelectors;
   const registry = deps.accountsRegistry || accountsRegistry;
   const fetchImpl = deps.fetch || global.fetch;
+  const fbLite = deps.fbLiteTokenService || fbLiteTokenService;
   const downloadVideo = deps.downloadVideo;
+  // Shared dependency bundle for the Facebook Lite (EAAD6V) token path.
+  const liteDeps = { kc, fbLite, fetchImpl };
   return async function handleRequest(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
@@ -629,6 +718,11 @@ function createHandler(deps = {}) {
         if (!account) return sendError(res, 400, 'Missing account');
         const { display } = sanitizeAccount(account);
         const wantDryRun = dryRun !== false;
+        // Facebook Lite accounts (numeric id or explicit flag) resolve the page token from a FRESH
+        // EAAD6V Lite login, never from the CloakBrowser session. The pushed token is tagged so the
+        // Worker records its source as facebook_lite_bridge (not cloak_session_bridge).
+        const liteExport = wantsFacebookLiteBridge(account, exportBody);
+        const tokenSource = liteExport ? 'facebook_lite_bridge' : 'cloak_session_bridge';
 
         // SAFE default: a dry run performs no Cloudflare/D1 writes and resolves no token. It only
         // echoes back what a real export WOULD push, so the UI/Dev can preview without side effects.
@@ -640,6 +734,7 @@ function createHandler(deps = {}) {
             pageId: pageId || null,
             dryRun: true,
             status: 'dry_run_only',
+            token_source: tokenSource,
             wouldUpdate: ['pages_token_pool_v1', 'pages.access_token'],
             note: 'No Cloudflare/D1 writes performed by this endpoint.'
           });
@@ -724,19 +819,25 @@ function createHandler(deps = {}) {
           }
         };
 
-        let resolved = await resolvePageForExport(account);
+        let resolved;
         let effectiveAccount = display;
-
-        // SAFE fallback: only when the explicit account could not resolve a usable page token,
-        // retry once with the default configured posting account/session — it is proven to list
-        // every administered page. The default is tried only if it is a different account, and is
-        // adopted only when it gets strictly further than the explicit attempt. The response still
-        // never carries a token; it only names the effective account.
-        if (resolved.status !== 'ok' && String(account).trim() !== String(POST_ACCOUNT).trim()) {
-          const fb = await resolvePageForExport(POST_ACCOUNT);
-          if (exportRank(fb.status) > exportRank(resolved.status)) {
-            resolved = fb;
-            effectiveAccount = sanitizeAccount(POST_ACCOUNT).display;
+        if (liteExport) {
+          // Facebook Lite: mint a fresh EAAD6V token and resolve the page token over me/accounts.
+          // NO CloakBrowser fallback — a Cloak session must never stand in as proof for a Lite page.
+          resolved = await resolveFacebookLitePageToken(liteDeps, account, pid);
+        } else {
+          resolved = await resolvePageForExport(account);
+          // SAFE fallback: only when the explicit account could not resolve a usable page token,
+          // retry once with the default configured posting account/session — it is proven to list
+          // every administered page. The default is tried only if it is a different account, and is
+          // adopted only when it gets strictly further than the explicit attempt. The response still
+          // never carries a token; it only names the effective account.
+          if (resolved.status !== 'ok' && String(account).trim() !== String(POST_ACCOUNT).trim()) {
+            const fb = await resolvePageForExport(POST_ACCOUNT);
+            if (exportRank(fb.status) > exportRank(resolved.status)) {
+              resolved = fb;
+              effectiveAccount = sanitizeAccount(POST_ACCOUNT).display;
+            }
           }
         }
 
@@ -744,7 +845,9 @@ function createHandler(deps = {}) {
           return send(res, 200, {
             ok: false, synced: false, status: resolved.status,
             account: effectiveAccount, namespace_id: ns, page_id: pid,
+            token_source: tokenSource,
             page_found: resolved.page_found, hasToken: resolved.hasToken,
+            ...(resolved.prefix ? { token_prefix: resolved.prefix } : {}),
             ...(resolved.reason ? { reason: resolved.reason } : {})
           });
         }
@@ -768,7 +871,12 @@ function createHandler(deps = {}) {
           page_name: resolvedPageName,
           access_token: pageToken,
           comment_token: pageToken,
-          account: effectiveAccount
+          account: effectiveAccount,
+          // Advisory only: the Worker's profile-sync ignores unknown fields and keys posting on the
+          // token VALUE (a fresh EAAD6V Lite page token leads pages_token_pool_v1 + pages.access_token
+          // via normalizePostTokenPool, so force-post derives an EAAD6V hint — never cloak_session_bridge
+          // and never the stale EAABsb token). This tag documents the source for diagnostics/logs.
+          token_source: tokenSource
         };
 
         let workerStatus = 0;
@@ -787,7 +895,7 @@ function createHandler(deps = {}) {
           return send(res, 200, {
             ok: false, synced: false, status: 'worker_unreachable',
             account: effectiveAccount, namespace_id: ns, page_id: pid,
-            page_found: true, hasToken: true,
+            page_found: true, hasToken: true, token_source: tokenSource,
             reason: sanitizePublicReason((e && (e.code || e.message)) || 'worker_unreachable', 'worker_unreachable')
           });
         }
@@ -802,6 +910,8 @@ function createHandler(deps = {}) {
           page_id: pid,
           page_found: true,
           hasToken: true,
+          token_source: tokenSource,
+          ...(resolved.prefix ? { token_prefix: resolved.prefix } : {}),
           worker_status: workerStatus,
           profile_sync_success: profileSyncSuccess
         });
@@ -814,6 +924,21 @@ function createHandler(deps = {}) {
 
       if (req.method === 'GET' && url.pathname === '/token') {
         const account = url.searchParams.get('account') || POST_ACCOUNT;
+        if (wantsFacebookLiteBridge(account, { facebook_lite: url.searchParams.get('facebook_lite') || url.searchParams.get('token_source') || '' })) {
+          const includeToken = ['1', 'true', 'yes'].includes(String(url.searchParams.get('includeToken') || '').trim().toLowerCase());
+          if (includeToken && !isLocalRequest(req)) return sendError(res, 403, 'includeToken is only allowed for local requests');
+          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+          if (!lite.ok) return send(res, 200, { ok: false, accessToken: false, fbDtsg: false, source: 'facebook_lite_eaad6', account: sanitizeAccount(account).display, error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), tokenPrefix: lite.prefix || null });
+          const payload = { ok: true, accessToken: true, fbDtsg: false, source: 'facebook_lite_eaad6', tokenPrefix: lite.prefix, account: sanitizeAccount(account).display };
+          // Operator verification ONLY: reveal the raw EAAD6V token on an explicit local request
+          // (includeToken=1 from 127.0.0.1, e.g. the bundled UI's "Reveal token" button). Never on a
+          // remote/tunnel request, and never logged.
+          if (includeToken && isLocalRequest(req)) {
+            payload.token = lite.token;
+            payload.warning = 'Raw token included only because includeToken=1 on localhost. Do not log or share this response.';
+          }
+          return send(res, 200, payload);
+        }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
           const accessToken = !!session.token;
@@ -821,7 +946,7 @@ function createHandler(deps = {}) {
           if (!fbDtsg && session.context) {
             try { fbDtsg = await posting.hasLoggedInSession(session.context); } catch {}
           }
-          return send(res, 200, { ok: true, accessToken, fbDtsg, account: sanitizeAccount(account).display });
+          return send(res, 200, { ok: true, accessToken, fbDtsg, source: session.source || 'browser_session', account: sanitizeAccount(account).display });
         } finally {
           await posting.closeSession(session);
         }
@@ -831,6 +956,15 @@ function createHandler(deps = {}) {
         const account = url.searchParams.get('account') || POST_ACCOUNT;
         const includeToken = ['1', 'true', 'yes'].includes(String(url.searchParams.get('includeToken') || '').trim().toLowerCase());
         if (includeToken && !isLocalRequest(req)) return sendError(res, 403, 'includeToken is only allowed for local requests');
+        // Facebook Lite account: list administered pages from the freshly-minted EAAD6V user token via
+        // me/accounts (NOT a CloakBrowser session). This is what the Worker's session-bridge organic
+        // publish path probes (/token + /pages) before posting, and what /pages?includeToken=1 reads.
+        if (wantsFacebookLiteBridge(account, { facebook_lite: url.searchParams.get('facebook_lite') || url.searchParams.get('token_source') || '' })) {
+          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+          if (!lite.ok || !lite.token) return send(res, 200, { data: [], source: 'facebook_lite_eaad6', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready') });
+          const result = await posting.listPagesPublic(lite.graphFetch, lite.token, includeToken && isLocalRequest(req));
+          return send(res, 200, { ...result, source: 'facebook_lite_eaad6' });
+        }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
           if (!session.token) return send(res, 200, { data: [], error: 'no_session' });
@@ -844,6 +978,25 @@ function createHandler(deps = {}) {
       if (req.method === 'POST' && url.pathname === '/post') {
         const body = await parseBody(req);
         const account = body.account || POST_ACCOUNT;
+        if (wantsFacebookLiteBridge(account, body)) {
+          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+          if (!lite.ok || !lite.token) return send(res, 200, { ok: false, step: 'facebook_lite_token', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), source: 'facebook_lite_eaad6', token_prefix: lite.prefix || null });
+          // A Facebook Lite (EAAD6V) PAGE token publishes an ORGANIC page video via /{page_id}/videos
+          // with the page token — it has NO ad-account access, so the OneCard/advideos path returns
+          // "(#10) Permission Denied". This is the organic /post the Worker's facebook_lite_bridge
+          // fallback calls; the Shopee link rides in the Page comment (/page-comment), not an ad CTA.
+          const result = await posting.publishPageVideoPost(lite.graphFetch, {
+            userToken: lite.token,
+            pageId: body.page_id,
+            videoUrl: body.video_url,
+            caption: body.message,
+            title: body.title,
+            adName: body.ad_name,
+            downloadVideo,
+            pollMs: POLL_MS
+          });
+          return send(res, postingStatus(result), { ...result, source: 'facebook_lite_eaad6', token_prefix: lite.prefix });
+        }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
           if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
@@ -871,10 +1024,26 @@ function createHandler(deps = {}) {
         const explicitAccount = body.account ? String(body.account).trim() : '';
         const pageId = String(body.page_id || '').trim();
         const tried = new Set();
-        const tryCommentWithAccount = async (account) => {
+        // allowLite is true ONLY for the explicitly-requested account. Auto-discovery candidates
+        // (registry sweep) stay on the CloakBrowser session path so a comment never fans out into
+        // real Facebook Lite logins across every numeric account in the registry.
+        const tryCommentWithAccount = async (account, allowLite = false) => {
           const key = sanitizeAccount(account).key;
           if (!key || tried.has(key)) return null;
           tried.add(key);
+          if (allowLite && wantsFacebookLiteBridge(account, body)) {
+            const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+            if (!lite.ok || !lite.token) return { ok: false, status: 200, step: 'facebook_lite_token', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), source: 'facebook_lite_eaad6', token_prefix: lite.prefix || null };
+            const result = await posting.pageComment(lite.graphFetch, {
+              userToken: lite.token,
+              pageId: body.page_id,
+              target: body.target,
+              storyId: body.story_id,
+              postId: body.post_id,
+              message: body.message
+            });
+            return { ...result, source: 'facebook_lite_eaad6', token_prefix: lite.prefix };
+          }
           const session = await posting.resolveSessionToken({ browser: br, account });
           try {
             const result = await posting.pageComment(session.graphFetch, {
@@ -891,7 +1060,7 @@ function createHandler(deps = {}) {
           }
         };
 
-        let result = await tryCommentWithAccount(explicitAccount || POST_ACCOUNT);
+        let result = await tryCommentWithAccount(explicitAccount || POST_ACCOUNT, true);
         const shouldAutoDiscoverAccount = pageId && (!explicitAccount) && result && result.step === 'page_token' && result.error === 'page_token_not_found';
         if (shouldAutoDiscoverAccount) {
           const accounts = await listAccountStatuses(kc, selectors, registry).catch(() => []);

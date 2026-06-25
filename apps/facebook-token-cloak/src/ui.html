@@ -586,6 +586,13 @@
             }, "Login/Get Token"),
             element("button", {
               type: "button",
+              onclick: function (event) {
+                event.stopPropagation();
+                revealFacebookLiteToken(account.account);
+              }
+            }, "Reveal token"),
+            element("button", {
+              type: "button",
               className: "danger",
               onclick: function (event) {
                 event.stopPropagation();
@@ -659,6 +666,28 @@
     } catch (error) {
       setResult(JSON.stringify({ error: error.message }, null, 2));
       toast("Login failed: " + error.message, "err");
+    }
+  }
+
+  // Operator verification: reveal the LATEST raw EAAD6V Facebook Lite token for an account. Calls
+  // the local-only GET /token?...&facebook_lite=1&includeToken=1 (the bridge mints a fresh EAAD6V
+  // and returns it ONLY to a 127.0.0.1 caller). Shown in a copyable prompt; never written to the
+  // result log so it cannot linger on screen.
+  async function revealFacebookLiteToken(explicitAccount) {
+    var account = explicitAccount || value("#account-input");
+    if (!account) { toast("Account / namespace is required", "err"); return; }
+    try {
+      toast("Minting fresh Facebook Lite token...", "");
+      var probe = await api("GET", "/token?account=" + encodeURIComponent(account) + "&facebook_lite=1&includeToken=1");
+      if (!probe || probe.ok !== true || !probe.token) {
+        toast("Token not available: " + ((probe && (probe.error || probe.reason)) || "not_ready"), "err");
+        return;
+      }
+      // window.prompt lets the operator copy the value; it is not persisted to the page/result log.
+      window.prompt("Latest EAAD6V token for " + account + " (prefix " + (probe.tokenPrefix || "") + ") — copy then close:", probe.token);
+      toast("Token revealed (prefix " + (probe.tokenPrefix || "") + ")", "ok");
+    } catch (error) {
+      toast("Reveal failed: " + ((error && error.message) || "error"), "err");
     }
   }
 

@@ -344,6 +344,124 @@ export function redactFacebookLiteRefreshResult(params: {
     }
 }
 
+// ---- Facebook Lite (EAAD6V) page-token prioritization --------------------
+// A Facebook Lite page token is EAAD6/EAAD6V-prefixed. The legacy isPostRoleToken() gate in
+// index.ts excludes EAAD6 (it predates Facebook Lite), which made a freshly-synced EAAD6V token
+// LOSE to a stale EAABsb token: the upsert/preserve gates dropped the EAAD6V from the stored
+// PRIMARY (`isPostRoleToken(existing) ? existing : ''` blanks an EAAD6V), and the candidate order
+// then kept the stale EAABsb ahead. These pure helpers fix that — an EAAD6V page token is a fully
+// valid stored_token POST candidate, and a freshly-synced page token (facebook_lite_bridge export
+// or the newest access_token) must lead the pool.
+
+export function isFacebookLitePageToken(token: unknown): boolean {
+    return /^EAAD6/i.test(String(token ?? '').trim())
+}
+
+// A page access_token worth keeping as the stored PRIMARY token — ANY non-empty page token,
+// EAAB- or EAAD6-prefixed. Used by the "preserve existing primary" gates so a fresh Facebook
+// Lite (EAAD6V) token is never wiped/blanked just because it is not EAAB-prefixed (the bug that
+// let stale EAABsb stay primary). It never PROMOTES a token ahead of a fresher one — it only
+// decides whether an EXISTING stored token is worth keeping when nothing fresher is available.
+export function isPersistablePagePrimaryToken(token: unknown): boolean {
+    return String(token ?? '').trim().length > 0
+}
+
+export interface SyncedPageTokenPools {
+    primaryToken: string
+    postTokens: string[]
+    commentTokens: string[]
+}
+
+// Case-insensitive, order-preserving de-dupe (mirrors index.ts uniqueTokens semantics) so this
+// module stays self-contained and unit-testable.
+function dedupePreserveOrder(tokens: Array<string | null | undefined>): string[] {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const raw of tokens) {
+        const token = String(raw ?? '').trim()
+        if (!token) continue
+        const key = token.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(token)
+    }
+    return out
+}
+
+// Compute the next stored pools when a freshly-synced page token arrives (profile-sync /
+// Token Bridge facebook_lite_bridge export). The fresh token ALWAYS leads post_tokens,
+// comment_tokens AND becomes the stored primary — so a fresh EAAD6V immediately outranks any
+// stale EAABsb already present (post + access_token). Prior tokens are retained strictly AFTER as
+// fallback (deduped, case-insensitive); none are deleted. When the incoming token is empty, the
+// freshest existing stored token is kept (never blanked). Promotion is unconditional so BOTH a
+// `token_source=facebook_lite_bridge` push and a bare EAAD6V accessToken are prioritized.
+export function prioritizeSyncedPageTokenPools(params: {
+    incomingToken: string
+    incomingCommentToken?: string
+    existingPrimaryToken?: string
+    existingPostTokens?: string[]
+    existingCommentTokens?: string[]
+}): SyncedPageTokenPools {
+    const incoming = String(params.incomingToken ?? '').trim()
+    const incomingComment = String(params.incomingCommentToken ?? '').trim()
+    const existingPrimary = String(params.existingPrimaryToken ?? '').trim()
+    const postTokens = dedupePreserveOrder([
+        incoming,
+        ...(params.existingPostTokens || []),
+        existingPrimary,
+    ])
+    const commentTokens = dedupePreserveOrder([
+        incomingComment || incoming,
+        incoming,
+        ...(params.existingCommentTokens || []),
+    ])
+    const primaryToken = incoming || postTokens[0] || existingPrimary || ''
+    return { primaryToken, postTokens, commentTokens }
+}
+
+// A Facebook Lite (EAAD6V) page token cannot publish through the Worker's own Graph app /
+// the ad account: those calls return "(#10) Permission Denied" (Graph error code 10), NOT an
+// auth/190 error. This is recoverable ONLY by posting through the local Facebook Lite bridge's
+// own logged-in session (organic /post), so it must trigger the bridge fallback the same way an
+// auth failure does. shouldAttemptFacebookLitePostingRefresh (auth/190/invalidated only) does NOT
+// match (#10), which is exactly why the bridge fallback was being skipped and the row burned.
+export function isFacebookLitePostingPermissionError(error: unknown): boolean {
+    const msg = String(error ?? '').toLowerCase()
+    if (!msg) return false
+    return (
+        /\(#10\)/.test(msg) ||
+        msg.includes('permission denied') ||
+        /(^|[^0-9])(?:code["']?\s*[:=]\s*)10(\D|$)/.test(msg)
+    )
+}
+
+// ---- OneCard (ad-account) → organic Facebook Lite reel fallback -----------
+// A page with onecard_enabled=1 publishes through the cloak-fb-bridge ad-account/create-ad path
+// (Power Editor). A stored Facebook Lite (EAAD6V) page token CANNOT drive the ad account, so an
+// ad-permission failure there (e.g. "upload_video:(#10) Permission Denied") must not burn the
+// post_history row. When a usable stored page post token exists, force-post falls back to a REAL
+// organic Page reel via that EAAD6V token (Worker Graph /video_reels|/videos + the Facebook Lite
+// bridge) instead of Power Editor. This pure predicate gates that fallback so it stays testable.
+export function shouldFallbackToOrganicAfterOneCardFailure(params: {
+    haveStoredPostToken: boolean
+    error?: unknown
+}): boolean {
+    // No stored page token → pure admin/CloakBrowser OneCard page; keep failing closed (unchanged).
+    if (!params.haveStoredPostToken) return false
+    // Local/pre-upload failures an organic retry would ALSO hit → no point falling back.
+    const msg = String(params.error ?? '').toLowerCase()
+    if (
+        msg.includes('video too small') ||
+        msg.includes('fetch video failed') ||
+        msg.includes('avatar_compose_failed')
+    ) {
+        return false
+    }
+    // Everything else (ad permission denied, bridge unreachable/not configured, advideos failure)
+    // is an ad-path problem an organic EAAD6V reel does NOT share → fall back.
+    return true
+}
+
 // Env subset the CloakBrowser Facebook posting bridge base URL is resolved from.
 export interface CloakFbBridgeEnv {
     // Primary: the non-Electron CloakBrowser Facebook posting bridge.

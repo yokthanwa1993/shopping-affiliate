@@ -3020,6 +3020,12 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
   const [forcingPost, setForcingPost] = useState(false)
   const [editingToken, setEditingToken] = useState<'access' | null>(null)
   const [editingTokenValue, setEditingTokenValue] = useState('')
+  // Reveal/copy of the latest system-managed Facebook Lite token. Default stays
+  // redacted; the full token is fetched from the worker only on explicit click.
+  const [managedTokenRevealed, setManagedTokenRevealed] = useState<string | null>(null)
+  const [managedTokenLoading, setManagedTokenLoading] = useState(false)
+  const [managedTokenError, setManagedTokenError] = useState('')
+  const [managedTokenCopied, setManagedTokenCopied] = useState(false)
   const [pageShortlinkLoaded, setPageShortlinkLoaded] = useState(false)
   const [pageShortlinkLoading, setPageShortlinkLoading] = useState(false)
   const [pageShortlinkMessage, setPageShortlinkMessage] = useState('')
@@ -3084,6 +3090,9 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     setAccessToken(page.access_token || '')
     setEditingToken(null)
     setEditingTokenValue('')
+    setManagedTokenRevealed(null)
+    setManagedTokenError('')
+    setManagedTokenCopied(false)
   }, [
     page.id,
     page.post_hours,
@@ -3236,6 +3245,59 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
     const token = String(value || '').trim()
     if (!token) return 'ไม่มีโทเค้น'
     return `${token.slice(0, 20)}...`
+  }
+
+  // Fetch the full latest system-managed Facebook Lite token from the worker.
+  // Only ever called on explicit operator action (ดู token / คัดลอก) — never on load.
+  const fetchManagedToken = async (): Promise<string> => {
+    const resp = await apiFetch(`${WORKER_URL}/api/pages/${encodeURIComponent(page.id)}/managed-token`)
+    if (!resp.ok) throw new Error('managed_token_fetch_failed')
+    const data = (await resp.json().catch(() => ({}))) as { token?: string; has_token?: boolean }
+    return String(data?.token || '').trim()
+  }
+
+  const handleRevealManagedToken = async () => {
+    setManagedTokenError('')
+    if (managedTokenRevealed) {
+      setManagedTokenRevealed(null)
+      return
+    }
+    setManagedTokenLoading(true)
+    try {
+      const token = await fetchManagedToken()
+      if (!token) {
+        setManagedTokenError('ยังไม่มีโทเค้นที่ระบบเก็บไว้')
+        return
+      }
+      setManagedTokenRevealed(token)
+    } catch {
+      setManagedTokenError('โหลดโทเค้นไม่สำเร็จ ลองใหม่อีกครั้ง')
+    } finally {
+      setManagedTokenLoading(false)
+    }
+  }
+
+  const handleCopyManagedToken = async () => {
+    setManagedTokenError('')
+    setManagedTokenLoading(true)
+    try {
+      const token = managedTokenRevealed || (await fetchManagedToken())
+      if (!token) {
+        setManagedTokenError('ยังไม่มีโทเค้นที่ระบบเก็บไว้')
+        return
+      }
+      const copied = await copyPlainText(token)
+      if (copied) {
+        setManagedTokenCopied(true)
+        setTimeout(() => setManagedTokenCopied(false), 2000)
+      } else {
+        setManagedTokenError('คัดลอกไม่สำเร็จ')
+      }
+    } catch {
+      setManagedTokenError('คัดลอกไม่สำเร็จ ลองใหม่อีกครั้ง')
+    } finally {
+      setManagedTokenLoading(false)
+    }
   }
 
   const toggleHour = (hour: number) => {
@@ -3691,16 +3753,45 @@ function PageDetail({ page, onBack, onSave, isSystemAdmin }: { page: FacebookPag
                 <div className="rounded-xl border border-gray-100 bg-gray-50 p-3">
                   <p className="text-sm font-bold text-gray-900">Facebook Lite Token (ระบบจัดการ)</p>
                   {accessToken.trim() ? (
-                    <p className="text-xs mt-1 font-mono break-all text-gray-500">
-                      โทเค้นล่าสุดที่ระบบเก็บไว้: {renderTokenPreview(accessToken)}
-                    </p>
+                    <>
+                      {managedTokenRevealed ? (
+                        <p className="text-xs mt-1 font-mono break-all text-gray-700 bg-white border border-gray-200 rounded-lg p-2">
+                          {managedTokenRevealed}
+                        </p>
+                      ) : (
+                        <p className="text-xs mt-1 font-mono break-all text-gray-500">
+                          โทเค้นล่าสุดที่ระบบเก็บไว้: {renderTokenPreview(accessToken)}
+                        </p>
+                      )}
+                      <div className="flex flex-wrap items-center gap-2 mt-2">
+                        <button
+                          type="button"
+                          onClick={handleRevealManagedToken}
+                          disabled={managedTokenLoading}
+                          className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-bold text-blue-600 active:scale-95 disabled:opacity-60"
+                        >
+                          {managedTokenLoading ? 'กำลังโหลด...' : managedTokenRevealed ? 'ซ่อน token' : 'ดู token'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleCopyManagedToken}
+                          disabled={managedTokenLoading}
+                          className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-bold text-gray-700 active:scale-95 disabled:opacity-60"
+                        >
+                          {managedTokenCopied ? 'คัดลอกแล้ว ✓' : 'คัดลอก'}
+                        </button>
+                      </div>
+                      {managedTokenError ? (
+                        <p className="text-[11px] text-red-500 mt-1">{managedTokenError}</p>
+                      ) : null}
+                    </>
                   ) : (
                     <p className="text-xs mt-1 text-gray-500">
                       ยังไม่มีโทเค้นที่เก็บไว้ — ระบบจะดึงให้เองเมื่อโพสต์ครั้งถัดไป
                     </p>
                   )}
                   <p className="text-[11px] text-gray-400 mt-2 leading-relaxed">
-                    โทเค้นนี้มาจาก Bridge Token บนเครื่อง; ถ้าหมดอายุระบบจะดึงใหม่และ sync กลับมาให้เอง ไม่ต้องวางเอง
+                    โทเค้นนี้มาจาก Bridge Token บนเครื่อง; ถ้าหมดอายุระบบจะดึงใหม่และ sync กลับมาให้เอง ไม่ต้องวางเอง · กด "ดู token" เพื่อแสดงแบบเต็มแล้วคัดลอกได้
                   </p>
                 </div>
               ) : (

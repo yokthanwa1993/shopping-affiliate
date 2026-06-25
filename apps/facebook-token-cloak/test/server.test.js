@@ -707,9 +707,12 @@ test('/token/export live export resolves the page via session.graphFetch (same a
   const SECRET = 'unit-test-bridge-secret';
   let captured = null;
   let r;
+  // A non-numeric alias keeps this on the CloakBrowser session export path (numeric ids route to
+  // the Facebook Lite EAAD6V path — covered by a dedicated test below).
+  const SESSION_ACCOUNT = 'cheap_session';
   const mockBrowser = exportBrowser({
     pagesByAccount: {
-      '100090320823561': [
+      [SESSION_ACCOUNT]: [
         { id: '999', name: 'Other', access_token: 'OTHERPAGESECRET' },
         { id: '1008898512617594', name: 'เฉียบ', access_token: 'PAGESECRET' }
       ]
@@ -732,7 +735,7 @@ test('/token/export live export resolves the page via session.graphFetch (same a
   }, async (request) => {
     const capturedConsole = await captureConsole(async () => {
       r = await request('POST', '/token/export', {
-        account: '100090320823561',
+        account: SESSION_ACCOUNT,
         namespaceId: '1774858894802785816',
         pageId: '1008898512617594',
         dryRun: false
@@ -746,15 +749,16 @@ test('/token/export live export resolves the page via session.graphFetch (same a
     assert.equal(r.body.page_found, true);
     assert.equal(r.body.hasToken, true);
     assert.equal(r.body.profile_sync_success, true);
+    assert.equal(r.body.token_source, 'cloak_session_bridge');
     assert.equal('access_token' in r.body, false);
     assert.equal('token' in r.body, false);
-    assertNoLeak({ body: r.body, logs }, ['PAGESECRET', 'OTHERPAGESECRET', 'SESSION_100090320823561', SECRET, 'fb_dtsg', 'datr=']);
+    assertNoLeak({ body: r.body, logs }, ['PAGESECRET', 'OTHERPAGESECRET', `SESSION_${SESSION_ACCOUNT}`, SECRET, 'fb_dtsg', 'datr=']);
     assert.ok(
       mockBrowser.graphCalls.some((call) =>
-        call.account === '100090320823561' &&
+        call.account === SESSION_ACCOUNT &&
         /\/me\/accounts/.test(call.url) &&
         /fields=access_token,id,name,category/.test(call.url) &&
-        /access_token=SESSION_100090320823561/.test(call.url)
+        new RegExp(`access_token=SESSION_${SESSION_ACCOUNT}`).test(call.url)
       ),
       'export must call session.graphFetch /me/accounts with the user token'
     );
@@ -768,6 +772,328 @@ test('/token/export live export resolves the page via session.graphFetch (same a
     assert.equal(captured.body.comment_token, 'PAGESECRET');
     assert.notEqual(captured.body.access_token, 'OTHERPAGESECRET', 'must choose the token for the matching page id');
   }));
+});
+
+// A deterministic Facebook Lite token service: facebookLogin() returns a fresh EAAD6V converted
+// token without any network. extractTokenPrefix reuses the real implementation so prefix hints
+// (e.g. "EAAD6V") match production.
+const { extractTokenPrefix: realExtractTokenPrefix } = require('../src/fb-lite-token-service.cjs');
+function mockFbLite({ token = 'EAAD6Vuser0000000000000000000', success = true, error } = {}) {
+  return {
+    extractTokenPrefix: realExtractTokenPrefix,
+    facebookLogin: async () => (success
+      ? { success: true, converted_token: { access_token: token } }
+      : { success: false, error: error || 'login_failed' })
+  };
+}
+// Minimal Keychain stub for the Facebook Lite credential path. Only the three secret reads the
+// Lite resolver uses are implemented.
+function mockKeychain({ username = 'lite-user', password = 'lite-pass', totp, datr } = {}) {
+  return {
+    retrieveCredential: async () => ({ username, password }),
+    retrieveTotp: async () => { if (totp == null) throw new Error('no totp'); return totp; },
+    retrieveDatr: async () => { if (datr == null) throw new Error('no datr'); return datr; }
+  };
+}
+
+test('/token/export Facebook Lite (numeric account) mints a fresh EAAD6V page token via me/accounts and tags facebook_lite_bridge, token-free', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const LITE_PAGE_TOKEN = 'EAAD6Vpage0000000000000000000';
+  let captured = null;
+  let meAccountsToken = null;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    // The CloakBrowser session must NEVER be consulted for a Facebook Lite account. graphErrors on
+    // every session would surface if it were used; here pagesByAccount is empty so a session resolve
+    // could only ever fail — proving the page token came from the Lite login, not the session.
+    browser: exportBrowser({}),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        meAccountsToken = m ? decodeURIComponent(m[1]) : null;
+        return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '999', name: 'Other', access_token: 'EAAD6Vother000000000000000000' },
+          { id: '1008898512617594', name: 'เฉียบ', access_token: LITE_PAGE_TOKEN }
+        ] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) {
+        captured = { headers: opts.headers, body: JSON.parse(opts.body) };
+        return { ok: true, status: 200, json: async () => ({ success: true, updated: true }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/export', {
+      account: '100090320823561',
+      namespaceId: '1774858894802785816',
+      pageId: '1008898512617594',
+      dryRun: false
+    });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.synced, true);
+    assert.equal(r.body.status, 'synced');
+    assert.equal(r.body.page_found, true);
+    assert.equal(r.body.hasToken, true);
+    // The minted token is a Facebook Lite EAAD6V — the response carries the source + prefix HINT only.
+    assert.equal(r.body.token_source, 'facebook_lite_bridge');
+    assert.equal(r.body.token_prefix, 'EAAD6V');
+    assert.equal('access_token' in r.body, false);
+    assert.equal('token' in r.body, false);
+    // me/accounts was resolved with the freshly minted Lite USER token (not a session token).
+    assert.equal(meAccountsToken, LITE_USER_TOKEN);
+    // The push carried the secret header + the EAAD6V PAGE token for the matching page id only.
+    assert.ok(captured, 'profile-sync must be called');
+    assert.equal(captured.headers['x-tag-sync-secret'], SECRET);
+    assert.equal(captured.body.access_token, LITE_PAGE_TOKEN);
+    assert.equal(captured.body.comment_token, LITE_PAGE_TOKEN);
+    assert.equal(captured.body.token_source, 'facebook_lite_bridge');
+    assertNoLeak(r.body, [LITE_USER_TOKEN, LITE_PAGE_TOKEN, 'EAAD6Vother000000000000000000', SECRET]);
+  }));
+});
+
+test('/token/export Facebook Lite dry run reports facebook_lite_bridge and pushes nothing', async () => {
+  let pushCalled = false;
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      if (String(url).includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/export', {
+      account: '100090320823561', namespaceId: 'NS', pageId: '1008898512617594'
+    });
+    assert.equal(r.body.status, 'dry_run_only');
+    assert.equal(r.body.dryRun, true);
+    assert.equal(r.body.token_source, 'facebook_lite_bridge');
+    assert.equal(pushCalled, false, 'a dry run must never push to the Worker');
+    assert.equal('access_token' in r.body, false);
+  });
+});
+
+test('/token/export Facebook Lite reports a token-free failure when the login cannot mint a token (no session fallback)', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let pushCalled = false;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ success: false, error: 'checkpoint_required' }),
+    // A working CloakBrowser session DOES administer the page — but a Facebook Lite account must
+    // NEVER fall back to it. The export must fail rather than sync a session-derived token.
+    browser: exportBrowser({ pagesByAccount: { content_paiya: [{ id: '1008898512617594', name: 'เฉียบ', access_token: 'PAGESECRET' }] } }),
+    fetch: async (url) => {
+      if (String(url).includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/export', {
+      account: '100090320823561', namespaceId: 'NS', pageId: '1008898512617594', dryRun: false
+    });
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.synced, false);
+    assert.equal(r.body.token_source, 'facebook_lite_bridge');
+    assert.equal(pushCalled, false, 'a failed Lite mint must never push a token');
+    assert.equal('access_token' in r.body, false);
+    assertNoLeak(r.body, ['PAGESECRET', SECRET]);
+  }));
+});
+
+test('POST /post facebook_lite publishes a REAL organic page video via /{page_id}/videos (EAAD6V page token), never the ad-account advideos path', async () => {
+  const PAGE = '1008898512617594';
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const LITE_PAGE_TOKEN = 'EAAD6Vpage0000000000000000000';
+  const calls = [];
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    // Multipart upload path: the bridge downloads the bytes itself, so no real network is needed.
+    downloadVideo: async () => ({ buffer: Buffer.from('VIDEOBYTES'), contentType: 'video/mp4' }),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      const method = String((opts && opts.method) || 'GET').toUpperCase();
+      calls.push({ url: u, method });
+      if (u.includes('/me/accounts')) {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: PAGE, name: 'เฉียบ', access_token: LITE_PAGE_TOKEN }] }) };
+      }
+      if (u.includes(`/${PAGE}/videos`) && method === 'POST') {
+        return { ok: true, status: 200, json: async () => ({ id: 'PAGEVIDX', post_id: `${PAGE}_NEWPOST` }) };
+      }
+      if (u.includes('/PAGEVIDX') && method === 'GET') {
+        return { ok: true, status: 200, json: async () => ({ post_id: `${PAGE}_NEWPOST`, permalink_url: `https://www.facebook.com/${PAGE}/posts/NEWPOST`, thumbnails: { data: [{ uri: 'https://thumb/x.jpg' }] } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/post', {
+      account: '100090320823561',
+      page_id: PAGE,
+      video_url: 'https://cdn/example.mp4',
+      message: 'hello lite'
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.equal(r.body.story_id, `${PAGE}_NEWPOST`);
+    assert.equal(r.body.video_id, 'PAGEVIDX');
+    assert.equal(r.body.published_to_page, true);
+    // HARD GUARANTEE: the organic /{page_id}/videos endpoint was used, and the ad-account advideos
+    // path (the source of the live "(#10) Permission Denied") was NEVER called.
+    assert.ok(calls.some((c) => c.url.includes(`/${PAGE}/videos`) && c.method === 'POST'), 'must publish via /{page_id}/videos');
+    assert.ok(!calls.some((c) => /\/advideos/.test(c.url)), 'must NOT call the ad-account advideos endpoint');
+    assertNoLeak({ body: r.body }, [LITE_USER_TOKEN, LITE_PAGE_TOKEN]);
+  });
+});
+
+test('GET /pages facebook_lite lists administered pages from the EAAD6V token (Worker bridge authorization probe), token-free by default', async () => {
+  const PAGE = '1008898512617594';
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const LITE_PAGE_TOKEN = 'EAAD6Vpage0000000000000000000';
+  let meAccountsToken = null;
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        meAccountsToken = m ? decodeURIComponent(m[1]) : null;
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: PAGE, name: 'เฉียบ', access_token: LITE_PAGE_TOKEN }] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('GET', '/pages?account=100090320823561');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.ok(Array.isArray(r.body.data));
+    assert.ok(r.body.data.map((p) => String(p.id)).includes(PAGE), 'must list the administered page so the Worker authorizes it');
+    // me/accounts was resolved with the freshly minted EAAD6V token, and no page token leaks by default.
+    assert.equal(meAccountsToken, LITE_USER_TOKEN);
+    for (const p of r.body.data) assert.equal(p.access_token, undefined, 'page tokens are stripped without includeToken');
+    assertNoLeak({ body: r.body }, [LITE_USER_TOKEN, LITE_PAGE_TOKEN]);
+  });
+});
+
+test('GET /token facebook_lite includeToken=1 reveals the raw EAAD6V token to a LOCAL operator (UI verification)', async () => {
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({}) })
+  }, async (request) => {
+    // Without includeToken: prefix only, no raw token (the default safe probe).
+    const safe = await request('GET', '/token?account=100090320823561&facebook_lite=1');
+    assert.equal(safe.body.ok, true);
+    assert.equal(safe.body.tokenPrefix, 'EAAD6V');
+    assert.equal('token' in safe.body, false);
+    // With includeToken=1 from localhost: the raw token IS returned for operator verification.
+    const r = await request('GET', '/token?account=100090320823561&facebook_lite=1&includeToken=1');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.equal(r.body.tokenPrefix, 'EAAD6V');
+    assert.equal(r.body.token, LITE_USER_TOKEN);
+    assert.ok(String(r.body.warning || '').includes('localhost'));
+  });
+});
+
+test('GET /token facebook_lite includeToken=1 is refused (403) for a NON-local request (never reveals the token remotely)', async () => {
+  const r = await callHandler({ keychain: mockKeychain(), fbLiteTokenService: mockFbLite() }, {
+    method: 'GET',
+    path: '/token?account=100090320823561&facebook_lite=1&includeToken=1',
+    remoteAddress: '203.0.113.7'
+  });
+  assert.equal(r.status, 403);
+  assert.equal('token' in r.body, false);
+});
+
+test('POST /page-comment facebook_lite mints a fresh EAAD6V token, resolves me/accounts and comments as the Page with the page token (never CloakBrowser, no leak)', async () => {
+  const PAGE = '1008898512617594';
+  const STORY = `${PAGE}_NEWPOST`;
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const LITE_PAGE_TOKEN = 'EAAD6Vpage0000000000000000000';
+  const loginCalls = [];
+  let meAccountsToken = null;
+  let commentBody = null;
+  let commentTarget = null;
+  // A login-tracking Facebook Lite service: records that facebookLogin is the source of the token
+  // (so we prove the comment is minted from stored credentials, not a CloakBrowser session).
+  const fbLiteTracking = {
+    extractTokenPrefix: realExtractTokenPrefix,
+    facebookLogin: async (args) => { loginCalls.push(args); return { success: true, converted_token: { access_token: LITE_USER_TOKEN } }; }
+  };
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: fbLiteTracking,
+    // A CloakBrowser session would throw on every me/accounts; it is never consulted for Lite.
+    browser: exportBrowser({ graphErrorsByAccount: { '100090320823561': 'cloak_session_must_not_be_used' } }),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      const method = String((opts && opts.method) || 'GET').toUpperCase();
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        meAccountsToken = m ? decodeURIComponent(m[1]) : null;
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: PAGE, name: 'เฉียบ', access_token: LITE_PAGE_TOKEN }] }) };
+      }
+      if (u.includes(`/${encodeURIComponent(STORY)}/comments`) || (u.includes('/comments') && u.includes(STORY))) {
+        commentTarget = u;
+        commentBody = opts && opts.body ? JSON.parse(opts.body) : null;
+        return { ok: true, status: 200, json: async () => ({ id: `${STORY}_CMT1` }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/page-comment', {
+      account: '100090320823561',
+      facebook_lite: 1,
+      page_id: PAGE,
+      story_id: STORY,
+      message: 'comment from lite'
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.equal(r.body.token_prefix, 'EAAD6V');
+    assert.equal(r.body.id, `${STORY}_CMT1`);
+    assert.equal(r.body.author_expected, 'page');
+    // The token came from a fresh credential login, me/accounts was resolved with that user token,
+    // and the comment was authored with the PAGE token resolved for this page id.
+    assert.equal(loginCalls.length, 1, 'must mint a fresh token via facebookLogin');
+    assert.equal(meAccountsToken, LITE_USER_TOKEN);
+    assert.ok(commentTarget && commentTarget.includes(STORY), 'comment must target the story id');
+    assert.ok(commentBody && commentBody.access_token === LITE_PAGE_TOKEN, 'comment must use the resolved page token');
+    assertNoLeak({ body: r.body }, [LITE_USER_TOKEN, LITE_PAGE_TOKEN]);
+  });
+});
+
+test('POST /page-comment facebook_lite fails closed (token-free) when the credential login cannot mint a token', async () => {
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ success: false, error: 'login_failed' }),
+    browser: exportBrowser({}),
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({}) })
+  }, async (request) => {
+    const r = await request('POST', '/page-comment', {
+      account: '100090320823561',
+      facebook_lite: 1,
+      page_id: '1008898512617594',
+      story_id: '1008898512617594_NEWPOST',
+      message: 'comment from lite'
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.equal(r.body.step, 'facebook_lite_token');
+    assert.equal('token' in r.body, false);
+    assert.equal('access_token' in r.body, false);
+  });
 });
 
 test('/token/export falls back to the default posting account when the explicit alias lacks a session', async () => {

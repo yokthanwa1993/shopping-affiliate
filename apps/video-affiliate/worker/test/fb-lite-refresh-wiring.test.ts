@@ -306,6 +306,51 @@ test('publish wrapper refreshes + retries once only on stored-token auth failure
     assert.ok(logLines.every((l) => !/token=\$\{|accessToken|\.token\}/.test(l)), 'wrapper logs must never interpolate a token value')
 })
 
+test('publish wrapper routes (#10) Permission Denied to the Facebook Lite bridge ORGANIC /post (distinct, fail-closed)', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
+    const fn = src.slice(start, src.indexOf('type PageOneCardLinkMode', start))
+    // The gate now admits permission-denied (#10) in ADDITION to the auth-failure refresh predicate,
+    // so the ad-account "(#10) Permission Denied" no longer rethrows before the bridge fallback.
+    assert.ok(fn.includes('isFacebookLitePostingPermissionError('), '(#10) permission errors must be detected')
+    assert.ok(/if \(!authFailure && !permissionDenied\)/.test(fn), 'gate must enter the fallback on auth failure OR permission denied')
+    // The bridge ORGANIC /post is attempted (publishReelViaSessionBridge, facebook_lite_bridge hint).
+    assert.ok(fn.includes('publishReelViaSessionBridge('), 'must attempt the Facebook Lite bridge organic /post')
+    assert.ok(fn.includes("postingTokenHint: 'facebook_lite_bridge'"), 'bridge publish is tagged facebook_lite_bridge')
+    // Fail-closed with DISTINCT errors so Hermes can see which path was attempted.
+    assert.ok(fn.includes('facebook_lite_bridge_organic_post_failed:'), 'a failed bridge organic post surfaces a distinct error')
+    assert.ok(fn.includes('facebook_lite_permission_denied_no_bridge_account:'), 'permission denied + no bridge account surfaces distinctly')
+})
+
+test('EAAD6V token publishes via direct /{page}/videos (is_reel OFF) as PRIMARY, never /video_reels; bridge organic /post is only the secondary', () => {
+    const src = readVideoAffiliateIndex()
+    const wrapStart = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
+    const wrapFn = src.slice(wrapStart, src.indexOf('type PageOneCardLinkMode', wrapStart))
+    // Detect the Facebook Lite (EAAD6V) post token up front.
+    assert.ok(/isFacebookLitePageToken\(litePostTokens\[0\]/.test(wrapFn), 'must detect a Facebook Lite (EAAD6V) post token up front')
+    // PRIMARY: Worker-direct /{page}/videos multipart with is_reel:false (the confirmed working path).
+    const litePrimaryIdx = wrapFn.indexOf('publishReelViaVideosEndpointWithTokenFallback(')
+    assert.ok(litePrimaryIdx >= 0, 'EAAD6V lane publishes via the direct /videos endpoint helper')
+    assert.ok(/isReel: false/.test(wrapFn), 'the EAAD6V /videos publish must OMIT is_reel (is_reel: false)')
+    // It runs BEFORE the generic Worker-direct chain and is NOT the /video_reels resumable path.
+    const genericDirectIdx = wrapFn.indexOf('return await publishReelWithCommentTokenPrimaryFallback({')
+    assert.ok(litePrimaryIdx < genericDirectIdx, 'the EAAD6V /videos publish must precede the generic publish chain')
+    // SECONDARY only (after the direct /videos attempt throws): the bridge organic /post.
+    const bridgeIdx = wrapFn.indexOf('publishOrganicViaFacebookLiteBridge(')
+    assert.ok(bridgeIdx > litePrimaryIdx, 'the bridge organic /post is a SECONDARY fallback, not the primary')
+    assert.ok(/reason: 'eaad6_videos_direct_failed'/.test(wrapFn), 'the bridge secondary is reached only after the direct /videos attempt fails')
+
+    // publishReelDirect omits is_reel when isReel===false (matches the confirmed curl: source + published only).
+    const directStart = src.indexOf('async function publishReelDirect(')
+    const directFn = src.slice(directStart, src.indexOf('async function applyPreferredVideoThumbnail', directStart))
+    assert.ok(/if \(params\.isReel !== false\) formData\.append\('is_reel', 'true'\)/.test(directFn), 'is_reel is appended only when not explicitly disabled')
+
+    // The bridge helper still surfaces a distinct, token-free capability blocker.
+    const helperStart = src.indexOf('async function publishOrganicViaFacebookLiteBridge')
+    const helperFn = src.slice(helperStart, src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh', helperStart))
+    assert.ok(helperFn.includes('facebook_lite_publish_capability_blocked:'), 'no usable bridge → distinct capability blocker (not an endless (#10))')
+})
+
 test('posting-token refresh prefers BrowserSaving, falls back to the Bridge Token /pages tunnel', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf('async function refreshFacebookLitePostingTokenForPage')
@@ -354,29 +399,59 @@ test('profile-sync upsert accepts an EAAD6 Facebook Lite token as the lead post 
     assert.notEqual(start, -1, 'upsertNamespacePageFromProfileSync must exist')
     const fn = src.slice(start, src.indexOf('function uniqueTokens', start))
     // ROOT FIX: the old EAAD6-excluding gate must be gone. isPostRoleToken() treated EAAD6 as
-    // "comment role" and so DROPPED a freshly-synced Facebook Lite page token from post_tokens,
-    // leaving the posting resolver on the stale token (live row 33210 kept reusing EAAD6V…ZDZD
-    // even after a successful Bridge Token refresh).
-    assert.ok(!/const incomingPostToken = isPostRoleToken\(accessToken\)/.test(fn),
-        'incoming post token must NOT be gated behind isPostRoleToken (that drops EAAD6 Lite tokens)')
-    // Any non-empty synced token is now trusted as a post token via normalizePostTokenPool.
-    assert.ok(/const incomingPostToken = normalizePostTokenPool\(\[accessToken\]\)\[0\] \|\| ''/.test(fn),
-        'incoming post token must accept any non-empty synced token (EAAD6 encodes the app id, not the scope)')
-    // The fresh token is prepended ahead of the existing pool → it becomes post_tokens[0]…
-    assert.ok(/nextPostTokens = normalizePostTokenPool\(\[\s*incomingPostToken,/.test(fn),
-        'fresh token must be prepended to post_tokens (becomes post_tokens[0])')
-    // …and pages.access_token (the primary the posting resolver reads) follows post_tokens[0].
-    assert.ok(/const nextPrimaryToken = String\(nextPostTokens\[0\]/.test(fn),
-        'pages.access_token primary must follow post_tokens[0] so the resolver uses the fresh token')
+    // "comment role" and so DROPPED a freshly-synced Facebook Lite page token from post_tokens /
+    // pages.access_token, leaving the posting resolver on the stale EAABsb token (live row 33519
+    // posted with a stale EAABsb even after a successful EAAD6V Bridge Token export).
+    assert.ok(!/isPostRoleToken\(String\(existing\?\.access_token/.test(fn),
+        'the upsert primary must NOT be gated behind isPostRoleToken (that blanks a fresh EAAD6V Lite token)')
+    // The fresh token is now made authoritative via the pure, unit-tested helper.
+    assert.ok(/prioritizeSyncedPageTokenPools\(\{/.test(fn),
+        'upsert must delegate token ordering to prioritizeSyncedPageTokenPools (fresh token leads pool + primary)')
+    // The fresh token becomes post_tokens[0]…
+    assert.ok(/const nextPostTokens = prioritized\.postTokens/.test(fn),
+        'fresh token leads post_tokens via the prioritization helper (becomes post_tokens[0])')
+    // …and pages.access_token (the primary the posting resolver reads) is the prioritized primary…
+    assert.ok(/const nextPrimaryToken = prioritized\.primaryToken/.test(fn),
+        'pages.access_token primary must be the prioritized primary (the fresh token)')
     assert.ok(/UPDATE pages SET access_token = \?/.test(fn),
         'the fresh primary must be written back to pages.access_token')
 })
 
 test('all three stored-token publish sites use the auto-refresh wrapper', () => {
     const src = readVideoAffiliateIndex()
-    const calls = (src.match(/await publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh\(/g) || []).length
+    // Retry awaits the wrapper directly; force-post + cron reference it via the
+    // publishStoredFacebookLiteReel closure (`() => publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(`).
+    const calls = (src.match(/(?:await |=> )publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh\(/g) || []).length
     assert.ok(calls >= 3, `force/retry/cron stored-token publishes must use the refresh wrapper (found ${calls})`)
     // Each call site supplies a reloadTokens closure that re-reads the fresh pool.
     const reloadSites = (src.match(/reloadTokens: async \(\) => \{/g) || []).length
     assert.ok(reloadSites >= 3, `each publish site must pass a reloadTokens closure (found ${reloadSites})`)
+})
+
+test('onecard_enabled pages fall back to the organic EAAD6V reel when the ad-account OneCard publish fails (not Power Editor)', () => {
+    const src = readVideoAffiliateIndex()
+    // Both force-post and cron wrap the OneCard publish in try/catch and fall back to the SAME
+    // organic Facebook Lite reel closure (publishStoredFacebookLiteReel) used by the stored_token
+    // default path — never burning the row on an ad-permission denial.
+    const oneCardCalls = (src.match(/await publishVideoViaOneCard\(/g) || []).length
+    assert.ok(oneCardCalls >= 2, `force-post + cron must both dispatch OneCard (found ${oneCardCalls})`)
+    const fallbackClosures = (src.match(/const publishStoredFacebookLiteReel = \(\) =>/g) || []).length
+    assert.ok(fallbackClosures >= 2, `force-post + cron must define the organic EAAD6V fallback closure (found ${fallbackClosures})`)
+    // The fallback is gated by the pure, tested predicate (no stored token → still fails closed).
+    const gatedFallbacks = (src.match(/shouldFallbackToOrganicAfterOneCardFailure\(\{ haveStoredPostToken/g) || []).length
+    assert.ok(gatedFallbacks >= 2, `OneCard catch must gate the organic fallback on a stored token (found ${gatedFallbacks})`)
+    // Each catch invokes the organic reel fallback (never re-invokes the ad-account OneCard path).
+    const fallbackInvocations = (src.match(/reelResult = await publishStoredFacebookLiteReel\(\)/g) || []).length
+    assert.ok(fallbackInvocations >= 4, `each site uses the organic fallback as both default + OneCard-failure path (found ${fallbackInvocations})`)
+})
+
+test('EAAD6V tokens NEVER enter the OneCard/ad-account lane — OneCard is skipped up front for Facebook Lite tokens', () => {
+    const src = readVideoAffiliateIndex()
+    // Both force-post and cron gate the OneCard branch on a non-Lite primary token, so an EAAD6V page
+    // (even with onecard_enabled=1) goes straight to the organic /{page}/videos lane — never advideos.
+    const guarded = (src.match(/const useOneCardForThisPost = pageOneCardEnabled && !isFacebookLitePageToken\(primaryPostingTokenCandidates\[0\]/g) || []).length
+    assert.ok(guarded >= 2, `force-post + cron must skip OneCard for EAAD6V tokens (found ${guarded})`)
+    // The OneCard dispatch is gated by that flag (not the bare pageOneCardEnabled) at both sites.
+    const dispatchGated = (src.match(/if \(useOneCardForThisPost\) \{/g) || []).length
+    assert.ok(dispatchGated >= 2, `both publish sites must dispatch OneCard via useOneCardForThisPost (found ${dispatchGated})`)
 })

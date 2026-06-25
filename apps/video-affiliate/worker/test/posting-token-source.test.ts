@@ -18,6 +18,11 @@ import {
     redactFacebookLiteRefreshResult,
     buildBridgeTokenPagesUrl,
     extractBridgeTokenPageAccessToken,
+    isFacebookLitePageToken,
+    isFacebookLitePostingPermissionError,
+    isPersistablePagePrimaryToken,
+    prioritizeSyncedPageTokenPools,
+    shouldFallbackToOrganicAfterOneCardFailure,
 } from '../src/posting-token-source'
 
 test('normalize: only two modes — stored_token and cloak_browser', () => {
@@ -319,4 +324,146 @@ test('bridge token /pages: extracts the matching page access_token, ignores othe
     // Garbage payloads never throw.
     assert.equal(extractBridgeTokenPageAccessToken(null, '5').found, false)
     assert.equal(extractBridgeTokenPageAccessToken({ data: 'nope' }, '5').found, false)
+})
+
+// ---- Facebook Lite (EAAD6V) page-token prioritization ----------------------
+// Regression guard for the live bug: after a facebook_lite_bridge export synced a fresh EAAD6V
+// page token, force-post kept posting/commenting with the stale EAABsb token (row 33519). The
+// fresh token must lead the pool + become the stored primary; stale EAABsb must fall behind.
+
+const STALE_EAAB = 'EAABsbStaleToken000000000000ZDZD'
+const FRESH_EAAD6V = 'EAAD6V7FreshLitePageToken1111111'
+
+test('isFacebookLitePageToken matches EAAD6/EAAD6V only', () => {
+    assert.equal(isFacebookLitePageToken(FRESH_EAAD6V), true)
+    assert.equal(isFacebookLitePageToken('EAAD6vlowercase'), true)
+    assert.equal(isFacebookLitePageToken(STALE_EAAB), false)
+    assert.equal(isFacebookLitePageToken(''), false)
+    assert.equal(isFacebookLitePageToken(null), false)
+})
+
+test('isPersistablePagePrimaryToken keeps EAAD6V page tokens (preserve gates must not blank them)', () => {
+    // The bug: preserve gates used isPostRoleToken, which excludes EAAD6 and blanked a fresh Lite
+    // token. The replacement predicate keeps ANY non-empty stored page token.
+    assert.equal(isPersistablePagePrimaryToken(FRESH_EAAD6V), true)
+    assert.equal(isPersistablePagePrimaryToken(STALE_EAAB), true)
+    assert.equal(isPersistablePagePrimaryToken('   '), false)
+    assert.equal(isPersistablePagePrimaryToken(''), false)
+    assert.equal(isPersistablePagePrimaryToken(undefined), false)
+})
+
+test('prioritizeSyncedPageTokenPools: fresh EAAD6V leads, stale EAABsb falls to second (post + primary + comment)', () => {
+    const out = prioritizeSyncedPageTokenPools({
+        incomingToken: FRESH_EAAD6V,
+        incomingCommentToken: FRESH_EAAD6V,
+        existingPrimaryToken: STALE_EAAB,
+        existingPostTokens: [STALE_EAAB],
+        existingCommentTokens: [STALE_EAAB],
+    })
+    // Stored primary becomes the fresh EAAD6V — not the stale EAABsb.
+    assert.equal(out.primaryToken, FRESH_EAAD6V)
+    // Candidate order: fresh first, stale retained strictly AFTER as fallback (never dropped).
+    assert.deepEqual(out.postTokens, [FRESH_EAAD6V, STALE_EAAB])
+    assert.deepEqual(out.commentTokens, [FRESH_EAAD6V, STALE_EAAB])
+})
+
+test('prioritizeSyncedPageTokenPools: a facebook_lite_bridge export with no prior pool seeds the EAAD6V token as sole primary', () => {
+    const out = prioritizeSyncedPageTokenPools({
+        incomingToken: FRESH_EAAD6V,
+        existingPrimaryToken: '',
+        existingPostTokens: [],
+        existingCommentTokens: [],
+    })
+    assert.equal(out.primaryToken, FRESH_EAAD6V)
+    assert.deepEqual(out.postTokens, [FRESH_EAAD6V])
+    // comment pool falls back to the access token when no explicit comment token is given.
+    assert.deepEqual(out.commentTokens, [FRESH_EAAD6V])
+})
+
+test('prioritizeSyncedPageTokenPools: any newer page token (not only EAAD6V) outranks an existing stale token', () => {
+    // Generic page token (simulating token_source=facebook_lite_bridge where the value is not EAAD6).
+    const FRESH = 'EAApageNewlySynced999999'
+    const out = prioritizeSyncedPageTokenPools({
+        incomingToken: FRESH,
+        existingPrimaryToken: STALE_EAAB,
+        existingPostTokens: [STALE_EAAB, 'EAAolderpost222'],
+    })
+    assert.equal(out.primaryToken, FRESH)
+    assert.equal(out.postTokens[0], FRESH)
+    assert.ok(out.postTokens.includes(STALE_EAAB), 'stale token retained as fallback')
+})
+
+test('prioritizeSyncedPageTokenPools de-dupes case-insensitively and never blanks the primary when incoming is empty', () => {
+    // Same token in pool + incoming → single leading entry.
+    const dup = prioritizeSyncedPageTokenPools({
+        incomingToken: FRESH_EAAD6V,
+        existingPostTokens: [FRESH_EAAD6V.toLowerCase(), STALE_EAAB],
+    })
+    assert.equal(dup.postTokens.filter((t) => t.toLowerCase() === FRESH_EAAD6V.toLowerCase()).length, 1)
+    assert.equal(dup.postTokens[0], FRESH_EAAD6V)
+    // Empty incoming (defensive) → keep the existing stored primary, never blank it.
+    const empty = prioritizeSyncedPageTokenPools({
+        incomingToken: '',
+        existingPrimaryToken: FRESH_EAAD6V,
+        existingPostTokens: [FRESH_EAAD6V],
+    })
+    assert.equal(empty.primaryToken, FRESH_EAAD6V)
+})
+
+// ---- OneCard (ad-account) → organic Facebook Lite reel fallback ------------
+// Page 1008898512617594 has onecard_enabled=1, so force-post routed into the cloak-fb-bridge
+// ad-account create-ad path and failed `upload_video:(#10) Permission Denied`. A stored Facebook
+// Lite (EAAD6V) page token cannot drive the ad account, so force-post must fall back to a REAL
+// organic Page reel via that token instead of burning the row — without touching Power Editor.
+
+test('shouldFallbackToOrganicAfterOneCardFailure: ad permission denied + stored token → fall back to organic EAAD6V', () => {
+    assert.equal(
+        shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: true, error: 'upload_video:(#10) Permission Denied' }),
+        true,
+    )
+    // Bridge problems are ad-path-only — an organic EAAD6V reel does not share them.
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: true, error: 'bridge_not_configured' }), true)
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: true, error: 'onecard_http_500' }), true)
+})
+
+test('shouldFallbackToOrganicAfterOneCardFailure: no stored token → keep failing closed (pure admin/CloakBrowser OneCard)', () => {
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: false, error: 'upload_video:(#10) Permission Denied' }), false)
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: false }), false)
+})
+
+test('shouldFallbackToOrganicAfterOneCardFailure: local/pre-upload failures organic would ALSO hit → do not fall back', () => {
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: true, error: 'Video too small (123 bytes). Download failed.' }), false)
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: true, error: 'Fetch video failed with status 404' }), false)
+    assert.equal(shouldFallbackToOrganicAfterOneCardFailure({ haveStoredPostToken: true, error: 'avatar_compose_failed: avatar_url_invalid' }), false)
+})
+
+// ---- (#10) Permission Denied → Facebook Lite bridge organic fallback -------
+// The stored EAAD6V page token cannot publish via the Worker Graph app / ad account ("(#10)
+// Permission Denied"), which is NOT an auth/190 error. It must still reach the Facebook Lite bridge
+// ORGANIC /post fallback (the local logged-in session CAN post). isFacebookLitePostingPermissionError
+// is the gate that lets it through (shouldAttemptFacebookLitePostingRefresh only matches auth errors).
+
+test('isFacebookLitePostingPermissionError matches the live (#10) Permission Denied publish errors', () => {
+    assert.equal(isFacebookLitePostingPermissionError('upload_video:(#10) Permission Denied'), true)
+    assert.equal(isFacebookLitePostingPermissionError('(#10) Permission Denied'), true)
+    assert.equal(isFacebookLitePostingPermissionError('all_post_tokens_failed: (#10) Permission denied'), true)
+    assert.equal(isFacebookLitePostingPermissionError('Graph error code: 10 permission'), true)
+})
+
+test('isFacebookLitePostingPermissionError does NOT match auth (190) or unrelated errors (no false promotion)', () => {
+    assert.equal(isFacebookLitePostingPermissionError('(#190) error validating access token'), false)
+    assert.equal(isFacebookLitePostingPermissionError('(#100) Tried accessing nonexisting field'), false)
+    assert.equal(isFacebookLitePostingPermissionError('please reduce the amount of data'), false)
+    assert.equal(isFacebookLitePostingPermissionError(''), false)
+    assert.equal(isFacebookLitePostingPermissionError(null), false)
+})
+
+test('a (#10) permission error reaches the bridge fallback while an auth error stays on the refresh path', () => {
+    // Auth errors keep working through shouldAttemptFacebookLitePostingRefresh (token re-mint)…
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: '(#190) session has been invalidated' }), true)
+    assert.equal(isFacebookLitePostingPermissionError('(#190) session has been invalidated'), false)
+    // …while (#10) does NOT trigger a refresh (it is a permission, not a token, problem) but DOES
+    // qualify for the bridge organic /post fallback. The wrapper enters the fallback on either.
+    assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: 'upload_video:(#10) Permission Denied' }), false)
+    assert.equal(isFacebookLitePostingPermissionError('upload_video:(#10) Permission Denied'), true)
 })
