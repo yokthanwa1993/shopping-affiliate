@@ -1,7 +1,5 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link } from '@tanstack/react-router'
-import { AlertTriangle } from 'lucide-react'
 import { fetchSettingsPages, updatePageActive, type SettingsPage } from '@/api/settings'
 import { PagePicker } from '@/components/PagePicker'
 import { PageDetailView } from '@/routes/settings'
@@ -75,35 +73,8 @@ export function CreatePostPage() {
     // Master (no page selected) breaks out of the shell's p-5 to become
     // full-bleed: the page-list card fills the whole content rect.
     <div className="-m-5 flex min-h-full flex-col gap-4 p-4">
-      <div className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">สร้างโพสต์เพจ</h1>
-        <p className="text-sm text-muted-foreground">
-          เลือกเพจ แล้วตั้งค่าการโพสต์ลงเพจ — หน้านี้ทำงานกับ “โพสต์” อย่างเดียว
-        </p>
-      </div>
-
-      {/* Separation guarantee — explicit, always visible on the master view. */}
-      <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-        <div>
-          <p className="font-semibold">หน้านี้ตั้งค่าและโพสต์ลงเพจเท่านั้น</p>
-          <p className="text-amber-800">
-            ไม่มี Video One Card / ไม่สร้างแคมเปญ / Ad Set / โฆษณา — หากต้องการสร้างแอด ให้ไปที่{' '}
-            <Link to="/create-ads" className="font-semibold underline">
-              หน้าสร้างแอด
-            </Link>
-          </p>
-        </div>
-      </div>
-
       {/* MASTER — page list first. No detail renders until a page is chosen. */}
       <section className="flex min-h-0 flex-1 flex-col gap-3">
-        <p className="flex items-baseline gap-2 text-xs text-muted-foreground">
-          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
-            1
-          </span>
-          แตะเพจที่ต้องการเพื่อเปิดหน้าตั้งค่าการโพสต์
-        </p>
         <div className="min-h-0 flex-1">
           <PagePicker
             pages={pages}
