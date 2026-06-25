@@ -10,15 +10,28 @@
 // This only affects the POST caption. Comment text, the CTA button link, shortlink reminting
 // and token-source routing are all computed elsewhere and are intentionally untouched here.
 
-// Prepend `shopeeLink` as the first caption line. Idempotent: if the caption already leads
-// with the exact same link (a caller that already prepended it, or a re-run), it is returned
-// unchanged so the link is never doubled.
+// The pin prefix that leads the first caption line, e.g.
+//   📌 พิกัด : https://s.shopee.co.th/AAF1LYGjhb
+// Keep the trailing space — the link is concatenated directly after it.
+export const CAPTION_LINK_PIN_PREFIX = '📌 พิกัด : '
+
+// Prepend the managed Shopee shortlink as the FIRST caption line, formatted as the pin line
+// `📌 พิกัด : <link>`. Idempotent and self-normalizing:
+//   - If the caption already leads with the exact new pin line for this link, return unchanged.
+//   - If the caption leads with a LEGACY bare-link first line for this link, normalize that
+//     first line into the new pin line (never duplicate, never leave a bare link behind).
+// Empty caption returns just the pin line.
 export function buildCaptionLinkFirstDescription(caption: string, shopeeLink: string): string {
     const link = String(shopeeLink || '').trim()
     const originalCaption = String(caption || '')
     if (!link) return originalCaption
-    if (originalCaption === link || originalCaption.startsWith(`${link}\n`)) return originalCaption
-    return originalCaption ? `${link}\n${originalCaption}` : link
+    const pinLine = `${CAPTION_LINK_PIN_PREFIX}${link}`
+    // Already leads with the new pin line — return unchanged so it is never doubled.
+    if (originalCaption === pinLine || originalCaption.startsWith(`${pinLine}\n`)) return originalCaption
+    // Legacy bare-link first line — normalize it in place to the new pin line.
+    if (originalCaption === link) return pinLine
+    if (originalCaption.startsWith(`${link}\n`)) return `${pinLine}${originalCaption.slice(link.length)}`
+    return originalCaption ? `${pinLine}\n${originalCaption}` : pinLine
 }
 
 // Resolve the caption to publish for a page. The gate is deliberately route-agnostic:
