@@ -939,17 +939,50 @@ export function buildFollowLaneShortlinkRequestUrl(input: {
     }
 }
 
-// Compose the Follow lane creative MESSAGE: caption text then the Shopee shortlink on its own line so
-// the link renders ABOVE the video preview in the dark/ad story. If the supplied caption already
-// contains the shortlink it is returned unchanged (never duplicate the link). Empty caption → just the
-// shortlink; empty shortlink → just the caption. Pure.
+// The exact first-line prefix the Follow/Create-Ads dark-story creative MUST lead with. The operator's
+// corrected requirement: the shortlink sits at the TOP of the ad creative caption as
+// `📌 พิกัด : <shortlink>`, with the product caption/title + hashtags BELOW it. This is the Create Ads
+// (Follow/Page-like dark-story) lane ONLY — normal visible Page posts must NOT carry a Shopee link in
+// their caption, so this prefix is never used on the post_history / force-post / cron page-post routes.
+export const FOLLOW_LANE_PIN_PREFIX = '📌 พิกัด : '
+
+// Compose the Follow lane creative MESSAGE for the dark/ad story. Per the operator correction the
+// shortlink leads as the FIRST line (`📌 พิกัด : <shortlink>`), followed by the product caption/title
+// and hashtags, so the link renders at the TOP of the ad creative (above the video preview) — NOT at the
+// bottom as the legacy `caption\nshortlink` form did.
+//   - empty shortlink → just the caption (no pin line; nothing to track).
+//   - empty caption   → just the pin line.
+// Idempotent + de-duplicating so re-composing a caption never repeats the link:
+//   - a caption that already leads with the SAME pin line is normalized, not duplicated;
+//   - a legacy first line that is the BARE shortlink is upgraded to the pin line;
+//   - any other occurrence of the shortlink (e.g. the legacy bottom link line) is removed before the
+//     pin line is prepended, so the link appears exactly once, at the top.
+// This helper drives the Create Ads (Follow/Page-like) creative ONLY; it must never touch normal Page
+// posting routes. Pure.
 export function buildFollowLaneCreativeMessage(input: { caption?: string; shortlink?: string }): string {
     const caption = str(input.caption)
     const shortlink = str(input.shortlink)
     if (!shortlink) return caption
-    if (caption && caption.includes(shortlink)) return caption
-    if (!caption) return shortlink
-    return `${caption}\n${shortlink}`
+    const pinLine = `${FOLLOW_LANE_PIN_PREFIX}${shortlink}`
+    if (!caption) return pinLine
+
+    // Strip any existing pin line / bare shortlink line / inline duplicate so the link is never repeated.
+    const cleanedLines: string[] = []
+    for (const line of caption.split('\n')) {
+        const trimmed = line.trim()
+        // Drop a whole line that is the pin line or the bare shortlink (legacy top/bottom link line).
+        if (trimmed === pinLine || trimmed === shortlink) continue
+        // Strip an inline duplicate of the shortlink, collapsing the whitespace it leaves behind.
+        if (trimmed.includes(shortlink)) {
+            const stripped = line.split(shortlink).join(' ').replace(/[ \t]+/g, ' ').trim()
+            if (stripped) cleanedLines.push(stripped)
+            continue
+        }
+        cleanedLines.push(line)
+    }
+    const body = cleanedLines.join('\n').trim()
+    if (!body) return pinLine
+    return `${pinLine}\n${body}`
 }
 
 // Build the Follow lane COMMENT shortlink REQUEST url. This is the FINAL, post-specific tracking link

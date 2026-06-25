@@ -20,6 +20,7 @@ import {
     resolveFollowLaneCampaignSub1,
     buildFollowLaneShortlinkRequestUrl,
     buildFollowLaneCreativeMessage,
+    FOLLOW_LANE_PIN_PREFIX,
     buildFollowLaneCommentShortlinkRequestUrl,
     buildFollowLaneCommentMessage,
     buildFollowAutoPickBody,
@@ -670,23 +671,50 @@ test('Follow shortlink uses the default campaign sub1 when none supplied', () =>
     assert.equal(new URL(url).searchParams.get('sub1'), '16JUN26FBSPCAD')
 })
 
-test('Follow creative message puts caption text + shortlink (link above the video preview)', () => {
-    const msg = buildFollowLaneCreativeMessage({ caption: 'กดติดตามเพจ', shortlink: 'https://s.shopee.co.th/x' })
-    assert.equal(msg, 'กดติดตามเพจ\nhttps://s.shopee.co.th/x')
-    // The shortlink IS present in the creative message.
+test('Follow creative message leads with the pin line `📌 พิกัด : <shortlink>` then the caption', () => {
+    const msg = buildFollowLaneCreativeMessage({ caption: 'กดติดตามเพจ #ของดี', shortlink: 'https://s.shopee.co.th/x' })
+    // Operator correction: shortlink at the TOP as the exact pin line, product caption/hashtags below.
+    assert.equal(msg, '📌 พิกัด : https://s.shopee.co.th/x\nกดติดตามเพจ #ของดี')
+    assert.equal(msg.split('\n')[0], '📌 พิกัด : https://s.shopee.co.th/x')
+    assert.ok(msg.startsWith(FOLLOW_LANE_PIN_PREFIX))
     assert.ok(msg.includes('https://s.shopee.co.th/x'))
 })
 
-test('Follow creative message never duplicates a shortlink already in the caption', () => {
+test('Follow creative message moves a legacy bottom shortlink line to the top pin line (no duplicate)', () => {
+    // The legacy form baked the bare link at the BOTTOM; re-composing must flip it to the top pin line.
+    const legacy = 'กดติดตามเพจ #ของดี\nhttps://s.shopee.co.th/x'
+    const msg = buildFollowLaneCreativeMessage({ caption: legacy, shortlink: 'https://s.shopee.co.th/x' })
+    assert.equal(msg, '📌 พิกัด : https://s.shopee.co.th/x\nกดติดตามเพจ #ของดี')
+    assert.equal((msg.match(/https:\/\/s\.shopee\.co\.th\/x/g) || []).length, 1)
+})
+
+test('Follow creative message normalizes a legacy bare-shortlink first line into the pin line', () => {
+    const legacy = 'https://s.shopee.co.th/x\nกดติดตามเพจ'
+    const msg = buildFollowLaneCreativeMessage({ caption: legacy, shortlink: 'https://s.shopee.co.th/x' })
+    assert.equal(msg, '📌 พิกัด : https://s.shopee.co.th/x\nกดติดตามเพจ')
+    assert.equal((msg.match(/https:\/\/s\.shopee\.co\.th\/x/g) || []).length, 1)
+})
+
+test('Follow creative message is idempotent when the caption already leads with the pin line', () => {
+    const composed = buildFollowLaneCreativeMessage({ caption: 'กดติดตามเพจ', shortlink: 'https://s.shopee.co.th/x' })
+    const again = buildFollowLaneCreativeMessage({ caption: composed, shortlink: 'https://s.shopee.co.th/x' })
+    assert.equal(again, composed)
+    assert.equal((again.match(/https:\/\/s\.shopee\.co\.th\/x/g) || []).length, 1)
+    assert.equal((again.match(/📌 พิกัด :/g) || []).length, 1)
+})
+
+test('Follow creative message removes an inline duplicate shortlink and still leads with the pin line', () => {
     const caption = 'ดูเลย https://s.shopee.co.th/x ของดี'
     const msg = buildFollowLaneCreativeMessage({ caption, shortlink: 'https://s.shopee.co.th/x' })
-    assert.equal(msg, caption)
+    assert.equal(msg, '📌 พิกัด : https://s.shopee.co.th/x\nดูเลย ของดี')
     assert.equal((msg.match(/https:\/\/s\.shopee\.co\.th\/x/g) || []).length, 1)
 })
 
 test('Follow creative message handles empty caption / empty shortlink', () => {
-    assert.equal(buildFollowLaneCreativeMessage({ caption: '', shortlink: 'https://x' }), 'https://x')
+    // Empty caption → just the pin line. Empty shortlink → caption untouched (no pin line, nothing to track).
+    assert.equal(buildFollowLaneCreativeMessage({ caption: '', shortlink: 'https://x' }), '📌 พิกัด : https://x')
     assert.equal(buildFollowLaneCreativeMessage({ caption: 'hi', shortlink: '' }), 'hi')
+    assert.ok(!buildFollowLaneCreativeMessage({ caption: 'hi', shortlink: '' }).includes(FOLLOW_LANE_PIN_PREFIX))
 })
 
 test('Follow COMMENT shortlink carries THREE subs: sub1=campaign, sub2=page id, sub3=post tail (default template)', () => {
