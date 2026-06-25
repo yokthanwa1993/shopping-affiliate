@@ -1424,3 +1424,138 @@ test('/token/import-pages is local-only (403 for a non-local request, no token r
   assert.equal(r.status, 403);
   assert.equal(r.body.success, false);
 });
+
+// ── /token/import-pages all-account realtime import (cross-account fallback) ────────────────────
+// account omitted/empty/"all"/"*" OR an explicit `accounts` list scans every Bridge account in real
+// time, dedupes pages by page_id (first account = primary, others = fallback), and on a live import
+// pushes each unique page once — automatically falling back to the next administering account if the
+// primary account's Worker push fails. Token-free in every response.
+
+// Per-account Keychain + FB Lite mocks: each account mints a DISTINCT EAAD6V user token derived from
+// its identifier, so the fetch mock can serve a different me/accounts list per account.
+function perAccountKeychain() {
+  return {
+    retrieveCredential: async (account) => ({ username: String(account), password: 'pw' }),
+    retrieveTotp: async () => { throw new Error('no totp'); },
+    retrieveDatr: async () => { throw new Error('no datr'); }
+  };
+}
+function perAccountFbLite() {
+  return {
+    extractTokenPrefix: realExtractTokenPrefix,
+    facebookLogin: async ({ identifier }) => ({ success: true, converted_token: { access_token: `EAAD6V_${identifier}` } })
+  };
+}
+
+test('/token/import-pages account=all dry run scans two accounts, dedupes a duplicate page_id, reports fallback_accounts (no push)', async () => {
+  let pushCalled = false;
+  await withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    // Two registered Bridge accounts → scanned in all mode.
+    accountsRegistry: { listAccounts: async () => [
+      { account: 'acct1', key: 'acct1' },
+      { account: 'acct2', key: 'acct2' }
+    ] },
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        const token = m ? decodeURIComponent(m[1]) : '';
+        if (token.toLowerCase().endsWith('acct1')) return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '2001', name: 'Shared', access_token: 'PT_A_2001' },
+          { id: '2002', name: 'OnlyA', access_token: 'PT_A_2002' }
+        ] }) };
+        if (token.toLowerCase().endsWith('acct2')) return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '2001', name: 'Shared', access_token: 'PT_B_2001' },
+          { id: '2003', name: 'OnlyB', access_token: 'PT_B_2003' }
+        ] }) };
+        return { ok: true, status: 200, json: async () => ({ data: [] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/import-pages', { account: 'all', namespaceId: ADMIN_NS });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.dryRun, true);
+    assert.equal(r.body.status, 'dry_run_only');
+    assert.equal(r.body.mode, 'all_accounts');
+    assert.equal(r.body.accounts_scanned, 2);
+    assert.equal(r.body.accounts_ok, 2);
+    assert.equal(r.body.accounts_failed, 0);
+    // Three UNIQUE pages: the duplicate page_id 2001 is deduped into a single candidate.
+    assert.equal(r.body.counts.candidates, 3);
+    assert.deepEqual(r.body.candidates.map((c) => c.page_id).sort(), ['2001', '2002', '2003']);
+    const shared = r.body.candidates.find((c) => c.page_id === '2001');
+    assert.equal(shared.primary_account, 'ACCT1', 'first scanned account is primary');
+    assert.deepEqual(shared.fallback_accounts, ['ACCT2'], 'the second admin is a fallback, not a duplicate row');
+    const onlyA = r.body.candidates.find((c) => c.page_id === '2002');
+    assert.deepEqual(onlyA.fallback_accounts, []);
+    assert.equal(pushCalled, false, 'a dry run must never push to the Worker');
+    for (const c of r.body.candidates) assert.equal('access_token' in c, false);
+    assertNoLeak(r.body, ['EAAD6V_acct1', 'EAAD6V_acct2', 'PT_A_2001', 'PT_B_2001', 'PT_A_2002', 'PT_B_2003']);
+  });
+});
+
+test('/token/import-pages live import falls back to the next account when the primary account push fails, imports the shared page once', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const captured = [];
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        const token = m ? decodeURIComponent(m[1]) : '';
+        if (token.toLowerCase().endsWith('acct1')) return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '2001', name: 'Shared', access_token: 'PT_A_2001' },
+          { id: '2002', name: 'OnlyA', access_token: 'PT_A_2002' }
+        ] }) };
+        if (token.toLowerCase().endsWith('acct2')) return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '2001', name: 'Shared', access_token: 'PT_B_2001' },
+          { id: '2003', name: 'OnlyB', access_token: 'PT_B_2003' }
+        ] }) };
+        return { ok: true, status: 200, json: async () => ({ data: [] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) {
+        const body = JSON.parse(opts.body);
+        captured.push(body);
+        // The primary account's token for the shared page is REJECTED → forces a cross-account fallback.
+        if (body.access_token === 'PT_A_2001') return { ok: true, status: 200, json: async () => ({ success: false }) };
+        return { ok: true, status: 200, json: async () => ({ success: true, created: true, staged_inactive: true }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    // Explicit accounts list exercises the verbatim-accounts path.
+    const r = await request('POST', '/token/import-pages', { accounts: ['acct1', 'acct2'], namespaceId: ADMIN_NS, dryRun: false });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.mode, 'all_accounts');
+    assert.equal(r.body.counts.imported, 3, 'three unique pages imported, shared page only once');
+    assert.equal(r.body.counts.errors, 0);
+    assert.equal(r.body.counts.fallback_used, 1, 'exactly the shared page used a fallback account');
+    // The shared page is imported exactly once, via the fallback account.
+    const sharedRows = r.body.results.filter((row) => row.page_id === '2001');
+    assert.equal(sharedRows.length, 1, 'no duplicate page row across the two admins');
+    assert.equal(sharedRows[0].status, 'imported');
+    assert.equal(sharedRows[0].primary_account, 'ACCT1');
+    assert.equal(sharedRows[0].fallback_used, true);
+    assert.equal(sharedRows[0].account, 'ACCT2');
+    assert.equal(sharedRows[0].fallback_account, 'ACCT2');
+    // The Worker saw the primary push (rejected) then the fallback push (accepted) for page 2001.
+    const sharedPushes = captured.filter((b) => b.page_id === '2001');
+    assert.deepEqual(sharedPushes.map((b) => b.access_token), ['PT_A_2001', 'PT_B_2001']);
+    for (const cap of captured) {
+      assert.equal(cap.is_active, 0, 'imported pages must be staged inactive');
+      assert.equal(cap.import_mode, 'facebook_lite_bridge_import');
+      assert.equal(cap.token_source, 'facebook_lite_bridge');
+    }
+    for (const row of r.body.results) assert.equal('access_token' in row, false);
+    assertNoLeak(r.body, ['EAAD6V_acct1', 'EAAD6V_acct2', 'PT_A_2001', 'PT_B_2001', 'PT_A_2002', 'PT_B_2003', SECRET]);
+  }));
+});

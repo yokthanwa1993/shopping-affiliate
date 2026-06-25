@@ -85,6 +85,26 @@ function allowedImportNamespaceIds() {
   return ids;
 }
 
+// Parse a caller-supplied `accounts` value (array, or comma/space separated string) into a deduped
+// list of sanitized DISPLAY ids for the all-account import. Returns null when nothing usable was
+// supplied (the caller then falls back to scanning the local registry). Never returns secrets.
+function parseAccountList(raw) {
+  let items = [];
+  if (Array.isArray(raw)) items = raw;
+  else if (typeof raw === 'string' && raw.trim()) items = raw.split(/[\s,]+/);
+  else return null;
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    let s;
+    try { s = sanitizeAccount(item); } catch { continue; }
+    if (!s.display || seen.has(s.key)) continue;
+    seen.add(s.key);
+    out.push(s.display);
+  }
+  return out.length ? out : null;
+}
+
 // Mint a FRESH Facebook Lite (EAAD6V) USER token straight from the stored Keychain credentials
 // (username/password + optional TOTP + datr), via the FB Lite login → auth.getSessionforApp(FB_LITE)
 // conversion. This is the ONLY success proof for a Facebook Lite account — a CloakBrowser/Power
@@ -948,20 +968,33 @@ function createHandler(deps = {}) {
         const importBody = await parseBody(req);
         const { account, target = 'video-affiliate', workerUrl, dryRun = true } = importBody;
         const ns = String(importBody.namespaceId || importBody.namespace_id || '').trim();
-        if (!account) return sendError(res, 400, 'Missing account');
         if (!ns) return sendError(res, 400, 'Missing namespaceId');
-        const { display } = sanitizeAccount(account);
         const wantDryRun = dryRun !== false;
 
+        // Mode detection. A SPECIFIC account id keeps the original one-account import untouched. The
+        // all-account (realtime cross-account fallback) mode triggers when `account` is omitted/empty/
+        // "all"/"*", OR an explicit `accounts` list is supplied. Explicit accounts are used verbatim
+        // (sanitized); otherwise every Bridge account in the local registry/status list is scanned now.
+        const explicitAccounts = parseAccountList(importBody.accounts);
+        const rawAccount = String(account == null ? '' : account).trim();
+        const allMode = (explicitAccounts && explicitAccounts.length > 0)
+          || rawAccount === '' || rawAccount.toLowerCase() === 'all' || rawAccount === '*';
+
         // Fail closed: only the admin namespace (or an env-allowlisted id) may receive a bulk import.
-        // Every other namespace keeps its existing one-by-one manual add behavior, untouched.
+        // Every other namespace keeps its existing one-by-one manual add behavior, untouched. Enforced
+        // for BOTH the one-account and the all-account modes, BEFORE any token resolution.
         const allowed = allowedImportNamespaceIds();
         if (!allowed.has(ns)) {
           return send(res, 403, {
-            ok: false, status: 'namespace_not_allowed', namespace_id: ns, account: display,
+            ok: false, status: 'namespace_not_allowed', namespace_id: ns,
+            account: allMode ? 'all' : sanitizeAccount(account).display,
             note: 'Bulk import is restricted to the admin namespace. Other namespaces keep manual add.'
           });
         }
+
+        // ── One-account import (UNCHANGED original behavior) ──────────────────────────────────────
+        if (!allMode) {
+        const { display } = sanitizeAccount(account);
 
         // Mint a fresh Facebook Lite (EAAD6V) session and list administered pages WITH page tokens
         // (local-safe). The page access_token stays INTERNAL — it only ever rides in the secret-authed
@@ -1091,6 +1124,200 @@ function createHandler(deps = {}) {
           import_mode: 'facebook_lite_bridge_import',
           ...(lite.prefix ? { token_prefix: lite.prefix } : {}),
           counts, results
+        });
+        } // ── end one-account import ──
+
+        // ── All-account realtime import (NEW) ─────────────────────────────────────────────────────
+        // Resolve which Bridge accounts to scan: an explicit `accounts` list verbatim, otherwise every
+        // FB-Lite-likely account from the local registry/status list (registered / credential / selector
+        // present). Each account is minted + me/accounts-listed in REAL TIME on this single call — there
+        // is no scheduled/background sync.
+        let scanAccounts = explicitAccounts;
+        if (!scanAccounts) {
+          let statuses = [];
+          try { statuses = await listAccountStatuses(kc, selectors, registry); } catch { statuses = []; }
+          const seen = new Set();
+          scanAccounts = [];
+          for (const s of statuses) {
+            if (!s || !s.account || seen.has(s.key)) continue;
+            const likelyLite = s.inRegistry || s.credentialPresent || s.selectorPresent;
+            if (!likelyLite) continue;
+            seen.add(s.key);
+            scanAccounts.push(s.account);
+          }
+        }
+
+        // page_id -> { page_id, page_name, primary_account, fallback_accounts[], tokens[] }
+        // De-dupe key is page_id: the FIRST account that administers a page becomes its PRIMARY; any
+        // other account that also administers it is a FALLBACK (no duplicate page row). The internal
+        // `tokens` pool (primary first, then fallbacks) is NEVER serialized into the response.
+        const pageMap = new Map();
+        const accountResults = [];
+        let accountsOk = 0;
+        let accountsFailed = 0;
+        for (const acct of scanAccounts) {
+          const accDisplay = sanitizeAccount(acct).display;
+          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, acct).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+          if (!lite.ok || !lite.token) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'fb_lite_token_not_ready', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
+            continue;
+          }
+          let listed;
+          try {
+            listed = await posting.listPagesPublic(lite.graphFetch, lite.token, true);
+          } catch (e) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed') });
+            continue;
+          }
+          if (listed && listed.error) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: sanitizePublicReason(listed.error, 'graph_pages_failed') });
+            continue;
+          }
+          const pages = Array.isArray(listed.data) ? listed.data : [];
+          accountsOk += 1;
+          let withToken = 0;
+          for (const p of pages) {
+            const pageId = p && p.id != null ? String(p.id) : '';
+            if (!pageId) continue;
+            const pageName = p && p.name != null ? String(p.name) : '';
+            const pageToken = p && p.access_token ? String(p.access_token) : '';
+            if (pageToken) withToken += 1;
+            if (!pageMap.has(pageId)) {
+              pageMap.set(pageId, { page_id: pageId, page_name: pageName, primary_account: accDisplay, fallback_accounts: [], tokens: [] });
+            }
+            const entry = pageMap.get(pageId);
+            if (!entry.page_name && pageName) entry.page_name = pageName;
+            if (accDisplay !== entry.primary_account && !entry.fallback_accounts.includes(accDisplay)) {
+              entry.fallback_accounts.push(accDisplay);
+            }
+            if (pageToken) entry.tokens.push({ account: accDisplay, token: pageToken });
+          }
+          accountResults.push({ account: accDisplay, ok: true, page_count: pages.length, with_token: withToken, ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
+        }
+
+        const uniquePages = [...pageMap.values()];
+        const candidateView = uniquePages.map((e) => ({
+          page_id: e.page_id, page_name: e.page_name,
+          primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
+          has_token: e.tokens.length > 0
+        }));
+
+        // SAFE default: a dry run lists the deduped candidate pages (primary + fallback accounts) and
+        // the per-account scan outcome, and performs NO Worker/D1 writes. Token-free.
+        if (wantDryRun) {
+          return send(res, 200, {
+            ok: true, dryRun: true, status: 'dry_run_only', mode: 'all_accounts', target,
+            namespace_id: ns, source: 'facebook_lite_eaad6',
+            token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
+            accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
+            accounts: accountResults,
+            counts: {
+              candidates: candidateView.length,
+              with_token: candidateView.filter((c) => c.has_token).length,
+              accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed
+            },
+            candidates: candidateView,
+            note: 'No Cloudflare/D1 writes performed. Duplicate pages across accounts are deduped by page_id (first account = primary, others = fallback). A real import stages each unique page is_active=0 (off).'
+          });
+        }
+
+        // ── Real all-account import: push each UNIQUE page once with its primary account's page token,
+        // automatically falling back to the next account that administers the page if the push fails. ──
+        const syncSecretAll = String(
+          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
+          process.env.TAG_SYNC_PUSH_SECRET ||
+          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
+          ''
+        ).trim();
+        if (!syncSecretAll) {
+          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', mode: 'all_accounts', namespace_id: ns, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed });
+        }
+        const baseAll = String(
+          workerUrl ||
+          process.env.VIDEO_AFFILIATE_WORKER_URL ||
+          process.env.WORKER_URL ||
+          'https://api.pubilo.com'
+        ).trim().replace(/\/+$/, '');
+        const syncUrlAll = `${baseAll}/api/pages/profile-sync`;
+
+        const countsAll = { created: 0, updated: 0, moved: 0, imported: 0, skipped: 0, errors: 0, fallback_used: 0 };
+        const resultsAll = [];
+        for (const e of uniquePages) {
+          if (!e.tokens.length) {
+            countsAll.skipped += 1;
+            resultsAll.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'skipped_no_token' });
+            continue;
+          }
+          let pushed = null;
+          let usedAccount = null;
+          let lastStatus = 0;
+          let unreachable = false;
+          // Try the primary account's page token first, then each fallback account's token in turn.
+          for (const tk of e.tokens) {
+            let workerStatus = 0;
+            let data = {};
+            try {
+              const resp = await fetchImpl(syncUrlAll, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecretAll },
+                body: JSON.stringify({
+                  namespace_id: ns,
+                  page_id: e.page_id,
+                  page_name: e.page_name,
+                  access_token: tk.token,
+                  comment_token: tk.token,
+                  account: tk.account,
+                  token_source: 'facebook_lite_bridge',
+                  is_active: 0,
+                  import_mode: 'facebook_lite_bridge_import'
+                })
+              });
+              workerStatus = Number(resp && resp.status) || 0;
+              try { data = await resp.json(); } catch { data = {}; }
+            } catch (err) {
+              unreachable = true;
+              continue; // automatic fallback to the next account that administers this page
+            }
+            const success = !!(data && data.success === true) && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300));
+            lastStatus = workerStatus;
+            if (success) { pushed = data; usedAccount = tk.account; break; }
+          }
+          if (!pushed) {
+            countsAll.errors += 1;
+            resultsAll.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: unreachable ? 'worker_unreachable' : 'worker_rejected', worker_status: lastStatus, fallback_used: false });
+            continue;
+          }
+          const fallbackUsed = usedAccount !== e.primary_account;
+          countsAll.imported += 1;
+          if (pushed.created) countsAll.created += 1;
+          if (pushed.updated) countsAll.updated += 1;
+          if (pushed.moved) countsAll.moved += 1;
+          if (fallbackUsed) countsAll.fallback_used += 1;
+          resultsAll.push({
+            page_id: e.page_id, page_name: e.page_name,
+            primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
+            account: usedAccount, fallback_used: fallbackUsed,
+            ...(fallbackUsed ? { fallback_account: usedAccount } : {}),
+            status: 'imported',
+            created: !!pushed.created, updated: !!pushed.updated, moved: !!pushed.moved,
+            staged_inactive: pushed.staged_inactive !== false
+          });
+        }
+
+        return send(res, 200, {
+          ok: countsAll.errors === 0,
+          synced: countsAll.imported > 0,
+          status: countsAll.errors === 0 ? 'imported' : 'imported_with_errors',
+          mode: 'all_accounts', target, namespace_id: ns,
+          source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
+          import_mode: 'facebook_lite_bridge_import',
+          accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
+          accounts: accountResults,
+          counts: { ...countsAll, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },
+          results: resultsAll
         });
       }
 
