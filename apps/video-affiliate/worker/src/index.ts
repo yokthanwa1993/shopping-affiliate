@@ -329,6 +329,7 @@ const MAX_VOICE_PROMPT_CHARS = 12000
 const MAX_GEMINI_API_KEY_CHARS = 512
 const MAX_GEMINI_API_KEY_SLOTS = 1
 const MAX_SHORTLINK_BASE_URL_CHARS = 512
+const DEFAULT_FACEBOOK_LITE_BRIDGE_ACCOUNT = '100090320823561'
 const MAX_SHORTLINK_ACCOUNT_CHARS = 64
 const MAX_SHORTLINK_EXPECTED_UTM_ID_CHARS = 32
 const MAX_LAZADA_MEMBER_ID_CHARS = 32
@@ -36091,7 +36092,7 @@ async function publishOrganicViaFacebookLiteBridge(params: {
         throw new Error(`facebook_lite_publish_capability_blocked: no_video_url (${params.reason})${graphSuffix}`)
     }
     const accountHint = String(params.candidateLoginIds?.[0] || '').trim()
-        || (String(params.pageId || '').trim() === '1008898512617594' ? '100090320823561' : '')
+        || (DEFAULT_FACEBOOK_LITE_BRIDGE_ACCOUNT)
     const bridgeLookup = await fetchFacebookLitePageTokenFromBridge({
         env: params.env,
         pageId: params.pageId,
@@ -36207,7 +36208,7 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
         const videoUrl = String(params.videoUrl || '').trim()
         if (videoUrl) {
             const accountHint = String(params.candidateLoginIds?.[0] || '').trim()
-                || (String(params.pageId || '').trim() === '1008898512617594' ? '100090320823561' : '')
+                || (DEFAULT_FACEBOOK_LITE_BRIDGE_ACCOUNT)
             const bridgeLookup = await fetchFacebookLitePageTokenFromBridge({
                 env: params.env,
                 pageId: params.pageId,
@@ -41104,7 +41105,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
         const confirmedCanonicalPostId = String(reelResult.postId || '').trim()
         const confirmedPostId = confirmedCanonicalPostId || fbVideoId
         const facebookLiteBridgeAccount = postingTokenUsed === 'facebook_lite_bridge'
-            ? (String(page.id || '').trim() === '1008898512617594' ? '100090320823561' : '')
+            ? (DEFAULT_FACEBOOK_LITE_BRIDGE_ACCOUNT)
             : ''
         let commentShopeeLink = normalizedShopeeLink
         // Re-shorten with the post id when we intend to comment — either via the stored
