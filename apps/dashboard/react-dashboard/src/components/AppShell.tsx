@@ -28,22 +28,52 @@ type NavItem = {
   exact: boolean
 }
 
-// Mirrors the production Astro sidebar (apps/dashboard/src/layouts/Layout.astro)
-// ordering so every ported /dashboard_next/* route is reachable from the nav,
-// not only via a typed-in deep link. Settings is pinned to the footer, matching
-// the live dashboard.
-const NAV: readonly NavItem[] = [
-  { to: '/', label: 'ภาพรวม', sublabel: 'Overview', icon: LayoutDashboard, exact: true },
-  { to: '/source-inventory', label: 'คลังต้นฉบับ', sublabel: 'Source Inventory', icon: PackageOpen, exact: false },
-  { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Cpu, exact: false },
-  { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Layers, exact: false },
-  { to: '/create-post', label: 'สร้างโพสต์', sublabel: 'Create Post', icon: PenSquare, exact: false },
-  { to: '/create-ads', label: 'สร้างแอด', sublabel: 'Create Ads', icon: Users, exact: false },
-  { to: '/page-posts', label: 'โพสต์เพจ', sublabel: 'Page Posts', icon: Facebook, exact: false },
-  { to: '/custom-link', label: 'คัสตอมลิงก์', sublabel: 'Custom Link', icon: Link2, exact: false },
-  { to: '/campaigns', label: 'แคมเปญ', sublabel: 'Campaigns', icon: Megaphone, exact: false },
-  { to: '/queue', label: 'คิวสร้างแอด', sublabel: 'Queue', icon: Clock, exact: false },
-  { to: '/history', label: 'ประวัติ', sublabel: 'History', icon: MessageSquare, exact: false },
+type NavGroup = {
+  // Shopee groups its sidebar under gray/bold section headers (Offer, Campaign,
+  // Report …). We keep every existing route + label, just clustered to mirror
+  // that visual rhythm. `title: null` renders the group flush (the top
+  // Dashboard entry), matching the screenshot's lead item.
+  title: string | null
+  items: readonly NavItem[]
+}
+
+// Mirrors the production Astro sidebar routes (apps/dashboard/src/layouts/Layout.astro)
+// so every ported /dashboard_next/* route stays reachable from the nav. Same
+// labels as before — only the grouping/skin changed to resemble the Shopee
+// Affiliate dashboard. Settings stays pinned to the footer.
+const NAV_GROUPS: readonly NavGroup[] = [
+  {
+    title: null,
+    items: [{ to: '/', label: 'ภาพรวม', sublabel: 'Dashboard', icon: LayoutDashboard, exact: true }],
+  },
+  {
+    title: 'คอนเทนต์ · Content',
+    items: [
+      { to: '/source-inventory', label: 'คลังต้นฉบับ', sublabel: 'Source Inventory', icon: PackageOpen, exact: false },
+      { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Cpu, exact: false },
+      { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Layers, exact: false },
+    ],
+  },
+  {
+    title: 'เผยแพร่ · Publish',
+    items: [
+      { to: '/create-post', label: 'สร้างโพสต์', sublabel: 'Create Post', icon: PenSquare, exact: false },
+      { to: '/create-ads', label: 'สร้างแอด', sublabel: 'Create Ads', icon: Users, exact: false },
+      { to: '/page-posts', label: 'โพสต์เพจ', sublabel: 'Page Posts', icon: Facebook, exact: false },
+    ],
+  },
+  {
+    title: 'เครื่องมือ · Tools',
+    items: [
+      { to: '/custom-link', label: 'คัสตอมลิงก์', sublabel: 'Custom Link', icon: Link2, exact: false },
+      { to: '/campaigns', label: 'แคมเปญ', sublabel: 'Campaigns', icon: Megaphone, exact: false },
+      { to: '/queue', label: 'คิวสร้างแอด', sublabel: 'Queue', icon: Clock, exact: false },
+    ],
+  },
+  {
+    title: 'กิจกรรม · Activity',
+    items: [{ to: '/history', label: 'ประวัติ', sublabel: 'History', icon: MessageSquare, exact: false }],
+  },
 ] as const
 
 const SETTINGS_NAV: NavItem = {
@@ -54,18 +84,24 @@ const SETTINGS_NAV: NavItem = {
   exact: false,
 }
 
+// Shopee active-row treatment: pale-orange wash, orange text/icon, and a thick
+// orange right rail. Inactive rows are flat dark-gray with a light hover. The
+// icon inherits `currentColor`, so it flips orange together with the label.
 function NavLink({ item }: { item: NavItem }) {
   return (
     <Link
       to={item.to}
       activeOptions={{ exact: item.exact }}
-      className="flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-      activeProps={{ className: 'bg-primary/10 text-foreground font-medium hover:bg-primary/10 hover:text-foreground' }}
+      className="flex items-center gap-2.5 border-r-[3px] border-transparent px-4 py-2 text-[#333333] transition-colors hover:bg-[#f5f5f5]"
+      activeProps={{
+        className:
+          'border-[#ee4d2d] bg-[#fff5f2] text-[#ee4d2d] hover:bg-[#fff5f2]',
+      }}
     >
-      <item.icon className="h-4 w-4 shrink-0" />
+      <item.icon className="h-[18px] w-[18px] shrink-0" />
       <span className="flex flex-col leading-tight">
-        <span className="text-sm font-semibold text-foreground">{item.sublabel}</span>
-        <span className="text-[11px] font-normal text-muted-foreground">{item.label}</span>
+        <span className="text-[13px] font-medium">{item.sublabel}</span>
+        <span className="text-[11px] font-normal text-[#999999]">{item.label}</span>
       </span>
     </Link>
   )
@@ -113,7 +149,7 @@ function WorkspaceSelector() {
         aria-expanded={open}
         aria-label="เลือก workspace"
         onClick={() => setOpen((value) => !value)}
-        className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+        className="flex items-center gap-1.5 rounded-[2px] px-2.5 py-1.5 text-sm font-medium text-[#333333] transition-colors hover:bg-[#f5f5f5]"
       >
         <span>{workspace}</span>
         <ChevronDown className="h-4 w-4 shrink-0" />
@@ -121,7 +157,7 @@ function WorkspaceSelector() {
       {open ? (
         <div
           role="menu"
-          className="absolute right-0 z-20 mt-1 w-36 overflow-hidden rounded-lg border bg-popover p-1 shadow-md"
+          className="absolute right-0 z-20 mt-1 w-36 overflow-hidden rounded-[2px] border bg-popover p-1 shadow-md"
         >
           {workspaces.map((name) => (
             <button
@@ -133,7 +169,7 @@ function WorkspaceSelector() {
                 setWorkspace(name)
                 setOpen(false)
               }}
-              className="flex w-full items-center justify-between rounded-md px-3 py-1.5 text-left text-sm text-foreground transition-colors hover:bg-accent"
+              className="flex w-full items-center justify-between rounded-[2px] px-3 py-1.5 text-left text-sm text-[#333333] transition-colors hover:bg-[#f5f5f5]"
             >
               <span>{name}</span>
               {name === workspace ? <Check className="h-4 w-4 shrink-0" /> : null}
@@ -162,57 +198,75 @@ function AppShellLayout({
   previewMount: boolean
 }) {
   return (
-    <div className="flex h-dvh flex-col overflow-hidden">
-      {/* Full-viewport-width topnav (Shopee-style): spans above the sidebar.
-          Left brand area is sized to the sidebar width so it visually aligns
-          with the nav column underneath it. */}
-      <header className="flex h-16 shrink-0 items-center border-b bg-background/80 px-5 backdrop-blur">
-        <div className="hidden w-64 shrink-0 items-center gap-2 md:flex">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-sm font-bold text-primary-foreground">
+    <div className="flex h-dvh flex-col overflow-hidden bg-[#f5f5f5]">
+      {/* Full-width 56px Shopee-style header: white, thin border, brand pinned
+          to the 200px sidebar column on the left so it aligns with the nav. */}
+      <header className="flex h-14 shrink-0 items-center border-b border-[#ededed] bg-white px-5">
+        <div className="hidden w-[200px] shrink-0 items-center gap-2 md:flex">
+          <div className="flex h-8 w-8 items-center justify-center rounded-[2px] bg-[#ee4d2d] text-sm font-bold text-white">
             P
           </div>
           <div>
-            <div className="text-sm font-semibold leading-tight">PUBILO</div>
-            <div className="text-xs text-foreground">Dashboard</div>
+            <div className="text-sm font-semibold leading-tight text-[#333333]">PUBILO</div>
+            <div className="text-[11px] text-[#999999]">Affiliate Dashboard</div>
           </div>
         </div>
 
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span className="truncate text-sm font-semibold">PUBILO Dashboard</span>
+          <span className="truncate text-sm font-semibold text-[#333333] md:hidden">PUBILO</span>
           {previewMount ? (
             <Badge variant="secondary">preview · /dashboard_next</Badge>
           ) : null}
         </div>
 
-        {/* Right-side topnav controls: language + workspace selector,
-            generously spaced with a vertical divider between them. */}
-        <div className="flex items-center gap-4">
+        {/* Right-side controls: language + workspace selector + Help Center pill,
+            minimal dark text to match the Shopee header. */}
+        <div className="flex items-center gap-3">
           <button
             type="button"
             aria-label="ภาษา"
-            className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+            className="flex items-center gap-1.5 rounded-[2px] px-2.5 py-1.5 text-sm font-medium text-[#333333] transition-colors hover:bg-[#f5f5f5]"
           >
             <span>ไทย</span>
             <ChevronDown className="h-4 w-4 shrink-0" />
           </button>
-          <span aria-hidden="true" className="h-6 w-px bg-border" />
+          <span aria-hidden="true" className="h-5 w-px bg-[#ededed]" />
           <WorkspaceSelector />
+          <span aria-hidden="true" className="h-5 w-px bg-[#ededed]" />
+          <a
+            href="https://api.pubilo.com"
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-[2px] border border-[#ededed] px-2.5 py-1.5 text-xs font-medium text-[#666666] transition-colors hover:border-[#ee4d2d] hover:text-[#ee4d2d]"
+          >
+            Help Center
+          </a>
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-64 shrink-0 flex-col border-r bg-card md:flex">
-          <nav className="flex-1 space-y-1 overflow-y-auto p-3">
-            {NAV.map((item) => (
-              <NavLink key={item.to} item={item} />
+        <aside className="hidden w-[200px] shrink-0 flex-col border-r border-[#ededed] bg-white md:flex">
+          <nav className="flex-1 space-y-3 overflow-y-auto py-3">
+            {NAV_GROUPS.map((group, index) => (
+              <div key={group.title ?? `group-${index}`} className="space-y-0.5">
+                {group.title ? (
+                  <div className="flex items-center justify-between px-4 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-wide text-[#999999]">
+                    <span>{group.title}</span>
+                    <ChevronDown className="h-3 w-3" />
+                  </div>
+                ) : null}
+                {group.items.map((item) => (
+                  <NavLink key={item.to} item={item} />
+                ))}
+              </div>
             ))}
           </nav>
-          <div className="space-y-1 border-t p-3">
+          <div className="border-t border-[#ededed] py-2">
             <NavLink item={SETTINGS_NAV} />
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1 overflow-y-auto p-5">{children}</main>
+        <main className="min-w-0 flex-1 overflow-y-auto bg-[#f5f5f5] p-6">{children}</main>
       </div>
     </div>
   )
