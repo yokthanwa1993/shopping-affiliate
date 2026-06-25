@@ -306,6 +306,110 @@ export function isAdOnlyQueueDue(lastRunIso: string, intervalMinutes: number, no
     return nowMs >= nextAdOnlyRunAtMs(lastRunIso, intervalMinutes, nowMs)
 }
 
+// =====================================================================
+// SCHEDULER JITTER — pure, deterministic helpers that scatter a fixed-interval cadence so runs do NOT
+// land on an exact, predictable minute/second. Meta's automation detection flags lockstep behavior —
+// e.g. 30 ACTIVE adsets created at an exact ~30-minute cadence. The base interval still defines the
+// cadence ("สร้างทุก X นาที"); these add a BOUNDED random offset on top so the real gap is
+// interval + jitter, where jitter ∈ [minJitter, maxJitter]. The offset is computed once and stored as
+// an absolute next-due timestamp (the worker request must NOT sleep) — cron claims it when reached.
+// =====================================================================
+
+// Bounded jitter ADDED to the base interval for the Follow lane cadence. Expressed in MINUTES; the
+// real gap between two Follow runs is interval + a uniform random value in this range. Chosen so the
+// extra spread is meaningful against the 20–30 min default interval yet never multiplies it: a 30-min
+// interval becomes a 32–43 min gap, breaking the exact ~30-min lockstep AND the exact second alignment
+// (the offset is computed in ms, so seconds drift too). The base cadence is preserved.
+export const DEFAULT_FOLLOW_AD_JITTER_MIN_MINUTES = 2
+export const DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES = 13
+export const DEFAULT_FOLLOW_AD_JITTER_MIN_MS = DEFAULT_FOLLOW_AD_JITTER_MIN_MINUTES * 60_000
+export const DEFAULT_FOLLOW_AD_JITTER_MAX_MS = DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES * 60_000
+
+// A uniform random jitter in [minJitterMs, maxJitterMs], rounded to whole ms. Bounds are normalized
+// (negatives clamped to 0, swapped if out of order) so a misconfigured pair never throws or goes
+// negative. rng defaults to Math.random; pass a seeded rng for deterministic tests. A degenerate range
+// (lo == hi) returns lo. Pure.
+export function computeSchedulerJitterMs(
+    minJitterMs: number,
+    maxJitterMs: number,
+    rng: () => number = Math.random,
+): number {
+    const a = Number.isFinite(minJitterMs) ? Math.max(0, minJitterMs) : 0
+    const b = Number.isFinite(maxJitterMs) ? Math.max(0, maxJitterMs) : 0
+    const lo = Math.min(a, b)
+    const hi = Math.max(a, b)
+    if (hi <= lo) return Math.round(lo)
+    const raw = rng()
+    const r = Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0
+    return Math.round(lo + r * (hi - lo))
+}
+
+// Next-due timestamp (ms) = base + interval + bounded jitter. The interval is clamped/defaulted by the
+// shared cadence helper, so the result is ALWAYS within [base + interval + minJitter, base + interval +
+// maxJitter]. `baseMs` is the anchor — last_run_at when advancing a normal cadence, or now when
+// re-scheduling immediately after a run. A non-finite base is treated as 0 so callers stay total. Pure
+// + deterministic given a seeded rng.
+export function computeJitteredNextRunAtMs(input: {
+    baseMs: number
+    intervalMinutes: number
+    minJitterMs?: number
+    maxJitterMs?: number
+    rng?: () => number
+}): number {
+    const interval = clampAdOnlyIntervalMinutes(input.intervalMinutes)
+    const minJ = Number.isFinite(input.minJitterMs as number) ? (input.minJitterMs as number) : DEFAULT_FOLLOW_AD_JITTER_MIN_MS
+    const maxJ = Number.isFinite(input.maxJitterMs as number) ? (input.maxJitterMs as number) : DEFAULT_FOLLOW_AD_JITTER_MAX_MS
+    const base = Number.isFinite(input.baseMs) ? input.baseMs : 0
+    return base + interval * 60_000 + computeSchedulerJitterMs(minJ, maxJ, input.rng)
+}
+
+// The jittered scheduler gate decision, pure so the whole "is it due, and what do I persist" rule is
+// unit-testable without D1/cron. Inputs are already-parsed epoch ms (NaN ⇒ unset). Behavior:
+//   - A valid stored next-due in the FUTURE ⇒ not due yet (reason 'jitter_pending'); persist nothing.
+//   - A valid stored next-due in the PAST/now ⇒ DUE; persist nothing here (the caller re-schedules the
+//     NEXT due from `now` AFTER the run completes, so the cadence keeps moving even if the run is slow).
+//   - No valid stored next-due ⇒ derive one from (last_run | now) + interval + jitter:
+//       · already reached ⇒ DUE (persist nothing; caller re-schedules post-run);
+//       · still in the future ⇒ not due, and persist the derived timestamp so subsequent ticks gate on
+//         it instead of re-rolling the jitter every minute.
+// `persistNextRun` true means the caller should write `nextRunAtMs` to the next-due setting now.
+export interface FollowAdScheduleDecision {
+    due: boolean
+    reason: 'jitter_pending' | 'due'
+    nextRunAtMs: number
+    persistNextRun: boolean
+}
+
+export function decideJitteredScheduleRun(input: {
+    nowMs: number
+    lastRunMs: number
+    storedNextRunMs: number
+    intervalMinutes: number
+    minJitterMs?: number
+    maxJitterMs?: number
+    rng?: () => number
+}): FollowAdScheduleDecision {
+    const { nowMs } = input
+    if (Number.isFinite(input.storedNextRunMs)) {
+        if (nowMs >= input.storedNextRunMs) {
+            return { due: true, reason: 'due', nextRunAtMs: 0, persistNextRun: false }
+        }
+        return { due: false, reason: 'jitter_pending', nextRunAtMs: input.storedNextRunMs, persistNextRun: false }
+    }
+    const base = Number.isFinite(input.lastRunMs) ? input.lastRunMs : nowMs
+    const candidate = computeJitteredNextRunAtMs({
+        baseMs: base,
+        intervalMinutes: input.intervalMinutes,
+        minJitterMs: input.minJitterMs,
+        maxJitterMs: input.maxJitterMs,
+        rng: input.rng,
+    })
+    if (nowMs >= candidate) {
+        return { due: true, reason: 'due', nextRunAtMs: 0, persistNextRun: false }
+    }
+    return { due: false, reason: 'jitter_pending', nextRunAtMs: candidate, persistNextRun: true }
+}
+
 // A queued ad-only row as stored in dashboard_ad_only_queue. Mirrors the create-ad-only input but is
 // flat/string-typed the way D1 returns it. daily_budget_thb / run_hours are stored as text and may be
 // empty ('' = use endpoint default).

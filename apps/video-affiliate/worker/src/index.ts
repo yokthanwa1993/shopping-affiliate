@@ -157,6 +157,10 @@ import {
     clampAdOnlyIntervalMinutes,
     isAdOnlyQueueDue,
     nextAdOnlyRunAtMs,
+    decideJitteredScheduleRun,
+    computeJitteredNextRunAtMs,
+    DEFAULT_FOLLOW_AD_JITTER_MIN_MINUTES,
+    DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES,
     DEFAULT_AD_ONLY_INTERVAL_MINUTES,
     type AdOnlyAutoCandidate,
     type AdOnlyHistoryIdRow,
@@ -13977,6 +13981,16 @@ const FOLLOW_AD_SCHED_ENABLED_KEY = 'follow_ad_scheduler_enabled'
 const FOLLOW_AD_SCHED_INTERVAL_KEY = 'follow_ad_interval_minutes'
 const FOLLOW_AD_SCHED_LAST_RUN_KEY = 'follow_ad_last_run_at'
 const FOLLOW_AD_SCHED_MODE_KEY = 'follow_ad_mode'
+// Absolute, jittered next-due timestamp (ISO). Stored so the cadence never lands on an exact fixed
+// minute/second — the worker request never sleeps; cron claims this slot once now >= it. Cleared at the
+// run so the post-run re-schedule writes a fresh jittered slot. See decideJitteredScheduleRun.
+const FOLLOW_AD_SCHED_NEXT_RUN_KEY = 'follow_ad_next_run_at'
+
+// Parse a stored ISO/empty next-due setting to epoch ms, or NaN when unset/unparseable (⇒ the
+// scheduler derives a fresh jittered slot). Pure-ish wrapper over Date.parse.
+function parseFollowAdNextRunMs(raw: unknown): number {
+    return Date.parse(String(raw ?? '').trim())
+}
 
 // Cadence (minutes), clamped/defaulted by the SAME helper as the ad-only queue (1–1440, default 20).
 async function getFollowAdIntervalMinutes(db: D1Database): Promise<number> {
@@ -14004,13 +14018,22 @@ app.get('/api/dashboard/follow-ad/status', async (c) => {
     const interval = await getFollowAdIntervalMinutes(c.env.DB)
     const mode = await getFollowAdMode(c.env.DB)
     const lastRun = await getDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY).catch(() => null)
-    const nextRunMs = enabled ? nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now()) : 0
+    const storedNext = await getDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY).catch(() => null)
+    // Prefer the stored jittered next-due (the real, scattered slot cron will claim). Fall back to the
+    // plain interval estimate only when no jittered slot is persisted yet. GET never mutates — it does
+    // not roll/store a new jitter, so polling the status can't shift the cadence.
+    const storedNextMs = parseFollowAdNextRunMs(storedNext?.value)
+    const nextRunMs = !enabled
+        ? 0
+        : (Number.isFinite(storedNextMs) ? storedNextMs : nextAdOnlyRunAtMs(String(lastRun?.value || ''), interval, Date.now()))
     return c.json({
         ok: true,
         lane: 'follow',
         scheduler_enabled: enabled,
         interval_minutes: interval,
         mode,
+        jitter_min_minutes: DEFAULT_FOLLOW_AD_JITTER_MIN_MINUTES,
+        jitter_max_minutes: DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES,
         template_adset: FOLLOW_LANE_TEMPLATE_ADSET,
         campaign_sub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
         cta_type: FOLLOW_LANE_CTA_TYPE,
@@ -14041,6 +14064,9 @@ app.put('/api/dashboard/follow-ad/interval', async (c) => {
     const body = await c.req.json().catch(() => ({})) as { interval_minutes?: number | string }
     const interval = clampAdOnlyIntervalMinutes(body.interval_minutes)
     await setDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_INTERVAL_KEY, String(interval))
+    // Clear the jittered next-due so the new interval takes effect immediately: the next cron tick
+    // re-derives a fresh jittered slot from the updated cadence instead of honoring the old one.
+    await setDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY, '').catch(() => null)
     return c.json({ ok: true, interval_minutes: interval }, 200)
 })
 
@@ -14118,20 +14144,43 @@ app.post('/api/dashboard/follow-ad/run-next', async (c) => {
 })
 
 // Cron entrypoint — create AT MOST ONE Follow ad per operator-set interval, ONLY when the Follow
-// scheduler is enabled. Claims the cadence slot (sets last_run) BEFORE creating so a slow create can't
-// be double-claimed by the next minute's tick. Never throws (cron must not be derailed).
+// scheduler is enabled. The cadence is JITTERED: instead of firing on an exact last_run + interval
+// boundary (the lockstep pattern Meta flags as automated), the due time is interval + a bounded random
+// offset, stored as an absolute slot (follow_ad_next_run_at) that cron claims once reached. The worker
+// request never sleeps — it just reads/derives/stores the timestamp. Claims the cadence slot (sets
+// last_run) BEFORE creating so a slow create can't be double-claimed by the next minute's tick, and
+// RE-SCHEDULES the next jittered slot from "now" after the run so the gap stays ≈ interval, never exact.
+// Never throws (cron must not be derailed).
 async function maybeProcessFollowAdOnSchedule(env: Env): Promise<{ ran: boolean; reason?: string }> {
     try {
         const enabled = await isFollowAdSchedulerEnabled(env.DB)
         if (!enabled) return { ran: false, reason: 'scheduler_disabled' }
         const interval = await getFollowAdIntervalMinutes(env.DB)
+        const nowMs = Date.now()
         const lastRun = await getDashboardSetting(env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY).catch(() => null)
-        if (!isAdOnlyQueueDue(String(lastRun?.value || ''), interval, Date.now())) {
-            return { ran: false, reason: 'interval_not_elapsed' }
+        const storedNext = await getDashboardSetting(env.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY).catch(() => null)
+        const decision = decideJitteredScheduleRun({
+            nowMs,
+            lastRunMs: Date.parse(String(lastRun?.value || '')),
+            storedNextRunMs: parseFollowAdNextRunMs(storedNext?.value),
+            intervalMinutes: interval,
+            rng: makeSeededRng(nowMs),
+        })
+        if (!decision.due) {
+            // First time we derive a jittered slot we persist it, so subsequent ticks gate on the SAME
+            // scattered timestamp instead of re-rolling the jitter (and drifting) every minute.
+            if (decision.persistNextRun) {
+                await setDashboardSetting(env.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY, new Date(decision.nextRunAtMs).toISOString()).catch(() => null)
+            }
+            return { ran: false, reason: 'jitter_pending' }
         }
-        await setDashboardSetting(env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY, new Date().toISOString()).catch(() => null)
+        // Claim the slot: stamp last_run now and pre-arm the NEXT jittered due time from now, so a slow
+        // create can't be double-claimed and the following gap is interval + fresh jitter (not exact).
+        await setDashboardSetting(env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY, new Date(nowMs).toISOString()).catch(() => null)
+        const nextRunMs = computeJitteredNextRunAtMs({ baseMs: nowMs, intervalMinutes: interval, rng: makeSeededRng(nowMs ^ 0x9e3779b9) })
+        await setDashboardSetting(env.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY, new Date(nextRunMs).toISOString()).catch(() => null)
         const res = await processOneFollowAd(env)
-        console.log(`[FOLLOW-AD] ok=${res.ok}${res.attempted ? ` attempted=${res.attempted}` : ''}${res.failedPages?.length ? ` failed_pages=${res.failedPages.join(',')}` : ''} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''}`)
+        console.log(`[FOLLOW-AD] ok=${res.ok}${res.attempted ? ` attempted=${res.attempted}` : ''}${res.failedPages?.length ? ` failed_pages=${res.failedPages.join(',')}` : ''} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''} next_run_at=${new Date(nextRunMs).toISOString()}`)
         return { ran: res.reason !== 'no_eligible_candidate', reason: res.reason }
     } catch (e) {
         console.error(`[FOLLOW-AD] ${e instanceof Error ? e.message : String(e)}`)

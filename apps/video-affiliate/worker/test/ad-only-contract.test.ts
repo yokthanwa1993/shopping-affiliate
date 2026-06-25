@@ -33,6 +33,15 @@ import {
     AUTO_ADS_DEFAULT_ENABLED_PAGE_ID,
     isAdFlowEnabledForPage,
     filterCreateAdsEnabledPageIds,
+    computeSchedulerJitterMs,
+    computeJitteredNextRunAtMs,
+    decideJitteredScheduleRun,
+    DEFAULT_FOLLOW_AD_JITTER_MIN_MINUTES,
+    DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES,
+    DEFAULT_FOLLOW_AD_JITTER_MIN_MS,
+    DEFAULT_FOLLOW_AD_JITTER_MAX_MS,
+    DEFAULT_AD_ONLY_INTERVAL_MINUTES,
+    makeSeededRng,
 } from '../src/ad-only-contract.js'
 import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
 import {
@@ -980,4 +989,187 @@ test('Follow lane scheduler exposes scheduler_enabled + interval + run-next and 
     assert.match(source, /row\?\.value \?\? '0'/)
     // Follow scheduler create body routes through the SAME create-ad-only endpoint with a follow body.
     assert.match(source, /buildFollowAutoPickBody\(\{/)
+})
+
+// =====================================================================
+// SCHEDULER JITTER — anti-automation-pattern pacing for the Follow lane.
+// =====================================================================
+
+test('computeSchedulerJitterMs stays within the bounds and is deterministic for a fixed rng', () => {
+    // r in [0,1] maps linearly into [lo, hi].
+    assert.equal(computeSchedulerJitterMs(1000, 5000, () => 0), 1000)
+    assert.equal(computeSchedulerJitterMs(1000, 5000, () => 1), 5000)
+    assert.equal(computeSchedulerJitterMs(1000, 5000, () => 0.5), 3000)
+    // Out-of-[0,1] / NaN rng output is clamped, never escaping the bounds.
+    assert.equal(computeSchedulerJitterMs(1000, 5000, () => 2), 5000)
+    assert.equal(computeSchedulerJitterMs(1000, 5000, () => -1), 1000)
+    assert.equal(computeSchedulerJitterMs(1000, 5000, () => NaN), 1000)
+    // Swapped / negative bounds are normalized; degenerate range returns lo.
+    assert.equal(computeSchedulerJitterMs(5000, 1000, () => 0), 1000)
+    assert.equal(computeSchedulerJitterMs(-50, -10, () => 0.5), 0)
+    assert.equal(computeSchedulerJitterMs(2000, 2000, () => 0.5), 2000)
+})
+
+test('computeSchedulerJitterMs default Follow bounds give sub-interval, second-level spread', () => {
+    // The default jitter window is meaningfully smaller than the 20-min default interval (so the base
+    // cadence still dominates) but large enough to break the exact ~30-min lockstep.
+    assert.ok(DEFAULT_FOLLOW_AD_JITTER_MIN_MS > 0)
+    assert.ok(DEFAULT_FOLLOW_AD_JITTER_MAX_MS > DEFAULT_FOLLOW_AD_JITTER_MIN_MS)
+    assert.equal(DEFAULT_FOLLOW_AD_JITTER_MIN_MS, DEFAULT_FOLLOW_AD_JITTER_MIN_MINUTES * 60_000)
+    assert.equal(DEFAULT_FOLLOW_AD_JITTER_MAX_MS, DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES * 60_000)
+    assert.ok(DEFAULT_FOLLOW_AD_JITTER_MAX_MINUTES < DEFAULT_AD_ONLY_INTERVAL_MINUTES)
+})
+
+test('computeJitteredNextRunAtMs is always within [base+interval+minJitter, base+interval+maxJitter]', () => {
+    const base = 1_700_000_000_000
+    const interval = 30 // minutes
+    const intervalMs = interval * 60_000
+    const lo = base + intervalMs + DEFAULT_FOLLOW_AD_JITTER_MIN_MS
+    const hi = base + intervalMs + DEFAULT_FOLLOW_AD_JITTER_MAX_MS
+    // Exhaustively probe a spread of rng outputs; every result lands inside the inclusive bound, and is
+    // STRICTLY greater than the plain base+interval (so the run never fires on the exact boundary).
+    for (let i = 0; i <= 20; i++) {
+        const r = i / 20
+        const next = computeJitteredNextRunAtMs({ baseMs: base, intervalMinutes: interval, rng: () => r })
+        assert.ok(next >= lo, `next ${next} >= lo ${lo} at r=${r}`)
+        assert.ok(next <= hi, `next ${next} <= hi ${hi} at r=${r}`)
+        assert.ok(next > base + intervalMs, `jittered next ${next} must exceed exact base+interval at r=${r}`)
+    }
+    // The interval is clamped/defaulted by the shared helper (0 → default), so a bad interval never
+    // collapses the offset to the exact boundary.
+    const defaulted = computeJitteredNextRunAtMs({ baseMs: base, intervalMinutes: 0, rng: () => 0 })
+    assert.equal(defaulted, base + DEFAULT_AD_ONLY_INTERVAL_MINUTES * 60_000 + DEFAULT_FOLLOW_AD_JITTER_MIN_MS)
+    // Explicit jitter bounds override the defaults.
+    const custom = computeJitteredNextRunAtMs({ baseMs: base, intervalMinutes: interval, minJitterMs: 0, maxJitterMs: 0, rng: () => 0.5 })
+    assert.equal(custom, base + intervalMs)
+})
+
+test('decideJitteredScheduleRun: a stored future slot is jitter_pending and never re-rolled', () => {
+    const now = 1_700_000_000_000
+    const d = decideJitteredScheduleRun({
+        nowMs: now,
+        lastRunMs: now - 60_000,
+        storedNextRunMs: now + 5 * 60_000, // 5 min in the future
+        intervalMinutes: 30,
+        rng: () => 0.42,
+    })
+    assert.equal(d.due, false)
+    assert.equal(d.reason, 'jitter_pending')
+    assert.equal(d.persistNextRun, false) // a valid stored slot is honored as-is, not rewritten
+    assert.equal(d.nextRunAtMs, now + 5 * 60_000)
+})
+
+test('decideJitteredScheduleRun: a stored past slot is due, and leaves re-scheduling to the caller', () => {
+    const now = 1_700_000_000_000
+    const d = decideJitteredScheduleRun({
+        nowMs: now,
+        lastRunMs: now - 60 * 60_000,
+        storedNextRunMs: now - 1000, // already reached
+        intervalMinutes: 30,
+        rng: () => 0.42,
+    })
+    assert.equal(d.due, true)
+    assert.equal(d.reason, 'due')
+    assert.equal(d.persistNextRun, false)
+})
+
+test('decideJitteredScheduleRun: no stored slot derives + persists a future jittered slot when not yet due', () => {
+    const now = 1_700_000_000_000
+    const lastRun = now - 60_000 // 1 min ago, interval 30 min ⇒ not due for ~29+ min
+    const d = decideJitteredScheduleRun({
+        nowMs: now,
+        lastRunMs: lastRun,
+        storedNextRunMs: NaN, // unset
+        intervalMinutes: 30,
+        rng: () => 0.5,
+    })
+    assert.equal(d.due, false)
+    assert.equal(d.reason, 'jitter_pending')
+    assert.equal(d.persistNextRun, true) // first derivation is persisted so later ticks don't re-roll
+    // The derived slot equals the pure next-run helper for the same inputs and is in the future.
+    const expected = computeJitteredNextRunAtMs({ baseMs: lastRun, intervalMinutes: 30, rng: () => 0.5 })
+    assert.equal(d.nextRunAtMs, expected)
+    assert.ok(d.nextRunAtMs > now)
+})
+
+test('decideJitteredScheduleRun: no stored slot and last_run long ago is due now (run, then re-schedule)', () => {
+    const now = 1_700_000_000_000
+    const d = decideJitteredScheduleRun({
+        nowMs: now,
+        lastRunMs: now - 5 * 60 * 60_000, // 5h ago ≫ interval + max jitter
+        storedNextRunMs: NaN,
+        intervalMinutes: 30,
+        rng: () => 0.9,
+    })
+    assert.equal(d.due, true)
+    assert.equal(d.reason, 'due')
+    assert.equal(d.persistNextRun, false)
+})
+
+test('decideJitteredScheduleRun: never-ran (no last_run, no stored slot) anchors jitter from now, not the epoch', () => {
+    const now = 1_700_000_000_000
+    const d = decideJitteredScheduleRun({
+        nowMs: now,
+        lastRunMs: NaN, // never ran
+        storedNextRunMs: NaN,
+        intervalMinutes: 30,
+        rng: () => 0,
+    })
+    // Anchored at now ⇒ first slot is now + interval + jitter (not due immediately), and persisted.
+    assert.equal(d.due, false)
+    assert.equal(d.persistNextRun, true)
+    assert.equal(d.nextRunAtMs, computeJitteredNextRunAtMs({ baseMs: now, intervalMinutes: 30, rng: () => 0 }))
+})
+
+test('Follow scheduler is jittered: gate + persistence wiring (source guard)', () => {
+    const source = getIndexSource()
+    const start = source.indexOf('async function maybeProcessFollowAdOnSchedule')
+    assert.notEqual(start, -1, 'maybeProcessFollowAdOnSchedule must exist')
+    const fn = source.slice(start, start + 2500)
+    // Uses the pure jittered decision, NOT the bare exact-interval gate.
+    assert.match(fn, /decideJitteredScheduleRun\(\{/)
+    assert.doesNotMatch(fn, /isAdOnlyQueueDue\(/) // the exact-boundary gate is no longer the Follow gate
+    // Persists a derived future slot when not yet due, so jitter isn't re-rolled every tick.
+    assert.match(fn, /decision\.persistNextRun/)
+    // Pre-arms the NEXT jittered slot from now after claiming, via the pure helper.
+    assert.match(fn, /computeJitteredNextRunAtMs\(\{ baseMs: nowMs/)
+    assert.match(fn, /FOLLOW_AD_SCHED_NEXT_RUN_KEY/)
+    // Still seeds the rng from the wall clock (deterministic tests inject a seed; runtime varies it).
+    assert.match(fn, /makeSeededRng\(/)
+})
+
+// Slice a single Hono route handler: from its `app.<verb>('<path>'` opener to the start of the NEXT
+// top-level declaration (another route, a function, or a section banner), so an assertion can't bleed
+// into an adjacent handler/function.
+function sliceRoute(source: string, opener: string): string {
+    const start = source.indexOf(opener)
+    assert.notEqual(start, -1, `${opener} must exist`)
+    const after = start + opener.length
+    const ends = ['\napp.', '\nasync function ', '\nfunction ', '\n// ====']
+        .map((m) => source.indexOf(m, after))
+        .filter((i) => i !== -1)
+    const end = ends.length ? Math.min(...ends) : Math.min(source.length, start + 4000)
+    return source.slice(start, end)
+}
+
+test('Follow status endpoint reports the stored jittered slot and does NOT mutate on GET', () => {
+    const route = sliceRoute(getIndexSource(), "app.get('/api/dashboard/follow-ad/status'")
+    // Reads the stored jittered next-due and prefers it over the plain interval estimate.
+    assert.match(route, /FOLLOW_AD_SCHED_NEXT_RUN_KEY/)
+    assert.match(route, /Number\.isFinite\(storedNextMs\)/)
+    // GET must not write the next-run setting (no mutation on read).
+    assert.doesNotMatch(route, /setDashboardSetting/)
+})
+
+test('Follow interval change clears the stale jittered slot so the new cadence applies', () => {
+    const route = sliceRoute(getIndexSource(), "app.put('/api/dashboard/follow-ad/interval'")
+    assert.match(route, /setDashboardSetting\(c\.env\.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY, ''\)/)
+})
+
+test('Manual Follow run-next stays immediate (no jitter gate)', () => {
+    const route = sliceRoute(getIndexSource(), "app.post('/api/dashboard/follow-ad/run-next'")
+    // Calls processOneFollowAd directly, bypassing any jitter/interval gate.
+    assert.match(route, /processOneFollowAd\(c\.env\)/)
+    assert.doesNotMatch(route, /decideJitteredScheduleRun/)
+    assert.doesNotMatch(route, /computeJitteredNextRunAtMs/)
 })
