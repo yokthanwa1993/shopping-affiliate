@@ -30,6 +30,9 @@ import {
     FOLLOW_LANE_COMMENT_BODY_LINES,
     AUTO_ADS_ALLOWED_PAGE_IDS,
     filterAutoAdsAllowedPageIds,
+    AUTO_ADS_DEFAULT_ENABLED_PAGE_ID,
+    isAdFlowEnabledForPage,
+    filterCreateAdsEnabledPageIds,
 } from '../src/ad-only-contract.js'
 import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
 import {
@@ -621,6 +624,70 @@ test('filterAutoAdsAllowedPageIds fails closed when the allowlist is empty', () 
 test('filterAutoAdsAllowedPageIds honors a custom allowlist, preserving input order and de-duping', () => {
     const out = filterAutoAdsAllowedPageIds(['c', 'a', 'b', 'a', 'z'], ['a', 'b', 'c'])
     assert.deepEqual(out, ['c', 'a', 'b'])
+})
+
+// =====================================================================
+// CREATE ADS ENABLED STATE (operator-toggleable per-page ad_flow_enabled)
+// =====================================================================
+
+const CHEARB = '1008898512617594'
+
+test('AUTO_ADS_DEFAULT_ENABLED_PAGE_ID is เฉียบ and matches the allowlist single page', () => {
+    assert.equal(AUTO_ADS_DEFAULT_ENABLED_PAGE_ID, CHEARB)
+    assert.deepEqual([...AUTO_ADS_ALLOWED_PAGE_IDS], [AUTO_ADS_DEFAULT_ENABLED_PAGE_ID])
+})
+
+test('isAdFlowEnabledForPage default (unset) enables ONLY เฉียบ, disables every other page', () => {
+    // No explicit setting → default rule: Chearb on, others off (preserves current production).
+    assert.equal(isAdFlowEnabledForPage(CHEARB, ''), true)
+    assert.equal(isAdFlowEnabledForPage(CHEARB, null), true)
+    assert.equal(isAdFlowEnabledForPage(CHEARB, undefined), true)
+    assert.equal(isAdFlowEnabledForPage('999', ''), false)
+    assert.equal(isAdFlowEnabledForPage('123456789', undefined), false)
+})
+
+test('isAdFlowEnabledForPage explicit off disables เฉียบ; explicit on enables another page', () => {
+    // Persisted OFF turns even the default page off.
+    for (const off of ['0', 'false', 'off', 'no', 'disabled']) {
+        assert.equal(isAdFlowEnabledForPage(CHEARB, off), false, `off value ${off}`)
+    }
+    // Persisted ON turns a non-default page on.
+    for (const on of ['1', 'true', 'on', 'yes', 'enabled']) {
+        assert.equal(isAdFlowEnabledForPage('999', on), true, `on value ${on}`)
+    }
+})
+
+test('filterCreateAdsEnabledPageIds default state is exactly เฉียบ among the held pages', () => {
+    // All 8 held pages, none with an explicit setting → only Chearb is in scope.
+    const held = [CHEARB, '111', '222', '333', '444', '555', '666', '777']
+    const out = filterCreateAdsEnabledPageIds(held.map((pageId) => ({ pageId, adFlowEnabled: '' })))
+    assert.deepEqual(out, [CHEARB])
+})
+
+test('filterCreateAdsEnabledPageIds excludes disabled pages and includes explicitly-enabled ones', () => {
+    const out = filterCreateAdsEnabledPageIds([
+        { pageId: CHEARB, adFlowEnabled: '0' }, // เฉียบ turned OFF → excluded
+        { pageId: '111', adFlowEnabled: '1' },  // another page turned ON → included
+        { pageId: '222', adFlowEnabled: '' },   // unset, not the default page → excluded
+        { pageId: '333', adFlowEnabled: 'on' }, // included
+    ])
+    assert.deepEqual(out, ['111', '333'])
+})
+
+test('filterCreateAdsEnabledPageIds fails closed (empty) when no page is enabled, and is null/empty safe', () => {
+    assert.deepEqual(filterCreateAdsEnabledPageIds([{ pageId: CHEARB, adFlowEnabled: '0' }]), [])
+    assert.deepEqual(filterCreateAdsEnabledPageIds([]), [])
+    assert.deepEqual(filterCreateAdsEnabledPageIds(null), [])
+    assert.deepEqual(filterCreateAdsEnabledPageIds(undefined), [])
+})
+
+test('filterCreateAdsEnabledPageIds preserves input order and de-dupes by page id', () => {
+    const out = filterCreateAdsEnabledPageIds([
+        { pageId: '333', adFlowEnabled: '1' },
+        { pageId: CHEARB, adFlowEnabled: '' }, // default-on
+        { pageId: '333', adFlowEnabled: '1' }, // duplicate → dropped
+    ])
+    assert.deepEqual(out, ['333', CHEARB])
 })
 
 // =====================================================================

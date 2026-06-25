@@ -379,6 +379,11 @@ export const AUTO_ADS_ALLOWED_PAGE_IDS: readonly string[] = ['1008898512617594']
 // Used by the empty-queue auto-pick scheduler to bound its candidate pages to the pages allowed to run
 // unattended ads. An empty allowlist yields [] (fail closed — never auto-spend on an unlisted page).
 // Pure: the caller passes the allowlist (defaults to AUTO_ADS_ALLOWED_PAGE_IDS).
+//
+// NOTE: the live scheduler now scopes itself with the OPERATOR-TOGGLEABLE per-page state via
+// filterCreateAdsEnabledPageIds below (persisted `ad_flow_enabled`) instead of this compile-time
+// allowlist. This helper is kept for the fail-closed default scope (AUTO_ADS_DEFAULT_ENABLED_PAGE_ID
+// equals the single allowlisted page) and its tests.
 export function filterAutoAdsAllowedPageIds(
     pageIds: ReadonlyArray<string> | null | undefined,
     allowed: ReadonlyArray<string> = AUTO_ADS_ALLOWED_PAGE_IDS,
@@ -390,6 +395,61 @@ export function filterAutoAdsAllowedPageIds(
     for (const raw of pageIds || []) {
         const id = str(raw)
         if (!id || seen.has(id) || !allow.has(id)) continue
+        seen.add(id)
+        out.push(id)
+    }
+    return out
+}
+
+// CREATE ADS ENABLED STATE (operator-toggleable) — the per-page Create Ads auto status the dashboard
+// toggle persists as the page setting `ad_flow_enabled`. This is the SCOPE the empty-queue auto-pick
+// scheduler now follows for deciding which pages it may auto-create for: a page is in scope when its
+// operator toggle resolves ON. To PRESERVE current production when NO explicit setting exists yet,
+// exactly the default page (เฉียบ) is treated as enabled and every other held page disabled — so with
+// nothing toggled the unattended scheduler stays scoped to เฉียบ alone, matching the old allowlist.
+export const AUTO_ADS_DEFAULT_ENABLED_PAGE_ID = '1008898512617594'
+
+// Parse the raw ad_flow_enabled setting value (D1 text). Returns true for on-ish, false for off-ish,
+// and null when UNSET ('' / null / undefined) so the caller can apply the default-page rule. Empty-safe.
+function parseAdFlowEnabledRaw(raw: unknown): boolean | null {
+    const s = str(raw).toLowerCase()
+    if (!s) return null
+    if (['1', 'true', 'on', 'yes', 'enabled'].includes(s)) return true
+    if (['0', 'false', 'off', 'no', 'disabled'].includes(s)) return false
+    return null
+}
+
+// Resolve whether Create Ads auto is ENABLED for one page from its persisted ad_flow_enabled value:
+//   - an explicit on/off value wins (even the default page can be deliberately turned OFF);
+//   - an UNSET value falls back to the default rule — only `defaultEnabledPageId` (เฉียบ) is enabled,
+//     every other page disabled. Pure; the caller reads the setting.
+export function isAdFlowEnabledForPage(
+    pageId: string,
+    rawSetting: unknown,
+    defaultEnabledPageId: string = AUTO_ADS_DEFAULT_ENABLED_PAGE_ID,
+): boolean {
+    const parsed = parseAdFlowEnabledRaw(rawSetting)
+    if (parsed !== null) return parsed
+    const def = str(defaultEnabledPageId)
+    return !!def && str(pageId) === def
+}
+
+// Keep only the page ids whose Create Ads toggle resolves ON (via isAdFlowEnabledForPage), preserving
+// input order and de-duplicating. Replaces the compile-time allowlist in the empty-queue auto-pick
+// scheduler so the unattended cadence follows the operator's persisted per-page toggle. Each entry
+// carries the page's raw ad_flow_enabled value ('' when unset → default-page rule applies). Fail-closed:
+// with no enabled page the result is [] (the scheduler never auto-spends). Pure.
+export function filterCreateAdsEnabledPageIds(
+    entries: ReadonlyArray<{ pageId: string; adFlowEnabled?: unknown }> | null | undefined,
+    defaultEnabledPageId: string = AUTO_ADS_DEFAULT_ENABLED_PAGE_ID,
+): string[] {
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const e of entries || []) {
+        if (!e) continue
+        const id = str(e.pageId)
+        if (!id || seen.has(id)) continue
+        if (!isAdFlowEnabledForPage(id, e.adFlowEnabled, defaultEnabledPageId)) continue
         seen.add(id)
         out.push(id)
     }

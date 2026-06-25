@@ -99,18 +99,25 @@ function PageActiveToggle({
   active,
   pending,
   onChange,
+  onLabel = 'ปิดการโพสต์เพจนี้',
+  offLabel = 'เปิดการโพสต์เพจนี้',
 }: {
   active: boolean
   pending: boolean
   onChange: (next: boolean) => void
+  /** aria/title shown when the page is currently ON (action = turn off). */
+  onLabel?: string
+  /** aria/title shown when the page is currently OFF (action = turn on). */
+  offLabel?: string
 }) {
+  const label = active ? onLabel : offLabel
   return (
     <button
       type="button"
       role="switch"
       aria-checked={active}
-      aria-label={active ? 'ปิดการโพสต์เพจนี้' : 'เปิดการโพสต์เพจนี้'}
-      title={active ? 'ปิดการโพสต์เพจนี้' : 'เปิดการโพสต์เพจนี้'}
+      aria-label={label}
+      title={label}
       disabled={pending}
       onClick={(e) => {
         // Never let the toggle select/open the row.
@@ -152,6 +159,8 @@ function PageTableRow({
   onToggleActive,
   togglePending,
   gateInactive,
+  toggleOnLabel,
+  toggleOffLabel,
 }: {
   page: SettingsPage
   selected: boolean
@@ -160,6 +169,8 @@ function PageTableRow({
   onToggleActive?: (page: SettingsPage, active: boolean) => void
   togglePending?: boolean
   gateInactive?: boolean
+  toggleOnLabel?: string
+  toggleOffLabel?: string
 }) {
   const toggleEnabled = !!onToggleActive
   // Rows are active-gated when a toggle is wired (Create Post) OR when the caller
@@ -244,6 +255,8 @@ function PageTableRow({
             active={page.active}
             pending={!!togglePending}
             onChange={(next) => onToggleActive!(page, next)}
+            onLabel={toggleOnLabel}
+            offLabel={toggleOffLabel}
           />
         </td>
       )}
@@ -279,6 +292,9 @@ export function PagePicker({
   onToggleActive,
   pendingToggleId = null,
   gateInactive = false,
+  toggleColumnLabel = 'การโพสต์',
+  toggleOnLabel,
+  toggleOffLabel,
 }: {
   pages: SettingsPage[]
   selectedId: string | null
@@ -313,6 +329,14 @@ export function PagePicker({
    *  Post's off behavior, but no on/off switch is rendered. Create Ads uses this to
    *  reflect the Create Ads auto status (only the allowlisted page is openable). */
   gateInactive?: boolean
+  /** Header label for the inline toggle column (`onToggleActive` mode). Defaults to
+   *  the Create Post wording ('การโพสต์'); Create Ads passes 'สร้างแอด'. */
+  toggleColumnLabel?: string
+  /** aria/title for the row toggle when the page is ON (action = turn off). Defaults
+   *  to the Create Post posting wording; Create Ads overrides to reference สร้างแอด. */
+  toggleOnLabel?: string
+  /** aria/title for the row toggle when the page is OFF (action = turn on). */
+  toggleOffLabel?: string
 }) {
   const [query, setQuery] = useState('')
   const filtered = useMemo(() => {
@@ -393,6 +417,8 @@ export function PagePicker({
           onToggleActive={onToggleActive}
           togglePending={pendingToggleId === page.id}
           gateInactive={gateInactive}
+          toggleOnLabel={toggleOnLabel}
+          toggleOffLabel={toggleOffLabel}
         />
         ))
       footer = `แสดง 1 ถึง ${filtered.length} จาก ${pages.length} เพจ`
@@ -419,7 +445,7 @@ export function PagePicker({
                 <th scope="col" className="px-4 py-2.5 font-medium">สถานะ</th>
                 <th scope="col" className="px-4 py-2.5 font-medium">Token</th>
                 {onToggleActive ? (
-                  <th scope="col" className="px-4 py-2.5 font-medium">การโพสต์</th>
+                  <th scope="col" className="px-4 py-2.5 font-medium">{toggleColumnLabel}</th>
                 ) : null}
                 <th scope="col" className="px-4 py-2.5 text-right font-medium">
                   <span className="sr-only">การจัดการ</span>

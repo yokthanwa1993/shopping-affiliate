@@ -161,7 +161,7 @@ import {
     type AdOnlyAutoCandidate,
     type AdOnlyHistoryIdRow,
     AD_ONLY_AUTO_MIN_VIEWS,
-    filterAutoAdsAllowedPageIds,
+    filterCreateAdsEnabledPageIds,
     buildAdOnlyUsedIdSetForBangkokDate,
     rankAdOnlyAutoCandidatesRandom,
     makeSeededRng,
@@ -10688,6 +10688,32 @@ app.put('/api/dashboard/settings', async (c) => {
     return c.json(result, 200, { 'Cache-Control': 'no-store' })
 })
 
+// Narrow read-only status map for the Create Ads master list: returns ONLY each page's persisted
+// Create Ads auto state (`ad_flow_enabled`) and its resolved enabled boolean — NEVER the full settings
+// blob, so no token-like field (facebook_sync_token, etc.) is ever read or exposed for this list. The
+// dashboard calls this once with the bounded held-page id list instead of one full /settings GET per
+// page. Reads via the SAME getPageSetting + isAdFlowEnabledForPage the empty-queue auto-pick scheduler
+// uses, so the master-list toggle state and the scheduler scope always agree. Default rule: page
+// 1008898512617594 (เฉียบ / AUTO_ADS_DEFAULT_ENABLED_PAGE_ID) ON when unset, every other page OFF when
+// unset; an explicit on/off value wins. Input is trimmed, de-duped and bounded to 50 ids.
+const CREATE_ADS_ENABLED_MAX_PAGE_IDS = 50
+app.get('/api/dashboard/create-ads-enabled', async (c) => {
+    const seen = new Set<string>()
+    const pageIds: string[] = []
+    for (const raw of String(c.req.query('page_ids') || '').split(',')) {
+        const id = raw.trim()
+        if (!id || seen.has(id)) continue
+        seen.add(id)
+        pageIds.push(id)
+        if (pageIds.length >= CREATE_ADS_ENABLED_MAX_PAGE_IDS) break
+    }
+    const pages = await Promise.all(pageIds.map(async (pageId) => {
+        const adFlowEnabled = String((await getPageSetting(c.env.DB, pageId, 'ad_flow_enabled').catch(() => null))?.value || '').trim()
+        return { page_id: pageId, ad_flow_enabled: adFlowEnabled, enabled: isAdFlowEnabledForPage(pageId, adFlowEnabled) }
+    }))
+    return c.json({ ok: true, pages }, 200, { 'Cache-Control': 'no-store' })
+})
+
 app.post('/api/dashboard/facebook-page-videos/sync', async (c) => {
     const body = await c.req.json().catch(() => ({})) as {
         page_id?: string
@@ -13751,11 +13777,18 @@ async function autoPickAdOnlyCandidates(env: Env): Promise<AdOnlyAutoCandidate[]
          ORDER BY page_id LIMIT ?`
     ).bind(AD_ONLY_AUTO_MIN_VIEWS, AD_ONLY_AUTO_MAX_PAGES).all().catch(() => ({ results: [] as Array<{ page_id?: string }> })) as { results?: Array<{ page_id?: string }> }
     const eligiblePageIds = (pageRows.results || []).map((r) => String(r.page_id || '').trim()).filter(Boolean)
-    // SAFETY: the unattended empty-queue auto-pick may only auto-create ads for the auto-ads allowlist
-    // (current production: exactly เฉียบ / 1008898512617594), so the scheduler never silently spends on
-    // the other account pages. Manual Create Ads + explicitly-queued rows are NOT routed through here and
-    // remain unrestricted for any selected page.
-    const pageIds = filterAutoAdsAllowedPageIds(eligiblePageIds)
+    // SCOPE: the unattended empty-queue auto-pick may only auto-create ads for pages whose OPERATOR
+    // Create Ads toggle (persisted per-page `ad_flow_enabled`, edited from the Create Ads master list)
+    // resolves ON. To preserve current production when nothing has been toggled, the default page
+    // (เฉียบ / AUTO_ADS_DEFAULT_ENABLED_PAGE_ID) is enabled and every other page disabled. Manual Create
+    // Ads + explicitly-queued rows are NOT routed through here and remain unrestricted for any selected
+    // page. Fail-closed: no enabled page → []. getPageSetting is the SAME read the dashboard GET uses, so
+    // the master-list toggle state and the scheduler scope always agree.
+    const flagEntries = await Promise.all(eligiblePageIds.map(async (pageId) => ({
+        pageId,
+        adFlowEnabled: String((await getPageSetting(env.DB, pageId, 'ad_flow_enabled').catch(() => null))?.value || ''),
+    })))
+    const pageIds = filterCreateAdsEnabledPageIds(flagEntries)
     if (!pageIds.length) return []
 
     // Temporary per-page cooldown: pages whose recent ad-only create failed with a permission/config

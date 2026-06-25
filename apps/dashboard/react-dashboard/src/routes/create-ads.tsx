@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, Check, Copy, ExternalLink, Info } from 'lucide-react'
 import { fetchGallery } from '@/api/gallery'
 import { fetchPageVideos } from '@/api/pagePosts'
 import {
+  CREATE_ADS_DEFAULT_ENABLED_PAGE_ID,
   EMPTY_FORM,
+  fetchCreateAdsEnabledMap,
   fetchPageSettings,
   fetchSettingsPages,
   savePageSettings,
+  updatePageAdFlowEnabled,
   type SettingsPage,
 } from '@/api/settings'
 import {
@@ -43,14 +46,6 @@ import { Button } from '@/components/ui/button'
 // then creates/promotes the ad from that new story. Submit goes only through the
 // dedicated Worker endpoint (api/createAds.ts → POST /api/dashboard/create-ad-only)
 // and the proof panel/history read from dashboard_ad_history.
-
-// The ONLY page that is "on" for the Create Ads auto context in production. The
-// empty-queue auto-pick scheduler (worker AUTO_ADS_ALLOWED_PAGE_IDS) may only
-// auto-create ads for this page (เฉียบ), so the master list mirrors that: only
-// this page shows active/open for Create Ads; every other held page is greyed
-// off and not clickable. This is presentation only — it does NOT change a page's
-// real posting active state (Create Post is untouched).
-const AUTO_ADS_ACTIVE_PAGE_ID = '1008898512617594'
 
 function SectionLabel({ step, title, hint }: { step: number; title: string; hint?: string }) {
   return (
@@ -163,6 +158,7 @@ export function CreateAdsPage() {
   // Master-detail: no page is auto-selected. The operator must pick a page from
   // the scalable list first; only then does the Create Ads detail screen come alive.
   const [selectedId, setSelectedId] = useState<string>('')
+  const queryClient = useQueryClient()
 
   const pagesQuery = useQuery({
     queryKey: ['settings-pages'],
@@ -171,16 +167,50 @@ export function CreateAdsPage() {
   const pages = pagesQuery.data ?? ([] as SettingsPage[])
   const selectedPage = pages.find((p) => p.id === selectedId) ?? null
 
-  // Master list still shows ALL held account pages, but `active` is overridden to
-  // the Create Ads auto status (only AUTO_ADS_ACTIVE_PAGE_ID is on) so the status
-  // column + row enabledness reflect Create Ads — not normal posting state. With
-  // PagePicker's `gateInactive`, every other page renders grey and is not
-  // clickable, never implying auto ads are enabled for it. Mapping here keeps
-  // Create Post (which passes the unmapped pages) completely unchanged.
-  const adPages = useMemo(
-    () => pages.map((p) => ({ ...p, active: p.id === AUTO_ADS_ACTIVE_PAGE_ID })),
-    [pages],
-  )
+  // Per-page Create Ads enabled state — the persisted `ad_flow_enabled` toggle, fetched for the held
+  // pages (bounded; 8 today, token fields never pulled). Default rule: เฉียบ on, every other page off,
+  // until the operator toggles. Keyed by the page-id set so it refetches if the held pages change.
+  const pageIds = pages.map((p) => p.id)
+  const adFlagsKey = ['create-ads-flags', pageIds.join(',')] as const
+  const adFlagsQuery = useQuery({
+    queryKey: adFlagsKey,
+    queryFn: ({ signal }) => fetchCreateAdsEnabledMap(pageIds, signal),
+    enabled: pageIds.length > 0,
+  })
+
+  // Toggle the Create Ads AUTO status for a page — persists ONLY `ad_flow_enabled` (never normal
+  // posting is_active, never any other setting). Optimistic so the row greys/ungreys AND re-sorts
+  // instantly; reconciled against the server (rolled back on error, invalidated on settle).
+  const toggleAdFlow = useMutation({
+    mutationFn: ({ pageId, enabled }: { pageId: string; enabled: boolean }) =>
+      updatePageAdFlowEnabled(pageId, enabled),
+    onMutate: async ({ pageId, enabled }) => {
+      await queryClient.cancelQueries({ queryKey: adFlagsKey })
+      const previous = queryClient.getQueryData<Record<string, boolean>>(adFlagsKey)
+      queryClient.setQueryData<Record<string, boolean>>(adFlagsKey, (old) => ({
+        ...(old ?? {}),
+        [pageId]: enabled,
+      }))
+      return { previous }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) queryClient.setQueryData(adFlagsKey, context.previous)
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['create-ads-flags'] })
+    },
+  })
+
+  // Master list shows ALL held account pages, but `active` is the Create Ads AUTO status (persisted
+  // ad_flow_enabled, default-on only for เฉียบ) — NOT normal posting state. Enabled pages sort to the
+  // TOP (stable within each group). With the inline toggle wired, an off page renders grey/locked but
+  // its switch stays usable to turn it back on. Mapping here keeps Create Post (unmapped pages) unchanged.
+  const adPages = useMemo(() => {
+    const flags = adFlagsQuery.data ?? {}
+    return pages
+      .map((p) => ({ ...p, active: flags[p.id] ?? p.id === CREATE_ADS_DEFAULT_ENABLED_PAGE_ID }))
+      .sort((a, b) => Number(b.active) - Number(a.active))
+  }, [pages, adFlagsQuery.data])
 
   if (selectedPage) {
     // DETAIL — Create Ads settings scoped to the chosen page, with a back affordance
@@ -213,9 +243,13 @@ export function CreateAdsPage() {
             searchable
             layout="table"
             fill
-            gateInactive
             title="เลือกเพจสำหรับสร้างแอด"
             actionLabel="เปิดหน้าตั้งค่าแอด"
+            onToggleActive={(p, active) => toggleAdFlow.mutate({ pageId: p.id, enabled: active })}
+            pendingToggleId={toggleAdFlow.isPending ? toggleAdFlow.variables?.pageId ?? null : null}
+            toggleColumnLabel="สร้างแอด"
+            toggleOnLabel="ปิดการสร้างแอดอัตโนมัติของเพจนี้"
+            toggleOffLabel="เปิดการสร้างแอดอัตโนมัติของเพจนี้"
           />
         </div>
       </section>

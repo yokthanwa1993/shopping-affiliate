@@ -183,3 +183,59 @@ export async function updatePageActive(pageId: string, active: boolean): Promise
     { method: 'PUT', timeoutMs: 15_000, body: { is_active: active } },
   )
 }
+
+// ─── Create Ads auto status (per-page toggle) ──────────────────────────────
+// The Create Ads master-list toggle controls a page's Create Ads AUTO status only — the persisted
+// per-page setting `ad_flow_enabled`. This is independent of normal Page posting (updatePageActive /
+// is_active above): turning Create Ads off here never stops a page from posting, and vice versa.
+
+// The only page treated as Create-Ads-ON when no explicit ad_flow_enabled setting exists yet. Mirrors
+// the worker's AUTO_ADS_DEFAULT_ENABLED_PAGE_ID so the master list's default state matches what the
+// unattended auto-pick scheduler actually does (เฉียบ on, every other held page off).
+export const CREATE_ADS_DEFAULT_ENABLED_PAGE_ID = '1008898512617594'
+
+// Resolve a page's Create Ads enabled state from its raw ad_flow_enabled value. An explicit on/off
+// value wins; an UNSET value defaults to ON only for the default page (เฉียบ) and OFF for every other
+// page — preserving current production until the operator toggles something. Mirrors the worker's
+// isAdFlowEnabledForPage so the UI and the scheduler agree.
+export function resolveCreateAdsEnabled(pageId: string, rawAdFlowEnabled: string | null | undefined): boolean {
+  const s = String(rawAdFlowEnabled ?? '').trim().toLowerCase()
+  if (s === '1' || s === 'true' || s === 'on' || s === 'yes' || s === 'enabled') return true
+  if (s === '0' || s === 'false' || s === 'off' || s === 'no' || s === 'disabled') return false
+  return pageId === CREATE_ADS_DEFAULT_ENABLED_PAGE_ID
+}
+
+// Fetch the per-page Create Ads enabled map for a BOUNDED list of pages (the held pages — 8 today).
+// Reads each page's ad_flow_enabled via the existing settings GET (token fields are never pulled into
+// this map), then applies the default rule. A failed read falls back to the default rule so the master
+// list still renders. Returns { [pageId]: boolean }.
+export async function fetchCreateAdsEnabledMap(
+  pageIds: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, boolean>> {
+  const entries = await Promise.all(
+    pageIds.map(async (pageId) => {
+      try {
+        const data = await workerFetchJson<SettingsResponse>(
+          `/api/dashboard/settings?page_id=${encodeURIComponent(pageId)}`,
+          { signal, timeoutMs: 15_000 },
+        )
+        return [pageId, resolveCreateAdsEnabled(pageId, String(data.ad_flow_enabled || ''))] as const
+      } catch {
+        return [pageId, resolveCreateAdsEnabled(pageId, '')] as const
+      }
+    }),
+  )
+  return Object.fromEntries(entries)
+}
+
+// Persist ONLY the Create Ads toggle (ad_flow_enabled) for a page. Sends a minimal PUT body —
+// page_id + ad_flow_enabled — so flipping the switch can NEVER clobber other page settings (the worker
+// writes only the keys present in the body). Distinct from updatePageActive (normal posting); this
+// toggles the Create Ads auto status alone.
+export async function updatePageAdFlowEnabled(pageId: string, enabled: boolean): Promise<void> {
+  await workerFetchJson<SettingsResponse>(
+    `/api/dashboard/settings?page_id=${encodeURIComponent(pageId)}`,
+    { method: 'PUT', timeoutMs: 15_000, body: { page_id: pageId, ad_flow_enabled: enabled ? '1' : '0' } },
+  )
+}
