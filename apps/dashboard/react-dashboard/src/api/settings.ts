@@ -206,27 +206,40 @@ export function resolveCreateAdsEnabled(pageId: string, rawAdFlowEnabled: string
 }
 
 // Fetch the per-page Create Ads enabled map for a BOUNDED list of pages (the held pages — 8 today).
-// Reads each page's ad_flow_enabled via the existing settings GET (token fields are never pulled into
-// this map), then applies the default rule. A failed read falls back to the default rule so the master
-// list still renders. Returns { [pageId]: boolean }.
+// Calls the narrow read-only Worker endpoint /api/dashboard/create-ads-enabled ONCE — that endpoint
+// returns ONLY each page's ad_flow_enabled + resolved `enabled`, so no Facebook token field is ever
+// pulled into the browser for this status map (unlike the full /settings GET). A failed read — or a
+// page the worker omitted — falls back to the local default rule so the master list still renders.
+// Returns { [pageId]: boolean }.
 export async function fetchCreateAdsEnabledMap(
   pageIds: string[],
   signal?: AbortSignal,
 ): Promise<Record<string, boolean>> {
-  const entries = await Promise.all(
-    pageIds.map(async (pageId) => {
-      try {
-        const data = await workerFetchJson<SettingsResponse>(
-          `/api/dashboard/settings?page_id=${encodeURIComponent(pageId)}`,
-          { signal, timeoutMs: 15_000 },
-        )
-        return [pageId, resolveCreateAdsEnabled(pageId, String(data.ad_flow_enabled || ''))] as const
-      } catch {
-        return [pageId, resolveCreateAdsEnabled(pageId, '')] as const
-      }
-    }),
-  )
-  return Object.fromEntries(entries)
+  const wanted = pageIds.map((id) => id.trim()).filter(Boolean)
+  const map: Record<string, boolean> = {}
+  try {
+    const data = await workerFetchJson<{
+      ok?: boolean
+      pages?: Array<{ page_id?: string; ad_flow_enabled?: string; enabled?: boolean }>
+    }>(
+      `/api/dashboard/create-ads-enabled?page_ids=${encodeURIComponent(wanted.join(','))}`,
+      { signal, timeoutMs: 15_000 },
+    )
+    for (const p of data.pages || []) {
+      const id = String(p?.page_id || '').trim()
+      if (!id) continue
+      // Trust the worker's resolved boolean when present; otherwise re-derive from the raw value with
+      // the same default rule so the UI and scheduler stay in agreement.
+      map[id] = typeof p?.enabled === 'boolean' ? p.enabled : resolveCreateAdsEnabled(id, String(p?.ad_flow_enabled || ''))
+    }
+  } catch {
+    // Read failure — leave the map empty so every page falls back to the local default below.
+  }
+  // Backfill any page the worker did not return (read failure, omitted id) with the local default rule.
+  for (const id of wanted) {
+    if (!(id in map)) map[id] = resolveCreateAdsEnabled(id, '')
+  }
+  return map
 }
 
 // Persist ONLY the Create Ads toggle (ad_flow_enabled) for a page. Sends a minimal PUT body —

@@ -162,6 +162,7 @@ import {
     type AdOnlyHistoryIdRow,
     AD_ONLY_AUTO_MIN_VIEWS,
     filterCreateAdsEnabledPageIds,
+    isAdFlowEnabledForPage,
     buildAdOnlyUsedIdSetForBangkokDate,
     rankAdOnlyAutoCandidatesRandom,
     makeSeededRng,
