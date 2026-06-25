@@ -30,6 +30,11 @@ const DEFAULT_PORT = 8820;
 // Do NOT silently fall back to the retired pre-SALES template adset 120244361318490263.
 const DEFAULT_TEMPLATE_ADSET = '120248134990230263';
 const POST_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT || 'content_paiya';
+// Admin/user namespace that may receive a Facebook Lite bridge BULK page import (Thanwa's
+// namespace). The bulk /token/import-pages endpoint is fail-closed: it imports ONLY into this
+// namespace (plus any explicitly env-allowlisted ids). Other namespaces keep their existing
+// one-by-one manual add behavior — they are never touched by the bulk importer.
+const ADMIN_IMPORT_NAMESPACE_ID = process.env.FACEBOOK_TOKEN_CLOAK_IMPORT_NAMESPACE || '61550488976801';
 const POST_AD_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_POST_AD_ACCOUNT || 'act_1148837732288721';
 const ADS_AD_ACCOUNT = process.env.FACEBOOK_TOKEN_CLOAK_AD_ACCOUNT || 'act_1030797047648459';
 const TEMPLATE_ADSET = process.env.FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET || DEFAULT_TEMPLATE_ADSET;
@@ -63,6 +68,21 @@ function wantsFacebookLiteBridge(account, body = {}) {
 
 async function optionalSecret(fn) {
   try { return await fn(); } catch { return null; }
+}
+
+// The set of namespace ids the bulk Facebook Lite page importer is allowed to write into. Always
+// includes the admin namespace (ADMIN_IMPORT_NAMESPACE_ID); an operator may widen it via the
+// FACEBOOK_TOKEN_CLOAK_IMPORT_NAMESPACE_ALLOWLIST env (comma/space separated). Any namespace NOT
+// in this set is rejected (fail-closed) so the bulk path can never affect other tenants.
+function allowedImportNamespaceIds() {
+  const ids = new Set();
+  const admin = String(ADMIN_IMPORT_NAMESPACE_ID || '').trim();
+  if (admin) ids.add(admin);
+  for (const raw of String(process.env.FACEBOOK_TOKEN_CLOAK_IMPORT_NAMESPACE_ALLOWLIST || '').split(/[\s,]+/)) {
+    const id = String(raw || '').trim();
+    if (id) ids.add(id);
+  }
+  return ids;
 }
 
 // Mint a FRESH Facebook Lite (EAAD6V) USER token straight from the stored Keychain credentials
@@ -914,6 +934,163 @@ function createHandler(deps = {}) {
           ...(resolved.prefix ? { token_prefix: resolved.prefix } : {}),
           worker_status: workerStatus,
           profile_sync_success: profileSyncSuccess
+        });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/token/import-pages') {
+        // Admin-only BULK page import. Lists every page the Facebook Lite account administers
+        // (me/accounts — the SAME semantics as GET /pages?facebook_lite=1) and stages each into ONE
+        // namespace's token pool through the Worker's secret-authed /api/pages/profile-sync, marked
+        // is_active=0 + import_mode=facebook_lite_bridge_import so the operator activates them later.
+        // Fail-closed to the admin namespace allowlist; local-only (it resolves Keychain creds and
+        // page tokens); dry-run by default; token-free in EVERY response (no raw token ever returned).
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Bulk page import is local-only');
+        const importBody = await parseBody(req);
+        const { account, target = 'video-affiliate', workerUrl, dryRun = true } = importBody;
+        const ns = String(importBody.namespaceId || importBody.namespace_id || '').trim();
+        if (!account) return sendError(res, 400, 'Missing account');
+        if (!ns) return sendError(res, 400, 'Missing namespaceId');
+        const { display } = sanitizeAccount(account);
+        const wantDryRun = dryRun !== false;
+
+        // Fail closed: only the admin namespace (or an env-allowlisted id) may receive a bulk import.
+        // Every other namespace keeps its existing one-by-one manual add behavior, untouched.
+        const allowed = allowedImportNamespaceIds();
+        if (!allowed.has(ns)) {
+          return send(res, 403, {
+            ok: false, status: 'namespace_not_allowed', namespace_id: ns, account: display,
+            note: 'Bulk import is restricted to the admin namespace. Other namespaces keep manual add.'
+          });
+        }
+
+        // Mint a fresh Facebook Lite (EAAD6V) session and list administered pages WITH page tokens
+        // (local-safe). The page access_token stays INTERNAL — it only ever rides in the secret-authed
+        // profile-sync body below, never in this endpoint's response.
+        const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+        if (!lite.ok || !lite.token) {
+          return send(res, 200, {
+            ok: false, status: 'fb_lite_token_not_ready', namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
+            error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'),
+            ...(lite.prefix ? { token_prefix: lite.prefix } : {})
+          });
+        }
+        let listed;
+        try {
+          listed = await posting.listPagesPublic(lite.graphFetch, lite.token, true);
+        } catch (e) {
+          return send(res, 200, {
+            ok: false, status: 'graph_pages_failed', namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
+            error: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed')
+          });
+        }
+        if (listed && listed.error) {
+          return send(res, 200, {
+            ok: false, status: 'graph_pages_failed', namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
+            error: sanitizePublicReason(listed.error, 'graph_pages_failed')
+          });
+        }
+        const pages = Array.isArray(listed.data) ? listed.data : [];
+        // Token-free candidate view: id/name/has_token only (access_token is NEVER surfaced).
+        const candidates = pages.map((p) => ({
+          page_id: p && p.id != null ? String(p.id) : null,
+          page_name: p && p.name != null ? String(p.name) : '',
+          has_token: !!(p && p.access_token)
+        }));
+
+        // SAFE default: a dry run lists the candidate pages + statuses and performs NO sync.
+        if (wantDryRun) {
+          return send(res, 200, {
+            ok: true, dryRun: true, status: 'dry_run_only', target,
+            namespace_id: ns, account: display, source: 'facebook_lite_eaad6',
+            token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
+            ...(lite.prefix ? { token_prefix: lite.prefix } : {}),
+            counts: { candidates: candidates.length, with_token: candidates.filter((c) => c.has_token).length },
+            candidates,
+            note: 'No Cloudflare/D1 writes performed. A real import stages each page is_active=0 (off) for the operator to activate later.'
+          });
+        }
+
+        // ── Real bulk import: push each page-scoped token through the secret-authed profile-sync ──
+        const syncSecret = String(
+          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
+          process.env.TAG_SYNC_PUSH_SECRET ||
+          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
+          ''
+        ).trim();
+        if (!syncSecret) {
+          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', namespace_id: ns, account: display });
+        }
+        const base = String(
+          workerUrl ||
+          process.env.VIDEO_AFFILIATE_WORKER_URL ||
+          process.env.WORKER_URL ||
+          'https://api.pubilo.com'
+        ).trim().replace(/\/+$/, '');
+        const syncUrl = `${base}/api/pages/profile-sync`;
+
+        const counts = { created: 0, updated: 0, moved: 0, imported: 0, skipped: 0, errors: 0 };
+        const results = [];
+        for (const p of pages) {
+          const pageId = p && p.id != null ? String(p.id) : '';
+          const pageName = p && p.name != null ? String(p.name) : '';
+          const pageToken = p && p.access_token ? String(p.access_token) : '';
+          if (!pageId || !pageToken) {
+            counts.skipped += 1;
+            results.push({ page_id: pageId || null, page_name: pageName, status: 'skipped_no_token' });
+            continue;
+          }
+          let workerStatus = 0;
+          let data = {};
+          try {
+            const resp = await fetchImpl(syncUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecret },
+              body: JSON.stringify({
+                namespace_id: ns,
+                page_id: pageId,
+                page_name: pageName,
+                access_token: pageToken,
+                comment_token: pageToken,
+                account: display,
+                token_source: 'facebook_lite_bridge',
+                // Stage imported pages OFF; the operator turns them on later.
+                is_active: 0,
+                import_mode: 'facebook_lite_bridge_import'
+              })
+            });
+            workerStatus = Number(resp && resp.status) || 0;
+            try { data = await resp.json(); } catch { data = {}; }
+          } catch (e) {
+            counts.errors += 1;
+            results.push({ page_id: pageId, page_name: pageName, status: 'worker_unreachable', reason: sanitizePublicReason((e && (e.code || e.message)) || 'worker_unreachable', 'worker_unreachable') });
+            continue;
+          }
+          const success = !!(data && data.success === true) && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300));
+          if (!success) {
+            counts.errors += 1;
+            results.push({ page_id: pageId, page_name: pageName, status: 'worker_rejected', worker_status: workerStatus });
+            continue;
+          }
+          counts.imported += 1;
+          if (data.created) counts.created += 1;
+          if (data.updated) counts.updated += 1;
+          if (data.moved) counts.moved += 1;
+          results.push({
+            page_id: pageId, page_name: pageName, status: 'imported',
+            created: !!data.created, updated: !!data.updated, moved: !!data.moved,
+            staged_inactive: data.staged_inactive !== false
+          });
+        }
+
+        return send(res, 200, {
+          ok: counts.errors === 0,
+          synced: counts.imported > 0,
+          status: counts.errors === 0 ? 'imported' : 'imported_with_errors',
+          target, namespace_id: ns, account: display,
+          source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
+          import_mode: 'facebook_lite_bridge_import',
+          ...(lite.prefix ? { token_prefix: lite.prefix } : {}),
+          counts, results
         });
       }
 

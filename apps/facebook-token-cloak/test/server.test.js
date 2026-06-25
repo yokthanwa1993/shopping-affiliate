@@ -1262,3 +1262,165 @@ test('/token/export sanitizes graph failure reasons and console output', async (
     ]);
   }));
 });
+
+// ── /token/import-pages admin-only Facebook Lite BULK import ───────────────────────────────────
+// Lists every page the Facebook Lite account administers (me/accounts) and stages each into ONE
+// admin namespace's token pool via the secret-authed profile-sync, marked is_active=0 +
+// import_mode=facebook_lite_bridge_import. Fail-closed to the admin namespace; local-only; dry-run
+// by default; token-free in every response.
+
+const ADMIN_NS = '61550488976801';
+
+test('/token/import-pages dry run (default) lists candidate pages for the admin namespace, pushes nothing, token-free', async () => {
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const LITE_PAGE_TOKEN_A = 'EAAD6VpageA000000000000000000';
+  const LITE_PAGE_TOKEN_B = 'EAAD6VpageB000000000000000000';
+  let pushCalled = false;
+  let meAccountsToken = null;
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        meAccountsToken = m ? decodeURIComponent(m[1]) : null;
+        return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '1001', name: 'Page A', access_token: LITE_PAGE_TOKEN_A },
+          { id: '1002', name: 'Page B', access_token: LITE_PAGE_TOKEN_B }
+        ] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/import-pages', { account: '100090320823561', namespaceId: ADMIN_NS });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.dryRun, true);
+    assert.equal(r.body.status, 'dry_run_only');
+    assert.equal(r.body.namespace_id, ADMIN_NS);
+    assert.equal(r.body.import_mode, 'facebook_lite_bridge_import');
+    assert.equal(r.body.token_source, 'facebook_lite_bridge');
+    assert.equal(r.body.counts.candidates, 2);
+    assert.equal(r.body.counts.with_token, 2);
+    assert.deepEqual(r.body.candidates.map((c) => c.page_id).sort(), ['1001', '1002']);
+    // me/accounts was resolved with the freshly minted EAAD6V token; nothing was pushed.
+    assert.equal(meAccountsToken, LITE_USER_TOKEN);
+    assert.equal(pushCalled, false, 'a dry run must never push to the Worker');
+    // Token-free: no page tokens surface anywhere in the response.
+    for (const c of r.body.candidates) assert.equal('access_token' in c, false);
+    assertNoLeak(r.body, [LITE_USER_TOKEN, LITE_PAGE_TOKEN_A, LITE_PAGE_TOKEN_B]);
+  });
+});
+
+test('/token/import-pages refuses a non-admin namespace (403, fail-closed), resolves no token and pushes nothing', async () => {
+  let pushCalled = false;
+  let liteResolved = false;
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: 'EAAD6Vuser0000000000000000000' }),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) liteResolved = true;
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/import-pages', { account: '100090320823561', namespaceId: '999999999999', dryRun: false });
+    assert.equal(r.status, 403);
+    assert.equal(r.body.status, 'namespace_not_allowed');
+    assert.equal(r.body.namespace_id, '999999999999');
+    assert.equal(pushCalled, false, 'a refused namespace must never push');
+    assert.equal(liteResolved, false, 'a refused namespace must short-circuit before resolving any token');
+  });
+});
+
+test('/token/import-pages live import stages every page is_active=0 + import_mode marker via the secret-authed profile-sync, token-free', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const PAGE_TOKEN_A = 'EAAD6VpageA000000000000000000';
+  const PAGE_TOKEN_B = 'EAAD6VpageB000000000000000000';
+  const captured = [];
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '1001', name: 'Page A', access_token: PAGE_TOKEN_A },
+          { id: '1002', name: 'Page B', access_token: PAGE_TOKEN_B }
+        ] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) {
+        const body = JSON.parse(opts.body);
+        captured.push({ headers: opts.headers, body });
+        // First page is created, second updated — mirror the Worker's token-free response.
+        const created = body.page_id === '1001';
+        return { ok: true, status: 200, json: async () => ({ success: true, created, updated: !created, moved: false, staged_inactive: true }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/import-pages', { account: '100090320823561', namespaceId: ADMIN_NS, dryRun: false });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.status, 'imported');
+    assert.equal(r.body.import_mode, 'facebook_lite_bridge_import');
+    assert.equal(r.body.token_source, 'facebook_lite_bridge');
+    assert.equal(r.body.counts.imported, 2);
+    assert.equal(r.body.counts.created, 1);
+    assert.equal(r.body.counts.updated, 1);
+    assert.equal(r.body.counts.errors, 0);
+    // Two secret-authed profile-sync pushes, each staging the page OFF with the import marker.
+    assert.equal(captured.length, 2);
+    for (const cap of captured) {
+      assert.equal(cap.headers['x-tag-sync-secret'], SECRET);
+      assert.equal(cap.body.namespace_id, ADMIN_NS);
+      assert.equal(cap.body.is_active, 0, 'imported pages must be staged inactive');
+      assert.equal(cap.body.import_mode, 'facebook_lite_bridge_import');
+      assert.equal(cap.body.token_source, 'facebook_lite_bridge');
+    }
+    // The matching page-scoped tokens rode in the push body only — never in the response.
+    const byId = Object.fromEntries(captured.map((c) => [c.body.page_id, c.body]));
+    assert.equal(byId['1001'].access_token, PAGE_TOKEN_A);
+    assert.equal(byId['1001'].comment_token, PAGE_TOKEN_A);
+    assert.equal(byId['1002'].access_token, PAGE_TOKEN_B);
+    for (const row of r.body.results) assert.equal('access_token' in row, false);
+    assertNoLeak(r.body, [LITE_USER_TOKEN, PAGE_TOKEN_A, PAGE_TOKEN_B, SECRET]);
+  }));
+});
+
+test('/token/import-pages live import returns sync_secret_missing when no secret is configured (no push)', async () => {
+  let pushCalled = false;
+  await withExportEnv({}, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: 'EAAD6Vuser0000000000000000000' }),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '1001', name: 'Page A', access_token: 'EAAD6VpageA000000000000000000' }] }) };
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/import-pages', { account: '100090320823561', namespaceId: ADMIN_NS, dryRun: false });
+    assert.equal(r.body.status, 'sync_secret_missing');
+    assert.equal(r.body.ok, false);
+    assert.equal(pushCalled, false);
+  }));
+});
+
+test('/token/import-pages is local-only (403 for a non-local request, no token resolution)', async () => {
+  const r = await callHandler({ keychain: mockKeychain(), fbLiteTokenService: mockFbLite() }, {
+    method: 'POST',
+    path: '/token/import-pages',
+    body: { account: '100090320823561', namespaceId: ADMIN_NS, dryRun: false },
+    remoteAddress: '203.0.113.7'
+  });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.success, false);
+});

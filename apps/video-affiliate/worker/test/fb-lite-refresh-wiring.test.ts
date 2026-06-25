@@ -417,6 +417,38 @@ test('profile-sync upsert accepts an EAAD6 Facebook Lite token as the lead post 
         'the fresh primary must be written back to pages.access_token')
 })
 
+test('profile-sync stages a NEW row inactive only for the Facebook Lite bulk import, default stays active', () => {
+    const src = readVideoAffiliateIndex()
+
+    // ── Route: parses the optional staging flag and forwards it to the upsert ──────────────────
+    const routeStart = src.indexOf("app.post('/api/pages/profile-sync'")
+    assert.notEqual(routeStart, -1, 'profile-sync route must exist')
+    const route = src.slice(routeStart, src.indexOf("app.post('/api/pages/profile-token-health'", routeStart))
+    // import_mode marker OR an explicit is_active:0/false/'0' stages the new row inactive.
+    assert.ok(/importMode === 'facebook_lite_bridge_import'/.test(route), 'import_mode marker must trigger inactive staging')
+    assert.ok(/rawInitialActive === 0 \|\| rawInitialActive === false \|\| rawInitialActive === '0'/.test(route),
+        'an explicit is_active:0/false/"0" must trigger inactive staging')
+    // Default is ACTIVE (1) — every normal sync/export/refresh omits these fields.
+    assert.ok(/const initialIsActive = stageInactive \? 0 : 1/.test(route), 'default must remain active (1)')
+    assert.ok(/initialIsActive,/.test(route), 'route must forward initialIsActive to the upsert')
+
+    // ── Upsert: applies initialIsActive to the INSERT only, never to UPDATE/move ───────────────
+    const upStart = src.indexOf('async function upsertNamespacePageFromProfileSync')
+    assert.notEqual(upStart, -1, 'upsertNamespacePageFromProfileSync must exist')
+    const fn = src.slice(upStart, src.indexOf('function uniqueTokens', upStart))
+    // The param exists and only 0 stages inactive (anything else, incl. undefined, defaults to 1).
+    assert.ok(/initialIsActive\?: number/.test(fn), 'upsert must accept an optional initialIsActive param')
+    assert.ok(/const initialIsActive = params\.initialIsActive === 0 \? 0 : 1/.test(fn),
+        'only an explicit 0 stages inactive; default stays active (1)')
+    // The INSERT (NEW row) binds initialIsActive in the is_active column...
+    assert.ok(/INSERT INTO pages \(id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, bot_id\)/.test(fn),
+        'INSERT must include is_active')
+    assert.ok(/generateRandomPostHours\(\), initialIsActive, namespaceId\)\.run\(\)/.test(fn),
+        'the NEW-row INSERT must bind initialIsActive (not a hardcoded 1)')
+    // ...while neither the UPDATE nor the move touches is_active (existing rows keep their state).
+    assert.ok(!/UPDATE pages SET[^\n]*is_active/.test(fn), 'no UPDATE/move statement may change is_active')
+})
+
 test('all three stored-token publish sites use the auto-refresh wrapper', () => {
     const src = readVideoAffiliateIndex()
     // Retry awaits the wrapper directly; force-post + cron reference it via the

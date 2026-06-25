@@ -1468,6 +1468,16 @@ app.post('/api/pages/profile-sync', async (c) => {
     // logging/diagnostics — prioritization is driven by the token VALUE, not this hint.
     const tokenSource = String(body?.token_source || body?.tokenSource || body?.post_token_hint || '').trim()
 
+    // Optional safe staging flag for the Facebook Lite bridge BULK import: stage a NEWLY created
+    // page inactive (is_active=0) so the operator decides activation later. Default behavior is
+    // unchanged (new rows active) for every normal profile-sync / Bridge Token export / token
+    // refresh — those omit these fields. Existing rows' is_active is NEVER changed here.
+    const importMode = String(body?.import_mode || body?.importMode || '').trim().toLowerCase()
+    const rawInitialActive = body?.initial_is_active ?? body?.initialIsActive ?? body?.is_active ?? body?.isActive
+    const stageInactive = importMode === 'facebook_lite_bridge_import' ||
+        rawInitialActive === 0 || rawInitialActive === false || rawInitialActive === '0'
+    const initialIsActive = stageInactive ? 0 : 1
+
     if (!namespaceId) return c.json({ error: 'namespace_not_found' }, 400)
     if (!pageId) return c.json({ error: 'page_id_required' }, 400)
     if (!accessToken) return c.json({ error: 'access_token_required' }, 400)
@@ -1485,6 +1495,7 @@ app.post('/api/pages/profile-sync', async (c) => {
             accessToken,
             commentToken,
             tokenSource,
+            initialIsActive,
         })
 
         if (profileId && looksLikeBrowserSavingProfileId(profileId)) {
@@ -1505,6 +1516,8 @@ app.post('/api/pages/profile-sync', async (c) => {
             namespace_id: namespaceId,
             page_id: pageId,
             profile_id: profileId || null,
+            // Token-free diagnostic: whether a NEW row was staged inactive (only meaningful when created).
+            staged_inactive: stageInactive,
             ...result,
         })
     } catch (e) {
@@ -28667,6 +28680,11 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     accessToken: string
     commentToken?: string
     tokenSource?: string
+    // Initial is_active value for a NEWLY INSERTED row only. Defaults to 1 (active) so normal
+    // profile-sync / Bridge Token export / token-refresh behavior is unchanged. A bulk Facebook
+    // Lite bridge import passes 0 to STAGE imported pages inactive (the operator turns them on
+    // later). This NEVER changes the is_active of an existing/moved row — only the INSERT path.
+    initialIsActive?: number
 }): Promise<{ created: boolean; updated: boolean; moved: boolean }> {
     const namespaceId = String(params.namespaceId || '').trim()
     const pageId = String(params.pageId || '').trim()
@@ -28676,6 +28694,8 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     const accessToken = String(params.accessToken || '').trim()
     const commentToken = String(params.commentToken || '').trim()
     const tokenSource = String(params.tokenSource || '').trim().toLowerCase()
+    // Only 0 stages a new row inactive; anything else (incl. undefined) keeps the legacy default (1).
+    const initialIsActive = params.initialIsActive === 0 ? 0 : 1
 
     if (!namespaceId) throw new Error('namespace_not_found')
     if (!pageId) throw new Error('page_id_required')
@@ -28739,7 +28759,7 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
         } else {
             await env.DB.prepare(
                 'INSERT INTO pages (id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, bot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-            ).bind(pageId, pageName, pageAvatarUrl, nextPrimaryToken, 60, generateRandomPostHours(), 1, namespaceId).run()
+            ).bind(pageId, pageName, pageAvatarUrl, nextPrimaryToken, 60, generateRandomPostHours(), initialIsActive, namespaceId).run()
             created = true
         }
     }
