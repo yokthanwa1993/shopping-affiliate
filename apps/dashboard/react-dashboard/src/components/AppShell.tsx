@@ -95,7 +95,7 @@ function NavLink({ item }: { item: NavItem }) {
       className="flex items-center gap-2.5 border-r-[3px] border-transparent px-4 py-2 text-[#333333] transition-colors hover:bg-[#f5f5f5]"
       activeProps={{
         className:
-          'border-[#ee4d2d] bg-[#fff5f2] text-[#ee4d2d] hover:bg-[#fff5f2]',
+          '!border-r-[#ee4d2d] bg-[#fff5f2] text-[#ee4d2d] hover:bg-[#fff5f2]',
       }}
     >
       <item.icon className="h-[18px] w-[18px] shrink-0" />
