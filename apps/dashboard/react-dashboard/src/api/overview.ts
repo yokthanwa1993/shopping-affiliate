@@ -32,6 +32,9 @@ export interface OverviewSummary {
   // Our traffic is social/page-post driven, so the single clicks figure doubles
   // as the "Social Media" channel count. Mirrors `clicks` when available.
   socialMediaClicks: number | null
+  // Report date returned by the daily-income endpoint (yesterday by default),
+  // rendered as the Shopee-style Data Period pill.
+  reportDateLabel: string | null
   // Shopee's "last update" timestamp string, passed through verbatim when present.
   lastUpdateTime: string | null
   apiStatus: ApiStatus
@@ -47,6 +50,7 @@ function emptySummary(): OverviewSummary {
     orderAmount: null,
     newBuyers: null,
     socialMediaClicks: null,
+    reportDateLabel: null,
     lastUpdateTime: null,
     apiStatus: 'down',
     error: null,
@@ -124,6 +128,15 @@ export function normalizeOverviewSummary(payload: unknown): OverviewSummary {
   // Single real clicks count, relabeled as the social-media channel.
   summary.socialMediaClicks = summary.clicks
 
+  const isoDate = safeString(record.isoDate)
+  if (isoDate) {
+    const parts = isoDate.split('-')
+    summary.reportDateLabel = parts.length === 3 ? `${parts[2]}-${parts[1]}-${parts[0]}` : isoDate
+  } else {
+    const reportTime = safeString(record.time)
+    summary.reportDateLabel = reportTime ? reportTime.replace(/\//g, '-') : null
+  }
+
   // First non-empty last_update_time wins (accounts share the same period).
   for (const account of accounts) {
     const ts = safeString(account.last_update_time)
@@ -162,7 +175,7 @@ export function normalizeOverviewSummary(payload: unknown): OverviewSummary {
 export async function fetchOverviewSummary(signal?: AbortSignal): Promise<OverviewSummary> {
   try {
     const payload = await workerFetchJson<unknown>(
-      `/daily_income?ids=${CHEARB_SHOPEE_AFFILIATE_ID}&time=today`,
+      `/daily_income?ids=${CHEARB_SHOPEE_AFFILIATE_ID}&time=yesterday`,
       { signal, timeoutMs: 20_000 },
     )
     return normalizeOverviewSummary(payload)

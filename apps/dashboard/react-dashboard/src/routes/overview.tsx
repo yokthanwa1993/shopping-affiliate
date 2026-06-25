@@ -41,12 +41,21 @@ function exactTitle(value: number | null): string | undefined {
   return value == null ? undefined : value.toLocaleString('th-TH', { maximumFractionDigits: 2 })
 }
 
-// DD-MM-YYYY to match the Shopee "Data Period" pill (e.g. 24-06-2026).
-function formatToday(): string {
-  const now = new Date()
-  const dd = String(now.getDate()).padStart(2, '0')
-  const mm = String(now.getMonth() + 1).padStart(2, '0')
-  return `${dd}-${mm}-${now.getFullYear()}`
+// DD-MM-YYYY fallback for the Shopee "Data Period" pill. The report API
+// defaults to yesterday because same-day Shopee totals are often not available yet.
+function formatYesterdayBangkok(): string {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Bangkok',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+  const bangkokToday = new Date(`${formatter.format(new Date())}T00:00:00+07:00`)
+  bangkokToday.setDate(bangkokToday.getDate() - 1)
+  const yyyy = bangkokToday.getFullYear()
+  const mm = String(bangkokToday.getMonth() + 1).padStart(2, '0')
+  const dd = String(bangkokToday.getDate()).padStart(2, '0')
+  return `${dd}-${mm}-${yyyy}`
 }
 
 interface MetricCard {
@@ -139,12 +148,12 @@ export function OverviewPage() {
       <div className="flex flex-wrap items-center gap-3 rounded-[2px] bg-white px-4 py-3 shadow-sm">
         <span className="text-sm font-medium text-[#333333]">Data Period</span>
         <span className="inline-flex items-center rounded-[2px] border border-[#e0e0e0] px-3 py-1 text-sm text-[#333333]">
-          {formatToday()}
+          {data?.reportDateLabel ?? formatYesterdayBangkok()}
         </span>
         <span className="ml-auto text-[13px] text-[#999999]">
           {data?.lastUpdateTime
             ? `อัปเดตล่าสุดจาก Shopee: ${data.lastUpdateTime}`
-            : 'ข้อมูลจริงจาก Shopee Affiliate · CHEARB'}
+            : 'ข้อมูลจริงจาก Shopee Affiliate · CHEARB · เมื่อวาน'}
         </span>
       </div>
 
