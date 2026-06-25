@@ -44,6 +44,14 @@ import { Button } from '@/components/ui/button'
 // dedicated Worker endpoint (api/createAds.ts → POST /api/dashboard/create-ad-only)
 // and the proof panel/history read from dashboard_ad_history.
 
+// The ONLY page that is "on" for the Create Ads auto context in production. The
+// empty-queue auto-pick scheduler (worker AUTO_ADS_ALLOWED_PAGE_IDS) may only
+// auto-create ads for this page (เฉียบ), so the master list mirrors that: only
+// this page shows active/open for Create Ads; every other held page is greyed
+// off and not clickable. This is presentation only — it does NOT change a page's
+// real posting active state (Create Post is untouched).
+const AUTO_ADS_ACTIVE_PAGE_ID = '1008898512617594'
+
 function SectionLabel({ step, title, hint }: { step: number; title: string; hint?: string }) {
   return (
     <div className="flex items-baseline gap-2">
@@ -163,6 +171,17 @@ export function CreateAdsPage() {
   const pages = pagesQuery.data ?? ([] as SettingsPage[])
   const selectedPage = pages.find((p) => p.id === selectedId) ?? null
 
+  // Master list still shows ALL held account pages, but `active` is overridden to
+  // the Create Ads auto status (only AUTO_ADS_ACTIVE_PAGE_ID is on) so the status
+  // column + row enabledness reflect Create Ads — not normal posting state. With
+  // PagePicker's `gateInactive`, every other page renders grey and is not
+  // clickable, never implying auto ads are enabled for it. Mapping here keeps
+  // Create Post (which passes the unmapped pages) completely unchanged.
+  const adPages = useMemo(
+    () => pages.map((p) => ({ ...p, active: p.id === AUTO_ADS_ACTIVE_PAGE_ID })),
+    [pages],
+  )
+
   if (selectedPage) {
     // DETAIL — Create Ads settings scoped to the chosen page, with a back affordance
     // to return to the page list. Keyed by page id so switching pages resets all
@@ -186,7 +205,7 @@ export function CreateAdsPage() {
       <section className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0 flex-1">
           <PagePicker
-            pages={pages}
+            pages={adPages}
             selectedId={null}
             onSelect={(p) => setSelectedId(p.id)}
             loading={pagesQuery.isLoading}
@@ -194,6 +213,7 @@ export function CreateAdsPage() {
             searchable
             layout="table"
             fill
+            gateInactive
             title="เลือกเพจสำหรับสร้างแอด"
             actionLabel="เปิดหน้าตั้งค่าแอด"
           />

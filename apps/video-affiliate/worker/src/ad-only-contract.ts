@@ -366,6 +366,36 @@ export function buildAdOnlyCreateBody(row: AdOnlyQueueRow | null | undefined): R
 // "only promote clips with real reach". A candidate below this is skipped.
 export const AD_ONLY_AUTO_MIN_VIEWS = 100_000
 
+// AUTO-ADS ALLOWLIST — the EMPTY-QUEUE auto-pick scheduler (both the click-link/sales ad-only lane and
+// the Follow lane) may only ever auto-create ads for these page ids. This is a SAFETY scope on the
+// unattended cadence ONLY: manual Create Ads and explicitly-queued rows are NOT restricted by this and
+// can target any selected page. Current production behavior is exactly one page — 1008898512617594
+// (เฉียบ) — so the unattended scheduler never silently spends on the other 7 account pages. (It matches
+// the worker's DASHBOARD_FACEBOOK_GALLERY_PAGE_ID, kept duplicated here so the pure helper stays
+// network/import-free and unit-testable.)
+export const AUTO_ADS_ALLOWED_PAGE_IDS: readonly string[] = ['1008898512617594']
+
+// Keep only the page ids that are on the auto-ads allowlist, preserving input order and de-duplicating.
+// Used by the empty-queue auto-pick scheduler to bound its candidate pages to the pages allowed to run
+// unattended ads. An empty allowlist yields [] (fail closed — never auto-spend on an unlisted page).
+// Pure: the caller passes the allowlist (defaults to AUTO_ADS_ALLOWED_PAGE_IDS).
+export function filterAutoAdsAllowedPageIds(
+    pageIds: ReadonlyArray<string> | null | undefined,
+    allowed: ReadonlyArray<string> = AUTO_ADS_ALLOWED_PAGE_IDS,
+): string[] {
+    const allow = new Set((allowed || []).map((id) => str(id)).filter(Boolean))
+    if (!allow.size) return []
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const raw of pageIds || []) {
+        const id = str(raw)
+        if (!id || seen.has(id) || !allow.has(id)) continue
+        seen.add(id)
+        out.push(id)
+    }
+    return out
+}
+
 // A cached page video reduced to the fields the auto-picker needs (a projection of
 // facebook_page_video_cache). videoId/postId are old Page source-signal ids only. systemVideoId is
 // the internal content that will be published as the NEW Page post. shopeeLink/views gate eligibility;

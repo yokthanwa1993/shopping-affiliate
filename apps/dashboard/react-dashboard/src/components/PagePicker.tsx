@@ -151,6 +151,7 @@ function PageTableRow({
   actionLabel,
   onToggleActive,
   togglePending,
+  gateInactive,
 }: {
   page: SettingsPage
   selected: boolean
@@ -158,11 +159,14 @@ function PageTableRow({
   actionLabel: string
   onToggleActive?: (page: SettingsPage, active: boolean) => void
   togglePending?: boolean
+  gateInactive?: boolean
 }) {
   const toggleEnabled = !!onToggleActive
-  // The row only opens when it's interactive: always in Create Ads / non-toggle
-  // mode, but in toggle mode only while the page is active.
-  const interactive = !toggleEnabled || page.active
+  // Rows are active-gated when a toggle is wired (Create Post) OR when the caller
+  // opts into `gateInactive` (Create Ads, which has no toggle column but still
+  // greys out / locks pages that are off for the Create Ads auto context). With
+  // neither, every row stays openable (the original Create Ads behavior).
+  const interactive = !(toggleEnabled || gateInactive) || page.active
   return (
     <tr
       role={interactive ? 'button' : undefined}
@@ -274,6 +278,7 @@ export function PagePicker({
   actionLabel = 'เปิดหน้าจัดการโพสต์',
   onToggleActive,
   pendingToggleId = null,
+  gateInactive = false,
 }: {
   pages: SettingsPage[]
   selectedId: string | null
@@ -303,6 +308,11 @@ export function PagePicker({
   onToggleActive?: (page: SettingsPage, active: boolean) => void
   /** Page id whose toggle is mid-flight; that switch shows a disabled/busy state. */
   pendingToggleId?: string | null
+  /** `table` layout only: active-gate rows WITHOUT adding the inline toggle column.
+   *  An off (`active:false`) page greys out and won't open, exactly like Create
+   *  Post's off behavior, but no on/off switch is rendered. Create Ads uses this to
+   *  reflect the Create Ads auto status (only the allowlisted page is openable). */
+  gateInactive?: boolean
 }) {
   const [query, setQuery] = useState('')
   const filtered = useMemo(() => {
@@ -382,6 +392,7 @@ export function PagePicker({
           actionLabel={actionLabel}
           onToggleActive={onToggleActive}
           togglePending={pendingToggleId === page.id}
+          gateInactive={gateInactive}
         />
         ))
       footer = `แสดง 1 ถึง ${filtered.length} จาก ${pages.length} เพจ`

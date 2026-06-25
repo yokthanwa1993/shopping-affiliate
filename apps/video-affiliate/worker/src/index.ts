@@ -161,6 +161,7 @@ import {
     type AdOnlyAutoCandidate,
     type AdOnlyHistoryIdRow,
     AD_ONLY_AUTO_MIN_VIEWS,
+    filterAutoAdsAllowedPageIds,
     buildAdOnlyUsedIdSetForBangkokDate,
     rankAdOnlyAutoCandidatesRandom,
     makeSeededRng,
@@ -13749,7 +13750,12 @@ async function autoPickAdOnlyCandidates(env: Env): Promise<AdOnlyAutoCandidate[]
          WHERE views >= ? AND TRIM(COALESCE(shopee_link, '')) != ''
          ORDER BY page_id LIMIT ?`
     ).bind(AD_ONLY_AUTO_MIN_VIEWS, AD_ONLY_AUTO_MAX_PAGES).all().catch(() => ({ results: [] as Array<{ page_id?: string }> })) as { results?: Array<{ page_id?: string }> }
-    const pageIds = (pageRows.results || []).map((r) => String(r.page_id || '').trim()).filter(Boolean)
+    const eligiblePageIds = (pageRows.results || []).map((r) => String(r.page_id || '').trim()).filter(Boolean)
+    // SAFETY: the unattended empty-queue auto-pick may only auto-create ads for the auto-ads allowlist
+    // (current production: exactly เฉียบ / 1008898512617594), so the scheduler never silently spends on
+    // the other account pages. Manual Create Ads + explicitly-queued rows are NOT routed through here and
+    // remain unrestricted for any selected page.
+    const pageIds = filterAutoAdsAllowedPageIds(eligiblePageIds)
     if (!pageIds.length) return []
 
     // Temporary per-page cooldown: pages whose recent ad-only create failed with a permission/config

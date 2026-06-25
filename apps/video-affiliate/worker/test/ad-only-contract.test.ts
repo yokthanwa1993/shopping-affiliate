@@ -28,6 +28,8 @@ import {
     FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
     FOLLOW_LANE_CTA_TYPE,
     FOLLOW_LANE_COMMENT_BODY_LINES,
+    AUTO_ADS_ALLOWED_PAGE_IDS,
+    filterAutoAdsAllowedPageIds,
 } from '../src/ad-only-contract.js'
 import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
 import {
@@ -72,6 +74,26 @@ function getAdHistoryNormalizerSource(): string {
         'normalizeDashboardAdHistoryRow'
     )
 }
+
+
+
+test('filterAutoAdsAllowedPageIds keeps only เฉียบ for unattended auto ads', () => {
+    assert.deepEqual(AUTO_ADS_ALLOWED_PAGE_IDS, ['1008898512617594'])
+    assert.deepEqual(
+        filterAutoAdsAllowedPageIds([
+            '103881139378321',
+            '1008898512617594',
+            '1008898512617594',
+            '107267395614980',
+            '',
+        ]),
+        ['1008898512617594'],
+    )
+})
+
+test('filterAutoAdsAllowedPageIds fails closed when the allowlist is empty', () => {
+    assert.deepEqual(filterAutoAdsAllowedPageIds(['1008898512617594'], []), [])
+})
 
 test('validate fails closed when page_id is missing', () => {
     const v = validateAdOnlyInput({ story_id: '123_456' })
@@ -578,6 +600,45 @@ test('truncateResultJson bounds long payloads and never throws on cycles', () =>
     const cyc: Record<string, unknown> = {}
     cyc.self = cyc
     assert.doesNotThrow(() => truncateResultJson(cyc))
+})
+
+// =====================================================================
+// AUTO-ADS ALLOWLIST — the EMPTY-QUEUE auto-pick scheduler may only ever auto-create ads for the
+// allowlisted page(s). Current production is exactly one page (เฉียบ / 1008898512617594), so the
+// unattended cadence never silently spends on the other account pages. Manual Create Ads and
+// explicitly-queued rows are NOT restricted by this list.
+// =====================================================================
+
+test('AUTO_ADS_ALLOWED_PAGE_IDS is exactly the one production page (เฉียบ)', () => {
+    assert.deepEqual([...AUTO_ADS_ALLOWED_PAGE_IDS], ['1008898512617594'])
+})
+
+test('filterAutoAdsAllowedPageIds keeps only the allowed page, trims, and de-dupes', () => {
+    const out = filterAutoAdsAllowedPageIds([
+        ' 1008898512617594 ', // surrounding whitespace is trimmed → allowed
+        '1008898512617594', // duplicate of the trimmed value → dropped
+        '999', // not allowed → dropped
+        '', // empty → dropped
+        '123456789', // not allowed → dropped
+    ])
+    assert.deepEqual(out, ['1008898512617594'])
+})
+
+test('filterAutoAdsAllowedPageIds drops every non-allowed page id (and is null/empty safe)', () => {
+    assert.deepEqual(filterAutoAdsAllowedPageIds(['1', '2', '3']), [])
+    assert.deepEqual(filterAutoAdsAllowedPageIds([]), [])
+    assert.deepEqual(filterAutoAdsAllowedPageIds(null), [])
+    assert.deepEqual(filterAutoAdsAllowedPageIds(undefined), [])
+})
+
+test('filterAutoAdsAllowedPageIds fails closed when the allowlist is empty', () => {
+    // An empty allowlist must yield [] — the unattended scheduler never auto-spends on an unlisted page.
+    assert.deepEqual(filterAutoAdsAllowedPageIds(['1008898512617594'], []), [])
+})
+
+test('filterAutoAdsAllowedPageIds honors a custom allowlist, preserving input order and de-duping', () => {
+    const out = filterAutoAdsAllowedPageIds(['c', 'a', 'b', 'a', 'z'], ['a', 'b', 'c'])
+    assert.deepEqual(out, ['c', 'a', 'b'])
 })
 
 // =====================================================================
