@@ -449,6 +449,52 @@ test('profile-sync stages a NEW row inactive only for the Facebook Lite bulk imp
     assert.ok(!/UPDATE pages SET[^\n]*is_active/.test(fn), 'no UPDATE/move statement may change is_active')
 })
 
+test('staging import (facebook_lite_bridge_import / initialIsActive=0) NEVER moves a page owned by another namespace — it skips with a structured conflict', () => {
+    const src = readVideoAffiliateIndex()
+    const upStart = src.indexOf('async function upsertNamespacePageFromProfileSync')
+    assert.notEqual(upStart, -1, 'upsertNamespacePageFromProfileSync must exist')
+    const fn = src.slice(upStart, src.indexOf('function uniqueTokens', upStart))
+
+    // ── The staging-import signal is derived from import_mode OR the inactive-staging flag ───────
+    assert.ok(/importMode\?: string/.test(fn), 'upsert must accept an optional importMode param')
+    assert.ok(/const isStagingImport = importMode === 'facebook_lite_bridge_import' \|\| initialIsActive === 0/.test(fn),
+        'staging import must be gated on import_mode OR initialIsActive=0')
+
+    // ── The cross-namespace branch must SKIP (not move) when staging, returning a conflict ───────
+    // Isolate the "exists in another namespace" branch body.
+    const branchIdx = fn.indexOf("existingInOtherNamespace?.bot_id && String(existingInOtherNamespace.bot_id")
+    assert.notEqual(branchIdx, -1, 'the cross-namespace branch must exist')
+    const branch = fn.slice(branchIdx, fn.indexOf('} else {', branchIdx))
+    // The staging guard short-circuits BEFORE the bot_id-moving UPDATE.
+    const guardIdx = branch.indexOf('if (isStagingImport)')
+    const moveIdx = branch.indexOf('UPDATE pages SET bot_id = ?')
+    assert.ok(guardIdx !== -1, 'the cross-namespace branch must check isStagingImport')
+    assert.ok(moveIdx !== -1, 'the cross-namespace branch must still contain the legacy move UPDATE')
+    assert.ok(guardIdx < moveIdx, 'the staging-import skip must come BEFORE the move UPDATE (so it never relocates the row)')
+    // The staging path returns skipped + the owning namespace, and does NOT run the move/pool write.
+    assert.ok(/skipped = true/.test(branch), 'staging skip must set skipped = true')
+    assert.ok(/conflictNamespaceId = otherNamespaceId/.test(branch), 'staging skip must record the owning namespace as the conflict')
+    assert.ok(/return \{ created, updated, moved, skipped, conflictNamespaceId \}/.test(branch),
+        'staging skip must early-return BEFORE touching the row or the token pool')
+
+    // ── The return type carries skipped/conflict so callers can count them ───────────────────────
+    assert.ok(/skipped: boolean/.test(fn), 'the upsert result type must include skipped')
+    assert.ok(/conflictNamespaceId\?: string/.test(fn), 'the upsert result type must include the conflict namespace id')
+
+    // ── Normal (non-staging) export still moves: the move UPDATE remains reachable for the else ──
+    // The move must NOT have been deleted — only guarded.
+    assert.ok(/moved = true/.test(branch), 'a non-staging cross-namespace sync (e.g. /token/export) must still move the row')
+
+    // ── The route forwards import_mode to the upsert ─────────────────────────────────────────────
+    const routeStart = src.indexOf("app.post('/api/pages/profile-sync'")
+    const route = src.slice(routeStart, src.indexOf("app.post('/api/pages/profile-token-health'", routeStart))
+    assert.ok(/\bimportMode,/.test(route), 'the profile-sync route must forward importMode to the upsert')
+    // The response surfaces skipped + a snake_case conflict alias for the importer.
+    assert.ok(/skipped: result\.skipped/.test(route), 'the route response must surface skipped')
+    assert.ok(/conflict_namespace_id: result\.conflictNamespaceId \|\| null/.test(route),
+        'the route response must surface a snake_case conflict_namespace_id for the importer')
+})
+
 test('all three stored-token publish sites use the auto-refresh wrapper', () => {
     const src = readVideoAffiliateIndex()
     // Retry awaits the wrapper directly; force-post + cron reference it via the

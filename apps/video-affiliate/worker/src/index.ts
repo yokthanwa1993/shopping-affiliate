@@ -1496,6 +1496,9 @@ app.post('/api/pages/profile-sync', async (c) => {
             commentToken,
             tokenSource,
             initialIsActive,
+            // Forward the staging-import marker so the upsert declines to MOVE a page that already
+            // posts in another namespace (it returns skipped/conflict instead of stealing the row).
+            importMode,
         })
 
         if (profileId && looksLikeBrowserSavingProfileId(profileId)) {
@@ -1518,6 +1521,12 @@ app.post('/api/pages/profile-sync', async (c) => {
             profile_id: profileId || null,
             // Token-free diagnostic: whether a NEW row was staged inactive (only meaningful when created).
             staged_inactive: stageInactive,
+            // Onboarding safety: a staging import that found the page already owned by ANOTHER
+            // namespace skips it (leaves the live posting row intact) instead of moving it. Surface
+            // both the camelCase upsert result fields (...result) AND a snake_case alias so the
+            // /token/import-pages importer can count skipped/conflict pages without raw tokens.
+            skipped: result.skipped,
+            conflict_namespace_id: result.conflictNamespaceId || null,
             ...result,
         })
     } catch (e) {
@@ -28685,7 +28694,21 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     // Lite bridge import passes 0 to STAGE imported pages inactive (the operator turns them on
     // later). This NEVER changes the is_active of an existing/moved row — only the INSERT path.
     initialIsActive?: number
-}): Promise<{ created: boolean; updated: boolean; moved: boolean }> {
+    // Onboarding/import marker. When this is a staging import (import_mode
+    // 'facebook_lite_bridge_import' OR initialIsActive=0) and the page already exists in ANOTHER
+    // namespace, the page is NOT moved/stolen — the existing row (and its active posting cron in
+    // that other namespace) is left intact and a structured { skipped: true, conflict } result is
+    // returned. Normal /token/export and token-refresh callers omit this and keep moving rows.
+    importMode?: string
+}): Promise<{
+    created: boolean
+    updated: boolean
+    moved: boolean
+    // true when a staging import declined to move an existing page that lives in another namespace.
+    skipped: boolean
+    // The namespace that already owns the page when skipped (so importers can report the conflict).
+    conflictNamespaceId?: string
+}> {
     const namespaceId = String(params.namespaceId || '').trim()
     const pageId = String(params.pageId || '').trim()
     const pageName = String(params.pageName || '').trim() || pageId
@@ -28696,6 +28719,12 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     const tokenSource = String(params.tokenSource || '').trim().toLowerCase()
     // Only 0 stages a new row inactive; anything else (incl. undefined) keeps the legacy default (1).
     const initialIsActive = params.initialIsActive === 0 ? 0 : 1
+    // A staging import (Facebook Lite bridge bulk onboarding) must NOT steal a page that already
+    // posts in another namespace. Gate on the explicit import_mode marker OR the inactive-staging
+    // signal (initialIsActive=0) — both mean "admin is onboarding pages into the admin namespace,
+    // not relocating live ones". Normal export/refresh callers omit both and keep moving rows.
+    const importMode = String(params.importMode || '').trim().toLowerCase()
+    const isStagingImport = importMode === 'facebook_lite_bridge_import' || initialIsActive === 0
 
     if (!namespaceId) throw new Error('namespace_not_found')
     if (!pageId) throw new Error('page_id_required')
@@ -28711,6 +28740,8 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     let created = false
     let updated = false
     let moved = false
+    let skipped = false
+    let conflictNamespaceId: string | undefined
 
     const tokenPool = await getNamespacePagesTokenPool(env.DB, namespaceId)
     const existingEntry = tokenPool[pageId] || { post_tokens: [], comment_tokens: [] }
@@ -28748,6 +28779,20 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
         ).bind(pageId).first() as { bot_id?: string; access_token?: string | null } | null
 
         if (existingInOtherNamespace?.bot_id && String(existingInOtherNamespace.bot_id || '').trim() !== namespaceId) {
+            const otherNamespaceId = String(existingInOtherNamespace.bot_id || '').trim()
+            if (isStagingImport) {
+                // SAFE ONBOARDING: the page already lives (and posts) in another namespace. A bulk
+                // import must NEVER move its bot_id / blank its is_active / disturb its post_hours —
+                // doing so is exactly what stopped page "เฉียบ" (id 1008898512617594) posting after
+                // it was relocated from namespace 177… to the admin namespace 615…. Leave the row
+                // untouched and report a structured conflict so the importer counts it as skipped.
+                console.log(`[PAGE-PROFILE-SYNC] staging import skipped existing page page=${pageId} owner_ns=${otherNamespaceId} requested_ns=${namespaceId} import_mode=${importMode || '(initial_is_active=0)'}`)
+                skipped = true
+                conflictNamespaceId = otherNamespaceId
+                // Do NOT touch the pages row OR the requested namespace token pool — leave the page
+                // entirely owned by its existing namespace.
+                return { created, updated, moved, skipped, conflictNamespaceId }
+            }
             const existingOtherPrimaryToken = isPersistablePagePrimaryToken(existingInOtherNamespace.access_token)
                 ? String(existingInOtherNamespace.access_token || '').trim()
                 : ''
@@ -28771,7 +28816,7 @@ async function upsertNamespacePageFromProfileSync(env: Env, params: {
     }
     await setNamespacePagesTokenPool(env.DB, namespaceId, tokenPool)
 
-    return { created, updated, moved }
+    return { created, updated, moved, skipped, conflictNamespaceId }
 }
 
 function uniqueTokens(raw: string[]): string[] {
