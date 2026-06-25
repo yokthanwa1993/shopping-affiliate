@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle } from 'lucide-react'
-import { fetchSettingsPages, type SettingsPage } from '@/api/settings'
+import { fetchSettingsPages, updatePageActive, type SettingsPage } from '@/api/settings'
 import { PagePicker } from '@/components/PagePicker'
 import { PageDetailView } from '@/routes/settings'
 
@@ -22,10 +22,35 @@ export function CreatePostPage() {
   // Master-detail: no page is auto-selected. The operator must pick a page from
   // the list first; only then does the post-only detail screen come alive.
   const [selectedId, setSelectedId] = useState<string>('')
+  const queryClient = useQueryClient()
 
   const pagesQuery = useQuery({
     queryKey: ['settings-pages'],
     queryFn: ({ signal }) => fetchSettingsPages(signal),
+  })
+
+  // Toggle a page's posting on/off straight from the master list. We optimistically
+  // flip page.active in the cached list so the row greys/ungreys instantly, then
+  // reconcile against the server (rolling back on error, invalidating on settle).
+  const toggleActive = useMutation({
+    mutationFn: ({ pageId, active }: { pageId: string; active: boolean }) =>
+      updatePageActive(pageId, active),
+    onMutate: async ({ pageId, active }) => {
+      await queryClient.cancelQueries({ queryKey: ['settings-pages'] })
+      const previous = queryClient.getQueryData<SettingsPage[]>(['settings-pages'])
+      queryClient.setQueryData<SettingsPage[]>(['settings-pages'], (old) =>
+        (old ?? []).map((p) => (p.id === pageId ? { ...p, active } : p)),
+      )
+      return { previous }
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(['settings-pages'], context.previous)
+      }
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings-pages'] })
+    },
   })
 
   const pages = pagesQuery.data ?? ([] as SettingsPage[])
@@ -90,6 +115,8 @@ export function CreatePostPage() {
             layout="table"
             fill
             title="เลือกเพจสำหรับตั้งค่าการโพสต์"
+            onToggleActive={(p, active) => toggleActive.mutate({ pageId: p.id, active })}
+            pendingToggleId={toggleActive.isPending ? toggleActive.variables?.pageId ?? null : null}
           />
         </div>
       </section>

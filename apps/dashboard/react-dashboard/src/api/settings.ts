@@ -173,3 +173,13 @@ export async function savePageSettings(
     { method: 'PUT', timeoutMs: 15_000, body },
   )
 }
+
+// Toggle a page's posting on/off. Hits the page resource endpoint (not the
+// dashboard settings blob) and sends ONLY the `is_active` flag — no token or
+// other field is ever included, so flipping the switch can't clobber settings.
+export async function updatePageActive(pageId: string, active: boolean): Promise<void> {
+  await workerFetchJson<Record<string, unknown>>(
+    `/api/pages/${encodeURIComponent(pageId)}`,
+    { method: 'PUT', timeoutMs: 15_000, body: { is_active: active } },
+  )
+}

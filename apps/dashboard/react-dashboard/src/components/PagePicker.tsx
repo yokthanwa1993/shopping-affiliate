@@ -85,39 +85,107 @@ function PageOption({
   )
 }
 
-// Number of columns in the `table` layout — kept in one place so the colSpan of
-// the loading / empty / no-match state rows always matches the header.
+// Base number of columns in the `table` layout — kept in one place so the
+// colSpan of the loading / empty / no-match state rows always matches the
+// header. When an `onToggleActive` callback is wired up the table grows one more
+// column for the inline toggle (see `cols` in the table layout).
 const TABLE_COLS = 5
+
+// Inline on/off switch used in the `table` layout's toggle column. Clicking it
+// never bubbles to the row (so it can't select/open the page) and it stays
+// usable even when the page is off, so an operator can switch a greyed page back
+// on. Purely controlled — the caller owns the page.active state.
+function PageActiveToggle({
+  active,
+  pending,
+  onChange,
+}: {
+  active: boolean
+  pending: boolean
+  onChange: (next: boolean) => void
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={active}
+      aria-label={active ? 'ปิดการโพสต์เพจนี้' : 'เปิดการโพสต์เพจนี้'}
+      title={active ? 'ปิดการโพสต์เพจนี้' : 'เปิดการโพสต์เพจนี้'}
+      disabled={pending}
+      onClick={(e) => {
+        // Never let the toggle select/open the row.
+        e.stopPropagation()
+        onChange(!active)
+      }}
+      // Keyboard activation of a <button> fires click (handled above); stop the
+      // keydown here so it doesn't also trigger the row's Enter/Space handler.
+      onKeyDown={(e) => e.stopPropagation()}
+      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:cursor-wait disabled:opacity-60 ${
+        active ? 'bg-emerald-500' : 'bg-muted-foreground/40'
+      }`}
+    >
+      <span
+        aria-hidden
+        className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+          active ? 'translate-x-4' : 'translate-x-1'
+        }`}
+      />
+    </button>
+  )
+}
 
 // One page rendered as a full-width clickable table row for the `table` layout.
 // Same data + token-safety as PageOption (presence badge only, never the raw
 // token). The whole <tr> is the click target with keyboard support, and the
 // right-most cell carries the "open post manager" cue.
+//
+// When `onToggleActive` is supplied (Create Post mode) the row gains a toggle
+// column AND becomes active-gated: an inactive page renders greyed, is not
+// selectable/openable, and shows a muted "ปิดอยู่" action — but the toggle
+// itself stays enabled so it can be turned back on. Without the callback the row
+// keeps its original always-openable behavior (Create Ads is unaffected).
 function PageTableRow({
   page,
   selected,
   onSelect,
   actionLabel,
+  onToggleActive,
+  togglePending,
 }: {
   page: SettingsPage
   selected: boolean
   onSelect: (page: SettingsPage) => void
   actionLabel: string
+  onToggleActive?: (page: SettingsPage, active: boolean) => void
+  togglePending?: boolean
 }) {
+  const toggleEnabled = !!onToggleActive
+  // The row only opens when it's interactive: always in Create Ads / non-toggle
+  // mode, but in toggle mode only while the page is active.
+  const interactive = !toggleEnabled || page.active
   return (
     <tr
-      role="button"
-      tabIndex={0}
-      aria-pressed={selected}
-      onClick={() => onSelect(page)}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onSelect(page)
-        }
-      }}
-      className={`group cursor-pointer border-b align-middle transition-colors last:border-b-0 hover:bg-accent focus:bg-accent focus:outline-none ${
-        selected ? 'bg-accent' : ''
+      role={interactive ? 'button' : undefined}
+      tabIndex={interactive ? 0 : -1}
+      aria-pressed={interactive ? selected : undefined}
+      aria-disabled={interactive ? undefined : true}
+      onClick={interactive ? () => onSelect(page) : undefined}
+      onKeyDown={
+        interactive
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                onSelect(page)
+              }
+            }
+          : undefined
+      }
+      className={`group border-b align-middle transition-colors last:border-b-0 ${
+        interactive
+          ? `cursor-pointer hover:bg-accent focus:bg-accent focus:outline-none ${
+              selected ? 'bg-accent' : ''
+            }`
+          : 'cursor-default bg-muted/40 opacity-60'
       }`}
     >
       {/* Selection indicator (the reference's leading select column). */}
@@ -165,12 +233,28 @@ function PageTableRow({
           {page.hasToken ? '🔒 มี token' : 'ไม่มี token'}
         </Badge>
       </td>
-      {/* Action cue. */}
+      {/* Toggle column — only in Create Post (toggle) mode. */}
+      {toggleEnabled && (
+        <td className="px-4 py-3">
+          <PageActiveToggle
+            active={page.active}
+            pending={!!togglePending}
+            onChange={(next) => onToggleActive!(page, next)}
+          />
+        </td>
+      )}
+      {/* Action cue. Greyed "ปิดอยู่" when the page is off and gated. */}
       <td className="px-4 py-3 text-right">
-        <span className="inline-flex items-center gap-1 whitespace-nowrap text-xs font-medium text-muted-foreground group-hover:text-foreground">
-          <span className="hidden sm:inline">{actionLabel}</span>
-          <ChevronRight className="h-4 w-4" />
-        </span>
+        {interactive ? (
+          <span className="inline-flex items-center gap-1 whitespace-nowrap text-xs font-medium text-muted-foreground group-hover:text-foreground">
+            <span className="hidden sm:inline">{actionLabel}</span>
+            <ChevronRight className="h-4 w-4" />
+          </span>
+        ) : (
+          <span className="inline-flex items-center whitespace-nowrap text-xs font-medium text-muted-foreground/70">
+            ปิดอยู่
+          </span>
+        )}
       </td>
     </tr>
   )
@@ -188,6 +272,8 @@ export function PagePicker({
   fill = false,
   title = 'รายการเพจ',
   actionLabel = 'เปิดหน้าจัดการโพสต์',
+  onToggleActive,
+  pendingToggleId = null,
 }: {
   pages: SettingsPage[]
   selectedId: string | null
@@ -210,6 +296,13 @@ export function PagePicker({
   title?: string
   /** Right-most table action cue. Defaults to the Create Post wording. */
   actionLabel?: string
+  /** `table` layout only: opt into the inline on/off toggle column. Supplying
+   *  this also active-gates rows (an off page greys out and won't open) — the
+   *  Create Post master wires it; Create Ads omits it and is unaffected. The
+   *  callback persists the new state (e.g. via updatePageActive). */
+  onToggleActive?: (page: SettingsPage, active: boolean) => void
+  /** Page id whose toggle is mid-flight; that switch shows a disabled/busy state. */
+  pendingToggleId?: string | null
 }) {
   const [query, setQuery] = useState('')
   const filtered = useMemo(() => {
@@ -226,6 +319,8 @@ export function PagePicker({
   // count. All states (loading / error / empty / no-match) render inside the
   // card body so the chrome stays consistent.
   if (layout === 'table') {
+    // One extra column when the inline toggle is wired up.
+    const cols = onToggleActive ? TABLE_COLS + 1 : TABLE_COLS
     const searchBox = searchable ? (
       <div className="relative w-full sm:max-w-xs">
         <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -244,7 +339,7 @@ export function PagePicker({
     if (loading && pages.length === 0) {
       body = Array.from({ length: 6 }).map((_, i) => (
         <tr key={i} className="border-b last:border-b-0">
-          <td colSpan={TABLE_COLS} className="px-4 py-3">
+          <td colSpan={cols} className="px-4 py-3">
             <div className="h-10 animate-pulse rounded-lg bg-muted" />
           </td>
         </tr>
@@ -253,7 +348,7 @@ export function PagePicker({
     } else if (error && pages.length === 0) {
       body = (
         <tr>
-          <td colSpan={TABLE_COLS} className="px-4 py-8 text-center text-sm text-destructive">
+          <td colSpan={cols} className="px-4 py-8 text-center text-sm text-destructive">
             โหลดรายการเพจไม่สำเร็จ — ต้องเข้าสู่ระบบแดชบอร์ดก่อนจึงจะเลือกเพจได้
           </td>
         </tr>
@@ -262,7 +357,7 @@ export function PagePicker({
     } else if (pages.length === 0) {
       body = (
         <tr>
-          <td colSpan={TABLE_COLS} className="px-4 py-8 text-center text-sm text-muted-foreground">
+          <td colSpan={cols} className="px-4 py-8 text-center text-sm text-muted-foreground">
             {emptyHint}
           </td>
         </tr>
@@ -271,7 +366,7 @@ export function PagePicker({
     } else if (filtered.length === 0) {
       body = (
         <tr>
-          <td colSpan={TABLE_COLS} className="px-4 py-8 text-center text-sm text-muted-foreground">
+          <td colSpan={cols} className="px-4 py-8 text-center text-sm text-muted-foreground">
             ไม่พบเพจที่ตรงกับ “{query.trim()}”
           </td>
         </tr>
@@ -285,6 +380,8 @@ export function PagePicker({
           selected={selectedId === page.id}
           onSelect={onSelect}
           actionLabel={actionLabel}
+          onToggleActive={onToggleActive}
+          togglePending={pendingToggleId === page.id}
         />
         ))
       footer = `แสดง 1 ถึง ${filtered.length} จาก ${pages.length} เพจ`
@@ -310,6 +407,9 @@ export function PagePicker({
                 <th scope="col" className="px-4 py-2.5 font-medium">เพจ</th>
                 <th scope="col" className="px-4 py-2.5 font-medium">สถานะ</th>
                 <th scope="col" className="px-4 py-2.5 font-medium">Token</th>
+                {onToggleActive ? (
+                  <th scope="col" className="px-4 py-2.5 font-medium">การโพสต์</th>
+                ) : null}
                 <th scope="col" className="px-4 py-2.5 text-right font-medium">
                   <span className="sr-only">การจัดการ</span>
                 </th>
