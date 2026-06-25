@@ -39,6 +39,57 @@ test('recognizeProxyTarget maps canonical Pubilo aliases to their upstream targe
     assert.equal(recognizeProxyTarget('/link/'), 'custom_link')
 })
 
+test('recognizeProxyTarget maps every income spelling to the daily-income upstream target', () => {
+    assert.equal(recognizeProxyTarget('/income'), 'income')
+    assert.equal(recognizeProxyTarget('/income/'), 'income')
+    assert.equal(recognizeProxyTarget('/income_report'), 'income')
+    assert.equal(recognizeProxyTarget('/income_report/'), 'income')
+    assert.equal(recognizeProxyTarget('/daily_income'), 'income')
+    assert.equal(recognizeProxyTarget('/daily_income/'), 'income')
+    assert.equal(recognizeProxyTarget('/daily-income'), 'income')
+    assert.equal(recognizeProxyTarget('/daily-income/'), 'income')
+})
+
+test('buildUpstreamUrl points every income alias at the daily-income-report route', () => {
+    assert.equal(
+        buildUpstreamUrl('income', '?ids=15130770000&time=today'),
+        'https://customlink.wwoom.com/daily-income-report?ids=15130770000&time=today',
+    )
+    // The upstream route name is never part of the public surface.
+    assert.equal(recognizeProxyTarget('/daily-income-report'), null)
+})
+
+test('handleReportProxyRequest proxies GET /daily_income to the daily-income upstream without leaking auth', async () => {
+    let observedUrl = ''
+    let observedHeaders: Record<string, string> = {}
+    const fetchImpl: ReportProxyFetch = async (input, init) => {
+        observedUrl = String(input)
+        observedHeaders = collectHeaders(init)
+        return new Response(JSON.stringify({ status: 'ok', report_type: 'daily_income_report' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        })
+    }
+    const response = await handleReportProxyRequest(
+        new Request('https://api.pubilo.com/daily_income?ids=15130770000&time=today', {
+            method: 'GET',
+            headers: { cookie: 'chearb_sess=sess_abc', 'x-admin-token': 'secret' },
+        }),
+        { fetchImpl },
+    )
+    assert.ok(response)
+    assert.equal(response!.status, 200)
+    assert.equal(
+        observedUrl,
+        'https://customlink.wwoom.com/daily-income-report?ids=15130770000&time=today',
+    )
+    assert.equal(observedHeaders['cookie'], undefined)
+    assert.equal(observedHeaders['x-admin-token'], undefined)
+    const body = await response!.json() as { status: string; report_type: string }
+    assert.equal(body.status, 'ok')
+    assert.equal(body.report_type, 'daily_income_report')
+})
+
 test('recognizeProxyTarget keeps legacy *_report aliases working side by side', () => {
     assert.equal(recognizeProxyTarget('/click_report'), 'click')
     assert.equal(recognizeProxyTarget('/click_report/'), 'click')

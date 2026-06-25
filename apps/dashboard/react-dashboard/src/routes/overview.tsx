@@ -1,53 +1,44 @@
-import { Link } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
-import { Activity, RefreshCw } from 'lucide-react'
-import { fetchOverviewSummary, type ApiStatus } from '@/api/overview'
+import { RefreshCw } from 'lucide-react'
+import { fetchOverviewSummary, type ApiStatus, type OverviewSummary } from '@/api/overview'
 import { cn } from '@/lib/utils'
 
-// Shopee-Affiliate-style operator overview. Same live data as the previous
-// build (gallery/processing/inbox counts + worker API status from
-// fetchOverviewSummary) — only the presentation was reworked to resemble the
-// Shopee Affiliate dashboard: a Data Period bar, a white Key Metrics panel of
-// metric boxes, a worker-health row (the Shopee "Clicks Breakdown" slot), and a
-// tools table (the Shopee "My Top 5 Products" slot). No fake/secret data: every
-// number is a real summary count or "—" when unavailable.
-
-type Tone = 'pos' | 'neg' | 'neutral'
-
-// A metric box is either a live count ('number'), the worker status dot
-// ('status'), or a static text value ('text' — e.g. the workspace name).
-type MetricKind = 'number' | 'status' | 'text'
-
-interface Metric {
-  label: string
-  kind: MetricKind
-  value: number | null
-  text?: string
-  meta: string
-  tone: Tone
-  to: '/gallery' | '/processing' | '/source-inventory' | '/campaigns'
-}
-
-interface ToolRow {
-  to: '/gallery' | '/processing' | '/source-inventory' | '/create-ads' | '/campaigns' | '/queue'
-  name: string
-  sub: string
-  // `dynamic` rows carry a live count (show "…" while loading); link-only rows
-  // have no metric and render "—".
-  dynamic: boolean
-  value: number | null
-  status: string
-  tone: Tone
-}
+// Shopee-Affiliate-style operator overview. Now backed by REAL Shopee dashboard
+// metrics for the CHEARB affiliate account (fetchOverviewSummary -> daily-income
+// report proxy): clicks, orders, est. commission, items sold, order amount. We
+// never fabricate numbers — any metric Shopee does not expose (e.g. new buyers)
+// renders "—" with a neutral note. The presentation is our own recreation of the
+// Shopee look, not copied Shopee CSS.
 
 const STATUS_LABEL: Record<ApiStatus, string> = {
-  ok: 'ปกติ',
-  partial: 'บางจุดล่ม',
-  down: 'เข้าไม่ได้',
+  ok: 'ข้อมูลจริงจาก API',
+  partial: 'บางบัญชียังไม่พร้อม',
+  down: 'ดึงข้อมูลไม่ได้',
 }
 
-function formatValue(value: number | null): string {
-  return value == null ? '—' : value.toLocaleString()
+// Compact Thai formatting matching the Shopee dashboard pills:
+//   23800 -> 23.8พัน   13000 -> 13พัน   744000 -> 744พัน   2_500_000 -> 2.5ล้าน
+function trimNum(n: number): string {
+  return (Math.round(n * 10) / 10).toLocaleString('th-TH', { maximumFractionDigits: 1 })
+}
+
+function formatCompact(value: number | null): string {
+  if (value == null) return '—'
+  const abs = Math.abs(value)
+  if (abs >= 1_000_000) return `${trimNum(value / 1_000_000)}ล้าน`
+  if (abs >= 1_000) return `${trimNum(value / 1_000)}พัน`
+  return value.toLocaleString('th-TH', { maximumFractionDigits: 2 })
+}
+
+function formatBaht(value: number | null): string {
+  if (value == null) return '—'
+  return `฿${formatCompact(value)}`
+}
+
+// Exact figure for the hover title, so the compact display never hides the real
+// number. Returns undefined (no title) when the metric is unavailable.
+function exactTitle(value: number | null): string | undefined {
+  return value == null ? undefined : value.toLocaleString('th-TH', { maximumFractionDigits: 2 })
 }
 
 // DD-MM-YYYY to match the Shopee "Data Period" pill (e.g. 24-06-2026).
@@ -58,12 +49,70 @@ function formatToday(): string {
   return `${dd}-${mm}-${now.getFullYear()}`
 }
 
-function toneClass(tone: Tone): string {
-  return tone === 'pos'
-    ? 'text-emerald-600'
-    : tone === 'neg'
-      ? 'text-[#ee4d2d]'
-      : 'text-[#999999]'
+interface MetricCard {
+  label: string
+  sub: string
+  value: number | null
+  display: string
+  // Neutral per-metric note — real source label or an "unavailable" hint. Never
+  // a fabricated day-over-day delta.
+  note: string
+  available: boolean
+}
+
+function buildMetrics(data: OverviewSummary | undefined): MetricCard[] {
+  const d = data
+  return [
+    {
+      label: 'คลิก',
+      sub: 'Clicks',
+      value: d?.clicks ?? null,
+      display: formatCompact(d?.clicks ?? null),
+      note: d?.clicks != null ? 'ข้อมูลจริงจาก API' : 'ไม่มีข้อมูล',
+      available: d?.clicks != null,
+    },
+    {
+      label: 'คำสั่งซื้อ',
+      sub: 'Orders',
+      value: d?.orders ?? null,
+      display: formatCompact(d?.orders ?? null),
+      note: d?.orders != null ? 'ข้อมูลจริงจาก API' : 'ไม่มีข้อมูล',
+      available: d?.orders != null,
+    },
+    {
+      label: 'ค่าคอมมิชชั่นโดยประมาณ',
+      sub: 'Est. Commission (฿)',
+      value: d?.commission ?? null,
+      display: formatBaht(d?.commission ?? null),
+      note: d?.commission != null ? 'ข้อมูลจริงจาก API' : 'ไม่มีข้อมูล',
+      available: d?.commission != null,
+    },
+    {
+      label: 'จำนวนที่ขายได้',
+      sub: 'Items Sold',
+      value: d?.itemsSold ?? null,
+      display: formatCompact(d?.itemsSold ?? null),
+      note: d?.itemsSold != null ? 'ข้อมูลจริงจาก API' : 'ไม่มีข้อมูล',
+      available: d?.itemsSold != null,
+    },
+    {
+      label: 'จำนวนคำสั่งซื้อ',
+      sub: 'Order Amount (฿)',
+      value: d?.orderAmount ?? null,
+      display: formatBaht(d?.orderAmount ?? null),
+      note: d?.orderAmount != null ? 'ข้อมูลจริงจาก API' : 'ไม่มีข้อมูล',
+      available: d?.orderAmount != null,
+    },
+    {
+      label: 'ลูกค้าใหม่',
+      sub: 'New Buyers',
+      value: d?.newBuyers ?? null,
+      display: formatCompact(d?.newBuyers ?? null),
+      // Shopee's dashboard/detail summary doesn't expose this — keep it honest.
+      note: 'API ไม่มีข้อมูลนี้',
+      available: d?.newBuyers != null,
+    },
+  ]
 }
 
 export function OverviewPage() {
@@ -74,120 +123,8 @@ export function OverviewPage() {
 
   const data = query.data
   const status: ApiStatus = query.isError ? 'down' : data?.apiStatus ?? 'down'
-
-  const galleryReady = data?.galleryReady ?? null
-  const processingActive = data?.processingActive ?? null
-  const failedJobs = data?.failedJobs ?? null
-  const inboxUnprocessed = data?.inboxUnprocessed ?? null
-
-  const metrics: Metric[] = [
-    {
-      label: 'Gallery ready',
-      kind: 'number',
-      value: galleryReady,
-      meta: (galleryReady ?? 0) > 0 ? 'มีคลิปพร้อมโพสต์' : 'ยังไม่มี',
-      tone: (galleryReady ?? 0) > 0 ? 'pos' : 'neutral',
-      to: '/gallery',
-    },
-    {
-      label: 'Processing active',
-      kind: 'number',
-      value: processingActive,
-      meta: (processingActive ?? 0) > 0 ? 'กำลังทำงาน' : 'ว่าง',
-      tone: (processingActive ?? 0) > 0 ? 'pos' : 'neutral',
-      to: '/processing',
-    },
-    {
-      label: 'Failed jobs',
-      kind: 'number',
-      value: failedJobs,
-      meta: (failedJobs ?? 0) > 0 ? 'ต้องตรวจสอบ' : 'ปกติ',
-      tone: (failedJobs ?? 0) > 0 ? 'neg' : 'pos',
-      to: '/processing',
-    },
-    {
-      label: 'Source inventory',
-      kind: 'number',
-      value: inboxUnprocessed,
-      meta: 'รอประมวลผล',
-      tone: (inboxUnprocessed ?? 0) > 0 ? 'pos' : 'neutral',
-      to: '/source-inventory',
-    },
-    {
-      label: 'API status',
-      kind: 'status',
-      value: null,
-      meta: query.isLoading ? 'กำลังตรวจ…' : STATUS_LABEL[status],
-      tone: status === 'ok' ? 'pos' : status === 'partial' ? 'neutral' : 'neg',
-      to: '/processing',
-    },
-    {
-      label: 'Workspace',
-      kind: 'text',
-      value: null,
-      text: 'PUBILO',
-      meta: 'เครื่องมือทั้งหมด',
-      tone: 'neutral',
-      to: '/campaigns',
-    },
-  ]
-
-  const tools: ToolRow[] = [
-    {
-      to: '/gallery',
-      name: 'แกลลี่',
-      sub: 'Gallery',
-      dynamic: true,
-      value: galleryReady,
-      status: (galleryReady ?? 0) > 0 ? 'พร้อมโพสต์' : 'ว่าง',
-      tone: (galleryReady ?? 0) > 0 ? 'pos' : 'neutral',
-    },
-    {
-      to: '/processing',
-      name: 'ประมวลผล',
-      sub: 'Processing',
-      dynamic: true,
-      value: processingActive,
-      status: (processingActive ?? 0) > 0 ? 'กำลังทำงาน' : 'ว่าง',
-      tone: (processingActive ?? 0) > 0 ? 'pos' : 'neutral',
-    },
-    {
-      to: '/source-inventory',
-      name: 'คลังต้นฉบับ',
-      sub: 'Source Inventory',
-      dynamic: true,
-      value: inboxUnprocessed,
-      status: (inboxUnprocessed ?? 0) > 0 ? 'รอประมวลผล' : 'ว่าง',
-      tone: (inboxUnprocessed ?? 0) > 0 ? 'pos' : 'neutral',
-    },
-    {
-      to: '/create-ads',
-      name: 'สร้างแอด',
-      sub: 'Create Ads',
-      dynamic: false,
-      value: null,
-      status: 'พร้อมใช้',
-      tone: 'neutral',
-    },
-    {
-      to: '/campaigns',
-      name: 'แคมเปญ',
-      sub: 'Campaigns',
-      dynamic: false,
-      value: null,
-      status: 'พร้อมใช้',
-      tone: 'neutral',
-    },
-    {
-      to: '/queue',
-      name: 'คิวสร้างแอด',
-      sub: 'Queue',
-      dynamic: false,
-      value: null,
-      status: 'พร้อมใช้',
-      tone: 'neutral',
-    },
-  ]
+  const metrics = buildMetrics(data)
+  const socialMediaClicks = data?.socialMediaClicks ?? null
 
   return (
     <div className="mx-auto max-w-6xl space-y-4">
@@ -205,7 +142,9 @@ export function OverviewPage() {
           {formatToday()}
         </span>
         <span className="ml-auto text-[13px] text-[#999999]">
-          ข้อมูลอัปเดตอัตโนมัติเมื่อรีเฟรช · Data is updated on refresh
+          {data?.lastUpdateTime
+            ? `อัปเดตล่าสุดจาก Shopee: ${data.lastUpdateTime}`
+            : 'ข้อมูลจริงจาก Shopee Affiliate · CHEARB'}
         </span>
       </div>
 
@@ -214,7 +153,18 @@ export function OverviewPage() {
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold text-[#333333]">Key Metrics</h2>
           <div className="flex items-center gap-3">
-            <span className="text-[13px] text-[#999999]">vs previous day</span>
+            <span
+              className={cn(
+                'text-[13px]',
+                status === 'ok'
+                  ? 'text-emerald-600'
+                  : status === 'partial'
+                    ? 'text-amber-600'
+                    : 'text-[#ee4d2d]',
+              )}
+            >
+              {query.isLoading ? 'กำลังโหลด…' : STATUS_LABEL[status]}
+            </span>
             <button
               type="button"
               onClick={() => void query.refetch()}
@@ -229,108 +179,71 @@ export function OverviewPage() {
 
         <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
           {metrics.map((metric) => (
-            <Link
-              key={metric.label}
-              to={metric.to}
-              className="rounded-[2px] border border-[#eeeeee] p-4 transition-colors hover:border-[#ee4d2d]/50 hover:shadow-sm"
+            <div
+              key={metric.sub}
+              title={exactTitle(metric.value)}
+              className="rounded-[2px] border border-[#eeeeee] p-4"
             >
               <p className="text-[13px] text-[#666666]">{metric.label}</p>
+              <p className="text-[11px] text-[#bbbbbb]">{metric.sub}</p>
               <div className="mt-2 flex items-end justify-between gap-2">
-                <div className="text-2xl font-semibold tracking-tight text-[#222222]">
-                  {metric.kind === 'number' ? (
-                    query.isLoading ? '…' : formatValue(metric.value)
-                  ) : metric.kind === 'status' ? (
-                    <span
-                      className={cn(
-                        'inline-block h-4 w-4 rounded-full',
-                        status === 'ok'
-                          ? 'bg-emerald-500'
-                          : status === 'partial'
-                            ? 'bg-amber-500'
-                            : query.isLoading
-                              ? 'bg-[#cccccc]'
-                              : 'bg-[#ee4d2d]',
-                      )}
-                    />
-                  ) : (
-                    metric.text
+                <div
+                  className={cn(
+                    'text-2xl font-semibold tracking-tight',
+                    metric.available ? 'text-[#222222]' : 'text-[#cccccc]',
                   )}
+                >
+                  {query.isLoading ? '…' : metric.display}
                 </div>
-                <span className={cn('text-xs font-medium', toneClass(metric.tone))}>{metric.meta}</span>
+                <span
+                  className={cn(
+                    'text-xs font-medium',
+                    metric.available ? 'text-[#999999]' : 'text-[#cccccc]',
+                  )}
+                >
+                  {metric.note}
+                </span>
               </div>
-            </Link>
+            </div>
           ))}
         </div>
       </section>
 
-      {/* 3. Clicks-Breakdown slot → worker health row */}
-      <section className="rounded-[2px] bg-white p-5 shadow-sm">
-        <h2 className="mb-3 text-base font-semibold text-[#333333]">Worker Health</h2>
-        <div className="flex items-center justify-between rounded-[2px] border border-[#eeeeee] px-4 py-3">
-          <div className="flex items-center gap-2.5">
+      {/* 3. Click breakdown — our traffic is social/page-post driven, so the real
+          clicks figure is shown as the single Social Media channel (no fabricated
+          channel split). Hidden entirely when no real clicks count exists. */}
+      {socialMediaClicks != null && (
+        <section className="rounded-[2px] bg-white p-5 shadow-sm">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-base font-semibold text-[#333333]">Click Breakdown</h2>
+            <span className="text-[13px] text-[#999999]">ตามช่องทาง · by channel</span>
+          </div>
+          <div className="flex items-center justify-between rounded-[2px] border border-[#eeeeee] px-4 py-3">
+            <div>
+              <p className="text-sm font-medium text-[#333333]">Social Media</p>
+              <p className="text-[12px] text-[#999999]">โพสต์/เพจ Facebook · ทราฟฟิกทั้งหมดเป็นโซเชียล</p>
+            </div>
             <span
-              className={cn(
-                'inline-block h-2.5 w-2.5 rounded-full',
-                status === 'ok'
-                  ? 'bg-emerald-500'
-                  : status === 'partial'
-                    ? 'bg-amber-500'
-                    : query.isLoading
-                      ? 'bg-[#cccccc]'
-                      : 'bg-[#ee4d2d]',
-              )}
-            />
-            <Activity className="h-4 w-4 text-[#999999]" />
-            <span className="text-sm text-[#333333]">
-              Worker API · <span className="text-[#999999]">/worker-api → api.pubilo.com</span>
+              className="text-xl font-semibold text-[#222222]"
+              title={exactTitle(socialMediaClicks)}
+            >
+              {query.isLoading ? '…' : formatCompact(socialMediaClicks)}
             </span>
           </div>
-          <span className="text-sm font-semibold text-[#333333]">
-            {query.isLoading ? 'กำลังตรวจ…' : STATUS_LABEL[status]}
-          </span>
-        </div>
-      </section>
+        </section>
+      )}
 
-      {/* 4. My-Top-5-Products slot → tools table */}
-      <section className="rounded-[2px] bg-white p-5 shadow-sm">
-        <h2 className="mb-3 text-base font-semibold text-[#333333]">เครื่องมือหลัก · Tools</h2>
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-[#eeeeee] text-left text-[13px] text-[#999999]">
-                <th className="py-2.5 pr-3 font-normal">Tool</th>
-                <th className="py-2.5 px-3 font-normal">Status</th>
-                <th className="py-2.5 px-3 text-right font-normal">Metric</th>
-                <th className="py-2.5 pl-3 text-right font-normal">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tools.map((tool) => (
-                <tr key={tool.to + tool.name} className="border-b border-[#f5f5f5] last:border-0">
-                  <td className="py-3 pr-3">
-                    <div className="font-medium text-[#2673dd]">{tool.name}</div>
-                    <div className="text-[12px] text-[#999999]">{tool.sub}</div>
-                  </td>
-                  <td className="px-3 py-3">
-                    <span className={cn('text-[13px] font-medium', toneClass(tool.tone))}>{tool.status}</span>
-                  </td>
-                  <td className="px-3 py-3 text-right text-[#333333]">
-                    {query.isLoading && tool.dynamic ? '…' : formatValue(tool.value)}
-                  </td>
-                  <td className="py-3 pl-3 text-right">
-                    <Link
-                      to={tool.to}
-                      className="inline-flex items-center rounded-[2px] bg-[#ee4d2d] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#d8431f]"
-                    >
-                      เปิด
-                    </Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </section>
+      {/* Neutral data-source footer. Surfaces a redacted reason when the Shopee
+          session needs attention, never a secret/token. */}
+      <p className="px-1 text-[12px] text-[#999999]">
+        ที่มา: Shopee Affiliate Dashboard (CHEARB) ผ่าน /worker-api → api.pubilo.com ·
+        {' '}
+        {query.isLoading
+          ? 'กำลังตรวจสอบสถานะ…'
+          : status === 'ok'
+            ? 'ข้อมูลจริงจาก API'
+            : `สถานะ: ${STATUS_LABEL[status]}${data?.error ? ` (${data.error})` : ''}`}
+      </p>
     </div>
   )
 }

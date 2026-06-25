@@ -4,9 +4,14 @@
 // Canonical Pubilo aliases (current public contract):
 //   /click[/]        -> https://customlink.wwoom.com/click-report
 //   /conversion[/]   -> https://customlink.wwoom.com/conversion-report
+//   /income[/]       -> https://customlink.wwoom.com/daily-income-report  (Shopee dashboard/detail summary)
 //   /custom_link[/]  -> https://customlink.wwoom.com/   (Shopee/Lazada shortlink JSON bridge)
 //   /customlink[/]   -> https://customlink.wwoom.com/
 //   /link[/]         -> https://customlink.wwoom.com/
+//
+// Income aliases (all collapse to the one daily-income-report upstream):
+//   /income[/]         /income_report[/]
+//   /daily_income[/]   /daily-income[/]
 //
 // Legacy aliases (kept working exactly as before, side by side):
 //   /click_report[/]       -> https://customlink.wwoom.com/click-report
@@ -17,13 +22,14 @@
 
 // Upstream destination behind each recognized path. Several public aliases can
 // map to the same target (e.g. /click and the legacy /click_report).
-export type ProxyTarget = 'click' | 'conversion' | 'custom_link'
+export type ProxyTarget = 'click' | 'conversion' | 'income' | 'custom_link'
 
 const UPSTREAM_HOST = 'https://customlink.wwoom.com'
 
 const UPSTREAM_PATH: Record<ProxyTarget, string> = {
     click: '/click-report',
     conversion: '/conversion-report',
+    income: '/daily-income-report',
     custom_link: '/',
 }
 
@@ -33,6 +39,16 @@ const RECOGNIZED_PATHS: Record<string, ProxyTarget> = {
     '/click/': 'click',
     '/conversion': 'conversion',
     '/conversion/': 'conversion',
+    // Daily income dashboard-detail summary — same upstream behind several
+    // read-only spellings the dashboard can call.
+    '/income': 'income',
+    '/income/': 'income',
+    '/income_report': 'income',
+    '/income_report/': 'income',
+    '/daily_income': 'income',
+    '/daily_income/': 'income',
+    '/daily-income': 'income',
+    '/daily-income/': 'income',
     '/custom_link': 'custom_link',
     '/custom_link/': 'custom_link',
     '/customlink': 'custom_link',
