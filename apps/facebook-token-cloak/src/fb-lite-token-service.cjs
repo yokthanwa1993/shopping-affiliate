@@ -1,9 +1,9 @@
 /**
  * Token Facebook Lite Service — Node.js port
- * 
+ *
  * POST /token  — Generate Facebook Lite token from credentials
  * GET  /health — Health check
- * 
+ *
  * Requires: npm install node-fetch otpauth node-forge
  */
 
