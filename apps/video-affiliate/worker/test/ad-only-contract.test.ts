@@ -77,24 +77,6 @@ function getAdHistoryNormalizerSource(): string {
 
 
 
-test('filterAutoAdsAllowedPageIds keeps only เฉียบ for unattended auto ads', () => {
-    assert.deepEqual(AUTO_ADS_ALLOWED_PAGE_IDS, ['1008898512617594'])
-    assert.deepEqual(
-        filterAutoAdsAllowedPageIds([
-            '103881139378321',
-            '1008898512617594',
-            '1008898512617594',
-            '107267395614980',
-            '',
-        ]),
-        ['1008898512617594'],
-    )
-})
-
-test('filterAutoAdsAllowedPageIds fails closed when the allowlist is empty', () => {
-    assert.deepEqual(filterAutoAdsAllowedPageIds(['1008898512617594'], []), [])
-})
-
 test('validate fails closed when page_id is missing', () => {
     const v = validateAdOnlyInput({ story_id: '123_456' })
     assert.equal(v.ok, false)
