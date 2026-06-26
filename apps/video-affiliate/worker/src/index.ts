@@ -12984,7 +12984,15 @@ async function runFollowLaneCreateAdOnly(
             const commentResp = await fetch(`${baseUrl}/page-comment`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ page_id: validation.pageId, story_id: adStoryIdForProof, message: commentMessage, comment_message: commentMessage }),
+                body: JSON.stringify({
+                    page_id: validation.pageId,
+                    story_id: adStoryIdForProof,
+                    // Use the same resolved bridge session account as /create-ad; otherwise the
+                    // Page-comment bridge can fail closed with session:no_session even after the ad succeeds.
+                    ...(bridgeAccount ? { account: bridgeAccount } : {}),
+                    message: commentMessage,
+                    comment_message: commentMessage,
+                }),
             })
             const commentData = await commentResp.json().catch(() => ({})) as Record<string, unknown>
             if (commentResp.ok && commentData.ok && commentData.id) {

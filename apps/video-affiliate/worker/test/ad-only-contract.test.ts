@@ -912,6 +912,7 @@ test('Follow lane handler remints a three-sub COMMENT shortlink off the story ta
     assert.match(src, /buildFollowLaneCommentMessage\(commentShortlink\)/)
     assert.match(src, /\/page-comment/)
     assert.match(src, /story_id: adStoryIdForProof/)
+    assert.match(src, /bridgeAccount \? \{ account: bridgeAccount \} : \{\}/, 'Page comment must use the resolved bridge account too')
     // Surfaces sanitized comment proof fields (no tokens).
     assert.match(src, /follow_comment_status/)
     assert.match(src, /follow_comment_id/)
