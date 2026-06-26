@@ -1,28 +1,16 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Copy, ExternalLink, Film, RefreshCw } from 'lucide-react'
+import { Check, Copy, Film, Play, RefreshCw } from 'lucide-react'
 import {
   fetchVideoMediaLibrary,
   uploadVideoToMediaLibrary,
   type VideoMediaLibraryItem,
 } from '@/api/videoMediaLibrary'
+import { WORKER_API_BASE } from '@/api/client'
 import { formatThaiDateTime } from '@/lib/format'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 
-// Maps the worker's upload_status string to a Shopee-ish badge tone. Anything we
-// don't recognize falls back to a neutral outline so new states still render.
-function statusVariant(status: string): 'success' | 'destructive' | 'secondary' | 'outline' {
-  const s = status.toLowerCase()
-  if (s === 'success' || s === 'ready') return 'success'
-  if (s === 'failed' || s.startsWith('skipped')) return 'destructive'
-  if (s === 'uploading' || s === 'in_progress' || s === 'processing') return 'secondary'
-  return 'outline'
-}
-
-// Small inline copy-to-clipboard affordance, mirroring the gallery card's copy
-// button. Shows a transient check after a successful copy.
 function CopyButton({ value, label }: { value: string; label: string }) {
   const [copied, setCopied] = useState(false)
   if (!value) return null
@@ -31,8 +19,9 @@ function CopyButton({ value, label }: { value: string; label: string }) {
       type="button"
       size="sm"
       variant="outline"
-      className="h-6 gap-1 px-2 text-[11px]"
-      onClick={() => {
+      className="h-7 gap-1 px-2 text-[11px]"
+      onClick={(e) => {
+        e.stopPropagation()
         void navigator.clipboard?.writeText(value).then(
           () => {
             setCopied(true)
@@ -48,66 +37,144 @@ function CopyButton({ value, label }: { value: string; label: string }) {
   )
 }
 
-function isReadyItem(item: VideoMediaLibraryItem) {
-  return Boolean(item.advideoId && ['success', 'ready'].includes(item.uploadStatus.toLowerCase()))
+// Meta's Asset Library can already play a freshly uploaded advideo while the raw
+// Graph status still says "processing". The dashboard should mirror the operator
+// view: if Meta returned an advideo id and our source file is playable with no
+// error, show it as a usable media-library asset instead of a processing row.
+function isDisplayReadyItem(item: VideoMediaLibraryItem) {
+  return Boolean(item.advideoId && item.fileUrl && !item.error)
 }
 
-function MediaRow({ item }: { item: VideoMediaLibraryItem }) {
-  const ready = isReadyItem(item)
-  const failed = item.uploadStatus.toLowerCase() === 'failed' || item.uploadStatus.toLowerCase().startsWith('skipped')
-  return (
-    <div className={`rounded-xl border bg-card p-3 text-sm ${failed ? 'border-destructive/40 bg-destructive/5' : ''}`}>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2 font-medium text-foreground">
-          <Film className="h-4 w-4 text-[#ee4d2d]" />
-          <span className="break-all">{item.systemVideoId}</span>
-        </div>
-        <Badge variant={statusVariant(item.uploadStatus)}>
-          {ready ? 'พร้อมใช้' : failed ? 'อัปโหลดไม่สำเร็จ' : (item.uploadStatus || 'unknown')}
-          {item.advideoStatus && !ready ? ` · ${item.advideoStatus}` : ''}
-        </Badge>
+function mediaThumbSrc(item: VideoMediaLibraryItem): string {
+  return `${WORKER_API_BASE}/api/gallery/${encodeURIComponent(item.systemVideoId)}/asset/thumb?namespace_id=${encodeURIComponent(item.namespaceId)}`
+}
+
+function MediaThumb({ item }: { item: VideoMediaLibraryItem }) {
+  const [failed, setFailed] = useState(false)
+  const src = mediaThumbSrc(item)
+  if (failed) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-muted text-muted-foreground">
+        <Film className="h-8 w-8" />
       </div>
+    )
+  }
+  return (
+    <img
+      src={src}
+      alt={item.systemVideoId}
+      loading="lazy"
+      className="h-full w-full object-cover"
+      onError={() => setFailed(true)}
+    />
+  )
+}
 
-      <dl className="mt-2 grid grid-cols-1 gap-x-4 gap-y-1.5 text-xs text-muted-foreground sm:grid-cols-2">
-        <div className="flex items-center gap-2">
-          <dt className="shrink-0 font-medium text-foreground/70">Meta video id</dt>
-          <dd className="flex min-w-0 items-center gap-1.5">
-            <span className="break-all">{item.advideoId || '—'}</span>
-            {item.advideoId ? <CopyButton value={item.advideoId} label="คัดลอก" /> : null}
-          </dd>
-        </div>
-        <div className="flex items-center gap-2">
-          <dt className="shrink-0 font-medium text-foreground/70">Ad account</dt>
-          <dd className="break-all">{item.adAccount || '—'}</dd>
-        </div>
-        <div className="flex items-center gap-2">
-          <dt className="shrink-0 font-medium text-foreground/70">อัปโหลด</dt>
-          <dd>{formatThaiDateTime(item.uploadedAt) || '—'}</dd>
-        </div>
-        <div className="flex items-center gap-2">
-          <dt className="shrink-0 font-medium text-foreground/70">อัปเดต</dt>
-          <dd>{formatThaiDateTime(item.updatedAt) || '—'}</dd>
-        </div>
-      </dl>
-
-      {item.error ? (
-        <p className={`mt-2 rounded-lg border px-2.5 py-1.5 text-[11px] ${failed ? 'border-destructive/40 bg-destructive/10 text-destructive' : 'border-amber-300 bg-amber-50 text-amber-900'}`}>
-          {failed ? 'อัปโหลดไม่สำเร็จ: ' : ''}{item.error}
-        </p>
-      ) : null}
-
-      {item.fileUrl ? (
-        <a
-          href={item.fileUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-[#ee4d2d] hover:underline"
+function MediaPreviewModal({ item, onClose }: { item: VideoMediaLibraryItem; onClose: () => void }) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={item.systemVideoId}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="relative flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border bg-card shadow-xl sm:flex-row"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="ปิด"
+          className="absolute right-3 top-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-full bg-black/50 text-white transition hover:bg-black/70"
         >
-          <ExternalLink className="h-3 w-3" />
-          เปิดไฟล์ต้นทาง
-        </a>
-      ) : null}
+          ×
+        </button>
+        <div className="flex items-center justify-center bg-black sm:w-1/2">
+          <video
+            src={item.fileUrl}
+            poster={mediaThumbSrc(item)}
+            controls
+            playsInline
+            autoPlay
+            className="max-h-[50vh] w-full object-contain sm:max-h-[90vh]"
+          />
+        </div>
+        <div className="flex min-w-0 flex-1 flex-col gap-3 overflow-y-auto p-4 sm:w-1/2">
+          <div>
+            <h2 className="text-base font-semibold leading-snug">{item.systemVideoId}</h2>
+            <p className="mt-1 text-xs text-muted-foreground">พร้อมแสดงผลใน Meta Asset Library</p>
+          </div>
+          <div className="space-y-2 text-xs text-muted-foreground">
+            <div className="flex items-center gap-2">
+              <span className="w-24 shrink-0 font-medium text-foreground/70">Meta video id</span>
+              <span className="break-all font-mono">{item.advideoId}</span>
+              <CopyButton value={item.advideoId} label="คัดลอก" />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-24 shrink-0 font-medium text-foreground/70">Ad account</span>
+              <span className="break-all">{item.adAccount || '—'}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="w-24 shrink-0 font-medium text-foreground/70">สร้างเมื่อ</span>
+              <span>{formatThaiDateTime(item.uploadedAt || item.updatedAt || item.createdAt) || '—'}</span>
+            </div>
+          </div>
+          <div className="mt-auto flex flex-col gap-2 pt-2">
+            <a
+              href={item.fileUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-lg bg-muted px-3 py-2 text-center text-sm font-semibold text-foreground transition hover:bg-accent"
+            >
+              เปิดวิดีโอในแท็บใหม่
+            </a>
+          </div>
+        </div>
+      </div>
     </div>
+  )
+}
+
+function MediaCard({ item, onOpen }: { item: VideoMediaLibraryItem; onOpen: () => void }) {
+  return (
+    <article className="overflow-hidden rounded-xl border bg-card shadow-sm transition hover:shadow-md">
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-label={`ดูวิดีโอ ${item.systemVideoId}`}
+        className="relative block aspect-[9/16] w-full overflow-hidden bg-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <MediaThumb item={item} />
+        <span className="absolute left-2 top-2 rounded bg-emerald-600/90 px-2 py-0.5 text-[11px] font-semibold text-white">
+          พร้อมแสดงผล
+        </span>
+        <span className="absolute bottom-2 right-2 inline-flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white">
+          <Play className="ml-0.5 h-4 w-4" fill="currentColor" />
+        </span>
+      </button>
+      <div className="space-y-2 p-3">
+        <p className="line-clamp-2 text-sm font-medium">{item.systemVideoId}</p>
+        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <span className="truncate font-mono">{item.advideoId}</span>
+          <span className="shrink-0">{formatThaiDateTime(item.uploadedAt || item.updatedAt || item.createdAt)}</span>
+        </div>
+        <div className="flex flex-wrap gap-1.5 pt-1 text-xs">
+          <span className="rounded bg-emerald-50 px-2 py-1 font-semibold text-emerald-700">Meta พร้อมใช้</span>
+          <a
+            href={item.fileUrl}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="rounded bg-muted px-2 py-1 font-semibold text-foreground hover:bg-accent"
+          >
+            เปิดวิดีโอ
+          </a>
+          <CopyButton value={item.advideoId} label="Meta id" />
+        </div>
+      </div>
+    </article>
   )
 }
 
@@ -116,16 +183,25 @@ export function MediaLibraryPage() {
   const [systemVideoId, setSystemVideoId] = useState('')
   const [pageId, setPageId] = useState('')
   const [adAccount, setAdAccount] = useState('')
+  const [search, setSearch] = useState('')
+  const [selected, setSelected] = useState<VideoMediaLibraryItem | null>(null)
 
   const query = useQuery({
     queryKey: ['video-media-library'],
-    queryFn: ({ signal }) => fetchVideoMediaLibrary(signal),
+    queryFn: ({ signal }) => fetchVideoMediaLibrary(signal, { limit: 200 }),
   })
   const items = query.data?.items ?? []
-  const libraryItems = items.filter((item) => item.advideoId || !['failed', 'skipped_missing_config'].some((status) => item.uploadStatus.toLowerCase().startsWith(status)))
-  const readyCount = items.filter(isReadyItem).length
-  const failedCount = items.filter((item) => item.uploadStatus.toLowerCase() === 'failed' || item.uploadStatus.toLowerCase().startsWith('skipped')).length
-  const hiddenFailedCount = items.length - libraryItems.length
+  const readyItems = useMemo(() => items.filter(isDisplayReadyItem), [items])
+  const hiddenCount = Math.max(0, items.length - readyItems.length)
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return readyItems
+    return readyItems.filter((item) =>
+      item.systemVideoId.toLowerCase().includes(q)
+      || item.advideoId.toLowerCase().includes(q)
+      || item.adAccount.toLowerCase().includes(q),
+    )
+  }, [readyItems, search])
 
   const uploadMutation = useMutation({
     mutationFn: () =>
@@ -139,133 +215,102 @@ export function MediaLibraryPage() {
       void qc.invalidateQueries({ queryKey: ['video-media-library'] })
     },
   })
-
   const uploadResultItem = uploadMutation.data?.item ?? null
-  const uploadWarning = uploadMutation.data?.warning ?? ''
 
   return (
-    <div className="mx-auto max-w-3xl space-y-4">
-      <div>
-        <h1 className="flex items-center gap-2 text-xl font-semibold text-[#333333]">
-          <Film className="h-5 w-5 text-[#ee4d2d]" />
-          คลังสื่อวิดีโอ
-        </h1>
+    <div className="mx-auto max-w-6xl space-y-5">
+      <div className="space-y-1">
+        <h1 className="text-2xl font-semibold tracking-tight">คลังสื่อ</h1>
         <p className="text-sm text-muted-foreground">
-          Meta Asset Library — วิดีโอที่อัปโหลดเข้า media library ของบัญชีโฆษณา (advideos). ต้องมีสถานะ “พร้อมใช้” และ Meta video id ก่อนนำไปสร้างแอดได้ — หน้านี้ยังไม่สร้างแอดจริง
+          วิดีโอที่เข้า Meta Asset Library แล้วและเปิดเล่นได้จริง พร้อมนำไปใช้สร้างแอด
         </p>
-        {items.length > 0 ? (
-          <p className={`mt-2 rounded-lg border px-3 py-2 text-xs ${readyCount > 0 ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-destructive/40 bg-destructive/5 text-destructive'}`}>
-            พร้อมใช้ {readyCount} / {libraryItems.length} วิดีโอในคลัง{failedCount ? ` · ซ่อน failed เก่า ${hiddenFailedCount} รายการ` : ''}
+      </div>
+
+      <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="inline-flex items-center gap-2 rounded-lg bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700">
+          <Film className="h-4 w-4" />
+          พร้อมแสดงผล {readyItems.length} วิดีโอ
+          {hiddenCount ? <span className="font-normal text-muted-foreground">· ซ่อนรายการที่ยังใช้ไม่ได้ {hiddenCount}</span> : null}
+        </div>
+        <div className="flex items-center gap-2 sm:max-w-md sm:flex-1">
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="ค้นหา video id หรือ Meta video id"
+          />
+          <Button type="button" variant="outline" onClick={() => void query.refetch()} disabled={query.isFetching}>
+            <RefreshCw className={`mr-1 h-4 w-4 ${query.isFetching ? 'animate-spin' : ''}`} />
+            รีเฟรช
+          </Button>
+        </div>
+      </div>
+
+      <div className="rounded-xl border bg-card p-3">
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_1fr_1fr_auto] md:items-end">
+          <label className="space-y-1 text-sm">
+            <span className="block font-medium text-foreground">System video id</span>
+            <Input value={systemVideoId} onChange={(e) => setSystemVideoId(e.target.value)} placeholder="เช่น ea0de816" />
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="block font-medium text-foreground">Page id (ไม่บังคับ)</span>
+            <Input value={pageId} onChange={(e) => setPageId(e.target.value)} placeholder="ใช้ default_page" />
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="block font-medium text-foreground">Ad account (ไม่บังคับ)</span>
+            <Input value={adAccount} onChange={(e) => setAdAccount(e.target.value)} placeholder="ใช้ค่าของเพจ" />
+          </label>
+          <Button
+            type="button"
+            onClick={() => uploadMutation.mutate()}
+            disabled={!systemVideoId.trim() || uploadMutation.isPending}
+          >
+            {uploadMutation.isPending ? 'กำลังเพิ่ม…' : 'Add Media'}
+          </Button>
+        </div>
+        {uploadMutation.isError ? (
+          <p className="mt-2 rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1.5 text-xs text-destructive">
+            {(uploadMutation.error as Error)?.message || 'เพิ่มวิดีโอไม่สำเร็จ'}
+          </p>
+        ) : null}
+        {uploadMutation.isSuccess && uploadResultItem ? (
+          <p className={`mt-2 rounded-lg border px-2.5 py-1.5 text-xs ${isDisplayReadyItem(uploadResultItem) ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-amber-300 bg-amber-50 text-amber-900'}`}>
+            {isDisplayReadyItem(uploadResultItem)
+              ? `เพิ่มเข้าคลังแล้ว — Meta video id ${uploadResultItem.advideoId}`
+              : 'ส่งเข้า Meta แล้ว รอรายการพร้อมแสดงผล'}
           </p>
         ) : null}
       </div>
 
-      {/* Manual upload of one system gallery video. */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">อัปโหลดวิดีโอเข้าคลังสื่อ</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <label className="space-y-1 text-sm">
-              <span className="block font-medium text-foreground">System video id *</span>
-              <input
-                type="text"
-                value={systemVideoId}
-                onChange={(e) => setSystemVideoId(e.target.value)}
-                placeholder="เช่น 2695c305"
-                className="w-full rounded-lg border bg-background px-2.5 py-1.5 text-sm text-foreground"
-              />
-            </label>
-            <label className="space-y-1 text-sm">
-              <span className="block font-medium text-foreground">Page id (ไม่บังคับ)</span>
-              <input
-                type="text"
-                value={pageId}
-                onChange={(e) => setPageId(e.target.value)}
-                placeholder="ใช้ default_page ถ้าเว้นว่าง"
-                className="w-full rounded-lg border bg-background px-2.5 py-1.5 text-sm text-foreground"
-              />
-            </label>
-            <label className="space-y-1 text-sm sm:col-span-2">
-              <span className="block font-medium text-foreground">Ad account (ไม่บังคับ)</span>
-              <input
-                type="text"
-                value={adAccount}
-                onChange={(e) => setAdAccount(e.target.value)}
-                placeholder="เช่น act_1030797047648459 — ใช้ค่าของเพจถ้าเว้นว่าง"
-                className="w-full rounded-lg border bg-background px-2.5 py-1.5 text-sm text-foreground"
-              />
-            </label>
-          </div>
+      {query.isError ? (
+        <div className="rounded-xl border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+          โหลดคลังสื่อไม่สำเร็จ: {query.error instanceof Error ? query.error.message : 'unknown error'}
+        </div>
+      ) : null}
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              onClick={() => uploadMutation.mutate()}
-              disabled={!systemVideoId.trim() || uploadMutation.isPending}
-            >
-              {uploadMutation.isPending ? 'กำลังอัปโหลด…' : 'อัปโหลดเข้าคลังสื่อ'}
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => void query.refetch()}
-              disabled={query.isFetching}
-            >
-              <RefreshCw className={`mr-1 h-4 w-4 ${query.isFetching ? 'animate-spin' : ''}`} />
-              รีเฟรช
-            </Button>
-          </div>
+      {query.isLoading ? (
+        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+          {Array.from({ length: 10 }).map((_, i) => (
+            <div key={i} className="aspect-[9/16] animate-pulse rounded-xl bg-muted" />
+          ))}
+        </div>
+      ) : filtered.length === 0 ? (
+        <p className="rounded-xl border border-dashed p-10 text-center text-sm text-muted-foreground">
+          ยังไม่มีวิดีโอที่พร้อมแสดงผลในคลังสื่อ
+        </p>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+          {filtered.map((item) => (
+            <MediaCard
+              key={`${item.adAccount}:${item.systemVideoId}:${item.advideoId}`}
+              item={item}
+              onOpen={() => setSelected(item)}
+            />
+          ))}
+        </div>
+      )}
 
-          {uploadMutation.isError ? (
-            <p className="rounded-lg border border-destructive/40 bg-destructive/5 px-2.5 py-1.5 text-xs text-destructive">
-              {(uploadMutation.error as Error)?.message || 'อัปโหลดไม่สำเร็จ'}
-            </p>
-          ) : null}
-          {uploadMutation.isSuccess ? (
-            <div className="space-y-2">
-              <p className={`rounded-lg border px-2.5 py-1.5 text-xs ${uploadResultItem && isReadyItem(uploadResultItem) ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-destructive/40 bg-destructive/5 text-destructive'}`}>
-                {uploadResultItem
-                  ? isReadyItem(uploadResultItem)
-                    ? `อัปโหลดสำเร็จ — Meta video id ${uploadResultItem.advideoId}`
-                    : `อัปโหลดยังไม่สำเร็จ — สถานะ: ${uploadResultItem.uploadStatus || 'unknown'}`
-                  : 'ส่งคำขออัปโหลดแล้ว — ยังอ่านแถวผลลัพธ์ไม่ได้ ลองรีเฟรช'}
-              </p>
-              {uploadWarning ? (
-                <p className="rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-900">
-                  {uploadWarning}
-                </p>
-              ) : null}
-              {uploadResultItem ? <MediaRow item={uploadResultItem} /> : null}
-            </div>
-          ) : null}
-        </CardContent>
-      </Card>
-
-      {/* Existing library rows, newest-first. */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">รายการในคลังสื่อ — {libraryItems.length} วิดีโอ</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-2">
-          {query.isLoading ? (
-            <p className="text-sm text-muted-foreground">กำลังโหลด…</p>
-          ) : query.isError ? (
-            <p className="text-sm text-destructive">
-              {(query.error as Error)?.message || 'โหลดคลังสื่อไม่สำเร็จ'}
-            </p>
-          ) : libraryItems.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              ยังไม่มีวิดีโอที่อัปโหลดเข้าคลังสำเร็จ — failed เก่าถูกซ่อนไว้เพื่อไม่ให้สับสน
-            </p>
-          ) : (
-            libraryItems.map((item) => (
-              <MediaRow key={`${item.adAccount}:${item.systemVideoId}`} item={item} />
-            ))
-          )}
-        </CardContent>
-      </Card>
+      <div className="text-xs text-muted-foreground">แสดง {filtered.length} วิดีโอพร้อมแสดงผล</div>
+      {selected ? <MediaPreviewModal item={selected} onClose={() => setSelected(null)} /> : null}
     </div>
   )
 }
