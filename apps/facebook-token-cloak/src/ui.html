@@ -491,13 +491,16 @@
       renderAccounts();
       try {
         var probe = await api("GET", "/token?account=" + encodeURIComponent(account));
-        var tokenReady = !!(probe && probe.accessToken);
+        // Render green ONLY when the endpoint reports ok=true (real-time Graph validation passed) AND
+        // accessToken=true. A minted EAAD6V token string/prefix alone must NOT look Ready — an
+        // invalidated token (password/security reset) comes back ok=false/accessToken=false.
+        var tokenReady = !!(probe && probe.ok && probe.accessToken);
         var sessionReady = !!(probe && probe.fbDtsg);
         state.tokenStatusByAccount[account] = {
           status: tokenReady ? "ready" : "incomplete",
           tokenPresent: tokenReady,
           sessionPresent: sessionReady,
-          reason: tokenReady ? undefined : (sessionReady ? "token_missing" : "not_logged_in")
+          reason: tokenReady ? undefined : ((probe && (probe.error || probe.reason)) || (sessionReady ? "token_missing" : "not_logged_in"))
         };
       } catch (error) {
         state.tokenStatusByAccount[account] = {

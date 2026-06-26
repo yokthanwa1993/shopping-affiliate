@@ -176,6 +176,36 @@ async function resolveFacebookLitePageToken(deps, account, pageId) {
   return { ...base, status: 'ok', page_found: true, hasToken: true, pageToken: info.pageToken, pageName: String(info.pageName || '') };
 }
 
+// Map a raw Graph token-validation error into a stable, sanitized public reason. A token minted
+// right after a password change / security reset comes back EAAD6V-shaped but Graph rejects it
+// ("The session has been invalidated because the user changed their password…") — surface that as
+// session_invalidated. An explicitly invalidated/expired/revoked/not-authorized token becomes
+// token_invalidated; anything else degrades to graph_token_invalid. NEVER echoes the raw token.
+function classifyGraphTokenError(raw) {
+  const text = String(raw || '').toLowerCase();
+  if (/password|changed the session|security reason/.test(text)) return 'session_invalidated';
+  if (/invalidat|expired|revoked|not authoriz|invalid oauth|malformed|session is invalid/.test(text)) return 'token_invalidated';
+  return 'graph_token_invalid';
+}
+
+// Validate a freshly-minted Facebook Lite token against the Graph API in REAL TIME. A token
+// string/prefix alone is NOT proof of usability — me/accounts is the SAME call the posting paths
+// use to resolve a PAGE token, so a pass here proves the token can actually drive Page operations
+// right now. Returns { ok, reason }; never returns the token. Gates GET /token + GET /pages
+// readiness so an EAAD6V token invalidated by a password/security reset never reads Ready.
+async function validateFacebookLiteGraphToken(lite) {
+  let result;
+  try {
+    result = await posting.listPagesPublic(lite.graphFetch, lite.token, false);
+  } catch (e) {
+    return { ok: false, reason: classifyGraphTokenError((e && (e.reason || e.code || e.message)) || 'graph_token_invalid') };
+  }
+  if (result && result.error) {
+    return { ok: false, reason: classifyGraphTokenError(result.error) };
+  }
+  return { ok: true, reason: null };
+}
+
 function isLocalRequest(req) {
   const a = req.socket.remoteAddress;
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
@@ -1333,6 +1363,14 @@ function createHandler(deps = {}) {
           if (includeToken && !isLocalRequest(req)) return sendError(res, 403, 'includeToken is only allowed for local requests');
           const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, source: 'facebook_lite_eaad6', reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
           if (!lite.ok) return send(res, 200, { ok: false, accessToken: false, fbDtsg: false, source: 'facebook_lite_eaad6', account: sanitizeAccount(account).display, error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), tokenPrefix: lite.prefix || null });
+          // Real-time Graph validation gate: a minted EAAD6V string/prefix is NOT proof of usability.
+          // Confirm the token authorizes me/accounts (Page-token operations) NOW. A token invalidated
+          // by a password change / security reset is EAAD6V-shaped but Graph-rejected — it must report
+          // ok=false/accessToken=false here, never Ready.
+          const validation = await validateFacebookLiteGraphToken(lite);
+          if (!validation.ok) {
+            return send(res, 200, { ok: false, accessToken: false, fbDtsg: false, source: 'facebook_lite_eaad6', account: sanitizeAccount(account).display, error: validation.reason, tokenPrefix: lite.prefix || null });
+          }
           const payload = { ok: true, accessToken: true, fbDtsg: false, source: 'facebook_lite_eaad6', tokenPrefix: lite.prefix, account: sanitizeAccount(account).display };
           // Operator verification ONLY: reveal the raw EAAD6V token on an explicit local request
           // (includeToken=1 from 127.0.0.1, e.g. the bundled UI's "Reveal token" button). Never on a
@@ -1367,6 +1405,11 @@ function createHandler(deps = {}) {
           const lite = await resolveFacebookLiteEAAD6Session(liteDeps, account).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
           if (!lite.ok || !lite.token) return send(res, 200, { data: [], source: 'facebook_lite_eaad6', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready') });
           const result = await posting.listPagesPublic(lite.graphFetch, lite.token, includeToken && isLocalRequest(req));
+          // Fail closed on a Graph token-validation error (e.g. password/session invalidated): return
+          // an empty list with a SANITIZED reason, never the raw Graph message and never source-ready.
+          if (result && result.error) {
+            return send(res, 200, { data: [], source: 'facebook_lite_eaad6', error: classifyGraphTokenError(result.error) });
+          }
           return send(res, 200, { ...result, source: 'facebook_lite_eaad6' });
         }
         const session = await posting.resolveSessionToken({ browser: br, account });

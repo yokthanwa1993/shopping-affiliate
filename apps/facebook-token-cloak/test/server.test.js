@@ -23,12 +23,16 @@ function assertNoLeak(value, secrets) {
   for (const secret of secrets) assert.ok(!payload.includes(secret), `leaked ${secret}`);
 }
 
-test('UI auto-check marks Facebook Lite ready from accessToken without requiring Power Editor fbDtsg', async () => {
+test('UI marks Facebook Lite ready only after the endpoint validates (ok=true AND accessToken=true), not from a token prefix alone', async () => {
   const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
-  assert.match(ui, /var tokenReady = !!\(probe && probe\.accessToken\)/);
+  // Readiness now requires the endpoint to report BOTH ok=true (real-time Graph validation passed)
+  // and accessToken=true. A minted EAAD6V prefix alone must NOT turn the badge green.
+  assert.match(ui, /var tokenReady = !!\(probe && probe\.ok && probe\.accessToken\)/);
   assert.match(ui, /var sessionReady = !!\(probe && probe\.fbDtsg\)/);
   assert.match(ui, /tokenPresent: tokenReady/);
   assert.match(ui, /sessionPresent: sessionReady/);
+  // The old prefix-only readiness check must be gone — Graph validation (probe.ok) now gates it.
+  assert.ok(!ui.includes('var tokenReady = !!(probe && probe.accessToken)'), 'readiness must not be derived from accessToken alone (prefix-only) — Graph validation gates it');
   assert.ok(!ui.includes('var ready = tokenReady && sessionReady'), 'Facebook Lite token status must not require Power Editor/session readiness');
   assert.ok(!ui.includes('tokenPresent: ready'), 'UI must not gate Facebook Lite token status on combined readiness');
 })
@@ -1001,6 +1005,89 @@ test('GET /token facebook_lite includeToken=1 reveals the raw EAAD6V token to a 
     assert.equal(r.body.tokenPrefix, 'EAAD6V');
     assert.equal(r.body.token, LITE_USER_TOKEN);
     assert.ok(String(r.body.warning || '').includes('localhost'));
+  });
+});
+
+test('GET /token facebook_lite reports NOT ready (token-free) when Graph rejects the minted token (password/session invalidated)', async () => {
+  // Regression: a token minted right after a password change comes back EAAD6V-shaped, but Meta's
+  // Graph rejects it. A prefix/string alone must NOT read Ready — only real-time Graph validation.
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const GRAPH_ERR = 'Error validating access token: The session has been invalidated because the user changed their password or Facebook has changed the session for security reasons.';
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      if (String(url).includes('/me/accounts')) {
+        return { ok: true, status: 200, json: async () => ({ error: { message: GRAPH_ERR } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('GET', '/token?account=100090320823561&facebook_lite=1');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, false, 'a Graph-rejected token must not be ok');
+    assert.equal(r.body.accessToken, false, 'a Graph-rejected token must not report accessToken=true');
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.equal(r.body.account, '100090320823561');
+    // Sanitized, stable reason — never the raw Graph message, never the token.
+    assert.equal(r.body.error, 'session_invalidated');
+    assert.equal('token' in r.body, false);
+    assertNoLeak(r.body, [LITE_USER_TOKEN, GRAPH_ERR]);
+  });
+});
+
+test('GET /token facebook_lite reports Ready only after Graph validates the minted token (me/accounts succeeds)', async () => {
+  const PAGE = '1008898512617594';
+  const LITE_USER_TOKEN = 'EAAD6Vuser0000000000000000000';
+  const LITE_PAGE_TOKEN = 'EAAD6Vpage0000000000000000000';
+  let meAccountsToken = null;
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite({ token: LITE_USER_TOKEN }),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        meAccountsToken = m ? decodeURIComponent(m[1]) : null;
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: PAGE, name: 'เฉียบ', access_token: LITE_PAGE_TOKEN }] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('GET', '/token?account=100090320823561&facebook_lite=1');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.accessToken, true);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.equal(r.body.tokenPrefix, 'EAAD6V');
+    // Readiness was confirmed by a real Graph me/accounts call with the freshly minted token.
+    assert.equal(meAccountsToken, LITE_USER_TOKEN, 'readiness must be proven via a real Graph call');
+    assert.equal('token' in r.body, false);
+    assertNoLeak(r.body, [LITE_USER_TOKEN, LITE_PAGE_TOKEN]);
+  });
+});
+
+test('GET /pages facebook_lite fails closed with a sanitized reason when Graph rejects the token (no raw graph error leaked)', async () => {
+  const GRAPH_ERR = 'Error validating access token: Session has expired.';
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      if (String(url).includes('/me/accounts')) {
+        return { ok: true, status: 200, json: async () => ({ error: { message: GRAPH_ERR } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('GET', '/pages?account=100090320823561');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.source, 'facebook_lite_eaad6');
+    assert.deepEqual(r.body.data, [], 'must fail closed with an empty page list');
+    assert.equal(r.body.error, 'token_invalidated');
+    assertNoLeak(r.body, [GRAPH_ERR]);
   });
 });
 
