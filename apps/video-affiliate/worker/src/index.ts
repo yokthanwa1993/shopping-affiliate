@@ -253,6 +253,7 @@ import {
     PROCESSED_VIDEO_ASSET_LIBRARY_ADVIDEO_INDEX_SQL,
     PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
     buildProcessedVideoAssetFileUrl,
+    mapProcessedVideoAssetLibraryItem,
     normalizeMetaVideoStatus,
     parseProcessedVideoR2Key,
     sanitizeMetaGraphError,
@@ -4024,6 +4025,11 @@ async function uploadProcessedVideoToMetaAssetLibrary(params: {
     env: Env
     namespaceId: string
     videoId: string
+    // Optional overrides for the manual "คลังสื่อ" upload path. When omitted (the
+    // R2 waitUntil auto-upload), we fall back to the default_page setting and its
+    // ad_account exactly as before — so existing behavior is byte-for-byte intact.
+    pageId?: string
+    adAccount?: string
 }): Promise<void> {
     const namespaceId = String(params.namespaceId || '').trim()
     const videoId = String(params.videoId || '').trim()
@@ -4036,10 +4042,12 @@ async function uploadProcessedVideoToMetaAssetLibrary(params: {
 
     await ensureProcessedVideoAssetLibraryTable(params.env.DB)
 
-    const defaultPageRow = await getDashboardSetting(params.env.DB, 'default_page').catch(() => null)
-    const pageId = String(defaultPageRow?.value || '').trim()
-    const adAccountRow = await getPageSetting(params.env.DB, pageId, 'ad_account').catch(() => null)
-    const adAccount = String(adAccountRow?.value || '').trim()
+    const explicitPageId = String(params.pageId || '').trim()
+    const defaultPageRow = explicitPageId ? null : await getDashboardSetting(params.env.DB, 'default_page').catch(() => null)
+    const pageId = explicitPageId || String(defaultPageRow?.value || '').trim()
+    const explicitAdAccount = String(params.adAccount || '').trim()
+    const adAccountRow = explicitAdAccount ? null : await getPageSetting(params.env.DB, pageId, 'ad_account').catch(() => null)
+    const adAccount = explicitAdAccount || String(adAccountRow?.value || '').trim()
     const token = await resolveFacebookSyncToken(params.env.DB, pageId, namespaceId).catch(() => '')
 
     if (!adAccount || !token) {
@@ -10622,6 +10630,115 @@ app.get('/api/dashboard/gallery', async (c) => {
         })
     } catch (e) {
         return c.json({ videos: [], error: String(e) }, 500)
+    }
+})
+
+// คลังสื่อวิดีโอ — Meta Asset Library (advideos) MVP. Read-only list of every
+// processed gallery video we have attempted to push to the ad account's media
+// library. Each stored advideo_id can later seed a real ad; this MVP never
+// creates ads and never returns tokens. Ordered newest-first by updated_at.
+app.get('/api/dashboard/video-media-library', async (c) => {
+    const namespaceId = String(
+        c.req.query('namespace_id') || c.req.query('bot_id') || c.get('botId') || '',
+    ).trim()
+    if (!namespaceId || namespaceId === 'default') return c.json({ error: 'namespace_id_required' }, 400)
+
+    const pageId = String(c.req.query('page_id') || '').trim()
+    const adAccountFilter = String(c.req.query('ad_account') || '').trim()
+    const limit = Math.min(Math.max(parseNonNegativeInt(c.req.query('limit'), 100), 1), 200)
+
+    try {
+        await ensureProcessedVideoAssetLibraryTable(c.env.DB)
+        const conditions = ['namespace_id = ?']
+        const binds: unknown[] = [namespaceId]
+        if (adAccountFilter) {
+            conditions.push('ad_account = ?')
+            binds.push(adAccountFilter)
+        }
+        const rows = await c.env.DB.prepare(
+            `SELECT namespace_id, system_video_id, ad_account, advideo_id, advideo_status,
+                    upload_status, error, file_url, uploaded_at, last_checked_at, created_at, updated_at
+             FROM processed_video_asset_library
+             WHERE ${conditions.join(' AND ')}
+             ORDER BY updated_at DESC
+             LIMIT ?`
+        ).bind(...binds, limit).all()
+        const items = (rows.results || []).map(mapProcessedVideoAssetLibraryItem)
+        return c.json({
+            ok: true,
+            namespace_id: namespaceId,
+            page_id: pageId,
+            ad_account: adAccountFilter,
+            count: items.length,
+            items,
+        }, 200, { 'Cache-Control': 'private, no-store' })
+    } catch (e) {
+        return c.json({ ok: false, items: [], error: sanitizeMetaGraphError(e) }, 500)
+    }
+})
+
+// Manual upload trigger for the คลังสื่อ UI. Pushes ONE system gallery video to
+// the ad account's advideos library via the shared helper, then reads back the
+// resulting row. Only accepts a system gallery video id (never a raw external
+// URL/path), validates namespace + id, and never returns tokens. Fails closed
+// with a clear error. Does NOT create any ad.
+app.post('/api/dashboard/video-media-library/upload', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const namespaceId = String(body.namespace_id ?? body.bot_id ?? c.get('botId') ?? '').trim()
+    const systemVideoId = String(body.system_video_id ?? body.video_id ?? '').trim()
+    const pageId = String(body.page_id ?? '').trim()
+    const adAccount = String(body.ad_account ?? '').trim()
+
+    if (!namespaceId || namespaceId === 'default') return c.json({ ok: false, error: 'namespace_id_required' }, 400)
+    if (!systemVideoId) return c.json({ ok: false, error: 'system_video_id_required' }, 400)
+    // Guard: only real processed gallery ids. Reject anything that looks like a
+    // URL or path so the MVP can never be coaxed into uploading an arbitrary
+    // external file_url — the helper builds the file_url itself from the id.
+    if (/^https?:/i.test(systemVideoId) || /[\/\\:?#\s]/.test(systemVideoId)) {
+        return c.json({ ok: false, error: 'invalid_system_video_id' }, 400)
+    }
+
+    try {
+        await uploadProcessedVideoToMetaAssetLibrary({
+            env: c.env,
+            namespaceId,
+            videoId: systemVideoId,
+            pageId: pageId || undefined,
+            adAccount: adAccount || undefined,
+        })
+    } catch (e) {
+        return c.json({ ok: false, error: sanitizeMetaGraphError(e) }, 500)
+    }
+
+    // Read back the freshest row for this video. When the caller pinned an ad
+    // account we filter on it; otherwise the most-recently-updated row is the
+    // one the helper just wrote (it resolves the default_page's ad_account).
+    try {
+        await ensureProcessedVideoAssetLibraryTable(c.env.DB)
+        const conditions = ['namespace_id = ?', 'system_video_id = ?']
+        const binds: unknown[] = [namespaceId, systemVideoId]
+        if (adAccount) {
+            conditions.push('ad_account = ?')
+            binds.push(adAccount)
+        }
+        const row = await c.env.DB.prepare(
+            `SELECT namespace_id, system_video_id, ad_account, advideo_id, advideo_status,
+                    upload_status, error, file_url, uploaded_at, last_checked_at, created_at, updated_at
+             FROM processed_video_asset_library
+             WHERE ${conditions.join(' AND ')}
+             ORDER BY updated_at DESC
+             LIMIT 1`
+        ).bind(...binds).first()
+        const item = row ? mapProcessedVideoAssetLibraryItem(row) : null
+        return c.json({ ok: true, namespace_id: namespaceId, system_video_id: systemVideoId, item }, 200)
+    } catch (e) {
+        return c.json({
+            ok: true,
+            namespace_id: namespaceId,
+            system_video_id: systemVideoId,
+            item: null,
+            warning: sanitizeMetaGraphError(e),
+        }, 200)
     }
 })
 

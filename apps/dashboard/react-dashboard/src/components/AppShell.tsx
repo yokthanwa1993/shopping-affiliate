@@ -7,6 +7,7 @@ import {
   Clock,
   Cpu,
   Facebook,
+  Film,
   Layers,
   LayoutDashboard,
   Link2,
@@ -52,6 +53,7 @@ const NAV_GROUPS: readonly NavGroup[] = [
       { to: '/source-inventory', label: 'คลังต้นฉบับ', sublabel: 'Source Inventory', icon: PackageOpen, exact: false },
       { to: '/processing', label: 'ประมวลผล', sublabel: 'Processing', icon: Cpu, exact: false },
       { to: '/gallery', label: 'แกลลี่', sublabel: 'Gallery', icon: Layers, exact: false },
+      { to: '/media-library', label: 'คลังสื่อ', sublabel: 'Media Library', icon: Film, exact: false },
     ],
   },
   {

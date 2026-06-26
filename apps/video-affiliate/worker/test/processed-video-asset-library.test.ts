@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
     PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
     buildProcessedVideoAssetFileUrl,
+    mapProcessedVideoAssetLibraryItem,
     normalizeMetaVideoStatus,
     parseProcessedVideoR2Key,
     sanitizeMetaGraphError,
@@ -52,6 +53,61 @@ test('processed video asset library SQL defines the requested key and non-secret
     assert.match(PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL, /PRIMARY KEY \(namespace_id, system_video_id, ad_account\)/)
     assert.match(PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL, /advideo_id TEXT/)
     assert.doesNotMatch(PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL, /token|secret|cookie/i)
+})
+
+test('mapProcessedVideoAssetLibraryItem projects only the non-secret columns the คลังสื่อ UI needs', () => {
+    const item = mapProcessedVideoAssetLibraryItem({
+        namespace_id: '1774858894802785816',
+        system_video_id: '2695c305',
+        ad_account: 'act_1030797047648459',
+        advideo_id: '987654321',
+        advideo_status: 'ready',
+        upload_status: 'success',
+        error: '',
+        file_url: 'https://api.pubilo.com/api/gallery/2695c305/asset/public?namespace_id=1774858894802785816',
+        uploaded_at: '2026-06-26T00:00:00.000Z',
+        last_checked_at: '2026-06-26T00:01:00.000Z',
+        created_at: '2026-06-25 12:00:00',
+        updated_at: '2026-06-26 00:01:00',
+    })
+    assert.deepEqual(item, {
+        namespace_id: '1774858894802785816',
+        system_video_id: '2695c305',
+        ad_account: 'act_1030797047648459',
+        advideo_id: '987654321',
+        advideo_status: 'ready',
+        upload_status: 'success',
+        error: '',
+        file_url: 'https://api.pubilo.com/api/gallery/2695c305/asset/public?namespace_id=1774858894802785816',
+        uploaded_at: '2026-06-26T00:00:00.000Z',
+        last_checked_at: '2026-06-26T00:01:00.000Z',
+        created_at: '2026-06-25 12:00:00',
+        updated_at: '2026-06-26 00:01:00',
+    })
+})
+
+test('mapProcessedVideoAssetLibraryItem re-sanitizes stored error and never surfaces extra columns', () => {
+    const item = mapProcessedVideoAssetLibraryItem({
+        namespace_id: 'ns',
+        system_video_id: 'vid',
+        ad_account: 'act_1',
+        error: 'graph_http_400: failed access_token=EAabcdefabcdefabcdefabcdef123456',
+        // A hypothetical future/secret column must NOT leak through the projection.
+        access_token: 'EAsecretsecretsecretsecret',
+    })
+    assert.equal(item.error, 'graph_http_400: failed access_token=[REDACTED]')
+    assert.equal(Object.prototype.hasOwnProperty.call(item, 'access_token'), false)
+    assert.deepEqual(Object.keys(item).sort(), [
+        'ad_account', 'advideo_id', 'advideo_status', 'created_at', 'error', 'file_url',
+        'last_checked_at', 'namespace_id', 'system_video_id', 'updated_at', 'upload_status', 'uploaded_at',
+    ])
+})
+
+test('mapProcessedVideoAssetLibraryItem tolerates null/garbage rows', () => {
+    const empty = mapProcessedVideoAssetLibraryItem(null)
+    assert.equal(empty.system_video_id, '')
+    assert.equal(empty.error, '')
+    assert.equal(mapProcessedVideoAssetLibraryItem('nope').advideo_id, '')
 })
 
 test('sanitizeMetaGraphError redacts access tokens from error strings', () => {

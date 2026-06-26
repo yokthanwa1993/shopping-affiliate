@@ -3,6 +3,7 @@ import { createRootRoute, createRoute, createRouter, Outlet } from '@tanstack/re
 import { AppShell } from '@/components/AppShell'
 import { OverviewPage } from '@/routes/overview'
 import { GalleryPage } from '@/routes/gallery'
+import { MediaLibraryPage } from '@/routes/media-library'
 import { SourceInventoryPage } from '@/routes/source-inventory'
 import { ProcessingPage } from '@/routes/processing'
 import { PagePostsPage } from '@/routes/page-posts'
@@ -50,6 +51,7 @@ function page<const TPath extends string>(path: TPath, component: () => ReactNod
 
 const overviewRoute = page('/', OverviewPage)
 const galleryRoute = page('/gallery', GalleryPage)
+const mediaLibraryRoute = page('/media-library', MediaLibraryPage)
 const sourceInventoryRoute = page('/source-inventory', SourceInventoryPage)
 // Production exposes the source inventory under both /source-inventory and the
 // legacy /inbox + /source-processing slugs — alias them to the same page.
@@ -70,6 +72,7 @@ const settingsRoute = page('/settings', SettingsPage)
 const routeTree = rootRoute.addChildren([
   overviewRoute,
   galleryRoute,
+  mediaLibraryRoute,
   sourceInventoryRoute,
   inboxRoute,
   sourceProcessingRoute,
