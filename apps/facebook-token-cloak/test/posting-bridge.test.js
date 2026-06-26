@@ -119,6 +119,36 @@ function graphRoute(url, method, pages, opts = {}) {
     const cid = opts.repairReadbackCreativeId !== undefined ? opts.repairReadbackCreativeId : 'CR1';
     return { creative: { id: cid, effective_object_story_id: `${LIVE_PAGE_ID}_REPAIRED_STORY`, object_story_spec: { video_data: { call_to_action: { type: 'SHOP_NOW', value: { link } } } } } };
   }
+  // media-library/resolve: read ONE advideo's public-safe metadata (status/source/thumbnails). Keyed
+  // on the ADVID_META id (the resolve URL is /{id}?fields=id%2Cstatus%2Csource%2C…) so it never
+  // collides with the broader fields= routes above. Mirrors the live ready-advideo shape: a complete
+  // status, an scontent…fbcdn.net mp4 source, and a thumbnails list with a preferred entry.
+  if (method === 'GET' && /\/ADVID_META\?fields=id/.test(u)) {
+    return {
+      id: 'ADVID_META',
+      status: {
+        video_status: 'ready',
+        uploading_phase: { status: 'complete' },
+        processing_phase: { status: 'complete' },
+        publishing_phase: { status: 'complete', publish_status: 'published' }
+      },
+      source: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t42/video.mp4?oh=ABC123&oe=64ABCDEF',
+      permalink_url: 'https://www.facebook.com/ADVID_META/',
+      thumbnails: {
+        data: [
+          { uri: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t15/thumb_first.jpg', is_preferred: false, width: 90, height: 160 },
+          { uri: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t15/thumb_preferred.jpg', is_preferred: true, width: 540, height: 960 }
+        ]
+      },
+      picture: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t15/picture.jpg',
+      created_time: '2026-06-20T10:00:00+0700',
+      updated_time: '2026-06-21T12:30:00+0700'
+    };
+  }
+  // media-library/resolve error path — Graph rejects the read (e.g. expired/invalid advideo id).
+  if (method === 'GET' && /\/ADVID_BAD\?fields=id/.test(u)) {
+    return { error: { message: 'Unsupported get request', code: 100, error_subcode: 33 } };
+  }
   if (u.includes('/me/accounts')) return { data: pages };
   // Source-post attachment lookup: the freshly posted page video's attachment target id.
   // attachmentVideoId === '' simulates a post with no resolvable video (empty target id).
@@ -714,6 +744,65 @@ test('POST /media-library/upload fails closed on missing payload', async () => {
   assert.equal(r.status, 400);
   assert.equal(r.body.ok, false);
   assert.equal(r.body.step, 'validate');
+});
+
+test('POST /media-library/resolve returns the REAL Meta source/preferred-thumbnail/status and never leaks tokens or creates ads', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/media-library/resolve', {
+    advideo_id: 'ADVID_META',
+    account: 'content_paiya'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.advideo_id, 'ADVID_META');
+  assert.equal(r.body.video_status, 'ready');
+  assert.equal(r.body.uploading_status, 'complete');
+  assert.equal(r.body.processing_status, 'complete');
+  assert.equal(r.body.publishing_status, 'complete');
+  assert.equal(r.body.publish_status, 'published');
+  // The playable source is the genuine scontent…fbcdn.net mp4, NOT a system file_url.
+  assert.equal(r.body.meta_source_url, 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t42/video.mp4?oh=ABC123&oe=64ABCDEF');
+  assert.equal(r.body.source, r.body.meta_source_url);
+  assert.ok(/fbcdn\.net/.test(r.body.meta_source_url), 'source is a real Meta CDN URL');
+  // The PREFERRED thumbnail wins over the first thumbnail entry.
+  assert.equal(r.body.meta_thumbnail_url, 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t15/thumb_preferred.jpg');
+  assert.equal(r.body.permalink_url, 'https://www.facebook.com/ADVID_META/');
+  assert.equal(r.body.created_time, '2026-06-20T10:00:00+0700');
+  assert.equal(r.body.updated_time, '2026-06-21T12:30:00+0700');
+  // Read-only: no ad/post/comment objects are ever created.
+  assert.ok(!browser.calls.some((c) => /\/adcreatives|\/campaigns|\/ads\?|\/comments|is_published/.test(c.url + (c.body || ''))), 'resolve creates nothing');
+  // The access_token travels only in the request URL; the RESPONSE must carry no secret.
+  assertNoLeak(r.body);
+});
+
+test('POST /media-library/resolve fails closed (validate) when advideo_id is missing', async () => {
+  await listen();
+  const r = await req('POST', '/media-library/resolve', { account: 'content_paiya' });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
+test('POST /media-library/resolve fails closed (no_session) when the profile is not logged in', async () => {
+  await listen({ browser: makeBrowser(NOT_LOGGED_IN) });
+  const r = await req('POST', '/media-library/resolve', { advideo_id: 'ADVID_META' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'session');
+  assert.equal(r.body.error, 'no_session');
+});
+
+test('POST /media-library/resolve surfaces a sanitized Graph error (non-ok, no leak) when the advideo cannot be read', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/media-library/resolve', { advideo_id: 'ADVID_BAD' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'resolve');
+  assert.equal(r.body.advideo_id, 'ADVID_BAD');
+  assert.ok(String(r.body.error || '').length > 0);
+  assertNoLeak(r.body);
 });
 
 test('POST /create-ad runs the OneCard/ads orchestration and returns ids, no token leak', async () => {

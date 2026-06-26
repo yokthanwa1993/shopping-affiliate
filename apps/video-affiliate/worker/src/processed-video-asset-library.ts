@@ -119,6 +119,48 @@ export function mapProcessedVideoAssetLibraryItem(row: unknown): VideoMediaLibra
     }
 }
 
+// Defence-in-depth for a Meta CDN URL that the dashboard will use as a <video src>/poster. Graph's
+// scontent…fbcdn.net source/thumbnail URLs carry only short-lived oh/oe signing params (NOT an
+// access_token), but if a token ever appeared in a URL we strip it before it can reach the client.
+export function sanitizeMetaSourceUrl(url: unknown): string {
+    const raw = normalizeText(url)
+    if (!raw) return ''
+    return raw
+        .replace(/([?#&]access_token=)[^&#\s]+/gi, '$1[REDACTED]')
+        .replace(/([?#&]token=)[^&#\s]+/gi, '$1[REDACTED]')
+        .replace(/\bEA[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]')
+        .slice(0, 2000)
+}
+
+// Resolved REAL Meta/Facebook media fields, merged onto a library item so the dashboard plays the
+// genuine source instead of the system file_url. Token-free by construction: only source/thumbnail/
+// status/permalink, with every URL run through sanitizeMetaSourceUrl. Empty strings when absent.
+export type ResolvedMetaVideoFields = {
+    meta_source_url: string
+    meta_thumbnail_url: string
+    meta_video_status: string
+    meta_permalink_url: string
+    meta_publish_status: string
+}
+
+// Pure projection of the cloak bridge `/media-library/resolve` response into the safe meta_* subset.
+// Accepts snake/camel and the bare Graph `source` alias; never copies through any unknown field.
+export function projectResolvedMetaVideoFields(raw: unknown): ResolvedMetaVideoFields {
+    const r = (raw && typeof raw === 'object') ? raw as Record<string, unknown> : {}
+    return {
+        meta_source_url: sanitizeMetaSourceUrl(r.meta_source_url ?? r.metaSourceUrl ?? r.source),
+        meta_thumbnail_url: sanitizeMetaSourceUrl(r.meta_thumbnail_url ?? r.metaThumbnailUrl ?? r.thumbnail_url),
+        meta_video_status: normalizeText(r.meta_video_status ?? r.video_status ?? r.metaVideoStatus),
+        meta_permalink_url: sanitizeMetaSourceUrl(r.meta_permalink_url ?? r.permalink_url ?? r.metaPermalinkUrl),
+        meta_publish_status: normalizeText(r.meta_publish_status ?? r.publish_status ?? r.metaPublishStatus),
+    }
+}
+
+// True when the resolve actually yielded a playable Meta source — used to decide whether to merge.
+export function hasResolvedMetaSource(fields: ResolvedMetaVideoFields | null | undefined): boolean {
+    return !!(fields && fields.meta_source_url)
+}
+
 export function sanitizeMetaGraphError(error: unknown): string {
     const raw = error instanceof Error ? error.message : normalizeText(error)
     const sanitized = raw

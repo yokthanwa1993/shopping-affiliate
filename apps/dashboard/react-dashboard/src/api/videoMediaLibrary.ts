@@ -21,6 +21,12 @@ export interface VideoMediaLibraryItem {
   lastCheckedAt: string
   createdAt: string
   updatedAt: string
+  // REAL Meta/Facebook media resolved from the advideo_id (empty when unresolved → System Preview).
+  metaSourceUrl: string
+  metaThumbnailUrl: string
+  metaVideoStatus: string
+  metaPermalinkUrl: string
+  metaPublishStatus: string
 }
 
 export interface VideoMediaLibraryResult {
@@ -47,6 +53,11 @@ function normalize(raw: unknown): VideoMediaLibraryItem | null {
     lastCheckedAt: safeString(raw.last_checked_at ?? raw.lastCheckedAt),
     createdAt: safeString(raw.created_at ?? raw.createdAt),
     updatedAt: safeString(raw.updated_at ?? raw.updatedAt),
+    metaSourceUrl: safeString(raw.meta_source_url ?? raw.metaSourceUrl ?? raw.source),
+    metaThumbnailUrl: safeString(raw.meta_thumbnail_url ?? raw.metaThumbnailUrl),
+    metaVideoStatus: safeString(raw.meta_video_status ?? raw.metaVideoStatus ?? raw.video_status),
+    metaPermalinkUrl: safeString(raw.meta_permalink_url ?? raw.metaPermalinkUrl ?? raw.permalink_url),
+    metaPublishStatus: safeString(raw.meta_publish_status ?? raw.metaPublishStatus ?? raw.publish_status),
   }
 }
 

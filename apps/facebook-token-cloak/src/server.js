@@ -1543,6 +1543,59 @@ function createHandler(deps = {}) {
         }
       }
 
+      // Resolve the REAL Meta/Facebook media for an advideo_id so the คลังสื่อ dashboard can play the
+      // genuine source (scontent…fbcdn.net mp4) + preferred thumbnail instead of our system file_url.
+      // Read-only: reads ONE advideo via the Power Editor Graph session and never creates an ad/post.
+      // Output is token-free — only Graph source/thumbnail/status/permalink fields, URL-sanitized.
+      if (req.method === 'POST' && url.pathname === '/media-library/resolve') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const advideoId = String(body.advideo_id || body.advideoId || body.video_id || body.videoId || '').trim();
+        if (!advideoId) return send(res, 400, { ok: false, step: 'validate', error: 'Missing: advideo_id' });
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          const meta = await posting.resolveAdVideoMeta(session.graphFetch, { advideoId, userToken: session.token });
+          if (!meta.ok) {
+            const err = meta.error || {};
+            return send(res, 200, {
+              ok: false,
+              step: 'resolve',
+              advideo_id: advideoId,
+              error: sanitizePublicReason((err && (err.message || err.type)) || 'graph_resolve_error', 'graph_resolve_error'),
+              fb_error_code: err && err.code,
+              fb_error_subcode: err && err.error_subcode
+            });
+          }
+          const data = meta.data || {};
+          const status = (data.status && typeof data.status === 'object') ? data.status : {};
+          const phaseStatus = (key) => (status[key] && typeof status[key] === 'object') ? String(status[key].status || '').trim() : '';
+          const thumbs = (data.thumbnails && Array.isArray(data.thumbnails.data)) ? data.thumbnails.data : [];
+          const preferredThumb = thumbs.find((t) => t && t.is_preferred) || thumbs[0] || null;
+          const thumbUri = preferredThumb && preferredThumb.uri ? sanitizeUrlSecrets(String(preferredThumb.uri))
+            : (data.picture ? sanitizeUrlSecrets(String(data.picture)) : '');
+          const sourceUrl = data.source ? sanitizeUrlSecrets(String(data.source)) : '';
+          const publishPhase = (status.publishing_phase && typeof status.publishing_phase === 'object') ? status.publishing_phase : {};
+          return send(res, 200, {
+            ok: true,
+            advideo_id: String(data.id || advideoId),
+            video_status: String(status.video_status || '').trim(),
+            uploading_status: phaseStatus('uploading_phase'),
+            processing_status: phaseStatus('processing_phase'),
+            publishing_status: phaseStatus('publishing_phase'),
+            publish_status: String(publishPhase.publish_status || '').trim(),
+            meta_source_url: sourceUrl,
+            source: sourceUrl,
+            meta_thumbnail_url: thumbUri,
+            permalink_url: data.permalink_url ? sanitizeUrlSecrets(String(data.permalink_url)) : '',
+            created_time: String(data.created_time || '').trim(),
+            updated_time: String(data.updated_time || '').trim()
+          });
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
       if (req.method === 'POST' && url.pathname === '/create-ad') {
         const body = await parseBody(req);
         const account = body.account || POST_ACCOUNT;

@@ -424,6 +424,27 @@ function firstAdImageHash(data) {
   return '';
 }
 
+// Read ONE ad-account advideo's public-safe metadata for the คลังสื่อ (media-library) UI so the
+// dashboard can play the REAL Meta/Facebook source instead of our system file. Token-free OUTPUT:
+// the access_token only ever travels in the request URL (same as every other Graph call here) and is
+// never part of the returned object. Returns { ok, data } on success or { ok:false, error } where
+// `error` is the Graph error object (the caller sanitizes it). Never creates/mutates anything.
+async function resolveAdVideoMeta(fetchImpl, { advideoId, userToken } = {}) {
+  const id = String(advideoId || '').trim();
+  if (!id) return { ok: false, error: { message: 'advideo_id_required' } };
+  // Graph field expansion: overall status + per-phase status, the playable source mp4, the preferred
+  // thumbnail, and the canonical permalink. encodeURIComponent keeps the {…} field-expansion intact.
+  const fields = 'id,status,source,permalink_url,thumbnails{uri,is_preferred,width,height},picture,created_time,updated_time';
+  const r = await gJson(
+    fetchImpl,
+    `${GRAPH}/${GRAPH_V}/${encodeURIComponent(id)}?fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(userToken || '')}`,
+    { method: 'GET' }
+  );
+  const data = r.data || {};
+  if (data.error) return { ok: false, error: data.error, status: r.status };
+  return { ok: true, data };
+}
+
 // Publish a NEW Page video post directly through the Page video endpoint, not through an adcreative.
 // This is the Create Ads Phase A path: old high-view posts are signals only; the bridge first creates
 // a fresh Page story from the system video, then the Worker mints the final post-specific shortlink
@@ -2483,5 +2504,6 @@ module.exports = {
   buildVideoMultipart,
   uploadAdVideoMultipart,
   uploadAdVideoFromUrl,
+  resolveAdVideoMeta,
   MAX_DOWNLOAD_VIDEO_BYTES
 };

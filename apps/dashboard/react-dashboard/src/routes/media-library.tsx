@@ -41,17 +41,39 @@ function CopyButton({ value, label }: { value: string; label: string }) {
 // Graph status still says "processing". The dashboard should mirror the operator
 // view: if Meta returned an advideo id and our source file is playable with no
 // error, show it as a usable media-library asset instead of a processing row.
+// A resolved metaSourceUrl is the strongest signal (genuine Meta video) but we
+// still show advideo rows whose Meta source could not be resolved this load,
+// falling back to the System Preview so the library never appears empty.
 function isDisplayReadyItem(item: VideoMediaLibraryItem) {
-  return Boolean(item.advideoId && item.fileUrl && !item.error)
+  return Boolean(item.advideoId && (item.metaSourceUrl || item.fileUrl) && !item.error)
 }
 
-function mediaThumbSrc(item: VideoMediaLibraryItem): string {
+// True when we resolved the REAL Meta/Facebook media for this row.
+function hasMetaSource(item: VideoMediaLibraryItem): boolean {
+  return Boolean(item.metaSourceUrl)
+}
+
+// The <video src>: the genuine Meta source when resolved, else our system file.
+function mediaVideoSrc(item: VideoMediaLibraryItem): string {
+  return item.metaSourceUrl || item.fileUrl
+}
+
+// System gallery thumbnail route — the fallback poster when Meta has no thumbnail.
+function systemThumbSrc(item: VideoMediaLibraryItem): string {
   return `${WORKER_API_BASE}/api/gallery/${encodeURIComponent(item.systemVideoId)}/asset/thumb?namespace_id=${encodeURIComponent(item.namespaceId)}`
+}
+
+// Poster/thumbnail: prefer Meta's preferred thumbnail, else the system thumb.
+function mediaThumbSrc(item: VideoMediaLibraryItem): string {
+  return item.metaThumbnailUrl || systemThumbSrc(item)
 }
 
 function MediaThumb({ item }: { item: VideoMediaLibraryItem }) {
   const [failed, setFailed] = useState(false)
-  const src = mediaThumbSrc(item)
+  // If Meta's thumbnail fails to load, fall back to the system thumb before giving up.
+  const metaThumb = item.metaThumbnailUrl
+  const systemThumb = systemThumbSrc(item)
+  const [src, setSrc] = useState(metaThumb || systemThumb)
   if (failed) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-muted text-muted-foreground">
@@ -65,7 +87,10 @@ function MediaThumb({ item }: { item: VideoMediaLibraryItem }) {
       alt={item.systemVideoId}
       loading="lazy"
       className="h-full w-full object-cover"
-      onError={() => setFailed(true)}
+      onError={() => {
+        if (src !== systemThumb) setSrc(systemThumb)
+        else setFailed(true)
+      }}
     />
   )
 }
@@ -93,7 +118,7 @@ function MediaPreviewModal({ item, onClose }: { item: VideoMediaLibraryItem; onC
         </button>
         <div className="flex items-center justify-center bg-black sm:w-1/2">
           <video
-            src={item.fileUrl}
+            src={mediaVideoSrc(item)}
             poster={mediaThumbSrc(item)}
             controls
             playsInline
@@ -104,7 +129,16 @@ function MediaPreviewModal({ item, onClose }: { item: VideoMediaLibraryItem; onC
         <div className="flex min-w-0 flex-1 flex-col gap-3 overflow-y-auto p-4 sm:w-1/2">
           <div>
             <h2 className="text-base font-semibold leading-snug">{item.systemVideoId}</h2>
-            <p className="mt-1 text-xs text-muted-foreground">พร้อมแสดงผลใน Meta Asset Library</p>
+            {hasMetaSource(item) ? (
+              <p className="mt-1 inline-flex items-center gap-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                เล่นจากแหล่ง Meta/Facebook จริง
+                {item.metaVideoStatus ? <span className="font-normal text-emerald-600/80">· {item.metaVideoStatus}</span> : null}
+              </p>
+            ) : (
+              <p className="mt-1 inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                System Preview (ยังไม่ได้ดึงวิดีโอจาก Meta)
+              </p>
+            )}
           </div>
           <div className="space-y-2 text-xs text-muted-foreground">
             <div className="flex items-center gap-2">
@@ -123,13 +157,23 @@ function MediaPreviewModal({ item, onClose }: { item: VideoMediaLibraryItem; onC
           </div>
           <div className="mt-auto flex flex-col gap-2 pt-2">
             <a
-              href={item.fileUrl}
+              href={mediaVideoSrc(item)}
               target="_blank"
               rel="noreferrer"
               className="rounded-lg bg-muted px-3 py-2 text-center text-sm font-semibold text-foreground transition hover:bg-accent"
             >
-              เปิดวิดีโอในแท็บใหม่
+              {hasMetaSource(item) ? 'เปิดวิดีโอ Meta ในแท็บใหม่' : 'เปิดวิดีโอในแท็บใหม่'}
             </a>
+            {item.metaPermalinkUrl ? (
+              <a
+                href={item.metaPermalinkUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-lg border px-3 py-2 text-center text-sm font-semibold text-foreground transition hover:bg-accent"
+              >
+                เปิดบน Facebook
+              </a>
+            ) : null}
           </div>
         </div>
       </div>
@@ -147,8 +191,12 @@ function MediaCard({ item, onOpen }: { item: VideoMediaLibraryItem; onOpen: () =
         className="relative block aspect-[9/16] w-full overflow-hidden bg-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <MediaThumb item={item} />
-        <span className="absolute left-2 top-2 rounded bg-emerald-600/90 px-2 py-0.5 text-[11px] font-semibold text-white">
-          พร้อมแสดงผล
+        <span
+          className={`absolute left-2 top-2 rounded px-2 py-0.5 text-[11px] font-semibold text-white ${
+            hasMetaSource(item) ? 'bg-emerald-600/90' : 'bg-slate-500/90'
+          }`}
+        >
+          {hasMetaSource(item) ? 'Meta/Facebook' : 'System Preview'}
         </span>
         <span className="absolute bottom-2 right-2 inline-flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white">
           <Play className="ml-0.5 h-4 w-4" fill="currentColor" />
@@ -161,9 +209,15 @@ function MediaCard({ item, onOpen }: { item: VideoMediaLibraryItem; onOpen: () =
           <span className="shrink-0">{formatThaiDateTime(item.uploadedAt || item.updatedAt || item.createdAt)}</span>
         </div>
         <div className="flex flex-wrap gap-1.5 pt-1 text-xs">
-          <span className="rounded bg-emerald-50 px-2 py-1 font-semibold text-emerald-700">Meta พร้อมใช้</span>
+          <span
+            className={`rounded px-2 py-1 font-semibold ${
+              hasMetaSource(item) ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'
+            }`}
+          >
+            {hasMetaSource(item) ? 'จาก Meta' : 'พรีวิวระบบ'}
+          </span>
           <a
-            href={item.fileUrl}
+            href={mediaVideoSrc(item)}
             target="_blank"
             rel="noreferrer"
             onClick={(e) => e.stopPropagation()}
@@ -191,7 +245,12 @@ export function MediaLibraryPage() {
     queryFn: ({ signal }) => fetchVideoMediaLibrary(signal, { limit: 200 }),
   })
   const items = query.data?.items ?? []
-  const readyItems = useMemo(() => items.filter(isDisplayReadyItem), [items])
+  // Surface rows whose REAL Meta source resolved first, so the default view plays genuine
+  // Meta/Facebook videos; unresolved-but-ready rows (System Preview) sort after, original order kept.
+  const readyItems = useMemo(() => {
+    const ready = items.filter(isDisplayReadyItem)
+    return [...ready].sort((a, b) => Number(hasMetaSource(b)) - Number(hasMetaSource(a)))
+  }, [items])
   const hiddenCount = Math.max(0, items.length - readyItems.length)
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()

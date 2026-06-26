@@ -3,10 +3,13 @@ import test from 'node:test'
 import {
     PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
     buildProcessedVideoAssetFileUrl,
+    hasResolvedMetaSource,
     mapProcessedVideoAssetLibraryItem,
     normalizeMetaVideoStatus,
     parseProcessedVideoR2Key,
+    projectResolvedMetaVideoFields,
     sanitizeMetaGraphError,
+    sanitizeMetaSourceUrl,
 } from '../src/processed-video-asset-library.js'
 
 test('parseProcessedVideoR2Key accepts only final processed gallery json or mp4 keys', () => {
@@ -108,6 +111,54 @@ test('mapProcessedVideoAssetLibraryItem tolerates null/garbage rows', () => {
     assert.equal(empty.system_video_id, '')
     assert.equal(empty.error, '')
     assert.equal(mapProcessedVideoAssetLibraryItem('nope').advideo_id, '')
+})
+
+test('projectResolvedMetaVideoFields keeps the REAL Meta source/thumbnail + status and copies no extra fields', () => {
+    const fields = projectResolvedMetaVideoFields({
+        advideo_id: 'ADVID_META',
+        meta_source_url: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t42/video.mp4?oh=ABC&oe=64ABCDEF',
+        meta_thumbnail_url: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t15/thumb_preferred.jpg',
+        video_status: 'ready',
+        permalink_url: 'https://www.facebook.com/ADVID_META/',
+        publish_status: 'published',
+        // A hypothetical secret field must NOT survive the projection.
+        access_token: 'EAsecretsecretsecretsecret',
+    })
+    assert.deepEqual(fields, {
+        meta_source_url: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t42/video.mp4?oh=ABC&oe=64ABCDEF',
+        meta_thumbnail_url: 'https://scontent.fbkk9-3.fna.fbcdn.net/v/t15/thumb_preferred.jpg',
+        meta_video_status: 'ready',
+        meta_permalink_url: 'https://www.facebook.com/ADVID_META/',
+        meta_publish_status: 'published',
+    })
+    assert.equal(Object.prototype.hasOwnProperty.call(fields, 'access_token'), false)
+})
+
+test('projectResolvedMetaVideoFields accepts the bare Graph `source` alias and camelCase, and is empty for garbage', () => {
+    const aliased = projectResolvedMetaVideoFields({ source: 'https://scontent/x.mp4', metaThumbnailUrl: 'https://scontent/t.jpg' })
+    assert.equal(aliased.meta_source_url, 'https://scontent/x.mp4')
+    assert.equal(aliased.meta_thumbnail_url, 'https://scontent/t.jpg')
+    const empty = projectResolvedMetaVideoFields(null)
+    assert.equal(empty.meta_source_url, '')
+    assert.equal(empty.meta_publish_status, '')
+})
+
+test('sanitizeMetaSourceUrl redacts any access_token/EA token but keeps the CDN URL playable', () => {
+    assert.equal(
+        sanitizeMetaSourceUrl('https://scontent.fbcdn.net/v/x.mp4?oh=AB&oe=CD'),
+        'https://scontent.fbcdn.net/v/x.mp4?oh=AB&oe=CD',
+    )
+    assert.equal(
+        sanitizeMetaSourceUrl('https://scontent.fbcdn.net/v/x.mp4?access_token=EAabcdefabcdefabcdefabcdef123456&oh=AB'),
+        'https://scontent.fbcdn.net/v/x.mp4?access_token=[REDACTED]&oh=AB',
+    )
+    assert.equal(sanitizeMetaSourceUrl(''), '')
+})
+
+test('hasResolvedMetaSource is true only when a playable Meta source resolved', () => {
+    assert.equal(hasResolvedMetaSource(projectResolvedMetaVideoFields({ source: 'https://scontent/x.mp4' })), true)
+    assert.equal(hasResolvedMetaSource(projectResolvedMetaVideoFields({ video_status: 'processing' })), false)
+    assert.equal(hasResolvedMetaSource(null), false)
 })
 
 test('sanitizeMetaGraphError redacts access tokens from error strings', () => {

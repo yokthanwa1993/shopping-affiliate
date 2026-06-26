@@ -193,6 +193,8 @@ import {
     resolveAdOnlyCandidateVideoSource,
     resolveAdOnlyBridgeAccountId,
     AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY,
+    AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID,
+    AD_ONLY_BRIDGE_ACCOUNT_DEFAULT,
 } from './ad-only-contract'
 import { handleReportProxyRequest } from './report-proxy'
 import {
@@ -253,10 +255,14 @@ import {
     PROCESSED_VIDEO_ASSET_LIBRARY_ADVIDEO_INDEX_SQL,
     PROCESSED_VIDEO_ASSET_LIBRARY_TABLE_SQL,
     buildProcessedVideoAssetFileUrl,
+    hasResolvedMetaSource,
     mapProcessedVideoAssetLibraryItem,
     normalizeMetaVideoStatus,
     parseProcessedVideoR2Key,
+    projectResolvedMetaVideoFields,
     sanitizeMetaGraphError,
+    type ResolvedMetaVideoFields,
+    type VideoMediaLibraryItem,
 } from './processed-video-asset-library'
 import {
     AVATAR_CHROMAKEY_BLEND_KEY,
@@ -4072,6 +4078,90 @@ async function uploadProcessedVideoToMetaAssetLibraryViaBridge(params: {
         advideoId,
         advideoStatus: readStringField(data, 'advideo_status') || readStringField(data, 'status') || 'processing',
     }
+}
+
+// Resolve the REAL Meta/Facebook media (source mp4 + preferred thumbnail + status) for one stored
+// advideo_id via the Power Editor bridge, so the คลังสื่อ dashboard plays the genuine asset instead
+// of our system file_url. Token-safe: the bridge returns only sanitized Graph URLs/status; we project
+// to the meta_* subset and never persist/echo a token. Returns null on any failure (fallback to
+// System Preview). The advideo source URLs are short-lived (oh/oe signing), so this resolves live.
+async function resolveProcessedVideoMetaViaBridge(params: {
+    env: Env
+    db: D1Database
+    pageId: string
+    advideoId: string
+}): Promise<ResolvedMetaVideoFields | null> {
+    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+    const advideoId = String(params.advideoId || '').trim()
+    if (!baseUrl || !advideoId) return null
+    const bridgePageId = params.pageId || AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID
+    // If the dashboard list did not specify a page_id, use the built-in Chearb default account rather
+    // than reading a possibly stale per-page bridge_account setting. Live smoke showed the old default
+    // bridge profile (`content_paiya`) can return no_session, while the numeric default account resolves
+    // the same advideo ids successfully. Explicit page_id still honors its page setting first.
+    const bridgeAccountRow = params.pageId
+        ? await getPageSetting(params.db, bridgePageId, AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY).catch(() => null)
+        : null
+    const bridgeAccount = resolveAdOnlyBridgeAccountId({
+        bodyValue: '',
+        settingValue: bridgeAccountRow?.value,
+        pageId: bridgePageId,
+    }) || AD_ONLY_BRIDGE_ACCOUNT_DEFAULT
+    const payload: Record<string, unknown> = { advideo_id: advideoId }
+    if (bridgePageId) payload.page_id = bridgePageId
+    if (bridgeAccount) payload.account = bridgeAccount
+    try {
+        const resp = await fetchWithTimeout(`${baseUrl}/media-library/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        }, 12000, 'media_library_bridge_resolve')
+        const data = await resp.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+        if (!resp.ok || data.ok === false) return null
+        const fields = projectResolvedMetaVideoFields(data)
+        return hasResolvedMetaSource(fields) ? fields : null
+    } catch {
+        return null
+    }
+}
+
+// Cap on how many library rows we resolve against the single CloakBrowser session per dashboard
+// load — a large library must never flood the bridge (which also serves posting crons). Newest-first
+// rows are resolved; the rest fall back to System Preview in the UI and can be reached by scrolling +
+// refreshing. Kept small + parallel so the GET stays well under the dashboard's fetch timeout.
+const MEDIA_LIBRARY_META_RESOLVE_CAP = 12
+
+function processedVideoAssetMetaKey(item: VideoMediaLibraryItem): string {
+    return `${item.ad_account} ${item.system_video_id} ${item.advideo_id}`
+}
+
+// Enrich library rows with the REAL Meta media. Only playable, error-free rows that actually carry an
+// advideo_id are resolved (capped, newest-first). Never throws — a bridge failure simply leaves the
+// row without meta_* fields so the dashboard shows the System Preview fallback.
+async function enrichMediaLibraryItemsWithMeta(
+    env: Env,
+    pageId: string,
+    items: VideoMediaLibraryItem[],
+): Promise<Array<VideoMediaLibraryItem & Partial<ResolvedMetaVideoFields>>> {
+    if (!resolveCloakFbBridgeBaseUrl(env)) return items
+    const targets = items
+        // Resolve any row that already has an advideo_id. Live smoke showed Meta can return the real
+        // source even while our stored upload_status still says processing/in_progress, so do not hide
+        // those rows behind the local reusable-status predicate. If Meta is not ready yet, the bridge
+        // simply returns no source and the UI falls back to System Preview.
+        .filter((it) => it.advideo_id && !it.error)
+        .slice(0, MEDIA_LIBRARY_META_RESOLVE_CAP)
+    if (!targets.length) return items
+    const resolvedByKey = new Map<string, ResolvedMetaVideoFields>()
+    await Promise.allSettled(targets.map(async (it) => {
+        const fields = await resolveProcessedVideoMetaViaBridge({ env, db: env.DB, pageId, advideoId: it.advideo_id })
+        if (fields) resolvedByKey.set(processedVideoAssetMetaKey(it), fields)
+    }))
+    if (!resolvedByKey.size) return items
+    return items.map((it) => {
+        const fields = resolvedByKey.get(processedVideoAssetMetaKey(it))
+        return fields ? { ...it, ...fields } : it
+    })
 }
 
 async function uploadProcessedVideoToMetaAssetLibrary(params: {
@@ -10681,13 +10771,16 @@ app.get('/api/dashboard/video-media-library', async (c) => {
              LIMIT ?`
         ).bind(...binds, limit).all()
         const items = (rows.results || []).map(mapProcessedVideoAssetLibraryItem)
+        // Enrich with the REAL Meta/Facebook source + preferred thumbnail so the dashboard plays the
+        // genuine asset; rows we cannot resolve keep only the system file_url (System Preview).
+        const enriched = await enrichMediaLibraryItemsWithMeta(c.env, pageId, items).catch(() => items)
         return c.json({
             ok: true,
             namespace_id: namespaceId,
             page_id: pageId,
             ad_account: adAccountFilter,
-            count: items.length,
-            items,
+            count: enriched.length,
+            items: enriched,
         }, 200, { 'Cache-Control': 'private, no-store' })
     } catch (e) {
         return c.json({ ok: false, items: [], error: sanitizeMetaGraphError(e) }, 500)
@@ -10747,7 +10840,17 @@ app.post('/api/dashboard/video-media-library/upload', async (c) => {
              LIMIT 1`
         ).bind(...binds).first()
         const item = row ? mapProcessedVideoAssetLibraryItem(row) : null
-        return c.json({ ok: true, namespace_id: namespaceId, system_video_id: systemVideoId, item }, 200)
+        // Resolve the REAL Meta media once for the just-uploaded row so the UI can play it immediately
+        // (best-effort; absence simply falls back to the System Preview). Never blocks the response on
+        // a bridge failure — the resolve is bounded + non-throwing.
+        let enrichedItem: (VideoMediaLibraryItem & Partial<ResolvedMetaVideoFields>) | null = item
+        if (item && item.advideo_id && !item.error) {
+            const fields = await resolveProcessedVideoMetaViaBridge({
+                env: c.env, db: c.env.DB, pageId: pageId || '', advideoId: item.advideo_id,
+            }).catch(() => null)
+            if (fields) enrichedItem = { ...item, ...fields }
+        }
+        return c.json({ ok: true, namespace_id: namespaceId, system_video_id: systemVideoId, item: enrichedItem }, 200)
     } catch (e) {
         return c.json({
             ok: true,
