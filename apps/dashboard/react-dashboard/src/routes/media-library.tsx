@@ -48,17 +48,23 @@ function CopyButton({ value, label }: { value: string; label: string }) {
   )
 }
 
+function isReadyItem(item: VideoMediaLibraryItem) {
+  return Boolean(item.advideoId && ['success', 'ready'].includes(item.uploadStatus.toLowerCase()))
+}
+
 function MediaRow({ item }: { item: VideoMediaLibraryItem }) {
+  const ready = isReadyItem(item)
+  const failed = item.uploadStatus.toLowerCase() === 'failed' || item.uploadStatus.toLowerCase().startsWith('skipped')
   return (
-    <div className="rounded-xl border bg-card p-3 text-sm">
+    <div className={`rounded-xl border bg-card p-3 text-sm ${failed ? 'border-destructive/40 bg-destructive/5' : ''}`}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 font-medium text-foreground">
           <Film className="h-4 w-4 text-[#ee4d2d]" />
           <span className="break-all">{item.systemVideoId}</span>
         </div>
         <Badge variant={statusVariant(item.uploadStatus)}>
-          {item.uploadStatus || 'unknown'}
-          {item.advideoStatus ? ` · ${item.advideoStatus}` : ''}
+          {ready ? 'พร้อมใช้' : failed ? 'อัปโหลดไม่สำเร็จ' : (item.uploadStatus || 'unknown')}
+          {item.advideoStatus && !ready ? ` · ${item.advideoStatus}` : ''}
         </Badge>
       </div>
 
@@ -85,8 +91,8 @@ function MediaRow({ item }: { item: VideoMediaLibraryItem }) {
       </dl>
 
       {item.error ? (
-        <p className="mt-2 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-900">
-          {item.error}
+        <p className={`mt-2 rounded-lg border px-2.5 py-1.5 text-[11px] ${failed ? 'border-destructive/40 bg-destructive/10 text-destructive' : 'border-amber-300 bg-amber-50 text-amber-900'}`}>
+          {failed ? 'อัปโหลดไม่สำเร็จ: ' : ''}{item.error}
         </p>
       ) : null}
 
@@ -116,6 +122,10 @@ export function MediaLibraryPage() {
     queryFn: ({ signal }) => fetchVideoMediaLibrary(signal),
   })
   const items = query.data?.items ?? []
+  const libraryItems = items.filter((item) => item.advideoId || !['failed', 'skipped_missing_config'].some((status) => item.uploadStatus.toLowerCase().startsWith(status)))
+  const readyCount = items.filter(isReadyItem).length
+  const failedCount = items.filter((item) => item.uploadStatus.toLowerCase() === 'failed' || item.uploadStatus.toLowerCase().startsWith('skipped')).length
+  const hiddenFailedCount = items.length - libraryItems.length
 
   const uploadMutation = useMutation({
     mutationFn: () =>
@@ -141,9 +151,13 @@ export function MediaLibraryPage() {
           คลังสื่อวิดีโอ
         </h1>
         <p className="text-sm text-muted-foreground">
-          Meta Asset Library — วิดีโอที่อัปโหลดเข้า media library ของบัญชีโฆษณา (advideos). Meta video id
-          ที่ได้สามารถนำไปสร้างแอดได้ภายหลัง — หน้านี้ยังไม่สร้างแอดจริง
+          Meta Asset Library — วิดีโอที่อัปโหลดเข้า media library ของบัญชีโฆษณา (advideos). ต้องมีสถานะ “พร้อมใช้” และ Meta video id ก่อนนำไปสร้างแอดได้ — หน้านี้ยังไม่สร้างแอดจริง
         </p>
+        {items.length > 0 ? (
+          <p className={`mt-2 rounded-lg border px-3 py-2 text-xs ${readyCount > 0 ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-destructive/40 bg-destructive/5 text-destructive'}`}>
+            พร้อมใช้ {readyCount} / {libraryItems.length} วิดีโอในคลัง{failedCount ? ` · ซ่อน failed เก่า ${hiddenFailedCount} รายการ` : ''}
+          </p>
+        ) : null}
       </div>
 
       {/* Manual upload of one system gallery video. */}
@@ -211,9 +225,11 @@ export function MediaLibraryPage() {
           ) : null}
           {uploadMutation.isSuccess ? (
             <div className="space-y-2">
-              <p className="rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-800">
+              <p className={`rounded-lg border px-2.5 py-1.5 text-xs ${uploadResultItem && isReadyItem(uploadResultItem) ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-destructive/40 bg-destructive/5 text-destructive'}`}>
                 {uploadResultItem
-                  ? `บันทึกแล้ว — สถานะ: ${uploadResultItem.uploadStatus || 'unknown'}${uploadResultItem.advideoId ? ` · Meta video id ${uploadResultItem.advideoId}` : ''}`
+                  ? isReadyItem(uploadResultItem)
+                    ? `อัปโหลดสำเร็จ — Meta video id ${uploadResultItem.advideoId}`
+                    : `อัปโหลดยังไม่สำเร็จ — สถานะ: ${uploadResultItem.uploadStatus || 'unknown'}`
                   : 'ส่งคำขออัปโหลดแล้ว — ยังอ่านแถวผลลัพธ์ไม่ได้ ลองรีเฟรช'}
               </p>
               {uploadWarning ? (
@@ -230,7 +246,7 @@ export function MediaLibraryPage() {
       {/* Existing library rows, newest-first. */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">รายการในคลังสื่อ — {items.length} วิดีโอ</CardTitle>
+          <CardTitle className="text-base">รายการในคลังสื่อ — {libraryItems.length} วิดีโอ</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2">
           {query.isLoading ? (
@@ -239,12 +255,12 @@ export function MediaLibraryPage() {
             <p className="text-sm text-destructive">
               {(query.error as Error)?.message || 'โหลดคลังสื่อไม่สำเร็จ'}
             </p>
-          ) : items.length === 0 ? (
+          ) : libraryItems.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              ยังไม่มีวิดีโอในคลังสื่อ — อัปโหลด system video id ด้านบนเพื่อเริ่มต้น
+              ยังไม่มีวิดีโอที่อัปโหลดเข้าคลังสำเร็จ — failed เก่าถูกซ่อนไว้เพื่อไม่ให้สับสน
             </p>
           ) : (
-            items.map((item) => (
+            libraryItems.map((item) => (
               <MediaRow key={`${item.adAccount}:${item.systemVideoId}`} item={item} />
             ))
           )}

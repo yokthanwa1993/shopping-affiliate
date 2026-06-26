@@ -20,6 +20,9 @@ ingress:
     path: /create-ad*
     service: http://127.0.0.1:8820
   - hostname: short.wwoom.com
+    path: /media-library*
+    service: http://127.0.0.1:8820
+  - hostname: short.wwoom.com
     path: /promote*
     service: http://127.0.0.1:8820
   - hostname: short.wwoom.com

@@ -1508,6 +1508,41 @@ function createHandler(deps = {}) {
         }
       }
 
+      if (req.method === 'POST' && url.pathname === '/media-library/upload') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const adAccount = String(body.ad_account || body.adAccount || ADS_AD_ACCOUNT || '').trim();
+        const videoUrl = String(body.video_url || body.videoUrl || '').trim();
+        if (!adAccount || !videoUrl) return send(res, 400, { ok: false, step: 'validate', error: 'Missing: ad_account, video_url' });
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          const up = await posting.uploadAdVideoFromUrl(session.graphFetch, {
+            adAccount,
+            userToken: session.token,
+            videoUrl,
+            download: downloadVideo
+          });
+          const data = up.data || {};
+          if (data.error) {
+            return send(res, 200, {
+              ok: false,
+              step: 'upload_video',
+              error: sanitizePublicReason(data.error.message || data.error.type || 'graph_upload_error'),
+              fb_error_code: data.error.code,
+              fb_error_subcode: data.error.error_subcode,
+              fb_trace_id: data.error.fbtrace_id,
+              upload_mode: up.uploadMode
+            });
+          }
+          const advideoId = String(data.id || '').trim();
+          if (!advideoId) return send(res, 200, { ok: false, step: 'upload_video', error: 'advideo_id_missing', upload_mode: up.uploadMode });
+          return send(res, 200, { ok: true, advideo_id: advideoId, video_id: advideoId, upload_mode: up.uploadMode });
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
       if (req.method === 'POST' && url.pathname === '/create-ad') {
         const body = await parseBody(req);
         const account = body.account || POST_ACCOUNT;

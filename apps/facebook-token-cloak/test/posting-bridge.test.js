@@ -688,6 +688,34 @@ test('POST /edit-page-comment-link response never leaks USER_TOKEN_SECRET or PAG
   assertNoLeak(r.body);
 });
 
+test('POST /media-library/upload uploads only an advideo through Power Editor session and creates no ad/post', async () => {
+  const browser = makeBrowser();
+  await listen({
+    browser,
+    downloadVideo: async () => ({ buffer: Buffer.from('REALBYTES'), contentType: 'video/mp4' })
+  });
+  const r = await req('POST', '/media-library/upload', {
+    video_url: 'https://cdn/example.mp4',
+    ad_account: 'act_test'
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.advideo_id, 'VID123');
+  assert.equal(r.body.upload_mode, 'multipart');
+  assertNoLeak(r.body);
+  assert.ok(browser.calls.some((c) => /\/act_test\/advideos\?/.test(c.url) && c.method === 'POST'), 'uploads to advideos');
+  assert.equal(browser.calls.some((c) => /\/adcreatives/.test(c.url) || /\/campaigns/.test(c.url) || /\/ads\?/.test(c.url)), false, 'does not create ad objects');
+  assert.equal(browser.calls.some((c) => /is_published/.test(c.body || '')), false, 'does not publish page story');
+});
+
+test('POST /media-library/upload fails closed on missing payload', async () => {
+  await listen();
+  const r = await req('POST', '/media-library/upload', { ad_account: 'act_test' });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+});
+
 test('POST /create-ad runs the OneCard/ads orchestration and returns ids, no token leak', async () => {
   await listen();
   const r = await req('POST', '/create-ad', {

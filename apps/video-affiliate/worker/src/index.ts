@@ -4021,6 +4021,59 @@ async function readMetaGraphJson(resp: Response): Promise<Record<string, unknown
     }
 }
 
+function readStringField(value: unknown, key: string): string {
+    if (!value || typeof value !== 'object') return ''
+    const data = value as Record<string, unknown>
+    return String(data[key] || '').trim()
+}
+
+async function uploadProcessedVideoToMetaAssetLibraryViaBridge(params: {
+    env: Env
+    db: D1Database
+    pageId: string
+    namespaceId: string
+    videoId: string
+    adAccount: string
+    fileUrl: string
+}): Promise<{ ok: boolean; advideoId?: string; advideoStatus?: string; error?: string }> {
+    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+    if (!baseUrl) return { ok: false, error: 'bridge_not_configured' }
+    const bridgeAccountRow = await getPageSetting(params.db, params.pageId, AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY).catch(() => null)
+    const bridgeAccount = resolveAdOnlyBridgeAccountId({
+        bodyValue: '',
+        settingValue: bridgeAccountRow?.value,
+        pageId: params.pageId,
+    })
+    const payload: Record<string, unknown> = {
+        ad_account: params.adAccount,
+        video_url: params.fileUrl,
+        system_video_id: params.videoId,
+        namespace_id: params.namespaceId,
+    }
+    if (params.pageId) payload.page_id = params.pageId
+    if (bridgeAccount) payload.account = bridgeAccount
+
+    const resp = await fetchWithTimeout(`${baseUrl}/media-library/upload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }, 180000, 'media_library_bridge_upload')
+    const data = await resp.json().catch(() => ({} as Record<string, unknown>)) as Record<string, unknown>
+    if (!resp.ok || data.ok === false) {
+        const step = readStringField(data, 'step')
+        const error = readStringField(data, 'error') || `bridge_http_${resp.status}`
+        const mode = readStringField(data, 'upload_mode')
+        return { ok: false, error: sanitizeMetaGraphError([step, error, mode].filter(Boolean).join(': ')) }
+    }
+    const advideoId = readStringField(data, 'advideo_id') || readStringField(data, 'video_id')
+    if (!advideoId) return { ok: false, error: 'bridge_advideo_id_missing' }
+    return {
+        ok: true,
+        advideoId,
+        advideoStatus: readStringField(data, 'advideo_status') || readStringField(data, 'status') || 'processing',
+    }
+}
+
 async function uploadProcessedVideoToMetaAssetLibrary(params: {
     env: Env
     namespaceId: string
@@ -4048,20 +4101,14 @@ async function uploadProcessedVideoToMetaAssetLibrary(params: {
     const explicitAdAccount = String(params.adAccount || '').trim()
     const adAccountRow = explicitAdAccount ? null : await getPageSetting(params.env.DB, pageId, 'ad_account').catch(() => null)
     const adAccount = explicitAdAccount || String(adAccountRow?.value || '').trim()
-    const token = await resolveFacebookSyncToken(params.env.DB, pageId, namespaceId).catch(() => '')
-
-    if (!adAccount || !token) {
-        const missing = [
-            !adAccount ? 'missing_ad_account' : '',
-            !token ? 'missing_facebook_sync_token' : '',
-        ].filter(Boolean).join(',')
+    if (!adAccount) {
         await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
             namespaceId,
             systemVideoId: videoId,
             adAccount,
             fileUrl,
             uploadStatus: 'skipped_missing_config',
-            error: missing,
+            error: 'missing_ad_account',
         })
         return
     }
@@ -4080,70 +4127,39 @@ async function uploadProcessedVideoToMetaAssetLibrary(params: {
 
     const uploadedAt = new Date().toISOString()
     try {
-        const body = new URLSearchParams()
-        body.set('file_url', fileUrl)
-        body.set('access_token', token)
-        body.set('title', `processed_${videoId}`.slice(0, 120))
-        body.set('description', `source:processed-gallery | namespace:${namespaceId} | system_video:${videoId}`.slice(0, 1000))
-
-        const uploadResp = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(adAccount)}/advideos`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body,
+        const bridgeResult = await uploadProcessedVideoToMetaAssetLibraryViaBridge({
+            env: params.env,
+            db: params.env.DB,
+            pageId,
+            namespaceId,
+            videoId,
+            adAccount,
+            fileUrl,
         })
-        const uploadData = await readMetaGraphJson(uploadResp)
-        if (!uploadResp.ok) {
+        if (!bridgeResult.ok || !bridgeResult.advideoId) {
             await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
                 namespaceId,
                 systemVideoId: videoId,
                 adAccount,
                 fileUrl,
                 uploadStatus: 'failed',
-                error: getMetaGraphErrorText(uploadData, uploadResp.status),
+                error: bridgeResult.error || 'bridge_upload_failed',
                 lastCheckedAt: uploadedAt,
             })
             return
-        }
-
-        const advideoId = String(uploadData.id || '').trim()
-        if (!advideoId) {
-            await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
-                namespaceId,
-                systemVideoId: videoId,
-                adAccount,
-                fileUrl,
-                uploadStatus: 'failed',
-                error: 'graph_advideo_id_missing',
-                lastCheckedAt: uploadedAt,
-            })
-            return
-        }
-
-        let advideoStatus = normalizeMetaVideoStatus(uploadData) || 'processing'
-        let lastCheckedAt = uploadedAt
-        const statusUrl = new URL(`https://graph.facebook.com/v21.0/${encodeURIComponent(advideoId)}`)
-        statusUrl.searchParams.set('fields', 'id,status')
-        statusUrl.searchParams.set('access_token', token)
-        const statusResp = await fetch(statusUrl.toString()).catch(() => null)
-        if (statusResp) {
-            lastCheckedAt = new Date().toISOString()
-            if (statusResp.ok) {
-                const statusData = await readMetaGraphJson(statusResp)
-                advideoStatus = normalizeMetaVideoStatus(statusData) || advideoStatus
-            }
         }
 
         await upsertProcessedVideoAssetLibraryRow(params.env.DB, {
             namespaceId,
             systemVideoId: videoId,
             adAccount,
-            advideoId,
-            advideoStatus,
+            advideoId: bridgeResult.advideoId,
+            advideoStatus: bridgeResult.advideoStatus || 'processing',
             fileUrl,
-            uploadStatus: normalizeProcessedVideoAssetUploadStatus(advideoStatus),
+            uploadStatus: normalizeProcessedVideoAssetUploadStatus(bridgeResult.advideoStatus || 'processing'),
             error: '',
             uploadedAt,
-            lastCheckedAt,
+            lastCheckedAt: uploadedAt,
         })
     } catch (error) {
         const sanitized = sanitizeMetaGraphError(error)
@@ -4156,8 +4172,9 @@ async function uploadProcessedVideoToMetaAssetLibrary(params: {
             error: sanitized,
             lastCheckedAt: new Date().toISOString(),
         }).catch(() => { })
-        console.error(`[PROCESSED-ASSET-LIBRARY] upload failed namespace=${namespaceId} video=${videoId} error=${sanitized}`)
+        console.error(`[PROCESSED-ASSET-LIBRARY] bridge upload failed namespace=${namespaceId} video=${videoId} error=${sanitized}`)
     }
+
 }
 
 async function getPageAvatarSettings(db: D1Database, pageId: string): Promise<PageAvatarSettings> {
