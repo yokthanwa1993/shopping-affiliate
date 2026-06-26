@@ -389,10 +389,13 @@ test('autoPauseCompletedAdOnlyCampaigns selects only finished, not-yet-paused ro
     const indexSrc = readFileSync(resolve(process.cwd(), 'src/index.ts'), 'utf8')
     const fnStart = indexSrc.indexOf('async function autoPauseCompletedAdOnlyCampaigns')
     assert.ok(fnStart >= 0, 'autoPauseCompletedAdOnlyCampaigns exists')
-    const fn = indexSrc.slice(fnStart, fnStart + 4000)
-    // Only rows whose run window has ENDED (end_time set and <= now) are eligible.
+    const fn = indexSrc.slice(fnStart, fnStart + 6000)
+    // Only rows whose run window has ENDED are eligible. Prefer explicit bridge end_time;
+    // fixed-adset bridge rows may omit end_time, so fall back to created_at + run_hours.
     assert.match(fn, /end_time != ''/)
     assert.match(fn, /datetime\(end_time\) <= datetime\('now'\)/)
+    assert.match(fn, /end_time = '' AND run_hours != '' AND created_at != ''/)
+    assert.match(fn, /datetime\(created_at, '\+' \|\| CAST\(run_hours AS INTEGER\) \|\| ' hours'\) <= datetime\('now'\)/)
     // One-shot: only rows not already auto-paused.
     assert.match(fn, /auto_paused_at = ''/)
     // Only created/success rows (rejected/unsupported/failed never made live objects).
@@ -406,7 +409,7 @@ test('autoPauseCompletedAdOnlyCampaigns selects only finished, not-yet-paused ro
 test('autoPauseCompletedAdOnlyCampaigns turns OFF via /pause-ad-only and NEVER deletes', () => {
     const indexSrc = readFileSync(resolve(process.cwd(), 'src/index.ts'), 'utf8')
     const fnStart = indexSrc.indexOf('async function autoPauseCompletedAdOnlyCampaigns')
-    const fn = indexSrc.slice(fnStart, fnStart + 4000)
+    const fn = indexSrc.slice(fnStart, fnStart + 6000)
     // It calls the bridge pause route (status=PAUSED only lives in the bridge), never legacy create.
     assert.match(fn, /\/pause-ad-only/)
     assert.ok(!fn.includes('create-ad-only'), 'auto-pause never re-creates ads')

@@ -4155,7 +4155,7 @@ async function resolveProcessedVideoMetaViaBridge(params: {
 const MEDIA_LIBRARY_META_RESOLVE_CAP = 12
 
 function processedVideoAssetMetaKey(item: VideoMediaLibraryItem): string {
-    return `${item.ad_account} ${item.system_video_id} ${item.advideo_id}`
+    return `${item.ad_account}\u0000${item.system_video_id}\u0000${item.advideo_id}`
 }
 
 // Enrich library rows with the REAL Meta media. Only playable, error-free rows that actually carry an
@@ -14606,8 +14606,11 @@ async function autoPauseCompletedAdOnlyCampaigns(
             `SELECT id, campaign_id, adset_id, ad_id
                FROM dashboard_ad_history
               WHERE auto_paused_at = ''
-                AND end_time != ''
-                AND datetime(end_time) <= datetime('now')
+                AND (
+                    (end_time != '' AND datetime(end_time) <= datetime('now'))
+                    OR (end_time = '' AND run_hours != '' AND created_at != ''
+                        AND datetime(created_at, '+' || CAST(run_hours AS INTEGER) || ' hours') <= datetime('now'))
+                )
                 AND status IN ('created', 'success')
                 AND (campaign_id != '' OR adset_id != '')
               ORDER BY id ASC
@@ -14765,6 +14768,7 @@ async function pickBestAutoAdsCandidateForPage(env: Env, pageId: string, rng: ()
         `SELECT page_id, status, error_message, truncated_result_json, created_at, published_to_page
          FROM dashboard_ad_history
          WHERE status IN ('failed', 'error', 'unsupported')
+           AND lane = 'follow'
          ORDER BY id DESC LIMIT ?`
     ).bind(AD_ONLY_AUTO_FAILURE_SCAN_LIMIT).all().catch(() => ({ results: [] as AdOnlyFailureRow[] })) as { results?: AdOnlyFailureRow[] }
     const skipped = buildAdOnlySkippedPageSet(failureRows.results || [], nowMs)
@@ -15046,28 +15050,22 @@ app.get('/api/dashboard/auto-ads/status', async (c) => {
 })
 
 // Manual "run now" for a single page's automation — bypass the cadence gate and create one Follow ad
-// immediately (still respects the daily cap). Accept fast, finish in waitUntil (the create can outrun
-// browser/tool HTTP timeouts).
+// immediately (still respects the daily cap). Await the create and return the concrete result; this must
+// not be fire-and-forget because long Meta bridge calls can be cancelled after the response ends.
 app.post('/api/dashboard/auto-ads/run-next', async (c) => {
     const body = await c.req.json().catch(() => ({})) as { page_id?: string }
     const pageId = String(body.page_id || '').trim()
     if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
-    c.executionCtx.waitUntil(
-        (async () => {
-            const nowMs = Date.now()
-            const maxPerDay = clampAutoAdsMaxPerDay((await getPageSetting(c.env.DB, pageId, AUTO_ADS_MAX_PER_DAY_SETTING_KEY).catch(() => null))?.value)
-            const todayCount = await countAutoAdsCreatedTodayForPage(c.env, pageId, nowMs)
-            if (!isUnderDailyAdCap(todayCount, maxPerDay)) {
-                console.log(`[AUTO-ADS] manual run-next page=${pageId} daily_cap_reached count=${todayCount}/${maxPerDay}`)
-                return
-            }
-            const res = await processOnePerPageAutoAd(c.env, pageId, nowMs)
-            console.log(`[AUTO-ADS] manual run-next page=${pageId} ok=${res.ok} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''}`)
-        })().catch((error) => {
-            console.error(`[AUTO-ADS] manual run-next failed: ${error instanceof Error ? error.message : String(error)}`)
-        })
-    )
-    return c.json({ ok: true, accepted: true, page_id: pageId }, 202, { 'Cache-Control': 'no-store' })
+    const nowMs = Date.now()
+    const maxPerDay = clampAutoAdsMaxPerDay((await getPageSetting(c.env.DB, pageId, AUTO_ADS_MAX_PER_DAY_SETTING_KEY).catch(() => null))?.value)
+    const todayCount = await countAutoAdsCreatedTodayForPage(c.env, pageId, nowMs)
+    if (!isUnderDailyAdCap(todayCount, maxPerDay)) {
+        console.log(`[AUTO-ADS] manual run-next page=${pageId} daily_cap_reached count=${todayCount}/${maxPerDay}`)
+        return c.json({ ok: true, page_id: pageId, created: false, reason: 'daily_cap_reached', today_count: todayCount, max_per_day: maxPerDay }, 200, { 'Cache-Control': 'no-store' })
+    }
+    const res = await processOnePerPageAutoAd(c.env, pageId, nowMs)
+    console.log(`[AUTO-ADS] manual run-next page=${pageId} ok=${res.ok} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''}`)
+    return c.json({ ok: res.ok, page_id: pageId, created: !!res.ad_id, ...res }, res.ok ? 200 : 500, { 'Cache-Control': 'no-store' })
 })
 
 // Manual "run now" for the Follow→Click-link handoff pass (process finished Follow rows immediately).
