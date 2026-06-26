@@ -1351,6 +1351,267 @@ function createHandler(deps = {}) {
         });
       }
 
+      if (req.method === 'POST' && url.pathname === '/token/auto-sync') {
+        // TRUE-BRIDGE RECOVERY. After Facebook invalidates a session/token and the operator logs
+        // the bridge back in, this single call re-mints a FRESH Facebook Lite (EAAD6V) token,
+        // lists administered pages over REAL-TIME me/accounts, and refreshes the page token of
+        // EVERY matching page in the target namespace via the Worker's secret-authed
+        // /api/pages/profile-sync — so posting resumes automatically WITHOUT the Dev exporting
+        // page-by-page. Unlike /token/import-pages this is NOT admin-only: it is recovery for the
+        // production namespace's EXISTING pages. Safety is preserved by sending the same
+        // import_mode=facebook_lite_bridge_import marker the importer uses, so the Worker upsert:
+        //   • refreshes an EXISTING page's token (is_active untouched — an active page keeps posting,
+        //     a previously-staged inactive page is NEVER auto-activated),
+        //   • DECLINES to move/steal a page that already posts in another namespace (returns a
+        //     structured conflict), and
+        //   • stages any genuinely-new page inactive for the operator to enable later.
+        // Local-only for live writes (it resolves Keychain creds + page tokens); dry-run by default;
+        // token-free in EVERY response (no raw token ever returned or logged). Event-driven only —
+        // there is NO background polling/mint loop here; one call = one real-time scan + push.
+        const syncBody = await parseBody(req);
+        const { target = 'video-affiliate', workerUrl, dryRun = true } = syncBody;
+        // Namespace: explicit body value first, else an env-configured default so the operator/UI can
+        // trigger recovery without re-typing the production namespace each time. Never hardcoded.
+        const ns = String(
+          syncBody.namespaceId || syncBody.namespace_id ||
+          process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE || ''
+        ).trim();
+        if (!ns) return sendError(res, 400, 'Missing namespaceId');
+        const wantDryRun = dryRun !== false;
+
+        // Live writes resolve Keychain credentials + page tokens, so they are gated to localhost.
+        if (!wantDryRun && !isLocalRequest(req)) return sendError(res, 403, 'Live auto-sync is local-only');
+
+        // Account selection mirrors the all-account importer: an explicit `accounts` list verbatim,
+        // a SPECIFIC `account`, or all-mode (account omitted/empty/"all"/"*") which scans every
+        // FB-Lite-likely Bridge account from the local registry/status list in REAL TIME now.
+        const explicitAccounts = parseAccountList(syncBody.accounts);
+        const rawAccount = String(syncBody.account == null ? '' : syncBody.account).trim();
+        const allMode = (explicitAccounts && explicitAccounts.length > 0)
+          || rawAccount === '' || rawAccount.toLowerCase() === 'all' || rawAccount === '*';
+        let scanAccounts;
+        if (explicitAccounts && explicitAccounts.length > 0) {
+          scanAccounts = explicitAccounts;
+        } else if (!allMode) {
+          scanAccounts = [rawAccount];
+        } else {
+          let statuses = [];
+          try { statuses = await listAccountStatuses(kc, selectors, registry); } catch { statuses = []; }
+          const seen = new Set();
+          scanAccounts = [];
+          for (const s of statuses) {
+            if (!s || !s.account || seen.has(s.key)) continue;
+            const likelyLite = s.inRegistry || s.credentialPresent || s.selectorPresent;
+            if (!likelyLite) continue;
+            seen.add(s.key);
+            scanAccounts.push(s.account);
+          }
+        }
+        if (!scanAccounts.length) {
+          return send(res, 200, {
+            ok: false, status: 'no_accounts_to_scan', namespace_id: ns, mode: allMode ? 'all_accounts' : 'single_account',
+            note: 'No Facebook Lite account resolved to scan. Pass an explicit account or register one.'
+          });
+        }
+
+        // Mint + validate + list each account in REAL TIME, de-duping pages by page_id (first account
+        // = primary, others = fallback). A token that mints EAAD6V-shaped but is Graph-rejected (e.g.
+        // password/session reset, or a fresh rate-limit) is reported NOT ready with a sanitized reason
+        // and contributes no pages — Ready never lies. The internal token pool is never serialized.
+        const pageMap = new Map();
+        const accountResults = [];
+        let accountsOk = 0;
+        let accountsFailed = 0;
+        for (const acct of scanAccounts) {
+          const accDisplay = sanitizeAccount(acct).display;
+          const lite = await resolveFacebookLiteEAAD6Session(liteDeps, acct).catch((e) => ({ ok: false, reason: (e && (e.code || e.message)) || 'fb_lite_token_error' }));
+          if (!lite.ok || !lite.token) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'fb_lite_token_not_ready', error: sanitizePublicReason(lite.reason || 'fb_lite_token_not_ready', 'fb_lite_token_not_ready'), ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
+            continue;
+          }
+          // Real-time Graph validation BEFORE listing pages: a minted EAAD6V string is not proof of
+          // usability. If me/accounts is rejected (invalidated/rate-limited), report a sanitized
+          // reason and skip — never treat a Graph-rejected token as Ready.
+          const validation = await validateFacebookLiteGraphToken(lite);
+          if (!validation.ok) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'token_not_ready', error: validation.reason, ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
+            continue;
+          }
+          let listed;
+          try {
+            listed = await posting.listPagesPublic(lite.graphFetch, lite.token, true);
+          } catch (e) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: sanitizePublicReason((e && (e.reason || e.code || e.message)) || 'graph_pages_failed', 'graph_pages_failed') });
+            continue;
+          }
+          if (listed && listed.error) {
+            accountsFailed += 1;
+            accountResults.push({ account: accDisplay, ok: false, status: 'graph_pages_failed', error: classifyGraphTokenError(listed.error) });
+            continue;
+          }
+          const pages = Array.isArray(listed.data) ? listed.data : [];
+          accountsOk += 1;
+          let withToken = 0;
+          for (const p of pages) {
+            const pageId = p && p.id != null ? String(p.id) : '';
+            if (!pageId) continue;
+            const pageName = p && p.name != null ? String(p.name) : '';
+            const pageToken = p && p.access_token ? String(p.access_token) : '';
+            if (pageToken) withToken += 1;
+            if (!pageMap.has(pageId)) {
+              pageMap.set(pageId, { page_id: pageId, page_name: pageName, primary_account: accDisplay, fallback_accounts: [], tokens: [] });
+            }
+            const entry = pageMap.get(pageId);
+            if (!entry.page_name && pageName) entry.page_name = pageName;
+            if (accDisplay !== entry.primary_account && !entry.fallback_accounts.includes(accDisplay)) {
+              entry.fallback_accounts.push(accDisplay);
+            }
+            if (pageToken) entry.tokens.push({ account: accDisplay, token: pageToken });
+          }
+          accountResults.push({ account: accDisplay, ok: true, page_count: pages.length, with_token: withToken, ...(lite.prefix ? { token_prefix: lite.prefix } : {}) });
+        }
+
+        const uniquePages = [...pageMap.values()];
+        const candidateView = uniquePages.map((e) => ({
+          page_id: e.page_id, page_name: e.page_name,
+          primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
+          has_token: e.tokens.length > 0
+        }));
+
+        // SAFE default: a dry run lists the deduped candidate pages + per-account scan outcomes and
+        // performs NO Worker/D1 writes. Token-free.
+        if (wantDryRun) {
+          return send(res, 200, {
+            ok: accountsOk > 0, dryRun: true, status: 'dry_run_only',
+            mode: allMode ? 'all_accounts' : 'single_account', target,
+            namespace_id: ns, source: 'facebook_lite_eaad6',
+            token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
+            accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
+            accounts: accountResults,
+            counts: {
+              candidates: candidateView.length,
+              with_token: candidateView.filter((c) => c.has_token).length,
+              accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed
+            },
+            candidates: candidateView,
+            note: 'No Cloudflare/D1 writes performed. A live auto-sync refreshes each EXISTING page token (is_active untouched), skips pages owned by another namespace, and stages genuinely-new pages inactive.'
+          });
+        }
+
+        // ── Live auto-sync: refresh each unique page once via the secret-authed profile-sync, with
+        // automatic fallback to the next account that administers the page if a push fails. ──
+        const syncSecretAuto = String(
+          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
+          process.env.TAG_SYNC_PUSH_SECRET ||
+          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
+          ''
+        ).trim();
+        if (!syncSecretAuto) {
+          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', mode: allMode ? 'all_accounts' : 'single_account', namespace_id: ns, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed });
+        }
+        const baseAuto = String(
+          workerUrl ||
+          process.env.VIDEO_AFFILIATE_WORKER_URL ||
+          process.env.WORKER_URL ||
+          'https://api.pubilo.com'
+        ).trim().replace(/\/+$/, '');
+        const syncUrlAuto = `${baseAuto}/api/pages/profile-sync`;
+
+        const countsAuto = { refreshed: 0, staged: 0, skipped: 0, errors: 0, no_token: 0, fallback_used: 0, synced: 0 };
+        const resultsAuto = [];
+        for (const e of uniquePages) {
+          if (!e.tokens.length) {
+            countsAuto.no_token += 1;
+            resultsAuto.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'error', reason: 'page_token_unavailable' });
+            continue;
+          }
+          let pushed = null;
+          let usedAccount = null;
+          let lastStatus = 0;
+          let unreachable = false;
+          for (const tk of e.tokens) {
+            let workerStatus = 0;
+            let data = {};
+            try {
+              const resp = await fetchImpl(syncUrlAuto, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-tag-sync-secret': syncSecretAuto },
+                body: JSON.stringify({
+                  namespace_id: ns,
+                  page_id: e.page_id,
+                  page_name: e.page_name,
+                  access_token: tk.token,
+                  comment_token: tk.token,
+                  account: tk.account,
+                  token_source: 'facebook_lite_bridge',
+                  // No-steal + no-surprise-activate: refresh existing rows, skip cross-namespace pages,
+                  // stage truly-new pages inactive. Existing rows' is_active is never changed.
+                  import_mode: 'facebook_lite_bridge_import'
+                })
+              });
+              workerStatus = Number(resp && resp.status) || 0;
+              try { data = await resp.json(); } catch { data = {}; }
+            } catch (err) {
+              unreachable = true;
+              continue; // automatic fallback to the next account that administers this page
+            }
+            const success = !!(data && data.success === true) && (workerStatus === 0 || (workerStatus >= 200 && workerStatus < 300));
+            lastStatus = workerStatus;
+            if (success) { pushed = data; usedAccount = tk.account; break; }
+          }
+          if (!pushed) {
+            countsAuto.errors += 1;
+            resultsAuto.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'error', reason: unreachable ? 'worker_unreachable' : 'worker_rejected', worker_status: lastStatus, profile_sync_success: false });
+            continue;
+          }
+          const fallbackUsed = usedAccount !== e.primary_account;
+          if (fallbackUsed) countsAuto.fallback_used += 1;
+          // The Worker upsert reports skipped=true with a conflict_namespace_id when a staging refresh
+          // declined to move a page already owned by another namespace — surface it as SKIPPED, not synced.
+          if (pushed.skipped === true) {
+            countsAuto.skipped += 1;
+            resultsAuto.push({
+              page_id: e.page_id, page_name: e.page_name,
+              primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
+              account: usedAccount, fallback_used: fallbackUsed,
+              status: 'skipped', reason: 'conflict_other_namespace',
+              conflict_namespace_id: pushed.conflict_namespace_id || pushed.conflictNamespaceId || null,
+              profile_sync_success: true, worker_status: lastStatus
+            });
+            continue;
+          }
+          countsAuto.synced += 1;
+          const staged = !!pushed.created; // a new page was inserted (staged inactive)
+          if (staged) countsAuto.staged += 1; else countsAuto.refreshed += 1;
+          resultsAuto.push({
+            page_id: e.page_id, page_name: e.page_name,
+            primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
+            account: usedAccount, fallback_used: fallbackUsed,
+            ...(fallbackUsed ? { fallback_account: usedAccount } : {}),
+            status: staged ? 'staged' : 'synced',
+            created: !!pushed.created, updated: !!pushed.updated, moved: !!pushed.moved,
+            staged_inactive: staged ? (pushed.staged_inactive !== false) : false,
+            profile_sync_success: true, worker_status: lastStatus
+          });
+        }
+
+        return send(res, 200, {
+          ok: countsAuto.errors === 0 && accountsOk > 0,
+          synced: countsAuto.synced > 0,
+          status: countsAuto.errors === 0 ? 'synced' : 'synced_with_errors',
+          mode: allMode ? 'all_accounts' : 'single_account', target, namespace_id: ns,
+          source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
+          import_mode: 'facebook_lite_bridge_import',
+          accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
+          accounts: accountResults,
+          counts: { ...countsAuto, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },
+          results: resultsAuto
+        });
+      }
+
       // ── Worker posting bridge routes (CloakBrowser) ──────────────────────────────────────
       // All resolve a fresh user token from the persistent logged-in profile, run their Graph
       // work through the cookie-bound browser client, and ALWAYS close the context in `finally`.

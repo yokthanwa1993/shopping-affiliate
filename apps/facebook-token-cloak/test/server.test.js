@@ -1646,3 +1646,215 @@ test('/token/import-pages live import falls back to the next account when the pr
     assertNoLeak(r.body, ['EAAD6V_acct1', 'EAAD6V_acct2', 'PT_A_2001', 'PT_B_2001', 'PT_A_2002', 'PT_B_2003', SECRET]);
   }));
 });
+
+// ── /token/auto-sync — TRUE-BRIDGE recovery for EXISTING pages ───────────────────────────────────
+// After Facebook invalidates tokens and the operator logs the bridge back in, ONE call re-mints a
+// fresh Facebook Lite token, lists administered pages over real-time me/accounts, and refreshes the
+// page token of every matching page in the TARGET namespace via the secret-authed profile-sync — so
+// posting resumes automatically with NO per-page manual export. Unlike /token/import-pages it is NOT
+// admin-only (it recovers the production namespace), but it sends the same import_mode marker so the
+// Worker refreshes existing rows (is_active untouched), never steals cross-namespace pages, and stages
+// genuinely-new pages inactive. Local-only for live writes; dry-run default; token-free everywhere.
+const PROD_NS = '1774858894802785816'; // production namespace — deliberately NOT the admin import ns
+
+test('/token/auto-sync live refreshes EXISTING pages into a NON-admin (production) namespace, sends import_mode, token-free', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const captured = [];
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        return { ok: true, status: 200, json: async () => ({ data: [
+          { id: '3001', name: 'PageOne', access_token: 'PT_3001' },
+          { id: '3002', name: 'PageTwo', access_token: 'PT_3002' }
+        ] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) {
+        captured.push(JSON.parse(opts.body));
+        // Both pages already exist in the production namespace → token refresh (updated, not created).
+        return { ok: true, status: 200, json: async () => ({ success: true, created: false, updated: true }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const { value: r, lines } = await captureConsole(() => request('POST', '/token/auto-sync', {
+      account: '100090320823561', namespaceId: PROD_NS, dryRun: false
+    }));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.synced, true);
+    assert.equal(r.body.status, 'synced');
+    assert.equal(r.body.namespace_id, PROD_NS, 'recovery targets the production namespace (not admin-gated)');
+    assert.equal(r.body.counts.synced, 2);
+    assert.equal(r.body.counts.refreshed, 2, 'both existing pages were token-refreshed');
+    assert.equal(r.body.counts.staged, 0);
+    assert.equal(r.body.counts.errors, 0);
+    // Per-page results are token-free and report the recovery outcome.
+    for (const row of r.body.results) {
+      assert.equal(row.status, 'synced');
+      assert.equal(row.profile_sync_success, true);
+      assert.equal('access_token' in row, false);
+      assert.equal('token' in row, false);
+    }
+    // Every push carried the secret header + import_mode marker + the page token in the BODY only.
+    assert.equal(captured.length, 2);
+    for (const cap of captured) {
+      assert.equal(cap.namespace_id, PROD_NS);
+      assert.equal(cap.import_mode, 'facebook_lite_bridge_import', 'no-steal / no-surprise-activate marker');
+      assert.equal(cap.token_source, 'facebook_lite_bridge');
+    }
+    assert.deepEqual(captured.map((c) => c.access_token).sort(), ['PT_3001', 'PT_3002']);
+    assertNoLeak({ body: r.body, lines }, ['EAAD6Vuser0000000000000000000', 'PT_3001', 'PT_3002', SECRET]);
+  }));
+});
+
+test('/token/auto-sync default stays dry_run_only and token-free (lists candidates, never pushes)', async () => {
+  let pushCalled = false;
+  await withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [
+        { id: '3001', name: 'PageOne', access_token: 'PT_3001' }
+      ] }) };
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/auto-sync', { account: '100090320823561', namespaceId: PROD_NS });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.dryRun, true);
+    assert.equal(r.body.status, 'dry_run_only');
+    assert.equal(r.body.counts.candidates, 1);
+    assert.equal(r.body.candidates[0].page_id, '3001');
+    assert.equal(r.body.candidates[0].has_token, true);
+    assert.equal(pushCalled, false, 'a dry run must never push to the Worker');
+    for (const c of r.body.candidates) assert.equal('access_token' in c, false);
+    assertNoLeak(r.body, ['EAAD6Vuser0000000000000000000', 'PT_3001']);
+  });
+});
+
+test('/token/auto-sync live write rejects non-local requests (403), resolves no token', async () => {
+  let touched = false;
+  const r = await callHandler({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: { extractTokenPrefix: realExtractTokenPrefix, facebookLogin: async () => { touched = true; return { success: true, converted_token: { access_token: 'EAAD6Vx' } }; } },
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({}) })
+  }, {
+    method: 'POST',
+    path: '/token/auto-sync',
+    body: { account: '100090320823561', namespaceId: PROD_NS, dryRun: false },
+    remoteAddress: '203.0.113.7'
+  });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.success, false);
+  assert.equal(touched, false, 'a non-local live request must never mint a token');
+});
+
+test('/token/auto-sync live returns sync_secret_missing when no secret is configured (no push)', async () => {
+  let pushCalled = false;
+  await withExportEnv({}, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '3001', name: 'PageOne', access_token: 'PT_3001' }] }) };
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/auto-sync', { account: '100090320823561', namespaceId: PROD_NS, dryRun: false });
+    assert.equal(r.body.status, 'sync_secret_missing');
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.synced, false);
+    assert.equal(pushCalled, false);
+  }));
+});
+
+test('/token/auto-sync fails closed when the minted token is Graph-rejected (invalidated/rate-limited) — no pages, no push, Ready never lies', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let pushCalled = false;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: mockFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      // Graph rejects me/accounts (e.g. password/session reset) → token is EAAD6V-shaped but unusable.
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ error: { message: 'The session has been invalidated because the user changed their password', code: 190 } }) };
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const { value: r, lines } = await captureConsole(() => request('POST', '/token/auto-sync', { account: '100090320823561', namespaceId: PROD_NS, dryRun: false }));
+    assert.equal(r.body.accounts_failed, 1);
+    assert.equal(r.body.accounts_ok, 0);
+    assert.equal(r.body.accounts[0].status, 'token_not_ready');
+    assert.equal(r.body.counts.synced, 0);
+    assert.equal(pushCalled, false, 'a Graph-rejected token must contribute no pages and never push');
+    // The sanitized reason must NOT echo the raw graph message verbatim.
+    assertNoLeak({ body: r.body, lines }, ['changed their password', 'EAAD6Vuser0000000000000000000', SECRET]);
+  }));
+});
+
+test('/token/auto-sync surfaces a cross-namespace page as SKIPPED (conflict), never stolen, never counted as synced', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '4001', name: 'OwnedElsewhere', access_token: 'PT_4001' }] }) };
+      if (u.includes('/api/pages/profile-sync')) {
+        // The Worker upsert declines to move a page already owned by another namespace.
+        return { ok: true, status: 200, json: async () => ({ success: true, skipped: true, conflict_namespace_id: '999000111' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/auto-sync', { account: '100090320823561', namespaceId: PROD_NS, dryRun: false });
+    assert.equal(r.body.counts.skipped, 1);
+    assert.equal(r.body.counts.synced, 0);
+    assert.equal(r.body.counts.refreshed, 0);
+    const row = r.body.results.find((x) => x.page_id === '4001');
+    assert.equal(row.status, 'skipped');
+    assert.equal(row.reason, 'conflict_other_namespace');
+    assert.equal(row.conflict_namespace_id, '999000111');
+    assertNoLeak(r.body, ['PT_4001', SECRET]);
+  }));
+});
+
+test('/token/auto-sync uses the env-default namespace when the body omits it', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let captured = null;
+  const savedSyncNs = process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE;
+  try {
+  process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE = PROD_NS;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url, opts) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '3001', name: 'PageOne', access_token: 'PT_3001' }] }) };
+      if (u.includes('/api/pages/profile-sync')) { captured = JSON.parse(opts.body); return { ok: true, status: 200, json: async () => ({ success: true, updated: true }) }; }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/auto-sync', { account: '100090320823561', dryRun: false });
+    assert.equal(r.body.namespace_id, PROD_NS);
+    assert.equal(r.body.synced, true);
+    assert.ok(captured && captured.namespace_id === PROD_NS, 'push must target the env-default namespace');
+  }));
+  } finally {
+    if (savedSyncNs === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE;
+    else process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE = savedSyncNs;
+  }
+});

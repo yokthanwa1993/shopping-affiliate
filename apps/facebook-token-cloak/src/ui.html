@@ -358,10 +358,15 @@
             <label for="totp-input">2FA secret/code</label>
             <input id="totp-input" name="totp" type="password" placeholder="write-only">
           </div>
+          <div>
+            <label for="namespace-input">Worker namespace (sync)</label>
+            <input id="namespace-input" name="namespace" placeholder="leave blank to use default" autocapitalize="off">
+          </div>
         </div>
         <div class="actions">
           <button class="primary" type="submit">Save</button>
           <button type="button" id="login-button">Login/Get Token</button>
+          <button type="button" id="sync-button">Sync to Worker</button>
           <button class="danger" type="button" id="delete-button">Delete</button>
         </div>
       </form>
@@ -591,6 +596,14 @@
               type: "button",
               onclick: function (event) {
                 event.stopPropagation();
+                fillForm(account);
+                runAutoSync(account.account);
+              }
+            }, "Sync to Worker"),
+            element("button", {
+              type: "button",
+              onclick: function (event) {
+                event.stopPropagation();
                 revealFacebookLiteToken(account.account);
               }
             }, "Reveal token"),
@@ -665,7 +678,9 @@
       state.tokenStatusByAccount[loginResult.account || account] = refreshResult;
       setResult(safeResult(loginResult, refreshResult));
       await loadAccounts();
-      toast(refreshResult.tokenPresent ? "Token verified" : "Login opened; token not found yet", refreshResult.tokenPresent ? "ok" : "");
+      // Expose (do NOT auto-fire) recovery sync once a token is verified: the operator clicks
+      // "Sync to Worker" to push fresh tokens. Keeping it explicit avoids spamming Facebook.
+      toast(refreshResult.tokenPresent ? "Token verified — click \"Sync to Worker\" to resume posting" : "Login opened; token not found yet", refreshResult.tokenPresent ? "ok" : "");
     } catch (error) {
       setResult(JSON.stringify({ error: error.message }, null, 2));
       toast("Login failed: " + error.message, "err");
@@ -694,6 +709,46 @@
     }
   }
 
+  // TRUE-BRIDGE recovery: after the operator logs the bridge back in, ONE explicit click re-mints a
+  // fresh token, lists pages in real time, and refreshes every matching page token in the Worker
+  // namespace so posting resumes — no per-page manual export. Event-driven ONLY (fires on click, never
+  // on tab switch / load) so Facebook is never spammed. A token-free dry-run preview is shown first;
+  // the operator confirms before the local-only live write. The namespace field is optional — the
+  // bridge falls back to its configured default namespace when blank.
+  async function runAutoSync(explicitAccount) {
+    var account = explicitAccount || value("#account-input");
+    if (!account) { toast("Account / namespace is required", "err"); return; }
+    var namespaceId = value("#namespace-input");
+    var dryBody = { account: account, dryRun: true };
+    if (namespaceId) dryBody.namespaceId = namespaceId;
+    try {
+      setResult("Scanning pages for " + account + " (dry run)...");
+      var preview = await api("POST", "/token/auto-sync", dryBody);
+      setResult(JSON.stringify(preview, null, 2));
+      if (preview && preview.status === "dry_run_only") {
+        var candidates = (preview.counts && preview.counts.candidates) || 0;
+        if (!candidates) { toast("No pages found to sync", ""); return; }
+        if (!window.confirm("Refresh " + candidates + " page token(s) into namespace " + (preview.namespace_id || namespaceId || "(default)") + "? This pushes fresh tokens to the Worker.")) {
+          toast("Sync cancelled", "");
+          return;
+        }
+        var liveBody = { account: account, dryRun: false };
+        if (namespaceId) liveBody.namespaceId = namespaceId;
+        setResult("Syncing tokens to Worker...");
+        var live = await api("POST", "/token/auto-sync", liveBody);
+        setResult(JSON.stringify(live, null, 2));
+        var synced = (live.counts && live.counts.synced) || 0;
+        toast(live.ok ? ("Synced " + synced + " page(s)") : ("Sync had errors (" + ((live.counts && live.counts.errors) || 0) + ")"), live.ok ? "ok" : "err");
+        await loadAccounts();
+      } else {
+        toast("Preview unavailable: " + ((preview && (preview.error || preview.status)) || "unknown"), "err");
+      }
+    } catch (error) {
+      setResult(JSON.stringify({ error: (error && error.message) || "error" }, null, 2));
+      toast("Sync failed: " + ((error && error.message) || "error"), "err");
+    }
+  }
+
   async function deleteAccount(explicitAccount) {
     var account = explicitAccount || value("#account-input");
     if (!account) {
@@ -719,6 +774,7 @@
 
   $("#account-form").addEventListener("submit", saveAccount);
   $("#login-button").addEventListener("click", function () { runLogin(); });
+  $("#sync-button").addEventListener("click", function () { runAutoSync(); });
   $("#delete-button").addEventListener("click", function () { deleteAccount(); });
 
   loadAccounts();

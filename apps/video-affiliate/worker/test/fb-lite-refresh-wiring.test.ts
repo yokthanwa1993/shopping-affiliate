@@ -113,6 +113,34 @@ test('pending-comment backlog: refresh+retry on missing token AND on auth failur
     assert.ok(fn.includes('sendStoredCommentBridgeFallback'), 'bridge fallback must remain as the safety net')
 })
 
+test('pending-comment refresh is BOUNDED to a single attempt (one-shot guard, never an infinite re-mint loop)', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function processPendingCommentBacklog')
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // The reload closure must early-return when it has already run once this row, so a permanently
+    // bad credential can never drive an unbounded mint/check loop (which is what tripped Facebook's
+    // rate limiter during manual recovery).
+    assert.ok(/if \(fbLiteRefreshAttempted\) return false/.test(fn), 'refresh must early-return once already attempted')
+    assert.ok(/fbLiteRefreshAttempted = true/.test(fn), 'the one-shot guard must be set before the refresh call')
+})
+
+test('targeted comment drain failure requeues the row to pending AND releases the comment-job lock (no 15-min stall)', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function processPendingCommentBacklog')
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // The per-row catch must terminally requeue a claimed 'processing' row back to 'pending' so a
+    // crashed/failed targeted drain does not wait for the 15-min general backstop to recover it. Anchor
+    // on the id-scoped requeue (distinct from the general backstop, which resets by status only).
+    const requeueIdx = fn.indexOf("AND comment_status = 'processing'")
+    assert.notEqual(requeueIdx, -1, 'per-row catch must requeue only a row it claimed (id-scoped processing guard)')
+    const requeueBlock = fn.slice(Math.max(0, requeueIdx - 300), requeueIdx)
+    assert.ok(/comment_status='pending'/.test(requeueBlock), 'catch must requeue the claimed row to pending')
+    assert.ok(/WHERE id = \?/.test(requeueBlock), 'the requeue must be scoped to the specific history row id')
+    // The finally must release the comment-job posting lock so the requeued row is immediately
+    // eligible again instead of being blocked behind a held 15-min lock.
+    assert.ok(fn.includes('releasePostingLock(env.DB, commentJobLockKey)'), 'finally must release the comment-job lock')
+})
+
 test('manual maintenance endpoint: authenticated, namespace-scoped, dry-run-safe, token-free', () => {
     const src = readVideoAffiliateIndex()
     const start = src.indexOf("app.post('/api/pages/:id/refresh-comment-token'")
