@@ -22,6 +22,8 @@ import {
     buildBridgeAutoSyncRequestBody,
     parseBridgeAutoSyncResponse,
     isBridgeAutoSyncAllowed,
+    parseAccountFallbackMap,
+    resolveBridgeFallbackAccounts,
     isFacebookLitePageToken,
     isFacebookLitePostingPermissionError,
     isPersistablePagePrimaryToken,
@@ -492,6 +494,52 @@ test('buildBridgeAutoSyncRequestBody is always dryRun:false (internal trusted re
     assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: '100090', candidateLoginIds: ['x'] }), { namespaceId: '177', dryRun: false, account: '100090' })
     // Candidate login ids (deduped, trimmed) only when no explicit account.
     assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [' a ', 'a', 'b'] }), { namespaceId: '177', dryRun: false, accounts: ['a', 'b'] })
+})
+
+test('buildBridgeAutoSyncRequestBody carries pageId + fallbackAccounts for page-targeted recovery (Chanalai → Thanwan), deduped, primary excluded', () => {
+    // A page-targeted recovery: primary account named, the failing page id, and an explicit fallback.
+    assert.deepEqual(
+        buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: '100090320823561', pageId: '182865331578296', fallbackAccounts: ['100077795357192'] }),
+        { namespaceId: '177', dryRun: false, account: '100090320823561', pageId: '182865331578296', fallbackAccounts: ['100077795357192'] },
+    )
+    // Fallbacks are trimmed/deduped and never re-list the primary account.
+    assert.deepEqual(
+        buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: 'A', fallbackAccounts: [' B ', 'B', 'A', 'C'] }),
+        { namespaceId: '177', dryRun: false, account: 'A', fallbackAccounts: ['B', 'C'] },
+    )
+    // No fallback fields emitted when none supplied (back-compat with existing all-account scan).
+    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [] }), { namespaceId: '177', dryRun: false })
+})
+
+test('parseAccountFallbackMap: tolerant JSON/object → normalized id lists, malformed never throws', () => {
+    // JSON string (env var shape): Chanalai uid → Thanwan uid.
+    assert.deepEqual(parseAccountFallbackMap('{"100090320823561":["100077795357192"]}'), { '100090320823561': ['100077795357192'] })
+    // Already-parsed object, comma/space string values, trimmed + deduped.
+    assert.deepEqual(parseAccountFallbackMap({ p: 'a, b  b', q: ['c', 'c', ' d '] }), { p: ['a', 'b'], q: ['c', 'd'] })
+    // Malformed / empty / wrong-type → {} (a bad env var can never break posting).
+    assert.deepEqual(parseAccountFallbackMap('not json'), {})
+    assert.deepEqual(parseAccountFallbackMap(''), {})
+    assert.deepEqual(parseAccountFallbackMap(null), {})
+    assert.deepEqual(parseAccountFallbackMap('[1,2,3]'), {})
+    // Empty value lists are dropped.
+    assert.deepEqual(parseAccountFallbackMap({ p: [] }), {})
+})
+
+test('resolveBridgeFallbackAccounts: ordered explicit → page-map → account-map, primary + page excluded, deduped', () => {
+    const accountFallbackMap = { '100090320823561': ['100077795357192', 'ACC_X'] }
+    const pageFallbackMap = { '182865331578296': ['PAGE_FB_1'] }
+    // Page-targeted: page mapping wins ordering ahead of the account mapping; explicit hint first.
+    assert.deepEqual(
+        resolveBridgeFallbackAccounts({ primaryAccount: '100090320823561', pageId: '182865331578296', accountFallbackMap, pageFallbackMap, explicit: ['HINT'] }),
+        ['HINT', 'PAGE_FB_1', '100077795357192', 'ACC_X'],
+    )
+    // The primary account is never returned as its own fallback even if a map lists it.
+    assert.deepEqual(
+        resolveBridgeFallbackAccounts({ primaryAccount: 'A', accountFallbackMap: { A: ['A', 'B'] } }),
+        ['B'],
+    )
+    // No mappings → empty (so an all-account scan is unaffected).
+    assert.deepEqual(resolveBridgeFallbackAccounts({ primaryAccount: 'A', pageId: 'P' }), [])
 })
 
 test('parseBridgeAutoSyncResponse reports synced from counts.synced or the synced flag, token-free, http failure never synced', () => {

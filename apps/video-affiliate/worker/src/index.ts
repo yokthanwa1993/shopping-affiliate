@@ -227,6 +227,8 @@ import {
     buildBridgeAutoSyncRequestBody,
     parseBridgeAutoSyncResponse,
     isBridgeAutoSyncAllowed,
+    parseAccountFallbackMap,
+    resolveBridgeFallbackAccounts,
     isFacebookLitePageToken,
     isFacebookLitePostingPermissionError,
     isPersistablePagePrimaryToken,
@@ -30195,6 +30197,24 @@ function getBridgeTokenSyncSecret(env: Env): string {
     return String(e.BRIDGE_TOKEN_SYNC_SECRET || e.TAG_SYNC_PUSH_SECRET || e.BROWSERSAVING_TAG_SYNC_SECRET || '').trim()
 }
 
+// Resolve the ordered Facebook Lite fallback-account chain for a failing page from env mappings. The
+// mapping lets an operator declare "when page P / account A can no longer mint a token, try account B"
+// WITHOUT hardcoding any uid in the binary (e.g. Chanalai 100090320823561 → Thanwan 100077795357192).
+// Two env vars, both optional JSON objects (malformed → ignored, never throws):
+//   FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS    {"<pageId>":["<accountUid>", ...]}
+//   FACEBOOK_LITE_ACCOUNT_FALLBACKS         {"<primaryAccountUid>":["<fallbackUid>", ...]}
+// The bridge ALSO merges these (and tries the primary first), so this is the Worker-side hint. Primary
+// account + the page itself are excluded from the result. Token-free (uids are public ids).
+function resolveFacebookLiteFallbackAccounts(env: Env, params: { pageId?: string; primaryAccount?: string }): string[] {
+    const e = env as Env & { FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS?: string; FACEBOOK_LITE_ACCOUNT_FALLBACKS?: string }
+    return resolveBridgeFallbackAccounts({
+        primaryAccount: params.primaryAccount,
+        pageId: params.pageId,
+        pageFallbackMap: parseAccountFallbackMap(e.FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS),
+        accountFallbackMap: parseAccountFallbackMap(e.FACEBOOK_LITE_ACCOUNT_FALLBACKS),
+    })
+}
+
 // Per-namespace backoff for the AUTOMATIC bridge auto-sync trigger. A repeated invalidated-token
 // failure across pages / cron passes must not re-mint a fresh token every time (that trips Facebook's
 // login rate limiter). One live recovery per namespace per TTL window is enough — its profile-sync
@@ -30216,6 +30236,11 @@ async function triggerBridgeAutoSyncForPage(params: {
     env: Env
     namespaceId: string
     candidateLoginIds?: string[]
+    // Page-targeted recovery context: when the failing page id is known the bridge scopes its scan to
+    // that page and falls back across the configured accounts (primary → Thanwan, etc.) that actually
+    // administer it — reporting page_not_found_for_all_accounts instead of silently doing nothing.
+    pageId?: string
+    fallbackAccounts?: string[]
     logPrefix: string
     nowMs?: number
 }): Promise<{ ok: boolean; synced: boolean; reason: string; skipped?: boolean }> {
@@ -30236,7 +30261,21 @@ async function triggerBridgeAutoSyncForPage(params: {
 
     const url = buildBridgeAutoSyncUrl(baseUrl)
     if (!url) return { ok: false, synced: false, reason: 'bridge_not_configured' }
-    const body = buildBridgeAutoSyncRequestBody({ namespaceId, candidateLoginIds: params.candidateLoginIds })
+    // Merge per-call fallback hints with the env-configured mapping for this page/account, so a
+    // page-targeted recovery (Chanalai → Thanwan) works even when the caller only knows the page id.
+    const fallbackAccounts = resolveBridgeFallbackAccounts({
+        primaryAccount: (params.candidateLoginIds ?? [])[0],
+        pageId: params.pageId,
+        explicit: params.fallbackAccounts,
+        pageFallbackMap: parseAccountFallbackMap((params.env as Env & { FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS?: string }).FACEBOOK_LITE_PAGE_FALLBACK_ACCOUNTS),
+        accountFallbackMap: parseAccountFallbackMap((params.env as Env & { FACEBOOK_LITE_ACCOUNT_FALLBACKS?: string }).FACEBOOK_LITE_ACCOUNT_FALLBACKS),
+    })
+    const body = buildBridgeAutoSyncRequestBody({
+        namespaceId,
+        candidateLoginIds: params.candidateLoginIds,
+        pageId: params.pageId,
+        fallbackAccounts,
+    })
     try {
         const resp = await fetchWithTimeout(url, {
             method: 'POST',
@@ -30326,6 +30365,14 @@ async function refreshFacebookLitePostingTokenForPage(params: {
         env: params.env,
         namespaceId: params.namespaceId,
         candidateLoginIds: params.candidateLoginIds,
+        // Page-targeted true-recovery: scope the bridge to the exact failing page and pass the
+        // env-configured fallback chain (e.g. Chanalai → Thanwan) so an account that lost the page
+        // hands off to one that still administers it.
+        pageId: params.pageId,
+        fallbackAccounts: resolveFacebookLiteFallbackAccounts(params.env, {
+            pageId: params.pageId,
+            primaryAccount: (params.candidateLoginIds ?? [])[0],
+        }),
         logPrefix: `${params.logPrefix} BRIDGE-AUTOSYNC`,
     })
     if (autoSync.synced) {
@@ -42748,6 +42795,8 @@ async function processPendingCommentBacklog(
                     const autoSync = await triggerBridgeAutoSyncForPage({
                         env,
                         namespaceId: botId,
+                        pageId,
+                        fallbackAccounts: resolveFacebookLiteFallbackAccounts(env, { pageId }),
                         logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId} BRIDGE-AUTOSYNC`,
                     }).catch(() => ({ ok: false, synced: false, reason: 'auto_sync_error' }))
                     if (!autoSync.synced) return false

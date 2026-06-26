@@ -105,6 +105,53 @@ function parseAccountList(raw) {
   return out.length ? out : null;
 }
 
+// Parse an env-configured fallback mapping for the auto-sync recovery: a JSON object whose KEY is an
+// account uid (account→fallbacks map) or a page id (page→accounts map) and whose VALUE is an array or
+// comma/space separated string of account ids. Each value is sanitized into DISPLAY ids (same shape as
+// scanAccounts). Malformed input yields {} (never throws) so a bad env var can never break recovery.
+// Token-free: account ids / page ids are public identifiers, never secrets. Not hardcoded — the
+// mapping comes entirely from the operator-provided env var.
+function parseFallbackMapEnv(raw) {
+  if (!raw || typeof raw !== 'string' || !raw.trim()) return {};
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return {}; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    const key = String(k == null ? '' : k).trim();
+    if (!key) continue;
+    const list = parseAccountList(v); // sanitized DISPLAY ids, or null
+    if (list && list.length) out[key] = list;
+  }
+  return out;
+}
+
+// Build the ordered fallback-account chain (sanitized DISPLAY ids) for a recovery call: an explicit
+// per-call hint first, then the page→accounts mapping for the target page, then the account→fallbacks
+// mapping for the primary account. The primary account is excluded (it is always scanned first), and
+// the chain is deduped by sanitized key so the primary is never re-scanned via a fallback.
+function resolveFallbackChain({ explicit, pageId, primaryAccount, envAccountFallbacks, envPageFallbacks }) {
+  const seen = new Set();
+  const primaryKey = (() => { try { return primaryAccount ? sanitizeAccount(primaryAccount).key : ''; } catch { return ''; } })();
+  if (primaryKey) seen.add(primaryKey);
+  const out = [];
+  const push = (list) => {
+    for (const display of (list || [])) {
+      let key;
+      try { key = sanitizeAccount(display).key; } catch { continue; }
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(display);
+    }
+  };
+  push(explicit);
+  const pid = String(pageId == null ? '' : pageId).trim();
+  if (pid) push(envPageFallbacks && envPageFallbacks[pid]);
+  const pk = String(primaryAccount == null ? '' : primaryAccount).trim();
+  if (pk) push(envAccountFallbacks && envAccountFallbacks[pk]);
+  return out;
+}
+
 // Mint a FRESH Facebook Lite (EAAD6V) USER token straight from the stored Keychain credentials
 // (username/password + optional TOTP + datr), via the FB Lite login → auth.getSessionforApp(FB_LITE)
 // conversion. This is the ONLY success proof for a Facebook Lite account — a CloakBrowser/Power
@@ -1413,6 +1460,19 @@ function createHandler(deps = {}) {
         if (!ns) return sendError(res, 400, 'Missing namespaceId');
         const wantDryRun = dryRun !== false;
 
+        // Page-targeted recovery: when the caller names the SPECIFIC page whose token was invalidated,
+        // the scan is scoped to that page so the response distinguishes "refreshed it" from "no scanned
+        // account administers it" (page_not_found_for_all_accounts), instead of silently touching nothing.
+        const targetPageId = String(syncBody.pageId || syncBody.page_id || '').trim();
+        // Explicit fallback accounts (accepted under several field names) + env-configured mappings. The
+        // chain lets Chanalai → Thanwan work without hardcoding any uid: the bridge tries the primary
+        // account first, then each fallback, and only syncs from an account that actually lists the page.
+        const explicitFallbackAccounts = parseAccountList(
+          syncBody.fallbackAccounts || syncBody.accountFallbacks || syncBody.fallback_accounts
+        );
+        const envAccountFallbacks = parseFallbackMapEnv(process.env.FACEBOOK_TOKEN_CLOAK_ACCOUNT_FALLBACKS);
+        const envPageFallbacks = parseFallbackMapEnv(process.env.FACEBOOK_TOKEN_CLOAK_PAGE_FALLBACK_ACCOUNTS);
+
         // Live writes resolve Keychain credentials + page tokens. INTERNAL machine-to-machine recovery:
         // a LOCAL caller OR a caller presenting the shared bridge sync secret may drive a live recovery,
         // so the remote Worker can trigger auto-sync over the cloudflared tunnel WITHOUT any operator/UI
@@ -1456,9 +1516,37 @@ function createHandler(deps = {}) {
             scanAccounts.push(s.account);
           }
         }
+        // Append the configured fallback chain AFTER the primary scan order so the primary account is
+        // always tried first; the chain is deduped against what is already scheduled to scan. The primary
+        // account for env-mapping lookup is the explicit account (single mode) or the first listed one.
+        const primaryAccountForFallback = !allMode
+          ? rawAccount
+          : ((explicitAccounts && explicitAccounts[0]) || '');
+        const fallbackChain = resolveFallbackChain({
+          explicit: explicitFallbackAccounts,
+          pageId: targetPageId,
+          primaryAccount: primaryAccountForFallback,
+          envAccountFallbacks,
+          envPageFallbacks
+        });
+        if (fallbackChain.length) {
+          const scheduled = new Set(scanAccounts.map((a) => { try { return sanitizeAccount(a).key; } catch { return String(a).toLowerCase(); } }));
+          for (const fb of fallbackChain) {
+            let key; try { key = sanitizeAccount(fb).key; } catch { continue; }
+            if (scheduled.has(key)) continue;
+            scheduled.add(key);
+            scanAccounts.push(fb);
+          }
+        }
+        // Mode label: a primary account with a configured fallback chain is its own mode (the recovery
+        // is targeted, not a blanket all-account scan, but it is no longer a single account either).
+        const modeLabel = allMode
+          ? 'all_accounts'
+          : (fallbackChain.length ? 'primary_with_fallback' : 'single_account');
+
         if (!scanAccounts.length) {
           return send(res, 200, {
-            ok: false, status: 'no_accounts_to_scan', namespace_id: ns, mode: allMode ? 'all_accounts' : 'single_account',
+            ok: false, status: 'no_accounts_to_scan', namespace_id: ns, mode: modeLabel,
             note: 'No Facebook Lite account resolved to scan. Pass an explicit account or register one.'
           });
         }
@@ -1471,7 +1559,7 @@ function createHandler(deps = {}) {
           if (lastLive && (Date.now() - lastLive) < AUTO_SYNC_TTL_MS) {
             return send(res, 200, {
               ok: true, synced: false, status: 'throttled', skipped: true,
-              mode: allMode ? 'all_accounts' : 'single_account', namespace_id: ns,
+              mode: modeLabel, namespace_id: ns,
               note: 'A live auto-sync ran for this namespace within the backoff window; skipped to avoid Facebook login rate limits.'
             });
           }
@@ -1541,7 +1629,34 @@ function createHandler(deps = {}) {
         }
 
         const uniquePages = [...pageMap.values()];
-        const candidateView = uniquePages.map((e) => ({
+        // Page-targeted recovery scopes everything below to the single requested page. When the target
+        // page was not administered by ANY scanned account (primary OR fallback), fail CLOSED with a
+        // distinct, token-free reason — NEVER silently push nothing. `fallback_account_missing_page` =
+        // at least one scanned account WAS ready but did not list the page (e.g. Thanwan is logged in
+        // but is not an admin of the Chanalai page); `page_not_found_for_all_accounts` = no account was
+        // even ready to list pages.
+        const recoveryPages = targetPageId ? uniquePages.filter((e) => e.page_id === targetPageId) : uniquePages;
+        if (targetPageId && recoveryPages.length === 0) {
+          const someAccountReady = accountsOk > 0;
+          return send(res, 200, {
+            ok: false, synced: false,
+            ...(wantDryRun ? { dryRun: true } : {}),
+            status: 'page_not_found_for_all_accounts',
+            reason: someAccountReady ? 'fallback_account_missing_page' : 'page_not_found_for_all_accounts',
+            mode: modeLabel, target, namespace_id: ns, page_id: targetPageId,
+            selected_account: null, fallback_used: false, profile_sync_success: false,
+            source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
+            accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
+            accounts: accountResults,
+            fallback_accounts_configured: fallbackChain,
+            counts: { candidates: 0, with_token: 0, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },
+            candidates: [],
+            note: someAccountReady
+              ? 'The target page is not administered by any scanned/fallback account (a ready fallback account does not list it). Add/admin the page on a fallback account, then recovery can complete.'
+              : 'No scanned account could list pages (token not ready / rate-limited), so the target page could not be located.'
+          });
+        }
+        const candidateView = recoveryPages.map((e) => ({
           page_id: e.page_id, page_name: e.page_name,
           primary_account: e.primary_account, fallback_accounts: e.fallback_accounts,
           has_token: e.tokens.length > 0
@@ -1552,9 +1667,11 @@ function createHandler(deps = {}) {
         if (wantDryRun) {
           return send(res, 200, {
             ok: accountsOk > 0, dryRun: true, status: 'dry_run_only',
-            mode: allMode ? 'all_accounts' : 'single_account', target,
+            mode: modeLabel, target,
             namespace_id: ns, source: 'facebook_lite_eaad6',
             token_source: 'facebook_lite_bridge', import_mode: 'facebook_lite_bridge_import',
+            ...(targetPageId ? { page_id: targetPageId } : {}),
+            fallback_accounts_configured: fallbackChain,
             accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
             accounts: accountResults,
             counts: {
@@ -1576,7 +1693,7 @@ function createHandler(deps = {}) {
           ''
         ).trim();
         if (!syncSecretAuto) {
-          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', mode: allMode ? 'all_accounts' : 'single_account', namespace_id: ns, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed });
+          return send(res, 200, { ok: false, synced: false, status: 'sync_secret_missing', mode: modeLabel, namespace_id: ns, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed });
         }
         const baseAuto = String(
           workerUrl ||
@@ -1588,7 +1705,7 @@ function createHandler(deps = {}) {
 
         const countsAuto = { refreshed: 0, staged: 0, skipped: 0, errors: 0, no_token: 0, fallback_used: 0, synced: 0 };
         const resultsAuto = [];
-        for (const e of uniquePages) {
+        for (const e of recoveryPages) {
           if (!e.tokens.length) {
             countsAuto.no_token += 1;
             resultsAuto.push({ page_id: e.page_id, page_name: e.page_name, primary_account: e.primary_account, fallback_accounts: e.fallback_accounts, status: 'error', reason: 'page_token_unavailable' });
@@ -1664,13 +1781,34 @@ function createHandler(deps = {}) {
           });
         }
 
+        // Page-targeted summary: surface the single page's outcome at the top level so the Worker can
+        // act on it directly (which account actually recovered it, whether a fallback was used). Here
+        // `fallback_used` is measured against the CONFIGURED primary account (the one named in the
+        // request / the head of the scan order), so a recovery via Thanwan for a Chanalai-primary page
+        // reads as fallback_used=true even when Chanalai's token was so dead it listed no pages at all.
+        const targetRow = targetPageId ? resultsAuto.find((r) => r.page_id === targetPageId) : null;
+        const selectedAccount = (targetRow && (targetRow.account || targetRow.primary_account)) || null;
+        const configuredPrimaryKey = (() => { try { return primaryAccountForFallback ? sanitizeAccount(primaryAccountForFallback).key : ''; } catch { return ''; } })();
+        const selectedKey = (() => { try { return selectedAccount ? sanitizeAccount(selectedAccount).key : ''; } catch { return ''; } })();
+        const targetFallbackUsed = configuredPrimaryKey && selectedKey
+          ? selectedKey !== configuredPrimaryKey
+          : !!(targetRow && targetRow.fallback_used);
+        const targetSummary = targetPageId ? {
+          page_id: targetPageId,
+          selected_account: selectedAccount,
+          fallback_used: targetFallbackUsed,
+          profile_sync_success: !!(targetRow && targetRow.profile_sync_success),
+        } : {};
+
         return send(res, 200, {
           ok: countsAuto.errors === 0 && accountsOk > 0,
           synced: countsAuto.synced > 0,
           status: countsAuto.errors === 0 ? 'synced' : 'synced_with_errors',
-          mode: allMode ? 'all_accounts' : 'single_account', target, namespace_id: ns,
+          mode: modeLabel, target, namespace_id: ns,
           source: 'facebook_lite_eaad6', token_source: 'facebook_lite_bridge',
           import_mode: 'facebook_lite_bridge_import',
+          ...targetSummary,
+          fallback_accounts_configured: fallbackChain,
           accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed,
           accounts: accountResults,
           counts: { ...countsAuto, accounts_scanned: scanAccounts.length, accounts_ok: accountsOk, accounts_failed: accountsFailed },

@@ -1954,3 +1954,207 @@ test('/token/auto-sync LIVE backoff: a second live recovery for the same namespa
     assert.equal(mintCount, mintsAfterFirst, 'the throttled call must not re-mint (no extra Facebook login)');
   }));
 });
+
+// ── /token/auto-sync — ACCOUNT FALLBACK CHAIN (e.g. Chanalai → Thanwan) ──────────────────────────
+// When a page's PRIMARY Facebook Lite account can no longer mint a token (or no longer administers
+// the page), the recovery automatically falls back to a configured account that still does. It only
+// ever syncs from an account whose real-time me/accounts actually lists the target page; if NONE do,
+// it fails CLOSED with a distinct, token-free reason. Mapping is per-call (fallbackAccounts) and/or
+// env (FACEBOOK_TOKEN_CLOAK_PAGE_FALLBACK_ACCOUNTS) — never hardcoded.
+const CHANALAI_PAGE = '182865331578296'; // Chanalai Supphakan (from the live incident)
+
+// A 2-account fetch mock: the PRIMARY account's freshly-minted token is Graph-rejected (dead session),
+// the FALLBACK account is healthy and serves whatever pages `fallbackPages` lists.
+function fallbackChainFetch({ primaryToken = 'chanalai', fallbackToken = 'thanwan', fallbackPages = [], captured }) {
+  return async (url, opts) => {
+    const u = String(url);
+    if (u.includes('/me/accounts')) {
+      const m = u.match(/access_token=([^&]+)/);
+      const token = (m ? decodeURIComponent(m[1]) : '').toLowerCase();
+      if (token.includes(primaryToken)) {
+        // Dead/invalidated primary: EAAD6V-shaped but Graph-rejected → contributes no pages.
+        return { ok: true, status: 200, json: async () => ({ error: { message: 'The session has been invalidated because the user changed their password', code: 190 } }) };
+      }
+      if (token.includes(fallbackToken)) {
+        return { ok: true, status: 200, json: async () => ({ data: fallbackPages }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    }
+    if (u.includes('/api/pages/profile-sync')) {
+      if (captured) captured.push(JSON.parse(opts.body));
+      return { ok: true, status: 200, json: async () => ({ success: true, created: false, updated: true }) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+}
+
+test('/token/auto-sync page-targeted: PRIMARY account dead, explicit fallback account administers the page → synced via fallback, fallback_used, token-free', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const captured = [];
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: fallbackChainFetch({
+      captured,
+      fallbackPages: [
+        { id: CHANALAI_PAGE, name: 'Chanalai Supphakan', access_token: 'PT_THANWAN_CHANALAI' },
+        { id: '9001', name: 'Thanwan Other', access_token: 'PT_THANWAN_OTHER' }
+      ]
+    })
+  }, async (request) => {
+    const { value: r, lines } = await captureConsole(() => request('POST', '/token/auto-sync', {
+      account: 'chanalai', fallbackAccounts: ['thanwan'], pageId: CHANALAI_PAGE,
+      namespaceId: PROD_NS, dryRun: false
+    }));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.synced, true);
+    assert.equal(r.body.mode, 'primary_with_fallback');
+    assert.equal(r.body.page_id, CHANALAI_PAGE);
+    assert.equal(r.body.selected_account, 'THANWAN', 'the fallback account recovered the page');
+    assert.equal(r.body.fallback_used, true, 'fallback measured against the configured primary (Chanalai)');
+    assert.equal(r.body.profile_sync_success, true);
+    assert.deepEqual(r.body.fallback_accounts_configured, ['THANWAN']);
+    // The primary was scanned + reported failed; the fallback succeeded.
+    assert.equal(r.body.accounts_ok, 1);
+    assert.equal(r.body.accounts_failed, 1);
+    // ONLY the target page was synced — the fallback's other page was not touched (page-scoped).
+    assert.equal(captured.length, 1, 'only the target page is pushed');
+    assert.equal(captured[0].page_id, CHANALAI_PAGE);
+    assert.equal(captured[0].access_token, 'PT_THANWAN_CHANALAI');
+    assert.equal(captured[0].token_source, 'facebook_lite_bridge');
+    assert.equal(captured[0].import_mode, 'facebook_lite_bridge_import');
+    // No raw token surfaces: rows never carry a token/access_token, and the page access tokens +
+    // sync secret never appear in the body or logs. (The synthetic all-caps mock USER token defeats
+    // the prefix heuristic that real mixed-case tokens trip at the first lowercase char, so the
+    // must-not-leak set here is the page tokens + the secret — the actual sensitive material.)
+    for (const row of r.body.results) { assert.equal('access_token' in row, false); assert.equal('token' in row, false); }
+    for (const acc of r.body.accounts) assert.equal('access_token' in acc, false);
+    assertNoLeak({ body: r.body, lines }, ['PT_THANWAN_CHANALAI', 'PT_THANWAN_OTHER', SECRET]);
+  }));
+});
+
+test('/token/auto-sync page-targeted: fallback account is READY but does NOT administer the page → fails closed (fallback_account_missing_page), no push, no leak', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let pushCalled = false;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) {
+        const m = u.match(/access_token=([^&]+)/);
+        const token = (m ? decodeURIComponent(m[1]) : '').toLowerCase();
+        if (token.includes('chanalai')) return { ok: true, status: 200, json: async () => ({ error: { message: 'session invalidated', code: 190 } }) };
+        // Thanwan is healthy but is NOT an admin of the Chanalai page (the live-evidence blocker).
+        if (token.includes('thanwan')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '9001', name: 'Thanwan Other', access_token: 'PT_THANWAN_OTHER' }] }) };
+        return { ok: true, status: 200, json: async () => ({ data: [] }) };
+      }
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const { value: r, lines } = await captureConsole(() => request('POST', '/token/auto-sync', {
+      account: 'chanalai', fallbackAccounts: ['thanwan'], pageId: CHANALAI_PAGE,
+      namespaceId: PROD_NS, dryRun: false
+    }));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.synced, false);
+    assert.equal(r.body.status, 'page_not_found_for_all_accounts');
+    assert.equal(r.body.reason, 'fallback_account_missing_page', 'a ready fallback that lacks the page is a distinct reason');
+    assert.equal(r.body.page_id, CHANALAI_PAGE);
+    assert.equal(r.body.selected_account, null);
+    assert.equal(r.body.fallback_used, false);
+    assert.equal(r.body.profile_sync_success, false);
+    assert.equal(pushCalled, false, 'nothing must be pushed when no account administers the target page');
+    assert.deepEqual(r.body.candidates, []);
+    assertNoLeak({ body: r.body, lines }, ['EAAD6V_chanalai', 'EAAD6V_thanwan', 'PT_THANWAN_OTHER', SECRET]);
+  }));
+});
+
+test('/token/auto-sync page-targeted: NO account could list pages (all tokens dead) → page_not_found_for_all_accounts, no push', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let pushCalled = false;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      // Both accounts' tokens are Graph-rejected → neither can list pages.
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ error: { message: 'session invalidated', code: 190 } }) };
+      if (u.includes('/api/pages/profile-sync')) pushCalled = true;
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const r = await request('POST', '/token/auto-sync', {
+      account: 'chanalai', fallbackAccounts: ['thanwan'], pageId: CHANALAI_PAGE,
+      namespaceId: PROD_NS, dryRun: false
+    });
+    assert.equal(r.body.ok, false);
+    assert.equal(r.body.status, 'page_not_found_for_all_accounts');
+    assert.equal(r.body.reason, 'page_not_found_for_all_accounts', 'no account was even ready → distinct reason');
+    assert.equal(r.body.accounts_ok, 0);
+    assert.equal(pushCalled, false);
+  }));
+});
+
+test('/token/auto-sync page-targeted: ENV page→fallback mapping drives the Thanwan fallback with NO payload fallbackAccounts', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const captured = [];
+  await withExportEnv({
+    BRIDGE_TOKEN_SYNC_SECRET: SECRET,
+    FACEBOOK_TOKEN_CLOAK_PAGE_FALLBACK_ACCOUNTS: JSON.stringify({ [CHANALAI_PAGE]: ['thanwan'] })
+  }, () => withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: fallbackChainFetch({
+      captured,
+      fallbackPages: [{ id: CHANALAI_PAGE, name: 'Chanalai Supphakan', access_token: 'PT_THANWAN_CHANALAI' }]
+    })
+  }, async (request) => {
+    // Only the dead primary is named; the fallback comes entirely from the env mapping.
+    const r = await request('POST', '/token/auto-sync', {
+      account: 'chanalai', pageId: CHANALAI_PAGE, namespaceId: PROD_NS, dryRun: false
+    });
+    assert.equal(r.body.synced, true);
+    assert.equal(r.body.mode, 'primary_with_fallback');
+    assert.equal(r.body.selected_account, 'THANWAN');
+    assert.equal(r.body.fallback_used, true);
+    assert.deepEqual(r.body.fallback_accounts_configured, ['THANWAN'], 'env mapping supplied the fallback chain');
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].page_id, CHANALAI_PAGE);
+  }));
+});
+
+test('/token/auto-sync page-targeted dry run lists ONLY the target page + fallback chain, never pushes', async () => {
+  const captured = [];
+  await withExportServer({
+    keychain: perAccountKeychain(),
+    fbLiteTokenService: perAccountFbLite(),
+    browser: exportBrowser({}),
+    fetch: fallbackChainFetch({
+      captured,
+      fallbackPages: [
+        { id: CHANALAI_PAGE, name: 'Chanalai Supphakan', access_token: 'PT_THANWAN_CHANALAI' },
+        { id: '9001', name: 'Thanwan Other', access_token: 'PT_THANWAN_OTHER' }
+      ]
+    })
+  }, async (request) => {
+    const r = await request('POST', '/token/auto-sync', {
+      account: 'chanalai', fallbackAccounts: ['thanwan'], pageId: CHANALAI_PAGE, namespaceId: PROD_NS
+    });
+    assert.equal(r.body.dryRun, true);
+    assert.equal(r.body.status, 'dry_run_only');
+    assert.equal(r.body.page_id, CHANALAI_PAGE);
+    assert.equal(r.body.counts.candidates, 1, 'scoped to the single target page');
+    assert.equal(r.body.candidates[0].page_id, CHANALAI_PAGE);
+    assert.deepEqual(r.body.fallback_accounts_configured, ['THANWAN']);
+    assert.equal(captured.length, 0, 'a dry run must never push');
+    for (const c of r.body.candidates) assert.equal('access_token' in c, false);
+  });
+});

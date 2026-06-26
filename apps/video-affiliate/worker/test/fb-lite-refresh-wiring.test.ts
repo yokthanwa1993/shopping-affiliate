@@ -586,6 +586,11 @@ test('triggerBridgeAutoSyncForPage: secret-authed machine-to-machine call to the
     assert.ok(fn.includes('buildBridgeAutoSyncUrl('), 'must build the auto-sync url via the pure helper')
     assert.ok(fn.includes('buildBridgeAutoSyncRequestBody('), 'must build the request body via the pure helper')
     assert.ok(fn.includes('parseBridgeAutoSyncResponse('), 'must parse the response via the pure helper')
+    // Page-targeted account fallback (Chanalai → Thanwan): the body carries the failing page id and a
+    // resolved fallback-account chain (per-call hint merged with the env-configured mapping).
+    assert.ok(fn.includes('resolveBridgeFallbackAccounts('), 'must resolve the fallback-account chain (env + per-call hint)')
+    assert.ok(fn.includes('pageId: params.pageId'), 'must scope the recovery to the failing page id')
+    assert.ok(fn.includes('fallbackAccounts'), 'must pass the resolved fallback accounts to the bridge')
     // Rate-limit backoff: one live trigger per namespace per TTL window (anti Facebook login spam).
     assert.ok(fn.includes('isBridgeAutoSyncAllowed('), 'must gate on the backoff predicate')
     assert.ok(fn.includes('bridgeAutoSyncLastAttemptByNamespace'), 'must track the per-namespace last attempt for backoff')
@@ -604,6 +609,10 @@ test('refreshFacebookLitePostingTokenForPage falls through to the bridge auto-sy
     assert.ok(fn.includes('triggerBridgeAutoSyncForPage('), 'must call the bridge auto-sync as the last tier')
     assert.ok(/if \(autoSync\.synced\)/.test(fn), 'must only mark recovered when the auto-sync actually synced a token')
     assert.ok(fn.includes("via: 'bridge_auto_sync'"), 'the auto-sync success path is labeled')
+    // The last tier is page-targeted with the env-resolved fallback chain so a dead primary account
+    // (Chanalai) hands off to a configured fallback (Thanwan) that still administers the page.
+    assert.ok(fn.includes('pageId: params.pageId'), 'auto-sync tier must scope to the failing page id')
+    assert.ok(fn.includes('resolveFacebookLiteFallbackAccounts('), 'auto-sync tier must pass the env-resolved fallback accounts')
     // Ordering: BrowserSaving → Bridge /pages → auto-sync.
     const bsIdx = fn.indexOf('refreshFacebookLiteCommentTokenForPage(')
     const pagesIdx = fn.indexOf('fetchFacebookLitePageTokenFromBridge(')

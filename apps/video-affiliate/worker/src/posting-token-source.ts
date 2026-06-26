@@ -575,12 +575,23 @@ export interface BridgeAutoSyncRequestBody {
     dryRun: false
     account?: string
     accounts?: string[]
+    // Page-targeted recovery: when a SPECIFIC page's token was invalidated, scope the bridge scan to
+    // that page so it refreshes exactly that row (and reports a page-not-found outcome instead of
+    // silently touching nothing) — the difference between "tried and the account lacks the page" and
+    // "recovered the whole namespace".
+    pageId?: string
+    // Explicit fallback accounts to try (in order, AFTER the primary `account`) when the page's primary
+    // bridge account can no longer mint a token / no longer administers the page. e.g. Chanalai →
+    // Thanwan. The bridge ALSO merges any env-configured fallback mapping; this is the per-call hint.
+    fallbackAccounts?: string[]
 }
 
 export function buildBridgeAutoSyncRequestBody(params: {
     namespaceId: string
     account?: string
     candidateLoginIds?: string[]
+    pageId?: string
+    fallbackAccounts?: string[]
 }): BridgeAutoSyncRequestBody {
     const body: BridgeAutoSyncRequestBody = { namespaceId: String(params.namespaceId ?? '').trim(), dryRun: false }
     const account = String(params.account ?? '').trim()
@@ -589,7 +600,72 @@ export function buildBridgeAutoSyncRequestBody(params: {
     ))
     if (account) body.account = account
     else if (accounts.length) body.accounts = accounts
+    const pageId = String(params.pageId ?? '').trim()
+    if (pageId) body.pageId = pageId
+    // Fallback accounts are sent verbatim (deduped/trimmed) and never collapsed into `account`/`accounts`
+    // — the bridge appends them to the scan order so the primary is always tried first.
+    const fallbackAccounts = Array.from(new Set(
+        (params.fallbackAccounts ?? []).map((v) => String(v ?? '').trim()).filter(Boolean),
+    )).filter((a) => a !== account)
+    if (fallbackAccounts.length) body.fallbackAccounts = fallbackAccounts
     return body
+}
+
+// Parse an env-configured account/page → fallback-accounts mapping. Accepts a JSON object whose values
+// are arrays or comma/space separated strings of account ids: e.g.
+//   {"100090320823561":["100077795357192"]}   (Chanalai → Thanwan)
+// Returns a normalized map of trimmed key → deduped trimmed id list. Malformed input yields {} (never
+// throws) so a bad env var can never break posting. Token-free (account ids are public uids).
+export function parseAccountFallbackMap(raw: unknown): Record<string, string[]> {
+    let parsed: unknown = raw
+    if (typeof raw === 'string') {
+        const trimmed = raw.trim()
+        if (!trimmed) return {}
+        try { parsed = JSON.parse(trimmed) } catch { return {} }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string[]> = {}
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        const key = String(k ?? '').trim()
+        if (!key) continue
+        let items: unknown[] = []
+        if (Array.isArray(v)) items = v
+        else if (typeof v === 'string') items = v.split(/[\s,]+/)
+        else continue
+        const ids = Array.from(new Set(items.map((x) => String(x ?? '').trim()).filter(Boolean)))
+        if (ids.length) out[key] = ids
+    }
+    return out
+}
+
+// Resolve the ordered fallback-account list for a failing page from env-configured mappings + an
+// optional explicit hint. Primary account (and the page itself) are excluded — the bridge always tries
+// the primary first, so a fallback list that re-listed it would be wasted. Deduped, order-preserving:
+// explicit hints first, then page→accounts mapping, then account→accounts mapping.
+export function resolveBridgeFallbackAccounts(params: {
+    primaryAccount?: string
+    pageId?: string
+    accountFallbackMap?: Record<string, string[]>
+    pageFallbackMap?: Record<string, string[]>
+    explicit?: string[]
+}): string[] {
+    const primary = String(params.primaryAccount ?? '').trim()
+    const pageId = String(params.pageId ?? '').trim()
+    const seen = new Set<string>()
+    if (primary) seen.add(primary)
+    const out: string[] = []
+    const push = (list: string[] | undefined) => {
+        for (const raw of list ?? []) {
+            const id = String(raw ?? '').trim()
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            out.push(id)
+        }
+    }
+    push(params.explicit)
+    if (pageId) push(params.pageFallbackMap?.[pageId])
+    if (primary) push(params.accountFallbackMap?.[primary])
+    return out
 }
 
 // Token-free outcome the Worker keeps after an auto-sync call. `synced` = the bridge refreshed ≥1
