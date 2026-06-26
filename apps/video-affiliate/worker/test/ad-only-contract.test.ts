@@ -47,6 +47,7 @@ import {
     DEFAULT_FOLLOW_AD_JITTER_MIN_MS,
     DEFAULT_FOLLOW_AD_JITTER_MAX_MS,
     DEFAULT_AD_ONLY_INTERVAL_MINUTES,
+    clampAdOnlyIntervalMinutes,
     makeSeededRng,
 } from '../src/ad-only-contract.js'
 import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
@@ -155,6 +156,14 @@ test('schedule defaults to PAUSED review mode (non-spending) with safe budget/ru
     assert.equal(s.dailyBudgetThb, DEFAULT_DAILY_BUDGET_THB)
     assert.equal(s.dailyBudgetMinor, DEFAULT_DAILY_BUDGET_THB * 100)
     assert.equal(s.runHours, DEFAULT_RUN_HOURS)
+})
+
+
+test('ad-only scheduler defaults to 30 minutes and invalid intervals fall back to that default', () => {
+    assert.equal(DEFAULT_AD_ONLY_INTERVAL_MINUTES, 30)
+    assert.equal(clampAdOnlyIntervalMinutes(undefined), 30)
+    assert.equal(clampAdOnlyIntervalMinutes(0), 30)
+    assert.equal(clampAdOnlyIntervalMinutes('bad'), 30)
 })
 
 test('schedule active mode requires a daily_campaign_name (fails closed without it)', () => {
@@ -1147,7 +1156,7 @@ test('computeSchedulerJitterMs stays within the bounds and is deterministic for 
 })
 
 test('computeSchedulerJitterMs default Follow bounds give sub-interval, second-level spread', () => {
-    // The default jitter window is meaningfully smaller than the 20-min default interval (so the base
+    // The default jitter window is meaningfully smaller than the 30-min default interval (so the base
     // cadence still dominates) but large enough to break the exact ~30-min lockstep.
     assert.ok(DEFAULT_FOLLOW_AD_JITTER_MIN_MS > 0)
     assert.ok(DEFAULT_FOLLOW_AD_JITTER_MAX_MS > DEFAULT_FOLLOW_AD_JITTER_MIN_MS)

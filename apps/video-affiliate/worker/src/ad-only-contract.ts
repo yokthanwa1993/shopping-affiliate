@@ -279,7 +279,7 @@ export interface AdHistoryRecord {
 export const AD_ONLY_QUEUE_ENDPOINT = '/api/dashboard/create-ad-only'
 
 // Cadence bounds for "สร้างทุก X นาที". Stored as a dashboard setting (operator-editable).
-export const DEFAULT_AD_ONLY_INTERVAL_MINUTES = 20
+export const DEFAULT_AD_ONLY_INTERVAL_MINUTES = 30
 export const MIN_AD_ONLY_INTERVAL_MINUTES = 1
 export const MAX_AD_ONLY_INTERVAL_MINUTES = 1440 // 24h
 
@@ -857,7 +857,7 @@ export function isAdOnlyFatalError(message: unknown): boolean {
 }
 
 // How long a page stays on cooldown after a fatal create failure. Bounded so the ban is temporary — a
-// config fix re-enables the page on the next tick after this window. 6h ≈ 18 cadence slots at 20-min.
+// config fix re-enables the page on the next tick after this window. 6h ≈ 12 cadence slots at 30-min.
 export const AD_ONLY_PAGE_COOLDOWN_MS = 6 * 60 * 60 * 1000
 
 // How many ranked candidates the scheduler attempts in ONE tick before giving up. Bounds the work per

@@ -1023,8 +1023,15 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   const templateAdset = String(params.templateAdset || '').trim();
   const creativeId = params.creativeId;
   const storyId = params.storyId;
-  const adName = params.adName;
   const body = params.body || {};
+  const storyIdStr = String(storyId || '');
+  const postTail = storyIdStr.includes('_') ? storyIdStr.split('_').slice(1).join('_') : storyIdStr;
+  const adOnlyTailSignal = body.skip_publish_to_page === true || body.skip_publish_to_page === 'true'
+    || body.campaign_daily_budget != null
+    || body.adset_run_hours != null
+    || body.force_adset_name_tail === true || body.force_adset_name_tail === 'true'
+    || body.force_ad_name_tail === true || body.force_ad_name_tail === 'true';
+  const adName = (adOnlyTailSignal && postTail) ? postTail : params.adName;
   const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
   const extraErrorFields = params.extraErrorFields || {};
   const now = Number.isFinite(params.now) ? params.now : Date.now();
@@ -1313,23 +1320,17 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   const runMs = Math.round(adsetRunHours * 3600 * 1000);
   let scheduleReport = null;
 
-  // Daily/post-first ADSET name = the post tail / sub2 (e.g. "984538171215406") — never the hash
-  // and never page_id_post_id. Derived from the source post id (storyId) tail. The AD name is left
-  // untouched (it stays the system video code/hash set at creation). Legacy paths keep the full
-  // storyId adset name.
+  // Daily/post-first ADSET + AD name = the post tail / sub2 (e.g. "984538171215406") —
+  // never the hash and never page_id_post_id. Derived from the source post id (storyId) tail.
+  // Legacy paths keep the caller-provided ad name and full storyId adset name.
   //
   // Ad-only paths can pass an EXPLICIT campaign_id (so usedDailyCampaign stays false) yet still want
   // the tail-only adset name — without this they would get the full page_id_post_id name. Detect the
   // ad-only flow (skip_publish_to_page / a campaign_daily_budget / an adset_run_hours / an explicit
   // force_adset_name_tail) and apply the same tail-only naming. Legacy (non-ad-only) callers without
   // a daily campaign are unchanged and keep the full storyId.
-  const storyIdStr = String(storyId || '');
-  const adOnlyTailSignal = body.skip_publish_to_page === true || body.skip_publish_to_page === 'true'
-    || body.campaign_daily_budget != null
-    || body.adset_run_hours != null
-    || body.force_adset_name_tail === true || body.force_adset_name_tail === 'true';
-  const adsetName = ((usedDailyCampaign || adOnlyTailSignal) && storyIdStr.includes('_'))
-    ? storyIdStr.split('_').slice(1).join('_')
+  const adsetName = ((usedDailyCampaign || adOnlyTailSignal) && postTail)
+    ? postTail
     : storyIdStr;
 
   // PAUSED ad-only path — see `paused` above. The copied adset is already status_option:'PAUSED'
@@ -1358,6 +1359,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
       campaign_name: resolvedCampaignName || undefined,
       adset_id: newAdset,
       ad_id: newAd,
+      ad_name: adName,
       // The copied adset and the ad are both left in their created PAUSED state (never activated).
       adset_status: 'PAUSED',
       ad_status: 'PAUSED',
@@ -1465,6 +1467,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     campaign_name: resolvedCampaignName || undefined,
     adset_id: newAdset,
     ad_id: newAd,
+    ad_name: adName,
     // The default (non-paused) path activates the copied adset + ad to ACTIVE above (and the daily
     // path read it back to confirm). Reported so callers can distinguish a live ad from a paused one.
     adset_status: 'ACTIVE',
@@ -1833,6 +1836,7 @@ async function createAd(fetchImpl, params = {}) {
       campaign_id: targetCampaignId,
       adset_id: newAdset,
       ad_id: newAd,
+      ad_name: adEntities.ad_name,
       video_id: vid.id,
       creative_id: crData.id,
       uploaded_for_instagram: uploadedForInstagram,

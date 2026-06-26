@@ -13664,7 +13664,7 @@ app.get('/api/dashboard/ad-history', async (c) => {
 // (dashboard_ad_only_queue) so it can never be picked up by the legacy ad-queue processor.
 //
 // Cadence: the scheduled handler processes AT MOST ONE queued row per interval (operator-set, stored
-// as a dashboard setting; clamped 1–1440 min, default 20). Default mode is the safe, non-spending
+// as a dashboard setting; clamped 1–1440 min, default 30). Default mode is the safe, non-spending
 // 'paused' review ad — an 'active' (spending) row is only ever created when the operator deliberately
 // queued one with a campaign date (the create-ad-only endpoint fails closed otherwise).
 // =====================================================================
@@ -14285,7 +14285,7 @@ function parseFollowAdNextRunMs(raw: unknown): number {
     return Date.parse(String(raw ?? '').trim())
 }
 
-// Cadence (minutes), clamped/defaulted by the SAME helper as the ad-only queue (1–1440, default 20).
+// Cadence (minutes), clamped/defaulted by the SAME helper as the ad-only queue (1–1440, default 30).
 async function getFollowAdIntervalMinutes(db: D1Database): Promise<number> {
     const row = await getDashboardSetting(db, FOLLOW_AD_SCHED_INTERVAL_KEY).catch(() => null)
     if (row && String(row.value || '').trim()) return clampAdOnlyIntervalMinutes(row.value)
