@@ -1118,7 +1118,7 @@ export const AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID = '1008898512617594'
 // The proof-confirmed CloakBrowser bridge login account for the Chearb default page. NOT a secret — it
 // is the numeric Facebook account id the bridge session is logged in as. Operators override per page via
 // the `bridge_account` setting; the global default below is applied ONLY for the default page.
-export const AD_ONLY_BRIDGE_ACCOUNT_DEFAULT = '100090320823561'
+export const AD_ONLY_BRIDGE_ACCOUNT_DEFAULT = '100077795357192'
 
 // Resolve the bridge session account to forward on the /create-ad call. Order:
 //   1. explicit body value (operator/internal caller pins an account) — always wins;

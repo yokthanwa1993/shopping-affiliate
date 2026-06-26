@@ -1049,7 +1049,7 @@ test('autoPickAdOnlyCandidates falls back to cached page source_url and prefers 
 test('resolveAdOnlyBridgeAccountId prefers body, then per-page setting, then the Chearb-only default', () => {
     assert.equal(AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY, 'bridge_account')
     assert.equal(AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID, '1008898512617594')
-    assert.equal(AD_ONLY_BRIDGE_ACCOUNT_DEFAULT, '100090320823561')
+    assert.equal(AD_ONLY_BRIDGE_ACCOUNT_DEFAULT, '100077795357192')
     // Explicit body value wins over everything.
     assert.equal(
         resolveAdOnlyBridgeAccountId({ bodyValue: 'acct-body', settingValue: 'acct-setting', pageId: 'P' }),
