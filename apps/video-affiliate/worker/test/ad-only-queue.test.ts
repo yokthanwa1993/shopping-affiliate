@@ -375,7 +375,9 @@ test('autoPickAdOnlyCandidates scopes dedup to the Bangkok day and picks randoml
     assert.match(indexSrc, /effective_object_story_id, created_at, status\s*\n\s*FROM dashboard_ad_history WHERE page_id = \? ORDER BY id DESC LIMIT 5000/)
     // Selection is randomized (per-page and cross-page), driven by one seeded rng per tick.
     assert.match(indexSrc, /const rng = makeSeededRng\(nowMs\)/)
-    assert.match(indexSrc, /rankAdOnlyAutoCandidatesRandom\(candidates, used, rng\)/)
+    // Mapped system-video candidates are ranked first; source_url fallbacks only when no mapped clip.
+    assert.match(indexSrc, /rankAdOnlyAutoCandidatesRandom\(mappedCandidates, used, rng\)/)
+    assert.match(indexSrc, /rankAdOnlyAutoCandidatesRandom\(sourceUrlCandidates, used, rng\)/)
     assert.match(indexSrc, /rankAdOnlyAutoCandidatesRandom\(perPageBest, new Set<string>\(\), rng\)/)
 })
 

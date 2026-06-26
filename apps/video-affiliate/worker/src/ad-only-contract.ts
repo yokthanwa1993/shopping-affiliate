@@ -571,10 +571,34 @@ export interface AdOnlyAutoCandidate {
     shopeeLink?: string
     views?: number | string
     createdTime?: string
-    /** Internal system video id that will be resolved to the NEW post's video_url. Required to create. */
+    /** Internal system video id that will be resolved to the NEW post's video_url. Preferred source. */
     systemVideoId?: string
+    /** Already-resolved video source url. The auto-picker uses the cached Facebook Page video source
+     * (facebook_page_video_cache.source_url) as a FALLBACK when no internal system_video_id maps to the
+     * signal, so an eligible high-reach clip can still be promoted. The endpoint validates this directly
+     * via video_url. Empty when a mapped systemVideoId is used. */
+    videoUrl?: string
+    /** Which source the candidate resolved to ('system_video' | 'page_source_url'). Audit/diagnostic only. */
+    sourceSelection?: string
     /** Optional human label forwarded as ad_name (defaults to the system/video id). */
     adName?: string
+}
+
+// Resolve a candidate's publish video source. The mapped internal system video ALWAYS wins; only when no
+// system_video_id maps to the signal does the auto-picker fall back to the cached Facebook Page video
+// source url (facebook_page_video_cache.source_url). Returns source:'' when NEITHER is available, so the
+// caller can skip the candidate (it can never publish). Pure.
+export interface AdOnlyCandidateVideoSource {
+    systemVideoId: string
+    videoUrl: string
+    source: 'system_video' | 'page_source_url' | ''
+}
+export function resolveAdOnlyCandidateVideoSource(input: { systemVideoId?: unknown; sourceUrl?: unknown }): AdOnlyCandidateVideoSource {
+    const systemVideoId = str(input.systemVideoId)
+    if (systemVideoId) return { systemVideoId, videoUrl: '', source: 'system_video' }
+    const videoUrl = str(input.sourceUrl)
+    if (videoUrl) return { systemVideoId: '', videoUrl, source: 'page_source_url' }
+    return { systemVideoId: '', videoUrl: '', source: '' }
 }
 
 // One dashboard_ad_history row's id columns, used to dedup an auto-pick against already-promoted
@@ -912,6 +936,10 @@ export function buildAdOnlyAutoPickBody(input: {
         daily_budget_thb: budget,
         run_hours: hours,
     }
+    // Fallback page source: when no internal system_video_id mapped, forward the cached Facebook Page
+    // video source url so the endpoint can still create (validated directly via video_url).
+    const videoUrl = str(c.videoUrl)
+    if (videoUrl) body.video_url = videoUrl
     return body
 }
 
@@ -1069,6 +1097,52 @@ export const FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY = 'template_adset_follow'
 
 // Per-page setting key holding a page-specific Follow campaign sub1 override.
 export const FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY = 'follow_campaign_sub1'
+
+// =====================================================================
+// BRIDGE SESSION ACCOUNT — the CloakBrowser FB bridge /create-ad route requires a logged-in session.
+// When the worker omits an explicit `account`, the bridge can fail closed with `no_session` in
+// production (the worker has no way to pick which logged-in account to use). The proof run confirmed
+// the bridge succeeds when passed account=100090320823561 for the Chearb (เฉียบ) page. These pure
+// helpers resolve which account to forward: explicit body value → per-page `bridge_account` setting →
+// a safe default for the Chearb page only (every other page sends no account so the bridge keeps its
+// own default session selection). The account id is configurable, NOT a secret.
+// =====================================================================
+
+// Per-page setting key holding a page-specific CloakBrowser bridge session account override.
+export const AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY = 'bridge_account'
+
+// The page that gets a built-in default bridge account when nothing is configured — Chearb / เฉียบ
+// (matches AUTO_ADS_DEFAULT_ENABLED_PAGE_ID). Kept duplicated so the pure helper stays import-free.
+export const AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID = '1008898512617594'
+
+// The proof-confirmed CloakBrowser bridge login account for the Chearb default page. NOT a secret — it
+// is the numeric Facebook account id the bridge session is logged in as. Operators override per page via
+// the `bridge_account` setting; the global default below is applied ONLY for the default page.
+export const AD_ONLY_BRIDGE_ACCOUNT_DEFAULT = '100090320823561'
+
+// Resolve the bridge session account to forward on the /create-ad call. Order:
+//   1. explicit body value (operator/internal caller pins an account) — always wins;
+//   2. per-page `bridge_account` setting;
+//   3. the built-in default account, but ONLY for the default page (Chearb / เฉียบ).
+// Returns '' for any other page with no explicit/setting value, so the bridge keeps its own default
+// session selection (the worker never forces an arbitrary account). A caller can disable the built-in
+// default by passing defaultAccountId:''. Pure.
+export function resolveAdOnlyBridgeAccountId(input: {
+    bodyValue?: unknown
+    settingValue?: unknown
+    pageId?: unknown
+    defaultPageId?: string
+    defaultAccountId?: string
+}): string {
+    const bodyValue = str(input.bodyValue)
+    if (bodyValue) return bodyValue
+    const settingValue = str(input.settingValue)
+    if (settingValue) return settingValue
+    const defaultPageId = str(input.defaultPageId ?? AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID)
+    const defaultAccountId = str(input.defaultAccountId ?? AD_ONLY_BRIDGE_ACCOUNT_DEFAULT)
+    if (defaultPageId && defaultAccountId && str(input.pageId) === defaultPageId) return defaultAccountId
+    return ''
+}
 
 // Resolve which ad-only lane a request targets. Defaults to 'sales' (the original click-link lane) so
 // every existing caller / queue row / auto-pick body is unchanged. 'follow' is selected only by an
@@ -1262,6 +1336,11 @@ export function buildFollowAutoPickBody(input: {
         ad_name: str(c.adName) || str(c.systemVideoId) || str(c.videoId),
         mode,
     }
+    // Fallback page source: when no internal system_video_id mapped, forward the cached Facebook Page
+    // video source url (facebook_page_video_cache.source_url) so the Follow lane can still create the
+    // dark/ad story (validated directly via video_url; publishVideoUrl = validation.videoUrl).
+    const videoUrl = str(c.videoUrl)
+    if (videoUrl) body.video_url = videoUrl
     const templateAdset = str(input.templateAdset)
     if (templateAdset) body.template_adset = templateAdset
     const campaignSub1 = str(input.campaignSub1)

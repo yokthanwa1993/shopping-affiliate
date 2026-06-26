@@ -24,6 +24,12 @@ import {
     buildFollowLaneCommentShortlinkRequestUrl,
     buildFollowLaneCommentMessage,
     buildFollowAutoPickBody,
+    buildAdOnlyAutoPickBody,
+    resolveAdOnlyCandidateVideoSource,
+    resolveAdOnlyBridgeAccountId,
+    AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY,
+    AD_ONLY_BRIDGE_ACCOUNT_DEFAULT,
+    AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID,
     FOLLOW_LANE_TEMPLATE_ADSET,
     FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
     FOLLOW_LANE_CTA_TYPE,
@@ -950,6 +956,135 @@ test('buildFollowAutoPickBody active mode carries the Bangkok daily campaign + C
     assert.equal(body.daily_campaign_name, '24/Jun/2026')
     assert.equal(body.daily_budget_thb, DEFAULT_DAILY_BUDGET_THB)
     assert.equal(body.run_hours, DEFAULT_RUN_HOURS)
+})
+
+// =====================================================================
+// PAGE SOURCE_URL FALLBACK — promote a high-reach cached page video that has no internal
+// system_video_id by using facebook_page_video_cache.source_url as the video source.
+// =====================================================================
+
+test('resolveAdOnlyCandidateVideoSource prefers the mapped system video, else falls back to source_url', () => {
+    // Mapped system video always wins, even when a source_url is also present.
+    assert.deepEqual(
+        resolveAdOnlyCandidateVideoSource({ systemVideoId: 'sys-1', sourceUrl: 'https://cdn/x.mp4' }),
+        { systemVideoId: 'sys-1', videoUrl: '', source: 'system_video' },
+    )
+    // No mapping → fall back to the cached page source url.
+    assert.deepEqual(
+        resolveAdOnlyCandidateVideoSource({ systemVideoId: '', sourceUrl: 'https://cdn/x.mp4' }),
+        { systemVideoId: '', videoUrl: 'https://cdn/x.mp4', source: 'page_source_url' },
+    )
+    // Neither → empty source so the caller skips (can never publish).
+    assert.deepEqual(
+        resolveAdOnlyCandidateVideoSource({ systemVideoId: '', sourceUrl: '' }),
+        { systemVideoId: '', videoUrl: '', source: '' },
+    )
+    assert.deepEqual(
+        resolveAdOnlyCandidateVideoSource({}),
+        { systemVideoId: '', videoUrl: '', source: '' },
+    )
+})
+
+test('buildFollowAutoPickBody forwards video_url for a source_url fallback candidate (no system_video_id)', () => {
+    const body = buildFollowAutoPickBody({
+        candidate: { pageId: FOLLOW_PAGE_ID, videoId: 'fb-9', postId: `${FOLLOW_PAGE_ID}_99`, systemVideoId: '', videoUrl: 'https://cdn/src.mp4', shopeeLink: FOLLOW_SHOPEE },
+        templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
+        campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        dailyCampaignName: '26/Jun/2026',
+    })
+    assert.equal(body.lane, 'follow')
+    assert.equal(body.system_video_id, '')
+    assert.equal(body.video_url, 'https://cdn/src.mp4')
+    // The fallback candidate still passes validation: video_url alone is a valid publish source.
+    const v = validateAdOnlyInput(body as Record<string, unknown>)
+    assert.equal(v.ok, true)
+    assert.equal(v.videoUrl, 'https://cdn/src.mp4')
+})
+
+test('buildFollowAutoPickBody omits video_url when a mapped system video is used', () => {
+    const body = buildFollowAutoPickBody({
+        candidate: { pageId: FOLLOW_PAGE_ID, videoId: 'fb-1', systemVideoId: 'sys-1', shopeeLink: FOLLOW_SHOPEE },
+        templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
+    })
+    assert.equal(body.system_video_id, 'sys-1')
+    assert.equal(body.video_url, undefined)
+})
+
+test('buildAdOnlyAutoPickBody forwards video_url for a source_url fallback candidate', () => {
+    const body = buildAdOnlyAutoPickBody({
+        candidate: { pageId: FOLLOW_PAGE_ID, videoId: 'fb-9', systemVideoId: '', videoUrl: 'https://cdn/src.mp4', shopeeLink: FOLLOW_SHOPEE },
+        dailyCampaignName: '26/Jun/2026',
+    })
+    assert.equal(body.system_video_id, '')
+    assert.equal(body.video_url, 'https://cdn/src.mp4')
+    assert.equal(body.mode, 'active')
+    const v = validateAdOnlyInput(body as Record<string, unknown>)
+    assert.equal(v.ok, true)
+})
+
+test('autoPickAdOnlyCandidates falls back to cached page source_url and prefers mapped system video', () => {
+    const autoPickSource = sliceIndexSource(
+        'async function autoPickAdOnlyCandidates',
+        '\n// Issue ONE create-ad-only call',
+        'autoPickAdOnlyCandidates'
+    )
+    // Uses the pure source selector and reads the cached page source_url for the fallback.
+    assert.match(autoPickSource, /resolveAdOnlyCandidateVideoSource\(/)
+    assert.match(autoPickSource, /v\.source_url/)
+    assert.match(autoPickSource, /videoUrl: src\.videoUrl/)
+    // Mapped candidates are preferred; source_url candidates are a per-page fall-through, not a mix.
+    assert.match(autoPickSource, /mappedCandidates/)
+    assert.match(autoPickSource, /sourceUrlCandidates/)
+    assert.match(autoPickSource, /rankedMapped\.length \? rankedMapped : rankAdOnlyAutoCandidatesRandom\(sourceUrlCandidates/)
+    // Still skips (with the same diagnostic) only when NEITHER source is available.
+    assert.match(autoPickSource, /src\.source === ''/)
+    assert.match(autoPickSource, /reason=system_video_unmapped_preflight/)
+})
+
+// =====================================================================
+// BRIDGE SESSION ACCOUNT — forward an explicit logged-in account so /create-ad never fails no_session.
+// =====================================================================
+
+test('resolveAdOnlyBridgeAccountId prefers body, then per-page setting, then the Chearb-only default', () => {
+    assert.equal(AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY, 'bridge_account')
+    assert.equal(AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID, '1008898512617594')
+    assert.equal(AD_ONLY_BRIDGE_ACCOUNT_DEFAULT, '100090320823561')
+    // Explicit body value wins over everything.
+    assert.equal(
+        resolveAdOnlyBridgeAccountId({ bodyValue: 'acct-body', settingValue: 'acct-setting', pageId: 'P' }),
+        'acct-body',
+    )
+    // Per-page setting beats the default.
+    assert.equal(
+        resolveAdOnlyBridgeAccountId({ settingValue: 'acct-setting', pageId: AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID }),
+        'acct-setting',
+    )
+    // Default page with nothing configured → the built-in default account.
+    assert.equal(
+        resolveAdOnlyBridgeAccountId({ pageId: AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID }),
+        AD_ONLY_BRIDGE_ACCOUNT_DEFAULT,
+    )
+    // Any OTHER page with nothing configured → empty (bridge keeps its own default session).
+    assert.equal(resolveAdOnlyBridgeAccountId({ pageId: 'some-other-page' }), '')
+    // The built-in default can be disabled by passing an empty defaultAccountId.
+    assert.equal(
+        resolveAdOnlyBridgeAccountId({ pageId: AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID, defaultAccountId: '' }),
+        '',
+    )
+})
+
+test('Follow lane handler forwards a resolved bridge account on the /create-ad call', () => {
+    const src = getFollowLaneHandlerSource()
+    assert.match(src, /AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY/)
+    assert.match(src, /resolveAdOnlyBridgeAccountId\(/)
+    assert.match(src, /bridgeAccount \? \{ account: bridgeAccount \} : \{\}/)
+})
+
+test('create-ad-only sales lane forwards a resolved bridge account on the /create-ad call', () => {
+    const route = getCreateAdOnlyRouteSource()
+    assert.match(route, /AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY/)
+    assert.match(route, /resolveAdOnlyBridgeAccountId\(/)
+    assert.match(route, /bridgeAccount \? \{ account: bridgeAccount \} : \{\}/)
 })
 
 test('create-ad-only route branches into the Follow lane via resolveAdOnlyLane', () => {

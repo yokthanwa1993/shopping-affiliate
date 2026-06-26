@@ -190,6 +190,9 @@ import {
     FOLLOW_LANE_CTA_TYPE,
     FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY,
     FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY,
+    resolveAdOnlyCandidateVideoSource,
+    resolveAdOnlyBridgeAccountId,
+    AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY,
 } from './ad-only-contract'
 import { handleReportProxyRequest } from './report-proxy'
 import {
@@ -12767,6 +12770,17 @@ async function runFollowLaneCreateAdOnly(
     const adAccount = String(adAccountRow?.value || '').trim()
     if (!templateAdset || !adAccount) return recordFailure('config_missing_template_or_ad_account')
 
+    // Bridge session account: forward an explicit logged-in account so the bridge /create-ad route does
+    // not fail closed with no_session in production. Order: body.account → per-page `bridge_account`
+    // setting → built-in default (Chearb page only). Empty for any other page → bridge keeps its own
+    // default session. The account id is configurable, not a secret.
+    const bridgeAccountRow = await getPageSetting(c.env.DB, validation.pageId, AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY).catch(() => null)
+    const bridgeAccount = resolveAdOnlyBridgeAccountId({
+        bodyValue: body.account ?? body.bridge_account,
+        settingValue: bridgeAccountRow?.value,
+        pageId: validation.pageId,
+    })
+
     // Resolve the namespace + internal system video URL to publish as the dark/ad story. Fail closed
     // (never boost/reuse the old Facebook post/video) — identical contract to the click-link lane.
     const namespaceRow = await c.env.DB.prepare('SELECT bot_id FROM pages WHERE id = ? LIMIT 1')
@@ -12879,6 +12893,8 @@ async function runFollowLaneCreateAdOnly(
             body: JSON.stringify({
                 page_id: validation.pageId,
                 video_url: publishVideoUrl,
+                // Forward the resolved bridge session account so production does not fail no_session.
+                ...(bridgeAccount ? { account: bridgeAccount } : {}),
                 // The Shopee link lives in the creative MESSAGE, NOT in a SHOP_NOW button — send the
                 // composed caption as the message. The LIKE_PAGE button comes from the template creative.
                 caption: creativeMessage,
@@ -13064,6 +13080,16 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     const adAccount = String(adAccountRow?.value || '').trim()
     if (!templateAdset || !adAccount) return recordAdOnlyFailure('config_missing_template_or_ad_account')
 
+    // Bridge session account (same resolution as the Follow lane): body.account → per-page
+    // `bridge_account` setting → built-in default (Chearb page only). Forwarded so the bridge /create-ad
+    // route does not fail closed with no_session in production. Empty → bridge keeps its own session.
+    const bridgeAccountRow = await getPageSetting(c.env.DB, validation.pageId, AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY).catch(() => null)
+    const bridgeAccount = resolveAdOnlyBridgeAccountId({
+        bodyValue: body.account ?? body.bridge_account,
+        settingValue: bridgeAccountRow?.value,
+        pageId: validation.pageId,
+    })
+
     // Resolve the namespace + internal system video URL that will be uploaded/published as the NEW Page
     // post. If the source signal has no system video mapping, fail closed instead of boosting/reusing
     // the old Facebook post/video.
@@ -13206,6 +13232,8 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
             body: JSON.stringify({
                 page_id: validation.pageId,
                 video_url: publishVideoUrl,
+                // Forward the resolved bridge session account so production does not fail no_session.
+                ...(bridgeAccount ? { account: bridgeAccount } : {}),
                 caption,
                 ...(adName ? { ad_name: adName } : {}),
                 ...(validation.systemVideoId ? { source_video_id: validation.systemVideoId } : {}),
@@ -13839,31 +13867,45 @@ async function autoPickAdOnlyCandidates(env: Env): Promise<AdOnlyAutoCandidate[]
         ).bind(pageId).all().catch(() => ({ results: [] as AdOnlyHistoryIdRow[] })) as { results?: AdOnlyHistoryIdRow[] }
         const used = buildAdOnlyUsedIdSetForBangkokDate(historyRows.results || [], nowMs)
 
-        const candidates: AdOnlyAutoCandidate[] = []
+        const mappedCandidates: AdOnlyAutoCandidate[] = []
+        const sourceUrlCandidates: AdOnlyAutoCandidate[] = []
         for (const v of videos) {
             const fbVideoId = String(v.video_id || '').trim()
             const postId = String(v.post_id || '').trim()
             const shopeeLink = String(v.shopee_link || '').trim()
             const resolved = await resolveAdOnlySystemVideoIdFromSignal(env, { pageId, postId, fbVideoId, shopeeLink })
-            const systemVideoId = resolved.systemVideoId
-            if (!systemVideoId) {
+            // Prefer the mapped internal system video; fall back to the cached Facebook Page video source
+            // url (facebook_page_video_cache.source_url) ONLY when no system_video_id maps to the signal,
+            // so a high-reach clip with no internal mapping can still be promoted via video_url. When
+            // NEITHER source is available the candidate can never publish → log + skip (preserves the
+            // system_video_unmapped_preflight diagnostic).
+            const sourceUrl = String(v.source_url || '').trim()
+            const src = resolveAdOnlyCandidateVideoSource({ systemVideoId: resolved.systemVideoId, sourceUrl })
+            if (src.source === '') {
                 console.warn(`[AD-ONLY-AUTO] skip candidate page=${pageId} video=${fbVideoId || postId || '(none)'} reason=system_video_unmapped_preflight`)
                 continue
             }
-            candidates.push({
+            const candidate: AdOnlyAutoCandidate = {
                 pageId,
                 videoId: fbVideoId,
                 postId,
-                systemVideoId,
+                systemVideoId: src.systemVideoId,
+                videoUrl: src.videoUrl,
+                sourceSelection: src.source,
                 shopeeLink,
                 views: Number(v.views || 0),
                 createdTime: String(v.created_time || '').trim(),
-                adName: String(v.title || '').trim() || systemVideoId || fbVideoId,
-            })
+                adName: String(v.title || '').trim() || src.systemVideoId || fbVideoId,
+            }
+            if (src.source === 'system_video') mappedCandidates.push(candidate)
+            else sourceUrlCandidates.push(candidate)
         }
-        // Per page take ONE random fresh candidate (not the highest-view one) — a page's other clips
-        // share the same page-level config, so the cross-page list is the right granularity for fall-through.
-        const ranked = rankAdOnlyAutoCandidatesRandom(candidates, used, rng)
+        // Per page take ONE random fresh candidate (not the highest-view one). PREFER mapped system-video
+        // candidates; only when the page has NO fresh mapped clip do we fall through to a cached
+        // source_url candidate, so a page never loses its mapped clips to an unmapped one. A page's other
+        // clips share the same page-level config, so the cross-page list is the right fall-through grain.
+        const rankedMapped = rankAdOnlyAutoCandidatesRandom(mappedCandidates, used, rng)
+        const ranked = rankedMapped.length ? rankedMapped : rankAdOnlyAutoCandidatesRandom(sourceUrlCandidates, used, rng)
         if (ranked.length) perPageBest.push(ranked[0])
     }
 
