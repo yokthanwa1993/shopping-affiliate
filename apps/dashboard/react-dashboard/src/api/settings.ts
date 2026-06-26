@@ -42,6 +42,16 @@ export const pageSettingsSchema = z.object({
   adFlowSourceStrategy: z.string().max(80).default('page_posts'),
   adFlowCtaStrategy: z.string().max(80).default('source_then_story'),
   adFlowCommentMode: z.string().max(80).default('template'),
+  // Per-page Follow→Click-link automation (Create Ads detail). Fail-closed defaults: automation off,
+  // run window 24h, cadence/quantity blank → worker default (30 min / unlimited).
+  autoAdsAutomationEnabled: z.string().max(10).default('0'),
+  autoAdsCadenceMinutes: z.string().max(10).default(''),
+  autoAdsMaxPerDay: z.string().max(10).default(''),
+  autoAdsRunHours: z.string().max(10).default('24'),
+  followFixedCampaignId: z.string().max(120).default(''),
+  followFixedAdsetId: z.string().max(120).default(''),
+  clickLinkFixedCampaignId: z.string().max(120).default(''),
+  clickLinkFixedAdsetId: z.string().max(120).default(''),
 })
 
 export type PageSettingsForm = z.infer<typeof pageSettingsSchema>
@@ -72,6 +82,14 @@ export const EMPTY_FORM: PageSettingsForm = {
   adFlowSourceStrategy: 'page_posts',
   adFlowCtaStrategy: 'source_then_story',
   adFlowCommentMode: 'template',
+  autoAdsAutomationEnabled: '0',
+  autoAdsCadenceMinutes: '',
+  autoAdsMaxPerDay: '',
+  autoAdsRunHours: '24',
+  followFixedCampaignId: '',
+  followFixedAdsetId: '',
+  clickLinkFixedCampaignId: '',
+  clickLinkFixedAdsetId: '',
 }
 
 export const FALLBACK_PAGES: SettingsPage[] = [
@@ -130,6 +148,14 @@ export async function fetchPageSettings(
       adFlowSourceStrategy: String(data.ad_flow_source_strategy || 'page_posts'),
       adFlowCtaStrategy: String(data.ad_flow_cta_strategy || 'source_then_story'),
       adFlowCommentMode: String(data.ad_flow_comment_mode || 'template'),
+      autoAdsAutomationEnabled: String(data.auto_ads_automation_enabled || '0'),
+      autoAdsCadenceMinutes: String(data.auto_ads_cadence_minutes || ''),
+      autoAdsMaxPerDay: String(data.auto_ads_max_per_day || ''),
+      autoAdsRunHours: String(data.auto_ads_run_hours || '24'),
+      followFixedCampaignId: String(data.follow_fixed_campaign_id || ''),
+      followFixedAdsetId: String(data.follow_fixed_adset_id || ''),
+      clickLinkFixedCampaignId: String(data.click_link_fixed_campaign_id || ''),
+      clickLinkFixedAdsetId: String(data.click_link_fixed_adset_id || ''),
     },
     // Presence only — the raw token string is intentionally dropped here.
     tokenPresent: !!data.facebook_sync_token || !!data.facebookSyncToken || !!data.facebookSyncTokenUpdatedAt,
@@ -162,6 +188,14 @@ export async function savePageSettings(
     ad_flow_source_strategy: form.adFlowSourceStrategy,
     ad_flow_cta_strategy: form.adFlowCtaStrategy,
     ad_flow_comment_mode: form.adFlowCommentMode,
+    auto_ads_automation_enabled: form.autoAdsAutomationEnabled,
+    auto_ads_cadence_minutes: form.autoAdsCadenceMinutes,
+    auto_ads_max_per_day: form.autoAdsMaxPerDay,
+    auto_ads_run_hours: form.autoAdsRunHours,
+    follow_fixed_campaign_id: form.followFixedCampaignId,
+    follow_fixed_adset_id: form.followFixedAdsetId,
+    click_link_fixed_campaign_id: form.clickLinkFixedCampaignId,
+    click_link_fixed_adset_id: form.clickLinkFixedAdsetId,
   }
   // Only write the token when the operator typed a new one. Omitting the field
   // leaves any existing token untouched (and never echoes it back to the UI).

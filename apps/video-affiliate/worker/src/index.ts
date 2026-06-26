@@ -168,6 +168,7 @@ import {
     filterCreateAdsEnabledPageIds,
     isAdFlowEnabledForPage,
     buildAdOnlyUsedIdSetForBangkokDate,
+    bangkokDateKey,
     rankAdOnlyAutoCandidatesRandom,
     makeSeededRng,
     buildAdOnlyAutoPickBody,
@@ -192,6 +193,20 @@ import {
     FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY,
     FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY,
     FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY,
+    CLICK_LINK_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY,
+    CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY,
+    AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY,
+    AUTO_ADS_CADENCE_MINUTES_SETTING_KEY,
+    AUTO_ADS_MAX_PER_DAY_SETTING_KEY,
+    AUTO_ADS_RUN_HOURS_SETTING_KEY,
+    AUTO_ADS_NEXT_RUN_AT_SETTING_KEY,
+    AUTO_ADS_LAST_RUN_AT_SETTING_KEY,
+    isAutoAdsAutomationEnabled,
+    clampAutoAdsRunHours,
+    clampAutoAdsMaxPerDay,
+    isUnderDailyAdCap,
+    isFollowRowHandoffEligible,
+    buildFollowToClickLinkHandoffBody,
     resolveAdOnlyCandidateVideoSource,
     resolveAdOnlyBridgeAccountId,
     AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY,
@@ -10884,6 +10899,13 @@ const DASHBOARD_SETTING_KEYS = [
     // by page_id + flow_key, so new flows can be staged side-by-side without taking over Chearb.
     'ad_flow_enabled', 'ad_flow_key', 'ad_flow_source_strategy', 'ad_flow_cta_strategy',
     'ad_flow_comment_mode',
+    // Per-page Follow→Click-link automation (Create Ads detail). Follow lane fixed target +
+    // click-link lane fixed target + cadence/quantity/run-window. ALL fail-closed (automation off,
+    // cadence/run-window defaulted) until the operator configures + enables a page. Round-tripped here
+    // so the Create Ads UI can read/write the whole per-page automation config in one settings call.
+    'follow_fixed_campaign_id', 'follow_fixed_adset_id',
+    'click_link_fixed_campaign_id', 'click_link_fixed_adset_id',
+    'auto_ads_automation_enabled', 'auto_ads_cadence_minutes', 'auto_ads_max_per_day', 'auto_ads_run_hours',
     // Per-page choice for how the create-ad pipeline shortens Shopee URLs:
     //   'api'        → call short.wwoom.com (default; same as the Electron flow)
     //   'extension'  → call affiliate.shopee.co.th GraphQL via the Feed Ad
@@ -10899,6 +10921,10 @@ const DASHBOARD_SETTING_ALIASES: Record<string, string> = {
     autoCreateTime: 'auto_create_time', shortlinkProvider: 'shortlink_provider', adFlowEnabled: 'ad_flow_enabled',
     adFlowKey: 'ad_flow_key', adFlowSourceStrategy: 'ad_flow_source_strategy', adFlowCtaStrategy: 'ad_flow_cta_strategy',
     adFlowCommentMode: 'ad_flow_comment_mode',
+    followFixedCampaignId: 'follow_fixed_campaign_id', followFixedAdsetId: 'follow_fixed_adset_id',
+    clickLinkFixedCampaignId: 'click_link_fixed_campaign_id', clickLinkFixedAdsetId: 'click_link_fixed_adset_id',
+    autoAdsAutomationEnabled: 'auto_ads_automation_enabled', autoAdsCadenceMinutes: 'auto_ads_cadence_minutes',
+    autoAdsMaxPerDay: 'auto_ads_max_per_day', autoAdsRunHours: 'auto_ads_run_hours',
 }
 
 app.get('/api/dashboard/settings', async (c) => {
@@ -12785,6 +12811,17 @@ async function ensureAdHistoryTable(db: D1Database): Promise<void> {
         `ALTER TABLE dashboard_ad_history ADD COLUMN campaign_status_after TEXT NOT NULL DEFAULT ''`,
         `ALTER TABLE dashboard_ad_history ADD COLUMN adset_status_after TEXT NOT NULL DEFAULT ''`,
         `ALTER TABLE dashboard_ad_history ADD COLUMN ad_status_after TEXT NOT NULL DEFAULT ''`,
+        // Lane column (additive). The Follow lane stamps lane='follow'; the click-link lane leaves it
+        // blank. Persisted so the 24h Follow→Click-link handoff can SELECT finished Follow rows directly.
+        `ALTER TABLE dashboard_ad_history ADD COLUMN lane TEXT NOT NULL DEFAULT ''`,
+        // 24h Follow→Click-link handoff audit (additive). After a Follow ad's run window ends and it is
+        // turned OFF (auto_paused_at set), the SAME source system video creates a click-link ad in the
+        // page's fixed click-link adset. click_link_handoff_at is the one-shot idempotency stamp (set
+        // only on a created/skipped handoff, so a transient failure re-qualifies on the next tick).
+        `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_at TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_ad_id TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_status TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_error TEXT NOT NULL DEFAULT ''`,
     ]) {
         await db.prepare(col).run().catch(() => undefined)
     }
@@ -12802,14 +12839,14 @@ async function insertAdHistoryRow(db: D1Database, rec: AdHistoryRecord, complete
            (completed_at, status, page_id, source_story_id, source_post_id, fb_video_id, system_video_id,
             campaign_id, campaign_name, adset_id, ad_id, creative_id, effective_object_story_id,
             click_link, error_message, truncated_result_json,
-            mode, daily_budget, run_hours, start_time, end_time)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            mode, daily_budget, run_hours, start_time, end_time, lane)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
         completed ? new Date().toISOString() : '',
         rec.status, rec.page_id, rec.source_story_id, rec.source_post_id, rec.fb_video_id, rec.system_video_id,
         rec.campaign_id, rec.campaign_name, rec.adset_id, rec.ad_id, rec.creative_id, rec.effective_object_story_id,
         rec.click_link, rec.error_message, rec.truncated_result_json,
-        rec.mode, rec.daily_budget, rec.run_hours, rec.start_time, rec.end_time,
+        rec.mode, rec.daily_budget, rec.run_hours, rec.start_time, rec.end_time, rec.lane,
     ).run()
     return (res as unknown as { meta?: { last_row_id?: number } }).meta?.last_row_id || 0
 }
@@ -13467,16 +13504,29 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
         || buildExpectedCaptionFromMeta(sourceMeta)
         || validation.systemVideoId
     const adName = String((body.ad_name as string) || validation.systemVideoId || '').trim()
+    // Fixed click-link adset target (the 24h Follow→Click-link handoff and any operator-pinned
+    // click-link adset use this). When set, the ad is dropped straight into the existing campaign/adset
+    // and the bridge MUST NOT create/reuse a Bangkok date-named daily campaign — analogous to the
+    // Follow lane's fixed-adset handling. resolveAdOnlySchedule already allows active mode with no
+    // daily_campaign_name when a fixed/existing adset is present.
+    const fixedTargetAdsetId = String(body.existing_adset_id || body.fixed_adset_id || body.target_adset_id || body.adset_id || '').trim()
     const lifecycleFields = schedule.mode === 'active'
-        ? {
-            daily_campaign_name: schedule.dailyCampaignName,
-            campaign_daily_budget: schedule.dailyBudgetMinor,
-            adset_run_hours: schedule.runHours,
-        }
+        ? (fixedTargetAdsetId
+            ? {
+                // Fixed-adset mode reuses the operator-selected adset/campaign as-is — forward only the
+                // run window, never daily_campaign_name/budget (which would mislead the bridge into
+                // daily-campaign diagnostics for an ad it placed in the fixed adset).
+                adset_run_hours: schedule.runHours,
+            }
+            : {
+                daily_campaign_name: schedule.dailyCampaignName,
+                campaign_daily_budget: schedule.dailyBudgetMinor,
+                adset_run_hours: schedule.runHours,
+            })
         : {
             paused: true as const,
             status_option: 'PAUSED' as const,
-            ...(schedule.dailyCampaignName ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
+            ...(schedule.dailyCampaignName && !fixedTargetAdsetId ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
         }
 
     if (!shopeeLink) {
@@ -13509,6 +13559,10 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                 ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
                 template_adset: templateAdset,
                 ad_account: adAccount,
+                ...(fixedTargetAdsetId ? {
+                    existing_adset_id: fixedTargetAdsetId,
+                    fixed_adset_id: fixedTargetAdsetId,
+                } : {}),
                 // HARD SEPARATION: ads lane creates a dark/ad story only; never publish a visible
                 // Page post here. The bridge already has a tested skip_publish_to_page path.
                 skip_publish_to_page: true,
@@ -14627,6 +14681,406 @@ async function autoPauseCompletedAdOnlyCampaigns(
         return { scanned: 0, paused: 0, failed: 0, reason: 'error' }
     }
 }
+
+// =====================================================================
+// PER-PAGE CREATE-ADS AUTOMATION — the operator-configured Follow→Click-link lane (Create Ads detail).
+// Unlike the GLOBAL Follow scheduler (one dashboard flag, cross-page candidate), this lane is driven by
+// PER-PAGE settings: each enabled page runs its OWN jittered cadence, daily quantity cap and run window,
+// and creates ACTIVE Follow ads inside its own fixed Follow adset (falling back to the Bangkok daily
+// campaign when no fixed adset is configured). Enabling a page is the deliberate spend opt-in; every
+// page is DISABLED by default (fail-closed). After a Follow ad finishes its run window and is turned OFF
+// by autoPauseCompletedAdOnlyCampaigns, processFollowToClickLinkHandoffs reuses the SAME source system
+// video to create the click-link ad in the page's fixed click-link adset (idempotent, one per row).
+// =====================================================================
+const AUTO_ADS_MAX_PAGES_PER_TICK = 8
+const AUTO_ADS_HANDOFF_BATCH = 10
+const AUTO_ADS_DAILY_COUNT_SCAN_LIMIT = 500
+
+// Per-page automation cadence (minutes), clamped/defaulted by the SAME helper as the ad-only queue and
+// global Follow lane (1–1440, default 30). Read page-scoped first (getPageSetting), so each page keeps
+// its own cadence; an unset page falls back to the shared default.
+async function getAutoAdsCadenceMinutes(db: D1Database, pageId: string): Promise<number> {
+    const row = await getPageSetting(db, pageId, AUTO_ADS_CADENCE_MINUTES_SETTING_KEY).catch(() => null)
+    if (row && String(row.value || '').trim()) return clampAdOnlyIntervalMinutes(row.value)
+    return DEFAULT_AD_ONLY_INTERVAL_MINUTES
+}
+
+// Per-page run window (hours) before the Follow→Click-link handoff. Clamped/defaulted (1–720, default 24).
+async function getAutoAdsRunHours(db: D1Database, pageId: string): Promise<number> {
+    const row = await getPageSetting(db, pageId, AUTO_ADS_RUN_HOURS_SETTING_KEY).catch(() => null)
+    return clampAutoAdsRunHours(row?.value)
+}
+
+// Enumerate the pages whose per-page automation is ENABLED. Page settings are flat dashboard_settings
+// rows keyed page:<id>:auto_ads_automation_enabled, so a single prefix scan yields the enabled set
+// without one read per held page. Fail-closed: only explicit-truthy values count. Returns [] on error.
+async function listAutoAdsEnabledPageIds(db: D1Database): Promise<string[]> {
+    const prefix = 'page:'
+    const suffix = `:${AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY}`
+    const rows = await db.prepare(
+        `SELECT key, value FROM dashboard_settings WHERE key LIKE ?`
+    ).bind(`${prefix}%${suffix}`).all().catch(() => ({ results: [] as Array<{ key?: string; value?: string }> })) as { results?: Array<{ key?: string; value?: string }> }
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const r of rows.results || []) {
+        const key = String(r?.key || '')
+        if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue
+        if (!isAutoAdsAutomationEnabled(r?.value)) continue
+        const pageId = key.slice(prefix.length, key.length - suffix.length).trim()
+        if (!pageId || seen.has(pageId)) continue
+        seen.add(pageId)
+        out.push(pageId)
+    }
+    return out
+}
+
+// Count the Follow ads the automation already created for a page on the CURRENT Bangkok day (used by the
+// per-page daily-quantity cap). Mirrors the dedup window: only created/success Follow-lane rows whose
+// created_at falls on today's Bangkok date are counted. Bounded scan.
+async function countAutoAdsCreatedTodayForPage(env: Env, pageId: string, nowMs: number): Promise<number> {
+    const todayKey = bangkokDateKey(nowMs)
+    if (!todayKey) return 0
+    const rows = await env.DB.prepare(
+        `SELECT created_at FROM dashboard_ad_history
+          WHERE page_id = ? AND lane = 'follow' AND status IN ('created', 'success')
+          ORDER BY id DESC LIMIT ?`
+    ).bind(pageId, AUTO_ADS_DAILY_COUNT_SCAN_LIMIT).all().catch(() => ({ results: [] as Array<{ created_at?: string }> })) as { results?: Array<{ created_at?: string }> }
+    let count = 0
+    for (const r of rows.results || []) {
+        if (bangkokDateKey(String(r?.created_at || '')) === todayKey) count += 1
+    }
+    return count
+}
+
+// Pick ONE fresh, eligible cached video for a SINGLE page (≥ min views + a Shopee link, not already used
+// today, page not on a fatal-error cooldown). Mirrors the per-page selection inside
+// autoPickAdOnlyCandidates but scoped to the one page the per-page automation is firing for. Requires the
+// page's ad_account (the bridge copies the template adset under it); the Follow template adset itself
+// falls back to the corrected default. Returns the best random candidate or null.
+async function pickBestAutoAdsCandidateForPage(env: Env, pageId: string, rng: () => number, nowMs: number): Promise<AdOnlyAutoCandidate | null> {
+    const adAccountRow = await getPageSetting(env.DB, pageId, 'ad_account').catch(() => null)
+    if (!String(adAccountRow?.value || '').trim()) return null
+
+    const failureRows = await env.DB.prepare(
+        `SELECT page_id, status, error_message, truncated_result_json, created_at, published_to_page
+         FROM dashboard_ad_history
+         WHERE status IN ('failed', 'error', 'unsupported')
+         ORDER BY id DESC LIMIT ?`
+    ).bind(AD_ONLY_AUTO_FAILURE_SCAN_LIMIT).all().catch(() => ({ results: [] as AdOnlyFailureRow[] })) as { results?: AdOnlyFailureRow[] }
+    const skipped = buildAdOnlySkippedPageSet(failureRows.results || [], nowMs)
+    if (skipped.has(pageId)) return null
+
+    const videos = await listFacebookPageVideoCache(env.DB, {
+        pageId,
+        minViews: AD_ONLY_AUTO_MIN_VIEWS,
+        limit: AD_ONLY_AUTO_VIDEOS_PER_PAGE,
+        order: 'newest',
+    }).catch(() => [] as FacebookPageVideoCacheRow[])
+    if (!videos.length) return null
+
+    const historyRows = await env.DB.prepare(
+        `SELECT source_story_id, source_post_id, fb_video_id, system_video_id, effective_object_story_id, created_at, status
+         FROM dashboard_ad_history WHERE page_id = ? ORDER BY id DESC LIMIT 5000`
+    ).bind(pageId).all().catch(() => ({ results: [] as AdOnlyHistoryIdRow[] })) as { results?: AdOnlyHistoryIdRow[] }
+    const used = buildAdOnlyUsedIdSetForBangkokDate(historyRows.results || [], nowMs)
+
+    const mappedCandidates: AdOnlyAutoCandidate[] = []
+    const sourceUrlCandidates: AdOnlyAutoCandidate[] = []
+    for (const v of videos) {
+        const fbVideoId = String(v.video_id || '').trim()
+        const postId = String(v.post_id || '').trim()
+        const shopeeLink = String(v.shopee_link || '').trim()
+        const resolved = await resolveAdOnlySystemVideoIdFromSignal(env, { pageId, postId, fbVideoId, shopeeLink })
+        const sourceUrl = String(v.source_url || '').trim()
+        const src = resolveAdOnlyCandidateVideoSource({ systemVideoId: resolved.systemVideoId, sourceUrl })
+        if (src.source === '') continue
+        const candidate: AdOnlyAutoCandidate = {
+            pageId,
+            videoId: fbVideoId,
+            postId,
+            systemVideoId: src.systemVideoId,
+            videoUrl: src.videoUrl,
+            sourceSelection: src.source,
+            shopeeLink,
+            views: Number(v.views || 0),
+            createdTime: String(v.created_time || '').trim(),
+            adName: String(v.title || '').trim() || src.systemVideoId || fbVideoId,
+        }
+        if (src.source === 'system_video') mappedCandidates.push(candidate)
+        else sourceUrlCandidates.push(candidate)
+    }
+    const rankedMapped = rankAdOnlyAutoCandidatesRandom(mappedCandidates, used, rng)
+    const ranked = rankedMapped.length ? rankedMapped : rankAdOnlyAutoCandidatesRandom(sourceUrlCandidates, used, rng)
+    return ranked.length ? ranked[0] : null
+}
+
+// Create ONE ACTIVE Follow ad for a page via the SAME create-ad-only endpoint (lane='follow'). Uses the
+// page's fixed Follow campaign/adset when configured (else the Bangkok daily campaign), the page's run
+// window, and a default daily budget. create-ad-only returns HTTP 200 ok:false on failure, so success
+// gates on data.ok. Never throws.
+async function processOnePerPageAutoAd(env: Env, pageId: string, nowMs: number): Promise<{ ok: boolean; reason?: string; error?: string }> {
+    const rng = makeSeededRng(nowMs ^ (Number(pageId.replace(/\D/g, '').slice(-9)) || 0))
+    const candidate = await pickBestAutoAdsCandidateForPage(env, pageId, rng, nowMs)
+    if (!candidate) return { ok: true, reason: 'no_eligible_candidate' }
+
+    const fixedCampaignRow = await getPageSetting(env.DB, pageId, FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null)
+    const fixedAdsetRow = await getPageSetting(env.DB, pageId, FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null)
+    const fixedCampaignId = String(fixedCampaignRow?.value || '').trim()
+    const fixedAdsetId = String(fixedAdsetRow?.value || '').trim()
+    const runHours = await getAutoAdsRunHours(env.DB, pageId)
+
+    const reqBody = buildFollowAutoPickBody({
+        candidate,
+        mode: 'active',
+        dailyCampaignName: fixedAdsetId ? '' : bangkokDailyCampaignName(),
+        templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
+        campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+        fixedCampaignId,
+        fixedAdsetId,
+        runHours,
+    })
+    const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+    try {
+        const resp = await fetch(`${workerUrl}/api/dashboard/create-ad-only`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reqBody),
+        })
+        const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+        if (resp.ok && data.ok) return { ok: true }
+        return { ok: false, error: String(data.error || `http_${resp.status}`).trim() }
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+}
+
+// Cron entrypoint — per-page automation cadence. For each ENABLED page: gate on its OWN jittered cadence
+// slot (auto_ads_next_run_at), then its OWN daily quantity cap, then create AT MOST one ACTIVE Follow ad.
+// Claims each page's slot (stamps last_run + the next jittered slot) BEFORE creating, so a slow create
+// can't be double-claimed and the cap is consulted once per slot. Bounded to AUTO_ADS_MAX_PAGES_PER_TICK
+// creates per tick. Never throws (cron must not be derailed).
+async function maybeProcessPerPageAutoAdsOnSchedule(env: Env): Promise<{ ran: number; reason?: string }> {
+    try {
+        const pageIds = await listAutoAdsEnabledPageIds(env.DB)
+        if (!pageIds.length) return { ran: 0, reason: 'no_enabled_pages' }
+        const nowMs = Date.now()
+        let created = 0
+        for (const pageId of pageIds) {
+            if (created >= AUTO_ADS_MAX_PAGES_PER_TICK) break
+            const interval = await getAutoAdsCadenceMinutes(env.DB, pageId)
+            const lastRun = await getPageSetting(env.DB, pageId, AUTO_ADS_LAST_RUN_AT_SETTING_KEY).catch(() => null)
+            const storedNext = await getPageSetting(env.DB, pageId, AUTO_ADS_NEXT_RUN_AT_SETTING_KEY).catch(() => null)
+            const decision = decideJitteredScheduleRun({
+                nowMs,
+                lastRunMs: Date.parse(String(lastRun?.value || '')),
+                storedNextRunMs: Date.parse(String(storedNext?.value || '').trim()),
+                intervalMinutes: interval,
+                rng: makeSeededRng(nowMs ^ (Number(pageId.replace(/\D/g, '').slice(-9)) || 0)),
+            })
+            if (!decision.due) {
+                if (decision.persistNextRun) {
+                    await setPageSetting(env.DB, pageId, AUTO_ADS_NEXT_RUN_AT_SETTING_KEY, new Date(decision.nextRunAtMs).toISOString()).catch(() => null)
+                }
+                continue
+            }
+            // Claim the slot first: stamp last_run + pre-arm the next jittered slot, so a slow create can't
+            // be double-claimed and the cap is consulted exactly once per cadence slot.
+            await setPageSetting(env.DB, pageId, AUTO_ADS_LAST_RUN_AT_SETTING_KEY, new Date(nowMs).toISOString()).catch(() => null)
+            const nextRunMs = computeJitteredNextRunAtMs({ baseMs: nowMs, intervalMinutes: interval, rng: makeSeededRng(nowMs ^ 0x9e3779b9 ^ (Number(pageId.replace(/\D/g, '').slice(-9)) || 0)) })
+            await setPageSetting(env.DB, pageId, AUTO_ADS_NEXT_RUN_AT_SETTING_KEY, new Date(nextRunMs).toISOString()).catch(() => null)
+
+            // Daily quantity cap (per page; 0 = unlimited). When reached, the slot is still advanced so the
+            // page simply waits for the next cadence/day rather than retrying every tick.
+            const maxPerDay = clampAutoAdsMaxPerDay((await getPageSetting(env.DB, pageId, AUTO_ADS_MAX_PER_DAY_SETTING_KEY).catch(() => null))?.value)
+            const todayCount = await countAutoAdsCreatedTodayForPage(env, pageId, nowMs)
+            if (!isUnderDailyAdCap(todayCount, maxPerDay)) {
+                console.log(`[AUTO-ADS] page=${pageId} daily_cap_reached count=${todayCount}/${maxPerDay}`)
+                continue
+            }
+            const res = await processOnePerPageAutoAd(env, pageId, nowMs)
+            console.log(`[AUTO-ADS] page=${pageId} ok=${res.ok} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''} next_run_at=${new Date(nextRunMs).toISOString()}`)
+            if (res.ok && res.reason !== 'no_eligible_candidate') created += 1
+        }
+        return { ran: created }
+    } catch (e) {
+        console.error(`[AUTO-ADS] ${e instanceof Error ? e.message : String(e)}`)
+        return { ran: 0, reason: 'error' }
+    }
+}
+
+// 24h Follow→Click-link handoff. After a per-page automation Follow ad finishes its run window and is
+// turned OFF (auto_paused_at set by autoPauseCompletedAdOnlyCampaigns), reuse the SAME source system
+// video to create the click-link (sales lane) ad in the page's FIXED click-link adset. Idempotent: the
+// click_link_handoff_at='' gate + a one-shot stamp guarantee AT MOST one click-link ad per Follow row.
+// A page with automation disabled or no configured click-link adset is stamped 'skipped' (terminal — the
+// handoff decision is made when the Follow ad finishes). A transient create failure leaves the stamp
+// empty so the next cron tick retries. Bounded batch, cheapest-first by id. Never throws.
+async function processFollowToClickLinkHandoffs(env: Env): Promise<{ scanned: number; handed_off: number; skipped: number; failed: number; reason?: string }> {
+    try {
+        await ensureAdHistoryTable(env.DB)
+        const rows = await env.DB.prepare(
+            `SELECT id, page_id, system_video_id, click_link, lane, status, auto_paused_at, click_link_handoff_at
+               FROM dashboard_ad_history
+              WHERE lane = 'follow'
+                AND click_link_handoff_at = ''
+                AND auto_paused_at != ''
+                AND system_video_id != ''
+                AND status IN ('created', 'success')
+              ORDER BY id ASC
+              LIMIT ?`
+        ).bind(AUTO_ADS_HANDOFF_BATCH).all().catch(() => ({ results: [] as Array<Record<string, unknown>> })) as { results?: Array<Record<string, unknown>> }
+        const list = rows.results || []
+        if (!list.length) return { scanned: 0, handed_off: 0, skipped: 0, failed: 0 }
+
+        const workerUrl = String(env.WORKER_URL || 'https://api.pubilo.com').trim().replace(/\/+$/, '')
+        let handedOff = 0
+        let skipped = 0
+        let failed = 0
+        for (const row of list) {
+            if (!isFollowRowHandoffEligible(row)) continue
+            const id = Number(row.id)
+            const pageId = String(row.page_id || '').trim()
+            const systemVideoId = String(row.system_video_id || '').trim()
+            const enabled = isAutoAdsAutomationEnabled((await getPageSetting(env.DB, pageId, AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY).catch(() => null))?.value)
+            const fixedAdsetId = String((await getPageSetting(env.DB, pageId, CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
+            const fixedCampaignId = String((await getPageSetting(env.DB, pageId, CLICK_LINK_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
+            if (!enabled || !fixedAdsetId) {
+                // Terminal skip — the handoff decision is made when the Follow ad finishes. Stamp so the
+                // row is not rescanned. (Configure the click-link adset BEFORE enabling the page.)
+                await env.DB.prepare(
+                    `UPDATE dashboard_ad_history
+                        SET click_link_handoff_at = datetime('now'),
+                            click_link_handoff_status = ?
+                      WHERE id = ?`
+                ).bind(!enabled ? 'skipped_disabled' : 'skipped_no_click_link_adset', id).run().catch(() => undefined)
+                skipped += 1
+                continue
+            }
+            const runHours = await getAutoAdsRunHours(env.DB, pageId)
+            const handoffBody = buildFollowToClickLinkHandoffBody({
+                pageId,
+                systemVideoId,
+                fixedAdsetId,
+                fixedCampaignId,
+                runHours,
+                shopeeUrl: String(row.click_link || '').trim(),
+                adName: systemVideoId,
+            })
+            try {
+                const resp = await fetch(`${workerUrl}/api/dashboard/create-ad-only`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(handoffBody),
+                })
+                const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+                if (resp.ok && data.ok && data.ad_id) {
+                    await env.DB.prepare(
+                        `UPDATE dashboard_ad_history
+                            SET click_link_handoff_at = datetime('now'),
+                                click_link_handoff_ad_id = ?,
+                                click_link_handoff_status = 'created',
+                                click_link_handoff_error = ''
+                          WHERE id = ?`
+                    ).bind(String(data.ad_id || ''), id).run().catch(() => undefined)
+                    handedOff += 1
+                } else {
+                    // Leave click_link_handoff_at empty → retried next tick.
+                    const err = String(data.error || `handoff_http_${resp.status}`).slice(0, 200)
+                    await env.DB.prepare(
+                        `UPDATE dashboard_ad_history
+                            SET click_link_handoff_status = 'failed', click_link_handoff_error = ?
+                          WHERE id = ?`
+                    ).bind(err, id).run().catch(() => undefined)
+                    failed += 1
+                }
+            } catch (e) {
+                const err = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                await env.DB.prepare(
+                    `UPDATE dashboard_ad_history
+                        SET click_link_handoff_status = 'failed', click_link_handoff_error = ?
+                      WHERE id = ?`
+                ).bind(err, id).run().catch(() => undefined)
+                failed += 1
+            }
+        }
+        return { scanned: list.length, handed_off: handedOff, skipped, failed }
+    } catch (e) {
+        console.error(`[AUTO-ADS-HANDOFF] ${e instanceof Error ? e.message : String(e)}`)
+        return { scanned: 0, handed_off: 0, skipped: 0, failed: 0, reason: 'error' }
+    }
+}
+
+// Per-page automation status — the resolved config + next-due slot for one page. GET never mutates the
+// cadence (it does not roll/store a jitter), so polling can't shift the schedule.
+app.get('/api/dashboard/auto-ads/status', async (c) => {
+    const pageId = String(c.req.query('page_id') || '').trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+    const enabled = isAutoAdsAutomationEnabled((await getPageSetting(c.env.DB, pageId, AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY).catch(() => null))?.value)
+    const cadence = await getAutoAdsCadenceMinutes(c.env.DB, pageId)
+    const maxPerDay = clampAutoAdsMaxPerDay((await getPageSetting(c.env.DB, pageId, AUTO_ADS_MAX_PER_DAY_SETTING_KEY).catch(() => null))?.value)
+    const runHours = await getAutoAdsRunHours(c.env.DB, pageId)
+    const followCampaign = String((await getPageSetting(c.env.DB, pageId, FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
+    const followAdset = String((await getPageSetting(c.env.DB, pageId, FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
+    const clickCampaign = String((await getPageSetting(c.env.DB, pageId, CLICK_LINK_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
+    const clickAdset = String((await getPageSetting(c.env.DB, pageId, CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
+    const lastRun = String((await getPageSetting(c.env.DB, pageId, AUTO_ADS_LAST_RUN_AT_SETTING_KEY).catch(() => null))?.value || '').trim()
+    const storedNext = String((await getPageSetting(c.env.DB, pageId, AUTO_ADS_NEXT_RUN_AT_SETTING_KEY).catch(() => null))?.value || '').trim()
+    const storedNextMs = Date.parse(storedNext)
+    const nextRunMs = !enabled ? 0 : (Number.isFinite(storedNextMs) ? storedNextMs : nextAdOnlyRunAtMs(lastRun, cadence, Date.now()))
+    const todayCount = await countAutoAdsCreatedTodayForPage(c.env, pageId, Date.now())
+    return c.json({
+        ok: true,
+        page_id: pageId,
+        automation_enabled: enabled,
+        cadence_minutes: cadence,
+        max_per_day: maxPerDay,
+        run_hours: runHours,
+        follow_fixed_campaign_id: followCampaign,
+        follow_fixed_adset_id: followAdset,
+        click_link_fixed_campaign_id: clickCampaign,
+        click_link_fixed_adset_id: clickAdset,
+        created_today: todayCount,
+        last_run_at: lastRun,
+        next_run_at: nextRunMs ? new Date(nextRunMs).toISOString() : '',
+    }, 200, { 'Cache-Control': 'no-store' })
+})
+
+// Manual "run now" for a single page's automation — bypass the cadence gate and create one Follow ad
+// immediately (still respects the daily cap). Accept fast, finish in waitUntil (the create can outrun
+// browser/tool HTTP timeouts).
+app.post('/api/dashboard/auto-ads/run-next', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { page_id?: string }
+    const pageId = String(body.page_id || '').trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+    c.executionCtx.waitUntil(
+        (async () => {
+            const nowMs = Date.now()
+            const maxPerDay = clampAutoAdsMaxPerDay((await getPageSetting(c.env.DB, pageId, AUTO_ADS_MAX_PER_DAY_SETTING_KEY).catch(() => null))?.value)
+            const todayCount = await countAutoAdsCreatedTodayForPage(c.env, pageId, nowMs)
+            if (!isUnderDailyAdCap(todayCount, maxPerDay)) {
+                console.log(`[AUTO-ADS] manual run-next page=${pageId} daily_cap_reached count=${todayCount}/${maxPerDay}`)
+                return
+            }
+            const res = await processOnePerPageAutoAd(c.env, pageId, nowMs)
+            console.log(`[AUTO-ADS] manual run-next page=${pageId} ok=${res.ok} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''}`)
+        })().catch((error) => {
+            console.error(`[AUTO-ADS] manual run-next failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    )
+    return c.json({ ok: true, accepted: true, page_id: pageId }, 202, { 'Cache-Control': 'no-store' })
+})
+
+// Manual "run now" for the Follow→Click-link handoff pass (process finished Follow rows immediately).
+app.post('/api/dashboard/auto-ads/handoff/run-next', async (c) => {
+    c.executionCtx.waitUntil(
+        processFollowToClickLinkHandoffs(c.env).then((r) => {
+            console.log(`[AUTO-ADS-HANDOFF] manual scanned=${r.scanned} handed_off=${r.handed_off} skipped=${r.skipped} failed=${r.failed} ${r.reason ? `reason=${r.reason}` : ''}`)
+        }).catch((error) => {
+            console.error(`[AUTO-ADS-HANDOFF] manual failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    )
+    return c.json({ ok: true, accepted: true }, 202, { 'Cache-Control': 'no-store' })
+})
 
 app.get('/api/dashboard/ad-links', async (c) => {
     const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
@@ -45003,6 +45457,17 @@ export default {
         // the ad-only queue, and swallows its own errors so a pause failure can't derail the cron.
         _ctx.waitUntil(autoPauseCompletedAdOnlyCampaigns(env).catch((error) => {
             console.error(`[AD-ONLY-AUTOPAUSE] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        // Per-page Create Ads automation: each ENABLED page runs its own jittered cadence + daily cap and
+        // creates one ACTIVE Follow ad per slot. Disabled by default (fail-closed); separate waitUntil so
+        // a slow create can't block posting or the other ad lanes.
+        _ctx.waitUntil(maybeProcessPerPageAutoAdsOnSchedule(env).catch((error) => {
+            console.error(`[AUTO-ADS] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        // 24h Follow→Click-link handoff: after a Follow ad is turned OFF, reuse the same source system
+        // video to create the click-link ad in the page's fixed click-link adset (idempotent, one per row).
+        _ctx.waitUntil(processFollowToClickLinkHandoffs(env).catch((error) => {
+            console.error(`[AUTO-ADS-HANDOFF] ${error instanceof Error ? error.message : String(error)}`)
         }))
     },
 }

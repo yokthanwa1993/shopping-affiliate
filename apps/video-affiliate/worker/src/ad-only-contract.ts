@@ -270,6 +270,9 @@ export interface AdHistoryRecord {
     run_hours: string
     start_time: string
     end_time: string
+    /** Which ad lane produced this row ('follow' | 'sales' | ''). Stored as a first-class column so the
+     * 24h Follow→Click-link handoff can SELECT finished Follow rows without scanning the result JSON. */
+    lane: string
 }
 
 // =====================================================================
@@ -1111,6 +1114,64 @@ export const FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY = 'follow_campaign_sub1'
 export const FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY = 'follow_fixed_campaign_id'
 export const FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY = 'follow_fixed_adset_id'
 
+// Per-page fixed Click Link (sales lane) target. The 24h Follow→Click-link handoff creates the
+// click-link ad inside THIS existing campaign/adset (forwarded as existing_adset_id/fixed_adset_id),
+// analogous to the Follow fixed target above. When the adset is unset the page has no click-link
+// destination and the handoff is skipped (the Follow ad is still turned off after its run window).
+export const CLICK_LINK_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY = 'click_link_fixed_campaign_id'
+export const CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY = 'click_link_fixed_adset_id'
+
+// =====================================================================
+// PER-PAGE CREATE-ADS AUTOMATION — the operator-facing settings that drive the per-page Follow→Click
+// link automation lane (Create Ads page detail). Each is a PER-PAGE setting (page:<id>:<key>), so every
+// page configures its own cadence / quantity / run window independently. ALL default fail-closed:
+// automation is DISABLED until the operator explicitly enables a page, and enabling a page is the
+// deliberate spend opt-in (the per-page lane creates ACTIVE, spending Follow ads that run for the
+// configured duration, then hand off to the click-link adset). Pure string keys — no network/D1 here.
+// =====================================================================
+export const AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY = 'auto_ads_automation_enabled'
+export const AUTO_ADS_CADENCE_MINUTES_SETTING_KEY = 'auto_ads_cadence_minutes'
+export const AUTO_ADS_MAX_PER_DAY_SETTING_KEY = 'auto_ads_max_per_day'
+export const AUTO_ADS_RUN_HOURS_SETTING_KEY = 'auto_ads_run_hours'
+// Per-page jittered next-due slot + last-run stamp (absolute ISO), mirroring the global Follow lane
+// scheduler but scoped per page so each page keeps its own cadence clock.
+export const AUTO_ADS_NEXT_RUN_AT_SETTING_KEY = 'auto_ads_next_run_at'
+export const AUTO_ADS_LAST_RUN_AT_SETTING_KEY = 'auto_ads_last_run_at'
+
+// Daily quantity bound for the per-page automation. 0 means UNLIMITED (cadence is the only throttle);
+// a positive value caps how many Follow ads the lane creates for a page per Bangkok day.
+export const DEFAULT_AUTO_ADS_MAX_PER_DAY = 0
+export const MAX_AUTO_ADS_MAX_PER_DAY = 200
+
+// Parse the per-page automation enable flag. Fail-closed: only an explicit truthy value enables it;
+// anything else (including unset) is OFF, so a page never auto-spends without a deliberate toggle.
+export function isAutoAdsAutomationEnabled(raw: unknown): boolean {
+    return ['1', 'true', 'on', 'yes', 'enabled'].includes(str(raw).toLowerCase())
+}
+
+// Clamp + default the per-page run-window length (hours before the Follow→Click-link handoff). Reuses
+// the click-link/Follow run-hours bounds (1..720, default 24).
+export function clampAutoAdsRunHours(v: unknown): number {
+    const n = toNum(v)
+    if (!Number.isFinite(n) || n <= 0) return DEFAULT_RUN_HOURS
+    return clamp(Math.round(n), MIN_RUN_HOURS, MAX_RUN_HOURS)
+}
+
+// Clamp + default the per-page daily quantity cap. Non-numeric/negative → the default (0 = unlimited);
+// otherwise clamped to [0, MAX_AUTO_ADS_MAX_PER_DAY]. 0 is a valid value meaning "no daily cap".
+export function clampAutoAdsMaxPerDay(v: unknown): number {
+    const n = toNum(v)
+    if (!Number.isFinite(n) || n < 0) return DEFAULT_AUTO_ADS_MAX_PER_DAY
+    return clamp(Math.floor(n), 0, MAX_AUTO_ADS_MAX_PER_DAY)
+}
+
+// The daily-quantity gate: may the lane create one more Follow ad for a page today? A non-positive cap
+// means unlimited (always true); otherwise true only while today's count is still below the cap. Pure.
+export function isUnderDailyAdCap(todayCount: number, maxPerDay: number): boolean {
+    if (!Number.isFinite(maxPerDay) || maxPerDay <= 0) return true
+    return todayCount < maxPerDay
+}
+
 
 // =====================================================================
 // BRIDGE SESSION ACCOUNT — the CloakBrowser FB bridge /create-ad route requires a logged-in session.
@@ -1425,5 +1486,76 @@ export function buildAdHistoryRecord(params: {
         run_hours: sched && sched.runHours ? String(sched.runHours) : '',
         start_time: pick('start_time'),
         end_time: pick('end_time'),
+        // Lane is carried in the bridge/result payload (the Follow handler stamps lane:'follow'); the
+        // click-link lane leaves it blank. Persisted as a column so the handoff query is index-friendly.
+        lane: pick('lane'),
     }
+}
+
+// =====================================================================
+// 24h FOLLOW → CLICK-LINK HANDOFF — pure helpers. After a per-page automation Follow ad finishes its
+// run window and is turned OFF (auto_paused_at set), the SAME source system video is reused to create a
+// click-link (sales lane) ad inside the page's configured fixed click-link adset. These helpers decide
+// eligibility and shape the create-ad-only body; the DB read/write + bridge call live in the worker.
+// =====================================================================
+
+// A finished Follow history row eligible for the click-link handoff. True ONLY when:
+//   - the row is the Follow lane (lane === 'follow');
+//   - it actually created an ad (status created/success) with a reusable system video id;
+//   - its run window already ended and it was turned OFF (auto_paused_at set) — so we never hand off a
+//     still-spending Follow ad; and
+//   - it has NOT already handed off (click_link_handoff_at empty) — the one-shot idempotency gate.
+// Pure: the caller supplies the row fields. Page-level enablement / fixed-adset config is checked
+// separately in the worker (it needs D1).
+export function isFollowRowHandoffEligible(row: {
+    lane?: unknown
+    status?: unknown
+    system_video_id?: unknown
+    auto_paused_at?: unknown
+    click_link_handoff_at?: unknown
+}): boolean {
+    if (str(row.lane).toLowerCase() !== 'follow') return false
+    const status = str(row.status).toLowerCase()
+    if (status !== 'created' && status !== 'success') return false
+    if (!str(row.system_video_id)) return false
+    if (!str(row.auto_paused_at)) return false
+    if (str(row.click_link_handoff_at)) return false
+    return true
+}
+
+// Build the POST /api/dashboard/create-ad-only body for the click-link handoff. Defaults to the SALES
+// lane (no `lane` field → resolveAdOnlyLane returns 'sales'), reuses the SAME source system video, and
+// pins the page's fixed click-link adset (existing_adset_id + fixed_adset_id) so the sales lane skips
+// Bangkok daily-campaign creation and drops the ad straight into the operator-selected adset. Always
+// ACTIVE (the click-link ad is the live destination after the Follow phase). Pure: no network.
+export function buildFollowToClickLinkHandoffBody(input: {
+    pageId: string
+    systemVideoId: string
+    fixedAdsetId: string
+    fixedCampaignId?: string
+    runHours?: number
+    shopeeUrl?: string
+    adName?: string
+}): Record<string, unknown> {
+    const fixedAdsetId = str(input.fixedAdsetId)
+    const hours = Number.isFinite(Number(input.runHours)) && Number(input.runHours) > 0
+        ? Math.round(Number(input.runHours))
+        : DEFAULT_RUN_HOURS
+    const body: Record<string, unknown> = {
+        page_id: str(input.pageId),
+        system_video_id: str(input.systemVideoId),
+        mode: 'active',
+        run_hours: hours,
+        // Pin the click-link destination adset; the sales lane forwards both keys to the bridge and the
+        // schedule resolver accepts active mode without a daily campaign name when a fixed adset is set.
+        existing_adset_id: fixedAdsetId,
+        fixed_adset_id: fixedAdsetId,
+    }
+    const fixedCampaignId = str(input.fixedCampaignId)
+    if (fixedCampaignId) body.campaign_id = fixedCampaignId
+    const shopeeUrl = str(input.shopeeUrl)
+    if (shopeeUrl) body.shopee_url = shopeeUrl
+    const adName = str(input.adName)
+    if (adName) body.ad_name = adName
+    return body
 }

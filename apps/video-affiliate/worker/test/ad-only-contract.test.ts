@@ -49,6 +49,17 @@ import {
     DEFAULT_AD_ONLY_INTERVAL_MINUTES,
     clampAdOnlyIntervalMinutes,
     makeSeededRng,
+    isAutoAdsAutomationEnabled,
+    clampAutoAdsRunHours,
+    clampAutoAdsMaxPerDay,
+    isUnderDailyAdCap,
+    isFollowRowHandoffEligible,
+    buildFollowToClickLinkHandoffBody,
+    resolveAdOnlyLane as resolveAdOnlyLaneForHandoff,
+    DEFAULT_AUTO_ADS_MAX_PER_DAY,
+    MAX_AUTO_ADS_MAX_PER_DAY,
+    CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY,
+    AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY,
 } from '../src/ad-only-contract.js'
 import { buildPostingCommentShortlinkSubIds } from '../src/shortlink-template.js'
 import {
@@ -1359,4 +1370,124 @@ test('resolveAdOnlySchedule allows active mode without daily campaign when fixed
     assert.equal(sched.mode, 'active')
     assert.equal(sched.fixedAdsetId, '120248982540070263')
     assert.equal(sched.dailyCampaignName, '')
+})
+
+// =====================================================================
+// Per-page Create-Ads automation (Follow → Click Link) — pure helpers.
+// =====================================================================
+
+test('isAutoAdsAutomationEnabled is fail-closed: only explicit-truthy enables', () => {
+    for (const v of ['1', 'true', 'on', 'yes', 'enabled', 'TRUE', ' On ']) {
+        assert.equal(isAutoAdsAutomationEnabled(v), true, `expected ${JSON.stringify(v)} → true`)
+    }
+    for (const v of ['0', 'false', 'off', 'no', '', null, undefined, 'maybe', '2']) {
+        assert.equal(isAutoAdsAutomationEnabled(v), false, `expected ${JSON.stringify(v)} → false`)
+    }
+})
+
+test('clampAutoAdsRunHours clamps to [1,720] and defaults to 24', () => {
+    assert.equal(clampAutoAdsRunHours(undefined), DEFAULT_RUN_HOURS)
+    assert.equal(clampAutoAdsRunHours(''), DEFAULT_RUN_HOURS)
+    assert.equal(clampAutoAdsRunHours(0), DEFAULT_RUN_HOURS)
+    assert.equal(clampAutoAdsRunHours(-5), DEFAULT_RUN_HOURS)
+    assert.equal(clampAutoAdsRunHours('48'), 48)
+    assert.equal(clampAutoAdsRunHours(99999), MAX_RUN_HOURS)
+    assert.equal(clampAutoAdsRunHours('not-a-number'), DEFAULT_RUN_HOURS)
+})
+
+test('clampAutoAdsMaxPerDay defaults to 0 (unlimited) and clamps the bound', () => {
+    assert.equal(clampAutoAdsMaxPerDay(undefined), DEFAULT_AUTO_ADS_MAX_PER_DAY)
+    assert.equal(clampAutoAdsMaxPerDay(''), DEFAULT_AUTO_ADS_MAX_PER_DAY)
+    assert.equal(clampAutoAdsMaxPerDay(-3), DEFAULT_AUTO_ADS_MAX_PER_DAY)
+    assert.equal(clampAutoAdsMaxPerDay('0'), 0)
+    assert.equal(clampAutoAdsMaxPerDay('5'), 5)
+    assert.equal(clampAutoAdsMaxPerDay(10_000), MAX_AUTO_ADS_MAX_PER_DAY)
+})
+
+test('isUnderDailyAdCap: non-positive cap is unlimited, else strict less-than', () => {
+    assert.equal(isUnderDailyAdCap(100, 0), true) // 0 = unlimited
+    assert.equal(isUnderDailyAdCap(100, -1), true)
+    assert.equal(isUnderDailyAdCap(0, 3), true)
+    assert.equal(isUnderDailyAdCap(2, 3), true)
+    assert.equal(isUnderDailyAdCap(3, 3), false)
+    assert.equal(isUnderDailyAdCap(4, 3), false)
+})
+
+test('isFollowRowHandoffEligible requires follow lane, finished+paused, video, and no prior handoff', () => {
+    const base = {
+        lane: 'follow',
+        status: 'created',
+        system_video_id: 'sysvid_1',
+        auto_paused_at: '2026-06-27 10:00:00',
+        click_link_handoff_at: '',
+    }
+    assert.equal(isFollowRowHandoffEligible(base), true)
+    assert.equal(isFollowRowHandoffEligible({ ...base, status: 'success' }), true)
+    // Not the follow lane → never hand off.
+    assert.equal(isFollowRowHandoffEligible({ ...base, lane: 'sales' }), false)
+    assert.equal(isFollowRowHandoffEligible({ ...base, lane: '' }), false)
+    // Not finished/turned-off yet (still spending) → wait.
+    assert.equal(isFollowRowHandoffEligible({ ...base, auto_paused_at: '' }), false)
+    // No reusable system video → can't recreate the click-link ad.
+    assert.equal(isFollowRowHandoffEligible({ ...base, system_video_id: '' }), false)
+    // Already handed off → idempotency gate blocks a second click-link ad.
+    assert.equal(isFollowRowHandoffEligible({ ...base, click_link_handoff_at: '2026-06-27 11:00:00' }), false)
+    // Only created/success rows qualify.
+    assert.equal(isFollowRowHandoffEligible({ ...base, status: 'failed' }), false)
+})
+
+test('buildFollowToClickLinkHandoffBody targets the SALES lane with the fixed click-link adset', () => {
+    const body = buildFollowToClickLinkHandoffBody({
+        pageId: '1008898512617594',
+        systemVideoId: 'sysvid_42',
+        fixedAdsetId: '120248981778190263',
+        fixedCampaignId: '120248151339120263',
+        runHours: 24,
+        shopeeUrl: 'https://s.shopee.co.th/abc',
+        adName: 'sysvid_42',
+    })
+    // Reuses the same source system video and pins the fixed click-link adset.
+    assert.equal(body.page_id, '1008898512617594')
+    assert.equal(body.system_video_id, 'sysvid_42')
+    assert.equal(body.existing_adset_id, '120248981778190263')
+    assert.equal(body.fixed_adset_id, '120248981778190263')
+    assert.equal(body.campaign_id, '120248151339120263')
+    assert.equal(body.mode, 'active')
+    assert.equal(body.run_hours, 24)
+    // No `lane` field → resolveAdOnlyLane resolves the click-link (sales) lane, never follow.
+    assert.equal(body.lane, undefined)
+    assert.equal(resolveAdOnlyLaneForHandoff(body), 'sales')
+})
+
+test('buildFollowToClickLinkHandoffBody defaults run hours and omits optional empties', () => {
+    const body = buildFollowToClickLinkHandoffBody({
+        pageId: 'p1',
+        systemVideoId: 'v1',
+        fixedAdsetId: 'adset1',
+    })
+    assert.equal(body.run_hours, DEFAULT_RUN_HOURS)
+    assert.equal(body.campaign_id, undefined)
+    assert.equal(body.shopee_url, undefined)
+    assert.equal(body.ad_name, undefined)
+    assert.equal(body.existing_adset_id, 'adset1')
+})
+
+test('buildAdHistoryRecord persists the lane from the result payload', () => {
+    const followRec = buildAdHistoryRecord({
+        status: 'created',
+        validation: validateAdOnlyInput({ page_id: 'p1', system_video_id: 'v1' }),
+        result: { lane: 'follow', ad_id: 'a1' },
+    })
+    assert.equal(followRec.lane, 'follow')
+    const salesRec = buildAdHistoryRecord({
+        status: 'created',
+        validation: validateAdOnlyInput({ page_id: 'p1', system_video_id: 'v1' }),
+        result: { ad_id: 'a2' },
+    })
+    assert.equal(salesRec.lane, '')
+})
+
+test('per-page automation setting keys are stable, page-scopable strings', () => {
+    assert.equal(CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY, 'click_link_fixed_adset_id')
+    assert.equal(AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY, 'auto_ads_automation_enabled')
 })

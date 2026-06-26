@@ -291,6 +291,18 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
   const [draftTemplateAdset, setDraftTemplateAdset] = useState('')
   const [draftSub1, setDraftSub1] = useState('')
 
+  // Per-page Follow→Click-link automation (this page only). All fail-closed: automation OFF until the
+  // operator enables this page (enabling is the deliberate spend opt-in — the lane creates ACTIVE Follow
+  // ads that run for the configured window, then hand off to the click-link adset).
+  const [autoEnabled, setAutoEnabled] = useState(false)
+  const [autoCadence, setAutoCadence] = useState('')
+  const [autoMaxPerDay, setAutoMaxPerDay] = useState('')
+  const [autoRunHours, setAutoRunHours] = useState('24')
+  const [followCampaignId, setFollowCampaignId] = useState('')
+  const [followAdsetId, setFollowAdsetId] = useState('')
+  const [clickCampaignId, setClickCampaignId] = useState('')
+  const [clickAdsetId, setClickAdsetId] = useState('')
+
   useEffect(() => {
     const form = pageSettingsQuery.data?.form
     if (!form) return
@@ -302,6 +314,14 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
     setDraftAdAccount(form.adAccount || '')
     setDraftTemplateAdset(form.templateAdset || '')
     setDraftSub1(form.subId || '')
+    setAutoEnabled(form.autoAdsAutomationEnabled === '1' || form.autoAdsAutomationEnabled === 'true')
+    setAutoCadence(form.autoAdsCadenceMinutes || '')
+    setAutoMaxPerDay(form.autoAdsMaxPerDay || '')
+    setAutoRunHours(form.autoAdsRunHours || '24')
+    setFollowCampaignId(form.followFixedCampaignId || '')
+    setFollowAdsetId(form.followFixedAdsetId || '')
+    setClickCampaignId(form.clickLinkFixedCampaignId || '')
+    setClickAdsetId(form.clickLinkFixedAdsetId || '')
   }, [pageSettingsQuery.data])
 
   const saveFlowMutation = useMutation({
@@ -315,6 +335,25 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
       adFlowSourceStrategy: sourceStrategy,
       adFlowCtaStrategy: ctaStrategy,
       adFlowCommentMode: commentMode,
+    }),
+    onSuccess: () => {
+      void pageSettingsQuery.refetch()
+    },
+  })
+
+  // Save ONLY the per-page automation config. Spreads the last-fetched form (so flow fields persist) and
+  // overrides the automation keys. Independent of the flow save above.
+  const saveAutomationMutation = useMutation({
+    mutationFn: () => savePageSettings(selectedId, {
+      ...(pageSettingsQuery.data?.form ?? EMPTY_FORM),
+      autoAdsAutomationEnabled: autoEnabled ? '1' : '0',
+      autoAdsCadenceMinutes: autoCadence.trim(),
+      autoAdsMaxPerDay: autoMaxPerDay.trim(),
+      autoAdsRunHours: autoRunHours.trim() || '24',
+      followFixedCampaignId: followCampaignId.trim(),
+      followFixedAdsetId: followAdsetId.trim(),
+      clickLinkFixedCampaignId: clickCampaignId.trim(),
+      clickLinkFixedAdsetId: clickAdsetId.trim(),
     }),
     onSuccess: () => {
       void pageSettingsQuery.refetch()
@@ -668,6 +707,145 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
             ) : (
               <span className="text-xs text-muted-foreground">
                 ค่า flow ใหม่ถูกเก็บแยกต่อเพจ — เฉียบจะไม่เปลี่ยนจนกว่าจะเปิด/บันทึกที่เพจเฉียบเอง
+              </span>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* Per-page Follow → Click Link automation. Independent per page; fail-closed (off by default). */}
+      <section className="space-y-3">
+        <SectionLabel
+          step={2}
+          title="ยิงแอดอัตโนมัติของเพจนี้ (Follow → Click Link)"
+          hint="ตั้งค่าแยกต่อเพจ · ปิดไว้ก่อนเป็นค่าเริ่มต้น"
+        />
+        <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <h3 className="text-sm font-semibold">ระบบจะสร้างแอด Follow ทุกๆ รอบที่ตั้งไว้</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
+                แต่ละแอด Follow จะรัน ~{(Number(autoRunHours) || 24)} ชม. แล้วระบบจะ <strong>ปิดแอด Follow</strong> นั้น
+                และใช้คอนเทนต์เดิมสร้างแอด <strong>Click Link</strong> ใน Ad set ที่ตั้งไว้ — ค่าทั้งหมดผูกกับเพจนี้เท่านั้น
+              </p>
+            </div>
+            <Button
+              type="button"
+              variant={autoEnabled ? 'default' : 'outline'}
+              onClick={() => setAutoEnabled((v) => !v)}
+              className="shrink-0"
+            >
+              {autoEnabled ? 'เปิดอัตโนมัติ (ใช้เงินจริง)' : 'ปิดอยู่ — ไม่ยิงอัตโนมัติ'}
+            </Button>
+          </div>
+
+          {autoEnabled ? (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                เปิดอยู่ — ระบบจะสร้างแอด <strong>Follow แบบ ACTIVE และเริ่มใช้เงินทันที</strong> ตามรอบเวลาที่ตั้งไว้
+                ต้องตั้ง Ad set ของ Click Link ให้เรียบร้อยก่อน มิฉะนั้นช่วงส่งต่อ (handoff) จะถูกข้าม
+              </span>
+            </div>
+          ) : null}
+
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">รอบการสร้าง (นาที)</span>
+              <select
+                value={autoCadence || '30'}
+                onChange={(e) => setAutoCadence(e.target.value)}
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              >
+                <option value="30">ทุก 30 นาที</option>
+                <option value="60">ทุก 1 ชั่วโมง</option>
+                <option value="120">ทุก 2 ชั่วโมง</option>
+                <option value="180">ทุก 3 ชั่วโมง</option>
+                <option value="360">ทุก 6 ชั่วโมง</option>
+                <option value="720">ทุก 12 ชั่วโมง</option>
+                <option value="1440">ทุก 24 ชั่วโมง</option>
+              </select>
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">จำนวนต่อวัน (0 = ไม่จำกัด)</span>
+              <input
+                type="number"
+                min={0}
+                max={200}
+                value={autoMaxPerDay}
+                onChange={(e) => setAutoMaxPerDay(e.target.value)}
+                placeholder="0"
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">รันต่อแอด (ชั่วโมง) ก่อนส่งต่อ</span>
+              <input
+                type="number"
+                min={1}
+                max={720}
+                value={autoRunHours}
+                onChange={(e) => setAutoRunHours(e.target.value)}
+                placeholder="24"
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Follow · Campaign ID</span>
+              <input
+                value={followCampaignId}
+                onChange={(e) => setFollowCampaignId(e.target.value)}
+                placeholder="120..."
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Follow · Ad set ID</span>
+              <input
+                value={followAdsetId}
+                onChange={(e) => setFollowAdsetId(e.target.value)}
+                placeholder="120..."
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <div className="hidden xl:block" />
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Click Link · Campaign ID</span>
+              <input
+                value={clickCampaignId}
+                onChange={(e) => setClickCampaignId(e.target.value)}
+                placeholder="120248151339120263"
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="block text-xs font-medium text-muted-foreground">Click Link · Ad set ID</span>
+              <input
+                value={clickAdsetId}
+                onChange={(e) => setClickAdsetId(e.target.value)}
+                placeholder="120248981778190263"
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 border-t pt-3">
+            <Button
+              type="button"
+              onClick={() => saveAutomationMutation.mutate()}
+              disabled={saveAutomationMutation.isPending || pageSettingsQuery.isLoading}
+            >
+              {saveAutomationMutation.isPending ? 'กำลังบันทึก…' : 'บันทึกการตั้งค่าอัตโนมัติ'}
+            </Button>
+            {saveAutomationMutation.isSuccess ? (
+              <span className="text-xs font-medium text-emerald-700">บันทึกแล้ว</span>
+            ) : saveAutomationMutation.isError ? (
+              <span className="text-xs font-medium text-amber-700">
+                บันทึกไม่ได้: {saveAutomationMutation.error instanceof Error ? saveAutomationMutation.error.message : 'unknown_error'}
+              </span>
+            ) : (
+              <span className="text-xs text-muted-foreground">
+                Ad account / Template / sub1 ใช้ค่าจากกล่อง “ตั้งค่า Flow ของเพจนี้” ด้านบน — บันทึกแยกกันได้
               </span>
             )}
           </div>
