@@ -477,3 +477,116 @@ test('/login without submit neither captures datr nor reports a submit', async (
   assert.equal(r.body.datrPresent, false);
   assert.ok(![...store.keys()].some(k => k.includes('.datr.')));
 });
+
+// ── Per-account context reuse + locked-profile error handling ──────────────────────────────────
+// A fake browser backend (injected via setBrowserBackend) lets us prove the reuse/launch logic
+// without a real Chromium. Each context exposes browser().isConnected() (the real liveness signal)
+// and an evicting 'close' event, mirroring a Playwright persistent context.
+function makeReuseLauncher() {
+  let launches = 0;
+  const makeContext = () => {
+    let connected = true;
+    const closeListeners = [];
+    const pages = [];
+    return {
+      pages() { return pages; },
+      async newPage() { const p = { goto: async () => {}, url: () => 'https://www.facebook.com/login' }; pages.push(p); return p; },
+      browser() { return { isConnected: () => connected }; },
+      on(ev, fn) { if (ev === 'close') closeListeners.push(fn); },
+      async close() { connected = false; closeListeners.forEach(f => { try { f(); } catch {} }); }
+    };
+  };
+  return {
+    get launches() { return launches; },
+    async launchPersistentContext() { launches += 1; return makeContext(); }
+  };
+}
+
+test('openPage reuse: two consecutive same-account opens reuse ONE context and launcher', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const first = await browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true });
+    const second = await browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true });
+    // The second /login must NOT launch a second persistent profile on the same (locked) dir.
+    assert.equal(launcher.launches, 1);
+    assert.equal(first.context, second.context); // same live context is reused
+    assert.equal(first.reused, false);
+    assert.equal(second.reused, true);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('concurrent same-account opens share a single launch (no double persistentContext)', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const [a, b] = await Promise.all([
+      browser.openPage('100090320823561', 'https://x/', { reuse: true }),
+      browser.openPage('100090320823561', 'https://x/', { reuse: true })
+    ]);
+    assert.equal(launcher.launches, 1);
+    assert.equal(a.context, b.context);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('openPage reuse relaunches after the cached context closes (no stale dead context)', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const first = await browser.openPage('100090320823561', 'https://x/', { reuse: true });
+    await first.context.close(); // window closed → cache must evict
+    const second = await browser.openPage('100090320823561', 'https://x/', { reuse: true });
+    assert.equal(launcher.launches, 2);
+    assert.notEqual(first.context, second.context);
+    assert.equal(second.reused, false);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('launchPersistentContext maps a SingletonLock failure to profile_already_open, not a generic error', async () => {
+  const launcher = { async launchPersistentContext() { throw new Error('Failed to create a ProcessSingleton for your profile directory. SingletonLock is held by another process.'); } };
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    await assert.rejects(
+      () => browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true }),
+      (err) => { assert.equal(err.code, 'profile_already_open'); assert.ok(!/SingletonLock|ProcessSingleton/.test(err.message)); return true; }
+    );
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+// Server-level: a locked profile must surface a sanitized profile_already_open (409), never a
+// generic HTTP 500 "Internal server error" — this is the exact symptom the operator reported.
+function lockMockBrowser() {
+  return {
+    PROFILE_ROOT: '/tmp/profiles',
+    loadBrowserBackend: async () => ({ backend: 'mock-browser' }),
+    openPage: async () => { throw Object.assign(new Error('Profile is already open in another browser process'), { code: 'profile_already_open' }); },
+    readDatrCookie: browser.readDatrCookie
+  };
+}
+
+test('/login returns a sanitized profile_already_open (409), never a generic 500, when the profile is locked', async () => {
+  await listenWith(lockMockBrowser());
+  const r = await req('GET', '/login?account=100090320823561&visible=1&autofill=0&submit=0');
+  assert.notEqual(r.status, 500);
+  assert.equal(r.status, 409);
+  assert.equal(r.body.success, false);
+  assert.equal(r.body.state, 'profile_already_open');
+  assert.equal(r.body.reason, 'profile_already_open');
+  assert.notEqual(r.body.error, 'Internal server error');
+});

@@ -702,7 +702,29 @@ function createHandler(deps = {}) {
             );
           }
         }
-        const opened = await br.openPage(account, 'https://www.facebook.com/login', { visible });
+        // Reuse the live context this process already owns for the account instead of launching a
+        // second persistentContext on the same (locked) profile dir — that double-launch is what
+        // surfaced as a generic 500 ("session disappeared") when a visible window was already open.
+        // The persistent profile/cookies are never reset; we just navigate the existing window.
+        let opened;
+        try {
+          opened = await br.openPage(account, 'https://www.facebook.com/login', { visible, reuse: true });
+        } catch (e) {
+          // Sanitize so the UI sees a useful, non-secret reason — not "Internal server error". A
+          // profile locked by an orphan/external Chrome answers profile_already_open (409 Conflict),
+          // not 500, so the operator knows the session is intact and only the window is busy.
+          const code = String((e && (e.code || e.reason)) || 'browser_open_failed');
+          const isLock = code === 'profile_already_open' || code === 'profile_locked';
+          const reason = sanitizePublicReason(code, 'browser_open_failed');
+          return sendError(res, isLock ? 409 : 502, reason, {
+            account: display,
+            credentialProvider,
+            state: isLock ? 'profile_already_open' : 'browser_unavailable',
+            reason,
+            ...(isLock ? { note: 'Session is preserved; the profile is already open in another window. Close it or reuse the open session.' } : {}),
+            ...selectorStatus
+          });
+        }
         let fill = { autofilled: false, submitted: false };
         if (autofill) {
           try {

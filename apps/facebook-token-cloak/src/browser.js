@@ -18,10 +18,86 @@ const TWO_FACTOR_SUBMIT_SELECTORS=[
   'div[role="button"][aria-label*="Continue" i]'
 ];
 const PROFILE_ROOT=process.env.FACEBOOK_TOKEN_CLOAK_PROFILE_ROOT||path.join(os.homedir(),'.facebook-token-cloak','profiles');
-async function loadBrowserBackend(){ try{const cloak=require('cloakbrowser'); if(cloak&&typeof cloak.launchPersistentContext==='function') return {backend:'cloakbrowser',launcher:cloak};}catch{} try{const {chromium}=require('playwright-core'); return {backend:'playwright-core',launcher:chromium};}catch{} throw Object.assign(new Error('No browser backend found. Install cloakbrowser or playwright-core.'),{code:'browser_backend_missing'}); }
+// Test seam: inject a fake browser backend so the reuse/launch logic can be exercised without a
+// real Chromium. Never used in production (override stays null unless setBrowserBackend is called).
+let _backendOverride=null;
+function setBrowserBackend(launcher,backend='mock'){ _backendOverride=launcher?{backend,launcher}:null; }
+async function loadBrowserBackend(){ if(_backendOverride) return _backendOverride; try{const cloak=require('cloakbrowser'); if(cloak&&typeof cloak.launchPersistentContext==='function') return {backend:'cloakbrowser',launcher:cloak};}catch{} try{const {chromium}=require('playwright-core'); return {backend:'playwright-core',launcher:chromium};}catch{} throw Object.assign(new Error('No browser backend found. Install cloakbrowser or playwright-core.'),{code:'browser_backend_missing'}); }
 function profileDirFor(accountKey){return path.join(PROFILE_ROOT,accountKey)}
-async function launchPersistentContext(rawAccount,options={}){ const {key}=sanitizeAccount(rawAccount); const {backend,launcher}=await loadBrowserBackend(); const profileDir=profileDirFor(key); const context=await launcher.launchPersistentContext(profileDir,{headless:options.visible===false,args:['--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check'],...options.launchOptions}); return {backend,profileDir,context}; }
-async function openPage(rawAccount,url,options={}){ const launched=await launchPersistentContext(rawAccount,options); const page=(launched.context.pages&&launched.context.pages()[0])||await launched.context.newPage(); await page.goto(url,{waitUntil:'domcontentloaded',timeout:options.timeoutMs||60000}); return {...launched,page}; }
+
+// ── Per-account persistent-context reuse ───────────────────────────────────────────────────────
+// A persistent profile dir can only be opened by ONE Chromium at a time — Chromium guards it with a
+// SingletonLock. The visible login flow used to call launchPersistentContext on every /login, so a
+// second open of an account whose window was already up threw the lock error and surfaced as a
+// generic HTTP 500 ("old session disappeared"). We now keep the live context this process owns per
+// account and reuse it instead of launching twice. Scoped to this server process.
+const _accountContexts=new Map();   // key -> { backend, profileDir, context }
+const _accountContextLaunches=new Map(); // key -> in-flight launch promise (dedupe concurrent opens)
+function resetAccountContexts(){ _accountContexts.clear(); _accountContextLaunches.clear(); }
+// Liveness probe. A persistent context exposes browser().isConnected(); when it is unavailable
+// (mock/unknown backend) we optimistically treat the cached context as usable.
+function isContextAlive(context){
+  if(!context) return false;
+  try{
+    if(typeof context.browser==='function'){
+      const b=context.browser();
+      if(b&&typeof b.isConnected==='function') return !!b.isConnected();
+    }
+  }catch{ return false; }
+  return true;
+}
+function forgetAccountContext(key,context){ const cur=_accountContexts.get(key); if(cur&&(!context||cur.context===context)) _accountContexts.delete(key); }
+// Patterns for a launchPersistentContext failure caused by the profile dir already being open in
+// another (often orphaned/external) Chromium holding the SingletonLock. Mapped to a stable, non-
+// secret code so the route can answer profile_already_open instead of a generic 500.
+const PROFILE_LOCK_PATTERNS=/ProcessSingleton|SingletonLock|Singleton|user data directory is already in use|profile (?:is )?(?:in use|locked|already)|already (?:in use|running|open)|cannot create|being used by another|lock(?:ed|file)?/i;
+function classifyLaunchError(error,profileDir){
+  const msg=String((error&&(error.message||error.code))||'');
+  if(PROFILE_LOCK_PATTERNS.test(msg)){
+    return Object.assign(new Error('Profile is already open in another browser process'),{code:'profile_already_open',profileDir});
+  }
+  return error;
+}
+async function launchPersistentContext(rawAccount,options={}){
+  const {key}=sanitizeAccount(rawAccount);
+  const {backend,launcher}=await loadBrowserBackend();
+  const profileDir=profileDirFor(key);
+  let context;
+  try{
+    context=await launcher.launchPersistentContext(profileDir,{headless:options.visible===false,args:['--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check'],...options.launchOptions});
+  }catch(e){ throw classifyLaunchError(e,profileDir); }
+  return {backend,profileDir,context};
+}
+// Reuse the live context this process already holds for the account (preserving its cookies/session
+// and avoiding a second SingletonLock-locked launch); only launch when there is none or it closed.
+// Concurrent opens for the same account share one launch. The 'close' event evicts the entry so a
+// later call relaunches a fresh window instead of handing back a dead context.
+async function acquireAccountContext(rawAccount,options={}){
+  const {key}=sanitizeAccount(rawAccount);
+  const existing=_accountContexts.get(key);
+  if(existing&&isContextAlive(existing.context)) return {...existing,reused:true};
+  if(existing) _accountContexts.delete(key);
+  if(_accountContextLaunches.has(key)){ const entry=await _accountContextLaunches.get(key); return {...entry,reused:true}; }
+  const launchPromise=(async()=>{
+    const launched=await launchPersistentContext(rawAccount,options);
+    try{ if(launched.context&&typeof launched.context.on==='function') launched.context.on('close',()=>forgetAccountContext(key,launched.context)); }catch{}
+    const entry={backend:launched.backend,profileDir:launched.profileDir,context:launched.context};
+    _accountContexts.set(key,entry);
+    return entry;
+  })();
+  _accountContextLaunches.set(key,launchPromise);
+  try{ const entry=await launchPromise; return {...entry,reused:false}; }
+  finally{ _accountContextLaunches.delete(key); }
+}
+// openPage with opt-in reuse. reuse:true (interactive /login) navigates the existing window for the
+// account; default (posting's ephemeral open→closeSession lifecycle) launches a fresh context as
+// before, so those flows are unchanged.
+async function openPage(rawAccount,url,options={}){
+  const launched=options.reuse?await acquireAccountContext(rawAccount,options):await launchPersistentContext(rawAccount,options);
+  const page=(launched.context.pages&&launched.context.pages()[0])||await launched.context.newPage();
+  await page.goto(url,{waitUntil:'domcontentloaded',timeout:options.timeoutMs||60000});
+  return {...launched,page};
+}
 // Locator-based presence check; best-effort, never throws.
 async function firstPresentSelector(page,selectors){
   if(typeof page.locator!=='function') return null;
@@ -272,4 +348,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,profileDirFor,launchPersistentContext,openPage,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,openPage,isContextAlive,classifyLaunchError,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
