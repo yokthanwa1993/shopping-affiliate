@@ -1021,6 +1021,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   const userToken = params.userToken;
   const adAccount = String(params.adAccount || '').trim();
   const templateAdset = String(params.templateAdset || '').trim();
+  const existingAdsetId = String(params.existingAdsetId || '').trim();
   const creativeId = params.creativeId;
   const storyId = params.storyId;
   const body = params.body || {};
@@ -1032,6 +1033,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     || body.force_adset_name_tail === true || body.force_adset_name_tail === 'true'
     || body.force_ad_name_tail === true || body.force_ad_name_tail === 'true';
   const adName = (adOnlyTailSignal && postTail) ? postTail : params.adName;
+  const fixedExistingAdsetMode = !!existingAdsetId;
   const pollMs = Number.isInteger(params.pollMs) ? params.pollMs : 3000;
   const extraErrorFields = params.extraErrorFields || {};
   const now = Number.isFinite(params.now) ? params.now : Date.now();
@@ -1104,6 +1106,8 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     campaign_name: resolvedCampaignName || undefined,
     daily_campaign_name: dailyCampaignName || undefined,
     used_daily_campaign: usedDailyCampaign || undefined,
+    existing_adset_id: existingAdsetId || undefined,
+    fixed_adset_mode: fixedExistingAdsetMode || undefined,
     created_new_campaign: createdCampaignId ? true : undefined
   });
 
@@ -1125,7 +1129,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   // into the error — cleaned_campaign_id on success, or orphan_campaign_id + campaign_cleanup_error
   // when the campaign delete fails. A reused existing campaign is left untouched.
   const failCleanup = async (adsetId) => {
-    if (adsetId) await deleteEntityQuiet(adsetId);
+    if (adsetId && !fixedExistingAdsetMode) await deleteEntityQuiet(adsetId);
     if (!createdCampaignId) return {};
     const cErr = await deleteEntityQuiet(createdCampaignId);
     if (cErr) return { orphan_campaign_id: createdCampaignId, campaign_cleanup_error: cErr };
@@ -1214,12 +1218,15 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     }
   }
 
-  // 6. Copy the template adset shell into the campaign.
+  // 6. Copy the template adset shell into the campaign, unless the operator configured fixed-adset
+  // mode. In fixed-adset mode we create ONLY a new ad under the existing adset; no campaign/adset is
+  // created, cloned, renamed, activated, scheduled, or deleted. This is the Follow scheduler mode used
+  // for the persistent Ads Manager FOLLOW adset.
   const copyTemplateAdset = (campaignId) => gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${templateAdset}/copies?access_token=${encodeURIComponent(userToken)}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ deep_copy: false, status_option: 'PAUSED', campaign_id: campaignId })
   });
-  let copy = await copyTemplateAdset(targetCampaignId);
+  let copy = fixedExistingAdsetMode ? { data: { copied_adset_id: existingAdsetId } } : await copyTemplateAdset(targetCampaignId);
   // Diagnostics describing a bad-reused-campaign recovery (empty), merged into the success and any
   // subsequent error so Hermes can see what happened. Empty when no recovery was attempted.
   let recoveryDiag = {};
@@ -1278,7 +1285,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   // outcome is recorded under copied_template_settings.adset for live verification (req: do not
   // fail closed unless the setting is explicitly required).
   let adsetLifecycle = { applied: false };
-  if (Object.keys(templateSettings.adsetSettings).length > 0) {
+  if (!fixedExistingAdsetMode && Object.keys(templateSettings.adsetSettings).length > 0) {
     const life = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAdset}?access_token=${encodeURIComponent(userToken)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(templateSettings.adsetSettings)
     });
@@ -1307,6 +1314,33 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     return { ok: false, step: 'ad', error: adData.error.message, fb_error_code: adData.error.code, fb_error_subcode: adData.error.error_subcode, fb_error_user_title: adData.error.error_user_title, fb_error_user_msg: adData.error.error_user_msg, fb_is_transient: adData.error.is_transient, fb_trace_id: adData.error.fbtrace_id, adset_id: newAdset, creative_id: creativeId, ...diag(), ...cleanup, ...extraErrorFields };
   }
   const newAd = adData.id;
+
+  if (fixedExistingAdsetMode) {
+    if (!paused) {
+      const adAct = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${newAd}?access_token=${encodeURIComponent(userToken)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'ACTIVE' })
+      });
+      if (adAct.data && adAct.data.error) {
+        return { ok: false, step: 'ad_activate', error: adAct.data.error.message, fb_error_code: adAct.data.error.code, fb_error_subcode: adAct.data.error.error_subcode, fb_trace_id: adAct.data.error.fbtrace_id, adset_id: newAdset, ad_id: newAd, ...diag(), ...extraErrorFields };
+      }
+    }
+    return {
+      ok: true,
+      fixed_adset_mode: true,
+      campaign_id: targetCampaignId || String(body.campaign_id || ''),
+      campaign_name: resolvedCampaignName || undefined,
+      adset_id: newAdset,
+      ad_id: newAd,
+      ad_name: adName,
+      adset_status: paused ? 'UNCHANGED' : 'ACTIVE',
+      ad_status: paused ? 'PAUSED' : 'ACTIVE',
+      ...(templateSettings.campaignId ? { template_campaign_id: templateSettings.campaignId } : {}),
+      copied_template_settings: {
+        campaign: { applied: false, fields: { ...campaignMirror }, reuse: 'fixed_existing_adset' },
+        adset: { applied: false, reuse: 'fixed_existing_adset', diagnostics: { ...templateSettings.adsetDiagnostics } }
+      }
+    };
+  }
 
   // 8. Schedule (daily-campaign path) → rename + activate → readback-confirm ACTIVE. The daily
   // campaign carries the CAMPAIGN-level (CBO) budget, so NO per-adset daily_budget is set here.
@@ -1552,6 +1586,7 @@ async function createAd(fetchImpl, params = {}) {
   const caption = body.caption || '';
   const adAccount = String(body.ad_account || params.defaultAdAccount || '').trim();
   const templateAdset = String(body.template_adset || params.defaultTemplateAdset || '').trim();
+  const existingAdsetId = String(body.existing_adset_id || body.fixed_adset_id || body.target_adset_id || '').trim();
   const shortlink = String(body.shortlink || '').trim();
   const shopeeUrl = String(body.shopee_url || '').trim();
   const thumbnailUrl = String(body.thumbnail_url || body.image_url || '').trim();
@@ -1802,7 +1837,7 @@ async function createAd(fetchImpl, params = {}) {
 
   // 5–8. Resolve/create campaign, copy adset, create + activate the ad.
   const adEntities = await buildAdFromCreative(fetchImpl, {
-    userToken, adAccount, templateAdset, creativeId: crData.id, storyId, adName, body, sleep, pollMs, paused,
+    userToken, adAccount, templateAdset, existingAdsetId, creativeId: crData.id, storyId, adName, body, sleep, pollMs, paused,
     extraErrorFields: { uploaded_for_instagram: uploadedForInstagram }
   });
   if (!adEntities.ok) return adEntities;
@@ -1943,6 +1978,7 @@ async function promoteOneCardPost(fetchImpl, params = {}) {
   const caption = body.caption || '';
   const adAccount = String(body.ad_account || params.defaultAdAccount || '').trim();
   const templateAdset = String(body.template_adset || params.defaultTemplateAdset || '').trim();
+  const existingAdsetId = String(body.existing_adset_id || body.fixed_adset_id || body.target_adset_id || '').trim();
   const finalCtaLink = String(body.final_cta_link || body.shortlink || '').trim();
   const thumbnailUrl = String(body.thumbnail_url || body.image_url || '').trim();
   // The source page post — used for ad naming/reference + adset grouping. Distinct from the

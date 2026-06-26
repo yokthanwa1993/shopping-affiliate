@@ -1318,3 +1318,45 @@ test('Manual Follow run-next stays immediate (no jitter gate)', () => {
     assert.doesNotMatch(route, /decideJitteredScheduleRun/)
     assert.doesNotMatch(route, /computeJitteredNextRunAtMs/)
 })
+
+
+test('buildFollowAutoPickBody fixed-adset mode targets existing campaign/adset and omits daily campaign', () => {
+    const candidate = {
+        pageId: '1008898512617594',
+        videoId: 'fb-video-1',
+        postId: 'post-1',
+        systemVideoId: 'sys-1',
+        shopeeLink: 'https://s.shopee.co.th/example',
+        adName: 'follow source',
+        views: 200000,
+        createdAtMs: 1,
+    }
+    const body = buildFollowAutoPickBody({
+        candidate,
+        mode: 'active',
+        dailyCampaignName: '27/Jun/2026',
+        templateAdset: '120248767074180263',
+        campaignSub1: '16JUN26FBSPCAD',
+        fixedCampaignId: '120248151339120263',
+        fixedAdsetId: '120248982540070263',
+    })
+    assert.equal(body.lane, 'follow')
+    assert.equal(body.mode, 'active')
+    assert.equal(body.campaign_id, '120248151339120263')
+    assert.equal(body.existing_adset_id, '120248982540070263')
+    assert.equal(body.fixed_adset_id, '120248982540070263')
+    assert.equal(body.daily_campaign_name, undefined)
+})
+
+test('resolveAdOnlySchedule allows active mode without daily campaign when fixed adset is configured', () => {
+    const sched = resolveAdOnlySchedule({
+        page_id: '1008898512617594',
+        mode: 'active',
+        fixed_adset_id: '120248982540070263',
+        campaign_id: '120248151339120263',
+    })
+    assert.equal(sched.ok, true)
+    assert.equal(sched.mode, 'active')
+    assert.equal(sched.fixedAdsetId, '120248982540070263')
+    assert.equal(sched.dailyCampaignName, '')
+})

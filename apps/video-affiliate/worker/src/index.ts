@@ -190,6 +190,8 @@ import {
     FOLLOW_LANE_CTA_TYPE,
     FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY,
     FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY,
+    FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY,
+    FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY,
     resolveAdOnlyCandidateVideoSource,
     resolveAdOnlyBridgeAccountId,
     AD_ONLY_BRIDGE_ACCOUNT_SETTING_KEY,
@@ -12873,6 +12875,8 @@ const AD_HISTORY_RESULT_SAFE_FIELDS = [
     'follow_campaign_sub1',
     'follow_shortlink_sub2',
     'follow_template_adset',
+    'fixed_adset_mode',
+    'existing_adset_id',
     // Follow lane Page-comment proof (the final three-sub comment-tracking link posted on the ad story).
     'follow_comment_status',
     'follow_comment_id',
@@ -13116,16 +13120,24 @@ async function runFollowLaneCreateAdOnly(
     const creativeMessage = buildFollowLaneCreativeMessage({ caption: captionText, shortlink: followLink })
     const adName = String((body.ad_name as string) || validation.systemVideoId || '').trim()
 
+    const fixedTargetAdsetId = String(body.existing_adset_id || body.fixed_adset_id || body.target_adset_id || '').trim()
     const lifecycleFields = schedule.mode === 'active'
-        ? {
-            daily_campaign_name: schedule.dailyCampaignName,
-            campaign_daily_budget: schedule.dailyBudgetMinor,
-            adset_run_hours: schedule.runHours,
-        }
+        ? (fixedTargetAdsetId
+            ? {
+                // Fixed-adset mode reuses the operator-selected FOLLOW adset/campaign as-is.
+                // Do NOT forward daily_campaign_name/budget here, or the bridge will correctly
+                // place the ad in the fixed adset but return misleading daily-campaign diagnostics.
+                adset_run_hours: schedule.runHours,
+            }
+            : {
+                daily_campaign_name: schedule.dailyCampaignName,
+                campaign_daily_budget: schedule.dailyBudgetMinor,
+                adset_run_hours: schedule.runHours,
+            })
         : {
             paused: true as const,
             status_option: 'PAUSED' as const,
-            ...(schedule.dailyCampaignName ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
+            ...(schedule.dailyCampaignName && !fixedTargetAdsetId ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
         }
 
     let bridgeResult: Record<string, unknown>
@@ -13146,6 +13158,10 @@ async function runFollowLaneCreateAdOnly(
                 ...(thumbnailUrl ? { thumbnail_url: thumbnailUrl } : {}),
                 template_adset: templateAdset,
                 ad_account: adAccount,
+                ...(fixedTargetAdsetId ? {
+                    existing_adset_id: fixedTargetAdsetId,
+                    fixed_adset_id: fixedTargetAdsetId,
+                } : {}),
                 // Hint the Follow CTA; the bridge keeps LIKE_PAGE when the template creative is LIKE_PAGE.
                 call_to_action_type: FOLLOW_LANE_CTA_TYPE,
                 // HARD SEPARATION: dark/ad story only — never publish a visible Page post here.
@@ -14312,6 +14328,9 @@ app.get('/api/dashboard/follow-ad/status', async (c) => {
     const mode = await getFollowAdMode(c.env.DB)
     const lastRun = await getDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_LAST_RUN_KEY).catch(() => null)
     const storedNext = await getDashboardSetting(c.env.DB, FOLLOW_AD_SCHED_NEXT_RUN_KEY).catch(() => null)
+    const statusPageId = String(c.req.query('page_id') || AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID).trim()
+    const fixedCampaignRow = await getPageSetting(c.env.DB, statusPageId, FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null)
+    const fixedAdsetRow = await getPageSetting(c.env.DB, statusPageId, FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null)
     // Prefer the stored jittered next-due (the real, scattered slot cron will claim). Fall back to the
     // plain interval estimate only when no jittered slot is persisted yet. GET never mutates — it does
     // not roll/store a new jitter, so polling the status can't shift the cadence.
@@ -14330,9 +14349,25 @@ app.get('/api/dashboard/follow-ad/status', async (c) => {
         template_adset: FOLLOW_LANE_TEMPLATE_ADSET,
         campaign_sub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
         cta_type: FOLLOW_LANE_CTA_TYPE,
+        fixed_page_id: statusPageId,
+        fixed_campaign_id: String(fixedCampaignRow?.value || '').trim(),
+        fixed_adset_id: String(fixedAdsetRow?.value || '').trim(),
+        fixed_adset_mode: !!String(fixedAdsetRow?.value || '').trim(),
         last_run_at: lastRun?.value || '',
         next_run_at: nextRunMs ? new Date(nextRunMs).toISOString() : '',
     }, 200, { 'Cache-Control': 'no-store' })
+})
+
+
+app.put('/api/dashboard/follow-ad/fixed-target', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { page_id?: string; campaign_id?: string; adset_id?: string; fixed_campaign_id?: string; fixed_adset_id?: string }
+    const pageId = String(body.page_id || AD_ONLY_BRIDGE_ACCOUNT_DEFAULT_PAGE_ID).trim()
+    const campaignId = String(body.fixed_campaign_id || body.campaign_id || '').trim()
+    const adsetId = String(body.fixed_adset_id || body.adset_id || '').trim()
+    if (!pageId) return c.json({ ok: false, error: 'page_id_required' }, 400)
+    await setPageSetting(c.env.DB, pageId, FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY, campaignId)
+    await setPageSetting(c.env.DB, pageId, FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY, adsetId)
+    return c.json({ ok: true, page_id: pageId, fixed_campaign_id: campaignId, fixed_adset_id: adsetId, fixed_adset_mode: !!adsetId }, 200, { 'Cache-Control': 'no-store' })
 })
 
 app.get('/api/dashboard/follow-ad/enabled', async (c) => {
@@ -14390,12 +14425,18 @@ async function processOneFollowAd(env: Env): Promise<{ ok: boolean; reason?: str
     let lastResult: unknown
     for (let i = 0; i < maxAttempts; i++) {
         const candidate = candidates[i]
+        const fixedCampaignRow = await getPageSetting(env.DB, candidate.pageId, FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null)
+        const fixedAdsetRow = await getPageSetting(env.DB, candidate.pageId, FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null)
+        const fixedCampaignId = String(fixedCampaignRow?.value || '').trim()
+        const fixedAdsetId = String(fixedAdsetRow?.value || '').trim()
         const reqBody = buildFollowAutoPickBody({
             candidate,
             mode,
-            dailyCampaignName,
+            dailyCampaignName: fixedAdsetId ? '' : dailyCampaignName,
             templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
             campaignSub1: FOLLOW_LANE_SHORTLINK_SUB1_DEFAULT,
+            fixedCampaignId,
+            fixedAdsetId,
         })
         try {
             const resp = await fetch(`${workerUrl}/api/dashboard/create-ad-only`, {

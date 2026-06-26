@@ -35,6 +35,11 @@ export interface AdOnlyInputBody {
     template_adset?: string
     placement_template?: string
     campaign_id?: string
+    /** Existing adset target for fixed-adset Follow mode; creates ads under this adset without cloning/new campaigns. */
+    existing_adset_id?: string
+    fixed_adset_id?: string
+    target_adset_id?: string
+    adset_id?: string
     new_campaign_name?: string
     daily_campaign_name?: string
     comment_shortlink?: string
@@ -130,8 +135,10 @@ export interface AdOnlySchedule {
     mode: AdOnlyMode
     /** True for the non-spending review path. */
     paused: boolean
-    /** Date-named campaign for the daily-campaign reuse path (required when mode is 'active'). */
+    /** Date-named campaign for the daily-campaign reuse path (required when mode is 'active' unless fixedAdsetId is set). */
     dailyCampaignName: string
+    /** Existing adset target for fixed-adset mode; skips daily campaign creation/cloning. */
+    fixedAdsetId: string
     /** Budget in whole THB (clamped, defaulted). */
     dailyBudgetThb: number
     /** Budget in Meta minor units (THB*100) — the CAMPAIGN-level (CBO) daily budget the bridge
@@ -161,6 +168,7 @@ export function resolveAdOnlySchedule(body: AdOnlyInputBody | null | undefined):
     const mode: AdOnlyMode = rawMode === 'active' || rawMode === 'scheduled' || rawMode === 'live' ? 'active' : 'paused'
     const paused = mode !== 'active'
     const dailyCampaignName = str(b.daily_campaign_name)
+    const fixedAdsetId = str(b.fixed_adset_id || b.existing_adset_id || b.target_adset_id || b.adset_id)
 
     // Budget: prefer whole-THB; else treat the minor-units alias as already in minor units.
     let dailyBudgetThb = toNum(b.daily_budget_thb)
@@ -176,13 +184,13 @@ export function resolveAdOnlySchedule(body: AdOnlyInputBody | null | undefined):
     if (!Number.isFinite(runHours) || runHours <= 0) runHours = DEFAULT_RUN_HOURS
     runHours = clamp(Math.round(runHours), MIN_RUN_HOURS, MAX_RUN_HOURS)
 
-    const base = { mode, paused, dailyCampaignName, dailyBudgetThb, dailyBudgetMinor, runHours }
+    const base = { mode, paused, dailyCampaignName, fixedAdsetId, dailyBudgetThb, dailyBudgetMinor, runHours }
 
-    if (mode === 'active' && !dailyCampaignName) {
+    if (mode === 'active' && !dailyCampaignName && !fixedAdsetId) {
         return {
             ok: false,
             error: 'ad_only_campaign_name_required',
-            detail: 'active/scheduled ad-only requires a daily_campaign_name (the date-named campaign that carries the per-adset budget + run-hours schedule)',
+            detail: 'active/scheduled ad-only requires daily_campaign_name unless fixed/existing adset is configured',
             ...base,
         }
     }
@@ -1098,6 +1106,12 @@ export const FOLLOW_LANE_TEMPLATE_ADSET_SETTING_KEY = 'template_adset_follow'
 // Per-page setting key holding a page-specific Follow campaign sub1 override.
 export const FOLLOW_LANE_CAMPAIGN_SUB1_SETTING_KEY = 'follow_campaign_sub1'
 
+// Per-page fixed Follow target. When both are configured, the scheduler creates new ads inside
+// this existing campaign/adset and MUST NOT create/reuse Bangkok date-named campaigns.
+export const FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY = 'follow_fixed_campaign_id'
+export const FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY = 'follow_fixed_adset_id'
+
+
 // =====================================================================
 // BRIDGE SESSION ACCOUNT — the CloakBrowser FB bridge /create-ad route requires a logged-in session.
 // When the worker omits an explicit `account`, the bridge can fail closed with `no_session` in
@@ -1323,6 +1337,8 @@ export function buildFollowAutoPickBody(input: {
     runHours?: number
     templateAdset?: string
     campaignSub1?: string
+    fixedCampaignId?: string
+    fixedAdsetId?: string
 }): Record<string, unknown> {
     const c = input.candidate
     const mode: AdOnlyMode = input.mode === 'active' ? 'active' : 'paused'
@@ -1345,10 +1361,17 @@ export function buildFollowAutoPickBody(input: {
     if (templateAdset) body.template_adset = templateAdset
     const campaignSub1 = str(input.campaignSub1)
     if (campaignSub1) body.follow_campaign_sub1 = campaignSub1
+    const fixedCampaignId = str(input.fixedCampaignId)
+    const fixedAdsetId = str(input.fixedAdsetId)
+    if (fixedCampaignId) body.campaign_id = fixedCampaignId
+    if (fixedAdsetId) {
+        body.existing_adset_id = fixedAdsetId
+        body.fixed_adset_id = fixedAdsetId
+    }
     // Always pass the Bangkok date-named campaign for the Follow lane, even when PAUSED, so proof ads
     // are discoverable under e.g. 25/Jun/2026 instead of falling back to ADS_PUBLISH_*.
     const dailyCampaignName = str(input.dailyCampaignName)
-    if (dailyCampaignName) body.daily_campaign_name = dailyCampaignName
+    if (dailyCampaignName && !fixedAdsetId) body.daily_campaign_name = dailyCampaignName
     if (mode === 'active') {
         const budget = Number.isFinite(Number(input.dailyBudgetThb)) && Number(input.dailyBudgetThb) > 0
             ? Math.round(Number(input.dailyBudgetThb))
