@@ -37,6 +37,20 @@ test('UI marks Facebook Lite ready only after the endpoint validates (ok=true AN
   assert.ok(!ui.includes('tokenPresent: ready'), 'UI must not gate Facebook Lite token status on combined readiness');
 })
 
+test('UI is status-only: recovery is AUTOMATIC — there is NO manual Sync-to-Worker button/handler/namespace field as the recovery path', async () => {
+  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
+  // The manual recovery affordance must NOT exist: no button label, no button id, no handler, no
+  // operator-typed namespace field, and the UI must never POST to /token/auto-sync itself. Recovery
+  // is machine-to-machine (the Worker calls the bridge), so the UI cannot be the required control path.
+  assert.ok(!/Sync to Worker/.test(ui), 'the manual "Sync to Worker" button label must be gone');
+  assert.ok(!/id="sync-button"/.test(ui), 'the sync-button element must be gone');
+  assert.ok(!/runAutoSync/.test(ui), 'the manual sync handler must be gone');
+  assert.ok(!/id="namespace-input"/.test(ui), 'the operator-typed namespace field must be gone');
+  assert.ok(!/["']\/token\/auto-sync["']/.test(ui), 'the UI must never call /token/auto-sync (recovery is not UI-driven)');
+  // It still positively states that recovery happens automatically (status-only affordance).
+  assert.ok(/automatic/i.test(ui), 'the UI should state that recovery is automatic');
+})
+
 function browser(url = 'https://postcron.com/auth/login/facebook/callback#access_token=EAAB_USER_SECRET', seen) {
   return {
     PROFILE_ROOT: '/tmp/profiles',
@@ -531,7 +545,7 @@ test('/login explicit domain and username override still wins for apple-password
 // /api/pages/profile-sync route. It is local-only, dry-run by default, and token-free in every
 // response it returns.
 
-const EXPORT_SECRET_ENV = ['BRIDGE_TOKEN_SYNC_SECRET', 'TAG_SYNC_PUSH_SECRET', 'BROWSERSAVING_TAG_SYNC_SECRET'];
+const EXPORT_SECRET_ENV = ['BRIDGE_TOKEN_SYNC_SECRET', 'TAG_SYNC_PUSH_SECRET', 'BROWSERSAVING_TAG_SYNC_SECRET', 'FACEBOOK_TOKEN_CLOAK_AUTOSYNC_TTL_MS'];
 
 function withExportEnv(values, fn) {
   const saved = {};
@@ -577,13 +591,13 @@ async function withExportServer(deps, fn) {
 
 // Invoke the raw handler with a synthetic non-local socket to exercise the local-only guard
 // (real http requests in this suite always arrive from 127.0.0.1).
-function callHandler(deps, { method, path, body, remoteAddress }) {
+function callHandler(deps, { method, path, body, remoteAddress, headers }) {
   const handler = createHandler({ accountSelectors: selectorStore(selectorConfigPath), ...deps });
   const payload = body ? JSON.stringify(body) : '';
   const req = Readable.from([payload]);
   req.method = method;
   req.url = path;
-  req.headers = { host: '127.0.0.1' };
+  req.headers = Object.assign({ host: '127.0.0.1' }, headers || {});
   req.socket = { remoteAddress };
   let resolveDone;
   const done = new Promise(resolve => { resolveDone = resolve; });
@@ -1857,4 +1871,86 @@ test('/token/auto-sync uses the env-default namespace when the body omits it', a
     if (savedSyncNs === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE;
     else process.env.FACEBOOK_TOKEN_CLOAK_SYNC_NAMESPACE = savedSyncNs;
   }
+});
+
+test('/token/auto-sync live write is allowed for a NON-local caller presenting the shared bridge sync secret (machine-to-machine recovery, no UI/button)', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  const captured = [];
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, async () => {
+    const { value: r } = await captureConsole(() => callHandler({
+      keychain: mockKeychain(),
+      fbLiteTokenService: mockFbLite(),
+      fetch: async (url, opts) => {
+        const u = String(url);
+        if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '3001', name: 'PageOne', access_token: 'PT_3001' }] }) };
+        if (u.includes('/api/pages/profile-sync')) { captured.push({ headers: opts.headers, body: JSON.parse(opts.body) }); return { ok: true, status: 200, json: async () => ({ success: true, updated: true }) }; }
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+    }, {
+      method: 'POST',
+      path: '/token/auto-sync',
+      body: { account: '100090320823561', namespaceId: PROD_NS, dryRun: false },
+      // A REMOTE Worker over the cloudflared tunnel — NOT localhost — proves recovery is driven
+      // machine-to-machine by the shared secret, never by a local UI click.
+      remoteAddress: '203.0.113.7',
+      headers: { 'x-bridge-sync-secret': SECRET }
+    }));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.synced, true, 'a secret-authed remote caller performs a live recovery');
+    assert.equal(r.body.namespace_id, PROD_NS);
+    assert.equal(captured.length, 1, 'the fresh page token was pushed to the Worker');
+    assert.equal(captured[0].body.import_mode, 'facebook_lite_bridge_import');
+    assert.equal('access_token' in r.body, false);
+    for (const row of r.body.results || []) assert.equal('token' in row, false);
+    assertNoLeak(r.body, ['EAAD6Vuser0000000000000000000', 'PT_3001', SECRET]);
+  });
+});
+
+test('/token/auto-sync live write rejects a NON-local caller with a WRONG secret (403), mints nothing', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let touched = false;
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET }, async () => {
+    const r = await callHandler({
+      keychain: mockKeychain(),
+      fbLiteTokenService: { extractTokenPrefix: realExtractTokenPrefix, facebookLogin: async () => { touched = true; return { success: true, converted_token: { access_token: 'EAAD6Vx' } }; } },
+      fetch: async () => ({ ok: true, status: 200, json: async () => ({}) })
+    }, {
+      method: 'POST',
+      path: '/token/auto-sync',
+      body: { account: '100090320823561', namespaceId: PROD_NS, dryRun: false },
+      remoteAddress: '203.0.113.7',
+      headers: { 'x-bridge-sync-secret': 'wrong-secret' }
+    });
+    assert.equal(r.status, 403);
+    assert.equal(r.body.success, false);
+    assert.equal(touched, false, 'a wrong-secret remote live request must never mint a token');
+  });
+});
+
+test('/token/auto-sync LIVE backoff: a second live recovery for the same namespace within the TTL window is throttled (no re-mint / re-push, anti-rate-limit)', async () => {
+  const SECRET = 'unit-test-bridge-secret';
+  let mintCount = 0;
+  let pushCount = 0;
+  // A large TTL guarantees the second call lands inside the backoff window.
+  await withExportEnv({ BRIDGE_TOKEN_SYNC_SECRET: SECRET, FACEBOOK_TOKEN_CLOAK_AUTOSYNC_TTL_MS: '600000' }, () => withExportServer({
+    keychain: mockKeychain(),
+    fbLiteTokenService: { extractTokenPrefix: realExtractTokenPrefix, facebookLogin: async () => { mintCount += 1; return { success: true, converted_token: { access_token: 'EAAD6Vuser0000000000000000000' } }; } },
+    browser: exportBrowser({}),
+    fetch: async (url) => {
+      const u = String(url);
+      if (u.includes('/me/accounts')) return { ok: true, status: 200, json: async () => ({ data: [{ id: '3001', name: 'PageOne', access_token: 'PT_3001' }] }) };
+      if (u.includes('/api/pages/profile-sync')) { pushCount += 1; return { ok: true, status: 200, json: async () => ({ success: true, updated: true }) }; }
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+  }, async (request) => {
+    const first = await request('POST', '/token/auto-sync', { account: '100090320823561', namespaceId: PROD_NS, dryRun: false });
+    assert.equal(first.body.synced, true);
+    assert.equal(pushCount, 1, 'first live recovery pushes the fresh token');
+    const mintsAfterFirst = mintCount;
+    const second = await request('POST', '/token/auto-sync', { account: '100090320823561', namespaceId: PROD_NS, dryRun: false });
+    assert.equal(second.body.status, 'throttled', 'a repeat within the TTL window is throttled');
+    assert.equal(second.body.skipped, true);
+    assert.equal(pushCount, 1, 'the throttled call must not push again');
+    assert.equal(mintCount, mintsAfterFirst, 'the throttled call must not re-mint (no extra Facebook login)');
+  }));
 });

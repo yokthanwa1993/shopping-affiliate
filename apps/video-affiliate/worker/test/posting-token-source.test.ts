@@ -18,6 +18,10 @@ import {
     redactFacebookLiteRefreshResult,
     buildBridgeTokenPagesUrl,
     extractBridgeTokenPageAccessToken,
+    buildBridgeAutoSyncUrl,
+    buildBridgeAutoSyncRequestBody,
+    parseBridgeAutoSyncResponse,
+    isBridgeAutoSyncAllowed,
     isFacebookLitePageToken,
     isFacebookLitePostingPermissionError,
     isPersistablePagePrimaryToken,
@@ -466,4 +470,52 @@ test('a (#10) permission error reaches the bridge fallback while an auth error s
     // qualify for the bridge organic /post fallback. The wrapper enters the fallback on either.
     assert.equal(shouldAttemptFacebookLitePostingRefresh({ source: 'stored_token', error: 'upload_video:(#10) Permission Denied' }), false)
     assert.equal(isFacebookLitePostingPermissionError('upload_video:(#10) Permission Denied'), true)
+})
+
+// ---- Bridge /token/auto-sync (Worker → bridge TRUE-RECOVERY trigger) -------
+// Recovery is fully AUTOMATIC and machine-to-machine: when a stored/Facebook Lite token is
+// invalidated, the Worker POSTs the bridge's /token/auto-sync itself (no operator button). These
+// pure helpers shape the URL/body, parse the token-free response, and back off to avoid spamming
+// Facebook's login rate limiter.
+
+test('buildBridgeAutoSyncUrl appends /token/auto-sync, returns "" when the bridge is unconfigured (fail closed)', () => {
+    assert.equal(buildBridgeAutoSyncUrl('https://short.wwoom.com'), 'https://short.wwoom.com/token/auto-sync')
+    assert.equal(buildBridgeAutoSyncUrl('https://short.wwoom.com/'), 'https://short.wwoom.com/token/auto-sync')
+    assert.equal(buildBridgeAutoSyncUrl(''), '')
+    assert.equal(buildBridgeAutoSyncUrl('   '), '')
+})
+
+test('buildBridgeAutoSyncRequestBody is always dryRun:false (internal trusted recovery), scopes by namespace, targets account/candidates', () => {
+    // Bare namespace → all-account scan, live (never a preview that would resolve no token).
+    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [] }), { namespaceId: '177', dryRun: false })
+    // A specific account is preferred over a candidate list.
+    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', account: '100090', candidateLoginIds: ['x'] }), { namespaceId: '177', dryRun: false, account: '100090' })
+    // Candidate login ids (deduped, trimmed) only when no explicit account.
+    assert.deepEqual(buildBridgeAutoSyncRequestBody({ namespaceId: '177', candidateLoginIds: [' a ', 'a', 'b'] }), { namespaceId: '177', dryRun: false, accounts: ['a', 'b'] })
+})
+
+test('parseBridgeAutoSyncResponse reports synced from counts.synced or the synced flag, token-free, http failure never synced', () => {
+    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, synced: true, counts: { synced: 2 } }).synced, true)
+    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, counts: { synced: 1 } }).synced, true)
+    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, status: 'synced_with_errors', counts: { synced: 0 } }).synced, false)
+    // A throttled/dry response is NOT synced.
+    assert.equal(parseBridgeAutoSyncResponse(true, { ok: true, synced: false, status: 'throttled' }).synced, false)
+    // A non-2xx transport never counts as synced regardless of body.
+    assert.equal(parseBridgeAutoSyncResponse(false, { ok: true, synced: true, counts: { synced: 5 } }).synced, false)
+    // reason is a short hint, capped, never a token.
+    const r = parseBridgeAutoSyncResponse(true, { ok: false, error: 'x'.repeat(400) })
+    assert.ok(r.reason.length <= 120)
+})
+
+test('isBridgeAutoSyncAllowed: first attempt allowed, repeat within TTL blocked, after TTL allowed again, non-positive TTL disables throttle', () => {
+    // Never attempted → allowed.
+    assert.equal(isBridgeAutoSyncAllowed(undefined, 1_000_000, 60_000), true)
+    assert.equal(isBridgeAutoSyncAllowed(0, 1_000_000, 60_000), true)
+    // Within the window → blocked.
+    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_030_000, 60_000), false)
+    // Exactly/after the window → allowed.
+    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_060_000, 60_000), true)
+    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_200_000, 60_000), true)
+    // TTL<=0 disables throttling (test override).
+    assert.equal(isBridgeAutoSyncAllowed(1_000_000, 1_000_001, 0), true)
 })

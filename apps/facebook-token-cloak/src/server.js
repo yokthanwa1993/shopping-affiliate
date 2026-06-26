@@ -484,6 +484,18 @@ function createHandler(deps = {}) {
   const downloadVideo = deps.downloadVideo;
   // Shared dependency bundle for the Facebook Lite (EAAD6V) token path.
   const liteDeps = { kc, fbLite, fetchImpl };
+  // Per-namespace backoff for LIVE /token/auto-sync. The Worker triggers recovery AUTOMATICALLY on a
+  // token-invalidated failure; a burst of such failures across pages/cron must not re-mint a fresh
+  // Facebook Lite session every time (that trips Facebook's login rate limiter). One live mint+scan
+  // per namespace per TTL window is enough — the scan refreshes EVERY administered page in the
+  // namespace at once, so siblings recover from a single call. Scoped to this handler instance.
+  const autoSyncLastLiveByNamespace = new Map();
+  const AUTO_SYNC_TTL_MS = (() => {
+    const raw = process.env.FACEBOOK_TOKEN_CLOAK_AUTOSYNC_TTL_MS;
+    if (raw == null || raw === '') return 60000;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 60000;
+  })();
   return async function handleRequest(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
@@ -1379,8 +1391,23 @@ function createHandler(deps = {}) {
         if (!ns) return sendError(res, 400, 'Missing namespaceId');
         const wantDryRun = dryRun !== false;
 
-        // Live writes resolve Keychain credentials + page tokens, so they are gated to localhost.
-        if (!wantDryRun && !isLocalRequest(req)) return sendError(res, 403, 'Live auto-sync is local-only');
+        // Live writes resolve Keychain credentials + page tokens. INTERNAL machine-to-machine recovery:
+        // a LOCAL caller OR a caller presenting the shared bridge sync secret may drive a live recovery,
+        // so the remote Worker can trigger auto-sync over the cloudflared tunnel WITHOUT any operator/UI
+        // action. A non-local caller without the secret is rejected. The secret is never echoed/logged.
+        const autoSyncSecret = String(
+          process.env.BRIDGE_TOKEN_SYNC_SECRET ||
+          process.env.TAG_SYNC_PUSH_SECRET ||
+          process.env.BROWSERSAVING_TAG_SYNC_SECRET ||
+          ''
+        ).trim();
+        const providedAutoSyncSecret = String(
+          (req.headers && (req.headers['x-bridge-sync-secret'] || req.headers['x-tag-sync-secret'])) || ''
+        ).trim();
+        const autoSyncSecretAuthorized = !!autoSyncSecret && providedAutoSyncSecret === autoSyncSecret;
+        if (!wantDryRun && !isLocalRequest(req) && !autoSyncSecretAuthorized) {
+          return sendError(res, 403, 'Live auto-sync requires localhost or a valid bridge sync secret');
+        }
 
         // Account selection mirrors the all-account importer: an explicit `accounts` list verbatim,
         // a SPECIFIC `account`, or all-mode (account omitted/empty/"all"/"*") which scans every
@@ -1412,6 +1439,23 @@ function createHandler(deps = {}) {
             ok: false, status: 'no_accounts_to_scan', namespace_id: ns, mode: allMode ? 'all_accounts' : 'single_account',
             note: 'No Facebook Lite account resolved to scan. Pass an explicit account or register one.'
           });
+        }
+
+        // LIVE backoff: skip a fresh mint/scan if this namespace was already recovered within the TTL
+        // window. The automatic Worker trigger fires per failing page; one live scan refreshes them all,
+        // so a repeat within the window is wasted Facebook logins. Dry-run previews are never throttled.
+        if (!wantDryRun && AUTO_SYNC_TTL_MS > 0) {
+          const lastLive = autoSyncLastLiveByNamespace.get(ns) || 0;
+          if (lastLive && (Date.now() - lastLive) < AUTO_SYNC_TTL_MS) {
+            return send(res, 200, {
+              ok: true, synced: false, status: 'throttled', skipped: true,
+              mode: allMode ? 'all_accounts' : 'single_account', namespace_id: ns,
+              note: 'A live auto-sync ran for this namespace within the backoff window; skipped to avoid Facebook login rate limits.'
+            });
+          }
+          // Stamp BEFORE the mint so even a failed attempt counts toward backoff (failures are exactly
+          // what we must avoid hammering Facebook with).
+          autoSyncLastLiveByNamespace.set(ns, Date.now());
         }
 
         // Mint + validate + list each account in REAL TIME, de-duping pages by page_id (first account

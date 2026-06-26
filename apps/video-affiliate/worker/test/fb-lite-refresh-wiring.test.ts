@@ -561,3 +561,84 @@ test('EAAD6V tokens NEVER enter the OneCard/ad-account lane — OneCard is skipp
     const dispatchGated = (src.match(/if \(useOneCardForThisPost\) \{/g) || []).length
     assert.ok(dispatchGated >= 2, `both publish sites must dispatch OneCard via useOneCardForThisPost (found ${dispatchGated})`)
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTOMATIC bridge /token/auto-sync recovery (no operator button / manual sync).
+// When a stored/Facebook Lite token is invalidated, the Worker itself POSTs the
+// bridge's secret-authed /token/auto-sync, reloads the pool and retries ONCE.
+// (index.ts read as source; not importable under node:test.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('triggerBridgeAutoSyncForPage: secret-authed machine-to-machine call to the bridge /token/auto-sync, fails closed, token-free, backed off', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function triggerBridgeAutoSyncForPage')
+    assert.notEqual(start, -1, 'triggerBridgeAutoSyncForPage must exist')
+    const fn = src.slice(start, src.indexOf('async function refreshFacebookLitePostingTokenForPage', start))
+    // Resolves the bridge base URL from configured env (CLOAK_FB_BRIDGE_URL) and the shared secret.
+    assert.ok(fn.includes('resolveCloakFbBridgeBaseUrl(params.env)'), 'must resolve the bridge base url from env')
+    assert.ok(fn.includes('getBridgeTokenSyncSecret(params.env)'), 'must resolve the shared bridge sync secret from env')
+    // Fail closed (no recovery marked) when the bridge URL or secret is missing.
+    assert.ok(/return \{ ok: false, synced: false, reason: 'bridge_not_configured' \}/.test(fn), 'must fail closed when the bridge url is missing')
+    assert.ok(/return \{ ok: false, synced: false, reason: 'sync_secret_missing' \}/.test(fn), 'must fail closed when the secret is missing')
+    // Sends the secret as a machine-to-machine header (NOT a UI/local-only path).
+    assert.ok(fn.includes("'x-bridge-sync-secret': secret") || fn.includes('x-bridge-sync-secret'), 'must send the bridge sync secret header')
+    // Uses the pure helpers to build the URL/body and parse the response.
+    assert.ok(fn.includes('buildBridgeAutoSyncUrl('), 'must build the auto-sync url via the pure helper')
+    assert.ok(fn.includes('buildBridgeAutoSyncRequestBody('), 'must build the request body via the pure helper')
+    assert.ok(fn.includes('parseBridgeAutoSyncResponse('), 'must parse the response via the pure helper')
+    // Rate-limit backoff: one live trigger per namespace per TTL window (anti Facebook login spam).
+    assert.ok(fn.includes('isBridgeAutoSyncAllowed('), 'must gate on the backoff predicate')
+    assert.ok(fn.includes('bridgeAutoSyncLastAttemptByNamespace'), 'must track the per-namespace last attempt for backoff')
+    assert.ok(/reason: 'auto_sync_throttled'/.test(fn), 'a throttled trigger must report a distinct reason and skip')
+    // Token-free: dryRun is never true (would resolve no token) and no token is ever interpolated in logs.
+    const logLines = fn.split('\n').filter((l) => /console\.(log|warn|error)/.test(l))
+    assert.ok(logLines.every((l) => !/token=\$\{|accessToken|\.token\}/.test(l)), 'auto-sync logs must never interpolate a token value')
+})
+
+test('refreshFacebookLitePostingTokenForPage falls through to the bridge auto-sync as the final automatic tier', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function refreshFacebookLitePostingTokenForPage')
+    assert.notEqual(start, -1, 'refreshFacebookLitePostingTokenForPage must exist')
+    const fn = src.slice(start, src.indexOf('async function initReelUploadWithPostingTokenAutoRecover', start))
+    // Tier 3: after BrowserSaving (tier 1) and Bridge /pages (tier 2), the bridge true-recovery runs.
+    assert.ok(fn.includes('triggerBridgeAutoSyncForPage('), 'must call the bridge auto-sync as the last tier')
+    assert.ok(/if \(autoSync\.synced\)/.test(fn), 'must only mark recovered when the auto-sync actually synced a token')
+    assert.ok(fn.includes("via: 'bridge_auto_sync'"), 'the auto-sync success path is labeled')
+    // Ordering: BrowserSaving → Bridge /pages → auto-sync.
+    const bsIdx = fn.indexOf('refreshFacebookLiteCommentTokenForPage(')
+    const pagesIdx = fn.indexOf('fetchFacebookLitePageTokenFromBridge(')
+    const autoIdx = fn.indexOf('triggerBridgeAutoSyncForPage(')
+    assert.ok(bsIdx >= 0 && pagesIdx > bsIdx && autoIdx > pagesIdx, 'auto-sync must be the LAST recovery tier')
+})
+
+test('publish wrapper reaches the auto-sync (via the refresh helper) ONLY on an auth failure, never on a (#10) permission error', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh')
+    const fn = src.slice(start, src.indexOf('type PageOneCardLinkMode', start))
+    // The refresh helper (which contains the auto-sync tier) is invoked on the auth-failure path.
+    const refreshIdx = fn.indexOf('refreshFacebookLitePostingTokenForPage(')
+    assert.ok(refreshIdx >= 0, 'the wrapper must call the refresh helper (which triggers auto-sync)')
+    // A permission-denied-without-auth-failure path throws BEFORE the refresh helper, so a (#10) error
+    // can never drive a token re-mint / auto-sync loop.
+    const permThrowIdx = fn.indexOf('facebook_lite_permission_denied_no_bridge_account:')
+    assert.ok(permThrowIdx >= 0 && permThrowIdx < refreshIdx, 'a permission-only error must throw before reaching the refresh/auto-sync helper')
+    // The refresh helper itself is gated by the auth-only predicate (no permission match).
+    assert.ok(fn.includes('shouldAttemptFacebookLitePostingRefresh('), 'refresh/auto-sync must be gated by the auth-only predicate')
+    // Single bounded retry after a successful refresh.
+    assert.ok(/if \(!refresh\.synced\)/.test(fn), 'must only retry when a fresh token was synced')
+    assert.ok(fn.includes('POST-REFRESH-RETRY'), 'the retry must be a single labeled re-publish')
+})
+
+test('pending-comment backlog: bridge auto-sync runs when BrowserSaving cannot re-mint, then reloads the fresh token (still one-shot, gated, no permission loop)', () => {
+    const src = readVideoAffiliateIndex()
+    const start = src.indexOf('async function processPendingCommentBacklog')
+    const fn = src.slice(start, src.indexOf('async function ensureCronRuntimeStateTable', start))
+    // The reload closure tries the bridge auto-sync as a fallback when BrowserSaving did not refresh.
+    assert.ok(fn.includes('triggerBridgeAutoSyncForPage('), 'comment backlog must trigger the bridge auto-sync fallback')
+    assert.ok(/if \(!autoSync\.synced\) return false/.test(fn), 'must only continue when the auto-sync synced a fresh token')
+    // It then re-reads the fresh token from the pool (never trusts the stale row).
+    assert.ok(fn.includes('resolveFacebookCommentToken(env.DB, pageId, botId)'), 'must reload the fresh token from the pool')
+    // Still bounded to one attempt and gated by the auth/missing predicate (permission never matches).
+    assert.ok(/if \(fbLiteRefreshAttempted\) return false/.test(fn), 'refresh+auto-sync must remain one-shot per row')
+    assert.ok(fn.includes('shouldAttemptFacebookLiteRefresh'), 'must stay gated by the auth/missing refresh predicate')
+})

@@ -548,3 +548,77 @@ export function extractBridgeTokenPageAccessToken(data: unknown, pageId: string)
     }
     return { found: false, hasToken: false, accessToken: '' }
 }
+
+// ---- Bridge /token/auto-sync (Worker → bridge TRUE-RECOVERY trigger) -------
+// The product is fully self-healing: there is NO operator button/manual sync/manual export. When a
+// stored/Facebook Lite PUBLISH or COMMENT fails because the page token was invalidated (190 /
+// "session has been invalidated"), the Worker AUTOMATICALLY asks the local Facebook Lite bridge to
+// run its true-bridge recovery — re-mint a fresh token from the stored credentials/session, list
+// the administered pages in real time, and refresh every matching page token back into THIS
+// namespace's pool. The Worker then reloads the pool and retries once. These pure helpers keep the
+// URL/body shaping, response parsing and rate-limit backoff testable and token-free. The bridge
+// endpoint is internal machine-to-machine (secret-authenticated), never UI-driven.
+
+// The bridge auto-sync URL. `baseUrl` must already be resolved (resolveCloakFbBridgeBaseUrl); '' when
+// the bridge is not configured, so the caller fails closed with a sanitized `bridge_not_configured`.
+export function buildBridgeAutoSyncUrl(baseUrl: string): string {
+    const base = String(baseUrl ?? '').trim().replace(/\/+$/, '')
+    return base ? `${base}/token/auto-sync` : ''
+}
+
+// Token-free body the Worker POSTs to /token/auto-sync. `namespaceId` scopes the recovery to the
+// failing page's namespace; `account` / `candidateLoginIds` target a specific FB Lite login (omitted
+// → the bridge scans all FB-Lite-likely accounts). `dryRun` is ALWAYS false for an internal trusted
+// recovery call — a dry run would resolve no token and leave posting broken.
+export interface BridgeAutoSyncRequestBody {
+    namespaceId: string
+    dryRun: false
+    account?: string
+    accounts?: string[]
+}
+
+export function buildBridgeAutoSyncRequestBody(params: {
+    namespaceId: string
+    account?: string
+    candidateLoginIds?: string[]
+}): BridgeAutoSyncRequestBody {
+    const body: BridgeAutoSyncRequestBody = { namespaceId: String(params.namespaceId ?? '').trim(), dryRun: false }
+    const account = String(params.account ?? '').trim()
+    const accounts = Array.from(new Set(
+        (params.candidateLoginIds ?? []).map((v) => String(v ?? '').trim()).filter(Boolean),
+    ))
+    if (account) body.account = account
+    else if (accounts.length) body.accounts = accounts
+    return body
+}
+
+// Token-free outcome the Worker keeps after an auto-sync call. `synced` = the bridge refreshed ≥1
+// page token into the pool (so the caller may reload + retry). `reason` is a short redacted hint,
+// never a token. The bridge response is already token-free (booleans/ids/sanitized reasons only).
+export interface BridgeAutoSyncOutcome {
+    ok: boolean
+    synced: boolean
+    reason: string
+}
+
+export function parseBridgeAutoSyncResponse(httpOk: boolean, data: unknown): BridgeAutoSyncOutcome {
+    const payload = (data && typeof data === 'object') ? data as Record<string, unknown> : {}
+    const counts = (payload.counts && typeof payload.counts === 'object') ? payload.counts as Record<string, unknown> : {}
+    const syncedCount = Number(counts.synced ?? 0)
+    const synced = httpOk && (payload.synced === true || syncedCount > 0)
+    const ok = httpOk && payload.ok === true
+    const reasonRaw = String(payload.status ?? payload.error ?? '').trim()
+    return { ok, synced, reason: reasonRaw ? reasonRaw.slice(0, 120) : (synced ? 'synced' : 'auto_sync_no_pages') }
+}
+
+// Rate-limit backoff: fire at most ONE live auto-sync per namespace per TTL window. A repeated
+// publish/comment failure across pages / cron passes in the same window must NOT re-trigger a fresh
+// mint — that is exactly what trips Facebook's login rate limiter. Pure, so it is unit-testable.
+// Returns true when a NEW attempt is allowed at `nowMs` given the last attempt (0/undefined = never
+// attempted). A non-positive TTL disables throttling (used by tests).
+export function isBridgeAutoSyncAllowed(lastAttemptMs: number | undefined, nowMs: number, ttlMs: number): boolean {
+    const last = Number(lastAttemptMs || 0)
+    if (!last) return true
+    if (!(ttlMs > 0)) return true
+    return (nowMs - last) >= ttlMs
+}

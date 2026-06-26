@@ -223,6 +223,10 @@ import {
     parseFacebookLiteRefreshResponse,
     buildBridgeTokenPagesUrl,
     extractBridgeTokenPageAccessToken,
+    buildBridgeAutoSyncUrl,
+    buildBridgeAutoSyncRequestBody,
+    parseBridgeAutoSyncResponse,
+    isBridgeAutoSyncAllowed,
     isFacebookLitePageToken,
     isFacebookLitePostingPermissionError,
     isPersistablePagePrimaryToken,
@@ -30183,6 +30187,80 @@ async function fetchFacebookLitePageTokenFromBridge(params: {
     return { token: '', account: '' }
 }
 
+// Dedicated bridge sync secret for the Worker → bridge /token/auto-sync recovery trigger. Prefers a
+// purpose-provisioned BRIDGE_TOKEN_SYNC_SECRET, then the existing BrowserSaving tag-sync secrets, so
+// the auto-sync can be authorized without rotating any existing secret. Never logged.
+function getBridgeTokenSyncSecret(env: Env): string {
+    const e = env as Env & { BRIDGE_TOKEN_SYNC_SECRET?: string; BROWSERSAVING_TAG_SYNC_SECRET?: string }
+    return String(e.BRIDGE_TOKEN_SYNC_SECRET || e.TAG_SYNC_PUSH_SECRET || e.BROWSERSAVING_TAG_SYNC_SECRET || '').trim()
+}
+
+// Per-namespace backoff for the AUTOMATIC bridge auto-sync trigger. A repeated invalidated-token
+// failure across pages / cron passes must not re-mint a fresh token every time (that trips Facebook's
+// login rate limiter). One live recovery per namespace per TTL window is enough — its profile-sync
+// refreshes EVERY administered page in that namespace at once, so siblings recover from a single call.
+const BRIDGE_AUTO_SYNC_TTL_MS = (() => {
+    const raw = Number(((globalThis as { BRIDGE_AUTO_SYNC_TTL_MS_OVERRIDE?: number }).BRIDGE_AUTO_SYNC_TTL_MS_OVERRIDE) ?? NaN)
+    return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60 * 1000
+})()
+const bridgeAutoSyncLastAttemptByNamespace = new Map<string, number>()
+
+// AUTOMATIC true-bridge recovery. When a stored/Facebook Lite token has been invalidated (190 /
+// "session has been invalidated"), the Worker asks the local Facebook Lite bridge to re-mint a fresh
+// token from the stored credentials/session and refresh every matching page token in this namespace's
+// pool — NO operator action, button, or manual export. This is the machine-to-machine counterpart of
+// the (now removed) UI sync: the bridge endpoint is secret-authenticated. Fails CLOSED with a
+// sanitized reason (and does NOT mark anything recovered) when the bridge URL or secret is missing.
+// Rate-limit-backed off to one live attempt per namespace per TTL. Token-free everywhere.
+async function triggerBridgeAutoSyncForPage(params: {
+    env: Env
+    namespaceId: string
+    candidateLoginIds?: string[]
+    logPrefix: string
+    nowMs?: number
+}): Promise<{ ok: boolean; synced: boolean; reason: string; skipped?: boolean }> {
+    const namespaceId = String(params.namespaceId || '').trim()
+    if (!namespaceId) return { ok: false, synced: false, reason: 'invalid_namespace' }
+    const baseUrl = resolveCloakFbBridgeBaseUrl(params.env)
+    if (!baseUrl) return { ok: false, synced: false, reason: 'bridge_not_configured' }
+    const secret = getBridgeTokenSyncSecret(params.env)
+    if (!secret) return { ok: false, synced: false, reason: 'sync_secret_missing' }
+
+    const now = Number.isFinite(params.nowMs) ? Number(params.nowMs) : Date.now()
+    const last = bridgeAutoSyncLastAttemptByNamespace.get(namespaceId)
+    if (!isBridgeAutoSyncAllowed(last, now, BRIDGE_AUTO_SYNC_TTL_MS)) {
+        console.log(`[${params.logPrefix}] bridge auto-sync throttled ns=${namespaceId} (recent attempt within ttl)`)
+        return { ok: false, synced: false, reason: 'auto_sync_throttled', skipped: true }
+    }
+    bridgeAutoSyncLastAttemptByNamespace.set(namespaceId, now)
+
+    const url = buildBridgeAutoSyncUrl(baseUrl)
+    if (!url) return { ok: false, synced: false, reason: 'bridge_not_configured' }
+    const body = buildBridgeAutoSyncRequestBody({ namespaceId, candidateLoginIds: params.candidateLoginIds })
+    try {
+        const resp = await fetchWithTimeout(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                // Machine-to-machine auth so the remote Worker (over the cloudflared tunnel) can drive
+                // a LIVE recovery without the local-only UI. Both header names are accepted by the bridge.
+                'x-bridge-sync-secret': secret,
+                'x-tag-sync-secret': secret,
+            },
+            body: JSON.stringify(body),
+        }, 60000, 'bridge_token_auto_sync')
+        const data = await resp.json().catch(() => ({}))
+        const outcome = parseBridgeAutoSyncResponse(resp.ok !== false && resp.status >= 200 && resp.status < 300, data)
+        console.log(`[${params.logPrefix}] bridge auto-sync ns=${namespaceId} status=${resp.status} ok=${outcome.ok} synced=${outcome.synced} reason=${outcome.reason}`)
+        return outcome
+    } catch (e) {
+        const reason = (e instanceof Error ? e.message : String(e)).slice(0, 120)
+        console.warn(`[${params.logPrefix}] bridge auto-sync failed ns=${namespaceId} (${reason})`)
+        return { ok: false, synced: false, reason: 'bridge_auto_sync_unreachable' }
+    }
+}
+
 // On-demand Facebook Lite (FB GET Token) refresh for a stored-token page's POSTING token. There is
 // no permanent "token expired" state for a Facebook Lite page: this re-mints a fresh page token and
 // syncs it into this namespace's pool so the caller can re-read it and retry publishing.
@@ -30190,6 +30268,8 @@ async function fetchFacebookLitePageTokenFromBridge(params: {
 //      and pushes the fresh token back via profile-sync (token-free, auto-discovers by page_id).
 //   2) Fallback — if that route did NOT sync (unavailable / "Not found"), pull a fresh page token
 //      straight from the Bridge Token tool's /pages route and upsert it into the pool ourselves.
+//   3) Last resort — trigger the bridge's own /token/auto-sync TRUE-RECOVERY (it re-mints from the
+//      stored bridge session/credentials and refreshes every administered page in this namespace).
 // Best-effort and token-free in logs: the Worker never logs a raw token value.
 async function refreshFacebookLitePostingTokenForPage(params: {
     env: Env
@@ -30239,7 +30319,20 @@ async function refreshFacebookLitePostingTokenForPage(params: {
         }
     }
 
-    return { refreshed: bs.refreshed, synced: false, via: 'none', reason: bs.reason }
+    // 3) Bridge /token/auto-sync TRUE-RECOVERY as the last automatic tier: the bridge re-mints from
+    // its stored session/credentials and refreshes every administered page in this namespace's pool.
+    // Fully automatic — no operator action — and bounded by the per-namespace backoff inside it.
+    const autoSync = await triggerBridgeAutoSyncForPage({
+        env: params.env,
+        namespaceId: params.namespaceId,
+        candidateLoginIds: params.candidateLoginIds,
+        logPrefix: `${params.logPrefix} BRIDGE-AUTOSYNC`,
+    })
+    if (autoSync.synced) {
+        return { refreshed: true, synced: true, via: 'bridge_auto_sync', reason: autoSync.reason }
+    }
+
+    return { refreshed: bs.refreshed, synced: false, via: 'none', reason: autoSync.reason || bs.reason }
 }
 
 async function initReelUploadWithPostingTokenAutoRecover(params: {
@@ -42647,9 +42740,20 @@ async function processPendingCommentBacklog(
                     profileCount: 0,
                     reason: e instanceof Error ? e.message : String(e),
                 }))
-                if (!refreshOutcome.refreshed) return false
-                // BrowserSaving pushed the fresh page token into the namespace pool; read it
-                // back (resolveFacebookCommentToken prefers pool comment/post tokens, then
+                if (!refreshOutcome.refreshed) {
+                    // BrowserSaving could not re-mint from the linked/discovered profiles. Fall through
+                    // to the bridge's own AUTOMATIC true-recovery (/token/auto-sync): it re-mints from
+                    // the stored bridge session/credentials and refreshes every administered page token
+                    // in this namespace's pool. No operator action / button / manual export.
+                    const autoSync = await triggerBridgeAutoSyncForPage({
+                        env,
+                        namespaceId: botId,
+                        logPrefix: `PENDING-COMMENT ${pageName || pageId} ${historyId} BRIDGE-AUTOSYNC`,
+                    }).catch(() => ({ ok: false, synced: false, reason: 'auto_sync_error' }))
+                    if (!autoSync.synced) return false
+                }
+                // BrowserSaving (or the bridge auto-sync) pushed the fresh page token into the namespace
+                // pool; read it back (resolveFacebookCommentToken prefers pool comment/post tokens, then
                 // pages.access_token) and put it at the head of the candidate list.
                 const refreshedResolution = await resolveFacebookCommentToken(env.DB, pageId, botId).catch(() => null)
                 const refreshedToken = String(refreshedResolution?.token || '').trim()
