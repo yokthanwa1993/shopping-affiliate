@@ -69,11 +69,6 @@ function clearStaleProfileSingletons(profileDir){
     const f=path.join(profileDir,name);
     try{ fs.rmSync(f,{force:true}); removed=true; }catch{}
   }
-  // CloakBrowser/Chromium may leave an additional zero-byte Default/LOCK after a failed launch.
-  // When no live SingletonLock pid exists (checked above), this is stale and blocks the next
-  // launchPersistentContext with profile_already_open even though no process owns the profile.
-  const defaultLock=path.join(profileDir,'Default','LOCK');
-  try{ fs.rmSync(defaultLock,{force:true}); removed=true; }catch{}
   return removed;
 }
 

@@ -503,9 +503,8 @@
           <span class="subsection-tag">Post</span>
           <h3>Post — Facebook Lite (Page posting / Token Bridge)</h3>
         </div>
-        <p class="muted">Page-posting token source (EAAD6V). Use the open-session button only when you need to log in or clear Facebook checks manually; it never autofills or submits credentials.</p>
+        <p class="muted">Page-posting token source (EAAD6V). Status-only by default; opening this page never mints, refreshes, or opens a browser. Refresh runs only when you click, validates readiness, and caches the result for one hour.</p>
         <div class="actions">
-          <button type="button" id="fb-lite-open-session">Open Facebook Lite session</button>
           <button type="button" id="fb-lite-manual-refresh">Manual refresh Facebook Lite token</button>
         </div>
       </div>
@@ -514,12 +513,9 @@
           <span class="subsection-tag">Ads</span>
           <h3>Ads — Power Editor (Ad creation)</h3>
         </div>
-        <p class="muted">For ad creation only. Use this to open the configured Power Editor Facebook session and log in manually before creating ads; it never autofills or submits credentials.</p>
-        <div class="actions">
-          <button type="button" id="power-editor-open-session">Open Power Editor session</button>
-        </div>
+        <p class="muted">For ad creation only. API-only role configuration; Accounts Bridge does not open browser sessions from this UI.</p>
       </div>
-      <p class="muted fb-note">Actions operate on the account selected in the form above. Open-session buttons only open the configured Facebook profile for manual login; they never autofill, submit, or expose tokens.</p>
+      <p class="muted fb-note">Actions operate on the account selected in the form above. Token recovery for posting and comments is fully automatic and machine-to-machine; this console is status-only.</p>
     </div>
   </section>
 
@@ -787,18 +783,6 @@
     }
   }
 
-  function openFacebookRoleSession(role) {
-    var account = role === "page_posting_facebook_lite" ? value("#role-posting-input") : value("#role-ads-input");
-    if (!account) {
-      toast("Set the " + (role === "page_posting_facebook_lite" ? "Facebook Lite" : "Power Editor") + " account first", "err");
-      return;
-    }
-    var url = "/login?account=" + encodeURIComponent(account) + "&visible=1&autofill=0&submit=0";
-    window.open(url, "_blank", "noopener");
-    setResult(JSON.stringify({ openedSession: role, account: account, autofill: false, submit: false }, null, 2));
-    toast("Opened " + (role === "page_posting_facebook_lite" ? "Facebook Lite" : "Power Editor") + " session for " + account, "ok");
-  }
-
   function fillForm(account) {
     $("#account-input").value = account.account || "";
     $("#username-input").value = account.username || account.email || account.phone || "";
@@ -962,8 +946,6 @@
   // Explicit, manual-only side effects. None runs on page load; each fires solely on click.
   $("#save-roles-button").addEventListener("click", function () { saveBridgeRoles(); });
   $("#check-roles-button").addEventListener("click", function () { checkBridgeRoles(); });
-  $("#fb-lite-open-session").addEventListener("click", function () { openFacebookRoleSession("page_posting_facebook_lite"); });
-  $("#power-editor-open-session").addEventListener("click", function () { openFacebookRoleSession("ads_power_editor"); });
   $("#fb-lite-manual-refresh").addEventListener("click", function () { refreshFacebookLiteToken(); });
 
   // ── Auto-run on load: STATUS reads ONLY. init() never logs in, mints/refreshes a token, opens a

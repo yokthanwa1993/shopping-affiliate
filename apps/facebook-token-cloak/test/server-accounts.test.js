@@ -112,12 +112,10 @@ afterEach(async () => {
   await new Promise(resolve => server.close(resolve));
 });
 
-test('GET / web UI serves the local Accounts Bridge console', async () => {
+test('GET / web UI is disabled because Account Manager is native-only', async () => {
   const r = await getRaw('/');
-  assert.equal(r.status, 200);
-  assert.match(r.text, /Accounts Bridge/);
-  assert.match(r.text, /Open Facebook Lite session/);
-  assert.match(r.text, /Open Power Editor session/);
+  assert.equal(r.status, 410);
+  assert.match(r.text, /native_app_only/);
   assertNoLeak(r.text, SECRETS);
 });
 
@@ -146,13 +144,6 @@ test('native-only mode keeps account APIs working while browser login stays disa
   assert.equal(r.status, 410);
   assert.equal(r.body.error, 'browser_login_disabled');
   assert.equal(r.body.state, 'browser_login_disabled');
-  assertNoLeak(r.body, SECRETS);
-
-  r = await req('GET', '/login?account=CHEARB&visible=1&autofill=0&submit=0');
-  assert.equal(r.status, 200);
-  assert.equal(r.body.state, 'login_opened');
-  assert.equal(r.body.autofilled, false);
-  assert.equal(r.body.submitted, false);
   assertNoLeak(r.body, SECRETS);
 
   r = await req('POST', '/token/refresh', { account: 'CHEARB', visible: false });
