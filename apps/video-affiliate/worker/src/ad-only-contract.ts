@@ -1550,8 +1550,10 @@ export function isFollowRowHandoffEligible(row: {
 export function buildFollowToClickLinkHandoffBody(input: {
     pageId: string
     systemVideoId: string
-    fixedAdsetId: string
+    fixedAdsetId?: string
     fixedCampaignId?: string
+    dailyCampaignName?: string
+    templateAdset?: string
     runHours?: number
     shopeeUrl?: string
     adName?: string
@@ -1565,10 +1567,20 @@ export function buildFollowToClickLinkHandoffBody(input: {
         system_video_id: str(input.systemVideoId),
         mode: 'active',
         run_hours: hours,
-        // Pin the click-link destination adset; the sales lane forwards both keys to the bridge and the
-        // schedule resolver accepts active mode without a daily campaign name when a fixed adset is set.
-        existing_adset_id: fixedAdsetId,
-        fixed_adset_id: fixedAdsetId,
+    }
+    if (fixedAdsetId) {
+        // Pin the click-link destination adset when configured; the schedule resolver accepts active mode
+        // without a daily campaign name when a fixed adset is set.
+        body.existing_adset_id = fixedAdsetId
+        body.fixed_adset_id = fixedAdsetId
+    } else {
+        // New daily 3-small-page flow: when no fixed click-link adset exists yet, create the SALES/click
+        // handoff under the Bangkok daily campaign using the template adset, matching the Follow lane's
+        // daily-campaign behavior instead of silently skipping the second 24h phase.
+        const dailyCampaignName = str(input.dailyCampaignName)
+        if (dailyCampaignName) body.daily_campaign_name = dailyCampaignName
+        const templateAdset = str(input.templateAdset)
+        if (templateAdset) body.template_adset = templateAdset
     }
     const fixedCampaignId = str(input.fixedCampaignId)
     if (fixedCampaignId) body.campaign_id = fixedCampaignId

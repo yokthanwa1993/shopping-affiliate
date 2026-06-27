@@ -15088,15 +15088,15 @@ async function processFollowToClickLinkHandoffs(env: Env): Promise<{ scanned: nu
             const enabled = isAutoAdsAutomationEnabled((await getPageSetting(env.DB, pageId, AUTO_ADS_AUTOMATION_ENABLED_SETTING_KEY).catch(() => null))?.value)
             const fixedAdsetId = String((await getPageSetting(env.DB, pageId, CLICK_LINK_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
             const fixedCampaignId = String((await getPageSetting(env.DB, pageId, CLICK_LINK_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
-            if (!enabled || !fixedAdsetId) {
+            if (!enabled) {
                 // Terminal skip — the handoff decision is made when the Follow ad finishes. Stamp so the
-                // row is not rescanned. (Configure the click-link adset BEFORE enabling the page.)
+                // row is not rescanned while automation is disabled.
                 await env.DB.prepare(
                     `UPDATE dashboard_ad_history
                         SET click_link_handoff_at = datetime('now'),
                             click_link_handoff_status = ?
                       WHERE id = ?`
-                ).bind(!enabled ? 'skipped_disabled' : 'skipped_no_click_link_adset', id).run().catch(() => undefined)
+                ).bind('skipped_disabled', id).run().catch(() => undefined)
                 skipped += 1
                 continue
             }
@@ -15106,6 +15106,8 @@ async function processFollowToClickLinkHandoffs(env: Env): Promise<{ scanned: nu
                 systemVideoId,
                 fixedAdsetId,
                 fixedCampaignId,
+                dailyCampaignName: fixedAdsetId ? '' : bangkokDailyCampaignName(),
+                templateAdset: FOLLOW_LANE_TEMPLATE_ADSET,
                 runHours,
                 shopeeUrl: String(row.click_link || '').trim(),
                 adName: systemVideoId,

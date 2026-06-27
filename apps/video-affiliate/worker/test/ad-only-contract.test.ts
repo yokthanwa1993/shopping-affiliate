@@ -1487,6 +1487,25 @@ test('buildFollowToClickLinkHandoffBody defaults run hours and omits optional em
     assert.equal(body.existing_adset_id, 'adset1')
 })
 
+test('buildFollowToClickLinkHandoffBody falls back to daily campaign/template adset when no fixed click-link adset exists', () => {
+    const body = buildFollowToClickLinkHandoffBody({
+        pageId: 'p-small',
+        systemVideoId: 'sysvid_from_chearb',
+        dailyCampaignName: '28/Jun/2026',
+        templateAdset: '120244389710100263',
+        runHours: 24,
+    })
+    assert.equal(body.page_id, 'p-small')
+    assert.equal(body.system_video_id, 'sysvid_from_chearb')
+    assert.equal(body.mode, 'active')
+    assert.equal(body.run_hours, 24)
+    assert.equal(body.daily_campaign_name, '28/Jun/2026')
+    assert.equal(body.template_adset, '120244389710100263')
+    assert.equal(body.existing_adset_id, undefined)
+    assert.equal(body.fixed_adset_id, undefined)
+    assert.equal(resolveAdOnlyLaneForHandoff(body), 'sales')
+})
+
 test('buildAdHistoryRecord persists the lane from the result payload', () => {
     const followRec = buildAdHistoryRecord({
         status: 'created',
