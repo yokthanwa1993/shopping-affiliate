@@ -1069,13 +1069,15 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
   const maxAdsetsPerCampaign = 10;
   const maxCampaigns = 10;
   const campaignPrefix = body.campaign_name || 'ADS_PUBLISH_';
+  // Fixed-adset mode must never resolve/create campaigns by prefix. The ad is placed directly
+  // into existingAdsetId; entering the prefix branch here caused unwanted ADS_PUBLISH_1 campaigns.
   // Daily campaign reuse: posts created on the same Bangkok calendar date share ONE campaign
   // named e.g. "15/Jun/2026" (DD/Mon/YYYY). Reuse an existing same-name + same-objective campaign
   // when present; otherwise create it once. DISTINCT from `new_campaign_name`, which ALWAYS
   // force-creates a brand-new campaign (dashboard behavior — must not reuse). `campaign_id` (when
   // explicit) still wins. `reuse_campaign_name` is an accepted alias for `daily_campaign_name`.
   const dailyCampaignName = String(body.daily_campaign_name || body.reuse_campaign_name || '').trim();
-  let targetCampaignId = body.campaign_id || null;
+  let targetCampaignId = fixedExistingAdsetMode ? (body.campaign_id || null) : (body.campaign_id || null);
   let resolvedCampaignName = '';
   // Apply the 24h run-hours schedule (below) ONLY for the daily-campaign path. The daily campaign
   // now carries a CAMPAIGN-level (CBO) daily_budget — matching the operator's updated Ads Manager
@@ -1164,7 +1166,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     createdCampaignStatus = campaignCreateStatus;
     resolvedCampaignName = String(body.new_campaign_name).trim();
     campaignSettingsApplied = Object.keys(campaignMirror).length > 0;
-  } else if (!targetCampaignId && dailyCampaignName) {
+  } else if (!fixedExistingAdsetMode && !targetCampaignId && dailyCampaignName) {
     // Exact-name reuse within the ad account, scoped to the template objective. CONTAIN narrows
     // the fetch; the exact `name ===` match guarantees we never reuse a different campaign.
     const filtering = encodeURIComponent(JSON.stringify([{ field: 'name', operator: 'CONTAIN', value: dailyCampaignName }]));
@@ -1210,7 +1212,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
     usedDailyCampaign = true;
   }
 
-  if (!targetCampaignId) {
+  if (!fixedExistingAdsetMode && !targetCampaignId) {
     const camps = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}&fields=id,name,status,objective&limit=50&filtering=[{"field":"name","operator":"CONTAIN","value":"${campaignPrefix}"}]`);
     const activeCamps = ((camps.data && camps.data.data) || []).filter((c) => c.status !== 'DELETED' && c.objective === templateObjective);
     for (const camp of activeCamps) {
@@ -1218,7 +1220,7 @@ async function buildAdFromCreative(fetchImpl, params = {}) {
       const count = ((adsets.data && adsets.data.data) || []).filter((a) => a.status !== 'DELETED').length;
       if (count < maxAdsetsPerCampaign) { targetCampaignId = camp.id; resolvedCampaignName = String(camp.name || ''); campaignReuse = 'reused_existing_campaign'; break; }
     }
-    if (!targetCampaignId) {
+    if (!fixedExistingAdsetMode && !targetCampaignId) {
       if (activeCamps.length >= maxCampaigns) return { ok: false, step: 'campaign', error: 'Max ' + maxCampaigns + ' campaigns reached for objective ' + templateObjective };
       const newCampNum = activeCamps.length + 1;
       const newCamp = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${adAccount}/campaigns?access_token=${encodeURIComponent(userToken)}`, {

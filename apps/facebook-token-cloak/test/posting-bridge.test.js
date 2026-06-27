@@ -3031,3 +3031,13 @@ test('pauseAdOnlyObjects source contains status=PAUSED and NEVER DELETE/DELETED'
   assert.ok(!/status:\s*'DELETED'/.test(code), 'pause helper never writes status=DELETED');
   assert.ok(!/method:\s*'DELETE'/.test(code), 'pause helper never issues a DELETE method');
 });
+
+
+test('fixed-adset mode never enters ADS_PUBLISH fallback campaign branch', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'posting.js'), 'utf8');
+  assert.ok(source.includes('if (!fixedExistingAdsetMode && !targetCampaignId) {'));
+  assert.ok(source.includes('else if (!fixedExistingAdsetMode && !targetCampaignId && dailyCampaignName) {'));
+  assert.ok(source.includes('Fixed-adset mode must never resolve/create campaigns by prefix'));
+});
