@@ -291,6 +291,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
   const [autoCadence, setAutoCadence] = useState('')
   const [autoMaxPerDay, setAutoMaxPerDay] = useState('')
   const [autoRunHours, setAutoRunHours] = useState('24')
+  // Source page whose cached videos seed this page's auto candidates. Empty → this page itself.
+  const [autoSourcePageId, setAutoSourcePageId] = useState('')
   const [followCampaignId, setFollowCampaignId] = useState('')
   const [followAdsetId, setFollowAdsetId] = useState('')
   const [clickCampaignId, setClickCampaignId] = useState('')
@@ -311,6 +313,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
     setAutoCadence(form.autoAdsCadenceMinutes || '')
     setAutoMaxPerDay(form.autoAdsMaxPerDay || '')
     setAutoRunHours(form.autoAdsRunHours || '24')
+    setAutoSourcePageId(form.autoAdsSourcePageId || '')
     setFollowCampaignId(form.followFixedCampaignId || '')
     setFollowAdsetId(form.followFixedAdsetId || '')
     setClickCampaignId(form.clickLinkFixedCampaignId || '')
@@ -343,6 +346,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
       autoAdsCadenceMinutes: autoCadence.trim(),
       autoAdsMaxPerDay: autoMaxPerDay.trim(),
       autoAdsRunHours: autoRunHours.trim() || '24',
+      autoAdsSourcePageId: autoSourcePageId.trim(),
       followFixedCampaignId: followCampaignId.trim(),
       followFixedAdsetId: followAdsetId.trim(),
       clickLinkFixedCampaignId: clickCampaignId.trim(),
@@ -812,6 +816,19 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
                 placeholder="24"
                 className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
               />
+            </label>
+            <label className="space-y-1 md:col-span-2 xl:col-span-3">
+              <span className="block text-xs font-medium text-muted-foreground">Source page สำหรับสุ่มวิดีโอ</span>
+              <input
+                value={autoSourcePageId}
+                onChange={(e) => setAutoSourcePageId(e.target.value)}
+                placeholder={`${selectedId} (เพจนี้)`}
+                className="w-full rounded-lg border bg-background px-2.5 py-2 text-sm"
+              />
+              <span className="block text-[11px] text-muted-foreground">
+                เว้นว่าง = ใช้วิดีโอของเพจนี้เอง · ใส่ page id ของเพจต้นทาง (เช่น เฉียบ 1008898512617594)
+                เพื่อสุ่มวิดีโอจากเพจนั้นมายิงแอด Follow ให้เพจนี้ (แอดยังสร้างให้เพจ {selectedId})
+              </span>
             </label>
             <label className="space-y-1">
               <span className="block text-xs font-medium text-muted-foreground">Follow · Campaign ID</span>

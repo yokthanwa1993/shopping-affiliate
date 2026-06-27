@@ -1172,6 +1172,21 @@ export function isUnderDailyAdCap(todayCount: number, maxPerDay: number): boolea
     return todayCount < maxPerDay
 }
 
+// Per-page setting: the page whose CACHED Facebook videos seed this target page's auto-ads candidates.
+// Default (unset) is the target page itself, preserving the existing per-page behavior. Configure it (for
+// example to the Chearb / เฉียบ source page 1008898512617594) so a smaller target page randomizes its
+// Follow ads from another page's high-reach videos. The ad is ALWAYS created for the TARGET page — only
+// the candidate video pool and the system-video resolution use the source page. Pure string key.
+export const AUTO_ADS_SOURCE_PAGE_ID_SETTING_KEY = 'auto_ads_source_page_id'
+
+// Resolve which page's video cache seeds a target page's auto-ads candidates. A trimmed, non-empty
+// configured value wins; empty/unset falls back to the target page id (existing behavior). Pure.
+export function resolveAutoAdsSourcePageId(rawSetting: unknown, targetPageId: string): string {
+    const configured = str(rawSetting).trim()
+    if (configured) return configured
+    return str(targetPageId).trim()
+}
+
 
 // =====================================================================
 // BRIDGE SESSION ACCOUNT — the CloakBrowser FB bridge /create-ad route requires a logged-in session.

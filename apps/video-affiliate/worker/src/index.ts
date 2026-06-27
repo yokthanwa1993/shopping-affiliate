@@ -201,6 +201,8 @@ import {
     AUTO_ADS_RUN_HOURS_SETTING_KEY,
     AUTO_ADS_NEXT_RUN_AT_SETTING_KEY,
     AUTO_ADS_LAST_RUN_AT_SETTING_KEY,
+    AUTO_ADS_SOURCE_PAGE_ID_SETTING_KEY,
+    resolveAutoAdsSourcePageId,
     isAutoAdsAutomationEnabled,
     clampAutoAdsRunHours,
     clampAutoAdsMaxPerDay,
@@ -10906,6 +10908,10 @@ const DASHBOARD_SETTING_KEYS = [
     'follow_fixed_campaign_id', 'follow_fixed_adset_id',
     'click_link_fixed_campaign_id', 'click_link_fixed_adset_id',
     'auto_ads_automation_enabled', 'auto_ads_cadence_minutes', 'auto_ads_max_per_day', 'auto_ads_run_hours',
+    // Source page whose cached high-reach videos seed THIS page's auto-ads candidates. Default (unset) is
+    // the page itself; set to another page id (e.g. Chearb 1008898512617594) to randomize a smaller page's
+    // Follow ads from a source page's videos while still creating the ad for THIS page.
+    'auto_ads_source_page_id',
     // Per-page choice for how the create-ad pipeline shortens Shopee URLs:
     //   'api'        → call short.wwoom.com (default; same as the Electron flow)
     //   'extension'  → call affiliate.shopee.co.th GraphQL via the Feed Ad
@@ -10925,6 +10931,7 @@ const DASHBOARD_SETTING_ALIASES: Record<string, string> = {
     clickLinkFixedCampaignId: 'click_link_fixed_campaign_id', clickLinkFixedAdsetId: 'click_link_fixed_adset_id',
     autoAdsAutomationEnabled: 'auto_ads_automation_enabled', autoAdsCadenceMinutes: 'auto_ads_cadence_minutes',
     autoAdsMaxPerDay: 'auto_ads_max_per_day', autoAdsRunHours: 'auto_ads_run_hours',
+    autoAdsSourcePageId: 'auto_ads_source_page_id',
 }
 
 app.get('/api/dashboard/settings', async (c) => {
@@ -14883,6 +14890,14 @@ async function pickBestAutoAdsCandidateForPage(env: Env, pageId: string, rng: ()
     const adAccountRow = await getPageSetting(env.DB, pageId, 'ad_account').catch(() => null)
     if (!String(adAccountRow?.value || '').trim()) return null
 
+    // Resolve the SOURCE page whose cached videos seed this target page's candidates. Defaults to the
+    // target page itself (existing behavior); when configured (e.g. the Chearb source page) a smaller
+    // target page randomizes its Follow ads from another page's high-reach videos. The ad is ALWAYS
+    // created for the TARGET page (candidate.pageId below stays pageId) — only the candidate video pool and
+    // the system-video resolution read from the source page.
+    const sourcePageRow = await getPageSetting(env.DB, pageId, AUTO_ADS_SOURCE_PAGE_ID_SETTING_KEY).catch(() => null)
+    const sourcePageId = resolveAutoAdsSourcePageId(sourcePageRow?.value, pageId)
+
     const failureRows = await env.DB.prepare(
         `SELECT page_id, status, error_message, truncated_result_json, created_at, published_to_page
          FROM dashboard_ad_history
@@ -14893,14 +14908,17 @@ async function pickBestAutoAdsCandidateForPage(env: Env, pageId: string, rng: ()
     const skipped = buildAdOnlySkippedPageSet(failureRows.results || [], nowMs)
     if (skipped.has(pageId)) return null
 
+    // Candidate video pool comes from the SOURCE page's cache (Chearb when configured, else this page).
     const videos = await listFacebookPageVideoCache(env.DB, {
-        pageId,
+        pageId: sourcePageId,
         minViews: AD_ONLY_AUTO_MIN_VIEWS,
         limit: AD_ONLY_AUTO_VIDEOS_PER_PAGE,
         order: 'newest',
     }).catch(() => [] as FacebookPageVideoCacheRow[])
     if (!videos.length) return null
 
+    // Used-id dedup stays keyed on the TARGET page (per-target-page same-day reuse), so two target pages
+    // can each promote the same source video on the same day, but neither reuses it for itself.
     const historyRows = await env.DB.prepare(
         `SELECT source_story_id, source_post_id, fb_video_id, system_video_id, effective_object_story_id, created_at, status
          FROM dashboard_ad_history WHERE page_id = ? ORDER BY id DESC LIMIT 5000`
@@ -14913,7 +14931,9 @@ async function pickBestAutoAdsCandidateForPage(env: Env, pageId: string, rng: ()
         const fbVideoId = String(v.video_id || '').trim()
         const postId = String(v.post_id || '').trim()
         const shopeeLink = String(v.shopee_link || '').trim()
-        const resolved = await resolveAdOnlySystemVideoIdFromSignal(env, { pageId, postId, fbVideoId, shopeeLink })
+        // Resolve the internal system video from the SOURCE page (the cached video, post_history and
+        // shopee link all belong to the source page). The created ad still targets the target page.
+        const resolved = await resolveAdOnlySystemVideoIdFromSignal(env, { pageId: sourcePageId, postId, fbVideoId, shopeeLink })
         const sourceUrl = String(v.source_url || '').trim()
         const src = resolveAdOnlyCandidateVideoSource({ systemVideoId: resolved.systemVideoId, sourceUrl })
         if (src.source === '') continue
@@ -15143,6 +15163,7 @@ app.get('/api/dashboard/auto-ads/status', async (c) => {
     const cadence = await getAutoAdsCadenceMinutes(c.env.DB, pageId)
     const maxPerDay = clampAutoAdsMaxPerDay((await getPageSetting(c.env.DB, pageId, AUTO_ADS_MAX_PER_DAY_SETTING_KEY).catch(() => null))?.value)
     const runHours = await getAutoAdsRunHours(c.env.DB, pageId)
+    const sourcePageId = resolveAutoAdsSourcePageId((await getPageSetting(c.env.DB, pageId, AUTO_ADS_SOURCE_PAGE_ID_SETTING_KEY).catch(() => null))?.value, pageId)
     const followCampaign = String((await getPageSetting(c.env.DB, pageId, FOLLOW_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
     const followAdset = String((await getPageSetting(c.env.DB, pageId, FOLLOW_LANE_FIXED_ADSET_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
     const clickCampaign = String((await getPageSetting(c.env.DB, pageId, CLICK_LINK_LANE_FIXED_CAMPAIGN_ID_SETTING_KEY).catch(() => null))?.value || '').trim()
@@ -15159,6 +15180,7 @@ app.get('/api/dashboard/auto-ads/status', async (c) => {
         cadence_minutes: cadence,
         max_per_day: maxPerDay,
         run_hours: runHours,
+        source_page_id: sourcePageId,
         follow_fixed_campaign_id: followCampaign,
         follow_fixed_adset_id: followAdset,
         click_link_fixed_campaign_id: clickCampaign,
