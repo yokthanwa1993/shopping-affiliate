@@ -130,6 +130,79 @@
     color: var(--muted);
     font-size: 12.5px;
   }
+  /* Top-level platform menu: Shopee and Facebook are presented as separate large areas. */
+  .platform-menu {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .platform-link {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 10px 16px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel);
+    color: var(--text);
+    text-decoration: none;
+    font-weight: 750;
+    box-shadow: var(--shadow);
+  }
+  .platform-link:hover { border-color: var(--accent); }
+  .platform-link .platform-sub {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 650;
+  }
+  .platform {
+    border-left: 4px solid var(--accent);
+  }
+  .platform-head {
+    background: var(--panel-muted);
+  }
+  .platform-head h2 {
+    font-size: 17px;
+    font-weight: 800;
+  }
+  .platform-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 9px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
+  /* Facebook sub-sections: Post (Facebook Lite) and Ads (Power Editor). */
+  .fb-subsection {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .fb-subsection:last-of-type { border-bottom: 0; }
+  .fb-subsection p { margin: 4px 0 10px; }
+  .subsection-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+  .subsection-head h3 { margin: 0; }
+  .subsection-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 6px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+  }
   .table-wrap {
     overflow-x: auto;
   }
@@ -322,6 +395,11 @@
 </header>
 
 <main>
+  <nav class="platform-menu" aria-label="Platforms">
+    <a class="platform-link" href="#shopee-section">Shopee</a>
+    <a class="platform-link" href="#facebook-section">Facebook<span class="platform-sub">Post · Ads</span></a>
+  </nav>
+
   <section class="panel" aria-labelledby="accounts-title">
     <div class="panel-head">
       <h2 id="accounts-title">Accounts</h2>
@@ -381,8 +459,21 @@
     </div>
   </section>
 
-  <section class="panel" aria-labelledby="facebook-title">
-    <div class="panel-head">
+  <section class="panel platform" id="shopee-section" aria-labelledby="shopee-title">
+    <div class="panel-head platform-head">
+      <span class="platform-tag">Platform</span>
+      <h2 id="shopee-title">Shopee</h2>
+      <div class="grow"></div>
+      <span class="status-line">Status-only — no browser session, no auto-login.</span>
+    </div>
+    <div class="panel-body">
+      <p class="muted">Shopee account credentials live in the shared Accounts table above. Accounts Bridge is status-only for Shopee: opening this page never logs in, refreshes a token, or opens a browser. To store or update a Shopee login, select or add the account in the form above (password and 2FA are write-only).</p>
+    </div>
+  </section>
+
+  <section class="panel platform" id="facebook-section" aria-labelledby="facebook-title">
+    <div class="panel-head platform-head">
+      <span class="platform-tag">Platform</span>
       <h2 id="facebook-title">Facebook</h2>
       <div class="grow"></div>
       <span class="status-line">Status-only by default — every action below is manual and runs only when clicked.</span>
@@ -390,14 +481,14 @@
     <div class="panel-body">
       <div class="fb-group" id="account-roles">
         <h3>Account roles (status / config)</h3>
-        <p class="muted">Map which saved account plays each Facebook role. Saving a role is config only — it never logs in, mints, refreshes a token, or opens a browser. Page posting and ad creation are intentionally separate roles.</p>
+        <p class="muted">Map which saved account plays each Facebook role. Saving a role is config only — it never logs in, mints, refreshes a token, or opens a browser. Post (Page posting) and Ads (ad creation) are intentionally separate roles.</p>
         <div class="fields">
           <div>
-            <label for="role-posting-input">Page posting account (Facebook Lite / Token Bridge)</label>
+            <label for="role-posting-input">Post account — Facebook Lite / Token Bridge</label>
             <input id="role-posting-input" placeholder="account / namespace" autocapitalize="characters">
           </div>
           <div>
-            <label for="role-ads-input">Ad creation account (Power Editor)</label>
+            <label for="role-ads-input">Ads account — Power Editor</label>
             <input id="role-ads-input" placeholder="account / namespace" autocapitalize="characters">
           </div>
         </div>
@@ -407,15 +498,21 @@
         </div>
         <p class="muted fb-note" id="roles-readiness">Account roles not loaded.</p>
       </div>
-      <div class="fb-group">
-        <h3>Facebook Lite — Page posting / Token Bridge (EAAD6V)</h3>
-        <p class="muted">Page-posting token source. Status-only by default; opening this page never mints, refreshes, or opens a browser. Refresh runs only when you click, validates readiness, and caches the result for one hour.</p>
+      <div class="fb-subsection" id="fb-post">
+        <div class="subsection-head">
+          <span class="subsection-tag">Post</span>
+          <h3>Post — Facebook Lite (Page posting / Token Bridge)</h3>
+        </div>
+        <p class="muted">Page-posting token source (EAAD6V). Status-only by default; opening this page never mints, refreshes, or opens a browser. Refresh runs only when you click, validates readiness, and caches the result for one hour.</p>
         <div class="actions">
           <button type="button" id="fb-lite-manual-refresh">Manual refresh Facebook Lite token</button>
         </div>
       </div>
-      <div class="fb-group">
-        <h3>Power Editor — Ad creation</h3>
+      <div class="fb-subsection" id="fb-ads">
+        <div class="subsection-head">
+          <span class="subsection-tag">Ads</span>
+          <h3>Ads — Power Editor (Ad creation)</h3>
+        </div>
         <p class="muted">For ad creation only. API-only role configuration; Accounts Bridge does not open browser sessions from this UI.</p>
       </div>
       <p class="muted fb-note">Actions operate on the account selected in the form above. Token recovery for posting and comments is fully automatic and machine-to-machine; this console is status-only.</p>

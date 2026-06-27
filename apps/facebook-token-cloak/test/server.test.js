@@ -72,10 +72,12 @@ test('UI is status-only on load: no automatic login, autofill/submit, token refr
   assert.doesNotMatch(ui, /Open Power Editor session \(manual\)/);
   assert.doesNotMatch(ui, /power-editor-button/);
   assert.doesNotMatch(ui, /Login\/Get Token/);
-  // (5) Facebook area is split into two explicit purposes: Facebook Lite (Page posting / Token Bridge
-  // EAAD6V) and Power Editor (ad creation, manual session only).
-  assert.match(ui, /Facebook Lite — Page posting \/ Token Bridge \(EAAD6V\)/);
-  assert.match(ui, /Power Editor — Ad creation/);
+  // (5) Facebook area is split into two explicit sub-sections under the Facebook platform: Post
+  // (Facebook Lite — Page posting / Token Bridge) and Ads (Power Editor — ad creation). The EAAD6V
+  // detail moved into the Post sub-section body; no "manual session only" wording remains.
+  assert.match(ui, /Post — Facebook Lite \(Page posting \/ Token Bridge\)/);
+  assert.match(ui, /Ads — Power Editor \(Ad creation\)/);
+  assert.match(ui, /EAAD6V/);
   assert.doesNotMatch(ui, /manual session only/);
   // (6) The manual Facebook Lite refresh calls the SAFE status endpoint only when clicked.
   assert.match(ui, /\$\("#fb-lite-manual-refresh"\)\.addEventListener\("click"/);
@@ -88,6 +90,49 @@ test('UI is status-only on load: no automatic login, autofill/submit, token refr
   assert.match(ui, /Accounts Bridge/);
   assert.doesNotMatch(ui, /Account Manager/);
   assert.doesNotMatch(ui, /FB Bridge/);
+})
+
+test('UI separates Shopee and Facebook as distinct top-level platform areas, with Facebook split into Post (Facebook Lite) and Ads (Power Editor) sub-sections', async () => {
+  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
+
+  // (1) Two separate large platform areas exist — Shopee and Facebook are NOT mixed into one panel.
+  assert.match(ui, /id="shopee-section"/, 'a dedicated Shopee platform section must exist');
+  assert.match(ui, /id="facebook-section"/, 'a dedicated Facebook platform section must exist');
+  assert.match(ui, /<h2 id="shopee-title">Shopee<\/h2>/, 'Shopee must be a top-level heading');
+  assert.match(ui, /<h2 id="facebook-title">Facebook<\/h2>/, 'Facebook must be a top-level heading');
+  // The two platform sections are independent siblings, in order Shopee then Facebook.
+  assert.ok(ui.indexOf('id="shopee-section"') < ui.indexOf('id="facebook-section"'), 'Shopee area comes before Facebook area');
+  assert.ok(ui.indexOf('id="shopee-section"') !== ui.indexOf('id="facebook-section"'), 'Shopee and Facebook are separate sections');
+
+  // (2) A top-level menu lists both platforms as distinct entries.
+  assert.match(ui, /class="platform-menu"/, 'a top-level platform menu must exist');
+  assert.match(ui, /href="#shopee-section">Shopee</, 'menu links to the Shopee area');
+  assert.match(ui, /href="#facebook-section">Facebook/, 'menu links to the Facebook area');
+
+  // (3) Under Facebook, two explicit sub-cards: Post = Facebook Lite, Ads = Power Editor.
+  assert.match(ui, /id="fb-post"/, 'Facebook Post sub-section must exist');
+  assert.match(ui, /id="fb-ads"/, 'Facebook Ads sub-section must exist');
+  assert.match(ui, /Post — Facebook Lite \(Page posting \/ Token Bridge\)/);
+  assert.match(ui, /Ads — Power Editor \(Ad creation\)/);
+  // The Post sub-section appears before the Ads sub-section and both live inside the Facebook area.
+  assert.ok(ui.indexOf('id="facebook-section"') < ui.indexOf('id="fb-post"'), 'Post sub-section is inside the Facebook area');
+  assert.ok(ui.indexOf('id="fb-post"') < ui.indexOf('id="fb-ads"'), 'Post sub-section comes before Ads sub-section');
+
+  // (4) Status-only is preserved: NO browser session launcher, NO /login?account= URL, NO auto-login,
+  // NO auto-fill/auto-submit, NO token refresh on load — even after the restructure.
+  assert.doesNotMatch(ui, /\/login\?account=/, 'no browser-login launcher URL');
+  assert.doesNotMatch(ui, /power-editor-button/, 'no Power Editor browser-session launcher');
+  assert.doesNotMatch(ui, /autofill=1/, 'no credential autofill');
+  assert.doesNotMatch(ui, /submit=1/, 'no automatic login submit');
+  assert.doesNotMatch(ui, /\/token\/refresh/, 'no token refresh endpoint call');
+  assert.doesNotMatch(ui, /runLogin/, 'no auto-login handler');
+  // Load-time work stays cache-only (no network token probe on open).
+  assert.match(ui, /hydrateTokenStatusesFromCache\(\);/, 'load hydrates from cache only');
+
+  // (5) No raw token/cookie/secret is rendered into the page body by the restructured markup. The
+  // Shopee and Facebook platform sections are status/config only.
+  const shopeeSection = ui.slice(ui.indexOf('id="shopee-section"'), ui.indexOf('id="facebook-section"'));
+  assert.doesNotMatch(shopeeSection, /access_token|EAAD6V|EAAB|datr=|fb_dtsg/, 'Shopee area must not render any raw token/cookie/secret');
 })
 
 function browser(url = 'https://postcron.com/auth/login/facebook/callback#access_token=EAAB_USER_SECRET', seen) {
