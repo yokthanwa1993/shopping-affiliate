@@ -161,7 +161,6 @@ export function CreateAdsPage() {
     queryFn: ({ signal }) => fetchSettingsPages(signal),
   })
   const pages = pagesQuery.data ?? ([] as SettingsPage[])
-  const selectedPage = pages.find((p) => p.id === selectedId) ?? null
 
   // Create Ads master must remain a PAGE TABLE, not a campaign table. Filter the table by ACTIVE
   // campaign names from Ads Manager: campaign name maps to page name (เช่น เฉียบ, รีวิวแบบไม่อวย,
@@ -217,6 +216,8 @@ export function CreateAdsPage() {
       .map((p) => ({ ...p, active: true }))
       .sort((a, b) => a.name.localeCompare(b.name))
   }, [pages, activeCampaignPageNames])
+
+  const selectedPage = adPages.find((p) => p.id === selectedId) ?? pages.find((p) => p.id === selectedId) ?? null
 
   if (selectedPage) {
     // DETAIL — Create Ads settings scoped to the chosen page, with a back affordance
