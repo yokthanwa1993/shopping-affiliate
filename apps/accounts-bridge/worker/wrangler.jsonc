@@ -1,0 +1,26 @@
+{
+  // Accounts Bridge v2 Worker — side-by-side, deploy-independent from video-affiliate / browsersaving.
+  // Pure D1 + config API. NO containers, NO Durable Objects, NO browser automation.
+  "name": "accounts-bridge-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-02-14",
+  "workers_dev": true,
+
+  // D1 database. Create with:  wrangler d1 create accounts-bridge-db
+  // then paste the returned database_id below. Migrations live in ./migrations.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "accounts-bridge-db",
+      "database_id": "7a9f4f4a-f586-4a74-a351-017d51f03032",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Non-secret vars only. The shared local-bridge API key is a SECRET — set it with:
+  //   wrangler secret put ACCOUNTS_BRIDGE_API_KEY
+  // Never place the key value in this file or in any var.
+  "vars": {
+    "CORS_ORIGIN": "*"
+  }
+}
