@@ -23,117 +23,12 @@ function assertNoLeak(value, secrets) {
   for (const secret of secrets) assert.ok(!payload.includes(secret), `leaked ${secret}`);
 }
 
-test('UI marks Facebook Lite ready only after the endpoint validates (ok=true AND accessToken=true), not from a token prefix alone', async () => {
-  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
-  // Readiness now requires the endpoint to report BOTH ok=true (real-time Graph validation passed)
-  // and accessToken=true. A minted EAAD6V prefix alone must NOT turn the badge green.
-  assert.match(ui, /var tokenReady = !!\(probe && probe\.ok && probe\.accessToken\)/);
-  assert.match(ui, /var sessionReady = !!\(probe && probe\.fbDtsg\)/);
-  assert.match(ui, /tokenPresent: tokenReady/);
-  assert.match(ui, /sessionPresent: sessionReady/);
-  // The old prefix-only readiness check must be gone — Graph validation (probe.ok) now gates it.
-  assert.ok(!ui.includes('var tokenReady = !!(probe && probe.accessToken)'), 'readiness must not be derived from accessToken alone (prefix-only) — Graph validation gates it');
-  assert.ok(!ui.includes('var ready = tokenReady && sessionReady'), 'Facebook Lite token status must not require Power Editor/session readiness');
-  assert.ok(!ui.includes('tokenPresent: ready'), 'UI must not gate Facebook Lite token status on combined readiness');
-})
-
-test('UI is status-only: recovery is AUTOMATIC — there is NO manual Sync-to-Worker button/handler/namespace field as the recovery path', async () => {
-  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
-  // The manual recovery affordance must NOT exist: no button label, no button id, no handler, no
-  // operator-typed namespace field, and the UI must never POST to /token/auto-sync itself. Recovery
-  // is machine-to-machine (the Worker calls the bridge), so the UI cannot be the required control path.
-  assert.ok(!/Sync to Worker/.test(ui), 'the manual "Sync to Worker" button label must be gone');
-  assert.ok(!/id="sync-button"/.test(ui), 'the sync-button element must be gone');
-  assert.ok(!/runAutoSync/.test(ui), 'the manual sync handler must be gone');
-  assert.ok(!/id="namespace-input"/.test(ui), 'the operator-typed namespace field must be gone');
-  assert.ok(!/["']\/token\/auto-sync["']/.test(ui), 'the UI must never call /token/auto-sync (recovery is not UI-driven)');
-  // It still positively states that recovery happens automatically (status-only affordance).
-  assert.ok(/automatic/i.test(ui), 'the UI should state that recovery is automatic');
-})
-
-test('UI is status-only on load: no automatic login, autofill/submit, token refresh, or browser-opening probe', async () => {
-  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
-  // (1) No aggressive auto-login from the UI: never autofill+submit, never autofill, never auto-submit.
-  assert.ok(!/visible=1&autofill=1&submit=1/.test(ui), 'UI must never auto-fill AND auto-submit a login');
-  assert.ok(!/autofill=1/.test(ui), 'UI must never request credential autofill');
-  assert.ok(!/submit=1/.test(ui), 'UI must never request an automatic login submit');
-  // (2) No legacy refresh-after-login path.
-  assert.ok(!/\/token\/refresh/.test(ui), 'UI must not POST /token/refresh');
-  assert.ok(!/runLogin/.test(ui), 'the auto-login runLogin path must be gone');
-  // (3) Load-time hydration is CACHE-ONLY — opening the page must make no /token network call and
-  // open no browser. The old network-probing hydrate-on-load is gone.
-  assert.match(ui, /function hydrateTokenStatusesFromCache\(\)/);
-  assert.match(ui, /hydrateTokenStatusesFromCache\(\);/, 'loadAccounts hydrates from cache only');
-  assert.ok(!/hydrateTokenStatuses\(\)/.test(ui), 'the old network-probing hydrate-on-load must be gone');
-  const cacheFn = ui.match(/function hydrateTokenStatusesFromCache\(\)[\s\S]*?\n  }/)[0];
-  assert.ok(!/api\(/.test(cacheFn), 'cache-only hydration must make NO network call');
-  // (4) Explicit, side-effect-clear manual buttons replace any generic "Login/Get Token".
-  assert.match(ui, /Manual refresh Facebook Lite token/);
-  assert.doesNotMatch(ui, /Open Power Editor session \(manual\)/);
-  assert.doesNotMatch(ui, /power-editor-button/);
-  assert.doesNotMatch(ui, /Login\/Get Token/);
-  // (5) Facebook area is split into two explicit sub-sections under the Facebook platform: Post
-  // (Facebook Lite — Page posting / Token Bridge) and Ads (Power Editor — ad creation). The EAAD6V
-  // detail moved into the Post sub-section body; no "manual session only" wording remains.
-  assert.match(ui, /Post — Facebook Lite \(Page posting \/ Token Bridge\)/);
-  assert.match(ui, /Ads — Power Editor \(Ad creation\)/);
-  assert.match(ui, /EAAD6V/);
-  assert.doesNotMatch(ui, /manual session only/);
-  // (6) The manual Facebook Lite refresh calls the SAFE status endpoint only when clicked.
-  assert.match(ui, /\$\("#fb-lite-manual-refresh"\)\.addEventListener\("click"/);
-  assert.match(ui, /async function refreshFacebookLiteToken\(explicitAccount\)/);
-  // (7) Browser-session launchers are removed from the UI entirely. Power Editor is configured via API only.
-  assert.doesNotMatch(ui, /\$\("#power-editor-button"\)\.addEventListener\("click"/);
-  assert.doesNotMatch(ui, /\/login\?account=/);
-  assert.doesNotMatch(ui, /visible=1&autofill=0&submit=0/);
-  // (8) Renamed user-facing tool; no FB Bridge / Account Manager wording remains.
-  assert.match(ui, /Accounts Bridge/);
-  assert.doesNotMatch(ui, /Account Manager/);
-  assert.doesNotMatch(ui, /FB Bridge/);
-})
-
-test('UI separates Shopee and Facebook as distinct top-level platform areas, with Facebook split into Post (Facebook Lite) and Ads (Power Editor) sub-sections', async () => {
-  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
-
-  // (1) Two separate large platform areas exist — Shopee and Facebook are NOT mixed into one panel.
-  assert.match(ui, /id="shopee-section"/, 'a dedicated Shopee platform section must exist');
-  assert.match(ui, /id="facebook-section"/, 'a dedicated Facebook platform section must exist');
-  assert.match(ui, /<h2 id="shopee-title">Shopee<\/h2>/, 'Shopee must be a top-level heading');
-  assert.match(ui, /<h2 id="facebook-title">Facebook<\/h2>/, 'Facebook must be a top-level heading');
-  // The two platform sections are independent siblings, in order Shopee then Facebook.
-  assert.ok(ui.indexOf('id="shopee-section"') < ui.indexOf('id="facebook-section"'), 'Shopee area comes before Facebook area');
-  assert.ok(ui.indexOf('id="shopee-section"') !== ui.indexOf('id="facebook-section"'), 'Shopee and Facebook are separate sections');
-
-  // (2) A top-level menu lists both platforms as distinct entries.
-  assert.match(ui, /class="platform-menu"/, 'a top-level platform menu must exist');
-  assert.match(ui, /href="#shopee-section">Shopee</, 'menu links to the Shopee area');
-  assert.match(ui, /href="#facebook-section">Facebook/, 'menu links to the Facebook area');
-
-  // (3) Under Facebook, two explicit sub-cards: Post = Facebook Lite, Ads = Power Editor.
-  assert.match(ui, /id="fb-post"/, 'Facebook Post sub-section must exist');
-  assert.match(ui, /id="fb-ads"/, 'Facebook Ads sub-section must exist');
-  assert.match(ui, /Post — Facebook Lite \(Page posting \/ Token Bridge\)/);
-  assert.match(ui, /Ads — Power Editor \(Ad creation\)/);
-  // The Post sub-section appears before the Ads sub-section and both live inside the Facebook area.
-  assert.ok(ui.indexOf('id="facebook-section"') < ui.indexOf('id="fb-post"'), 'Post sub-section is inside the Facebook area');
-  assert.ok(ui.indexOf('id="fb-post"') < ui.indexOf('id="fb-ads"'), 'Post sub-section comes before Ads sub-section');
-
-  // (4) Status-only is preserved: NO browser session launcher, NO /login?account= URL, NO auto-login,
-  // NO auto-fill/auto-submit, NO token refresh on load — even after the restructure.
-  assert.doesNotMatch(ui, /\/login\?account=/, 'no browser-login launcher URL');
-  assert.doesNotMatch(ui, /power-editor-button/, 'no Power Editor browser-session launcher');
-  assert.doesNotMatch(ui, /autofill=1/, 'no credential autofill');
-  assert.doesNotMatch(ui, /submit=1/, 'no automatic login submit');
-  assert.doesNotMatch(ui, /\/token\/refresh/, 'no token refresh endpoint call');
-  assert.doesNotMatch(ui, /runLogin/, 'no auto-login handler');
-  // Load-time work stays cache-only (no network token probe on open).
-  assert.match(ui, /hydrateTokenStatusesFromCache\(\);/, 'load hydrates from cache only');
-
-  // (5) No raw token/cookie/secret is rendered into the page body by the restructured markup. The
-  // Shopee and Facebook platform sections are status/config only.
-  const shopeeSection = ui.slice(ui.indexOf('id="shopee-section"'), ui.indexOf('id="facebook-section"'));
-  assert.doesNotMatch(shopeeSection, /access_token|EAAD6V|EAAB|datr=|fb_dtsg/, 'Shopee area must not render any raw token/cookie/secret');
-})
+test('native-only Accounts Bridge ships no local web UI files', async () => {
+  const uiHtml = path.join(__dirname, '..', 'src', 'ui.html');
+  const uiJs = path.join(__dirname, '..', 'src', 'ui.js');
+  await assert.rejects(fs.access(uiHtml), { code: 'ENOENT' });
+  await assert.rejects(fs.access(uiJs), { code: 'ENOENT' });
+});
 
 function browser(url = 'https://postcron.com/auth/login/facebook/callback#access_token=EAAB_USER_SECRET', seen) {
   return {

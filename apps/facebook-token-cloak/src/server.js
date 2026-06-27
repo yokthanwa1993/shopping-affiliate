@@ -7,7 +7,6 @@ const browser = require('./browser');
 const accountSelectors = require('./account-selectors');
 const accountsRegistry = require('./accounts-registry');
 const bridgeConfig = require('./bridge-config');
-const ui = require('./ui');
 const posting = require('./posting');
 const fbLiteTokenService = require('./fb-lite-token-service.cjs');
 const {
