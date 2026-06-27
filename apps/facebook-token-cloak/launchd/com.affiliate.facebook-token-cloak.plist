@@ -26,10 +26,9 @@
     <string>production</string>
     <key>PATH</key>
     <string>/Users/yok-macmini/.local/opt/node-v24.14.1-darwin-arm64/bin:/Users/yok-macmini/.local/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <!-- CloakBrowser profile that drives the Worker posting bridge endpoints
-         (/token, /pages, /post, /page-comment, /create-ad). Not a secret. -->
+    <!-- Accounts Bridge v2 default account. Must match the configured Facebook Lite/Power Editor role owner; do not point this at a legacy profile. -->
     <key>FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT</key>
-    <string>content_paiya</string>
+    <string>100090320823561</string>
     <!-- Non-secret Ads Manager TEMPLATE_SALES adset id. Keep runtime explicit so the bridge never
          falls back to the retired pre-SALES template adset. -->
     <key>FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET</key>
