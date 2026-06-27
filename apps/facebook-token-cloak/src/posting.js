@@ -133,10 +133,16 @@ function makeBrowserGraphFetch(target) {
   return browserGraphFetch;
 }
 
-// Close the browser context opened for a request's Graph work. Safe on any shape; swallows
-// errors. Call in a `finally` after all Graph calls complete so contexts never leak.
+// Close the browser context opened for a request's Graph work. Safe on any shape; swallows errors.
+// Call in a `finally` after all Graph calls complete so one-off contexts never leak.
+//
+// REUSED contexts are NEVER closed here: when resolveSessionToken reused the live context an
+// operator's visible /login left open (session.reused === true), that window is owned by the login
+// flow — closing it would tear down the operator's active session/window mid-use. Only the one-off
+// contexts this request opened itself (session.reused falsy) are closed.
 async function closeSession(session) {
   try {
+    if (session && session.reused) return;
     if (session && session.context && typeof session.context.close === 'function') {
       await session.context.close();
     }
@@ -156,9 +162,16 @@ async function resolveSessionToken({ browser, account, visible = false } = {}) {
   }
   let opened;
   try {
-    opened = await browser.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible });
+    // reuseIfPresent: when an operator's visible /login left a live context open for this account,
+    // REUSE it to resolve the token instead of launching a second persistentContext on the same
+    // (locked) profile dir — that double-launch is what surfaced as profile_already_open and then an
+    // opaque no_session. When there is no live context, this still launches a fresh one-off context
+    // from the same profile (closed by closeSession), so the non-visible posting path is unchanged.
+    opened = await browser.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible, reuseIfPresent: true });
   } catch (e) {
-    return { token: null, reason: (e && (e.code || e.message)) || 'browser_open_failed', fbDtsgPresent: false, userId: null };
+    // Preserve the sanitized blocker code (profile_already_open / profile_locked / browser_open_failed)
+    // so the route can surface it instead of collapsing every open failure into a bare no_session.
+    return { token: null, reason: (e && (e.code || e.message)) || 'browser_open_failed', reused: false, fbDtsgPresent: false, userId: null };
   }
 
   let currentUrl = '';
@@ -193,6 +206,8 @@ async function resolveSessionToken({ browser, account, visible = false } = {}) {
     fbDtsgPresent,
     userId,
     currentUrl,
+    // True when the live operator-visible context was reused — closeSession must NOT close it.
+    reused: !!opened.reused,
     backend: opened.backend,
     profileDir: opened.profileDir,
     context: opened.context,

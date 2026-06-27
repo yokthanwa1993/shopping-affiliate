@@ -316,6 +316,20 @@ function sanitizePublicReason(value, fallback = 'request_failed') {
     .replace(/\b(fb_dtsg|datr|cookie|cookies|password)\b\s*[:=]?\s*[^,\s;)]+/ig, '$1=[REDACTED]');
 }
 
+// Build the response body for a posting route that could not resolve a usable session token. `error`
+// stays the stable 'no_session' code (the Worker + existing tests key on it), but the SANITIZED
+// blocker `reason` (profile_already_open / profile_locked / token_not_found / browser_unavailable …)
+// and the sanitized landing `current_url` are added so the failure is no longer collapsed into an
+// opaque no_session. Never carries a token, cookie, datr, or fb_dtsg — both fields are sanitized.
+function sessionFailureBody(session, extra = {}) {
+  const raw = String((session && session.reason) || '').trim();
+  const out = { ok: false, step: 'session', error: 'no_session', ...extra };
+  if (raw && raw !== 'no_session') out.reason = sanitizePublicReason(raw, 'no_session');
+  const currentUrl = session && session.currentUrl;
+  if (currentUrl) out.current_url = sanitizeUrlSecrets(String(currentUrl)).slice(0, 500);
+  return out;
+}
+
 async function safeKeychainStatus(kc, account) {
   try {
     return await kc.getStatus(account);
@@ -1853,7 +1867,17 @@ function createHandler(deps = {}) {
           if (!fbDtsg && session.context) {
             try { fbDtsg = await posting.hasLoggedInSession(session.context); } catch {}
           }
-          return send(res, 200, { ok: true, accessToken, fbDtsg, source: session.source || 'browser_session', account: sanitizeAccount(account).display });
+          // When no token resolved, surface the sanitized blocker reason (profile_already_open /
+          // token_not_found …) so a session probe is diagnosable instead of a bare accessToken:false.
+          const rawReason = String(session.reason || '').trim();
+          return send(res, 200, {
+            ok: true,
+            accessToken,
+            fbDtsg,
+            source: session.source || 'browser_session',
+            account: sanitizeAccount(account).display,
+            ...(!accessToken && rawReason && rawReason !== 'no_session' ? { reason: sanitizePublicReason(rawReason, 'token_not_found') } : {})
+          });
         } finally {
           await posting.closeSession(session);
         }
@@ -1879,7 +1903,17 @@ function createHandler(deps = {}) {
         }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { data: [], error: 'no_session' });
+          if (!session.token) {
+            // Surface the sanitized blocker reason (profile_already_open / token_not_found …) alongside
+            // the stable no_session code instead of an empty list with no explanation.
+            const raw = String(session.reason || '').trim();
+            return send(res, 200, {
+              data: [],
+              error: 'no_session',
+              ...(raw && raw !== 'no_session' ? { reason: sanitizePublicReason(raw, 'no_session') } : {}),
+              ...(session.currentUrl ? { current_url: sanitizeUrlSecrets(String(session.currentUrl)).slice(0, 500) } : {})
+            });
+          }
           const result = await posting.listPagesPublic(session.graphFetch, session.token, includeToken && isLocalRequest(req));
           return send(res, 200, result);
         } finally {
@@ -1911,7 +1945,7 @@ function createHandler(deps = {}) {
         }
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           const result = await posting.postOneCardVideo(session.graphFetch, {
             userToken: session.token,
             adAccount: body.ad_account || POST_AD_ACCOUNT,
@@ -1998,7 +2032,7 @@ function createHandler(deps = {}) {
         const account = body.account || POST_ACCOUNT;
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           // EDIT-ONLY: replace the Shopee link inside an EXISTING Page-owned comment. Never creates a
           // duplicate comment, never deletes; allow_create_new is intentionally not honored here.
           const result = await posting.editPageCommentLink(session.graphFetch, {
@@ -2024,7 +2058,7 @@ function createHandler(deps = {}) {
         if (!adAccount || !videoUrl) return send(res, 400, { ok: false, step: 'validate', error: 'Missing: ad_account, video_url' });
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           const up = await posting.uploadAdVideoFromUrl(session.graphFetch, {
             adAccount,
             userToken: session.token,
@@ -2062,7 +2096,7 @@ function createHandler(deps = {}) {
         if (!advideoId) return send(res, 400, { ok: false, step: 'validate', error: 'Missing: advideo_id' });
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           const meta = await posting.resolveAdVideoMeta(session.graphFetch, { advideoId, userToken: session.token });
           if (!meta.ok) {
             const err = meta.error || {};
@@ -2109,7 +2143,7 @@ function createHandler(deps = {}) {
         const account = body.account || POST_ACCOUNT;
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           const result = await posting.createAd(session.graphFetch, {
             userToken: session.token,
             body,
@@ -2129,7 +2163,7 @@ function createHandler(deps = {}) {
         const account = body.account || POST_ACCOUNT;
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           const result = await posting.promoteOneCardPost(session.graphFetch, {
             userToken: session.token,
             body,
@@ -2152,7 +2186,7 @@ function createHandler(deps = {}) {
         if (!pageId || !storyId) return send(res, 400, { ok: false, step: 'validate', error: 'Missing: page_id, story_id' });
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           // Publish the SAME ad story to the page feed (page token only, resolved internally).
           // ok:true ONLY when publishStoryToPage confirms publishedToPage. No tokens returned.
           const pub = await posting.publishStoryToPage(session.graphFetch, { userToken: session.token, pageId, storyId, pollMs: POLL_MS });
@@ -2175,7 +2209,7 @@ function createHandler(deps = {}) {
         const account = body.account || POST_ACCOUNT;
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           const result = await posting.updateVisiblePostCta(session.graphFetch, {
             userToken: session.token,
             pageId: body.page_id,
@@ -2196,7 +2230,7 @@ function createHandler(deps = {}) {
         const account = body.account || POST_ACCOUNT;
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           // Repair the PAID ad creative CTA (Ads Manager) — DISTINCT from /update-cta (visible post).
           // Creates a new creative carrying the final post-specific Shopee link and re-points the ad.
           const result = await posting.repairPaidAdCta(session.graphFetch, {
@@ -2225,7 +2259,7 @@ function createHandler(deps = {}) {
         const account = body.account || POST_ACCOUNT;
         const session = await posting.resolveSessionToken({ browser: br, account });
         try {
-          if (!session.token) return send(res, 200, { ok: false, step: 'session', error: 'no_session' });
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
           // Turn OFF finished system-created ad objects — status=PAUSED ONLY. This NEVER deletes:
           // pauseAdOnlyObjects issues no DELETE request and never sets status='DELETED'. Read-back of
           // status/effective_status is returned so the worker can record proof of the off-state.

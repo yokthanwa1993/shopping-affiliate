@@ -47,6 +47,18 @@ function isContextAlive(context){
   return true;
 }
 function forgetAccountContext(key,context){ const cur=_accountContexts.get(key); if(cur&&(!context||cur.context===context)) _accountContexts.delete(key); }
+// Non-launching peek at the live cached context this process already owns for the account (the one a
+// visible /login left open). Returns the entry only when it is still alive; evicts and returns null
+// when it has since closed. NEVER launches a new persistent context — this is what posting's
+// session-token resolution uses to decide whether an operator-visible session is reusable, so it can
+// avoid a second SingletonLock-locked launch on the same profile dir without keeping a window open.
+function peekAccountContext(rawAccount){
+  const {key}=sanitizeAccount(rawAccount);
+  const existing=_accountContexts.get(key);
+  if(existing&&isContextAlive(existing.context)) return {backend:existing.backend,profileDir:existing.profileDir,context:existing.context};
+  if(existing) _accountContexts.delete(key);
+  return null;
+}
 // Patterns for a launchPersistentContext failure caused by the profile dir already being open in
 // another (often orphaned/external) Chromium holding the SingletonLock. Mapped to a stable, non-
 // secret code so the route can answer profile_already_open instead of a generic 500.
@@ -89,14 +101,34 @@ async function acquireAccountContext(rawAccount,options={}){
   try{ const entry=await launchPromise; return {...entry,reused:false}; }
   finally{ _accountContextLaunches.delete(key); }
 }
-// openPage with opt-in reuse. reuse:true (interactive /login) navigates the existing window for the
-// account; default (posting's ephemeral open→closeSession lifecycle) launches a fresh context as
-// before, so those flows are unchanged.
+// openPage with three modes (the returned object always carries a `reused` boolean so the caller can
+// decide whether closeSession should close the context):
+//   reuse:true          interactive /login — reuse-or-launch-and-CACHE the per-account context so a
+//                       second /login navigates the same window instead of locking the profile dir.
+//   reuseIfPresent:true posting/session-token resolution — REUSE the live cached context an operator's
+//                       visible /login already left open (reused:true, never closed by closeSession),
+//                       but when there is none, launch a FRESH one-off context (reused:false, NOT
+//                       cached) that closeSession closes after the request. This is the fix for the
+//                       no_session bug: it never launches a second locked persistent context on a
+//                       profile whose window is already up.
+//   default             posting's original ephemeral open→closeSession lifecycle — a fresh one-off
+//                       context (reused:false), unchanged.
 async function openPage(rawAccount,url,options={}){
-  const launched=options.reuse?await acquireAccountContext(rawAccount,options):await launchPersistentContext(rawAccount,options);
+  let launched; let reused=false;
+  if(options.reuse){
+    launched=await acquireAccountContext(rawAccount,options);
+    reused=!!launched.reused;
+  }else if(options.reuseIfPresent){
+    const existing=peekAccountContext(rawAccount);
+    if(existing){ launched=existing; reused=true; }
+    else { launched=await launchPersistentContext(rawAccount,options); reused=false; }
+  }else{
+    launched=await launchPersistentContext(rawAccount,options);
+    reused=false;
+  }
   const page=(launched.context.pages&&launched.context.pages()[0])||await launched.context.newPage();
   await page.goto(url,{waitUntil:'domcontentloaded',timeout:options.timeoutMs||60000});
-  return {...launched,page};
+  return {backend:launched.backend,profileDir:launched.profileDir,context:launched.context,reused,page};
 }
 // Locator-based presence check; best-effort, never throws.
 async function firstPresentSelector(page,selectors){
@@ -348,4 +380,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,openPage,isContextAlive,classifyLaunchError,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,openPage,isContextAlive,classifyLaunchError,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};

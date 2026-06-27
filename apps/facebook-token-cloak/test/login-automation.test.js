@@ -590,3 +590,107 @@ test('/login returns a sanitized profile_already_open (409), never a generic 500
   assert.equal(r.body.reason, 'profile_already_open');
   assert.notEqual(r.body.error, 'Internal server error');
 });
+
+// ── reuseIfPresent: posting/session-token resolution reuses an operator-visible context ─────────
+// The no_session bug: posting's resolveSessionToken opened a SECOND persistentContext on a profile
+// dir whose window a visible /login had already locked. reuseIfPresent fixes it: reuse the live
+// cached context when one exists, otherwise open a fresh one-off (that closeSession then closes).
+const posting = require('../src/posting');
+
+test('openPage reuseIfPresent REUSES the live context a visible /login left open (no second launch)', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    // A visible /login caches a live context for the account.
+    const login = await browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true });
+    assert.equal(login.reused, false);
+    // Posting/session-token resolution reuses that SAME context — never a second persistentContext.
+    const reuse = await browser.openPage('100090320823561', 'https://www.facebook.com/dialog/oauth', { reuseIfPresent: true });
+    assert.equal(launcher.launches, 1);
+    assert.equal(reuse.context, login.context);
+    assert.equal(reuse.reused, true);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('openPage reuseIfPresent opens a fresh one-off context when none is cached (and does NOT cache it)', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const first = await browser.openPage('100090320823561', 'https://x/', { reuseIfPresent: true });
+    assert.equal(first.reused, false);
+    assert.equal(launcher.launches, 1);
+    // A one-off open must NOT populate the reuse cache, so the next reuseIfPresent launches again.
+    const second = await browser.openPage('100090320823561', 'https://x/', { reuseIfPresent: true });
+    assert.equal(second.reused, false);
+    assert.equal(launcher.launches, 2);
+    assert.notEqual(first.context, second.context);
+    assert.equal(browser.peekAccountContext('100090320823561'), null);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('resolveSessionToken reuses the operator-visible context and closeSession does NOT close it', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const login = await browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true });
+    const session = await posting.resolveSessionToken({ browser, account: '100090320823561' });
+    assert.equal(session.reused, true);
+    assert.equal(session.context, login.context);
+    await posting.closeSession(session);
+    // The operator's live context must remain OPEN after closeSession — never torn down mid-use.
+    assert.equal(login.context.browser().isConnected(), true);
+    assert.equal(launcher.launches, 1);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('resolveSessionToken opens a one-off context when none is cached and closeSession closes it', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const session = await posting.resolveSessionToken({ browser, account: '100090320823561' });
+    assert.equal(session.reused, false);
+    assert.equal(session.context.browser().isConnected(), true);
+    await posting.closeSession(session);
+    // A one-off context this request opened IS closed (no leak).
+    assert.equal(session.context.browser().isConnected(), false);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+// Direct closeSession contract (no resolveSessionToken plumbing): a context whose close() bumps a
+// counter lets us assert exactly when the teardown fires. reused:true is the operator-visible
+// context — never closed; reused:false (one-off) and reused:undefined (default lifecycle, no flag)
+// are both closed exactly once.
+function makeClosable() {
+  let closes = 0;
+  return { get closes() { return closes; }, context: { close: async () => { closes += 1; } } };
+}
+
+test('closeSession skips a reused:true context but closes reused:false / undefined one-off contexts', async () => {
+  const reused = makeClosable();
+  await posting.closeSession({ reused: true, context: reused.context });
+  assert.equal(reused.closes, 0); // operator-visible context left OPEN
+
+  const oneOff = makeClosable();
+  await posting.closeSession({ reused: false, context: oneOff.context });
+  assert.equal(oneOff.closes, 1); // one-off context torn down
+
+  const noFlag = makeClosable();
+  await posting.closeSession({ context: noFlag.context }); // default lifecycle: reused undefined
+  assert.equal(noFlag.closes, 1);
+});
