@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   adsManagerUrl,
   dailyBudgetThb,
-  fetchCampaigns,
+  fetchCampaignsResult,
   resolveAdAccount,
 } from '@/api/campaigns'
 import { Badge } from '@/components/ui/badge'
@@ -25,10 +25,12 @@ export function CampaignsPage() {
   const query = useQuery({
     queryKey: ['campaigns', adAccount],
     enabled: !!adAccount,
-    queryFn: ({ signal }) => fetchCampaigns(adAccount as string, signal),
+    queryFn: ({ signal }) => fetchCampaignsResult(adAccount as string, {}, signal),
   })
 
-  const campaigns = query.data ?? []
+  const result = query.data
+  const campaigns = result?.campaigns ?? []
+  const fromHistory = result?.source === 'history_fallback'
 
   return (
     <div className="mx-auto max-w-5xl space-y-5">
@@ -39,6 +41,15 @@ export function CampaignsPage() {
           {adAccount ? <> · <span className="font-mono">{adAccount}</span></> : null}
         </p>
       </div>
+
+      {/* Honest provenance: when the live Graph account edge returns nothing, the worker re-derives the
+          open campaigns from verified ad-history. Say so plainly instead of implying it's live. */}
+      {fromHistory ? (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          ไม่พบข้อมูลสดจากบัญชีโฆษณานี้ — แสดง <strong>แคมเปญที่เปิดอยู่จากประวัติการสร้างแอด</strong> (verified) แทน
+          {result?.graphError ? <span className="block text-xs text-amber-800">graph: {result.graphError}</span> : null}
+        </div>
+      ) : null}
 
       <div className="flex justify-end">
         <Button type="button" variant="outline" onClick={() => void query.refetch()} disabled={query.isFetching || !adAccount}>

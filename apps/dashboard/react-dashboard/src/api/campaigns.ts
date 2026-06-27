@@ -24,6 +24,19 @@ export interface Campaign {
   impressions: string
   spend: string
   costPerLinkClick: string
+  /** Per-row provenance: 'graph' (live Ads Manager) or 'history_fallback' (verified D1 ad-history). */
+  source: string
+}
+
+// Response-level provenance for the campaigns list. `source` is 'graph' when the live Facebook Graph
+// account edge returned data, 'history_fallback' when the worker re-derived the open campaigns from
+// verified dashboard_ad_history (live edge empty / wrong account / bridge error), or '' on hard error.
+// graphError carries the bridge/Graph error message when the fallback fired because of a failure.
+export interface CampaignsResult {
+  campaigns: Campaign[]
+  source: string
+  graphAvailable: boolean
+  graphError: string
 }
 
 function normalizeAdSet(raw: unknown): CampaignAdSet | null {
@@ -51,6 +64,7 @@ function normalize(raw: unknown): Campaign | null {
     impressions: safeString(raw.impressions),
     spend: safeString(raw.spend),
     costPerLinkClick: safeString(raw.costPerLinkClick ?? raw.cost_per_link_click),
+    source: safeString(raw.source),
   }
 }
 
@@ -68,13 +82,44 @@ export async function resolveAdAccount(signal?: AbortSignal): Promise<string> {
   }
 }
 
-export async function fetchCampaigns(adAccount: string, signal?: AbortSignal): Promise<Campaign[]> {
-  const data = await workerFetchJson<{ campaigns?: unknown[] }>(
-    `/api/dashboard/campaigns?ad_account=${encodeURIComponent(adAccount)}`,
-    { signal, timeoutMs: 30_000 },
-  )
+export interface FetchCampaignsOptions {
+  /** Scope the worker's history fallback to these page ids (the Create Ads master's held pages). */
+  pageIds?: string[]
+  /** 'picker' = fast adset-count-only mode (no per-campaign insights); omit for full insights. */
+  mode?: 'picker'
+}
+
+// Full read-only campaigns fetch — returns the normalized list AND the worker's provenance so the UI
+// can be honest about whether the rows came from the live Graph account edge or the verified
+// dashboard_ad_history fallback. Both /dashboard/campaigns and the Create Ads active-campaign summary
+// call this, so they always agree on the same source.
+export async function fetchCampaignsResult(
+  adAccount: string,
+  options: FetchCampaignsOptions = {},
+  signal?: AbortSignal,
+): Promise<CampaignsResult> {
+  const qs = new URLSearchParams({ ad_account: adAccount })
+  const ids = (options.pageIds ?? []).map((id) => id.trim()).filter(Boolean)
+  if (ids.length) qs.set('page_ids', ids.join(','))
+  if (options.mode) qs.set('mode', options.mode)
+  const data = await workerFetchJson<{
+    campaigns?: unknown[]
+    source?: unknown
+    graph_available?: unknown
+    graph_error?: unknown
+  }>(`/api/dashboard/campaigns?${qs.toString()}`, { signal, timeoutMs: 30_000 })
   const list = Array.isArray(data.campaigns) ? data.campaigns : []
-  return list.map(normalize).filter((c): c is Campaign => c !== null)
+  return {
+    campaigns: list.map(normalize).filter((c): c is Campaign => c !== null),
+    source: safeString(data.source),
+    graphAvailable: data.graph_available !== false,
+    graphError: safeString(data.graph_error),
+  }
+}
+
+export async function fetchCampaigns(adAccount: string, signal?: AbortSignal): Promise<Campaign[]> {
+  const result = await fetchCampaignsResult(adAccount, {}, signal)
+  return result.campaigns
 }
 
 export function dailyBudgetThb(value: string): string {

@@ -1,17 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { AlertTriangle, ArrowLeft, Check, Copy, ExternalLink, Info } from 'lucide-react'
 import { fetchGallery } from '@/api/gallery'
 import { fetchPageVideos } from '@/api/pagePosts'
 import {
-  CREATE_ADS_DEFAULT_ENABLED_PAGE_ID,
   EMPTY_FORM,
-  fetchCreateAdsEnabledMap,
   fetchPageSettings,
   fetchSettingsPages,
   savePageSettings,
-  updatePageAdFlowEnabled,
   type SettingsPage,
 } from '@/api/settings'
 import {
@@ -28,6 +25,12 @@ import {
   type EnqueueAdOnlyResult,
 } from '@/api/createAds'
 import { fetchAdOnlyInterval, setAdOnlyInterval } from '@/api/adQueue'
+import {
+  adsManagerUrl,
+  dailyBudgetThb,
+  fetchCampaignsResult,
+  resolveAdAccount,
+} from '@/api/campaigns'
 import { formatCompactViews, formatThaiDateTime } from '@/lib/format'
 import { PagePicker, graphPageImageUrl } from '@/components/PagePicker'
 import { PageHealthCard } from '@/components/PageHealthCard'
@@ -154,66 +157,129 @@ function CandidateCard({
   )
 }
 
+// Read-only "แคมเปญที่เปิดอยู่" summary for the Create Ads master. Uses the SAME source as
+// /dashboard/campaigns (resolveAdAccount + fetchCampaignsResult) so the two screens always agree. When
+// the live Graph account edge is empty the worker re-derives the open campaigns from verified
+// ad-history and tags source='history_fallback' — surfaced honestly here. Scoped to the held pages so
+// the fallback only counts THIS workspace's campaigns. Never creates/edits anything.
+function ActiveCampaignsCard({ pageIds }: { pageIds: string[] }) {
+  const adAccountQuery = useQuery({
+    queryKey: ['ad-account'],
+    queryFn: ({ signal }) => resolveAdAccount(signal),
+  })
+  const adAccount = adAccountQuery.data
+  const idsKey = [...pageIds].sort().join(',')
+  const query = useQuery({
+    // Fast picker mode (adset counts, no per-campaign insights) — this is a glanceable summary.
+    queryKey: ['create-ads-active-campaigns', adAccount, idsKey],
+    enabled: !!adAccount,
+    queryFn: ({ signal }) =>
+      fetchCampaignsResult(adAccount as string, { pageIds, mode: 'picker' }, signal),
+  })
+  const result = query.data
+  // Only ACTIVE rows count as "open" — the worker already filters to ACTIVE, but guard here too so the
+  // count never lies if the contract ever loosens.
+  const open = (result?.campaigns ?? []).filter((c) => c.status === 'ACTIVE')
+  const fromHistory = result?.source === 'history_fallback'
+  const loading = query.isLoading || adAccountQuery.isLoading
+
+  return (
+    <section className="space-y-2 rounded-xl border bg-card p-4 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-base font-semibold tracking-tight">แคมเปญที่เปิดอยู่</h2>
+          <Badge variant="secondary">{open.length}</Badge>
+          {adAccount ? <span className="font-mono text-[11px] text-muted-foreground">{adAccount}</span> : null}
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => void query.refetch()}
+          disabled={query.isFetching || !adAccount}
+        >
+          {query.isFetching ? 'กำลังโหลด…' : 'รีเฟรช'}
+        </Button>
+      </div>
+
+      {fromHistory ? (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            ไม่พบข้อมูลสดจากบัญชีโฆษณา — แสดงจาก <strong>ประวัติการสร้างแอด (verified)</strong> ที่ยังเปิดอยู่
+            {result?.graphError ? <span className="block font-mono">graph: {result.graphError}</span> : null}
+          </span>
+        </div>
+      ) : null}
+
+      {query.isError ? (
+        <p className="rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          โหลดแคมเปญไม่สำเร็จ: {query.error instanceof Error ? query.error.message : 'unknown error'}
+        </p>
+      ) : loading ? (
+        <div className="space-y-2">
+          {Array.from({ length: 2 }).map((_, i) => (
+            <div key={i} className="h-9 animate-pulse rounded-lg bg-muted" />
+          ))}
+        </div>
+      ) : open.length === 0 ? (
+        <p className="rounded-lg border border-dashed px-3 py-3 text-center text-xs text-muted-foreground">
+          ยังไม่มีแคมเปญที่เปิดอยู่ในบัญชีนี้
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {open.map((c) => (
+            <div
+              key={c.id}
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border bg-muted/30 px-3 py-2 text-xs"
+            >
+              <Badge variant="default">ACTIVE</Badge>
+              <span className="min-w-0 flex-1 truncate font-medium">{c.name || c.id}</span>
+              <span className="font-mono text-[10px] text-muted-foreground">{c.id}</span>
+              <span className="font-mono">งบ/วัน: {dailyBudgetThb(c.dailyBudget)}</span>
+              <span className="font-mono">Ad set: {c.activeAdsetCount}/{c.adsetCount || c.adsets.length}</span>
+              {adAccount ? (
+                <a
+                  href={adsManagerUrl(adAccount, c.id)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 font-semibold text-primary hover:underline"
+                >
+                  Ads Manager <ExternalLink className="h-3 w-3" />
+                </a>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
 export function CreateAdsPage() {
   // Master-detail: no page is auto-selected. The operator must pick a page from
   // the scalable list first; only then does the Create Ads detail screen come alive.
   const [selectedId, setSelectedId] = useState<string>('')
-  const queryClient = useQueryClient()
-
   const pagesQuery = useQuery({
     queryKey: ['settings-pages'],
     queryFn: ({ signal }) => fetchSettingsPages(signal),
   })
   const pages = pagesQuery.data ?? ([] as SettingsPage[])
+  const pageIds = pages.map((p) => p.id)
   const selectedPage = pages.find((p) => p.id === selectedId) ?? null
 
-  // Per-page Create Ads enabled state — the persisted `ad_flow_enabled` toggle, fetched for the held
-  // pages (bounded; 8 today, token fields never pulled). Default rule: เฉียบ on, every other page off,
-  // until the operator toggles. Keyed by the page-id set so it refetches if the held pages change.
-  const pageIds = pages.map((p) => p.id)
-  const adFlagsKey = ['create-ads-flags', pageIds.join(',')] as const
-  const adFlagsQuery = useQuery({
-    queryKey: adFlagsKey,
-    queryFn: ({ signal }) => fetchCreateAdsEnabledMap(pageIds, signal),
-    enabled: pageIds.length > 0,
-  })
-
-  // Toggle the Create Ads AUTO status for a page — persists ONLY `ad_flow_enabled` (never normal
-  // posting is_active, never any other setting). Optimistic so the row disappears from the
-  // enabled-only list instantly when turned off; reconciled against the server (rolled back on
-  // error, invalidated on settle).
-  const toggleAdFlow = useMutation({
-    mutationFn: ({ pageId, enabled }: { pageId: string; enabled: boolean }) =>
-      updatePageAdFlowEnabled(pageId, enabled),
-    onMutate: async ({ pageId, enabled }) => {
-      await queryClient.cancelQueries({ queryKey: adFlagsKey })
-      const previous = queryClient.getQueryData<Record<string, boolean>>(adFlagsKey)
-      queryClient.setQueryData<Record<string, boolean>>(adFlagsKey, (old) => ({
-        ...(old ?? {}),
-        [pageId]: enabled,
-      }))
-      return { previous }
-    },
-    onError: (_err, _vars, context) => {
-      if (context?.previous) queryClient.setQueryData(adFlagsKey, context.previous)
-    },
-    onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ['create-ads-flags'] })
-    },
-  })
-
-  // Master list shows ONLY pages that are enabled for Create Ads — `active` is the resolved Create
-  // Ads AUTO status (persisted ad_flow_enabled, default-on only for เฉียบ), NOT normal posting state.
-  // Disabled/off pages are filtered OUT entirely (no greyed/locked rows here). The inline toggle stays
-  // wired on the surviving enabled rows so an operator can turn one off — once the mutation/flags
-  // settle, that row drops out of this list. Mapping here keeps Create Post (unmapped pages) unchanged.
+  // Master list shows only pages that are OPEN in the normal page source (`page.active` from
+  // /api/dashboard/facebook-page-sources), matching the operator's "เพจที่เปิดอยู่" expectation.
+  // Do NOT use `ad_flow_enabled` here: that flag is the Create Ads auto/cron toggle and can be on for
+  // only เฉียบ, which incorrectly collapsed this list to 1 page. Keep the row `active` true so the
+  // PagePicker renders these open pages as selectable; Create Ads auto status remains editable in the
+  // selected page detail, not used as the master-list filter.
   const adPages = useMemo(() => {
-    const flags = adFlagsQuery.data ?? {}
     return pages
-      .map((p) => ({ ...p, active: flags[p.id] ?? p.id === CREATE_ADS_DEFAULT_ENABLED_PAGE_ID }))
       .filter((p) => p.active)
+      .map((p) => ({ ...p, active: true }))
       .sort((a, b) => a.name.localeCompare(b.name))
-  }, [pages, adFlagsQuery.data])
+  }, [pages])
 
   if (selectedPage) {
     // DETAIL — Create Ads settings scoped to the chosen page, with a back affordance
@@ -233,27 +299,26 @@ export function CreateAdsPage() {
   return (
     // Master (no page selected) breaks out of the shell's p-5 to become
     // full-bleed: the page-list card fills the whole content rect.
-    <div className="-m-5 flex min-h-full flex-col p-4">
-      {/* MASTER — page list first. No Create Ads detail renders until a page is chosen. */}
+    <div className="-m-5 flex min-h-full flex-col gap-4 p-4">
+      {/* Open campaigns first — a read-only mirror of /dashboard/campaigns so the operator can see which
+          campaigns are currently active (matching Ads Manager) BEFORE picking a page to create an ad. */}
+      <ActiveCampaignsCard pageIds={pageIds} />
+
+      {/* MASTER — page list. No Create Ads detail renders until a page is chosen. */}
       <section className="flex min-h-0 flex-1 flex-col">
         <div className="min-h-0 flex-1">
           <PagePicker
             pages={adPages}
             selectedId={null}
             onSelect={(p) => setSelectedId(p.id)}
-            loading={pagesQuery.isLoading || adFlagsQuery.isLoading}
+            loading={pagesQuery.isLoading}
             error={pagesQuery.isError}
             searchable
             layout="table"
             fill
             title="เลือกเพจสำหรับสร้างแอด"
-            emptyHint="ยังไม่มีเพจที่เปิดใช้งาน “สร้างแอด” — เปิดสถานะสร้างแอดให้เพจในหน้าตั้งค่าก่อน เพจจึงจะแสดงในรายการนี้"
+            emptyHint="ยังไม่มีเพจที่เปิดใช้งานอยู่ — เปิดเพจใน Create Post/Settings ก่อน จึงจะแสดงในรายการสร้างแอด"
             actionLabel="เปิดหน้าตั้งค่าแอด"
-            onToggleActive={(p, active) => toggleAdFlow.mutate({ pageId: p.id, enabled: active })}
-            pendingToggleId={toggleAdFlow.isPending ? toggleAdFlow.variables?.pageId ?? null : null}
-            toggleColumnLabel="สร้างแอด"
-            toggleOnLabel="ปิดการสร้างแอดอัตโนมัติของเพจนี้"
-            toggleOffLabel="เปิดการสร้างแอดอัตโนมัติของเพจนี้"
           />
         </div>
       </section>

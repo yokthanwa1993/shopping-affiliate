@@ -15339,11 +15339,126 @@ app.get('/api/dashboard/ad-links', async (c) => {
     }
 })
 
+// =====================================================================
+// ACTIVE-CAMPAIGN HISTORY FALLBACK — used by GET /api/dashboard/campaigns when the live Facebook Graph
+// account edge returns no campaigns (empty edge / wrong account / bridge error). It re-derives the
+// currently-open campaigns from VERIFIED dashboard_ad_history rows only — fields already persisted in
+// D1 (status / mode / campaign ids / lifecycle stamps). It NEVER reads tokens and NEVER fabricates a
+// campaign: a row only counts as open if the worker recorded it as created, active, and not yet
+// auto-paused (SALES lane) or archived (Follow lane). Live Graph data always takes precedence.
+// =====================================================================
+
+// Only consider history rows created within this many days as "currently open". Run windows are ~24h
+// (Follow lane) to a few days; this caps ancient stale rows that were never reconciled while still
+// surfacing the day's active Follow / click-link campaigns. Kept generous so we don't under-count.
+const ACTIVE_CAMPAIGN_HISTORY_FALLBACK_DAYS = 7
+
+interface ActiveCampaignFallback {
+    id: string
+    name: string
+    status: string
+    dailyBudget: string
+    startTime: string
+    adsets: Array<{ id: string; name: string; status: string }>
+    adsetCount: number
+    activeAdsetCount: number
+    reach: string
+    impressions: string
+    spend: string
+    costPerLinkClick: string
+    source: 'history_fallback'
+}
+
+// Pure mapping: collapse the already-SQL-filtered active history rows into unique campaigns. Groups by
+// campaign_id (newest row wins for name/budget since rows arrive id-DESC), unions adset ids, and drops
+// any campaign a later Graph read-back recorded as NON-active (campaign_status_after). Exported shape
+// matches the live Graph campaign object so the dashboard's normalize() reads both identically.
+function buildActiveCampaignsFromAdHistoryRows(rows: Array<Record<string, unknown>>): ActiveCampaignFallback[] {
+    const byCampaign = new Map<string, ActiveCampaignFallback>()
+    for (const r of rows) {
+        const campId = String(r.campaign_id || '').trim()
+        if (!campId) continue
+        // A later Graph read-back that saw the campaign paused/archived wins over the create-time
+        // intent — never resurface a campaign the worker already knows is no longer ACTIVE.
+        const after = String(r.campaign_status_after || '').trim().toUpperCase()
+        if (after && after !== 'ACTIVE') continue
+        const adsetId = String(r.adset_id || '').trim()
+        const existing = byCampaign.get(campId)
+        if (!existing) {
+            byCampaign.set(campId, {
+                id: campId,
+                name: String(r.campaign_name || '').trim() || campId,
+                status: 'ACTIVE',
+                dailyBudget: String(r.daily_budget || '').trim(),
+                startTime: String(r.start_time || '').trim(),
+                adsets: adsetId ? [{ id: adsetId, name: '', status: 'ACTIVE' }] : [],
+                adsetCount: adsetId ? 1 : 0,
+                activeAdsetCount: adsetId ? 1 : 0,
+                reach: '',
+                impressions: '',
+                spend: '',
+                costPerLinkClick: '',
+                source: 'history_fallback',
+            })
+        } else if (adsetId && !existing.adsets.some((a) => a.id === adsetId)) {
+            existing.adsets.push({ id: adsetId, name: '', status: 'ACTIVE' })
+            existing.adsetCount = existing.adsets.length
+            existing.activeAdsetCount = existing.adsets.length
+        }
+    }
+    return Array.from(byCampaign.values())
+}
+
+// SQL gate for "currently open" history rows + pure mapping. Filters to created + active-mode rows that
+// the worker has NOT auto-paused (SALES lane) or archived (Follow lane), within the recency window, and
+// optionally scoped to a set of page ids (the only scope available — there is no ad_account column).
+async function fetchActiveCampaignsFromAdHistory(db: D1Database, pageIds: string[]): Promise<ActiveCampaignFallback[]> {
+    await ensureAdHistoryTable(db)
+    const clauses = [
+        "status = 'created'",
+        "LOWER(TRIM(COALESCE(mode,''))) = 'active'",
+        "TRIM(COALESCE(campaign_id,'')) <> ''",
+        "TRIM(COALESCE(auto_paused_at,'')) = ''",
+        "TRIM(COALESCE(follow_removed_at,'')) = ''",
+        `created_at >= datetime('now', '-${ACTIVE_CAMPAIGN_HISTORY_FALLBACK_DAYS} days')`,
+    ]
+    const binds: unknown[] = []
+    const ids = pageIds.map((id) => id.trim()).filter(Boolean)
+    if (ids.length) {
+        clauses.push(`page_id IN (${ids.map(() => '?').join(',')})`)
+        binds.push(...ids)
+    }
+    const rows = await db.prepare(
+        `SELECT campaign_id, campaign_name, daily_budget, start_time, adset_id, campaign_status_after, id
+         FROM dashboard_ad_history
+         WHERE ${clauses.join(' AND ')}
+         ORDER BY id DESC LIMIT 500`
+    ).bind(...binds).all() as { results?: Array<Record<string, unknown>> }
+    return buildActiveCampaignsFromAdHistoryRows(rows.results || [])
+}
+
 app.get('/api/dashboard/campaigns', async (c) => {
     const adAccount = String(c.req.query('ad_account') || 'act_1030797047648459').trim()
     const mode = String(c.req.query('mode') || '').trim().toLowerCase()
+    // Optional page scoping for the history fallback. `page_ids` (comma list) lets the Create Ads
+    // master surface the open campaigns across ALL its held pages; `page_id` is the single-page form.
+    // dashboard_ad_history has no ad_account column, so the fallback can only be scoped by page id.
+    const pageIds = [
+        ...String(c.req.query('page_ids') || '').split(','),
+        String(c.req.query('page_id') || ''),
+    ].map((s) => s.trim()).filter(Boolean)
+    // Token-safe history fallback: when the live Graph account edge returns NOTHING (empty edge, wrong
+    // account, or a bridge error) we must not show a false zero while Ads Manager has live campaigns.
+    // Re-derive the currently-open campaigns from verified dashboard_ad_history rows (status/result
+    // fields already in D1 — never tokens, never fabricated). Live Graph data always wins when present.
+    const historyFallback = () =>
+        fetchActiveCampaignsFromAdHistory(c.env.DB, pageIds).catch(() => [] as ActiveCampaignFallback[])
     const baseUrl = resolveCloakFbBridgeBaseUrl(c.env)
-    if (!baseUrl) return c.json({ ok: false, error: 'bridge_not_configured' }, 503)
+    if (!baseUrl) {
+        const fb = await historyFallback()
+        if (fb.length) return c.json({ ok: true, source: 'history_fallback', graph_available: false, campaigns: fb })
+        return c.json({ ok: false, error: 'bridge_not_configured', source: '' }, 503)
+    }
     try {
         // Pull more than the visible limit (60) so after we filter out paused
         // /archived/etc. we still have enough ACTIVE campaigns to show. Operator
@@ -15389,11 +15504,13 @@ app.get('/api/dashboard/campaigns', async (c) => {
                     costPerLinkClick: '',
                 }
             }))
-            return c.json({
-                ok: true,
-                mode: 'picker',
-                campaigns: withCounts,
-            })
+            if (withCounts.length > 0) {
+                return c.json({ ok: true, mode: 'picker', source: 'graph', campaigns: withCounts })
+            }
+            // Live account edge is empty in picker mode too — fall back to verified history so the
+            // picker isn't a false zero. Marked source so the caller knows it's not live Graph data.
+            const fb = await historyFallback()
+            return c.json({ ok: true, mode: 'picker', source: fb.length ? 'history_fallback' : 'graph', campaigns: fb })
         }
 
         // Helper: pull the per-action numeric cost out of the FB insights array
@@ -15440,9 +15557,16 @@ app.get('/api/dashboard/campaigns', async (c) => {
                 costPerLinkClick: pickCostPerAction(insights, 'link_click'),
             })
         }
-        return c.json({ ok: true, campaigns: result })
+        if (result.length > 0) return c.json({ ok: true, source: 'graph', campaigns: result })
+        // Live account edge returned no ACTIVE campaigns — re-derive from verified history before
+        // reporting an empty list (prevents the dashboard's false zero vs. Ads Manager).
+        const fb = await historyFallback()
+        return c.json({ ok: true, source: fb.length ? 'history_fallback' : 'graph', campaigns: fb })
     } catch (e) {
-        return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 502)
+        const graphError = e instanceof Error ? e.message : String(e)
+        const fb = await historyFallback()
+        if (fb.length) return c.json({ ok: true, source: 'history_fallback', graph_error: graphError, campaigns: fb })
+        return c.json({ ok: false, error: graphError, source: '' }, 502)
     }
 })
 
