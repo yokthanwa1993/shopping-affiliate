@@ -614,17 +614,20 @@ test('/login returns a sanitized profile_already_open (409), never a generic 500
 });
 
 
-test('loadBrowserBackend requires Chrome for Testing and rejects ordinary Chrome executables', async () => {
+test('loadBrowserBackend requires CloakBrowser and never accepts Chrome executable fallbacks', async () => {
   const oldBrowser = process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
   const oldChrome = process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
   const oldGeneric = process.env.CHROME_EXECUTABLE_PATH;
   browser.setBrowserBackend(null);
   browser.resetAccountContexts();
   process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-  delete process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
-  delete process.env.CHROME_EXECUTABLE_PATH;
+  process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE='/Users/example/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+  process.env.CHROME_EXECUTABLE_PATH='/tmp/chrome';
   try {
-    await assert.rejects(() => browser.loadBrowserBackend(), /Chrome for Testing/);
+    const backend = await browser.loadBrowserBackend();
+    assert.equal(backend.backend, 'cloakbrowser');
+    assert.equal(backend.executablePath, undefined);
+    assert.equal(typeof backend.launcher.launchPersistentContext, 'function');
   } finally {
     if (oldBrowser === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
     else process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE=oldBrowser;
@@ -637,31 +640,10 @@ test('loadBrowserBackend requires Chrome for Testing and rejects ordinary Chrome
   }
 });
 
-test('loadBrowserBackend defaults to Playwright Chrome for Testing, not bundled headless shell or Google Chrome', async () => {
-  const oldBrowser = process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
-  const oldChrome = process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
-  const oldGeneric = process.env.CHROME_EXECUTABLE_PATH;
-  browser.setBrowserBackend(null);
-  browser.resetAccountContexts();
-  delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
-  delete process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
-  delete process.env.CHROME_EXECUTABLE_PATH;
-  try {
-    const backend = await browser.loadBrowserBackend();
-    assert.equal(backend.backend, 'chrome-for-testing');
-    assert.match(backend.executablePath, /Google Chrome for Testing\.app\/Contents\/MacOS\/Google Chrome for Testing$/);
-    assert.doesNotMatch(backend.executablePath, /chrome-headless-shell|Google Chrome\.app\/Contents\/MacOS\/Google Chrome$/);
-    assert.equal(typeof backend.launcher.launchPersistentContext, 'function');
-  } finally {
-    if (oldBrowser === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
-    else process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE=oldBrowser;
-    if (oldChrome === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
-    else process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE=oldChrome;
-    if (oldGeneric === undefined) delete process.env.CHROME_EXECUTABLE_PATH;
-    else process.env.CHROME_EXECUTABLE_PATH=oldGeneric;
-    browser.setBrowserBackend(null);
-    browser.resetAccountContexts();
-  }
+test('loadBrowserBackend uses CloakBrowser launchPersistentContext object signature', async () => {
+  const backend = await browser.loadBrowserBackend();
+  assert.equal(backend.backend, 'cloakbrowser');
+  assert.equal(typeof backend.launcher.launchPersistentContext, 'function');
 });
 
 // ── reuseIfPresent: posting/session-token resolution reuses an operator-visible context ─────────

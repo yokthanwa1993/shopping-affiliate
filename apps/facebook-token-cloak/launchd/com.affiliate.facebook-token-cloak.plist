@@ -4,8 +4,6 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE</key>
-		<string>/Users/yok-macmini/Library/Caches/ms-playwright/chromium-1223/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing</string>
 		<key>FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT</key>
 		<string>100090320823561</string>
 		<key>FACEBOOK_TOKEN_CLOAK_TEMPLATE_ADSET</key>

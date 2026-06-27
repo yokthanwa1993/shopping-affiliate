@@ -18,59 +18,28 @@ const TWO_FACTOR_SUBMIT_SELECTORS=[
   'div[role="button"][aria-label*="Continue" i]'
 ];
 const PROFILE_ROOT=process.env.FACEBOOK_TOKEN_CLOAK_PROFILE_ROOT||path.join(os.homedir(),'.facebook-token-cloak','profiles');
-const CHROME_FOR_TESTING_APP_NAME='Google Chrome for Testing.app';
-const CHROME_FOR_TESTING_EXECUTABLE_REL=path.join(CHROME_FOR_TESTING_APP_NAME,'Contents','MacOS','Google Chrome for Testing');
 // Test seam: inject a fake browser backend so the reuse/launch logic can be exercised without a
-// real Chromium. Never used in production (override stays null unless setBrowserBackend is called).
+// real browser. Never used in production (override stays null unless setBrowserBackend is called).
 let _backendOverride=null;
 function setBrowserBackend(launcher,backend='mock'){ _backendOverride=launcher?{backend,launcher}:null; }
-function isChromeForTestingExecutable(executablePath){
-  const p=String(executablePath||'');
-  return p.includes(CHROME_FOR_TESTING_APP_NAME)&&p.endsWith(path.join('Contents','MacOS','Google Chrome for Testing'));
-}
-function resolveChromeForTestingExecutable(){
-  const fs=require('fs');
-  const explicit=String(process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE||process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE||process.env.CHROME_EXECUTABLE_PATH||'').trim();
-  if(explicit){
-    if(!isChromeForTestingExecutable(explicit)){
-      throw Object.assign(new Error('Accounts Bridge requires Chrome for Testing; refusing non-CFT browser executable'),{code:'chrome_for_testing_required',executablePath:explicit});
-    }
-    if(!fs.existsSync(explicit)){
-      throw Object.assign(new Error('Configured Chrome for Testing executable not found'),{code:'chrome_for_testing_missing',executablePath:explicit});
-    }
-    return explicit;
-  }
-  const roots=[
-    path.join(os.homedir(),'Library','Caches','ms-playwright'),
-    path.join(os.homedir(),'.cache','ms-playwright'),
-  ];
-  const candidates=[];
-  for(const root of roots){
-    try{
-      for(const entry of fs.readdirSync(root,{withFileTypes:true})){
-        if(!entry.isDirectory()||!/^chromium-\d+/.test(entry.name)) continue;
-        const exec=path.join(root,entry.name,'chrome-mac-arm64',CHROME_FOR_TESTING_EXECUTABLE_REL);
-        if(fs.existsSync(exec)) candidates.push({entry:entry.name,exec});
-      }
-    }catch{}
-  }
-  candidates.sort((a,b)=>{
-    const an=Number((a.entry.match(/chromium-(\d+)/)||[])[1]||0);
-    const bn=Number((b.entry.match(/chromium-(\d+)/)||[])[1]||0);
-    return bn-an;
-  });
-  if(candidates[0]) return candidates[0].exec;
-  throw Object.assign(new Error('Chrome for Testing executable not found; install Playwright Chromium or set FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE to Google Chrome for Testing'),{code:'chrome_for_testing_missing'});
-}
 async function loadBrowserBackend(){
   if(_backendOverride) return _backendOverride;
-  const chromeExecutable=resolveChromeForTestingExecutable();
-  const {chromium}=require('playwright-core');
+  let cloakModule;
+  try{
+    cloakModule=await import('cloakbrowser');
+  }catch(e){
+    throw Object.assign(new Error('Accounts Bridge requires CloakBrowser; refusing Chrome/Playwright fallback'),{code:'cloakbrowser_required',cause:e});
+  }
+  const cloak=cloakModule&&cloakModule.default&&typeof cloakModule.default.launchPersistentContext==='function'
+    ? cloakModule.default
+    : cloakModule;
+  if(!cloak||typeof cloak.launchPersistentContext!=='function'){
+    throw Object.assign(new Error('CloakBrowser launchPersistentContext is unavailable'),{code:'cloakbrowser_backend_missing'});
+  }
   return {
-    backend:'chrome-for-testing',
-    executablePath:chromeExecutable,
+    backend:'cloakbrowser',
     launcher:{
-      launchPersistentContext:(profileDir,options={})=>chromium.launchPersistentContext(profileDir,{...options,executablePath:chromeExecutable})
+      launchPersistentContext:(profileDir,options={})=>cloak.launchPersistentContext({userDataDir:profileDir,humanize:true,...options})
     }
   };
 }
