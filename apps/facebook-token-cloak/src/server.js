@@ -6,6 +6,7 @@ const keychain = require('./keychain');
 const browser = require('./browser');
 const accountSelectors = require('./account-selectors');
 const accountsRegistry = require('./accounts-registry');
+const bridgeConfig = require('./bridge-config');
 const ui = require('./ui');
 const posting = require('./posting');
 const fbLiteTokenService = require('./fb-lite-token-service.cjs');
@@ -309,7 +310,31 @@ function hasValue(v) {
   return v != null && String(v).trim() !== '';
 }
 
+function normalizePublicFacebookLiteReason(value, fallback = 'request_failed') {
+  const raw = String(value || fallback || '').trim();
+  const text = raw.toLowerCase();
+
+  // Facebook Lite sometimes returns localized first-party messages (for example Vietnamese)
+  // from the mobile/login endpoint. Do not surface those raw strings to the operator UI;
+  // convert them to stable Thai/English operational reasons instead.
+  if (/giới hạn tần suất|khoảng thời gian nhất định|bảo vệ cộng đồng|spam|temporar(?:y|ily).*limit|try again later|rate limit|too many/i.test(raw)) {
+    return 'facebook_rate_limited: Facebook จำกัดความถี่การโพสต์/คอมเมนต์ชั่วคราว ให้ใช้บัญชี fallback หรือรอแล้วลองใหม่';
+  }
+  if (/mật khẩu.*chưa chính xác|tên người dùng.*mật khẩu.*không hợp lệ|username.*password.*invalid|password.*incorrect|incorrect password|invalid password/i.test(raw)) {
+    return 'credential_invalid: รหัสผ่าน Facebook Lite ไม่ถูกต้องหรือหมดอายุ ต้องอัปเดตรหัสใน Keychain';
+  }
+  if (/checkpoint|two[_ -]?factor|2fa|authentication code|xác thực|mã xác minh/i.test(raw)) {
+    return 'facebook_checkpoint: Facebook ต้องยืนยันตัวตน/2FA ใน browser session ก่อน';
+  }
+  if (/invalidat|expired|revoked|not authoriz|invalid oauth|session.*invalid|security reason|changed their password/i.test(text)) {
+    return 'token_invalidated: Facebook token หมดอายุหรือถูก invalidate ต้อง refresh จาก Facebook Lite bridge';
+  }
+  return '';
+}
+
 function sanitizePublicReason(value, fallback = 'request_failed') {
+  const normalized = normalizePublicFacebookLiteReason(value, fallback);
+  if (normalized) return normalized;
   const text = sanitizeUrlSecrets(String(value || fallback)).slice(0, 500);
   return text
     .replace(/\bEAA[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
@@ -410,6 +435,45 @@ async function listAccountStatuses(kc, selectors, registry) {
     out.push(mergeAccountStatus(rec, kcStatus, selStatus));
   }
   out.sort((a, b) => (a.account < b.account ? -1 : a.account > b.account ? 1 : 0));
+  return out;
+}
+
+// Local-only readiness for one Facebook role, derived ENTIRELY from cached/local metadata (registry
+// presence + Keychain present/absent flags). No token is minted or refreshed and no browser is
+// opened — these booleans only reflect "do we hold the local material this role would need". Token
+// values never appear here.
+function facebookRoleReadiness(accountStatus) {
+  if (!accountStatus) {
+    return { credentialPresent: false, totpPresent: false, datrPresent: false, inRegistry: false };
+  }
+  return {
+    credentialPresent: !!accountStatus.credentialPresent,
+    totpPresent: !!accountStatus.totpPresent,
+    datrPresent: !!accountStatus.datrPresent,
+    inRegistry: !!accountStatus.inRegistry,
+    selectorPresent: !!accountStatus.selectorPresent
+  };
+}
+
+// Build the public Facebook role view from the stored role mapping plus the redacted account list.
+// `source: 'local_metadata'` documents that readiness is never a live probe. Token-free by design.
+function buildFacebookBridgeView(roles, accountList) {
+  const byKey = new Map();
+  for (const acc of accountList) byKey.set(acc.key, acc);
+  const out = {};
+  for (const role of bridgeConfig.FACEBOOK_ROLES) {
+    const account = roles && roles[role] ? roles[role] : null;
+    const key = account ? sanitizeAccount(account).key : null;
+    const matched = key ? byKey.get(key) : null;
+    out[role] = {
+      role,
+      label: bridgeConfig.FACEBOOK_ROLE_LABELS[role] || role,
+      account: account || null,
+      configured: !!account,
+      accountExists: !!matched,
+      readiness: { source: 'local_metadata', ...facebookRoleReadiness(matched) }
+    };
+  }
   return out;
 }
 
@@ -540,6 +604,7 @@ function createHandler(deps = {}) {
   const br = deps.browser || browser;
   const selectors = deps.accountSelectors || accountSelectors;
   const registry = deps.accountsRegistry || accountsRegistry;
+  const bridge = deps.bridgeConfig || bridgeConfig;
   const fetchImpl = deps.fetch || global.fetch;
   const fbLite = deps.fbLiteTokenService || fbLiteTokenService;
   const downloadVideo = deps.downloadVideo;
@@ -620,6 +685,109 @@ function createHandler(deps = {}) {
       if (req.method === 'GET' && url.pathname === '/accounts') {
         if (!isLocalRequest(req)) return sendError(res, 403, 'Account endpoints are local-only');
         return send(res, 200, { accounts: await listAccountStatuses(kc, selectors, registry) });
+      }
+
+      // ── Accounts Bridge: API-first account-role configuration/status ──────────────────────────
+      // These endpoints are token-free and side-effect-free reads (GET) plus a non-secret config
+      // write (POST). NONE of them mint/refresh a token or open a browser. They exist so ops/Hermes
+      // can inspect and configure which account plays each Facebook role on demand.
+      if (req.method === 'GET' && url.pathname === '/accounts/bridge/status') {
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Account endpoints are local-only');
+        const roles = await bridge.getFacebookRoles();
+        const accountList = await listAccountStatuses(kc, selectors, registry);
+        return send(res, 200, {
+          app: 'accounts-bridge',
+          shopee: {
+            managed: false,
+            roles: {},
+            note: 'Shopee report/login is handled by the affiliate-shortlink-cloak bridge, not this Accounts Bridge.'
+          },
+          facebook: {
+            accountsCount: accountList.length,
+            roles: buildFacebookBridgeView(roles, accountList)
+          },
+          note: 'Status-only. No token is minted or refreshed and no browser is opened by this call.'
+        });
+      }
+
+      if (req.method === 'GET' && url.pathname === '/accounts/bridge/facebook') {
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Account endpoints are local-only');
+        const roles = await bridge.getFacebookRoles();
+        const accountList = await listAccountStatuses(kc, selectors, registry);
+        return send(res, 200, {
+          roles: buildFacebookBridgeView(roles, accountList),
+          note: 'Readiness is derived from cached/local metadata only. No token mint, refresh, or browser open occurs on this call.'
+        });
+      }
+
+      if ((req.method === 'POST' || req.method === 'PUT') && url.pathname === '/accounts/bridge/facebook') {
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Account endpoints are local-only');
+        const body = await parseBody(req);
+        // Only roles explicitly present in the body are changed; pass null/'' to clear a role.
+        const patch = {};
+        for (const role of bridge.FACEBOOK_ROLES) {
+          if (!Object.prototype.hasOwnProperty.call(body, role)) continue;
+          const raw = body[role];
+          patch[role] = raw == null || String(raw).trim() === '' ? null : String(raw).trim();
+        }
+        if (Object.keys(patch).length === 0) {
+          return sendError(res, 400, `Provide at least one role: ${bridge.FACEBOOK_ROLES.join(', ')}`);
+        }
+        const accountList = await listAccountStatuses(kc, selectors, registry);
+        const knownKeys = new Set(accountList.map(a => a.key));
+        for (const [role, value] of Object.entries(patch)) {
+          if (!value) continue;
+          const { key, display } = sanitizeAccount(value); // throws 400 on a malformed alias
+          if (!knownKeys.has(key)) return sendError(res, 400, 'Account not found for role', { role, account: display });
+        }
+        const roles = await bridge.setFacebookRoles(patch);
+        return send(res, 200, { roles: buildFacebookBridgeView(roles, accountList), updated: true });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/accounts/bridge/facebook/check') {
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Account endpoints are local-only');
+        const body = await parseBody(req);
+        // dry_run defaults TRUE — a default check is status-only. A browser opens only when the
+        // operator explicitly passes dry_run=false AND open_browser=true (and browser login is
+        // enabled); even then it is non-visible and never autofills or submits credentials.
+        const dryRun = body.dry_run !== false && body.dry_run !== 'false' && body.dry_run !== 0;
+        const openBrowser = body.open_browser === true || body.open_browser === '1' || body.open_browser === 'true';
+        const role = body.role == null || body.role === '' ? null : String(body.role);
+        if (role && !bridge.FACEBOOK_ROLES.includes(role)) {
+          return sendError(res, 400, 'Unknown facebook role', { role, allowedRoles: bridge.FACEBOOK_ROLES });
+        }
+        const roles = await bridge.getFacebookRoles();
+        const account = hasValue(body.account) ? String(body.account).trim() : role ? roles[role] : null;
+        if (!account) return sendError(res, 400, 'Missing account (provide account or a configured role)');
+        const { key, display } = sanitizeAccount(account);
+        const accountList = await listAccountStatuses(kc, selectors, registry);
+        const matched = accountList.find(a => a.key === key) || null;
+        const readiness = { source: 'local_metadata', ...facebookRoleReadiness(matched) };
+        let browserOpened = false;
+        let browserNote = 'browser_not_opened';
+        if (!dryRun && openBrowser) {
+          if (process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED !== '1') {
+            browserNote = 'browser_login_disabled';
+          } else {
+            try {
+              const opened = await br.openPage(account, 'https://www.facebook.com/login', { visible: false, reuse: true });
+              browserOpened = true;
+              browserNote = sanitizeUrlSecrets(opened.page.url());
+            } catch (e) {
+              browserNote = sanitizePublicReason(String((e && (e.code || e.reason)) || 'browser_open_failed'), 'browser_open_failed');
+            }
+          }
+        }
+        return send(res, 200, {
+          account: display,
+          role: role || null,
+          dryRun,
+          accountExists: !!matched,
+          browserOpened,
+          browserNote,
+          readiness,
+          note: 'Check is token-free and status-only; it never mints or refreshes a token. A browser opens only with dry_run=false and open_browser=true while browser login is enabled.'
+        });
       }
 
       if ((req.method === 'POST' || req.method === 'PUT') && url.pathname === '/accounts') {
@@ -742,6 +910,13 @@ function createHandler(deps = {}) {
       }
 
       if (req.method === 'GET' && url.pathname === '/login') {
+        if (process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED !== '1') {
+          return sendError(res, 410, 'browser_login_disabled', {
+            state: 'browser_login_disabled',
+            reason: 'browser_login_disabled',
+            note: 'Browser login/open-session automation is disabled. Use Token Bridge credential minting only; do not open Chrome automatically.'
+          });
+        }
         const account = url.searchParams.get('account');
         if (!account) return sendError(res, 400, 'Missing account parameter');
         const { display } = sanitizeAccount(account);

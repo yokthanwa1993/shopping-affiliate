@@ -316,7 +316,7 @@
     <div class="mark">A</div>
     <div>
       <h1>Accounts Bridge</h1>
-      <div class="subtitle">Local account table — status only. Login and token refresh are manual.</div>
+      <div class="subtitle">Status &amp; config view. Actions run via APIs only — opening this page never logs in, refreshes a token, or opens a browser.</div>
     </div>
   </div>
 </header>
@@ -388,6 +388,25 @@
       <span class="status-line">Status-only by default — every action below is manual and runs only when clicked.</span>
     </div>
     <div class="panel-body">
+      <div class="fb-group" id="account-roles">
+        <h3>Account roles (status / config)</h3>
+        <p class="muted">Map which saved account plays each Facebook role. Saving a role is config only — it never logs in, mints, refreshes a token, or opens a browser. Page posting and ad creation are intentionally separate roles.</p>
+        <div class="fields">
+          <div>
+            <label for="role-posting-input">Page posting account (Facebook Lite / Token Bridge)</label>
+            <input id="role-posting-input" placeholder="account / namespace" autocapitalize="characters">
+          </div>
+          <div>
+            <label for="role-ads-input">Ad creation account (Power Editor)</label>
+            <input id="role-ads-input" placeholder="account / namespace" autocapitalize="characters">
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="save-roles-button">Save account roles</button>
+          <button type="button" id="check-roles-button">Check roles (dry run)</button>
+        </div>
+        <p class="muted fb-note" id="roles-readiness">Account roles not loaded.</p>
+      </div>
       <div class="fb-group">
         <h3>Facebook Lite — Page posting / Token Bridge (EAAD6V)</h3>
         <p class="muted">Page-posting token source. Status-only by default; opening this page never mints, refreshes, or opens a browser. Refresh runs only when you click, validates readiness, and caches the result for one hour.</p>
@@ -623,6 +642,76 @@
     $("#result").textContent = text;
   }
 
+  // ── Accounts Bridge role mapping (API-first; thin status/config view) ──────────────────────────
+  // These talk ONLY to the token-free /accounts/bridge/facebook* APIs. None of them logs in, mints,
+  // refreshes a token, or opens a browser. The dry-run check is status-only by default.
+  var BRIDGE_ROLE_KEYS = ["page_posting_facebook_lite", "ads_power_editor"];
+
+  function describeRole(role) {
+    if (!role || !role.account) return "unset";
+    var r = role.readiness || {};
+    var bits = [role.account, role.accountExists ? "known" : "missing"];
+    bits.push("pw " + (r.credentialPresent ? "yes" : "no"));
+    bits.push("2fa " + (r.totpPresent ? "yes" : "no"));
+    return bits.join(" · ");
+  }
+
+  function renderRolesReadiness(roles) {
+    roles = roles || {};
+    var posting = roles.page_posting_facebook_lite || {};
+    var ads = roles.ads_power_editor || {};
+    $("#roles-readiness").textContent =
+      "Page posting: " + describeRole(posting) + "  |  Ad creation: " + describeRole(ads) +
+      "  (local metadata only — no token mint/refresh, no browser)";
+  }
+
+  // GET /accounts/bridge/facebook — token-free status read. Safe to run on page load.
+  async function loadBridgeRoles() {
+    try {
+      var data = await api("GET", "/accounts/bridge/facebook");
+      var roles = (data && data.roles) || {};
+      $("#role-posting-input").value = (roles.page_posting_facebook_lite && roles.page_posting_facebook_lite.account) || "";
+      $("#role-ads-input").value = (roles.ads_power_editor && roles.ads_power_editor.account) || "";
+      renderRolesReadiness(roles);
+    } catch (error) {
+      $("#roles-readiness").textContent = "Could not load account roles: " + ((error && error.message) || "error");
+    }
+  }
+
+  // POST /accounts/bridge/facebook — non-secret config write only. Both keys are always sent so an
+  // emptied field clears that role.
+  async function saveBridgeRoles() {
+    var body = {
+      page_posting_facebook_lite: value("#role-posting-input") || "",
+      ads_power_editor: value("#role-ads-input") || ""
+    };
+    try {
+      var data = await api("POST", "/accounts/bridge/facebook", body);
+      renderRolesReadiness((data && data.roles) || {});
+      setResult(JSON.stringify({ accountRoles: data && data.roles, updated: !!(data && data.updated) }, null, 2));
+      toast("Account roles saved", "ok");
+    } catch (error) {
+      toast("Save roles failed: " + ((error && error.message) || "error"), "err");
+    }
+  }
+
+  // POST /accounts/bridge/facebook/check with dry_run=true — explicit, token-free, no browser.
+  async function checkBridgeRoles() {
+    try {
+      var results = {};
+      for (var i = 0; i < BRIDGE_ROLE_KEYS.length; i++) {
+        var role = BRIDGE_ROLE_KEYS[i];
+        var account = role === "page_posting_facebook_lite" ? value("#role-posting-input") : value("#role-ads-input");
+        if (!account) { results[role] = { skipped: "no account set" }; continue; }
+        results[role] = await api("POST", "/accounts/bridge/facebook/check", { role: role, account: account, dry_run: true });
+      }
+      setResult(JSON.stringify({ roleCheck: results }, null, 2));
+      toast("Dry-run role check complete", "ok");
+    } catch (error) {
+      toast("Role check failed: " + ((error && error.message) || "error"), "err");
+    }
+  }
+
   function fillForm(account) {
     $("#account-input").value = account.account || "";
     $("#username-input").value = account.username || account.email || account.phone || "";
@@ -783,11 +872,19 @@
 
   $("#account-form").addEventListener("submit", saveAccount);
   $("#delete-button").addEventListener("click", function () { deleteAccount(); });
-  // Explicit, manual-only side effects. Neither runs on page load; each fires solely on click.
+  // Explicit, manual-only side effects. None runs on page load; each fires solely on click.
+  $("#save-roles-button").addEventListener("click", function () { saveBridgeRoles(); });
+  $("#check-roles-button").addEventListener("click", function () { checkBridgeRoles(); });
   $("#fb-lite-manual-refresh").addEventListener("click", function () { refreshFacebookLiteToken(); });
   $("#power-editor-button").addEventListener("click", function () { openPowerEditorSession(); });
 
-  loadAccounts();
+  // ── Auto-run on load: STATUS reads ONLY. init() never logs in, mints/refreshes a token, opens a
+  // browser, or submits credentials — it only calls the two token-free status loaders below.
+  function init() {
+    loadAccounts();     // GET /accounts (redacted account status)
+    loadBridgeRoles();  // GET /accounts/bridge/facebook (role mapping + local readiness)
+  }
+  init();
 })();
 </script>
 </body>

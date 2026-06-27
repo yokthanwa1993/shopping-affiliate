@@ -22,8 +22,53 @@ const PROFILE_ROOT=process.env.FACEBOOK_TOKEN_CLOAK_PROFILE_ROOT||path.join(os.h
 // real Chromium. Never used in production (override stays null unless setBrowserBackend is called).
 let _backendOverride=null;
 function setBrowserBackend(launcher,backend='mock'){ _backendOverride=launcher?{backend,launcher}:null; }
-async function loadBrowserBackend(){ if(_backendOverride) return _backendOverride; try{const cloak=require('cloakbrowser'); if(cloak&&typeof cloak.launchPersistentContext==='function') return {backend:'cloakbrowser',launcher:cloak};}catch{} try{const {chromium}=require('playwright-core'); return {backend:'playwright-core',launcher:chromium};}catch{} throw Object.assign(new Error('No browser backend found. Install cloakbrowser or playwright-core.'),{code:'browser_backend_missing'}); }
+async function loadBrowserBackend(){
+  if(_backendOverride) return _backendOverride;
+  const chromeExecutable=String(process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE||process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE||process.env.CHROME_EXECUTABLE_PATH||'').trim();
+  if(chromeExecutable){
+    try{
+      const {chromium}=require('playwright-core');
+      return {
+        backend:'browser-executable',
+        executablePath:chromeExecutable,
+        launcher:{
+          launchPersistentContext:(profileDir,options={})=>chromium.launchPersistentContext(profileDir,{...options,executablePath:chromeExecutable})
+        }
+      };
+    }catch{}
+  }
+  try{const cloak=require('cloakbrowser'); if(cloak&&typeof cloak.launchPersistentContext==='function') return {backend:'cloakbrowser',launcher:cloak};}catch{}
+  try{const {chromium}=require('playwright-core'); return {backend:'playwright-core',launcher:chromium};}catch{}
+  throw Object.assign(new Error('No browser backend found. Install cloakbrowser or playwright-core.'),{code:'browser_backend_missing'});
+}
 function profileDirFor(accountKey){return path.join(PROFILE_ROOT,accountKey)}
+
+function pidExists(pid){
+  const n=Number(pid);
+  if(!Number.isInteger(n)||n<=0) return false;
+  try{ process.kill(n,0); return true; }
+  catch(e){ return e&&e.code==='EPERM'; }
+}
+function singletonLockPid(profileDir){
+  try{
+    const fs=require('fs');
+    const lock=path.join(profileDir,'SingletonLock');
+    const target=fs.readlinkSync(lock);
+    const m=String(target||'').match(/-(\d+)$/);
+    return m?Number(m[1]):0;
+  }catch{ return 0; }
+}
+function clearStaleProfileSingletons(profileDir){
+  const fs=require('fs');
+  const pid=singletonLockPid(profileDir);
+  if(pid&&pidExists(pid)) return false;
+  let removed=false;
+  for(const name of ['SingletonLock','SingletonCookie','SingletonSocket']){
+    const f=path.join(profileDir,name);
+    try{ fs.rmSync(f,{force:true}); removed=true; }catch{}
+  }
+  return removed;
+}
 
 // ── Per-account persistent-context reuse ───────────────────────────────────────────────────────
 // A persistent profile dir can only be opened by ONE Chromium at a time — Chromium guards it with a
@@ -74,10 +119,14 @@ async function launchPersistentContext(rawAccount,options={}){
   const {key}=sanitizeAccount(rawAccount);
   const {backend,launcher}=await loadBrowserBackend();
   const profileDir=profileDirFor(key);
+  clearStaleProfileSingletons(profileDir);
   let context;
   try{
     context=await launcher.launchPersistentContext(profileDir,{headless:options.visible===false,args:['--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check'],...options.launchOptions});
-  }catch(e){ throw classifyLaunchError(e,profileDir); }
+  }catch(e){
+    clearStaleProfileSingletons(profileDir);
+    throw classifyLaunchError(e,profileDir);
+  }
   return {backend,profileDir,context};
 }
 // Reuse the live context this process already holds for the account (preserving its cookies/session
@@ -380,4 +429,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,openPage,isContextAlive,classifyLaunchError,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};

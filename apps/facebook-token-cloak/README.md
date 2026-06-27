@@ -23,11 +23,16 @@ Once running, open the local console in a browser:
 http://127.0.0.1:8820/
 ```
 
-The console is a single static page (no build step, no external CDNs) that shows
-which Facebook accounts/users exist in the local system and lets you add, edit,
-log in, check, and delete them. The browser UI always saves and logs in through
-the app's own macOS Generic Keychain provider (`generic-keychain`); it does not
-offer macOS Passwords.app selection.
+The console is the **Accounts Bridge** — a single static page (no build step, no
+external CDNs) and an **API-first, thin status/config view**. It shows which
+Facebook accounts/users exist in the local system and lets you add, edit, and
+delete them plus configure account roles. **Opening the page never logs in,
+refreshes a token, opens Chrome/Ads Manager, or submits credentials** — `init()`
+runs only token-free status reads (`GET /accounts`, `GET /accounts/bridge/facebook`).
+All side-effecting actions run through the explicit APIs below so ops/Hermes can
+drive inspect/fix/do steps on demand. The browser UI saves through the app's own
+macOS Generic Keychain provider (`generic-keychain`); it does not offer
+macOS Passwords.app selection.
 
 Sections:
 
@@ -35,9 +40,13 @@ Sections:
    present/missing pills for credential, 2FA, and token/session status.
 2. **Add / edit account** — alias/namespace, username/email/phone, and the
    write-only secret fields (password and 2FA seed/code).
-3. **Status** — Save and Login/Get Token show only redacted status. The UI never
-   requests raw token output (`includeToken` is never sent) and has no token
-   export or datr tools.
+3. **Account roles (status / config)** — map which saved account plays each
+   Facebook role (page posting via Facebook Lite / Token Bridge, ad creation via
+   Power Editor). Saving a role is config only; "Check roles (dry run)" is
+   token-free and opens no browser.
+4. **Status** — Save shows only redacted status. The UI never requests raw token
+   output by default (`includeToken` is sent only by the explicit local-only
+   Facebook Lite token reveal) and has no token export or datr tools.
 
 ### Safety model
 
@@ -53,8 +62,12 @@ Sections:
   provider, username/email/phone hint, domain/server, and the convert-token-mode
   label — never a password, token, cookie, secret, or datr value (such fields are
   rejected). The UI sends `provider: "generic-keychain"` for account saves.
-- All management endpoints (`/`, `/accounts*`, `/keychain/*`, `/accounts/selector`)
-  are localhost-only.
+- All management endpoints (`/`, `/accounts*`, `/accounts/bridge/*`,
+  `/keychain/*`, `/accounts/selector`) are localhost-only.
+- **Browser login is disabled by default.** `GET /login` returns `410
+  browser_login_disabled` unless `FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED=1`.
+  Token recovery for posting/comments is automatic and machine-to-machine; the
+  console never drives it.
 - The served HTML is fully static (no account data is server-rendered), and the
   client renders all values with `textContent`, so account values cannot inject
   markup. A strict `Content-Security-Policy` is sent with the page.
@@ -93,6 +106,52 @@ curl -X POST http://127.0.0.1:8820/keychain/datr \
 curl 'http://127.0.0.1:8820/keychain/datr?account=CHEARB'   # {"datrPresent":true|false}
 curl -X DELETE 'http://127.0.0.1:8820/keychain/datr?account=CHEARB'
 ```
+
+### Accounts Bridge endpoints (account-role config / status)
+
+API-first surface for configuring and inspecting account roles. All responses are
+**token-free** (no raw token, `accessToken`, or secret is ever returned) and none
+of these calls open a browser or mint/refresh a token.
+
+Page posting (Facebook Lite / Token Bridge) and ad creation (Power Editor) are
+kept conceptually separate by role name: `page_posting_facebook_lite` and
+`ads_power_editor`.
+
+Overall status — Shopee + Facebook sections plus configured roles:
+
+```sh
+curl http://127.0.0.1:8820/accounts/bridge/status
+```
+
+Facebook role mapping + readiness summary (from cached/local metadata only):
+
+```sh
+curl http://127.0.0.1:8820/accounts/bridge/facebook
+```
+
+Set the role mapping (account must already exist; pass `""` to clear a role):
+
+```sh
+curl -X POST http://127.0.0.1:8820/accounts/bridge/facebook \
+  -H 'Content-Type: application/json' \
+  -d '{"page_posting_facebook_lite":"CHEARB","ads_power_editor":"ADSPAGE"}'
+```
+
+Explicit operator check (defaults to `dry_run:true` — status-only, no browser). A
+browser opens only with `dry_run:false` **and** `open_browser:true` while
+`FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED=1`; even then it never autofills or
+submits credentials:
+
+```sh
+curl -X POST http://127.0.0.1:8820/accounts/bridge/facebook/check \
+  -H 'Content-Type: application/json' \
+  -d '{"role":"page_posting_facebook_lite","account":"CHEARB"}'
+```
+
+The role mapping persists in a non-secret file outside git at
+`~/.facebook-token-cloak/bridge-config.json` (mode `0600`, override with
+`FACEBOOK_TOKEN_CLOAK_BRIDGE_CONFIG`). It stores account aliases only — never a
+password, token, cookie, secret, or datr value (such fields are rejected).
 
 ## macOS LaunchAgent
 
@@ -149,10 +208,13 @@ curl -X POST http://127.0.0.1:8820/keychain/totp \
   -d '{"account":"CHEARB","secret":"[REDACTED]"}'
 ```
 
-Open login browser profile:
+Open login browser profile (**disabled by default** — returns `410
+browser_login_disabled` unless `FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED=1`; the
+console never calls this on load):
 
 ```sh
-curl 'http://127.0.0.1:8820/login?account=CHEARB&visible=1&autofill=1&submit=0'
+FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED=1 \
+curl 'http://127.0.0.1:8820/login?account=CHEARB&visible=1&autofill=0&submit=0'
 ```
 
 ## Legacy Apple Passwords backend support

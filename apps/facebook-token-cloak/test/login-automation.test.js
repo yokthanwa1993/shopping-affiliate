@@ -356,12 +356,14 @@ async function listenWith(mock) {
 }
 
 beforeEach(() => {
+  process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED=String.fromCharCode(49);
   store.clear();
   securityCalls.length = 0;
   keychain.setRunner(fakeRunner);
 });
 
 afterEach(async () => {
+  delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED;
   keychain.clearRunner();
   if (server) await new Promise(resolve => server.close(resolve));
 });
@@ -580,6 +582,26 @@ function lockMockBrowser() {
   };
 }
 
+
+test('clearStaleProfileSingletons removes dead Chromium Singleton symlinks but keeps a live lock', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-profile-lock-'));
+  try {
+    fs.symlinkSync('Thanwas-Mac-mini.local-99999999', path.join(dir, 'SingletonLock'));
+    fs.symlinkSync('cookie', path.join(dir, 'SingletonCookie'));
+    fs.symlinkSync('/tmp/socket', path.join(dir, 'SingletonSocket'));
+    assert.equal(browser.clearStaleProfileSingletons(dir), true);
+    assert.equal(fs.existsSync(path.join(dir, 'SingletonLock')), false);
+    fs.symlinkSync(`Thanwas-Mac-mini.local-${process.pid}`, path.join(dir, 'SingletonLock'));
+    assert.equal(browser.clearStaleProfileSingletons(dir), false);
+    assert.equal(fs.lstatSync(path.join(dir, 'SingletonLock')).isSymbolicLink(), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('/login returns a sanitized profile_already_open (409), never a generic 500, when the profile is locked', async () => {
   await listenWith(lockMockBrowser());
   const r = await req('GET', '/login?account=100090320823561&visible=1&autofill=0&submit=0');
@@ -589,6 +611,29 @@ test('/login returns a sanitized profile_already_open (409), never a generic 500
   assert.equal(r.body.state, 'profile_already_open');
   assert.equal(r.body.reason, 'profile_already_open');
   assert.notEqual(r.body.error, 'Internal server error');
+});
+
+
+test('loadBrowserBackend honors FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE before Chrome-for-Testing fallback', async () => {
+  const oldBrowser = process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
+  const oldChrome = process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
+  browser.setBrowserBackend(null);
+  browser.resetAccountContexts();
+  process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE='/Users/yok-macmini/.cloakbrowser/chromium-145.0.7632.109.2/Chromium.app/Contents/MacOS/Chromium';
+  delete process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
+  try {
+    const backend = await browser.loadBrowserBackend();
+    assert.equal(backend.backend, 'browser-executable');
+    assert.equal(backend.executablePath, '/Users/yok-macmini/.cloakbrowser/chromium-145.0.7632.109.2/Chromium.app/Contents/MacOS/Chromium');
+    assert.equal(typeof backend.launcher.launchPersistentContext, 'function');
+  } finally {
+    if (oldBrowser === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE;
+    else process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_EXECUTABLE=oldBrowser;
+    if (oldChrome === undefined) delete process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE;
+    else process.env.FACEBOOK_TOKEN_CLOAK_CHROME_EXECUTABLE=oldChrome;
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
 });
 
 // ── reuseIfPresent: posting/session-token resolution reuses an operator-visible context ─────────
@@ -693,4 +738,17 @@ test('closeSession skips a reused:true context but closes reused:false / undefin
   const noFlag = makeClosable();
   await posting.closeSession({ context: noFlag.context }); // default lifecycle: reused undefined
   assert.equal(noFlag.closes, 1);
+});
+test('readTemplateSettings captures promoted_object so conversion adsets keep pixel tracking', async () => {
+  const posting = require('../src/posting');
+  const fetchImpl = async () => ({
+    json: async () => ({
+      promoted_object: { pixel_id: '123', custom_event_type: 'PURCHASE' },
+      existing_customer_budget_percentage: 0,
+      campaign: { id: 'camp1', objective: 'OUTCOME_SALES', smart_promotion_type: 'GUIDED_CREATION' }
+    })
+  });
+  const settings = await posting.readTemplateSettings(fetchImpl, { userToken: 'tok', templateAdset: 'tpl' });
+  assert.equal(settings.objective, 'OUTCOME_SALES');
+  assert.deepEqual(settings.adsetSettings.promoted_object, { pixel_id: '123', custom_event_type: 'PURCHASE' });
 });

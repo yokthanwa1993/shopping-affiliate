@@ -984,12 +984,13 @@ async function publishStoryToPage(fetchImpl, { userToken, pageId, storyId, sleep
 // known-creatable so Graph never rejects an immutable/invalid field (req: do not include fields
 // that would make Graph reject). Only fields actually present on the template are forwarded.
 const TEMPLATE_CAMPAIGN_MIRROR_FIELDS = ['smart_promotion_type'];
-// Template AD SET fields carrying the customer-lifecycle / customer-acquisition strategy
-// ("Reach new and existing customers" vs "Acquire new customers only"). Per Meta's Marketing API
-// this lives on the AD SET (existing_customer_budget_percentage), NOT the campaign — so a fresh
-// daily campaign cannot carry it; it must be re-applied to the COPIED adset. deep_copy:false copies
-// the adset shell but was live-observed to drop this strategy, so we re-apply it explicitly.
-const TEMPLATE_ADSET_LIFECYCLE_FIELDS = ['existing_customer_budget_percentage'];
+// Template AD SET fields carrying customer-lifecycle plus required conversion tracking source
+// ("Reach new and existing customers" vs "Acquire new customers only") and conversion
+// tracking source (`promoted_object`, e.g. pixel/custom event). Per Meta's Marketing API these
+// live on the AD SET, NOT the campaign — so a fresh daily campaign cannot carry them; they must be
+// re-applied to the COPIED adset. deep_copy:false copies the adset shell but live traffic showed it
+// can drop settings, causing Meta subcode 1487888 (tracking pixel required) at ad creation.
+const TEMPLATE_ADSET_LIFECYCLE_FIELDS = ['existing_customer_budget_percentage', 'promoted_object'];
 // Additional template adset fields READ for diagnostics only (not re-applied — they are not safely
 // settable via a plain adset POST). Surfaced under copied_template_settings for live verification.
 const TEMPLATE_ADSET_DIAGNOSTIC_FIELDS = ['targeting_optimization_types'];
