@@ -69,8 +69,10 @@ test('UI is status-only on load: no automatic login, autofill/submit, token refr
   assert.ok(!/api\(/.test(cacheFn), 'cache-only hydration must make NO network call');
   // (4) Explicit, side-effect-clear manual buttons replace any generic "Login/Get Token".
   assert.match(ui, /Manual refresh Facebook Lite token/);
-  assert.doesNotMatch(ui, /Open Power Editor session \(manual\)/);
-  assert.doesNotMatch(ui, /power-editor-button/);
+  assert.match(ui, /Open Facebook Lite session/);
+  assert.match(ui, /Open Power Editor session/);
+  assert.match(ui, /fb-lite-open-session/);
+  assert.match(ui, /power-editor-open-session/);
   assert.doesNotMatch(ui, /Login\/Get Token/);
   // (5) Facebook area is split into two explicit sub-sections under the Facebook platform: Post
   // (Facebook Lite — Page posting / Token Bridge) and Ads (Power Editor — ad creation). The EAAD6V
@@ -82,10 +84,11 @@ test('UI is status-only on load: no automatic login, autofill/submit, token refr
   // (6) The manual Facebook Lite refresh calls the SAFE status endpoint only when clicked.
   assert.match(ui, /\$\("#fb-lite-manual-refresh"\)\.addEventListener\("click"/);
   assert.match(ui, /async function refreshFacebookLiteToken\(explicitAccount\)/);
-  // (7) Browser-session launchers are removed from the UI entirely. Power Editor is configured via API only.
-  assert.doesNotMatch(ui, /\$\("#power-editor-button"\)\.addEventListener\("click"/);
-  assert.doesNotMatch(ui, /\/login\?account=/);
-  assert.doesNotMatch(ui, /visible=1&autofill=0&submit=0/);
+  // (7) Browser-session launchers exist only for manual open-session, never autofill/submit.
+  assert.match(ui, /openFacebookRoleSession/);
+  assert.match(ui, /visible=1&autofill=0&submit=0/);
+  assert.doesNotMatch(ui, /autofill=1/);
+  assert.doesNotMatch(ui, /submit=1/);
   // (8) Renamed user-facing tool; no FB Bridge / Account Manager wording remains.
   assert.match(ui, /Accounts Bridge/);
   assert.doesNotMatch(ui, /Account Manager/);
@@ -118,10 +121,10 @@ test('UI separates Shopee and Facebook as distinct top-level platform areas, wit
   assert.ok(ui.indexOf('id="facebook-section"') < ui.indexOf('id="fb-post"'), 'Post sub-section is inside the Facebook area');
   assert.ok(ui.indexOf('id="fb-post"') < ui.indexOf('id="fb-ads"'), 'Post sub-section comes before Ads sub-section');
 
-  // (4) Status-only is preserved: NO browser session launcher, NO /login?account= URL, NO auto-login,
-  // NO auto-fill/auto-submit, NO token refresh on load — even after the restructure.
-  assert.doesNotMatch(ui, /\/login\?account=/, 'no browser-login launcher URL');
-  assert.doesNotMatch(ui, /power-editor-button/, 'no Power Editor browser-session launcher');
+  // (4) Manual open-session launchers are allowed, but NO auto-login, NO auto-fill/auto-submit,
+  // NO token refresh on load — even after the restructure.
+  assert.match(ui, /openFacebookRoleSession/, 'manual browser-session launcher exists');
+  assert.match(ui, /visible=1&autofill=0&submit=0/, 'manual launcher is open-only');
   assert.doesNotMatch(ui, /autofill=1/, 'no credential autofill');
   assert.doesNotMatch(ui, /submit=1/, 'no automatic login submit');
   assert.doesNotMatch(ui, /\/token\/refresh/, 'no token refresh endpoint call');

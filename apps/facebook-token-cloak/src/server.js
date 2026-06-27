@@ -626,7 +626,8 @@ function createHandler(deps = {}) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-        return sendError(res, 410, 'native_app_only');
+        if (!isLocalRequest(req)) return sendError(res, 403, 'UI is local-only');
+        return sendHtml(res, ui.INDEX_HTML);
       }
 
       if (req.method === 'GET' && url.pathname === '/health') {
@@ -913,19 +914,20 @@ function createHandler(deps = {}) {
       }
 
       if (req.method === 'GET' && url.pathname === '/login') {
-        if (process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED !== '1') {
-          return sendError(res, 410, 'browser_login_disabled', {
-            state: 'browser_login_disabled',
-            reason: 'browser_login_disabled',
-            note: 'Browser login/open-session automation is disabled. Use status-only checks; do not open Chrome from Accounts Bridge.'
-          });
-        }
         const account = url.searchParams.get('account');
         if (!account) return sendError(res, 400, 'Missing account parameter');
         const { display } = sanitizeAccount(account);
         const visible = parseBool(url.searchParams.get('visible'), false);
         const autofill = parseBool(url.searchParams.get('autofill'), true);
         const submit = parseBool(url.searchParams.get('submit'), false);
+        const openSessionOnly = visible === true && autofill === false && submit === false;
+        if (process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED !== '1' && !openSessionOnly) {
+          return sendError(res, 410, 'browser_login_disabled', {
+            state: 'browser_login_disabled',
+            reason: 'browser_login_disabled',
+            note: 'Browser login/open-session automation is disabled for autofill/submit. Use open-session only (visible=1&autofill=0&submit=0) to let the operator log in manually.'
+          });
+        }
         const credentialProvider = credentialProviderFromParams(url.searchParams);
         const { credentialOptions, selectorStatus } = await resolveCredentialOptions(selectors, account, credentialProvider, url.searchParams);
         let credential = null;

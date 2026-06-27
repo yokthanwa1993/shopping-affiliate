@@ -273,11 +273,13 @@ test('bridge status + config reads never touch the browser', async () => {
 
 // ── UI invariants: API-first, no auto login/refresh on load ───────────────────────────────────
 
-test('GET / web UI is disabled; Accounts Bridge UI is native-only', async () => {
+test('GET / web UI serves the local Accounts Bridge console without opening a browser', async () => {
   const r = await getRaw('/');
-  assert.equal(r.status, 410);
-  assert.match(r.text, /native_app_only/);
-  assert.equal(openPageCalls, 0, 'disabled web root must not open a browser');
+  assert.equal(r.status, 200);
+  assert.match(r.text, /Accounts Bridge/);
+  assert.match(r.text, /Open Facebook Lite session/);
+  assert.match(r.text, /Open Power Editor session/);
+  assert.equal(openPageCalls, 0, 'loading web root must not open a browser');
 
   const status = await req('GET', '/accounts/bridge/status');
   assert.equal(status.status, 200);
