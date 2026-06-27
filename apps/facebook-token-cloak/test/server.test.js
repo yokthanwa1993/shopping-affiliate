@@ -51,6 +51,43 @@ test('UI is status-only: recovery is AUTOMATIC — there is NO manual Sync-to-Wo
   assert.ok(/automatic/i.test(ui), 'the UI should state that recovery is automatic');
 })
 
+test('UI is status-only on load: no automatic login, autofill/submit, token refresh, or browser-opening probe', async () => {
+  const ui = await fs.readFile(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8');
+  // (1) No aggressive auto-login from the UI: never autofill+submit, never autofill, never auto-submit.
+  assert.ok(!/visible=1&autofill=1&submit=1/.test(ui), 'UI must never auto-fill AND auto-submit a login');
+  assert.ok(!/autofill=1/.test(ui), 'UI must never request credential autofill');
+  assert.ok(!/submit=1/.test(ui), 'UI must never request an automatic login submit');
+  // (2) No legacy refresh-after-login path.
+  assert.ok(!/\/token\/refresh/.test(ui), 'UI must not POST /token/refresh');
+  assert.ok(!/runLogin/.test(ui), 'the auto-login runLogin path must be gone');
+  // (3) Load-time hydration is CACHE-ONLY — opening the page must make no /token network call and
+  // open no browser. The old network-probing hydrate-on-load is gone.
+  assert.match(ui, /function hydrateTokenStatusesFromCache\(\)/);
+  assert.match(ui, /hydrateTokenStatusesFromCache\(\);/, 'loadAccounts hydrates from cache only');
+  assert.ok(!/hydrateTokenStatuses\(\)/.test(ui), 'the old network-probing hydrate-on-load must be gone');
+  const cacheFn = ui.match(/function hydrateTokenStatusesFromCache\(\)[\s\S]*?\n  }/)[0];
+  assert.ok(!/api\(/.test(cacheFn), 'cache-only hydration must make NO network call');
+  // (4) Explicit, side-effect-clear manual buttons replace any generic "Login/Get Token".
+  assert.match(ui, /Manual refresh Facebook Lite token/);
+  assert.match(ui, /Open Power Editor session \(manual\)/);
+  assert.doesNotMatch(ui, /Login\/Get Token/);
+  // (5) Facebook area is split into two explicit purposes: Facebook Lite (Page posting / Token Bridge
+  // EAAD6V) and Power Editor (ad creation, manual session only).
+  assert.match(ui, /Facebook Lite — Page posting \/ Token Bridge \(EAAD6V\)/);
+  assert.match(ui, /Power Editor — Ad creation \(manual session only\)/);
+  // (6) The manual Facebook Lite refresh calls the SAFE status endpoint only when clicked.
+  assert.match(ui, /\$\("#fb-lite-manual-refresh"\)\.addEventListener\("click"/);
+  assert.match(ui, /async function refreshFacebookLiteToken\(explicitAccount\)/);
+  // (7) The manual Power Editor open uses a no-autofill, no-submit VISIBLE login only when clicked.
+  assert.match(ui, /\$\("#power-editor-button"\)\.addEventListener\("click"/);
+  assert.match(ui, /\/login\?account=/);
+  assert.match(ui, /&visible=1&autofill=0&submit=0/);
+  // (8) Renamed user-facing tool; no FB Bridge / Account Manager wording remains.
+  assert.match(ui, /Accounts Bridge/);
+  assert.doesNotMatch(ui, /Account Manager/);
+  assert.doesNotMatch(ui, /FB Bridge/);
+})
+
 function browser(url = 'https://postcron.com/auth/login/facebook/callback#access_token=EAAB_USER_SECRET', seen) {
   return {
     PROFILE_ROOT: '/tmp/profiles',
@@ -140,6 +177,7 @@ async function listenWith(mockBrowser = browser()) {
 }
 
 beforeEach(async () => {
+  process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED = '1';
   store.clear();
   internetStore.clear();
   securityCalls.length = 0;
@@ -149,6 +187,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED;
   keychain.clearRunner();
   await new Promise(resolve => server.close(resolve));
 });

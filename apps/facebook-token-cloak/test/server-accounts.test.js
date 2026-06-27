@@ -118,7 +118,10 @@ test('GET / serves the simple account table/form console and never requests a ra
   assert.match(r.headers['content-type'], /text\/html/);
   assert.ok(r.headers['content-security-policy'], 'CSP header present');
   assert.equal(r.headers['x-content-type-options'], 'nosniff');
-  assert.match(r.text, /Facebook Token Cloak/);
+  // The user-facing tool is renamed to "Accounts Bridge" (no FB Bridge / Account Manager wording).
+  assert.match(r.text, /Accounts Bridge/);
+  assert.doesNotMatch(r.text, /Account Manager/);
+  assert.doesNotMatch(r.text, /FB Bridge/);
   assert.match(r.text, /id="accounts-table"/);
   assert.match(r.text, /id="account-form"/);
   assert.match(r.text, /id="account-input"/);
@@ -126,7 +129,8 @@ test('GET / serves the simple account table/form console and never requests a ra
   assert.match(r.text, /id="password-input"/);
   assert.match(r.text, /id="totp-input"/);
   assert.match(r.text, /Save/);
-  assert.match(r.text, /Login\/Get Token/);
+  assert.doesNotMatch(r.text, /Login\/Get Token/);
+  assert.match(r.text, /Browser login disabled/);
   assert.match(r.text, /Reveal token/);
   assert.match(r.text, /Delete/);
   const visibleMarkup = r.text.slice(0, r.text.indexOf('<script>'));
@@ -157,19 +161,20 @@ test('GET / serves the simple account table/form console and never requests a ra
   assertNoLeak(r.text, SECRETS);
 });
 
-test('GET / uses only the generic-keychain UI save/login path', async () => {
+test('GET / uses only the generic-keychain UI save path and disables browser login', async () => {
   const r = await getRaw('/');
   assert.equal(r.status, 200);
   assert.match(r.text, /function formAccount\(\)[\s\S]*provider: "generic-keychain"[\s\S]*password: value\("#password-input"\)[\s\S]*totp: value\("#totp-input"\)/);
   assert.match(r.text, /api\("POST", "\/accounts", body\)/);
-  assert.match(r.text, /var loginPath = "\/login\?account=" \+ encodeURIComponent\(account\) \+ "&visible=1&autofill=1&submit=1";/);
-  assert.match(r.text, /api\("POST", "\/token\/refresh", \{ account: account, visible: false \}\)/);
+  assert.doesNotMatch(r.text, /var loginPath = "\/login\?account=/);
+  assert.doesNotMatch(r.text, /autofill=1|submit=1|id="login-button"|Login\/Get Token/);
+  assert.match(r.text, /Browser login disabled/);
   assert.doesNotMatch(r.text, /provider=/i);
   assert.doesNotMatch(r.text, /domain|server|protocol/i);
   assert.doesNotMatch(r.text, /apple-passwords/i);
 });
 
-test('simple save/login/token path stays redacted and clears write-only fields in UI code', async () => {
+test('simple save/token path stays redacted, browser login disabled, and clears write-only fields in UI code', async () => {
   let r = await req('POST', '/accounts', {
     account: 'CHEARB',
     provider: 'generic-keychain',
@@ -183,11 +188,9 @@ test('simple save/login/token path stays redacted and clears write-only fields i
   assertNoLeak(r.body, SECRETS);
 
   r = await req('GET', '/login?account=CHEARB&visible=1&autofill=1&submit=1');
-  assert.equal(r.status, 200);
-  assert.equal(r.body.state, 'login_opened');
-  assert.equal(r.body.credentialProvider, 'generic-keychain');
-  assert.equal(typeof r.body.autofilled, 'boolean');
-  assert.equal(typeof r.body.submitted, 'boolean');
+  assert.equal(r.status, 410);
+  assert.equal(r.body.error, 'browser_login_disabled');
+  assert.equal(r.body.state, 'browser_login_disabled');
   assertNoLeak(r.body, SECRETS);
 
   r = await req('POST', '/token/refresh', { account: 'CHEARB', visible: false });

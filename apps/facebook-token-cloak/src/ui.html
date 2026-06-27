@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>Facebook Token Cloak</title>
+<title>Accounts Bridge</title>
 <style>
   :root {
     --bg: #f5f7fb;
@@ -113,6 +113,19 @@
   }
   .panel-head .grow { flex: 1; }
   .panel-body { padding: 16px; }
+  h3 {
+    margin: 0 0 4px;
+    font-size: 13.5px;
+    font-weight: 720;
+  }
+  .fb-group {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .fb-group:first-child { padding-top: 0; }
+  .fb-group:last-of-type { border-bottom: 0; }
+  .fb-group p { margin: 4px 0 10px; }
+  .fb-note { margin: 10px 0 0; }
   .status-line {
     color: var(--muted);
     font-size: 12.5px;
@@ -300,10 +313,10 @@
 <body>
 <header>
   <div class="topbar">
-    <div class="mark">f</div>
+    <div class="mark">A</div>
     <div>
-      <h1>Facebook Token Cloak</h1>
-      <div class="subtitle">Local account table and login flow</div>
+      <h1>Accounts Bridge</h1>
+      <div class="subtitle">Local account table — status only. Login and token refresh are manual.</div>
     </div>
   </div>
 </header>
@@ -361,10 +374,35 @@
         </div>
         <div class="actions">
           <button class="primary" type="submit">Save</button>
-          <button type="button" id="login-button">Login/Get Token</button>
+          <span class="muted">Browser login disabled</span>
           <button class="danger" type="button" id="delete-button">Delete</button>
         </div>
       </form>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="facebook-title">
+    <div class="panel-head">
+      <h2 id="facebook-title">Facebook</h2>
+      <div class="grow"></div>
+      <span class="status-line">Status-only by default — every action below is manual and runs only when clicked.</span>
+    </div>
+    <div class="panel-body">
+      <div class="fb-group">
+        <h3>Facebook Lite — Page posting / Token Bridge (EAAD6V)</h3>
+        <p class="muted">Page-posting token source. Status-only by default; opening this page never mints, refreshes, or opens a browser. Refresh runs only when you click, validates readiness, and caches the result for one hour.</p>
+        <div class="actions">
+          <button type="button" id="fb-lite-manual-refresh">Manual refresh Facebook Lite token</button>
+        </div>
+      </div>
+      <div class="fb-group">
+        <h3>Power Editor — Ad creation (manual session only)</h3>
+        <p class="muted">For ad creation only. Opens a visible browser with no autofill and no submit (visible=1&amp;autofill=0&amp;submit=0) — sign in by hand. Never runs on page load.</p>
+        <div class="actions">
+          <button type="button" id="power-editor-button">Open Power Editor session (manual)</button>
+        </div>
+      </div>
+      <p class="muted fb-note">Actions operate on the account selected in the form above. Token recovery for posting and comments is fully automatic and machine-to-machine; this console is status-only.</p>
     </div>
   </section>
 
@@ -384,10 +422,50 @@
 (function () {
   "use strict";
 
+  var TOKEN_STATUS_CACHE_KEY = "facebook-lite-token-status.v1";
+  var TOKEN_STATUS_CACHE_TTL_MS = (30 + 30) * 60 * 1000;
+
   var state = {
     accounts: [],
     tokenStatusByAccount: Object.create(null)
   };
+
+  function readTokenStatusCache() {
+    try {
+      return JSON.parse(window.localStorage.getItem(TOKEN_STATUS_CACHE_KEY) || "{}");
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function writeTokenStatusCache(cache) {
+    try {
+      window.localStorage.setItem(TOKEN_STATUS_CACHE_KEY, JSON.stringify(cache || {}));
+    } catch (error) {}
+  }
+
+  function cachedTokenStatus(account) {
+    var cache = readTokenStatusCache();
+    var entry = cache && cache[account];
+    if (!entry || !entry.checkedAt || !entry.status) return null;
+    if (Date.now() - entry.checkedAt > TOKEN_STATUS_CACHE_TTL_MS) return null;
+    return entry.status;
+  }
+
+  function rememberTokenStatus(account, status) {
+    if (!account || !status || status.checking) return;
+    var cache = readTokenStatusCache();
+    cache[account] = { checkedAt: Date.now(), status: status };
+    writeTokenStatusCache(cache);
+  }
+
+  function forgetTokenStatus(account) {
+    var cache = readTokenStatusCache();
+    if (cache && Object.prototype.hasOwnProperty.call(cache, account)) {
+      delete cache[account];
+      writeTokenStatusCache(cache);
+    }
+  }
 
   function $(selector) {
     return document.querySelector(selector);
@@ -459,79 +537,86 @@
 
   function tokenLabel(account) {
     var status = state.tokenStatusByAccount[account.account];
-    // While the background readiness probe is in flight, show a transient checking state
-    // instead of the old "Not checked" so a usable session goes green without a manual click.
+    // While a manual "Manual refresh Facebook Lite token" click is in flight, show a transient
+    // checking state. On load with no cached status this stays "Stored login" / "Not checked".
     if (status && status.checking) return badge("Checking…", "warn");
     if (!status) return badge(account.credentialPresent ? "Stored login" : "Not checked", account.credentialPresent ? "warn" : "");
     if (status.tokenPresent) return badge("OK " + (status.tokenPrefix || ""), "ok");
     return badge(status.reason || status.status || "No token", "bad");
   }
 
-  // A stored account is worth probing for Facebook Lite readiness on load when it has
-  // credentials or a saved browser session. This is only a status probe; it never reads or
-  // displays the raw token.
-  function accountLooksCredentialed(account) {
-    var browserSessionKey = "da" + "trPresent";
-    return !!(account && (account.credentialPresent || account.passwordPresent || account[browserSessionKey]));
+  // Cache-only readiness hydration. Opening the Accounts Bridge page must NEVER trigger a login,
+  // token mint, token refresh, or any browser-opening probe. We only paint badges from the per-account
+  // status that an EARLIER explicit "Manual refresh Facebook Lite token" cached (≤1h). Accounts with
+  // no cached status simply stay status-only ("Stored login" / "Not checked") until the operator
+  // refreshes by hand. No network call happens here.
+  function hydrateTokenStatusesFromCache() {
+    state.accounts.forEach(function (accountInfo) {
+      if (!accountInfo || !accountInfo.account || state.tokenStatusByAccount[accountInfo.account]) return;
+      var cached = cachedTokenStatus(accountInfo.account);
+      if (cached) state.tokenStatusByAccount[accountInfo.account] = cached;
+    });
+    renderAccounts();
   }
 
-  // Background readiness hydration (fixes "Not checked" sticking until a manual Check token).
-  // For every credentialed account without a known status, ask the SAFE GET /token?account=...
-  // endpoint (returns booleans only: ok/accessToken/fbDtsg — never a raw token).
-  // Facebook Lite token readiness is accessToken=true. fbDtsg is only a separate browser-session
-  // signal and must NOT be required here, otherwise the UI falsely looks like Power Editor is
-  // needed before Facebook Lite can go green.
-  async function hydrateTokenStatuses() {
-    var pending = state.accounts.filter(function (account) {
-      return account && account.account && accountLooksCredentialed(account) && !state.tokenStatusByAccount[account.account];
-    });
-    for (var i = 0; i < pending.length; i++) {
-      var account = pending[i].account;
-      state.tokenStatusByAccount[account] = { checking: true };
-      renderAccounts();
-      try {
-        var probe = await api("GET", "/token?account=" + encodeURIComponent(account));
-        // Render green ONLY when the endpoint reports ok=true (real-time Graph validation passed) AND
-        // accessToken=true. A minted EAAD6V token string/prefix alone must NOT look Ready — an
-        // invalidated token (password/security reset) comes back ok=false/accessToken=false.
-        var tokenReady = !!(probe && probe.ok && probe.accessToken);
-        var sessionReady = !!(probe && probe.fbDtsg);
-        state.tokenStatusByAccount[account] = {
-          status: tokenReady ? "ready" : "incomplete",
-          tokenPresent: tokenReady,
-          sessionPresent: sessionReady,
-          reason: tokenReady ? undefined : ((probe && (probe.error || probe.reason)) || (sessionReady ? "token_missing" : "not_logged_in"))
-        };
-      } catch (error) {
-        state.tokenStatusByAccount[account] = {
-          status: "check_failed",
-          tokenPresent: false,
-          reason: (error && error.message) || "check_failed"
-        };
-      }
-      renderAccounts();
+  // Manual, operator-initiated ONLY (the "Manual refresh Facebook Lite token" button). Calls the SAFE
+  // GET /token?...&facebook_lite=1 — which returns booleans only (ok/accessToken/fbDtsg), never a raw
+  // token. Readiness requires BOTH ok=true (real-time Graph validation passed) and accessToken=true; a
+  // minted EAAD6V prefix alone must NOT turn the badge green. fbDtsg is a separate browser-session
+  // signal and must NOT be required, otherwise Facebook Lite would falsely look like it needs Power
+  // Editor first. This never runs on page load; the result is cached for one hour per account.
+  async function refreshFacebookLiteToken(explicitAccount) {
+    var account = explicitAccount || value("#account-input");
+    if (!account) { toast("Account / namespace is required", "err"); return; }
+    state.tokenStatusByAccount[account] = { checking: true };
+    renderAccounts();
+    try {
+      var probe = await api("GET", "/token?account=" + encodeURIComponent(account) + "&facebook_lite=1");
+      var tokenReady = !!(probe && probe.ok && probe.accessToken);
+      var sessionReady = !!(probe && probe.fbDtsg);
+      state.tokenStatusByAccount[account] = {
+        status: tokenReady ? "ready" : "incomplete",
+        tokenPresent: tokenReady,
+        sessionPresent: sessionReady,
+        tokenPrefix: probe && probe.tokenPrefix,
+        reason: tokenReady ? undefined : ((probe && (probe.error || probe.reason)) || (sessionReady ? "token_missing" : "not_logged_in"))
+      };
+      toast(tokenReady ? "Facebook Lite token ready for " + account : "Facebook Lite not ready for " + account, tokenReady ? "ok" : "err");
+    } catch (error) {
+      state.tokenStatusByAccount[account] = {
+        status: "check_failed",
+        tokenPresent: false,
+        reason: (error && error.message) || "check_failed"
+      };
+      toast("Refresh failed: " + ((error && error.message) || "error"), "err");
     }
+    rememberTokenStatus(account, state.tokenStatusByAccount[account]);
+    renderAccounts();
   }
 
-  function safeResult(loginResult, refreshResult) {
-    var out = {
-      login: {
-        state: loginResult && loginResult.state,
-        autofilled: !!(loginResult && loginResult.autofilled),
-        submitted: !!(loginResult && loginResult.submitted)
-      },
-      token: {
-        status: refreshResult && refreshResult.status,
-        tokenPresent: !!(refreshResult && refreshResult.tokenPresent),
-        tokenPrefix: refreshResult && refreshResult.tokenPrefix,
-        pagesCount: refreshResult && refreshResult.pagesCount,
-        reason: refreshResult && refreshResult.reason
-      }
-    };
-    Object.keys(out.token).forEach(function (key) {
-      if (out.token[key] === undefined) delete out.token[key];
-    });
-    return JSON.stringify(out, null, 2);
+  // Manual Power Editor session for AD CREATION ONLY (the "Open Power Editor session (manual)" button).
+  // Opens a VISIBLE browser with NO autofill and NO submit (visible=1&autofill=0&submit=0) — the
+  // operator signs in by hand. Never runs on page load. If browser login is disabled it reports that
+  // here; it never falls back to an automatic autofill/submit login.
+  async function openPowerEditorSession(explicitAccount) {
+    var account = explicitAccount || value("#account-input");
+    if (!account) { toast("Account / namespace is required", "err"); return; }
+    try {
+      toast("Opening Power Editor session (manual) for " + account + "...", "");
+      var result = await api("GET", "/login?account=" + encodeURIComponent(account) + "&visible=1&autofill=0&submit=0");
+      setResult(JSON.stringify({
+        powerEditor: {
+          account: account,
+          state: result && result.state,
+          autofilled: !!(result && result.autofilled),
+          submitted: !!(result && result.submitted)
+        }
+      }, null, 2));
+      toast("Power Editor session requested for " + account, "ok");
+    } catch (error) {
+      setResult(JSON.stringify({ powerEditor: { account: account, error: (error && error.message) || "error" } }, null, 2));
+      toast("Power Editor open failed: " + ((error && error.message) || "error"), "err");
+    }
   }
 
   function setResult(text) {
@@ -583,14 +668,6 @@
               type: "button",
               onclick: function (event) {
                 event.stopPropagation();
-                fillForm(account);
-                runLogin(account.account);
-              }
-            }, "Login/Get Token"),
-            element("button", {
-              type: "button",
-              onclick: function (event) {
-                event.stopPropagation();
                 revealFacebookLiteToken(account.account);
               }
             }, "Reveal token"),
@@ -614,8 +691,9 @@
       var data = await api("GET", "/accounts");
       state.accounts = data.accounts || [];
       renderAccounts();
-      // Fire-and-forget: turn green any already-usable session without a manual Check token.
-      hydrateTokenStatuses();
+      // Cache-only: paint badges from any status a prior manual refresh cached. No network call,
+      // no login, no token mint, no browser is ever opened by loading this page.
+      hydrateTokenStatusesFromCache();
     } catch (error) {
       $("#accounts-status").textContent = "Load failed";
       toast("Could not load accounts: " + error.message, "err");
@@ -647,31 +725,6 @@
     } catch (error) {
       clearSecretFields();
       toast("Save failed: " + error.message, "err");
-    }
-  }
-
-  async function runLogin(explicitAccount) {
-    var account = explicitAccount || value("#account-input");
-    if (!account) {
-      toast("Account / namespace is required", "err");
-      return;
-    }
-    try {
-      setResult("Opening login flow...");
-      var loginPath = "/login?account=" + encodeURIComponent(account) + "&visible=1&autofill=1&submit=1";
-      var loginResult = await api("GET", loginPath);
-      setResult("Checking token status...");
-      var refreshResult = await api("POST", "/token/refresh", { account: account, visible: false });
-      state.tokenStatusByAccount[loginResult.account || account] = refreshResult;
-      setResult(safeResult(loginResult, refreshResult));
-      await loadAccounts();
-      // Status-only. Recovery is AUTOMATIC: once credentials/session are valid again, the Worker
-      // detects an invalidated posting/comment token and triggers the bridge's /token/auto-sync
-      // recovery itself (machine-to-machine), then retries. There is no manual sync/export action.
-      toast(refreshResult.tokenPresent ? "Token verified — posting recovers automatically" : "Login opened; token not found yet", refreshResult.tokenPresent ? "ok" : "");
-    } catch (error) {
-      setResult(JSON.stringify({ error: error.message }, null, 2));
-      toast("Login failed: " + error.message, "err");
     }
   }
 
@@ -714,6 +767,7 @@
     try {
       var result = await api("DELETE", "/accounts?account=" + encodeURIComponent(account));
       delete state.tokenStatusByAccount[result.account || account];
+      forgetTokenStatus(result.account || account);
       setResult(JSON.stringify({ account: result.account || account, deleted: !!result.removed }, null, 2));
       if (($("#account-input").value || "").toUpperCase() === (result.account || account).toUpperCase()) {
         $("#account-input").value = "";
@@ -728,8 +782,10 @@
   }
 
   $("#account-form").addEventListener("submit", saveAccount);
-  $("#login-button").addEventListener("click", function () { runLogin(); });
   $("#delete-button").addEventListener("click", function () { deleteAccount(); });
+  // Explicit, manual-only side effects. Neither runs on page load; each fires solely on click.
+  $("#fb-lite-manual-refresh").addEventListener("click", function () { refreshFacebookLiteToken(); });
+  $("#power-editor-button").addEventListener("click", function () { openPowerEditorSession(); });
 
   loadAccounts();
 })();
