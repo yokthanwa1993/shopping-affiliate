@@ -626,8 +626,7 @@ function createHandler(deps = {}) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
-        if (!isLocalRequest(req)) return sendError(res, 403, 'UI is local-only');
-        return sendHtml(res, ui.INDEX_HTML);
+        return sendError(res, 410, 'native_app_only');
       }
 
       if (req.method === 'GET' && url.pathname === '/health') {

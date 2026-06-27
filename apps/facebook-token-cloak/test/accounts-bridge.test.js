@@ -273,30 +273,16 @@ test('bridge status + config reads never touch the browser', async () => {
 
 // ── UI invariants: API-first, no auto login/refresh on load ───────────────────────────────────
 
-test('UI is Accounts Bridge and never auto-logs-in, auto-fills, or auto-submits', async () => {
+test('GET / web UI is disabled; Accounts Bridge UI is native-only', async () => {
   const r = await getRaw('/');
-  assert.equal(r.status, 200);
-  assert.match(r.text, /Accounts Bridge/);
-  // No automatic visible=1&autofill=1&submit=1 anywhere.
-  assert.doesNotMatch(r.text, /autofill=1/);
-  assert.doesNotMatch(r.text, /submit=1/);
-  assert.doesNotMatch(r.text, /visible=1&autofill=1&submit=1/);
+  assert.equal(r.status, 410);
+  assert.match(r.text, /native_app_only/);
+  assert.equal(openPageCalls, 0, 'disabled web root must not open a browser');
 
-  // The auto-run init() does STATUS reads only — it must not reference /login or /token in any form.
-  const initBody = r.text.slice(r.text.indexOf('function init()'), r.text.indexOf('init();', r.text.indexOf('function init()')));
-  assert.ok(initBody.length > 0, 'init() function found');
-  assert.match(initBody, /loadAccounts\(\)/);
-  assert.match(initBody, /loadBridgeRoles\(\)/);
-  assert.doesNotMatch(initBody, /\/login/);
-  assert.doesNotMatch(initBody, /\/token/);
-  assert.doesNotMatch(initBody, /refreshFacebookLiteToken|openPowerEditorSession/);
-
-  // loadBridgeRoles (the load-path bridge call) hits the token-free GET, never a refresh/login.
-  const loadRoles = r.text.slice(r.text.indexOf('async function loadBridgeRoles'), r.text.indexOf('async function saveBridgeRoles'));
-  assert.match(loadRoles, /api\("GET", "\/accounts\/bridge\/facebook"\)/);
-  assert.doesNotMatch(loadRoles, /\/token\/refresh/);
-  assert.doesNotMatch(loadRoles, /\/login/);
-
-  // The dry-run check the UI issues is explicitly dry_run:true.
-  assert.match(r.text, /"\/accounts\/bridge\/facebook\/check", \{ role: role, account: account, dry_run: true \}/);
+  const status = await req('GET', '/accounts/bridge/status');
+  assert.equal(status.status, 200);
+  assert.equal(status.body.app, 'accounts-bridge');
+  assert.ok(status.body.facebook.roles.page_posting_facebook_lite);
+  assert.ok(status.body.facebook.roles.ads_power_editor);
+  assertTokenFree(status.body);
 });
