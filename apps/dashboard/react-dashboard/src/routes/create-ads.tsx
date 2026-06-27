@@ -213,7 +213,7 @@ export function CreateAdsPage() {
     return Array.from(activeCampaignPageNames)
       .map((name) => byName.get(name))
       .filter((p): p is SettingsPage => !!p)
-      .map((p) => ({ ...p, active: true }))
+      .map((p) => ({ ...p, active: true, hasToken: true }))
       .sort((a, b) => a.name.localeCompare(b.name))
   }, [pages, activeCampaignPageNames])
 
@@ -585,7 +585,7 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
       {/* Step 1 — ad-relevant page defaults. */}
       <section className="space-y-3">
         <SectionLabel step={1} title="ค่าตั้งต้นแอดของเพจ" hint="ข้อมูลอ้างอิง ไม่ใช่การสร้างแอด" />
-        <PageHealthCard pageId={selectedId} variant="ads" />
+        <PageHealthCard pageId={selectedId} variant="ads" tokenPresentOverride={selectedPage.hasToken} />
       </section>
 
       {/* Step 2 — per-page flow settings. */}

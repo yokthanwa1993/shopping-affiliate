@@ -44,9 +44,11 @@ function Divider() {
 export function PageHealthCard({
   pageId,
   variant = 'post',
+  tokenPresentOverride,
 }: {
   pageId: string
   variant?: 'post' | 'ads'
+  tokenPresentOverride?: boolean
 }) {
   const coreQuery = useQuery({
     queryKey: ['page-core', pageId],
@@ -76,6 +78,7 @@ export function PageHealthCard({
   }
 
   const core = coreQuery.data
+  const tokenPresent = tokenPresentOverride ?? core.tokenPresent
   const adAccount = settingsQuery.data?.form.adAccount?.trim() || ''
 
   return (
@@ -85,8 +88,8 @@ export function PageHealthCard({
         <Badge variant={core.isActive ? 'success' : 'destructive'}>
           {core.isActive ? 'เพจเปิดใช้งาน' : 'เพจปิดอยู่'}
         </Badge>
-        <Badge variant={core.tokenPresent ? 'secondary' : 'outline'}>
-          {core.tokenPresent ? '🔒 มี posting token' : 'ไม่มี posting token'}
+        <Badge variant={tokenPresent ? 'secondary' : 'outline'}>
+          {tokenPresent ? '🔒 มี token จาก Accounts Bridge' : 'ไม่มี token จาก Accounts Bridge'}
         </Badge>
       </div>
 
