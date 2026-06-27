@@ -13510,6 +13510,10 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
     // Follow lane's fixed-adset handling. resolveAdOnlySchedule already allows active mode with no
     // daily_campaign_name when a fixed/existing adset is present.
     const fixedTargetAdsetId = String(body.existing_adset_id || body.fixed_adset_id || body.target_adset_id || body.adset_id || '').trim()
+    // Always send an explicit Bangkok-date campaign for click-link/ad-only when not targeting a fixed
+    // adset. Without this, paused/manual ad-only requests can fall through the bridge's legacy
+    // ADS_PUBLISH_ prefix branch and create hard-to-track ADS_PUBLISH_1 campaigns.
+    const bridgeDailyCampaignName = fixedTargetAdsetId ? '' : (schedule.dailyCampaignName || bangkokDailyCampaignName())
     const lifecycleFields = schedule.mode === 'active'
         ? (fixedTargetAdsetId
             ? {
@@ -13519,14 +13523,14 @@ app.post('/api/dashboard/create-ad-only', async (c) => {
                 adset_run_hours: schedule.runHours,
             }
             : {
-                daily_campaign_name: schedule.dailyCampaignName,
+                daily_campaign_name: bridgeDailyCampaignName,
                 campaign_daily_budget: schedule.dailyBudgetMinor,
                 adset_run_hours: schedule.runHours,
             })
         : {
             paused: true as const,
             status_option: 'PAUSED' as const,
-            ...(schedule.dailyCampaignName && !fixedTargetAdsetId ? { daily_campaign_name: schedule.dailyCampaignName } : {}),
+            ...(bridgeDailyCampaignName ? { daily_campaign_name: bridgeDailyCampaignName } : {}),
         }
 
     if (!shopeeLink) {
