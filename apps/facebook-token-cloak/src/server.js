@@ -913,7 +913,7 @@ function createHandler(deps = {}) {
           return sendError(res, 410, 'browser_login_disabled', {
             state: 'browser_login_disabled',
             reason: 'browser_login_disabled',
-            note: 'Browser login/open-session automation is disabled. Use Token Bridge credential minting only; do not open Chrome automatically.'
+            note: 'Browser login/open-session automation is disabled. Use status-only checks; do not open Chrome from Accounts Bridge.'
           });
         }
         const account = url.searchParams.get('account');
