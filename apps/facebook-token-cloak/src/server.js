@@ -631,8 +631,11 @@ function createHandler(deps = {}) {
 
       if (req.method === 'GET' && url.pathname === '/health') {
         let backend = 'unavailable';
+        let executablePath = '';
         try {
-          backend = (await br.loadBrowserBackend()).backend;
+          const browserBackend = await br.loadBrowserBackend();
+          backend = browserBackend.backend;
+          executablePath = browserBackend.executablePath || '';
         } catch {}
         return send(res, 200, {
           ok: true,
@@ -640,6 +643,7 @@ function createHandler(deps = {}) {
           host: DEFAULT_HOST,
           port: DEFAULT_PORT,
           backend,
+          executablePath,
           keychainSupported: process.platform === 'darwin',
           profileRoot: br.PROFILE_ROOT
         });
