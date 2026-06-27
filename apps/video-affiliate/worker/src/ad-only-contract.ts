@@ -1494,16 +1494,19 @@ export function buildAdHistoryRecord(params: {
 
 // =====================================================================
 // 24h FOLLOW → CLICK-LINK HANDOFF — pure helpers. After a per-page automation Follow ad finishes its
-// run window and is turned OFF (auto_paused_at set), the SAME source system video is reused to create a
-// click-link (sales lane) ad inside the page's configured fixed click-link adset. These helpers decide
-// eligibility and shape the create-ad-only body; the DB read/write + bridge call live in the worker.
+// run window it must be REMOVED/ARCHIVED from Ads (follow_removed_at set) — NOT merely paused. Pausing
+// alone leaves the LIKE_PAGE/Follow button bound to the story/creative, which blocks the click-link ad
+// and the button removal (operator correction by Thanwa). Only after the Follow ad is confirmed removed
+// is the SAME source system video reused to create a click-link (sales lane) ad inside the page's
+// configured fixed click-link adset. These helpers decide eligibility and shape the create-ad-only
+// body; the DB read/write + bridge archive call live in the worker.
 // =====================================================================
 
 // A finished Follow history row eligible for the click-link handoff. True ONLY when:
 //   - the row is the Follow lane (lane === 'follow');
 //   - it actually created an ad (status created/success) with a reusable system video id;
-//   - its run window already ended and it was turned OFF (auto_paused_at set) — so we never hand off a
-//     still-spending Follow ad; and
+//   - its Follow ad was REMOVED/ARCHIVED from Ads (follow_removed_at set) — NOT merely paused — so the
+//     LIKE_PAGE button is detached before the click-link ad is created; and
 //   - it has NOT already handed off (click_link_handoff_at empty) — the one-shot idempotency gate.
 // Pure: the caller supplies the row fields. Page-level enablement / fixed-adset config is checked
 // separately in the worker (it needs D1).
@@ -1511,14 +1514,15 @@ export function isFollowRowHandoffEligible(row: {
     lane?: unknown
     status?: unknown
     system_video_id?: unknown
-    auto_paused_at?: unknown
+    follow_removed_at?: unknown
     click_link_handoff_at?: unknown
 }): boolean {
     if (str(row.lane).toLowerCase() !== 'follow') return false
     const status = str(row.status).toLowerCase()
     if (status !== 'created' && status !== 'success') return false
     if (!str(row.system_video_id)) return false
-    if (!str(row.auto_paused_at)) return false
+    // Pause is NOT completion for the Follow lane — the ad must be confirmed removed/archived.
+    if (!str(row.follow_removed_at)) return false
     if (str(row.click_link_handoff_at)) return false
     return true
 }

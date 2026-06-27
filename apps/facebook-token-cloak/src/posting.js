@@ -2536,6 +2536,80 @@ async function pauseAdOnlyObjects(fetchImpl, params = {}) {
   return result;
 }
 
+// POST /archive-ad-only — REMOVE a finished Follow/Page-like ad from Ads (NOT merely pause it). The
+// Follow lane's corrected lifecycle: after its 24h run a Follow ad must be ARCHIVED, not paused —
+// otherwise the LIKE_PAGE/Follow button stays bound to the story/creative and the later click-link
+// ad / button removal can never take effect (operator correction by Thanwa). This is a SAFE archive,
+// not a hard delete:
+//   • the ONLY write performed is Meta's recoverable `status: 'ARCHIVED'` (alias status='DELETED' when
+//     the caller asks for it). Meta keeps the row + its insights; the object simply leaves the active
+//     surface and detaches the live creative/button. No audit/evidence row is destroyed.
+//   • it NEVER issues an HTTP DELETE request,
+//   • each object is read back (status + effective_status) so the caller can PROVE it is archived.
+// The AD is the object that carries the LIKE_PAGE creative/button, so ad_id is REQUIRED and the ad is
+// always archived. The adset/campaign are containers and are archived ONLY when the caller explicitly
+// opts in (archive_adset / archive_campaign) — the worker's auto-path archives the AD ONLY, so a
+// shared/fixed Follow adset or campaign is never touched. Uses the user (ad-account) token; no page
+// token is needed. No token is ever returned or logged.
+async function archiveAdOnlyObjects(fetchImpl, params = {}) {
+  const userToken = params.userToken;
+  const adId = String(params.adId || params.ad_id || '').trim();
+  const adsetId = String(params.adsetId || params.adset_id || '').trim();
+  const campaignId = String(params.campaignId || params.campaign_id || '').trim();
+  const archiveAdset = params.archiveAdset === true || params.archive_adset === true;
+  const archiveCampaign = params.archiveCampaign === true || params.archive_campaign === true;
+  // Recoverable archive. 'ARCHIVED' is the safe default (object leaves the active surface, insights are
+  // preserved); a caller may request 'DELETED' (also recoverable on Meta) via archive_status.
+  const requested = String(params.archiveStatus || params.archive_status || 'ARCHIVED').trim().toUpperCase();
+  const archiveStatus = requested === 'DELETED' ? 'DELETED' : 'ARCHIVED';
+
+  // The ad carries the LIKE_PAGE creative/button — without it there is nothing to remove from Ads.
+  if (!adId) return { ok: false, step: 'validate', error: 'Missing: ad_id' };
+  if (!userToken) return { ok: false, step: 'session', error: 'no_session' };
+
+  // Archive ONE ad object by id. The request body is EXACTLY { status: '<ARCHIVED|DELETED>' } sent via
+  // POST (never an HTTP DELETE) — both are RECOVERABLE on Meta — then a read-back of status/
+  // effective_status confirms the object left the active surface.
+  const archiveOne = async (objectId) => {
+    const upd = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(objectId)}?access_token=${encodeURIComponent(userToken)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: archiveStatus })
+    });
+    if (upd.data && upd.data.error) {
+      return {
+        ok: false,
+        error: String(upd.data.error.message || 'archive_failed').substring(0, 200),
+        fb_error_code: upd.data.error.code, fb_error_subcode: upd.data.error.error_subcode, fb_trace_id: upd.data.error.fbtrace_id
+      };
+    }
+    let status = '';
+    let effectiveStatus = '';
+    try {
+      const rb = await gJson(fetchImpl, `${GRAPH}/${GRAPH_V}/${encodeURIComponent(objectId)}?fields=status,effective_status&access_token=${encodeURIComponent(userToken)}`);
+      if (rb.data && !rb.data.error) {
+        status = String(rb.data.status || '').trim();
+        effectiveStatus = String(rb.data.effective_status || '').trim();
+      }
+    } catch {}
+    // Confirmed removed when the read-back echoes the archived state (status or effective_status).
+    const archived = [status, effectiveStatus].some((s) => s === 'ARCHIVED' || s === 'DELETED');
+    return { ok: true, status, effective_status: effectiveStatus, archived };
+  };
+
+  const result = { ok: true, phase: 'archive_ad_only', requested_status: archiveStatus };
+  // Always archive the ad (the button/creative carrier).
+  result.ad_id = adId;
+  result.ad = await archiveOne(adId);
+  // Containers are opt-in only, so a shared/fixed Follow adset/campaign is never archived by default.
+  if (archiveAdset && adsetId) { result.adset_id = adsetId; result.adset = await archiveOne(adsetId); }
+  if (archiveCampaign && campaignId) { result.campaign_id = campaignId; result.campaign = await archiveOne(campaignId); }
+
+  // Overall ok only when every attempted object archived without a Graph error AND the read-back
+  // confirms the archived state — the worker requires confirmed removal before the click-link handoff.
+  const attempted = [result.ad, result.adset, result.campaign].filter(Boolean);
+  result.ok = attempted.length > 0 && attempted.every((r) => r && r.ok && r.archived);
+  return result;
+}
+
 module.exports = {
   GRAPH,
   GRAPH_V,
@@ -2558,6 +2632,7 @@ module.exports = {
   updateVisiblePostCta,
   repairPaidAdCta,
   pauseAdOnlyObjects,
+  archiveAdOnlyObjects,
   downloadVideoToBuffer,
   buildVideoMultipart,
   uploadAdVideoMultipart,

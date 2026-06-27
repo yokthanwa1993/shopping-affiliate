@@ -2453,6 +2453,32 @@ function createHandler(deps = {}) {
         }
       }
 
+      if (req.method === 'POST' && url.pathname === '/archive-ad-only') {
+        const body = await parseBody(req);
+        const account = body.account || POST_ACCOUNT;
+        const session = await posting.resolveSessionToken({ browser: br, account });
+        try {
+          if (!session.token) return send(res, 200, sessionFailureBody(session));
+          // REMOVE (archive) a finished Follow/Page-like ad from Ads so its LIKE_PAGE button detaches
+          // from the story — the corrected Follow lifecycle (NOT pause). archiveAdOnlyObjects issues a
+          // recoverable status='ARCHIVED' (or 'DELETED') POST, NEVER an HTTP DELETE, and reads back
+          // status/effective_status so the worker can record proof of removal. The ad is always
+          // archived; the adset/campaign only when archive_adset/archive_campaign is set.
+          const result = await posting.archiveAdOnlyObjects(session.graphFetch, {
+            userToken: session.token,
+            adId: body.ad_id,
+            adsetId: body.adset_id,
+            campaignId: body.campaign_id,
+            archiveAdset: body.archive_adset,
+            archiveCampaign: body.archive_campaign,
+            archiveStatus: body.archive_status
+          });
+          return send(res, postingStatus(result), result);
+        } finally {
+          await posting.closeSession(session);
+        }
+      }
+
       return sendError(res, 404, 'Not found');
     } catch (e) {
       return sendError(res, e.status || 500, e.status ? e.message : 'Internal server error');

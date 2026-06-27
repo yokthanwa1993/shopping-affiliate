@@ -1413,12 +1413,12 @@ test('isUnderDailyAdCap: non-positive cap is unlimited, else strict less-than', 
     assert.equal(isUnderDailyAdCap(4, 3), false)
 })
 
-test('isFollowRowHandoffEligible requires follow lane, finished+paused, video, and no prior handoff', () => {
+test('isFollowRowHandoffEligible requires follow lane, finished+REMOVED, video, and no prior handoff', () => {
     const base = {
         lane: 'follow',
         status: 'created',
         system_video_id: 'sysvid_1',
-        auto_paused_at: '2026-06-27 10:00:00',
+        follow_removed_at: '2026-06-27 10:00:00',
         click_link_handoff_at: '',
     }
     assert.equal(isFollowRowHandoffEligible(base), true)
@@ -1426,14 +1426,29 @@ test('isFollowRowHandoffEligible requires follow lane, finished+paused, video, a
     // Not the follow lane → never hand off.
     assert.equal(isFollowRowHandoffEligible({ ...base, lane: 'sales' }), false)
     assert.equal(isFollowRowHandoffEligible({ ...base, lane: '' }), false)
-    // Not finished/turned-off yet (still spending) → wait.
-    assert.equal(isFollowRowHandoffEligible({ ...base, auto_paused_at: '' }), false)
+    // Follow ad not REMOVED/ARCHIVED yet (LIKE_PAGE button still bound) → wait.
+    assert.equal(isFollowRowHandoffEligible({ ...base, follow_removed_at: '' }), false)
     // No reusable system video → can't recreate the click-link ad.
     assert.equal(isFollowRowHandoffEligible({ ...base, system_video_id: '' }), false)
     // Already handed off → idempotency gate blocks a second click-link ad.
     assert.equal(isFollowRowHandoffEligible({ ...base, click_link_handoff_at: '2026-06-27 11:00:00' }), false)
     // Only created/success rows qualify.
     assert.equal(isFollowRowHandoffEligible({ ...base, status: 'failed' }), false)
+})
+
+test('isFollowRowHandoffEligible treats PAUSE-only (no removal) as NOT eligible — pause is not completion', () => {
+    // A Follow row that was only paused (legacy behavior) carries no follow_removed_at, so the LIKE_PAGE
+    // button is still bound to the story. The handoff must NOT fire until the ad is actually removed.
+    const pausedOnly = {
+        lane: 'follow',
+        status: 'created',
+        system_video_id: 'sysvid_paused',
+        follow_removed_at: '',
+        click_link_handoff_at: '',
+    }
+    assert.equal(isFollowRowHandoffEligible(pausedOnly), false)
+    // Once removal is confirmed (archive read-back), it becomes eligible.
+    assert.equal(isFollowRowHandoffEligible({ ...pausedOnly, follow_removed_at: '2026-06-27 12:00:00' }), true)
 })
 
 test('buildFollowToClickLinkHandoffBody targets the SALES lane with the fixed click-link adset', () => {

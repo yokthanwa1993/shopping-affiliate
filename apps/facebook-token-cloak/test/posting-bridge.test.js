@@ -33,7 +33,15 @@ function graphRoute(url, method, pages, opts = {}) {
   // campaign adset readback below (which matches the broader /effective_status/). The pause readback
   // requests EXACTLY fields=status,effective_status; echo PAUSED so auto-pause can confirm the off-state.
   if (method === 'GET' && /\?fields=status,effective_status&/.test(u)) {
-    return { status: 'PAUSED', effective_status: 'PAUSED' };
+    // archive-ad-only confirms an ARCHIVED/DELETED read-back; pause confirms PAUSED. opts.archiveReadbackStatus
+    // overrides the default so the same fields route serves both routes (default PAUSED keeps pause tests green).
+    const s = opts.archiveReadbackStatus || 'PAUSED';
+    return { status: s, effective_status: s };
+  }
+  // archive-ad-only failure path: opts.archiveError simulates Graph rejecting the status=ARCHIVED/DELETED
+  // write on the ad. Must precede the generic success fallthrough.
+  if (method === 'POST' && /"status":"(ARCHIVED|DELETED)"/.test(reqBody) && opts.archiveError) {
+    return { error: { message: 'Cannot archive ad', code: 100, fbtrace_id: 'TRACE_ARCHIVE' } };
   }
   // CAMPAIGN-level (CBO) budget update POST on a REUSED daily campaign: { daily_budget } only, sent
   // to the campaign id (NOT an adset). opts.campaignBudgetError simulates a Graph error on it — the
@@ -321,6 +329,8 @@ function makeBrowser(opts = {}) {
     publishErrorMessage: opts.publishErrorMessage, publishReadbackPublished: opts.publishReadbackPublished,
     publishFailTimes: opts.publishFailTimes, publishReadbackPermalink: opts.publishReadbackPermalink,
     repairReadbackCtaLink: opts.repairReadbackCtaLink, repairReadbackCreativeId: opts.repairReadbackCreativeId,
+    // archive-ad-only routing: status read-back value + write-error simulation.
+    archiveReadbackStatus: opts.archiveReadbackStatus, archiveError: opts.archiveError,
     // edit-page-comment-link routing: which comments each target exposes + edit/readback overrides.
     commentsByTarget: opts.commentsByTarget, commentEditError: opts.commentEditError,
     editCommentId: opts.editCommentId, readbackFromId: opts.readbackFromId,
@@ -3030,6 +3040,111 @@ test('pauseAdOnlyObjects source contains status=PAUSED and NEVER DELETE/DELETED'
   const code = fn.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.ok(!/status:\s*'DELETED'/.test(code), 'pause helper never writes status=DELETED');
   assert.ok(!/method:\s*'DELETE'/.test(code), 'pause helper never issues a DELETE method');
+});
+
+
+// =====================================================================
+// FOLLOW-AD REMOVAL (/archive-ad-only) — the corrected Follow lifecycle: after its 24h run a Follow ad
+// must be REMOVED/ARCHIVED from Ads (so its LIKE_PAGE button detaches from the story), NOT merely paused.
+// The HARD invariant: a recoverable status=ARCHIVED/DELETED POST, NEVER an HTTP DELETE request.
+// =====================================================================
+test('POST /archive-ad-only archives the AD (status=ARCHIVED) and reads back the removed state', async () => {
+  const browser = makeBrowser({ archiveReadbackStatus: 'ARCHIVED' });
+  await listen({ browser });
+  const r = await req('POST', '/archive-ad-only', { ad_id: 'ADX' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.phase, 'archive_ad_only');
+  assert.equal(r.body.ad_id, 'ADX');
+  assert.equal(r.body.requested_status, 'ARCHIVED');
+  assert.equal(r.body.ad.ok, true);
+  assert.equal(r.body.ad.effective_status, 'ARCHIVED');
+  assert.equal(r.body.ad.archived, true);
+  // The ad got a { status: 'ARCHIVED' } POST.
+  const archivePost = browser.calls.find((c) => /\/ADX\?/.test(c.url) && c.method === 'POST' && /"status":"ARCHIVED"/.test(String(c.body || '')));
+  assert.ok(archivePost, 'ADX received a status=ARCHIVED POST');
+  // HARD GUARANTEE: never an HTTP DELETE request.
+  assert.ok(!browser.calls.some((c) => String(c.method).toUpperCase() === 'DELETE'), 'no HTTP DELETE request issued');
+  assertNoLeak(r.body);
+});
+
+test('POST /archive-ad-only archives ONLY the ad by default — never a shared adset/campaign', async () => {
+  const browser = makeBrowser({ archiveReadbackStatus: 'ARCHIVED' });
+  await listen({ browser });
+  const r = await req('POST', '/archive-ad-only', { ad_id: 'ADX', adset_id: 'ADSETX', campaign_id: 'CAMPX' });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.ad.archived, true);
+  // The adset/campaign were forwarded for audit but NOT archived (no opt-in flags).
+  assert.equal(r.body.adset, undefined, 'shared adset not archived without archive_adset');
+  assert.equal(r.body.campaign, undefined, 'shared campaign not archived without archive_campaign');
+  assert.ok(!browser.calls.some((c) => /\/ADSETX\?/.test(c.url) && /"status":"ARCHIVED"/.test(String(c.body || ''))), 'no archive write to the adset');
+  assert.ok(!browser.calls.some((c) => /\/CAMPX\?/.test(c.url) && /"status":"ARCHIVED"/.test(String(c.body || ''))), 'no archive write to the campaign');
+  assertNoLeak(r.body);
+});
+
+test('POST /archive-ad-only archives the adset/campaign too when explicitly opted in', async () => {
+  const browser = makeBrowser({ archiveReadbackStatus: 'ARCHIVED' });
+  await listen({ browser });
+  const r = await req('POST', '/archive-ad-only', {
+    ad_id: 'ADX', adset_id: 'ADSETX', campaign_id: 'CAMPX', archive_adset: true, archive_campaign: true
+  });
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.ad.archived, true);
+  assert.equal(r.body.adset.archived, true);
+  assert.equal(r.body.campaign.archived, true);
+  for (const id of ['ADX', 'ADSETX', 'CAMPX']) {
+    assert.ok(browser.calls.some((c) => new RegExp(`/${id}\\?`).test(c.url) && c.method === 'POST' && /"status":"ARCHIVED"/.test(String(c.body || ''))), `${id} archived`);
+  }
+  assert.ok(!browser.calls.some((c) => String(c.method).toUpperCase() === 'DELETE'), 'no HTTP DELETE request issued');
+  assertNoLeak(r.body);
+});
+
+test('POST /archive-ad-only fails closed (validate) when ad_id is missing', async () => {
+  const browser = makeBrowser();
+  await listen({ browser });
+  const r = await req('POST', '/archive-ad-only', { adset_id: 'ADSETX', campaign_id: 'CAMPX' });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.step, 'validate');
+  // Nothing was written to Graph.
+  assert.ok(!browser.calls.some((c) => c.method === 'POST' && /"status"/.test(String(c.body || ''))), 'no status write on a rejected request');
+  assertNoLeak(r.body);
+});
+
+test('POST /archive-ad-only is NOT ok when the read-back does not confirm removal (still active)', async () => {
+  // The write succeeds but the read-back echoes ACTIVE — the worker must NOT treat this as removed
+  // (it gates the click-link handoff on a CONFIRMED archive), so ok is false and it retries next tick.
+  const browser = makeBrowser({ archiveReadbackStatus: 'ACTIVE' });
+  await listen({ browser });
+  const r = await req('POST', '/archive-ad-only', { ad_id: 'ADX' });
+  assert.equal(r.body.ok, false, 'unconfirmed archive is not ok');
+  assert.equal(r.body.ad.ok, true, 'the write itself did not error');
+  assert.equal(r.body.ad.archived, false, 'read-back did not confirm the archived state');
+  assertNoLeak(r.body);
+});
+
+test('POST /archive-ad-only surfaces a sanitized Graph error and stays not-ok', async () => {
+  const browser = makeBrowser({ archiveError: true });
+  await listen({ browser });
+  const r = await req('POST', '/archive-ad-only', { ad_id: 'ADX' });
+  assert.equal(r.body.ok, false);
+  assert.equal(r.body.ad.ok, false);
+  assert.ok(String(r.body.ad.error || '').includes('Cannot archive ad'), 'surfaces the Graph error message');
+  assertNoLeak(r.body);
+});
+
+// SOURCE INVARIANT — the archive helper must be provably HTTP-DELETE-free (status writes are recoverable).
+test('archiveAdOnlyObjects source uses a recoverable status write and NEVER an HTTP DELETE method', () => {
+  const { readFileSync } = require('fs');
+  const { resolve } = require('path');
+  const src = readFileSync(resolve(__dirname, '../src/posting.js'), 'utf8');
+  const fnStart = src.indexOf('async function archiveAdOnlyObjects');
+  assert.ok(fnStart >= 0, 'archiveAdOnlyObjects exists');
+  const fnEnd = src.indexOf('\nmodule.exports', fnStart);
+  const fn = src.slice(fnStart, fnEnd > fnStart ? fnEnd : undefined);
+  // Strip comments so the doc-comment text does not satisfy the invariant — only executable code is checked.
+  const code = fn.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(/archiveStatus/.test(code), 'archive helper writes a recoverable status value');
+  assert.ok(!/method:\s*'DELETE'/.test(code), 'archive helper never issues an HTTP DELETE method');
 });
 
 

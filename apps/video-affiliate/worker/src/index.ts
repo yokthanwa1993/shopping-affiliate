@@ -12822,6 +12822,14 @@ async function ensureAdHistoryTable(db: D1Database): Promise<void> {
         `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_ad_id TEXT NOT NULL DEFAULT ''`,
         `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_status TEXT NOT NULL DEFAULT ''`,
         `ALTER TABLE dashboard_ad_history ADD COLUMN click_link_handoff_error TEXT NOT NULL DEFAULT ''`,
+        // Follow-lane REMOVAL audit (additive). The corrected Follow lifecycle ARCHIVES (removes) the
+        // finished Follow ad from Ads instead of pausing it — pausing alone leaves the LIKE_PAGE button
+        // bound to the story and blocks the click-link handoff. follow_removed_at is set ONLY on a
+        // confirmed archive read-back, and is the gate the Follow→Click-link handoff requires (NOT
+        // auto_paused_at). A transient archive failure leaves it empty so the next cron tick retries.
+        `ALTER TABLE dashboard_ad_history ADD COLUMN follow_removed_at TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN follow_removed_status TEXT NOT NULL DEFAULT ''`,
+        `ALTER TABLE dashboard_ad_history ADD COLUMN follow_removed_error TEXT NOT NULL DEFAULT ''`,
     ]) {
         await db.prepare(col).run().catch(() => undefined)
     }
@@ -14581,7 +14589,7 @@ async function maybeProcessFollowAdOnSchedule(env: Env): Promise<{ ran: boolean;
 }
 
 // =====================================================================
-// Auto-pause FINISHED ad-only campaigns — turn OFF, never delete.
+// Auto-pause FINISHED ad-only campaigns — turn OFF, never delete. SALES/CLICK-LINK LANE ONLY.
 // ---------------------------------------------------------------------
 // After a system-created ACTIVE ad-only ad's scheduled run window ends (end_time <= now), this turns
 // the campaign + adset (and the ad, when known) OFF via the bridge /pause-ad-only route. It ONLY ever
@@ -14590,6 +14598,10 @@ async function maybeProcessFollowAdOnSchedule(env: Env): Promise<{ ran: boolean;
 // block (or be blocked by) posting or the ad-only queue, and swallows its own errors. A row's
 // auto_paused_at is set ONLY on a confirmed pause, so a transient bridge/Graph failure is simply
 // retried on the next cron tick (bounded batch, cheapest-first by id).
+//
+// FOLLOW LANE IS EXCLUDED here (lane='follow'): a finished Follow ad must be REMOVED/ARCHIVED from Ads,
+// not merely paused — otherwise its LIKE_PAGE/Follow button stays bound to the story and blocks the
+// click-link handoff. Follow rows are handled by autoRemoveCompletedFollowAds below.
 const AUTO_PAUSE_AD_ONLY_BATCH = 15
 
 async function autoPauseCompletedAdOnlyCampaigns(
@@ -14617,6 +14629,7 @@ async function autoPauseCompletedAdOnlyCampaigns(
                 )
                 AND status IN ('created', 'success')
                 AND (campaign_id != '' OR adset_id != '')
+                AND COALESCE(lane, '') != 'follow'
               ORDER BY id ASC
               LIMIT ?`
         ).bind(limit).all()
@@ -14686,6 +14699,108 @@ async function autoPauseCompletedAdOnlyCampaigns(
     } catch (e) {
         console.error(`[AD-ONLY-AUTOPAUSE] ${e instanceof Error ? e.message : String(e)}`)
         return { scanned: 0, paused: 0, failed: 0, reason: 'error' }
+    }
+}
+
+// =====================================================================
+// Auto-REMOVE finished FOLLOW ads — archive (remove from Ads), NOT pause. FOLLOW LANE ONLY.
+// ---------------------------------------------------------------------
+// The corrected Follow lifecycle (operator correction by Thanwa): after a Follow/Page-like ad's run
+// window ends it must be REMOVED/ARCHIVED from Ads, not merely paused. Pausing alone leaves the
+// LIKE_PAGE/Follow button bound to the story/creative, which blocks the later click-link ad and the
+// button removal — so the click-link handoff requires REMOVAL, not pause. This turns the finished
+// Follow ad OFF-the-active-surface via the bridge /archive-ad-only route (recoverable status=ARCHIVED;
+// NEVER an HTTP DELETE, NEVER a hard delete — Meta keeps the row + insights). It archives the AD ONLY
+// (the LIKE_PAGE creative/button carrier); a shared/fixed Follow adset or campaign is never touched.
+// follow_removed_at is set ONLY on a CONFIRMED archive read-back, so a transient bridge/Graph failure
+// is simply retried on the next cron tick (bounded batch, cheapest-first by id). Never throws.
+async function autoRemoveCompletedFollowAds(
+    env: Env,
+    opts?: { limit?: number }
+): Promise<{ scanned: number; removed: number; failed: number; reason?: string }> {
+    try {
+        await ensureAdHistoryTable(env.DB)
+        const baseUrl = resolveCloakFbBridgeBaseUrl(env)
+        if (!baseUrl) return { scanned: 0, removed: 0, failed: 0, reason: 'bridge_not_configured' }
+
+        const limit = Math.min(25, Math.max(1, Math.floor(opts?.limit ?? AUTO_PAUSE_AD_ONLY_BATCH)))
+        // Only created (success) FOLLOW-lane rows whose run window has ended and that carry an ad id are
+        // eligible — the ad is the LIKE_PAGE creative/button carrier we must remove. follow_removed_at=''
+        // makes each row a one-shot (and lets a failed archive re-qualify on the next tick). The finished
+        // gate mirrors auto-pause: end_time<=now, or created_at + run_hours<=now when no end_time.
+        const rows = await env.DB.prepare(
+            `SELECT id, campaign_id, adset_id, ad_id
+               FROM dashboard_ad_history
+              WHERE follow_removed_at = ''
+                AND lane = 'follow'
+                AND (
+                    (end_time != '' AND datetime(end_time) <= datetime('now'))
+                    OR (end_time = '' AND run_hours != '' AND created_at != ''
+                        AND datetime(created_at, '+' || CAST(run_hours AS INTEGER) || ' hours') <= datetime('now'))
+                )
+                AND status IN ('created', 'success')
+                AND ad_id != ''
+              ORDER BY id ASC
+              LIMIT ?`
+        ).bind(limit).all()
+
+        const list = (rows?.results || []) as Array<{ id: number; campaign_id: string; adset_id: string; ad_id: string }>
+        let removed = 0
+        let failed = 0
+
+        for (const row of list) {
+            const adId = String(row.ad_id || '').trim()
+            try {
+                // Archive the AD only (the button/creative carrier). Forward the campaign/adset ids for
+                // audit, but do NOT request their archive — a shared/fixed Follow adset/campaign must
+                // never be removed by the unattended path.
+                const resp = await fetch(`${baseUrl}/archive-ad-only`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ad_id: adId }),
+                })
+                const data = await resp.json().catch(() => ({})) as Record<string, unknown>
+                const ad = (data.ad || {}) as Record<string, unknown>
+                if (resp.ok && data.ok) {
+                    // Confirmed removed — stamp follow_removed_at so this row is never archived again,
+                    // and record the Graph read-back status for the audit/proof panel. The handoff query
+                    // gates on follow_removed_at (NOT auto_paused_at).
+                    await env.DB.prepare(
+                        `UPDATE dashboard_ad_history
+                            SET follow_removed_at = datetime('now'),
+                                follow_removed_status = 'success',
+                                follow_removed_error = '',
+                                ad_status_after = ?
+                          WHERE id = ?`
+                    ).bind(
+                        String(ad.effective_status || ad.status || ''),
+                        row.id
+                    ).run().catch(() => undefined)
+                    removed += 1
+                } else {
+                    // Leave follow_removed_at empty so the next cron tick retries this row.
+                    const err = String(data.error || data.step || `archive_http_${resp.status}`).slice(0, 200)
+                    await env.DB.prepare(
+                        `UPDATE dashboard_ad_history
+                            SET follow_removed_status = 'failed', follow_removed_error = ?
+                          WHERE id = ?`
+                    ).bind(err, row.id).run().catch(() => undefined)
+                    failed += 1
+                }
+            } catch (e) {
+                const err = (e instanceof Error ? e.message : String(e)).slice(0, 200)
+                await env.DB.prepare(
+                    `UPDATE dashboard_ad_history
+                        SET follow_removed_status = 'failed', follow_removed_error = ?
+                      WHERE id = ?`
+                ).bind(err, row.id).run().catch(() => undefined)
+                failed += 1
+            }
+        }
+        return { scanned: list.length, removed, failed }
+    } catch (e) {
+        console.error(`[FOLLOW-AD-REMOVE] ${e instanceof Error ? e.message : String(e)}`)
+        return { scanned: 0, removed: 0, failed: 0, reason: 'error' }
     }
 }
 
@@ -14917,8 +15032,9 @@ async function maybeProcessPerPageAutoAdsOnSchedule(env: Env): Promise<{ ran: nu
 }
 
 // 24h Follow→Click-link handoff. After a per-page automation Follow ad finishes its run window and is
-// turned OFF (auto_paused_at set by autoPauseCompletedAdOnlyCampaigns), reuse the SAME source system
-// video to create the click-link (sales lane) ad in the page's FIXED click-link adset. Idempotent: the
+// REMOVED/ARCHIVED from Ads (follow_removed_at set by autoRemoveCompletedFollowAds — NOT merely paused,
+// so its LIKE_PAGE button is detached from the story first), reuse the SAME source system video to
+// create the click-link (sales lane) ad in the page's FIXED click-link adset. Idempotent: the
 // click_link_handoff_at='' gate + a one-shot stamp guarantee AT MOST one click-link ad per Follow row.
 // A page with automation disabled or no configured click-link adset is stamped 'skipped' (terminal — the
 // handoff decision is made when the Follow ad finishes). A transient create failure leaves the stamp
@@ -14927,11 +15043,11 @@ async function processFollowToClickLinkHandoffs(env: Env): Promise<{ scanned: nu
     try {
         await ensureAdHistoryTable(env.DB)
         const rows = await env.DB.prepare(
-            `SELECT id, page_id, system_video_id, click_link, lane, status, auto_paused_at, click_link_handoff_at
+            `SELECT id, page_id, system_video_id, click_link, lane, status, follow_removed_at, click_link_handoff_at
                FROM dashboard_ad_history
               WHERE lane = 'follow'
                 AND click_link_handoff_at = ''
-                AND auto_paused_at != ''
+                AND follow_removed_at != ''
                 AND system_video_id != ''
                 AND status IN ('created', 'success')
               ORDER BY id ASC
@@ -15074,9 +15190,14 @@ app.post('/api/dashboard/auto-ads/run-next', async (c) => {
 })
 
 // Manual "run now" for the Follow→Click-link handoff pass (process finished Follow rows immediately).
+// First REMOVE/ARCHIVE finished Follow ads (so follow_removed_at is set and the LIKE_PAGE button is
+// detached), THEN run the handoff — pausing alone is not completion for the Follow lane.
 app.post('/api/dashboard/auto-ads/handoff/run-next', async (c) => {
     c.executionCtx.waitUntil(
-        processFollowToClickLinkHandoffs(c.env).then((r) => {
+        autoRemoveCompletedFollowAds(c.env).then((rm) => {
+            console.log(`[FOLLOW-AD-REMOVE] manual scanned=${rm.scanned} removed=${rm.removed} failed=${rm.failed} ${rm.reason ? `reason=${rm.reason}` : ''}`)
+            return processFollowToClickLinkHandoffs(c.env)
+        }).then((r) => {
             console.log(`[AUTO-ADS-HANDOFF] manual scanned=${r.scanned} handed_off=${r.handed_off} skipped=${r.skipped} failed=${r.failed} ${r.reason ? `reason=${r.reason}` : ''}`)
         }).catch((error) => {
             console.error(`[AUTO-ADS-HANDOFF] manual failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -45473,11 +45594,18 @@ export default {
         _ctx.waitUntil(maybeProcessFollowAdOnSchedule(env).catch((error) => {
             console.error(`[FOLLOW-AD] ${error instanceof Error ? error.message : String(error)}`)
         }))
-        // Turn OFF (status=PAUSED, NEVER delete) system-created ad-only campaigns whose scheduled run
-        // window has ended. Runs in its OWN waitUntil so it never blocks (or is blocked by) posting or
-        // the ad-only queue, and swallows its own errors so a pause failure can't derail the cron.
+        // Turn OFF (status=PAUSED, NEVER delete) finished SALES/click-link ad-only campaigns whose
+        // scheduled run window has ended. Runs in its OWN waitUntil so it never blocks (or is blocked by)
+        // posting or the ad-only queue, and swallows its own errors so a pause failure can't derail the
+        // cron. The Follow lane is handled separately by autoRemoveCompletedFollowAds (archive, not pause).
         _ctx.waitUntil(autoPauseCompletedAdOnlyCampaigns(env).catch((error) => {
             console.error(`[AD-ONLY-AUTOPAUSE] ${error instanceof Error ? error.message : String(error)}`)
+        }))
+        // REMOVE/ARCHIVE finished FOLLOW ads (recoverable status=ARCHIVED, NEVER hard-deleted) so the
+        // LIKE_PAGE button detaches from the story before the click-link handoff. Pausing alone is NOT
+        // completion for the Follow lane. Own waitUntil + error swallow so it can't derail the cron.
+        _ctx.waitUntil(autoRemoveCompletedFollowAds(env).catch((error) => {
+            console.error(`[FOLLOW-AD-REMOVE] ${error instanceof Error ? error.message : String(error)}`)
         }))
         // Per-page Create Ads automation: each ENABLED page runs its own jittered cadence + daily cap and
         // creates one ACTIVE Follow ad per slot. Disabled by default (fail-closed); separate waitUntil so
