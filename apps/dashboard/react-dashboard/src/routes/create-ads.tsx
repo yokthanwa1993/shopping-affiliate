@@ -45,18 +45,6 @@ import { Button } from '@/components/ui/button'
 // dedicated Worker endpoint (api/createAds.ts → POST /api/dashboard/create-ad-only)
 // and the proof panel/history read from dashboard_ad_history.
 
-function SectionLabel({ step, title, hint }: { step: number; title: string; hint?: string }) {
-  return (
-    <div className="flex items-baseline gap-2">
-      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary text-xs font-bold text-primary-foreground">
-        {step}
-      </span>
-      <h2 className="text-base font-semibold tracking-tight">{title}</h2>
-      {hint ? <span className="text-xs text-muted-foreground">{hint}</span> : null}
-    </div>
-  )
-}
-
 function CopyId({
   label,
   value,
@@ -272,6 +260,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
   const [copiedRef, setCopiedRef] = useState('')
   const [adResult, setAdResult] = useState<CreateAdOnlyResult | null>(null)
   const [queueResult, setQueueResult] = useState<EnqueueAdOnlyResult | null>(null)
+  // Top segmented tabs replace the old vertical Step 1/2/3/4 layout. Default to ตั้งค่า.
+  const [activeTab, setActiveTab] = useState<'settings' | 'history' | 'videos'>('settings')
 
   // Ad settings — operator-controlled lifecycle/budget/timing. Default to the safe PAUSED review
   // mode; the operator must deliberately switch to the scheduled/active (spending) mode.
@@ -571,6 +561,31 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
         </div>
       </div>
 
+      {/* Segmented pill tab menu — replaces the old vertical Step 1/2/3/4 layout. */}
+      <div className="inline-flex flex-wrap items-center gap-1 rounded-full bg-muted p-1">
+        {([
+          { key: 'settings', label: 'ตั้งค่า' },
+          { key: 'history', label: 'ประวัติการสร้าง' },
+          { key: 'videos', label: 'วิดีโอที่ใช้สร้างแอด' },
+        ] as const).map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            onClick={() => setActiveTab(tab.key)}
+            aria-pressed={activeTab === tab.key}
+            className={`rounded-full px-4 py-1.5 text-sm font-medium transition ${
+              activeTab === tab.key
+                ? 'bg-primary text-primary-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === 'settings' ? (
+      <div className="space-y-6">
       {/* Contract guarantee — explicit, always visible on the detail screen. */}
       <div className="flex items-start gap-2 rounded-xl border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900">
         <Info className="mt-0.5 h-4 w-4 shrink-0" />
@@ -582,15 +597,21 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
         </div>
       </div>
 
-      {/* Step 1 — ad-relevant page defaults. */}
+      {/* Ad-relevant page defaults. */}
       <section className="space-y-3">
-        <SectionLabel step={1} title="ค่าตั้งต้นแอดของเพจ" hint="ข้อมูลอ้างอิง ไม่ใช่การสร้างแอด" />
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-base font-semibold tracking-tight">ค่าตั้งต้นแอดของเพจ</h2>
+          <span className="text-xs text-muted-foreground">ข้อมูลอ้างอิง ไม่ใช่การสร้างแอด</span>
+        </div>
         <PageHealthCard pageId={selectedId} variant="ads" tokenPresentOverride={selectedPage.hasToken} />
       </section>
 
-      {/* Step 2 — per-page flow settings. */}
+      {/* Per-page flow settings. */}
       <section className="space-y-3">
-        <SectionLabel step={2} title="ตั้งค่า Flow ของเพจนี้" hint="กัน flow ใหม่ไม่ให้ทับเพจเดิม" />
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-base font-semibold tracking-tight">ตั้งค่า Flow ของเพจนี้</h2>
+          <span className="text-xs text-muted-foreground">กัน flow ใหม่ไม่ให้ทับเพจเดิม</span>
+        </div>
         <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -718,11 +739,10 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
 
       {/* Per-page Follow → Click Link automation. Independent per page; fail-closed (off by default). */}
       <section className="space-y-3">
-        <SectionLabel
-          step={2}
-          title="ยิงแอดอัตโนมัติของเพจนี้ (Follow → Click Link)"
-          hint="ตั้งค่าแยกต่อเพจ · ปิดไว้ก่อนเป็นค่าเริ่มต้น"
-        />
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-base font-semibold tracking-tight">ยิงแอดอัตโนมัติของเพจนี้ (Follow → Click Link)</h2>
+          <span className="text-xs text-muted-foreground">ตั้งค่าแยกต่อเพจ · ปิดไว้ก่อนเป็นค่าเริ่มต้น</span>
+        </div>
         <div className="space-y-4 rounded-xl border bg-card p-4 shadow-sm">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
@@ -855,9 +875,17 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
         </div>
       </section>
 
-      {/* Step 3 — pick a high-performing source signal. */}
+      </div>
+      ) : null}
+
+      {activeTab === 'videos' ? (
+      <div className="space-y-6">
+      {/* Pick a high-performing source signal. */}
       <section className="space-y-3">
-        <SectionLabel step={3} title="เลือกต้นแบบ/สัญญาณยอดดี" hint="โพสต์เก่าหรือวิดีโอระบบ" />
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-base font-semibold tracking-tight">เลือกต้นแบบ/สัญญาณยอดดี</h2>
+          <span className="text-xs text-muted-foreground">โพสต์เก่าหรือวิดีโอระบบ</span>
+        </div>
             <div className="flex flex-col gap-3 rounded-xl border bg-card p-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="inline-flex items-center gap-1 rounded-lg bg-muted p-1">
                 <Button
@@ -929,9 +957,17 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
             )}
           </section>
 
-          {/* Step 4 — selected signal summary + create action. */}
+      </div>
+      ) : null}
+
+      {activeTab === 'history' ? (
+      <div className="space-y-6">
+          {/* Selected signal summary + create action. */}
           <section className="space-y-3">
-            <SectionLabel step={4} title="สรุปต้นแบบและสร้างแอด" hint="สร้างโพสต์ใหม่ก่อนสร้างแอด" />
+            <div className="flex items-baseline gap-2">
+              <h2 className="text-base font-semibold tracking-tight">สรุปต้นแบบและสร้างแอด</h2>
+              <span className="text-xs text-muted-foreground">สร้างโพสต์ใหม่ก่อนสร้างแอด</span>
+            </div>
             {!selectedInput ? (
               <p className="rounded-xl border border-dashed p-6 text-center text-sm text-muted-foreground">
                 ยังไม่ได้เลือกต้นแบบ — เลือกการ์ดด้านบนหนึ่งใบเพื่อใช้เป็นสัญญาณคอนเทนต์
@@ -1281,6 +1317,8 @@ function CreateAdsDetail({ page, onBack }: { page: SettingsPage; onBack: () => v
               )}
             </div>
           </section>
+      </div>
+      ) : null}
     </div>
   )
 }
