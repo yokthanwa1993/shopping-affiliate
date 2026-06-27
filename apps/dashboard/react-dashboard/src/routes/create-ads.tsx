@@ -179,8 +179,9 @@ export function CreateAdsPage() {
   })
 
   // Toggle the Create Ads AUTO status for a page — persists ONLY `ad_flow_enabled` (never normal
-  // posting is_active, never any other setting). Optimistic so the row greys/ungreys AND re-sorts
-  // instantly; reconciled against the server (rolled back on error, invalidated on settle).
+  // posting is_active, never any other setting). Optimistic so the row disappears from the
+  // enabled-only list instantly when turned off; reconciled against the server (rolled back on
+  // error, invalidated on settle).
   const toggleAdFlow = useMutation({
     mutationFn: ({ pageId, enabled }: { pageId: string; enabled: boolean }) =>
       updatePageAdFlowEnabled(pageId, enabled),
@@ -201,15 +202,17 @@ export function CreateAdsPage() {
     },
   })
 
-  // Master list shows ALL held account pages, but `active` is the Create Ads AUTO status (persisted
-  // ad_flow_enabled, default-on only for เฉียบ) — NOT normal posting state. Enabled pages sort to the
-  // TOP (stable within each group). With the inline toggle wired, an off page renders grey/locked but
-  // its switch stays usable to turn it back on. Mapping here keeps Create Post (unmapped pages) unchanged.
+  // Master list shows ONLY pages that are enabled for Create Ads — `active` is the resolved Create
+  // Ads AUTO status (persisted ad_flow_enabled, default-on only for เฉียบ), NOT normal posting state.
+  // Disabled/off pages are filtered OUT entirely (no greyed/locked rows here). The inline toggle stays
+  // wired on the surviving enabled rows so an operator can turn one off — once the mutation/flags
+  // settle, that row drops out of this list. Mapping here keeps Create Post (unmapped pages) unchanged.
   const adPages = useMemo(() => {
     const flags = adFlagsQuery.data ?? {}
     return pages
       .map((p) => ({ ...p, active: flags[p.id] ?? p.id === CREATE_ADS_DEFAULT_ENABLED_PAGE_ID }))
-      .sort((a, b) => Number(b.active) - Number(a.active))
+      .filter((p) => p.active)
+      .sort((a, b) => a.name.localeCompare(b.name))
   }, [pages, adFlagsQuery.data])
 
   if (selectedPage) {
@@ -238,12 +241,13 @@ export function CreateAdsPage() {
             pages={adPages}
             selectedId={null}
             onSelect={(p) => setSelectedId(p.id)}
-            loading={pagesQuery.isLoading}
+            loading={pagesQuery.isLoading || adFlagsQuery.isLoading}
             error={pagesQuery.isError}
             searchable
             layout="table"
             fill
             title="เลือกเพจสำหรับสร้างแอด"
+            emptyHint="ยังไม่มีเพจที่เปิดใช้งาน “สร้างแอด” — เปิดสถานะสร้างแอดให้เพจในหน้าตั้งค่าก่อน เพจจึงจะแสดงในรายการนี้"
             actionLabel="เปิดหน้าตั้งค่าแอด"
             onToggleActive={(p, active) => toggleAdFlow.mutate({ pageId: p.id, enabled: active })}
             pendingToggleId={toggleAdFlow.isPending ? toggleAdFlow.variables?.pageId ?? null : null}
