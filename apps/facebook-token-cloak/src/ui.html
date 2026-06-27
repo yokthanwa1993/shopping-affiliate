@@ -415,11 +415,8 @@
         </div>
       </div>
       <div class="fb-group">
-        <h3>Power Editor — Ad creation (manual session only)</h3>
-        <p class="muted">For ad creation only. Opens a visible browser with no autofill and no submit (visible=1&amp;autofill=0&amp;submit=0) — sign in by hand. Never runs on page load.</p>
-        <div class="actions">
-          <button type="button" id="power-editor-button">Open Power Editor session (manual)</button>
-        </div>
+        <h3>Power Editor — Ad creation</h3>
+        <p class="muted">For ad creation only. API-only role configuration; Accounts Bridge does not open browser sessions from this UI.</p>
       </div>
       <p class="muted fb-note">Actions operate on the account selected in the form above. Token recovery for posting and comments is fully automatic and machine-to-machine; this console is status-only.</p>
     </div>
@@ -613,30 +610,7 @@
     renderAccounts();
   }
 
-  // Manual Power Editor session for AD CREATION ONLY (the "Open Power Editor session (manual)" button).
-  // Opens a VISIBLE browser with NO autofill and NO submit (visible=1&autofill=0&submit=0) — the
-  // operator signs in by hand. Never runs on page load. If browser login is disabled it reports that
-  // here; it never falls back to an automatic autofill/submit login.
-  async function openPowerEditorSession(explicitAccount) {
-    var account = explicitAccount || value("#account-input");
-    if (!account) { toast("Account / namespace is required", "err"); return; }
-    try {
-      toast("Opening Power Editor session (manual) for " + account + "...", "");
-      var result = await api("GET", "/login?account=" + encodeURIComponent(account) + "&visible=1&autofill=0&submit=0");
-      setResult(JSON.stringify({
-        powerEditor: {
-          account: account,
-          state: result && result.state,
-          autofilled: !!(result && result.autofilled),
-          submitted: !!(result && result.submitted)
-        }
-      }, null, 2));
-      toast("Power Editor session requested for " + account, "ok");
-    } catch (error) {
-      setResult(JSON.stringify({ powerEditor: { account: account, error: (error && error.message) || "error" } }, null, 2));
-      toast("Power Editor open failed: " + ((error && error.message) || "error"), "err");
-    }
-  }
+  // Browser-session launchers intentionally removed: Accounts Bridge is API-first and never opens Chrome from the UI.
 
   function setResult(text) {
     $("#result").textContent = text;
@@ -876,7 +850,6 @@
   $("#save-roles-button").addEventListener("click", function () { saveBridgeRoles(); });
   $("#check-roles-button").addEventListener("click", function () { checkBridgeRoles(); });
   $("#fb-lite-manual-refresh").addEventListener("click", function () { refreshFacebookLiteToken(); });
-  $("#power-editor-button").addEventListener("click", function () { openPowerEditorSession(); });
 
   // ── Auto-run on load: STATUS reads ONLY. init() never logs in, mints/refreshes a token, opens a
   // browser, or submits credentials — it only calls the two token-free status loaders below.

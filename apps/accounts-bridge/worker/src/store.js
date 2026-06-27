@@ -9,6 +9,15 @@
 // this layer. The blob is intentionally never surfaced past the store boundary.
 
 import { newId, nowIso, sha256Hex, assertEncryptedBlob } from './lib.js';
+import { SCHEMA_SQL } from './schema.js';
+
+
+function splitSchemaStatements(sql) {
+  return String(sql)
+    .split(';')
+    .map((s) => s.trim())
+    .filter((s) => s && !s.startsWith('--'));
+}
 
 function publicSession(row) {
   if (!row) return null;
@@ -57,6 +66,20 @@ export class AccountsStore {
 
   ts() {
     return nowIso(this.clock);
+  }
+
+
+  async bootstrapSchema() {
+    const statements = splitSchemaStatements(SCHEMA_SQL);
+    for (const stmt of statements) {
+      await this.db.prepare(stmt).run();
+    }
+    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events'];
+    const { results } = await this.db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${wanted.map(() => '?').join(',')}) ORDER BY name`)
+      .bind(...wanted)
+      .all();
+    return { applied: statements.length, tables: results.map((r) => r.name) };
   }
 
   // --- accounts ----------------------------------------------------------

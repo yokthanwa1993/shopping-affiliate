@@ -96,6 +96,14 @@ export async function handleRequest(request, env, deps = {}) {
     // Everything under /v1 requires the shared local-bridge key.
     if (path.startsWith('/v1/')) requireApiKey(request, env);
 
+
+    // --- fixed schema bootstrap (for environments where Wrangler D1 management is unavailable) ---
+    if (path === '/v1/admin/bootstrap' && method === 'POST') {
+      const result = await store.bootstrapSchema();
+      await store.insertAudit({ event_type: 'schema.bootstrap', source: 'api' });
+      return json({ ok: true, ...result });
+    }
+
     // --- accounts ---
     if (path === '/v1/accounts' && method === 'GET') {
       const platform = url.searchParams.get('platform');

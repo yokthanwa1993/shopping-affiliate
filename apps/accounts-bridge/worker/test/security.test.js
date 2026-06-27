@@ -22,6 +22,7 @@ function req(method, p, { key, body } = {}) {
 test('every /v1 endpoint rejects a missing or wrong API key with 401', async () => {
   const env = makeEnv();
   const probes = [
+    ['POST', '/v1/admin/bootstrap'],
     ['GET', '/v1/accounts'],
     ['POST', '/v1/accounts'],
     ['GET', '/v1/roles/facebook'],

@@ -7,7 +7,7 @@
   "main": "src/index.js",
   "scripts": {
     "test": "node --test --experimental-sqlite test/*.test.js",
-    "check": "node --check src/index.js && node --check src/router.js && node --check src/store.js && node --check src/lib.js",
+    "check": "node --check src/index.js && node --check src/router.js && node --check src/store.js && node --check src/lib.js && node --check src/schema.js",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrate:local": "wrangler d1 migrations apply accounts-bridge-db --local",

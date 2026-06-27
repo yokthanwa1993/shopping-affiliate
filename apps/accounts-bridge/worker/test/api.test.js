@@ -150,3 +150,17 @@ test('audit events accept non-secret detail and reject secret-looking detail key
   assert.equal(bad.status, 400);
   assert.equal(bad.json.error, 'forbidden_detail');
 });
+
+
+test('admin bootstrap applies the fixed schema and is token-free', async () => {
+  const env = makeEnv({ applyMigration: false });
+  const boot = await call(env, 'POST', '/v1/admin/bootstrap');
+  assert.equal(boot.status, 200);
+  assert.equal(boot.json.ok, true);
+  assert.ok(boot.json.tables.includes('accounts'));
+  assert.ok(boot.json.tables.includes('session_records'));
+  assertNoBlobLeak(boot.text);
+
+  const create = await call(env, 'POST', '/v1/accounts', { body: { account_uid: 'uidBoot', platform: 'facebook' } });
+  assert.equal(create.status, 201);
+});

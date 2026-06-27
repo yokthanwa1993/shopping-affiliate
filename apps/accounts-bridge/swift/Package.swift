@@ -15,7 +15,8 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .library(name: "AccountsBridgeKit", targets: ["AccountsBridgeKit"]),
-        .executable(name: "AccountsBridgeApp", targets: ["AccountsBridgeApp"])
+        .executable(name: "AccountsBridgeApp", targets: ["AccountsBridgeApp"]),
+        .executable(name: "AccountsBridgeContractSmoke", targets: ["AccountsBridgeContractSmoke"])
     ],
     targets: [
         .target(name: "AccountsBridgeKit"),
@@ -23,8 +24,8 @@ let package = Package(
             name: "AccountsBridgeApp",
             dependencies: ["AccountsBridgeKit"]
         ),
-        .testTarget(
-            name: "AccountsBridgeKitTests",
+        .executableTarget(
+            name: "AccountsBridgeContractSmoke",
             dependencies: ["AccountsBridgeKit"]
         )
     ]

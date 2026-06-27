@@ -69,19 +69,21 @@ test('UI is status-only on load: no automatic login, autofill/submit, token refr
   assert.ok(!/api\(/.test(cacheFn), 'cache-only hydration must make NO network call');
   // (4) Explicit, side-effect-clear manual buttons replace any generic "Login/Get Token".
   assert.match(ui, /Manual refresh Facebook Lite token/);
-  assert.match(ui, /Open Power Editor session \(manual\)/);
+  assert.doesNotMatch(ui, /Open Power Editor session \(manual\)/);
+  assert.doesNotMatch(ui, /power-editor-button/);
   assert.doesNotMatch(ui, /Login\/Get Token/);
   // (5) Facebook area is split into two explicit purposes: Facebook Lite (Page posting / Token Bridge
   // EAAD6V) and Power Editor (ad creation, manual session only).
   assert.match(ui, /Facebook Lite — Page posting \/ Token Bridge \(EAAD6V\)/);
-  assert.match(ui, /Power Editor — Ad creation \(manual session only\)/);
+  assert.match(ui, /Power Editor — Ad creation/);
+  assert.doesNotMatch(ui, /manual session only/);
   // (6) The manual Facebook Lite refresh calls the SAFE status endpoint only when clicked.
   assert.match(ui, /\$\("#fb-lite-manual-refresh"\)\.addEventListener\("click"/);
   assert.match(ui, /async function refreshFacebookLiteToken\(explicitAccount\)/);
-  // (7) The manual Power Editor open uses a no-autofill, no-submit VISIBLE login only when clicked.
-  assert.match(ui, /\$\("#power-editor-button"\)\.addEventListener\("click"/);
-  assert.match(ui, /\/login\?account=/);
-  assert.match(ui, /&visible=1&autofill=0&submit=0/);
+  // (7) Browser-session launchers are removed from the UI entirely. Power Editor is configured via API only.
+  assert.doesNotMatch(ui, /\$\("#power-editor-button"\)\.addEventListener\("click"/);
+  assert.doesNotMatch(ui, /\/login\?account=/);
+  assert.doesNotMatch(ui, /visible=1&autofill=0&submit=0/);
   // (8) Renamed user-facing tool; no FB Bridge / Account Manager wording remains.
   assert.match(ui, /Accounts Bridge/);
   assert.doesNotMatch(ui, /Account Manager/);

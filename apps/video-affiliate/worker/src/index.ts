@@ -15065,7 +15065,8 @@ app.post('/api/dashboard/auto-ads/run-next', async (c) => {
     }
     const res = await processOnePerPageAutoAd(c.env, pageId, nowMs)
     console.log(`[AUTO-ADS] manual run-next page=${pageId} ok=${res.ok} ${res.reason ? `reason=${res.reason}` : ''} ${res.error ? `error=${res.error}` : ''}`)
-    return c.json({ ok: res.ok, page_id: pageId, created: !!res.ad_id, ...res }, res.ok ? 200 : 500, { 'Cache-Control': 'no-store' })
+    const resRecord = res as Record<string, unknown>
+    return c.json({ ok: res.ok, page_id: pageId, created: !!resRecord.ad_id, ...res }, res.ok ? 200 : 500, { 'Cache-Control': 'no-store' })
 })
 
 // Manual "run now" for the Follow→Click-link handoff pass (process finished Follow rows immediately).
@@ -41341,6 +41342,24 @@ app.post('/api/pages/:id/force-post', async (c) => {
             pageId: page.id,
             reason: 'stale_posting_timeout_no_fb_post_id_force_post',
         }).catch(() => 0)
+        // Hot path guard: a Worker request can die after acquiring posting_locks but before
+        // inserting/finishing post_history. Do not let that orphaned page lock block urgent
+        // operator force-posts for the full TTL. Only clear the page lock when no fresh
+        // status='posting' row exists for this namespace/page, so a real in-flight post is kept safe.
+        await env.DB.prepare(
+            `DELETE FROM posting_locks
+             WHERE namespace_id = ?
+               AND page_id = ?
+               AND scope = 'page'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM post_history
+                   WHERE bot_id = ?
+                     AND page_id = ?
+                     AND status = 'posting'
+                     AND datetime(posted_at) >= datetime('now', '-5 minutes')
+               )`
+        ).bind(botId, page.id, botId, page.id).run().catch(() => { })
         pagePostingLockKey = await tryAcquirePostingLock(env.DB, {
             scope: 'page',
             namespaceId: botId,
