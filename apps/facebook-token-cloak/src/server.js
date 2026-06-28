@@ -11,6 +11,7 @@ const posting = require('./posting');
 const fbLiteTokenService = require('./fb-lite-token-service.cjs');
 const profileArchiveSync = require('./profileArchiveSync');
 const { createRemoteBrowserManager } = require('./remoteBrowser');
+const { attachRemoteBrowserUpgrade } = require('./remoteBrowserWs');
 const {
   FACEBOOK_OAUTH_URL,
   extractAccessTokenFromUrl,
@@ -2723,7 +2724,18 @@ function createHandler(deps = {}) {
 }
 
 function createServer(deps = {}) {
-  return http.createServer(createHandler(deps));
+  // Build the Cloud Browser manager ONCE so the HTTP handler and the WebSocket `upgrade` handler share
+  // the same session map (the LIVE stream attaches a CDP screencast to a session opened over HTTP).
+  const remoteBrowser = deps.remoteBrowser || createRemoteBrowserManager({
+    browser: deps.browser || browser,
+    profileArchiveSync: deps.profileArchiveSync || profileArchiveSync,
+  });
+  const server = http.createServer(createHandler({ ...deps, remoteBrowser }));
+  // LIVE CDP screencast stream: /remote-browser/:id/stream upgrades to a WebSocket. Gated by the SAME
+  // shared-secret check the HTTP routes use (cloudflared makes tunnel traffic look like loopback). The
+  // HTTP /screenshot route stays as a polling fallback for clients/proxies without WebSocket support.
+  attachRemoteBrowserUpgrade(server, remoteBrowser, { authorized: remoteBrowserAuthorized });
+  return server;
 }
 
 function start(port = DEFAULT_PORT, host = DEFAULT_HOST) {

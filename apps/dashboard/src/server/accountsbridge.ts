@@ -128,9 +128,7 @@ function resolveRemoteBrowserPath(method: string, sub: string): string | null {
 // no JSON body). JSON routes are still stripped of secret-shaped keys as defence in depth. When no
 // bridge base URL is configured, returns 503 remote_browser_not_configured WITHOUT leaking localhost.
 async function handleRemoteBrowserProxy(request: Request, env: AuthEnv, sub: string): Promise<Response> {
-  const base = String(env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_BASE_URL || env.FACEBOOK_TOKEN_CLOAK_BRIDGE_URL || '')
-    .trim()
-    .replace(/\/+$/, '')
+  const base = remoteBrowserBase(env)
   if (!base) return jsonResponse({ error: 'remote_browser_not_configured' }, 503)
 
   const upstreamPath = resolveRemoteBrowserPath(request.method, sub)
@@ -185,9 +183,61 @@ async function handleRemoteBrowserProxy(request: Request, env: AuthEnv, sub: str
   return jsonResponse(stripSecrets(parsed ?? {}), upstream.status)
 }
 
+// Resolve the Mac bridge base URL for Cloud Browser routes. Shared by the HTTP proxy and the WebSocket
+// stream proxy so both agree on configuration + 503 behavior.
+function remoteBrowserBase(env: AuthEnv): string {
+  return String(env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_BASE_URL || env.FACEBOOK_TOKEN_CLOAK_BRIDGE_URL || '')
+    .trim()
+    .replace(/\/+$/, '')
+}
+
+// LIVE Cloud Browser stream: proxy the WebSocket upgrade for /remote-browser/:id/stream to the Mac
+// bridge, injecting the shared secret SERVER-SIDE. Cloudflare Workers tunnel a WebSocket when the
+// forwarded request keeps its `Upgrade: websocket` headers and the upstream answers 101 — we return
+// that response unchanged so the client ↔ Mac bridge socket is bridged same-origin (the browser never
+// holds the key and never talks to the bridge directly). The HTTP /screenshot route stays as a polling
+// fallback when WebSockets are unavailable (returned by the viewer logic, not here).
+async function handleRemoteBrowserStreamProxy(request: Request, env: AuthEnv, sub: string): Promise<Response> {
+  if ((request.headers.get('upgrade') || '').toLowerCase() !== 'websocket') {
+    // Not an upgrade — make the contract explicit so the viewer falls back to screenshot polling.
+    return jsonResponse({ error: 'expected_websocket_upgrade' }, 426)
+  }
+  const base = remoteBrowserBase(env)
+  if (!base) return jsonResponse({ error: 'remote_browser_not_configured' }, 503)
+
+  const m = sub.match(/^\/remote-browser\/([A-Za-z0-9_-]+)\/stream$/)
+  if (!m) return jsonResponse({ error: 'not_found' }, 404)
+
+  const target = new URL(`${base}/remote-browser/${m[1]}/stream`)
+  // Forward optional quality/fps hints the viewer may set.
+  const reqUrl = new URL(request.url)
+  for (const key of ['quality', 'everyNthFrame']) {
+    const v = reqUrl.searchParams.get(key)
+    if (v != null) target.searchParams.set(key, v)
+  }
+
+  // Carry the WebSocket handshake headers through and inject the shared secret server-side.
+  const key = String(env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_KEY || env.ACCOUNTS_BRIDGE_API_KEY || '').trim()
+  const headers = new Headers(request.headers)
+  if (key) headers.set('x-remote-browser-key', key)
+
+  try {
+    // Returning the upstream 101 response (with its attached webSocket) lets the Worker runtime tunnel
+    // the socket end-to-end. Do NOT read/clone the body — that would break the upgrade.
+    return await fetch(target.toString(), { method: 'GET', headers })
+  } catch {
+    return jsonResponse({ error: 'remote_browser_unreachable' }, 502)
+  }
+}
+
 async function handleAccountsBridgeProxy(request: Request, env: AuthEnv): Promise<Response> {
   const url = new URL(request.url)
   const sub = url.pathname.slice(ACCOUNTS_BRIDGE_PREFIX.length) || '/'
+
+  // LIVE Cloud Browser stream (WebSocket) — branch FIRST so the upgrade is tunneled, never buffered.
+  if (/^\/remote-browser\/[A-Za-z0-9_-]+\/stream$/.test(sub)) {
+    return handleRemoteBrowserStreamProxy(request, env, sub)
+  }
 
   // Cloud Browser routes go to the Mac bridge, not the cloud accounts Worker. Branch BEFORE the
   // accounts-worker plumbing so the two backends stay cleanly separated.

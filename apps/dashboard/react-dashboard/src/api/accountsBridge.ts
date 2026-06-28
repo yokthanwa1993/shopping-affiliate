@@ -422,6 +422,30 @@ export function remoteBrowserScreenshotUrl(sessionId: string, nonce: number | st
   return `${ACCOUNTS_BRIDGE_BASE}/remote-browser/${encodeURIComponent(sessionId)}/screenshot?t=${encodeURIComponent(String(nonce))}`
 }
 
+// Same-origin WebSocket URL for the LIVE CDP screencast stream. The dashboard worker proxy tunnels the
+// upgrade to the Mac bridge, injecting the shared secret server-side — the browser never holds the key
+// and never talks to the bridge directly. Returns a ws:// or wss:// URL matching the page scheme.
+export function remoteBrowserStreamUrl(sessionId: string): string {
+  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${scheme}//${window.location.host}${ACCOUNTS_BRIDGE_BASE}/remote-browser/${encodeURIComponent(sessionId)}/stream`
+}
+
+// Messages the bridge pushes down the screencast WebSocket. `frame` carries base64 JPEG bytes; `status`
+// mirrors the secret-free session status; `error` is a stable code. None ever carry a secret.
+export type RemoteBrowserStreamMessage =
+  | { type: 'frame'; sessionId: string; seq: number; data: string; metadata?: { deviceWidth?: number; deviceHeight?: number } | null }
+  | { type: 'status'; sessionId: string; url: string | null; title: string | null; viewport: { width: number; height: number } | null; status: RemoteBrowserStatus }
+  | { type: 'error'; error: string }
+
+// Messages the viewer sends UP the WebSocket. Mirrors the bridge's fixed input vocabulary — there is NO
+// eval / raw-CDP message. Mouse/key map onto CDP Input.dispatch*; navigate/command drive the page.
+export type RemoteBrowserStreamInput =
+  | { type: 'mouse'; event: 'mousePressed' | 'mouseReleased' | 'mouseMoved' | 'mouseWheel'; x: number; y: number; button?: 'none' | 'left' | 'middle' | 'right'; clickCount?: number; deltaX?: number; deltaY?: number }
+  | { type: 'key'; event: 'keyDown' | 'keyUp' | 'char'; key?: string; code?: string; text?: string; windowsVirtualKeyCode?: number }
+  | { type: 'navigate'; url: string }
+  | { type: 'command'; command: 'back' | 'forward' | 'reload' | 'stop' }
+  | { type: 'status' }
+
 // Relay one validated input action to the remote page (click/type/key/scroll/navigate/back/forward/reload).
 export async function sendRemoteBrowserInput(
   sessionId: string,
