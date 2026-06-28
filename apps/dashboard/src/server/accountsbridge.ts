@@ -211,7 +211,7 @@ async function handleRemoteBrowserStreamProxy(request: Request, env: AuthEnv, su
   const target = new URL(`${base}/remote-browser/${m[1]}/stream`)
   // Forward optional quality/fps hints the viewer may set.
   const reqUrl = new URL(request.url)
-  for (const key of ['quality', 'everyNthFrame']) {
+  for (const key of ['quality', 'everyNthFrame', 'maxWidth', 'maxHeight']) {
     const v = reqUrl.searchParams.get(key)
     if (v != null) target.searchParams.set(key, v)
   }

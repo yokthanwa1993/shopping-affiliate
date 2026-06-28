@@ -51,6 +51,13 @@ function clampQuality(v) {
   return Math.min(100, Math.max(1, Math.round(n)));
 }
 
+
+function clampScreencastDimension(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(4096, Math.max(320, Math.round(n)));
+}
+
 function clampEveryNthFrame(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return DEFAULT_EVERY_NTH_FRAME;
@@ -334,12 +341,14 @@ function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl, e
     ws.on('close', cast.onClose);
     ws.on('error', cast.onError);
 
+    const maxWidth = clampScreencastDimension(opts.maxWidth ?? process.env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_MAX_WIDTH, 2560);
+    const maxHeight = clampScreencastDimension(opts.maxHeight ?? process.env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_MAX_HEIGHT, 1440);
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
-      quality: clampQuality(opts.quality),
-      everyNthFrame: clampEveryNthFrame(opts.everyNthFrame),
-      maxWidth: 1920,
-      maxHeight: 1920,
+      quality: clampQuality(opts.quality ?? process.env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_QUALITY ?? 95),
+      everyNthFrame: clampEveryNthFrame(opts.everyNthFrame ?? process.env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_EVERY_NTH_FRAME ?? 1),
+      maxWidth,
+      maxHeight,
     });
 
     // Send an initial status so the viewer's address bar / title populate immediately.

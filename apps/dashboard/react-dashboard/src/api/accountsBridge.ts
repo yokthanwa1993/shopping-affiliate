@@ -436,8 +436,13 @@ export function remoteBrowserScreenshotUrl(sessionId: string, nonce: number | st
 // upgrade to the Mac bridge, injecting the shared secret server-side — the browser never holds the key
 // and never talks to the bridge directly. Returns a ws:// or wss:// URL matching the page scheme.
 export function remoteBrowserStreamUrl(sessionId: string): string {
-  const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${scheme}//${window.location.host}${ACCOUNTS_BRIDGE_BASE}/remote-browser/${encodeURIComponent(sessionId)}/stream`
+  const params = new URLSearchParams({
+    quality: '95',
+    everyNthFrame: '1',
+    maxWidth: '2560',
+    maxHeight: '1440',
+  })
+  return `${window.location.origin}/accounts-bridge/remote-browser/${encodeURIComponent(sessionId)}/stream?${params.toString()}`
 }
 
 // Messages the bridge pushes down the screencast WebSocket. `frame` carries base64 JPEG bytes; `status`

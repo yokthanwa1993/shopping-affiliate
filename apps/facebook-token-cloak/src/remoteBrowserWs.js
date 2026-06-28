@@ -244,10 +244,14 @@ function attachRemoteBrowserUpgrade(server, remoteBrowser, options = {}) {
     // Optional quality/fps hints from the query string, clamped inside startScreencast.
     const quality = Number(url.searchParams.get('quality'));
     const everyNthFrame = Number(url.searchParams.get('everyNthFrame'));
+    const maxWidth = Number(url.searchParams.get('maxWidth'));
+    const maxHeight = Number(url.searchParams.get('maxHeight'));
     Promise.resolve(
       remoteBrowser.startScreencast(sessionId, ws, {
         quality: Number.isFinite(quality) ? quality : undefined,
         everyNthFrame: Number.isFinite(everyNthFrame) ? everyNthFrame : undefined,
+        maxWidth: Number.isFinite(maxWidth) ? maxWidth : undefined,
+        maxHeight: Number.isFinite(maxHeight) ? maxHeight : undefined,
       }),
     ).catch((err) => {
       const code = err && err.code ? String(err.code) : 'screencast_failed';
