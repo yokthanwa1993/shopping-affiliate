@@ -118,7 +118,7 @@ test('open_profile reuses the safe visible open (no autofill/submit) and reports
   assert.equal(outcome.status, 'succeeded');
   assert.equal(openCalls.length, 1);
   assert.equal(openCalls[0].account, 'chearb');
-  assert.equal(openCalls[0].url, 'https://www.facebook.com/login');
+  assert.equal(openCalls[0].url, 'https://www.facebook.com/');
   assert.equal(openCalls[0].options.visible, true);
   assert.equal(openCalls[0].options.reuse, true);
   // CRITICAL: autofill and submit are never enabled by the agent path.

@@ -135,7 +135,7 @@ function createPoller(deps = {}) {
 
   // open_profile: VISIBLE window, autofill + submit OFF. Reuses the same safe open path as /login.
   async function openProfile(accountUid) {
-    const opened = await br.openPage(accountUid, 'https://www.facebook.com/login', { visible: true, reuse: true });
+    const opened = await br.openPage(accountUid, 'https://www.facebook.com/', { visible: true, reuse: true });
     return stripSecrets({ opened: true, profileDir: opened && opened.profileDir ? opened.profileDir : null, reused: !!(opened && opened.reused) });
   }
 
