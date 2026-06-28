@@ -189,3 +189,51 @@ The local helper has its own suite at `apps/accounts-bridge/local/test/` (manife
 `ABENC1` envelope round-trip with a real in-test AES-GCM key, and the HTTP flow). The Swift contract
 smoke (`AccountsBridgeContractSmoke`) additionally checks `sealArchive`/`unsealArchive` round-trips,
 the `ABENC1` magic, the essential-paths allowlist safety, and `ProfileArchiveMeta` decoding.
+
+## Cloud-backed Mac Agent launcher (Open profile from any machine)
+
+`https://www.pubilo.com/dashboard/accounts` must work from any machine, not only the Mac on
+loopback. The chosen UX is **"Open profile on Mac via Agent"** — **not** browser streaming / noVNC /
+WebRTC. It is a small command queue, not a remote display.
+
+```
+Dashboard (browser, any machine)
+  → POST /accounts-bridge/commands           (same-origin; dashboard worker injects the API key)
+    → Accounts Bridge Worker  /v1/commands   (row: action + non-secret payload, status=queued)
+
+Local Mac agent (apps/facebook-token-cloak optional poller)
+  → POST /v1/agents/:id/poll                 (claims queued → running; also a heartbeat)
+  → opens/closes the profile on THIS Mac     (open_profile = visible window, autofill+submit OFF)
+  → POST /v1/commands/:id/complete           (non-secret result; status=succeeded|failed)
+
+Dashboard polls /accounts-bridge/agents + /accounts-bridge/commands to show heartbeat + status.
+```
+
+### Worker (control plane)
+- Migration `0003_agent_commands.sql` adds `agents` (heartbeat) + `agent_commands` (queue). Both
+  `payload_json` / `result_json` are non-secret JSON — the API rejects secret-shaped keys/values
+  before any write; `error_message` is sanitized + truncated.
+- The claim is a deterministic compare-and-set per command (guarded on `status='queued'`), so two
+  concurrent polls never double-claim — no D1 multi-row transaction needed.
+
+### Local Mac agent (`apps/facebook-token-cloak/src/accountsBridgePoller.js`)
+- Optional. Starts from `bin/start.js` **only** when `ACCOUNTS_BRIDGE_WORKER_URL` +
+  `ACCOUNTS_BRIDGE_API_KEY` are present (and `ACCOUNTS_BRIDGE_AGENT_POLL` ≠ `0`). It does **not** run
+  on require and **not** in tests.
+- Syncs the local registry to `/v1/accounts` (token-free: `account_uid` + `display_label` only),
+  heartbeats `/v1/agents/<id>/status`, polls its queue, and reports sanitized results. `open_profile`
+  reuses the existing safe visible-open path (autofill + submit OFF — no credential read, no submit,
+  no token mint). Default agent id `mac-mini` (`ACCOUNTS_BRIDGE_AGENT_ID`, sanitized). No local web
+  UI is added; the root `/` native-only invariant is untouched.
+
+### Dashboard (`apps/dashboard`)
+- Server proxy `src/server/accountsbridge.ts` (`/accounts-bridge/*`) forwards an allowlist of
+  token-free reads + command enqueue/list to the cloud Worker, injecting `x-accounts-bridge-key`
+  **server-side**. The key is a Worker **secret** (`wrangler secret put ACCOUNTS_BRIDGE_API_KEY`);
+  `ACCOUNTS_BRIDGE_WORKER_URL` is a non-secret var in `wrangler.jsonc`. The browser never sees the
+  key. When the URL is unset the proxy returns `503 cloud_bridge_not_configured` and the UI shows a
+  clear "Cloud bridge not configured" message — it never falls back to localhost.
+- Frontend `react-dashboard/src/api/accountsBridge.ts` now fetches the same-origin proxy (cloud
+  mode) instead of `http://127.0.0.1:8820`. `/dashboard/accounts` shows cloud connectivity, agent
+  heartbeat, the cloud account list, recent command status, and **Open on Mac / Close on Mac**
+  buttons that enqueue commands. Secret-shaped fields are stripped defensively client-side too.

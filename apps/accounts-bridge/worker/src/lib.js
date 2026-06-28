@@ -21,6 +21,12 @@ export const SURFACE_ROLE = Object.freeze({
   ads: 'ads_power_editor'
 });
 
+// Agent command-queue vocabulary. Actions are the MVP set the local Mac agent understands; statuses
+// walk a fixed lifecycle (queued -> running -> terminal). Agent heartbeat statuses are a small set.
+export const COMMAND_ACTIONS = Object.freeze(['open_profile', 'close_profile', 'sync_accounts', 'status']);
+export const COMMAND_TERMINAL_STATUSES = Object.freeze(['succeeded', 'failed', 'cancelled']);
+export const AGENT_STATUSES = Object.freeze(['online', 'idle', 'busy', 'error', 'offline']);
+
 // A request error carrying an HTTP status. Thrown by validators, caught by the router.
 export class HttpError extends Error {
   constructor(message, status = 400, code) {
@@ -49,6 +55,44 @@ export function assertEncryptedBlob(value, field = 'encrypted_blob') {
     throw badRequest(`${field} looks like a plaintext secret — store ciphertext only`, 'blob_not_encrypted');
   }
   return value;
+}
+
+// Secret-shaped KEY names. A command payload/result is non-secret provenance only; any key whose
+// name suggests a credential is refused so a token/cookie/password can never ride along even by
+// mistake. Boolean readiness flags (…Present) are allowed by callers BEFORE reaching this check.
+const SECRET_KEY_RE = /password|token|cookie|secret|datr|fb_dtsg|dtsg|totp|otp|2fa|authorization|encrypted_blob|access_token|c_user/i;
+
+// Reject a payload/result object that names a secret-shaped key, OR whose serialized values look
+// like a raw secret (reuses the plaintext-secret tripwire). Returns the object on success (or null).
+export function assertNoSecretMaterial(value, field = 'payload') {
+  if (value == null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw badRequest(`${field} must be a JSON object`, `bad_${field}`);
+  }
+  const walk = (node, prefix) => {
+    if (!node || typeof node !== 'object') return;
+    for (const [key, nested] of Object.entries(node)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (SECRET_KEY_RE.test(key)) throw badRequest(`Forbidden ${field} field: ${path}`, 'forbidden_field');
+      walk(nested, path);
+    }
+  };
+  walk(value, '');
+  // Value-shape tripwire: even with safe key names, refuse a raw token/cookie/datr value.
+  if (PLAINTEXT_SECRET_RE.test(JSON.stringify(value))) {
+    throw badRequest(`${field} contains a value that looks like a plaintext secret`, 'forbidden_value');
+  }
+  return value;
+}
+
+// A safe, bounded error string for the command queue: control-chars stripped, secret-shaped content
+// removed, and truncated. Never echoes a raw token/cookie even if an agent reports one by mistake.
+export function sanitizeErrorMessage(value, maxLen = 240) {
+  if (value == null) return null;
+  let s = String(value).replace(/[\x00-\x1f\x7f]/g, ' ').trim();
+  if (s === '') return null;
+  if (PLAINTEXT_SECRET_RE.test(s)) s = '[redacted]';
+  return s.slice(0, maxLen);
 }
 
 // Non-secret SHA-256 digest of a blob, so callers can compare versions without seeing plaintext.

@@ -63,7 +63,12 @@
     "PASSKEY_RP_NAME": "PUBILO Dashboard",
     "PASSKEY_NAMESPACE_ID": "1774858894802785816",
     "PASSKEY_WORKSPACE_NAME": "PUBILO",
-    "PASSKEY_BOOTSTRAP_DISPLAY_NAME": "YOK"
+    "PASSKEY_BOOTSTRAP_DISPLAY_NAME": "YOK",
+    // Accounts Bridge cloud Worker base URL (non-secret). The /accounts-bridge/* proxy in
+    // src/server/accountsbridge.ts forwards to this origin and injects the API key server-side.
+    // The API key itself is a SECRET — never put it here. Set it with:
+    //   wrangler secret put ACCOUNTS_BRIDGE_API_KEY
+    "ACCOUNTS_BRIDGE_WORKER_URL": "https://accounts-bridge-worker.onlyy-gor.workers.dev"
   },
   "observability": {
     "enabled": true

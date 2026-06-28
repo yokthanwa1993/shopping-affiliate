@@ -21,6 +21,11 @@ export interface AuthEnv {
   PASSKEY_NAMESPACE_ID: string
   PASSKEY_WORKSPACE_NAME: string
   PASSKEY_BOOTSTRAP_DISPLAY_NAME: string
+  // Accounts Bridge cloud proxy (server-side only). URL is a non-secret var; the API key is a Worker
+  // SECRET (set via `wrangler secret put ACCOUNTS_BRIDGE_API_KEY`) and is never exposed to the bundle.
+  // Optional: when ACCOUNTS_BRIDGE_WORKER_URL is unset the proxy returns cloud_bridge_not_configured.
+  ACCOUNTS_BRIDGE_WORKER_URL?: string
+  ACCOUNTS_BRIDGE_API_KEY?: string
 }
 
 export const SESSION_COOKIE = 'pubilo_dashboard_session'

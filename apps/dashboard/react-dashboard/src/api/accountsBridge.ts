@@ -1,22 +1,17 @@
-// Client for the local Mac "Accounts Bridge" (apps/facebook-token-cloak), the token pool that
-// manages Facebook Lite (posting) / Power Editor (ads) accounts on this machine. The dashboard runs
-// on https://www.pubilo.com but this bridge listens on loopback only — browsers permit fetches to
-// http://127.0.0.1 from an https page (the loopback carve-out in the mixed-content spec), and the
-// bridge echoes our origin back via its narrow CORS allowlist for the safe accounts endpoints.
+// Client for the CLOUD Accounts Bridge, reached SAME-ORIGIN through the dashboard worker proxy at
+// /accounts-bridge/* (apps/dashboard/src/server/accountsbridge.ts). The proxy injects the shared API
+// key server-side and forwards to the Accounts Bridge Worker (apps/accounts-bridge/worker), so this
+// page works from ANY machine — not only the Mac running the local bridge on loopback.
 //
-// SAFETY: this client only ever touches the token-free read/open/close endpoints, and the adapter
-// below strips any raw secret-ish field (token/cookie/password/secret/datr/dtsg) by key name before
-// the value reaches React. Readiness *booleans* (credentialPresent, datrPresent, …) are preserved —
-// the bridge already returns presence flags, never the secrets themselves.
+// The browser never talks to http://127.0.0.1:8820 anymore and never sees the API key. This file
+// only touches token-free read endpoints plus the non-secret command queue (enqueue/list), and the
+// adapter below strips any secret-shaped field by key name as defence in depth on top of the proxy +
+// worker redaction.
 
-// Default to the documented loopback address; allow a build-time override for local dev setups.
-export const ACCOUNTS_BRIDGE_BASE =
-  (import.meta.env.VITE_ACCOUNTS_BRIDGE_URL as string | undefined)?.replace(/\/+$/, '') ||
-  'http://127.0.0.1:8820'
+// Same-origin proxy base. No localhost fallback: when the cloud worker URL is not configured the
+// proxy returns 503 cloud_bridge_not_configured and the UI shows a clear "not configured" message.
+export const ACCOUNTS_BRIDGE_BASE = '/accounts-bridge'
 
-// A key whose name contains any of these is treated as a raw secret and dropped from any response
-// before it is rendered or stored — defence in depth on top of the bridge's own redaction. Note we
-// only drop NON-boolean values: presence flags like `datrPresent: false` are safe readiness signals.
 const SECRET_KEY_RE = /token|cookie|password|secret|datr|dtsg/i
 
 function stripSecrets<T>(value: T): T {
@@ -26,7 +21,6 @@ function stripSecrets<T>(value: T): T {
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
     for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
-      // Keep boolean readiness flags (…Present) even if the key matches; drop raw secret values.
       if (SECRET_KEY_RE.test(key) && typeof raw !== 'boolean') continue
       out[key] = stripSecrets(raw)
     }
@@ -35,10 +29,19 @@ function stripSecrets<T>(value: T): T {
   return value
 }
 
-// Thrown when the local bridge cannot be reached at all (process not running, port closed, blocked).
-// Callers render this as the "Offline" state rather than a hard error.
+// The cloud worker proxy is reachable but the cloud bridge URL is not configured server-side. The UI
+// renders this distinctly from a transport failure — it is an operator/config problem, not "offline".
+export class CloudNotConfiguredError extends Error {
+  constructor(message = 'Cloud bridge not configured') {
+    super(message)
+    this.name = 'CloudNotConfiguredError'
+  }
+}
+
+// Thrown when the cloud bridge cannot be reached at all (proxy 502 / network failure). The UI renders
+// this as the cloud-connectivity "Offline" state.
 export class BridgeOfflineError extends Error {
-  constructor(message = 'Accounts Bridge is offline') {
+  constructor(message = 'Cloud Accounts Bridge is unreachable') {
     super(message)
     this.name = 'BridgeOfflineError'
   }
@@ -46,6 +49,7 @@ export class BridgeOfflineError extends Error {
 
 interface BridgeRequestOptions {
   method?: string
+  body?: unknown
   searchParams?: Record<string, string>
   timeoutMs?: number
   signal?: AbortSignal
@@ -53,26 +57,32 @@ interface BridgeRequestOptions {
 
 async function bridgeFetch<T>(path: string, options: BridgeRequestOptions = {}): Promise<T> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 6000)
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 12000)
   if (options.signal) {
     if (options.signal.aborted) controller.abort()
     else options.signal.addEventListener('abort', () => controller.abort(), { once: true })
   }
-  const url = new URL(`${ACCOUNTS_BRIDGE_BASE}${path}`)
+  const url = new URL(`${ACCOUNTS_BRIDGE_BASE}${path}`, window.location.origin)
   for (const [key, val] of Object.entries(options.searchParams ?? {})) {
     url.searchParams.set(key, val)
+  }
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  let body: string | undefined
+  if (options.body !== undefined && options.body !== null) {
+    body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body)
+    headers['Content-Type'] = 'application/json'
   }
   let response: Response
   try {
     response = await fetch(url.toString(), {
       method: options.method ?? 'GET',
-      // No cookies/credentials — the bridge is token-free and CORS is non-credentialed.
-      credentials: 'omit',
-      headers: { Accept: 'application/json' },
+      // Same-origin so the dashboard session cookie authenticates the proxy hop.
+      credentials: 'same-origin',
+      headers,
+      body,
       signal: controller.signal,
     })
   } catch {
-    // Network-level failure (offline, refused, aborted) — the bridge is unreachable.
     throw new BridgeOfflineError()
   } finally {
     clearTimeout(timer)
@@ -86,103 +96,111 @@ async function bridgeFetch<T>(path: string, options: BridgeRequestOptions = {}):
       throw new Error(`Accounts Bridge returned non-JSON (HTTP ${response.status})`)
     }
   }
+  const errorCode =
+    json && typeof json === 'object' && 'error' in json ? String((json as Record<string, unknown>).error) : null
+  if (response.status === 503 && errorCode === 'cloud_bridge_not_configured') {
+    throw new CloudNotConfiguredError()
+  }
+  if (response.status === 502 || errorCode === 'cloud_bridge_unreachable' || errorCode === 'cloud_bridge_bad_response') {
+    throw new BridgeOfflineError()
+  }
   if (!response.ok) {
-    const message =
-      json && typeof json === 'object' && 'error' in json
-        ? String((json as Record<string, unknown>).error)
-        : `HTTP ${response.status}`
-    throw new Error(message)
+    throw new Error(errorCode || `HTTP ${response.status}`)
   }
   return stripSecrets((json ?? {}) as T)
 }
 
-// ── Public, sanitized response shapes (booleans + non-secret identifiers only) ──────────────────
+// ── Public, sanitized cloud shapes ──────────────────────────────────────────────────────────────
 
-export interface BridgeHealth {
+export interface CloudHealth {
   ok: boolean
-  app: string
-  host: string
-  port: number
-  backend: string
-  keychainSupported: boolean
+  service: string
+  api: string
 }
 
-export interface BridgeAccount {
-  account: string
-  key: string
-  displayName: string | null
-  provider: string
-  domain: string | null
-  convertTokenMode: string
-  inRegistry: boolean
-  credentialPresent: boolean
-  usernamePresent: boolean
-  passwordPresent: boolean
-  totpPresent: boolean
-  datrPresent: boolean
-  selectorPresent: boolean
-  usernameHintPresent: boolean
+export interface CloudAccount {
+  account_uid: string
+  platform: string
+  display_label: string | null
+  status: string
+  created_at?: string
+  updated_at?: string
 }
 
-export interface BridgeProfileStatus {
-  account: string
-  key: string
-  profileDir: string
-  profileExists: boolean
-  running: boolean
-  bridgeSession: boolean
-  visibleSession: boolean
-  lockPidPresent: boolean
-  pidCount: number
-  statusKnown: boolean
+export type AgentStatus = 'online' | 'idle' | 'busy' | 'error' | 'offline'
+
+export interface CloudAgent {
+  agent_id: string
+  label: string | null
+  status: AgentStatus
+  detail: Record<string, unknown> | null
+  last_seen_at: string | null
+  created_at: string
+  updated_at: string
 }
 
-export interface BridgeStatusSummary {
-  app: string
-  facebook: {
-    accountsCount: number
-    roles: Record<string, unknown>
-  }
-  note?: string
+export type CommandAction = 'open_profile' | 'close_profile' | 'sync_accounts' | 'status'
+export type CommandStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+export interface CloudCommand {
+  id: string
+  agent_id: string
+  action: CommandAction
+  account_uid: string | null
+  status: CommandStatus
+  error_code: string | null
+  error_message: string | null
+  result: Record<string, unknown> | null
+  created_at: string
+  updated_at: string
+  completed_at: string | null
 }
 
-export function fetchBridgeHealth(signal?: AbortSignal): Promise<BridgeHealth> {
-  return bridgeFetch<BridgeHealth>('/health', { signal })
+export function fetchCloudHealth(signal?: AbortSignal): Promise<CloudHealth> {
+  return bridgeFetch<CloudHealth>('/health', { signal })
 }
 
-export async function fetchBridgeAccounts(signal?: AbortSignal): Promise<BridgeAccount[]> {
-  const data = await bridgeFetch<{ accounts?: BridgeAccount[] }>('/accounts', { signal })
+export async function fetchCloudAccounts(signal?: AbortSignal): Promise<CloudAccount[]> {
+  const data = await bridgeFetch<{ accounts?: CloudAccount[] }>('/accounts', { searchParams: { platform: 'facebook' }, signal })
   return data.accounts ?? []
 }
 
-export function fetchBridgeStatus(signal?: AbortSignal): Promise<BridgeStatusSummary> {
-  return bridgeFetch<BridgeStatusSummary>('/accounts/bridge/status', { signal })
+export async function fetchCloudAgents(signal?: AbortSignal): Promise<CloudAgent[]> {
+  const data = await bridgeFetch<{ agents?: CloudAgent[] }>('/agents', { signal })
+  return data.agents ?? []
 }
 
-export async function fetchProfileStatus(uid: string, signal?: AbortSignal): Promise<BridgeProfileStatus> {
-  const data = await bridgeFetch<{ profile?: BridgeProfileStatus }>('/accounts/profile-status', {
-    searchParams: { account: uid },
-    signal,
-  })
-  if (!data.profile) throw new Error('Profile status unavailable')
-  return data.profile
+export async function fetchCloudCommands(agentId?: string, limit = 20, signal?: AbortSignal): Promise<CloudCommand[]> {
+  const searchParams: Record<string, string> = { limit: String(limit) }
+  if (agentId) searchParams.agent_id = agentId
+  const data = await bridgeFetch<{ commands?: CloudCommand[] }>('/commands', { searchParams, signal })
+  return data.commands ?? []
 }
 
-// User-triggered safe open: a VISIBLE browser session with autofill + submit explicitly off, so the
-// operator can SEE which account is logged in without the bridge ever reading a credential, submitting
-// a login, or minting a token.
-export function openSafeSession(uid: string, signal?: AbortSignal): Promise<unknown> {
-  return bridgeFetch<unknown>('/login', {
-    searchParams: { account: uid, visible: '1', autofill: '0', submit: '0' },
-    timeoutMs: 30000,
-    signal,
-  })
+export async function enqueueCommand(input: {
+  agent_id: string
+  action: CommandAction
+  account_uid?: string
+}): Promise<CloudCommand> {
+  const data = await bridgeFetch<{ command: CloudCommand }>('/commands', { method: 'POST', body: input, timeoutMs: 15000 })
+  return data.command
 }
 
-export function closeSession(uid: string, signal?: AbortSignal): Promise<unknown> {
-  return bridgeFetch<unknown>('/login/close', {
-    searchParams: { account: uid },
-    timeoutMs: 15000,
-    signal,
-  })
+// "Open on Mac": enqueue an open_profile command. The Mac agent opens a VISIBLE Facebook Lite window
+// with autofill + submit OFF — no credential is read, no login is submitted, no token is minted.
+export function openOnMac(agentId: string, accountUid: string): Promise<CloudCommand> {
+  return enqueueCommand({ agent_id: agentId, action: 'open_profile', account_uid: accountUid })
+}
+
+// "Close on Mac": enqueue a close_profile command.
+export function closeOnMac(agentId: string, accountUid: string): Promise<CloudCommand> {
+  return enqueueCommand({ agent_id: agentId, action: 'close_profile', account_uid: accountUid })
+}
+
+// An agent is "live" only if it heartbeated recently — status alone can go stale when the agent dies.
+export function isAgentLive(agent: CloudAgent | null | undefined, maxAgeMs = 60000): boolean {
+  if (!agent || !agent.last_seen_at) return false
+  const seen = Date.parse(agent.last_seen_at)
+  if (Number.isNaN(seen)) return false
+  return Date.now() - seen <= maxAgeMs
 }

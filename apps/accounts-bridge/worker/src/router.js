@@ -15,11 +15,15 @@ import {
   ROLES,
   ROLE_LABELS,
   SURFACE_ROLE,
+  COMMAND_ACTIONS,
+  COMMAND_TERMINAL_STATUSES,
+  AGENT_STATUSES,
   HttpError,
   badRequest,
   assertPlatform,
   assertRole,
   assertIdentifier,
+  assertNoSecretMaterial,
   timingSafeEqualStr,
   json,
   redact
@@ -325,6 +329,99 @@ export async function handleRequest(request, env, deps = {}) {
       const detail = assertSafeDetail(body.detail);
       const event = await store.insertAudit({ event_type: eventType, account_uid: accountUid, platform, role, page_id: pageId, source: source || 'api', detail });
       return json({ event }, 201);
+    }
+
+    // --- agent command queue (cloud-backed Mac Agent launcher) ----------------------------------
+    // The Worker is still a pure DB API: it stores non-secret commands + agent heartbeats and never
+    // opens a browser / mints a token. The local Mac agent polls its queue, runs each command on its
+    // OWN machine, and reports a non-secret result. payload/result reject secret-shaped keys/values.
+
+    // Enqueue a command for an agent.
+    if (path === '/v1/commands' && method === 'POST') {
+      const body = await readJson(request);
+      const agentId = assertIdentifier('agent_id', body.agent_id, { maxLen: 120 });
+      const action = assertIdentifier('action', body.action, { maxLen: 40 });
+      if (!COMMAND_ACTIONS.includes(action)) {
+        throw badRequest(`Unknown action: ${redact(action)}`, 'bad_action');
+      }
+      const platform = body.platform == null || body.platform === '' ? null : assertPlatform(body.platform);
+      const role = body.role == null || body.role === '' ? null : assertRole(body.role);
+      const accountUid = body.account_uid == null || body.account_uid === '' ? null : assertIdentifier('account_uid', body.account_uid);
+      // open/close target a specific profile; the account_uid is mandatory for them.
+      if ((action === 'open_profile' || action === 'close_profile') && !accountUid) {
+        throw badRequest(`account_uid is required for action ${action}`, 'account_uid_required');
+      }
+      const payload = assertNoSecretMaterial(body.payload == null ? null : body.payload, 'payload');
+      const command = await store.enqueueCommand({ agent_id: agentId, action, platform, role, account_uid: accountUid, payload });
+      await store.insertAudit({ event_type: 'command.enqueued', account_uid: accountUid, platform, role, source: 'api', detail: { agent_id: agentId, action, command_id: command.id } });
+      return json({ command }, 201);
+    }
+
+    // List recent commands (most-recent-first), optionally filtered by agent_id / status.
+    if (path === '/v1/commands' && method === 'GET') {
+      const agentId = url.searchParams.get('agent_id');
+      if (agentId) assertIdentifier('agent_id', agentId, { maxLen: 120 });
+      const status = url.searchParams.get('status');
+      const limit = url.searchParams.get('limit');
+      const commands = await store.listCommands({ agent_id: agentId || null, status: status || null, limit: limit || 20 });
+      return json({ commands });
+    }
+
+    // Report a terminal result for a running command.
+    const completeMatch = path.match(/^\/v1\/commands\/([^/]+)\/complete$/);
+    if (completeMatch && method === 'POST') {
+      const commandId = assertIdentifier('command_id', decodeURIComponent(completeMatch[1]), { maxLen: 120 });
+      const body = await readJson(request);
+      const status = assertIdentifier('status', body.status, { maxLen: 40 });
+      if (!COMMAND_TERMINAL_STATUSES.includes(status)) {
+        throw badRequest(`status must be one of ${COMMAND_TERMINAL_STATUSES.join(', ')}`, 'bad_status');
+      }
+      const result = assertNoSecretMaterial(body.result == null ? null : body.result, 'result');
+      const errorCode = body.error_code == null ? null : assertIdentifier('error_code', String(body.error_code), { maxLen: 80 });
+      const errorMessage = body.error_message == null ? null : String(body.error_message);
+      const outcome = await store.completeCommand({ id: commandId, status, result, error_code: errorCode, error_message: errorMessage });
+      if (!outcome.ok && outcome.reason === 'not_found') return json({ ok: false, error: 'command_not_found' }, 404);
+      if (!outcome.ok && outcome.reason === 'not_running') return json({ ok: false, error: 'command_not_running', command: outcome.command }, 409);
+      await store.insertAudit({ event_type: 'command.completed', source: 'api', detail: { command_id: commandId, status, error_code: outcome.command?.error_code ?? null } });
+      return json({ command: outcome.command });
+    }
+
+    // Agent poll: atomically claim queued commands and mark them running. Also a heartbeat.
+    const pollMatch = path.match(/^\/v1\/agents\/([^/]+)\/poll$/);
+    if (pollMatch && method === 'POST') {
+      const agentId = assertIdentifier('agent_id', decodeURIComponent(pollMatch[1]), { maxLen: 120 });
+      let body = {};
+      try { body = await readJson(request); } catch { body = {}; }
+      const limit = body && body.limit != null ? body.limit : 5;
+      const commands = await store.claimQueuedCommands({ agent_id: agentId, limit });
+      return json({ agent_id: agentId, commands });
+    }
+
+    // Agent heartbeat / status upsert.
+    const statusMatch = path.match(/^\/v1\/agents\/([^/]+)\/status$/);
+    if (statusMatch) {
+      const agentId = assertIdentifier('agent_id', decodeURIComponent(statusMatch[1]), { maxLen: 120 });
+      if (method === 'GET') {
+        const agent = await store.getAgent(agentId);
+        return json({ agent_id: agentId, present: !!agent, agent });
+      }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await readJson(request);
+        let status = null;
+        if (body.status != null && body.status !== '') {
+          status = assertIdentifier('status', body.status, { maxLen: 40 });
+          if (!AGENT_STATUSES.includes(status)) throw badRequest(`status must be one of ${AGENT_STATUSES.join(', ')}`, 'bad_status');
+        }
+        const label = body.label == null ? null : assertIdentifier('label', body.label, { maxLen: 120 });
+        const detail = assertNoSecretMaterial(body.detail == null ? null : body.detail, 'detail');
+        const agent = await store.upsertAgentStatus({ agent_id: agentId, status, label, detail, seen: true });
+        return json({ agent });
+      }
+    }
+
+    // List known agents (dashboard heartbeat view).
+    if (path === '/v1/agents' && method === 'GET') {
+      return json({ agents: await store.listAgents() });
     }
 
     return json({ ok: false, error: 'not_found', path }, 404);

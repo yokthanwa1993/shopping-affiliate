@@ -75,6 +75,36 @@ compared). `/health` is public. Fails **closed** (503) if the key is unconfigure
 | `GET /v1/profile-archives/:platform/:role/:account_uid/download` | Fetch the sealed archive bytes on open (ciphertext only) |
 | `GET /v1/profile-archives/:platform/:role/:account_uid/status` | Presence/digest/version/size metadata, never the bytes |
 | `POST /v1/audit/events` | Append a non-secret audit event |
+| `POST /v1/commands` | Enqueue a non-secret agent command |
+| `GET /v1/commands` | List recent commands (`?agent_id=&status=&limit=`) |
+| `POST /v1/agents/:agent_id/poll` | Agent claims queued commands → `running` (also a heartbeat) |
+| `POST /v1/commands/:id/complete` | Agent reports a terminal result (`succeeded`/`failed`/`cancelled`) |
+| `POST` \| `PUT /v1/agents/:agent_id/status` | Agent heartbeat / status upsert |
+| `GET /v1/agents/:agent_id/status` | Read one agent's heartbeat |
+| `GET /v1/agents` | List known agents (dashboard heartbeat view) |
+
+### Agent command queue — cloud-backed "Open profile on Mac via Agent"
+
+So `https://www.pubilo.com/dashboard/accounts` works from **any** machine (not only the Mac on
+loopback), the Worker carries a small command queue + agent heartbeat. This is **not** browser
+streaming/noVNC — the dashboard enqueues a command and a local Mac agent
+(`apps/facebook-token-cloak`, optional poller) runs it on its own machine.
+
+- **Actions (MVP):** `open_profile`, `close_profile`, `sync_accounts`, `status`. `open_profile` /
+  `close_profile` require an `account_uid`.
+- **Lifecycle:** `queued` → (poll claims it) `running` → `succeeded` \| `failed` \| `cancelled`.
+  The claim is a deterministic compare-and-set per command, so two concurrent polls never
+  double-claim the same row (no D1 multi-row transaction needed).
+- **Secret policy:** `payload_json` / `result_json` are **non-secret JSON only**. The API rejects any
+  secret-shaped **key** (`token`/`cookie`/`password`/`datr`/`fb_dtsg`/…) *and* any value that looks
+  like a raw token/cookie before a row is written; `error_message` is sanitized + truncated.
+- **The Worker still opens no browser and mints no token.** The agent does the local work and the
+  command is the message between them. `open_profile` opens a **VISIBLE** window with autofill +
+  submit OFF (same safe path as `GET /login?visible=1&autofill=0&submit=0`).
+
+Agent identity defaults to `mac-mini` (override with `ACCOUNTS_BRIDGE_AGENT_ID`, sanitized). The
+dashboard reaches all of this **same-origin** via the worker proxy at `/accounts-bridge/*`, which
+injects `x-accounts-bridge-key` server-side — the browser never sees the key.
 
 ### Profile archive sync — BrowserSaving semantics, but sealed
 
@@ -113,7 +143,7 @@ npm run check                     # syntax check
 # One-time backend provisioning (requires a Cloudflare account; not run here):
 wrangler d1 create accounts-bridge-db                       # paste database_id into wrangler.jsonc
 wrangler r2 bucket create accounts-bridge-profile-archives  # sealed profile archives (opaque ciphertext)
-npm run db:migrate:local                                    # apply migrations/ locally (0001 + 0002)
+npm run db:migrate:local                                    # apply migrations/ locally (0001 + 0002 + 0003)
 wrangler secret put ACCOUNTS_BRIDGE_API_KEY                 # set the shared local-bridge key (value not stored here)
 npm run dev                                                  # local Worker on http://127.0.0.1:8787
 ```

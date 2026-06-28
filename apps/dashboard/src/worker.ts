@@ -8,6 +8,7 @@ import {
 import { customlinkApp } from './server/customlink'
 import { jsonResponse } from './server/http'
 import { workerApiApp } from './server/workerapi'
+import { accountsBridgeApp } from './server/accountsbridge'
 
 export interface Env extends AuthEnv {
   ASSETS: {
@@ -279,7 +280,8 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
         !isAuthPath(url.pathname) &&
         !url.pathname.startsWith('/auth/') &&
         !url.pathname.startsWith('/worker-api/') &&
-        !url.pathname.startsWith('/customlink-api/')
+        !url.pathname.startsWith('/customlink-api/') &&
+        !url.pathname.startsWith('/accounts-bridge/')
       ) {
         const canonicalPath = legacyDashboardCanonicalPath(url.pathname)
         const target = new URL(canonicalPath + url.search, CANONICAL_WWW_ORIGIN)
@@ -294,12 +296,13 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
     const isStatic = isStaticAssetPath(url.pathname)
     const isWorkerApi = url.pathname.startsWith('/worker-api/')
     const isCustomlinkApi = url.pathname.startsWith('/customlink-api/')
+    const isAccountsBridge = url.pathname.startsWith('/accounts-bridge/')
     if (!isAuthEndpoint && !isStatic) {
       const count = await credentialCount(env).catch(() => 0)
       if (count > 0) {
         const sess = await loadSession(env, request)
         if (!sess) {
-          if (isWorkerApi || isCustomlinkApi || isCanonicalCustomlinkApi) {
+          if (isWorkerApi || isCustomlinkApi || isCanonicalCustomlinkApi || isAccountsBridge) {
             return jsonResponse({ error: 'authentication_required' }, 401)
           }
           // HTML / SPA navigation → redirect to /login. Only redirect when the
@@ -336,6 +339,13 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
     // exactly as before.
     if (isWorkerApi) {
       return workerApiApp.fetch(request, env)
+    }
+
+    // Accounts Bridge cloud proxy — same bridge pattern as /worker-api. The worker owns the auth
+    // gate above; this slice injects the cloud API key server-side and forwards the allowlisted
+    // /accounts-bridge/* request to the Accounts Bridge Worker.
+    if (isAccountsBridge) {
+      return accountsBridgeApp.fetch(request, env)
     }
 
     // React preview SPA: serve dist/dashboard_next/index.html for the entry and

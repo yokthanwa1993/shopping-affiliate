@@ -8,8 +8,56 @@
 // Every method that returns session/cookie rows strips the `encrypted_blob` column before it leaves
 // this layer. The blob is intentionally never surfaced past the store boundary.
 
-import { newId, nowIso, sha256Hex, sha256HexBytes, assertEncryptedBlob, assertEncryptedArchive, HttpError } from './lib.js';
+import { newId, nowIso, sha256Hex, sha256HexBytes, assertEncryptedBlob, assertEncryptedArchive, sanitizeErrorMessage, HttpError } from './lib.js';
 import { SCHEMA_SQL } from './schema.js';
+
+// Parse a stored JSON column back to an object, tolerating null/legacy-bad rows (never throws).
+function parseJsonColumn(value) {
+  if (value == null || value === '') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Public (non-secret) shape of an agent_commands row. payload/result are already non-secret JSON
+// (the API rejects secret-shaped keys/values before insert); error_message was sanitized on write.
+function publicCommand(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    agent_id: row.agent_id,
+    action: row.action,
+    platform: row.platform ?? null,
+    role: row.role ?? null,
+    account_uid: row.account_uid ?? null,
+    status: row.status,
+    payload: parseJsonColumn(row.payload_json),
+    result: parseJsonColumn(row.result_json),
+    error_code: row.error_code ?? null,
+    error_message: row.error_message ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    claimed_at: row.claimed_at ?? null,
+    completed_at: row.completed_at ?? null
+  };
+}
+
+// Public (non-secret) shape of an agents row. detail is non-secret provenance only.
+function publicAgent(row) {
+  if (!row) return null;
+  return {
+    agent_id: row.agent_id,
+    label: row.label ?? null,
+    status: row.status,
+    detail: parseJsonColumn(row.detail),
+    last_seen_at: row.last_seen_at ?? null,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
 
 // R2 object key for the current sealed profile archive. Scoped by platform/role/account_uid (NOT a
 // bare profile id) so ownership is unambiguous and BrowserSaving's `browser-data/{profileId}` ambiguity
@@ -102,7 +150,7 @@ export class AccountsStore {
     for (const stmt of statements) {
       await this.db.prepare(stmt).run();
     }
-    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events', 'profile_archives'];
+    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events', 'profile_archives', 'agents', 'agent_commands'];
     const { results } = await this.db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${wanted.map(() => '?').join(',')}) ORDER BY name`)
       .bind(...wanted)
@@ -321,6 +369,120 @@ export class AccountsStore {
       .bind(id, event_type, account_uid, platform, role, page_id, source, detailJson, now)
       .run();
     return { id, event_type, created_at: now };
+  }
+
+  // --- agents (heartbeat + last-seen) -----------------------------------
+  async getAgent(agentId) {
+    const row = await this.db.prepare('SELECT * FROM agents WHERE agent_id = ?').bind(agentId).first();
+    return publicAgent(row);
+  }
+
+  async listAgents() {
+    const { results } = await this.db.prepare('SELECT * FROM agents ORDER BY agent_id').all();
+    return results.map((r) => publicAgent(r));
+  }
+
+  // Upsert an agent heartbeat. `detail` is non-secret JSON (validated by the router). Touching the
+  // row always advances last_seen_at/updated_at so the dashboard can tell a live agent from a stale
+  // one. `status` defaults to 'online' on first contact and is only overwritten when provided.
+  async upsertAgentStatus({ agent_id, status = null, label = null, detail = null, seen = true }) {
+    const now = this.ts();
+    const detailJson = detail == null ? null : JSON.stringify(detail);
+    const existing = await this.db.prepare('SELECT * FROM agents WHERE agent_id = ?').bind(agent_id).first();
+    const lastSeen = seen ? now : existing ? existing.last_seen_at : null;
+    if (existing) {
+      await this.db
+        .prepare('UPDATE agents SET status = ?, label = COALESCE(?, label), detail = COALESCE(?, detail), last_seen_at = ?, updated_at = ? WHERE agent_id = ?')
+        .bind(status || existing.status, label, detailJson, lastSeen, now, agent_id)
+        .run();
+    } else {
+      await this.db
+        .prepare('INSERT INTO agents (agent_id, label, status, detail, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .bind(agent_id, label, status || 'online', detailJson, lastSeen, now, now)
+        .run();
+    }
+    return this.getAgent(agent_id);
+  }
+
+  // --- agent command queue ----------------------------------------------
+  async enqueueCommand({ agent_id, action, platform = null, role = null, account_uid = null, payload = null }) {
+    const now = this.ts();
+    const id = newId('cmd');
+    const payloadJson = payload == null ? null : JSON.stringify(payload);
+    await this.db
+      .prepare(
+        'INSERT INTO agent_commands (id, agent_id, action, platform, role, account_uid, status, payload_json, result_json, error_code, error_message, created_at, updated_at, claimed_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      )
+      .bind(id, agent_id, action, platform, role, account_uid, 'queued', payloadJson, null, null, null, now, now, null, null)
+      .run();
+    // Enqueuing implies the agent is a known target; register/refresh it WITHOUT marking it seen
+    // (only the agent itself, by polling/heartbeat, proves liveness).
+    const existing = await this.db.prepare('SELECT agent_id FROM agents WHERE agent_id = ?').bind(agent_id).first();
+    if (!existing) await this.upsertAgentStatus({ agent_id, status: 'offline', seen: false });
+    return publicCommand(await this.db.prepare('SELECT * FROM agent_commands WHERE id = ?').bind(id).first());
+  }
+
+  async getCommand(id) {
+    return publicCommand(await this.db.prepare('SELECT * FROM agent_commands WHERE id = ?').bind(id).first());
+  }
+
+  async listCommands({ agent_id = null, status = null, limit = 20 } = {}) {
+    const n = Math.max(1, Math.min(100, Number(limit) || 20));
+    let sql = 'SELECT * FROM agent_commands';
+    const where = [];
+    const args = [];
+    if (agent_id) { where.push('agent_id = ?'); args.push(agent_id); }
+    if (status) { where.push('status = ?'); args.push(status); }
+    if (where.length) sql += ' WHERE ' + where.join(' AND ');
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?';
+    args.push(n);
+    const { results } = await this.db.prepare(sql).bind(...args).all();
+    return results.map((r) => publicCommand(r));
+  }
+
+  // Atomically claim up to `limit` queued commands for an agent and transition them to 'running'.
+  // D1/the test shim have no multi-row transaction primitive, so we claim ONE row at a time with a
+  // compare-and-set UPDATE guarded on status='queued' and confirm via meta.changes — a deterministic
+  // single-command claim that two concurrent pollers can never double-claim (the loser's UPDATE
+  // matches zero rows). The poll itself is also an agent heartbeat.
+  async claimQueuedCommands({ agent_id, limit = 5 }) {
+    const n = Math.max(1, Math.min(50, Number(limit) || 5));
+    await this.upsertAgentStatus({ agent_id, status: 'online', seen: true });
+    const { results } = await this.db
+      .prepare("SELECT id FROM agent_commands WHERE agent_id = ? AND status = 'queued' ORDER BY created_at ASC, id ASC LIMIT ?")
+      .bind(agent_id, n)
+      .all();
+    const claimed = [];
+    for (const { id } of results) {
+      const now = this.ts();
+      const res = await this.db
+        .prepare("UPDATE agent_commands SET status = 'running', claimed_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'")
+        .bind(now, now, id)
+        .run();
+      const changes = res?.meta?.changes ?? res?.changes ?? 0;
+      if (changes === 1) {
+        claimed.push(await this.getCommand(id));
+      }
+    }
+    return claimed;
+  }
+
+  // Report a terminal result for a running command. Guarded on status='running' so a command can't
+  // be completed twice or completed before it was claimed (returns null → router answers 409).
+  // result is non-secret JSON (validated by the router); error_message is sanitized defensively here.
+  async completeCommand({ id, status, result = null, error_code = null, error_message = null }) {
+    const existing = await this.db.prepare('SELECT * FROM agent_commands WHERE id = ?').bind(id).first();
+    if (!existing) return { ok: false, reason: 'not_found', command: null };
+    if (existing.status !== 'running') return { ok: false, reason: 'not_running', command: publicCommand(existing) };
+    const now = this.ts();
+    const resultJson = result == null ? null : JSON.stringify(result);
+    const safeError = sanitizeErrorMessage(error_message);
+    const safeCode = error_code == null ? null : sanitizeErrorMessage(error_code, 80);
+    await this.db
+      .prepare('UPDATE agent_commands SET status = ?, result_json = ?, error_code = ?, error_message = ?, updated_at = ?, completed_at = ? WHERE id = ?')
+      .bind(status, resultJson, safeCode, safeError, now, now, id)
+      .run();
+    return { ok: true, command: await this.getCommand(id) };
   }
 
   // --- profile archives (sealed bytes in R2, metadata in D1) -------------
