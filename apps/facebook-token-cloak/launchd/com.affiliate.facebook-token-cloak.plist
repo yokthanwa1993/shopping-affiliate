@@ -14,6 +14,10 @@
 		<string>production</string>
 		<key>PATH</key>
 		<string>/Users/yok-macmini/.local/opt/node-v24.14.1-darwin-arm64/bin:/Users/yok-macmini/.local/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>ACCOUNTS_BRIDGE_PROFILE_SYNC</key>
+		<string>1</string>
+		<key>ACCOUNTS_BRIDGE_WORKER_URL</key>
+		<string>https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev</string>
 	</dict>
 	<key>KeepAlive</key>
 	<true/>

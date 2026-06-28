@@ -9,6 +9,7 @@ const accountsRegistry = require('./accounts-registry');
 const bridgeConfig = require('./bridge-config');
 const posting = require('./posting');
 const fbLiteTokenService = require('./fb-lite-token-service.cjs');
+const profileArchiveSync = require('./profileArchiveSync');
 const {
   FACEBOOK_OAUTH_URL,
   extractAccessTokenFromUrl,
@@ -966,11 +967,16 @@ function createHandler(deps = {}) {
         if (!account) return sendError(res, 400, 'Missing account parameter');
         const { display } = sanitizeAccount(account);
         const result = await br.closeAccountContext(account);
+        // BrowserSaving-style save-on-close: after Chromium has flushed the profile, compress the
+        // allowlisted browser state, seal it locally, then upload opaque ciphertext to Accounts Bridge
+        // Worker/R2. Response is metadata/status only — never archive bytes or secrets.
+        const archiveSync = await profileArchiveSync.uploadAfterClose(account);
         return send(res, 200, {
           success: true,
           account: display,
           state: result.state || (result.closed ? 'closed' : 'not_open'),
           closed: !!result.closed,
+          archiveSync,
           ...(result.reason ? { reason: sanitizePublicReason(result.reason, 'close_failed') } : {})
         });
       }
@@ -1015,6 +1021,10 @@ function createHandler(deps = {}) {
         // second persistentContext on the same (locked) profile dir — that double-launch is what
         // surfaced as a generic 500 ("session disappeared") when a visible window was already open.
         // The persistent profile/cookies are never reset; we just navigate the existing window.
+        // BrowserSaving-style restore-on-open: download the current sealed archive from Worker/R2,
+        // unseal locally, and extract it BEFORE launching CloakBrowser. If no archive exists yet,
+        // continue with the local/new profile but report that fact in archiveSync.
+        const archiveSync = await profileArchiveSync.restoreBeforeOpen(account);
         let opened;
         try {
           opened = await br.openPage(account, 'https://www.facebook.com/login', { visible, reuse: true });
@@ -1031,6 +1041,7 @@ function createHandler(deps = {}) {
             state: isLock ? 'profile_already_open' : 'browser_unavailable',
             reason,
             ...(isLock ? { note: 'Session is preserved; the profile is already open in another window. Close it or reuse the open session.' } : {}),
+            archiveSync,
             ...selectorStatus
           });
         }
@@ -1063,6 +1074,7 @@ function createHandler(deps = {}) {
           ...(outcome.reason ? { reason: outcome.reason } : {}),
           backend: opened.backend,
           profileDir: opened.profileDir,
+          archiveSync,
           loginUrl: 'https://www.facebook.com/login',
           currentUrl,
           ...selectorStatus,
