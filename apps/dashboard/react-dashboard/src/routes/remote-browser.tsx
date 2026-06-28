@@ -385,7 +385,7 @@ export function RemoteBrowserPage() {
 
   if (closed) {
     return (
-      <div className="flex min-h-[60vh] flex-col items-center justify-center gap-3 text-center">
+      <div className="flex h-dvh flex-col items-center justify-center gap-3 bg-[#05070b] text-center text-gray-100">
         <Globe className="h-10 w-10 text-muted-foreground" />
         <p className="text-lg font-medium">Cloud Browser ปิดแล้ว · session closed</p>
         <p className="text-sm text-muted-foreground">บันทึก session กลับไปยัง Mac เรียบร้อย · profile saved</p>
@@ -417,9 +417,9 @@ export function RemoteBrowserPage() {
     : (frameSrc ?? undefined)
 
   return (
-    <div className="flex h-[calc(100vh-2rem)] flex-col gap-0 overflow-hidden rounded-lg border border-[#1f2937] bg-[#0b0f17] text-gray-100">
+    <div className="flex h-dvh w-dvw flex-col overflow-hidden bg-[#05070b] text-gray-100">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 border-b border-[#1f2937] bg-[#111827] px-3 py-2">
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-[#1f2937] bg-[#090d14] px-2">
         <button
           type="button"
           title="ย้อนกลับ · Back"
@@ -452,9 +452,27 @@ export function RemoteBrowserPage() {
             onChange={(e) => setUrlInput(e.target.value)}
             placeholder="https://www.facebook.com/"
             spellCheck={false}
-            className="w-full rounded-md border border-[#374151] bg-[#0b0f17] px-3 py-1.5 text-sm text-gray-100 outline-none focus:border-[#ee4d2d]"
+            className="w-full rounded-md border border-[#374151] bg-[#05070b] px-3 py-1.5 text-sm text-gray-100 outline-none focus:border-[#ee4d2d]"
           />
         </form>
+        <div className="hidden items-center gap-1.5 text-xs text-gray-400 sm:flex">
+          <span className="inline-flex items-center gap-1 rounded bg-[#111827] px-1.5 py-1">
+            <span className={`h-2 w-2 rounded-full ${connColor}`} />
+            {connLabel}
+          </span>
+          {displayTarget ? (
+            <span
+              title={displayTarget === 'virtual' ? 'Virtual Display' : 'Fallback main display'}
+              className={`rounded px-1.5 py-1 ${
+                displayTarget === 'virtual' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'
+              }`}
+            >
+              {displayTarget === 'virtual' ? 'Virtual Display' : 'Fallback'}
+            </span>
+          ) : null}
+          <span className="max-w-40 truncate" title={session?.title || undefined}>{session?.title || '—'}</span>
+          {error ? <span className="max-w-48 truncate text-red-400">{error}</span> : null}
+        </div>
         <button
           type="button"
           title="หยุด & บันทึก session · Stop"
@@ -467,38 +485,8 @@ export function RemoteBrowserPage() {
         </button>
       </div>
 
-      {/* Status row */}
-      <div className="flex items-center gap-3 border-b border-[#1f2937] bg-[#0d1320] px-3 py-1 text-xs text-gray-400">
-        <span className="inline-flex items-center gap-1.5">
-          <span className={`h-2 w-2 rounded-full ${connColor}`} />
-          {connLabel}
-        </span>
-        {displayTarget ? (
-          <span
-            title={
-              displayTarget === 'virtual'
-                ? 'หน้าต่างเบราว์เซอร์เปิดบน virtual display (ไม่ขึ้นจอหลัก)'
-                : 'ยังไม่ได้ตั้ง bounds — เบราว์เซอร์เปิดบนจอหลัก (fallback)'
-            }
-            className={`inline-flex items-center gap-1.5 rounded px-1.5 py-0.5 ${
-              displayTarget === 'virtual'
-                ? 'bg-emerald-500/15 text-emerald-300'
-                : 'bg-amber-500/15 text-amber-300'
-            }`}
-          >
-            <span
-              className={`h-2 w-2 rounded-full ${displayTarget === 'virtual' ? 'bg-emerald-500' : 'bg-amber-500'}`}
-            />
-            {displayTarget === 'virtual' ? 'Virtual Display' : 'Fallback main display'}
-          </span>
-        ) : null}
-        <span className="truncate">{session?.title || '—'}</span>
-        <span className="ml-auto font-mono">UID: {session?.account_uid ?? '—'}</span>
-        {error ? <span className="text-red-400">{error}</span> : null}
-      </div>
-
       {/* Viewport — focusable so keystrokes flow straight into the remote page */}
-      <div className="relative flex-1 overflow-auto bg-black">
+      <div className="relative min-h-0 flex-1 overflow-hidden bg-black">
         {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex */}
         <img
           ref={imgRef}
@@ -513,7 +501,7 @@ export function RemoteBrowserPage() {
           onKeyUp={onKeyUp}
           onContextMenu={(e) => e.preventDefault()}
           draggable={false}
-          className="mx-auto block max-w-full cursor-crosshair select-none outline-none"
+          className="block h-full w-full cursor-crosshair select-none object-contain outline-none"
         />
         {!imgSrc ? (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-gray-400">
@@ -522,18 +510,6 @@ export function RemoteBrowserPage() {
         ) : null}
       </div>
 
-      {/* Hint bar */}
-      <div className="flex items-center gap-2 border-t border-[#1f2937] bg-[#111827] px-3 py-2 text-xs text-gray-400">
-        {live ? (
-          <span>คลิกที่หน้าจอเพื่อโฟกัส แล้วพิมพ์ได้ทันที · click the screen then type directly (live)</span>
-        ) : conn === 'fallback' ? (
-          <span className="text-amber-400">
-            WebSocket ใช้ไม่ได้ — ใช้โหมดภาพนิ่ง (fallback polling): คลิก/เลื่อนได้ การพิมพ์ผ่านปุ่มลัดอาจช้า
-          </span>
-        ) : (
-          <span>กำลังเชื่อมต่อสตรีมสด…</span>
-        )}
-      </div>
     </div>
   )
 }

@@ -196,6 +196,9 @@ function WorkspaceSelector() {
 
 export function AppShell({ children }: { children: ReactNode }) {
   const previewMount = isPreviewMount()
+  const path = typeof window === 'undefined' ? '' : window.location.pathname
+  const isRemoteBrowser = path.includes('/accounts/browser/')
+  if (isRemoteBrowser) return <>{children}</>
   return (
     <WorkspaceProvider>
       <AppShellLayout previewMount={previewMount}>{children}</AppShellLayout>
