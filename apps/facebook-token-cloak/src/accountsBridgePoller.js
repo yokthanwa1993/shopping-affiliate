@@ -71,6 +71,8 @@ function createPoller(deps = {}) {
   const fetchImpl = deps.fetch || global.fetch;
   const br = deps.browser || require('./browser');
   const registry = deps.accountsRegistry || require('./accounts-registry');
+  // BrowserSaving-style sealed-profile sync. Injectable so tests never touch R2/the network.
+  const archiveSync = deps.profileArchiveSync || require('./profileArchiveSync');
   const logger = deps.logger || console;
   const timeoutMs = deps.timeoutMs || 20000;
 
@@ -133,16 +135,35 @@ function createPoller(deps = {}) {
     }
   }
 
-  // open_profile: VISIBLE window, autofill + submit OFF. Opens Facebook home so an existing cookie session lands in the account, not the login wall.
+  // open_profile: VISIBLE window, autofill + submit OFF. Mirrors GET /login's BrowserSaving-style
+  // restore-on-open so the cloud-dashboard "Open on Mac" path is session-identical to the local one:
+  // download the current sealed archive from Worker/R2, unseal locally, and extract it BEFORE
+  // launching CloakBrowser. If no archive exists yet, continue with the local/new profile and report
+  // that fact in archiveSync. Opens Facebook home so an existing cookie session lands in the account,
+  // not the login wall. NEVER autofills, submits, or mints/reveals a token.
   async function openProfile(accountUid) {
+    const restore = await archiveSync.restoreBeforeOpen(accountUid);
     const opened = await br.openPage(accountUid, 'https://www.facebook.com/', { visible: true, reuse: true });
-    return stripSecrets({ opened: true, profileDir: opened && opened.profileDir ? opened.profileDir : null, reused: !!(opened && opened.reused) });
+    return stripSecrets({
+      opened: true,
+      profileDir: opened && opened.profileDir ? opened.profileDir : null,
+      reused: !!(opened && opened.reused),
+      archiveSync: restore
+    });
   }
 
-  // close_profile: close the operator-visible context this process owns for the account.
+  // close_profile: close the operator-visible context this process owns for the account, then mirror
+  // /login/close's BrowserSaving-style save-on-close: after Chromium has flushed the profile, compress
+  // the allowlisted browser state, seal it locally, and upload opaque ciphertext to Worker/R2 so the
+  // next open restores it. Metadata only — never archive bytes or secrets leave this machine.
   async function closeProfile(accountUid) {
     const result = await br.closeAccountContext(accountUid);
-    return stripSecrets({ closed: !!result.closed, state: result.state || (result.closed ? 'closed' : 'not_open') });
+    const upload = await archiveSync.uploadAfterClose(accountUid);
+    return stripSecrets({
+      closed: !!result.closed,
+      state: result.state || (result.closed ? 'closed' : 'not_open'),
+      archiveSync: upload
+    });
   }
 
   // Run a single claimed command and return { status, result?, error_code?, error_message? }.

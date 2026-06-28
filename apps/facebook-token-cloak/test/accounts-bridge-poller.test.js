@@ -36,6 +36,15 @@ function mockRegistry(accounts) {
   return { listAccounts: async () => accounts };
 }
 
+// A profileArchiveSync mock that records call order so tests can prove restore-before-open and
+// upload-after-close, without touching R2/the network/the filesystem.
+function mockArchiveSync(order = [], overrides = {}) {
+  return {
+    restoreBeforeOpen: async (account) => { order.push(`restore:${account}`); return overrides.restore || { ok: true, restored: true, role: 'page_posting_facebook_lite', bytes: 1234 }; },
+    uploadAfterClose: async (account) => { order.push(`upload:${account}`); return overrides.upload || { ok: true, uploaded: true, role: 'page_posting_facebook_lite', bytes: 4321, files: 9 }; }
+  };
+}
+
 const SECRET_KEYS_RE = /password|token|cookie|secret|datr|dtsg|totp/i;
 function assertNoSecretKeys(obj) {
   const walk = (v) => {
@@ -105,15 +114,17 @@ test('syncAccounts uploads ONLY token-free identity fields (uid + display label)
 });
 
 test('open_profile reuses the safe visible open (no autofill/submit) and reports a sanitized result', async () => {
+  const order = [];
   const openCalls = [];
   const browser = {
     openPage: async (account, url, options) => {
+      order.push(`open:${account}`);
       openCalls.push({ account, url, options });
       // Even if the browser layer returned a secret-shaped field, it must be stripped before upload.
       return { profileDir: 'chearb', reused: false, access_token: 'EAABsecret-should-be-stripped' };
     }
   };
-  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]) });
+  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]), profileArchiveSync: mockArchiveSync(order) });
   const outcome = await poller.runCommand({ id: 'cmd_1', action: 'open_profile', account_uid: 'chearb' });
   assert.equal(outcome.status, 'succeeded');
   assert.equal(openCalls.length, 1);
@@ -124,19 +135,40 @@ test('open_profile reuses the safe visible open (no autofill/submit) and reports
   // CRITICAL: autofill and submit are never enabled by the agent path.
   assert.notEqual(openCalls[0].options.autofill, true);
   assert.notEqual(openCalls[0].options.submit, true);
+  // BrowserSaving parity: the sealed archive is restored BEFORE the window is opened.
+  assert.deepEqual(order, ['restore:chearb', 'open:chearb']);
+  assert.equal(outcome.result.archiveSync.restored, true);
   assertNoSecretKeys(outcome.result);
   assert.equal(outcome.result.access_token, undefined);
   assert.equal(outcome.result.opened, true);
 });
 
-test('close_profile delegates to closeAccountContext', async () => {
+test('open_profile restore-before-open metadata is sanitized of any secret-shaped key', async () => {
+  const browser = { openPage: async () => ({ profileDir: 'chearb', reused: true }) };
+  // Even if archive sync somehow surfaced a secret-shaped field, stripSecrets must drop it.
+  const archive = mockArchiveSync([], { restore: { ok: true, restored: true, role: 'x', access_token: 'EAABleak', cookie: 'c_user=leak' } });
+  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]), profileArchiveSync: archive });
+  const outcome = await poller.runCommand({ id: 'cmd_1b', action: 'open_profile', account_uid: 'chearb' });
+  assert.equal(outcome.status, 'succeeded');
+  assertNoSecretKeys(outcome.result);
+  assert.equal(outcome.result.archiveSync.access_token, undefined);
+  assert.equal(outcome.result.archiveSync.cookie, undefined);
+  assert.equal(outcome.result.archiveSync.restored, true);
+});
+
+test('close_profile delegates to closeAccountContext and uploads the sealed archive after closing', async () => {
+  const order = [];
   const closeCalls = [];
-  const browser = { closeAccountContext: async (account) => { closeCalls.push(account); return { closed: true, state: 'closed' }; } };
-  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]) });
+  const browser = { closeAccountContext: async (account) => { order.push(`close:${account}`); closeCalls.push(account); return { closed: true, state: 'closed' }; } };
+  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]), profileArchiveSync: mockArchiveSync(order) });
   const outcome = await poller.runCommand({ id: 'cmd_2', action: 'close_profile', account_uid: 'chearb' });
   assert.equal(outcome.status, 'succeeded');
   assert.deepEqual(closeCalls, ['chearb']);
   assert.equal(outcome.result.closed, true);
+  // BrowserSaving parity: the profile is uploaded AFTER the context is closed (and flushed).
+  assert.deepEqual(order, ['close:chearb', 'upload:chearb']);
+  assert.equal(outcome.result.archiveSync.uploaded, true);
+  assertNoSecretKeys(outcome.result);
 });
 
 test('open_profile / close_profile fail cleanly without an account_uid', async () => {
@@ -148,7 +180,7 @@ test('open_profile / close_profile fail cleanly without an account_uid', async (
 
 test('a browser error becomes a failed outcome with a sanitized code, never a throw', async () => {
   const browser = { openPage: async () => { const e = new Error('profile is locked'); e.code = 'profile_already_open'; throw e; } };
-  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]) });
+  const poller = createPoller({ env: CONFIGURED_ENV, fetch: makeFetch([]), browser, accountsRegistry: mockRegistry([]), profileArchiveSync: mockArchiveSync() });
   const outcome = await poller.runCommand({ id: 'c', action: 'open_profile', account_uid: 'chearb' });
   assert.equal(outcome.status, 'failed');
   assert.equal(outcome.error_code, 'profile_already_open');
@@ -160,7 +192,7 @@ test('poll claims a command, runs it, and reports a sanitized completion', async
     ['/complete', { status: 200 }]
   ]);
   const browser = { openPage: async () => ({ profileDir: 'chearb', reused: true, cookie: 'c_user=should-not-leave' }) };
-  const poller = createPoller({ env: CONFIGURED_ENV, fetch: fetchImpl, browser, accountsRegistry: mockRegistry([]) });
+  const poller = createPoller({ env: CONFIGURED_ENV, fetch: fetchImpl, browser, accountsRegistry: mockRegistry([]), profileArchiveSync: mockArchiveSync() });
   const done = await poller.poll();
   assert.deepEqual(done, ['cmd_99']);
   const complete = fetchImpl.calls.find((c) => c.url.includes('/complete'));

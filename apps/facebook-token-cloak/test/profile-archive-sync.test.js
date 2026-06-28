@@ -69,6 +69,29 @@ test('restoreBeforeOpen downloads sealed bytes and restores selected files', asy
   assert.equal(fs.readFileSync(path.join(root, 'uidrestore', 'Default', 'Preferences'), 'utf8'), '{"ok":true}');
 });
 
+test('default Worker URL targets the active accounts-bridge worker when env is unset', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-sync-'));
+  // Clear the explicit URL so the module must fall back to its baked-in DEFAULT_WORKER_URL.
+  delete process.env.ACCOUNTS_BRIDGE_WORKER_URL;
+  delete process.env.ACCOUNTS_BRIDGE_URL;
+  process.env.FACEBOOK_TOKEN_CLOAK_PROFILE_ROOT = root;
+  process.env.ACCOUNTS_BRIDGE_PROFILE_SYNC = '1';
+  process.env.ACCOUNTS_BRIDGE_API_KEY = 'test-api-key';
+  process.env.ACCOUNTS_BRIDGE_ARCHIVE_SECRET = 'test-archive-secret';
+  delete require.cache[require.resolve('../src/browser')];
+  delete require.cache[require.resolve('../src/profileArchiveSync')];
+  const sync = require('../src/profileArchiveSync');
+  const cfg = sync.configured();
+  assert.equal(cfg.configured, true);
+  assert.equal(cfg.baseUrl, 'https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev');
+  assert.equal(cfg.baseUrl.includes('onlyy-gor'), false);
+  const urls = [];
+  global.fetch = async (url) => { urls.push(String(url)); return { ok: false, status: 500, json: async () => ({}) }; };
+  await sync.restoreBeforeOpen('UIDDEFAULT');
+  assert.ok(urls.length > 0);
+  assert.ok(urls.every(u => u.startsWith('https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev')), `unexpected target: ${urls.join(', ')}`);
+});
+
 test('uploadAfterClose seals tarball and uploads ciphertext only', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ab-sync-'));
   const sync = freshModule(root);

@@ -14,7 +14,7 @@ const { sanitizeAccount } = require('./accounts');
 const { PROFILE_ROOT, profileDirFor } = require('./browser');
 
 const ARCHIVE_MAGIC = Buffer.from('ABENC1', 'ascii');
-const DEFAULT_WORKER_URL = 'https://accounts-bridge-worker.onlyy-gor.workers.dev';
+const DEFAULT_WORKER_URL = 'https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev';
 const NATIVE_ACCOUNTS_JSON = path.join(os.homedir(), 'Library', 'Application Support', 'fb-lite-token-tool', 'accounts.json');
 
 // Same intent as BrowserSaving's browser-data tarball, restricted to Chromium state paths.
