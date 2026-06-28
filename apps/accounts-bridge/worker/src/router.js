@@ -9,6 +9,7 @@
 //   * Page bindings reject a mismatched account/role: the account must actually hold the role.
 
 import { AccountsStore } from './store.js';
+import { getCredentialKey, detectImageMime } from './crypto.js';
 import {
   SERVICE,
   API_VERSION,
@@ -18,6 +19,9 @@ import {
   COMMAND_ACTIONS,
   COMMAND_TERMINAL_STATUSES,
   AGENT_STATUSES,
+  ACCOUNT_TAGS,
+  AVATAR_MAX_BYTES,
+  CREDENTIAL_FIELD_NAMES,
   HttpError,
   badRequest,
   assertPlatform,
@@ -58,6 +62,46 @@ async function readJson(request) {
     throw badRequest('JSON object body required', 'bad_json');
   }
   return body;
+}
+
+// Parse an avatar upload from multipart/form-data (file field), application/json (data_url/base64), or
+// a raw image body. Validates the image TYPE by signature (never trusting a client-claimed MIME) and
+// the size cap. Returns { bytes, mime } where mime is the canonical png/jpeg/webp.
+async function readAvatarUpload(request) {
+  const ct = (request.headers.get('content-type') || '').toLowerCase();
+  let bytes = null;
+  if (ct.includes('multipart/form-data')) {
+    let form;
+    try { form = await request.formData(); } catch { throw badRequest('invalid multipart form', 'bad_avatar'); }
+    const file = form.get('file') || form.get('avatar') || form.get('image');
+    if (!file || typeof file === 'string' || typeof file.arrayBuffer !== 'function') {
+      throw badRequest('avatar file field required', 'bad_avatar');
+    }
+    bytes = new Uint8Array(await file.arrayBuffer());
+  } else if (ct.includes('application/json')) {
+    const body = await readJson(request);
+    let b64 = null;
+    if (typeof body.data_url === 'string') {
+      const m = body.data_url.match(/^data:[^;,]*;base64,(.+)$/);
+      if (!m) throw badRequest('data_url must be a base64 image data URL', 'bad_avatar');
+      b64 = m[1];
+    } else if (typeof body.base64 === 'string') {
+      b64 = body.base64.replace(/^data:[^,]*,/, '');
+    }
+    if (!b64) throw badRequest('avatar image (data_url or base64) required', 'bad_avatar');
+    try {
+      bytes = Uint8Array.from(atob(b64.trim()), (ch) => ch.charCodeAt(0));
+    } catch {
+      throw badRequest('avatar base64 is invalid', 'bad_avatar');
+    }
+  } else {
+    bytes = new Uint8Array(await request.arrayBuffer());
+  }
+  if (!bytes || bytes.byteLength === 0) throw badRequest('avatar image is empty', 'bad_avatar');
+  if (bytes.byteLength > AVATAR_MAX_BYTES) throw badRequest('avatar image is too large (max 2MB)', 'avatar_too_large');
+  const mime = detectImageMime(bytes);
+  if (!mime) throw badRequest('avatar must be a PNG, JPEG, or WEBP image', 'bad_avatar_type');
+  return { bytes, mime };
 }
 
 function assertSafeDetail(detail) {
@@ -122,6 +166,27 @@ function readAccountRole(value) {
   if (value == null || value === '') return null;
   return assertIdentifier('account_role', value, { maxLen: ACCOUNT_ROLE_MAX });
 }
+
+// BrowserSaving-style single tag: exactly one of post/comment/mobile, or null when blank/absent.
+function readAccountTag(value) {
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string') throw badRequest('tag must be a string', 'bad_tag');
+  const v = value.trim().toLowerCase();
+  if (!ACCOUNT_TAGS.includes(v)) throw badRequest(`tag must be one of ${ACCOUNT_TAGS.join(', ')}`, 'bad_tag');
+  return v;
+}
+
+// Non-secret login email LABEL (never a password). Loose sanity check only; null when blank/absent.
+function readAccountEmail(value) {
+  if (value == null || value === '') return null;
+  if (typeof value !== 'string') throw badRequest('email must be a string', 'bad_email');
+  const v = value.trim();
+  if (v === '') return null;
+  if (v.length > 200 || /[\x00-\x1f\x7f]/.test(v) || !/^[^@\s]+@[^@\s]+$/.test(v)) {
+    throw badRequest('email is invalid', 'bad_email');
+  }
+  return v;
+}
 function readPreferredAgentId(value) {
   if (value == null || value === '') return null;
   return assertIdentifier('preferred_agent_id', value, { maxLen: 120 });
@@ -133,8 +198,11 @@ function readAccountMetadataForCreate(body) {
     display_label: optAccountText('display_label', body.display_label, { maxLen: 120 }),
     notes: optAccountText('notes', body.notes, { maxLen: 500, allowNewlines: true }),
     tags: validateTagsInput(body.tags) ?? null,
+    tag: readAccountTag(body.tag),
     page_label: optAccountText('page_label', body.page_label, { maxLen: 120 }),
     account_role: readAccountRole(body.account_role),
+    homepage_url: optAccountText('homepage_url', body.homepage_url, { maxLen: 300 }),
+    email: readAccountEmail(body.email),
     preferred_agent_id: readPreferredAgentId(body.preferred_agent_id)
   };
 }
@@ -146,8 +214,11 @@ function readAccountMetadataForPatch(body) {
   if ('display_label' in body) patch.display_label = optAccountText('display_label', body.display_label, { maxLen: 120 });
   if ('notes' in body) patch.notes = optAccountText('notes', body.notes, { maxLen: 500, allowNewlines: true });
   if ('tags' in body) patch.tags = validateTagsInput(body.tags) ?? null;
+  if ('tag' in body) patch.tag = readAccountTag(body.tag);
   if ('page_label' in body) patch.page_label = optAccountText('page_label', body.page_label, { maxLen: 120 });
   if ('account_role' in body) patch.account_role = readAccountRole(body.account_role);
+  if ('homepage_url' in body) patch.homepage_url = optAccountText('homepage_url', body.homepage_url, { maxLen: 300 });
+  if ('email' in body) patch.email = readAccountEmail(body.email);
   if ('preferred_agent_id' in body) patch.preferred_agent_id = readPreferredAgentId(body.preferred_agent_id);
   const status = normalizeAccountStatus(body.status);
   if (status !== undefined) patch.status = status;
@@ -162,8 +233,15 @@ function platformFromQuery(url, fallback = 'facebook') {
 
 export function createStore(env, opts = {}) {
   if (!env || !env.DB) throw new HttpError('DB binding missing', 500, 'no_db');
-  // PROFILE_ARCHIVES is the optional R2 bucket binding for sealed profile archives.
-  return new AccountsStore(env.DB, { bucket: env.PROFILE_ARCHIVES, ...opts });
+  // PROFILE_ARCHIVES = sealed profile archives; ACCOUNT_AVATARS = avatar images. The credential-key
+  // provider seals/opens the AES-GCM credential vault (dedicated ACCOUNTS_BRIDGE_SECRETS_KEY preferred,
+  // else derived from ACCOUNTS_BRIDGE_API_KEY). All optional — only the matching routes require them.
+  return new AccountsStore(env.DB, {
+    bucket: env.PROFILE_ARCHIVES,
+    avatarBucket: env.ACCOUNT_AVATARS,
+    getCredentialKey: () => getCredentialKey(env),
+    ...opts
+  });
 }
 
 // Core dispatch. `store` is injectable for tests; defaults to a D1-backed store.
@@ -254,6 +332,81 @@ export async function handleRequest(request, env, deps = {}) {
         if (!account) return json({ ok: false, error: 'account_not_found' }, 404);
         await store.insertAudit({ event_type: 'account.archived', account_uid: accountUid, platform, source: 'api' });
         return json({ account, archived: true });
+      }
+    }
+
+    // --- account credential vault (WRITE-ONLY; AES-GCM at rest; presence flags ONLY ever returned) ---
+    // The sensitive profile fields (password / datr_cookie / totp_secret / proxy_url) are sealed into a
+    // separate encrypted table. A blank/absent field is left untouched ("leave blank to keep existing");
+    // a `clear_<field>: true` flag removes it. The response is presence booleans + a host-only proxy
+    // hint — a raw secret value is NEVER returned by any method here.
+    const credMatch = path.match(/^\/v1\/accounts\/([a-z]+)\/([^/]+)\/credentials$/);
+    if (credMatch && method === 'PUT') {
+      const platform = assertPlatform(credMatch[1]);
+      const accountUid = assertAccountUid(decodeURIComponent(credMatch[2]));
+      if (!(await store.getAccount(platform, accountUid))) {
+        return json({ ok: false, error: 'account_not_found' }, 404);
+      }
+      const body = await readJson(request);
+      const updates = {};
+      const clears = new Set();
+      for (const f of CREDENTIAL_FIELD_NAMES) {
+        if (body[`clear_${f}`] === true) clears.add(f);
+        if (f in body) {
+          const raw = body[f];
+          if (raw == null || (typeof raw === 'string' && raw.trim() === '')) continue; // blank → keep existing
+          if (typeof raw !== 'string') throw badRequest(`${f} must be a string`, 'bad_credential');
+          const v = raw.trim();
+          if (v.length > 8192) throw badRequest(`${f} is too long`, 'bad_credential');
+          updates[f] = v;
+        }
+      }
+      let presence;
+      try {
+        presence = await store.putCredentials(platform, accountUid, { updates, clears });
+      } catch (err) {
+        if (err && err.code === 'credential_key_unconfigured') {
+          throw new HttpError('Credential vault key is not configured', 503, 'credential_vault_unconfigured');
+        }
+        throw err;
+      }
+      await store.insertAudit({
+        event_type: 'account.credentials_updated',
+        account_uid: accountUid,
+        platform,
+        source: 'api',
+        detail: { set: Object.keys(updates), cleared: [...clears] }
+      });
+      return json({ platform, account_uid: accountUid, ...presence });
+    }
+
+    // --- account avatar (image bytes in R2; non-secret) ---
+    const avatarMatch = path.match(/^\/v1\/accounts\/([a-z]+)\/([^/]+)\/avatar$/);
+    if (avatarMatch) {
+      const platform = assertPlatform(avatarMatch[1]);
+      const accountUid = assertAccountUid(decodeURIComponent(avatarMatch[2]));
+      if (method === 'GET') {
+        const { mime, object } = await store.getAvatarBytes(platform, accountUid);
+        if (!object) return json({ ok: false, error: 'avatar_not_found' }, 404);
+        return new Response(object.body, {
+          status: 200,
+          headers: { 'content-type': mime, 'cache-control': 'private, max-age=300' }
+        });
+      }
+      if (method === 'POST' || method === 'PUT') {
+        if (!(await store.getAccount(platform, accountUid))) {
+          throw new HttpError(`Account not found: ${redact(accountUid)}`, 422, 'account_not_found');
+        }
+        const { bytes, mime } = await readAvatarUpload(request);
+        const account = await store.putAvatar(platform, accountUid, bytes, mime);
+        await store.insertAudit({ event_type: 'account.avatar_updated', account_uid: accountUid, platform, source: 'api', detail: { mime, byte_size: bytes.byteLength } });
+        return json({ account });
+      }
+      if (method === 'DELETE') {
+        const account = await store.deleteAvatar(platform, accountUid);
+        if (!account) return json({ ok: false, error: 'account_not_found' }, 404);
+        await store.insertAudit({ event_type: 'account.avatar_removed', account_uid: accountUid, platform, source: 'api' });
+        return json({ account });
       }
     }
 

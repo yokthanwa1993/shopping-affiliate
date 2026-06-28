@@ -10,6 +10,7 @@
 
 import { newId, nowIso, sha256Hex, sha256HexBytes, assertEncryptedBlob, assertEncryptedArchive, sanitizeErrorMessage, HttpError } from './lib.js';
 import { SCHEMA_SQL } from './schema.js';
+import { CREDENTIAL_FIELDS, sealCredentials, openCredentials, proxyHostHint } from './crypto.js';
 
 // Parse a stored JSON column back to an object, tolerating null/legacy-bad rows (never throws).
 function parseJsonColumn(value) {
@@ -54,7 +55,9 @@ function normalizeTagsToJson(input) {
   return out.length ? JSON.stringify(out) : null;
 }
 
-// Public (non-secret) shape of an accounts row. Metadata columns are operator labels only.
+// Public (non-secret) shape of an accounts row. Metadata columns are operator labels only. Sensitive
+// credentials are NEVER here — only presence booleans (cred_has_* from a LEFT JOIN) and a host-only
+// proxy hint surface. The avatar is a pointer/flag; the bytes are streamed from R2 on a dedicated GET.
 function publicAccountRow(r) {
   if (!r) return null;
   return {
@@ -64,14 +67,40 @@ function publicAccountRow(r) {
     display_label: r.display_label ?? null,
     notes: r.notes ?? null,
     tags: parseTags(r.tags),
+    tag: r.tag ?? null,
     page_label: r.page_label ?? null,
     account_role: r.account_role ?? null,
+    homepage_url: r.homepage_url ?? null,
+    email: r.email ?? null,
     preferred_agent_id: r.preferred_agent_id ?? null,
     status: r.status,
+    avatar_present: !!r.avatar_r2_key,
+    avatar_mime: r.avatar_mime ?? null,
+    avatar_updated_at: r.avatar_updated_at ?? null,
+    // Write-only credential vault: presence flags ONLY (raw values never leave the store).
+    credential_presence: {
+      password: !!r.cred_has_password,
+      datr_cookie: !!r.cred_has_datr_cookie,
+      totp_secret: !!r.cred_has_totp_secret,
+      proxy_url: !!r.cred_has_proxy_url
+    },
+    proxy_host_hint: r.cred_proxy_host_hint ?? null,
     created_at: r.created_at,
     updated_at: r.updated_at
   };
 }
+
+// SELECT that LEFT JOINs the credential presence flags + host-only proxy hint onto an account row.
+// NEVER selects account_credentials.encrypted_blob — the ciphertext never leaves the store boundary.
+const ACCOUNT_SELECT =
+  'SELECT a.*, ' +
+  'c.has_password AS cred_has_password, ' +
+  'c.has_datr_cookie AS cred_has_datr_cookie, ' +
+  'c.has_totp_secret AS cred_has_totp_secret, ' +
+  'c.has_proxy_url AS cred_has_proxy_url, ' +
+  'c.proxy_host_hint AS cred_proxy_host_hint ' +
+  'FROM accounts a ' +
+  'LEFT JOIN account_credentials c ON c.platform = a.platform AND c.account_uid = a.account_uid';
 
 // Public (non-secret) shape of an agent_commands row. payload/result are already non-secret JSON
 // (the API rejects secret-shaped keys/values before insert); error_message was sanitized on write.
@@ -183,12 +212,18 @@ function publicCookie(row) {
 }
 
 export class AccountsStore {
-  constructor(db, { clock, bucket } = {}) {
+  constructor(db, { clock, bucket, avatarBucket, getCredentialKey } = {}) {
     this.db = db;
     this.clock = clock;
     // R2 bucket binding for sealed profile archives (env.PROFILE_ARCHIVES). Optional: only the
     // profile-archive routes require it; the rest of the API is pure D1.
     this.bucket = bucket;
+    // R2 bucket binding for account avatars (env.ACCOUNT_AVATARS). Optional: only the avatar routes
+    // require it. Avatars are ordinary images (NOT secret) stored under account-avatars/{platform}/{uid}.
+    this.avatarBucket = avatarBucket;
+    // async () => ({ key, keyVersion }) for the AES-GCM credential vault, injected by the router from
+    // env. Optional: only the credential routes (and credential merges) require it.
+    this.getCredentialKey = getCredentialKey;
   }
 
   ts() {
@@ -201,7 +236,7 @@ export class AccountsStore {
     for (const stmt of statements) {
       await this.db.prepare(stmt).run();
     }
-    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events', 'profile_archives', 'agents', 'agent_commands'];
+    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events', 'profile_archives', 'agents', 'agent_commands', 'account_credentials'];
     const { results } = await this.db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${wanted.map(() => '?').join(',')}) ORDER BY name`)
       .bind(...wanted)
@@ -214,18 +249,27 @@ export class AccountsStore {
   async listAccounts(platform, { includeArchived = false } = {}) {
     const where = [];
     const args = [];
-    if (platform) { where.push('platform = ?'); args.push(platform); }
-    if (!includeArchived) where.push("status != 'archived'");
-    let sql = 'SELECT * FROM accounts';
+    if (platform) { where.push('a.platform = ?'); args.push(platform); }
+    if (!includeArchived) where.push("a.status != 'archived'");
+    let sql = ACCOUNT_SELECT;
     if (where.length) sql += ' WHERE ' + where.join(' AND ');
-    sql += ' ORDER BY created_at';
+    sql += ' ORDER BY a.created_at';
     const { results } = await this.db.prepare(sql).bind(...args).all();
     return results.map((r) => publicAccountRow(r));
   }
 
+  // Bare account row for existence/identity checks (no credential join). Never returned to a client.
   async getAccount(platform, accountUid) {
     return this.db
       .prepare('SELECT * FROM accounts WHERE platform = ? AND account_uid = ?')
+      .bind(platform, accountUid)
+      .first();
+  }
+
+  // Account row joined with its credential presence flags + proxy hint — the shape behind publicAccount.
+  async getAccountWithCreds(platform, accountUid) {
+    return this.db
+      .prepare(ACCOUNT_SELECT + ' WHERE a.platform = ? AND a.account_uid = ?')
       .bind(platform, accountUid)
       .first();
   }
@@ -236,8 +280,11 @@ export class AccountsStore {
     display_label = null,
     notes = null,
     tags = null,
+    tag = null,
     page_label = null,
     account_role = null,
+    homepage_url = null,
+    email = null,
     preferred_agent_id = null,
     status = 'active'
   }) {
@@ -248,7 +295,7 @@ export class AccountsStore {
     const now = this.ts();
     await this.db
       .prepare(
-        'INSERT INTO accounts (id, account_uid, platform, display_label, notes, tags, page_label, account_role, preferred_agent_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO accounts (id, account_uid, platform, display_label, notes, tags, tag, page_label, account_role, homepage_url, email, preferred_agent_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
       )
       .bind(
         newId('acc'),
@@ -257,8 +304,11 @@ export class AccountsStore {
         display_label,
         notes,
         normalizeTagsToJson(tags),
+        tag,
         page_label,
         account_role,
+        homepage_url,
+        email,
         preferred_agent_id,
         status,
         now,
@@ -280,8 +330,11 @@ export class AccountsStore {
     if ('display_label' in patch) setCol('display_label', patch.display_label ?? null);
     if ('notes' in patch) setCol('notes', patch.notes ?? null);
     if ('tags' in patch) setCol('tags', normalizeTagsToJson(patch.tags));
+    if ('tag' in patch) setCol('tag', patch.tag ?? null);
     if ('page_label' in patch) setCol('page_label', patch.page_label ?? null);
     if ('account_role' in patch) setCol('account_role', patch.account_role ?? null);
+    if ('homepage_url' in patch) setCol('homepage_url', patch.homepage_url ?? null);
+    if ('email' in patch) setCol('email', patch.email ?? null);
     if ('preferred_agent_id' in patch) setCol('preferred_agent_id', patch.preferred_agent_id ?? null);
     if ('status' in patch && patch.status != null) setCol('status', patch.status);
     if (sets.length === 0) {
@@ -313,7 +366,136 @@ export class AccountsStore {
   }
 
   async publicAccount(platform, accountUid) {
-    return publicAccountRow(await this.getAccount(platform, accountUid));
+    return publicAccountRow(await this.getAccountWithCreds(platform, accountUid));
+  }
+
+  // --- credential vault (AES-GCM at rest; write-only; presence flags ONLY ever returned) ----------
+  requireCredentialKey() {
+    if (!this.getCredentialKey) {
+      throw new HttpError('Credential vault is not configured', 503, 'credential_vault_unconfigured');
+    }
+    return this.getCredentialKey();
+  }
+
+  async getCredentialsRow(platform, accountUid) {
+    return this.db
+      .prepare('SELECT * FROM account_credentials WHERE platform = ? AND account_uid = ?')
+      .bind(platform, accountUid)
+      .first();
+  }
+
+  // Presence-only view of the credential vault: which fields are stored, plus a credential-free proxy
+  // host hint. NEVER returns any raw secret value.
+  async credentialPresence(platform, accountUid) {
+    const row = await this.getCredentialsRow(platform, accountUid);
+    return {
+      credential_presence: {
+        password: !!(row && row.has_password),
+        datr_cookie: !!(row && row.has_datr_cookie),
+        totp_secret: !!(row && row.has_totp_secret),
+        proxy_url: !!(row && row.has_proxy_url)
+      },
+      proxy_host_hint: row ? row.proxy_host_hint ?? null : null
+    };
+  }
+
+  // Merge write-only credential fields into the sealed blob. `updates` holds fields to SET (non-blank
+  // strings), `clears` is a Set of field names to remove; any field absent from both is left untouched
+  // (so an edit that re-saves metadata without re-typing a password keeps the existing one). When the
+  // merged set is empty the row is deleted so no ciphertext lingers. Returns presence flags only.
+  async putCredentials(platform, accountUid, { updates = {}, clears = new Set() } = {}) {
+    const { key, keyVersion } = await this.requireCredentialKey();
+    const existingRow = await this.getCredentialsRow(platform, accountUid);
+    const current = existingRow ? await openCredentials(key, existingRow.encrypted_blob) : {};
+    const merged = { ...current };
+    for (const f of CREDENTIAL_FIELDS) {
+      if (clears.has(f)) { delete merged[f]; continue; }
+      if (f in updates && updates[f] != null && updates[f] !== '') merged[f] = updates[f];
+    }
+    // Drop any empty values defensively so presence flags never lie.
+    for (const f of Object.keys(merged)) {
+      if (merged[f] == null || merged[f] === '') delete merged[f];
+    }
+    const now = this.ts();
+    if (Object.keys(merged).length === 0) {
+      if (existingRow) await this.db.prepare('DELETE FROM account_credentials WHERE id = ?').bind(existingRow.id).run();
+      return this.credentialPresence(platform, accountUid);
+    }
+    const blob = await sealCredentials(key, merged);
+    const proxyHint = merged.proxy_url ? proxyHostHint(merged.proxy_url) : null;
+    const flags = [
+      merged.password ? 1 : 0,
+      merged.datr_cookie ? 1 : 0,
+      merged.totp_secret ? 1 : 0,
+      merged.proxy_url ? 1 : 0
+    ];
+    if (existingRow) {
+      await this.db
+        .prepare(
+          'UPDATE account_credentials SET encrypted_blob = ?, cipher = ?, key_version = ?, has_password = ?, has_datr_cookie = ?, has_totp_secret = ?, has_proxy_url = ?, proxy_host_hint = ?, updated_at = ? WHERE id = ?'
+        )
+        .bind(blob, 'aesgcm', keyVersion, flags[0], flags[1], flags[2], flags[3], proxyHint, now, existingRow.id)
+        .run();
+    } else {
+      await this.db
+        .prepare(
+          'INSERT INTO account_credentials (id, platform, account_uid, encrypted_blob, cipher, key_version, has_password, has_datr_cookie, has_totp_secret, has_proxy_url, proxy_host_hint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .bind(newId('cred'), platform, accountUid, blob, 'aesgcm', keyVersion, flags[0], flags[1], flags[2], flags[3], proxyHint, now, now)
+        .run();
+    }
+    return this.credentialPresence(platform, accountUid);
+  }
+
+  // --- avatars (bytes in R2; non-secret images; pointer/flag in accounts) -------------------------
+  requireAvatarBucket() {
+    if (!this.avatarBucket) {
+      throw new HttpError('Avatar storage (R2) is not configured', 503, 'avatar_store_unconfigured');
+    }
+    return this.avatarBucket;
+  }
+
+  avatarR2Key(platform, accountUid) {
+    return `account-avatars/${platform}/${accountUid}`;
+  }
+
+  // Store/replace the avatar image bytes in R2 and point the account row at them. `mime` is the
+  // signature-verified content type (png/jpeg/webp). Returns the updated public account.
+  async putAvatar(platform, accountUid, bytes, mime) {
+    const bucket = this.requireAvatarBucket();
+    const key = this.avatarR2Key(platform, accountUid);
+    await bucket.put(key, bytes, { httpMetadata: { contentType: mime } });
+    const now = this.ts();
+    await this.db
+      .prepare('UPDATE accounts SET avatar_r2_key = ?, avatar_mime = ?, avatar_updated_at = ?, updated_at = ? WHERE platform = ? AND account_uid = ?')
+      .bind(key, mime, now, now, platform, accountUid)
+      .run();
+    return this.publicAccount(platform, accountUid);
+  }
+
+  // Fetch the avatar bytes for streaming. Returns { mime, object } where object is the R2 body or null.
+  async getAvatarBytes(platform, accountUid) {
+    const acc = await this.getAccount(platform, accountUid);
+    if (!acc || !acc.avatar_r2_key) return { mime: null, object: null, updated_at: null };
+    const bucket = this.requireAvatarBucket();
+    const object = await bucket.get(acc.avatar_r2_key);
+    return { mime: acc.avatar_mime || 'application/octet-stream', object, updated_at: acc.avatar_updated_at ?? null };
+  }
+
+  // Remove the avatar (R2 object + account pointer). Returns the updated public account, or null when
+  // the account does not exist.
+  async deleteAvatar(platform, accountUid) {
+    const acc = await this.getAccount(platform, accountUid);
+    if (!acc) return null;
+    if (acc.avatar_r2_key && this.avatarBucket && typeof this.avatarBucket.delete === 'function') {
+      try { await this.avatarBucket.delete(acc.avatar_r2_key); } catch { /* best-effort cleanup */ }
+    }
+    const now = this.ts();
+    await this.db
+      .prepare('UPDATE accounts SET avatar_r2_key = NULL, avatar_mime = NULL, avatar_updated_at = NULL, updated_at = ? WHERE platform = ? AND account_uid = ?')
+      .bind(now, platform, accountUid)
+      .run();
+    return this.publicAccount(platform, accountUid);
   }
 
   // --- roles -------------------------------------------------------------

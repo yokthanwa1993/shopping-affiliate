@@ -92,9 +92,19 @@ export class R2Memory {
     if (!obj) return null;
     return { key, size: obj.bytes.byteLength, customMetadata: obj.customMetadata };
   }
+
+  async delete(key) {
+    this.objects.delete(key);
+  }
 }
 
-// Build an `env`-like object with a fresh in-memory D1 + R2 each call.
+// Build an `env`-like object with a fresh in-memory D1 + R2 (archives + avatars) each call.
 export function makeEnv(overrides = {}) {
-  return { DB: new D1Sqlite(), PROFILE_ARCHIVES: new R2Memory(), ACCOUNTS_BRIDGE_API_KEY: 'test-bridge-key-AAAA', ...overrides };
+  return {
+    DB: new D1Sqlite(),
+    PROFILE_ARCHIVES: new R2Memory(),
+    ACCOUNT_AVATARS: new R2Memory(),
+    ACCOUNTS_BRIDGE_API_KEY: 'test-bridge-key-AAAA',
+    ...overrides
+  };
 }

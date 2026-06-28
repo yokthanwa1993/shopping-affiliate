@@ -62,8 +62,11 @@ compared). `/health` is public. Fails **closed** (503) if the key is unconfigure
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | Liveness + advertised roles (public) |
-| `GET /v1/accounts` | List accounts (token-free) |
-| `POST /v1/accounts` | Create/ensure an account |
+| `GET /v1/accounts` | List accounts (token-free; includes `credential_presence`, `avatar_present`, `proxy_host_hint`) |
+| `POST /v1/accounts` | Create/ensure an account (non-secret metadata: `display_label`, `tag` ∈ {post,comment,mobile}, `homepage_url`, `email`, `notes`, `page_label`, `status`) |
+| `GET` \| `PATCH` \| `DELETE /v1/accounts/:platform/:account_uid` | Read / update metadata / soft-archive a single account |
+| `PUT /v1/accounts/:platform/:account_uid/credentials` | **Write-only** credential vault — `password` / `datr_cookie` / `totp_secret` / `proxy_url` are AES-GCM-sealed; blank field keeps existing, `clear_<field>:true` removes; returns **presence flags + host-only `proxy_host_hint` only** |
+| `GET` \| `POST` \| `PUT` \| `DELETE /v1/accounts/:platform/:account_uid/avatar` | Avatar image bytes in R2 (png/jpeg/webp ≤2MB, validated by signature); GET streams the image |
 | `GET /v1/roles/facebook` | Read the role→account mapping |
 | `PUT /v1/roles/facebook` | Assign/clear role owners |
 | `GET /v1/pages/:page_id/binding` | Read a page's role bindings |
@@ -160,6 +163,9 @@ npm test                          # manifest path-safety + ABENC1 envelope round
 | Name | Where | What |
 |---|---|---|
 | `ACCOUNTS_BRIDGE_API_KEY` | Worker secret + macOS Keychain (local app) | Shared local-bridge API key for `/v1/*` |
+| `ACCOUNTS_BRIDGE_SECRETS_KEY` | Worker secret (**preferred**, optional) | Dedicated AES-GCM key for the credential vault. If unset, the key is **derived from `ACCOUNTS_BRIDGE_API_KEY`** so deployment still works — but a dedicated key is preferred (rotating the API key would otherwise re-key the vault). Set with `wrangler secret put ACCOUNTS_BRIDGE_SECRETS_KEY`. |
+
+R2 bucket for avatars (one-time): `wrangler r2 bucket create accounts-bridge-account-avatars` (binding `ACCOUNT_AVATARS`).
 
 ## Migration / audit path
 

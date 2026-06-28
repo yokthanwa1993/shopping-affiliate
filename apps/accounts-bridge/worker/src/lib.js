@@ -21,6 +21,16 @@ export const SURFACE_ROLE = Object.freeze({
   ads: 'ads_power_editor'
 });
 
+// BrowserSaving-style single profile tag. Exactly one of these (or null) per account.
+export const ACCOUNT_TAGS = Object.freeze(['post', 'comment', 'mobile']);
+
+// Avatar upload limits. Bytes are stored in R2; only png/jpeg/webp by SIGNATURE are accepted.
+export const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // ~2MB
+export const AVATAR_MIME_TYPES = Object.freeze(['image/png', 'image/jpeg', 'image/webp']);
+
+// The write-only credential fields the vault accepts. NEVER returned by any GET.
+export const CREDENTIAL_FIELD_NAMES = Object.freeze(['password', 'datr_cookie', 'totp_secret', 'proxy_url']);
+
 // Agent command-queue vocabulary. Actions are the MVP set the local Mac agent understands; statuses
 // walk a fixed lifecycle (queued -> running -> terminal). Agent heartbeat statuses are a small set.
 export const COMMAND_ACTIONS = Object.freeze(['open_profile', 'close_profile', 'sync_accounts', 'status']);
