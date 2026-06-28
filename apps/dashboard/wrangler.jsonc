@@ -68,7 +68,7 @@
     // src/server/accountsbridge.ts forwards to this origin and injects the API key server-side.
     // The API key itself is a SECRET — never put it here. Set it with:
     //   wrangler secret put ACCOUNTS_BRIDGE_API_KEY
-    "ACCOUNTS_BRIDGE_WORKER_URL": "https://accounts-bridge-worker.onlyy-gor.workers.dev"
+    "ACCOUNTS_BRIDGE_WORKER_URL": "https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev"
   },
   "observability": {
     "enabled": true

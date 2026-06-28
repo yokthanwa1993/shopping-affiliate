@@ -18,7 +18,7 @@
 //     which bin/start.js does ONLY when ACCOUNTS_BRIDGE_WORKER_URL + ACCOUNTS_BRIDGE_API_KEY are set.
 //   * It adds NO local web UI and never touches the root '/' native-only invariant.
 
-const DEFAULT_WORKER_URL = 'https://accounts-bridge-worker.onlyy-gor.workers.dev';
+const DEFAULT_WORKER_URL = 'https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev';
 const DEFAULT_AGENT_ID = 'mac-mini';
 const DEFAULT_POLL_MS = 5000;
 
@@ -218,8 +218,14 @@ function createPoller(deps = {}) {
     if (ticking) return;
     ticking = true;
     try {
-      await heartbeat();
-      await poll();
+      const ok = await heartbeat();
+      const done = await poll();
+      if (done.length && logger.log) logger.log(`[accounts-bridge-poller] completed commands: ${done.join(',')}`);
+      return { heartbeat: ok, done };
+    } catch (e) {
+      const code = String((e && (e.code || e.name || e.message)) || 'tick_failed');
+      try { logger.warn && logger.warn(`[accounts-bridge-poller] tick failed: ${code}`); } catch {}
+      return { heartbeat: false, done: [], error: code };
     } finally {
       ticking = false;
     }
@@ -231,10 +237,10 @@ function createPoller(deps = {}) {
       return null;
     }
     logger.log && logger.log(`[accounts-bridge-poller] starting · agent=${agentId} · worker=${cfg.baseUrl} · interval=${cfg.pollMs}ms`);
-    // Prime the cloud once with the current account list, then tick on an interval.
+    // Prime the cloud once with the current account list, then tick immediately and on an interval.
     syncAccounts().then((r) => logger.log && logger.log(`[accounts-bridge-poller] initial account sync: ${r.synced}/${r.total}`)).catch(() => {});
-    timer = setInterval(() => { tick().catch(() => {}); }, cfg.pollMs);
-    if (timer && typeof timer.unref === 'function') timer.unref();
+    tick().then((r) => logger.log && logger.log(`[accounts-bridge-poller] first tick: heartbeat=${!!(r && r.heartbeat)} done=${((r && r.done) || []).length}`)).catch((e) => logger.warn && logger.warn(`[accounts-bridge-poller] first tick failed: ${String(e && e.message)}`));
+    timer = setInterval(() => { tick().catch((e) => { try { logger.warn && logger.warn(`[accounts-bridge-poller] interval tick failed: ${String(e && e.message)}`); } catch {} }); }, cfg.pollMs);
     return handle;
   }
 
