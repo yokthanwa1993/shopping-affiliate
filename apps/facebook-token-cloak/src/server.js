@@ -437,6 +437,32 @@ async function listAccountStatuses(kc, selectors, registry) {
   return out;
 }
 
+// Token-free, no-launch profile/session status for the native Accounts Bridge profile manager.
+// Delegates to browser.profileStatus when available, degrading to a `statusKnown:false` "unknown"
+// verdict for injected/test backends that don't implement it. NEVER opens a browser, mints/refreshes
+// a token, reads a credential, or returns a secret — it only forwards presence/running booleans.
+function safeProfileStatus(br, account) {
+  const { display, key } = sanitizeAccount(account);
+  const unknown = {
+    account: display,
+    key,
+    profileDir: key,
+    profileExists: false,
+    running: false,
+    bridgeSession: false,
+    visibleSession: false,
+    lockPidPresent: false,
+    pidCount: 0,
+    statusKnown: false
+  };
+  if (typeof br.profileStatus !== 'function') return unknown;
+  try {
+    return { ...br.profileStatus(account), statusKnown: true };
+  } catch {
+    return unknown;
+  }
+}
+
 // Local-only readiness for one Facebook role, derived ENTIRELY from cached/local metadata (registry
 // presence + Keychain present/absent flags). No token is minted or refreshed and no browser is
 // opened — these booleans only reflect "do we hold the local material this role would need". Token
@@ -719,6 +745,30 @@ function createHandler(deps = {}) {
         return send(res, 200, {
           roles: buildFacebookBridgeView(roles, accountList),
           note: 'Readiness is derived from cached/local metadata only. No token mint, refresh, or browser open occurs on this call.'
+        });
+      }
+
+      // ── Accounts Bridge: native profile-manager status (token-free, NO browser launch) ──────────
+      // Powers the Swift native "Open Profile / Close Profile / Refresh Status" UI. This is a pure
+      // read: it NEVER opens a browser, mints/refreshes a token, reads a credential, or returns any
+      // secret. It reports only profile presence + whether a browser is currently using the profile
+      // (and whether that is the operator-visible session this bridge owns). Open/Close keep using
+      // /login (visible=1&autofill=0&submit=0) and /login/close — this endpoint must never side-effect.
+      if (req.method === 'GET' && url.pathname === '/accounts/profile-status') {
+        if (!isLocalRequest(req)) return sendError(res, 403, 'Account endpoints are local-only');
+        const account = url.searchParams.get('account');
+        if (account) {
+          try { sanitizeAccount(account); }
+          catch { return sendError(res, 400, 'Invalid account parameter'); }
+          return send(res, 200, {
+            profile: safeProfileStatus(br, account),
+            note: 'Status-only. No token is minted/refreshed and no browser is opened by this call.'
+          });
+        }
+        const accountList = await listAccountStatuses(kc, selectors, registry);
+        return send(res, 200, {
+          profiles: accountList.map(a => safeProfileStatus(br, a.account)),
+          note: 'Status-only. No token is minted/refreshed and no browser is opened by this call.'
         });
       }
 

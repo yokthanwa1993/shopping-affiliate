@@ -109,6 +109,17 @@ function peekAccountContext(rawAccount){
   if(existing&&!isContextAlive(existing.context)) _accountContexts.delete(key);
   return null;
 }
+// Non-launching inspection of the live cached context this server process owns for the account.
+// Unlike peekAccountContext (visible-only, used for posting reuse), this reports ANY live bridge-
+// owned context plus whether it is the operator-visible window — so the native profile-manager UI
+// can show "Running (bridge)" vs "Running (visible)". NEVER launches; evicts a dead cached entry.
+function inspectAccountContext(rawAccount){
+  const {key}=sanitizeAccount(rawAccount);
+  const existing=_accountContexts.get(key);
+  if(existing&&isContextAlive(existing.context)) return {bridgeOwned:true,visible:existing.visible===true};
+  if(existing&&!isContextAlive(existing.context)) _accountContexts.delete(key);
+  return {bridgeOwned:false,visible:false};
+}
 // Patterns for a launchPersistentContext failure caused by the profile dir already being open in
 // another (often orphaned/external) Chromium holding the SingletonLock. Mapped to a stable, non-
 // secret code so the route can answer profile_already_open instead of a generic 500.
@@ -185,6 +196,39 @@ async function closeAccountContext(rawAccount){
   }catch(e){
     return {closed:false, state:'close_failed', reason:String((e&&(e.code||e.message))||'close_failed')};
   }
+}
+
+// Token-free, side-effect-free profile/session status for the native Accounts Bridge profile
+// manager. It NEVER launches a browser, mints/refreshes a token, reads a credential, or returns any
+// secret. It only inspects the in-memory context map + the on-disk profile dir and reports:
+//   account/key       sanitized display + lowercased key (the directory basename)
+//   profileDir        the profile directory BASENAME only (never the full home path — no leakage)
+//   profileExists     whether the persistent profile dir exists on disk
+//   running           a browser is using this profile right now: a live bridge-owned context OR an
+//                     external Chromium still holding the profile's SingletonLock
+//   bridgeSession     this server process owns a live context for the account
+//   visibleSession    that bridge-owned context is the operator-visible window (Open Profile result)
+//   lockPidPresent    a live SingletonLock pid is held (a browser has the profile open)
+//   pidCount          0/1 — count only of the live lock pid (loopback-safe; never the raw pid value)
+function profileStatus(rawAccount){
+  const {key,display}=sanitizeAccount(rawAccount);
+  const profileDir=profileDirFor(key);
+  let profileExists=false;
+  try{ const fs=require('fs'); profileExists=fs.statSync(profileDir).isDirectory(); }catch{}
+  const ctx=inspectAccountContext(rawAccount);
+  const lockPid=singletonLockPid(profileDir);
+  const lockAlive=!!lockPid&&pidExists(lockPid);
+  return {
+    account:display,
+    key,
+    profileDir:key,            // basename only — never the absolute filesystem path
+    profileExists,
+    running:ctx.bridgeOwned||lockAlive,
+    bridgeSession:ctx.bridgeOwned,
+    visibleSession:ctx.visible,
+    lockPidPresent:lockAlive,
+    pidCount:lockAlive?1:0
+  };
 }
 
 async function openPage(rawAccount,url,options={}){
@@ -459,4 +503,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,inspectAccountContext,profileStatus,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
