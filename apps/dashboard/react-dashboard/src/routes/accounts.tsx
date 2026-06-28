@@ -5,10 +5,8 @@ import {
   Cloud,
   CloudOff,
   Facebook,
-  Globe,
   ImagePlus,
   Laptop,
-  Loader2,
   Pencil,
   Play,
   Plus,
@@ -32,7 +30,6 @@ import {
   fetchCloudHealth,
   isAgentLive,
   isValidAccountUid,
-  openOnMac,
   putAccountCredentials,
   startRemoteBrowser,
   updateCloudAccount,
@@ -204,10 +201,6 @@ function AccountRow({
   const agentLive = isAgentLive(agent)
   const canAct = !!agent && agentLive
 
-  const openMutation = useMutation({
-    mutationFn: () => openOnMac(agent!.agent_id, uid),
-    onSuccess: onRefresh,
-  })
   const closeMutation = useMutation({
     mutationFn: () => closeOnMac(agent!.agent_id, uid),
     onSuccess: onRefresh,
@@ -230,8 +223,8 @@ function AccountRow({
       if (tab) tab.close()
     },
   })
-  const busy = openMutation.isPending || closeMutation.isPending || cloudBrowserMutation.isPending
-  const actionError = openMutation.error || closeMutation.error || cloudBrowserMutation.error
+  const busy = closeMutation.isPending || cloudBrowserMutation.isPending
+  const actionError = closeMutation.error || cloudBrowserMutation.error
 
   const run = runStateForAccount(uid, commands, agentLive)
   const isRunning = run.label === 'Running'
@@ -344,9 +337,12 @@ function AccountRow({
           ) : (
             <button
               type="button"
-              title={canAct ? 'เปิดโปรไฟล์บน Mac (Open on Mac)' : 'agent ออฟไลน์'}
-              aria-label="Open on Mac"
-              onClick={() => openMutation.mutate()}
+              title={canAct ? 'เปิด Cloud Browser ในแท็บใหม่ (ขับเบราว์เซอร์จากเว็บ)' : 'agent ออฟไลน์'}
+              aria-label="Open Cloud Browser"
+              onClick={() => {
+                const tab = typeof window !== 'undefined' ? window.open('', '_blank') : null
+                cloudBrowserMutation.mutate(tab)
+              }}
               disabled={!canAct || busy}
               className="inline-flex h-8 items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 text-xs font-medium text-emerald-600 transition-colors hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -358,24 +354,6 @@ function AccountRow({
             <RefreshCw className="h-4 w-4" />
           </IconAction>
           <span className="mx-0.5 h-5 w-px bg-border" />
-          {/* Cloud Browser: start a live remote-browser session on the Mac and DRIVE it from a new tab.
-              The blank tab is opened synchronously here (popup-blocker safe) and handed to the mutation,
-              which points it at the viewer once the session id returns. Stop stays available above. */}
-          <IconAction
-            title={canAct ? 'เปิด Cloud Browser ในแท็บใหม่ (ขับเบราว์เซอร์จากเว็บ)' : 'agent ออฟไลน์'}
-            onClick={() => {
-              const tab = typeof window !== 'undefined' ? window.open('', '_blank') : null
-              cloudBrowserMutation.mutate(tab)
-            }}
-            disabled={!canAct || busy}
-            className="hover:!bg-[#fff1ec] hover:!text-[#ee4d2d]"
-          >
-            {cloudBrowserMutation.isPending ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Globe className="h-4 w-4" />
-            )}
-          </IconAction>
           <IconAction title="แก้ไขบัญชี (Edit)" onClick={onEdit}>
             <Pencil className="h-4 w-4" />
           </IconAction>
@@ -1100,7 +1078,7 @@ export function AccountsPage() {
       )}
 
       <p className="text-[11px] text-muted-foreground">
-        Open enqueues a command; the Mac agent opens a VISIBLE Facebook Lite window with autofill and submit
+        Open starts a Cloud Browser session in a new tab; the Mac agent runs only that browser profile with autofill and submit
         both OFF — no credential is read, no login is submitted, and no token is minted. กด Stop เพื่อให้ agent
         ปิดเบราว์เซอร์แล้วอัปโหลด cookie/session archive กลับขึ้น Worker (ไม่มี token/cookie ดิบแสดงบนหน้านี้).
       </p>
