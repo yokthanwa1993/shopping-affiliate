@@ -133,7 +133,7 @@ function createPoller(deps = {}) {
     }
   }
 
-  // open_profile: VISIBLE window, autofill + submit OFF. Reuses the same safe open path as /login.
+  // open_profile: VISIBLE window, autofill + submit OFF. Opens Facebook home so an existing cookie session lands in the account, not the login wall.
   async function openProfile(accountUid) {
     const opened = await br.openPage(accountUid, 'https://www.facebook.com/', { visible: true, reuse: true });
     return stripSecrets({ opened: true, profileDir: opened && opened.profileDir ? opened.profileDir : null, reused: !!(opened && opened.reused) });
