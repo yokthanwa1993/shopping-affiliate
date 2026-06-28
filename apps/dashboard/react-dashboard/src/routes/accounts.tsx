@@ -10,10 +10,10 @@ import {
   Pencil,
   Play,
   Plus,
-  Power,
   RefreshCw,
   Search,
   Settings,
+  Square,
   Trash2,
 } from 'lucide-react'
 import {
@@ -186,6 +186,7 @@ function AccountRow({
   const actionError = openMutation.error || closeMutation.error
 
   const run = runStateForAccount(uid, commands, agentLive)
+  const isRunning = run.label === 'Running'
 
   return (
     <tr className="border-b border-border last:border-0 hover:bg-[#fafafa]">
@@ -259,21 +260,33 @@ function AccountRow({
       {/* ACTIONS */}
       <td className="min-w-[200px] px-3 py-3 align-middle">
         <div className="flex items-center gap-1.5">
-          <IconAction
-            title={canAct ? 'เปิดโปรไฟล์บน Mac (Open on Mac)' : 'agent ออฟไลน์'}
-            onClick={() => openMutation.mutate()}
-            disabled={!canAct || busy}
-            className="border-emerald-200 bg-emerald-50 text-emerald-600 hover:bg-emerald-100"
-          >
-            <Play className="h-4 w-4" />
-          </IconAction>
-          <IconAction
-            title={canAct ? 'ปิดโปรไฟล์บน Mac (Close on Mac)' : 'agent ออฟไลน์'}
-            onClick={() => closeMutation.mutate()}
-            disabled={!canAct || busy}
-          >
-            <Power className="h-4 w-4" />
-          </IconAction>
+          {/* One primary button, BrowserSaving-style: Play when stopped, Stop when running.
+              Stop reuses closeOnMac → agent closes the browser and uploads the cookie/session archive. */}
+          {isRunning ? (
+            <button
+              type="button"
+              title={canAct ? 'หยุด & บันทึก session บน Mac (Stop on Mac · Save session)' : 'agent ออฟไลน์'}
+              aria-label="Stop on Mac"
+              onClick={() => closeMutation.mutate()}
+              disabled={!canAct || busy}
+              className="inline-flex h-8 items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 text-xs font-medium text-red-600 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Square className="h-3.5 w-3.5 fill-current" />
+              Stop
+            </button>
+          ) : (
+            <button
+              type="button"
+              title={canAct ? 'เปิดโปรไฟล์บน Mac (Open on Mac)' : 'agent ออฟไลน์'}
+              aria-label="Open on Mac"
+              onClick={() => openMutation.mutate()}
+              disabled={!canAct || busy}
+              className="inline-flex h-8 items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 text-xs font-medium text-emerald-600 transition-colors hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Play className="h-3.5 w-3.5 fill-current" />
+              Open
+            </button>
+          )}
           <IconAction title="รีเฟรชสถานะคำสั่ง" onClick={onRefresh}>
             <RefreshCw className="h-4 w-4" />
           </IconAction>
@@ -531,11 +544,11 @@ export function AccountsPage() {
             <span>{filtered.length} profiles</span>
             <span className="flex items-center gap-1.5">
               <span className="inline-flex items-center gap-1">
-                <Play className="h-3 w-3 text-emerald-600" /> Open on Mac
+                <Play className="h-3 w-3 fill-current text-emerald-600" /> เปิด · Open
               </span>
               <span className="text-[#dddddd]">·</span>
               <span className="inline-flex items-center gap-1">
-                <Power className="h-3 w-3" /> Close on Mac
+                <Square className="h-3 w-3 fill-current text-red-600" /> หยุด · Stop = บันทึก session
               </span>
             </span>
           </div>
@@ -544,7 +557,8 @@ export function AccountsPage() {
 
       <p className="text-[11px] text-muted-foreground">
         Open enqueues a command; the Mac agent opens a VISIBLE Facebook Lite window with autofill and submit
-        both OFF — no credential is read, no login is submitted, and no token is minted.
+        both OFF — no credential is read, no login is submitted, and no token is minted. กด Stop เพื่อให้ agent
+        ปิดเบราว์เซอร์แล้วอัปโหลด cookie/session archive กลับขึ้น Worker (ไม่มี token/cookie ดิบแสดงบนหน้านี้).
       </p>
     </div>
   )
