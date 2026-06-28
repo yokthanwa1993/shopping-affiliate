@@ -19,6 +19,7 @@
 
 const crypto = require('crypto');
 const { sanitizeAccount } = require('./accounts');
+const { readVirtualDisplayConfig } = require('./virtualDisplay');
 
 const DEFAULT_URL = 'https://www.facebook.com/';
 // Bound input so a hostile/buggy client cannot drive absurd coordinates or paste megabytes of text.
@@ -104,12 +105,15 @@ function validateHttpUrl(raw) {
 //   browser            the src/browser.js module (openPage / closeAccountContext)
 //   profileArchiveSync the src/profileArchiveSync.js module (restoreBeforeOpen / uploadAfterClose)
 //   defaultUrl         landing URL when start() omits initial_url (default Facebook home)
-function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl } = {}) {
+function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl, env } = {}) {
   if (!browser || typeof browser.openPage !== 'function') {
     throw new Error('createRemoteBrowserManager requires a browser backend with openPage');
   }
   const archive = profileArchiveSync || {};
   const landingUrl = defaultUrl || DEFAULT_URL;
+  // Display config is resolved from env at each start() so an operator can provision the virtual display
+  // bounds and restart the bridge without code changes. `env` is injectable for tests.
+  const displayEnv = env || process.env;
   // session_id -> { session_id, account_uid, context, page, started_at, last_activity_at, status }
   const sessions = new Map();
 
@@ -130,6 +134,7 @@ function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl } 
     let viewport = null;
     try { url = typeof s.page.url === 'function' ? s.page.url() : null; } catch {}
     try { viewport = typeof s.page.viewportSize === 'function' ? s.page.viewportSize() : null; } catch {}
+    const display = s.display || null;
     return {
       id: s.session_id,
       account_uid: s.account_uid,
@@ -137,7 +142,14 @@ function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl } 
       title: title, // filled asynchronously by status(); start() returns null title initially
       status: s.status,
       viewport: viewport || null,
-      started_at: s.started_at
+      started_at: s.started_at,
+      // Non-secret display placement metadata so the dashboard can show a Virtual Display / Fallback
+      // main display chip. These are plain geometry/flags — never cookies/tokens/profile bytes.
+      displayTarget: display ? display.target : null,
+      displayBounds: display ? display.bounds : null,
+      displayConfigured: display ? display.configured : false,
+      placementApplied: display ? display.placementApplied : false,
+      displayReason: display ? display.reason : null
     };
   }
 
@@ -155,9 +167,16 @@ function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl } 
       ? await archive.restoreBeforeOpen(key)
       : { ok: true, skipped: true, reason: 'no_archive_sync' };
 
+    // Resolve the Virtual Display intent: the browser stays HEADFUL (Facebook sees a real display) but
+    // its window is placed onto the configured virtual display so only the viewport is streamed — never
+    // the Mac's main/remote desktop. When no bounds are configured this honestly falls back to the main
+    // display (target='main', reason='virtual_display_bounds_missing') rather than pretending.
+    const displayConfig = readVirtualDisplayConfig(displayEnv);
+
     // visible+reuse mirrors openProfile in the poller — a cached per-account persistent context so a
-    // second open navigates the same window instead of locking the profile dir.
-    const opened = await browser.openPage(key, target, { visible: true, reuse: true });
+    // second open navigates the same window instead of locking the profile dir. `args` carries the
+    // window-position/window-size placement; browser.js merges them with the base anti-automation args.
+    const opened = await browser.openPage(key, target, { visible: true, reuse: true, args: displayConfig.launchArgs });
     const session_id = newSessionId();
     const now = new Date().toISOString();
     const session = {
@@ -167,7 +186,16 @@ function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl } 
       page: opened.page,
       started_at: now,
       last_activity_at: now,
-      status: 'running'
+      status: 'running',
+      // Placement is meaningful only on a FRESH launch; a reused window keeps its prior position, so
+      // report placementApplied honestly as false when the context was reused.
+      display: {
+        target: displayConfig.target,
+        bounds: displayConfig.metadata.displayBounds,
+        configured: displayConfig.configured,
+        placementApplied: displayConfig.placementApplied && !opened.reused,
+        reason: opened.reused ? 'reused_existing_window' : (displayConfig.reason || null)
+      }
     };
     sessions.set(session_id, session);
     return {
@@ -486,7 +514,13 @@ function createRemoteBrowserManager({ browser, profileArchiveSync, defaultUrl } 
     return [...sessions.keys()];
   }
 
-  return { start, status, screenshot, input, stop, listSessionIds, startScreencast };
+  // Sanitized, secret-free snapshot of the resolved Virtual Display config for a diagnostic endpoint.
+  // Returns ONLY geometry/flags (displayTarget/displayBounds/displayConfigured/placementApplied/reason).
+  function displayStatus() {
+    return readVirtualDisplayConfig(displayEnv).metadata;
+  }
+
+  return { start, status, screenshot, input, stop, listSessionIds, startScreencast, displayStatus };
 }
 
 module.exports = { createRemoteBrowserManager, DEFAULT_URL };

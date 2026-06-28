@@ -370,6 +370,11 @@ export function closeOnMac(agentId: string, accountUid: string): Promise<CloudCo
 
 export type RemoteBrowserStatus = 'running' | 'closing' | 'closed'
 
+// Non-secret display-placement target for the headful Cloud Browser window. 'virtual' = placed onto a
+// macOS virtual display (operator never sees it on the main desktop); 'main' = fell back to the main
+// display (e.g. bounds not configured yet). These are plain geometry/flags, never secrets.
+export type RemoteBrowserDisplayTarget = 'virtual' | 'main'
+
 export interface RemoteBrowserSession {
   id: string
   account_uid: string
@@ -378,6 +383,11 @@ export interface RemoteBrowserSession {
   status: RemoteBrowserStatus
   viewport: { width: number; height: number } | null
   started_at?: string
+  displayTarget?: RemoteBrowserDisplayTarget | null
+  displayBounds?: string | null
+  displayConfigured?: boolean
+  placementApplied?: boolean
+  displayReason?: string | null
 }
 
 // The fixed, validated input vocabulary mirrored from the Mac bridge — NO eval/script action exists.

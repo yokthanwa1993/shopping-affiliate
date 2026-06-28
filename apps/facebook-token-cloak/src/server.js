@@ -344,7 +344,9 @@ const CORS_SAFE_PATHS = new Set([
 // id is an unguessable crypto handle, never an account secret.
 const REMOTE_BROWSER_PREFIX = '/remote-browser';
 function isRemoteBrowserCorsPath(pathname) {
-  return pathname === REMOTE_BROWSER_PREFIX + '/start' || /^\/remote-browser\/[A-Za-z0-9_-]+\/(status|screenshot|input|stop)$/.test(pathname);
+  return pathname === REMOTE_BROWSER_PREFIX + '/start'
+    || pathname === REMOTE_BROWSER_PREFIX + '/display/status'
+    || /^\/remote-browser\/[A-Za-z0-9_-]+\/(status|screenshot|input|stop)$/.test(pathname);
 }
 
 // The remote-browser routes are reached by the dashboard through the cloudflared tunnel, where every
@@ -2683,6 +2685,12 @@ function createHandler(deps = {}) {
         const body = await parseBody(req);
         const result = await remoteBrowser.start({ account_uid: body.account_uid || body.account, initial_url: body.initial_url || body.url });
         return send(res, 200, { success: true, session: result });
+      }
+      // Diagnostic: report the resolved Virtual Display config (sanitized geometry/flags only — no
+      // secrets). Matched BEFORE the session-id route below since 'display' would otherwise look like a
+      // session id. Gated by the same shared-secret check as the other remote-browser routes.
+      if (req.method === 'GET' && url.pathname === '/remote-browser/display/status') {
+        return send(res, 200, { success: true, display: remoteBrowser.displayStatus() });
       }
       {
         const rb = url.pathname.match(/^\/remote-browser\/([A-Za-z0-9_-]+)\/(status|screenshot|input|stop)$/);

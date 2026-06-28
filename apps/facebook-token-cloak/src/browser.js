@@ -180,14 +180,42 @@ function classifyLaunchError(error,profileDir){
   }
   return error;
 }
+// Merge Chromium launch-arg groups by FLAG NAME (the part before `=`), first-wins. This lets a caller
+// pass extra args (e.g. virtual-display --window-position/--window-size from virtualDisplay.js) WITHOUT
+// dropping the base anti-automation args, and without emitting a duplicate flag if the caller repeats
+// one. Base args are listed first so they always win over a caller override of the same flag.
+function mergeBrowserArgs(...groups){
+  const out=[]; const seen=new Set();
+  for(const group of groups){
+    if(!Array.isArray(group)) continue;
+    for(const raw of group){
+      const arg=String(raw==null?'':raw).trim();
+      if(!arg) continue;
+      const flag=arg.split('=')[0];
+      if(seen.has(flag)) continue;
+      seen.add(flag); out.push(arg);
+    }
+  }
+  return out;
+}
 async function launchPersistentContext(rawAccount,options={}){
   const {key}=sanitizeAccount(rawAccount);
   const {backend,launcher}=await loadBrowserBackend();
   const profileDir=profileDirFor(key);
   clearStaleProfileSingletons(profileDir);
+  // Base anti-automation/launch args ALWAYS apply; caller-supplied args (options.args and
+  // options.launchOptions.args) are merged on top by flag name without clobbering the base set.
+  const launchOptions=(options.launchOptions&&typeof options.launchOptions==='object')?options.launchOptions:{};
+  const mergedArgs=mergeBrowserArgs(
+    ['--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check'],
+    options.args,
+    launchOptions.args
+  );
   let context;
   try{
-    context=await launcher.launchPersistentContext(profileDir,{headless:options.visible===false,args:['--disable-blink-features=AutomationControlled','--no-first-run','--no-default-browser-check'],...options.launchOptions});
+    // Spread launchOptions FIRST, then force the merged args last so a launchOptions.args can never
+    // silently replace the merged set (it has already been folded into mergedArgs above).
+    context=await launcher.launchPersistentContext(profileDir,{headless:options.visible===false,...launchOptions,args:mergedArgs});
   }catch(e){
     clearStaleProfileSingletons(profileDir);
     throw classifyLaunchError(e,profileDir);
@@ -557,4 +585,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,inspectAccountContext,profileStatus,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,isHeadlessProfileProcess,terminateStaleHeadlessProfileLock,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,mergeBrowserArgs,launchPersistentContext,acquireAccountContext,peekAccountContext,inspectAccountContext,profileStatus,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,isHeadlessProfileProcess,terminateStaleHeadlessProfileLock,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};

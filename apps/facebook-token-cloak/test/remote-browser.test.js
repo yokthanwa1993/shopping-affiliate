@@ -148,6 +148,63 @@ test('unknown session id is a 404-coded not_found', async () => {
   await assert.rejects(() => mgr.status('rb_doesnotexist'), (e) => e.status === 404 && e.code === 'session_not_found');
 });
 
+// ── Virtual Display placement ─────────────────────────────────────────────────────────────────────
+
+test('start opens the headful browser on the virtual display when bounds env is configured', async () => {
+  const browser = makeMockBackend();
+  const mgr = createRemoteBrowserManager({
+    browser,
+    profileArchiveSync: makeMockArchive(),
+    env: { ACCOUNTS_BRIDGE_VIRTUAL_DISPLAY_BOUNDS: '3840,0,1280,800' },
+  });
+  const res = await mgr.start({ account_uid: 'CHEARB' });
+  // openPage received the window-position/window-size placement args.
+  const args = browser.state.openPageCalls[0].options.args;
+  assert.ok(Array.isArray(args));
+  assert.ok(args.includes('--window-position=3840,0'), 'expected window-position arg');
+  assert.ok(args.includes('--window-size=1280,800'), 'expected window-size arg');
+  assert.ok(args.includes('--start-windowed'));
+  // Response metadata says the virtual display is configured and placement was applied (fresh launch).
+  assert.equal(res.displayTarget, 'virtual');
+  assert.equal(res.displayBounds, '3840,0,1280,800');
+  assert.equal(res.displayConfigured, true);
+  assert.equal(res.placementApplied, true);
+  assert.equal(res.displayReason, null);
+  // Still secret-free.
+  assert.ok(!/cookie|token|password|datr|dtsg/i.test(JSON.stringify(res)));
+});
+
+test('start falls back to the main display HONESTLY when bounds env is missing', async () => {
+  const browser = makeMockBackend();
+  const mgr = createRemoteBrowserManager({
+    browser,
+    profileArchiveSync: makeMockArchive(),
+    env: {}, // no ACCOUNTS_BRIDGE_VIRTUAL_DISPLAY_BOUNDS
+  });
+  const res = await mgr.start({ account_uid: 'CHEARB' });
+  const args = browser.state.openPageCalls[0].options.args;
+  // No window-position is sent — we never pretend to place a window we cannot place.
+  assert.ok(!args.some((a) => a.startsWith('--window-position')), 'must not emit window-position');
+  assert.equal(res.displayTarget, 'main');
+  assert.equal(res.displayBounds, null);
+  assert.equal(res.displayConfigured, false);
+  assert.equal(res.placementApplied, false);
+  assert.equal(res.displayReason, 'virtual_display_bounds_missing');
+});
+
+test('displayStatus returns sanitized config metadata only', () => {
+  const mgr = createRemoteBrowserManager({
+    browser: makeMockBackend(),
+    profileArchiveSync: makeMockArchive(),
+    env: { ACCOUNTS_BRIDGE_VIRTUAL_DISPLAY_BOUNDS: '3840,0,1280,800' },
+  });
+  const d = mgr.displayStatus();
+  assert.equal(d.displayTarget, 'virtual');
+  assert.equal(d.displayBounds, '3840,0,1280,800');
+  assert.equal(d.displayConfigured, true);
+  assert.ok(!/cookie|token|password|datr|dtsg|secret/i.test(JSON.stringify(d)));
+});
+
 // ── Server endpoint tests ──────────────────────────────────────────────────────────────────────
 
 let server;
@@ -214,6 +271,16 @@ test('server: full start → status → screenshot → input → stop lifecycle'
   assert.equal(stop.status, 200);
   assert.equal(stop.body.closed, true);
   assert.equal(archive.state.uploaded[0], 'chearb');
+});
+
+test('server: GET /remote-browser/display/status returns sanitized display config', async () => {
+  const r = await req('GET', '/remote-browser/display/status');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.success, true);
+  assert.ok(r.body.display);
+  // displayTarget is present (main fallback in tests since no bounds env is set) and carries no secret.
+  assert.ok(['virtual', 'main'].includes(r.body.display.displayTarget));
+  assert.ok(!/cookie|token|password|datr|dtsg/i.test(JSON.stringify(r.body.display)));
 });
 
 test('server: input on unknown session returns 404', async () => {

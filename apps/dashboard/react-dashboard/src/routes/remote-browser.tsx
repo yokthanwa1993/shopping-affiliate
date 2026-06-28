@@ -9,6 +9,7 @@ import {
   sendRemoteBrowserInput,
   stopRemoteBrowser,
   type RemoteBrowserAction,
+  type RemoteBrowserDisplayTarget,
   type RemoteBrowserInputPayload,
   type RemoteBrowserSession,
   type RemoteBrowserStreamInput,
@@ -61,6 +62,9 @@ export function RemoteBrowserPage() {
   const [error, setError] = useState<string | null>(null)
   const [closed, setClosed] = useState(false)
   const [busy, setBusy] = useState(false)
+  // Display placement metadata (Virtual Display vs Fallback main display). The WS status stream does not
+  // carry it, so we fetch the HTTP status once on mount — it is identical for the life of the session.
+  const [displayTarget, setDisplayTarget] = useState<RemoteBrowserDisplayTarget | null>(null)
 
   const imgRef = useRef<HTMLImageElement | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -99,6 +103,26 @@ export function RemoteBrowserPage() {
     },
     [sessionId],
   )
+
+  // ── Display placement (Virtual Display chip) — fetched once on mount ─────────────────────────────
+  useEffect(() => {
+    if (!sessionId) return
+    let cancelled = false
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        const s = await getRemoteBrowserStatus(sessionId, controller.signal)
+        if (cancelled) return
+        if (s.displayTarget) setDisplayTarget(s.displayTarget)
+      } catch {
+        /* non-fatal — chip simply stays hidden */
+      }
+    })()
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [sessionId])
 
   // ── WebSocket lifecycle (primary) ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -449,6 +473,25 @@ export function RemoteBrowserPage() {
           <span className={`h-2 w-2 rounded-full ${connColor}`} />
           {connLabel}
         </span>
+        {displayTarget ? (
+          <span
+            title={
+              displayTarget === 'virtual'
+                ? 'หน้าต่างเบราว์เซอร์เปิดบน virtual display (ไม่ขึ้นจอหลัก)'
+                : 'ยังไม่ได้ตั้ง bounds — เบราว์เซอร์เปิดบนจอหลัก (fallback)'
+            }
+            className={`inline-flex items-center gap-1.5 rounded px-1.5 py-0.5 ${
+              displayTarget === 'virtual'
+                ? 'bg-emerald-500/15 text-emerald-300'
+                : 'bg-amber-500/15 text-amber-300'
+            }`}
+          >
+            <span
+              className={`h-2 w-2 rounded-full ${displayTarget === 'virtual' ? 'bg-emerald-500' : 'bg-amber-500'}`}
+            />
+            {displayTarget === 'virtual' ? 'Virtual Display' : 'Fallback main display'}
+          </span>
+        ) : null}
         <span className="truncate">{session?.title || '—'}</span>
         <span className="ml-auto font-mono">UID: {session?.account_uid ?? '—'}</span>
         {error ? <span className="text-red-400">{error}</span> : null}
