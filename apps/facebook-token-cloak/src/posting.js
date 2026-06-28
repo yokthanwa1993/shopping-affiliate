@@ -162,14 +162,12 @@ async function resolveSessionToken({ browser, account, visible = false } = {}) {
   }
   let opened;
   try {
-    // reuseIfPresent: when an operator's visible /login left a live context open for this account,
-    // REUSE it to resolve the token instead of launching a second persistentContext on the same
-    // (locked) profile dir — that double-launch is what surfaced as profile_already_open and then an
-    // opaque no_session. When there is no live context, this still launches a fresh one-off context
-    // from the same profile (closed by closeSession), so the non-visible posting path is unchanged.
+    // reuseIfPresent is guarded by browser.openPage: if an operator-visible /login window is open,
+    // it fails closed with operator_visible_session_open instead of navigating/refreshing that manual
+    // inspection window. When none is open, this launches a fresh one-off context that closeSession closes.
     opened = await browser.openPage(account, FACEBOOK_OAUTH_URL, { visible: !!visible, reuseIfPresent: true });
   } catch (e) {
-    // Preserve the sanitized blocker code (profile_already_open / profile_locked / browser_open_failed)
+    // Preserve the sanitized blocker code (operator_visible_session_open / profile_already_open / browser_open_failed)
     // so the route can surface it instead of collapsing every open failure into a bare no_session.
     return { token: null, reason: (e && (e.code || e.message)) || 'browser_open_failed', reused: false, fbDtsgPresent: false, userId: null };
   }

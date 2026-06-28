@@ -685,25 +685,24 @@ test('loadBrowserBackend uses CloakBrowser launchPersistentContext object signat
   assert.equal(typeof backend.launcher.launchPersistentContext, 'function');
 });
 
-// ── reuseIfPresent: posting/session-token resolution reuses an operator-visible context ─────────
-// The no_session bug: posting's resolveSessionToken opened a SECOND persistentContext on a profile
-// dir whose window a visible /login had already locked. reuseIfPresent fixes it: reuse the live
-// cached context when one exists, otherwise open a fresh one-off (that closeSession then closes).
+// ── reuseIfPresent: posting/session-token resolution must not disturb operator-visible context ───
+// A manual visible /login window is operator-owned: status/token automation must not reuse/navigate it,
+// because that makes the debug browser refresh/redirect while the operator is inspecting it.
 const posting = require('../src/posting');
 
-test('openPage reuseIfPresent REUSES the live context a visible /login left open (no second launch)', async () => {
+test('openPage reuseIfPresent refuses to navigate an operator-visible /login window', async () => {
   const launcher = makeReuseLauncher();
   browser.setBrowserBackend(launcher, 'mock');
   browser.resetAccountContexts();
   try {
-    // A visible /login caches a live context for the account.
     const login = await browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true });
     assert.equal(login.reused, false);
-    // Posting/session-token resolution reuses that SAME context — never a second persistentContext.
-    const reuse = await browser.openPage('100090320823561', 'https://www.facebook.com/dialog/oauth', { reuseIfPresent: true });
+    await assert.rejects(
+      () => browser.openPage('100090320823561', 'https://www.facebook.com/dialog/oauth', { reuseIfPresent: true }),
+      (err) => err && err.code === 'operator_visible_session_open'
+    );
     assert.equal(launcher.launches, 1);
-    assert.equal(reuse.context, login.context);
-    assert.equal(reuse.reused, true);
+    assert.equal(login.context.pages()[0].url(), 'https://www.facebook.com/login');
   } finally {
     browser.setBrowserBackend(null);
     browser.resetAccountContexts();
@@ -730,19 +729,18 @@ test('openPage reuseIfPresent opens a fresh one-off context when none is cached 
   }
 });
 
-test('resolveSessionToken reuses the operator-visible context and closeSession does NOT close it', async () => {
+test('resolveSessionToken fails closed while an operator-visible context is open (no refresh)', async () => {
   const launcher = makeReuseLauncher();
   browser.setBrowserBackend(launcher, 'mock');
   browser.resetAccountContexts();
   try {
     const login = await browser.openPage('100090320823561', 'https://www.facebook.com/login', { visible: true, reuse: true });
     const session = await posting.resolveSessionToken({ browser, account: '100090320823561' });
-    assert.equal(session.reused, true);
-    assert.equal(session.context, login.context);
-    await posting.closeSession(session);
-    // The operator's live context must remain OPEN after closeSession — never torn down mid-use.
-    assert.equal(login.context.browser().isConnected(), true);
+    assert.equal(session.token, null);
+    assert.equal(session.reason, 'operator_visible_session_open');
     assert.equal(launcher.launches, 1);
+    assert.equal(login.context.browser().isConnected(), true);
+    assert.equal(login.context.pages()[0].url(), 'https://www.facebook.com/login');
   } finally {
     browser.setBrowserBackend(null);
     browser.resetAccountContexts();

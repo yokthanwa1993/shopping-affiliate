@@ -194,8 +194,13 @@ async function openPage(rawAccount,url,options={}){
     reused=!!launched.reused;
   }else if(options.reuseIfPresent){
     const existing=peekAccountContext(rawAccount);
-    if(existing){ launched=existing; reused=true; }
-    else { launched=await launchPersistentContext(rawAccount,options); reused=false; }
+    if(existing){
+      const err=new Error('Operator-visible browser session is open; automation must not navigate it');
+      err.code='operator_visible_session_open';
+      err.profileDir=existing.profileDir;
+      throw err;
+    }
+    launched=await launchPersistentContext(rawAccount,options); reused=false;
   }else{
     launched=await launchPersistentContext(rawAccount,options);
     reused=false;
