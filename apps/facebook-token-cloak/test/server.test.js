@@ -164,6 +164,35 @@ test('server health/keychain/login/refresh/export', async () => {
   assert.equal(r.body.status, 'dry_run_only');
 });
 
+test('/login safe visible no-autofill no-submit is allowed when browser login is disabled', async () => {
+  // Operator "Open Browser Session" debug case: a VISIBLE window with autofill=0 AND submit=0 may
+  // be opened even when FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED is not set, so the operator can
+  // see which user is logged in / whether Facebook is stuck at checkpoint. No credential is read,
+  // nothing is submitted, and no secret is returned.
+  delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED;
+  const r = await req('GET', '/login?account=CHEARB&visible=1&autofill=0&submit=0');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.state, 'login_opened');
+  assert.equal(r.body.autofilled, false);
+  assert.equal(r.body.submitted, false);
+  assertNoLeak(r.body, ['EAAB_USER_SECRET']);
+});
+
+test('/login still rejects autofill or submit while browser login is disabled', async () => {
+  // The unsafe automation (read a stored credential / submit a login) stays gated behind the env
+  // flag. With the flag unset, any autofill=1 or submit=1 is refused with browser_login_disabled.
+  delete process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED;
+
+  let r = await req('GET', '/login?account=CHEARB&visible=1&autofill=1&submit=0');
+  assert.equal(r.status, 410);
+  assert.equal(r.body.state, 'browser_login_disabled');
+  assert.equal(r.body.reason, 'browser_login_disabled');
+
+  r = await req('GET', '/login?account=CHEARB&visible=1&autofill=0&submit=1');
+  assert.equal(r.status, 410);
+  assert.equal(r.body.state, 'browser_login_disabled');
+});
+
 test('/accounts/selector saves, reports, and deletes redacted apple passwords selector', async () => {
   let r = await req('GET', '/accounts/selector?account=CHEARB');
   assert.equal(r.status, 200);

@@ -912,19 +912,26 @@ function createHandler(deps = {}) {
       }
 
       if (req.method === 'GET' && url.pathname === '/login') {
-        if (process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED !== '1') {
-          return sendError(res, 410, 'browser_login_disabled', {
-            state: 'browser_login_disabled',
-            reason: 'browser_login_disabled',
-            note: 'Browser login/open-session automation is disabled. Use status-only checks; do not open Chrome from Accounts Bridge.'
-          });
-        }
         const account = url.searchParams.get('account');
         if (!account) return sendError(res, 400, 'Missing account parameter');
         const { display } = sanitizeAccount(account);
         const visible = parseBool(url.searchParams.get('visible'), false);
         const autofill = parseBool(url.searchParams.get('autofill'), true);
         const submit = parseBool(url.searchParams.get('submit'), false);
+        // Credential autofill + login submit stay gated behind the explicit env flag (they read a
+        // stored secret and drive a real login). The ONE thing allowed when that flag is off is the
+        // safe operator debug case: open a VISIBLE session with autofill=0 AND submit=0 so the
+        // operator can SEE which user is logged in and whether Facebook is stuck at
+        // checkpoint/CAPTCHA/2FA. That path never reads a credential, never submits, never mints a
+        // token, and returns no secret. Any autofill=1/submit=1 while disabled is refused.
+        if (process.env.FACEBOOK_TOKEN_CLOAK_BROWSER_LOGIN_ENABLED !== '1' && (autofill || submit)) {
+          return sendError(res, 410, 'browser_login_disabled', {
+            account: display,
+            state: 'browser_login_disabled',
+            reason: 'browser_login_disabled',
+            note: 'Credential autofill/submit is disabled. Only a visible no-autofill, no-submit session may be opened from Accounts Bridge to inspect login state.'
+          });
+        }
         const credentialProvider = credentialProviderFromParams(url.searchParams);
         const { credentialOptions, selectorStatus } = await resolveCredentialOptions(selectors, account, credentialProvider, url.searchParams);
         let credential = null;
