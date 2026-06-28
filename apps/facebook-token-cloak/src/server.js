@@ -911,6 +911,20 @@ function createHandler(deps = {}) {
         return send(res, 200, { ok: true, account: r.account, service: r.service });
       }
 
+      if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/login/close') {
+        const account = url.searchParams.get('account') || (req.method === 'POST' ? (await parseBody(req)).account : '');
+        if (!account) return sendError(res, 400, 'Missing account parameter');
+        const { display } = sanitizeAccount(account);
+        const result = await br.closeAccountContext(account);
+        return send(res, 200, {
+          success: true,
+          account: display,
+          state: result.state || (result.closed ? 'closed' : 'not_open'),
+          closed: !!result.closed,
+          ...(result.reason ? { reason: sanitizePublicReason(result.reason, 'close_failed') } : {})
+        });
+      }
+
       if (req.method === 'GET' && url.pathname === '/login') {
         const account = url.searchParams.get('account');
         if (!account) return sendError(res, 400, 'Missing account parameter');

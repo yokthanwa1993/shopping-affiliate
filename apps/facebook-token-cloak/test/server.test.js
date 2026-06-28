@@ -193,6 +193,49 @@ test('/login still rejects autofill or submit while browser login is disabled', 
   assert.equal(r.body.state, 'browser_login_disabled');
 });
 
+
+
+test('/login/close closes the cached browser session idempotently and token-free', async () => {
+  let closed = 0;
+  const deps = browser('https://www.facebook.com/login');
+  let liveContext = {
+    close: async () => { closed += 1; },
+    browser: () => ({ isConnected: () => true })
+  };
+  deps.closeAccountContext = async (account) => {
+    if (account !== 'CHEARB') return { closed: false, state: 'not_open' };
+    if (!liveContext) return { closed: false, state: 'not_open' };
+    await liveContext.close();
+    liveContext = null;
+    return { closed: true, state: 'closed' };
+  };
+  const handler = createHandler({ keychain, browser: deps, selectors: selectorStore(selectorConfigPath), graphFetch: fakeFetch });
+  const call = (path) => new Promise((resolve, reject) => {
+    const req = new Readable({ read() {} });
+    req.url = path;
+    req.method = 'GET';
+    req.headers = { host: '127.0.0.1' };
+    req.socket = { remoteAddress: '127.0.0.1' };
+    const chunks = [];
+    const res = {
+      setHeader() {},
+      writeHead(status) { this.statusCode = status; },
+      end(chunk) { if (chunk) chunks.push(Buffer.from(chunk)); resolve({ status: this.statusCode || 200, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
+    };
+    handler(req, res).catch(reject);
+    req.push(null);
+  });
+  let r = await call('/login/close?account=CHEARB');
+  assert.equal(r.status, 200);
+  assert.equal(r.body.state, 'closed');
+  assert.equal(r.body.closed, true);
+  assert.equal(closed, 1);
+  assertNoLeak(r.body, ['EAAB_USER_SECRET']);
+  r = await call('/login/close?account=CHEARB');
+  assert.equal(r.body.state, 'not_open');
+  assert.equal(r.body.closed, false);
+});
+
 test('/accounts/selector saves, reports, and deletes redacted apple passwords selector', async () => {
   let r = await req('GET', '/accounts/selector?account=CHEARB');
   assert.equal(r.status, 200);

@@ -522,6 +522,45 @@ test('openPage reuse: two consecutive same-account opens reuse ONE context and l
   }
 });
 
+
+
+test('openPage visible request relaunches when the cached context is headless/non-visible', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const headless = await browser.openPage('100090320823561', 'https://x/', { visible: false, reuse: true });
+    assert.equal(headless.reused, false);
+    const visible = await browser.openPage('100090320823561', 'https://x/', { visible: true, reuse: true });
+    assert.equal(launcher.launches, 2);
+    assert.notEqual(visible.context, headless.context);
+    assert.equal(headless.context.browser().isConnected(), false);
+    assert.equal(visible.reused, false);
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
+test('closeAccountContext closes only the cached account context and is idempotent', async () => {
+  const launcher = makeReuseLauncher();
+  browser.setBrowserBackend(launcher, 'mock');
+  browser.resetAccountContexts();
+  try {
+    const login = await browser.openPage('100090320823561', 'https://x/', { visible: true, reuse: true });
+    const closed = await browser.closeAccountContext('100090320823561');
+    assert.equal(closed.closed, true);
+    assert.equal(closed.state, 'closed');
+    assert.equal(login.context.browser().isConnected(), false);
+    const again = await browser.closeAccountContext('100090320823561');
+    assert.equal(again.closed, false);
+    assert.equal(again.state, 'not_open');
+  } finally {
+    browser.setBrowserBackend(null);
+    browser.resetAccountContexts();
+  }
+});
+
 test('concurrent same-account opens share a single launch (no double persistentContext)', async () => {
   const launcher = makeReuseLauncher();
   browser.setBrowserBackend(launcher, 'mock');

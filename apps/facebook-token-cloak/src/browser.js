@@ -102,14 +102,17 @@ function forgetAccountContext(key,context){ const cur=_accountContexts.get(key);
 function peekAccountContext(rawAccount){
   const {key}=sanitizeAccount(rawAccount);
   const existing=_accountContexts.get(key);
-  if(existing&&isContextAlive(existing.context)) return {backend:existing.backend,profileDir:existing.profileDir,context:existing.context};
-  if(existing) _accountContexts.delete(key);
+  // Only an operator-visible context is safe to reuse for posting/session-token resolution.
+  // A cached headless/non-visible context would make the Open Browser button look broken and
+  // closeSession would skip closing it because it is marked reused.
+  if(existing&&isContextAlive(existing.context)&&existing.visible===true) return {backend:existing.backend,profileDir:existing.profileDir,context:existing.context,visible:true};
+  if(existing&&!isContextAlive(existing.context)) _accountContexts.delete(key);
   return null;
 }
 // Patterns for a launchPersistentContext failure caused by the profile dir already being open in
 // another (often orphaned/external) Chromium holding the SingletonLock. Mapped to a stable, non-
 // secret code so the route can answer profile_already_open instead of a generic 500.
-const PROFILE_LOCK_PATTERNS=/ProcessSingleton|SingletonLock|Singleton|user data directory is already in use|profile (?:is )?(?:in use|locked|already)|already (?:in use|running|open)|cannot create|being used by another|lock(?:ed|file)?/i;
+const PROFILE_LOCK_PATTERNS=/ProcessSingleton|SingletonLock|SingletonCookie|SingletonSocket|user data directory is already in use|profile (?:is )?(?:in use|locked|already open)|already (?:in use|running|open)|being used by another|\block(?:ed|file)?\b/i;
 function classifyLaunchError(error,profileDir){
   const msg=String((error&&(error.message||error.code))||'');
   if(PROFILE_LOCK_PATTERNS.test(msg)){
@@ -137,14 +140,21 @@ async function launchPersistentContext(rawAccount,options={}){
 // later call relaunches a fresh window instead of handing back a dead context.
 async function acquireAccountContext(rawAccount,options={}){
   const {key}=sanitizeAccount(rawAccount);
+  const wantsVisible=options.visible===true;
   const existing=_accountContexts.get(key);
-  if(existing&&isContextAlive(existing.context)) return {...existing,reused:true};
+  if(existing&&isContextAlive(existing.context)){
+    if(!wantsVisible||existing.visible===true) return {...existing,reused:true};
+    // The operator explicitly asked to SEE the browser, but the cached context is headless/non-visible.
+    // Close only this bridge-owned context and relaunch visible; do not delete the profile/cookies.
+    try{ if(existing.context&&typeof existing.context.close==='function') await existing.context.close(); }catch{}
+    _accountContexts.delete(key);
+  }
   if(existing) _accountContexts.delete(key);
   if(_accountContextLaunches.has(key)){ const entry=await _accountContextLaunches.get(key); return {...entry,reused:true}; }
   const launchPromise=(async()=>{
     const launched=await launchPersistentContext(rawAccount,options);
     try{ if(launched.context&&typeof launched.context.on==='function') launched.context.on('close',()=>forgetAccountContext(key,launched.context)); }catch{}
-    const entry={backend:launched.backend,profileDir:launched.profileDir,context:launched.context};
+    const entry={backend:launched.backend,profileDir:launched.profileDir,context:launched.context,visible:options.visible===true};
     _accountContexts.set(key,entry);
     return entry;
   })();
@@ -164,6 +174,19 @@ async function acquireAccountContext(rawAccount,options={}){
 //                       profile whose window is already up.
 //   default             posting's original ephemeral open→closeSession lifecycle — a fresh one-off
 //                       context (reused:false), unchanged.
+async function closeAccountContext(rawAccount){
+  const {key}=sanitizeAccount(rawAccount);
+  const existing=_accountContexts.get(key);
+  if(!existing) return {closed:false, state:'not_open'};
+  _accountContexts.delete(key);
+  try{
+    if(existing.context&&typeof existing.context.close==='function') await existing.context.close();
+    return {closed:true, state:'closed'};
+  }catch(e){
+    return {closed:false, state:'close_failed', reason:String((e&&(e.code||e.message))||'close_failed')};
+  }
+}
+
 async function openPage(rawAccount,url,options={}){
   let launched; let reused=false;
   if(options.reuse){
@@ -431,4 +454,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
