@@ -253,6 +253,7 @@ import {
     isPersistablePagePrimaryToken,
     prioritizeSyncedPageTokenPools,
     shouldFallbackToOrganicAfterOneCardFailure,
+    sanitizePostingProfileUid,
     type FacebookLiteRefreshOutcome,
     type FacebookLiteRefreshRequestBody,
 } from './posting-token-source'
@@ -31084,8 +31085,19 @@ async function refreshFacebookLitePostingTokenForPage(params: {
     pageId: string
     pageName: string
     candidateLoginIds?: string[]
+    // Per-page Accounts Bridge posting account UID (pages.posting_profile_uid). When set, the refresh
+    // request targets this exact account as profile_id / candidate_profile_ids. Blank → unchanged
+    // auto-discovery behavior (the bridge finds the credentialed profile that owns the page).
+    configuredPostingProfileUid?: string
     logPrefix: string
 }): Promise<{ refreshed: boolean; synced: boolean; via: string; reason: string }> {
+    const configuredProfileUid = sanitizePostingProfileUid(params.configuredPostingProfileUid)
+    // Prepend the configured UID so it is tried first as both an explicit candidate profile id and a
+    // candidate login id, without discarding any caller-supplied candidates. Blank → no override.
+    const candidateProfileIds = configuredProfileUid ? [configuredProfileUid] : undefined
+    const candidateLoginIds = configuredProfileUid
+        ? [configuredProfileUid, ...(params.candidateLoginIds ?? [])]
+        : params.candidateLoginIds
     // 1) BrowserSaving secret mint + profile-sync (the fresh page token lands in the post pool).
     const bs = await refreshFacebookLiteCommentTokenForPage({
         env: params.env,
@@ -31093,7 +31105,8 @@ async function refreshFacebookLitePostingTokenForPage(params: {
         namespaceId: params.namespaceId,
         pageId: params.pageId,
         pageName: params.pageName,
-        candidateLoginIds: params.candidateLoginIds,
+        candidateProfileIds,
+        candidateLoginIds,
         logPrefix: `${params.logPrefix} POST-REFRESH`,
     }).catch((e) => ({ refreshed: false, synced: false, profileCount: 0, reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
     if (bs.synced) {
@@ -31104,7 +31117,7 @@ async function refreshFacebookLitePostingTokenForPage(params: {
     const bridge = await fetchFacebookLitePageTokenFromBridge({
         env: params.env,
         pageId: params.pageId,
-        candidateLoginIds: params.candidateLoginIds,
+        candidateLoginIds,
         logPrefix: `${params.logPrefix} BRIDGE-TOKEN`,
     })
     if (bridge.token) {
@@ -31131,14 +31144,14 @@ async function refreshFacebookLitePostingTokenForPage(params: {
     const autoSync = await triggerBridgeAutoSyncForPage({
         env: params.env,
         namespaceId: params.namespaceId,
-        candidateLoginIds: params.candidateLoginIds,
+        candidateLoginIds,
         // Page-targeted true-recovery: scope the bridge to the exact failing page and pass the
         // env-configured fallback chain (e.g. Chanalai → Thanwan) so an account that lost the page
         // hands off to one that still administers it.
         pageId: params.pageId,
         fallbackAccounts: resolveFacebookLiteFallbackAccounts(params.env, {
             pageId: params.pageId,
-            primaryAccount: (params.candidateLoginIds ?? [])[0],
+            primaryAccount: (candidateLoginIds ?? [])[0],
         }),
         logPrefix: `${params.logPrefix} BRIDGE-AUTOSYNC`,
     })
@@ -37485,6 +37498,9 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
     description: string
     logPrefix: string
     candidateLoginIds?: string[]
+    // Per-page Accounts Bridge posting account UID (pages.posting_profile_uid). Threaded into the
+    // stored-token Facebook Lite refresh so it targets the right account; blank → auto-discovery.
+    configuredPostingProfileUid?: string
     preferVideoReelsFirst?: boolean
     reloadTokens: () => Promise<{ commentTokens: string[]; postTokens: string[] }>
 }): Promise<{ id: string; postId: string; permalinkUrl: string; postingToken: string }> {
@@ -37606,6 +37622,7 @@ async function publishReelWithCommentTokenPrimaryFallbackAndLiteRefresh(params: 
             pageId: params.pageId,
             pageName: params.pageName,
             candidateLoginIds: params.candidateLoginIds,
+            configuredPostingProfileUid: params.configuredPostingProfileUid,
             logPrefix: params.logPrefix,
         }).catch((e) => ({ refreshed: false, synced: false, via: 'error', reason: (e instanceof Error ? e.message : String(e)).slice(0, 120) }))
         if (!refresh.synced) {
@@ -37676,6 +37693,9 @@ async function ensurePagesOneCardColumns(db: D1Database): Promise<void> {
         `ALTER TABLE pages ADD COLUMN posting_token_source TEXT DEFAULT 'stored_token'`,
         // Per-page comment token source (NULL → runtime follows the posting source).
         `ALTER TABLE pages ADD COLUMN comment_token_source TEXT`,
+        // Per-page Accounts Bridge posting account UID (e.g. 100077795357192). Public
+        // FB account uid only — never a token. '' → no per-page override (auto-discovery).
+        `ALTER TABLE pages ADD COLUMN posting_profile_uid TEXT DEFAULT ''`,
     ]
     for (const sql of alterStatements) {
         await db.prepare(sql).run().catch(() => undefined)
@@ -38203,7 +38223,7 @@ app.get('/api/pages', async (c) => {
         const botId = c.get('botId')
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(botId).all()).results || []) as any[])
         c.header('Cache-Control', 'private, no-store')
         return c.json({ pages })
@@ -38229,7 +38249,7 @@ app.get('/api/admin/pages', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const pages = (((await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid, last_post_at, created_at, updated_at FROM pages WHERE bot_id = ? ORDER BY created_at DESC'
         ).bind(requestedNamespaceId).all()).results || []) as any[])
         return c.json({ pages, namespace_id: requestedNamespaceId })
     } catch (e) {
@@ -38753,7 +38773,7 @@ app.get('/api/pages/:id', async (c) => {
     try {
         await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
         if (!page) return c.json({ error: 'Page not found' }, 404)
         c.header('Cache-Control', 'private, no-store')
@@ -39277,7 +39297,7 @@ app.post('/api/pages', async (c) => {
         const onecardCta = normalizePageOneCardCta(onecard_cta)
         await ensurePagesOneCardColumns(c.env.DB)
         const existingInNamespace = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, botId).first()
         if (existingInNamespace) {
             return c.json({ success: true, id, updated: false, page: existingInNamespace })
@@ -39299,7 +39319,7 @@ app.post('/api/pages', async (c) => {
         ).bind(id, name, image_url, postToken, post_interval_minutes, botId, onecardEnabled, onecardLinkMode, onecardCta, captionLinkEnabled).run()
 
         const page = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, botId).first()
         return c.json({ success: true, id, page })
     } catch (e) {
@@ -39324,6 +39344,7 @@ app.put('/api/pages/:id', async (c) => {
             ads_publish_enabled,
             posting_token_source,
             comment_token_source,
+            posting_profile_uid,
             caption_link_enabled,
             base_post_hours,
             base_post_interval_minutes,
@@ -39342,6 +39363,19 @@ app.put('/api/pages/:id', async (c) => {
         const nextCaptionLinkEnabled = caption_link_enabled !== undefined ? ((caption_link_enabled === true || Number(caption_link_enabled || 0) === 1) ? 1 : 0) : undefined
         const nextOneCardLinkMode = onecard_link_mode !== undefined ? normalizePageOneCardLinkMode(onecard_link_mode) : undefined
         const nextOneCardCta = onecard_cta !== undefined ? normalizePageOneCardCta(onecard_cta) : undefined
+
+        // posting_profile_uid — per-page Accounts Bridge posting account UID (e.g. 100077795357192).
+        // Public FB account uid only, NEVER a token. Strict validation: trimmed, then either '' (clears
+        // the override → auto-discovery) or 5–32 digits. Anything else is rejected up-front (400) so a
+        // malformed value can never be persisted or threaded into the Facebook Lite refresh request.
+        let nextPostingProfileUid: string | undefined
+        if (posting_profile_uid !== undefined) {
+            const trimmed = String(posting_profile_uid ?? '').trim()
+            if (trimmed !== '' && !/^\d{5,32}$/.test(trimmed)) {
+                return c.json({ error: 'invalid_posting_profile_uid' }, 400)
+            }
+            nextPostingProfileUid = trimmed
+        }
 
         await ensurePagesOneCardColumns(c.env.DB)
         const page = await c.env.DB.prepare(
@@ -39636,13 +39670,21 @@ app.put('/api/pages/:id', async (c) => {
                 'UPDATE pages SET comment_token_source = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
             ).bind(normalizedCommentTokenSource, id, c.get('botId')).run()
         }
+
+        // posting_profile_uid — persist the validated UID (or '' to clear). Independent of any token
+        // validation: it only hints which Accounts Bridge account the stored-token refresh should target.
+        if (nextPostingProfileUid !== undefined) {
+            await c.env.DB.prepare(
+                'UPDATE pages SET posting_profile_uid = ?, updated_at = datetime("now") WHERE id = ? AND bot_id = ?'
+            ).bind(nextPostingProfileUid, id, c.get('botId')).run()
+        }
         if (tokenUpdated) {
             const issueKey = `_alerts/comment_token/${c.get('botId')}/${id}.json`
             await c.env.BUCKET.delete(issueKey).catch(() => undefined)
         }
 
         const updatedPage = await c.env.DB.prepare(
-            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
+            'SELECT id, name, image_url, access_token, post_interval_minutes, post_hours, is_active, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid, last_post_at, created_at, updated_at FROM pages WHERE id = ? AND bot_id = ?'
         ).bind(id, c.get('botId')).first()
 
         return c.json({ success: true, resolved, resolved_details, page: updatedPage })
@@ -41604,8 +41646,8 @@ app.post('/api/pages/:id/force-post', async (c) => {
         // Get page info
         await ensurePagesOneCardColumns(env.DB)
         const page = await env.DB.prepare(
-            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source FROM pages WHERE id = ? AND bot_id = ?'
-        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null; caption_link_enabled?: number | null; posting_token_source?: string | null; comment_token_source?: string | null } | null
+            'SELECT id, name, access_token, post_hours, onecard_enabled, onecard_link_mode, onecard_cta, ads_publish_enabled, caption_link_enabled, posting_token_source, comment_token_source, posting_profile_uid FROM pages WHERE id = ? AND bot_id = ?'
+        ).bind(pageId, botId).first() as { id: string; name: string; access_token: string; post_hours: string; onecard_enabled?: number | null; onecard_link_mode?: string | null; onecard_cta?: string | null; caption_link_enabled?: number | null; posting_token_source?: string | null; comment_token_source?: string | null; posting_profile_uid?: string | null } | null
 
         if (!page) return c.json({ error: 'Page not found' }, 404)
         // Clear any posting attempt that died before flipping status so a stale
@@ -41735,6 +41777,9 @@ app.post('/api/pages/:id/force-post', async (c) => {
             normalizePagePostingTokenSource((page as Record<string, unknown>).posting_token_source),
             namespaceIsAdminOwned,
         )
+        // Per-page Accounts Bridge posting account UID — threaded into the stored-token Facebook Lite
+        // refresh so it targets the right account (blank → unchanged auto-discovery).
+        const configuredPostingProfileUid = sanitizePostingProfileUid((page as Record<string, unknown>).posting_profile_uid)
         const pageAdsPublishLegacyFlag = Number((page as Record<string, unknown>).ads_publish_enabled || 0) === 1
         // The legacy ads_publish_enabled flag promotes even a stored_token source to the
         // CloakBrowser OneCard/create-ad bridge route — also admin-owned only. Gate it on
@@ -42416,6 +42461,7 @@ app.post('/api/pages/:id/force-post', async (c) => {
             description: publishDescription,
             logPrefix: 'FORCE-POST',
             preferVideoReelsFirst: true,
+            configuredPostingProfileUid,
             reloadTokens: async () => {
                 const refreshed = await ensurePageTokenCandidates({
                     env,
@@ -44005,7 +44051,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
     // The API-side drift guard already ensures post_hours stays in sync with
     // interval-mode saves, so a NULL/empty post_hours genuinely means "off".
     const { results: pages } = await env.DB.prepare(`
-        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta, caption_link_enabled, ads_publish_enabled, posting_token_source, comment_token_source
+        SELECT id, name, access_token, post_hours, last_post_at, bot_id, onecard_enabled, onecard_link_mode, onecard_cta, caption_link_enabled, ads_publish_enabled, posting_token_source, comment_token_source, posting_profile_uid
         FROM pages
         WHERE is_active = 1
           AND post_hours IS NOT NULL
@@ -44025,6 +44071,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             ads_publish_enabled?: number | null
             posting_token_source?: string | null
             comment_token_source?: string | null
+            posting_profile_uid?: string | null
         }>
     }
     // Keep scheduled handler logs compact. Dumping every candidate page on every
@@ -44392,6 +44439,9 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
             normalizePagePostingTokenSource(page.posting_token_source),
             namespaceIsAdminOwned,
         )
+        // Per-page Accounts Bridge posting account UID — threaded into the stored-token Facebook Lite
+        // refresh (blank → unchanged auto-discovery). Mirror of the force-post path.
+        const configuredPostingProfileUid = sanitizePostingProfileUid(page.posting_profile_uid)
         const pageAdsPublishLegacyFlag = Number(page.ads_publish_enabled || 0) === 1
         // Gate the legacy ads_publish_enabled → OneCard/create-ad bridge promotion on namespace
         // ownership (mirror of the force-post guard): the bridge route is admin-owned only.
@@ -45093,6 +45143,7 @@ async function handleScheduled(env: Env, ctx?: ExecutionContext) {
                 description: publishDescription,
                 logPrefix: `CRON ${page.name}`,
                 preferVideoReelsFirst: true,
+                configuredPostingProfileUid,
                 reloadTokens: async () => {
                     const refreshed = await ensurePageTokenCandidates({
                         env,

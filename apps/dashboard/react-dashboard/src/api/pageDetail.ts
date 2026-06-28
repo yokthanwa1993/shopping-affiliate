@@ -85,6 +85,8 @@ export interface PageCore {
   oneCardCta: OneCardCta
   postingTokenSource: PostingTokenSource
   commentTokenSource: CommentTokenSource
+  /** Per-page Accounts Bridge posting account UID (digits only, '' when unset). Never a token. */
+  postingProfileUid: string
   /** True when the worker has a posting access token stored. Never the value. */
   tokenPresent: boolean
   lastPostAt: string
@@ -106,6 +108,7 @@ interface RawPage {
   onecard_cta?: string
   posting_token_source?: string
   comment_token_source?: string
+  posting_profile_uid?: string
   last_post_at?: string
   updated_at?: string
 }
@@ -145,6 +148,7 @@ export async function fetchPageCore(pageId: string, signal?: AbortSignal): Promi
       page.comment_token_source,
       normalizePostingTokenSource(page.posting_token_source),
     ),
+    postingProfileUid: String(page.posting_profile_uid || '').trim(),
     // Presence only — the raw token string is intentionally dropped here.
     tokenPresent: !!String(page.access_token || '').trim(),
     lastPostAt: String(page.last_post_at || ''),
@@ -168,6 +172,7 @@ export interface SavePageCoreInput {
   oneCardCta: OneCardCta
   postingTokenSource: PostingTokenSource
   commentTokenSource: CommentTokenSource
+  postingProfileUid: string
   newToken?: string
 }
 
@@ -186,6 +191,7 @@ export async function savePageCore(pageId: string, input: SavePageCoreInput): Pr
     onecard_cta: input.oneCardCta,
     posting_token_source: input.postingTokenSource,
     comment_token_source: input.commentTokenSource,
+    posting_profile_uid: input.postingProfileUid.trim(),
   }
   const trimmed = (input.newToken ?? '').trim()
   if (trimmed) payload.access_token = trimmed

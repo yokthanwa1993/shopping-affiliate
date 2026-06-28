@@ -1083,6 +1083,7 @@ export function PageDetailView({
   const [oneCardCta, setOneCardCta] = useState<OneCardCta>('SHOP_NOW')
   const [postingTokenSource, setPostingTokenSource] = useState<PostingTokenSource>('stored_token')
   const [commentTokenSource, setCommentTokenSource] = useState<CommentTokenSource>('stored_token')
+  const [postingProfileUid, setPostingProfileUid] = useState('')
   const [tokenPresent, setTokenPresent] = useState(page.hasToken)
   // Original loaded snapshot, used for the `base_*` fields in the PUT payload.
   const [basePostHours, setBasePostHours] = useState('')
@@ -1159,6 +1160,7 @@ export function PageDetailView({
         setOneCardCta(core.oneCardCta)
         setPostingTokenSource(core.postingTokenSource)
         setCommentTokenSource(core.commentTokenSource)
+        setPostingProfileUid(core.postingProfileUid)
         setTokenPresent(core.tokenPresent)
         setBasePostHours(core.postHours)
         setBaseInterval(core.postIntervalMinutes ?? null)
@@ -1324,6 +1326,7 @@ export function PageDetailView({
           oneCardCta,
           postingTokenSource,
           commentTokenSource,
+          postingProfileUid,
           newToken: '',
         })
         setSaveStatus('saved')
@@ -1354,6 +1357,7 @@ export function PageDetailView({
         oneCardCta,
         postingTokenSource,
         commentTokenSource,
+        postingProfileUid,
         newToken,
       })
       // Reflect the saved core values locally.
@@ -1614,6 +1618,27 @@ export function PageDetailView({
                 </div>
               )}
             </DetailCard>
+
+            {tokenOnly ? (
+              <DetailCard className="space-y-3">
+                <div className="min-w-0">
+                  <p className="font-bold text-foreground">Account UID สำหรับโพสต์</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    ใส่ UID จาก Accounts Bridge เช่น 100077795357192 — เว้นว่างเพื่อให้ระบบ auto-discover เหมือนเดิม
+                  </p>
+                </div>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  value={postingProfileUid}
+                  onChange={(event) => setPostingProfileUid(event.target.value.replace(/\D/g, '').slice(0, 32))}
+                  placeholder="100077795357192"
+                  disabled={!canEdit}
+                  className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm font-semibold text-foreground outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100 disabled:cursor-not-allowed disabled:opacity-60"
+                />
+              </DetailCard>
+            ) : null}
 
             {/* โทเค้นสำหรับคอมเมนต์ — chosen independently of the posting source */}
             <DetailCard className="space-y-3">

@@ -172,6 +172,21 @@ export function isStoredCommentTokenAuthFailure(error: unknown): boolean {
     )
 }
 
+// ---- Per-page posting Account UID (Accounts Bridge) ----------------------
+// Each page may pin WHICH Accounts Bridge account UID mints/syncs its Facebook
+// Lite (stored_token) posting token — e.g. 100077795357192. This is a public
+// Facebook account uid, NEVER a token/cookie/password. When set it steers the
+// FB Lite refresh request body (profile_id + candidate_profile_ids) and the
+// bridge account hint so the CORRECT account recovers tokens for that page.
+// Blank = no per-page override; the existing auto-discovery behavior is kept
+// EXACTLY as before. Runtime sanitization mirrors the API validator: trimmed
+// value must be 5–32 digits, otherwise it is treated as unset. This keeps the
+// hint safe for SQL bind params, logs, and bridge request bodies.
+export function sanitizePostingProfileUid(rawValue: unknown): string {
+    const trimmed = String(rawValue ?? '').trim()
+    return /^\d{5,32}$/.test(trimmed) ? trimmed : ''
+}
+
 // ---- Facebook Lite (FB GET Token) on-demand refresh ----------------------
 // The product builds a password-backed FB GET Token / Facebook Lite system: every
 // stored profile keeps its uid/password/TOTP/datr in BrowserSaving, so a fresh page

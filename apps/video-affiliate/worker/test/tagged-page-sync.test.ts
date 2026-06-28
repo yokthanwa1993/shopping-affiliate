@@ -870,7 +870,7 @@ test('force-post routes CloakBrowser OneCard vs organic Reel without stored-toke
     const routeSource = getForcePostRouteSource()
 
     // SELECT reads the saved source back (posting + comment token sources).
-    assert.match(routeSource, /SELECT[\s\S]*posting_token_source, comment_token_source FROM pages WHERE id = \? AND bot_id = \?/)
+    assert.match(routeSource, /SELECT[\s\S]*posting_token_source, comment_token_source, posting_profile_uid FROM pages WHERE id = \? AND bot_id = \?/)
     // Effective decision is centralized in the tested resolvePostingRoute helper.
     assert.match(routeSource, /normalizePagePostingTokenSource\(\(page as Record<string, unknown>\)\.posting_token_source\)/)
     // The Video One Card flag selects OneCard/create-ad vs organic Reel for a CloakBrowser page.
@@ -932,7 +932,7 @@ test('cron routes CloakBrowser OneCard vs organic Reel without stored-token fall
     const cronSource = getHandleScheduledSource()
 
     // SELECT reads the saved source back for every candidate page (posting + comment).
-    assert.match(cronSource, /SELECT[\s\S]*ads_publish_enabled, posting_token_source, comment_token_source\s*\n\s*FROM pages/)
+    assert.match(cronSource, /SELECT[\s\S]*ads_publish_enabled, posting_token_source, comment_token_source, posting_profile_uid\s*\n\s*FROM pages/)
     // Same centralized decision as force-post; never silently falls back to the stored token.
     assert.match(cronSource, /normalizePagePostingTokenSource\(page\.posting_token_source\)/)
     // Mirror of the force-post guard: legacy ads_publish_enabled promotion is admin-gated.
