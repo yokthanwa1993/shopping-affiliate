@@ -142,6 +142,48 @@ test('GET / web UI is disabled because Account Manager is native-only', async ()
   assertNoLeak(r.text, SECRETS);
 });
 
+// Raw request that lets a test set arbitrary headers (Origin) and method (OPTIONS) to exercise CORS.
+function rawReq(method, reqPath, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const r = http.request(
+      { hostname: '127.0.0.1', port: server.address().port, path: reqPath, method, headers },
+      res => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: data }));
+      }
+    );
+    r.on('error', reject);
+    r.end();
+  });
+}
+
+test('CORS preflight is allowed for the Pubilo dashboard origin on safe accounts endpoints', async () => {
+  const r = await rawReq('OPTIONS', '/accounts', { Origin: 'https://www.pubilo.com' });
+  assert.equal(r.status, 204);
+  assert.equal(r.headers['access-control-allow-origin'], 'https://www.pubilo.com');
+  assert.match(r.headers['access-control-allow-methods'] || '', /GET/);
+});
+
+test('CORS echoes the allowed origin on a real safe GET', async () => {
+  const r = await rawReq('GET', '/accounts', { Origin: 'https://pubilo.com' });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers['access-control-allow-origin'], 'https://pubilo.com');
+});
+
+test('CORS is refused for a non-allowlisted origin', async () => {
+  const r = await rawReq('OPTIONS', '/accounts', { Origin: 'https://evil.example.com' });
+  assert.equal(r.status, 403);
+  assert.equal(r.headers['access-control-allow-origin'], undefined);
+});
+
+test('CORS is not applied to non-safe (token/posting) endpoints', async () => {
+  // /token/refresh is a token route — it must never gain cross-origin reach, even from pubilo.com.
+  const r = await rawReq('OPTIONS', '/token/refresh', { Origin: 'https://www.pubilo.com' });
+  assert.equal(r.status, 403);
+  assert.equal(r.headers['access-control-allow-origin'], undefined);
+});
+
 test('native-only mode keeps account APIs working while browser login stays disabled', async () => {
   let r = await req('POST', '/accounts', {
     account: 'CHEARB',

@@ -306,6 +306,50 @@ function sendError(res, status, message, extra = {}) {
   send(res, status, { success: false, error: message, ...extra });
 }
 
+// ── Narrow CORS for the Pubilo dashboard Accounts page ──────────────────────────────────────────
+// The dashboard is served from https://www.pubilo.com but the Accounts Bridge runs on THIS Mac at
+// 127.0.0.1:8820. A browser tab on pubilo.com can read a loopback response only if we echo an
+// allowed Origin back. We do this ONLY for the safe, token-free accounts read/open/close endpoints
+// — never for any token-mint or posting route — so the bridge stays a local-only surface for
+// everything that touches a secret. No credentials are allowed (the dashboard fetches with
+// credentials:'omit'), so the echoed origin is always a single concrete origin, never '*'.
+const CORS_ALLOWED_ORIGINS = new Set([
+  'https://www.pubilo.com',
+  'https://pubilo.com',
+  'https://dashboard.pubilo.com',
+  // Local dev / preview origins for the React dashboard (Vite dev 5173, preview 4173).
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4173',
+  'http://127.0.0.1:4173'
+]);
+
+// Endpoints the dashboard Accounts page may call cross-origin: status-only reads plus the explicit
+// user-triggered visible-open / close actions. None of these mint, refresh, or return a secret.
+const CORS_SAFE_PATHS = new Set([
+  '/health',
+  '/accounts',
+  '/accounts/bridge/status',
+  '/accounts/bridge/facebook',
+  '/accounts/profile-status',
+  '/login',
+  '/login/close'
+]);
+
+function resolveCorsOrigin(req) {
+  const origin = req.headers.origin;
+  if (origin && CORS_ALLOWED_ORIGINS.has(origin)) return origin;
+  return null;
+}
+
+function applyCorsHeaders(res, origin) {
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-bot-id');
+  res.setHeader('Access-Control-Max-Age', '600');
+}
+
 function hasValue(v) {
   return v != null && String(v).trim() !== '';
 }
@@ -651,6 +695,20 @@ function createHandler(deps = {}) {
   return async function handleRequest(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || `${DEFAULT_HOST}:${DEFAULT_PORT}`}`);
     try {
+      // Narrow CORS: only the safe, token-free accounts endpoints are reachable cross-origin from the
+      // allowlisted Pubilo dashboard origins. Set the response headers up-front so every send() below
+      // carries them, and answer the preflight before any routing/side-effect runs.
+      const corsOrigin = resolveCorsOrigin(req);
+      const corsSafe = CORS_SAFE_PATHS.has(url.pathname);
+      if (corsOrigin && corsSafe) applyCorsHeaders(res, corsOrigin);
+      if (req.method === 'OPTIONS') {
+        if (corsOrigin && corsSafe) {
+          res.writeHead(204);
+          return res.end();
+        }
+        return sendError(res, 403, 'cors_not_allowed');
+      }
+
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
         return sendError(res, 410, 'native_app_only');
       }

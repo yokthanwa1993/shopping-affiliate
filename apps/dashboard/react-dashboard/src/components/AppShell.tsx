@@ -16,6 +16,7 @@ import {
   PackageOpen,
   PenSquare,
   Settings,
+  UserCog,
   Users,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
@@ -77,6 +78,16 @@ const NAV_GROUPS: readonly NavGroup[] = [
     items: [{ to: '/history', label: 'ประวัติ', sublabel: 'History', icon: MessageSquare, exact: false }],
   },
 ] as const
+
+// Account/user management lives on the dashboard now and drives the local Accounts Bridge (the token
+// pool on this Mac). Pinned to the footer just before Settings.
+const ACCOUNTS_NAV: NavItem = {
+  to: '/accounts',
+  label: 'บัญชี',
+  sublabel: 'Accounts',
+  icon: UserCog,
+  exact: false,
+}
 
 const SETTINGS_NAV: NavItem = {
   to: '/settings',
@@ -264,6 +275,7 @@ function AppShellLayout({
             ))}
           </nav>
           <div className="border-t border-[#ededed] py-2">
+            <NavLink item={ACCOUNTS_NAV} />
             <NavLink item={SETTINGS_NAV} />
           </div>
         </aside>

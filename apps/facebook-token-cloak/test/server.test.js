@@ -2211,11 +2211,11 @@ test('/token/auto-sync page-targeted dry run lists ONLY the target page + fallba
     for (const c of r.body.candidates) assert.equal('access_token' in c, false);
   });
 });
-test('LaunchAgent default post account is Accounts Bridge v2 Chanalai, not legacy profile', () => {
+test('LaunchAgent default post account is Thanwan and ads account is Chanalai', () => {
   const nodeFs = require('node:fs');
   const plist = nodeFs.readFileSync(path.join(__dirname, '..', 'launchd', 'com.affiliate.facebook-token-cloak.plist'), 'utf8');
-  assert.match(plist, /<key>FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT<\/key>\s*<string>100090320823561<\/string>/);
-  assert.doesNotMatch(plist, /100077795357192/);
+  assert.match(plist, /<key>FACEBOOK_TOKEN_CLOAK_POST_ACCOUNT<\/key>\s*<string>100077795357192<\/string>/);
+  assert.match(plist, /<key>FACEBOOK_TOKEN_CLOAK_ADS_ACCOUNT<\/key>\s*<string>100090320823561<\/string>/);
   assert.doesNotMatch(plist, /content_paiya/);
 });
 

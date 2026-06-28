@@ -13,6 +13,7 @@ import { CreatePostPage } from '@/routes/create-post'
 import { CreateAdsPage } from '@/routes/create-ads'
 import { QueuePage } from '@/routes/queue'
 import { HistoryPage } from '@/routes/history'
+import { AccountsPage } from '@/routes/accounts'
 import { SettingsPage } from '@/routes/settings'
 
 // Basepath derives from Vite's `base` (/dashboard_next/) for the preview mount,
@@ -67,6 +68,7 @@ const createPostRoute = page('/create-post', CreatePostPage)
 const createAdsRoute = page('/create-ads', CreateAdsPage)
 const queueRoute = page('/queue', QueuePage)
 const historyRoute = page('/history', HistoryPage)
+const accountsRoute = page('/accounts', AccountsPage)
 const settingsRoute = page('/settings', SettingsPage)
 
 const routeTree = rootRoute.addChildren([
@@ -85,6 +87,7 @@ const routeTree = rootRoute.addChildren([
   createAdsRoute,
   queueRoute,
   historyRoute,
+  accountsRoute,
   settingsRoute,
 ])
 
