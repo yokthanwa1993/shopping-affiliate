@@ -98,10 +98,18 @@ async function bridgeFetch<T>(path: string, options: BridgeRequestOptions = {}):
   }
   const errorCode =
     json && typeof json === 'object' && 'error' in json ? String((json as Record<string, unknown>).error) : null
-  if (response.status === 503 && errorCode === 'cloud_bridge_not_configured') {
-    throw new CloudNotConfiguredError()
+  if (response.status === 503 && (errorCode === 'cloud_bridge_not_configured' || errorCode === 'remote_browser_not_configured')) {
+    throw new CloudNotConfiguredError(
+      errorCode === 'remote_browser_not_configured' ? 'Cloud Browser bridge not configured' : undefined,
+    )
   }
-  if (response.status === 502 || errorCode === 'cloud_bridge_unreachable' || errorCode === 'cloud_bridge_bad_response') {
+  if (
+    response.status === 502 ||
+    errorCode === 'cloud_bridge_unreachable' ||
+    errorCode === 'cloud_bridge_bad_response' ||
+    errorCode === 'remote_browser_unreachable' ||
+    errorCode === 'remote_browser_bad_response'
+  ) {
     throw new BridgeOfflineError()
   }
   if (!response.ok) {
@@ -118,6 +126,16 @@ export interface CloudHealth {
   api: string
 }
 
+// Which sensitive fields are STORED (write-only vault). The raw values never reach the browser.
+export interface CredentialPresence {
+  password: boolean
+  datr_cookie: boolean
+  totp_secret: boolean
+  proxy_url: boolean
+}
+
+export type AccountTag = 'post' | 'comment' | 'mobile'
+
 export interface CloudAccount {
   account_uid: string
   platform: string
@@ -125,10 +143,20 @@ export interface CloudAccount {
   // Non-secret operator metadata (never cookies/tokens/passwords/datr/fb_dtsg/sessions).
   notes: string | null
   tags: string[]
+  tag: AccountTag | string | null
   page_label: string | null
   account_role: string | null
+  homepage_url: string | null
+  email: string | null
   preferred_agent_id: string | null
   status: string
+  // Avatar pointer/flag — bytes are streamed from the avatar endpoint, never inlined here.
+  avatar_present: boolean
+  avatar_mime?: string | null
+  avatar_updated_at?: string | null
+  // Presence-only view of the encrypted credential vault + a host-only (credential-free) proxy hint.
+  credential_presence: CredentialPresence
+  proxy_host_hint: string | null
   created_at?: string
   updated_at?: string
 }
@@ -140,10 +168,26 @@ export interface CloudAccountInput {
   display_label?: string | null
   notes?: string | null
   tags?: string[] | string | null
+  tag?: AccountTag | string | null
   page_label?: string | null
   account_role?: string | null
+  homepage_url?: string | null
+  email?: string | null
   preferred_agent_id?: string | null
   status?: string | null
+}
+
+// Write-only credential input. Each value is sent UP only; a blank/omitted field keeps the existing
+// stored value, and `clear_<field>: true` removes it. No raw value ever comes back.
+export interface CredentialInput {
+  password?: string
+  datr_cookie?: string
+  totp_secret?: string
+  proxy_url?: string
+  clear_password?: boolean
+  clear_datr_cookie?: boolean
+  clear_totp_secret?: boolean
+  clear_proxy_url?: boolean
 }
 
 // account_uid is a numeric platform UID (5–32 digits). The server is the source of truth, but we
@@ -228,6 +272,65 @@ export async function archiveCloudAccount(platform: string, accountUid: string):
   return data.account
 }
 
+// Save sensitive credentials into the WRITE-ONLY vault. Returns presence flags only — never the raw
+// values. Blank fields are left untouched server-side; pass clear_<field> to remove one.
+export async function putAccountCredentials(
+  platform: string,
+  accountUid: string,
+  input: CredentialInput,
+): Promise<{ credential_presence: CredentialPresence; proxy_host_hint: string | null }> {
+  return bridgeFetch<{ credential_presence: CredentialPresence; proxy_host_hint: string | null }>(
+    `/accounts/${platform}/${accountUid}/credentials`,
+    { method: 'PUT', body: input, timeoutMs: 15000 },
+  )
+}
+
+// Same-origin URL for an account's avatar image. Cache-busted by avatar_updated_at so a freshly
+// uploaded image shows immediately. Returns null when no avatar is stored.
+export function accountAvatarUrl(account: Pick<CloudAccount, 'platform' | 'account_uid' | 'avatar_present' | 'avatar_updated_at'>): string | null {
+  if (!account.avatar_present) return null
+  const v = account.avatar_updated_at ? `?v=${encodeURIComponent(account.avatar_updated_at)}` : ''
+  return `${ACCOUNTS_BRIDGE_BASE}/accounts/${account.platform}/${account.account_uid}/avatar${v}`
+}
+
+// Upload an avatar image (png/jpeg/webp, ≤2MB) via multipart FormData. The browser sets the multipart
+// boundary; the dashboard proxy forwards the bytes verbatim. Returns the updated account.
+export async function uploadAccountAvatar(platform: string, accountUid: string, file: File): Promise<CloudAccount> {
+  const form = new FormData()
+  form.append('file', file)
+  const url = new URL(`${ACCOUNTS_BRIDGE_BASE}/accounts/${platform}/${accountUid}/avatar`, window.location.origin)
+  let response: Response
+  try {
+    response = await fetch(url.toString(), { method: 'POST', credentials: 'same-origin', body: form })
+  } catch {
+    throw new BridgeOfflineError()
+  }
+  const text = await response.text()
+  let json: unknown = undefined
+  if (text) {
+    try {
+      json = JSON.parse(text)
+    } catch {
+      throw new Error(`Avatar upload returned non-JSON (HTTP ${response.status})`)
+    }
+  }
+  const errorCode =
+    json && typeof json === 'object' && 'error' in json ? String((json as Record<string, unknown>).error) : null
+  if (response.status === 503 && errorCode === 'cloud_bridge_not_configured') throw new CloudNotConfiguredError()
+  if (response.status === 502 || errorCode === 'cloud_bridge_unreachable') throw new BridgeOfflineError()
+  if (!response.ok) throw new Error(errorCode || `HTTP ${response.status}`)
+  return (json as { account: CloudAccount }).account
+}
+
+// Remove an account's avatar. Returns the updated account.
+export async function deleteAccountAvatar(platform: string, accountUid: string): Promise<CloudAccount> {
+  const data = await bridgeFetch<{ account: CloudAccount }>(`/accounts/${platform}/${accountUid}/avatar`, {
+    method: 'DELETE',
+    timeoutMs: 15000,
+  })
+  return data.account
+}
+
 export async function fetchCloudAgents(signal?: AbortSignal): Promise<CloudAgent[]> {
   const data = await bridgeFetch<{ agents?: CloudAgent[] }>('/agents', { signal })
   return data.agents ?? []
@@ -258,6 +361,84 @@ export function openOnMac(agentId: string, accountUid: string): Promise<CloudCom
 // "Close on Mac": enqueue a close_profile command.
 export function closeOnMac(agentId: string, accountUid: string): Promise<CloudCommand> {
   return enqueueCommand({ agent_id: agentId, action: 'close_profile', account_uid: accountUid })
+}
+
+// ── Cloud Browser (remote browser) ───────────────────────────────────────────────────────────────
+// Open + stream + drive a single visible page on the Mac's persistent profile from a dashboard tab.
+// The screenshot is loaded via <img> (same-origin URL); start/status/input/stop are JSON. None of
+// these carry a secret — status exposes only id/url/title/status/viewport, screenshot is a JPEG frame.
+
+export type RemoteBrowserStatus = 'running' | 'closing' | 'closed'
+
+export interface RemoteBrowserSession {
+  id: string
+  account_uid: string
+  url: string | null
+  title: string | null
+  status: RemoteBrowserStatus
+  viewport: { width: number; height: number } | null
+  started_at?: string
+}
+
+// The fixed, validated input vocabulary mirrored from the Mac bridge — NO eval/script action exists.
+export type RemoteBrowserAction = 'click' | 'type' | 'key' | 'scroll' | 'navigate' | 'back' | 'forward' | 'reload'
+
+export interface RemoteBrowserInputPayload {
+  x?: number
+  y?: number
+  text?: string
+  key?: string
+  deltaX?: number
+  deltaY?: number
+  url?: string
+}
+
+// Start a Cloud Browser session for an account. Returns the session handle (unguessable id) + initial
+// status. The dashboard then opens /accounts/browser/:id which streams the screenshot and relays input.
+export async function startRemoteBrowser(accountUid: string, initialUrl?: string): Promise<RemoteBrowserSession> {
+  const body: { account_uid: string; initial_url?: string } = { account_uid: accountUid }
+  if (initialUrl) body.initial_url = initialUrl
+  const data = await bridgeFetch<{ session: RemoteBrowserSession }>('/remote-browser/start', {
+    method: 'POST',
+    body,
+    timeoutMs: 30000,
+  })
+  return data.session
+}
+
+export async function getRemoteBrowserStatus(sessionId: string, signal?: AbortSignal): Promise<RemoteBrowserSession> {
+  const data = await bridgeFetch<{ session: RemoteBrowserSession }>(
+    `/remote-browser/${encodeURIComponent(sessionId)}/status`,
+    { signal },
+  )
+  return data.session
+}
+
+// Same-origin URL for the live viewport frame. Cache-busted by `nonce` so each poll fetches a fresh
+// image. Loaded by an <img> tag; the dashboard session cookie authenticates the proxy hop.
+export function remoteBrowserScreenshotUrl(sessionId: string, nonce: number | string): string {
+  // `t` matches the cache-buster the dashboard proxy forwards upstream; it also varies the same-origin
+  // URL so the browser never serves a stale frame from cache.
+  return `${ACCOUNTS_BRIDGE_BASE}/remote-browser/${encodeURIComponent(sessionId)}/screenshot?t=${encodeURIComponent(String(nonce))}`
+}
+
+// Relay one validated input action to the remote page (click/type/key/scroll/navigate/back/forward/reload).
+export async function sendRemoteBrowserInput(
+  sessionId: string,
+  action: RemoteBrowserAction,
+  payload: RemoteBrowserInputPayload = {},
+): Promise<void> {
+  await bridgeFetch(`/remote-browser/${encodeURIComponent(sessionId)}/input`, {
+    method: 'POST',
+    body: { action, payload },
+    timeoutMs: 30000,
+  })
+}
+
+// Stop the session: the Mac closes the page/context and uploads the sealed profile archive so the next
+// open restores it. Returns only metadata (no secret, no bytes).
+export async function stopRemoteBrowser(sessionId: string): Promise<void> {
+  await bridgeFetch(`/remote-browser/${encodeURIComponent(sessionId)}/stop`, { method: 'POST', timeoutMs: 30000 })
 }
 
 // An agent is "live" only if it heartbeated recently — status alone can go stale when the agent dies.

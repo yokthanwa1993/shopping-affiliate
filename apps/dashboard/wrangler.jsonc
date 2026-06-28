@@ -68,7 +68,17 @@
     // src/server/accountsbridge.ts forwards to this origin and injects the API key server-side.
     // The API key itself is a SECRET — never put it here. Set it with:
     //   wrangler secret put ACCOUNTS_BRIDGE_API_KEY
-    "ACCOUNTS_BRIDGE_WORKER_URL": "https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev"
+    "ACCOUNTS_BRIDGE_WORKER_URL": "https://accounts-bridge-worker.yokthanwa1993-bc9.workers.dev",
+    "ACCOUNTS_BRIDGE_REMOTE_BROWSER_BASE_URL": "https://short.wwoom.com"
+    // Cloud Browser (Accounts → Globe button). The /accounts-bridge/remote-browser/* proxy forwards
+    // to the Mac facebook-token-cloak bridge — a PUBLIC tunnel of 127.0.0.1:8820 (Workers cannot reach
+    // loopback). REQUIRED for the feature; until set, the proxy returns 503 remote_browser_not_configured
+    // and the Globe button surfaces "Cloud Browser bridge not configured" (never falls back to localhost):
+    //   "ACCOUNTS_BRIDGE_REMOTE_BROWSER_BASE_URL": "https://<your-cloudflared-tunnel-hostname>"
+    // And set the matching shared secret on BOTH sides (dashboard worker + the Mac bridge env):
+    //   wrangler secret put ACCOUNTS_BRIDGE_REMOTE_BROWSER_KEY     # dashboard side (injected as x-remote-browser-key)
+    //   export ACCOUNTS_BRIDGE_REMOTE_BROWSER_KEY=...              # Mac bridge side (gates /remote-browser/*)
+    // Both sides fall back to ACCOUNTS_BRIDGE_API_KEY, so a single shared key already configured works.
   },
   "observability": {
     "enabled": true

@@ -37,6 +37,14 @@ ingress:
   - hostname: short.wwoom.com
     path: /publish-story*
     service: http://127.0.0.1:8820
+  # Cloud Browser (remote browser) — live JPEG viewport + input relay for the dashboard Accounts page.
+  # Gated by the x-remote-browser-key header (the dashboard proxy injects it server-side); the session
+  # id is a second unguessable capability. Only ONE Playwright page is screenshotted — never the Mac
+  # desktop. Set FACEBOOK_TOKEN_CLOAK_REMOTE_BROWSER_KEY (or ACCOUNTS_BRIDGE_API_KEY) BEFORE restarting
+  # cloudflared, otherwise the route is open to the internet.
+  - hostname: short.wwoom.com
+    path: /remote-browser*
+    service: http://127.0.0.1:8820
   - hostname: short.wwoom.com
     service: http://127.0.0.1:8810
   - service: http_status:404

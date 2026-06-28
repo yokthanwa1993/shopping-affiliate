@@ -6,7 +6,9 @@ import {
   CloudOff,
   Facebook,
   Globe,
+  ImagePlus,
   Laptop,
+  Loader2,
   Pencil,
   Play,
   Plus,
@@ -18,6 +20,7 @@ import {
   X,
 } from 'lucide-react'
 import {
+  accountAvatarUrl,
   archiveCloudAccount,
   BridgeOfflineError,
   CloudNotConfiguredError,
@@ -30,11 +33,15 @@ import {
   isAgentLive,
   isValidAccountUid,
   openOnMac,
+  putAccountCredentials,
+  startRemoteBrowser,
   updateCloudAccount,
+  uploadAccountAvatar,
   type CloudAccount,
   type CloudAccountInput,
   type CloudAgent,
   type CloudCommand,
+  type CredentialInput,
 } from '@/api/accountsBridge'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -46,6 +53,17 @@ function isNotConfigured(error: unknown): boolean {
 }
 function isOffline(error: unknown): boolean {
   return error instanceof BridgeOfflineError
+}
+
+// Build the Cloud Browser tab URL under the active router prefix (/dashboard or the Vite preview
+// base), mirroring resolveBasepath() in router.tsx so the new tab lands on the right mount.
+function cloudBrowserPath(sessionId: string): string {
+  const base =
+    typeof window !== 'undefined' &&
+    (window.location.pathname === '/dashboard' || window.location.pathname.startsWith('/dashboard/'))
+      ? '/dashboard'
+      : (import.meta.env.BASE_URL.replace(/\/+$/, '') || '')
+  return `${base}/accounts/browser/${encodeURIComponent(sessionId)}`
 }
 
 // Short relative time for heartbeats / command timestamps. Cloud timestamps are ISO strings.
@@ -194,8 +212,26 @@ function AccountRow({
     mutationFn: () => closeOnMac(agent!.agent_id, uid),
     onSuccess: onRefresh,
   })
-  const busy = openMutation.isPending || closeMutation.isPending
-  const actionError = openMutation.error || closeMutation.error
+  // Cloud Browser: start a live remote-browser session on the Mac and open it in a new dashboard tab.
+  // The blank tab is opened synchronously on click (popup-blocker safe) and pointed at the viewer once
+  // the session id is back; on failure the tab is closed and the error surfaces in the row.
+  const cloudBrowserMutation = useMutation({
+    mutationFn: async (tab: Window | null) => {
+      const session = await startRemoteBrowser(uid)
+      return { session, tab }
+    },
+    onSuccess: ({ session, tab }) => {
+      const target = cloudBrowserPath(session.id)
+      if (tab) tab.location.href = target
+      else window.open(target, '_blank', 'noopener')
+      onRefresh()
+    },
+    onError: (_e, tab) => {
+      if (tab) tab.close()
+    },
+  })
+  const busy = openMutation.isPending || closeMutation.isPending || cloudBrowserMutation.isPending
+  const actionError = openMutation.error || closeMutation.error || cloudBrowserMutation.error
 
   const run = runStateForAccount(uid, commands, agentLive)
   const isRunning = run.label === 'Running'
@@ -217,11 +253,19 @@ function AccountRow({
       {/* NAME */}
       <td className="min-w-[260px] px-3 py-3 align-middle">
         <div className="flex items-center gap-3">
-          <span
-            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${avatarTint(uid)}`}
-          >
-            {initials(label)}
-          </span>
+          {account.avatar_present ? (
+            <img
+              src={accountAvatarUrl(account) ?? ''}
+              alt=""
+              className="h-9 w-9 shrink-0 rounded-full object-cover"
+            />
+          ) : (
+            <span
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${avatarTint(uid)}`}
+            >
+              {initials(label)}
+            </span>
+          )}
           <span className="min-w-0">
             <span className="block truncate text-sm font-medium text-[#333333]">{label}</span>
             <span className="block truncate font-mono text-[11px] text-muted-foreground">UID: {uid}</span>
@@ -238,19 +282,15 @@ function AccountRow({
           <span className="text-[#cfcfcf]">—</span>
         )}
       </td>
-      {/* TAG */}
+      {/* TAG (single BrowserSaving-style tag) */}
       <td className="min-w-[120px] px-3 py-3 align-middle">
-        <span className="flex flex-wrap items-center gap-1">
-          {account.tags.length > 0 ? (
-            account.tags.map((tag) => (
-              <Badge key={tag} variant="secondary" className="bg-[#fff1ec] text-[#ee4d2d]">
-                {tag}
-              </Badge>
-            ))
-          ) : (
-            <span className="text-sm text-[#cfcfcf]">—</span>
-          )}
-        </span>
+        {account.tag ? (
+          <Badge variant="secondary" className="bg-[#fff1ec] text-[#ee4d2d]">
+            {account.tag}
+          </Badge>
+        ) : (
+          <span className="text-sm text-[#cfcfcf]">—</span>
+        )}
       </td>
       {/* PAGE */}
       <td className="min-w-[200px] px-3 py-3 align-middle">
@@ -318,8 +358,23 @@ function AccountRow({
             <RefreshCw className="h-4 w-4" />
           </IconAction>
           <span className="mx-0.5 h-5 w-px bg-border" />
-          <IconAction title="เปิดเบราว์เซอร์ (เร็ว ๆ นี้)" placeholder>
-            <Globe className="h-4 w-4" />
+          {/* Cloud Browser: start a live remote-browser session on the Mac and DRIVE it from a new tab.
+              The blank tab is opened synchronously here (popup-blocker safe) and handed to the mutation,
+              which points it at the viewer once the session id returns. Stop stays available above. */}
+          <IconAction
+            title={canAct ? 'เปิด Cloud Browser ในแท็บใหม่ (ขับเบราว์เซอร์จากเว็บ)' : 'agent ออฟไลน์'}
+            onClick={() => {
+              const tab = typeof window !== 'undefined' ? window.open('', '_blank') : null
+              cloudBrowserMutation.mutate(tab)
+            }}
+            disabled={!canAct || busy}
+            className="hover:!bg-[#fff1ec] hover:!text-[#ee4d2d]"
+          >
+            {cloudBrowserMutation.isPending ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Globe className="h-4 w-4" />
+            )}
           </IconAction>
           <IconAction title="แก้ไขบัญชี (Edit)" onClick={onEdit}>
             <Pencil className="h-4 w-4" />
@@ -350,19 +405,40 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: 'disabled', label: 'ปิดใช้งาน · Disabled' },
   { value: 'archived', label: 'เก็บถาวร · Archived' },
 ]
-const ROLE_OPTIONS: { value: string; label: string }[] = [
+// BrowserSaving-style single tag.
+const TAG_OPTIONS: { value: string; label: string }[] = [
   { value: '', label: '— ไม่ระบุ' },
-  { value: 'post', label: 'โพสต์ · Post' },
-  { value: 'ads', label: 'โฆษณา · Ads' },
-  { value: 'general', label: 'ทั่วไป · General' },
+  { value: 'post', label: 'โพสต์ · post' },
+  { value: 'comment', label: 'คอมเมนต์ · comment' },
+  { value: 'mobile', label: 'มือถือ · mobile' },
 ]
 
 const fieldLabelCls = 'mb-1 block text-xs font-medium text-[#555555]'
 const fieldInputCls =
   'h-9 w-full rounded-md border border-input bg-white px-3 text-sm text-[#333333] focus:outline-none focus:ring-2 focus:ring-ring'
 
-// Create/Edit account modal. NON-SECRET metadata fields only — there is intentionally no cookie /
-// token / password / session field anywhere in this form.
+// Payload the modal hands back: non-secret metadata, an optional write-only credential patch, and an
+// optional avatar file. The page orchestrates the (up to) three API calls in order.
+type AccountSavePayload = {
+  metadata: CloudAccountInput
+  credentials: CredentialInput | null
+  avatarFile: File | null
+}
+
+// Small "saved" presence chip shown next to a write-only secret field when a value already exists.
+function SavedChip({ present }: { present: boolean }) {
+  if (!present) return null
+  return (
+    <span className="ml-2 inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-600">
+      บันทึกแล้ว · saved
+    </span>
+  )
+}
+
+// Add / Edit Profile modal — BrowserSaving-style layout: a centered avatar uploader on top, then the
+// profile fields. SECRET fields (proxy / password / DATR cookie / 2FA secret) are WRITE-ONLY: on edit
+// they render blank with a "leave blank to keep existing" hint and a "saved" chip when a value is
+// already stored. Their raw values are never fetched or displayed — only presence flags exist client-side.
 function AccountFormModal({
   mode,
   account,
@@ -378,18 +454,41 @@ function AccountFormModal({
   submitting: boolean
   error: string | null
   onClose: () => void
-  onSubmit: (values: CloudAccountInput) => void
+  onSubmit: (payload: AccountSavePayload) => void
 }) {
+  const isCreate = mode === 'create'
+  const presence = account?.credential_presence
+
   const [uid, setUid] = useState(account?.account_uid ?? '')
   const [name, setName] = useState(account?.display_label ?? '')
-  const [notes, setNotes] = useState(account?.notes ?? '')
-  const [tags, setTags] = useState((account?.tags ?? []).join(', '))
+  const [tag, setTag] = useState(account?.tag ?? '')
+  const [homepage, setHomepage] = useState(account?.homepage_url ?? '')
+  const [email, setEmail] = useState(account?.email ?? '')
   const [pageLabel, setPageLabel] = useState(account?.page_label ?? '')
-  const [role, setRole] = useState(account?.account_role ?? '')
+  const [notes, setNotes] = useState(account?.notes ?? '')
   const [status, setStatus] = useState<string>(statusToFormValue(account?.status))
   const [preferredAgent, setPreferredAgent] = useState(account?.preferred_agent_id ?? '')
 
-  const isCreate = mode === 'create'
+  // Write-only secrets — always start blank, even on edit.
+  const [proxy, setProxy] = useState('')
+  const [password, setPassword] = useState('')
+  const [datr, setDatr] = useState('')
+  const [totp, setTotp] = useState('')
+
+  // Avatar: existing image (edit) until a new file is picked; local preview for the new file.
+  const [avatarFile, setAvatarFile] = useState<File | null>(null)
+  const [avatarPreview, setAvatarPreview] = useState<string | null>(null)
+  const existingAvatar = account ? accountAvatarUrl(account) : null
+  const shownAvatar = avatarPreview ?? existingAvatar
+
+  function pickAvatar(file: File | null) {
+    if (!file) return
+    setAvatarFile(file)
+    const reader = new FileReader()
+    reader.onload = () => setAvatarPreview(typeof reader.result === 'string' ? reader.result : null)
+    reader.readAsDataURL(file)
+  }
+
   const uidValid = isValidAccountUid(uid)
   const nameValid = name.trim().length > 0
   const canSubmit = nameValid && (isCreate ? uidValid : true) && !submitting
@@ -397,21 +496,32 @@ function AccountFormModal({
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!canSubmit) return
-    const values: CloudAccountInput = {
+    const metadata: CloudAccountInput = {
       display_label: name.trim(),
-      notes: notes.trim() || null,
-      tags: tags.trim(), // server normalizes the comma/newline-separated string
+      tag: tag || null,
+      homepage_url: homepage.trim() || null,
+      email: email.trim() || null,
       page_label: pageLabel.trim() || null,
-      account_role: role || null,
+      notes: notes.trim() || null,
       preferred_agent_id: preferredAgent || null,
       status,
     }
     if (isCreate) {
-      values.account_uid = uid.trim()
-      values.platform = 'facebook'
+      metadata.account_uid = uid.trim()
+      metadata.platform = 'facebook'
     }
-    onSubmit(values)
+    // Only send credential fields the operator actually typed (blank = keep existing server-side).
+    const credentials: CredentialInput = {}
+    if (proxy.trim()) credentials.proxy_url = proxy.trim()
+    if (password) credentials.password = password
+    if (datr.trim()) credentials.datr_cookie = datr.trim()
+    if (totp.trim()) credentials.totp_secret = totp.trim()
+    const hasCredentials = Object.keys(credentials).length > 0
+
+    onSubmit({ metadata, credentials: hasCredentials ? credentials : null, avatarFile })
   }
+
+  const secretFieldCls = `${fieldInputCls} font-mono`
 
   return (
     <div
@@ -422,10 +532,10 @@ function AccountFormModal({
         if (e.target === e.currentTarget) onClose()
       }}
     >
-      <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg bg-white shadow-xl">
+      <div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-lg bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
           <h2 className="text-base font-semibold text-[#333333]">
-            {isCreate ? 'เพิ่มบัญชี · Add account' : 'แก้ไขบัญชี · Edit account'}
+            {isCreate ? 'เพิ่มโปรไฟล์ · Add Profile' : 'แก้ไขโปรไฟล์ · Edit Profile'}
           </h2>
           <button
             type="button"
@@ -438,9 +548,100 @@ function AccountFormModal({
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-3.5 px-5 py-4">
+          {/* Avatar uploader */}
+          <div className="flex flex-col items-center gap-2">
+            <label
+              htmlFor="acc-avatar"
+              className="group relative flex h-20 w-20 cursor-pointer items-center justify-center overflow-hidden rounded-full border border-dashed border-[#cccccc] bg-[#fafafa] text-[#999999] hover:border-[#ee4d2d]"
+              title="คลิกเพื่ออัปโหลดรูป · Click to upload"
+            >
+              {shownAvatar ? (
+                <img src={shownAvatar} alt="" className="h-full w-full object-cover" />
+              ) : (
+                <ImagePlus className="h-6 w-6" />
+              )}
+              <span className="absolute inset-x-0 bottom-0 bg-black/45 py-0.5 text-center text-[9px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+                อัปโหลด
+              </span>
+            </label>
+            <input
+              id="acc-avatar"
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              className="hidden"
+              onChange={(e) => pickAvatar(e.target.files?.[0] ?? null)}
+            />
+            <span className="text-[11px] text-muted-foreground">
+              คลิกวงกลมเพื่ออัปโหลดรูป (PNG/JPEG/WEBP ≤ 2MB)
+            </span>
+          </div>
+
+          <div>
+            <label className={fieldLabelCls} htmlFor="acc-name">
+              ชื่อโปรไฟล์ · Profile Name <span className="text-red-500">*</span>
+            </label>
+            <input
+              id="acc-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="เช่น Chanalai"
+              className={fieldInputCls}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={fieldLabelCls} htmlFor="acc-tag">แท็ก · Tag</label>
+              <select id="acc-tag" value={tag} onChange={(e) => setTag(e.target.value)} className={fieldInputCls}>
+                {TAG_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className={fieldLabelCls} htmlFor="acc-status">สถานะ · Status</label>
+              <select id="acc-status" value={status} onChange={(e) => setStatus(e.target.value)} className={fieldInputCls}>
+                {STATUS_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label className={fieldLabelCls} htmlFor="acc-proxy">
+              พร็อกซี · Proxy
+              <SavedChip present={!!presence?.proxy_url} />
+            </label>
+            <input
+              id="acc-proxy"
+              value={proxy}
+              onChange={(e) => setProxy(e.target.value)}
+              placeholder={presence?.proxy_url ? (account?.proxy_host_hint ?? 'เว้นว่างเพื่อใช้ค่าเดิม') : 'host:port หรือ socks5://user:pass@host:port'}
+              className={secretFieldCls}
+              autoComplete="off"
+            />
+            {presence?.proxy_url ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                เว้นว่างเพื่อใช้ค่าเดิม{account?.proxy_host_hint ? ` (${account.proxy_host_hint})` : ''}
+              </p>
+            ) : null}
+          </div>
+
+          <div>
+            <label className={fieldLabelCls} htmlFor="acc-home">โฮมเพจ · Homepage</label>
+            <input
+              id="acc-home"
+              value={homepage}
+              onChange={(e) => setHomepage(e.target.value)}
+              placeholder="https://facebook.com/yourpage"
+              className={fieldInputCls}
+            />
+          </div>
+
           <div>
             <label className={fieldLabelCls} htmlFor="acc-uid">
-              UID (ตัวเลขล้วน 5–32 หลัก) <span className="text-red-500">*</span>
+              UID (Facebook User ID, ตัวเลขล้วน) <span className="text-red-500">*</span>
             </label>
             <input
               id="acc-uid"
@@ -458,72 +659,89 @@ function AccountFormModal({
           </div>
 
           <div>
-            <label className={fieldLabelCls} htmlFor="acc-name">
-              ชื่อบัญชี · Name <span className="text-red-500">*</span>
+            <label className={fieldLabelCls} htmlFor="acc-email">อีเมล · Email</label>
+            <input
+              id="acc-email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="name@example.com"
+              className={fieldInputCls}
+              autoComplete="off"
+            />
+          </div>
+
+          <div>
+            <label className={fieldLabelCls} htmlFor="acc-password">
+              รหัสผ่าน · Password
+              <SavedChip present={!!presence?.password} />
             </label>
             <input
-              id="acc-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="เช่น Chanalai"
-              className={fieldInputCls}
+              id="acc-password"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={presence?.password ? 'เว้นว่างเพื่อใช้ค่าเดิม · Leave blank to keep existing' : '••••••••'}
+              className={secretFieldCls}
+              autoComplete="new-password"
+            />
+          </div>
+
+          <div>
+            <label className={fieldLabelCls} htmlFor="acc-datr">
+              DATR Cookie
+              <SavedChip present={!!presence?.datr_cookie} />
+            </label>
+            <input
+              id="acc-datr"
+              value={datr}
+              onChange={(e) => setDatr(e.target.value)}
+              placeholder={presence?.datr_cookie ? 'เว้นว่างเพื่อใช้ค่าเดิม · Leave blank to keep existing' : 'datr cookie value'}
+              className={secretFieldCls}
+              autoComplete="off"
+            />
+          </div>
+
+          <div>
+            <label className={fieldLabelCls} htmlFor="acc-totp">
+              2FA Secret (TOTP)
+              <SavedChip present={!!presence?.totp_secret} />
+            </label>
+            <input
+              id="acc-totp"
+              value={totp}
+              onChange={(e) => setTotp(e.target.value)}
+              placeholder={presence?.totp_secret ? 'เว้นว่างเพื่อใช้ค่าเดิม · Leave blank to keep existing' : 'เช่น JBSWY3DPEHPK3PXP'}
+              className={secretFieldCls}
+              autoComplete="off"
             />
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className={fieldLabelCls} htmlFor="acc-role">บทบาท · Role</label>
-              <select id="acc-role" value={role} onChange={(e) => setRole(e.target.value)} className={fieldInputCls}>
-                {ROLE_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
+              <label className={fieldLabelCls} htmlFor="acc-page">เพจ · Page label</label>
+              <input
+                id="acc-page"
+                value={pageLabel}
+                onChange={(e) => setPageLabel(e.target.value)}
+                placeholder="เช่น เพจหลัก"
+                className={fieldInputCls}
+              />
             </div>
             <div>
-              <label className={fieldLabelCls} htmlFor="acc-status">สถานะ · Status</label>
-              <select id="acc-status" value={status} onChange={(e) => setStatus(e.target.value)} className={fieldInputCls}>
-                {STATUS_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
+              <label className={fieldLabelCls} htmlFor="acc-agent">Agent · Preferred</label>
+              <select
+                id="acc-agent"
+                value={preferredAgent}
+                onChange={(e) => setPreferredAgent(e.target.value)}
+                className={fieldInputCls}
+              >
+                <option value="">— ไม่ระบุ</option>
+                {agents.map((a) => (
+                  <option key={a.agent_id} value={a.agent_id}>{a.label || a.agent_id}</option>
                 ))}
               </select>
             </div>
-          </div>
-
-          <div>
-            <label className={fieldLabelCls} htmlFor="acc-page">เพจ · Page label</label>
-            <input
-              id="acc-page"
-              value={pageLabel}
-              onChange={(e) => setPageLabel(e.target.value)}
-              placeholder="เช่น เพจหลัก"
-              className={fieldInputCls}
-            />
-          </div>
-
-          <div>
-            <label className={fieldLabelCls} htmlFor="acc-tags">แท็ก · Tags (คั่นด้วย ,)</label>
-            <input
-              id="acc-tags"
-              value={tags}
-              onChange={(e) => setTags(e.target.value)}
-              placeholder="post, main"
-              className={fieldInputCls}
-            />
-          </div>
-
-          <div>
-            <label className={fieldLabelCls} htmlFor="acc-agent">Agent ที่ต้องการ · Preferred agent</label>
-            <select
-              id="acc-agent"
-              value={preferredAgent}
-              onChange={(e) => setPreferredAgent(e.target.value)}
-              className={fieldInputCls}
-            >
-              <option value="">— ไม่ระบุ</option>
-              {agents.map((a) => (
-                <option key={a.agent_id} value={a.agent_id}>{a.label || a.agent_id}</option>
-              ))}
-            </select>
           </div>
 
           <div>
@@ -539,7 +757,7 @@ function AccountFormModal({
           </div>
 
           <p className="rounded-md bg-[#f7f7f7] px-3 py-2 text-[11px] text-muted-foreground">
-            เก็บเฉพาะข้อมูลที่ไม่ใช่ความลับ — ไม่มีช่องสำหรับ cookie / token / password / session ที่นี่
+            พร็อกซี / รหัสผ่าน / DATR / 2FA ถูกเข้ารหัสและเก็บแบบเขียนอย่างเดียว — ค่าจริงจะไม่ถูกดึงกลับมาแสดงอีก
           </p>
 
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
@@ -549,7 +767,7 @@ function AccountFormModal({
               ยกเลิก
             </Button>
             <Button type="submit" size="sm" disabled={!canSubmit}>
-              {submitting ? 'กำลังบันทึก…' : isCreate ? 'เพิ่มบัญชี' : 'บันทึก'}
+              {submitting ? 'กำลังบันทึก…' : isCreate ? 'เพิ่มโปรไฟล์' : 'บันทึก'}
             </Button>
           </div>
         </form>
@@ -630,14 +848,28 @@ export function AccountsPage() {
     void commandsQuery.refetch()
   }
 
-  // Create or update an account, then invalidate accounts + commands so the table reflects it.
+  // Save a profile: (1) create/patch non-secret metadata, then (2) write any typed secrets into the
+  // encrypted vault, then (3) upload a newly-picked avatar. Each step targets the same (platform, uid);
+  // on create we read the identity back from step 1. Steps 2/3 run only when the operator supplied them.
   const saveMutation = useMutation({
-    mutationFn: async (values: CloudAccountInput) => {
+    mutationFn: async (payload: AccountSavePayload) => {
+      let platform: string
+      let accountUid: string
       if (modal?.mode === 'edit' && modal.account) {
-        return updateCloudAccount(modal.account.platform, modal.account.account_uid, values)
+        platform = modal.account.platform
+        accountUid = modal.account.account_uid
+        await updateCloudAccount(platform, accountUid, payload.metadata)
+      } else {
+        const { account } = await createCloudAccount(payload.metadata)
+        platform = account.platform
+        accountUid = account.account_uid
       }
-      const { account } = await createCloudAccount(values)
-      return account
+      if (payload.credentials) {
+        await putAccountCredentials(platform, accountUid, payload.credentials)
+      }
+      if (payload.avatarFile) {
+        await uploadAccountAvatar(platform, accountUid, payload.avatarFile)
+      }
     },
     onSuccess: () => {
       setModal(null)

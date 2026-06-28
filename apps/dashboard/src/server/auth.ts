@@ -26,6 +26,18 @@ export interface AuthEnv {
   // Optional: when ACCOUNTS_BRIDGE_WORKER_URL is unset the proxy returns cloud_bridge_not_configured.
   ACCOUNTS_BRIDGE_WORKER_URL?: string
   ACCOUNTS_BRIDGE_API_KEY?: string
+  // Cloud Browser (remote browser) base URL. The /accounts-bridge/remote-browser/* routes forward to
+  // THIS origin — the Mac facebook-token-cloak bridge (a public tunnel of 127.0.0.1:8820), NOT the
+  // cloud accounts Worker — because screenshots stream live binary frames off the Mac's Chromium.
+  // Optional: when unset the proxy returns 503 remote_browser_not_configured (it never leaks
+  // localhost). FACEBOOK_TOKEN_CLOAK_BRIDGE_URL is accepted as a fallback name for the same origin.
+  ACCOUNTS_BRIDGE_REMOTE_BROWSER_BASE_URL?: string
+  FACEBOOK_TOKEN_CLOAK_BRIDGE_URL?: string
+  // Shared secret the proxy injects as x-remote-browser-key when forwarding to the Mac bridge. The
+  // bridge gates its /remote-browser/* routes on this (cloudflared makes tunnel traffic look like
+  // loopback, so the header is the real auth). A Worker SECRET, never exposed to the bundle. When
+  // unset the proxy falls back to ACCOUNTS_BRIDGE_API_KEY — matching the bridge's own fallback.
+  ACCOUNTS_BRIDGE_REMOTE_BROWSER_KEY?: string
 }
 
 export const SESSION_COOKIE = 'pubilo_dashboard_session'

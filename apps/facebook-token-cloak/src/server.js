@@ -10,6 +10,7 @@ const bridgeConfig = require('./bridge-config');
 const posting = require('./posting');
 const fbLiteTokenService = require('./fb-lite-token-service.cjs');
 const profileArchiveSync = require('./profileArchiveSync');
+const { createRemoteBrowserManager } = require('./remoteBrowser');
 const {
   FACEBOOK_OAUTH_URL,
   extractAccessTokenFromUrl,
@@ -335,6 +336,39 @@ const CORS_SAFE_PATHS = new Set([
   '/login',
   '/login/close'
 ]);
+
+// Remote (cloud) browser routes carry a session id in the path, so they cannot live in the fixed
+// CORS_SAFE_PATHS set. They are token-free (only id/url/title/status + a rasterized image) and the
+// dashboard drives them cross-origin, so they are treated as CORS-safe via this matcher. The session
+// id is an unguessable crypto handle, never an account secret.
+const REMOTE_BROWSER_PREFIX = '/remote-browser';
+function isRemoteBrowserCorsPath(pathname) {
+  return pathname === REMOTE_BROWSER_PREFIX + '/start' || /^\/remote-browser\/[A-Za-z0-9_-]+\/(status|screenshot|input|stop)$/.test(pathname);
+}
+
+// The remote-browser routes are reached by the dashboard through the cloudflared tunnel, where every
+// request arrives from 127.0.0.1 (cloudflared → loopback) — so isLocalRequest() can NOT distinguish
+// internet traffic from a genuine local call. They are therefore gated by a shared secret header that
+// the dashboard proxy injects SERVER-SIDE (never exposed to the browser). When no key is configured
+// the gate is open for on-Mac local/dev use only; an operator MUST set the key BEFORE adding the
+// tunnel ingress for /remote-browser*. The unguessable session id is a second capability on top.
+function remoteBrowserAuthorized(req) {
+  // Accept either env name (FACEBOOK_TOKEN_CLOAK_* on the Mac, or the dashboard-shared
+  // ACCOUNTS_BRIDGE_REMOTE_BROWSER_KEY) and fall back to ACCOUNTS_BRIDGE_API_KEY, so a single shared
+  // secret configured on both sides just works — matching the dashboard proxy's own fallback chain.
+  const expected = String(
+    process.env.FACEBOOK_TOKEN_CLOAK_REMOTE_BROWSER_KEY ||
+    process.env.ACCOUNTS_BRIDGE_REMOTE_BROWSER_KEY ||
+    process.env.ACCOUNTS_BRIDGE_API_KEY || ''
+  ).trim();
+  if (!expected) return true;
+  const provided = String(req.headers['x-remote-browser-key'] || '').trim();
+  if (!provided) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  try { return require('crypto').timingSafeEqual(a, b); } catch { return false; }
+}
 
 function resolveCorsOrigin(req) {
   const origin = req.headers.origin;
@@ -683,6 +717,16 @@ function createHandler(deps = {}) {
   const fetchImpl = deps.fetch || global.fetch;
   const fbLite = deps.fbLiteTokenService || fbLiteTokenService;
   const downloadVideo = deps.downloadVideo;
+  // Cloud Browser manager — opens/streams/drives a single visible page on this Mac's persistent
+  // profile for the dashboard Accounts "Cloud Browser" feature. One instance per handler so its
+  // session map is shared across requests. Reuses the same browser backend + profile archive sync as
+  // the Accounts Bridge open/close lifecycle, so a cloud session is cookie-identical to a local one.
+  const remoteBrowser = deps.remoteBrowser || createRemoteBrowserManager({
+    browser: br,
+    profileArchiveSync: deps.profileArchiveSync || profileArchiveSync
+  });
+  // /remote-browser/* capability routes are gated by remoteBrowserAuthorized() (shared-secret header
+  // injected by the dashboard proxy) since cloudflared makes tunnel traffic look like loopback.
   // Shared dependency bundle for the Facebook Lite (EAAD6V) token path.
   const liteDeps = { kc, fbLite, fetchImpl };
   // Per-namespace backoff for LIVE /token/auto-sync. The Worker triggers recovery AUTOMATICALLY on a
@@ -704,7 +748,7 @@ function createHandler(deps = {}) {
       // allowlisted Pubilo dashboard origins. Set the response headers up-front so every send() below
       // carries them, and answer the preflight before any routing/side-effect runs.
       const corsOrigin = resolveCorsOrigin(req);
-      const corsSafe = CORS_SAFE_PATHS.has(url.pathname);
+      const corsSafe = CORS_SAFE_PATHS.has(url.pathname) || isRemoteBrowserCorsPath(url.pathname);
       if (corsOrigin && corsSafe) applyCorsHeaders(res, corsOrigin, req);
       if (req.method === 'OPTIONS') {
         if (corsOrigin && corsSafe) {
@@ -2621,6 +2665,53 @@ function createHandler(deps = {}) {
           return send(res, postingStatus(result), result);
         } finally {
           await posting.closeSession(session);
+        }
+      }
+
+      // ── Cloud Browser (remote browser) ─────────────────────────────────────────────────────────
+      // Open + stream + drive a single visible page on this Mac's persistent profile so the dashboard
+      // Accounts page can SEE and CONTROL a logged-in Facebook profile WITHOUT remoting the desktop.
+      // All routes are token-free: status/input return JSON with no secret; screenshot returns a
+      // rasterized JPEG. No JS-eval route exists. The session id is an unguessable crypto handle.
+      // The capability-granting routes are gated by a shared secret header (the dashboard proxy injects
+      // it) because cloudflared makes tunnel traffic indistinguishable from loopback. Fail closed.
+      if (isRemoteBrowserCorsPath(url.pathname) && !remoteBrowserAuthorized(req)) {
+        return sendError(res, 401, 'remote_browser_unauthorized');
+      }
+      if (req.method === 'POST' && url.pathname === '/remote-browser/start') {
+        const body = await parseBody(req);
+        const result = await remoteBrowser.start({ account_uid: body.account_uid || body.account, initial_url: body.initial_url || body.url });
+        return send(res, 200, { success: true, session: result });
+      }
+      {
+        const rb = url.pathname.match(/^\/remote-browser\/([A-Za-z0-9_-]+)\/(status|screenshot|input|stop)$/);
+        if (rb) {
+          const sessionId = rb[1];
+          const op = rb[2];
+          if (req.method === 'GET' && op === 'status') {
+            const status = await remoteBrowser.status(sessionId);
+            return send(res, 200, { success: true, session: status });
+          }
+          if (req.method === 'GET' && op === 'screenshot') {
+            const shot = await remoteBrowser.screenshot(sessionId);
+            res.writeHead(200, {
+              'Content-Type': shot.contentType,
+              'Content-Length': shot.buffer.length,
+              'Cache-Control': 'no-store',
+              'X-Content-Type-Options': 'nosniff'
+            });
+            return res.end(shot.buffer);
+          }
+          if (req.method === 'POST' && op === 'input') {
+            const body = await parseBody(req);
+            const result = await remoteBrowser.input(sessionId, body.action, body.payload || body);
+            return send(res, 200, { success: true, ...result });
+          }
+          if (req.method === 'POST' && op === 'stop') {
+            const result = await remoteBrowser.stop(sessionId);
+            return send(res, 200, { success: true, ...result });
+          }
+          return sendError(res, 405, 'method_not_allowed');
         }
       }
 
