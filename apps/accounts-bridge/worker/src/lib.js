@@ -58,6 +58,51 @@ export async function sha256Hex(value) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Non-secret SHA-256 digest of raw bytes (encrypted profile archive). Same hex format as sha256Hex.
+export async function sha256HexBytes(bytes) {
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const digest = await crypto.subtle.digest('SHA-256', view);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Sealed-archive envelope magic. The local app prepends these ASCII bytes ("ABENC1") to the AES-GCM
+// ciphertext so the Worker can prove an upload is sealed ciphertext — not a raw tar.gz/zip from which
+// cookies/tokens could be parsed. The Worker has no key and never decrypts; it only checks the shape.
+export const ARCHIVE_MAGIC = new Uint8Array([0x41, 0x42, 0x45, 0x4e, 0x43, 0x31]); // "ABENC1"
+export const ARCHIVE_MAGIC_TEXT = 'ABENC1';
+// AES-GCM minimum overhead past the magic: 12-byte nonce + 16-byte tag.
+const ARCHIVE_MIN_OVERHEAD = 12 + 16;
+
+function startsWith(bytes, prefix) {
+  if (bytes.byteLength < prefix.byteLength) return false;
+  for (let i = 0; i < prefix.byteLength; i += 1) {
+    if (bytes[i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
+// Tripwire for the binary archive path: refuse anything that is NOT our local-sealed envelope, and
+// explicitly refuse the common UNencrypted archive magics (gzip / zip) so a raw browser-data archive
+// can never be stored even by mistake. Returns the byte view on success.
+export function assertEncryptedArchive(value, field = 'archive') {
+  const bytes = value instanceof Uint8Array ? value : value ? new Uint8Array(value) : null;
+  if (!bytes || bytes.byteLength === 0) {
+    throw badRequest(`${field} must be non-empty sealed-archive bytes`, 'archive_required');
+  }
+  // gzip (1f 8b) / zip (PK\x03\x04) — the shapes BrowserSaving uploads RAW. We refuse them: only a
+  // locally-sealed ABENC1 envelope is acceptable here.
+  if ((bytes[0] === 0x1f && bytes[1] === 0x8b) || (bytes[0] === 0x50 && bytes[1] === 0x4b)) {
+    throw badRequest(`${field} looks like an unencrypted archive — seal it locally first`, 'archive_not_encrypted');
+  }
+  if (!startsWith(bytes, ARCHIVE_MAGIC)) {
+    throw badRequest(`${field} is missing the ${ARCHIVE_MAGIC_TEXT} sealed-envelope header`, 'archive_not_encrypted');
+  }
+  if (bytes.byteLength < ARCHIVE_MAGIC.byteLength + ARCHIVE_MIN_OVERHEAD) {
+    throw badRequest(`${field} is too small to be a sealed archive`, 'archive_too_small');
+  }
+  return bytes;
+}
+
 export function newId(prefix) {
   return `${prefix}_${crypto.randomUUID()}`;
 }

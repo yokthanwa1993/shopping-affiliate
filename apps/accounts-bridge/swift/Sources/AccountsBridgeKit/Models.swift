@@ -71,6 +71,40 @@ public struct SessionStatus: Codable, Sendable {
     public let latest: SessionMeta?
 }
 
+/// Status-only view of the CURRENT sealed profile archive for an owner triple. The archive bytes are
+/// opaque ciphertext in R2; this view never carries them — only digest/version/size so the UI can show
+/// "present / restorable" without ever seeing the ciphertext, let alone the plaintext profile.
+public struct ProfileArchiveMeta: Codable, Sendable {
+    public let platform: Platform
+    public let role: BridgeRole
+    public let accountUid: String
+    public let blobDigest: String
+    public let byteSize: Int
+    public let cipher: String
+    public let version: String
+    public let source: String
+    public let status: String
+    public let hasArchive: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case platform
+        case role
+        case accountUid = "account_uid"
+        case blobDigest = "blob_digest"
+        case byteSize = "byte_size"
+        case cipher
+        case version
+        case source
+        case status
+        case hasArchive = "has_archive"
+    }
+}
+
+public struct ProfileArchiveStatus: Codable, Sendable {
+    public let present: Bool
+    public let archive: ProfileArchiveMeta?
+}
+
 public struct SessionMeta: Codable, Sendable {
     public let accountUid: String
     public let role: BridgeRole

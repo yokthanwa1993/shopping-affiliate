@@ -65,6 +65,10 @@ already encrypted — are pushed to the Worker. The Worker and the status UI con
 - **cookie_records** — encrypted cookie blob, same binding discipline.
 - **audit_events** — append-only, non-secret provenance (`event_type`, who/what/when, `detail` JSON
   with a forbidden-key guard so no secret-looking field can be recorded).
+- **profile_archives** (`migrations/0002_profile_archives.sql`) — metadata for the sealed profile
+  archive: `r2_key + blob_digest + byte_size + cipher + version + source`, bound to
+  `platform + role + account_uid` with `UNIQUE(platform, role, account_uid)` (one CURRENT archive per
+  owner). The bytes themselves live in R2, **never** in D1.
 
 ## Sync flow (write path)
 
@@ -76,6 +80,47 @@ already encrypted — are pushed to the Worker. The Worker and the status UI con
 4. `POST /v1/sessions` (or `/v1/cookies`) with the sealed blob. The Worker computes a SHA-256
    `blob_digest`, stores ciphertext only, and returns metadata (never the blob).
 5. The Worker writes an `audit_events` row for each step.
+
+## Profile archive sync (sealed, BrowserSaving-style)
+
+Thanwa's requirement: BrowserSaving does **not** keep profile data local-only — on close it compresses
+the Chrome/session data and uploads it to its Worker, and on open it downloads/restores the archive
+first, so session data never disappears. Accounts Bridge reproduces that *behaviour* but not its
+*trust model*.
+
+| | BrowserSaving | Accounts Bridge v2 |
+|---|---|---|
+| On close | `tar.gz` the profile, upload **raw** bytes | `tar.gz`, then **seal locally** (AES-GCM → `ABENC1` envelope), upload **ciphertext** |
+| Worker storage | R2 `browser-data/{profileId}.tar.gz` | R2 `profile-archives/{platform}/{role}/{account_uid}.tar.gz.enc` (account/role-scoped) |
+| Worker reads secrets? | Yes — parses cookies/`datr` out of the archive into D1 columns | **No** — has no key, never decrypts; D1 holds only digest/size/version metadata |
+| Download returns | raw archive (and a `/cookies` JSON endpoint) | **ciphertext only**, to the authenticated local client, which unseals locally |
+| Upload validation | rejects `< 1024` bytes | rejects anything that isn't a sealed `ABENC1` envelope (`archive_not_encrypted` on raw gzip/zip) |
+
+Flow:
+
+1. **Open** → `GET …/download`. If present, the local app receives the sealed `ABENC1` bytes, unseals
+   with the Keychain key, extracts the `tar.gz` into the profile dir, then launches the browser. This
+   is what stops session/cookie data from "disappearing".
+2. **Close** → the local app collects only the allowlisted essential paths (`buildArchiveManifest`),
+   `tar.gz`-es them, **seals locally** (`sealArchiveEnvelope` / `LocalBlobSealer.sealArchive`), and
+   `POST …/upload`s the ciphertext. The Worker computes a SHA-256 of the ciphertext, writes the bytes
+   to R2, upserts non-secret metadata to `profile_archives` (one CURRENT archive per
+   `platform+role+account_uid`), and emits a `profile_archive.uploaded` audit event.
+3. **Status** → `GET …/status` returns `present` + digest/version/size only (the "head" surface).
+
+Why this is safe where BrowserSaving's pattern would not be: the Worker is a zero-knowledge byte store
+for archives. Even with full DB + R2 access, an attacker sees only opaque ciphertext and metadata — no
+cookies, no `datr`, no tokens, no passwords. The only place plaintext profile bytes exist is on the
+operator's device, behind the Keychain-held seal key.
+
+Storage: bytes live in R2 (`PROFILE_ARCHIVES` binding); D1's `profile_archives` row holds
+`r2_key + blob_digest + byte_size + cipher + version + source + timestamps` and never the blob. The
+account must exist **and hold the role** for an upload to be accepted (same no-fallback discipline as
+sessions), so a restored profile is always traceable to its rightful owner.
+
+Local helper: `apps/accounts-bridge/local/profile-archive.js` — `ESSENTIAL_PROFILE_PATHS`,
+`isSafeRelativePath`/`buildArchiveManifest` (allowlist + traversal refusal), `sealArchiveEnvelope`/
+`unsealArchiveEnvelope` (key injected, never in repo), and `ProfileArchiveClient`.
 
 ## Read / status flow
 
@@ -131,6 +176,16 @@ migration and real store queries (no mocks, no network, no secrets):
 - `api.test.js` — token-free responses; role assignment; **page binding rejects mismatched
   account/role**; session store returns digest/flags but never the blob; plaintext-secret blob
   rejected; status mirrors stored session; audit forbidden-key guard.
-- `security.test.js` — every `/v1` route requires the key (401); fail-closed (503) when unconfigured;
-  health stays public; **worker source contains no browser/login/token-mint code path**; no GET over
-  a populated DB ever leaks ciphertext or names `encrypted_blob`.
+- `security.test.js` — every `/v1` route requires the key (401, incl. the profile-archive routes);
+  fail-closed (503) when unconfigured; health stays public; **worker source contains no
+  browser/login/token-mint code path**; no GET over a populated DB ever leaks ciphertext or names
+  `encrypted_blob`.
+- `archives.test.js` — profile-archive sync: upload seals bytes to R2 and returns metadata only;
+  download returns the exact ciphertext with non-secret headers; re-upload replaces (singleton);
+  raw gzip / missing-`ABENC1` uploads rejected; role/account drift refused; R2-unconfigured fails
+  closed (503).
+
+The local helper has its own suite at `apps/accounts-bridge/local/test/` (manifest path-safety,
+`ABENC1` envelope round-trip with a real in-test AES-GCM key, and the HTTP flow). The Swift contract
+smoke (`AccountsBridgeContractSmoke`) additionally checks `sealArchive`/`unsealArchive` round-trips,
+the `ABENC1` magic, the essential-paths allowlist safety, and `ProfileArchiveMeta` decoding.

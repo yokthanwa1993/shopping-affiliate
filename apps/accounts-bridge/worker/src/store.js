@@ -8,8 +8,33 @@
 // Every method that returns session/cookie rows strips the `encrypted_blob` column before it leaves
 // this layer. The blob is intentionally never surfaced past the store boundary.
 
-import { newId, nowIso, sha256Hex, assertEncryptedBlob } from './lib.js';
+import { newId, nowIso, sha256Hex, sha256HexBytes, assertEncryptedBlob, assertEncryptedArchive, HttpError } from './lib.js';
 import { SCHEMA_SQL } from './schema.js';
+
+// R2 object key for the current sealed profile archive. Scoped by platform/role/account_uid (NOT a
+// bare profile id) so ownership is unambiguous and BrowserSaving's `browser-data/{profileId}` ambiguity
+// can't recur. `.enc` marks it as opaque ciphertext the Worker never decrypts.
+export function profileArchiveR2Key({ platform, role, account_uid }) {
+  return `profile-archives/${platform}/${role}/${account_uid}.tar.gz.enc`;
+}
+
+function publicArchive(row) {
+  if (!row) return null;
+  return {
+    platform: row.platform,
+    role: row.role,
+    account_uid: row.account_uid,
+    blob_digest: row.blob_digest,
+    byte_size: row.byte_size,
+    cipher: row.cipher,
+    version: row.version,
+    source: row.source,
+    status: row.status,
+    has_archive: true,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
 
 
 function splitSchemaStatements(sql) {
@@ -59,9 +84,12 @@ function publicCookie(row) {
 }
 
 export class AccountsStore {
-  constructor(db, { clock } = {}) {
+  constructor(db, { clock, bucket } = {}) {
     this.db = db;
     this.clock = clock;
+    // R2 bucket binding for sealed profile archives (env.PROFILE_ARCHIVES). Optional: only the
+    // profile-archive routes require it; the rest of the API is pure D1.
+    this.bucket = bucket;
   }
 
   ts() {
@@ -74,7 +102,7 @@ export class AccountsStore {
     for (const stmt of statements) {
       await this.db.prepare(stmt).run();
     }
-    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events'];
+    const wanted = ['accounts', 'sections', 'account_roles', 'page_bindings', 'session_records', 'cookie_records', 'audit_events', 'profile_archives'];
     const { results } = await this.db
       .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${wanted.map(() => '?').join(',')}) ORDER BY name`)
       .bind(...wanted)
@@ -293,5 +321,68 @@ export class AccountsStore {
       .bind(id, event_type, account_uid, platform, role, page_id, source, detailJson, now)
       .run();
     return { id, event_type, created_at: now };
+  }
+
+  // --- profile archives (sealed bytes in R2, metadata in D1) -------------
+  requireBucket() {
+    if (!this.bucket) {
+      throw new HttpError('Profile archive storage (R2) is not configured', 503, 'archive_store_unconfigured');
+    }
+    return this.bucket;
+  }
+
+  async getArchiveRow({ platform, role, account_uid }) {
+    return this.db
+      .prepare('SELECT * FROM profile_archives WHERE platform = ? AND role = ? AND account_uid = ?')
+      .bind(platform, role, account_uid)
+      .first();
+  }
+
+  // Replace the CURRENT sealed archive for this owner triple: write opaque ciphertext to R2, then
+  // upsert non-secret metadata in D1. `archive` MUST be the locally-sealed ABENC1 envelope (validated
+  // here so a raw browser-data archive can never be stored). Returns metadata only — never the bytes.
+  async putProfileArchive({ platform, role, account_uid, version, source, cipher = 'aesgcm', archive }) {
+    const bytes = assertEncryptedArchive(archive);
+    const bucket = this.requireBucket();
+    const key = profileArchiveR2Key({ platform, role, account_uid });
+    const digest = await sha256HexBytes(bytes);
+    await bucket.put(key, bytes, {
+      httpMetadata: { contentType: 'application/octet-stream' },
+      customMetadata: { platform, role, account_uid, version, source, cipher, digest }
+    });
+    const now = this.ts();
+    const existing = await this.getArchiveRow({ platform, role, account_uid });
+    if (existing) {
+      await this.db
+        .prepare(
+          'UPDATE profile_archives SET r2_key = ?, blob_digest = ?, byte_size = ?, cipher = ?, version = ?, source = ?, status = ?, updated_at = ? WHERE id = ?'
+        )
+        .bind(key, digest, bytes.byteLength, cipher, version, source, 'active', now, existing.id)
+        .run();
+    } else {
+      await this.db
+        .prepare(
+          'INSERT INTO profile_archives (id, platform, role, account_uid, r2_key, blob_digest, byte_size, cipher, version, source, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        )
+        .bind(newId('arch'), platform, role, account_uid, key, digest, bytes.byteLength, cipher, version, source, 'active', now, now)
+        .run();
+    }
+    return publicArchive(await this.getArchiveRow({ platform, role, account_uid }));
+  }
+
+  // Metadata-only presence check (the "head" surface). Never touches the bytes.
+  async profileArchiveStatus({ platform, role, account_uid }) {
+    const meta = publicArchive(await this.getArchiveRow({ platform, role, account_uid }));
+    return { present: !!meta, archive: meta };
+  }
+
+  // Fetch the sealed ciphertext for restore-before-open. Returns `{ meta, body }` where `body` is the
+  // R2 object body (opaque bytes) or null when absent. The Worker has no key; it streams ciphertext.
+  async getProfileArchiveBytes({ platform, role, account_uid }) {
+    const row = await this.getArchiveRow({ platform, role, account_uid });
+    if (!row) return { meta: null, object: null };
+    const bucket = this.requireBucket();
+    const object = await bucket.get(row.r2_key);
+    return { meta: publicArchive(row), object };
   }
 }

@@ -32,7 +32,10 @@ test('every /v1 endpoint rejects a missing or wrong API key with 401', async () 
     ['POST', '/v1/sessions'],
     ['GET', '/v1/sessions/status?account_uid=x&role=ads_power_editor'],
     ['POST', '/v1/cookies'],
-    ['POST', '/v1/audit/events']
+    ['POST', '/v1/audit/events'],
+    ['GET', '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost/status'],
+    ['GET', '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost/download'],
+    ['POST', '/v1/profile-archives/facebook/page_posting_facebook_lite/uidPost/upload?version=v1&source=local']
   ];
   for (const [method, p] of probes) {
     const missing = await handleRequest(req(method, p), env);

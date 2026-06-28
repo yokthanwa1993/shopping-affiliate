@@ -17,6 +17,16 @@
     }
   ],
 
+  // R2 bucket for SEALED profile archives (encrypted ABENC1 envelopes — opaque ciphertext only).
+  // Create with:  wrangler r2 bucket create accounts-bridge-profile-archives
+  // The Worker never decrypts these objects; it has no key. Only the profile-archive routes use it.
+  "r2_buckets": [
+    {
+      "binding": "PROFILE_ARCHIVES",
+      "bucket_name": "accounts-bridge-profile-archives"
+    }
+  ],
+
   // Non-secret vars only. The shared local-bridge API key is a SECRET — set it with:
   //   wrangler secret put ACCOUNTS_BRIDGE_API_KEY
   // Never place the key value in this file or in any var.

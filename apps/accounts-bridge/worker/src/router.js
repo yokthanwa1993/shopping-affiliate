@@ -77,7 +77,8 @@ function platformFromQuery(url, fallback = 'facebook') {
 
 export function createStore(env, opts = {}) {
   if (!env || !env.DB) throw new HttpError('DB binding missing', 500, 'no_db');
-  return new AccountsStore(env.DB, opts);
+  // PROFILE_ARCHIVES is the optional R2 bucket binding for sealed profile archives.
+  return new AccountsStore(env.DB, { bucket: env.PROFILE_ARCHIVES, ...opts });
 }
 
 // Core dispatch. `store` is injectable for tests; defaults to a D1-backed store.
@@ -258,6 +259,58 @@ export async function handleRequest(request, env, deps = {}) {
       });
       await store.insertAudit({ event_type: 'cookie.stored', account_uid: accountUid, platform, role, page_id: pageId, source: 'api', detail: { version, digest: cookie.blob_digest } });
       return json({ cookie }, 201);
+    }
+
+    // --- profile archives (BrowserSaving-style restore-on-open / save-on-close, but SEALED) ---
+    // The bytes are a locally-sealed ABENC1 envelope; the Worker stores opaque ciphertext in R2 and
+    // never parses cookies/tokens/datr/passwords from them. Metadata responses are token-free.
+    const archiveMatch = path.match(/^\/v1\/profile-archives\/([a-z]+)\/([a-z_]+)\/([^/]+)\/(upload|download|status)$/);
+    if (archiveMatch) {
+      const platform = assertPlatform(archiveMatch[1]);
+      const role = assertRole(archiveMatch[2]);
+      const accountUid = assertIdentifier('account_uid', decodeURIComponent(archiveMatch[3]));
+      const action = archiveMatch[4];
+      const owner = { platform, role, account_uid: accountUid };
+
+      if (action === 'status' && method === 'GET') {
+        return json({ ...owner, ...(await store.profileArchiveStatus(owner)) });
+      }
+
+      if (action === 'download' && method === 'GET') {
+        const { meta, object } = await store.getProfileArchiveBytes(owner);
+        if (!meta || !object) return json({ ok: false, error: 'archive_not_found', ...owner }, 404);
+        // Stream opaque ciphertext to the authenticated local client. Non-secret metadata rides in
+        // headers so the client can verify what it restored without a second round-trip.
+        return new Response(object.body, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'x-archive-digest': meta.blob_digest,
+            'x-archive-version': meta.version,
+            'x-archive-cipher': meta.cipher,
+            'x-archive-size': String(meta.byte_size)
+          }
+        });
+      }
+
+      if (action === 'upload' && method === 'POST') {
+        const version = assertIdentifier('version', url.searchParams.get('version') || '', { maxLen: 120 });
+        const source = assertIdentifier('source', url.searchParams.get('source') || '', { maxLen: 120 });
+        const cipherRaw = url.searchParams.get('cipher');
+        const cipher = cipherRaw == null || cipherRaw === '' ? 'aesgcm' : assertIdentifier('cipher', cipherRaw, { maxLen: 40 });
+        // Ownership is explicit: the account must exist AND actually hold the role, so a restored
+        // profile can always be traced to its rightful owner (no fallback account).
+        if (!(await store.getAccount(platform, accountUid))) {
+          throw new HttpError(`Account not found: ${redact(accountUid)}`, 422, 'account_not_found');
+        }
+        if (!(await store.accountHoldsRole(platform, accountUid, role))) {
+          throw new HttpError(`Account ${redact(accountUid)} does not hold role ${role}`, 409, 'role_mismatch');
+        }
+        const archiveBytes = new Uint8Array(await request.arrayBuffer());
+        const archive = await store.putProfileArchive({ platform, role, account_uid: accountUid, version, source, cipher, archive: archiveBytes });
+        await store.insertAudit({ event_type: 'profile_archive.uploaded', account_uid: accountUid, platform, role, source: 'api', detail: { version, digest: archive.blob_digest, byte_size: archive.byte_size } });
+        return json({ archive }, 201);
+      }
     }
 
     // --- audit ---

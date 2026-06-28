@@ -96,6 +96,37 @@ public struct AccountsBridgeClient: Sendable {
         return try JSONDecoder().decode(Wrap.self, from: data).session
     }
 
+    // MARK: - Profile archive sync (restore-on-open / save-on-close, SEALED)
+    //
+    // Mirrors BrowserSaving's compress-on-close / restore-on-open behaviour, but the bytes are sealed
+    // LOCALLY (`LocalBlobSealer.sealArchive`) into an ABENC1 envelope before upload. The Worker stores
+    // opaque ciphertext in R2 and never decrypts it. Download returns that ciphertext for local
+    // restore; the plaintext profile never round-trips through the API.
+
+    /// Metadata-only presence check for the current sealed archive (the "open" precondition).
+    public func profileArchiveStatus(accountUid: String, role: BridgeRole, platform: Platform = .facebook) async throws -> ProfileArchiveStatus {
+        let (data, _) = try await get("/v1/profile-archives/\(platform.rawValue)/\(role.rawValue)/\(escape(accountUid))/status")
+        return try JSONDecoder().decode(ProfileArchiveStatus.self, from: data)
+    }
+
+    /// Upload the sealed profile archive on CLOSE. `sealedArchive` MUST be an ABENC1 envelope produced
+    /// by `LocalBlobSealer.sealArchive` — raw tar.gz/zip bytes are refused by the Worker.
+    @discardableResult
+    public func uploadProfileArchive(accountUid: String, role: BridgeRole, sealedArchive: Data, version: String, source: String, cipher: String = "aesgcm", platform: Platform = .facebook) async throws -> ProfileArchiveMeta {
+        let q = "version=\(escape(version))&source=\(escape(source))&cipher=\(escape(cipher))"
+        let (data, _) = try await sendRaw("POST", "/v1/profile-archives/\(platform.rawValue)/\(role.rawValue)/\(escape(accountUid))/upload?\(q)", body: sealedArchive)
+        struct Wrap: Decodable { let archive: ProfileArchiveMeta }
+        return try JSONDecoder().decode(Wrap.self, from: data).archive
+    }
+
+    /// Download the sealed profile archive on OPEN (restore-before-launch). Returns the opaque
+    /// ciphertext bytes, or `nil` when no archive exists yet. The caller unseals locally.
+    public func downloadProfileArchive(accountUid: String, role: BridgeRole, platform: Platform = .facebook) async throws -> Data? {
+        let (data, response) = try await sendRaw("GET", "/v1/profile-archives/\(platform.rawValue)/\(role.rawValue)/\(escape(accountUid))/download", body: nil, allow404: true)
+        if (response as? HTTPURLResponse)?.statusCode == 404 { return nil }
+        return data
+    }
+
     public func recordAudit(eventType: String, accountUid: String? = nil, platform: Platform? = nil, role: BridgeRole? = nil, pageId: String? = nil, detail: [String: String]? = nil) async throws {
         var body: [String: Any] = ["event_type": eventType]
         if let accountUid { body["account_uid"] = accountUid }
@@ -141,6 +172,29 @@ public struct AccountsBridgeClient: Sendable {
         }
         return (data, response)
     }
+
+    /// Raw-bytes transport for the profile-archive endpoints: sends/receives `application/octet-stream`
+    /// instead of JSON. `allow404` lets the download path treat "no archive yet" as a non-error.
+    private func sendRaw(_ method: String, _ path: String, body: Data?, allow404: Bool = false) async throws -> (Data, URLResponse) {
+        var req = URLRequest(url: baseURL.appendingPathComponent(String(path.split(separator: "?").first ?? "")))
+        if let query = path.split(separator: "?", maxSplits: 1).dropFirst().first {
+            var comps = URLComponents(url: req.url!, resolvingAgainstBaseURL: false)!
+            comps.percentEncodedQuery = String(query)
+            req.url = comps.url
+        }
+        req.httpMethod = method
+        req.setValue(apiKey, forHTTPHeaderField: "x-accounts-bridge-key")
+        if let body {
+            req.setValue("application/octet-stream", forHTTPHeaderField: "content-type")
+            req.httpBody = body
+        }
+        let (data, response) = try await session.data(for: req)
+        if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
+            if allow404 && http.statusCode == 404 { return (data, response) }
+            throw BridgeError.http(status: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+        }
+        return (data, response)
+    }
 }
 
 public enum BridgeError: Error {
@@ -166,4 +220,68 @@ public struct LocalBlobSealer {
         throw BridgeError.sealingUnavailable
         #endif
     }
+
+    /// ASCII envelope magic ("ABENC1") the Worker checks to prove an upload is sealed ciphertext — not
+    /// a raw browser-data archive. Must stay byte-identical to the Worker's `ARCHIVE_MAGIC`.
+    public static let archiveMagic = Data("ABENC1".utf8)
+
+    /// Seal a compressed profile archive (tar.gz bytes) into an ABENC1 envelope for upload. The bytes
+    /// are AES-GCM ciphertext prefixed with the magic; the plaintext profile never leaves the device.
+    public func sealArchive(_ archive: Data) throws -> Data {
+        #if canImport(CryptoKit)
+        let box = try AES.GCM.seal(archive, using: key)
+        guard let combined = box.combined else { throw BridgeError.sealingUnavailable }
+        var out = Data(LocalBlobSealer.archiveMagic)
+        out.append(combined)
+        return out
+        #else
+        throw BridgeError.sealingUnavailable
+        #endif
+    }
+
+    /// Unseal an ABENC1 envelope downloaded for restore. Inverse of `sealArchive`.
+    public func unsealArchive(_ envelope: Data) throws -> Data {
+        #if canImport(CryptoKit)
+        let magic = LocalBlobSealer.archiveMagic
+        guard envelope.count > magic.count, envelope.prefix(magic.count) == magic else {
+            throw BridgeError.sealingUnavailable
+        }
+        let box = try AES.GCM.SealedBox(combined: envelope.dropFirst(magic.count))
+        return try AES.GCM.open(box, using: key)
+        #else
+        throw BridgeError.sealingUnavailable
+        #endif
+    }
+}
+
+/// The essential Chrome/Chromium profile paths Accounts Bridge collects into a sealed archive on
+/// close and restores on open — the same surface BrowserSaving captures (cookies, logins, local
+/// storage, service workers, etc.). This list is the LOCAL contract; the Worker never sees these
+/// names, only the sealed bytes. Paths are relative to the profile directory and are an allowlist:
+/// the local archiver must refuse anything outside it (no absolute paths, no `..` traversal).
+public enum ProfileArchive {
+    public static let essentialPaths: [String] = [
+        "Cookies",
+        "Cookies-journal",
+        "Login Data",
+        "Login Data-journal",
+        "Web Data",
+        "Web Data-journal",
+        "History",
+        "Preferences",
+        "Secure Preferences",
+        "Network/Cookies",
+        "Network/Network Persistent State",
+        "Network/Trust Tokens",
+        "Local Storage",
+        "Session Storage",
+        "IndexedDB",
+        "Service Worker",
+        "Local Extension Settings",
+        "Sync Data"
+    ]
+
+    /// The Local State file lives at the user-data-dir ROOT (one level above the profile dir); kept
+    /// separate so the archiver can include it without widening the per-profile allowlist.
+    public static let userDataRootPaths: [String] = ["Local State"]
 }

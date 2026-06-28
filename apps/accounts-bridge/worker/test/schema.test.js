@@ -12,7 +12,8 @@ const EXPECTED_TABLES = [
   'page_bindings',
   'session_records',
   'cookie_records',
-  'audit_events'
+  'audit_events',
+  'profile_archives'
 ];
 
 test('migration creates every expected table', async () => {
@@ -65,5 +66,27 @@ test('session_records requires encrypted_blob + blob_digest (NOT NULL)', async (
     db.db
       .prepare('INSERT INTO session_records (id, account_uid, platform, role, version, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)')
       .run('s1', 'uidA', 'facebook', 'page_posting_facebook_lite', 'v1', 'api', 't', 't')
+  );
+});
+
+test('profile_archives is a singleton per (platform, role, account_uid)', async () => {
+  const db = new D1Sqlite();
+  db.db.prepare('INSERT INTO accounts (id, account_uid, platform, created_at, updated_at) VALUES (?,?,?,?,?)').run('a1', 'uidA', 'facebook', 't', 't');
+  const ins = (id) =>
+    db.db
+      .prepare('INSERT INTO profile_archives (id, platform, role, account_uid, r2_key, blob_digest, byte_size, version, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run(id, 'facebook', 'page_posting_facebook_lite', 'uidA', 'k', 'd', 100, 'v1', 'api', 't', 't');
+  ins('arch1');
+  // A second CURRENT archive for the same owner triple must violate UNIQUE.
+  assert.throws(() => ins('arch2'));
+});
+
+test('profile_archives.platform/role CHECKs reject unsupported values', async () => {
+  const db = new D1Sqlite();
+  db.db.prepare('INSERT INTO accounts (id, account_uid, platform, created_at, updated_at) VALUES (?,?,?,?,?)').run('a1', 'uidA', 'facebook', 't', 't');
+  assert.throws(() =>
+    db.db
+      .prepare('INSERT INTO profile_archives (id, platform, role, account_uid, r2_key, blob_digest, byte_size, version, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run('arch1', 'facebook', 'not_a_role', 'uidA', 'k', 'd', 100, 'v1', 'api', 't', 't')
   );
 });
