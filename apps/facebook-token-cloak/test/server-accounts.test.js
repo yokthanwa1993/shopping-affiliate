@@ -165,6 +165,18 @@ test('CORS preflight is allowed for the Pubilo dashboard origin on safe accounts
   assert.match(r.headers['access-control-allow-methods'] || '', /GET/);
 });
 
+
+test('CORS preflight opts into Chromium private-network access for Pubilo dashboard', async () => {
+  const r = await rawReq('OPTIONS', '/accounts', {
+    Origin: 'https://www.pubilo.com',
+    'Access-Control-Request-Method': 'GET',
+    'Access-Control-Request-Private-Network': 'true'
+  });
+  assert.equal(r.status, 204);
+  assert.equal(r.headers['access-control-allow-origin'], 'https://www.pubilo.com');
+  assert.equal(r.headers['access-control-allow-private-network'], 'true');
+});
+
 test('CORS echoes the allowed origin on a real safe GET', async () => {
   const r = await rawReq('GET', '/accounts', { Origin: 'https://pubilo.com' });
   assert.equal(r.status, 200);

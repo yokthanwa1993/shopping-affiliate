@@ -342,11 +342,16 @@ function resolveCorsOrigin(req) {
   return null;
 }
 
-function applyCorsHeaders(res, origin) {
+function applyCorsHeaders(res, origin, req = null) {
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-bot-id');
+  // Chromium/Opera Private Network Access: public https://pubilo.com -> local
+  // http://127.0.0.1:8820 requires this opt-in on the preflight response.
+  if (req?.headers?.['access-control-request-private-network'] === 'true') {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
   res.setHeader('Access-Control-Max-Age', '600');
 }
 
@@ -700,7 +705,7 @@ function createHandler(deps = {}) {
       // carries them, and answer the preflight before any routing/side-effect runs.
       const corsOrigin = resolveCorsOrigin(req);
       const corsSafe = CORS_SAFE_PATHS.has(url.pathname);
-      if (corsOrigin && corsSafe) applyCorsHeaders(res, corsOrigin);
+      if (corsOrigin && corsSafe) applyCorsHeaders(res, corsOrigin, req);
       if (req.method === 'OPTIONS') {
         if (corsOrigin && corsSafe) {
           res.writeHead(204);
