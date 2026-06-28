@@ -39345,6 +39345,7 @@ app.put('/api/pages/:id', async (c) => {
             posting_token_source,
             comment_token_source,
             posting_profile_uid,
+            postingProfileUid,
             caption_link_enabled,
             base_post_hours,
             base_post_interval_minutes,
@@ -39369,8 +39370,9 @@ app.put('/api/pages/:id', async (c) => {
         // the override → auto-discovery) or 5–32 digits. Anything else is rejected up-front (400) so a
         // malformed value can never be persisted or threaded into the Facebook Lite refresh request.
         let nextPostingProfileUid: string | undefined
-        if (posting_profile_uid !== undefined) {
-            const trimmed = String(posting_profile_uid ?? '').trim()
+        const rawPostingProfileUid = posting_profile_uid !== undefined ? posting_profile_uid : postingProfileUid
+        if (rawPostingProfileUid !== undefined) {
+            const trimmed = String(rawPostingProfileUid ?? '').trim()
             if (trimmed !== '' && !/^\d{5,32}$/.test(trimmed)) {
                 return c.json({ error: 'invalid_posting_profile_uid' }, 400)
             }
