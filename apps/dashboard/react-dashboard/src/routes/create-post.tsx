@@ -58,7 +58,14 @@ export function CreatePostPage() {
     // DETAIL — Mini App-like page settings, normal posting only. PageDetailView
     // renders its own centered avatar/name/id header with back/close (→ master).
     return (
-      <div className="mx-auto w-full max-w-lg pb-10 lg:max-w-5xl xl:max-w-6xl">
+      <div className="mx-auto w-full max-w-lg space-y-3 pb-10 lg:max-w-5xl xl:max-w-6xl">
+        <div className="rounded-2xl border border-blue-100 bg-blue-50/80 p-4 shadow-sm">
+          <p className="text-xs font-bold uppercase tracking-wide text-blue-600">Create Post settings</p>
+          <h2 className="mt-1 text-lg font-extrabold text-foreground">ตั้งค่าเพจและ Account UID สำหรับโพสต์</h2>
+          <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+            เลือกเพจนี้ว่าจะใช้ Account UID ไหนจาก Accounts Bridge ตอนโพสต์ — บัญชีใน Accounts Bridge เป็น pool ใส่ได้หลายบัญชี แต่ UID ที่นี่คือบัญชีที่เพจนี้จะใช้โพสต์จริง
+          </p>
+        </div>
         <PageDetailView
           page={selectedPage}
           canEdit
@@ -85,7 +92,7 @@ export function CreatePostPage() {
             searchable
             layout="table"
             fill
-            title="เลือกเพจสำหรับตั้งค่าการโพสต์"
+            title="เลือกเพจเพื่อตั้งค่า Account UID สำหรับโพสต์"
             onToggleActive={(p, active) => toggleActive.mutate({ pageId: p.id, active })}
             pendingToggleId={toggleActive.isPending ? toggleActive.variables?.pageId ?? null : null}
           />

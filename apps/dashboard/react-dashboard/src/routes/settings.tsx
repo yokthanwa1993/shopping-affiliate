@@ -1579,13 +1579,11 @@ export function PageDetailView({
               </div>
 
               {compactToken ? (
-                // Light modes stay compact: no token storage UI here. Point the
-                // operator to Settings for the Facebook Lite token itself.
+                // Create Post owns the posting-account decision. Keep this mode
+                // focused on per-page source + UID, without sending operators
+                // back to /settings for the same workflow.
                 <p className="text-[11px] leading-relaxed text-muted-foreground">
-                  ตั้งค่า token ของ Facebook Lite ได้ที่{' '}
-                  <Link to="/settings" className="font-semibold text-blue-600 underline">
-                    Settings › Pages
-                  </Link>
+                  เลือกแหล่งโพสต์และ Account UID ได้ในหน้านี้เลย; ถ้าต้องเพิ่ม/refresh บัญชี ให้ทำใน Accounts Bridge แล้วกลับมาใส่ UID ที่นี่
                 </p>
               ) : postingTokenSource === 'stored_token' ? (
                 <div className="flex items-start justify-between gap-3 rounded-xl border bg-muted/50 p-3">
