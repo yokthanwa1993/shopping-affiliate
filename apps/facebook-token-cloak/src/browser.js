@@ -71,6 +71,55 @@ function clearStaleProfileSingletons(profileDir){
   }
   return removed;
 }
+// Full argv of a live pid via `ps`. Returns '' when the pid is gone/unreadable. Used ONLY to decide
+// whether a SingletonLock holder is a STALE bridge-spawned HEADLESS Chromium on the exact profile dir
+// — never to act on an operator's visible/external browser.
+function processCommandLine(pid){
+  const n=Number(pid);
+  if(!Number.isInteger(n)||n<=0) return '';
+  try{
+    const {execFileSync}=require('child_process');
+    return String(execFileSync('ps',['-o','command=','-p',String(n)],{encoding:'utf8',timeout:2000})||'').trim();
+  }catch{ return ''; }
+}
+// True only when a command line is a HEADLESS Chromium launched on EXACTLY this profile dir. Requires
+// BOTH a --headless flag AND the exact profile path, so an operator's visible browser (no --headless)
+// or a Chromium on a different profile is NEVER matched. This is the safety gate that keeps us from
+// killing non-headless/external windows.
+function isHeadlessProfileProcess(commandLine,profileDir){
+  const cmd=String(commandLine||'');
+  const dir=String(profileDir||'');
+  if(!cmd||!dir) return false;
+  if(!/(?:^|\s)--headless(?:=\S*)?(?=\s|$)/.test(cmd)) return false;
+  return cmd.includes('--user-data-dir='+dir)||cmd.includes('--user-data-dir "'+dir+'"')||cmd.includes('--user-data-dir='+dir+'/');
+}
+// When the operator clicks Open Profile (visible) but this profile's SingletonLock is held by a STALE
+// bridge-spawned HEADLESS Chromium on the exact profile dir, terminate ONLY that headless process so
+// the visible relaunch can take the lock. A non-headless/external/visible browser is left untouched
+// (its lock survives and the launch still surfaces profile_already_open). NEVER deletes profile/cookies.
+// Deps (readCommandLine/kill/sleep) are injectable so the behavior can be tested without real processes.
+async function terminateStaleHeadlessProfileLock(profileDir,deps={}){
+  const readCommandLine=deps.readCommandLine||processCommandLine;
+  const kill=deps.kill||((pid,sig)=>{ try{ process.kill(pid,sig); return true; }catch{ return false; } });
+  const sleep=deps.sleep||(ms=>new Promise(r=>setTimeout(r,ms)));
+  const waitMs=Number.isFinite(deps.waitMs)?deps.waitMs:1500;
+  const stepMs=Number.isFinite(deps.stepMs)?deps.stepMs:100;
+  const pid=singletonLockPid(profileDir);
+  if(!pid||!pidExists(pid)) return {terminated:false,reason:'no_live_lock'};
+  if(!isHeadlessProfileProcess(readCommandLine(pid),profileDir)) return {terminated:false,reason:'not_headless_profile_process',pid};
+  kill(pid,'SIGTERM');
+  // Wait briefly for the killed process to drop the SingletonLock before the caller relaunches.
+  let waited=0;
+  while(waited<waitMs){
+    const cur=singletonLockPid(profileDir);
+    if(!cur||!pidExists(cur)) break;
+    await sleep(stepMs); waited+=stepMs;
+  }
+  const survivor=singletonLockPid(profileDir);
+  if(survivor&&pidExists(survivor)&&isHeadlessProfileProcess(readCommandLine(survivor),profileDir)) kill(survivor,'SIGKILL');
+  clearStaleProfileSingletons(profileDir);
+  return {terminated:true,pid};
+}
 
 // ── Per-account persistent-context reuse ───────────────────────────────────────────────────────
 // A persistent profile dir can only be opened by ONE Chromium at a time — Chromium guards it with a
@@ -161,6 +210,11 @@ async function acquireAccountContext(rawAccount,options={}){
     _accountContexts.delete(key);
   }
   if(existing) _accountContexts.delete(key);
+  // Operator clicked Open Profile (visible) but this process holds no live bridge context. If a STALE
+  // bridge-spawned HEADLESS Chromium still holds the profile's SingletonLock, terminate ONLY that
+  // headless process so the visible relaunch can take the lock instead of failing profile_already_open.
+  // External/visible/non-headless browsers are left untouched. Never deletes profile/cookies.
+  if(wantsVisible){ try{ await terminateStaleHeadlessProfileLock(profileDirFor(key),options.lockClearDeps||{}); }catch{} }
   if(_accountContextLaunches.has(key)){ const entry=await _accountContextLaunches.get(key); return {...entry,reused:true}; }
   const launchPromise=(async()=>{
     const launched=await launchPersistentContext(rawAccount,options);
@@ -503,4 +557,4 @@ async function fillFacebookLogin(page,credential,{submit=false,totpProvider=null
   result.loggedIn=result.submitted&&!onAuthWall&&(!result.twoFactorRequired||result.twoFactorHandled);
   return result;
 }
-module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,inspectAccountContext,profileStatus,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
+module.exports={PROFILE_ROOT,loadBrowserBackend,setBrowserBackend,profileDirFor,launchPersistentContext,acquireAccountContext,peekAccountContext,inspectAccountContext,profileStatus,closeAccountContext,openPage,isContextAlive,classifyLaunchError,clearStaleProfileSingletons,isHeadlessProfileProcess,terminateStaleHeadlessProfileLock,resetAccountContexts,fillFacebookLogin,readDatrCookie,generateTotpCode,chooseTwoFactorCodeMethod,handleTrustDevicePage,dismissSavePasswordPrompt,looksLikeTwoFactorUrl};
